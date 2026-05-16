@@ -66,7 +66,7 @@ http://127.0.0.1:8093/cmdbuild/ui/#custompages/CmdbDynamicPages
 Designer route:
 
 ```text
-http://127.0.0.1:8093/cmdbuild/ui/#custompages/CmdbDynamicPages/designer
+http://127.0.0.1:8093/cmdbuild/ui/?cmdpMode=designer#custompages/CmdbDynamicPages
 ```
 
 Designer includes JSON editing plus a simple visual builder that generates specs for classes by attribute, domain traversal, attribute comparison, and set operations.
@@ -74,25 +74,25 @@ Designer includes JSON editing plus a simple visual builder that generates specs
 Runtime route example:
 
 ```text
-http://127.0.0.1:8093/cmdbuild/ui/#custompages/CmdbDynamicPages/ProbeClassesByAttributeType?attrType=reference
+http://127.0.0.1:8093/cmdbuild/ui/?cmdpTemplate=ProbeClassesByAttributeType&attrType=reference#custompages/CmdbDynamicPages
 ```
 
 Domain traversal sample:
 
 ```text
-http://127.0.0.1:8093/cmdbuild/ui/#custompages/CmdbDynamicPages/ProbeReferenceDomainTraversal?attrType=reference&className=ARM&depth=2
+http://127.0.0.1:8093/cmdbuild/ui/?cmdpTemplate=ProbeReferenceDomainTraversal&attrType=reference&className=ARM&depth=2#custompages/CmdbDynamicPages
 ```
 
 Attribute comparison sample:
 
 ```text
-http://127.0.0.1:8093/cmdbuild/ui/#custompages/CmdbDynamicPages/ProbeAttributeComparison?attrType=reference&referenceClass=ARM
+http://127.0.0.1:8093/cmdbuild/ui/?cmdpTemplate=ProbeAttributeComparison&attrType=reference&referenceClass=ARM#custompages/CmdbDynamicPages
 ```
 
 Join/intersection sample:
 
 ```text
-http://127.0.0.1:8093/cmdbuild/ui/#custompages/CmdbDynamicPages/ProbeClassSetOperations?leftType=reference&rightType=string
+http://127.0.0.1:8093/cmdbuild/ui/?cmdpTemplate=ProbeClassSetOperations&leftType=reference&rightType=string#custompages/CmdbDynamicPages
 ```
 
 The proxy forwards ordinary `/cmdbuild/...` requests to CMDBuild on `8090`.
@@ -124,7 +124,7 @@ The legacy PoC routes `/cmdbuild/custom-api/session-probe` and `/cmdbuild/custom
 
 State-changing custom API routes require a same-origin `Origin` or `Referer` header and `X-CMDBDynamicPages-CSRF`. The custom page obtains the token from `/cmdbuild/custom-api/csrf` and attaches it automatically. Schema bootstrap also requires the current CMDBuild role to have `admin_classes_modify`.
 
-Important: URL routes after `#` are client-side only. A URL such as `/cmdbuild/ui/#custompages/CmdbDynamicPages/template` cannot be used as a backend route because the browser never sends the hash fragment to the server.
+Important: URL routes after `#` are client-side only. CMDBuild may also normalize extra path segments after the custom page name. Use `cmdpMode` and `cmdpTemplate` query parameters before `#` for direct links.
 
 Run/preview endpoints support bounded execution query parameters:
 

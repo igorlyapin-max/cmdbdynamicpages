@@ -59,8 +59,9 @@ Ext.define('CMDBuildUI.view.custompages.CmdbDynamicPages.CmdbDynamicPages', {
         var hash = window.location.hash || '';
         var marker = 'custompages/CmdbDynamicPages';
         var index = hash.indexOf(marker);
+        var urlParams = this.parseParams((window.location.search || '').replace(/^\?/, ''));
         if (index === -1) {
-            return { mode: 'home', params: {} };
+            return { mode: 'home', params: urlParams };
         }
 
         var suffix = hash.slice(index + marker.length).replace(/^\/+/, '');
@@ -71,17 +72,33 @@ Ext.define('CMDBuildUI.view.custompages.CmdbDynamicPages.CmdbDynamicPages', {
             suffix = suffix.slice(0, queryIndex);
         }
 
+        var hashParams = this.parseParams(query);
+        var params = this.mergeParams(hashParams, urlParams);
+        var explicitMode = params.cmdpMode || '';
+        var explicitTemplate = params.cmdpTemplate || '';
+
+        if (explicitMode === 'designer') {
+            return { mode: 'designer', params: this.stripRouteParams(params) };
+        }
+        if (explicitTemplate) {
+            return {
+                mode: 'runtime',
+                templateCode: explicitTemplate,
+                params: this.stripRouteParams(params)
+            };
+        }
+
         var parts = suffix.split('/').filter(Boolean).map(decodeURIComponent);
         if (!parts.length) {
-            return { mode: 'home', params: this.parseParams(query) };
+            return { mode: 'home', params: params };
         }
         if (parts[0] === 'designer') {
-            return { mode: 'designer', params: this.parseParams(query) };
+            return { mode: 'designer', params: this.stripRouteParams(params) };
         }
         return {
             mode: 'runtime',
             templateCode: parts[0],
-            params: this.parseParams(query)
+            params: this.stripRouteParams(params)
         };
     },
 
@@ -92,6 +109,29 @@ Ext.define('CMDBuildUI.view.custompages.CmdbDynamicPages.CmdbDynamicPages', {
             params[key] = value;
         });
         return params;
+    },
+
+    mergeParams: function () {
+        var merged = {};
+        Ext.Array.forEach(arguments, function (params) {
+            var source = params || {};
+            Object.keys(source).forEach(function (key) {
+                merged[key] = source[key];
+            });
+        });
+        return merged;
+    },
+
+    stripRouteParams: function (params) {
+        var cleaned = {};
+        var routeKeys = {
+            cmdpMode: true,
+            cmdpTemplate: true
+        };
+        Object.keys(params || {}).forEach(function (key) {
+            if (!routeKeys[key]) cleaned[key] = params[key];
+        });
+        return cleaned;
     },
 
     loadHome: function () {
@@ -232,7 +272,26 @@ Ext.define('CMDBuildUI.view.custompages.CmdbDynamicPages.CmdbDynamicPages', {
 
     goTo: function (path) {
         var base = '#custompages/CmdbDynamicPages';
-        window.location.hash = path ? base + '/' + path : base;
+        var hash = base;
+        if (path === 'designer') {
+            hash = base + '?cmdpMode=designer';
+        } else if (path) {
+            hash = base + '?cmdpTemplate=' + encodeURIComponent(path);
+        }
+
+        if (window.history && window.history.replaceState) {
+            window.history.replaceState(null, document.title, window.location.pathname + hash);
+            if (path === 'designer') {
+                this.loadDesigner();
+            } else if (path) {
+                this.loadRuntime(path, {});
+            } else {
+                this.loadHome();
+            }
+            return;
+        }
+
+        window.location.hash = hash;
     },
 
     selectTemplate: function (code) {

@@ -145,7 +145,7 @@ Not done:
 - [x] Parse URLs like:
 
 ```text
-/cmdbuild/ui/#custompages/CmdbDynamicPages/<templateCode>?param=value
+/cmdbuild/ui/?cmdpTemplate=<templateCode>&param=value#custompages/CmdbDynamicPages
 ```
 
 - [x] Call:

@@ -36,10 +36,10 @@ Production should expose one origin:
 /cmdbuild/custom-api/*  -> cmdbdynamicpages backend
 ```
 
-The browser never sends URL fragments to the server. Runtime template URLs can use hash routing for the UI:
+The browser never sends URL fragments to the server. CMDBuild 4.1 may normalize extra path segments after a custom page name, so direct runtime links should keep the custom page hash stable and put dynamic page routing in query parameters before `#`:
 
 ```text
-/cmdbuild/ui/#custompages/CmdbDynamicPages/<templateCode>?param=value
+/cmdbuild/ui/?cmdpTemplate=<templateCode>&param=value#custompages/CmdbDynamicPages
 ```
 
 The custom page must parse the hash client-side and call a real backend path:
@@ -218,7 +218,7 @@ Local limited-user setup:
 Designer route:
 
 ```text
-/cmdbuild/ui/#custompages/CmdbDynamicPages/designer
+/cmdbuild/ui/?cmdpMode=designer#custompages/CmdbDynamicPages
 ```
 
 Designer responsibilities:
@@ -388,7 +388,7 @@ Sample template:
 User opens:
 
 ```text
-/cmdbuild/ui/#custompages/CmdbDynamicPages/<templateCode>?param=value
+/cmdbuild/ui/?cmdpTemplate=<templateCode>&param=value#custompages/CmdbDynamicPages
 ```
 
 Custom page:
@@ -400,7 +400,7 @@ Custom page:
 
 Implemented Runtime MVP:
 
-- parses `/cmdbuild/ui/#custompages/CmdbDynamicPages/<templateCode>?param=value`;
+- parses `/cmdbuild/ui/?cmdpTemplate=<templateCode>&param=value#custompages/CmdbDynamicPages`;
 - calls `/cmdbuild/custom-api/templates/<templateCode>/run`;
 - renders result tables returned by the backend.
 
