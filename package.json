@@ -1,0 +1,11 @@
+{
+  "name": "cmdbdynamicpages",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:zip": "zip -j dist/cmdbdynamicpages-custompage.zip src/CmdbDynamicPages.js",
+    "check": "node --check src/CmdbDynamicPages.js && node --check scripts/dev-proxy-server.mjs",
+    "proxy:dev": "PROXY_PORT=8093 node scripts/dev-proxy-server.mjs"
+  }
+}
