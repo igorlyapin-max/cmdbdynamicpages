@@ -44,14 +44,18 @@ Ext.define('CMDBuildUI.view.custompages.CmdbDynamicPages.CmdbDynamicPages', {
     },
 
     loadRoute: function () {
-        var route = this.parseRoute();
-        this.currentRoute = route;
-        if (route.mode === 'designer') {
-            this.loadDesigner();
-        } else if (route.mode === 'runtime') {
-            this.loadRuntime(route.templateCode, route.params);
-        } else {
-            this.loadHome();
+        try {
+            var route = this.parseRoute();
+            this.currentRoute = route;
+            if (route.mode === 'designer') {
+                this.loadDesigner();
+            } else if (route.mode === 'runtime') {
+                this.loadRuntime(route.templateCode, route.params);
+            } else {
+                this.loadHome();
+            }
+        } catch (error) {
+            this.update(this.renderError(error));
         }
     },
 
@@ -104,21 +108,29 @@ Ext.define('CMDBuildUI.view.custompages.CmdbDynamicPages.CmdbDynamicPages', {
 
     parseParams: function (query) {
         var params = {};
-        var search = new URLSearchParams(query || '');
-        search.forEach(function (value, key) {
-            params[key] = value;
+        var text = query || '';
+        if (text.charAt(0) === '?') text = text.slice(1);
+        if (!text) return params;
+        Ext.Array.forEach(text.split('&'), function (part) {
+            if (!part) return;
+            var index = part.indexOf('=');
+            var rawKey = index === -1 ? part : part.slice(0, index);
+            var rawValue = index === -1 ? '' : part.slice(index + 1);
+            var key = decodeURIComponent(rawKey.replace(/\+/g, ' '));
+            if (!key) return;
+            params[key] = decodeURIComponent(rawValue.replace(/\+/g, ' '));
         });
         return params;
     },
 
     mergeParams: function () {
         var merged = {};
-        Ext.Array.forEach(arguments, function (params) {
-            var source = params || {};
+        for (var index = 0; index < arguments.length; index += 1) {
+            var source = arguments[index] || {};
             Object.keys(source).forEach(function (key) {
                 merged[key] = source[key];
             });
-        });
+        }
         return merged;
     },
 
