@@ -10,7 +10,11 @@ Build CMDBuild dynamic custom pages with two scenarios:
 ## Runtime Architecture
 
 ```text
-CMDBuild UI custom page
+CMDBuild UI custom page launcher
+  |
+  | redirect
+  v
+/cmdbuild/dynamicpages/ui/*
   |
   | fetch(..., { credentials: 'include' })
   v
@@ -36,13 +40,26 @@ Production should expose one origin:
 /cmdbuild/custom-api/*  -> cmdbdynamicpages backend
 ```
 
-The browser never sends URL fragments to the server. CMDBuild 4.1 may normalize extra path segments after a custom page name, so direct runtime links should keep the custom page hash stable and put dynamic page routing in query parameters before `#`:
+Production should also expose project UI routes on the same origin:
+
+```text
+/cmdbuild/dynamicpages/ui/designer             -> cmdbdynamicpages backend
+/cmdbuild/dynamicpages/ui/run/<templateCode>  -> cmdbdynamicpages backend
+```
+
+The preferred runtime link is now a backend-owned UI route:
+
+```text
+/cmdbuild/dynamicpages/ui/run/<templateCode>?param=value
+```
+
+The browser never sends URL fragments to the server. CMDBuild 4.1 may normalize extra path segments after a custom page name, so launcher-based runtime links should keep the custom page hash stable and put dynamic page routing in query parameters before `#`:
 
 ```text
 /cmdbuild/ui/?cmdpTemplate=<templateCode>&param=value#custompages/CmdbDynamicPages
 ```
 
-The custom page must parse the hash client-side and call a real backend path:
+The custom page must only parse the URL and redirect to a project-owned UI path. The backend UI calls real backend API paths:
 
 ```text
 /cmdbuild/custom-api/templates/<templateCode>/run
@@ -68,9 +85,54 @@ Requirements:
 CSRF strategy:
 
 - `GET /cmdbuild/custom-api/csrf` returns a token derived server-side from the current CMDBuild session token and backend secret;
-- the custom page sends this token in `X-CMDBDynamicPages-CSRF` for non-GET backend calls;
+- the backend-served UI sends this token in `X-CMDBDynamicPages-CSRF` for non-GET backend calls;
 - state-changing backend calls require both same-origin `Origin`/`Referer` and a valid CSRF token;
+- runtime iframe execution uses read-only `GET /cmdbuild/custom-api/templates/:code/run?param=value`, skips audit card creation, and does not require a CSRF token;
 - the CSRF token is not the CMDBuild token and cannot be used as CMDBuild REST authorization.
+
+## Runtime Result Cache
+
+Runtime template results may be expensive because templates can scan cards and resolve reference/domain paths through CMDBuild REST. Runtime cache storage uses Redis when available, with backend in-memory fallback for local dev. Cache behavior is controlled per template in `spec.cache`:
+
+- `permissionOnly` is the default. The cache is shared inside the same endpoint/template/params after the viewer passes a lightweight probe over the classes and attributes actually used by that template. This mode assumes row-level CMDBuild scope is not different between users;
+- `visibilityHash` adds a hash of visible card ids to the cache key before sharing a result, and is intended for templates where row-level scope can differ;
+- `privateUser` keeps the result cache isolated by CMDBuild user/session scope;
+- `disabled` turns result caching off for the template.
+
+Cache keys include template code, spec hash, runtime params, executor limits, template cache policy, dependency-map hash, and either the endpoint visibility hash or the per-user scope hash depending on mode. Template `ttlSeconds` controls how long this template result is kept in cache; the Designer edits this value in hours and defaults new templates to 8 hours. System `RuntimeConfigJson.runtimeCache.refreshCooldownSec` controls how long users must wait before requesting a manual cache rebuild. The runtime page shows cache status, generated time, expiry countdown, refresh countdown, and a refresh button when the template allows manual refresh.
+
+The executor builds a used-field dependency map from filters, matching rules, final data, and visualization settings. `selectCards` materializes only the base card identifiers plus the fields that are actually used downstream; unrelated attributes are not added to result rows and are not part of the cache probe.
+
+Published static snapshots are separate from the runtime result cache. `spec.publish.mode = "staticSnapshot"` requires `warningAccepted = true`; publication executes the template once under the editor's CMDBuild session and stores the result in Redis without TTL. Runtime then reads only Redis data and can serve the page without checking viewer permissions on source CMDBuild objects. If the snapshot is missing, runtime renders `Страница отсутствует для загрузки`. Redis dev mode uses RDB snapshots, so absent snapshots are restored by republishing.
+
+Production Redis is a password-protected dependency. The backend accepts credentials from `CMDBDYNAMIC_REDIS_PASSWORD_FILE`, `CMDBDYNAMIC_REDIS_PASSWORD`, or the password component of `CMDBDYNAMIC_REDIS_URL`; file-based secret injection is preferred. Redis credentials must not be committed to git. Health/status endpoints mask Redis credentials in returned URLs.
+
+Runtime table sorting and text filtering are intentionally browser-local. They operate only on rows already returned by the authorized template execution and do not perform another `/run` call. Runtime text filtering is enabled by default unless Visualization explicitly disables it. Row grouping disables sorting and filtering for that table because merged cells depend on stable row order; split subtables keep sorting inside each subtable.
+
+Shared endpoint result caching is explicit template behavior. The default `permissionOnly` mode is fast and administrator-controlled, but it intentionally does not prove identical row-level visibility. Use `visibilityHash` or `privateUser` when row-level scope matters.
+
+Permission-scope probe:
+
+- `GET /cmdbuild/custom-api/auth/permission-scope` returns endpoint statuses for session, roles, current role, users, groups, classes, and domains;
+- it returns sampled readable classes/attributes and visible domains for the current user;
+- it returns a diagnostic `visibleModelHash` and `userScopeHash`.
+
+## Production Health Checks
+
+Health endpoints are unauthenticated and have both root and backend-prefixed forms:
+
+```text
+/health/live
+/health/ready
+/health/redis
+/cmdbuild/custom-api/health/live
+/cmdbuild/custom-api/health/ready
+/cmdbuild/custom-api/health/redis
+```
+
+`/health/live` only proves that the Node process answers HTTP. `/health/redis` performs a strict Redis `PING` and returns `503` when Redis is disabled or unavailable. `/health/ready` checks the process, Redis, and CMDBuild upstream reachability; it returns `503` when Redis is required and unavailable or CMDBuild cannot be reached. `CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=false` can relax readiness for local development, but production should leave Redis required when Redis-backed runtime cache or static snapshots are expected.
+
+`/cmdbuild/custom-api/cache/status` remains a diagnostics endpoint. It reports Redis visibility and in-memory fallback counters, but it returns `200` even during fallback and therefore must not be used as strict production readiness.
 
 ## Technical Root
 
@@ -153,13 +215,18 @@ Implemented runtime config:
 
 - `GET /cmdbuild/custom-api/config` reads the `Cst_QueryToolConfig` card for the current technical root;
 - `PUT /cmdbuild/custom-api/config` upserts that card through the current user's CMDBuild permissions;
-- Designer shows and saves `RuntimeConfigJson`;
-- `preview/run` use `RuntimeConfigJson.executionLimits` for default and capped executor limits.
+- Designer shows `RuntimeConfigJson` as described form fields and saves the JSON object internally; the raw JSON textarea is not exposed;
+- Designer General settings expose `runtimeCache.refreshCooldownSec` as the system-wide manual refresh cooldown;
+- `preview/run` use `RuntimeConfigJson.executionLimits` for default and capped executor limits;
+- `run` uses template `spec.cache.ttlSeconds` for result TTL and `RuntimeConfigJson.runtimeCache.refreshCooldownSec` for manual refresh cooldown.
 
 Current `RuntimeConfigJson` shape:
 
 ```json
 {
+  "runtimeCache": {
+    "refreshCooldownSec": 180
+  },
   "executionLimits": {
     "maxRowsDefault": 300,
     "maxRowsPreviewDefault": 20,
@@ -218,6 +285,13 @@ Local limited-user setup:
 Designer route:
 
 ```text
+/cmdbuild/dynamicpages/ui/designer
+/cmdbuild/dynamicpages/ui/designer/<section>
+```
+
+CMDBuild launcher route:
+
+```text
 /cmdbuild/ui/?cmdpMode=designer#custompages/CmdbDynamicPages
 ```
 
@@ -225,7 +299,7 @@ Designer responsibilities:
 
 - list templates;
 - create and edit templates;
-- show available CMDBuild classes, attributes, and domains according to the current user's permissions;
+- check a class by entered name and show its attributes according to the current user's permissions;
 - validate DSL JSON;
 - preview results;
 - save templates into `QueryTemplate`;
@@ -233,16 +307,39 @@ Designer responsibilities:
 
 The designer must not limit available business classes by the technical `/root`.
 
+Language behavior:
+
+- Designer and Runtime support `en` and `ru`;
+- explicit `cmdpLang` or `lang` query parameter wins;
+- the UI persists manual selection in browser `localStorage`;
+- if CMDBuild exposes language in session/storage, the UI can use it before falling back to browser language;
+- local CMDBuild 4.1 `/sessions/current` currently does not expose a language field.
+
 Implemented Designer MVP:
 
 - lists templates from `Cst_QueryTemplate`;
-- creates and edits templates through JSON text areas;
+- creates templates through a minimal code/description form and edits query logic through focused Designer sections;
+- caches the CMDBuild class/attribute/domain catalog in the browser and shows a header freshness lamp with a sync control; the lamp turns stale/yellow after 24 hours from the last sync;
+- edits object-group templates visually as one or more named selections and compiles each include/exclude scope rule set into a separate `selectCards` result;
+- edits object-matching templates visually and compiles them into `selectCards` + `expandRelations`;
+- lets the extraction preview display either a named selection result or the final object-matching result;
+- no longer exposes standalone relation-chain, value-search, group-comparison, or composition sections in the Designer UI; existing saved DSL steps remain supported by the backend executor;
+- edits the final runtime view visually and writes `result.tables` with selected columns, column labels, display mode, empty-state text, and permission-denied text;
+- limits Visualization column selectors for sorting, subtables, and grouping to the columns actually present in Final data;
+- defaults split-subtable titles to the selected split-column token, for example `${Выборка2.city}`;
+- renders runtime sorting and text filters client-side only, with both controls disabled when row grouping is enabled;
+- edits `spec.params` through a structured table with name, type, required flag, default, example, and description;
+- can fill test runtime parameters from `spec.params.*.example` and falls back to `spec.params.*.default` when input is omitted;
+- rejects optional `spec.params` entries that do not define `default` or `defaultValue`;
+- renders CMDBuild class selectors as an inheritance tree using cached catalog `parent` metadata and class descriptions;
+- executes superclass selections by expanding `selectCards` and relation target filters to readable non-prototype descendants of the selected class;
+- adds and previews `extractVariables` regexp steps for internal variable extraction;
 - provides a simple visual builder that generates DSL JSON for the implemented operation families;
 - validates and previews templates through backend endpoints;
 - saves templates into CMDBuild cards;
 - shows saved template versions and can load a version spec back into the editor;
-- shows schema readiness and can call schema bootstrap for the configured technical root;
-- shows selectable CMDBuild classes, attributes for the selected class, and detailed domain metadata visible to the current user.
+- uses a two-level navigation menu and keeps technical schema/bootstrap and class probe details out of the main Designer screen;
+- stores optional `SpecJson.defaults.className` fallback for templates that can run without a `className` URL parameter.
 
 ## Query DSL
 
@@ -251,6 +348,9 @@ Templates should store declarative JSON, not arbitrary JavaScript, SQL, or CQL.
 The first DSL version should cover:
 
 - finding classes by attribute type;
+- extracting variables from input parameters with regular expressions;
+- selecting CMDBuild cards by class and bounded filters;
+- composing final output tables from intermediate results;
 - filtering by attributes;
 - comparing attribute values;
 - traversing domains;
@@ -296,10 +396,12 @@ Initial API:
 ```text
 GET  /cmdbuild/custom-api/session
 GET  /cmdbuild/custom-api/model/classes
+GET  /cmdbuild/custom-api/model/classes/:className
 GET  /cmdbuild/custom-api/model/classes/:className/attributes
 GET  /cmdbuild/custom-api/model/domains
 GET  /cmdbuild/custom-api/model/domains/:domainName
 GET  /cmdbuild/custom-api/auth/capabilities
+GET  /cmdbuild/custom-api/auth/permission-scope
 GET  /cmdbuild/custom-api/csrf
 GET  /cmdbuild/custom-api/schema
 POST /cmdbuild/custom-api/schema/bootstrap
@@ -312,10 +414,14 @@ GET  /cmdbuild/custom-api/templates/:code
 GET  /cmdbuild/custom-api/templates/:code/versions
 POST /cmdbuild/custom-api/templates
 PUT  /cmdbuild/custom-api/templates/:code
+DELETE /cmdbuild/custom-api/templates/:code
 
 POST /cmdbuild/custom-api/templates/:code/validate
 POST /cmdbuild/custom-api/templates/:code/preview
+GET  /cmdbuild/custom-api/templates/:code/run
 POST /cmdbuild/custom-api/templates/:code/run
+POST /cmdbuild/custom-api/draft/validate
+POST /cmdbuild/custom-api/draft/preview
 ```
 
 Backend responsibilities:
@@ -326,24 +432,27 @@ Backend responsibilities:
 - validate DSL and parameters;
 - execute DSL through CMDBuild REST as the current user;
 - enforce execution limits for rows, class/domain scans, domain traversal depth, REST calls, and individual CMDBuild REST timeouts;
-- return table-oriented JSON to the custom page.
+- return table-oriented JSON to the backend-served UI.
 
 Implemented foundation routes:
 
 - `GET /cmdbuild/custom-api/session`: returns a sanitized current session and selected role privilege flags;
-- `GET /cmdbuild/custom-api/model/classes`: returns sanitized CMDBuild class metadata according to current user permissions;
+- `GET /cmdbuild/custom-api/model/classes`: returns sanitized CMDBuild class metadata according to current user permissions for diagnostic/advanced use;
+- `GET /cmdbuild/custom-api/model/classes/:className`: checks one class by name and returns sanitized metadata;
 - `GET /cmdbuild/custom-api/model/classes/:className/attributes`: returns sanitized attribute metadata for one visible class;
 - `GET /cmdbuild/custom-api/model/domains`: returns sanitized domain metadata, with optional `details=true` expansion for source/destination/cardinality fields;
 - `GET /cmdbuild/custom-api/model/domains/:domainName`: returns sanitized detailed metadata for one visible domain;
 - `GET /cmdbuild/custom-api/auth/capabilities`: returns role/user/groups endpoint probe results and confirms the `cmdbuild-class-crud` editor permission strategy.
+- `GET /cmdbuild/custom-api/auth/permission-scope`: returns visible-model permission-scope diagnostics for the current user; runtime result sharing is controlled by template `spec.cache.scopeMode`;
 - `GET /cmdbuild/custom-api/csrf`: returns a session-bound custom API CSRF token for non-GET backend calls;
 - `GET /cmdbuild/custom-api/schema`: checks technical root/classes/attributes under the configured root;
 - `POST /cmdbuild/custom-api/schema/bootstrap`: creates missing technical classes/attributes, guarded by same-origin headers and `admin_classes_modify`;
 - `GET/PUT /cmdbuild/custom-api/config`: reads and writes `Cst_QueryToolConfig.RuntimeConfigJson`;
 - `GET /cmdbuild/custom-api/execution-logs`: returns sanitized execution audit cards visible to the current user;
 - `GET /cmdbuild/custom-api/templates/:code/versions`: returns sanitized version cards visible to the current user;
-- `GET/POST/PUT /cmdbuild/custom-api/templates...`: stores and reads template JSON from `Cst_QueryTemplate` cards;
+- `GET/POST/PUT/DELETE /cmdbuild/custom-api/templates...`: stores, reads, updates, and deletes template JSON in `Cst_QueryTemplate` cards;
 - `POST /validate`, `/preview`, `/run`: validates or executes DSL v1 templates under the current user's CMDBuild permissions.
+- `POST /cmdbuild/custom-api/draft/validate` and `/draft/preview`: validate or execute the Designer's current unsaved JSON draft under the current user's CMDBuild permissions.
 
 Executor limits:
 
@@ -356,7 +465,9 @@ Executor limits:
 
 Execution audit:
 
-- `preview` and `run` write best-effort cards to `Cst_QueryExecutionLog`;
+- `preview` and direct `POST run` write best-effort cards to `Cst_QueryExecutionLog`;
+- runtime iframe `GET run` is read-only and skips audit card creation;
+- draft `validate` and `preview` do not write templates, versions, or execution audit cards;
 - audit cards store template code, started/finished timestamps, username, execution status, row count, and error message;
 - request parameters and CMDBuild cookies/tokens are not stored in audit cards;
 - audit failures are returned as `auditLog.success=false` but do not hide a successful execution result.
@@ -370,6 +481,10 @@ Template versioning:
 Implemented DSL v1 operations:
 
 - `findClassesByAttributeType`;
+- `extractVariables`;
+- `selectCards`;
+- `expandRelations`;
+- `composeRows`;
 - `listDomains`;
 - `filterRows`;
 - `intersectRows` for set intersections between intermediate table results;
@@ -383,25 +498,44 @@ Sample template:
 - `ProbeAttributeComparison`: finds classes by attribute type and compares class attribute sets by selected metadata fields such as `name` and `type`.
 - `ProbeClassSetOperations`: finds class sets by two attribute types, intersects them by class code, and joins the intersected set to the second attribute set.
 
+`selectCards` is the first business-data selection operation. It is intentionally not a generic REST proxy: the template declares a class source, filters, a result alias, and a limit. The backend then reads `/classes/:className/cards` with the current user's CMDBuild session, applies fixed/parameter/source-row filters, and returns a table result. Object-group scope filters can use `scope: include|exclude`, catalog `path`, and `regex`; regex text may include `${param.name}` placeholders resolved from template input parameters.
+
+`expandRelations` is the first card-level relation operation. It takes rows from a previous step, resolves source class/id columns, reads `/classes/:className/cards/:id/relations`, optionally filters by domain, target class, and direct/inverse direction, and reads related cards through `/classes/:relatedClass/cards/:relatedId` when related-card attributes are requested. It remains allowlisted DSL behavior, not a generic CMDBuild REST proxy.
+
+The Designer stores relation templates with `spec.visualModel.mode = "relationExpansion"`. This visual model is non-executable metadata: the backend executes only the compiled DSL steps. It lets the Designer refill source selection, relation filters, and related-card columns when an existing template is selected.
+
+`composeRows` prepares the table that users normally see in runtime views. It can project/rename columns from one intermediate result, add fixed or parameter values, or join two intermediate results by declared keys and then project the joined row into a named output table.
+
+Visualization is stored in `result.tables`, not as executable JavaScript. Each visible table references a result alias and may define a title, display mode (`table`, `compact`, `keyValue`), explicit columns, and empty-state text. `result.permissionDeniedText` defaults to `Вам не хватает прав увидеть данные или интерфейс дизайнера` and is returned for technical-class read denial or CMDBuild 401/403 during template execution. The runtime renderer only formats the tables returned by the executor and does not gain any additional CMDBuild access.
+
+Publication is stored in `spec.publish`. `dynamicUser` keeps the normal current-user execution path. `staticSnapshot` serves an explicitly published Redis snapshot; the Designer shows a warning and requires confirmation before the template can be saved/published in that mode.
+
 ## Runtime Flow
 
 User opens:
 
 ```text
+/cmdbuild/dynamicpages/ui/run/<templateCode>?param=value
+```
+
+CMDBuild launcher alternative:
+
+```text
 /cmdbuild/ui/?cmdpTemplate=<templateCode>&param=value#custompages/CmdbDynamicPages
 ```
 
-Custom page:
+Runtime UI:
 
-- parses the hash route;
+- reads the template code from `/run/<templateCode>`;
 - extracts template code and params;
-- calls `/cmdbuild/custom-api/templates/<templateCode>/run`;
+- calls `GET /cmdbuild/custom-api/templates/<templateCode>/run?param=value`;
 - renders result tables or permission/validation errors.
 
 Implemented Runtime MVP:
 
-- parses `/cmdbuild/ui/?cmdpTemplate=<templateCode>&param=value#custompages/CmdbDynamicPages`;
-- calls `/cmdbuild/custom-api/templates/<templateCode>/run`;
+- serves `/cmdbuild/dynamicpages/ui/run/<templateCode>?param=value`;
+- custom page launcher redirects legacy launcher URLs to the direct runtime UI route;
+- calls `GET /cmdbuild/custom-api/templates/<templateCode>/run?param=value`;
 - renders result tables returned by the backend.
 
 Backend:

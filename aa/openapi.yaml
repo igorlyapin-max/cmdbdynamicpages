@@ -1,0 +1,601 @@
+openapi: 3.0.3
+info:
+  title: cmdbdynamicpages API
+  version: 0.1.0
+  description: >
+    Backend-owned UI/API for CMDBuild dynamic pages. Dynamic endpoints run with
+    the current CMDBuild session cookie. Health endpoints are unauthenticated.
+servers:
+  - url: http://127.0.0.1:8093
+    description: Local dynamicpages backend
+  - url: http://localhost:8088
+    description: Local same-origin nginx front
+tags:
+  - name: health
+  - name: diagnostics
+  - name: session
+  - name: model
+  - name: schema
+  - name: templates
+  - name: runtime
+  - name: config
+security:
+  - cmdbuildCookie: []
+paths:
+  /health/live:
+    get:
+      tags: [health]
+      security: []
+      summary: Liveness probe
+      responses:
+        "200":
+          description: Backend process is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiveHealth"
+  /health/redis:
+    get:
+      tags: [health]
+      security: []
+      summary: Strict Redis health probe
+      responses:
+        "200":
+          description: Redis is available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RedisHealth"
+        "503":
+          description: Redis is unavailable or disabled
+  /health/ready:
+    get:
+      tags: [health]
+      security: []
+      summary: Production readiness probe
+      responses:
+        "200":
+          description: Backend is ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyHealth"
+        "503":
+          description: Backend is not ready
+  /cmdbuild/custom-api/cache/status:
+    get:
+      tags: [diagnostics]
+      security: []
+      summary: Diagnostic cache status
+      description: Returns 200 even when Redis fallback to memory is active; do not use as strict readiness.
+      responses:
+        "200":
+          description: Cache diagnostic status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CacheStatus"
+  /cmdbuild/custom-api/session:
+    get:
+      tags: [session]
+      summary: Current CMDBuild session
+      responses:
+        "200":
+          description: Sanitized session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiResponse"
+        "401":
+          description: CMDBuild session cookie is missing or invalid
+  /cmdbuild/custom-api/model/catalog:
+    get:
+      tags: [model]
+      summary: Current-user visible model catalog
+      responses:
+        "200":
+          description: Classes, attributes, domains, lookups visible to current user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiResponse"
+  /cmdbuild/custom-api/model/classes:
+    get:
+      tags: [model]
+      summary: Visible CMDBuild classes
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Start"
+      responses:
+        "200":
+          description: Class list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiResponse"
+  /cmdbuild/custom-api/model/classes/{className}:
+    get:
+      tags: [model]
+      summary: One CMDBuild class metadata
+      parameters:
+        - $ref: "#/components/parameters/ClassName"
+      responses:
+        "200":
+          description: Class metadata
+        "403":
+          description: Access denied
+        "404":
+          description: Class not found
+  /cmdbuild/custom-api/model/classes/{className}/attributes:
+    get:
+      tags: [model]
+      summary: Attributes visible for one class
+      parameters:
+        - $ref: "#/components/parameters/ClassName"
+      responses:
+        "200":
+          description: Attribute list
+  /cmdbuild/custom-api/model/domains:
+    get:
+      tags: [model]
+      summary: Visible CMDBuild domains
+      parameters:
+        - name: detailed
+          in: query
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: Domain list
+  /cmdbuild/custom-api/auth/permission-scope:
+    get:
+      tags: [model]
+      summary: Permission-scope diagnostics
+      responses:
+        "200":
+          description: Diagnostic visible-model hashes and endpoint statuses
+  /cmdbuild/custom-api/csrf:
+    get:
+      tags: [session]
+      summary: Get custom API CSRF token
+      responses:
+        "200":
+          description: CSRF token for non-GET calls
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  token:
+                    type: string
+  /cmdbuild/custom-api/schema:
+    get:
+      tags: [schema]
+      summary: Technical schema readiness
+      responses:
+        "200":
+          description: Technical schema status
+  /cmdbuild/custom-api/schema/bootstrap:
+    post:
+      tags: [schema]
+      summary: Create missing technical schema objects
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                root:
+                  type: string
+                  example: Cst_QueryTool
+      responses:
+        "200":
+          description: Bootstrap completed
+        "403":
+          description: CSRF or admin privilege check failed
+  /cmdbuild/custom-api/config:
+    get:
+      tags: [config]
+      summary: Runtime configuration
+      responses:
+        "200":
+          description: Config card data
+    put:
+      tags: [config]
+      summary: Upsert runtime configuration
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Config saved
+  /cmdbuild/custom-api/templates:
+    get:
+      tags: [templates]
+      summary: List query templates
+      responses:
+        "200":
+          description: Template list
+    post:
+      tags: [templates]
+      summary: Create query template
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplatePayload"
+      responses:
+        "200":
+          description: Template created
+  /cmdbuild/custom-api/templates/{code}:
+    parameters:
+      - $ref: "#/components/parameters/TemplateCode"
+    get:
+      tags: [templates]
+      summary: Get one template
+      responses:
+        "200":
+          description: Template
+        "404":
+          description: Template not found
+    put:
+      tags: [templates]
+      summary: Update one template
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplatePayload"
+      responses:
+        "200":
+          description: Template updated
+    delete:
+      tags: [templates]
+      summary: Delete one template
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      responses:
+        "200":
+          description: Template deleted
+  /cmdbuild/custom-api/templates/{code}/versions:
+    parameters:
+      - $ref: "#/components/parameters/TemplateCode"
+    get:
+      tags: [templates]
+      summary: Template versions
+      responses:
+        "200":
+          description: Version list
+  /cmdbuild/custom-api/templates/{code}/validate:
+    parameters:
+      - $ref: "#/components/parameters/TemplateCode"
+    post:
+      tags: [templates]
+      summary: Validate saved template
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      responses:
+        "200":
+          description: Validation result
+  /cmdbuild/custom-api/templates/{code}/preview:
+    parameters:
+      - $ref: "#/components/parameters/TemplateCode"
+    post:
+      tags: [templates]
+      summary: Preview saved template
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        $ref: "#/components/requestBodies/RunParams"
+      responses:
+        "200":
+          description: Preview result
+  /cmdbuild/custom-api/templates/{code}/run:
+    parameters:
+      - $ref: "#/components/parameters/TemplateCode"
+    get:
+      tags: [runtime]
+      summary: Read-only runtime execution
+      description: Used by Runtime UI/iframe; no CSRF required and no execution audit card is written.
+      parameters:
+        - name: refresh
+          in: query
+          schema:
+            type: string
+            enum: ["1"]
+        - name: noCache
+          in: query
+          schema:
+            type: string
+            enum: ["1"]
+      responses:
+        "200":
+          description: Runtime result
+        "403":
+          description: Permission denied
+    post:
+      tags: [runtime]
+      summary: Direct runtime execution with audit
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        $ref: "#/components/requestBodies/RunParams"
+      responses:
+        "200":
+          description: Runtime result
+  /cmdbuild/custom-api/templates/{code}/publish:
+    parameters:
+      - $ref: "#/components/parameters/TemplateCode"
+    post:
+      tags: [runtime]
+      summary: Publish static snapshot to Redis
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        $ref: "#/components/requestBodies/RunParams"
+      responses:
+        "200":
+          description: Snapshot published
+  /cmdbuild/custom-api/public-snapshots/{code}/run:
+    parameters:
+      - $ref: "#/components/parameters/TemplateCode"
+    get:
+      tags: [runtime]
+      security: []
+      summary: Run public static snapshot
+      responses:
+        "200":
+          description: Snapshot result or missing snapshot response
+  /cmdbuild/custom-api/draft/validate:
+    post:
+      tags: [templates]
+      summary: Validate unsaved draft
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DraftPayload"
+      responses:
+        "200":
+          description: Validation result
+  /cmdbuild/custom-api/draft/preview:
+    post:
+      tags: [templates]
+      summary: Preview unsaved draft
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DraftPayload"
+      responses:
+        "200":
+          description: Preview result
+components:
+  securitySchemes:
+    cmdbuildCookie:
+      type: apiKey
+      in: cookie
+      name: CMDBuild-Authorization
+    csrfHeader:
+      type: apiKey
+      in: header
+      name: X-CMDBDynamicPages-CSRF
+  parameters:
+    TemplateCode:
+      name: code
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^[A-Za-z][A-Za-z0-9_]*$"
+    ClassName:
+      name: className
+      in: path
+      required: true
+      schema:
+        type: string
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 0
+        default: 100
+    Start:
+      name: start
+      in: query
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+  requestBodies:
+    RunParams:
+      required: false
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              params:
+                type: object
+                additionalProperties: true
+              refresh:
+                type: boolean
+              noCache:
+                type: boolean
+  schemas:
+    ApiResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+      additionalProperties: true
+    LiveHealth:
+      type: object
+      required: [service, status, live]
+      properties:
+        service:
+          type: string
+          example: cmdbdynamicpages
+        timestamp:
+          type: string
+          format: date-time
+        startedAt:
+          type: string
+          format: date-time
+        uptimeSec:
+          type: integer
+        pid:
+          type: integer
+        status:
+          type: string
+          example: live
+        live:
+          type: boolean
+    RedisStatus:
+      type: object
+      properties:
+        required:
+          type: boolean
+        ok:
+          type: boolean
+        status:
+          type: string
+        enabled:
+          type: boolean
+        backend:
+          type: string
+          enum: [redis, memory]
+        available:
+          type: boolean
+        url:
+          type: string
+          description: Redis URL with credentials masked.
+        keyPrefix:
+          type: string
+        lastCheckedAt:
+          type: string
+          format: date-time
+        error:
+          type: string
+    RedisHealth:
+      allOf:
+        - $ref: "#/components/schemas/LiveHealth"
+        - type: object
+          properties:
+            redis:
+              $ref: "#/components/schemas/RedisStatus"
+    ReadyHealth:
+      allOf:
+        - $ref: "#/components/schemas/LiveHealth"
+        - type: object
+          properties:
+            ready:
+              type: boolean
+            checks:
+              type: object
+              properties:
+                process:
+                  type: object
+                  properties:
+                    ok:
+                      type: boolean
+                    status:
+                      type: string
+                redis:
+                  $ref: "#/components/schemas/RedisStatus"
+                cmdbuild:
+                  type: object
+                  properties:
+                    required:
+                      type: boolean
+                    ok:
+                      type: boolean
+                    status:
+                      type: string
+                    url:
+                      type: string
+                    latencyMs:
+                      type: integer
+                    statusCode:
+                      type: integer
+                    error:
+                      type: string
+    CacheStatus:
+      type: object
+      properties:
+        success:
+          type: boolean
+        redis:
+          $ref: "#/components/schemas/RedisStatus"
+        memory:
+          type: object
+          properties:
+            runtimeEntries:
+              type: integer
+            staticSnapshotEntries:
+              type: integer
+            inFlightRuntimeBuilds:
+              type: integer
+    TemplatePayload:
+      type: object
+      required: [code, spec]
+      properties:
+        code:
+          type: string
+        description:
+          type: string
+        active:
+          type: boolean
+        spec:
+          type: object
+          additionalProperties: true
+        paramsSchema:
+          type: object
+          additionalProperties: true
+        resultSchema:
+          type: object
+          additionalProperties: true
+    DraftPayload:
+      type: object
+      required: [spec]
+      properties:
+        spec:
+          type: object
+          additionalProperties: true
+        params:
+          type: object
+          additionalProperties: true
