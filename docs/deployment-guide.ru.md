@@ -8,7 +8,8 @@
 - `cmdbdynamicpages` backend/proxy запускается на `http://127.0.0.1:8093`.
 - Redis доступен на `redis://127.0.0.1:6379/0`; в production пароль обязателен.
 - Для iframe/wiki используется same-origin nginx front `http://localhost:8088`.
-- Для первого создания схемы нужен CMDBuild role с `admin_classes_modify`.
+- Для первого создания схемы нужен CMDBuild role с `admin_classes_modify` и доступом к metadata/classes API.
+- Доступ к Designer равен доступу к технической схеме проекта: пользователь с правом редактировать технические классы может создавать и менять шаблоны runtime endpoints.
 
 ## 2. Backend/proxy
 
@@ -32,6 +33,15 @@ CMDP_LOG_TARGET=stdout
 CMDP_LOG_FORMAT=json
 ```
 
+Если платформа передает Redis secret только строкой, поддерживаются варианты:
+
+```text
+CMDBDYNAMIC_REDIS_PASSWORD=<secret>
+CMDBDYNAMIC_REDIS_URL=redis://:password@redis-host:6379/0
+```
+
+Любой из этих вариантов должен приходить из deployment secret/env уровня контура, а не из git. Приоритет у `CMDBDYNAMIC_REDIS_PASSWORD_FILE`, затем `CMDBDYNAMIC_REDIS_PASSWORD`, затем пароль внутри `CMDBDYNAMIC_REDIS_URL`.
+
 ## 3. Redis
 
 Для dev:
@@ -40,7 +50,7 @@ CMDP_LOG_FORMAT=json
 docker compose -f docker-compose.nginx.yml up -d redis
 ```
 
-Production Redis должен быть защищен паролем. Предпочтительно передавать пароль через `CMDBDYNAMIC_REDIS_PASSWORD_FILE`; не хранить секрет в git или compose-файле репозитория.
+Production Redis должен быть защищен паролем. Предпочтительно передавать пароль через `CMDBDYNAMIC_REDIS_PASSWORD_FILE`; если используется строковая передача секрета, задавать `CMDBDYNAMIC_REDIS_PASSWORD` или password в `CMDBDYNAMIC_REDIS_URL` только через secret/env платформы. Не хранить секрет в git или compose-файле репозитория.
 
 ## 4. Регистрация custom page
 
@@ -74,7 +84,7 @@ http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/designer
 
 ## 5. Создание технической схемы
 
-1. Войти в CMDBuild через proxy `8093` под ролью с `admin_classes_modify`.
+1. Войти в CMDBuild через proxy `8093` под административной ролью с `admin_classes_modify`.
 2. Открыть Designer.
 3. Перейти в меню `Управление схемой и настройками` -> `Схема`.
 4. Указать:
@@ -88,6 +98,8 @@ http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/designer
 
 Bootstrap создает только недостающие классы и атрибуты. Он не удаляет, не переносит и не меняет типы существующих объектов CMDBuild.
 
+Администратор bootstrap должен иметь права CMDBuild на изменение модели классов: создание классов под выбранным parent superclass, создание атрибутов, чтение metadata classes/attributes и проверку существующей схемы. После bootstrap эту роль не нужно выдавать обычным редакторам шаблонов.
+
 ## 6. Права CMDBuild
 
 Редакторам шаблонов нужны права чтения/создания/изменения на технические классы:
@@ -97,6 +109,8 @@ Bootstrap создает только недостающие классы и а�
 <Root>QueryTemplateVersion
 <Root>QueryToolConfig
 ```
+
+Это и есть основной контроль доступа к Designer: если пользователь может открыть Designer и писать в `QueryTemplate`/`QueryToolConfig`, он может изменить поведение runtime endpoints. Поэтому доступ редакторов должен выдаваться тем же процессом, которым управляются права на технические классы CMDBuild.
 
 Runtime-пользователям нужны:
 

@@ -8,7 +8,8 @@ English branch. Russian branch: [deployment-guide.ru.md](deployment-guide.ru.md)
 - `cmdbdynamicpages` backend/proxy runs on `http://127.0.0.1:8093`.
 - Redis is reachable at `redis://127.0.0.1:6379/0`; production Redis must require a password.
 - Wiki/iframe scenarios use the same-origin nginx front `http://localhost:8088`.
-- First technical schema creation requires a CMDBuild role with `admin_classes_modify`.
+- First technical schema creation requires a CMDBuild role with `admin_classes_modify` and access to the metadata/classes API.
+- Designer access is access to the project's technical schema: a user who can edit technical classes can create and change runtime endpoint templates.
 
 ## 2. Backend/proxy
 
@@ -32,6 +33,15 @@ CMDP_LOG_TARGET=stdout
 CMDP_LOG_FORMAT=json
 ```
 
+If the platform can pass the Redis secret only as a string, these variants are supported:
+
+```text
+CMDBDYNAMIC_REDIS_PASSWORD=<secret>
+CMDBDYNAMIC_REDIS_URL=redis://:password@redis-host:6379/0
+```
+
+In every case the value must come from deployment secret/env, not from git. Precedence is `CMDBDYNAMIC_REDIS_PASSWORD_FILE`, then `CMDBDYNAMIC_REDIS_PASSWORD`, then the password embedded in `CMDBDYNAMIC_REDIS_URL`.
+
 ## 3. Redis
 
 For dev:
@@ -40,7 +50,7 @@ For dev:
 docker compose -f docker-compose.nginx.yml up -d redis
 ```
 
-Production Redis must be password-protected. Prefer `CMDBDYNAMIC_REDIS_PASSWORD_FILE`; do not store the secret in git or in the repository compose file.
+Production Redis must be password-protected. Prefer `CMDBDYNAMIC_REDIS_PASSWORD_FILE`; if string delivery is used, set `CMDBDYNAMIC_REDIS_PASSWORD` or a password inside `CMDBDYNAMIC_REDIS_URL` only through platform secret/env. Do not store the secret in git or in the repository compose file.
 
 ## 4. Register the custom page
 
@@ -74,7 +84,7 @@ http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/designer
 
 ## 5. Create the technical schema
 
-1. Log in to CMDBuild through proxy `8093` with a role that has `admin_classes_modify`.
+1. Log in to CMDBuild through proxy `8093` with an administrator role that has `admin_classes_modify`.
 2. Open Designer.
 3. Go to `Schema and settings` -> `Schema`.
 4. Set:
@@ -88,6 +98,8 @@ http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/designer
 
 Bootstrap creates only missing classes and attributes. It does not delete, move, or change the type of existing CMDBuild objects.
 
+The bootstrap administrator must be allowed to modify the CMDBuild class model: create classes under the selected parent superclass, create attributes, read metadata classes/attributes, and inspect the existing schema. After bootstrap, normal template editors do not need this administrative role.
+
 ## 6. CMDBuild permissions
 
 Template editors need read/create/update on the technical classes:
@@ -97,6 +109,8 @@ Template editors need read/create/update on the technical classes:
 <Root>QueryTemplateVersion
 <Root>QueryToolConfig
 ```
+
+This is the primary Designer access control. If a user can open Designer and write `QueryTemplate`/`QueryToolConfig`, that user can change runtime endpoint behavior. Grant editor access through the same CMDBuild permission process used for the technical classes.
 
 Runtime users need:
 
