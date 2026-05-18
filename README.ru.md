@@ -21,6 +21,16 @@ CMDBuild custom page оставлен тонким launcher-компоненто
 
 Все маршруты находятся под `/cmdbuild`, поэтому браузер автоматически отправляет `HttpOnly` cookie CMDBuild. JavaScript не читает и не пересылает `CMDBuild-Authorization`; backend получает cookie на same-origin маршруте и сам вызывает CMDBuild REST с серверным заголовком `CMDBuild-Authorization`.
 
+Срок жизни пользовательской сессии задает CMDBuild/Tomcat, а не `cmdbdynamicpages`. На текущем стенде server-side idle timeout составляет 30 минут неактивности. Ориентировочный блок настройки находится в Tomcat `web.xml`:
+
+```xml
+<session-config>
+    <session-timeout>30</session-timeout>
+</session-config>
+```
+
+Значение указывается в минутах. Это не TTL runtime-кэша шаблона: cookie может оставаться в браузере, но backend все равно проверяет `/sessions/current`, и после истечения CMDBuild-сессии пользователь должен авторизоваться заново.
+
 Компоненты разработки:
 
 ```text

@@ -20,6 +20,16 @@ The current implementation keeps CMDBuild custom page code intentionally small:
 - the backend receives the CMDBuild `HttpOnly` cookie on same-origin routes;
 - the backend forwards the cookie value to CMDBuild REST as a server-side `CMDBuild-Authorization` header.
 
+The CMDBuild/Tomcat deployment owns the user session lifetime; `cmdbdynamicpages` does not extend it. On the current test stand the server-side idle timeout is 30 minutes. The relevant Tomcat `web.xml` block is approximately:
+
+```xml
+<session-config>
+    <session-timeout>30</session-timeout>
+</session-config>
+```
+
+The value is in minutes. This is separate from template runtime cache TTL: the browser may still hold a cookie, but the backend validates `/sessions/current` and treats the user as unauthenticated after CMDBuild expires the session.
+
 ## Custom Page
 
 The project custom page is registered as:

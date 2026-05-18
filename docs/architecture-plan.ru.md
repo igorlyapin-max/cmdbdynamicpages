@@ -65,6 +65,16 @@ http://localhost:8088/health/*         -> dynamicpages health on 8093
 
 Браузер не читает `CMDBuild-Authorization`, потому что cookie `HttpOnly`. Backend получает cookie автоматически на same-origin маршрутах под `/cmdbuild`, извлекает значение на сервере и вызывает CMDBuild REST с заголовком `CMDBuild-Authorization`.
 
+Время жизни пользовательской сессии определяется CMDBuild/Tomcat. На текущем стенде обнаружен idle timeout 30 минут неактивности; `cmdbdynamicpages` этот TTL не увеличивает и не выполняет refresh/logout сессии. Примерный блок настройки Tomcat:
+
+```xml
+<session-config>
+    <session-timeout>30</session-timeout>
+</session-config>
+```
+
+Значение `session-timeout` задается в минутах. При изменении настройки требуется перезапуск CMDBuild/Tomcat. Если cookie еще присутствует в браузере, но `/sessions/current` уже возвращает отказ, backend считает сессию истекшей и показывает сценарий повторной авторизации.
+
 Ограничения:
 
 - cookie/token не логируются;

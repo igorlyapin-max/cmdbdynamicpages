@@ -82,6 +82,16 @@ Requirements:
 - protect state-changing backend operations with `Origin`/`Referer` checks and `X-CMDBDynamicPages-CSRF`;
 - verify that the normal CMDBuild UI still works through the reverse proxy.
 
+CMDBuild/Tomcat owns the user session lifetime. The current test stand uses a 30-minute idle timeout; `cmdbdynamicpages` does not refresh or extend CMDBuild sessions. The relevant Tomcat `web.xml` block is approximately:
+
+```xml
+<session-config>
+    <session-timeout>30</session-timeout>
+</session-config>
+```
+
+The value is in minutes and requires a CMDBuild/Tomcat restart when changed. This timeout is not the template runtime cache TTL. If the browser still sends a cookie but `/sessions/current` rejects it, the backend treats the session as expired and sends the user through the login flow.
+
 CSRF strategy:
 
 - `GET /cmdbuild/custom-api/csrf` returns a token derived server-side from the current CMDBuild session token and backend secret;

@@ -1106,6 +1106,7 @@ function dynamicPagesClientScript() {
       menuRun: 'Run',
       menuSettings: 'Schema and settings',
       menuHelp: 'Help',
+      menuAbout: 'About',
       menuTemplateList: 'List',
       menuVersions: 'Versions',
       menuParams: 'Input variables',
@@ -1120,6 +1121,7 @@ function dynamicPagesClientScript() {
       menuGeneralSettings: 'General settings',
       menuRuntimeSettings: 'Runtime settings',
       menuDiagnostics: 'Diagnostics',
+      aboutText: 'Designed and implemented by Igor Lyapin email:igor.lyapin@gmail.com 2026\\n\\nLicensed under GNU GPLv3.',
       generalSettings: 'General settings',
       maxDepthHelp: 'Controls how many relation hops the Designer uses for catalog path hints. It does not change CMDBuild permissions.',
       runtimeSettings: 'Runtime settings',
@@ -1656,6 +1658,7 @@ function dynamicPagesClientScript() {
       menuRun: 'Запуск',
       menuSettings: 'Управление схемой и настройками',
       menuHelp: 'Помощь',
+      menuAbout: 'О программе',
       menuTemplateList: 'Список',
       menuVersions: 'Версии',
       menuParams: 'Входные переменные',
@@ -1670,6 +1673,7 @@ function dynamicPagesClientScript() {
       menuGeneralSettings: 'Общие настройки',
       menuRuntimeSettings: 'Runtime-настройки',
       menuDiagnostics: 'Диагностика',
+      aboutText: 'Спроектировано и овеществлено Игорем Ляпиным email:igor.lyapin@gmail.com 2026\\n\\nПод лицензией GNU GPLv3.',
       generalSettings: 'Общие настройки',
       maxDepthHelp: 'Определяет, сколько шагов связей Designer использует для подсказок путей по каталогу. Права CMDBuild эта настройка не меняет.',
       runtimeSettings: 'Runtime-настройки',
@@ -2225,7 +2229,8 @@ function dynamicPagesClientScript() {
       'schema',
       'general-settings',
       'settings',
-      'diagnostics'
+      'diagnostics',
+      'about'
     ];
     return allowed.indexOf(section) === -1 ? 'templates' : section;
   }
@@ -4183,6 +4188,9 @@ function dynamicPagesClientScript() {
       group(t('menuHelp'), [
         { section: 'diagnostics', label: t('menuDiagnostics') }
       ]),
+      group(t('menuAbout'), [
+        { section: 'about', label: t('menuAbout') }
+      ]),
       '</div></nav>'
     ].join('');
   }
@@ -4654,6 +4662,14 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
+  function renderAbout() {
+    return [
+      '<section class="section" id="cmdp-about"><h2>' + t('menuAbout') + '</h2>',
+      '<p>' + escapeHtml(t('aboutText')).replace(/\\n/g, '<br>') + '</p>',
+      '</section>'
+    ].join('');
+  }
+
   function renderDesignerSection(selected, config, templateRows) {
     var section = normalizeDesignerSection(state.designerSection);
     if (section === 'template') return renderTemplateEditor(selected);
@@ -4676,6 +4692,7 @@ function dynamicPagesClientScript() {
     if (section === 'general-settings') return renderGeneralSettings();
     if (section === 'settings') return renderRuntimeSettings(config);
     if (section === 'diagnostics') return renderDiagnostics();
+    if (section === 'about') return renderAbout();
     return renderTemplateList(templateRows);
   }
 
@@ -4698,6 +4715,7 @@ function dynamicPagesClientScript() {
     if (section === 'general-settings') return t('menuGeneralSettings');
     if (section === 'settings') return t('menuRuntimeSettings');
     if (section === 'diagnostics') return t('menuDiagnostics');
+    if (section === 'about') return t('menuAbout');
     return t('menuTemplateList');
   }
 

@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="820" viewBox="0 0 1400 820" role="img" aria-labelledby="title desc">
+  <title id="title">CMDB Dynamic Pages environment architecture</title>
+  <desc id="desc">High-level architecture diagram for browser, same-origin proxy, cmdbdynamicpages backend, CMDBuild, Redis, health checks and logging.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2f5f7f"/>
+    </marker>
+    <filter id="shadow" x="-8%" y="-12%" width="116%" height="130%">
+      <feDropShadow dx="0" dy="6" stdDeviation="6" flood-color="#16324f" flood-opacity="0.14"/>
+    </filter>
+    <style>
+      .bg{fill:#f6f8fb}
+      .zone{fill:#ffffff;stroke:#d4dde8;stroke-width:2}
+      .zone-title{font:700 21px Arial,sans-serif;fill:#26384d}
+      .box{filter:url(#shadow);stroke-width:2}
+      .box-title{font:700 20px Arial,sans-serif;fill:#172b3a}
+      .box-text{font:15px Arial,sans-serif;fill:#43566b}
+      .small{font:13px Arial,sans-serif;fill:#5a6d82}
+      .port{font:700 14px Arial,sans-serif;fill:#234c68}
+      .flow{stroke:#2f5f7f;stroke-width:3;fill:none;marker-end:url(#arrow)}
+      .flow-soft{stroke:#7a94aa;stroke-width:2.4;fill:none;marker-end:url(#arrow);stroke-dasharray:7 6}
+      .label{font:14px Arial,sans-serif;fill:#234c68}
+      .label-bg{fill:#f6f8fb;stroke:#d4dde8}
+      .browser{fill:#dff2ef;stroke:#68a9a1}
+      .front{fill:#e8f0fb;stroke:#6d93c4}
+      .app{fill:#fff4df;stroke:#d59b3f}
+      .cmdb{fill:#eaf5e8;stroke:#6da766}
+      .redis{fill:#fde8e6;stroke:#c86f67}
+      .ops{fill:#f0ebfb;stroke:#8b79bc}
+      .note{fill:#ffffff;stroke:#d4dde8;stroke-width:1.5}
+    </style>
+  </defs>
+
+  <rect class="bg" width="1400" height="820"/>
+  <text x="60" y="52" class="zone-title">CMDB Dynamic Pages: высокоуровневая архитектура окружения</text>
+  <text x="60" y="80" class="small">Локальный стенд: единый origin для wiki/iframe, backend-owned UI, CMDBuild REST под правами пользователя, Redis для кэша и снимков.</text>
+
+  <rect x="40" y="115" width="1320" height="650" rx="18" class="zone"/>
+  <text x="70" y="154" class="zone-title">Developer / Test host</text>
+
+  <rect x="85" y="210" width="210" height="118" rx="12" class="box browser"/>
+  <text x="110" y="248" class="box-title">Browser</text>
+  <text x="110" y="276" class="box-text">CMDBuild user</text>
+  <text x="110" y="300" class="box-text">Wiki iframe / direct URL</text>
+
+  <rect x="380" y="178" width="250" height="170" rx="12" class="box front"/>
+  <text x="410" y="216" class="box-title">Nginx same-origin</text>
+  <text x="410" y="246" class="port">localhost:8088</text>
+  <text x="410" y="276" class="box-text">/ -> wiki</text>
+  <text x="410" y="300" class="box-text">/cmdbuild/* -> app chain</text>
+  <text x="410" y="324" class="box-text">/health/* -> app health</text>
+
+  <rect x="380" y="425" width="250" height="120" rx="12" class="box front"/>
+  <text x="410" y="464" class="box-title">Wiki / Portal</text>
+  <text x="410" y="494" class="port">localhost:3000</text>
+  <text x="410" y="522" class="box-text">Pages with runtime iframe</text>
+
+  <rect x="735" y="170" width="290" height="210" rx="12" class="box app"/>
+  <text x="765" y="208" class="box-title">cmdbdynamicpages</text>
+  <text x="765" y="238" class="port">127.0.0.1:8093</text>
+  <text x="765" y="268" class="box-text">Designer UI</text>
+  <text x="765" y="292" class="box-text">Runtime UI</text>
+  <text x="765" y="316" class="box-text">Custom API / validation</text>
+  <text x="765" y="340" class="box-text">CMDBuild launcher proxy</text>
+
+  <rect x="1110" y="165" width="210" height="135" rx="12" class="box cmdb"/>
+  <text x="1140" y="204" class="box-title">CMDBuild</text>
+  <text x="1140" y="234" class="port">127.0.0.1:8090</text>
+  <text x="1140" y="264" class="box-text">UI + REST API</text>
+
+  <rect x="1110" y="365" width="210" height="110" rx="12" class="box cmdb"/>
+  <text x="1140" y="404" class="box-title">CMDBuild DB</text>
+  <text x="1140" y="434" class="box-text">business data</text>
+  <text x="1140" y="458" class="box-text">technical classes</text>
+
+  <rect x="735" y="485" width="290" height="135" rx="12" class="box redis"/>
+  <text x="765" y="524" class="box-title">Redis</text>
+  <text x="765" y="554" class="port">127.0.0.1:6379/0</text>
+  <text x="765" y="584" class="box-text">runtime result cache</text>
+  <text x="765" y="608" class="box-text">static snapshots, RDB</text>
+
+  <rect x="1110" y="550" width="210" height="110" rx="12" class="box ops"/>
+  <text x="1140" y="588" class="box-title">Ops</text>
+  <text x="1140" y="618" class="box-text">health checks</text>
+  <text x="1140" y="642" class="box-text">stdout / syslog / ELK</text>
+
+  <path class="flow" d="M295 250 C330 250 342 250 380 250"/>
+  <rect x="310" y="224" width="60" height="24" rx="6" class="label-bg"/>
+  <text x="322" y="241" class="label">8088</text>
+
+  <path class="flow" d="M505 348 C505 378 505 395 505 425"/>
+  <rect x="520" y="376" width="80" height="24" rx="6" class="label-bg"/>
+  <text x="532" y="393" class="label">wiki UI</text>
+
+  <path class="flow" d="M630 263 C675 263 690 263 735 263"/>
+  <rect x="650" y="237" width="67" height="24" rx="6" class="label-bg"/>
+  <text x="663" y="254" class="label">8093</text>
+
+  <path class="flow-soft" d="M295 300 C455 380 575 410 735 335"/>
+  <rect x="465" y="357" width="143" height="24" rx="6" class="label-bg"/>
+  <text x="476" y="374" class="label">direct dev 8093</text>
+
+  <path class="flow" d="M1025 242 C1062 242 1072 235 1110 232"/>
+  <rect x="1032" y="210" width="72" height="24" rx="6" class="label-bg"/>
+  <text x="1044" y="227" class="label">REST</text>
+
+  <path class="flow" d="M1215 300 C1215 330 1215 340 1215 365"/>
+  <text x="1230" y="338" class="small">cards, metadata</text>
+
+  <path class="flow" d="M880 380 C880 420 880 445 880 485"/>
+  <rect x="895" y="424" width="110" height="24" rx="6" class="label-bg"/>
+  <text x="907" y="441" class="label">cache/snapshot</text>
+
+  <path class="flow-soft" d="M1025 570 C1060 584 1076 595 1110 605"/>
+  <rect x="1030" y="548" width="72" height="24" rx="6" class="label-bg"/>
+  <text x="1042" y="565" class="label">health</text>
+
+  <path class="flow-soft" d="M1025 330 C1085 405 1095 500 1110 590"/>
+  <rect x="1037" y="430" width="52" height="24" rx="6" class="label-bg"/>
+  <text x="1048" y="447" class="label">logs</text>
+
+  <rect x="86" y="610" width="545" height="95" rx="10" class="note"/>
+  <text x="112" y="644" class="box-title">Авторизация и безопасность</text>
+  <text x="112" y="674" class="box-text">Browser отправляет HttpOnly cookie на same-origin route /cmdbuild/*.</text>
+  <text x="112" y="698" class="box-text">Backend извлекает token server-side и вызывает CMDBuild REST; cookie/token не логируются.</text>
+
+  <rect x="735" y="660" width="585" height="45" rx="10" class="note"/>
+  <text x="760" y="689" class="box-text">Dynamic runtime работает под правами текущего пользователя; static snapshot отдается из Redis после публикации редактором.</text>
+</svg>
