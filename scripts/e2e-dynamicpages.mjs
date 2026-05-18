@@ -461,6 +461,17 @@ await test('session', async () => {
   return `user=${json.session && json.session.username ? json.session.username : ''} role=${json.session && json.session.role ? json.session.role : ''}`;
 });
 
+await test('logging status', async () => {
+  const result = await request('GET', `${proxyOrigin}/cmdbuild/custom-api/logging/status`);
+  assertStatus(result, 200);
+  const json = getJson(result);
+  assert(json.success === true, 'Logging status returned success=false.');
+  assert(json.logging && Array.isArray(json.logging.targets), 'Logging targets are missing.');
+  assert(json.logging.redactHeaders && json.logging.redactHeaders.includes('cookie'), 'Logging header redaction does not include cookie.');
+  assert(json.logging.redactQuery && json.logging.redactQuery.includes('token'), 'Logging query redaction does not include token.');
+  return `targets=${json.logging.targets.join(',')}`;
+});
+
 await test('model catalog', async () => {
   const result = await request('GET', `${proxyOrigin}/cmdbuild/custom-api/model/catalog?maxClasses=5&maxDomains=5&includeAttributes=true`);
   assertStatus(result, 200);
@@ -526,6 +537,7 @@ await test('draft preview', async () => {
   assert(json.success === true, 'Draft preview failed.');
   assert(json.result && Array.isArray(json.result.tables) && json.result.tables.length === 1, 'Draft preview did not return one result table.');
   assert(Array.isArray(json.result.trace) && json.result.trace.length === 1, 'Draft preview did not return execution trace.');
+  assert(json.cache === undefined || json.cache === null, 'Draft preview unexpectedly returned runtime cache metadata.');
   return resultSummary(json.result);
 });
 
@@ -667,9 +679,11 @@ if (writeMode) {
 
   await checkRuntimeShell(writeTemplate, 'write runtime shell');
   await runSavedTemplate(writeTemplate, 'write template run');
+  await runSavedTemplateCacheChecks(writeTemplate);
 } else {
   await checkRuntimeShell(runtimeTemplate, 'runtime shell');
   await runSavedTemplate(runtimeTemplate, 'saved template run');
+  await runSavedTemplateCacheChecks(runtimeTemplate);
 }
 
 console.log('');
@@ -703,16 +717,66 @@ async function checkRuntimeShell(templateCode, name) {
 
 async function runSavedTemplate(templateCode, name) {
   await test(name, async () => {
-    const result = await request('POST', `${proxyOrigin}/cmdbuild/custom-api/templates/${encodeURIComponent(templateCode)}/run?root=${encodeURIComponent(root)}&maxRows=2`, {
-      params: { attrType: runtimeAttrType }
-    }, withCsrf(csrf));
+    const json = await postTemplateRun(templateCode);
+    return `${resultSummary(json.result)} cache=${cacheStatus(json)}`;
+  });
+}
+
+async function runSavedTemplateCacheChecks(templateCode) {
+  await test('saved template cache hit', async () => {
+    const json = await postTemplateRun(templateCode);
+    if (!json.cache || json.cache.enabled === false) return `cache=${cacheStatus(json)}`;
+    assert(json.cache.status === 'hit', `Expected cache hit, got ${json.cache.status}.`);
+    return `cache=${cacheStatus(json)} key=${json.cache.key || ''}`;
+  });
+
+  await test('saved template force refresh bypasses cooldown', async () => {
+    const json = await postTemplateRun(templateCode, { forceRefresh: true });
+    if (!json.cache || json.cache.enabled === false) return `cache=${cacheStatus(json)}`;
+    assert(json.cache.status === 'force-refresh', `Expected force-refresh, got ${json.cache.status}.`);
+    assert(json.cache.refreshAllowed === false || json.cache.refreshAllowed === true, 'Force refresh cache metadata is incomplete.');
+    return `cache=${cacheStatus(json)} key=${json.cache.key || ''}`;
+  });
+
+  await test('GET runtime cannot force refresh', async () => {
+    const result = await request('GET', `${proxyOrigin}/cmdbuild/custom-api/templates/${encodeURIComponent(templateCode)}/run?attrType=${encodeURIComponent(runtimeAttrType)}&forceRefresh=1`);
     assertStatus(result, 200);
     const json = getJson(result);
-    assert(json.success === true, 'Saved template run failed.');
-    assert(json.result && Array.isArray(json.result.tables) && json.result.tables.length >= 1, 'Saved template run did not return tables.');
-    assert(Array.isArray(json.result.trace) && json.result.trace.length >= 1, 'Saved template run did not return trace.');
-    return resultSummary(json.result);
+    assert(json.success === true, 'GET runtime failed.');
+    if (json.cache) {
+      assert(json.cache.status !== 'force-refresh', 'GET runtime unexpectedly forced cache refresh.');
+    }
+    return `cache=${cacheStatus(json)}`;
   });
+}
+
+async function postTemplateRun(templateCode, options = {}) {
+  const query = new URLSearchParams({
+    root,
+    maxRows: '2'
+  });
+  if (options.forceRefresh) query.set('forceRefresh', '1');
+  if (options.noCache) query.set('noCache', '1');
+  const body = {
+    params: { attrType: runtimeAttrType }
+  };
+  if (options.forceRefresh) {
+    body.refresh = true;
+    body.forceRefresh = true;
+  }
+  if (options.noCache) body.noCache = true;
+  const result = await request('POST', `${proxyOrigin}/cmdbuild/custom-api/templates/${encodeURIComponent(templateCode)}/run?${query}`, body, withCsrf(csrf));
+  assertStatus(result, 200);
+  const json = getJson(result);
+  assert(json.success === true, 'Saved template run failed.');
+  assert(json.result && Array.isArray(json.result.tables) && json.result.tables.length >= 1, 'Saved template run did not return tables.');
+  assert(Array.isArray(json.result.trace) && json.result.trace.length >= 1, 'Saved template run did not return trace.');
+  return json;
+}
+
+function cacheStatus(json) {
+  if (!json || !json.cache) return 'none';
+  return `${json.cache.scopeMode || json.cache.scope || 'cache'}:${json.cache.status || 'unknown'}`;
 }
 
 function withCsrf(token) {

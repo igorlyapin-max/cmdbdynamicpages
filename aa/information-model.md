@@ -11,6 +11,7 @@ flowchart LR
   CMDB[CMDBuild UI/REST<br/>127.0.0.1:8090]
   Redis[Redis<br/>127.0.0.1:6379]
   Monitor[Monitoring / LB]
+  Logs[Log collector / Syslog / ELK<br/>514/5044/9200]
 
   Browser -->|IF-001 HTTPS/HTTP UI 8088| Nginx
   Nginx -->|IF-002 HTTP wiki 3000| Wiki
@@ -20,6 +21,7 @@ flowchart LR
   Browser -->|IF-006 HTTP direct dev 8093| Backend
   Browser -->|IF-007 HTTP CMDBuild launcher 8093->8090| CMDB
   Monitor -->|IF-008 HTTP health 8093/8088| Backend
+  Backend -->|IF-009 stdout/syslog/log shipper 514/5044/9200| Logs
 ```
 
 ## Реестр информационных потоков
@@ -34,6 +36,7 @@ flowchart LR
 | IF-006 | Browser | cmdbdynamicpages Backend | HTTP `127.0.0.1:8093` | Direct dev Designer/Runtime/API | Локальный прямой доступ без nginx |
 | IF-007 | Browser | CMDBuild UI через proxy chain | HTTP `127.0.0.1:8093` -> `8090` | CMDBuild UI assets, custom page launcher | Нужен для входа и получения session cookie |
 | IF-008 | Monitoring/LB | cmdbdynamicpages Backend | HTTP `8093` или `8088` | `/health/live`, `/health/ready`, `/health/redis` JSON | Readiness возвращает `503` при Redis/CMDBuild проблемах |
+| IF-009 | cmdbdynamicpages Backend | Log collector / Syslog / ELK | stdout без порта; syslog `514` UDP/TCP; collector `5044/24224`; Elasticsearch `9200` | Structured operational events | Прямого Elasticsearch output из приложения нет; secrets маскируются |
 
 ## Данные CMDBuild
 
@@ -47,6 +50,8 @@ flowchart LR
 | `Cst_QueryExecutionLog` | Best-effort audit preview/direct POST run |
 
 Business data читаются из существующих CMDBuild классов через DSL (`selectCards`, `expandRelations`, matching). Состав полей ограничивается used-field dependency map: backend запрашивает только атрибуты, реально используемые фильтрами, сопоставлением, итоговыми данными или визуализацией.
+
+Специальный шаблон `kind=cmdbBuildView` читает не business cards, а metadata модели CMDBuild: classes, class attributes, domains, domain attributes, lookup types и lookup values. Он выполняется тем же backend и тем же `CMDBuild-Authorization` текущего пользователя. Отдельная авторизация соседнего `../cmdbuild` приложения не используется. Protected-шаблон `CmdbBuildView` хранится в `Cst_QueryTemplate`, но удаление такого шаблона блокируется backend.
 
 ## Данные Redis
 

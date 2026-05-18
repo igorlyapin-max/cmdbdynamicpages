@@ -35,6 +35,15 @@ function cmdbDynamicPagesBuildQuery(params) {
     return pairs.join('&');
 }
 
+function cmdbDynamicPagesEscapeHtml(value) {
+    return String(value === undefined || value === null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 function cmdbDynamicPagesReadHashRoute() {
     var hash = window.location.hash || '';
     var marker = 'custompages/CmdbDynamicPages';
@@ -87,8 +96,18 @@ function cmdbDynamicPagesBuildTargetUrl() {
     return '/cmdbuild/dynamicpages/ui/run/' + encodeURIComponent(templateCode) + (runtimeQuery ? '?' + runtimeQuery : '');
 }
 
+function cmdbDynamicPagesRememberTarget(target) {
+    try {
+        if (window.sessionStorage && target) {
+            window.sessionStorage.setItem('cmdbdynamicpages.pendingTarget', target);
+        }
+    } catch (error) {
+    }
+}
+
 function cmdbDynamicPagesOpenExternalUi() {
     var target = cmdbDynamicPagesBuildTargetUrl();
+    cmdbDynamicPagesRememberTarget(target);
     cmdbDynamicPagesClientLog('launcher-redirect', target);
     window.location.replace(target);
 }
@@ -119,11 +138,14 @@ Ext.define('CMDBuildUI.view.custompages.CmdbDynamicPages.CmdbDynamicPages', {
     title: 'CMDB Dynamic Pages',
 
     initComponent: function () {
+        var target = cmdbDynamicPagesBuildTargetUrl();
+        cmdbDynamicPagesRememberTarget(target);
         cmdbDynamicPagesClientLog('initComponent', 'launcher');
         this.html = [
             '<div style="font-family:Arial,sans-serif;line-height:1.45">',
             '<h2 style="font-size:20px;margin:0 0 8px">CMDB Dynamic Pages</h2>',
-            '<p style="margin:0;color:#52606d">Opening dynamic pages UI...</p>',
+            '<p style="margin:0 0 12px;color:#52606d">Opening dynamic pages UI...</p>',
+            '<p style="margin:0"><a style="display:inline-block;background:#236c91;color:#fff;padding:8px 12px;border-radius:4px;text-decoration:none;font-weight:600" href="' + cmdbDynamicPagesEscapeHtml(target) + '">Open Designer</a></p>',
             '</div>'
         ].join('');
         this.callParent(arguments);

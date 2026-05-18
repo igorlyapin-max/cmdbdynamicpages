@@ -7,6 +7,8 @@
 - Designer UI для подготовки шаблонов динамических страниц и хранения их JSON-описаний в технических классах CMDBuild;
 - Runtime UI для запуска шаблона по URL и вывода результата таблицами в рамках прав текущего пользователя CMDBuild либо как опубликованный статический снимок.
 
+Пошаговая инструкция развертывания: [docs/deployment-guide.ru.md](docs/deployment-guide.ru.md).
+
 ## Текущая архитектура
 
 CMDBuild custom page оставлен тонким launcher-компонентом. Он не содержит сложный UI, а перенаправляет браузер на backend-owned маршруты проекта:
@@ -81,6 +83,12 @@ npm run nginx:dev
 Проверки:
 
 ```bash
+npm test
+npm run test:static
+npm run test:unit
+npm run test:api
+npm run test:ui
+npm run test:nginx
 npm run check
 npm run diag
 npm run e2e
@@ -88,6 +96,8 @@ npm run e2e:write
 npm run e2e:limited
 npm run nginx:test
 ```
+
+`npm test` выполняет syntax check, статическую проверку OpenAPI/ссылок `aa/` и unit-тесты. `test:unit` покрывает ключи runtime cache, cooldown refresh, defaults параметров, IPv4-сравнения, dependency map и маскирование логов. `test:api` является smoke-контрактом для уже запущенного proxy на `8093`; если proxy недоступен, тесты помечаются как skipped. `test:ui` запускает skip-safe Playwright smoke, только если Playwright установлен и есть валидная CMDBuild cookie. `test:nginx` проверяет nginx config и same-origin wiki/iframe маршруты через `localhost:8088`.
 
 ## Redis и секреты
 
@@ -134,6 +144,7 @@ GET /cmdbuild/custom-api/health/redis
 - `/health/redis` делает строгий Redis `PING`; при недоступности Redis возвращает `503`.
 - `/health/ready` проверяет процесс, Redis и CMDBuild upstream; при проблеме возвращает `503`.
 - `/cmdbuild/custom-api/cache/status` остается диагностикой и может возвращать `200` даже при fallback на memory.
+- `/cmdbuild/custom-api/logging/status` показывает текущий log level, target и правила маскирования без секретов.
 
 Настройки:
 
@@ -141,6 +152,30 @@ GET /cmdbuild/custom-api/health/redis
 CMDBDYNAMIC_HEALTH_TIMEOUT_MS=2000
 CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=true
 ```
+
+## Логирование
+
+Backend пишет структурированные операционные логи. Для Docker-установок основной режим - `stdout`: дальше поток забирает Docker logging driver, Filebeat, Fluent Bit или Logstash и передает в ELK. Прямой output в Elasticsearch из приложения не используется.
+
+```text
+CMDP_LOG_LEVEL=info
+CMDP_LOG_FORMAT=json
+CMDP_LOG_TARGET=stdout
+CMDP_LOG_REDACT_HEADERS=cookie,authorization,cmdbuild-authorization,x-csrf-token,x-cmdbdynamicpages-csrf,set-cookie
+CMDP_LOG_REDACT_QUERY=password,passwd,pwd,token,secret,authorization,auth,csrf,x-cmdbdynamicpages-csrf
+```
+
+Syslog включается отдельно для VM/bare-metal или SIEM:
+
+```text
+CMDP_LOG_TARGET=syslog
+CMDP_SYSLOG_HOST=127.0.0.1
+CMDP_SYSLOG_PORT=514
+CMDP_SYSLOG_PROTOCOL=udp
+CMDP_SYSLOG_FACILITY=local0
+```
+
+Если нужны оба канала, можно указать `CMDP_LOG_TARGET=stdout,syslog`. В логи попадают завершение HTTP-запросов, CSRF/same-origin отказы, изменение доступности Redis, ошибки CMDBuild upstream, runtime cache hit/miss/refresh, static snapshot publish/hit/miss и create/update/delete шаблонов. Cookie, authorization headers, CSRF token и secret-like query параметры маскируются. Runtime-строки результата и payload карточек CMDBuild в операционные логи не пишутся.
 
 ## Designer
 
@@ -167,6 +202,8 @@ http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/designer
 ```
 
 Новая сессия Designer открывается со списка шаблонов. Первый шаблон автоматически не выбирается.
+
+Вверху каждого route есть закрепленная контекстная кнопочная строка. Кнопки уровня страницы, например применить, сохранить, прогнать, опубликовать, открыть диагностику или сохранить настройки, остаются сверху и не уезжают вниз длинной формы.
 
 Designer умеет:
 
@@ -253,7 +290,9 @@ Designer показывает TTL в часах. Значение по умол�
 - `privateUser` - изоляция кэша по пользователю/сессии.
 - `disabled` - кэш runtime результата выключен.
 
-Системный cooldown ручного refresh хранится в `Cst_QueryToolConfig.RuntimeConfigJson.runtimeCache.refreshCooldownSec`.
+Системный cooldown ручного refresh хранится в `Cst_QueryToolConfig.RuntimeConfigJson.runtimeCache.refreshCooldownSec`. В Runtime cache UI компактный: в header таблицы название остается слева, а поиск и иконка `⟳` прижаты справа на том же уровне; подробности кэша показываются в tooltip по hover/focus.
+
+Preview в Designer отделен от кэша сохраненного runtime результата: `Визуализировать в редакторе` вызывает `/draft/preview` по текущему черновику и не читает final runtime cache. В разделе `Прогон` также есть `Обновить кэш и показать`: это `POST run` сохраненного шаблона с `forceRefresh=true`, он перестраивает runtime cache без пользовательского cooldown и требует CSRF, поэтому iframe/read-only `GET run` не может обходить таймер.
 
 ## Техническая схема CMDBuild
 

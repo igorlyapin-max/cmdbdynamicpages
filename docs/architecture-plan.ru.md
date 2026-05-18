@@ -103,7 +103,9 @@ TTL шаблона хранится в секундах, но Designer пока�
 - `privateUser` - кэш изолирован по пользователю/сессии;
 - `disabled` - runtime result cache отключен.
 
-Системный cooldown ручного refresh хранится в `RuntimeConfigJson.runtimeCache.refreshCooldownSec`.
+Системный cooldown ручного refresh хранится в `RuntimeConfigJson.runtimeCache.refreshCooldownSec`. Runtime UI остается компактным: в header таблицы название находится слева, а поиск и иконка `⟳` выровнены вправо на той же строке; статус кэша, время построения, истечение, countdown refresh, backend и scope показываются в tooltip по hover/focus.
+
+Designer draft preview намеренно не использует runtime cache: `Визуализировать в редакторе` вызывает `/cmdbuild/custom-api/draft/preview` и выполняет текущий несохраненный черновик. Для проверки сохраненного endpoint в разделе `Прогон` есть forced refresh: `POST /cmdbuild/custom-api/templates/:code/run` с `forceRefresh=true`. Forced refresh игнорирует пользовательский cooldown, но принимается только на CSRF-защищенном POST; read-only Runtime iframe `GET run` сохраняет поведение с таймером.
 
 ## Redis password
 
@@ -145,6 +147,28 @@ CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=true
 
 `/cmdbuild/custom-api/cache/status` не является readiness: это диагностика Redis/memory fallback и она может возвращать `200` при fallback.
 
+## Логирование и ELK
+
+Runtime-логирование структурированное и не привязано к конкретному сборщику. По умолчанию backend пишет JSON-события в `stdout`, что является рекомендуемым режимом для Docker/Kubernetes. ELK подключается через платформенный collector:
+
+```text
+cmdbdynamicpages stdout -> Docker logging/Filebeat/Fluent Bit/Logstash -> Elasticsearch
+```
+
+Для VM/bare-metal или SIEM можно включить syslog:
+
+```text
+CMDP_LOG_TARGET=syslog
+CMDP_SYSLOG_HOST=<syslog-host>
+CMDP_SYSLOG_PORT=514
+CMDP_SYSLOG_PROTOCOL=udp|tcp
+CMDP_SYSLOG_FACILITY=local0
+```
+
+`CMDP_LOG_TARGET=stdout,syslog` дублирует события в оба транспорта. Прямой output в Elasticsearch из приложения намеренно не реализуется, чтобы не связывать доступность runtime с observability backend. `/cmdbuild/custom-api/logging/status` показывает активную конфигурацию логирования без секретов и является диагностикой, а не readiness.
+
+В логи пишутся завершение HTTP-запросов, доступность Redis, ошибки CMDBuild upstream, CSRF/same-origin отказы, runtime cache hit/miss/refresh, static snapshot publish/hit/miss и create/update/delete шаблонов. Headers и query-параметры из `CMDP_LOG_REDACT_HEADERS` и `CMDP_LOG_REDACT_QUERY` маскируются; cookie, authorization headers, CSRF token, строки runtime-таблиц и raw payload карточек CMDBuild не должны попадать в операционные логи.
+
 ## Технический root
 
 Root по умолчанию:
@@ -184,6 +208,34 @@ Raw JSON в UI не показывается: Designer редактирует н
 - cache policy;
 - publication mode.
 
+## Специальный шаблон CMDBuild model view
+
+Для переноса функциональности соседнего проекта `../cmdbuild` введен специальный вид шаблона:
+
+```json
+{
+  "version": 1,
+  "kind": "cmdbBuildView",
+  "protected": true,
+  "cmdbBuildView": {
+    "language": "auto",
+    "showSystemAttributes": false,
+    "sections": ["classes", "domains", "lookups"],
+    "rootClass": "",
+    "lookupScope": "used"
+  }
+}
+```
+
+Он не использует обычную DSL-цепочку выборок/сопоставлений. Backend собирает модель CMDBuild через текущую серверную авторизацию пользователя: классы, атрибуты, домены, lookup-типы и значения lookup. Собственная авторизация `../cmdbuild` не переносится.
+
+Режимы выполнения такие же, как у обычных шаблонов:
+
+- `dynamicUser` - HTML строится под правами текущего пользователя CMDBuild;
+- `staticSnapshot` - редактор публикует снимок в Redis, runtime отдает готовую страницу без повторной проверки прав на исходную модель.
+
+Шаблон `CmdbBuildView` считается protected/system: Designer скрывает удаление, а backend блокирует `DELETE` для protected-шаблонов. Настройки редактируются в Designer в разделе `CMDBuild model view`; внешний вид приводится к минималистичному runtime-представлению проекта, без отдельного login screen и без тяжелого UI соседнего проекта.
+
 ## Права редактора
 
 Редактор определяется правами CMDBuild на технический класс `Cst_QueryTemplate`. Отдельная ACL внутри проекта не ведется.
@@ -218,6 +270,8 @@ Designer расположен по адресу:
 - прогон.
 
 Новая сессия открывает список шаблонов без авто-выбора первого шаблона.
+
+Действия уровня страницы вынесены в закрепленную контекстную кнопочную строку сверху каждого route. Состав кнопок меняется по разделу: список шаблонов, конструктор, визуализация, кэш, публикация, настройки и диагностика показывают только релевантные действия.
 
 ## DSL
 

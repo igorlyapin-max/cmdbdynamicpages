@@ -13,6 +13,7 @@ flowchart TB
     Backend[Node.js cmdbdynamicpages<br/>listen 127.0.0.1:8093]
     Redis[Redis container<br/>listen 127.0.0.1:6379<br/>RDB snapshot]
     CMDBuild[CMDBuild app<br/>listen 127.0.0.1:8090]
+    Logs[Docker stdout / optional syslog<br/>514 UDP/TCP]
     CMDBDB[CMDBuild DB]
   end
 
@@ -22,6 +23,7 @@ flowchart TB
   Browser -->|HTTP direct dev 8093| Backend
   Backend -->|HTTP REST 8090| CMDBuild
   Backend -->|RESP AUTH 6379| Redis
+  Backend -->|JSON stdout / syslog 514| Logs
   CMDBuild --> CMDBDB
 ```
 
@@ -37,6 +39,9 @@ flowchart TB
   CMDB[CMDBuild REST<br/>443 или 8090]
   CMDBDB[(CMDBuild DB)]
   Mon[Monitoring / LB health probe]
+  LogCollector[Log collector<br/>Filebeat/Fluent Bit/Logstash<br/>5044/24224/platform port]
+  Syslog[Syslog / SIEM<br/>514 UDP/TCP]
+  ELK[Elasticsearch / ELK<br/>9200/platform port]
   Secret[Secret store<br/>Redis password, CSRF secret]
 
   User -->|HTTPS 443| LB
@@ -45,6 +50,10 @@ flowchart TB
   App -->|HTTPS/HTTP CMDBuild REST 443/8090| CMDB
   App -->|Redis RESP 6379, AUTH| Redis
   App -->|read secrets at startup| Secret
+  App -->|JSON stdout via platform logging| LogCollector
+  App -->|optional syslog 514 UDP/TCP| Syslog
+  Syslog -->|optional forward| LogCollector
+  LogCollector -->|index/bulk 9200| ELK
   CMDB --> CMDBDB
   Mon -->|GET /health/live,/ready 443/app port| App
 ```

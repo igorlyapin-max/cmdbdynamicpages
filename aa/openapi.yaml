@@ -75,6 +75,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CacheStatus"
+  /cmdbuild/custom-api/logging/status:
+    get:
+      tags: [diagnostics]
+      summary: Diagnostic logging configuration
+      description: Returns active log level, target and redaction settings without secrets. This is not readiness.
+      responses:
+        "200":
+          description: Logging diagnostic status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoggingStatus"
+        "401":
+          description: CMDBuild session cookie is missing or invalid
   /cmdbuild/custom-api/session:
     get:
       tags: [session]
@@ -174,13 +188,31 @@ paths:
     get:
       tags: [schema]
       summary: Technical schema readiness
+      parameters:
+        - name: root
+          in: query
+          schema:
+            type: string
+            example: Cst_QueryTool
+        - name: parent
+          in: query
+          schema:
+            type: string
+            example: Class
       responses:
         "200":
           description: Technical schema status
-  /cmdbuild/custom-api/schema/bootstrap:
+  /cmdbuild/custom-api/schema/parents:
+    get:
+      tags: [schema]
+      summary: Candidate parent superclasses for technical schema
+      responses:
+        "200":
+          description: Parent class list
+  /cmdbuild/custom-api/schema/preview:
     post:
       tags: [schema]
-      summary: Create missing technical schema objects
+      summary: Preview non-destructive technical schema bootstrap
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -189,11 +221,25 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              properties:
-                root:
-                  type: string
-                  example: Cst_QueryTool
+              $ref: "#/components/schemas/SchemaBootstrapRequest"
+      responses:
+        "200":
+          description: Schema plan without CMDBuild changes
+        "403":
+          description: CSRF check failed
+  /cmdbuild/custom-api/schema/bootstrap:
+    post:
+      tags: [schema]
+      summary: Create missing technical schema objects without destructive updates
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SchemaBootstrapRequest"
       responses:
         "200":
           description: Bootstrap completed
@@ -339,9 +385,16 @@ paths:
     post:
       tags: [runtime]
       summary: Direct runtime execution with audit
+      description: Designer/API POST may request `forceRefresh` to rebuild the runtime cache without the user refresh cooldown. GET runtime does not accept forced refresh.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
+      parameters:
+        - name: forceRefresh
+          in: query
+          schema:
+            type: string
+            enum: ["1"]
       requestBody:
         $ref: "#/components/requestBodies/RunParams"
       responses:
@@ -456,6 +509,10 @@ components:
                 type: boolean
               noCache:
                 type: boolean
+              forceRefresh:
+                type: boolean
+              bypassRefreshCooldown:
+                type: boolean
   schemas:
     ApiResponse:
       type: object
@@ -463,6 +520,22 @@ components:
         success:
           type: boolean
       additionalProperties: true
+    SchemaBootstrapRequest:
+      type: object
+      properties:
+        root:
+          type: string
+          example: Cst_QueryTool
+        description:
+          type: string
+          example: CMDB Dynamic Pages technical root
+        parent:
+          type: string
+          description: CMDBuild superclass under which the technical root class is created.
+          example: Class
+        confirm:
+          type: boolean
+          description: UI confirmation that bootstrap may create only missing classes/attributes and must not move/delete existing objects.
     LiveHealth:
       type: object
       required: [service, status, live]
@@ -570,6 +643,53 @@ components:
               type: integer
             inFlightRuntimeBuilds:
               type: integer
+    LoggingStatus:
+      type: object
+      properties:
+        success:
+          type: boolean
+        logging:
+          type: object
+          properties:
+            level:
+              type: string
+              enum: [debug, info, warn, error, silent]
+            format:
+              type: string
+              enum: [json, text]
+            targets:
+              type: array
+              items:
+                type: string
+                enum: [stdout, syslog]
+            redactHeaders:
+              type: array
+              items:
+                type: string
+            redactQuery:
+              type: array
+              items:
+                type: string
+            syslog:
+              nullable: true
+              type: object
+              properties:
+                host:
+                  type: string
+                port:
+                  type: integer
+                protocol:
+                  type: string
+                  enum: [udp, tcp]
+                facility:
+                  type: string
+            elk:
+              type: object
+              properties:
+                directOutput:
+                  type: boolean
+                recommendedPipeline:
+                  type: string
     TemplatePayload:
       type: object
       required: [code, spec]
@@ -582,6 +702,7 @@ components:
           type: boolean
         spec:
           type: object
+          description: Template Spec JSON. Normal dynamic templates use the DSL steps/result model; special CMDBuild model view templates set `kind=cmdbBuildView` and store renderer settings under `cmdbBuildView`.
           additionalProperties: true
         paramsSchema:
           type: object

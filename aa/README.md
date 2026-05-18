@@ -13,6 +13,7 @@
 | Карта HealthCheck | [healthcheck-map.md](healthcheck-map.md) |
 | Карта секретов | [secrets-map.md](secrets-map.md) |
 | Карта регистрации событий | [event-logging-map.md](event-logging-map.md) |
+| Схема потоков логирования | [logging-flow.md](logging-flow.md) |
 | Карта метрик | [metrics-map.md](metrics-map.md) |
 | AsyncAPI применимость | [asyncapi-applicability.md](asyncapi-applicability.md) |
 | Карта доступов Kafka | [kafka-access-map.md](kafka-access-map.md) |

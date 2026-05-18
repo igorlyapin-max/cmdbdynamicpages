@@ -26,6 +26,7 @@ Done:
 - Designer UI has a simple visual builder that generates JSON specs for implemented DSL operation families.
 - Designer UI shows template versions and can load a saved version spec into the editor.
 - Designer UI uses a two-level navigation menu and no longer shows the session, technical-schema, inline guide, or class-name probe blocks on the main screen.
+- Designer UI has a Schema section for first-run setup: root, description, parent superclass, preview, and non-destructive bootstrap.
 - Runtime UI MVP is implemented as a backend-served standalone UI for template URLs.
 - Runtime template execution has a Redis-backed cache with per-template sharing modes, in-memory dev fallback, and a refresh countdown.
 - Helpdesk limited-user grants were configured for runtime read access to the custom page and technical classes.
@@ -43,7 +44,12 @@ Done:
 - Designer and Runtime UI are served by backend-owned same-origin routes under `/cmdbuild/dynamicpages/ui/*`.
 - Designer and Runtime UI support Russian/English language selection with browser/CMDBuild storage fallback detection.
 - Designer validates and previews the current unsaved draft before save and shows an execution trace.
-- `npm run e2e` verifies session, schema readiness, CSRF rejection, draft preview, Runtime shell loading, and saved-template run.
+- `npm test` runs syntax checks, static OpenAPI/architecture-link validation, and unit tests.
+- `npm run test:unit` covers runtime cache keys, cache metadata, parameter defaults, IPv4 matching, dependency maps, and log redaction.
+- `npm run test:api` provides a skip-safe API contract smoke against a running proxy.
+- `npm run test:ui` provides a skip-safe Playwright smoke for Designer and Runtime shell behavior.
+- `npm run test:nginx` validates nginx config and same-origin wiki/dynamicpages routes through `localhost:8088`.
+- `npm run e2e` verifies session, logging diagnostics, schema readiness, CSRF rejection, draft preview without runtime cache, Runtime shell loading, saved-template run, cache hit, POST `forceRefresh`, and that GET runtime cannot force refresh.
 - `npm run e2e:write` creates or updates a stable smoke template and verifies save/version/runtime flow.
 - `npm run e2e:limited` logs in as local `mdavis` / `Helpdesk`, verifies runtime access, and verifies template create is rejected.
 - Designer caches the CMDBuild model catalog client-side and shows a header freshness lamp with manual sync; stale/yellow starts after 24 hours.
@@ -68,6 +74,8 @@ Not done:
 
 - No remaining core implementation items in the current plan.
 - Example templates are tracked separately from the implementation plan.
+- Deeper Playwright Runtime table checks for client-side search/sort and grouped table behavior are planned but not implemented.
+- Browser-level iframe rendering inside a real wiki page is planned when a stable local wiki test page is available.
 
 ## 1. CMDBuild Roles/Groups Check
 

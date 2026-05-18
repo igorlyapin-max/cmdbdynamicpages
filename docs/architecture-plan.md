@@ -99,7 +99,9 @@ Runtime template results may be expensive because templates can scan cards and r
 - `privateUser` keeps the result cache isolated by CMDBuild user/session scope;
 - `disabled` turns result caching off for the template.
 
-Cache keys include template code, spec hash, runtime params, executor limits, template cache policy, dependency-map hash, and either the endpoint visibility hash or the per-user scope hash depending on mode. Template `ttlSeconds` controls how long this template result is kept in cache; the Designer edits this value in hours and defaults new templates to 8 hours. System `RuntimeConfigJson.runtimeCache.refreshCooldownSec` controls how long users must wait before requesting a manual cache rebuild. The runtime page shows cache status, generated time, expiry countdown, refresh countdown, and a refresh button when the template allows manual refresh.
+Cache keys include template code, spec hash, runtime params, executor limits, template cache policy, dependency-map hash, and either the endpoint visibility hash or the per-user scope hash depending on mode. Template `ttlSeconds` controls how long this template result is kept in cache; the Designer edits this value in hours and defaults new templates to 8 hours. System `RuntimeConfigJson.runtimeCache.refreshCooldownSec` controls how long users must wait before requesting a manual cache rebuild. The runtime page keeps the visible UI compact: the table header places the title on the left and right-aligns search plus a `⟳` refresh icon on the same line; the icon exposes cache status, generated time, expiry, refresh countdown, backend, and scope details in a hover/focus tooltip.
+
+Designer draft preview is intentionally cache-free: `Visualize in editor` calls `/cmdbuild/custom-api/draft/preview` and executes the current unsaved draft. For saved endpoint testing the Designer Run page exposes a forced cache refresh action that calls `POST /cmdbuild/custom-api/templates/:code/run` with `forceRefresh=true`. Forced refresh ignores the user cooldown but is only accepted on CSRF-protected POST; read-only Runtime iframe `GET run` keeps the cooldown behavior.
 
 The executor builds a used-field dependency map from filters, matching rules, final data, and visualization settings. `selectCards` materializes only the base card identifiers plus the fields that are actually used downstream; unrelated attributes are not added to result rows and are not part of the cache probe.
 
@@ -133,6 +135,28 @@ Health endpoints are unauthenticated and have both root and backend-prefixed for
 `/health/live` only proves that the Node process answers HTTP. `/health/redis` performs a strict Redis `PING` and returns `503` when Redis is disabled or unavailable. `/health/ready` checks the process, Redis, and CMDBuild upstream reachability; it returns `503` when Redis is required and unavailable or CMDBuild cannot be reached. `CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=false` can relax readiness for local development, but production should leave Redis required when Redis-backed runtime cache or static snapshots are expected.
 
 `/cmdbuild/custom-api/cache/status` remains a diagnostics endpoint. It reports Redis visibility and in-memory fallback counters, but it returns `200` even during fallback and therefore must not be used as strict production readiness.
+
+## Logging And ELK
+
+Runtime logging is structured and transport-neutral. The backend emits JSON events by default to `stdout`, which is the recommended Docker/Kubernetes mode. ELK integration is expected to be provided by the platform collector path:
+
+```text
+cmdbdynamicpages stdout -> Docker logging/Filebeat/Fluent Bit/Logstash -> Elasticsearch
+```
+
+For VM/bare-metal or SIEM-oriented deployments the backend can send the same event payload to syslog:
+
+```text
+CMDP_LOG_TARGET=syslog
+CMDP_SYSLOG_HOST=<syslog-host>
+CMDP_SYSLOG_PORT=514
+CMDP_SYSLOG_PROTOCOL=udp|tcp
+CMDP_SYSLOG_FACILITY=local0
+```
+
+`CMDP_LOG_TARGET=stdout,syslog` duplicates events to both transports. Direct Elasticsearch output is intentionally not implemented in the application to avoid coupling runtime availability to the observability backend. `/cmdbuild/custom-api/logging/status` reports the active logging configuration without secrets and is a diagnostics endpoint, not readiness.
+
+Logged events cover HTTP request completion, Redis availability, CMDBuild upstream failures, CSRF/same-origin rejections, runtime cache hit/miss/refresh, static snapshot publish/hit/miss, and template create/update/delete. Headers and query parameters configured in `CMDP_LOG_REDACT_HEADERS` and `CMDP_LOG_REDACT_QUERY` are redacted; cookies, authorization headers, CSRF tokens, runtime table rows, and raw CMDBuild card payloads must not appear in operational logs.
 
 ## Technical Root
 
@@ -243,6 +267,34 @@ Current `RuntimeConfigJson` shape:
 }
 ```
 
+## Special CMDBuild Model View Template
+
+The neighboring `../cmdbuild` project is integrated as a special template kind instead of a separate service:
+
+```json
+{
+  "version": 1,
+  "kind": "cmdbBuildView",
+  "protected": true,
+  "cmdbBuildView": {
+    "language": "auto",
+    "showSystemAttributes": false,
+    "sections": ["classes", "domains", "lookups"],
+    "rootClass": "",
+    "lookupScope": "used"
+  }
+}
+```
+
+This kind does not use the normal selection/matching DSL. The backend collects CMDBuild model metadata with the current server-side CMDBuild authorization: classes, attributes, domains, lookup types, and lookup values. The standalone `../cmdbuild` login flow and cookies are intentionally not reused.
+
+Execution modes are the same as for ordinary templates:
+
+- `dynamicUser` builds the HTML view under the current viewer's CMDBuild permissions;
+- `staticSnapshot` publishes a Redis snapshot under the editor's permissions and serves the stored page without source permission checks.
+
+The `CmdbBuildView` template is treated as protected/system: the Designer hides deletion and the backend rejects `DELETE` for protected templates. Settings are edited in the Designer `CMDBuild model view` section, and the runtime appearance is rendered with the project's compact/minimal visual style instead of the heavier standalone UI from `../cmdbuild`.
+
 ## Editor Permissions
 
 We should avoid maintaining a separate editor list if CMDBuild can provide the required authorization signal.
@@ -318,6 +370,7 @@ Language behavior:
 Implemented Designer MVP:
 
 - lists templates from `Cst_QueryTemplate`;
+- keeps page-level Designer actions in a sticky contextual action bar at the top of each route;
 - creates templates through a minimal code/description form and edits query logic through focused Designer sections;
 - caches the CMDBuild class/attribute/domain catalog in the browser and shows a header freshness lamp with a sync control; the lamp turns stale/yellow after 24 hours from the last sync;
 - edits object-group templates visually as one or more named selections and compiles each include/exclude scope rule set into a separate `selectCards` result;

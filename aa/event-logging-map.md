@@ -11,6 +11,11 @@
 | LOG-007 | IF-005 | Redis недоступен | backend stderr/container logs + `/health/redis` response | error message, timestamp | Redis password маскируется |
 | LOG-008 | IF-004 | CMDBuild upstream недоступен | backend stderr/container logs + `/health/ready` response | status/error, latency | CMDBuild token отсутствует в health |
 | LOG-009 | IF-003 | CSRF rejection | API response + backend logs при наличии runtime логирования окружения | HTTP 403, route | CSRF token не логировать |
+| LOG-010 | IF-003/IF-004 | HTTP request завершен | structured logger `stdout`/syslog | requestId, method, masked path, statusCode, durationMs, route, sessionHash | Cookie и authorization headers не пишутся; query secrets маскируются |
+| LOG-011 | IF-004/IF-005 | Runtime cache hit/miss/refresh | structured logger `runtime.cache_result` | templateCode, username, cache status, backend, scope, rowsCount | Результирующие строки таблиц не пишутся |
+| LOG-012 | IF-004/IF-005 | Static snapshot publish/hit/miss | structured logger `snapshot.*` | templateCode, username, backend, key/hash, rowsCount, paramsMode | Исходные CMDBuild-объекты и runtime rows не пишутся |
+| LOG-013 | IF-004 | Create/update/delete шаблона | structured logger `template.*` + `Cst_QueryTemplateVersion` | templateCode, username, cmdbuildStatus, versionLogged | `SpecJson` хранится в version class, но не пишется в операционный лог |
+| LOG-014 | IF-009 | Передача логов в ELK/SIEM | stdout/syslog -> collector | JSON event или RFC5424-like syslog message | Прямого подключения приложения к Elasticsearch нет |
 
 ## Обязательные события ИБ
 
@@ -22,4 +27,4 @@
 
 ## Ограничения текущей реализации
 
-Memory diagnostic logs ограничены по размеру и не заменяют централизованный аудит. Для production события backend stdout/stderr и access logs reverse proxy должны собираться штатной системой логирования контура.
+Memory diagnostic logs ограничены по размеру и не заменяют централизованный аудит. Для production structured logs backend пишутся в `stdout` или syslog и должны собираться штатной системой логирования контура. ELK подключается через Docker/Filebeat/Fluent Bit/Logstash collector; прямого output в Elasticsearch из приложения нет.

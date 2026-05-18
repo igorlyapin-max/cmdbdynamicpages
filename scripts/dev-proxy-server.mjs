@@ -1,8 +1,49 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
+import dgram from 'node:dgram';
 import fs from 'node:fs';
+import os from 'node:os';
 import net from 'node:net';
-import { URL } from 'node:url';
+import { URL, pathToFileURL } from 'node:url';
+import {
+  CMDB_BUILD_VIEW_KIND,
+  DEFAULT_CMDB_BUILD_VIEW_CODE,
+  defaultCmdbBuildViewSpec,
+  executeCmdbBuildViewSpec,
+  isCmdbBuildViewSpec,
+  normalizeCmdbBuildViewConfig,
+  validateCmdbBuildViewSpec
+} from '../src/special-renderers/cmdb-build-view.mjs';
+
+const syslogFacilityCodes = {
+  kern: 0,
+  user: 1,
+  mail: 2,
+  daemon: 3,
+  auth: 4,
+  syslog: 5,
+  lpr: 6,
+  news: 7,
+  uucp: 8,
+  cron: 9,
+  authpriv: 10,
+  ftp: 11,
+  local0: 16,
+  local1: 17,
+  local2: 18,
+  local3: 19,
+  local4: 20,
+  local5: 21,
+  local6: 22,
+  local7: 23
+};
+const logLevelWeights = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40,
+  silent: 100
+};
 
 const LISTEN_HOST = process.env.PROXY_HOST || '127.0.0.1';
 const LISTEN_PORT = Number(process.env.PROXY_PORT || 8093);
@@ -21,6 +62,15 @@ const RUNTIME_REFRESH_COOLDOWN_MS = Math.max(10_000, Number(process.env.CMDBDYNA
 const RUNTIME_CACHE_MAX_ENTRIES = Math.max(10, Number(process.env.CMDBDYNAMIC_RUNTIME_CACHE_MAX_ENTRIES || 100) || 100);
 const HEALTH_TIMEOUT_MS = Math.max(500, Number(process.env.CMDBDYNAMIC_HEALTH_TIMEOUT_MS || 2000) || 2000);
 const HEALTH_REDIS_REQUIRED = process.env.CMDBDYNAMIC_HEALTH_REDIS_REQUIRED !== 'false';
+const LOG_LEVEL = normalizeLogLevel(process.env.CMDP_LOG_LEVEL || 'info');
+const LOG_FORMAT = normalizeLogFormat(process.env.CMDP_LOG_FORMAT || 'json');
+const LOG_TARGETS = normalizeLogTargets(process.env.CMDP_LOG_TARGET || 'stdout');
+const LOG_REDACT_HEADERS = parseNameSet(process.env.CMDP_LOG_REDACT_HEADERS || 'cookie,authorization,cmdbuild-authorization,x-csrf-token,x-cmdbdynamicpages-csrf,set-cookie');
+const LOG_REDACT_QUERY = parseNameSet(process.env.CMDP_LOG_REDACT_QUERY || 'password,passwd,pwd,token,secret,authorization,auth,csrf,x-cmdbdynamicpages-csrf');
+const SYSLOG_HOST = process.env.CMDP_SYSLOG_HOST || '127.0.0.1';
+const SYSLOG_PORT = Number(process.env.CMDP_SYSLOG_PORT || 514);
+const SYSLOG_PROTOCOL = normalizeSyslogProtocol(process.env.CMDP_SYSLOG_PROTOCOL || 'udp');
+const SYSLOG_FACILITY = normalizeSyslogFacility(process.env.CMDP_SYSLOG_FACILITY || 'local0');
 const REDIS_URL = process.env.CMDBDYNAMIC_REDIS_URL || 'redis://127.0.0.1:6379/0';
 const REDIS_PASSWORD = readSecretValue(process.env.CMDBDYNAMIC_REDIS_PASSWORD, process.env.CMDBDYNAMIC_REDIS_PASSWORD_FILE);
 const REDIS_ENABLED = process.env.CMDBDYNAMIC_REDIS_ENABLED !== 'false';
@@ -49,6 +99,229 @@ const redisState = {
   lastCheckedAt: null,
   disabledUntil: 0
 };
+
+function normalizeLogLevel(value) {
+  const text = String(value || '').trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(logLevelWeights, text) ? text : 'info';
+}
+
+function normalizeLogFormat(value) {
+  const text = String(value || '').trim().toLowerCase();
+  return text === 'text' ? 'text' : 'json';
+}
+
+function normalizeLogTargets(value) {
+  const targets = String(value || 'stdout')
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean)
+    .filter((item) => item === 'stdout' || item === 'syslog');
+  return targets.length ? Array.from(new Set(targets)) : ['stdout'];
+}
+
+function parseNameSet(value) {
+  return new Set(String(value || '')
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean));
+}
+
+function normalizeSyslogProtocol(value) {
+  const text = String(value || '').trim().toLowerCase();
+  return text === 'tcp' ? 'tcp' : 'udp';
+}
+
+function normalizeSyslogFacility(value) {
+  const text = String(value || '').trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(syslogFacilityCodes, text) ? text : 'local0';
+}
+
+function logLevelEnabled(level) {
+  return (logLevelWeights[level] || logLevelWeights.info) >= (logLevelWeights[LOG_LEVEL] || logLevelWeights.info);
+}
+
+function redactByName(name, value, redactSet) {
+  return redactSet.has(String(name || '').toLowerCase()) ? '[REDACTED]' : value;
+}
+
+function sanitizeHeaders(headers) {
+  const result = {};
+  Object.entries(headers || {}).forEach(([name, value]) => {
+    const normalized = String(name || '').toLowerCase();
+    if (LOG_REDACT_HEADERS.has(normalized)) {
+      result[name] = '[REDACTED]';
+      return;
+    }
+    if (Array.isArray(value)) {
+      result[name] = value.map((item) => truncateText(item, 300));
+      return;
+    }
+    result[name] = truncateText(value, 300);
+  });
+  return result;
+}
+
+function sanitizeRequestPath(requestUrl) {
+  const params = new URLSearchParams();
+  requestUrl.searchParams.forEach((value, name) => {
+    params.append(name, truncateText(redactByName(name, value, LOG_REDACT_QUERY), 200));
+  });
+  const query = params.toString();
+  return truncateText(`${requestUrl.pathname}${query ? `?${query}` : ''}`, 1000);
+}
+
+function sanitizeReqUrl(req) {
+  try {
+    return sanitizeRequestPath(new URL(req.url || '/', `http://${req.headers.host || `${LISTEN_HOST}:${LISTEN_PORT}`}`));
+  } catch {
+    return truncateText(req.url || '', 1000);
+  }
+}
+
+function sessionHashFromCookie(cookieHeader) {
+  const token = getCookieValue(cookieHeader, 'CMDBuild-Authorization');
+  return token ? sha256Hex(token).slice(0, 16) : '';
+}
+
+function routeKind(pathname) {
+  if (isHealthPath(pathname)) return 'health';
+  if (pathname.startsWith(`${BACKEND_PREFIX}/`)) return 'backend';
+  if (pathname === DYNAMIC_UI_PREFIX || pathname.startsWith(`${DYNAMIC_UI_PREFIX}/`)) return 'dynamic-ui';
+  return 'cmdbuild-proxy';
+}
+
+function shouldStructuredLogRequest(pathname) {
+  return isHealthPath(pathname) ||
+    pathname.startsWith(`${BACKEND_PREFIX}/`) ||
+    pathname === DYNAMIC_UI_PREFIX ||
+    pathname.startsWith(`${DYNAMIC_UI_PREFIX}/`) ||
+    shouldLogProxyRequest(pathname);
+}
+
+function syslogSeverity(level) {
+  if (level === 'error') return 3;
+  if (level === 'warn') return 4;
+  if (level === 'debug') return 7;
+  return 6;
+}
+
+function sendSyslog(payload) {
+  const pri = (syslogFacilityCodes[SYSLOG_FACILITY] * 8) + syslogSeverity(payload.level);
+  const message = `<${pri}>1 ${payload.time} ${os.hostname()} cmdbdynamicpages ${process.pid} ${payload.event || '-'} - ${JSON.stringify(payload)}`;
+  if (SYSLOG_PROTOCOL === 'tcp') {
+    const socket = net.createConnection({ host: SYSLOG_HOST, port: SYSLOG_PORT }, () => {
+      socket.end(`${message}\n`);
+    });
+    socket.setTimeout(1000, () => socket.destroy());
+    socket.on('error', (error) => {
+      process.stderr.write(JSON.stringify({
+        time: new Date().toISOString(),
+        level: 'warn',
+        event: 'logging.syslog_failed',
+        error: error.message || String(error)
+      }) + '\n');
+    });
+    return;
+  }
+  const socket = dgram.createSocket('udp4');
+  socket.send(Buffer.from(message), SYSLOG_PORT, SYSLOG_HOST, (error) => {
+    socket.close();
+    if (error) {
+      process.stderr.write(JSON.stringify({
+        time: new Date().toISOString(),
+        level: 'warn',
+        event: 'logging.syslog_failed',
+        error: error.message || String(error)
+      }) + '\n');
+    }
+  });
+}
+
+function writeStructuredLog(level, event, fields = {}) {
+  const normalizedLevel = normalizeLogLevel(level);
+  if (!logLevelEnabled(normalizedLevel)) return;
+  const payload = {
+    time: new Date().toISOString(),
+    level: normalizedLevel,
+    service: 'cmdbdynamicpages',
+    event,
+    ...fields
+  };
+  if (LOG_TARGETS.includes('stdout')) {
+    const line = LOG_FORMAT === 'text'
+      ? `${payload.time} ${payload.level.toUpperCase()} ${payload.event} ${JSON.stringify(fields)}`
+      : JSON.stringify(payload);
+    const stream = normalizedLevel === 'error' ? process.stderr : process.stdout;
+    stream.write(`${line}\n`);
+  }
+  if (LOG_TARGETS.includes('syslog')) sendSyslog(payload);
+}
+
+function logDebug(event, fields) {
+  writeStructuredLog('debug', event, fields);
+}
+
+function logInfo(event, fields) {
+  writeStructuredLog('info', event, fields);
+}
+
+function logWarn(event, fields) {
+  writeStructuredLog('warn', event, fields);
+}
+
+function logError(event, fields) {
+  writeStructuredLog('error', event, fields);
+}
+
+function loggingStatus() {
+  return {
+    level: LOG_LEVEL,
+    format: LOG_FORMAT,
+    targets: LOG_TARGETS,
+    redactHeaders: Array.from(LOG_REDACT_HEADERS).sort(),
+    redactQuery: Array.from(LOG_REDACT_QUERY).sort(),
+    syslog: LOG_TARGETS.includes('syslog') ? {
+      host: SYSLOG_HOST,
+      port: SYSLOG_PORT,
+      protocol: SYSLOG_PROTOCOL,
+      facility: SYSLOG_FACILITY
+    } : null,
+    elk: {
+      directOutput: false,
+      recommendedPipeline: 'stdout/syslog -> collector -> Elasticsearch'
+    }
+  };
+}
+
+function attachHttpRequestLogging(req, res, requestUrl) {
+  if (!shouldStructuredLogRequest(requestUrl.pathname)) return;
+  const requestId = truncateText(req.headers['x-request-id'] || crypto.randomUUID(), 120);
+  req.cmdpRequestId = requestId;
+  const startedAt = Date.now();
+  if (!res.headersSent) res.setHeader('x-request-id', requestId);
+  const common = {
+    requestId,
+    method: req.method || '',
+    path: sanitizeRequestPath(requestUrl),
+    route: routeKind(requestUrl.pathname),
+    hasCmdbuildCookie: Boolean(getCookieValue(req.headers.cookie, 'CMDBuild-Authorization')),
+    sessionHash: sessionHashFromCookie(req.headers.cookie),
+    userAgent: truncateText(req.headers['user-agent'] || '', 200),
+    referer: truncateText(req.headers.referer || '', 500)
+  };
+  logDebug('http.request.start', common);
+  res.on('finish', () => {
+    const statusCode = res.statusCode || 0;
+    const fields = {
+      ...common,
+      statusCode,
+      durationMs: Date.now() - startedAt
+    };
+    if (statusCode >= 500) logError('http.request.finish', fields);
+    else if (statusCode >= 400) logWarn('http.request.finish', fields);
+    else logInfo('http.request.finish', fields);
+  });
+}
 
 function appendBoundedLog(target, item, maxItems = 100) {
   target.push(item);
@@ -173,16 +446,33 @@ async function redisCommand(parts, options = {}) {
       clearTimeout(timer);
       socket.destroy();
       if (error) {
+        const previousAvailable = redisState.available;
+        const previousError = redisState.lastError;
         redisState.available = false;
         redisState.lastError = error.message || String(error);
         redisState.lastCheckedAt = new Date().toISOString();
         redisState.disabledUntil = Date.now() + REDIS_RETRY_AFTER_MS;
+        if (previousAvailable !== false || previousError !== redisState.lastError) {
+          logWarn('redis.unavailable', {
+            backend: 'memory',
+            url: sanitizeRedisUrl(REDIS_URL),
+            retryAfterMs: REDIS_RETRY_AFTER_MS,
+            error: redisState.lastError
+          });
+        }
         reject(error);
       } else {
+        const wasUnavailable = redisState.available === false;
         redisState.available = true;
         redisState.lastError = '';
         redisState.lastCheckedAt = new Date().toISOString();
         redisState.disabledUntil = 0;
+        if (wasUnavailable) {
+          logInfo('redis.available', {
+            backend: 'redis',
+            url: sanitizeRedisUrl(REDIS_URL)
+          });
+        }
         resolve(value);
       }
     }
@@ -564,6 +854,17 @@ function rewriteCmdbuildUiHtml(body) {
     '}',
     'document.cookie="ext-cache=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/";',
     'if(navigator.serviceWorker&&navigator.serviceWorker.getRegistrations){navigator.serviceWorker.getRegistrations().then(function(r){r.forEach(function(x){x.unregister();});});}',
+    'var pendingKey="cmdbdynamicpages.pendingTarget";',
+    'function parseQuery(q){var r={};String(q||"").replace(/^\\?/,"").split("&").forEach(function(part){if(!part)return;var i=part.indexOf("=");var k=i===-1?part:part.slice(0,i);var v=i===-1?"":part.slice(i+1);k=decodeURIComponent(k.replace(/\\+/g," "));if(k)r[k]=decodeURIComponent(v.replace(/\\+/g," "));});return r;}',
+    'function buildQuery(params){var pairs=[];Object.keys(params||{}).forEach(function(k){if(params[k]===undefined||params[k]===null)return;pairs.push(encodeURIComponent(k)+"="+encodeURIComponent(String(params[k])));});return pairs.join("&");}',
+    'function readHashRoute(){var h=window.location.hash||"";var marker="custompages/CmdbDynamicPages";var at=h.indexOf(marker);if(at===-1)return{path:[],params:{}};var suffix=h.slice(at+marker.length).replace(/^\\/+/, "");var query="";var qi=suffix.indexOf("?");if(qi!==-1){query=suffix.slice(qi+1);suffix=suffix.slice(0,qi);}return{path:suffix.split("/").filter(Boolean).map(decodeURIComponent),params:parseQuery(query)};}',
+    'function dynamicTarget(){var query=parseQuery(window.location.search||"");var route=readHashRoute();var params={};Object.keys(route.params||{}).forEach(function(k){params[k]=route.params[k];});Object.keys(query||{}).forEach(function(k){params[k]=query[k];});var mode=params.cmdpMode||"";var code=params.cmdpTemplate||"";delete params.cmdpMode;delete params.cmdpTemplate;if(!code&&route.path&&route.path.length){if(route.path[0]==="designer"){mode="designer";}else{code=route.path[0];}}if(!(mode||code||(window.location.hash||"").indexOf("custompages/CmdbDynamicPages")!==-1))return"";var q=buildQuery(params);if(mode==="designer"||!code)return"/cmdbuild/dynamicpages/ui/designer"+(q?"?"+q:"");return"/cmdbuild/dynamicpages/ui/run/"+encodeURIComponent(code)+(q?"?"+q:"");}',
+    'var target=dynamicTarget();',
+    'if(target&&window.sessionStorage){window.sessionStorage.setItem(pendingKey,target);}',
+    'var pending=window.sessionStorage&&window.sessionStorage.getItem(pendingKey)||"";',
+    'function clearPending(){try{if(window.sessionStorage)window.sessionStorage.removeItem(pendingKey);}catch(e){}}',
+    'function showPendingLink(){if(!pending||document.getElementById("cmdp-login-fallback-link")||!document.body)return;var a=document.createElement("a");a.id="cmdp-login-fallback-link";a.href=pending;a.textContent="Open CMDB Dynamic Pages";a.style.cssText="position:fixed;right:14px;bottom:14px;z-index:2147483647;background:#236c91;color:#fff;padding:9px 12px;border-radius:4px;text-decoration:none;font:600 13px Arial,sans-serif;box-shadow:0 6px 16px rgba(15,23,42,.18)";document.body.appendChild(a);}',
+    'if(pending){if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",showPendingLink);}else{showPendingLink();}fetch("/cmdbuild/custom-api/session",{credentials:"include",headers:{Accept:"application/json"}}).then(function(r){if(r.ok){clearPending();window.location.replace(pending);}}).catch(function(){});}',
     '}catch(e){}})();',
     '</script>'
   ].join('');
@@ -699,8 +1000,8 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     h1{font-size:18px;margin:0} h2{font-size:15px;margin:0 0 10px} h3{font-size:13px;margin:12px 0 6px;color:#334e68}
     p{margin:0 0 8px}.guide-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.guide-card{border:1px solid var(--line);padding:10px;background:#fbfdff}.guide-card h3{margin-top:0}.steps{margin:8px 0 0;padding-left:20px}.steps li{margin:4px 0}.code-inline{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:#f8fafc;border:1px solid var(--line);padding:1px 4px;border-radius:3px}
     main{padding:14px 16px}.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
-    .runtime-page{background:#fff}.runtime-page main{padding:8px}.runtime-page .result-table-wrap:first-child{margin-top:0}.runtime-page .notice{margin:0}.runtime-cache-bar{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;border:1px solid var(--line);background:#fbfdff;padding:6px 8px;margin-bottom:8px}.runtime-cache-info{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:var(--muted);font-size:12px}.runtime-cache-info strong{color:var(--text)}.runtime-cache-bar button:disabled{opacity:.55;cursor:not-allowed}.run-launch-url{display:flex;align-items:center;gap:6px;min-width:260px;max-width:100%;flex:1 1 420px}.run-launch-url span{color:var(--muted);font-size:12px;white-space:nowrap}.run-launch-url a{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--accent);overflow-wrap:anywhere}
-    .designer-menu{position:fixed;left:16px;top:64px;bottom:14px;width:246px;overflow:auto;border:1px solid var(--line);background:#fff;padding:10px;display:grid;gap:10px;z-index:10}.designer-main{margin-left:266px}.menu-groups{display:grid;grid-template-columns:1fr;gap:10px}.menu-group strong{display:block;font-size:12px;color:#334e68;margin-bottom:6px}.menu-links{display:grid;grid-template-columns:1fr;gap:5px}.menu-links a{border:1px solid var(--line);background:#f8fafc;color:var(--text);padding:5px 7px;border-radius:4px;text-decoration:none;font-size:12px}.menu-links a.active{background:#e6f4f1;border-color:#86b7b3;color:#07575b;font-weight:bold}.template-context{border:1px solid #b7d8d4;background:#f2faf8;padding:8px 10px;margin-bottom:12px}.template-context strong{margin-right:6px}.template-context .code-inline{font-weight:bold}
+    .runtime-page{background:#fff}.runtime-page main{padding:8px}.runtime-page .result-table-wrap:first-child{margin-top:0}.runtime-page .notice{margin:0}.run-launch-url{display:flex;align-items:center;gap:6px;min-width:260px;max-width:100%;flex:1 1 420px}.run-launch-url span{color:var(--muted);font-size:12px;white-space:nowrap}.run-launch-url a{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--accent);overflow-wrap:anywhere}
+    .designer-menu{position:fixed;left:16px;top:64px;bottom:14px;width:246px;overflow:auto;border:1px solid var(--line);background:#fff;padding:10px;display:grid;gap:10px;z-index:10}.designer-main{margin-left:266px}.designer-actionbar{position:sticky;top:0;z-index:30;border:1px solid var(--line);background:rgba(255,255,255,.96);box-shadow:0 6px 16px rgba(15,23,42,.08);padding:8px 10px;margin:0 0 12px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.designer-actionbar-title{font-weight:bold;color:#334e68;white-space:nowrap}.designer-actionbar-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;min-width:0;flex:1 1 auto}.designer-actionbar-context{display:flex;align-items:center;gap:8px;min-width:240px;max-width:100%;flex:1 1 420px}.designer-actionbar-context .run-launch-url{min-width:0;flex:1 1 auto}.menu-groups{display:grid;grid-template-columns:1fr;gap:10px}.menu-group strong{display:block;font-size:12px;color:#334e68;margin-bottom:6px}.menu-links{display:grid;grid-template-columns:1fr;gap:5px}.menu-links a{border:1px solid var(--line);background:#f8fafc;color:var(--text);padding:5px 7px;border-radius:4px;text-decoration:none;font-size:12px}.menu-links a.active{background:#e6f4f1;border-color:#86b7b3;color:#07575b;font-weight:bold}.template-context{border:1px solid #b7d8d4;background:#f2faf8;padding:8px 10px;margin-bottom:12px}.template-context strong{margin-right:6px}.template-context .code-inline{font-weight:bold}
     button,a.button{border:1px solid #9fb3c8;background:#fff;color:var(--text);padding:6px 10px;border-radius:4px;cursor:pointer;text-decoration:none;display:inline-block}
     button.primary,a.button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
     button.danger,a.button.danger{border-color:#f0b8b0;color:var(--danger);background:#fff7f5}
@@ -708,7 +1009,7 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     .lamp{width:13px;height:13px;border-radius:50%;display:inline-block;border:1px solid rgba(0,0,0,.2);background:#9aa5b1;box-shadow:0 0 0 2px rgba(0,0,0,.03)}
     .lamp.ok{background:var(--ok)}.lamp.warn{background:#d99a21}.lamp.error{background:var(--danger)}.lamp.loading{background:#3b82f6}
     .layout{display:grid;grid-template-columns:minmax(280px,1fr) minmax(460px,2fr);gap:14px}.panel{background:var(--panel);border:1px solid var(--line);padding:12px}
-    .section{background:var(--panel);border:1px solid var(--line);padding:12px;margin-bottom:12px}
+    .section{background:var(--panel);border:1px solid var(--line);padding:12px;margin-bottom:12px}.section-title-row{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin:10px 0 6px}.section-title-row h3,.section-title-row h4{margin:0}
     .object-selection{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
     .matching-block{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
     .matching-rule-list{display:grid;gap:10px;margin-top:8px}
@@ -728,9 +1029,11 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}.kpi{border:1px solid var(--line);padding:8px}.kpi span{display:block;color:var(--muted);font-size:12px}.kpi strong{display:block;font-size:14px}
     .pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 7px;color:var(--muted);font-size:12px}.pill.ok{border-color:#82c995;color:var(--ok)}.pill.error{border-color:#f0b8b0;color:var(--danger)}
     .model{display:grid;gap:10px;max-height:520px;overflow:auto}.muted{color:var(--muted)}pre{white-space:pre-wrap;background:#f8fafc;border:1px solid var(--line);padding:8px;overflow:auto}
-    .visual-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.visual-grid label{min-width:0}.visual-grid input,.visual-grid select{width:100%}.visualization-table{table-layout:fixed}.visualization-table th,.visualization-table td{overflow-wrap:anywhere}.visualization-table th:nth-child(1){width:30%}.visualization-table th:nth-child(2){width:14%}.visualization-table th:nth-child(3){width:15%}.visualization-table th:nth-child(4){width:26%}.visualization-table th:nth-child(5){width:15%}.visualization-table input,.visualization-table select{width:100%;min-width:0}.visual-row-groups{margin-top:10px;display:grid;gap:6px}.visual-row-group{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.visual-row-group label{flex:1 1 240px;min-width:0}.visual-row-group select{width:100%;min-width:0}.result-table-wrap{margin-top:12px}.result-table-tools{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin:6px 0}.result-table-filter{min-width:220px}.result-table-title{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.result-subtitle{font-size:12px;color:var(--muted);margin:10px 0 4px}.table-sort{border:0;background:transparent;padding:0;color:inherit;font:inherit;text-align:left}.table-sort:after{content:" ↕";font-size:10px;color:var(--muted)}.cmdp-density-compact th,.cmdp-density-compact td{padding:4px 6px}.cmdp-font-small{font-size:12px}.cmdp-font-normal{font-size:13px}.cmdp-font-large{font-size:15px}.cmdp-zebra tbody tr:nth-child(even) td{background:#fbfdff}.cmdp-row-group-cell{background:#f8fafc;font-weight:600;vertical-align:top}
+    .visual-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.visual-grid label{min-width:0}.visual-grid input,.visual-grid select{width:100%}.visualization-table{table-layout:fixed}.visualization-table th,.visualization-table td{overflow-wrap:anywhere}.visualization-table th:nth-child(1){width:30%}.visualization-table th:nth-child(2){width:14%}.visualization-table th:nth-child(3){width:15%}.visualization-table th:nth-child(4){width:26%}.visualization-table th:nth-child(5){width:15%}.visualization-table input,.visualization-table select{width:100%;min-width:0}.visual-row-groups{margin-top:10px;display:grid;gap:6px}.visual-row-group{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.visual-row-group label{flex:1 1 240px;min-width:0}.visual-row-group select{width:100%;min-width:0}.result-table-wrap{margin-top:8px}.result-table-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:6px;min-height:30px;margin:0 0 2px}.result-table-header{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 4px;min-height:30px}.result-table-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex:0 0 auto;flex-wrap:wrap}.result-table-filter{width:240px;max-width:min(52vw,320px);height:30px;padding:4px 7px}.runtime-cache-control{position:relative;display:inline-flex;align-items:center}.runtime-cache-button{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;font-size:18px;line-height:1}.runtime-cache-button[data-disabled="true"]{opacity:.55;cursor:default}.runtime-cache-button.refreshing{animation:cmdp-spin 1s linear infinite}.runtime-cache-tooltip{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:50;min-width:250px;max-width:min(86vw,420px);padding:8px 10px;border:1px solid var(--line);background:#1f2933;color:#fff;box-shadow:0 8px 22px rgba(15,23,42,.18);font-size:12px;line-height:1.35;text-align:left}.runtime-cache-tooltip span{display:block;white-space:nowrap}.runtime-cache-control:hover .runtime-cache-tooltip,.runtime-cache-control:focus-within .runtime-cache-tooltip{display:block}.result-table-title{display:flex;align-items:center;gap:8px;flex:1 1 auto;flex-wrap:wrap;min-width:0;margin:0}.result-table-title h3{margin:0;font-size:13px}.result-subtitle{font-size:12px;color:var(--muted);margin:10px 0 4px}.table-sort{border:0;background:transparent;padding:0;color:inherit;font:inherit;text-align:left}.table-sort:after{content:" ↕";font-size:10px;color:var(--muted)}.cmdp-density-compact th,.cmdp-density-compact td{padding:4px 6px}.cmdp-font-small{font-size:12px}.cmdp-font-normal{font-size:13px}.cmdp-font-large{font-size:15px}.cmdp-zebra tbody tr:nth-child(even) td{background:#fbfdff}.cmdp-row-group-cell{background:#f8fafc;font-weight:600;vertical-align:top}@keyframes cmdp-spin{to{transform:rotate(360deg)}}
+    .cmdp-html-result{display:block}.cmdp-build-view{display:grid;gap:10px}.cmdp-build-toolbar{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border-bottom:1px solid var(--line);padding-bottom:6px}.cmdp-build-toolbar-main{display:grid;gap:5px;min-width:0}.cmdp-build-summary,.cmdp-build-nav{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.cmdp-build-nav a{color:var(--accent);text-decoration:none;font-size:12px}.cmdp-build-search{flex:0 0 260px;max-width:min(42vw,320px)}.cmdp-build-section{display:grid;gap:8px}.cmdp-build-section h2{font-size:15px;margin:8px 0 0}.cmdp-build-panel{border:1px solid var(--line);background:#fff;margin:0 0 8px}.cmdp-build-panel>summary{cursor:pointer;display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 10px;background:#fbfdff}.cmdp-build-title{font-weight:700}.cmdp-build-panel .table-wrap{border:0;border-top:1px solid var(--line)}.cmdp-build-table{width:100%;table-layout:auto}.cmdp-build-table th,.cmdp-build-table td{vertical-align:top}.cmdp-build-related,.cmdp-build-links{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:8px 10px}.cmdp-build-related a,.cmdp-build-links a{color:var(--accent);text-decoration:none}
+    .settings-block{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}.settings-block:first-of-type{border-top:0;margin-top:0;padding-top:0}.settings-block h3{margin:0 0 8px}.settings-block h4{margin:0 0 7px;font-size:12px;color:#334e68}.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}.settings-grid label{display:grid;gap:4px;color:var(--muted);font-size:12px;min-width:0}.settings-grid input,.settings-grid select{width:100%;min-width:0}.checkbox-list{display:grid;gap:8px}.checkbox-stacked{align-items:flex-start!important}.checkbox-stacked>span{display:grid;gap:2px}.checkbox-stacked strong{font-size:12px;color:var(--text)}.visual-table-list{display:grid;gap:12px}.visual-table-panel{border:1px solid var(--line);background:#fbfdff;padding:10px}.visual-table-heading{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px}.visual-table-heading h3{margin:0}.visual-table-subblock{border-top:1px solid #e4e9f0;padding-top:9px;margin-top:9px}.run-param-list{display:grid;gap:8px}.run-param-row{display:grid;grid-template-columns:minmax(180px,1fr) minmax(220px,1.4fr);gap:10px;align-items:start;border:1px solid var(--line);background:#fbfdff;padding:8px}.run-param-main{display:grid;gap:3px;min-width:0}.run-param-main strong{font-size:13px}.run-param-meta{font-size:12px;color:var(--muted)}.run-param-value label{display:grid;gap:4px;color:var(--muted);font-size:12px}.run-param-value input,.run-param-value select{width:100%}.run-action-grid{display:grid;grid-template-columns:minmax(220px,max-content) minmax(280px,1fr);gap:10px;align-items:start}.run-action-buttons{display:flex;gap:8px;flex-wrap:wrap}
     @media(max-width:1100px){.designer-menu{position:static;width:auto;overflow:visible;margin-bottom:12px}.designer-main{margin-left:0}.menu-groups{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}.menu-links{display:flex;flex-wrap:wrap}}
-    @media(max-width:900px){.layout{grid-template-columns:1fr}main{padding:10px}header{height:auto;align-items:flex-start;gap:8px;flex-direction:column;padding:10px}.header-side{justify-content:flex-start}}
+    @media(max-width:900px){.layout{grid-template-columns:1fr}main{padding:10px}header{height:auto;align-items:flex-start;gap:8px;flex-direction:column;padding:10px}.header-side{justify-content:flex-start}.designer-actionbar{align-items:flex-start}.designer-actionbar-actions{justify-content:flex-start}.designer-actionbar-context{flex-basis:100%}}
   </style>
 </head>
 <body${mode === 'runtime' ? ' class="runtime-page"' : ''}>
@@ -772,11 +1075,32 @@ function dynamicPagesClientScript() {
       schemaMissing: 'Schema is not created',
       schemaInaccessible: 'No access to schema metadata',
       schemaError: 'Schema check error',
+      schemaConflict: 'Schema conflict',
       schemaReadyHelp: 'Technical classes are present and metadata is readable.',
       schemaMissingHelp: 'Technical classes or attributes are missing. Use Bootstrap from a role with CMDBuild admin_classes_modify privilege.',
       schemaInaccessibleHelp: 'Current CMDBuild role cannot inspect technical class metadata. The schema may already exist, but bootstrap/check requires admin metadata access.',
       schemaErrorHelp: 'CMDBuild returned an unexpected error while checking technical schema.',
+      schemaConflictHelp: 'Existing CMDBuild classes or attributes differ from the requested schema. The tool will not change them destructively.',
       bootstrapRequiresAdmin: 'Bootstrap requires CMDBuild admin_classes_modify privilege. Log in with an administrator role or ask an administrator to create the schema.',
+      schemaRootName: 'Technical root class',
+      schemaRootDescription: 'Root description',
+      schemaParent: 'Parent superclass',
+      schemaParentHelp: 'Technical project classes will be created under this superclass. Existing classes are never moved automatically.',
+      schemaRootHelp: 'Use a customer-specific prefix, for example Cst_QueryTool. The root defines names for all technical classes.',
+      schemaPreview: 'Check schema',
+      schemaCreateMissing: 'Create missing schema',
+      schemaConfirmBootstrap: 'I understand: create only missing classes/attributes, never delete or move existing CMDBuild objects',
+      schemaConfirmRequired: 'Confirm non-destructive schema creation before bootstrap.',
+      schemaPreviewReady: 'Schema check completed.',
+      schemaBootstrapDone: 'Schema bootstrap completed.',
+      schemaPlan: 'Schema plan',
+      schemaObjects: 'Technical objects',
+      schemaConflicts: 'Conflicts',
+      schemaNoConflicts: 'No conflicts.',
+      schemaActionCreate: 'will be created',
+      schemaActionCreated: 'created',
+      schemaActionNone: 'exists',
+      schemaNoParents: 'Parent list is unavailable; type a CMDBuild class name manually.',
       menuTemplates: 'Templates',
       menuDesigner: 'Designer',
       menuRun: 'Run',
@@ -792,6 +1116,7 @@ function dynamicPagesClientScript() {
       menuRelations: 'Object matching',
       menuFinalView: 'Final data',
       menuPublication: 'Publication',
+      menuSchema: 'Schema',
       menuGeneralSettings: 'General settings',
       menuRuntimeSettings: 'Runtime settings',
       menuDiagnostics: 'Diagnostics',
@@ -837,6 +1162,28 @@ function dynamicPagesClientScript() {
       editingTemplate: 'Modifying',
       creatingTemplate: 'Creating a new template',
       templateCreateHelp: 'Set the template code and description, then save it. Query logic is configured in the constructor sections.',
+      templateKind: 'Template type',
+      templateKindDsl: 'Dynamic data template',
+      templateKindCmdbBuildView: 'CMDBuild model view',
+      templateKindHelp: 'CMDBuild model view uses a built-in renderer and does not use the ordinary selection/matching DSL.',
+      menuCmdbBuildView: 'CMDBuild model view',
+      cmdbBuildViewEditor: 'CMDBuild model view',
+      cmdbBuildViewHelp: 'Special template that renders CMDBuild classes, attributes, domains, and lookups with the current user rights or as a published snapshot.',
+      cmdbBuildViewLanguage: 'Language',
+      cmdbBuildViewLanguageAuto: 'Auto',
+      cmdbBuildViewRootClass: 'Root class filter',
+      cmdbBuildViewRootClassHelp: 'Optional CMDBuild superclass/class name. If set, the view shows this class and its descendants.',
+      cmdbBuildViewSections: 'Sections',
+      cmdbBuildViewClasses: 'Classes',
+      cmdbBuildViewDomains: 'Domains',
+      cmdbBuildViewLookups: 'Lookups',
+      cmdbBuildViewSystemAttributes: 'Show system attributes',
+      cmdbBuildViewLookupScope: 'Lookup scope',
+      cmdbBuildViewLookupUsed: 'Used lookups only',
+      cmdbBuildViewLookupAll: 'All lookup types',
+      cmdbBuildViewApplied: 'CMDBuild model view settings applied to Spec JSON.',
+      protectedTemplate: 'Protected',
+      protectedTemplateHelp: 'System template: deletion is blocked by the backend.',
       copyFromTemplate: 'Copy from template',
       doNotCopy: 'Do not copy',
       noTemplateToCopy: 'No saved templates to copy.',
@@ -844,12 +1191,15 @@ function dynamicPagesClientScript() {
       templateCopyApplied: 'Template {code} copied into the new template draft.',
       yes: 'yes',
       no: 'no',
+      noData: 'No data.',
       run: 'Run',
       visualizeInEditor: 'Visualize in editor',
       visualizeExternal: 'Visualize in separate page',
+      forceRefreshInEditor: 'Refresh cache and show',
       runLaunchUrl: 'Template launch URL',
       runLaunchUrlHelp: 'Direct runtime URL for a link or iframe. Generated from declared input variables; missing defaults are replaced with test values.',
       visualizationRunCompleted: 'Visualization completed.',
+      forceRefreshRunCompleted: 'Cache refreshed and result rendered.',
       publicationEditor: 'Publication',
       publicationHelp: 'Static snapshots are served from Redis without checking the viewer permissions for source CMDBuild objects.',
       publicationMode: 'Runtime mode',
@@ -858,6 +1208,7 @@ function dynamicPagesClientScript() {
       publicationParamsMode: 'Snapshot parameters',
       publicationParamsExact: 'Exact parameter set',
       publicationParamsIgnore: 'Ignore runtime parameters',
+      publicationParamsModeHelp: 'Exact parameter set publishes the snapshot only for the current run parameters, for example city=city49. Ignore runtime parameters publishes one page for the template code; URL parameters are ignored and every viewer sees the same published result.',
       publicationWarning: 'Warning: users will see the published result without read permissions on the source CMDBuild objects.',
       publicationWarningAccepted: 'I understand and accept this publication mode',
       applyPublication: 'Apply publication settings',
@@ -955,6 +1306,13 @@ function dynamicPagesClientScript() {
       visualizationEditorHelp: 'Configure visual presentation for the data tables prepared in Final data: empty text, table titles, grouping, sorting, filters, and base style.',
       visualizationGlobal: 'Global presentation',
       visualizationTables: 'Table presentation',
+      visualizationMessages: 'Messages',
+      visualizationBaseStyle: 'Base style',
+      visualizationRuntimeBehavior: 'Runtime behavior',
+      visualizationTableHeader: 'Table header',
+      visualizationSorting: 'Sorting',
+      visualizationSubtables: 'Subtables',
+      visualizationRowGrouping: 'Row grouping',
       visualizationSource: 'Table',
       visualizationTitle: 'Table title',
       visualizationTitleHelp: 'You can use runtime parameters inside the title as $' + '{param.city}, for example Routers in $' + '{param.city}.',
@@ -1003,6 +1361,7 @@ function dynamicPagesClientScript() {
       viewComposerMode: 'Display mode',
       viewComposerOnlyThis: 'Show only this table',
       viewComposerColumns: 'Visible columns',
+      columnsCount: 'columns',
       viewComposerColumnField: 'Field',
       viewComposerColumnTitle: 'Column title',
       viewComposerMultiMode: 'Multiple values',
@@ -1205,6 +1564,10 @@ function dynamicPagesClientScript() {
       runtimeCacheRefreshReady: 'Refresh is available',
       runtimeCacheGeneratedAt: 'Generated',
       runtimeCacheExpiresIn: 'Cache expires in {time}',
+      runtimeCacheBackend: 'Backend',
+      runtimeCacheScope: 'Scope',
+      runtimeCacheKey: 'Cache key',
+      runtimeCacheManualDisabled: 'Manual refresh is disabled',
       runtimeTableControlsDisabledByGrouping: 'Sorting and filters are disabled because row grouping is enabled.',
       runtimeFilterPlaceholder: 'Search in visible rows',
       runtimeRefresh: 'Refresh',
@@ -1262,11 +1625,32 @@ function dynamicPagesClientScript() {
       schemaMissing: 'Схема не создана',
       schemaInaccessible: 'Нет доступа к метаданным схемы',
       schemaError: 'Ошибка проверки схемы',
+      schemaConflict: 'Конфликт схемы',
       schemaReadyHelp: 'Технические классы есть, метаданные доступны.',
       schemaMissingHelp: 'Не хватает технических классов или атрибутов. Нажмите Создать схему из роли с правом CMDBuild admin_classes_modify.',
       schemaInaccessibleHelp: 'Текущая роль CMDBuild не может читать метаданные технических классов. Схема может уже существовать, но проверка/bootstrap требуют доступа к метаданным администратора.',
       schemaErrorHelp: 'CMDBuild вернул неожиданную ошибку при проверке технической схемы.',
+      schemaConflictHelp: 'Существующие классы или атрибуты CMDBuild отличаются от требуемой схемы. Инструмент не будет менять их разрушительно.',
       bootstrapRequiresAdmin: 'Создание схемы требует права CMDBuild admin_classes_modify. Войдите под администраторской ролью или попросите администратора создать схему.',
+      schemaRootName: 'Технический root-класс',
+      schemaRootDescription: 'Описание root',
+      schemaParent: 'Родительский суперкласс',
+      schemaParentHelp: 'Под этим суперклассом будут созданы технические классы проекта. Существующие классы автоматически не переносятся.',
+      schemaRootHelp: 'Используйте customer-specific префикс, например Cst_QueryTool. Root определяет имена всех технических классов.',
+      schemaPreview: 'Проверить схему',
+      schemaCreateMissing: 'Создать недостающее',
+      schemaConfirmBootstrap: 'Я понимаю: создавать только недостающие классы/атрибуты, не удалять и не переносить существующие объекты CMDBuild',
+      schemaConfirmRequired: 'Подтвердите non-destructive создание схемы перед bootstrap.',
+      schemaPreviewReady: 'Проверка схемы выполнена.',
+      schemaBootstrapDone: 'Bootstrap схемы выполнен.',
+      schemaPlan: 'План схемы',
+      schemaObjects: 'Технические объекты',
+      schemaConflicts: 'Конфликты',
+      schemaNoConflicts: 'Конфликтов нет.',
+      schemaActionCreate: 'будет создано',
+      schemaActionCreated: 'создано',
+      schemaActionNone: 'существует',
+      schemaNoParents: 'Список родителей недоступен; введите имя класса CMDBuild вручную.',
       menuTemplates: 'Шаблоны',
       menuDesigner: 'Конструктор',
       menuRun: 'Запуск',
@@ -1282,6 +1666,7 @@ function dynamicPagesClientScript() {
       menuRelations: 'Сопоставление с объектами',
       menuFinalView: 'Итоговые данные',
       menuPublication: 'Публикация',
+      menuSchema: 'Схема',
       menuGeneralSettings: 'Общие настройки',
       menuRuntimeSettings: 'Runtime-настройки',
       menuDiagnostics: 'Диагностика',
@@ -1327,6 +1712,28 @@ function dynamicPagesClientScript() {
       editingTemplate: 'Модифицируем',
       creatingTemplate: 'Создаем новый шаблон',
       templateCreateHelp: 'Укажите код и описание шаблона, затем сохраните. Логика запроса настраивается в разделах конструктора.',
+      templateKind: 'Тип шаблона',
+      templateKindDsl: 'Динамический шаблон данных',
+      templateKindCmdbBuildView: 'CMDBuild model view',
+      templateKindHelp: 'CMDBuild model view использует встроенный renderer и не проходит через обычный DSL выборок/сопоставлений.',
+      menuCmdbBuildView: 'CMDBuild model view',
+      cmdbBuildViewEditor: 'CMDBuild model view',
+      cmdbBuildViewHelp: 'Специальный шаблон, который показывает классы, атрибуты, домены и lookup CMDBuild по правам текущего пользователя либо как опубликованный снимок.',
+      cmdbBuildViewLanguage: 'Язык',
+      cmdbBuildViewLanguageAuto: 'Авто',
+      cmdbBuildViewRootClass: 'Root-класс для фильтра',
+      cmdbBuildViewRootClassHelp: 'Необязательное имя класса/суперкласса CMDBuild. Если задано, показывается этот класс и его наследники.',
+      cmdbBuildViewSections: 'Разделы',
+      cmdbBuildViewClasses: 'Классы',
+      cmdbBuildViewDomains: 'Домены',
+      cmdbBuildViewLookups: 'Lookup',
+      cmdbBuildViewSystemAttributes: 'Показывать системные атрибуты',
+      cmdbBuildViewLookupScope: 'Объем lookup',
+      cmdbBuildViewLookupUsed: 'Только используемые lookup',
+      cmdbBuildViewLookupAll: 'Все lookup-типы',
+      cmdbBuildViewApplied: 'Настройки CMDBuild model view применены к Spec JSON.',
+      protectedTemplate: 'Защищен',
+      protectedTemplateHelp: 'Системный шаблон: удаление блокируется backend.',
       copyFromTemplate: 'Скопировать с шаблона',
       doNotCopy: 'Не копировать',
       noTemplateToCopy: 'Нет сохраненных шаблонов для копирования.',
@@ -1334,12 +1741,15 @@ function dynamicPagesClientScript() {
       templateCopyApplied: 'Шаблон {code} скопирован в черновик нового шаблона.',
       yes: 'да',
       no: 'нет',
+      noData: 'Нет данных.',
       run: 'Запустить',
       visualizeInEditor: 'Визуализировать в редакторе',
       visualizeExternal: 'Визуализировать в отдельной странице',
+      forceRefreshInEditor: 'Обновить кэш и показать',
       runLaunchUrl: 'URL запуска шаблона',
       runLaunchUrlHelp: 'Прямой runtime URL для ссылки или iframe. Строится из объявленных входных переменных; если default не задан, подставляется тестовое значение.',
       visualizationRunCompleted: 'Визуализация выполнена.',
+      forceRefreshRunCompleted: 'Кэш обновлен, результат показан.',
       publicationEditor: 'Публикация',
       publicationHelp: 'Статические снимки отдаются из Redis без проверки прав зрителя на исходные CMDBuild-объекты.',
       publicationMode: 'Режим выполнения',
@@ -1348,6 +1758,7 @@ function dynamicPagesClientScript() {
       publicationParamsMode: 'Параметры снимка',
       publicationParamsExact: 'Точный набор параметров',
       publicationParamsIgnore: 'Игнорировать runtime-параметры',
+      publicationParamsModeHelp: 'Точный набор параметров публикует снимок только для текущих параметров запуска, например city=city49. Если runtime-параметры игнорируются, публикуется одна страница на код шаблона: параметры URL не учитываются, и все зрители видят один опубликованный результат.',
       publicationWarning: 'Внимание: пользователи увидят опубликованный результат без прав чтения на исходные CMDBuild-объекты.',
       publicationWarningAccepted: 'Я понимаю и принимаю этот режим публикации',
       applyPublication: 'Применить настройки публикации',
@@ -1445,6 +1856,13 @@ function dynamicPagesClientScript() {
       visualizationEditorHelp: 'Настройте визуальное представление таблиц, подготовленных в Итоговых данных: пустой результат, заголовки, группировка, сортировка, фильтры и базовый стиль.',
       visualizationGlobal: 'Общее представление',
       visualizationTables: 'Представление таблиц',
+      visualizationMessages: 'Сообщения',
+      visualizationBaseStyle: 'Базовый стиль',
+      visualizationRuntimeBehavior: 'Поведение runtime',
+      visualizationTableHeader: 'Заголовок таблицы',
+      visualizationSorting: 'Сортировка',
+      visualizationSubtables: 'Подтаблицы',
+      visualizationRowGrouping: 'Группировка строк',
       visualizationSource: 'Таблица',
       visualizationTitle: 'Заголовок таблицы',
       visualizationTitleHelp: 'Можно использовать входные параметры внутри заголовка: $' + '{param.city}, например Маршрутизаторы города $' + '{param.city}.',
@@ -1493,6 +1911,7 @@ function dynamicPagesClientScript() {
       viewComposerMode: 'Режим отображения',
       viewComposerOnlyThis: 'Показывать только эту таблицу',
       viewComposerColumns: 'Видимые колонки',
+      columnsCount: 'колонок',
       viewComposerColumnField: 'Поле',
       viewComposerColumnTitle: 'Заголовок колонки',
       viewComposerMultiMode: 'Несколько значений',
@@ -1695,6 +2114,10 @@ function dynamicPagesClientScript() {
       runtimeCacheRefreshReady: 'Обновление доступно',
       runtimeCacheGeneratedAt: 'Построено',
       runtimeCacheExpiresIn: 'Кэш истекает через {time}',
+      runtimeCacheBackend: 'Backend',
+      runtimeCacheScope: 'Scope',
+      runtimeCacheKey: 'Ключ кэша',
+      runtimeCacheManualDisabled: 'Ручное обновление отключено',
       runtimeTableControlsDisabledByGrouping: 'Сортировка и фильтры отключены, потому что включена группировка строк.',
       runtimeFilterPlaceholder: 'Поиск по видимым строкам',
       runtimeRefresh: 'Обновить',
@@ -1740,11 +2163,18 @@ function dynamicPagesClientScript() {
   var CATALOG_CACHE_STORE = 'catalogCache';
   var CATALOG_CACHE_VERSION = 1;
   var CATALOG_FRESH_MS = 24 * 60 * 60 * 1000;
+  var CMDB_BUILD_VIEW_KIND = 'cmdbBuildView';
+  var DEFAULT_CMDB_BUILD_VIEW_CODE = 'CmdbBuildView';
   var state = {
     language: activeLanguage,
     root: 'Cst_QueryTool',
     session: boot.session || {},
     schema: null,
+    schemaParents: [],
+    schemaPlan: null,
+    schemaRootDraft: '',
+    schemaDescriptionDraft: '',
+    schemaParentDraft: '',
     config: null,
     catalog: null,
     catalogStatus: { state: 'missing', updatedAt: null, error: '' },
@@ -1784,6 +2214,7 @@ function dynamicPagesClientScript() {
       'object-group',
       'relations',
       'final-view',
+      'cmdb-build-view',
       'params',
       'extraction',
       'run',
@@ -1791,6 +2222,7 @@ function dynamicPagesClientScript() {
       'publication',
       'selection',
       'visualization',
+      'schema',
       'general-settings',
       'settings',
       'diagnostics'
@@ -1817,6 +2249,7 @@ function dynamicPagesClientScript() {
       'object-group',
       'relations',
       'final-view',
+      'cmdb-build-view',
       'params',
       'extraction',
       'run',
@@ -2157,9 +2590,10 @@ function dynamicPagesClientScript() {
     return apiPrefix + '/public-snapshots/' + encodeURIComponent(templateCode) + '/run' + (query ? '?' + query : '');
   }
 
-  function runtimeRunPath(templateCode, params, refresh) {
+  function runtimeRunPath(templateCode, params, refresh, forceRefresh) {
     var queryParams = new URLSearchParams(params || {});
     if (refresh) queryParams.set('refresh', '1');
+    if (forceRefresh) queryParams.set('forceRefresh', '1');
     var query = queryParams.toString();
     return apiPrefix + '/templates/' + encodeURIComponent(templateCode) + '/run' + (query ? '?' + query : '');
   }
@@ -2279,13 +2713,14 @@ function dynamicPagesClientScript() {
   function captureVisibleDesignerState() {
     var selected = state.selectedTemplate || emptyTemplate();
     try {
-      if (hasField('cmdp-code') || hasField('cmdp-description') || hasField('cmdp-active') || hasField('cmdp-spec') || hasField('cmdp-params-schema') || hasField('cmdp-result-schema')) {
+      if (hasField('cmdp-code') || hasField('cmdp-description') || hasField('cmdp-active') || hasField('cmdp-template-kind') || hasField('cmdp-spec') || hasField('cmdp-params-schema') || hasField('cmdp-result-schema')) {
         var code = readTemplateCode(selected);
+        var capturedSpec = applyTemplateKindFromEditor(readCurrentSpec(selected.spec || defaultSpec()));
         state.selectedTemplate = Object.assign({}, selected, {
           code: code || selected.code || '',
           description: readTemplateDescription(selected, code) || selected.description || '',
           active: readTemplateActive(selected),
-          spec: readCurrentSpec(selected.spec || defaultSpec()),
+          spec: capturedSpec,
           paramsSchema: readCurrentParamsSchema(selected.paramsSchema || {}),
           resultSchema: readCurrentResultSchema(selected.resultSchema || {})
         });
@@ -2304,6 +2739,12 @@ function dynamicPagesClientScript() {
       if (hasField('cmdp-cache-enabled')) {
         updateSelectedFromEditor(applyCacheToSpec(state.selectedTemplate.spec || defaultSpec(), false));
       }
+      if (hasField('cmdp-cmdb-build-language')) {
+        updateSelectedFromEditor(applyCmdbBuildViewToSpec(state.selectedTemplate.spec || defaultCmdbBuildViewSpecClient(), false));
+      }
+      if (hasField('cmdp-root')) state.schemaRootDraft = readValue('cmdp-root') || state.root;
+      if (hasField('cmdp-schema-description')) state.schemaDescriptionDraft = readValue('cmdp-schema-description');
+      if (hasField('cmdp-schema-parent')) state.schemaParentDraft = readValue('cmdp-schema-parent') || 'Class';
       if (hasField('cmdp-params') || document.querySelectorAll('[data-run-param-field]').length) state.runParams = readRunParams();
       return true;
     } catch (error) {
@@ -2333,6 +2774,35 @@ function dynamicPagesClientScript() {
         tables: [{ name: 'classes', columns: ['Class', 'Description', 'Attribute', 'AttributeType'] }]
       }
     };
+  }
+
+  function defaultCmdbBuildViewSpecClient() {
+    return {
+      version: 1,
+      kind: CMDB_BUILD_VIEW_KIND,
+      protected: true,
+      params: {},
+      publish: { mode: 'dynamicUser', paramsMode: 'ignore', warningAccepted: false },
+      cache: {
+        enabled: true,
+        scopeMode: 'permissionOnly',
+        probeMode: 'usedFieldsOnly',
+        shareMode: 'endpoint',
+        ttlSeconds: DEFAULT_TEMPLATE_CACHE_TTL_SEC,
+        allowManualRefresh: true
+      },
+      cmdbBuildView: {
+        language: 'auto',
+        showSystemAttributes: false,
+        sections: ['classes', 'domains', 'lookups'],
+        rootClass: '',
+        lookupScope: 'used'
+      }
+    };
+  }
+
+  function templateKindForSpec(spec) {
+    return spec && spec.kind === CMDB_BUILD_VIEW_KIND ? CMDB_BUILD_VIEW_KIND : 'dsl';
   }
 
   function publishModelForSpec(spec) {
@@ -2585,6 +3055,7 @@ function dynamicPagesClientScript() {
     if (schema.ready) return t('ready');
     if (schema.status === 'inaccessible') return t('schemaInaccessible');
     if (schema.status === 'missing') return t('schemaMissing');
+    if (schema.status === 'conflict') return t('schemaConflict');
     if (schema.status === 'error') return t('schemaError');
     return t('notReady');
   }
@@ -2594,6 +3065,7 @@ function dynamicPagesClientScript() {
     if (schema.ready) return t('schemaReadyHelp');
     if (schema.status === 'inaccessible') return t('schemaInaccessibleHelp');
     if (schema.status === 'missing') return t('schemaMissingHelp');
+    if (schema.status === 'conflict') return t('schemaConflictHelp');
     if (schema.status === 'error') return t('schemaErrorHelp');
     return t('schemaErrorHelp');
   }
@@ -2602,6 +3074,7 @@ function dynamicPagesClientScript() {
     var details = [];
     if (schema && Array.isArray(schema.missing) && schema.missing.length) details.push('missing: ' + schema.missing.length);
     if (schema && Array.isArray(schema.inaccessible) && schema.inaccessible.length) details.push('inaccessible: ' + schema.inaccessible.length);
+    if (schema && Array.isArray(schema.conflicts) && schema.conflicts.length) details.push('conflicts: ' + schema.conflicts.length);
     if (schema && Array.isArray(schema.errors) && schema.errors.length) details.push('errors: ' + schema.errors.length);
     return [
       '<div class="notice ' + (schema && schema.ready ? 'ok' : 'error') + '">',
@@ -3541,14 +4014,12 @@ function dynamicPagesClientScript() {
       '<label>' + t('objectSelectionTitle') + '<input data-object-selection-field="name" value="' + escapeHtml(selection.name || defaultObjectSelectionName(index)) + '"></label>',
       '<label>' + t('objectGroupSourceClass') + '<select' + classId + ' data-object-selection-field="className">' + renderClassOptions(selection.className) + '</select></label>',
       '</div>',
-      '<h3>' + escapeHtml(selection.name || defaultObjectSelectionName(index)) + '</h3>',
+      '<div class="section-title-row"><h3>' + escapeHtml(selection.name || defaultObjectSelectionName(index)) + '</h3>',
+      '<button data-action="add-object-scope-row">' + t('addObjectGroupRule') + '</button></div>',
       '<table class="compact"><thead><tr><th>' + t('objectGroupScopeAction') + '</th><th>' + t('objectGroupPath') + '</th><th>' + t('objectGroupRegex') + '</th><th></th></tr></thead>',
       '<tbody' + rowsId + '>',
       ruleRows,
       '</tbody></table>',
-      '<div class="toolbar" style="margin-top:8px">',
-      '<button data-action="add-object-scope-row">' + t('addObjectGroupRule') + '</button>',
-      '</div>',
       '</div>'
     ].join('');
   }
@@ -3561,10 +4032,6 @@ function dynamicPagesClientScript() {
       '<section class="section" id="cmdp-object-group-editor"><h2>' + t('objectGroupEditor') + '</h2>',
       '<p class="muted">' + t('objectGroupHelp') + '</p>',
       selections.map(renderObjectGroupSelection).join(''),
-      '<div class="toolbar" style="margin-top:8px">',
-      '<button data-action="add-object-selection">' + t('addObjectSelection') + '</button>',
-      '<button data-action="apply-object-group">' + t('applyObjectGroup') + '</button>',
-      '</div>',
       renderObjectGroupRegexExamples(),
       '</section>'
     ].join('');
@@ -3642,7 +4109,8 @@ function dynamicPagesClientScript() {
       : '<label>' + t('matchingPreviousResult') + '<input data-matching-block-field="from" value="' + escapeHtml(block.from || '') + '" readonly></label>';
     return [
       '<div class="matching-block" data-matching-block data-matching-block-index="' + index + '">',
-      '<h3>' + t('matchingBlock', { number: index + 1 }) + '</h3>',
+      '<div class="section-title-row"><h3>' + t('matchingBlock', { number: index + 1 }) + '</h3>',
+      '<button data-action="add-matching-rule-row">' + t('addMatchingRule') + '</button></div>',
       '<div class="row">',
       leftControl,
       '<label>' + t('matchingRightSelection') + '<select data-matching-block-field="with">' + renderSelectionAliasOptions(spec, block.with) + '</select></label>',
@@ -3654,9 +4122,6 @@ function dynamicPagesClientScript() {
       '<p class="muted">' + t('matchingRegexHelp') + '</p>',
       '<p class="muted">' + t('matchingIpv4Help') + '</p>',
       renderMatchingIpv4Examples(),
-      '<div class="toolbar" style="margin-top:8px">',
-      '<button data-action="add-matching-rule-row">' + t('addMatchingRule') + '</button>',
-      '</div>',
       '</div>'
     ].join('');
   }
@@ -3676,9 +4141,6 @@ function dynamicPagesClientScript() {
       '<section class="section" id="cmdp-relation-expansion-editor"><h2>' + t('relationEditor') + '</h2>',
       '<p class="muted">' + t('relationHelp') + '</p>',
       model.blocks.map(function (block, index) { return renderObjectMatchingBlock(block, index, model, spec); }).join(''),
-      '<div class="toolbar" style="margin-top:8px">',
-      '<button data-action="apply-relation-expansion">' + t('applyRelation') + '</button>',
-      '</div>',
       '</section>'
     ].join('');
   }
@@ -3703,7 +4165,8 @@ function dynamicPagesClientScript() {
         { section: 'params', label: t('menuParams') },
         { section: 'object-group', label: t('menuObjectGroup') },
         { section: 'relations', label: t('menuRelations') },
-        { section: 'final-view', label: t('menuFinalView') }
+        { section: 'final-view', label: t('menuFinalView') },
+        { section: 'cmdb-build-view', label: t('menuCmdbBuildView') }
       ]),
       group(t('menuRun'), [
         { section: 'extraction', label: t('menuExtraction') },
@@ -3713,6 +4176,7 @@ function dynamicPagesClientScript() {
         { section: 'run', label: t('menuTemplateRun') }
       ]),
       group(t('menuSettings'), [
+        { section: 'schema', label: t('menuSchema') },
         { section: 'general-settings', label: t('menuGeneralSettings') },
         { section: 'settings', label: t('menuRuntimeSettings') }
       ]),
@@ -3762,6 +4226,122 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
+  function schemaFieldValue(name, fallback) {
+    if (hasField(name)) return readValue(name);
+    return fallback;
+  }
+
+  function currentSchemaRoot() {
+    return String(state.schemaRootDraft || state.root || (state.schema && state.schema.root) || 'Cst_QueryTool').trim() || 'Cst_QueryTool';
+  }
+
+  function currentSchemaDescription() {
+    return String(state.schemaDescriptionDraft || (state.schema && state.schema.rootDescription) || 'CMDB Dynamic Pages technical root').trim();
+  }
+
+  function currentSchemaParent() {
+    return String(state.schemaParentDraft || (state.schema && state.schema.rootParent) || 'Class').trim() || 'Class';
+  }
+
+  function parentOptionsHtml(selected) {
+    var parents = Array.isArray(state.schemaParents) ? state.schemaParents : [];
+    var names = ['Class'].concat(parents.map(function (item) { return item && item.name; }).filter(Boolean));
+    var unique = [];
+    names.forEach(function (name) {
+      if (unique.indexOf(name) === -1) unique.push(name);
+    });
+    return unique.map(function (name) {
+      return '<option value="' + escapeHtml(name) + '"' + (name === selected ? ' selected' : '') + '>' + escapeHtml(name) + '</option>';
+    }).join('');
+  }
+
+  function renderSchemaActionStatus(item) {
+    if (!item) return '';
+    if (item.created || item.action === 'created') return t('schemaActionCreated');
+    if (item.exists) return t('schemaActionNone');
+    return t('schemaActionCreate');
+  }
+
+  function renderSchemaClassRows(schema) {
+    var rows = Array.isArray(schema && schema.classes) ? schema.classes : [];
+    if (!rows.length) return '<tr><td colspan="5">' + t('noData') + '</td></tr>';
+    return rows.map(function (item) {
+      return '<tr><td>' + escapeHtml(item.name) + '</td><td>' + escapeHtml(item.description || '') + '</td><td>' + escapeHtml(item.parent || '') + '</td><td>' + escapeHtml(item.prototype ? 'prototype' : 'standard') + '</td><td>' + escapeHtml(renderSchemaActionStatus(item)) + '</td></tr>';
+    }).join('');
+  }
+
+  function renderSchemaAttributeRows(schema) {
+    var rows = [];
+    (Array.isArray(schema && schema.classes) ? schema.classes : []).forEach(function (classItem) {
+      (Array.isArray(classItem.attributes) ? classItem.attributes : []).forEach(function (attribute) {
+        rows.push({ className: classItem.name, attribute: attribute });
+      });
+    });
+    if (!rows.length) return '<tr><td colspan="4">' + t('noData') + '</td></tr>';
+    return rows.map(function (item) {
+      return '<tr><td>' + escapeHtml(item.className) + '</td><td>' + escapeHtml(item.attribute.name) + '</td><td>' + escapeHtml(item.attribute.type || '') + '</td><td>' + escapeHtml(renderSchemaActionStatus(item.attribute)) + '</td></tr>';
+    }).join('');
+  }
+
+  function renderSchemaConflicts(schema) {
+    var conflicts = Array.isArray(schema && schema.conflicts) ? schema.conflicts : [];
+    if (!conflicts.length) return '<div class="notice ok">' + t('schemaNoConflicts') + '</div>';
+    return [
+      '<table class="compact"><thead><tr><th>' + t('schemaObjects') + '</th><th>Field</th><th>Expected</th><th>Actual</th><th>Reason</th></tr></thead><tbody>',
+      conflicts.map(function (item) {
+        var objectName = item.type === 'attribute' ? item.className + '.' + item.name : item.name;
+        return '<tr><td>' + escapeHtml(objectName || '') + '</td><td>' + escapeHtml(item.field || '') + '</td><td>' + escapeHtml(item.expected) + '</td><td>' + escapeHtml(item.actual) + '</td><td>' + escapeHtml(item.reason || '') + '</td></tr>';
+      }).join(''),
+      '</tbody></table>'
+    ].join('');
+  }
+
+  function renderSchemaPlanSummary(schema) {
+    var summary = schema && schema.summary || {};
+    return [
+      '<div class="kpis">',
+      '<div class="kpi"><span>Classes</span><strong>' + escapeHtml(summary.classCount || 0) + '</strong></div>',
+      '<div class="kpi"><span>Attributes</span><strong>' + escapeHtml(summary.attributeCount || 0) + '</strong></div>',
+      '<div class="kpi"><span>Creates</span><strong>' + escapeHtml(summary.plannedCreates || 0) + '</strong></div>',
+      '<div class="kpi"><span>Conflicts</span><strong>' + escapeHtml(summary.conflicts || 0) + '</strong></div>',
+      '</div>'
+    ].join('');
+  }
+
+  function renderSchemaManager() {
+    var schema = state.schemaPlan || state.schema || {};
+    var root = currentSchemaRoot();
+    var description = currentSchemaDescription();
+    var parent = currentSchemaParent();
+    return [
+      '<section class="section" id="cmdp-schema-manager"><h2>' + t('menuSchema') + '</h2>',
+      '<p class="muted">' + t('schemaRootHelp') + '</p>',
+      renderSchemaStatus(schema),
+      '<div class="form">',
+      '<div class="visual-grid">',
+      '<label>' + t('schemaRootName') + '<input id="cmdp-root" value="' + escapeHtml(root) + '"><span class="muted">' + t('schemaRootHelp') + '</span></label>',
+      '<label>' + t('schemaRootDescription') + '<input id="cmdp-schema-description" value="' + escapeHtml(description) + '"></label>',
+      '<label>' + t('schemaParent') + '<input id="cmdp-schema-parent" list="cmdp-schema-parent-list" value="' + escapeHtml(parent) + '"><datalist id="cmdp-schema-parent-list">' + parentOptionsHtml(parent) + '</datalist><span class="muted">' + t('schemaParentHelp') + '</span></label>',
+      '</div>',
+      state.schemaParents.length ? '' : '<p class="muted">' + t('schemaNoParents') + '</p>',
+      '<label class="checkbox checkbox-stacked"><input type="checkbox" id="cmdp-schema-confirm"><span><strong>' + t('schemaConfirmBootstrap') + '</strong><span class="muted">' + t('schemaConflictHelp') + '</span></span></label>',
+      '</div>',
+      '<h3>' + t('schemaPlan') + '</h3>',
+      renderSchemaPlanSummary(schema),
+      '<h3>' + t('schemaObjects') + '</h3>',
+      '<table class="compact"><thead><tr><th>' + t('code') + '</th><th>' + t('description') + '</th><th>' + t('schemaParent') + '</th><th>Type</th><th>Status</th></tr></thead><tbody>',
+      renderSchemaClassRows(schema),
+      '</tbody></table>',
+      '<h3>Attributes</h3>',
+      '<table class="compact"><thead><tr><th>Class</th><th>' + t('code') + '</th><th>Type</th><th>Status</th></tr></thead><tbody>',
+      renderSchemaAttributeRows(schema),
+      '</tbody></table>',
+      '<h3>' + t('schemaConflicts') + '</h3>',
+      renderSchemaConflicts(schema),
+      '</section>'
+    ].join('');
+  }
+
   function renderRuntimeSettings(config) {
     config = config || { runtimeConfig: defaultRuntimeConfig(), exists: false };
     var runtimeConfig = normalizeRuntimeConfigForEditor(config.runtimeConfig || defaultRuntimeConfig());
@@ -3769,10 +4349,7 @@ function dynamicPagesClientScript() {
     var executionLimits = runtimeConfig.executionLimits || defaultRuntimeConfig().executionLimits;
     return [
       '<section class="section" id="cmdp-runtime-settings"><h2>' + t('runtimeSettings') + '</h2>',
-      '<div class="toolbar">',
-      '<button data-action="save-config">' + t('saveConfig') + '</button>',
       '<span class="pill ' + (config.exists ? 'ok' : '') + '">' + (config.exists ? t('configCard') : t('defaultConfig')) + '</span>',
-      '</div>',
       '<div class="form">',
       '<h3>' + t('runtimeCacheSettings') + '</h3>',
       renderRuntimeCacheFields(runtimeCache),
@@ -3798,7 +4375,6 @@ function dynamicPagesClientScript() {
       '</select></label>',
       '<h3>' + t('runtimeCacheSettings') + '</h3>',
       renderRuntimeCacheFields(runtimeCache),
-      '<div class="toolbar"><button data-action="save-general-settings">' + t('saveConfig') + '</button></div>',
       '</div>',
       '</section>'
     ].join('');
@@ -3832,15 +4408,69 @@ function dynamicPagesClientScript() {
   }
 
   function renderTemplateEditor(selected) {
+    var kind = templateKindForSpec((selected && selected.spec) || defaultSpec());
+    var protectedHelp = selected && selected.protected ? '<p class="muted">' + escapeHtml(t('protectedTemplateHelp')) + '</p>' : '';
     return [
       '<section class="section" id="cmdp-template-editor"><h2>' + t('creatingTemplate') + '</h2>',
       '<p class="muted">' + t('templateCreateHelp') + '</p>',
       '<div class="form">',
       renderTemplateCopySelector(selected),
+      '<label>' + t('templateKind') + '<select id="cmdp-template-kind">',
+      '<option value="dsl"' + (kind === 'dsl' ? ' selected' : '') + '>' + t('templateKindDsl') + '</option>',
+      '<option value="' + CMDB_BUILD_VIEW_KIND + '"' + (kind === CMDB_BUILD_VIEW_KIND ? ' selected' : '') + '>' + t('templateKindCmdbBuildView') + '</option>',
+      '</select><span class="muted">' + escapeHtml(t('templateKindHelp')) + '</span></label>',
       '<label>' + t('code') + '<input id="cmdp-code" value="' + escapeHtml(selected.code || '') + '"' + (selected.id ? ' readonly' : '') + '></label>',
       '<label>' + t('description') + '<input id="cmdp-description" value="' + escapeHtml(selected.description || '') + '"></label>',
-      '<div class="toolbar"><button class="primary" data-action="save-template">' + t('save') + '</button></div>',
+      selected && selected.protected ? '<span class="pill">' + escapeHtml(t('protectedTemplate')) + '</span>' : '',
+      protectedHelp,
       '</div>',
+      '</section>'
+    ].join('');
+  }
+
+  function cmdbBuildViewModelForSpec(spec) {
+    var source = spec && spec.cmdbBuildView && typeof spec.cmdbBuildView === 'object' && !Array.isArray(spec.cmdbBuildView)
+      ? spec.cmdbBuildView
+      : {};
+    var sections = Array.isArray(source.sections) && source.sections.length ? source.sections : ['classes', 'domains', 'lookups'];
+    return {
+      language: source.language || 'auto',
+      showSystemAttributes: Boolean(source.showSystemAttributes),
+      rootClass: source.rootClass || '',
+      lookupScope: source.lookupScope === 'all' ? 'all' : 'used',
+      sections: sections
+    };
+  }
+
+  function renderCmdbBuildViewEditor(selected) {
+    var spec = (selected && selected.spec) || defaultCmdbBuildViewSpecClient();
+    var model = cmdbBuildViewModelForSpec(spec);
+    function checked(section) {
+      return model.sections.indexOf(section) !== -1 ? ' checked' : '';
+    }
+    return [
+      '<section class="section" id="cmdp-cmdb-build-view-editor"><h2>' + t('cmdbBuildViewEditor') + '</h2>',
+      '<p class="muted">' + t('cmdbBuildViewHelp') + '</p>',
+      '<div class="settings-block"><h3>' + t('cmdbBuildViewSections') + '</h3>',
+      '<div class="checkbox-list">',
+      '<label class="checkbox"><input data-cmdb-build-section="classes" type="checkbox"' + checked('classes') + '> ' + t('cmdbBuildViewClasses') + '</label>',
+      '<label class="checkbox"><input data-cmdb-build-section="domains" type="checkbox"' + checked('domains') + '> ' + t('cmdbBuildViewDomains') + '</label>',
+      '<label class="checkbox"><input data-cmdb-build-section="lookups" type="checkbox"' + checked('lookups') + '> ' + t('cmdbBuildViewLookups') + '</label>',
+      '</div></div>',
+      '<div class="settings-block"><h3>' + t('generalSettings') + '</h3>',
+      '<div class="settings-grid">',
+      '<label>' + t('cmdbBuildViewLanguage') + '<select id="cmdp-cmdb-build-language">',
+      '<option value="auto"' + (model.language === 'auto' ? ' selected' : '') + '>' + t('cmdbBuildViewLanguageAuto') + '</option>',
+      '<option value="ru"' + (model.language === 'ru' ? ' selected' : '') + '>ru</option>',
+      '<option value="en"' + (model.language === 'en' ? ' selected' : '') + '>en</option>',
+      '</select></label>',
+      '<label>' + t('cmdbBuildViewRootClass') + '<input id="cmdp-cmdb-build-root-class" value="' + escapeHtml(model.rootClass || '') + '"><span class="muted">' + escapeHtml(t('cmdbBuildViewRootClassHelp')) + '</span></label>',
+      '<label>' + t('cmdbBuildViewLookupScope') + '<select id="cmdp-cmdb-build-lookup-scope">',
+      '<option value="used"' + (model.lookupScope === 'used' ? ' selected' : '') + '>' + t('cmdbBuildViewLookupUsed') + '</option>',
+      '<option value="all"' + (model.lookupScope === 'all' ? ' selected' : '') + '>' + t('cmdbBuildViewLookupAll') + '</option>',
+      '</select></label>',
+      '<label class="checkbox"><input id="cmdp-cmdb-build-system-attributes" type="checkbox" ' + (model.showSystemAttributes ? 'checked' : '') + '> ' + t('cmdbBuildViewSystemAttributes') + '</label>',
+      '</div></div>',
       '</section>'
     ].join('');
   }
@@ -3878,9 +4508,18 @@ function dynamicPagesClientScript() {
   }
 
   function renderRunParamRow(row) {
-    return '<tr><td>' + escapeHtml(row.name || '') + '</td><td>' + escapeHtml(row.type || 'string') + '</td><td>' +
-      escapeHtml(row.required ? t('yes') : t('no')) + '</td><td>' + escapeHtml(row.defaultValue == null ? '' : String(row.defaultValue)) + '</td><td>' + renderRunParamValueControl(row) + '</td><td>' +
-      escapeHtml(row.description || '') + '</td></tr>';
+    var meta = [
+      t('paramType') + ': ' + (row.type || 'string'),
+      t('paramRequired') + ': ' + (row.required ? t('yes') : t('no')),
+      t('paramDefault') + ': ' + (row.defaultValue == null ? '' : String(row.defaultValue))
+    ].join(' / ');
+    return '<div class="run-param-row">' +
+      '<div class="run-param-main"><strong>' + escapeHtml(row.name || '') + '</strong>' +
+      '<span class="run-param-meta">' + escapeHtml(meta) + '</span>' +
+      (row.description ? '<span class="muted">' + escapeHtml(row.description) + '</span>' : '') +
+      '</div>' +
+      '<div class="run-param-value"><label>' + t('runParamValue') + renderRunParamValueControl(row) + '</label></div>' +
+      '</div>';
   }
 
   function renderRunParamsEditor(selected) {
@@ -3888,8 +4527,7 @@ function dynamicPagesClientScript() {
     return [
       '<section class="section" id="cmdp-run-params-editor"><h2>' + t('runInputValues') + '</h2>',
       '<p class="muted">' + t('runInputValuesHelp') + '</p>',
-      rows.length ? '<table class="compact"><thead><tr><th>' + t('paramName') + '</th><th>' + t('paramType') + '</th><th>' + t('paramRequired') + '</th><th>' + t('paramDefault') + '</th><th>' + t('runParamValue') + '</th><th>' + t('paramDescription') + '</th></tr></thead><tbody>' +
-        rows.map(renderRunParamRow).join('') + '</tbody></table>' : '<div class="notice">' + t('noInputVariables') + '</div>',
+      rows.length ? '<div class="run-param-list">' + rows.map(renderRunParamRow).join('') + '</div>' : '<div class="notice">' + t('noInputVariables') + '</div>',
       '</section>'
     ].join('');
   }
@@ -3951,13 +4589,6 @@ function dynamicPagesClientScript() {
   function renderTemplateRunSection(selected) {
     return [
       renderRunParamsEditor(selected),
-      '<section class="section" id="cmdp-template-run"><h2>' + t('menuTemplateRun') + '</h2>',
-      '<div class="toolbar">',
-      '<button class="primary" data-action="visualize-editor">' + t('visualizeInEditor') + '</button>',
-      '<button data-action="visualize-external">' + t('visualizeExternal') + '</button>',
-      renderTemplateLaunchUrl(selected),
-      '</div>',
-      '</section>',
       state.result ? renderEditorVisualizationResult(state.result) : ''
     ].join('');
   }
@@ -3978,13 +4609,8 @@ function dynamicPagesClientScript() {
       '<label>' + t('publicationParamsMode') + '<select id="cmdp-publish-params-mode">',
       '<option value="exact"' + (publish.paramsMode === 'exact' ? ' selected' : '') + '>' + t('publicationParamsExact') + '</option>',
       '<option value="ignore"' + (publish.paramsMode === 'ignore' ? ' selected' : '') + '>' + t('publicationParamsIgnore') + '</option>',
-      '</select></label>',
+      '</select><span class="muted">' + escapeHtml(t('publicationParamsModeHelp')) + '</span></label>',
       '<label class="checkbox"><input id="cmdp-publish-warning-accepted" type="checkbox" ' + (publish.warningAccepted ? 'checked' : '') + '> ' + t('publicationWarningAccepted') + '</label>',
-      '</div>',
-      '<div class="toolbar" style="margin-top:8px">',
-      '<button data-action="apply-publication">' + t('applyPublication') + '</button>',
-      '<button class="primary" data-action="publish-snapshot">' + t('publishSnapshot') + '</button>',
-      renderTemplateLaunchUrl(selected),
       '</div>',
       '</section>'
     ].join('');
@@ -4016,10 +4642,6 @@ function dynamicPagesClientScript() {
       '<label class="checkbox"><input id="cmdp-cache-allow-manual-refresh" type="checkbox" ' + (cache.allowManualRefresh ? 'checked' : '') + '> ' + t('cacheAllowManualRefresh') + '</label>',
       '</div>',
       '</div>',
-      '<div class="toolbar" style="margin-top:8px">',
-      '<button data-action="apply-cache">' + t('cacheApply') + '</button>',
-      renderTemplateLaunchUrl(selected),
-      '</div>',
       '</section>'
     ].join('');
   }
@@ -4028,14 +4650,6 @@ function dynamicPagesClientScript() {
     return [
       '<section class="section" id="cmdp-diagnostics"><h2>' + t('menuDiagnostics') + '</h2>',
       '<p class="muted">' + t('diagnosticsHelp') + '</p>',
-      '<div class="toolbar">',
-      '<a class="button" href="/cmdbuild/custom-api/client-log" target="_blank" rel="noreferrer">' + t('clientLog') + '</a>',
-      '<a class="button" href="/cmdbuild/custom-api/proxy-log" target="_blank" rel="noreferrer">' + t('proxyLog') + '</a>',
-      '<a class="button" href="/cmdbuild/custom-api/cache/status" target="_blank" rel="noreferrer">Redis/cache</a>',
-      '<a class="button" href="/health/ready" target="_blank" rel="noreferrer">Readiness</a>',
-      '<a class="button" href="/health/redis" target="_blank" rel="noreferrer">Redis health</a>',
-      '<a class="button" href="/cmdbuild/ui/?cmdpMode=designer#custompages/CmdbDynamicPages">' + t('customPageLauncher') + '</a>',
-      '</div>',
       '</section>'
     ].join('');
   }
@@ -4043,10 +4657,12 @@ function dynamicPagesClientScript() {
   function renderDesignerSection(selected, config, templateRows) {
     var section = normalizeDesignerSection(state.designerSection);
     if (section === 'template') return renderTemplateEditor(selected);
+    if (section === 'schema') return renderSchemaManager();
     if (section === 'versions') return renderVersions();
     if (section === 'object-group') return renderObjectGroupEditor(selected);
     if (section === 'relations') return renderRelationExpansionEditor(selected);
     if (section === 'final-view') return renderViewComposerEditor(selected);
+    if (section === 'cmdb-build-view') return renderCmdbBuildViewEditor(selected);
     if (section === 'params') return renderParamsEditor(selected);
     if (section === 'extraction') return renderExtractionEditor(selected);
     if (section === 'run') return renderTemplateRunSection(selected);
@@ -4061,6 +4677,140 @@ function dynamicPagesClientScript() {
     if (section === 'settings') return renderRuntimeSettings(config);
     if (section === 'diagnostics') return renderDiagnostics();
     return renderTemplateList(templateRows);
+  }
+
+  function designerSectionTitle(section) {
+    section = normalizeDesignerSection(section);
+    if (section === 'template') return t('creatingTemplate');
+    if (section === 'schema') return t('menuSchema');
+    if (section === 'versions') return t('menuVersions');
+    if (section === 'params') return t('menuParams');
+    if (section === 'object-group') return t('menuObjectGroup');
+    if (section === 'relations') return t('menuRelations');
+    if (section === 'final-view') return t('menuFinalView');
+    if (section === 'cmdb-build-view') return t('menuCmdbBuildView');
+    if (section === 'extraction') return t('menuExtraction');
+    if (section === 'run') return t('menuTemplateRun');
+    if (section === 'publication') return t('menuPublication');
+    if (section === 'cache') return t('cacheEditor');
+    if (section === 'selection') return t('menuSelection');
+    if (section === 'visualization') return t('visualizationEditor');
+    if (section === 'general-settings') return t('menuGeneralSettings');
+    if (section === 'settings') return t('menuRuntimeSettings');
+    if (section === 'diagnostics') return t('menuDiagnostics');
+    return t('menuTemplateList');
+  }
+
+  function renderActionButton(action, label, options) {
+    options = options || {};
+    var classes = [];
+    if (options.primary) classes.push('primary');
+    if (options.danger) classes.push('danger');
+    var classAttr = classes.length ? ' class="' + classes.join(' ') + '"' : '';
+    var typeAttr = options.type ? ' type="' + escapeHtml(options.type) + '"' : '';
+    return '<button' + classAttr + typeAttr + ' data-action="' + escapeHtml(action) + '">' + escapeHtml(label) + '</button>';
+  }
+
+  function renderActionLink(href, label, options) {
+    options = options || {};
+    var classes = ['button'];
+    if (options.primary) classes.push('primary');
+    return '<a class="' + classes.join(' ') + '" href="' + escapeHtml(href) + '"' + (options.blank ? ' target="_blank" rel="noreferrer"' : '') + '>' + escapeHtml(label) + '</a>';
+  }
+
+  function sectionPersistsTemplate(section) {
+    return [
+      'template',
+      'params',
+      'object-group',
+      'relations',
+      'final-view',
+      'cmdb-build-view',
+      'selection',
+      'visualization',
+      'cache',
+      'publication'
+    ].indexOf(normalizeDesignerSection(section)) !== -1;
+  }
+
+  function renderDesignerActionBar(selected) {
+    var section = normalizeDesignerSection(state.designerSection);
+    var actions = [
+      renderActionLink('/cmdbuild/ui/#management', t('cmdbuild')),
+      renderActionButton('refresh', t('refresh'))
+    ];
+    var context = '';
+
+    if (section === 'templates') {
+      actions.push(renderActionButton('new-template', t('newTemplate'), { primary: true }));
+      actions.push(renderActionButton('new-cmdb-build-view', t('templateKindCmdbBuildView')));
+    } else if (section === 'template') {
+      actions.push(renderActionButton('save-template', t('save'), { primary: true }));
+    } else if (section === 'params') {
+      actions.push(renderActionButton('add-param-row', t('addParam')));
+      actions.push(renderActionButton('apply-params', t('applyParams'), { primary: true }));
+      actions.push(renderActionButton('fill-param-examples', t('fillExamples')));
+    } else if (section === 'object-group') {
+      actions.push(renderActionButton('add-object-selection', t('addObjectSelection')));
+      actions.push(renderActionButton('apply-object-group', t('applyObjectGroup'), { primary: true }));
+    } else if (section === 'relations') {
+      actions.push(renderActionButton('apply-relation-expansion', t('applyRelation'), { primary: true }));
+    } else if (section === 'final-view') {
+      actions.push(renderActionButton('add-view-column-row', t('addViewColumn')));
+      actions.push(renderActionButton('apply-view-composer', t('applyViewComposer'), { primary: true }));
+    } else if (section === 'cmdb-build-view') {
+      actions.push(renderActionButton('apply-cmdb-build-view', t('apply'), { primary: true }));
+    } else if (section === 'extraction') {
+      actions.push(renderActionButton('extract-template', t('extractByTemplate'), { primary: true }));
+    } else if (section === 'visualization') {
+      actions.push(renderActionButton('apply-visualization', t('applyVisualization'), { primary: true }));
+    } else if (section === 'cache') {
+      actions.push(renderActionButton('apply-cache', t('cacheApply'), { primary: true }));
+      if (readTemplateCode(selected)) context = renderTemplateLaunchUrl(selected);
+    } else if (section === 'publication') {
+      actions.push(renderActionButton('apply-publication', t('applyPublication')));
+      actions.push(renderActionButton('publish-snapshot', t('publishSnapshot'), { primary: true }));
+      if (readTemplateCode(selected)) context = renderTemplateLaunchUrl(selected);
+    } else if (section === 'run') {
+      actions.push(renderActionButton('visualize-editor', t('visualizeInEditor'), { primary: true }));
+      actions.push(renderActionButton('force-refresh-editor', t('forceRefreshInEditor')));
+      actions.push(renderActionButton('visualize-external', t('visualizeExternal')));
+      if (readTemplateCode(selected)) context = renderTemplateLaunchUrl(selected);
+    } else if (section === 'selection') {
+      actions.push(renderActionButton('add-selection-filter-row', t('addFilter')));
+      actions.push(renderActionButton('apply-selection', t('applySelection'), { primary: true }));
+    } else if (section === 'schema') {
+      actions.push(renderActionButton('schema-preview', t('schemaPreview')));
+      actions.push(renderActionButton('bootstrap-schema', t('schemaCreateMissing'), { primary: true }));
+    } else if (section === 'general-settings') {
+      actions.push(renderActionButton('save-general-settings', t('saveConfig'), { primary: true }));
+    } else if (section === 'settings') {
+      actions.push(renderActionButton('save-config', t('saveConfig'), { primary: true }));
+    } else if (section === 'diagnostics') {
+      actions.push(renderActionLink('/cmdbuild/custom-api/client-log', t('clientLog'), { blank: true }));
+      actions.push(renderActionLink('/cmdbuild/custom-api/proxy-log', t('proxyLog'), { blank: true }));
+      actions.push(renderActionLink('/cmdbuild/custom-api/cache/status', 'Redis/cache', { blank: true }));
+      actions.push(renderActionLink('/cmdbuild/custom-api/logging/status', 'Logging', { blank: true }));
+      actions.push(renderActionLink('/health/ready', 'Readiness', { blank: true }));
+      actions.push(renderActionLink('/health/redis', 'Redis health', { blank: true }));
+      actions.push(renderActionLink('/cmdbuild/ui/?cmdpMode=designer#custompages/CmdbDynamicPages', t('customPageLauncher')));
+    }
+
+    if (sectionPersistsTemplate(section) && section !== 'template') {
+      actions.push(renderActionButton('save-template', t('save')));
+      actions.push(renderActionButton('validate-template', t('validate')));
+      actions.push(renderActionButton('preview-template', t('preview')));
+    }
+
+    return [
+      '<div class="designer-actionbar">',
+      '<div class="designer-actionbar-title">' + escapeHtml(designerSectionTitle(section)) + '</div>',
+      '<div class="designer-actionbar-actions">',
+      actions.join(''),
+      context ? '<div class="designer-actionbar-context">' + context + '</div>' : '',
+      '</div>',
+      '</div>'
+    ].join('');
   }
 
   function renderDesigner() {
@@ -4080,23 +4830,20 @@ function dynamicPagesClientScript() {
     };
     var templateRows = state.templates.map(function (template) {
       var selectedRow = state.selectedTemplate && state.selectedTemplate.code === template.code ? ' class="selected"' : '';
+      var description = escapeHtml(template.description || '') + (template.protected ? ' <span class="pill">' + escapeHtml(t('protectedTemplate')) + '</span>' : '');
+      var deleteAction = template.protected
+        ? '<span class="muted">' + escapeHtml(t('protectedTemplate')) + '</span>'
+        : '<button class="danger" data-action="delete-template" data-code="' + escapeHtml(template.code) + '">' + t('deleteTemplate') + '</button>';
       return '<tr' + selectedRow + '><td><button class="link" data-action="select-template" data-code="' + escapeHtml(template.code) + '">' + escapeHtml(template.code) + '</button></td>' +
-        '<td>' + escapeHtml(template.description || '') + '</td><td>' + escapeHtml(template.active ? t('yes') : t('no')) + '</td>' +
-        '<td><button class="danger" data-action="delete-template" data-code="' + escapeHtml(template.code) + '">' + t('deleteTemplate') + '</button></td></tr>';
+        '<td>' + description + '</td><td>' + escapeHtml(template.active ? t('yes') : t('no')) + '</td>' +
+        '<td>' + deleteAction + '</td></tr>';
     }).join('');
 
     state.designerSection = normalizeDesignerSection(state.designerSection);
     app.innerHTML = [
       renderDesignerMenu(),
       '<div class="designer-main">',
-      '<div class="toolbar">',
-      '<a class="button" href="/cmdbuild/ui/#management">' + t('cmdbuild') + '</a>',
-      '<button data-action="refresh">' + t('refresh') + '</button>',
-      '<button data-action="new-template">' + t('newTemplate') + '</button>',
-      '<button class="primary" data-action="save-template">' + t('save') + '</button>',
-      '<button data-action="validate-template">' + t('validate') + '</button>',
-      '<button data-action="preview-template">' + t('preview') + '</button>',
-      '</div>',
+      renderDesignerActionBar(selected),
       renderNotice(state.message),
       renderTemplateContext(selected),
       renderDesignerSection(selected, config, templateRows),
@@ -4235,11 +4982,7 @@ function dynamicPagesClientScript() {
       '</tr></thead><tbody id="cmdp-param-rows">',
       rows,
       '</tbody></table>',
-      '<div class="toolbar" style="margin-top:8px">',
-      '<button data-action="add-param-row">' + t('addParam') + '</button>',
-      '<button data-action="apply-params">' + t('applyParams') + '</button>',
-      '<button data-action="fill-param-examples">' + t('fillExamples') + '</button>',
-      '</div></section>'
+      '</section>'
     ].join('');
   }
 
@@ -4698,9 +5441,8 @@ function dynamicPagesClientScript() {
     var options = renderExtractionResultOptions(state.extractionSource, spec, optionTables);
     return [
       '<section class="section" id="cmdp-extraction-editor"><h2>' + t('extractionEditor') + '</h2>',
-      '<div class="toolbar">',
+      '<div class="row">',
       options ? '<label>' + t('extractionResultSource') + '<select id="cmdp-extraction-source">' + options + '</select></label>' : '',
-      '<button class="primary" data-action="extract-template">' + t('extractByTemplate') + '</button>',
       '</div>',
       renderExtractionPreview(spec),
       '</section>'
@@ -4767,10 +5509,7 @@ function dynamicPagesClientScript() {
       filterRows,
       renderSelectionFilterRow({}),
       '</tbody></table>',
-      '<div class="toolbar" style="margin-top:8px">',
-      '<button data-action="add-selection-filter-row">' + t('addFilter') + '</button>',
-      '<button data-action="apply-selection">' + t('applySelection') + '</button>',
-      '</div></section>'
+      '</section>'
     ].join('');
   }
 
@@ -5076,10 +5815,7 @@ function dynamicPagesClientScript() {
       rows,
       renderViewComposerColumnRow({}, spec, model.sourceAlias),
       '</tbody></table>',
-      '<div class="toolbar" style="margin-top:8px">',
-      '<button data-action="add-view-column-row">' + t('addViewColumn') + '</button>',
-      '<button data-action="apply-view-composer">' + t('applyViewComposer') + '</button>',
-      '</div></section>'
+      '</section>'
     ].join('');
   }
 
@@ -5098,28 +5834,40 @@ function dynamicPagesClientScript() {
     if (savedGroupTitle === groupTitleToken('value')) savedGroupTitle = '';
     var groupTitleTemplate = savedGroupTitle || defaultGroupTitle;
     return [
-      '<tr data-visualization-row>',
-      '<td><label>' + t('visualizationTitle') + '<input data-visualization-field="title" value="' + escapeHtml(title) + '"></label><div class="muted">' + escapeHtml(t('visualizationTitleHelp')) + '</div><input type="hidden" data-visualization-field="name" value="' + escapeHtml(name) + '"></td>',
-      '<td><select data-visualization-field="titleAlign">' + renderTitleAlignOptions(titleAlign) + '</select></td>',
-      '<td><select data-visualization-field="mode">' + renderVisualizationModeOptions(settings.mode || table.mode || table.view || 'table') + '</select></td>',
-      '<td><select data-visualization-field="sortColumn">' + renderColumnSelectOptions(columnOptions, settings.sortColumn || '', '') + '</select></td>',
-      '<td><select data-visualization-field="sortDirection"><option value="asc"' + (sortDirection === 'asc' ? ' selected' : '') + '>' + t('visualizationSortAsc') + '</option><option value="desc"' + (sortDirection === 'desc' ? ' selected' : '') + '>' + t('visualizationSortDesc') + '</option></select></td>',
-      '</tr>',
-      '<tr data-visualization-row-detail>',
-      '<td colspan="5">',
-      '<div class="visual-grid" style="grid-template-columns:repeat(3,minmax(0,1fr))">',
-      '<label class="checkbox"><input data-visualization-field="splitSubtables" type="checkbox" ' + (splitSubtables ? 'checked' : '') + '> ' + t('visualizationSplitSubtables') + '</label>',
+      '<div class="visual-table-panel" data-visualization-row data-visualization-row-detail>',
+      '<div class="visual-table-heading"><h3>' + escapeHtml(name || t('visualizationSource')) + '</h3><span class="muted">' + escapeHtml(String(columns.length)) + ' ' + escapeHtml(t('columnsCount')) + '</span></div>',
+      '<input type="hidden" data-visualization-field="name" value="' + escapeHtml(name) + '">',
+      '<div class="visual-table-subblock">',
+      '<h4>' + t('visualizationTableHeader') + '</h4>',
+      '<div class="settings-grid">',
+      '<label>' + t('visualizationTitle') + '<input data-visualization-field="title" value="' + escapeHtml(title) + '"><span class="muted">' + escapeHtml(t('visualizationTitleHelp')) + '</span></label>',
+      '<label>' + t('visualizationTitleAlign') + '<select data-visualization-field="titleAlign">' + renderTitleAlignOptions(titleAlign) + '</select></label>',
+      '<label>' + t('visualizationMode') + '<select data-visualization-field="mode">' + renderVisualizationModeOptions(settings.mode || table.mode || table.view || 'table') + '</select></label>',
+      '</div></div>',
+      '<div class="visual-table-subblock">',
+      '<h4>' + t('visualizationSorting') + '</h4>',
+      '<div class="settings-grid">',
+      '<label>' + t('visualizationSortColumn') + '<select data-visualization-field="sortColumn">' + renderColumnSelectOptions(columnOptions, settings.sortColumn || '', '') + '</select></label>',
+      '<label>' + t('visualizationSortDirection') + '<select data-visualization-field="sortDirection"><option value="asc"' + (sortDirection === 'asc' ? ' selected' : '') + '>' + t('visualizationSortAsc') + '</option><option value="desc"' + (sortDirection === 'desc' ? ' selected' : '') + '>' + t('visualizationSortDesc') + '</option></select></label>',
+      '</div></div>',
+      '<div class="visual-table-subblock">',
+      '<h4>' + t('visualizationSubtables') + '</h4>',
+      '<div class="settings-grid">',
+      '<label class="checkbox checkbox-stacked"><input data-visualization-field="splitSubtables" type="checkbox" ' + (splitSubtables ? 'checked' : '') + '> <span><strong>' + t('visualizationSplitSubtables') + '</strong></span></label>',
       '<label>' + t('visualizationGroupBy') + '<select data-visualization-field="groupBy">' + renderColumnSelectOptions(columnOptions, settings.groupBy || '', '') + '</select></label>',
       '<label>' + t('visualizationGroupTitle') + '<input data-visualization-field="groupTitleTemplate" data-default-group-title-template="' + escapeHtml(defaultGroupTitle) + '" value="' + escapeHtml(groupTitleTemplate) + '"><span class="muted">' + escapeHtml(t('visualizationGroupTitleHelp')) + '</span></label>',
-      '</div>',
+      '</div></div>',
+      '<div class="visual-table-subblock">',
       '<select data-visualization-column-options hidden>' + renderColumnSelectOptions(columnOptions, '', '') + '</select>',
       '<div class="visual-row-groups" data-visualization-row-groups>',
+      '<div class="section-title-row"><h4>' + t('visualizationRowGrouping') + '</h4>',
+      '<button data-action="add-visual-row-group" type="button">' + t('visualizationAddRowGroup') + '</button></div>',
       '<div class="muted">' + escapeHtml(t('visualizationRowGroupHelp')) + '</div>',
       renderVisualizationRowGroupRows(columnOptions, settings),
-      '<div><button data-action="add-visual-row-group" type="button">' + t('visualizationAddRowGroup') + '</button></div>',
+      '<div data-visualization-row-group-insert></div>',
       '</div>',
-      '</td>',
-      '</tr>'
+      '</div>',
+      '</div>'
     ].join('');
   }
 
@@ -5133,29 +5881,32 @@ function dynamicPagesClientScript() {
     return [
       '<section class="section" id="cmdp-visualization-editor"><h2>' + t('visualizationEditor') + '</h2>',
       '<p class="muted">' + t('visualizationEditorHelp') + '</p>',
-      '<h3>' + t('visualizationGlobal') + '</h3>',
-      '<div class="visual-grid">',
+      '<div class="settings-block">',
+      '<h3>' + t('visualizationMessages') + '</h3>',
+      '<div class="settings-grid">',
       '<label>' + t('visualizationEmptyText') + '<input id="cmdp-visual-empty-text" value="' + escapeHtml(presentation.emptyText) + '"></label>',
       '<label>' + t('visualizationPermissionDeniedText') + '<input id="cmdp-visual-permission-denied-text" value="' + escapeHtml(presentation.permissionDeniedText) + '"></label>',
+      '</div></div>',
+      '<div class="settings-block">',
+      '<h3>' + t('visualizationBaseStyle') + '</h3>',
+      '<div class="settings-grid">',
       '<label>' + t('visualizationFontSize') + '<select id="cmdp-visual-font-size"><option value="small"' + (presentation.fontSize === 'small' ? ' selected' : '') + '>' + t('visualizationFontSmall') + '</option><option value="normal"' + (presentation.fontSize === 'normal' ? ' selected' : '') + '>' + t('visualizationFontNormal') + '</option><option value="large"' + (presentation.fontSize === 'large' ? ' selected' : '') + '>' + t('visualizationFontLarge') + '</option></select></label>',
       '<label>' + t('visualizationDensity') + '<select id="cmdp-visual-density"><option value="normal"' + (presentation.density === 'normal' ? ' selected' : '') + '>' + t('visualizationDensityNormal') + '</option><option value="compact"' + (presentation.density === 'compact' ? ' selected' : '') + '>' + t('visualizationDensityCompact') + '</option></select></label>',
-      '<label class="checkbox"><input id="cmdp-visual-zebra" type="checkbox" ' + (presentation.zebra ? 'checked' : '') + '> ' + t('visualizationZebra') + '</label>',
-      '<label class="checkbox"><input id="cmdp-visual-filters" type="checkbox" ' + (presentation.filters ? 'checked' : '') + '> ' + t('visualizationRuntimeFilters') + '<span class="muted">' + escapeHtml(t('visualizationRuntimeFiltersHelp')) + '</span></label>',
-      '<label class="checkbox"><input id="cmdp-visual-sortable" type="checkbox" ' + (presentation.sortable ? 'checked' : '') + '> ' + t('visualizationSortable') + '</label>',
       '</div>',
-      '<h3>' + t('extractionFinalResult') + '</h3>',
-      tables.length ? '<table class="compact visualization-table"><thead><tr>' +
-        '<th>' + t('visualizationTitle') + '</th>' +
-        '<th>' + t('visualizationTitleAlign') + '</th>' +
-        '<th>' + t('visualizationMode') + '</th>' +
-        '<th>' + t('visualizationSortColumn') + '</th>' +
-        '<th>' + t('visualizationSortDirection') + '</th>' +
-        '</tr></thead><tbody id="cmdp-visualization-rows">' +
-        rows +
-        '</tbody></table>' : '<div class="notice">' + t('visualizationNoTables') + '</div>',
-      '<div class="toolbar" style="margin-top:8px">',
-      '<button data-action="apply-visualization">' + t('applyVisualization') + '</button>',
-      '</div></section>'
+      '<div class="checkbox-list" style="margin-top:8px">',
+      '<label class="checkbox checkbox-stacked"><input id="cmdp-visual-zebra" type="checkbox" ' + (presentation.zebra ? 'checked' : '') + '> <span><strong>' + t('visualizationZebra') + '</strong></span></label>',
+      '</div></div>',
+      '<div class="settings-block">',
+      '<h3>' + t('visualizationRuntimeBehavior') + '</h3>',
+      '<div class="checkbox-list">',
+      '<label class="checkbox checkbox-stacked"><input id="cmdp-visual-filters" type="checkbox" ' + (presentation.filters ? 'checked' : '') + '> <span><strong>' + t('visualizationRuntimeFilters') + '</strong><span class="muted">' + escapeHtml(t('visualizationRuntimeFiltersHelp')) + '</span></span></label>',
+      '<label class="checkbox checkbox-stacked"><input id="cmdp-visual-sortable" type="checkbox" ' + (presentation.sortable ? 'checked' : '') + '> <span><strong>' + t('visualizationSortable') + '</strong></span></label>',
+      '</div></div>',
+      '<div class="settings-block">',
+      '<h3>' + t('visualizationTables') + '</h3>',
+      tables.length ? '<div class="visual-table-list" id="cmdp-visualization-rows">' + rows + '</div>' : '<div class="notice">' + t('visualizationNoTables') + '</div>',
+      '</div>',
+      '</section>'
     ].join('');
   }
 
@@ -5275,7 +6026,22 @@ function dynamicPagesClientScript() {
     return t('runtimeCacheBuilt');
   }
 
-  function renderRuntimeCacheStatus(result) {
+  function runtimeCacheTooltipHtml(cache, refreshText, expiresText) {
+    var html = [
+      '<span>' + escapeHtml(runtimeCacheStatusLabel(cache)) + '</span>',
+      '<span>' + escapeHtml(t('runtimeCacheGeneratedAt')) + ': ' + escapeHtml(cache.generatedAt || cache.publishedAt || '') + '</span>'
+    ];
+    if (expiresText) html.push('<span data-runtime-cache-live-expires>' + escapeHtml(expiresText) + '</span>');
+    if (refreshText) html.push('<span data-runtime-cache-live-wait>' + escapeHtml(refreshText) + '</span>');
+    if (cache.backend) html.push('<span>' + escapeHtml(t('runtimeCacheBackend')) + ': ' + escapeHtml(cache.backend) + '</span>');
+    if (cache.scope || cache.scopeMode) html.push('<span>' + escapeHtml(t('runtimeCacheScope')) + ': ' + escapeHtml([cache.scope, cache.scopeMode].filter(Boolean).join(' / ')) + '</span>');
+    if (cache.key) html.push('<span>' + escapeHtml(t('runtimeCacheKey')) + ': ' + escapeHtml(cache.key) + '</span>');
+    if (cache.message) html.push('<span>' + escapeHtml(cache.message) + '</span>');
+    if (cache.allowManualRefresh === false) html.push('<span>' + escapeHtml(t('runtimeCacheManualDisabled')) + '</span>');
+    return html.join('');
+  }
+
+  function renderRuntimeCacheControl(result) {
     var cache = result && result.json ? result.json.cache : null;
     if (!cache || !cache.enabled) return '';
     var now = Date.now();
@@ -5288,22 +6054,17 @@ function dynamicPagesClientScript() {
     var expiresText = Number.isFinite(expiresMs)
       ? t('runtimeCacheExpiresIn', { time: formatRuntimeDuration(expiresMs - now) })
       : '';
-    var disabled = waitMs > 0 || state.runtimeRefreshInProgress;
-    var refreshButton = cache.allowManualRefresh === false
-      ? ''
-      : '<button data-action="runtime-refresh" ' + (disabled ? 'disabled' : '') + '>' + escapeHtml(state.runtimeRefreshInProgress ? t('runtimeRefreshing') : t('runtimeRefresh')) + '</button>';
+    var disabled = waitMs > 0 || state.runtimeRefreshInProgress || cache.allowManualRefresh === false;
+    var buttonLabel = state.runtimeRefreshInProgress ? t('runtimeRefreshing') : t('runtimeRefresh');
     return [
-      '<div class="runtime-cache-bar" data-runtime-cache',
+      '<span class="runtime-cache-control" data-runtime-cache',
       ' data-next-refresh="' + escapeHtml(cache.nextRefreshAllowedAt || '') + '"',
       ' data-expires="' + escapeHtml(cache.expiresAt || '') + '">',
-      '<div class="runtime-cache-info">',
-      '<strong>' + escapeHtml(runtimeCacheStatusLabel(cache)) + '</strong>',
-      '<span>' + escapeHtml(t('runtimeCacheGeneratedAt')) + ': ' + escapeHtml(cache.generatedAt || '') + '</span>',
-      '<span data-runtime-cache-expires>' + escapeHtml(expiresText) + '</span>',
-      '<span data-runtime-cache-wait>' + escapeHtml(refreshText) + '</span>',
-      '</div>',
-      refreshButton,
-      '</div>'
+      '<button class="runtime-cache-button' + (state.runtimeRefreshInProgress ? ' refreshing' : '') + '" data-action="runtime-refresh" data-manual-disabled="' + (cache.allowManualRefresh === false ? 'true' : 'false') + '" data-disabled="' + (disabled ? 'true' : 'false') + '" aria-disabled="' + (disabled ? 'true' : 'false') + '" aria-label="' + escapeHtml(buttonLabel) + '">&#8635;</button>',
+      '<span class="runtime-cache-tooltip" role="tooltip" data-runtime-cache-tooltip>',
+      runtimeCacheTooltipHtml(cache, refreshText, expiresText),
+      '</span>',
+      '</span>'
     ].join('');
   }
 
@@ -5313,21 +6074,28 @@ function dynamicPagesClientScript() {
     var now = Date.now();
     var nextRefreshMs = Date.parse(bar.getAttribute('data-next-refresh') || '');
     var expiresMs = Date.parse(bar.getAttribute('data-expires') || '');
-    var wait = bar.querySelector('[data-runtime-cache-wait]');
-    var expires = bar.querySelector('[data-runtime-cache-expires]');
     var button = bar.querySelector('[data-action="runtime-refresh"]');
+    var tooltip = bar.querySelector('[data-runtime-cache-tooltip]');
     var waitMs = Number.isFinite(nextRefreshMs) ? nextRefreshMs - now : 0;
-    if (wait) {
-      wait.textContent = waitMs > 0
-        ? t('runtimeCacheRefreshWait', { time: formatRuntimeDuration(waitMs) })
-        : t('runtimeCacheRefreshReady');
-    }
-    if (expires && Number.isFinite(expiresMs)) {
-      expires.textContent = t('runtimeCacheExpiresIn', { time: formatRuntimeDuration(expiresMs - now) });
-    }
+    var refreshText = waitMs > 0
+      ? t('runtimeCacheRefreshWait', { time: formatRuntimeDuration(waitMs) })
+      : t('runtimeCacheRefreshReady');
+    var expiresText = Number.isFinite(expiresMs)
+      ? t('runtimeCacheExpiresIn', { time: formatRuntimeDuration(expiresMs - now) })
+      : '';
     if (button) {
-      button.disabled = waitMs > 0 || state.runtimeRefreshInProgress;
-      button.textContent = state.runtimeRefreshInProgress ? t('runtimeRefreshing') : t('runtimeRefresh');
+      var disabled = waitMs > 0 || state.runtimeRefreshInProgress || button.getAttribute('data-manual-disabled') === 'true';
+      if (state.runtimeRefreshInProgress) button.classList.add('refreshing');
+      else button.classList.remove('refreshing');
+      button.setAttribute('data-disabled', disabled ? 'true' : 'false');
+      button.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+      button.setAttribute('aria-label', state.runtimeRefreshInProgress ? t('runtimeRefreshing') : t('runtimeRefresh'));
+    }
+    if (tooltip) {
+      var waitNode = tooltip.querySelector('[data-runtime-cache-live-wait]');
+      var expiresNode = tooltip.querySelector('[data-runtime-cache-live-expires]');
+      if (waitNode) waitNode.textContent = refreshText;
+      if (expiresNode) expiresNode.textContent = expiresText;
     }
   }
 
@@ -5341,12 +6109,20 @@ function dynamicPagesClientScript() {
     if (!result) return '';
     var resultBody = result.json && result.json.result ? result.json.result : null;
     var tables = visibleResultTables(resultBody ? (resultBody.tables || []) : []);
-    var cacheHtml = renderRuntimeCacheStatus(result);
+    var cacheHtml = renderRuntimeCacheControl(result);
     if (!result.ok) {
-      return cacheHtml + '<div class="notice error">' + escapeHtml(result.json && result.json.permissionDeniedText || errorText(result)) + '</div>';
+      return (cacheHtml ? '<div class="result-table-toolbar"><div class="result-table-actions">' + cacheHtml + '</div></div>' : '') + '<div class="notice error">' + escapeHtml(result.json && result.json.permissionDeniedText || errorText(result)) + '</div>';
     }
-    if (tables.length) return cacheHtml + tables.map(renderResultTable).join('');
-    return cacheHtml + '<div class="notice">' + escapeHtml(resultBody && resultBody.emptyText || DEFAULT_EMPTY_RESULT_TEXT) + '</div>';
+    if (resultBody && resultBody.kind === 'html' && resultBody.htmlTrusted && resultBody.html) {
+      return '<div class="result-table-wrap" data-result-table>' +
+        '<div class="result-table-header"><div class="result-table-title"><h3>' + escapeHtml(result.json && result.json.template && result.json.template.description || result.json && result.json.template && result.json.template.code || t('templateKindCmdbBuildView')) + '</h3></div>' +
+        (cacheHtml ? '<div class="result-table-actions">' + cacheHtml + '</div>' : '') + '</div>' +
+        '<div class="cmdp-html-result">' + resultBody.html + '</div></div>';
+    }
+    if (tables.length) return tables.map(function (table, index) {
+      return renderResultTable(table, index === 0 ? cacheHtml : '');
+    }).join('');
+    return (cacheHtml ? '<div class="result-table-toolbar"><div class="result-table-actions">' + cacheHtml + '</div></div>' : '') + '<div class="notice">' + escapeHtml(resultBody && resultBody.emptyText || DEFAULT_EMPTY_RESULT_TEXT) + '</div>';
   }
 
   function renderExecutionTrace(trace) {
@@ -5466,7 +6242,7 @@ function dynamicPagesClientScript() {
     return text;
   }
 
-  function renderResultTable(table) {
+  function renderResultTable(table, cacheControlHtml) {
     var columns = table.columns || [];
     var columnLabels = table.columnLabels && typeof table.columnLabels === 'object' ? table.columnLabels : {};
     var title = displayTitleForResult(table.name, table.title || table.label || '');
@@ -5474,7 +6250,13 @@ function dynamicPagesClientScript() {
     var presentation = table.presentation && typeof table.presentation === 'object' ? table.presentation : {};
     var compact = mode === 'compact';
     if (mode === 'keyValue') {
-      return '<h3' + titleAlignStyle(presentation, false) + '>' + escapeHtml(title) + (table.truncated ? ' <span class="pill">' + t('truncated') + '</span>' : '') + '</h3>' + renderKeyValueTable(table, compact);
+      return '<div class="result-table-wrap" data-result-table>' +
+        '<div class="result-table-header">' +
+        '<div class="result-table-title"' + titleAlignStyle(presentation, true) + '><h3>' + escapeHtml(title) + '</h3>' +
+        (table.truncated ? ' <span class="pill">' + t('truncated') + '</span>' : '') + '</div>' +
+        (cacheControlHtml ? '<div class="result-table-actions">' + cacheControlHtml + '</div>' : '') +
+        '</div>' +
+        renderKeyValueTable(table, compact) + '</div>';
     }
     var rows = table.rows || [];
     var tableClass = presentationClassNames(presentation, compact);
@@ -5515,9 +6297,16 @@ function dynamicPagesClientScript() {
       var subtitle = presentation.splitSubtables && presentation.groupBy ? '<div class="result-subtitle">' + escapeHtml(renderGroupTitle(presentation.groupTitleTemplate, presentation.groupBy, group.key, groupTitleColumnLabel)) + '</div>' : '';
       return '<div data-result-group>' + subtitle + '<table class="' + tableClass + '"><thead><tr>' + head + '</tr></thead><tbody>' + renderRows(group.rows) + '</tbody></table></div>';
     }).join('') : '<table class="' + tableClass + '"><tbody><tr><td>' + escapeHtml(table.emptyText || DEFAULT_EMPTY_RESULT_TEXT) + '</td></tr></tbody></table>';
-    return '<div class="result-table-wrap" data-result-table><div class="result-table-title"' + titleAlignStyle(presentation, true) + '><h3>' + escapeHtml(title) + '</h3>' +
+    var actions = [
+      filtersEnabled ? '<input class="result-table-filter" data-result-filter placeholder="' + escapeHtml(t('runtimeFilterPlaceholder')) + '">' : '',
+      cacheControlHtml || ''
+    ].filter(Boolean).join('');
+    return '<div class="result-table-wrap" data-result-table>' +
+      '<div class="result-table-header">' +
+      '<div class="result-table-title"' + titleAlignStyle(presentation, true) + '><h3>' + escapeHtml(title) + '</h3>' +
       (table.truncated ? ' <span class="pill">' + t('truncated') + '</span>' : '') + '</div>' +
-      (filtersEnabled ? '<div class="result-table-tools"><input class="result-table-filter" data-result-filter placeholder="' + escapeHtml(t('runtimeFilterPlaceholder')) + '"></div>' : '') +
+      (actions ? '<div class="result-table-actions">' + actions + '</div>' : '') +
+      '</div>' +
       disabledNotice +
       tableHtml + '</div>';
   }
@@ -5530,14 +6319,19 @@ function dynamicPagesClientScript() {
     return Promise.all([
       request(apiPrefix + '/session'),
       request(apiPrefix + '/schema?root=' + encodeURIComponent(state.root)),
+      request(apiPrefix + '/schema/parents?limit=500'),
       request(apiPrefix + '/config?root=' + encodeURIComponent(state.root)),
       request(apiPrefix + '/templates?limit=100')
     ]).then(function (results) {
       state.session = results[0].json && results[0].json.session ? results[0].json.session : state.session;
       state.schema = results[1].json ? results[1].json.schema : null;
-      state.config = results[2].json ? results[2].json.config : null;
-      state.templates = results[3].json && results[3].json.data ? results[3].json.data : [];
-      var accessDenied = [results[2], results[3]].find(resultIsPermissionDenied);
+      state.schemaParents = results[2].json && Array.isArray(results[2].json.parents) ? results[2].json.parents : [];
+      if (!state.schemaRootDraft && state.schema && state.schema.root) state.schemaRootDraft = state.schema.root;
+      if (!state.schemaDescriptionDraft && state.schema && state.schema.rootDescription) state.schemaDescriptionDraft = state.schema.rootDescription;
+      if (!state.schemaParentDraft && state.schema && state.schema.rootParent) state.schemaParentDraft = state.schema.rootParent;
+      state.config = results[3].json ? results[3].json.config : null;
+      state.templates = results[4].json && results[4].json.data ? results[4].json.data : [];
+      var accessDenied = [results[3], results[4]].find(resultIsPermissionDenied);
       if (accessDenied) {
         state.technicalSchemaAccessDenied = true;
         state.accessDeniedText = accessDeniedTextFromResult(accessDenied);
@@ -5575,6 +6369,7 @@ function dynamicPagesClientScript() {
     var code = readTemplateCode(selected);
     if (!code) throw new Error(t('templateCodeRequired'));
     var specData = readSpecWithEditorBlocks();
+    specData.spec = applyTemplateKindFromEditor(specData.spec);
     return {
       code: code,
       description: readTemplateDescription(selected, code) || code,
@@ -5583,6 +6378,21 @@ function dynamicPagesClientScript() {
       paramsSchema: readCurrentParamsSchema(selected.paramsSchema || {}),
       resultSchema: readCurrentResultSchema(selected.resultSchema || {})
     };
+  }
+
+  function applyTemplateKindFromEditor(spec) {
+    if (!hasField('cmdp-template-kind')) return spec;
+    var kind = readValue('cmdp-template-kind') === CMDB_BUILD_VIEW_KIND ? CMDB_BUILD_VIEW_KIND : 'dsl';
+    if (kind === CMDB_BUILD_VIEW_KIND && templateKindForSpec(spec) !== CMDB_BUILD_VIEW_KIND) {
+      var next = defaultCmdbBuildViewSpecClient();
+      next.publish = spec && spec.publish ? spec.publish : next.publish;
+      next.cache = spec && spec.cache ? spec.cache : next.cache;
+      return next;
+    }
+    if (kind === 'dsl' && templateKindForSpec(spec) === CMDB_BUILD_VIEW_KIND) {
+      return defaultSpec();
+    }
+    return spec;
   }
 
   function captureParamRowsDraftFromDom() {
@@ -6533,6 +7343,7 @@ function dynamicPagesClientScript() {
     specData.spec = applyVisualizationToSpec(specData.spec, false);
     specData.spec = applyPublicationToSpec(specData.spec, false);
     specData.spec = applyCacheToSpec(specData.spec, false);
+    specData.spec = applyCmdbBuildViewToSpec(specData.spec, false);
     return specData;
   }
 
@@ -6732,6 +7543,49 @@ function dynamicPagesClientScript() {
       state.runParams = Object.assign({}, specData.examples, state.runParams || {});
       clearDraftExecutionState();
       state.message = { type: 'ok', text: t('publicationApplied') };
+      renderDesigner();
+    } catch (error) {
+      state.message = { type: 'error', text: error.message };
+      renderDesigner();
+    }
+  }
+
+  function applyCmdbBuildViewToSpec(spec, required) {
+    if (!hasField('cmdp-cmdb-build-language') && !required) return spec;
+    var next = cloneJsonValue(spec || defaultCmdbBuildViewSpecClient(), defaultCmdbBuildViewSpecClient());
+    if (templateKindForSpec(next) !== CMDB_BUILD_VIEW_KIND) {
+      var publish = next.publish;
+      var cache = next.cache;
+      next = defaultCmdbBuildViewSpecClient();
+      if (publish) next.publish = publish;
+      if (cache) next.cache = cache;
+    }
+    var sections = Array.prototype.slice.call(document.querySelectorAll('[data-cmdb-build-section]'))
+      .filter(function (field) { return field.checked; })
+      .map(function (field) { return field.getAttribute('data-cmdb-build-section'); })
+      .filter(Boolean);
+    if (!sections.length) sections = ['classes'];
+    next.kind = CMDB_BUILD_VIEW_KIND;
+    next.protected = true;
+    next.params = next.params && typeof next.params === 'object' && !Array.isArray(next.params) ? next.params : {};
+    next.cmdbBuildView = {
+      language: readValue('cmdp-cmdb-build-language') || 'auto',
+      showSystemAttributes: readChecked('cmdp-cmdb-build-system-attributes'),
+      sections: sections,
+      rootClass: String(readValue('cmdp-cmdb-build-root-class') || '').trim(),
+      lookupScope: readValue('cmdp-cmdb-build-lookup-scope') === 'all' ? 'all' : 'used'
+    };
+    return next;
+  }
+
+  function applyCmdbBuildViewEditor() {
+    try {
+      var specData = readSpecWithParamEditor();
+      specData.spec = applyCmdbBuildViewToSpec(specData.spec, true);
+      updateSelectedFromEditor(specData.spec);
+      state.runParams = Object.assign({}, specData.examples, state.runParams || {});
+      clearDraftExecutionState();
+      state.message = { type: 'ok', text: t('cmdbBuildViewApplied') };
       renderDesigner();
     } catch (error) {
       state.message = { type: 'error', text: error.message };
@@ -6948,7 +7802,7 @@ function dynamicPagesClientScript() {
     var container = button && button.closest ? button.closest('[data-visualization-row-groups]') : null;
     if (!container) return;
     var options = visualizationColumnOptionsHtmlForRowGroup(container);
-    var insertBefore = button.parentElement || container;
+    var insertBefore = container.querySelector('[data-visualization-row-group-insert]') || button.parentElement || container;
     insertBefore.insertAdjacentHTML('beforebegin',
       '<div class="visual-row-group" data-visualization-row-group>' +
       '<label><span data-row-group-label>' + t('visualizationRowGroupNextBy') + '</span><select data-visualization-field="rowGroupBy">' + options + '</select></label>' +
@@ -7043,15 +7897,48 @@ function dynamicPagesClientScript() {
 
   function bootstrapSchema() {
     var root = readValue('cmdp-root') || state.root;
+    var description = readValue('cmdp-schema-description') || currentSchemaDescription();
+    var parent = readValue('cmdp-schema-parent') || currentSchemaParent();
     state.root = root;
+    state.schemaRootDraft = root;
+    state.schemaDescriptionDraft = description;
+    state.schemaParentDraft = parent;
+    if (hasField('cmdp-schema-confirm') && !readChecked('cmdp-schema-confirm')) {
+      state.message = { type: 'error', text: t('schemaConfirmRequired') };
+      renderDesigner();
+      return;
+    }
     if (!canBootstrapSchema()) {
       state.message = { type: 'error', text: t('bootstrapRequiresAdmin') };
       renderDesigner();
       return;
     }
-    request(apiPrefix + '/schema/bootstrap', { method: 'POST', body: { root: root } }).then(function (result) {
+    request(apiPrefix + '/schema/bootstrap', { method: 'POST', body: { root: root, description: description, parent: parent, confirm: true } }).then(function (result) {
       state.schema = result.json ? result.json.schema : null;
-      state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t('schemaReadyMessage') : errorText(result) };
+      state.schemaPlan = state.schema;
+      state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t('schemaBootstrapDone') : errorText(result) };
+      renderDesigner();
+    }).catch(function (error) {
+      state.message = { type: 'error', text: error.message || String(error) };
+      renderDesigner();
+    });
+  }
+
+  function previewSchema() {
+    var root = readValue('cmdp-root') || state.root;
+    var description = readValue('cmdp-schema-description') || currentSchemaDescription();
+    var parent = readValue('cmdp-schema-parent') || currentSchemaParent();
+    state.root = root;
+    state.schemaRootDraft = root;
+    state.schemaDescriptionDraft = description;
+    state.schemaParentDraft = parent;
+    request(apiPrefix + '/schema/preview', { method: 'POST', body: { root: root, description: description, parent: parent } }).then(function (result) {
+      state.schemaPlan = result.json ? result.json.schema : null;
+      state.schema = state.schemaPlan || state.schema;
+      state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t('schemaPreviewReady') : errorText(result) };
+      renderDesigner();
+    }).catch(function (error) {
+      state.message = { type: 'error', text: error.message || String(error) };
       renderDesigner();
     });
   }
@@ -7456,6 +8343,35 @@ function dynamicPagesClientScript() {
     renderDesigner();
   }
 
+  function newCmdbBuildViewTemplate() {
+    state.selectedTemplate = {
+      code: DEFAULT_CMDB_BUILD_VIEW_CODE,
+      description: 'CMDBuild model view',
+      active: true,
+      protected: true,
+      spec: defaultCmdbBuildViewSpecClient(),
+      paramsSchema: {},
+      resultSchema: {}
+    };
+    state.templateVersions = [];
+    state.runParams = {};
+    state.objectGroupDraft = null;
+    state.relationDraft = null;
+    state.viewComposerDraft = null;
+    state.paramRowsDraft = null;
+    state.extractionPreview = null;
+    state.extractionSource = '';
+    state.selectedClass = '';
+    state.checkedClass = null;
+    state.classCheckResult = null;
+    state.classAttributes = [];
+    state.result = null;
+    state.message = null;
+    state.designerSection = 'template';
+    if (window.history && window.history.pushState) window.history.pushState({ designerSection: 'template' }, '', designerSectionUrl('template'));
+    renderDesigner();
+  }
+
   function deleteTemplate(code) {
     var templateCode = String(code || '').trim();
     if (!templateCode) return;
@@ -7538,6 +8454,35 @@ function dynamicPagesClientScript() {
     var url = runtimeTemplateUrl(code, runUrlParamsForTemplate(state.selectedTemplate || {}, true));
     if (window.open) window.open(url, '_blank', 'noopener');
     else window.location.href = url;
+  }
+
+  function forceRefreshInEditor() {
+    var code = readTemplateCode();
+    var params;
+    if (!code) {
+      state.message = { type: 'error', text: t('templateCodeRequired') };
+      renderDesigner();
+      return;
+    }
+    try {
+      params = readRunParams();
+    } catch (error) {
+      state.message = { type: 'error', text: error.message };
+      renderDesigner();
+      return;
+    }
+    request(runtimeRunPath(code, {}, true, true), {
+      method: 'POST',
+      body: { params: params, refresh: true, forceRefresh: true }
+    }).then(function (result) {
+      state.result = result;
+      state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t('forceRefreshRunCompleted') : errorText(result) };
+      state.designerSection = 'run';
+      renderDesigner();
+    }).catch(function (error) {
+      state.message = { type: 'error', text: error.message || String(error) };
+      renderDesigner();
+    });
   }
 
   function publishSnapshot() {
@@ -7713,13 +8658,18 @@ function dynamicPagesClientScript() {
     if (!target) return;
     event.preventDefault();
     var action = target.getAttribute('data-action');
-    if (action === 'runtime-refresh') loadRuntime(true);
+    if (action === 'runtime-refresh') {
+      if (target.getAttribute('data-disabled') === 'true') return;
+      loadRuntime(true);
+    }
     if (action === 'refresh') refreshDesigner();
     if (action === 'new-template') newTemplate();
+    if (action === 'new-cmdb-build-view') newCmdbBuildViewTemplate();
     if (action === 'save-template') saveTemplate();
     if (action === 'validate-template') runDraftAction('validate');
     if (action === 'preview-template') runDraftAction('preview');
     if (action === 'visualize-editor') visualizeInEditor();
+    if (action === 'force-refresh-editor') forceRefreshInEditor();
     if (action === 'visualize-external') visualizeExternal();
     if (action === 'select-template') selectTemplate(target.getAttribute('data-code'));
     if (action === 'delete-template') deleteTemplate(target.getAttribute('data-code'));
@@ -7730,6 +8680,7 @@ function dynamicPagesClientScript() {
     if (action === 'apply-relation-expansion') applyRelationExpansionEditor();
     if (action === 'add-matching-rule-row') addMatchingRuleRow(target);
     if (action === 'clear-matching-rule-row') clearMatchingRuleRow(target);
+    if (action === 'apply-cmdb-build-view') applyCmdbBuildViewEditor();
     if (action === 'add-param-row') addParamRow();
     if (action === 'apply-params') applyParamsEditor();
     if (action === 'fill-param-examples') fillParamExamples();
@@ -7756,6 +8707,7 @@ function dynamicPagesClientScript() {
     if (action === 'apply-class-fallback') applyClassFallback();
     if (action === 'select-class') checkClassByName(target.getAttribute('data-class'));
     if (action === 'load-version') loadVersion(target.getAttribute('data-version'));
+    if (action === 'schema-preview') previewSchema();
     if (action === 'bootstrap-schema') bootstrapSchema();
     if (action === 'save-config') saveConfig();
     if (action === 'save-general-settings') saveGeneralSettings();
@@ -7946,8 +8898,10 @@ function baseAttributePayload(attribute, index) {
   return payload;
 }
 
-function buildTechnicalSchema(rootValue) {
+function buildTechnicalSchema(rootValue, options = {}) {
   const root = validateCmdbuildIdentifier(rootValue || DEFAULT_TECHNICAL_ROOT, 'root');
+  const rootParent = validateCmdbuildIdentifier(options.parent || options.rootParent || 'Class', 'schema parent');
+  const rootDescription = truncateText(options.description || options.rootDescription || 'CMDB Dynamic Pages technical root', 250);
   const prefix = getTechnicalPrefix(root);
   const classNames = {
     root,
@@ -7959,13 +8913,15 @@ function buildTechnicalSchema(rootValue) {
 
   return {
     root,
+    rootParent,
+    rootDescription,
     prefix,
     classNames,
     classes: [
       {
         name: classNames.root,
-        description: 'CMDB Dynamic Pages technical root',
-        parent: 'Class',
+        description: rootDescription,
+        parent: rootParent,
         prototype: true,
         attributes: []
       },
@@ -8056,6 +9012,13 @@ function hasSameOriginMutationHeaders(req) {
 
 function requireSameOriginMutation(req, res) {
   if (hasSameOriginMutationHeaders(req)) return true;
+  logWarn('security.same_origin_rejected', {
+    requestId: req.cmdpRequestId || '',
+    method: req.method || '',
+    path: sanitizeReqUrl(req),
+    origin: truncateText(req.headers.origin || '', 500),
+    referer: truncateText(req.headers.referer || '', 500)
+  });
   sendJson(res, 403, {
     success: false,
     message: 'State-changing custom API calls require a same-origin Origin or Referer header.'
@@ -8082,6 +9045,13 @@ function requireCsrfToken(req, res, authToken) {
   if (provided && timingSafeEqualString(provided, getCsrfToken(authToken))) {
     return true;
   }
+  logWarn('security.csrf_rejected', {
+    requestId: req.cmdpRequestId || '',
+    method: req.method || '',
+    path: sanitizeReqUrl(req),
+    hasToken: Boolean(provided),
+    hasCmdbuildCookie: Boolean(authToken)
+  });
   sendJson(res, 403, {
     success: false,
     message: 'State-changing custom API calls require a valid CSRF token.'
@@ -8534,6 +9504,7 @@ function buildListPath(basePath, requestUrl, defaults = {}) {
 function cmdbuildRequest(path, authToken, options = {}) {
   const target = new URL(path, CMDBUILD_ORIGIN);
   const body = options.body === undefined ? null : JSON.stringify(options.body);
+  const startedAt = Date.now();
   const headers = {
     accept: 'application/json',
     'CMDBuild-Authorization': authToken,
@@ -8563,15 +9534,32 @@ function cmdbuildRequest(path, authToken, options = {}) {
         } catch {
           json = null;
         }
-        resolve({
+        const result = {
           statusCode: res.statusCode || 0,
           ok: Boolean(res.statusCode && res.statusCode >= 200 && res.statusCode < 300),
           json,
           text
-        });
+        };
+        if (!result.ok && result.statusCode >= 500) {
+          logWarn('cmdbuild.request_failed', {
+            method: options.method || 'GET',
+            path: sanitizeRequestPath(target),
+            statusCode: result.statusCode,
+            durationMs: Date.now() - startedAt
+          });
+        }
+        resolve(result);
       });
     });
-    req.on('error', reject);
+    req.on('error', (error) => {
+      logError('cmdbuild.request_error', {
+        method: options.method || 'GET',
+        path: sanitizeRequestPath(target),
+        durationMs: Date.now() - startedAt,
+        error: error && error.message ? error.message : String(error)
+      });
+      reject(error);
+    });
     req.setTimeout(CMDBUILD_REQUEST_TIMEOUT_MS, () => {
       req.destroy(new Error(`CMDBuild request timed out after ${CMDBUILD_REQUEST_TIMEOUT_MS}ms.`));
     });
@@ -8582,12 +9570,140 @@ function cmdbuildRequest(path, authToken, options = {}) {
   });
 }
 
-async function checkOrCreateTechnicalSchema(authToken, root, createMissing) {
-  const schema = buildTechnicalSchema(root);
+function schemaParentFromInput(input, fallback = 'Class') {
+  const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  return source.parent || source.rootParent || source.superclass || source.superClass || fallback || 'Class';
+}
+
+function sanitizeExistingClassForSchema(classResponse) {
+  const data = classResponse && classResponse.json && classResponse.json.data ? classResponse.json.data : null;
+  if (!data) return null;
+  return {
+    name: data.name || '',
+    description: data._description_translation || data.description || '',
+    parent: data.parent || null,
+    prototype: data.prototype === undefined ? null : Boolean(data.prototype),
+    type: data.type || null,
+    active: data.active === undefined ? null : Boolean(data.active)
+  };
+}
+
+function sanitizeExistingAttributeForSchema(attributeResponse) {
+  const data = attributeResponse && attributeResponse.json && attributeResponse.json.data ? attributeResponse.json.data : null;
+  if (!data) return null;
+  return {
+    name: data.name || '',
+    description: data._description_translation || data.description || '',
+    type: data.type || null,
+    active: data.active === undefined ? null : Boolean(data.active),
+    inherited: data.inherited === undefined ? null : Boolean(data.inherited),
+    mandatory: data.mandatory === undefined ? null : Boolean(data.mandatory)
+  };
+}
+
+function addSchemaConflict(conflicts, item) {
+  conflicts.push({
+    severity: 'error',
+    destructiveUpdateRequired: true,
+    ...item
+  });
+}
+
+function compareClassDefinition(classDefinition, classResponse, conflicts) {
+  const existing = sanitizeExistingClassForSchema(classResponse);
+  if (!existing) return existing;
+  if (existing.parent && existing.parent !== classDefinition.parent) {
+    addSchemaConflict(conflicts, {
+      type: 'class',
+      name: classDefinition.name,
+      field: 'parent',
+      expected: classDefinition.parent,
+      actual: existing.parent,
+      reason: 'existing_class_parent_mismatch'
+    });
+  }
+  if (existing.prototype !== null && existing.prototype !== Boolean(classDefinition.prototype)) {
+    addSchemaConflict(conflicts, {
+      type: 'class',
+      name: classDefinition.name,
+      field: 'prototype',
+      expected: Boolean(classDefinition.prototype),
+      actual: existing.prototype,
+      reason: 'existing_class_prototype_mismatch'
+    });
+  }
+  return existing;
+}
+
+function compareAttributeDefinition(classDefinition, attribute, attrResponse, conflicts) {
+  const existing = sanitizeExistingAttributeForSchema(attrResponse);
+  if (!existing) return existing;
+  if (existing.type && existing.type !== attribute.type) {
+    addSchemaConflict(conflicts, {
+      type: 'attribute',
+      className: classDefinition.name,
+      name: attribute.name,
+      field: 'type',
+      expected: attribute.type,
+      actual: existing.type,
+      reason: 'existing_attribute_type_mismatch'
+    });
+  }
+  return existing;
+}
+
+function technicalSchemaPlanSummary(schema, actions, conflicts) {
+  const creates = actions.filter((item) => item.action === 'create' || item.action === 'created').length;
+  const failures = actions.filter((item) => String(item.action || '').endsWith('_failed')).length;
+  return {
+    classCount: schema.classes.length,
+    attributeCount: schema.classes.reduce((count, item) => count + (Array.isArray(item.attributes) ? item.attributes.length : 0), 0),
+    plannedCreates: creates,
+    conflicts: conflicts.length,
+    failures,
+    destructiveUpdates: conflicts.filter((item) => item.destructiveUpdateRequired).length
+  };
+}
+
+async function listTechnicalSchemaParents(authToken, requestUrl) {
+  const maxClasses = getPositiveInt(requestUrl.searchParams, 'limit', 200, ABSOLUTE_EXECUTION_LIMITS.maxClasses);
+  const classesResponse = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes?limit=${maxClasses}&detailed=true`, authToken);
+  const data = Array.isArray(classesResponse.json && classesResponse.json.data)
+    ? classesResponse.json.data.map(sanitizeClass).filter(Boolean).filter((item) => item.active !== false)
+    : [];
+  const parents = [{ name: 'Class', description: 'CMDBuild root class', parent: null, prototype: true }]
+    .concat(data)
+    .filter((item, index, arr) => item.name && arr.findIndex((candidate) => candidate.name === item.name) === index)
+    .sort((left, right) => String(left.name).localeCompare(String(right.name)));
+  return {
+    success: classesResponse.ok,
+    cmdbuildStatus: classesResponse.statusCode,
+    parents
+  };
+}
+
+async function checkOrCreateTechnicalSchema(authToken, root, createMissing, options = {}) {
+  if (createMissing) {
+    const preview = await checkOrCreateTechnicalSchema(authToken, root, false, options);
+    if ((preview.conflicts && preview.conflicts.length) || (preview.inaccessible && preview.inaccessible.length) || (preview.errors && preview.errors.length)) {
+      return {
+        ...preview,
+        createMissing: true,
+        mode: 'bootstrap',
+        ready: false,
+        destructiveUpdatesAllowed: false
+      };
+    }
+  }
+  const schema = buildTechnicalSchema(root, {
+    parent: schemaParentFromInput(options),
+    description: options.description || options.rootDescription || ''
+  });
   const actions = [];
   const missing = [];
   const inaccessible = [];
   const errors = [];
+  const conflicts = [];
   const classes = [];
 
   const addSchemaProblem = (target, item) => {
@@ -8610,6 +9726,7 @@ async function checkOrCreateTechnicalSchema(authToken, root, createMissing) {
     let classResponse = await cmdbuildRequest(classPath, authToken);
     let classExists = classResponse.ok;
     let classCreated = false;
+    let existingClass = classExists ? compareClassDefinition(classDefinition, classResponse, conflicts) : null;
 
     if (!classExists && createMissing) {
       const createResponse = await cmdbuildRequest('/cmdbuild/services/rest/v3/classes/', authToken, {
@@ -8625,6 +9742,14 @@ async function checkOrCreateTechnicalSchema(authToken, root, createMissing) {
       classResponse = createResponse;
       classExists = createResponse.ok;
       classCreated = createResponse.ok;
+      existingClass = classExists ? sanitizeExistingClassForSchema(createResponse) : null;
+    } else if (!classExists && !createMissing && classResponse.statusCode === 404) {
+      actions.push({
+        type: 'class',
+        name: classDefinition.name,
+        action: 'create',
+        parent: classDefinition.parent
+      });
     }
 
     if (!classExists) {
@@ -8643,6 +9768,7 @@ async function checkOrCreateTechnicalSchema(authToken, root, createMissing) {
       exists: classExists,
       created: classCreated,
       cmdbuildStatus: classResponse.statusCode,
+      existing: existingClass,
       attributes: []
     };
 
@@ -8653,6 +9779,7 @@ async function checkOrCreateTechnicalSchema(authToken, root, createMissing) {
         let attrResponse = await cmdbuildRequest(attrPath, authToken);
         let attrExists = attrResponse.ok;
         let attrCreated = false;
+        let existingAttribute = attrExists ? compareAttributeDefinition(classDefinition, attribute, attrResponse, conflicts) : null;
 
         if (!attrExists && createMissing) {
           const createAttrResponse = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(classDefinition.name)}/attributes`, authToken, {
@@ -8669,6 +9796,14 @@ async function checkOrCreateTechnicalSchema(authToken, root, createMissing) {
           attrResponse = createAttrResponse;
           attrExists = createAttrResponse.ok;
           attrCreated = createAttrResponse.ok;
+          existingAttribute = attrExists ? sanitizeExistingAttributeForSchema(createAttrResponse) : null;
+        } else if (!attrExists && !createMissing && attrResponse.statusCode === 404) {
+          actions.push({
+            type: 'attribute',
+            className: classDefinition.name,
+            name: attribute.name,
+            action: 'create'
+          });
         }
 
         if (!attrExists) {
@@ -8686,7 +9821,8 @@ async function checkOrCreateTechnicalSchema(authToken, root, createMissing) {
           type: attribute.type,
           exists: attrExists,
           created: attrCreated,
-          cmdbuildStatus: attrResponse.statusCode
+          cmdbuildStatus: attrResponse.statusCode,
+          existing: existingAttribute
         });
         index += 10;
       }
@@ -8697,21 +9833,29 @@ async function checkOrCreateTechnicalSchema(authToken, root, createMissing) {
 
   return {
     root: schema.root,
+    rootParent: schema.rootParent,
+    rootDescription: schema.rootDescription,
     prefix: schema.prefix,
     classNames: schema.classNames,
-    ready: missing.length === 0 && inaccessible.length === 0 && errors.length === 0,
-    status: missing.length === 0 && inaccessible.length === 0 && errors.length === 0
+    ready: missing.length === 0 && inaccessible.length === 0 && errors.length === 0 && conflicts.length === 0,
+    status: missing.length === 0 && inaccessible.length === 0 && errors.length === 0 && conflicts.length === 0
       ? 'ready'
       : inaccessible.length > 0
         ? 'inaccessible'
         : missing.length > 0
           ? 'missing'
-          : 'error',
+          : conflicts.length > 0
+            ? 'conflict'
+            : 'error',
     createMissing,
+    mode: createMissing ? 'bootstrap' : 'preview',
+    destructiveUpdatesAllowed: false,
     missing,
     inaccessible,
     errors,
+    conflicts,
     actions,
+    summary: technicalSchemaPlanSummary(schema, actions, conflicts),
     classes
   };
 }
@@ -8759,17 +9903,27 @@ function cmdbuildJsonAttribute(value, fallback = {}) {
 
 function sanitizeTemplateCard(card) {
   if (!card) return null;
+  const spec = safeJsonValue(card.SpecJson, null);
+  const code = card.Code || '';
   return {
     id: card._id,
-    code: card.Code || '',
+    code,
     description: card.Description || '',
     active: card.Active === undefined ? null : Boolean(card.Active),
-    spec: safeJsonValue(card.SpecJson, null),
+    spec,
     paramsSchema: safeJsonValue(card.ParamsSchemaJson, null),
     resultSchema: safeJsonValue(card.ResultSchemaJson, null),
     owner: card.Owner || '',
-    updatedAt: card.UpdatedAt || null
+    updatedAt: card.UpdatedAt || null,
+    protected: templateIsProtected({ code, spec })
   };
+}
+
+function templateIsProtected(template) {
+  const code = template && (template.code || template.Code) || '';
+  const spec = template && template.spec || template && safeJsonValue(template.SpecJson, null);
+  return code === DEFAULT_CMDB_BUILD_VIEW_CODE
+    || Boolean(spec && (spec.protected === true || spec.system === true || spec.system && spec.system.protected === true));
 }
 
 function sanitizeTemplateVersionCard(card) {
@@ -9435,6 +10589,34 @@ async function probeTemplateAccess(authToken, spec, params, executionOptions, de
   };
   const effectiveParams = applyTemplateParamDefaults(spec, params);
   const cmdbuildExecRequest = createExecutionRequest(authToken, limits);
+  if (isCmdbBuildViewSpec(spec)) {
+    const viewConfig = normalizeCmdbBuildViewConfig(spec, effectiveParams);
+    const probes = [
+      '/cmdbuild/services/rest/v3/classes?limit=1&detailed=true'
+    ];
+    if (viewConfig.sections.includes('domains')) probes.push('/cmdbuild/services/rest/v3/domains?limit=1');
+    if (viewConfig.sections.includes('lookups')) probes.push('/cmdbuild/services/rest/v3/lookup_types?limit=1');
+    for (const probePath of probes) {
+      const probe = await cmdbuildExecRequest(probePath);
+      if (!probe.ok) {
+        return {
+          ok: false,
+          mode: config.scopeMode,
+          cmdbuildStatus: probe.statusCode || 403,
+          message: `CMDBuild model view cache probe failed with status ${probe.statusCode || 0}.`,
+          checkedClasses: viewConfig.rootClass ? [viewConfig.rootClass] : [],
+          incomplete: true
+        };
+      }
+    }
+    return {
+      ok: true,
+      mode: config.scopeMode,
+      visibilityHash: '',
+      checkedClasses: viewConfig.rootClass ? [viewConfig.rootClass] : [],
+      incomplete: false
+    };
+  }
   const classesCache = { loaded: false, classes: [], ok: false };
   const resolvedClassCache = new Map();
   const visibilityIds = config.scopeMode === 'visibilityHash' ? [] : null;
@@ -9522,10 +10704,11 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
   const refreshCooldownMs = runtimeCacheConfig.refreshCooldownSec * 1000;
   const keyParts = runtimeCacheKeyParts(root, template, params, sessionData, executionOptions, runtimeCacheConfig, templateCacheConfig, dependencyMap, accessProbe);
   const refreshRequested = Boolean(options.refreshRequested);
+  const forceRefreshRequested = Boolean(options.forceRefreshRequested);
   const cached = await cacheGetJson('runtime', keyParts.key, runtimeResultCache);
   let entry = cached.value;
 
-  if (entry && refreshRequested && templateCacheConfig.allowManualRefresh === false && entry.expiresAt > now) {
+  if (entry && refreshRequested && !forceRefreshRequested && templateCacheConfig.allowManualRefresh === false && entry.expiresAt > now) {
     entry.lastServedAt = now;
     const remainingTtlMs = Math.max(1, entry.expiresAt - now);
     await cacheSetJson('runtime', keyParts.key, entry, remainingTtlMs, runtimeResultCache);
@@ -9538,7 +10721,7 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
     };
   }
 
-  if (entry && refreshRequested && now < (entry.lastServedAt || entry.createdAt) + refreshCooldownMs) {
+  if (entry && refreshRequested && !forceRefreshRequested && now < (entry.lastServedAt || entry.createdAt) + refreshCooldownMs) {
     return {
       result: cloneJsonValueServer(entry.result, { tables: [] }),
       cache: runtimeCacheMeta(entry, 'refresh-wait', now, {
@@ -9608,7 +10791,7 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
     entry = await promise;
     return {
       result: cloneJsonValueServer(entry.result, { tables: [] }),
-      cache: runtimeCacheMeta(entry, refreshRequested ? 'refresh' : 'miss', Date.now(), { backend: entry.cacheBackend || 'memory' })
+      cache: runtimeCacheMeta(entry, forceRefreshRequested ? 'force-refresh' : (refreshRequested ? 'refresh' : 'miss'), Date.now(), { backend: entry.cacheBackend || 'memory' })
     };
   } finally {
     runtimeResultInFlight.delete(keyParts.key);
@@ -9637,7 +10820,7 @@ function staticSnapshotKey(templateCode, params, publishConfig) {
 function publicSnapshotParamsFromUrl(requestUrl) {
   const params = {};
   requestUrl.searchParams.forEach((value, key) => {
-    if (key === 'lang' || key === 'cmdpLang' || key === 'refresh' || key === 'noCache') return;
+    if (key === 'lang' || key === 'cmdpLang' || key === 'refresh' || key === 'noCache' || key === 'forceRefresh' || key === 'bypassRefreshCooldown') return;
     params[key] = value;
   });
   return params;
@@ -9947,6 +11130,13 @@ function validateTemplateSpec(spec) {
         }
       });
     }
+  }
+  if (spec.kind !== undefined && spec.kind !== CMDB_BUILD_VIEW_KIND && spec.kind !== 'dsl') {
+    errors.push({ path: '$.kind', message: `Template kind must be dsl or ${CMDB_BUILD_VIEW_KIND}.` });
+  }
+  if (isCmdbBuildViewSpec(spec)) {
+    errors.push(...validateCmdbBuildViewSpec(spec));
+    return errors;
   }
   if (!Array.isArray(spec.steps) || spec.steps.length === 0) {
     errors.push({ path: '$.steps', message: 'Template spec must contain at least one step.' });
@@ -12172,6 +13362,9 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
   };
   const context = {};
   const cmdbuildExecRequest = createExecutionRequest(authToken, limits);
+  if (isCmdbBuildViewSpec(spec)) {
+    return executeCmdbBuildViewSpec(cmdbuildExecRequest, spec, effectiveParams, { limits });
+  }
   const dependencyMap = options.dependencyMap || dependencyMapWithHash(spec);
   const trace = [];
 
@@ -12360,6 +13553,15 @@ async function handleBackend(req, res, requestUrl) {
     sendJson(res, 200, {
       success: true,
       data: proxyLogs
+    });
+    return;
+  }
+
+  if (requestUrl.pathname === `${BACKEND_PREFIX}/logging/status`) {
+    if (!methodAllowed(req, res, 'GET')) return;
+    sendJson(res, 200, {
+      success: true,
+      logging: loggingStatus()
     });
     return;
   }
@@ -12574,7 +13776,31 @@ async function handleBackend(req, res, requestUrl) {
       return;
     }
     const root = requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
-    const schema = await checkOrCreateTechnicalSchema(authToken, root, false);
+    const parent = requestUrl.searchParams.get('parent') || requestUrl.searchParams.get('rootParent') || requestUrl.searchParams.get('superclass') || 'Class';
+    const description = requestUrl.searchParams.get('description') || '';
+    const schema = await checkOrCreateTechnicalSchema(authToken, root, false, { parent, description });
+    sendJson(res, 200, {
+      success: true,
+      schema
+    });
+    return;
+  }
+
+  if (requestUrl.pathname === `${BACKEND_PREFIX}/schema/parents`) {
+    if (!methodAllowed(req, res, 'GET')) return;
+    const parents = await listTechnicalSchemaParents(authToken, requestUrl);
+    sendJson(res, parents.success ? 200 : 502, parents);
+    return;
+  }
+
+  if (requestUrl.pathname === `${BACKEND_PREFIX}/schema/preview`) {
+    if (!methodAllowed(req, res, 'POST')) return;
+    if (!requireStateChangingRequest(req, res, authToken)) return;
+    const body = await readJsonBody(req);
+    const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
+    const parent = schemaParentFromInput(body, requestUrl.searchParams.get('parent') || 'Class');
+    const description = body.description || body.rootDescription || requestUrl.searchParams.get('description') || '';
+    const schema = await checkOrCreateTechnicalSchema(authToken, root, false, { parent, description });
     sendJson(res, 200, {
       success: true,
       schema
@@ -12588,7 +13814,9 @@ async function handleBackend(req, res, requestUrl) {
     if (!(await requireAdminClassesModify(authToken, res))) return;
     const body = await readJsonBody(req);
     const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
-    const schema = await checkOrCreateTechnicalSchema(authToken, root, true);
+    const parent = schemaParentFromInput(body, requestUrl.searchParams.get('parent') || 'Class');
+    const description = body.description || body.rootDescription || requestUrl.searchParams.get('description') || '';
+    const schema = await checkOrCreateTechnicalSchema(authToken, root, true, { parent, description });
     sendJson(res, schema.ready ? 200 : 502, {
       success: schema.ready,
       schema
@@ -12828,6 +14056,13 @@ async function handleBackend(req, res, requestUrl) {
       const versionLog = created.ok
         ? await writeTemplateVersion(authToken, existing.schema.root, payload.Code, safeJsonValue(payload.SpecJson, null), session.data && session.data.username, body.changeComment || 'create')
         : null;
+      logInfo(created.ok ? 'template.created' : 'template.create_failed', {
+        requestId: req.cmdpRequestId || '',
+        templateCode: payload.Code,
+        username: session.data && session.data.username || '',
+        cmdbuildStatus: created.statusCode,
+        versionLogged: Boolean(versionLog)
+      });
       sendJson(res, created.ok ? 201 : 502, {
         success: created.ok,
         cmdbuildStatus: created.statusCode,
@@ -12965,7 +14200,12 @@ async function handleBackend(req, res, requestUrl) {
         maxTraversalDepthMax: executionLimits.maxTraversalDepthMax
       };
       const cacheDisabled = requestUrl.searchParams.get('noCache') === '1' || body.noCache === true;
-      const refreshRequested = requestUrl.searchParams.get('refresh') === '1' || body.refresh === true;
+      const forceRefreshRequested = !runtimeReadOnly && (
+        requestUrl.searchParams.get('forceRefresh') === '1' ||
+        body.forceRefresh === true ||
+        body.bypassRefreshCooldown === true
+      );
+      const refreshRequested = forceRefreshRequested || requestUrl.searchParams.get('refresh') === '1' || body.refresh === true;
       let result;
       let auditLog;
       let cache = null;
@@ -12988,6 +14228,15 @@ async function handleBackend(req, res, requestUrl) {
           status: lookup.snapshot ? 'snapshot-hit' : 'snapshot-miss',
           rowsCount: countResultRows(result),
           errorMessage: ''
+        });
+        logInfo(lookup.snapshot ? 'snapshot.hit' : 'snapshot.miss', {
+          requestId: req.cmdpRequestId || '',
+          templateCode: template.code,
+          username,
+          rowsCount: countResultRows(result),
+          backend: lookup.backend,
+          key: lookup.key,
+          paramsMode: publishConfig.paramsMode || 'exact'
         });
         sendJson(res, 200, {
           success: true,
@@ -13035,13 +14284,35 @@ async function handleBackend(req, res, requestUrl) {
             paramsHash: snapshot.paramsHash,
             specHash: snapshot.specHash
           }, 'snapshot-published', snapshot.backend, snapshot.key);
+          logInfo('snapshot.published', {
+            requestId: req.cmdpRequestId || '',
+            templateCode: template.code,
+            username,
+            rowsCount: countResultRows(result),
+            backend: snapshot.backend,
+            key: snapshot.key,
+            paramsMode: publishConfig.paramsMode || 'exact'
+          });
         } else if (templateAction === 'run' && !cacheDisabled) {
           const cached = await executeTemplateRunWithCache(authToken, root, template, params, session.data, executionOptions, {
             refreshRequested,
+            forceRefreshRequested,
             runtimeCacheConfig
           });
           result = cached.result;
           cache = cached.cache;
+          logInfo('runtime.cache_result', {
+            requestId: req.cmdpRequestId || '',
+            templateCode: template.code,
+            username,
+            status: cache && cache.status || '',
+            scope: cache && cache.scope || '',
+            scopeMode: cache && cache.scopeMode || '',
+            backend: cache && cache.backend || '',
+            rowsCount: countResultRows(result),
+            refreshRequested: Boolean(refreshRequested),
+            forceRefreshRequested: Boolean(forceRefreshRequested)
+          });
         } else {
           result = await executeTemplateSpec(authToken, template.spec, params, executionOptions);
         }
@@ -13057,6 +14328,14 @@ async function handleBackend(req, res, requestUrl) {
           status: 'error',
           rowsCount: 0,
           errorMessage: error && error.message ? error.message : String(error)
+        });
+        logWarn('template.execution_failed', {
+          requestId: req.cmdpRequestId || '',
+          action: templateAction,
+          templateCode: template.code,
+          username,
+          permissionDenied,
+          error: error && error.message ? error.message : String(error)
         });
         sendJson(res, permissionDenied ? 403 : 400, {
           success: false,
@@ -13082,6 +14361,17 @@ async function handleBackend(req, res, requestUrl) {
         rowsCount: countResultRows(result),
         errorMessage: ''
       });
+      if (templateAction === 'run' || templateAction === 'preview') {
+        logInfo('template.executed', {
+          requestId: req.cmdpRequestId || '',
+          action: templateAction,
+          templateCode: template.code,
+          username,
+          rowsCount: countResultRows(result),
+          cacheStatus: cache && cache.status || (cacheDisabled ? 'disabled' : ''),
+          auditLogged: Boolean(auditLog)
+        });
+      }
       sendJson(res, 200, {
         success: true,
         action: templateAction,
@@ -13122,6 +14412,15 @@ async function handleBackend(req, res, requestUrl) {
         });
         return;
       }
+      const protectedTemplate = sanitizeTemplateCard(found.card);
+      if (protectedTemplate && protectedTemplate.protected) {
+        sendJson(res, 403, {
+          success: false,
+          message: `Template ${templateCode} is protected and cannot be deleted.`,
+          template: protectedTemplate
+        });
+        return;
+      }
       const cardId = found.card._id || found.card.Id || found.card.id;
       if (!cardId) {
         sendJson(res, 502, {
@@ -13134,6 +14433,11 @@ async function handleBackend(req, res, requestUrl) {
       }
       const deleted = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(found.schema.classNames.template)}/cards/${encodeURIComponent(cardId)}`, authToken, {
         method: 'DELETE'
+      });
+      logInfo(deleted.ok ? 'template.deleted' : 'template.delete_failed', {
+        requestId: req.cmdpRequestId || '',
+        templateCode,
+        cmdbuildStatus: deleted.statusCode
       });
       sendJson(res, deleted.ok ? 200 : 502, {
         success: deleted.ok,
@@ -13221,6 +14525,13 @@ async function handleBackend(req, res, requestUrl) {
       const versionLog = updated.ok
         ? await writeTemplateVersion(authToken, found.schema.root, payload.Code, safeJsonValue(payload.SpecJson, null), session.data && session.data.username, body.changeComment || 'update')
         : null;
+      logInfo(updated.ok ? 'template.updated' : 'template.update_failed', {
+        requestId: req.cmdpRequestId || '',
+        templateCode: payload.Code,
+        username: session.data && session.data.username || '',
+        cmdbuildStatus: updated.statusCode,
+        versionLogged: Boolean(versionLog)
+      });
       sendJson(res, updated.ok ? 200 : 502, {
         success: updated.ok,
         cmdbuildStatus: updated.statusCode,
@@ -13283,13 +14594,13 @@ async function handleDynamicPagesUi(req, res, requestUrl) {
       }));
       return;
     }
-    sendHtml(res, 401, `<!doctype html><html><head><meta charset="utf-8"><title>CMDB Dynamic Pages</title></head><body style="font-family:Arial,sans-serif;padding:24px"><h1>CMDB Dynamic Pages</h1><p>CMDBuild session cookie was not sent. Open CMDBuild through the proxy and log in first.</p><p><a href="/cmdbuild/ui/#custompages/CmdbDynamicPages">Open CMDBuild custom page</a></p></body></html>`);
+    sendHtml(res, 401, `<!doctype html><html><head><meta charset="utf-8"><title>CMDB Dynamic Pages</title></head><body style="font-family:Arial,sans-serif;padding:24px"><h1>CMDB Dynamic Pages</h1><p>CMDBuild session cookie was not sent. Open CMDBuild through the proxy and log in first.</p><p><a href="/cmdbuild/ui/?cmdpMode=designer#custompages/CmdbDynamicPages">Open CMDBuild custom page</a></p><p><a href="/cmdbuild/dynamicpages/ui/designer">Open Designer directly</a></p></body></html>`);
     return;
   }
 
   const session = await getSessionData(authToken);
   if (!session.response.ok || !session.data) {
-    sendHtml(res, 401, `<!doctype html><html><head><meta charset="utf-8"><title>CMDB Dynamic Pages</title></head><body style="font-family:Arial,sans-serif;padding:24px"><h1>CMDB Dynamic Pages</h1><p>CMDBuild session is not valid.</p><p><a href="/cmdbuild/ui/#custompages/CmdbDynamicPages">Open CMDBuild custom page</a></p></body></html>`);
+    sendHtml(res, 401, `<!doctype html><html><head><meta charset="utf-8"><title>CMDB Dynamic Pages</title></head><body style="font-family:Arial,sans-serif;padding:24px"><h1>CMDB Dynamic Pages</h1><p>CMDBuild session is not valid.</p><p><a href="/cmdbuild/ui/?cmdpMode=designer#custompages/CmdbDynamicPages">Open CMDBuild custom page</a></p><p><a href="/cmdbuild/dynamicpages/ui/designer">Open Designer directly</a></p></body></html>`);
     return;
   }
 
@@ -13381,6 +14692,7 @@ function proxyToCmdbuild(req, res, requestUrl) {
 
 const server = http.createServer((req, res) => {
   const requestUrl = new URL(req.url || '/', `http://${req.headers.host || `${LISTEN_HOST}:${LISTEN_PORT}`}`);
+  attachHttpRequestLogging(req, res, requestUrl);
   if (isHealthPath(requestUrl.pathname)) {
     handleHealth(req, res, requestUrl).catch((error) => {
       sendJson(res, 503, {
@@ -13410,8 +14722,51 @@ const server = http.createServer((req, res) => {
   proxyToCmdbuild(req, res, requestUrl);
 });
 
-server.listen(LISTEN_PORT, LISTEN_HOST, () => {
-  console.log(`cmdbdynamicpages dev proxy listening at http://${LISTEN_HOST}:${LISTEN_PORT}`);
-  console.log(`Proxy target: ${CMDBUILD_ORIGIN}`);
-  console.log(`Backend prefix: ${BACKEND_PREFIX}`);
+server.on('error', (error) => {
+  logError('app.listen_failed', {
+    listen: `http://${LISTEN_HOST}:${LISTEN_PORT}`,
+    error: error && error.message ? error.message : String(error)
+  });
+  process.exitCode = 1;
 });
+
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isMainModule) {
+  server.listen(LISTEN_PORT, LISTEN_HOST, () => {
+    logInfo('app.started', {
+      listen: `http://${LISTEN_HOST}:${LISTEN_PORT}`,
+      cmdbuildOrigin: CMDBUILD_ORIGIN,
+      backendPrefix: BACKEND_PREFIX,
+      logging: loggingStatus(),
+      redis: {
+        enabled: REDIS_ENABLED,
+        url: sanitizeRedisUrl(REDIS_URL),
+        keyPrefix: REDIS_KEY_PREFIX
+      }
+    });
+  });
+}
+
+export {
+  DEFAULT_TEMPLATE_CACHE_TTL_SEC,
+  applyTemplateParamDefaults,
+  buildTechnicalSchema,
+  defaultRuntimeConfig,
+  dependencyMapWithHash,
+  ipv4ValueMatches,
+  loggingStatus,
+  normalizeLogFormat,
+  normalizeLogLevel,
+  normalizeLogTargets,
+  normalizeRuntimeCacheConfig,
+  normalizeTemplateCacheConfig,
+  parseNameSet,
+  publicSnapshotParamsFromUrl,
+  redactByName,
+  renderRuntimeParamTemplate,
+  runtimeCacheKeyParts,
+  runtimeCacheMeta,
+  sanitizeRequestPath,
+  schemaParentFromInput
+};

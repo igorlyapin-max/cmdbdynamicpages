@@ -26,6 +26,7 @@
 - Designer поддерживает русский/английский язык.
 - Designer открывает список шаблонов без авто-выбора первого шаблона.
 - Designer умеет создавать шаблон, копировать из существующего, редактировать входные переменные, `ВыборкаX`, сопоставление, итоговые данные, визуализацию, кэширование и прогон.
+- Designer содержит раздел `Схема` для первого запуска: root, описание, родительский суперкласс, preview и non-destructive bootstrap.
 - Каталог CMDBuild кэшируется на клиенте; светофор каталога показывает freshness и запускает sync.
 - Runtime table sorting и text filtering выполняются на клиенте без повторного обращения к серверу.
 - Row grouping отключает сортировку/фильтры, потому что merged cells требуют стабильного порядка строк.
@@ -44,6 +45,8 @@
 
 - Нет оставшихся core implementation задач.
 - Примеры шаблонов ведутся отдельно от roadmap.
+- Глубокие Playwright Runtime table проверки для client-side search/sort и grouped table behavior пока не реализованы.
+- Browser-level проверка iframe внутри реальной wiki page запланирована, когда появится стабильная тестовая страница локальной wiki.
 
 ## 1. Проверка ролей и групп CMDBuild
 
@@ -141,6 +144,12 @@
 ## 9. End-to-end проверки
 
 - [x] `npm run check`
+- [x] `npm test`
+- [x] `npm run test:static`
+- [x] `npm run test:unit`
+- [x] `npm run test:api`
+- [x] `npm run test:ui`
+- [x] `npm run test:nginx`
 - [x] `npm run diag`
 - [x] `npm run e2e`
 - [x] `npm run e2e:write`

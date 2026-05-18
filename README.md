@@ -7,6 +7,8 @@ The project has two target scenarios:
 - a designer UI for preparing and storing query templates as JSON in CMDBuild technical classes;
 - a runtime UI that opens a template from the CMDBuild custom page URL and renders the result as tables, using the current user's CMDBuild permissions.
 
+Step-by-step deployment guide: [docs/deployment-guide.md](docs/deployment-guide.md).
+
 ## Current Architecture
 
 The current implementation keeps CMDBuild custom page code intentionally small:
@@ -64,13 +66,36 @@ Run self-diagnostics:
 npm run diag
 ```
 
+Run local non-CMDBuild checks:
+
+```bash
+npm test
+npm run test:static
+npm run test:unit
+npm run test:ui
+```
+
+`test:static` validates required OpenAPI paths, local component `$ref` references, and links between architecture artifacts in `aa/`. `test:unit` uses the built-in Node.js test runner and covers cache key behavior, refresh metadata, parameter defaults, IPv4 matching, dependency maps, and log redaction. `test:ui` is a skip-safe Playwright browser smoke; it runs only when Playwright is installed and a valid CMDBuild session cookie is available.
+
 Run the backend smoke/e2e check against the local proxy:
 
 ```bash
 npm run e2e
 ```
 
-The e2e check verifies session, technical schema readiness, CSRF rejection, draft validate/preview, relation expansion, multi-hop relation chains, value search, group comparison, Runtime shell loading, and saved-template `run`. Direct saved-template `POST run` writes a normal best-effort execution audit card in CMDBuild; iframe/runtime UI uses read-only `GET run` and does not require CSRF.
+The e2e check verifies session, logging diagnostics, technical schema readiness, CSRF rejection, draft validate/preview without runtime cache, relation expansion, multi-hop relation chains, value search, group comparison, Runtime shell loading, saved-template `run`, cache hit, POST `forceRefresh`, and that read-only GET runtime cannot force refresh. Direct saved-template `POST run` writes a normal best-effort execution audit card in CMDBuild; iframe/runtime UI uses read-only `GET run` and does not require CSRF.
+
+Optional API contract smoke tests can run against a started proxy:
+
+```bash
+npm run test:api
+```
+
+Run same-origin nginx/wiki iframe checks after starting nginx:
+
+```bash
+npm run test:nginx
+```
 
 Run the write workflow e2e check:
 
@@ -197,7 +222,8 @@ http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/run/ProbeClassesByAttributeType?a
 The direct runtime page renders only the final result tables, without Designer chrome or diagnostic parameters.
 Use the same URL as a normal link or as an iframe source. Dynamic templates require a valid CMDBuild session cookie through the proxy. Published static snapshots can be served without that cookie because the runtime reads only Redis snapshot data and does not execute CMDBuild business-data requests.
 Runtime template execution uses a Redis-backed cache with in-memory fallback when Redis is unavailable in dev. Cache behavior is controlled by each template in `spec.cache`; the default mode is `permissionOnly`, which shares a result inside the same endpoint/template/params after the viewer passes a lightweight probe for the classes and attributes actually used by the template. This default assumes row-level CMDBuild scope is not different between users. Use `visibilityHash` when row-level scope can differ, or `privateUser` when the cache must stay isolated by CMDBuild user/session scope. The executor builds a used-field dependency map and avoids materializing unrelated card attributes in `selectCards`.
-Cache TTL is a template setting. Manual refresh cooldown is a system Runtime setting stored in `Cst_QueryToolConfig.RuntimeConfigJson.runtimeCache.refreshCooldownSec`. The runtime page shows cache age/expiry, a countdown to the next allowed refresh, and a refresh button when the template allows manual refresh.
+Cache TTL is a template setting. Manual refresh cooldown is a system Runtime setting stored in `Cst_QueryToolConfig.RuntimeConfigJson.runtimeCache.refreshCooldownSec`. The runtime page keeps cache controls compact: the table header shows the title on the left and search plus a `⟳` refresh icon on the right; the icon tooltip contains cache age/expiry, refresh countdown, backend, and scope details.
+Designer preview is separate from the saved runtime cache: `Visualize in editor` runs `/draft/preview` against the current draft and does not read the final runtime result cache. The Run page also has `Refresh cache and show`, which calls saved-template `POST run` with `forceRefresh=true`; this rebuilds the runtime cache without the user refresh cooldown and requires CSRF, so iframe/read-only `GET run` cannot bypass the timer.
 For cross-origin iframe experiments, the dev reverse proxy can rewrite CMDBuild `Set-Cookie` headers with `CMDBDYNAMIC_PROXY_COOKIE_SAMESITE=None` and `CMDBDYNAMIC_PROXY_COOKIE_SECURE=true`. The recommended local iframe setup is the nginx same-origin proxy below, so this rewrite is normally not needed.
 
 Redis dev helper:
@@ -323,6 +349,7 @@ Production health/readiness endpoints are unauthenticated and are also available
 - `GET /health/redis` performs a strict Redis `PING` and returns `503` when Redis is disabled or unavailable.
 - `GET /health/ready` checks process, Redis, and the CMDBuild upstream. It returns `503` if Redis is required and unavailable, or if CMDBuild is not reachable.
 - `GET /cmdbuild/custom-api/cache/status` remains a diagnostic endpoint: it reports Redis visibility and memory fallback counters, but it intentionally returns `200` even when the app has fallen back to memory.
+- `GET /cmdbuild/custom-api/logging/status` returns the active log level, target and redaction settings without secrets.
 
 Readiness configuration:
 
@@ -332,6 +359,30 @@ CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=true
 ```
 
 `CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=false` can be used for local/dev operation without Redis. Production should keep Redis required when runtime cache and static snapshots are part of the service contract.
+
+## Logging
+
+The backend writes structured operational logs. Docker deployments should keep the default `stdout` target and let Docker, Filebeat, Fluent Bit or Logstash forward the stream to ELK. The application does not write directly to Elasticsearch.
+
+```text
+CMDP_LOG_LEVEL=info
+CMDP_LOG_FORMAT=json
+CMDP_LOG_TARGET=stdout
+CMDP_LOG_REDACT_HEADERS=cookie,authorization,cmdbuild-authorization,x-csrf-token,x-cmdbdynamicpages-csrf,set-cookie
+CMDP_LOG_REDACT_QUERY=password,passwd,pwd,token,secret,authorization,auth,csrf,x-cmdbdynamicpages-csrf
+```
+
+Syslog output is optional for VM/bare-metal deployments or SIEM integration:
+
+```text
+CMDP_LOG_TARGET=syslog
+CMDP_SYSLOG_HOST=127.0.0.1
+CMDP_SYSLOG_PORT=514
+CMDP_SYSLOG_PROTOCOL=udp
+CMDP_SYSLOG_FACILITY=local0
+```
+
+`CMDP_LOG_TARGET=stdout,syslog` can be used when both outputs are required. Logged events include request completion, CSRF/same-origin rejection, Redis availability changes, CMDBuild upstream errors, runtime cache status, static snapshot publish/hit/miss, and template create/update/delete. Cookies, authorization headers, CSRF tokens and configured secret-like query parameters are redacted; runtime result rows and CMDBuild card payloads are not logged.
 
 Important: URL routes after `#` are client-side only. CMDBuild may also normalize extra path segments after the custom page name. The preferred entry points are the direct `/cmdbuild/dynamicpages/ui/*` URLs. Use `cmdpMode` and `cmdpTemplate` query parameters before `#` only when entering through the CMDBuild custom page launcher.
 
@@ -506,7 +557,7 @@ Templates can also define runtime-cache behavior:
 
 `ttlSeconds` defines how long this template result is kept in cache; the Designer edits it in hours and defaults new templates to 8 hours. Refresh cooldown is not stored in the template; it is the system setting `runtimeCache.refreshCooldownSec`. `permissionOnly` is the default endpoint-shared mode. It probes only the CMDBuild classes and attributes that the template actually uses in filters, matching, final data, and visualization. `visibilityHash` additionally hashes visible card ids before sharing a cached result. `privateUser` keeps the cache per CMDBuild user/session. `disabled` turns result caching off for the template.
 
-Designer uses a two-level navigation menu for templates, visual design, checks, settings, and help. It does not show the CMDBuild session block, technical-schema bootstrap block, inline guide, or class-name probe on the main screen. If runtime URL parameters do not provide `className`, advanced JSON users can still store a fallback value in:
+Designer uses a two-level navigation menu for templates, visual design, checks, settings, and help. The top of each Designer route has a sticky contextual action bar: page-level buttons such as apply, save, run, publish, diagnostics, and settings actions stay at the top instead of at the bottom of long forms. It does not show the CMDBuild session block, technical-schema bootstrap block, inline guide, or class-name probe on the main screen. If runtime URL parameters do not provide `className`, advanced JSON users can still store a fallback value in:
 
 ```json
 {
