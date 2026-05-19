@@ -601,6 +601,7 @@ Runtime UI:
 - extracts template code and params;
 - calls `GET /cmdbuild/custom-api/templates/<templateCode>/run?param=value`;
 - renders result tables or permission/validation errors.
+- when the reserved query parameter `json=true` is present, the backend-owned runtime route returns the same authorized final tables as `application/json`; `json` is excluded from business template params and does not alter permissions or cache policy.
 
 Implemented Runtime MVP:
 

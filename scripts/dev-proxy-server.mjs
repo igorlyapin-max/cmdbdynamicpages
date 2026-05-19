@@ -80,6 +80,7 @@ const REDIS_RETRY_AFTER_MS = Math.max(1000, Number(process.env.CMDBDYNAMIC_REDIS
 const DEFAULT_EMPTY_RESULT_TEXT = 'В результате вашего запроса объекты не найдены';
 const DEFAULT_PERMISSION_DENIED_TEXT = 'Вам не хватает прав увидеть данные или интерфейс дизайнера';
 const SNAPSHOT_MISSING_TEXT = 'Страница отсутствует для загрузки';
+const RUNTIME_SYSTEM_PARAMS = new Set(['json']);
 const STARTED_AT = new Date();
 const ABSOLUTE_EXECUTION_LIMITS = {
   maxRows: 2000,
@@ -1000,7 +1001,7 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     h1{font-size:18px;margin:0} h2{font-size:15px;margin:0 0 10px} h3{font-size:13px;margin:12px 0 6px;color:#334e68}
     p{margin:0 0 8px}.guide-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.guide-card{border:1px solid var(--line);padding:10px;background:#fbfdff}.guide-card h3{margin-top:0}.steps{margin:8px 0 0;padding-left:20px}.steps li{margin:4px 0}.code-inline{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:#f8fafc;border:1px solid var(--line);padding:1px 4px;border-radius:3px}
     main{padding:14px 16px}.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
-    .runtime-page{background:#fff}.runtime-page main{padding:8px}.runtime-page .result-table-wrap:first-child{margin-top:0}.runtime-page .notice{margin:0}.run-launch-url{display:flex;align-items:center;gap:6px;min-width:260px;max-width:100%;flex:1 1 420px}.run-launch-url span{color:var(--muted);font-size:12px;white-space:nowrap}.run-launch-url a{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--accent);overflow-wrap:anywhere}
+    .runtime-page{background:#fff}.runtime-page main{padding:8px}.runtime-page .result-table-wrap:first-child{margin-top:0}.runtime-page .notice{margin:0}.run-launch-url{display:flex;align-items:center;gap:6px;min-width:260px;max-width:100%;flex:1 1 420px}.run-launch-url span,.run-launch-params span{color:var(--muted);font-size:12px;white-space:nowrap}.run-launch-url a{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--accent);overflow-wrap:anywhere}.run-launch-params{display:flex;align-items:center;gap:6px;min-width:260px;max-width:100%;flex:1 1 100%;font-size:12px}.run-launch-params code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:#334e68;background:#f8fafc;border:1px solid var(--line);padding:2px 4px;overflow-wrap:anywhere;white-space:normal}
     .designer-menu{position:fixed;left:16px;top:64px;bottom:14px;width:246px;overflow:auto;border:1px solid var(--line);background:#fff;padding:10px;display:grid;gap:10px;z-index:10}.designer-main{margin-left:266px}.designer-actionbar{position:sticky;top:0;z-index:30;border:1px solid var(--line);background:rgba(255,255,255,.96);box-shadow:0 6px 16px rgba(15,23,42,.08);padding:8px 10px;margin:0 0 12px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.designer-actionbar-title{font-weight:bold;color:#334e68;white-space:nowrap}.designer-actionbar-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;min-width:0;flex:1 1 auto}.designer-actionbar-context{display:flex;align-items:center;gap:8px;min-width:240px;max-width:100%;flex:1 1 420px}.designer-actionbar-context .run-launch-url{min-width:0;flex:1 1 auto}.menu-groups{display:grid;grid-template-columns:1fr;gap:10px}.menu-group strong{display:block;font-size:12px;color:#334e68;margin-bottom:6px}.menu-links{display:grid;grid-template-columns:1fr;gap:5px}.menu-links a{border:1px solid var(--line);background:#f8fafc;color:var(--text);padding:5px 7px;border-radius:4px;text-decoration:none;font-size:12px}.menu-links a.active{background:#e6f4f1;border-color:#86b7b3;color:#07575b;font-weight:bold}.template-context{border:1px solid #b7d8d4;background:#f2faf8;padding:8px 10px;margin-bottom:12px}.template-context strong{margin-right:6px}.template-context .code-inline{font-weight:bold}
     button,a.button{border:1px solid #9fb3c8;background:#fff;color:var(--text);padding:6px 10px;border-radius:4px;cursor:pointer;text-decoration:none;display:inline-block}
     button.primary,a.button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
@@ -1214,7 +1215,11 @@ function dynamicPagesClientScript() {
       visualizeExternal: 'Visualize in separate page',
       forceRefreshInEditor: 'Refresh cache and show',
       runLaunchUrl: 'Template launch URL',
-      runLaunchUrlHelp: 'Direct runtime URL for a link or iframe. Generated from declared input variables; missing defaults are replaced with test values.',
+      runLaunchJsonUrl: 'JSON URL',
+      runLaunchParams: 'Parameter variants',
+      runLaunchParamsHelp: 'Query string used by the run links. The JSON variant adds the system parameter json=true; this parameter is not passed to the template as input.',
+      runLaunchNoParams: 'without input parameters',
+      runLaunchUrlHelp: 'Direct runtime URL for a link or iframe. Generated from declared input variables; missing defaults are replaced with test values. Add json=true to receive the same result as application/json.',
       visualizationRunCompleted: 'Visualization completed.',
       forceRefreshRunCompleted: 'Cache refreshed and result rendered.',
       publicationEditor: 'Publication',
@@ -1274,6 +1279,7 @@ function dynamicPagesClientScript() {
       paramsApplied: 'Input parameters applied to Spec JSON.',
       examplesFilled: 'Run params were filled from examples.',
       invalidParamName: 'Parameter name must start with a Latin letter or underscore and contain only Latin letters, digits, and underscores.',
+      reservedParamName: 'Parameter {name} is reserved for runtime output mode.',
       optionalParamNeedsDefault: 'Optional parameter {name} must have a default value.',
       invalidParamValue: 'Invalid value for {name}.',
       extractionEditor: 'Extraction',
@@ -1788,7 +1794,11 @@ function dynamicPagesClientScript() {
       visualizeExternal: 'Визуализировать в отдельной странице',
       forceRefreshInEditor: 'Обновить кэш и показать',
       runLaunchUrl: 'URL запуска шаблона',
-      runLaunchUrlHelp: 'Прямой runtime URL для ссылки или iframe. Строится из объявленных входных переменных; если default не задан, подставляется тестовое значение.',
+      runLaunchJsonUrl: 'JSON URL',
+      runLaunchParams: 'Варианты параметров',
+      runLaunchParamsHelp: 'Query-строка, с которой будут построены ссылки запуска. Для JSON добавляется системный параметр json=true; он не передается в шаблон как входная переменная.',
+      runLaunchNoParams: 'без входных параметров',
+      runLaunchUrlHelp: 'Прямой runtime URL для ссылки или iframe. Строится из объявленных входных переменных; если default не задан, подставляется тестовое значение. Добавьте json=true, чтобы получить тот же результат как application/json.',
       visualizationRunCompleted: 'Визуализация выполнена.',
       forceRefreshRunCompleted: 'Кэш обновлен, результат показан.',
       publicationEditor: 'Публикация',
@@ -1848,6 +1858,7 @@ function dynamicPagesClientScript() {
       paramsApplied: 'Входные параметры применены к Spec JSON.',
       examplesFilled: 'Параметры запуска заполнены из примеров.',
       invalidParamName: 'Имя параметра должно начинаться с латинской буквы или подчеркивания и содержать только латинские буквы, цифры и подчеркивания.',
+      reservedParamName: 'Параметр {name} зарезервирован для режима вывода runtime.',
       optionalParamNeedsDefault: 'Необязательный параметр {name} должен иметь значение по умолчанию.',
       invalidParamValue: 'Некорректное значение для {name}.',
       extractionEditor: 'Извлечение',
@@ -2238,6 +2249,7 @@ function dynamicPagesClientScript() {
     schemaRootDraft: '',
     schemaDescriptionDraft: '',
     schemaParentDraft: '',
+    schemaClassDrafts: {},
     config: null,
     catalog: null,
     catalogStatus: { state: 'missing', updatedAt: null, error: '' },
@@ -2823,6 +2835,7 @@ function dynamicPagesClientScript() {
       if (hasField('cmdp-root')) state.schemaRootDraft = readValue('cmdp-root') || state.root;
       if (hasField('cmdp-schema-description')) state.schemaDescriptionDraft = readValue('cmdp-schema-description');
       if (hasField('cmdp-schema-parent')) state.schemaParentDraft = readValue('cmdp-schema-parent') || 'Class';
+      if (document.querySelectorAll('[data-schema-class-role]').length) state.schemaClassDrafts = readSchemaClassDraftsFromDom();
       if (hasField('cmdp-params') || document.querySelectorAll('[data-run-param-field]').length) state.runParams = readRunParams();
       return true;
     } catch (error) {
@@ -4400,6 +4413,57 @@ function dynamicPagesClientScript() {
     return String(state.schemaParentDraft || (state.schema && state.schema.rootParent) || 'Class').trim() || 'Class';
   }
 
+  function readSchemaClassDraftsFromDom() {
+    var drafts = {};
+    Array.prototype.forEach.call(document.querySelectorAll('[data-schema-class-role]'), function (row) {
+      var role = row.getAttribute('data-schema-class-role') || '';
+      if (!role) return;
+      var nameField = row.querySelector('[data-schema-class-name]');
+      var descriptionField = row.querySelector('[data-schema-class-description]');
+      drafts[role] = {
+        name: nameField ? nameField.value.trim() : '',
+        description: descriptionField ? descriptionField.value.trim() : ''
+      };
+    });
+    return drafts;
+  }
+
+  function schemaClassDraftsFromPlan(schema) {
+    var drafts = {};
+    (Array.isArray(schema && schema.classes) ? schema.classes : []).forEach(function (item) {
+      var role = item.role || item.schemaRole || '';
+      if (!role) return;
+      drafts[role] = {
+        name: item.name || '',
+        description: item.description || item.name || ''
+      };
+    });
+    return drafts;
+  }
+
+  function currentSchemaClassDrafts(schema) {
+    var defaults = schemaClassDraftsFromPlan(schema);
+    var drafts = state.schemaClassDrafts || {};
+    Object.keys(drafts).forEach(function (role) {
+      defaults[role] = {
+        name: drafts[role] && drafts[role].name || defaults[role] && defaults[role].name || '',
+        description: drafts[role] && drafts[role].description || defaults[role] && defaults[role].description || drafts[role] && drafts[role].name || ''
+      };
+    });
+    return defaults;
+  }
+
+  function schemaClassOverridesPayload(schema) {
+    var drafts = currentSchemaClassDrafts(schema);
+    return Object.keys(drafts).map(function (role) {
+      return {
+        role: role,
+        name: drafts[role].name,
+        description: drafts[role].description || drafts[role].name
+      };
+    });
+  }
+
   function parentOptionsHtml(selected) {
     var parents = Array.isArray(state.schemaParents) ? state.schemaParents : [];
     var names = ['Class'].concat(parents.map(function (item) { return item && item.name; }).filter(Boolean));
@@ -4422,8 +4486,19 @@ function dynamicPagesClientScript() {
   function renderSchemaClassRows(schema) {
     var rows = Array.isArray(schema && schema.classes) ? schema.classes : [];
     if (!rows.length) return '<tr><td colspan="5">' + t('noData') + '</td></tr>';
+    var drafts = currentSchemaClassDrafts(schema);
     return rows.map(function (item) {
-      return '<tr><td>' + escapeHtml(item.name) + '</td><td>' + escapeHtml(item.description || '') + '</td><td>' + escapeHtml(item.parent || '') + '</td><td>' + escapeHtml(item.prototype ? 'prototype' : 'standard') + '</td><td>' + escapeHtml(renderSchemaActionStatus(item)) + '</td></tr>';
+      var role = item.role || item.schemaRole || '';
+      var draft = drafts[role] || { name: item.name || '', description: item.description || item.name || '' };
+      return [
+        '<tr data-schema-class-role="' + escapeHtml(role) + '">',
+        '<td><input data-schema-class-name value="' + escapeHtml(draft.name || '') + '"></td>',
+        '<td><input data-schema-class-description value="' + escapeHtml(draft.description || draft.name || '') + '"></td>',
+        '<td>' + escapeHtml(item.parent || '') + '</td>',
+        '<td>' + escapeHtml(item.prototype ? 'prototype' : 'standard') + '</td>',
+        '<td>' + escapeHtml(renderSchemaActionStatus(item)) + '</td>',
+        '</tr>'
+      ].join('');
     }).join('');
   }
 
@@ -4470,6 +4545,7 @@ function dynamicPagesClientScript() {
     var root = currentSchemaRoot();
     var description = currentSchemaDescription();
     var parent = currentSchemaParent();
+    var needsBootstrap = !(schema && schema.ready);
     return [
       '<section class="section" id="cmdp-schema-manager"><h2>' + t('menuSchema') + '</h2>',
       '<p class="muted">' + t('schemaRootHelp') + '</p>',
@@ -4481,7 +4557,7 @@ function dynamicPagesClientScript() {
       '<label>' + t('schemaParent') + '<input id="cmdp-schema-parent" list="cmdp-schema-parent-list" value="' + escapeHtml(parent) + '"><datalist id="cmdp-schema-parent-list">' + parentOptionsHtml(parent) + '</datalist><span class="muted">' + t('schemaParentHelp') + '</span></label>',
       '</div>',
       state.schemaParents.length ? '' : '<p class="muted">' + t('schemaNoParents') + '</p>',
-      '<label class="checkbox checkbox-stacked"><input type="checkbox" id="cmdp-schema-confirm"><span><strong>' + t('schemaConfirmBootstrap') + '</strong><span class="muted">' + t('schemaConflictHelp') + '</span></span></label>',
+      needsBootstrap ? '<label class="checkbox checkbox-stacked"><input type="checkbox" id="cmdp-schema-confirm"><span><strong>' + t('schemaConfirmBootstrap') + '</strong><span class="muted">' + t('schemaConflictHelp') + '</span></span></label>' : '',
       '</div>',
       '<h3>' + t('schemaPlan') + '</h3>',
       renderSchemaPlanSummary(schema),
@@ -4727,11 +4803,25 @@ function dynamicPagesClientScript() {
     return params;
   }
 
+  function runParamVariantsText(params) {
+    var query = new URLSearchParams(params || {}).toString();
+    var htmlQuery = query || t('runLaunchNoParams');
+    var jsonQuery = new URLSearchParams(Object.assign({}, params || {}, { json: 'true' })).toString();
+    return 'HTML: ' + htmlQuery + ' | JSON: ' + jsonQuery;
+  }
+
   function renderTemplateLaunchUrl(selected) {
     var code = readTemplateCode(selected);
     if (!code) return '<div class="notice error">' + escapeHtml(t('templateCodeRequired')) + '</div>';
-    var url = absoluteRuntimeTemplateUrl(code, runUrlParamsForTemplate(selected, false));
-    return '<div class="run-launch-url" title="' + escapeHtml(t('runLaunchUrlHelp')) + '"><span>' + escapeHtml(t('runLaunchUrl')) + '</span><a id="cmdp-run-launch-url" data-template-code="' + escapeHtml(code) + '" href="' + escapeHtml(url) + '" target="_blank" rel="noreferrer">' + escapeHtml(url) + '</a></div>';
+    var params = runUrlParamsForTemplate(selected, false);
+    var url = absoluteRuntimeTemplateUrl(code, params);
+    var jsonParams = Object.assign({}, params, { json: 'true' });
+    var jsonUrl = absoluteRuntimeTemplateUrl(code, jsonParams);
+    return [
+      '<div class="run-launch-url" title="' + escapeHtml(t('runLaunchUrlHelp')) + '"><span>' + escapeHtml(t('runLaunchUrl')) + '</span><a id="cmdp-run-launch-url" data-template-code="' + escapeHtml(code) + '" href="' + escapeHtml(url) + '" target="_blank" rel="noreferrer">' + escapeHtml(url) + '</a></div>',
+      '<div class="run-launch-url" title="' + escapeHtml(t('runLaunchUrlHelp')) + '"><span>' + escapeHtml(t('runLaunchJsonUrl')) + '</span><a id="cmdp-run-launch-json-url" data-template-code="' + escapeHtml(code) + '" href="' + escapeHtml(jsonUrl) + '" target="_blank" rel="noreferrer">' + escapeHtml(jsonUrl) + '</a></div>',
+      '<div class="run-launch-params" title="' + escapeHtml(t('runLaunchParamsHelp')) + '"><span>' + escapeHtml(t('runLaunchParams')) + '</span><code id="cmdp-run-launch-params">' + escapeHtml(runParamVariantsText(params)) + '</code></div>'
+    ].join('');
   }
 
   function renderResultSection() {
@@ -4875,7 +4965,9 @@ function dynamicPagesClientScript() {
     if (options.danger) classes.push('danger');
     var classAttr = classes.length ? ' class="' + classes.join(' ') + '"' : '';
     var typeAttr = options.type ? ' type="' + escapeHtml(options.type) + '"' : '';
-    return '<button' + classAttr + typeAttr + ' data-action="' + escapeHtml(action) + '">' + escapeHtml(label) + '</button>';
+    var disabledAttr = options.disabled ? ' disabled aria-disabled="true"' : '';
+    var titleAttr = options.title ? ' title="' + escapeHtml(options.title) + '"' : '';
+    return '<button' + classAttr + typeAttr + disabledAttr + titleAttr + ' data-action="' + escapeHtml(action) + '">' + escapeHtml(label) + '</button>';
   }
 
   function renderActionLink(href, label, options) {
@@ -4947,8 +5039,9 @@ function dynamicPagesClientScript() {
       actions.push(renderActionButton('add-selection-filter-row', t('addFilter')));
       actions.push(renderActionButton('apply-selection', t('applySelection'), { primary: true }));
     } else if (section === 'schema') {
+      var schemaReady = Boolean((state.schemaPlan || state.schema || {}).ready);
       actions.push(renderActionButton('schema-preview', t('schemaPreview')));
-      actions.push(renderActionButton('bootstrap-schema', t('schemaCreateMissing'), { primary: true }));
+      if (!schemaReady) actions.push(renderActionButton('bootstrap-schema', t('schemaCreateMissing'), { primary: true }));
     } else if (section === 'general-settings') {
       actions.push(renderActionButton('save-general-settings', t('saveConfig'), { primary: true }));
     } else if (section === 'settings') {
@@ -6743,6 +6836,7 @@ function dynamicPagesClientScript() {
       var name = String(row.name || '').trim();
       if (!name) return;
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(t('invalidParamName'));
+      if (name === 'json') throw new Error(t('reservedParamName', { name: name }));
       var type = String(row.type || 'string').trim() || 'string';
       var defaultValue = row.defaultValue === undefined || row.defaultValue === null ? '' : String(row.defaultValue);
       var example = row.example === undefined || row.example === null ? '' : String(row.example);
@@ -8262,10 +8356,14 @@ function dynamicPagesClientScript() {
     var root = readValue('cmdp-root') || state.root;
     var description = readValue('cmdp-schema-description') || currentSchemaDescription();
     var parent = readValue('cmdp-schema-parent') || currentSchemaParent();
+    var classes = schemaClassOverridesPayload(state.schemaPlan || state.schema);
+    var rootOverride = classes.find(function (item) { return item.role === 'root'; });
+    if (rootOverride && rootOverride.name) root = rootOverride.name;
     state.root = root;
     state.schemaRootDraft = root;
     state.schemaDescriptionDraft = description;
     state.schemaParentDraft = parent;
+    state.schemaClassDrafts = readSchemaClassDraftsFromDom();
     if (hasField('cmdp-schema-confirm') && !readChecked('cmdp-schema-confirm')) {
       state.message = { type: 'error', text: t('schemaConfirmRequired') };
       renderDesigner();
@@ -8276,9 +8374,10 @@ function dynamicPagesClientScript() {
       renderDesigner();
       return;
     }
-    request(apiPrefix + '/schema/bootstrap', { method: 'POST', body: { root: root, description: description, parent: parent, confirm: true } }).then(function (result) {
+    request(apiPrefix + '/schema/bootstrap', { method: 'POST', body: { root: root, description: description, parent: parent, classes: classes, confirm: true } }).then(function (result) {
       state.schema = result.json ? result.json.schema : null;
       state.schemaPlan = state.schema;
+      state.schemaClassDrafts = schemaClassDraftsFromPlan(state.schemaPlan);
       state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t('schemaBootstrapDone') : errorText(result) };
       renderDesigner();
     }).catch(function (error) {
@@ -8291,13 +8390,18 @@ function dynamicPagesClientScript() {
     var root = readValue('cmdp-root') || state.root;
     var description = readValue('cmdp-schema-description') || currentSchemaDescription();
     var parent = readValue('cmdp-schema-parent') || currentSchemaParent();
+    var classes = schemaClassOverridesPayload(state.schemaPlan || state.schema);
+    var rootOverride = classes.find(function (item) { return item.role === 'root'; });
+    if (rootOverride && rootOverride.name) root = rootOverride.name;
     state.root = root;
     state.schemaRootDraft = root;
     state.schemaDescriptionDraft = description;
     state.schemaParentDraft = parent;
-    request(apiPrefix + '/schema/preview', { method: 'POST', body: { root: root, description: description, parent: parent } }).then(function (result) {
+    state.schemaClassDrafts = readSchemaClassDraftsFromDom();
+    request(apiPrefix + '/schema/preview', { method: 'POST', body: { root: root, description: description, parent: parent, classes: classes } }).then(function (result) {
       state.schemaPlan = result.json ? result.json.schema : null;
       state.schema = state.schemaPlan || state.schema;
+      state.schemaClassDrafts = schemaClassDraftsFromPlan(state.schemaPlan);
       state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t('schemaPreviewReady') : errorText(result) };
       renderDesigner();
     }).catch(function (error) {
@@ -8887,12 +8991,23 @@ function dynamicPagesClientScript() {
 
   function refreshTemplateLaunchUrl() {
     var link = document.getElementById('cmdp-run-launch-url');
-    if (!link) return;
-    var code = link.getAttribute('data-template-code') || readTemplateCode();
+    var jsonLink = document.getElementById('cmdp-run-launch-json-url');
+    var paramsText = document.getElementById('cmdp-run-launch-params');
+    if (!link && !jsonLink && !paramsText) return;
+    var code = (link && link.getAttribute('data-template-code')) || (jsonLink && jsonLink.getAttribute('data-template-code')) || readTemplateCode();
     if (!code) return;
-    var url = absoluteRuntimeTemplateUrl(code, runUrlParamsForTemplate(state.selectedTemplate || {}, true));
-    link.href = url;
-    link.textContent = url;
+    var params = runUrlParamsForTemplate(state.selectedTemplate || {}, true);
+    var url = absoluteRuntimeTemplateUrl(code, params);
+    if (link) {
+      link.href = url;
+      link.textContent = url;
+    }
+    if (jsonLink) {
+      var jsonUrl = absoluteRuntimeTemplateUrl(code, Object.assign({}, params, { json: 'true' }));
+      jsonLink.href = jsonUrl;
+      jsonLink.textContent = jsonUrl;
+    }
+    if (paramsText) paramsText.textContent = runParamVariantsText(params);
   }
 
   function loadRuntime(refresh) {
@@ -9205,10 +9320,39 @@ function getTechnicalPrefix(root) {
   return root.endsWith('QueryTool') ? root.slice(0, -'QueryTool'.length) : `${root}_`;
 }
 
+function technicalClassDescription(className, label) {
+  const safeName = String(className || '').trim();
+  const safeLabel = String(label || '').trim() || safeName;
+  return truncateText(safeLabel, 250);
+}
+
+function schemaClassOverrideMap(options = {}) {
+  const source = Array.isArray(options.classes)
+    ? options.classes
+    : Array.isArray(options.classOverrides)
+      ? options.classOverrides
+      : [];
+  const map = {};
+  source.forEach((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return;
+    const role = String(item.role || item.schemaRole || '').trim();
+    if (!['root', 'config', 'template', 'version', 'log'].includes(role)) return;
+    const override = {};
+    if (item.name !== undefined && String(item.name).trim()) {
+      override.name = validateCmdbuildIdentifier(item.name, `${role} class`);
+    }
+    if (item.description !== undefined && String(item.description).trim()) {
+      override.description = truncateText(String(item.description).trim(), 250);
+    }
+    map[role] = override;
+  });
+  return map;
+}
+
 function baseClassPayload(definition) {
   return {
     name: definition.name,
-    description: definition.description,
+    description: definition.description || definition.name,
     parent: definition.parent,
     prototype: Boolean(definition.prototype),
     type: 'standard',
@@ -9269,17 +9413,18 @@ function baseAttributePayload(attribute, index) {
 }
 
 function buildTechnicalSchema(rootValue, options = {}) {
-  const root = validateCmdbuildIdentifier(rootValue || DEFAULT_TECHNICAL_ROOT, 'root');
+  const overrides = schemaClassOverrideMap(options);
+  const root = validateCmdbuildIdentifier((overrides.root && overrides.root.name) || rootValue || DEFAULT_TECHNICAL_ROOT, 'root');
   const rootParent = validateCmdbuildIdentifier(options.parent || options.rootParent || 'Class', 'schema parent');
-  const rootDescription = truncateText(options.description || options.rootDescription || 'CMDB Dynamic Pages technical root', 250);
   const prefix = getTechnicalPrefix(root);
   const classNames = {
     root,
-    config: validateCmdbuildIdentifier(`${prefix}QueryToolConfig`, 'config class'),
-    template: validateCmdbuildIdentifier(`${prefix}QueryTemplate`, 'template class'),
-    version: validateCmdbuildIdentifier(`${prefix}QueryTemplateVersion`, 'template version class'),
-    log: validateCmdbuildIdentifier(`${prefix}QueryExecutionLog`, 'execution log class')
+    config: validateCmdbuildIdentifier(overrides.config && overrides.config.name || `${prefix}QueryToolConfig`, 'config class'),
+    template: validateCmdbuildIdentifier(overrides.template && overrides.template.name || `${prefix}QueryTemplate`, 'template class'),
+    version: validateCmdbuildIdentifier(overrides.version && overrides.version.name || `${prefix}QueryTemplateVersion`, 'template version class'),
+    log: validateCmdbuildIdentifier(overrides.log && overrides.log.name || `${prefix}QueryExecutionLog`, 'execution log class')
   };
+  const rootDescription = technicalClassDescription(root, overrides.root && overrides.root.description || options.description || options.rootDescription || root);
 
   return {
     root,
@@ -9289,6 +9434,7 @@ function buildTechnicalSchema(rootValue, options = {}) {
     classNames,
     classes: [
       {
+        role: 'root',
         name: classNames.root,
         description: rootDescription,
         parent: rootParent,
@@ -9296,8 +9442,9 @@ function buildTechnicalSchema(rootValue, options = {}) {
         attributes: []
       },
       {
+        role: 'config',
         name: classNames.config,
-        description: 'Query Tool Config',
+        description: technicalClassDescription(classNames.config, overrides.config && overrides.config.description || classNames.config),
         parent: classNames.root,
         prototype: false,
         attributes: [
@@ -9307,8 +9454,9 @@ function buildTechnicalSchema(rootValue, options = {}) {
         ]
       },
       {
+        role: 'template',
         name: classNames.template,
-        description: 'Query Template',
+        description: technicalClassDescription(classNames.template, overrides.template && overrides.template.description || classNames.template),
         parent: classNames.root,
         prototype: false,
         attributes: [
@@ -9321,8 +9469,9 @@ function buildTechnicalSchema(rootValue, options = {}) {
         ]
       },
       {
+        role: 'version',
         name: classNames.version,
-        description: 'Query Template Version',
+        description: technicalClassDescription(classNames.version, overrides.version && overrides.version.description || classNames.version),
         parent: classNames.root,
         prototype: false,
         attributes: [
@@ -9335,8 +9484,9 @@ function buildTechnicalSchema(rootValue, options = {}) {
         ]
       },
       {
+        role: 'log',
         name: classNames.log,
-        description: 'Query Execution Log',
+        description: technicalClassDescription(classNames.log, overrides.log && overrides.log.description || classNames.log),
         parent: classNames.root,
         prototype: false,
         attributes: [
@@ -10131,6 +10281,7 @@ async function checkOrCreateTechnicalSchema(authToken, root, createMissing, opti
     }
 
     const classStatus = {
+      role: classDefinition.role,
       name: classDefinition.name,
       description: classDefinition.description,
       parent: classDefinition.parent,
@@ -11190,10 +11341,18 @@ function staticSnapshotKey(templateCode, params, publishConfig) {
 function publicSnapshotParamsFromUrl(requestUrl) {
   const params = {};
   requestUrl.searchParams.forEach((value, key) => {
-    if (key === 'lang' || key === 'cmdpLang' || key === 'refresh' || key === 'noCache' || key === 'forceRefresh' || key === 'bypassRefreshCooldown') return;
+    if (key === 'lang' || key === 'cmdpLang' || key === 'refresh' || key === 'noCache' || key === 'forceRefresh' || key === 'bypassRefreshCooldown' || RUNTIME_SYSTEM_PARAMS.has(key)) return;
     params[key] = value;
   });
   return params;
+}
+
+function truthyRuntimeFlag(value) {
+  return ['1', 'true', 'yes', 'y', 'on'].includes(String(value || '').trim().toLowerCase());
+}
+
+function runtimeJsonOutputRequested(requestUrl) {
+  return truthyRuntimeFlag(requestUrl && requestUrl.searchParams ? requestUrl.searchParams.get('json') : '');
 }
 
 async function readStaticSnapshot(templateCode, params, publishConfig = { paramsMode: 'exact' }) {
@@ -11260,8 +11419,95 @@ function staticSnapshotCacheMeta(snapshot, status, backend, key) {
   };
 }
 
+function isRawObjectGroupTableNameServer(name) {
+  return /^objects(\d+)?$/.test(String(name || ''));
+}
+
+function visibleRuntimeResultTables(tables) {
+  const source = Array.isArray(tables) ? tables : [];
+  const prepared = source.filter((table) => table && table.name && !isRawObjectGroupTableNameServer(table.name));
+  if (prepared.length) return [prepared[prepared.length - 1]];
+  return source.length ? [source[source.length - 1]] : [];
+}
+
+function runtimeResultTableTitle(table) {
+  return String(table && (table.title || table.label || table.name) || '');
+}
+
+function runtimeJsonCellLinks(row, rowIndex, columns, table, params) {
+  const metaByColumn = table && table.cellMeta && table.cellMeta[String(rowIndex)] || {};
+  const links = {};
+  const columnLinks = table && table.presentation && table.presentation.columnLinks || {};
+  (Array.isArray(columns) ? columns : []).forEach((column) => {
+    const linkConfig = columnLinks[column] || {};
+    if (!linkConfig || linkConfig.mode !== 'link' || !linkConfig.urlTemplate) return;
+    const value = displayCardValue(row && row[column]);
+    const meta = metaByColumn[column] || {};
+    const mysource = {
+      ...meta,
+      value,
+      column,
+      attribute: meta.attribute || column
+    };
+    const href = renderCellTemplate(linkConfig.urlTemplate, { mysource, row, params });
+    if (!isSafeRuntimeLinkUrl(href)) return;
+    const text = renderCellTemplate(linkConfig.textTemplate || '${mysource.value}', { mysource, row, params }) || value;
+    links[column] = {
+      href,
+      text,
+      value,
+      target: linkConfig.target === 'blank' ? 'blank' : 'self'
+    };
+  });
+  return links;
+}
+
+function runtimeJsonTables(result, params = {}) {
+  const tables = visibleRuntimeResultTables(result && result.tables);
+  return tables.map((table) => {
+    const columns = Array.isArray(table.columns) ? table.columns : [];
+    const labels = table.columnLabels && typeof table.columnLabels === 'object' && !Array.isArray(table.columnLabels) ? table.columnLabels : {};
+    const rows = Array.isArray(table.rows) ? table.rows : [];
+    const jsonRows = rows.map((row, rowIndex) => {
+      const values = {};
+      columns.forEach((column) => {
+        values[column] = row && row[column] !== undefined ? row[column] : null;
+      });
+      const links = runtimeJsonCellLinks(row, rowIndex, columns, table, params);
+      return Object.keys(links).length ? { values, links } : values;
+    });
+    return {
+      name: table.name || '',
+      title: runtimeResultTableTitle(table),
+      mode: table.mode || table.view || 'table',
+      columns: columns.map((column) => ({ key: column, label: labels[column] || column })),
+      rows: jsonRows,
+      emptyText: table.emptyText || result && result.emptyText || DEFAULT_EMPTY_RESULT_TEXT,
+      truncated: Boolean(table.truncated),
+      presentation: table.presentation || undefined
+    };
+  });
+}
+
+function runtimeJsonResponsePayload(payload) {
+  const result = payload.result || { tables: [] };
+  return {
+    success: Boolean(payload.success),
+    action: payload.action || 'run',
+    snapshotFound: payload.snapshotFound,
+    template: payload.template || {},
+    params: payload.params || {},
+    tables: runtimeJsonTables(result, payload.params || {}),
+    emptyText: result.emptyText || DEFAULT_EMPTY_RESULT_TEXT,
+    cache: payload.cache || null,
+    auditLog: payload.auditLog || null,
+    html: result.kind === 'html' && result.htmlTrusted ? result.html : undefined
+  };
+}
+
 async function sendPublicSnapshotRun(res, requestUrl, templateCode) {
   const params = publicSnapshotParamsFromUrl(requestUrl);
+  const jsonOutput = runtimeJsonOutputRequested(requestUrl);
   let lookup;
   try {
     lookup = await readStaticSnapshot(templateCode, params, { paramsMode: 'ignore' });
@@ -11274,7 +11520,7 @@ async function sendPublicSnapshotRun(res, requestUrl, templateCode) {
   }
   const snapshot = lookup.snapshot;
   if (!snapshot) {
-    sendJson(res, 200, {
+    const payload = {
       success: true,
       snapshotFound: false,
       action: 'run',
@@ -11282,10 +11528,11 @@ async function sendPublicSnapshotRun(res, requestUrl, templateCode) {
       params,
       result: { emptyText: SNAPSHOT_MISSING_TEXT, tables: [] },
       cache: staticSnapshotCacheMeta(null, 'snapshot-miss', lookup.backend, lookup.key)
-    });
+    };
+    sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : payload);
     return;
   }
-  sendJson(res, 200, {
+  const payload = {
     success: true,
     snapshotFound: true,
     action: 'run',
@@ -11296,7 +11543,8 @@ async function sendPublicSnapshotRun(res, requestUrl, templateCode) {
     params: snapshot.params || params,
     result: snapshot.result || { tables: [] },
     cache: staticSnapshotCacheMeta(snapshot, 'snapshot-hit', lookup.backend, lookup.key)
-  });
+  };
+  sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : payload);
 }
 
 function sanitizeExecutionLogCard(card) {
@@ -11490,6 +11738,9 @@ function validateTemplateSpec(spec) {
         const path = `$.params.${name}`;
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
           errors.push({ path, message: 'Parameter name must start with a Latin letter or underscore and contain only Latin letters, digits, and underscores.' });
+        }
+        if (RUNTIME_SYSTEM_PARAMS.has(name)) {
+          errors.push({ path, message: `Parameter name ${name} is reserved for runtime output mode.` });
         }
         if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
           errors.push({ path, message: 'Parameter definition must be an object with type, required, and optional default fields.' });
@@ -14349,7 +14600,7 @@ async function handleBackend(req, res, requestUrl) {
     const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
     const parent = schemaParentFromInput(body, requestUrl.searchParams.get('parent') || 'Class');
     const description = body.description || body.rootDescription || requestUrl.searchParams.get('description') || '';
-    const schema = await checkOrCreateTechnicalSchema(authToken, root, false, { parent, description });
+    const schema = await checkOrCreateTechnicalSchema(authToken, root, false, { parent, description, classes: body.classes || body.classOverrides });
     sendJson(res, 200, {
       success: true,
       schema
@@ -14365,7 +14616,7 @@ async function handleBackend(req, res, requestUrl) {
     const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
     const parent = schemaParentFromInput(body, requestUrl.searchParams.get('parent') || 'Class');
     const description = body.description || body.rootDescription || requestUrl.searchParams.get('description') || '';
-    const schema = await checkOrCreateTechnicalSchema(authToken, root, true, { parent, description });
+    const schema = await checkOrCreateTechnicalSchema(authToken, root, true, { parent, description, classes: body.classes || body.classOverrides });
     sendJson(res, schema.ready ? 200 : 502, {
       success: schema.ready,
       schema
@@ -14725,6 +14976,7 @@ async function handleBackend(req, res, requestUrl) {
 
       const body = runtimeReadOnly ? {} : await readJsonBody(req);
       const params = runtimeReadOnly ? publicSnapshotParamsFromUrl(requestUrl) : body.params || {};
+      const jsonOutput = templateAction === 'run' && runtimeJsonOutputRequested(requestUrl);
       const startedAt = new Date();
       const session = await getSessionData(authToken);
       const username = session.data && session.data.username ? session.data.username : '';
@@ -14787,7 +15039,7 @@ async function handleBackend(req, res, requestUrl) {
           key: lookup.key,
           paramsMode: publishConfig.paramsMode || 'exact'
         });
-        sendJson(res, 200, {
+        const payload = {
           success: true,
           snapshotFound: Boolean(lookup.snapshot),
           action: templateAction,
@@ -14800,7 +15052,8 @@ async function handleBackend(req, res, requestUrl) {
           result,
           cache,
           auditLog
-        });
+        };
+        sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : payload);
         return;
       }
 
@@ -14921,7 +15174,7 @@ async function handleBackend(req, res, requestUrl) {
           auditLogged: Boolean(auditLog)
         });
       }
-      sendJson(res, 200, {
+      const payload = {
         success: true,
         action: templateAction,
         template: {
@@ -14933,7 +15186,8 @@ async function handleBackend(req, res, requestUrl) {
         result,
         cache,
         auditLog
-      });
+      };
+      sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : payload);
       return;
     }
 
@@ -15126,6 +15380,7 @@ async function handleDynamicPagesUi(req, res, requestUrl) {
 
   const pathname = requestUrl.pathname.replace(/\/+$/, '') || DYNAMIC_UI_PREFIX;
   const authToken = getCookieValue(req.headers.cookie, 'CMDBuild-Authorization');
+  const jsonOutput = runtimeJsonOutputRequested(requestUrl);
   if (!authToken) {
     if (pathname.startsWith(`${DYNAMIC_UI_PREFIX}/run/`)) {
       const templateCode = decodeURIComponent(pathname.slice(`${DYNAMIC_UI_PREFIX}/run/`.length));
@@ -15133,6 +15388,12 @@ async function handleDynamicPagesUi(req, res, requestUrl) {
         validateCmdbuildIdentifier(templateCode, 'template code');
       } catch (error) {
         sendHtml(res, 400, `<!doctype html><html><head><meta charset="utf-8"><title>CMDB Dynamic Pages</title></head><body style="font-family:Arial,sans-serif;padding:24px"><h1>Invalid template code</h1><p>${htmlEscape(error.message)}</p></body></html>`);
+        return;
+      }
+      if (jsonOutput) {
+        const publicUrl = new URL(requestUrl.href);
+        publicUrl.pathname = `${BACKEND_PREFIX}/public-snapshots/${encodeURIComponent(templateCode)}/run`;
+        await handleBackend(req, res, publicUrl);
         return;
       }
       sendHtml(res, 200, renderDynamicPagesShell({
@@ -15173,6 +15434,12 @@ async function handleDynamicPagesUi(req, res, requestUrl) {
       validateCmdbuildIdentifier(templateCode, 'template code');
     } catch (error) {
       sendHtml(res, 400, `<!doctype html><html><head><meta charset="utf-8"><title>CMDB Dynamic Pages</title></head><body style="font-family:Arial,sans-serif;padding:24px"><h1>Invalid template code</h1><p>${htmlEscape(error.message)}</p></body></html>`);
+      return;
+    }
+    if (jsonOutput) {
+      const backendUrl = new URL(requestUrl.href);
+      backendUrl.pathname = `${BACKEND_PREFIX}/templates/${encodeURIComponent(templateCode)}/run`;
+      await handleBackend(req, res, backendUrl);
       return;
     }
     sendHtml(res, 200, renderDynamicPagesShell({
@@ -15325,6 +15592,8 @@ export {
   renderCellTemplate,
   runtimeCacheKeyParts,
   runtimeCacheMeta,
+  runtimeJsonOutputRequested,
+  runtimeJsonResponsePayload,
   sanitizeRequestPath,
   schemaParentFromInput,
   isSafeRuntimeLinkUrl

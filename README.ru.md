@@ -278,6 +278,14 @@ GET /cmdbuild/custom-api/templates/<templateCode>/run?param=value
 
 Для dynamic шаблонов выполнение идет под правами текущего пользователя CMDBuild. Для static snapshot шаблонов Runtime читает опубликованный результат из Redis; права зрителя на исходные CMDBuild-объекты не проверяются, поэтому Designer требует явного подтверждения режима публикации.
 
+Чтобы получить те же итоговые таблицы как `application/json`, добавьте системный параметр `json=true`:
+
+```text
+http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/run/<templateCode>?param=value&json=true
+```
+
+`json` зарезервирован для режима вывода runtime и не объявляется во входных переменных шаблона. Права, кэш, static snapshot и cooldown refresh работают так же, как для HTML runtime view.
+
 Runtime ссылки в ячейках строятся только из итоговых данных, metadata ячейки и входных параметров. Небезопасные URL-схемы `javascript:`, `data:` и `vbscript:` блокируются; в этом случае значение выводится обычным текстом.
 
 ## Кэширование

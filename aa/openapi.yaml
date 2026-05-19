@@ -377,9 +377,19 @@ paths:
           schema:
             type: string
             enum: ["1"]
+        - name: json
+          in: query
+          description: Reserved runtime output flag. When true/1/yes, returns the final runtime result as application/json instead of the normal API envelope used by the HTML runtime shell.
+          schema:
+            type: string
+            enum: ["true", "1", "yes"]
       responses:
         "200":
           description: Runtime result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuntimeJsonResult"
         "403":
           description: Permission denied
     post:
@@ -424,6 +434,10 @@ paths:
       responses:
         "200":
           description: Snapshot result or missing snapshot response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuntimeJsonResult"
   /cmdbuild/custom-api/draft/validate:
     post:
       tags: [templates]
@@ -520,6 +534,86 @@ components:
         success:
           type: boolean
       additionalProperties: true
+    RuntimeJsonResult:
+      type: object
+      properties:
+        success:
+          type: boolean
+        action:
+          type: string
+          example: run
+        snapshotFound:
+          type: boolean
+        template:
+          type: object
+          properties:
+            code:
+              type: string
+            description:
+              type: string
+            active:
+              type: boolean
+        params:
+          type: object
+          additionalProperties: true
+        tables:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              title:
+                type: string
+              mode:
+                type: string
+              columns:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    key:
+                      type: string
+                    label:
+                      type: string
+              rows:
+                type: array
+                items:
+                  oneOf:
+                    - type: object
+                      additionalProperties: true
+                    - type: object
+                      properties:
+                        values:
+                          type: object
+                          additionalProperties: true
+                        links:
+                          type: object
+                          additionalProperties:
+                            type: object
+                            properties:
+                              href:
+                                type: string
+                              text:
+                                type: string
+                              value:
+                                type: string
+                              target:
+                                type: string
+              emptyText:
+                type: string
+              truncated:
+                type: boolean
+        emptyText:
+          type: string
+        cache:
+          type: object
+          nullable: true
+          additionalProperties: true
+        auditLog:
+          type: object
+          nullable: true
+          additionalProperties: true
     SchemaBootstrapRequest:
       type: object
       properties:

@@ -355,6 +355,8 @@ Runtime UI вызывает:
 GET /cmdbuild/custom-api/templates/<templateCode>/run?param=value
 ```
 
+Если в runtime URL передан зарезервированный параметр `json=true`, backend-owned route возвращает те же авторизованные итоговые таблицы как `application/json`. `json` исключается из бизнес-параметров шаблона и не меняет модель прав, кэша, static snapshot или cooldown refresh.
+
 Backend:
 
 1. Загружает шаблон из `Cst_QueryTemplate`.

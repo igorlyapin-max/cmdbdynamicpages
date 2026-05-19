@@ -235,6 +235,13 @@ http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/run/ProbeClassesByAttributeType?a
 
 The direct runtime page renders only the final result tables, without Designer chrome or diagnostic parameters.
 Use the same URL as a normal link or as an iframe source. Dynamic templates require a valid CMDBuild session cookie through the proxy. Published static snapshots can be served without that cookie because the runtime reads only Redis snapshot data and does not execute CMDBuild business-data requests.
+Add the reserved system parameter `json=true` to the same runtime URL to receive the final tables as `application/json` instead of HTML:
+
+```text
+http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/run/ProbeClassesByAttributeType?attrType=reference&json=true
+```
+
+`json` is not a template input variable and cannot be declared in `spec.params`. Permissions, cache keys, static snapshots, and refresh cooldown behavior stay the same as for the HTML runtime view.
 Runtime template execution uses a Redis-backed cache with in-memory fallback when Redis is unavailable in dev. Cache behavior is controlled by each template in `spec.cache`; the default mode is `permissionOnly`, which shares a result inside the same endpoint/template/params after the viewer passes a lightweight probe for the classes and attributes actually used by the template. This default assumes row-level CMDBuild scope is not different between users. Use `visibilityHash` when row-level scope can differ, or `privateUser` when the cache must stay isolated by CMDBuild user/session scope. The executor builds a used-field dependency map and avoids materializing unrelated card attributes in `selectCards`.
 Cache TTL is a template setting. Manual refresh cooldown is a system Runtime setting stored in `Cst_QueryToolConfig.RuntimeConfigJson.runtimeCache.refreshCooldownSec`. The runtime page keeps cache controls compact: the table header shows the title on the left and search plus a `⟳` refresh icon on the right; the icon tooltip contains cache age/expiry, refresh countdown, backend, and scope details.
 Designer preview is separate from the saved runtime cache: `Visualize in editor` runs `/draft/preview` against the current draft and does not read the final runtime result cache. The Run page also has `Refresh cache and show`, which calls saved-template `POST run` with `forceRefresh=true`; this rebuilds the runtime cache without the user refresh cooldown and requires CSRF, so iframe/read-only `GET run` cannot bypass the timer.

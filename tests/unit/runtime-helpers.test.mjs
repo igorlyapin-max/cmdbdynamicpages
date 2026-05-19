@@ -8,7 +8,9 @@ import {
   ipv4ValueMatches,
   isSafeRuntimeLinkUrl,
   renderCellTemplate,
-  renderRuntimeParamTemplate
+  renderRuntimeParamTemplate,
+  runtimeJsonOutputRequested,
+  runtimeJsonResponsePayload
 } from '../../scripts/dev-proxy-server.mjs';
 
 test('template params combine defaults and explicit values without clearing defaults on empty input', () => {
@@ -114,6 +116,60 @@ test('runtime source URLs tolerate underscore and id variants from final rows', 
     renderCellTemplate('${mysource.sourceURLSelection3Related}', { mysource: meta[0].Code }),
     '/cmdbuild/ui/#classes/Country/cards/7'
   );
+});
+
+test('runtime json output flag is an output mode and not a business parameter', () => {
+  assert.equal(runtimeJsonOutputRequested(new URL('http://local/run?json=true')), true);
+  assert.equal(runtimeJsonOutputRequested(new URL('http://local/run?json=1')), true);
+  assert.equal(runtimeJsonOutputRequested(new URL('http://local/run?json=yes')), true);
+  assert.equal(runtimeJsonOutputRequested(new URL('http://local/run?json=false')), false);
+});
+
+test('runtime json response exposes visible table rows and safe cell links', () => {
+  const payload = runtimeJsonResponsePayload({
+    success: true,
+    action: 'run',
+    template: { code: 'testtemplate', description: 'Test template' },
+    params: { city: 'city49' },
+    result: {
+      tables: [
+        {
+          name: 'RawObjects',
+          columns: ['Code'],
+          rows: [{ Code: 'raw' }]
+        },
+        {
+          name: 'final',
+          title: 'Routers',
+          columns: ['Code'],
+          columnLabels: { Code: 'Router code' },
+          rows: [{ Code: 'router047', Class: 'Router', _id: 47 }],
+          cellMeta: buildResultCellMeta([{ Code: 'router047', Class: 'Router', _id: 47 }], ['Code']),
+          presentation: {
+            columnLinks: {
+              Code: {
+                mode: 'link',
+                urlTemplate: '${mysource.sourceURL}',
+                textTemplate: '${mysource.value}',
+                target: 'blank'
+              }
+            }
+          }
+        }
+      ]
+    },
+    cache: { status: 'hit', expiresAt: '2026-05-19T16:00:00Z' }
+  });
+
+  assert.equal(payload.success, true);
+  assert.equal(payload.template.code, 'testtemplate');
+  assert.deepEqual(payload.params, { city: 'city49' });
+  assert.equal(payload.tables.length, 1);
+  assert.equal(payload.tables[0].title, 'Routers');
+  assert.deepEqual(payload.tables[0].columns, [{ key: 'Code', label: 'Router code' }]);
+  assert.deepEqual(payload.tables[0].rows[0].values, { Code: 'router047' });
+  assert.equal(payload.tables[0].rows[0].links.Code.href, '/cmdbuild/ui/#classes/Router/cards/47');
+  assert.equal(payload.cache.status, 'hit');
 });
 
 test('runtime link URL safety blocks script-like protocols', () => {
