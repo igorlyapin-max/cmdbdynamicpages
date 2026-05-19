@@ -3,8 +3,11 @@ import assert from 'node:assert/strict';
 
 import {
   applyTemplateParamDefaults,
+  buildResultCellMeta,
   dependencyMapWithHash,
   ipv4ValueMatches,
+  isSafeRuntimeLinkUrl,
+  renderCellTemplate,
   renderRuntimeParamTemplate
 } from '../../scripts/dev-proxy-server.mjs';
 
@@ -43,6 +46,117 @@ test('runtime title templates support param placeholders', () => {
     renderRuntimeParamTemplate('Routers for ${params.city}', { city: 'city49' }),
     'Routers for city49'
   );
+});
+
+test('runtime cell link templates support current cell, row and params', () => {
+  const rendered = renderCellTemplate(
+    '/cmdbuild/ui/#classes/${mysource.sourceClass}/cards/${mysource.sourceId}?city=${param.city}&ip=${row.Выборка2.ipaddress}',
+    {
+      mysource: {
+        value: 'router047',
+        source: 'Выборка2',
+        sourceClass: 'Router',
+        sourceId: 47,
+        attribute: 'Code',
+        domainPath: 'CityRouter'
+      },
+      row: { 'Выборка2.ipaddress': '10.1.2.3' },
+      params: { city: 'city49' }
+    }
+  );
+
+  assert.equal(rendered, '/cmdbuild/ui/#classes/Router/cards/47?city=city49&ip=10.1.2.3');
+});
+
+test('runtime cell link templates support ready source URLs for matched selections', () => {
+  const meta = buildResultCellMeta([
+    {
+      Class: 'City',
+      _id: 49,
+      'Выборка2.Class': 'Router',
+      'Выборка2._id': 47,
+      'Selection3.Class': 'Country',
+      'Selection3._id': 7
+    }
+  ], ['Выборка2.Code']);
+
+  assert.equal(
+    renderCellTemplate('${mysource.sourceURLВыборка1}', { mysource: meta[0]['Выборка2.Code'] }),
+    '/cmdbuild/ui/#classes/City/cards/49'
+  );
+  assert.equal(
+    renderCellTemplate('${mysource.sourceURLВыборка2}', { mysource: meta[0]['Выборка2.Code'] }),
+    '/cmdbuild/ui/#classes/Router/cards/47'
+  );
+  assert.equal(
+    renderCellTemplate('${mysource.sourceURLSelection3}', { mysource: meta[0]['Выборка2.Code'] }),
+    '/cmdbuild/ui/#classes/Country/cards/7'
+  );
+});
+
+test('runtime source URLs tolerate underscore and id variants from final rows', () => {
+  const meta = buildResultCellMeta([
+    {
+      Class: 'City',
+      _id: 49,
+      'Выборка2_Class': 'Router',
+      'Выборка2_id': 47,
+      Selection3RelatedClass: 'Country',
+      Selection3RelatedId: 7
+    }
+  ], ['Code']);
+
+  assert.equal(
+    renderCellTemplate('${mysource.sourceURLВыборка2}', { mysource: meta[0].Code }),
+    '/cmdbuild/ui/#classes/Router/cards/47'
+  );
+  assert.equal(
+    renderCellTemplate('${mysource.sourceURLSelection3Related}', { mysource: meta[0].Code }),
+    '/cmdbuild/ui/#classes/Country/cards/7'
+  );
+});
+
+test('runtime link URL safety blocks script-like protocols', () => {
+  assert.equal(isSafeRuntimeLinkUrl('/cmdbuild/ui/#classes/Router/cards/47'), true);
+  assert.equal(isSafeRuntimeLinkUrl('https://example.test/router047'), true);
+  assert.equal(isSafeRuntimeLinkUrl('mailto:owner@example.test'), true);
+  assert.equal(isSafeRuntimeLinkUrl('javascript:alert(1)'), false);
+  assert.equal(isSafeRuntimeLinkUrl('data:text/html,<script>alert(1)</script>'), false);
+  assert.equal(isSafeRuntimeLinkUrl('vbscript:msgbox(1)'), false);
+});
+
+test('result cell metadata preserves source class and card id for projected rows', () => {
+  const meta = buildResultCellMeta([
+    {
+      __source: 'Выборка2',
+      Class: 'Router',
+      _id: 47,
+      Domain: 'CityRouter',
+      Code: 'router047'
+    }
+  ], ['Code']);
+
+  assert.deepEqual(meta, {
+    0: {
+      Code: {
+        source: 'Выборка2',
+        sourceClass: 'Router',
+        sourceId: '47',
+        attribute: 'Code',
+        domainPath: 'CityRouter',
+        sourceURL: '/cmdbuild/ui/#classes/Router/cards/47',
+        sourceURLSelection1: '/cmdbuild/ui/#classes/Router/cards/47',
+        sourceURLВыборка1: '/cmdbuild/ui/#classes/Router/cards/47',
+        sourceURLВыборка2: '/cmdbuild/ui/#classes/Router/cards/47',
+        sourceUrls: {
+          sourceURL: '/cmdbuild/ui/#classes/Router/cards/47',
+          sourceURLSelection1: '/cmdbuild/ui/#classes/Router/cards/47',
+          sourceURLВыборка1: '/cmdbuild/ui/#classes/Router/cards/47',
+          sourceURLВыборка2: '/cmdbuild/ui/#classes/Router/cards/47'
+        }
+      }
+    }
+  });
 });
 
 test('ipv4 comparison operators cover address, CIDR and range cases', () => {

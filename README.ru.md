@@ -227,6 +227,10 @@ Designer умеет:
 - задавать cache-политику конкретного шаблона;
 - прогонять шаблон в редакторе и в отдельной runtime-странице.
 
+В `Группе объектов` список атрибутов/путей можно фильтровать по домену, кардинальности и направлению связи. Это помогает явно выбрать, через какой `reference`/`domain` пришел атрибут, если одинаковые имена полей доступны через разные связи. В разделе есть свернутая подсказка с примерами.
+
+В `Визуализации` колонку итоговых данных можно превратить в ссылку. Шаблон URL и текста поддерживает `${mysource.value}`, `${mysource.source}`, `${mysource.sourceClass}`, `${mysource.sourceId}`, `${mysource.attribute}`, `${mysource.domainPath}`, `${row.<column>}` и `${param.<name>}`. Для внутренних ссылок на карточки, участвовавшие в результате, есть готовые переменные `${mysource.sourceURLВыборка1}`, `${mysource.sourceURLВыборка2}`, `${mysource.sourceURLSelection1}` и так далее. Например: `${mysource.sourceURLВыборка2}`, `/cmdbuild/ui/#classes/${mysource.sourceClass}/cards/${mysource.sourceId}` или `/wiki/${param.city}/${mysource.value}`.
+
 ## Шаблоны
 
 Шаблон хранится в CMDBuild классе `Cst_QueryTemplate`.
@@ -273,6 +277,8 @@ GET /cmdbuild/custom-api/templates/<templateCode>/run?param=value
 ```
 
 Для dynamic шаблонов выполнение идет под правами текущего пользователя CMDBuild. Для static snapshot шаблонов Runtime читает опубликованный результат из Redis; права зрителя на исходные CMDBuild-объекты не проверяются, поэтому Designer требует явного подтверждения режима публикации.
+
+Runtime ссылки в ячейках строятся только из итоговых данных, metadata ячейки и входных параметров. Небезопасные URL-схемы `javascript:`, `data:` и `vbscript:` блокируются; в этом случае значение выводится обычным текстом.
 
 ## Кэширование
 

@@ -115,6 +115,14 @@ Designer draft preview is intentionally cache-free: `Visualize in editor` calls 
 
 The executor builds a used-field dependency map from filters, matching rules, final data, and visualization settings. `selectCards` materializes only the base card identifiers plus the fields that are actually used downstream; unrelated attributes are not added to result rows and are not part of the cache probe.
 
+## Domain-aware Paths And Runtime Links
+
+The catalog cache stores path metadata in addition to class and attribute names: domain, domain description, cardinality, direction, source class, and target class. The Designer uses this metadata in Object group path pickers so editors can filter attributes/paths by relationship type when the same attribute name is reachable through multiple references/domains. This is only a picker aid over the current user's visible catalog; it does not expand CMDBuild permissions.
+
+Runtime final tables carry lightweight per-cell `cellMeta`: source selection (`SelectionX`/`ВыборкаX`), source class, source card id, attribute name, and domain path when available. The backend also derives ready-made internal card URLs for row participants, for example `${mysource.sourceURLВыборка1}`, `${mysource.sourceURLВыборка2}`, `${mysource.sourceURLSelection1}`, and similar variables from detected selection prefixes. Visualization link templates can use `${mysource.value}`, `${mysource.source}`, `${mysource.sourceClass}`, `${mysource.sourceId}`, `${mysource.attribute}`, `${mysource.domainPath}`, `${row.<column>}`, and `${param.<name>}`.
+
+Both backend and client reject unsafe link schemes: `javascript:`, `data:`, and `vbscript:`. Empty or unsafe rendered URLs fall back to plain text.
+
 Published static snapshots are separate from the runtime result cache. `spec.publish.mode = "staticSnapshot"` requires `warningAccepted = true`; publication executes the template once under the editor's CMDBuild session and stores the result in Redis without TTL. Runtime then reads only Redis data and can serve the page without checking viewer permissions on source CMDBuild objects. If the snapshot is missing, runtime renders `Страница отсутствует для загрузки`. Redis dev mode uses RDB snapshots, so absent snapshots are restored by republishing.
 
 Production Redis is a password-protected dependency. The backend accepts credentials from `CMDBDYNAMIC_REDIS_PASSWORD_FILE`, `CMDBDYNAMIC_REDIS_PASSWORD`, or the password component of `CMDBDYNAMIC_REDIS_URL`; file-based secret injection is preferred. Redis credentials must not be committed to git. Health/status endpoints mask Redis credentials in returned URLs.

@@ -169,6 +169,8 @@ Class selectors are shown as an inheritance tree and include both CMDBuild class
 
 The first visual mode is `Object group`: configure one or more selections. The first selection is shown as `Выборка 1` / `Selection 1` and keeps the legacy `objects` alias; additional selections use `objects2`, `objects3`, and so on. Each selection has its own starting CMDBuild class plus include/exclude scope rules. A rule selects a class attribute/path, including reference/domain/lookup paths expanded from the cached catalog up to the configured depth, and a regular expression. Regex fields can reference input variables as `${param.name}`. Applying it generates executable `selectCards` DSL plus `spec.visualModel`.
 
+Object group path pickers can be filtered by domain, cardinality, and relation direction. Use this when the same attribute name is reachable through several references/domains and the template must keep paths from a specific relationship type. A collapsed help block in the section shows examples.
+
 The second visual mode is `Object matching`: compare object selections with one or more `matchRows` blocks. Each rule is edited as left object, operator, and right object. The operator has an explicit negation selector, so `!` + `equals` replaces the older standalone `notEquals` form. IPv4 operators cover IP in CIDR, IP in range, CIDR overlap, and CIDR contains; the UI shows examples with expected true/false results.
 
 DSL step `expandRelations` expands selected cards through CMDBuild card relations with the current user's session. It reads only allowlisted CMDBuild paths for relations and related cards, supports domain/target-class/direction filters, and returns table rows with source card, relation, and related-card columns.
@@ -176,6 +178,8 @@ DSL step `expandRelations` expands selected cards through CMDBuild card relation
 The visible Designer does not expose standalone relation-chain, search-by-values, group-comparison, or composition constructors. Existing saved templates that already use the underlying DSL steps still run through the backend executor, but new templates are prepared through Object group, Object matching, Final data, Visualization, and Run sections. The Extraction section can display a chosen result table: a specific selection or the final Object matching result when a matching step exists; after object matching is configured, the final matching result is selected by default.
 
 The `Final view` block is the focused runtime layout composer. It chooses the visible result alias, table title, display mode, empty-state text, visible columns, and column labels, then writes ordinary `result.tables` metadata. It can replace the runtime output with one final table while keeping the full DSL steps available for preview/debug.
+
+Visualization can render a final-data column as a link. URL and text templates support `${mysource.value}`, `${mysource.source}`, `${mysource.sourceClass}`, `${mysource.sourceId}`, `${mysource.attribute}`, `${mysource.domainPath}`, `${row.<column>}`, and `${param.<name>}`. Internal links to cards that participated in the result can use ready-made variables such as `${mysource.sourceURLВыборка1}`, `${mysource.sourceURLВыборка2}`, `${mysource.sourceURLSelection1}`, and so on. Examples: `${mysource.sourceURLВыборка2}`, `/cmdbuild/ui/#classes/${mysource.sourceClass}/cards/${mysource.sourceId}` or `/wiki/${param.city}/${mysource.value}`. Unsafe `javascript:`, `data:`, and `vbscript:` URLs are blocked and fall back to plain text.
 
 Minimal relation expansion draft:
 

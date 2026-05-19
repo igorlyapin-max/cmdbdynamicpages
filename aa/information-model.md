@@ -51,6 +51,10 @@ flowchart LR
 
 Business data читаются из существующих CMDBuild классов через DSL (`selectCards`, `expandRelations`, matching). Состав полей ограничивается used-field dependency map: backend запрашивает только атрибуты, реально используемые фильтрами, сопоставлением, итоговыми данными или визуализацией.
 
+Кэш каталога хранит metadata путей через `reference`/`domain`: имя домена, описание, кардинальность, направление, исходный и целевой класс. Эти данные используются в Designer для фильтрации выбора атрибутов по типу связи и не дают дополнительных прав на чтение CMDBuild.
+
+Runtime final table может содержать `cellMeta` по ячейкам: источник выборки, source class, source card id, attribute, domain path и производные внутренние URL на карточки, участвовавшие в строке (`sourceURLВыборка1`, `sourceURLВыборка2`, `sourceURLSelection1` и т.п.). Эти metadata используются только для отображения ссылок в UI, не содержат cookie/token/Redis secret и не пишутся в операционные логи.
+
 Специальный шаблон `kind=cmdbBuildView` читает не business cards, а metadata модели CMDBuild: classes, class attributes, domains, domain attributes, lookup types и lookup values. Он выполняется тем же backend и тем же `CMDBuild-Authorization` текущего пользователя. Отдельная авторизация соседнего `../cmdbuild` приложения не используется. Protected-шаблон `CmdbBuildView` хранится в `Cst_QueryTemplate`, но удаление такого шаблона блокируется backend.
 
 ## Данные Redis

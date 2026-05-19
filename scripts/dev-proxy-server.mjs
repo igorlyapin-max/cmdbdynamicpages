@@ -1029,7 +1029,7 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}.kpi{border:1px solid var(--line);padding:8px}.kpi span{display:block;color:var(--muted);font-size:12px}.kpi strong{display:block;font-size:14px}
     .pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 7px;color:var(--muted);font-size:12px}.pill.ok{border-color:#82c995;color:var(--ok)}.pill.error{border-color:#f0b8b0;color:var(--danger)}
     .model{display:grid;gap:10px;max-height:520px;overflow:auto}.muted{color:var(--muted)}pre{white-space:pre-wrap;background:#f8fafc;border:1px solid var(--line);padding:8px;overflow:auto}
-    .visual-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.visual-grid label{min-width:0}.visual-grid input,.visual-grid select{width:100%}.visualization-table{table-layout:fixed}.visualization-table th,.visualization-table td{overflow-wrap:anywhere}.visualization-table th:nth-child(1){width:30%}.visualization-table th:nth-child(2){width:14%}.visualization-table th:nth-child(3){width:15%}.visualization-table th:nth-child(4){width:26%}.visualization-table th:nth-child(5){width:15%}.visualization-table input,.visualization-table select{width:100%;min-width:0}.visual-row-groups{margin-top:10px;display:grid;gap:6px}.visual-row-group{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.visual-row-group label{flex:1 1 240px;min-width:0}.visual-row-group select{width:100%;min-width:0}.result-table-wrap{margin-top:8px}.result-table-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:6px;min-height:30px;margin:0 0 2px}.result-table-header{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 4px;min-height:30px}.result-table-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex:0 0 auto;flex-wrap:wrap}.result-table-filter{width:240px;max-width:min(52vw,320px);height:30px;padding:4px 7px}.runtime-cache-control{position:relative;display:inline-flex;align-items:center}.runtime-cache-button{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;font-size:18px;line-height:1}.runtime-cache-button[data-disabled="true"]{opacity:.55;cursor:default}.runtime-cache-button.refreshing{animation:cmdp-spin 1s linear infinite}.runtime-cache-tooltip{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:50;min-width:250px;max-width:min(86vw,420px);padding:8px 10px;border:1px solid var(--line);background:#1f2933;color:#fff;box-shadow:0 8px 22px rgba(15,23,42,.18);font-size:12px;line-height:1.35;text-align:left}.runtime-cache-tooltip span{display:block;white-space:nowrap}.runtime-cache-control:hover .runtime-cache-tooltip,.runtime-cache-control:focus-within .runtime-cache-tooltip{display:block}.result-table-title{display:flex;align-items:center;gap:8px;flex:1 1 auto;flex-wrap:wrap;min-width:0;margin:0}.result-table-title h3{margin:0;font-size:13px}.result-subtitle{font-size:12px;color:var(--muted);margin:10px 0 4px}.table-sort{border:0;background:transparent;padding:0;color:inherit;font:inherit;text-align:left}.table-sort:after{content:" ↕";font-size:10px;color:var(--muted)}.cmdp-density-compact th,.cmdp-density-compact td{padding:4px 6px}.cmdp-font-small{font-size:12px}.cmdp-font-normal{font-size:13px}.cmdp-font-large{font-size:15px}.cmdp-zebra tbody tr:nth-child(even) td{background:#fbfdff}.cmdp-row-group-cell{background:#f8fafc;font-weight:600;vertical-align:top}@keyframes cmdp-spin{to{transform:rotate(360deg)}}
+    .visual-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.visual-grid label{min-width:0}.visual-grid input,.visual-grid select{width:100%}.visualization-table{table-layout:fixed}.visualization-table th,.visualization-table td{overflow-wrap:anywhere}.visualization-table th:nth-child(1){width:30%}.visualization-table th:nth-child(2){width:14%}.visualization-table th:nth-child(3){width:15%}.visualization-table th:nth-child(4){width:26%}.visualization-table th:nth-child(5){width:15%}.visualization-table input,.visualization-table select{width:100%;min-width:0}.visualization-link-table{table-layout:fixed}.visualization-link-table th,.visualization-link-table td{overflow-wrap:anywhere}.visualization-link-table input,.visualization-link-table select{width:100%;min-width:0}.visual-row-groups{margin-top:10px;display:grid;gap:6px}.visual-row-group{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.visual-row-group label{flex:1 1 240px;min-width:0}.visual-row-group select{width:100%;min-width:0}.result-table-wrap{margin-top:8px}.result-table-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:6px;min-height:30px;margin:0 0 2px}.result-table-header{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 4px;min-height:30px}.result-table-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex:0 0 auto;flex-wrap:wrap}.result-table-filter{width:240px;max-width:min(52vw,320px);height:30px;padding:4px 7px}.runtime-cache-control{position:relative;display:inline-flex;align-items:center}.runtime-cache-button{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;font-size:18px;line-height:1}.runtime-cache-button[data-disabled="true"]{opacity:.55;cursor:default}.runtime-cache-button.refreshing{animation:cmdp-spin 1s linear infinite}.runtime-cache-tooltip{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:50;min-width:250px;max-width:min(86vw,420px);padding:8px 10px;border:1px solid var(--line);background:#1f2933;color:#fff;box-shadow:0 8px 22px rgba(15,23,42,.18);font-size:12px;line-height:1.35;text-align:left}.runtime-cache-tooltip span{display:block;white-space:nowrap}.runtime-cache-control:hover .runtime-cache-tooltip,.runtime-cache-control:focus-within .runtime-cache-tooltip{display:block}.result-table-title{display:flex;align-items:center;gap:8px;flex:1 1 auto;flex-wrap:wrap;min-width:0;margin:0}.result-table-title h3{margin:0;font-size:13px}.result-subtitle{font-size:12px;color:var(--muted);margin:10px 0 4px}.table-sort{border:0;background:transparent;padding:0;color:inherit;font:inherit;text-align:left}.table-sort:after{content:" ↕";font-size:10px;color:var(--muted)}.cmdp-density-compact th,.cmdp-density-compact td{padding:4px 6px}.cmdp-font-small{font-size:12px}.cmdp-font-normal{font-size:13px}.cmdp-font-large{font-size:15px}.cmdp-zebra tbody tr:nth-child(even) td{background:#fbfdff}.cmdp-row-group-cell{background:#f8fafc;font-weight:600;vertical-align:top}@keyframes cmdp-spin{to{transform:rotate(360deg)}}
     .cmdp-html-result{display:block}.cmdp-build-view{display:grid;gap:10px}.cmdp-build-toolbar{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border-bottom:1px solid var(--line);padding-bottom:6px}.cmdp-build-toolbar-main{display:grid;gap:5px;min-width:0}.cmdp-build-summary,.cmdp-build-nav{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.cmdp-build-nav a{color:var(--accent);text-decoration:none;font-size:12px}.cmdp-build-search{flex:0 0 260px;max-width:min(42vw,320px)}.cmdp-build-section{display:grid;gap:8px}.cmdp-build-section h2{font-size:15px;margin:8px 0 0}.cmdp-build-panel{border:1px solid var(--line);background:#fff;margin:0 0 8px}.cmdp-build-panel>summary{cursor:pointer;display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 10px;background:#fbfdff}.cmdp-build-title{font-weight:700}.cmdp-build-panel .table-wrap{border:0;border-top:1px solid var(--line)}.cmdp-build-table{width:100%;table-layout:auto}.cmdp-build-table th,.cmdp-build-table td{vertical-align:top}.cmdp-build-related,.cmdp-build-links{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:8px 10px}.cmdp-build-related a,.cmdp-build-links a{color:var(--accent);text-decoration:none}
     .settings-block{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}.settings-block:first-of-type{border-top:0;margin-top:0;padding-top:0}.settings-block h3{margin:0 0 8px}.settings-block h4{margin:0 0 7px;font-size:12px;color:#334e68}.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}.settings-grid label{display:grid;gap:4px;color:var(--muted);font-size:12px;min-width:0}.settings-grid input,.settings-grid select{width:100%;min-width:0}.checkbox-list{display:grid;gap:8px}.checkbox-stacked{align-items:flex-start!important}.checkbox-stacked>span{display:grid;gap:2px}.checkbox-stacked strong{font-size:12px;color:var(--text)}.visual-table-list{display:grid;gap:12px}.visual-table-panel{border:1px solid var(--line);background:#fbfdff;padding:10px}.visual-table-heading{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px}.visual-table-heading h3{margin:0}.visual-table-subblock{border-top:1px solid #e4e9f0;padding-top:9px;margin-top:9px}.run-param-list{display:grid;gap:8px}.run-param-row{display:grid;grid-template-columns:minmax(180px,1fr) minmax(220px,1.4fr);gap:10px;align-items:start;border:1px solid var(--line);background:#fbfdff;padding:8px}.run-param-main{display:grid;gap:3px;min-width:0}.run-param-main strong{font-size:13px}.run-param-meta{font-size:12px;color:var(--muted)}.run-param-value label{display:grid;gap:4px;color:var(--muted);font-size:12px}.run-param-value input,.run-param-value select{width:100%}.run-action-grid{display:grid;grid-template-columns:minmax(220px,max-content) minmax(280px,1fr);gap:10px;align-items:start}.run-action-buttons{display:flex;gap:8px;flex-wrap:wrap}
     @media(max-width:1100px){.designer-menu{position:static;width:auto;overflow:visible;margin-bottom:12px}.designer-main{margin-left:0}.menu-groups{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}.menu-links{display:flex;flex-wrap:wrap}}
@@ -1055,6 +1055,21 @@ function dynamicPagesClientScript() {
   var DEFAULT_EMPTY_RESULT_TEXT = ${JSON.stringify(DEFAULT_EMPTY_RESULT_TEXT)};
   var DEFAULT_PERMISSION_DENIED_TEXT = ${JSON.stringify(DEFAULT_PERMISSION_DENIED_TEXT)};
   var DEFAULT_TEMPLATE_CACHE_TTL_SEC = ${JSON.stringify(DEFAULT_TEMPLATE_CACHE_TTL_SEC)};
+  function clientLog(stage, message) {
+    try {
+      var img = new Image();
+      img.src = apiPrefix + '/client-log?stage=' + encodeURIComponent(stage || '') + '&href=' + encodeURIComponent(window.location.href || '') + '&message=' + encodeURIComponent(message || '');
+    } catch (error) {
+    }
+  }
+  window.addEventListener('error', function (event) {
+    clientLog('window-error', event && (event.message || event.error && event.error.message) || 'unknown error');
+  });
+  window.addEventListener('unhandledrejection', function (event) {
+    var reason = event && event.reason;
+    clientLog('unhandled-rejection', reason && reason.message ? reason.message : String(reason || 'unknown rejection'));
+  });
+  clientLog('script-loaded', '');
   var I18N = {
     en: {
       appTitle: 'CMDB Dynamic Pages',
@@ -1344,6 +1359,20 @@ function dynamicPagesClientScript() {
       visualizationRowGroupNextBy: 'Then by',
       visualizationAddRowGroup: '+',
       visualizationRowGroupHelp: 'Repeated adjacent values in selected columns are rendered as one merged cell.',
+      visualizationLinkColumns: 'Column links',
+      visualizationLinkColumnsHelp: 'Turn a final data cell into a safe runtime link. URL and text templates can use current cell, row, and input parameter tokens.',
+      visualizationLinkModeText: 'Text',
+      visualizationLinkModeLink: 'Link',
+      visualizationLinkTargetSelf: 'Current tab',
+      visualizationLinkTargetBlank: 'New tab',
+      visualizationLinkColumn: 'Column',
+      visualizationLinkMode: 'Mode',
+      visualizationLinkUrlTemplate: 'URL template',
+      visualizationLinkTextTemplate: 'Text template',
+      visualizationLinkTarget: 'Target',
+      visualizationLinkExamples: 'Link examples',
+      visualizationLinkExamplesHelp: 'Supported tokens: $' + '{mysource.value}, $' + '{mysource.source}, $' + '{mysource.sourceClass}, $' + '{mysource.sourceId}, $' + '{mysource.attribute}, $' + '{mysource.domainPath}, $' + '{mysource.sourceURLSelection1}, $' + '{mysource.sourceURLВыборка1}, $' + '{row.ColumnName}, $' + '{param.name}. javascript:, data:, and vbscript: links are blocked.',
+      visualizationNoColumns: 'No final data columns.',
       visualizationSortColumn: 'Initial sort',
       visualizationSortDirection: 'Direction',
       visualizationSortAsc: 'Ascending',
@@ -1453,6 +1482,14 @@ function dynamicPagesClientScript() {
       objectGroupInclude: 'Include in scope',
       objectGroupExclude: 'Exclude from scope',
       objectGroupPath: 'Class attribute/path',
+      objectGroupDomainFilter: 'Domain',
+      objectGroupCardinalityFilter: 'Cardinality',
+      objectGroupDirectionFilter: 'Direction',
+      objectGroupDomainExamples: 'Domain path examples',
+      objectGroupDomainExamplesHelp: 'Use these filters when the same attribute name can be reached through different references or domains and the template must keep only paths from a specific relationship type.',
+      objectGroupDomainExample1: 'Domain = NetworkACL keeps paths that came through that CMDBuild domain.',
+      objectGroupDomainExample2: 'Cardinality = N:N leaves only paths that can return several related cards.',
+      objectGroupDomainExample3: 'Direction = inverse helps distinguish attributes reached from the opposite side of the domain.',
       objectGroupRegex: 'Regular expression',
       objectGroupRegexExamples: 'Regular expression examples',
       objectGroupRegexExample: 'Example',
@@ -1896,6 +1933,20 @@ function dynamicPagesClientScript() {
       visualizationRowGroupNextBy: 'Далее по',
       visualizationAddRowGroup: '+',
       visualizationRowGroupHelp: 'Повторяющиеся соседние значения в выбранных колонках выводятся одной объединенной ячейкой.',
+      visualizationLinkColumns: 'Ссылки из колонок',
+      visualizationLinkColumnsHelp: 'Превращает ячейку итоговых данных в безопасную runtime-ссылку. В шаблонах URL и текста можно использовать текущую ячейку, строку и входные параметры.',
+      visualizationLinkModeText: 'Текст',
+      visualizationLinkModeLink: 'Ссылка',
+      visualizationLinkTargetSelf: 'Текущая вкладка',
+      visualizationLinkTargetBlank: 'Новая вкладка',
+      visualizationLinkColumn: 'Колонка',
+      visualizationLinkMode: 'Режим',
+      visualizationLinkUrlTemplate: 'Шаблон URL',
+      visualizationLinkTextTemplate: 'Шаблон текста',
+      visualizationLinkTarget: 'Куда открывать',
+      visualizationLinkExamples: 'Примеры ссылок',
+      visualizationLinkExamplesHelp: 'Доступны токены: $' + '{mysource.value}, $' + '{mysource.source}, $' + '{mysource.sourceClass}, $' + '{mysource.sourceId}, $' + '{mysource.attribute}, $' + '{mysource.domainPath}, $' + '{mysource.sourceURLSelection1}, $' + '{mysource.sourceURLВыборка1}, $' + '{row.ColumnName}, $' + '{param.name}. Ссылки javascript:, data: и vbscript: блокируются.',
+      visualizationNoColumns: 'Нет колонок итоговых данных.',
       visualizationSortColumn: 'Начальная сортировка',
       visualizationSortDirection: 'Направление',
       visualizationSortAsc: 'По возрастанию',
@@ -2005,6 +2056,14 @@ function dynamicPagesClientScript() {
       objectGroupInclude: 'Включить в scope',
       objectGroupExclude: 'Исключить из scope',
       objectGroupPath: 'Атрибут/путь класса',
+      objectGroupDomainFilter: 'Домен',
+      objectGroupCardinalityFilter: 'Кардинальность',
+      objectGroupDirectionFilter: 'Направление',
+      objectGroupDomainExamples: 'Примеры путей через домены',
+      objectGroupDomainExamplesHelp: 'Используйте эти фильтры, когда одно и то же имя атрибута доступно через разные reference/domain и в шаблоне нужно оставить только пути от конкретного типа связи.',
+      objectGroupDomainExample1: 'Домен = NetworkACL оставляет пути, пришедшие через этот домен CMDBuild.',
+      objectGroupDomainExample2: 'Кардинальность = N:N оставляет только пути, которые могут вернуть несколько связанных карточек.',
+      objectGroupDomainExample3: 'Направление = inverse помогает отличать атрибуты, пришедшие с обратной стороны домена.',
       objectGroupRegex: 'Регулярное выражение',
       objectGroupRegexExamples: 'Примеры регулярных выражений',
       objectGroupRegexExample: 'Пример',
@@ -2571,17 +2630,31 @@ function dynamicPagesClientScript() {
   function request(path, options) {
     options = options || {};
     var method = (options.method || 'GET').toUpperCase();
+    var timeoutMs = Math.max(1000, Number(options.timeoutMs || 15000));
+    var controller = window.AbortController ? new AbortController() : null;
+    var timeoutId = null;
     var fetchOptions = {
       method: method,
       credentials: 'include',
       headers: { Accept: 'application/json' }
     };
+    if (controller) fetchOptions.signal = controller.signal;
     if (options.body !== undefined) {
       fetchOptions.headers['Content-Type'] = 'application/json';
       fetchOptions.body = JSON.stringify(options.body);
     }
     var execute = function () {
-      return fetch(path, fetchOptions).then(parseResponse);
+      timeoutId = window.setTimeout(function () {
+        if (controller) controller.abort();
+      }, timeoutMs);
+      return fetch(path, fetchOptions).then(parseResponse).then(function (result) {
+        window.clearTimeout(timeoutId);
+        return result;
+      }).catch(function (error) {
+        window.clearTimeout(timeoutId);
+        if (error && error.name === 'AbortError') throw new Error('Request timeout: ' + path);
+        throw error;
+      });
     };
     if (method === 'GET') return execute();
     return getCsrfToken().then(function (token) {
@@ -3346,35 +3419,54 @@ function dynamicPagesClientScript() {
     var seen = {};
     var maxDepth = Math.max(1, Math.min(5, Number(state.maxTraversalDepth) || 1));
 
-    function add(value, label, type) {
+    function add(value, label, type, relation) {
       var text = String(value || '').trim();
       if (!text || seen[text]) return;
       seen[text] = true;
+      relation = relation || {};
       result.push({
         value: text,
         label: label || text,
-        type: type || ''
+        type: type || '',
+        domain: relation.domain || '',
+        domainDescription: relation.domainDescription || '',
+        cardinality: relation.cardinality || '',
+        direction: relation.direction || '',
+        sourceClass: relation.sourceClass || '',
+        targetClass: relation.targetClass || '',
+        relationPath: relation.relationPath || ''
       });
     }
 
-    function addDirectAttributes(owner, prefix, depth) {
+    function addDirectAttributes(owner, prefix, depth, relation) {
       if (!owner || depth > maxDepth) return;
       catalogAttributeOptions(owner.name).forEach(function (attribute) {
         if (!attribute || !attribute.name) return;
         var path = prefix + attribute.name;
         var label = path + (attribute.type ? ' : ' + attribute.type : '');
         if (attribute.description && attribute.description !== attribute.name) label += ' - ' + attribute.description;
-        add(path, label, attribute.type || '');
+        if (relation && relation.domain) {
+          label += ' [' + relation.domain + (relation.cardinality ? ' ' + relation.cardinality : '') + (relation.direction ? ' ' + relation.direction : '') + ']';
+        }
+        add(path, label, attribute.type || '', relation);
       });
     }
 
-    function visit(owner, prefix, depth, visited) {
+    function domainDirectionForClass(domain, ownerName) {
+      var sources = domainSources(domain);
+      var destinations = domainDestinations(domain);
+      if (sources.indexOf(ownerName) !== -1) return 'direct';
+      if (destinations.indexOf(ownerName) !== -1) return 'inverse';
+      return '';
+    }
+
+    function visit(owner, prefix, depth, visited, relation) {
       if (!owner || depth > maxDepth) return;
       var ownerKey = String(owner.name || '').toLowerCase();
       var nextVisited = Object.assign({}, visited || {});
       if (nextVisited[ownerKey]) return;
       nextVisited[ownerKey] = true;
-      addDirectAttributes(owner, prefix, depth);
+      addDirectAttributes(owner, prefix, depth, relation);
       if (depth >= maxDepth) return;
 
       (owner.attributes || []).forEach(function (attribute) {
@@ -3382,19 +3474,29 @@ function dynamicPagesClientScript() {
         var targetClass = attribute.targetClass || attribute.targetType || '';
         var target = catalogClassByName(targetClass);
         if (!target) return;
-        visit(target, prefix + attribute.name + '.', depth + 1, nextVisited);
+        visit(target, prefix + attribute.name + '.', depth + 1, nextVisited, relation);
       });
 
       catalogDomains().forEach(function (domain) {
         domainRelatedClasses(domain, owner.name).forEach(function (relatedClass) {
           var target = catalogClassByName(relatedClass);
           if (!target) return;
-          visit(target, prefix + '{' + domain.name + ':' + relatedClass + '}.', depth + 1, nextVisited);
+          var direction = domainDirectionForClass(domain, owner.name);
+          var relationInfo = {
+            domain: domain.name || '',
+            domainDescription: domain.description || '',
+            cardinality: domain.cardinality || '',
+            direction: direction,
+            sourceClass: owner.name || '',
+            targetClass: relatedClass,
+            relationPath: prefix + '{' + domain.name + ':' + relatedClass + '}'
+          };
+          visit(target, prefix + '{' + domain.name + ':' + relatedClass + '}.', depth + 1, nextVisited, relationInfo);
         });
       });
     }
 
-    visit(catalogClassByName(className), '', 0, {});
+    visit(catalogClassByName(className), '', 0, {}, null);
     return result;
   }
 
@@ -3403,8 +3505,14 @@ function dynamicPagesClientScript() {
     if (selectedName && !options.some(function (item) { return item.value === selectedName; })) {
       options.unshift({ value: selectedName, label: selectedName, type: '' });
     }
-    return '<option value=""></option>' + options.map(function (item) {
-      return '<option value="' + escapeHtml(item.value || '') + '"' + (item.value === selectedName ? ' selected' : '') + '>' + escapeHtml(item.label || item.value || '') + '</option>';
+    return '<option value=""></option>' + options.filter(Boolean).map(function (item) {
+      return '<option value="' + escapeHtml(item.value || '') + '"' +
+        ' data-domain="' + escapeHtml(item.domain || '') + '"' +
+        ' data-cardinality="' + escapeHtml(item.cardinality || '') + '"' +
+        ' data-direction="' + escapeHtml(item.direction || '') + '"' +
+        ' data-source-class="' + escapeHtml(item.sourceClass || '') + '"' +
+        ' data-target-class="' + escapeHtml(item.targetClass || '') + '"' +
+        (item.value === selectedName ? ' selected' : '') + '>' + escapeHtml(item.label || item.value || '') + '</option>';
     }).join('');
   }
 
@@ -3882,7 +3990,7 @@ function dynamicPagesClientScript() {
     }
     ['Class', '_id', 'Code', 'Description'].forEach(function (column) { add(column, column); });
     tableColumnsForAlias(spec || {}, alias).forEach(function (column) { add(column, column); });
-    catalogScopePathOptions(selection.className || sourceClassForAlias(spec || {}, alias)).forEach(function (item) {
+    catalogScopePathOptions(selection.className || sourceClassForAlias(spec || {}, alias)).filter(Boolean).forEach(function (item) {
       add(item.value, item.label || item.value);
     });
     return items;
@@ -3899,7 +4007,7 @@ function dynamicPagesClientScript() {
     if (!matchStep) return matchingColumnOptionRowsForSelection(spec, name, false);
     var result = matchingColumnOptionRowsForOutput(spec, matchStep.from, seenAliases);
     var rightPrefix = matchStep.rightPrefix || objectSelectionOutputPrefix(spec || defaultSpec(), matchStep.with);
-    matchingColumnOptionRowsForSelection(spec, matchStep.with, true, rightPrefix).forEach(function (item) {
+    matchingColumnOptionRowsForSelection(spec, matchStep.with, true, rightPrefix).filter(Boolean).forEach(function (item) {
       if (!result.some(function (existing) { return existing.value === item.value; })) result.push(item);
     });
     (Array.isArray(matchStep.rules || matchStep.where) ? (matchStep.rules || matchStep.where) : []).forEach(function (rule) {
@@ -3915,7 +4023,7 @@ function dynamicPagesClientScript() {
   }
 
   function renderMatchingColumnOptions(options, selectedName) {
-    var items = Array.isArray(options) ? options.slice() : [];
+    var items = Array.isArray(options) ? options.slice().filter(Boolean) : [];
     if (selectedName && !items.some(function (item) { return item.value === selectedName; })) {
       items.unshift({ value: selectedName, label: selectedName });
     }
@@ -3933,7 +4041,7 @@ function dynamicPagesClientScript() {
     for (var index = 0; index < blockIndex; index += 1) {
       var previousBlock = blocks[index] || {};
       var rightPrefix = previousBlock.rightPrefix || objectSelectionOutputPrefix(spec || defaultSpec(), previousBlock.with);
-      matchingColumnOptionRowsForSelection(spec, previousBlock.with, true, rightPrefix).forEach(function (item) {
+      matchingColumnOptionRowsForSelection(spec, previousBlock.with, true, rightPrefix).filter(Boolean).forEach(function (item) {
         if (!result.some(function (existing) { return existing.value === item.value; })) result.push(item);
       });
     }
@@ -3957,6 +4065,45 @@ function dynamicPagesClientScript() {
       '<td><input data-object-scope-field="regex" value="' + escapeHtml(rule.regex || '') + '" placeholder="' + escapeHtml('$' + '{param.name}') + '"></td>',
       '<td><button data-action="clear-object-scope-row">' + t('clear') + '</button></td>',
       '</tr>'
+    ].join('');
+  }
+
+  function objectGroupDomainFilterOptions(className, selected, field) {
+    var values = [];
+    catalogScopePathOptions(className).forEach(function (item) {
+      var value = String(item && item[field] || '').trim();
+      if (value && values.indexOf(value) === -1) values.push(value);
+    });
+    values.sort();
+    if (selected && values.indexOf(selected) === -1) values.unshift(selected);
+    return '<option value=""></option>' + values.map(function (value) {
+      return '<option value="' + escapeHtml(value) + '"' + (value === selected ? ' selected' : '') + '>' + escapeHtml(value) + '</option>';
+    }).join('');
+  }
+
+  function renderObjectGroupDomainFilters(selection) {
+    selection = selection || {};
+    var className = selection.className || '';
+    return [
+      '<div class="settings-grid" data-object-path-filter style="margin:8px 0">',
+      '<label>' + t('objectGroupDomainFilter') + '<select data-object-path-filter-field="domain">' + objectGroupDomainFilterOptions(className, selection.domainFilter || '', 'domain') + '</select></label>',
+      '<label>' + t('objectGroupCardinalityFilter') + '<select data-object-path-filter-field="cardinality">' + objectGroupDomainFilterOptions(className, selection.cardinalityFilter || '', 'cardinality') + '</select></label>',
+      '<label>' + t('objectGroupDirectionFilter') + '<select data-object-path-filter-field="direction">' + objectGroupDomainFilterOptions(className, selection.directionFilter || '', 'direction') + '</select></label>',
+      '</div>'
+    ].join('');
+  }
+
+  function renderObjectGroupDomainExamples() {
+    return [
+      '<details style="margin-top:12px;border-top:1px solid var(--line);padding-top:8px">',
+      '<summary>' + t('objectGroupDomainExamples') + '</summary>',
+      '<div class="muted" style="margin-top:8px">' + escapeHtml(t('objectGroupDomainExamplesHelp')) + '</div>',
+      '<ul class="steps">',
+      '<li>' + escapeHtml(t('objectGroupDomainExample1')) + '</li>',
+      '<li>' + escapeHtml(t('objectGroupDomainExample2')) + '</li>',
+      '<li>' + escapeHtml(t('objectGroupDomainExample3')) + '</li>',
+      '</ul>',
+      '</details>'
     ].join('');
   }
 
@@ -4021,6 +4168,7 @@ function dynamicPagesClientScript() {
       '</div>',
       '<div class="section-title-row"><h3>' + escapeHtml(selection.name || defaultObjectSelectionName(index)) + '</h3>',
       '<button data-action="add-object-scope-row">' + t('addObjectGroupRule') + '</button></div>',
+      renderObjectGroupDomainFilters(selection),
       '<table class="compact"><thead><tr><th>' + t('objectGroupScopeAction') + '</th><th>' + t('objectGroupPath') + '</th><th>' + t('objectGroupRegex') + '</th><th></th></tr></thead>',
       '<tbody' + rowsId + '>',
       ruleRows,
@@ -4037,6 +4185,7 @@ function dynamicPagesClientScript() {
       '<section class="section" id="cmdp-object-group-editor"><h2>' + t('objectGroupEditor') + '</h2>',
       '<p class="muted">' + t('objectGroupHelp') + '</p>',
       selections.map(renderObjectGroupSelection).join(''),
+      renderObjectGroupDomainExamples(),
       renderObjectGroupRegexExamples(),
       '</section>'
     ].join('');
@@ -4868,6 +5017,7 @@ function dynamicPagesClientScript() {
       '</div>'
     ].join('');
     hydrateVisualizationRowGroupOptions(app);
+    applyObjectPathFilter(app);
   }
 
   function hydrateVisualizationRowGroupOptions(container) {
@@ -5254,7 +5404,7 @@ function dynamicPagesClientScript() {
     if (selected && !options.some(function (item) { return item.value === selected; })) {
       options.unshift({ value: selected, label: selected });
     }
-    return '<option value="">' + escapeHtml(emptyLabel || '') + '</option>' + options.map(function (item) {
+    return '<option value="">' + escapeHtml(emptyLabel || '') + '</option>' + options.filter(Boolean).map(function (item) {
       var tokenLabel = String(item.label || item.value);
       var label = tokenLabel;
       if (label && label !== item.value) label += ' (' + item.value + ')';
@@ -5585,6 +5735,70 @@ function dynamicPagesClientScript() {
     }).join('');
   }
 
+  function normalizeColumnLinks(value) {
+    var result = {};
+    var source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    Object.keys(source).forEach(function (column) {
+      var item = source[column] || {};
+      var textTemplate = String(item.textTemplate || item.labelTemplate || '$' + '{mysource.value}').trim() || '$' + '{mysource.value}';
+      var target = item.target === 'blank' || item.target === '_blank' ? 'blank' : 'self';
+      if (item.mode !== 'link' && !item.urlTemplate && textTemplate === '$' + '{mysource.value}' && target === 'self') return;
+      result[column] = {
+        mode: item.mode === 'link' ? 'link' : 'text',
+        urlTemplate: String(item.urlTemplate || item.url || '').trim(),
+        textTemplate: textTemplate,
+        target: target
+      };
+    });
+    return result;
+  }
+
+  function renderVisualizationLinkModeOptions(selected) {
+    return '<option value="text"' + (selected !== 'link' ? ' selected' : '') + '>' + t('visualizationLinkModeText') + '</option>' +
+      '<option value="link"' + (selected === 'link' ? ' selected' : '') + '>' + t('visualizationLinkModeLink') + '</option>';
+  }
+
+  function renderVisualizationLinkTargetOptions(selected) {
+    return '<option value="self"' + (selected !== 'blank' ? ' selected' : '') + '>' + t('visualizationLinkTargetSelf') + '</option>' +
+      '<option value="blank"' + (selected === 'blank' ? ' selected' : '') + '>' + t('visualizationLinkTargetBlank') + '</option>';
+  }
+
+  function renderVisualizationColumnLinks(columns, settings) {
+    var links = normalizeColumnLinks(settings && (settings.columnLinks || settings.links));
+    var rows = (Array.isArray(columns) ? columns : []).map(normalizeColumnOption).filter(function (item) { return item.value; }).map(function (column) {
+      var link = links[column.value] || {};
+      return '<tr data-visualization-link-row data-column="' + escapeHtml(column.value) + '">' +
+        '<td>' + escapeHtml(column.label || column.value) + '<input type="hidden" data-visualization-link-field="column" value="' + escapeHtml(column.value) + '"></td>' +
+        '<td><select data-visualization-link-field="mode">' + renderVisualizationLinkModeOptions(link.mode || 'text') + '</select></td>' +
+        '<td><input data-visualization-link-field="urlTemplate" value="' + escapeHtml(link.urlTemplate || '') + '" placeholder="/cmdbuild/ui/#classes/$' + '{mysource.sourceClass}/cards/$' + '{mysource.sourceId}"></td>' +
+        '<td><input data-visualization-link-field="textTemplate" value="' + escapeHtml(link.textTemplate || '$' + '{mysource.value}') + '"></td>' +
+        '<td><select data-visualization-link-field="target">' + renderVisualizationLinkTargetOptions(link.target || 'self') + '</select></td>' +
+        '</tr>';
+    }).join('');
+    return [
+      '<table class="compact visualization-link-table"><thead><tr><th>' + t('visualizationLinkColumn') + '</th><th>' + t('visualizationLinkMode') + '</th><th>' + t('visualizationLinkUrlTemplate') + '</th><th>' + t('visualizationLinkTextTemplate') + '</th><th>' + t('visualizationLinkTarget') + '</th></tr></thead><tbody>',
+      rows || '<tr><td colspan="5">' + t('visualizationNoColumns') + '</td></tr>',
+      '</tbody></table>'
+    ].join('');
+  }
+
+  function renderVisualizationLinkExamples() {
+    return [
+      '<details class="help-details" style="margin-top:8px">',
+      '<summary>' + t('visualizationLinkExamples') + '</summary>',
+      '<div class="muted" style="margin-top:8px">' + escapeHtml(t('visualizationLinkExamplesHelp')) + '</div>',
+      '<ul class="steps">',
+      '<li><span class="code-inline">/cmdbuild/ui/#classes/$' + '{mysource.sourceClass}/cards/$' + '{mysource.sourceId}</span></li>',
+      '<li><span class="code-inline">$' + '{mysource.sourceURLВыборка1}</span></li>',
+      '<li><span class="code-inline">$' + '{mysource.sourceURLSelection2}</span></li>',
+      '<li><span class="code-inline">https://monitoring.local/host/$' + '{row.Выборка2.ipaddress}</span></li>',
+      '<li><span class="code-inline">$' + '{mysource.value}</span> ' + escapeHtml(t('visualizationLinkTextTemplate')) + '</li>',
+      '<li><span class="code-inline">/wiki/$' + '{param.city}/$' + '{mysource.value}</span></li>',
+      '</ul>',
+      '</details>'
+    ].join('');
+  }
+
   function objectSelectionPrefixForAlias(spec, alias) {
     var visual = getStoredVisualModel(spec || {}, 'objectGroup');
     var selections = visual && Array.isArray(visual.selections) ? visual.selections : [];
@@ -5751,12 +5965,12 @@ function dynamicPagesClientScript() {
       seen[text] = true;
       items.push({ value: text, label: label || text });
     }
-    matchingColumnOptionRowsForOutput(spec, sourceAlias).forEach(function (item) {
+    matchingColumnOptionRowsForOutput(spec, sourceAlias).filter(Boolean).forEach(function (item) {
       add(item.value, item.label || item.value);
     });
     tableColumnsForAlias(spec, sourceAlias).forEach(function (column) { add(column, column); });
     common.forEach(function (column) { add(column, column); });
-    catalogScopePathOptions(sourceClassForAlias(spec, sourceAlias)).forEach(function (item) {
+    catalogScopePathOptions(sourceClassForAlias(spec, sourceAlias)).filter(Boolean).forEach(function (item) {
       add(item.value, item.label || item.value);
     });
     if (selectedField && !seen[selectedField]) items.unshift({ value: selectedField, label: selectedField });
@@ -5868,6 +6082,12 @@ function dynamicPagesClientScript() {
       '<label>' + t('visualizationSortColumn') + '<select data-visualization-field="sortColumn">' + renderColumnSelectOptions(columnOptions, settings.sortColumn || '', '') + '</select></label>',
       '<label>' + t('visualizationSortDirection') + '<select data-visualization-field="sortDirection"><option value="asc"' + (sortDirection === 'asc' ? ' selected' : '') + '>' + t('visualizationSortAsc') + '</option><option value="desc"' + (sortDirection === 'desc' ? ' selected' : '') + '>' + t('visualizationSortDesc') + '</option></select></label>',
       '</div></div>',
+      '<div class="visual-table-subblock">',
+      '<h4>' + t('visualizationLinkColumns') + '</h4>',
+      '<div class="muted">' + escapeHtml(t('visualizationLinkColumnsHelp')) + '</div>',
+      renderVisualizationColumnLinks(columnOptions, settings),
+      renderVisualizationLinkExamples(),
+      '</div>',
       '<div class="visual-table-subblock">',
       '<h4>' + t('visualizationSubtables') + '</h4>',
       '<div class="settings-grid">',
@@ -6260,6 +6480,71 @@ function dynamicPagesClientScript() {
     return text;
   }
 
+  function renderCellTemplateClient(template, context) {
+    var source = context && context.mysource ? context.mysource : {};
+    var row = context && context.row ? context.row : {};
+    var params = context && context.params ? context.params : {};
+    return String(template || '').replace(/\\$\\{([^{}]+)\\}/g, function (match, token) {
+      var text = String(token || '').trim();
+      if (!text) return '';
+      if (text === 'mysource.value') return rowColumnText(source, 'value');
+      if (text === 'mysource.column') return rowColumnText(source, 'column');
+      if (text === 'mysource.source') return rowColumnText(source, 'source');
+      if (text === 'mysource.sourceClass') return rowColumnText(source, 'sourceClass');
+      if (text === 'mysource.sourceId') return rowColumnText(source, 'sourceId');
+      if (text === 'mysource.attribute') return rowColumnText(source, 'attribute');
+      if (text === 'mysource.domainPath') return rowColumnText(source, 'domainPath');
+      if (text.indexOf('mysource.') === 0 && Object.prototype.hasOwnProperty.call(source, text.slice(9))) return rowColumnText(source, text.slice(9));
+      if (Object.prototype.hasOwnProperty.call(source, text)) return rowColumnText(source, text);
+      if (text.indexOf('row.') === 0) return rowColumnText(row, text.slice(4));
+      if (text.indexOf('param.') === 0) return rowColumnText(params, text.slice(6));
+      if (text.indexOf('params.') === 0) return rowColumnText(params, text.slice(7));
+      return '';
+    });
+  }
+
+  function isSafeRuntimeLinkUrlClient(value) {
+    var text = String(value || '').trim();
+    if (!text) return false;
+    var lower = text.toLowerCase().split('').filter(function (ch) {
+      return ch.charCodeAt(0) > 31 && !/\\s/.test(ch);
+    }).join('');
+    if (lower.indexOf('javascript:') === 0 || lower.indexOf('data:') === 0 || lower.indexOf('vbscript:') === 0) return false;
+    if (/^[a-z][a-z0-9+.\\-]*:/i.test(text)) return /^https?:/i.test(text) || /^mailto:/i.test(text);
+    return true;
+  }
+
+  function renderResultCell(row, column, table, rowGroupColumns) {
+    var value = rowColumnText(row, column);
+    var rowIndex = row && row.__cmdpRowIndex !== undefined ? String(row.__cmdpRowIndex) : '';
+    var meta = table && table.cellMeta && table.cellMeta[rowIndex] && table.cellMeta[rowIndex][column] || {};
+    var linkConfig = table && table.presentation && table.presentation.columnLinks && table.presentation.columnLinks[column] || {};
+    var content = escapeHtml(value);
+    if (linkConfig && linkConfig.mode === 'link' && linkConfig.urlTemplate) {
+      var thisContext = Object.assign({}, meta, {
+        value: value,
+        column: column,
+        attribute: meta.attribute || column
+      });
+      var href = renderCellTemplateClient(linkConfig.urlTemplate, {
+        mysource: thisContext,
+        row: row,
+        params: state.runParams || {}
+      });
+      if (isSafeRuntimeLinkUrlClient(href)) {
+        var text = renderCellTemplateClient(linkConfig.textTemplate || '$' + '{mysource.value}', {
+          mysource: thisContext,
+          row: row,
+          params: state.runParams || {}
+        }) || value;
+        var target = linkConfig.target === 'blank' ? ' target="_blank" rel="noreferrer"' : '';
+        content = '<a href="' + escapeHtml(href) + '"' + target + '>' + escapeHtml(text) + '</a>';
+      }
+    }
+    var groupIndex = rowGroupColumns.indexOf(column);
+    return { value: value, html: content, groupIndex: groupIndex };
+  }
+
   function renderResultTable(table, cacheControlHtml) {
     var columns = table.columns || [];
     var columnLabels = table.columnLabels && typeof table.columnLabels === 'object' ? table.columnLabels : {};
@@ -6276,7 +6561,9 @@ function dynamicPagesClientScript() {
         '</div>' +
         renderKeyValueTable(table, compact) + '</div>';
     }
-    var rows = table.rows || [];
+    var rows = (table.rows || []).map(function (row, index) {
+      return Object.assign({ __cmdpRowIndex: index }, row || {});
+    });
     var tableClass = presentationClassNames(presentation, compact);
     var rowGroupColumns = presentationRowGroupColumns(presentation, columns);
     var controlsDisabledByRowGrouping = rowGroupColumns.length > 0;
@@ -6297,13 +6584,12 @@ function dynamicPagesClientScript() {
       return groupRows.map(function (row, rowIndex) {
         var filterText = columns.map(function (column) { return rowColumnText(row, column); }).join(' ');
         return '<tr data-result-row data-filter-text="' + escapeHtml(filterText.toLowerCase()) + '">' + columns.map(function (column) {
-          var value = rowColumnText(row, column);
-          var groupIndex = rowGroupColumns.indexOf(column);
-          if (groupIndex !== -1) {
-            if (rowIndex > 0 && sameRowGroupPrefix(groupRows, rowIndex, rowIndex - 1, rowGroupColumns, groupIndex)) return '';
-            return '<td class="cmdp-row-group-cell" rowspan="' + rowGroupSpan(groupRows, rowIndex, rowGroupColumns, groupIndex) + '" data-cell-value="' + escapeHtml(value) + '">' + escapeHtml(value) + '</td>';
+          var cell = renderResultCell(row, column, table, rowGroupColumns);
+          if (cell.groupIndex !== -1) {
+            if (rowIndex > 0 && sameRowGroupPrefix(groupRows, rowIndex, rowIndex - 1, rowGroupColumns, cell.groupIndex)) return '';
+            return '<td class="cmdp-row-group-cell" rowspan="' + rowGroupSpan(groupRows, rowIndex, rowGroupColumns, cell.groupIndex) + '" data-cell-value="' + escapeHtml(cell.value) + '">' + cell.html + '</td>';
           }
-          return '<td data-cell-value="' + escapeHtml(value) + '">' + escapeHtml(value) + '</td>';
+          return '<td data-cell-value="' + escapeHtml(cell.value) + '">' + cell.html + '</td>';
         }).join('') + '</tr>';
       }).join('');
     }
@@ -6332,15 +6618,28 @@ function dynamicPagesClientScript() {
   function loadDesigner() {
     updateChrome();
     app.innerHTML = '<div class="notice">' + t('loadingDesigner') + '</div>';
+    clientLog('load-designer-start', state.designerSection || '');
     state.technicalSchemaAccessDenied = false;
     state.accessDeniedText = DEFAULT_PERMISSION_DENIED_TEXT;
+    function namedRequest(name, path, options) {
+      clientLog('load-designer-request', name);
+      return request(path, options).then(function (result) {
+        clientLog('load-designer-response', name + ' ' + result.status);
+        app.innerHTML = '<div class="notice">' + escapeHtml(t('loadingDesigner')) + '<div class="muted">' + escapeHtml(name + ' ' + result.status) + '</div></div>';
+        return result;
+      });
+    }
     return Promise.all([
-      request(apiPrefix + '/session'),
-      request(apiPrefix + '/schema?root=' + encodeURIComponent(state.root)),
-      request(apiPrefix + '/schema/parents?limit=500'),
-      request(apiPrefix + '/config?root=' + encodeURIComponent(state.root)),
-      request(apiPrefix + '/templates?limit=100')
+      namedRequest('session', apiPrefix + '/session'),
+      namedRequest('schema', apiPrefix + '/schema?root=' + encodeURIComponent(state.root)),
+      namedRequest('schemaParents', apiPrefix + '/schema/parents?limit=500').catch(function (error) {
+        clientLog('load-designer-optional-failed', 'schemaParents ' + (error && error.message ? error.message : String(error)));
+        return { ok: true, status: 0, json: { parents: [] }, body: '' };
+      }),
+      namedRequest('config', apiPrefix + '/config?root=' + encodeURIComponent(state.root)),
+      namedRequest('templates', apiPrefix + '/templates?limit=100')
     ]).then(function (results) {
+      clientLog('load-designer-results', results.map(function (item) { return item.status; }).join(','));
       state.session = results[0].json && results[0].json.session ? results[0].json.session : state.session;
       state.schema = results[1].json ? results[1].json.schema : null;
       state.schemaParents = results[2].json && Array.isArray(results[2].json.parents) ? results[2].json.parents : [];
@@ -6364,9 +6663,11 @@ function dynamicPagesClientScript() {
       var failed = results.find(function (item) { return !item.ok; });
       state.message = failed ? { type: 'error', text: errorText(failed) } : null;
       return loadCatalogCache().then(function () {
+        clientLog('load-designer-catalog', 'loaded');
         return fetchVersions(state.selectedTemplate && state.selectedTemplate.code).then(renderDesigner);
       });
     }).catch(function (error) {
+      clientLog('load-designer-error', error && error.message ? error.message : String(error));
       app.innerHTML = '<div class="notice error">' + escapeHtml(error.message || String(error)) + '</div>';
     });
   }
@@ -6790,6 +7091,27 @@ function dynamicPagesClientScript() {
         var value = String(field.value || '').trim();
         if (value && rowGroupBy.indexOf(value) === -1) rowGroupBy.push(value);
       });
+      var columnLinks = {};
+      Array.prototype.slice.call(detailRow.querySelectorAll('[data-visualization-link-row]')).forEach(function (linkRow) {
+        function linkField(field) {
+          return linkRow.querySelector('[data-visualization-link-field="' + field + '"]');
+        }
+        var column = String((linkField('column') || {}).value || '').trim();
+        var modeValue = String((linkField('mode') || {}).value || 'text').trim();
+        var urlTemplate = String((linkField('urlTemplate') || {}).value || '').trim();
+        var textTemplate = String((linkField('textTemplate') || {}).value || '').trim() || '$' + '{mysource.value}';
+        var target = String((linkField('target') || {}).value || 'self').trim() === 'blank' ? 'blank' : 'self';
+        var defaultTextTemplate = '$' + '{mysource.value}';
+        var hasLinkDraft = modeValue === 'link' || urlTemplate || textTemplate !== defaultTextTemplate || target !== 'self';
+        if (column && hasLinkDraft) {
+          columnLinks[column] = {
+            mode: modeValue === 'link' ? 'link' : 'text',
+            urlTemplate: urlTemplate,
+            textTemplate: textTemplate,
+            target: target
+          };
+        }
+      });
       var table = { name: name, mode: mode, titleAlign: titleAlign };
       if (title) table.title = title;
       if (splitSubtables) table.splitSubtables = true;
@@ -6799,6 +7121,7 @@ function dynamicPagesClientScript() {
       if (rowGroupBy.length) table.rowGroupBy = rowGroupBy;
       if (sortColumn) table.sortColumn = sortColumn;
       if (sortColumn) table.sortDirection = sortDirection;
+      if (Object.keys(columnLinks).length) table.columnLinks = columnLinks;
       settings.tables.push(table);
     });
     return settings;
@@ -6839,7 +7162,8 @@ function dynamicPagesClientScript() {
         groupTitleTemplate: settingsTable.groupTitleTemplate || '',
         rowGroupBy: normalizeVisualizationRowGroupBy(settingsTable.rowGroupBy),
         sortColumn: settingsTable.sortColumn || '',
-        sortDirection: settingsTable.sortDirection || 'asc'
+        sortDirection: settingsTable.sortDirection || 'asc',
+        columnLinks: normalizeColumnLinks(settingsTable.columnLinks)
       };
       return next;
     }) : [];
@@ -7804,6 +8128,27 @@ function dynamicPagesClientScript() {
     });
   }
 
+  function applyObjectPathFilter(container) {
+    Array.prototype.slice.call((container || document).querySelectorAll('[data-object-selection]')).forEach(function (selection) {
+      var filter = selection.querySelector('[data-object-path-filter]');
+      if (!filter) return;
+      var domain = String((filter.querySelector('[data-object-path-filter-field="domain"]') || {}).value || '').trim().toLowerCase();
+      var cardinality = String((filter.querySelector('[data-object-path-filter-field="cardinality"]') || {}).value || '').trim().toLowerCase();
+      var direction = String((filter.querySelector('[data-object-path-filter-field="direction"]') || {}).value || '').trim().toLowerCase();
+      Array.prototype.slice.call(selection.querySelectorAll('[data-object-scope-field="path"] option')).forEach(function (option) {
+        if (!option.value) {
+          option.hidden = false;
+          return;
+        }
+        var matches = true;
+        if (domain && String(option.getAttribute('data-domain') || '').toLowerCase() !== domain) matches = false;
+        if (cardinality && String(option.getAttribute('data-cardinality') || '').toLowerCase() !== cardinality) matches = false;
+        if (direction && String(option.getAttribute('data-direction') || '').toLowerCase() !== direction) matches = false;
+        option.hidden = !matches;
+      });
+    });
+  }
+
   function visualizationColumnOptionsHtmlForRowGroup(container) {
     var detailRow = container && container.closest ? container.closest('[data-visualization-row-detail]') : null;
     var source = detailRow && detailRow.querySelector('[data-visualization-column-options]');
@@ -8561,6 +8906,7 @@ function dynamicPagesClientScript() {
       if (key === 'lang' || key === 'cmdpLang') return;
       params[key] = value;
     });
+    state.runParams = params;
     if (boot.publicRuntime) {
       request(publicSnapshotRunPath(templateCode, params)).then(function (result) {
         state.runtimeRefreshInProgress = false;
@@ -8741,11 +9087,17 @@ function dynamicPagesClientScript() {
     if (event.target && event.target.matches && event.target.matches('[data-run-param-field]')) {
       refreshTemplateLaunchUrl();
     }
+    if (event.target && event.target.matches && event.target.matches('[data-object-path-filter-field]')) {
+      applyObjectPathFilter(event.target.closest('[data-object-selection]') || document);
+    }
   });
 
   document.addEventListener('change', function (event) {
     if (event.target && event.target.matches && event.target.matches('[data-run-param-field]')) {
       refreshTemplateLaunchUrl();
+    }
+    if (event.target && event.target.matches && event.target.matches('[data-object-path-filter-field]')) {
+      applyObjectPathFilter(event.target.closest('[data-object-selection]') || document);
     }
   });
 
@@ -11468,6 +11820,183 @@ function projectRows(rows, columns) {
   });
 }
 
+function runtimeCardUrl(className, id) {
+  const classText = displayCardValue(className).trim();
+  const idText = displayCardValue(id).trim();
+  if (!classText || !idText) return '';
+  return `/cmdbuild/ui/#classes/${encodeURIComponent(classText)}/cards/${encodeURIComponent(idText)}`;
+}
+
+function sourceUrlKeySuffix(value) {
+  return displayCardValue(value).trim().replace(/[._\s]+$/g, '').replace(/^[._\s]+/g, '').replace(/[._\s]+/g, '');
+}
+
+function addSourceUrlVar(vars, suffix, className, id) {
+  const keySuffix = sourceUrlKeySuffix(suffix);
+  const url = runtimeCardUrl(className, id);
+  if (!keySuffix || !url) return;
+  vars[`sourceURL${keySuffix}`] = url;
+}
+
+function firstPresentRowValue(row, keys) {
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(row, key) && row[key] !== undefined && row[key] !== null && row[key] !== '') {
+      return row[key];
+    }
+  }
+  return '';
+}
+
+function prefixedRowKeys(prefix) {
+  const cleanPrefix = String(prefix || '');
+  return {
+    classKeys: [
+      `${cleanPrefix}.Class`,
+      `${cleanPrefix}.class`,
+      `${cleanPrefix}.Type`,
+      `${cleanPrefix}._type`,
+      `${cleanPrefix}.RelatedClass`,
+      `${cleanPrefix}.SourceClass`,
+      `${cleanPrefix}_Class`,
+      `${cleanPrefix}_class`,
+      `${cleanPrefix}_Type`,
+      `${cleanPrefix}__type`,
+      `${cleanPrefix}_RelatedClass`,
+      `${cleanPrefix}_SourceClass`,
+      `${cleanPrefix}Class`,
+      `${cleanPrefix}RelatedClass`,
+      `${cleanPrefix}SourceClass`
+    ],
+    idKeys: [
+      `${cleanPrefix}._id`,
+      `${cleanPrefix}.id`,
+      `${cleanPrefix}.Id`,
+      `${cleanPrefix}.RelatedId`,
+      `${cleanPrefix}.SourceId`,
+      `${cleanPrefix}__id`,
+      `${cleanPrefix}_id`,
+      `${cleanPrefix}_Id`,
+      `${cleanPrefix}_RelatedId`,
+      `${cleanPrefix}_SourceId`,
+      `${cleanPrefix}Id`,
+      `${cleanPrefix}RelatedId`,
+      `${cleanPrefix}SourceId`
+    ]
+  };
+}
+
+function addPrefixedSourceUrlVar(vars, row, prefix) {
+  const keys = prefixedRowKeys(prefix);
+  addSourceUrlVar(vars, prefix, firstPresentRowValue(row, keys.classKeys), firstPresentRowValue(row, keys.idKeys));
+}
+
+function buildRowSourceUrlVars(row) {
+  const vars = {};
+  if (!row || typeof row !== 'object') return vars;
+
+  const className = row.Class || row.RelatedClass || row.SourceClass;
+  const id = row._id || row.RelatedId || row.SourceId;
+  const defaultUrl = runtimeCardUrl(className, id);
+  if (defaultUrl) {
+    vars.sourceURL = defaultUrl;
+    addSourceUrlVar(vars, row.__source, className, id);
+    addSourceUrlVar(vars, 'Выборка1', className, id);
+    addSourceUrlVar(vars, 'Selection1', className, id);
+  }
+
+  addSourceUrlVar(vars, 'Source', row.SourceClass, row.SourceId);
+  addSourceUrlVar(vars, 'Related', row.RelatedClass, row.RelatedId);
+
+  const prefixes = new Set();
+  for (const key of Object.keys(row)) {
+    if (key.endsWith('.Class')) {
+      const prefix = key.slice(0, -'.Class'.length);
+      prefixes.add(prefix);
+    } else if (key.endsWith('_Class')) {
+      const prefix = key.slice(0, -'_Class'.length);
+      prefixes.add(prefix);
+    } else if (key.endsWith('.RelatedClass')) {
+      const prefix = key.slice(0, -'.RelatedClass'.length);
+      prefixes.add(prefix);
+      addSourceUrlVar(vars, `${prefix}Related`, row[key], row[`${prefix}.RelatedId`] || row[`${prefix}._id`]);
+    } else if (key.endsWith('_RelatedClass')) {
+      const prefix = key.slice(0, -'_RelatedClass'.length);
+      prefixes.add(prefix);
+      addSourceUrlVar(vars, `${prefix}Related`, row[key], row[`${prefix}_RelatedId`] || row[`${prefix}__id`] || row[`${prefix}_id`]);
+    } else if (key.endsWith('.class')) {
+      prefixes.add(key.slice(0, -'.class'.length));
+    } else if (key.endsWith('_class')) {
+      prefixes.add(key.slice(0, -'_class'.length));
+    } else if (key.endsWith('Class') && key.length > 'Class'.length) {
+      prefixes.add(key.slice(0, -'Class'.length));
+    } else if (key.endsWith('RelatedClass') && key.length > 'RelatedClass'.length) {
+      prefixes.add(key.slice(0, -'RelatedClass'.length));
+    }
+  }
+  prefixes.forEach((prefix) => addPrefixedSourceUrlVar(vars, row, prefix));
+
+  return vars;
+}
+
+function sourceCellMetaForRow(row, column) {
+  const sourceClass = displayCardValue(row && (row.SourceClass || row.RelatedClass || row.Class));
+  const sourceId = displayCardValue(row && (row.SourceId || row.RelatedId || row._id));
+  const sourceUrls = buildRowSourceUrlVars(row);
+  return {
+    source: displayCardValue(row && row.__source),
+    sourceClass,
+    sourceId,
+    attribute: String(column || ''),
+    domainPath: displayCardValue(row && row.Domain),
+    sourceUrls,
+    ...sourceUrls
+  };
+}
+
+function buildResultCellMeta(rows, columns) {
+  const result = {};
+  (Array.isArray(rows) ? rows : []).forEach((row, rowIndex) => {
+    const rowMeta = {};
+    (Array.isArray(columns) ? columns : []).forEach((column) => {
+      rowMeta[column] = sourceCellMetaForRow(row, column);
+    });
+    result[String(rowIndex)] = rowMeta;
+  });
+  return result;
+}
+
+function renderCellTemplate(template, context) {
+  const source = context && context.mysource ? context.mysource : {};
+  const row = context && context.row ? context.row : {};
+  const params = context && context.params ? context.params : {};
+  return String(template || '').replace(/\$\{([^{}]+)\}/g, (match, token) => {
+    const text = String(token || '').trim();
+    if (!text) return '';
+    if (text === 'mysource.value') return displayCardValue(source.value);
+    if (text === 'mysource.column') return displayCardValue(source.column);
+    if (text === 'mysource.source') return displayCardValue(source.source);
+    if (text === 'mysource.sourceClass') return displayCardValue(source.sourceClass);
+    if (text === 'mysource.sourceId') return displayCardValue(source.sourceId);
+    if (text === 'mysource.attribute') return displayCardValue(source.attribute);
+    if (text === 'mysource.domainPath') return displayCardValue(source.domainPath);
+    if (text.startsWith('mysource.') && Object.prototype.hasOwnProperty.call(source, text.slice(9))) return displayCardValue(source[text.slice(9)]);
+    if (Object.prototype.hasOwnProperty.call(source, text)) return displayCardValue(source[text]);
+    if (text.startsWith('row.')) return displayCardValue(row[text.slice(4)]);
+    if (text.startsWith('param.')) return displayCardValue(params[text.slice(6)]);
+    if (text.startsWith('params.')) return displayCardValue(params[text.slice(7)]);
+    return '';
+  });
+}
+
+function isSafeRuntimeLinkUrl(value) {
+  const text = String(value || '').trim();
+  if (!text) return false;
+  const lower = text.toLowerCase().split('').filter((ch) => ch.charCodeAt(0) > 31 && !/\s/.test(ch)).join('');
+  if (lower.startsWith('javascript:') || lower.startsWith('data:') || lower.startsWith('vbscript:')) return false;
+  if (/^[a-z][a-z0-9+\.\-]*:/i.test(text)) return /^https?:/i.test(text) || /^mailto:/i.test(text);
+  return true;
+}
+
 function uniqueStrings(values) {
   const result = [];
   for (const value of values) {
@@ -13455,6 +13984,7 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
   const tables = spec.result.tables.map((table) => {
     const source = context[table.name] || { columns: [], rows: [], truncated: false };
     const columns = Array.isArray(table.columns) && table.columns.length ? table.columns : source.columns;
+    const sourceRows = Array.isArray(source.rows) ? source.rows : [];
     const namedPresentation = globalTablePresentations.find((item) => item && item.name === table.name) || {};
     const tablePresentation = table.presentation && typeof table.presentation === 'object' && !Array.isArray(table.presentation)
       ? table.presentation
@@ -13479,7 +14009,8 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
       columns,
       columnLabels: table.columnLabels && typeof table.columnLabels === 'object' && !Array.isArray(table.columnLabels) ? table.columnLabels : {},
       presentation,
-      rows: projectRows(source.rows, columns),
+      cellMeta: buildResultCellMeta(sourceRows, columns),
+      rows: projectRows(sourceRows, columns),
       truncated: Boolean(source.truncated)
     };
   });
@@ -14724,7 +15255,14 @@ const server = http.createServer((req, res) => {
   }
   if (requestUrl.pathname === DYNAMIC_UI_PREFIX || requestUrl.pathname.startsWith(`${DYNAMIC_UI_PREFIX}/`)) {
     handleDynamicPagesUi(req, res, requestUrl).catch((error) => {
-      sendHtml(res, 500, `<!doctype html><html><head><meta charset="utf-8"><title>CMDB Dynamic Pages</title></head><body style="font-family:Arial,sans-serif;padding:24px"><h1>CMDB Dynamic Pages error</h1><pre>${htmlEscape(error && error.message ? error.message : String(error))}</pre></body></html>`);
+      logError('dynamic_ui.render_failed', {
+        requestId: req.cmdpRequestId || '',
+        path: requestUrl.pathname,
+        message: error && error.message ? error.message : String(error),
+        stack: error && error.stack ? error.stack : ''
+      });
+      const details = error && error.stack ? error.stack : (error && error.message ? error.message : String(error));
+      sendHtml(res, 500, `<!doctype html><html><head><meta charset="utf-8"><title>CMDB Dynamic Pages</title></head><body style="font-family:Arial,sans-serif;padding:24px"><h1>CMDB Dynamic Pages error</h1><pre>${htmlEscape(details)}</pre></body></html>`);
     });
     return;
   }
@@ -14769,6 +15307,7 @@ if (isMainModule) {
 export {
   DEFAULT_TEMPLATE_CACHE_TTL_SEC,
   applyTemplateParamDefaults,
+  buildResultCellMeta,
   buildTechnicalSchema,
   defaultRuntimeConfig,
   dependencyMapWithHash,
@@ -14783,8 +15322,10 @@ export {
   publicSnapshotParamsFromUrl,
   redactByName,
   renderRuntimeParamTemplate,
+  renderCellTemplate,
   runtimeCacheKeyParts,
   runtimeCacheMeta,
   sanitizeRequestPath,
-  schemaParentFromInput
+  schemaParentFromInput,
+  isSafeRuntimeLinkUrl
 };
