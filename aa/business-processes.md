@@ -36,7 +36,7 @@ flowchart TD
 | --- | --- | --- |
 | Загрузка launcher/custom page | `/cmdbuild/custom-api/client-log` | stage, href, timestamp |
 | Proxy request к CMDBuild UI | `/cmdbuild/custom-api/proxy-log` | method, path, referer, userAgent |
-| Preview шаблона | `Cst_QueryExecutionLog` best-effort | template, user, status, rows |
+| Preview шаблона | standard backend logs | requestId, template, user, status, rows |
 | Save/update шаблона | `Cst_QueryTemplateVersion` best-effort | template, version, changedBy |
 
 ## BP-002. Запуск dynamic runtime страницы
@@ -74,9 +74,11 @@ flowchart TD
 | Событие | Где фиксируется | Данные |
 | --- | --- | --- |
 | GET runtime iframe | access/proxy logs окружения | URL без cookie/token |
-| Direct `POST run` | `Cst_QueryExecutionLog` | template, user, status, rows |
-| Runtime `GET run` | не пишет audit card | read-only iframe режим |
-| Ошибка выполнения | response JSON + backend stderr/container logs | message/status |
+| Direct `POST run` | standard backend logs | template, user, status, rows |
+| Runtime `GET run` | standard backend logs | read-only iframe режим |
+| Нет данных в правах пользователя | response JSON | HTTP 200, `success=true`, пустые `rows`, `emptyText` |
+| Нет прав на используемый класс/атрибут | response JSON + backend stderr/container logs | HTTP 403, `success=false`, `permissionDenied=true`, `permissionDeniedText`; частичный результат по другим выборкам не отдается |
+| Ошибка выполнения | response JSON + backend stderr/container logs | message/status; masked CMDBuild 404 может классифицироваться как generic execution error |
 
 ## BP-003. Публикация static snapshot
 

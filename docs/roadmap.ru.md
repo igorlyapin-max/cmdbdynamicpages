@@ -69,7 +69,6 @@
 - [x] `Cst_QueryToolConfig`
 - [x] `Cst_QueryTemplate`
 - [x] `Cst_QueryTemplateVersion`
-- [x] `Cst_QueryExecutionLog`
 - [x] Runtime config хранится в `Cst_QueryToolConfig.RuntimeConfigJson`.
 - [x] Шаблоны хранятся в CMDBuild, не в локальных файлах.
 

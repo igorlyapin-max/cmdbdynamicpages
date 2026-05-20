@@ -365,7 +365,7 @@ paths:
     get:
       tags: [runtime]
       summary: Read-only runtime execution
-      description: Used by Runtime UI/iframe; no CSRF required and no execution audit card is written.
+      description: Used by Runtime UI/iframe; no CSRF required. Runtime execution is not stored in CMDBuild technical classes; events go through standard backend logging. Empty authorized results are returned as HTTP 200 with empty rows and `emptyText`. An explicit CMDBuild 401/403 on a class or attribute used by the template is returned as HTTP 403 with `permissionDenied=true`; the runtime does not return a partial multi-selection result in that case. If CMDBuild masks permission denial as 404, the current implementation may classify it as a generic execution error.
       parameters:
         - name: refresh
           in: query
@@ -392,6 +392,10 @@ paths:
                 $ref: "#/components/schemas/RuntimeJsonResult"
         "403":
           description: Permission denied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuntimePermissionDenied"
     post:
       tags: [runtime]
       summary: Direct runtime execution with audit
@@ -536,6 +540,7 @@ components:
       additionalProperties: true
     RuntimeJsonResult:
       type: object
+      description: Runtime JSON output for `json=true`. A successful response can contain empty rows when no objects are visible under the current user's CMDBuild permissions.
       properties:
         success:
           type: boolean
@@ -610,10 +615,34 @@ components:
           type: object
           nullable: true
           additionalProperties: true
-        auditLog:
+    RuntimePermissionDenied:
+      type: object
+      description: Returned when a class or attribute actually used by the runtime template is denied by CMDBuild as 401/403. The endpoint does not return partial data from other selections in this case.
+      properties:
+        success:
+          type: boolean
+          example: false
+        action:
+          type: string
+          example: run
+        permissionDenied:
+          type: boolean
+          example: true
+        template:
           type: object
-          nullable: true
-          additionalProperties: true
+          properties:
+            code:
+              type: string
+            description:
+              type: string
+            active:
+              type: boolean
+        message:
+          type: string
+          example: Вам не хватает прав увидеть данные или интерфейс дизайнера
+        permissionDeniedText:
+          type: string
+          example: Вам не хватает прав увидеть данные или интерфейс дизайнера
     SchemaBootstrapRequest:
       type: object
       properties:

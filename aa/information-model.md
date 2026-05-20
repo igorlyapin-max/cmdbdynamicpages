@@ -47,7 +47,6 @@ flowchart LR
 | `Cst_QueryToolConfig` | Runtime/system settings |
 | `Cst_QueryTemplate` | Шаблоны DSL |
 | `Cst_QueryTemplateVersion` | Версии шаблонов |
-| `Cst_QueryExecutionLog` | Best-effort audit preview/direct POST run |
 
 Business data читаются из существующих CMDBuild классов через DSL (`selectCards`, `expandRelations`, matching). Состав полей ограничивается used-field dependency map: backend запрашивает только атрибуты, реально используемые фильтрами, сопоставлением, итоговыми данными или визуализацией.
 

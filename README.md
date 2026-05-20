@@ -93,7 +93,7 @@ Run the backend smoke/e2e check against the local proxy:
 npm run e2e
 ```
 
-The e2e check verifies session, logging diagnostics, technical schema readiness, CSRF rejection, draft validate/preview without runtime cache, relation expansion, multi-hop relation chains, value search, group comparison, Runtime shell loading, saved-template `run`, cache hit, POST `forceRefresh`, and that read-only GET runtime cannot force refresh. Direct saved-template `POST run` writes a normal best-effort execution audit card in CMDBuild; iframe/runtime UI uses read-only `GET run` and does not require CSRF.
+The e2e check verifies session, logging diagnostics, technical schema readiness, CSRF rejection, draft validate/preview without runtime cache, relation expansion, multi-hop relation chains, value search, group comparison, Runtime shell loading, saved-template `run`, cache hit, POST `forceRefresh`, and that read-only GET runtime cannot force refresh. Runtime execution events are written only through the standard backend logging paths; no runtime execution cards are stored in CMDBuild.
 
 Optional API contract smoke tests can run against a started proxy:
 
@@ -242,6 +242,7 @@ http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/run/ProbeClassesByAttributeType?a
 ```
 
 `json` is not a template input variable and cannot be declared in `spec.params`. Permissions, cache keys, static snapshots, and refresh cooldown behavior stay the same as for the HTML runtime view.
+If the requested template has no matching data under the current user's CMDBuild permissions, JSON runtime returns HTTP `200`, `success: true`, empty `tables[].rows`, and the configured `emptyText`. If a class or attribute that is actually used by the template fails with CMDBuild `401/403`, JSON runtime returns HTTP `403`, `success: false`, `permissionDenied: true`, and the configured `permissionDeniedText`; it does not return a partial result from the other selections. Current behavior depends on CMDBuild exposing the denial as `401/403`: if CMDBuild masks a missing permission as `404`, the response may be a generic execution error, and superclass selections with only a subset of readable descendants may be returned as the readable subset.
 Runtime template execution uses a Redis-backed cache with in-memory fallback when Redis is unavailable in dev. Cache behavior is controlled by each template in `spec.cache`; the default mode is `permissionOnly`, which shares a result inside the same endpoint/template/params after the viewer passes a lightweight probe for the classes and attributes actually used by the template. This default assumes row-level CMDBuild scope is not different between users. Use `visibilityHash` when row-level scope can differ, or `privateUser` when the cache must stay isolated by CMDBuild user/session scope. The executor builds a used-field dependency map and avoids materializing unrelated card attributes in `selectCards`.
 Cache TTL is a template setting. Manual refresh cooldown is a system Runtime setting stored in `Cst_QueryToolConfig.RuntimeConfigJson.runtimeCache.refreshCooldownSec`. The runtime page keeps cache controls compact: the table header shows the title on the left and search plus a `⟳` refresh icon on the right; the icon tooltip contains cache age/expiry, refresh countdown, backend, and scope details.
 Designer preview is separate from the saved runtime cache: `Visualize in editor` runs `/draft/preview` against the current draft and does not read the final runtime result cache. The Run page also has `Refresh cache and show`, which calls saved-template `POST run` with `forceRefresh=true`; this rebuilds the runtime cache without the user refresh cooldown and requires CSRF, so iframe/read-only `GET run` cannot bypass the timer.
@@ -336,7 +337,6 @@ It handles backend routes under:
 /cmdbuild/custom-api/schema
 /cmdbuild/custom-api/schema/bootstrap
 /cmdbuild/custom-api/config
-/cmdbuild/custom-api/execution-logs
 /cmdbuild/custom-api/templates
 /cmdbuild/custom-api/templates/<code>
 DELETE /cmdbuild/custom-api/templates/<code>
@@ -362,7 +362,7 @@ State-changing custom API routes require a same-origin `Origin` or `Referer` hea
 
 `GET /cmdbuild/custom-api/auth/permission-scope` probes what permission-scope metadata is visible to the current CMDBuild session. It returns session role data, endpoint statuses for roles/users/groups/classes/domains, sampled readable classes/attributes, and a visible-model hash. That hash is diagnostic only; runtime result sharing is controlled explicitly by each template's `spec.cache.scopeMode`.
 
-Runtime iframe pages call `GET /cmdbuild/custom-api/templates/<code>/run?param=value`. This endpoint still requires the CMDBuild session cookie for dynamic templates, but it is read-only from CMDBuild's perspective, skips execution-audit card creation, and does not require `X-CMDBDynamicPages-CSRF`. `POST /cmdbuild/custom-api/templates/<code>/run` remains available for API/Designer checks and keeps CSRF protection plus best-effort audit logging.
+Runtime iframe pages call `GET /cmdbuild/custom-api/templates/<code>/run?param=value`. This endpoint still requires the CMDBuild session cookie for dynamic templates, but it is read-only from CMDBuild's perspective and does not require `X-CMDBDynamicPages-CSRF`. `POST /cmdbuild/custom-api/templates/<code>/run` remains available for API/Designer checks and keeps CSRF protection. Both GET and POST runtime executions use standard backend logging only.
 
 Production health/readiness endpoints are unauthenticated and are also available at root aliases `/health/live`, `/health/ready`, and `/health/redis`.
 
@@ -541,6 +541,7 @@ The visualization block edits `SpecJson.result.tables`. It controls what runtime
 
 Supported modes are `table`, `compact`, and `keyValue`. Visualization does not grant extra access; it only formats result aliases already produced by the DSL executor.
 The default empty-result text is `В результате вашего запроса объекты не найдены`. The default permission text is `Вам не хватает прав увидеть данные или интерфейс дизайнера`; the backend returns it when the current user cannot read the technical classes needed to load templates/settings, or when template execution hits a CMDBuild 401/403.
+For multi-selection templates, a `401/403` on any used selection class/attribute makes the whole runtime result a permission error. The runtime does not synthesize a partial table from the selections that did succeed, because that would change the meaning of the template.
 Table titles can be runtime templates such as `Маршрутизаторы города ${param.city}`. The value comes from the template input parameters, and visualization settings also control title alignment.
 Visualization can also group rows by one or more visible columns from Final data. Adjacent rows with the same selected group values are rendered with merged cells, while the remaining columns stay attached as detail rows.
 When a table is split into subtables, the subtable title defaults to the selected split-column token, for example `${Выборка2.city}`. Static text can be added around that token.
@@ -611,29 +612,15 @@ Cst_QueryTemplate
 Cst_QueryTemplateVersion
 ```
 
-The same role has write grant on `Cst_QueryExecutionLog` so runtime audit cards can be created as the current user. With these grants, `mdavis` can read and run templates but cannot create templates through the backend.
+With these grants, `mdavis` can read and run templates but cannot create templates through the backend.
 
-## Execution Audit
+## Runtime Logging
 
-`preview` and direct `POST run` write best-effort audit cards into `Cst_QueryExecutionLog`. Runtime iframe `GET run` skips audit logging so it can remain read-only and CSRF-free.
+Runtime executions are not stored in CMDBuild technical classes. Preview, direct `POST run`, iframe `GET run`, cache hits/misses, permission failures, and execution failures are emitted through the standard backend logging paths (`stdout`, syslog, or the configured platform collector).
 
-Designer can also validate and preview the current unsaved draft through `/cmdbuild/custom-api/draft/validate` and `/cmdbuild/custom-api/draft/preview`. Draft preview executes with the current user's CMDBuild permissions and shows an execution trace, but does not save templates, create versions, or write audit cards.
+Designer can also validate and preview the current unsaved draft through `/cmdbuild/custom-api/draft/validate` and `/cmdbuild/custom-api/draft/preview`. Draft preview executes with the current user's CMDBuild permissions and shows an execution trace, but does not save templates or create versions.
 
 Template `create` and `update` write best-effort version snapshots into `Cst_QueryTemplateVersion`, and Designer shows the latest versions for the selected template.
-
-Stored fields:
-
-```text
-TemplateCode
-StartedAt
-FinishedAt
-Username
-ExecutionStatus
-RowsCount
-ErrorMessage
-```
-
-Template parameters and CMDBuild cookie/token values are not stored in audit cards.
 
 ## CMDBuild Upload Constraints
 

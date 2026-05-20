@@ -193,7 +193,6 @@ Cst_QueryTool
 Cst_QueryToolConfig
 Cst_QueryTemplate
 Cst_QueryTemplateVersion
-Cst_QueryExecutionLog
 ```
 
 Root ограничивает только технические классы проекта. Бизнес-данные выбираются из обычных CMDBuild классов в рамках прав текущего пользователя.
@@ -262,8 +261,9 @@ Backend и client блокируют небезопасные URL-схемы `ja
 
 - чтение custom page;
 - чтение `Cst_QueryTool`, `Cst_QueryToolConfig`, `Cst_QueryTemplate`, `Cst_QueryTemplateVersion`;
-- права на бизнес-объекты, которые он должен видеть;
-- при `POST run`/preview может потребоваться запись в `Cst_QueryExecutionLog`, но iframe runtime использует `GET run` и не пишет audit card.
+- права на бизнес-объекты, которые он должен видеть.
+
+Runtime-выполнение не хранится в CMDBuild технических классах. Preview, `POST run`, iframe `GET run`, cache hit/miss и ошибки пишутся только в стандартные backend-логи.
 
 ## Designer UI
 
@@ -356,6 +356,8 @@ GET /cmdbuild/custom-api/templates/<templateCode>/run?param=value
 ```
 
 Если в runtime URL передан зарезервированный параметр `json=true`, backend-owned route возвращает те же авторизованные итоговые таблицы как `application/json`. `json` исключается из бизнес-параметров шаблона и не меняет модель прав, кэша, static snapshot или cooldown refresh.
+
+Для JSON runtime отсутствие данных в рамках прав пользователя является успешным ответом HTTP `200` с пустыми строками и настроенным `emptyText`. Явный `401/403` от CMDBuild на используемый класс или атрибут считается ошибкой прав: backend возвращает HTTP `403`, `permissionDenied=true` и настроенный `permissionDeniedText`; частичный результат по другим выборкам не отдается. Граница текущей реализации: если CMDBuild маскирует запрет как `404`, ответ может классифицироваться как общая ошибка выполнения; если суперкласс раскрывается только в читаемую часть наследников, runtime может вернуть это читаемое подмножество.
 
 Backend:
 

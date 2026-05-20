@@ -19,8 +19,7 @@ test('technical schema plan derives all project classes from the selected root',
     root: 'Acme_QueryTool',
     config: 'Acme_QueryToolConfig',
     template: 'Acme_QueryTemplate',
-    version: 'Acme_QueryTemplateVersion',
-    log: 'Acme_QueryExecutionLog'
+    version: 'Acme_QueryTemplateVersion'
   });
   assert.equal(schema.classes[0].parent, 'Acme_TechnicalRoot');
   assert.equal(schema.classes[0].role, 'root');
@@ -44,9 +43,25 @@ test('technical schema accepts the legacy default root and Class parent', () => 
       'Cst_QueryTool',
       'Cst_QueryToolConfig',
       'Cst_QueryTemplate',
-      'Cst_QueryTemplateVersion',
-      'Cst_QueryExecutionLog'
+      'Cst_QueryTemplateVersion'
     ]
+  );
+});
+
+test('technical schema defines descriptions for every custom attribute', () => {
+  const schema = buildTechnicalSchema();
+  const attributes = schema.classes.flatMap((classDefinition) =>
+    (classDefinition.attributes || []).map((attribute) => ({
+      className: classDefinition.name,
+      name: attribute.name,
+      description: attribute.description
+    }))
+  );
+
+  assert.ok(attributes.length > 0);
+  assert.deepEqual(
+    attributes.filter((attribute) => !String(attribute.description || '').trim()),
+    []
   );
 });
 
@@ -57,8 +72,7 @@ test('technical schema accepts per-class name and description overrides', () => 
       { role: 'root', name: 'AcmeRoot', description: 'Acme root' },
       { role: 'config', name: 'AcmeConfig', description: 'Acme config' },
       { role: 'template', name: 'AcmeTemplate', description: 'Acme template' },
-      { role: 'version', name: 'AcmeTemplateVersion', description: 'Acme template version' },
-      { role: 'log', name: 'AcmeExecutionLog', description: 'Acme log' }
+      { role: 'version', name: 'AcmeTemplateVersion', description: 'Acme template version' }
     ]
   });
 
@@ -67,8 +81,7 @@ test('technical schema accepts per-class name and description overrides', () => 
     root: 'AcmeRoot',
     config: 'AcmeConfig',
     template: 'AcmeTemplate',
-    version: 'AcmeTemplateVersion',
-    log: 'AcmeExecutionLog'
+    version: 'AcmeTemplateVersion'
   });
   assert.equal(schema.classes[1].parent, 'AcmeRoot');
   assert.equal(schema.classes[1].description, 'Acme config');

@@ -33,7 +33,7 @@ Done:
 - Runtime end-to-end was verified with limited user `mdavis`.
 - DSL v1 now supports row filters, model-level domain traversal, class attribute comparison, joins, and intersections.
 - Template executor enforces per-run REST call limits and per-request CMDBuild REST timeout.
-- Template `preview` and direct `POST run` write execution audit cards to `Cst_QueryExecutionLog`; runtime iframe `GET run` is read-only and CSRF-free.
+- Template `preview`, direct `POST run`, and runtime iframe `GET run` write execution events only to standard backend logs; no runtime execution cards are stored in CMDBuild.
 - State-changing backend calls require same-origin headers and `X-CMDBDynamicPages-CSRF`.
 - Project runtime settings are stored in `Cst_QueryToolConfig` and applied to executor limits.
 - Project runtime settings expose the system manual refresh cooldown in Designer.
@@ -111,11 +111,9 @@ Not done:
 - [x] `Cst_QueryToolConfig`
 - [x] `Cst_QueryTemplate`
 - [x] `Cst_QueryTemplateVersion`
-- [x] `Cst_QueryExecutionLog`
 - [x] Configure CMDBuild grants for limited users on technical classes.
   - `Helpdesk` has read grants on `Cst_QueryTool`, `Cst_QueryToolConfig`, `Cst_QueryTemplate`, and `Cst_QueryTemplateVersion`.
   - `Helpdesk` has read grant on custom page `CmdbDynamicPages` (`1662627`).
-  - `Helpdesk` has write grant on `Cst_QueryExecutionLog` so runtime audit can be written as the current user.
   - Create template under `mdavis` is rejected by CMDBuild with the read-only grants.
 - [x] Store actual project settings cards in CMDBuild classes where technically possible.
   - `GET /cmdbuild/custom-api/config`
@@ -150,8 +148,6 @@ Not done:
   - [x] `POST /cmdbuild/custom-api/templates/:code/preview`
   - [x] `GET /cmdbuild/custom-api/templates/:code/run`
   - [x] `POST /cmdbuild/custom-api/templates/:code/run`
-- [x] Execution logs:
-  - [x] `GET /cmdbuild/custom-api/execution-logs`
 - [x] Config:
   - [x] `GET /cmdbuild/custom-api/config`
   - [x] `PUT /cmdbuild/custom-api/config`
@@ -279,7 +275,6 @@ GET /cmdbuild/custom-api/schema
 POST /cmdbuild/custom-api/schema/bootstrap
 GET /cmdbuild/custom-api/config
 PUT /cmdbuild/custom-api/config
-GET /cmdbuild/custom-api/execution-logs
 GET /cmdbuild/custom-api/templates
 GET /cmdbuild/custom-api/templates/:code
 GET /cmdbuild/custom-api/templates/:code/versions

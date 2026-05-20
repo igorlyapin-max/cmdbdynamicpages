@@ -9326,6 +9326,19 @@ function technicalClassDescription(className, label) {
   return truncateText(safeLabel, 250);
 }
 
+function technicalAttributeDescription(attribute) {
+  const description = String(attribute && attribute.description || '').trim();
+  if (description) return truncateText(description, 250);
+  return truncateText(String(attribute && attribute.name || '').trim(), 250);
+}
+
+function normalizeTechnicalAttributes(attributes) {
+  return (Array.isArray(attributes) ? attributes : []).map((attribute) => ({
+    ...attribute,
+    description: technicalAttributeDescription(attribute)
+  }));
+}
+
 function schemaClassOverrideMap(options = {}) {
   const source = Array.isArray(options.classes)
     ? options.classes
@@ -9336,7 +9349,7 @@ function schemaClassOverrideMap(options = {}) {
   source.forEach((item) => {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return;
     const role = String(item.role || item.schemaRole || '').trim();
-    if (!['root', 'config', 'template', 'version', 'log'].includes(role)) return;
+    if (!['root', 'config', 'template', 'version'].includes(role)) return;
     const override = {};
     if (item.name !== undefined && String(item.name).trim()) {
       override.name = validateCmdbuildIdentifier(item.name, `${role} class`);
@@ -9378,9 +9391,10 @@ function baseClassPayload(definition) {
 }
 
 function baseAttributePayload(attribute, index) {
+  const description = technicalAttributeDescription(attribute);
   const payload = {
     name: attribute.name,
-    description: attribute.description,
+    description,
     type: attribute.type,
     mode: 'write',
     active: true,
@@ -9421,10 +9435,65 @@ function buildTechnicalSchema(rootValue, options = {}) {
     root,
     config: validateCmdbuildIdentifier(overrides.config && overrides.config.name || `${prefix}QueryToolConfig`, 'config class'),
     template: validateCmdbuildIdentifier(overrides.template && overrides.template.name || `${prefix}QueryTemplate`, 'template class'),
-    version: validateCmdbuildIdentifier(overrides.version && overrides.version.name || `${prefix}QueryTemplateVersion`, 'template version class'),
-    log: validateCmdbuildIdentifier(overrides.log && overrides.log.name || `${prefix}QueryExecutionLog`, 'execution log class')
+    version: validateCmdbuildIdentifier(overrides.version && overrides.version.name || `${prefix}QueryTemplateVersion`, 'template version class')
   };
   const rootDescription = technicalClassDescription(root, overrides.root && overrides.root.description || options.description || options.rootDescription || root);
+
+  const classes = [
+    {
+      role: 'root',
+      name: classNames.root,
+      description: rootDescription,
+      parent: rootParent,
+      prototype: true,
+      attributes: []
+    },
+    {
+      role: 'config',
+      name: classNames.config,
+      description: technicalClassDescription(classNames.config, overrides.config && overrides.config.description || classNames.config),
+      parent: classNames.root,
+      prototype: false,
+      attributes: [
+        { name: 'RootCode', description: 'Root code', type: 'string', maxLength: 100, mandatory: true, showInGrid: true },
+        { name: 'Active', description: 'Active', type: 'boolean', showInGrid: true },
+        { name: 'RuntimeConfigJson', description: 'Runtime config JSON', type: 'json' }
+      ]
+    },
+    {
+      role: 'template',
+      name: classNames.template,
+      description: technicalClassDescription(classNames.template, overrides.template && overrides.template.description || classNames.template),
+      parent: classNames.root,
+      prototype: false,
+      attributes: [
+        { name: 'Active', description: 'Active', type: 'boolean', showInGrid: true },
+        { name: 'SpecJson', description: 'Template spec JSON', type: 'json', mandatory: true },
+        { name: 'ParamsSchemaJson', description: 'Parameters schema JSON', type: 'json' },
+        { name: 'ResultSchemaJson', description: 'Result schema JSON', type: 'json' },
+        { name: 'Owner', description: 'Owner', type: 'string', maxLength: 100, showInGrid: true },
+        { name: 'UpdatedAt', description: 'Updated at', type: 'dateTime', showInGrid: true }
+      ]
+    },
+    {
+      role: 'version',
+      name: classNames.version,
+      description: technicalClassDescription(classNames.version, overrides.version && overrides.version.description || classNames.version),
+      parent: classNames.root,
+      prototype: false,
+      attributes: [
+        { name: 'TemplateCode', description: 'Template code', type: 'string', maxLength: 100, mandatory: true, showInGrid: true },
+        { name: 'Version', description: 'Version', type: 'integer', mandatory: true, showInGrid: true },
+        { name: 'SpecJson', description: 'Template spec JSON', type: 'json', mandatory: true },
+        { name: 'ChangedBy', description: 'Changed by', type: 'string', maxLength: 100, showInGrid: true },
+        { name: 'ChangedAt', description: 'Changed at', type: 'dateTime', showInGrid: true },
+        { name: 'ChangeComment', description: 'Change comment', type: 'text' }
+      ]
+    }
+  ].map((classDefinition) => ({
+    ...classDefinition,
+    attributes: normalizeTechnicalAttributes(classDefinition.attributes)
+  }));
 
   return {
     root,
@@ -9432,74 +9501,7 @@ function buildTechnicalSchema(rootValue, options = {}) {
     rootDescription,
     prefix,
     classNames,
-    classes: [
-      {
-        role: 'root',
-        name: classNames.root,
-        description: rootDescription,
-        parent: rootParent,
-        prototype: true,
-        attributes: []
-      },
-      {
-        role: 'config',
-        name: classNames.config,
-        description: technicalClassDescription(classNames.config, overrides.config && overrides.config.description || classNames.config),
-        parent: classNames.root,
-        prototype: false,
-        attributes: [
-          { name: 'RootCode', description: 'Root code', type: 'string', maxLength: 100, mandatory: true, showInGrid: true },
-          { name: 'Active', description: 'Active', type: 'boolean', showInGrid: true },
-          { name: 'RuntimeConfigJson', description: 'Runtime config JSON', type: 'json' }
-        ]
-      },
-      {
-        role: 'template',
-        name: classNames.template,
-        description: technicalClassDescription(classNames.template, overrides.template && overrides.template.description || classNames.template),
-        parent: classNames.root,
-        prototype: false,
-        attributes: [
-          { name: 'Active', description: 'Active', type: 'boolean', showInGrid: true },
-          { name: 'SpecJson', description: 'Template spec JSON', type: 'json', mandatory: true },
-          { name: 'ParamsSchemaJson', description: 'Parameters schema JSON', type: 'json' },
-          { name: 'ResultSchemaJson', description: 'Result schema JSON', type: 'json' },
-          { name: 'Owner', description: 'Owner', type: 'string', maxLength: 100, showInGrid: true },
-          { name: 'UpdatedAt', description: 'Updated at', type: 'dateTime', showInGrid: true }
-        ]
-      },
-      {
-        role: 'version',
-        name: classNames.version,
-        description: technicalClassDescription(classNames.version, overrides.version && overrides.version.description || classNames.version),
-        parent: classNames.root,
-        prototype: false,
-        attributes: [
-          { name: 'TemplateCode', description: 'Template code', type: 'string', maxLength: 100, mandatory: true, showInGrid: true },
-          { name: 'Version', description: 'Version', type: 'integer', mandatory: true, showInGrid: true },
-          { name: 'SpecJson', description: 'Template spec JSON', type: 'json', mandatory: true },
-          { name: 'ChangedBy', description: 'Changed by', type: 'string', maxLength: 100, showInGrid: true },
-          { name: 'ChangedAt', description: 'Changed at', type: 'dateTime', showInGrid: true },
-          { name: 'ChangeComment', description: 'Change comment', type: 'text' }
-        ]
-      },
-      {
-        role: 'log',
-        name: classNames.log,
-        description: technicalClassDescription(classNames.log, overrides.log && overrides.log.description || classNames.log),
-        parent: classNames.root,
-        prototype: false,
-        attributes: [
-          { name: 'TemplateCode', description: 'Template code', type: 'string', maxLength: 100, mandatory: true, showInGrid: true },
-          { name: 'StartedAt', description: 'Started at', type: 'dateTime', showInGrid: true },
-          { name: 'FinishedAt', description: 'Finished at', type: 'dateTime', showInGrid: true },
-          { name: 'Username', description: 'Username', type: 'string', maxLength: 100, showInGrid: true },
-          { name: 'ExecutionStatus', description: 'Execution status', type: 'string', maxLength: 50, showInGrid: true },
-          { name: 'RowsCount', description: 'Rows count', type: 'integer', showInGrid: true },
-          { name: 'ErrorMessage', description: 'Error message', type: 'text' }
-        ]
-      }
-    ]
+    classes
   };
 }
 
@@ -11500,7 +11502,6 @@ function runtimeJsonResponsePayload(payload) {
     tables: runtimeJsonTables(result, payload.params || {}),
     emptyText: result.emptyText || DEFAULT_EMPTY_RESULT_TEXT,
     cache: payload.cache || null,
-    auditLog: payload.auditLog || null,
     html: result.kind === 'html' && result.htmlTrusted ? result.html : undefined
   };
 }
@@ -11545,76 +11546,6 @@ async function sendPublicSnapshotRun(res, requestUrl, templateCode) {
     cache: staticSnapshotCacheMeta(snapshot, 'snapshot-hit', lookup.backend, lookup.key)
   };
   sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : payload);
-}
-
-function sanitizeExecutionLogCard(card) {
-  if (!card) return null;
-  return {
-    id: card._id,
-    code: card.Code || '',
-    description: card.Description || '',
-    templateCode: card.TemplateCode || '',
-    startedAt: card.StartedAt || null,
-    finishedAt: card.FinishedAt || null,
-    username: card.Username || '',
-    executionStatus: card.ExecutionStatus || '',
-    rowsCount: card.RowsCount === undefined || card.RowsCount === null ? null : Number(card.RowsCount),
-    errorMessage: card.ErrorMessage || ''
-  };
-}
-
-async function writeExecutionLog(authToken, root, log) {
-  const schema = buildTechnicalSchema(root);
-  const startedAt = log.startedAt instanceof Date ? log.startedAt : new Date(log.startedAt || Date.now());
-  const finishedAt = log.finishedAt instanceof Date ? log.finishedAt : new Date(log.finishedAt || Date.now());
-  const action = validateCmdbuildIdentifier(log.action || 'run', 'log action').toUpperCase().slice(0, 8);
-  const templateCode = validateCmdbuildIdentifier(log.templateCode, 'template code');
-  const compactTime = finishedAt.toISOString().replace(/[-:.]/g, '');
-  const code = truncateText(`${action}_${templateCode}_${compactTime}`, 90);
-  const payload = {
-    Code: code,
-    Description: truncateText(`${action.toLowerCase()} ${templateCode} ${log.status || ''}`, 250),
-    TemplateCode: templateCode,
-    StartedAt: startedAt.toISOString(),
-    FinishedAt: finishedAt.toISOString(),
-    Username: truncateText(log.username || '', 100),
-    ExecutionStatus: truncateText(log.status || 'unknown', 50),
-    RowsCount: Number.isFinite(log.rowsCount) ? log.rowsCount : 0,
-    ErrorMessage: truncateText(log.errorMessage || '', 4000)
-  };
-
-  try {
-    const created = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(schema.classNames.log)}/cards`, authToken, {
-      method: 'POST',
-      body: payload
-    });
-    return {
-      success: created.ok,
-      cmdbuildStatus: created.statusCode,
-      className: schema.classNames.log,
-      log: created.ok ? sanitizeExecutionLogCard(created.json && created.json.data) : null
-    };
-  } catch (error) {
-    return {
-      success: false,
-      cmdbuildStatus: 0,
-      className: schema.classNames.log,
-      message: error && error.message ? error.message : String(error)
-    };
-  }
-}
-
-async function listExecutionLogCards(authToken, root, requestUrl) {
-  const schema = buildTechnicalSchema(root);
-  const limit = getPositiveInt(requestUrl.searchParams, 'limit', 100, 1000);
-  const start = getPositiveInt(requestUrl.searchParams, 'start', 0, 100000);
-  const cards = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(schema.classNames.log)}/cards?limit=${limit}&start=${start}`, authToken);
-  return {
-    schema,
-    response: cards,
-    cards: Array.isArray(cards.json && cards.json.data) ? cards.json.data : [],
-    meta: cards.json && cards.json.meta ? cards.json.meta : null
-  };
 }
 
 async function listTemplateCards(authToken, root, requestUrl) {
@@ -14624,26 +14555,6 @@ async function handleBackend(req, res, requestUrl) {
     return;
   }
 
-  if (requestUrl.pathname === `${BACKEND_PREFIX}/execution-logs`) {
-    if (!methodAllowed(req, res, 'GET')) return;
-    const root = requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
-    const list = await listExecutionLogCards(authToken, root, requestUrl);
-    if (!list.response.ok && sendTechnicalSchemaAccessDeniedIfNeeded(res, {
-      cmdbuildStatus: list.response.statusCode,
-      root: list.schema.root,
-      className: list.schema.classNames.log
-    })) return;
-    sendJson(res, list.response.ok ? 200 : 502, {
-      success: list.response.ok,
-      cmdbuildStatus: list.response.statusCode,
-      root: list.schema.root,
-      className: list.schema.classNames.log,
-      data: list.cards.map(sanitizeExecutionLogCard),
-      meta: list.meta
-    });
-    return;
-  }
-
   if (requestUrl.pathname === `${BACKEND_PREFIX}/config`) {
     const root = requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
 
@@ -14977,7 +14888,6 @@ async function handleBackend(req, res, requestUrl) {
       const body = runtimeReadOnly ? {} : await readJsonBody(req);
       const params = runtimeReadOnly ? publicSnapshotParamsFromUrl(requestUrl) : body.params || {};
       const jsonOutput = templateAction === 'run' && runtimeJsonOutputRequested(requestUrl);
-      const startedAt = new Date();
       const session = await getSessionData(authToken);
       const username = session.data && session.data.username ? session.data.username : '';
       const runtimeConfig = await getRuntimeConfig(authToken, root);
@@ -15008,7 +14918,6 @@ async function handleBackend(req, res, requestUrl) {
       );
       const refreshRequested = forceRefreshRequested || requestUrl.searchParams.get('refresh') === '1' || body.refresh === true;
       let result;
-      let auditLog;
       let cache = null;
 
       if (templateAction === 'run' && publishConfig.mode === 'staticSnapshot') {
@@ -15020,16 +14929,6 @@ async function handleBackend(req, res, requestUrl) {
           result = { emptyText: SNAPSHOT_MISSING_TEXT, tables: [] };
           cache = staticSnapshotCacheMeta(null, 'snapshot-miss', lookup.backend, lookup.key);
         }
-        auditLog = runtimeReadOnly ? null : await writeExecutionLog(authToken, root, {
-          action: templateAction,
-          templateCode: template.code,
-          startedAt,
-          finishedAt: new Date(),
-          username,
-          status: lookup.snapshot ? 'snapshot-hit' : 'snapshot-miss',
-          rowsCount: countResultRows(result),
-          errorMessage: ''
-        });
         logInfo(lookup.snapshot ? 'snapshot.hit' : 'snapshot.miss', {
           requestId: req.cmdpRequestId || '',
           templateCode: template.code,
@@ -15050,8 +14949,7 @@ async function handleBackend(req, res, requestUrl) {
           },
           params,
           result,
-          cache,
-          auditLog
+          cache
         };
         sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : payload);
         return;
@@ -15121,16 +15019,6 @@ async function handleBackend(req, res, requestUrl) {
       } catch (error) {
         const permissionDenied = errorLooksPermissionDenied(error);
         const permissionDeniedText = permissionDeniedTextFromSpec(template.spec);
-        auditLog = runtimeReadOnly ? null : await writeExecutionLog(authToken, root, {
-          action: templateAction,
-          templateCode: template.code,
-          startedAt,
-          finishedAt: new Date(),
-          username,
-          status: 'error',
-          rowsCount: 0,
-          errorMessage: error && error.message ? error.message : String(error)
-        });
         logWarn('template.execution_failed', {
           requestId: req.cmdpRequestId || '',
           action: templateAction,
@@ -15148,21 +15036,10 @@ async function handleBackend(req, res, requestUrl) {
             active: template.active
           },
           message: permissionDenied ? permissionDeniedText : (error && error.message ? error.message : String(error)),
-          permissionDeniedText: permissionDenied ? permissionDeniedText : undefined,
-          auditLog
+          permissionDeniedText: permissionDenied ? permissionDeniedText : undefined
         });
         return;
       }
-      auditLog = runtimeReadOnly ? null : await writeExecutionLog(authToken, root, {
-        action: templateAction,
-        templateCode: template.code,
-        startedAt,
-        finishedAt: new Date(),
-        username,
-        status: cache && cache.status === 'hit' ? 'cache-hit' : 'ok',
-        rowsCount: countResultRows(result),
-        errorMessage: ''
-      });
       if (templateAction === 'run' || templateAction === 'preview') {
         logInfo('template.executed', {
           requestId: req.cmdpRequestId || '',
@@ -15170,8 +15047,7 @@ async function handleBackend(req, res, requestUrl) {
           templateCode: template.code,
           username,
           rowsCount: countResultRows(result),
-          cacheStatus: cache && cache.status || (cacheDisabled ? 'disabled' : ''),
-          auditLogged: Boolean(auditLog)
+          cacheStatus: cache && cache.status || (cacheDisabled ? 'disabled' : '')
         });
       }
       const payload = {
@@ -15184,8 +15060,7 @@ async function handleBackend(req, res, requestUrl) {
         },
         params,
         result,
-        cache,
-        auditLog
+        cache
       };
       sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : payload);
       return;

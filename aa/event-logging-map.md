@@ -5,8 +5,8 @@
 | LOG-001 | IF-007 | Загрузка custom page launcher | `/cmdbuild/custom-api/client-log` memory log | timestamp, stage, href | Cookie/token не пишутся |
 | LOG-002 | IF-007 | Redirect launcher -> Designer/Runtime | `/cmdbuild/custom-api/client-log` memory log | timestamp, target URL, href | URL параметры могут быть бизнес-параметрами; не писать secrets |
 | LOG-003 | IF-003 | Proxy request CMDBuild UI | `/cmdbuild/custom-api/proxy-log` memory log | method, path, referer, userAgent | Headers/cookies не пишутся |
-| LOG-004 | IF-004 | Preview шаблона | `Cst_QueryExecutionLog` | TemplateCode, StartedAt, FinishedAt, Username, ExecutionStatus, RowsCount, ErrorMessage | Параметры запуска и CMDBuild token не пишутся |
-| LOG-005 | IF-004 | Direct `POST run` | `Cst_QueryExecutionLog` | TemplateCode, StartedAt, FinishedAt, Username, ExecutionStatus, RowsCount, ErrorMessage | Iframe `GET run` audit card не пишет |
+| LOG-004 | IF-004 | Preview шаблона | structured logger `template.executed` / `template.execution_failed` | requestId, action, templateCode, username, rowsCount, status/error | Параметры запуска и CMDBuild token не пишутся |
+| LOG-005 | IF-004 | Direct `POST run` / iframe `GET run` | structured logger `template.executed` / `runtime.cache_result` / `template.execution_failed` | requestId, action, templateCode, username, rowsCount, cache status, status/error | Runtime rows и cookie/token не пишутся |
 | LOG-006 | IF-004 | Save/update шаблона | `Cst_QueryTemplateVersion` | TemplateCode, Version, SpecJson, ChangedBy, ChangedAt, ChangeComment | SpecJson может содержать бизнес-логику, но не должен содержать secrets |
 | LOG-007 | IF-005 | Redis недоступен | backend stderr/container logs + `/health/redis` response | error message, timestamp | Redis password маскируется |
 | LOG-008 | IF-004 | CMDBuild upstream недоступен | backend stderr/container logs + `/health/ready` response | status/error, latency | CMDBuild token отсутствует в health |

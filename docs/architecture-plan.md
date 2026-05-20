@@ -97,7 +97,7 @@ CSRF strategy:
 - `GET /cmdbuild/custom-api/csrf` returns a token derived server-side from the current CMDBuild session token and backend secret;
 - the backend-served UI sends this token in `X-CMDBDynamicPages-CSRF` for non-GET backend calls;
 - state-changing backend calls require both same-origin `Origin`/`Referer` and a valid CSRF token;
-- runtime iframe execution uses read-only `GET /cmdbuild/custom-api/templates/:code/run?param=value`, skips audit card creation, and does not require a CSRF token;
+- runtime iframe execution uses read-only `GET /cmdbuild/custom-api/templates/:code/run?param=value` and does not require a CSRF token;
 - the CSRF token is not the CMDBuild token and cannot be used as CMDBuild REST authorization.
 
 ## Runtime Result Cache
@@ -192,7 +192,6 @@ Technical classes under that root can include:
 Cst_QueryToolConfig
 Cst_QueryTemplate
 Cst_QueryTemplateVersion
-Cst_QueryExecutionLog
 ```
 
 User queries run against the existing CMDBuild model according to the current user's normal CMDBuild rights.
@@ -228,15 +227,6 @@ QueryTemplateVersion
   ChangedBy
   ChangedAt
   ChangeComment
-
-QueryExecutionLog
-  Template
-  StartedAt
-  FinishedAt
-  Username
-  ExecutionStatus
-  RowsCount
-  ErrorMessage
 ```
 
 Implemented local technical classes use the `Cst_` prefix under `Cst_QueryTool`:
@@ -246,10 +236,9 @@ Cst_QueryTool
 Cst_QueryToolConfig
 Cst_QueryTemplate
 Cst_QueryTemplateVersion
-Cst_QueryExecutionLog
 ```
 
-`Cst_QueryTemplateVersion` and `Cst_QueryExecutionLog` currently keep `TemplateCode` as a string. A CMDBuild reference/domain can be added later if the designer needs navigable relations between template cards, versions, and logs.
+`Cst_QueryTemplateVersion` currently keeps `TemplateCode` as a string. A CMDBuild reference/domain can be added later if the designer needs navigable relations between template cards and versions.
 
 CMDBuild `json` card attributes are written through REST as JSON strings and parsed back to JSON objects by the backend response layer.
 
@@ -346,7 +335,6 @@ Grant-management findings:
 Local limited-user setup:
 
 - role `Helpdesk` has read grants on `Cst_QueryTool`, `Cst_QueryToolConfig`, `Cst_QueryTemplate`, and `Cst_QueryTemplateVersion`;
-- role `Helpdesk` has write grant on `Cst_QueryExecutionLog` so audit cards can be written as the current CMDBuild user;
 - role `Helpdesk` has read grant on custom page `CmdbDynamicPages` (`1662627`);
 - user `mdavis` can read templates and run runtime URLs, but cannot create templates through the backend with these grants.
 
@@ -478,7 +466,6 @@ GET  /cmdbuild/custom-api/schema
 POST /cmdbuild/custom-api/schema/bootstrap
 GET  /cmdbuild/custom-api/config
 PUT  /cmdbuild/custom-api/config
-GET  /cmdbuild/custom-api/execution-logs
 
 GET  /cmdbuild/custom-api/templates
 GET  /cmdbuild/custom-api/templates/:code
@@ -519,7 +506,6 @@ Implemented foundation routes:
 - `GET /cmdbuild/custom-api/schema`: checks technical root/classes/attributes under the configured root;
 - `POST /cmdbuild/custom-api/schema/bootstrap`: creates missing technical classes/attributes, guarded by same-origin headers and `admin_classes_modify`;
 - `GET/PUT /cmdbuild/custom-api/config`: reads and writes `Cst_QueryToolConfig.RuntimeConfigJson`;
-- `GET /cmdbuild/custom-api/execution-logs`: returns sanitized execution audit cards visible to the current user;
 - `GET /cmdbuild/custom-api/templates/:code/versions`: returns sanitized version cards visible to the current user;
 - `GET/POST/PUT/DELETE /cmdbuild/custom-api/templates...`: stores, reads, updates, and deletes template JSON in `Cst_QueryTemplate` cards;
 - `POST /validate`, `/preview`, `/run`: validates or executes DSL v1 templates under the current user's CMDBuild permissions.
@@ -534,14 +520,11 @@ Executor limits:
 - `maxTraversalDepth`: defaults to `1`, capped at `5`;
 - `CMDBUILD_REQUEST_TIMEOUT_MS`: defaults to `10000` ms for each CMDBuild REST call.
 
-Execution audit:
+Runtime logging:
 
-- `preview` and direct `POST run` write best-effort cards to `Cst_QueryExecutionLog`;
-- runtime iframe `GET run` is read-only and skips audit card creation;
-- draft `validate` and `preview` do not write templates, versions, or execution audit cards;
-- audit cards store template code, started/finished timestamps, username, execution status, row count, and error message;
-- request parameters and CMDBuild cookies/tokens are not stored in audit cards;
-- audit failures are returned as `auditLog.success=false` but do not hide a successful execution result.
+- preview, direct `POST run`, iframe `GET run`, cache hits/misses, permission failures, and execution failures are written only to standard backend logging paths;
+- no runtime execution cards are stored in CMDBuild technical classes;
+- request parameters and CMDBuild cookies/tokens are redacted according to backend logging settings.
 
 Template versioning:
 
@@ -602,6 +585,8 @@ Runtime UI:
 - calls `GET /cmdbuild/custom-api/templates/<templateCode>/run?param=value`;
 - renders result tables or permission/validation errors.
 - when the reserved query parameter `json=true` is present, the backend-owned runtime route returns the same authorized final tables as `application/json`; `json` is excluded from business template params and does not alter permissions or cache policy.
+- runtime JSON treats an empty authorized result as HTTP `200` with empty rows and treats explicit CMDBuild `401/403` on a used class/attribute as HTTP `403` with `permissionDenied=true`; the executor does not return a partial multi-selection result when one required selection is denied.
+- known boundary: if CMDBuild masks a denied class/attribute as `404`, the current implementation may classify it as a generic execution error; if a superclass resolves to only readable descendants, the runtime can return the readable descendant subset.
 
 Implemented Runtime MVP:
 
@@ -630,7 +615,7 @@ Add defensive limits before exposing broad template execution:
 - max traversal depth;
 - timeout;
 - cancellation;
-- audit log.
+- standard backend logging.
 
 ## Implementation Order
 

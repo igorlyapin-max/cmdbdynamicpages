@@ -117,7 +117,6 @@ Runtime users need:
 ```text
 read on <Root>QueryTemplate
 read on <Root>QueryTemplateVersion
-read/write on <Root>QueryExecutionLog when current-user audit is required
 read on custom page CmdbDynamicPages
 ```
 
