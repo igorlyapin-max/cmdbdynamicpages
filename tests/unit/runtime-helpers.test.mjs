@@ -3,14 +3,23 @@ import assert from 'node:assert/strict';
 
 import {
   applyTemplateParamDefaults,
+  baaErrorResponse,
+  baaResponseFromRuntimeResult,
   buildResultCellMeta,
+  defaultRuntimeConfig,
   dependencyMapWithHash,
+  executeBaaPlanObjects,
   ipv4ValueMatches,
   isSafeRuntimeLinkUrl,
+  normalizedBaaRequestForCache,
+  normalizeRuntimeCacheConfig,
+  normalizeTemplateCacheConfig,
   renderCellTemplate,
   renderRuntimeParamTemplate,
+  runtimeCacheKeyParts,
   runtimeJsonOutputRequested,
-  runtimeJsonResponsePayload
+  runtimeJsonResponsePayload,
+  validateBaaVerificationRequest
 } from '../../scripts/dev-proxy-server.mjs';
 
 test('template params combine defaults and explicit values without clearing defaults on empty input', () => {
@@ -170,6 +179,190 @@ test('runtime json response exposes visible table rows and safe cell links', () 
   assert.deepEqual(payload.tables[0].rows[0].values, { Code: 'router047' });
   assert.equal(payload.tables[0].rows[0].links.Code.href, '/cmdbuild/ui/#classes/Router/cards/47');
   assert.equal(payload.cache.status, 'hit');
+});
+
+test('BAA request validation and plan objects create an internal table', () => {
+  const spec = {
+    endpoint: { kind: 'baaVerification' },
+    baaContract: {
+      code: 'contract-verification-input-v1',
+      version: '1',
+      contractParams: [
+        { name: 'strictMode', type: 'boolean', required: false, default: false }
+      ],
+      objects: [
+        {
+          alias: 'aclCandidate',
+          className: 'ACL',
+          payload: [
+            { name: 'Code', type: 'string', required: true },
+            { name: 'destinationAddress', type: 'ipv4-cidr', required: true }
+          ]
+        }
+      ]
+    }
+  };
+  const request = {
+    source: 'CMDB BAA',
+    inputContract: { code: 'contract-verification-input-v1', version: '1', checksum: 'sha256-test' },
+    contractParams: [{ name: 'strictMode', type: 'boolean', required: false, defaultValue: false }],
+    variables: { sourceSegment: ['office', 'dmz'] },
+    variableSources: [{ name: 'sourceSegment', sourceKind: 'class', sourceExpression: 'class.ACL.segment', valuePresent: true }],
+    endpoint: { code: 'network-acl-check', params: { environment: 'prod', strictMode: true } },
+    plan: {
+      objects: [
+        {
+          planIndex: 0,
+          kind: 'aclCandidate',
+          className: 'ACL',
+          pageShapeKey: 'visio/pages/page1.xml:12',
+          mappingKey: 'connector:acl',
+          relationBindingStatus: 'bound',
+          payload: {
+            Code: 'ACL-001',
+            destinationAddress: '10.0.0.0/24'
+          }
+        }
+      ],
+      missingAttributes: [],
+      skipped: []
+    }
+  };
+
+  assert.equal(validateBaaVerificationRequest(request, spec).ok, true);
+  assert.equal(validateBaaVerificationRequest({ plan: { objects: [{ payload: [] }] } }).ok, false);
+  assert.equal(validateBaaVerificationRequest({ endpoint: { params: { strictMode: 'wrong' } }, plan: { objects: [{ kind: 'aclCandidate', payload: { Code: 'ACL-001' } }] } }, spec).ok, false);
+  assert.equal(renderRuntimeParamTemplate('mode ${contractparam.strictMode}', { 'contractparam.strictMode': true }), 'mode true');
+  assert.deepEqual(normalizedBaaRequestForCache(request).variables.sourceSegment, ['office', 'dmz']);
+  assert.equal(normalizedBaaRequestForCache(request).variableSources[0].sourceKind, 'class');
+
+  const table = executeBaaPlanObjects({ payloadPrefix: 'Payload.' }, request, { maxRows: 100 }, spec.baaContract);
+  assert.deepEqual(table.columns, [
+    'PlanIndex',
+    'Kind',
+    'ClassName',
+    'PageShapeKey',
+    'MappingKey',
+    'RelationBindingStatus',
+    'Payload.Code',
+    'BAA.aclCandidate.Code',
+    'BAA.ACL.Code',
+    'Payload.destinationAddress',
+    'BAA.aclCandidate.destinationAddress',
+    'BAA.ACL.destinationAddress'
+  ]);
+  assert.equal(table.rows[0].PlanIndex, 0);
+  assert.equal(table.rows[0].ClassName, 'ACL');
+  assert.equal(table.rows[0]['Payload.destinationAddress'], '10.0.0.0/24');
+  assert.equal(table.rows[0]['BAA.aclCandidate.destinationAddress'], '10.0.0.0/24');
+});
+
+test('BAA input contract classes are treated as candidate objects', () => {
+  const spec = {
+    endpoint: { kind: 'baaVerification' },
+    baaContract: {
+      code: 'contract-verification-input-v1',
+      version: '1',
+      classes: [
+        {
+          name: 'ACL',
+          attributes: [
+            { name: 'Code', type: 'string', required: true },
+            { name: 'destinationAddress', type: 'ipv4-cidr', required: true }
+          ]
+        }
+      ]
+    }
+  };
+  const request = {
+    plan: {
+      objects: [
+        {
+          planIndex: 7,
+          kind: 'context',
+          className: 'ACL',
+          payload: {
+            Code: 'ACL-001',
+            destinationAddress: '10.0.0.0/24'
+          }
+        }
+      ]
+    }
+  };
+
+  assert.equal(validateBaaVerificationRequest(request, spec).ok, true);
+  assert.equal(validateBaaVerificationRequest({ plan: { objects: [{ className: 'ACL', payload: { Code: 'ACL-001' } }] } }, spec).ok, false);
+
+  const table = executeBaaPlanObjects({ payloadPrefix: 'Payload.' }, request, { maxRows: 100 }, spec.baaContract);
+  assert.ok(table.columns.includes('BAA.ACL.Code'));
+  assert.ok(table.columns.includes('BAA.ACL.destinationAddress'));
+  assert.equal(table.rows[0]['BAA.ACL.destinationAddress'], '10.0.0.0/24');
+});
+
+test('BAA runtime adapter converts result tables and errors to BAA envelope', () => {
+  const result = {
+    tables: [
+      {
+        name: 'destination_networks',
+        title: 'Destination является сетью',
+        columns: ['aclCode', 'destination'],
+        columnLabels: { aclCode: 'ACL', destination: 'Destination' },
+        rows: [
+          { aclCode: 'ACL-001', destination: '10.0.0.0/24' }
+        ]
+      }
+    ]
+  };
+
+  const response = baaResponseFromRuntimeResult(result, { code: 'network-acl-check', description: 'Network ACL check' });
+  assert.equal(response.success, true);
+  assert.equal(response.status, 'completed');
+  assert.equal(response.summary.rows, 1);
+  assert.deepEqual(response.tables[0].columns, [
+    { name: 'aclCode', title: 'ACL', type: 'string' },
+    { name: 'destination', title: 'Destination', type: 'string' }
+  ]);
+  assert.deepEqual(response.tables[0].rows[0], {
+    aclCode: 'ACL-001',
+    destination: '10.0.0.0/24'
+  });
+
+  const error = baaErrorResponse('CMDB_PERMISSION_DENIED', 'Недостаточно прав');
+  assert.equal(error.success, false);
+  assert.equal(error.status, 'error');
+  assert.equal(error.items[0].code, 'CMDB_PERMISSION_DENIED');
+});
+
+test('BAA cache context changes runtime cache keys without changing business params', () => {
+  const spec = {
+    version: 1,
+    steps: [{ type: 'baaPlanObjects', as: 'baaObjects' }],
+    result: { tables: [{ name: 'baaObjects', columns: ['PlanIndex', 'Payload.Code'] }] }
+  };
+  const template = { code: 'BaaProbe', active: true, spec };
+  const runtimeCache = normalizeRuntimeCacheConfig(defaultRuntimeConfig());
+  const config = normalizeTemplateCacheConfig({ cache: { scopeMode: 'permissionOnly' } }, runtimeCache);
+  const dependencyMap = dependencyMapWithHash(spec);
+  const requestA = normalizedBaaRequestForCache({ endpoint: { params: { environment: 'prod' } }, plan: { objects: [{ planIndex: 1, payload: { Code: 'ACL-001' } }] } });
+  const requestB = normalizedBaaRequestForCache({ endpoint: { params: { environment: 'prod' } }, plan: { objects: [{ planIndex: 1, payload: { Code: 'ACL-002' } }] } });
+
+  const keyA = runtimeCacheKeyParts('Cst_QueryTool', template, { environment: 'prod' }, { username: 'alice' }, {
+    maxRows: 25,
+    maxClasses: 10,
+    maxDomains: 10,
+    maxRestCalls: 50,
+    maxTraversalDepth: 1
+  }, runtimeCache, config, dependencyMap, {}, { baa: requestA });
+  const keyB = runtimeCacheKeyParts('Cst_QueryTool', template, { environment: 'prod' }, { username: 'alice' }, {
+    maxRows: 25,
+    maxClasses: 10,
+    maxDomains: 10,
+    maxRestCalls: 50,
+    maxTraversalDepth: 1
+  }, runtimeCache, config, dependencyMap, {}, { baa: requestB });
+
+  assert.notEqual(keyA.key, keyB.key);
+  assert.equal(keyA.paramsHash, keyB.paramsHash);
 });
 
 test('runtime link URL safety blocks script-like protocols', () => {

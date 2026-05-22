@@ -1033,6 +1033,7 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     .visual-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.visual-grid label{min-width:0}.visual-grid input,.visual-grid select{width:100%}.visualization-table{table-layout:fixed}.visualization-table th,.visualization-table td{overflow-wrap:anywhere}.visualization-table th:nth-child(1){width:30%}.visualization-table th:nth-child(2){width:14%}.visualization-table th:nth-child(3){width:15%}.visualization-table th:nth-child(4){width:26%}.visualization-table th:nth-child(5){width:15%}.visualization-table input,.visualization-table select{width:100%;min-width:0}.visualization-link-table{table-layout:fixed}.visualization-link-table th,.visualization-link-table td{overflow-wrap:anywhere}.visualization-link-table input,.visualization-link-table select{width:100%;min-width:0}.visual-row-groups{margin-top:10px;display:grid;gap:6px}.visual-row-group{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.visual-row-group label{flex:1 1 240px;min-width:0}.visual-row-group select{width:100%;min-width:0}.result-table-wrap{margin-top:8px}.result-table-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:6px;min-height:30px;margin:0 0 2px}.result-table-header{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 4px;min-height:30px}.result-table-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex:0 0 auto;flex-wrap:wrap}.result-table-filter{width:240px;max-width:min(52vw,320px);height:30px;padding:4px 7px}.runtime-cache-control{position:relative;display:inline-flex;align-items:center}.runtime-cache-button{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;font-size:18px;line-height:1}.runtime-cache-button[data-disabled="true"]{opacity:.55;cursor:default}.runtime-cache-button.refreshing{animation:cmdp-spin 1s linear infinite}.runtime-cache-tooltip{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:50;min-width:250px;max-width:min(86vw,420px);padding:8px 10px;border:1px solid var(--line);background:#1f2933;color:#fff;box-shadow:0 8px 22px rgba(15,23,42,.18);font-size:12px;line-height:1.35;text-align:left}.runtime-cache-tooltip span{display:block;white-space:nowrap}.runtime-cache-control:hover .runtime-cache-tooltip,.runtime-cache-control:focus-within .runtime-cache-tooltip{display:block}.result-table-title{display:flex;align-items:center;gap:8px;flex:1 1 auto;flex-wrap:wrap;min-width:0;margin:0}.result-table-title h3{margin:0;font-size:13px}.result-subtitle{font-size:12px;color:var(--muted);margin:10px 0 4px}.table-sort{border:0;background:transparent;padding:0;color:inherit;font:inherit;text-align:left}.table-sort:after{content:" ↕";font-size:10px;color:var(--muted)}.cmdp-density-compact th,.cmdp-density-compact td{padding:4px 6px}.cmdp-font-small{font-size:12px}.cmdp-font-normal{font-size:13px}.cmdp-font-large{font-size:15px}.cmdp-zebra tbody tr:nth-child(even) td{background:#fbfdff}.cmdp-row-group-cell{background:#f8fafc;font-weight:600;vertical-align:top}@keyframes cmdp-spin{to{transform:rotate(360deg)}}
     .cmdp-html-result{display:block}.cmdp-build-view{display:grid;gap:10px}.cmdp-build-toolbar{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border-bottom:1px solid var(--line);padding-bottom:6px}.cmdp-build-toolbar-main{display:grid;gap:5px;min-width:0}.cmdp-build-summary,.cmdp-build-nav{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.cmdp-build-nav a{color:var(--accent);text-decoration:none;font-size:12px}.cmdp-build-search{flex:0 0 260px;max-width:min(42vw,320px)}.cmdp-build-section{display:grid;gap:8px}.cmdp-build-section h2{font-size:15px;margin:8px 0 0}.cmdp-build-panel{border:1px solid var(--line);background:#fff;margin:0 0 8px}.cmdp-build-panel>summary{cursor:pointer;display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 10px;background:#fbfdff}.cmdp-build-title{font-weight:700}.cmdp-build-panel .table-wrap{border:0;border-top:1px solid var(--line)}.cmdp-build-table{width:100%;table-layout:auto}.cmdp-build-table th,.cmdp-build-table td{vertical-align:top}.cmdp-build-related,.cmdp-build-links{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:8px 10px}.cmdp-build-related a,.cmdp-build-links a{color:var(--accent);text-decoration:none}
     .settings-block{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}.settings-block:first-of-type{border-top:0;margin-top:0;padding-top:0}.settings-block h3{margin:0 0 8px}.settings-block h4{margin:0 0 7px;font-size:12px;color:#334e68}.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}.settings-grid label{display:grid;gap:4px;color:var(--muted);font-size:12px;min-width:0}.settings-grid input,.settings-grid select{width:100%;min-width:0}.checkbox-list{display:grid;gap:8px}.checkbox-stacked{align-items:flex-start!important}.checkbox-stacked>span{display:grid;gap:2px}.checkbox-stacked strong{font-size:12px;color:var(--text)}.visual-table-list{display:grid;gap:12px}.visual-table-panel{border:1px solid var(--line);background:#fbfdff;padding:10px}.visual-table-heading{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px}.visual-table-heading h3{margin:0}.visual-table-subblock{border-top:1px solid #e4e9f0;padding-top:9px;margin-top:9px}.run-param-list{display:grid;gap:8px}.run-param-row{display:grid;grid-template-columns:minmax(180px,1fr) minmax(220px,1.4fr);gap:10px;align-items:start;border:1px solid var(--line);background:#fbfdff;padding:8px}.run-param-main{display:grid;gap:3px;min-width:0}.run-param-main strong{font-size:13px}.run-param-meta{font-size:12px;color:var(--muted)}.run-param-value label{display:grid;gap:4px;color:var(--muted);font-size:12px}.run-param-value input,.run-param-value select{width:100%}.run-action-grid{display:grid;grid-template-columns:minmax(220px,max-content) minmax(280px,1fr);gap:10px;align-items:start}.run-action-buttons{display:flex;gap:8px;flex-wrap:wrap}
+    .baa-contract-summary{display:grid;gap:10px}.baa-contract-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.baa-contract-meta div{border:1px solid var(--line);background:#fbfdff;padding:8px;min-width:0}.baa-contract-meta span{display:block;color:var(--muted);font-size:11px;margin-bottom:3px}.baa-contract-meta strong{display:block;font-size:13px;overflow-wrap:anywhere}.baa-contract-table{width:100%;border-collapse:collapse;table-layout:fixed}.baa-contract-table th,.baa-contract-table td{border:1px solid var(--line);padding:6px;text-align:left;vertical-align:top;font-size:12px}.baa-contract-table th{background:#f0f4f8;color:#334e68}.baa-usage-note{border:1px solid #d9e2ec;background:#fbfdff;padding:8px;color:#334e68;font-size:12px;line-height:1.45}
     @media(max-width:1100px){.designer-menu{position:static;width:auto;overflow:visible;margin-bottom:12px}.designer-main{margin-left:0}.menu-groups{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}.menu-links{display:flex;flex-wrap:wrap}}
     @media(max-width:900px){.layout{grid-template-columns:1fr}main{padding:10px}header{height:auto;align-items:flex-start;gap:8px;flex-direction:column;padding:10px}.header-side{justify-content:flex-start}.designer-actionbar{align-items:flex-start}.designer-actionbar-actions{justify-content:flex-start}.designer-actionbar-context{flex-basis:100%}}
   </style>
@@ -1129,6 +1130,7 @@ function dynamicPagesClientScript() {
       menuExtraction: 'Extraction',
       menuSelection: 'Selection',
       menuTemplateRun: 'Run',
+      menuBaaEndpoint: 'BAA endpoint',
       menuObjectGroup: 'Object group',
       menuRelations: 'Object matching',
       menuFinalView: 'Final data',
@@ -1149,6 +1151,14 @@ function dynamicPagesClientScript() {
       configCard: 'Config card',
       defaultConfig: 'Default config',
       runtimeCacheSettings: 'Runtime cache',
+      baaTechnicalSettings: 'BAA technical contracts',
+      baaTechnicalSuperclassPath: 'BAA technical superclass path from root',
+      baaTechnicalSuperclassPathHelp: 'Path/name of the superclass branch where BAA contract classes are stored. It is used only to find external contracts, not as a business-data permission boundary.',
+      baaConversionContractClass: 'Conversion contract class',
+      baaConversionContractVersionClass: 'Conversion contract version class',
+      baaVerificationInputContractClass: 'Verification input contract class',
+      baaVerificationOutputContractClass: 'Verification output contract class',
+      baaVerificationEndpointClass: 'Verification endpoint class',
       runtimeRefreshCooldownSec: 'Refresh cooldown, seconds',
       runtimeRefreshCooldownHelp: 'Minimum delay before a runtime result can be rebuilt manually.',
       runtimeExecutionLimits: 'Execution limits',
@@ -1214,6 +1224,36 @@ function dynamicPagesClientScript() {
       visualizeInEditor: 'Visualize in editor',
       visualizeExternal: 'Visualize in separate page',
       forceRefreshInEditor: 'Refresh cache and show',
+      baaVerifyPreview: 'BAA verify',
+      baaEndpointEditor: 'BAA endpoint',
+      baaEndpointHelp: 'Describe the BAA input contract before building rules. plan.objects are incoming CMDB-like candidates, not CMDBuild cards.',
+      baaContractCode: 'Contract code',
+      baaContractVersion: 'Contract version',
+      baaContractDescription: 'Contract description',
+      baaContractSource: 'Saved input contract',
+      baaContractSourceManual: 'Manual contract in template',
+      baaContractObjects: 'Incoming BAA objects',
+      baaContractObjectsHelp: 'These are not CMDBuild classes. They describe objects expected in POST plan.objects. Saved BAA input contracts are mapped from classes[] to this list.',
+      baaContractUsage: 'How to use this contract',
+      baaContractUsageHelp: 'In matching rules choose BAA candidates as a selection. Payload fields are available as Payload.<field> and BAA.<className>.<field>. After matching, use the final result in Final data and Visualization.',
+      baaContractNoObjects: 'The selected contract has no readable classes/attributes.',
+      baaContractVariables: 'BAA variables',
+      baaContractParams: 'Contract parameters',
+      baaContractParamsHelp: 'Contract parameters are defined by the input contract as contractparam.*. BAA sends their runtime values in endpoint.params.',
+      baaRequestVariables: 'Request variables',
+      baaRequestVariablesHelp: 'BAA computes these top-level variables before POST. They arrive in request.variables, can be scalar or array values, and are available as $' + '{var.name} and $' + '{param.name}.',
+      baaObjectAlias: 'Alias',
+      baaObjectClassName: 'Incoming class',
+      baaPayloadFields: 'Payload fields',
+      baaPayloadFieldsHelp: 'One field per line: name:type:required:example:description. Supported types include string, number, boolean, ipv4, ipv4-cidr.',
+      baaVariablesHelp: 'One variable per line: name:type:required:default:example:description. Variables from POST body are available as $' + '{var.name} and $' + '{param.name}.',
+      addBaaObject: 'Add candidate type',
+      applyBaaEndpoint: 'Apply without saving',
+      baaEndpointApplied: 'BAA endpoint contract applied.',
+      baaContractValidationFailed: 'BAA contract validation failed.',
+      baaRequestEditor: 'BAA verification request',
+      baaRequestHelp: 'POST body for BAA verification exchange. endpoint.params are passed as template parameters; plan.objects are available through the baaPlanObjects DSL step.',
+      baaVerifyCompleted: 'BAA verification endpoint completed.',
       runLaunchUrl: 'Template launch URL',
       runLaunchJsonUrl: 'JSON URL',
       runLaunchParams: 'Parameter variants',
@@ -1479,6 +1519,8 @@ function dynamicPagesClientScript() {
       catalogClassApplied: 'Class selected from cached catalog.',
       objectGroupEditor: 'Object group',
       objectGroupHelp: 'Build the object scope from a starting CMDBuild class and include/exclude rules.',
+      baaObjectGroupSource: 'BAA input source',
+      baaObjectGroupSourceHelp: 'Objects from POST plan.objects are already available as BAA candidates. Do not select them in the CMDBuild class lists below: below you choose only CMDBuild classes to match against the BAA input.',
       objectSelectionTitle: 'Selection name',
       objectSelectionDefault: 'Selection{number}',
       addObjectSelection: 'Add selection',
@@ -1708,6 +1750,7 @@ function dynamicPagesClientScript() {
       menuExtraction: 'Извлечение',
       menuSelection: 'Выборка',
       menuTemplateRun: 'Прогон',
+      menuBaaEndpoint: 'BAA endpoint',
       menuObjectGroup: 'Группа объектов',
       menuRelations: 'Сопоставление с объектами',
       menuFinalView: 'Итоговые данные',
@@ -1728,6 +1771,14 @@ function dynamicPagesClientScript() {
       configCard: 'Карточка настроек',
       defaultConfig: 'Настройки по умолчанию',
       runtimeCacheSettings: 'Runtime-кэш',
+      baaTechnicalSettings: 'BAA technical contracts',
+      baaTechnicalSuperclassPath: 'Путь к BAA technical superclass от root',
+      baaTechnicalSuperclassPathHelp: 'Путь/имя ветки суперкласса, где лежат классы BAA-контрактов. Используется только для поиска внешних контрактов, не ограничивает права на business data.',
+      baaConversionContractClass: 'Класс conversion contract',
+      baaConversionContractVersionClass: 'Класс версий conversion contract',
+      baaVerificationInputContractClass: 'Класс verification input contract',
+      baaVerificationOutputContractClass: 'Класс verification output contract',
+      baaVerificationEndpointClass: 'Класс verification endpoint',
       runtimeRefreshCooldownSec: 'Пауза refresh, секунд',
       runtimeRefreshCooldownHelp: 'Минимальная пауза перед ручной перестройкой результата runtime-страницы.',
       runtimeExecutionLimits: 'Лимиты выполнения',
@@ -1793,6 +1844,36 @@ function dynamicPagesClientScript() {
       visualizeInEditor: 'Визуализировать в редакторе',
       visualizeExternal: 'Визуализировать в отдельной странице',
       forceRefreshInEditor: 'Обновить кэш и показать',
+      baaVerifyPreview: 'BAA verify',
+      baaEndpointEditor: 'BAA endpoint',
+      baaEndpointHelp: 'Опишите входной BAA-контракт до настройки правил. plan.objects - это входящие CMDB-like кандидаты, а не карточки CMDBuild.',
+      baaContractCode: 'Код контракта',
+      baaContractVersion: 'Версия контракта',
+      baaContractDescription: 'Описание контракта',
+      baaContractSource: 'Сохраненный input contract',
+      baaContractSourceManual: 'Ручной контракт в шаблоне',
+      baaContractObjects: 'Входящие объекты BAA',
+      baaContractObjectsHelp: 'Это не CMDBuild-классы. Здесь описаны объекты, ожидаемые в POST plan.objects. Сохраненные BAA input contracts преобразуются из classes[] в этот список.',
+      baaContractUsage: 'Как использовать этот контракт',
+      baaContractUsageHelp: 'В правилах сопоставления выберите BAA candidates как выборку. Payload-поля доступны как Payload.<поле> и BAA.<className>.<поле>. После сопоставления используйте конечный результат в Итоговых данных и Визуализации.',
+      baaContractNoObjects: 'В выбранном контракте нет читаемых classes/attributes.',
+      baaContractVariables: 'BAA variables',
+      baaContractParams: 'Параметры контракта',
+      baaContractParamsHelp: 'Параметры контракта описаны в input contract как contractparam.*. BAA передает runtime-значения в endpoint.params.',
+      baaRequestVariables: 'Переменные отправки',
+      baaRequestVariablesHelp: 'BAA вычисляет эти переменные верхнего уровня перед POST. Они приходят в request.variables, могут быть скаляром или массивом и доступны как $' + '{var.name} и $' + '{param.name}.',
+      baaObjectAlias: 'Alias',
+      baaObjectClassName: 'Входящий класс',
+      baaPayloadFields: 'Payload-поля',
+      baaPayloadFieldsHelp: 'Одно поле на строку: name:type:required:example:description. Типы: string, number, boolean, ipv4, ipv4-cidr.',
+      baaVariablesHelp: 'Одна переменная на строку: name:type:required:default:example:description. Variables из POST body доступны как $' + '{var.name} и $' + '{param.name}.',
+      addBaaObject: 'Добавить тип кандидата',
+      applyBaaEndpoint: 'Применить без сохранения',
+      baaEndpointApplied: 'BAA endpoint contract применен.',
+      baaContractValidationFailed: 'BAA contract validation failed.',
+      baaRequestEditor: 'BAA verification request',
+      baaRequestHelp: 'POST body для BAA verification exchange. endpoint.params передаются как параметры шаблона; plan.objects доступны через DSL step baaPlanObjects.',
+      baaVerifyCompleted: 'BAA verification endpoint выполнен.',
       runLaunchUrl: 'URL запуска шаблона',
       runLaunchJsonUrl: 'JSON URL',
       runLaunchParams: 'Варианты параметров',
@@ -2058,6 +2139,8 @@ function dynamicPagesClientScript() {
       catalogClassApplied: 'Класс выбран из кэшированного каталога.',
       objectGroupEditor: 'Группа объектов',
       objectGroupHelp: 'Соберите scope объектов из стартового класса CMDBuild и правил включения/исключения.',
+      baaObjectGroupSource: 'BAA-вход',
+      baaObjectGroupSourceHelp: 'Объекты из POST plan.objects уже доступны как BAA candidates. Их не надо выбирать в списках CMDBuild-классов ниже: ниже выбираются только CMDBuild-классы, с которыми будет сопоставляться BAA-вход.',
       objectSelectionTitle: 'Название выборки',
       objectSelectionDefault: 'Выборка{number}',
       addObjectSelection: 'Добавить выборку',
@@ -2254,6 +2337,7 @@ function dynamicPagesClientScript() {
     catalog: null,
     catalogStatus: { state: 'missing', updatedAt: null, error: '' },
     catalogSyncing: false,
+    baaInputContracts: [],
     maxTraversalDepth: Math.max(1, Math.min(5, Number(readStorageValue('cmdbdynamicpages.maxTraversalDepth') || 2))),
     designerSection: normalizeDesignerSection(boot.designerSection || readDesignerSectionFromLocation()),
     templates: [],
@@ -2264,6 +2348,7 @@ function dynamicPagesClientScript() {
     classCheckResult: null,
     classAttributes: [],
     objectGroupDraft: null,
+    baaContractDraft: null,
     relationDraft: null,
     viewComposerDraft: null,
     paramRowsDraft: null,
@@ -2286,6 +2371,7 @@ function dynamicPagesClientScript() {
       'templates',
       'template',
       'versions',
+      'baa-endpoint',
       'object-group',
       'relations',
       'final-view',
@@ -2322,6 +2408,7 @@ function dynamicPagesClientScript() {
   function sectionNeedsSelectedTemplate(section) {
     return [
       'versions',
+      'baa-endpoint',
       'object-group',
       'relations',
       'final-view',
@@ -2820,6 +2907,9 @@ function dynamicPagesClientScript() {
         updateSelectedFromEditor(specData.spec);
         state.runParams = Object.assign({}, specData.examples || {}, state.runParams || {});
       }
+      if (hasBaaEndpointEditorFields()) {
+        updateSelectedFromEditor(applyBaaEndpointToSpec(state.selectedTemplate.spec || defaultSpec(), false));
+      }
       if (document.querySelectorAll('[data-view-column-row]').length) {
         state.viewComposerDraft = captureViewComposerDraftFromDom();
       }
@@ -2972,6 +3062,14 @@ function dynamicPagesClientScript() {
       runtimeCache: {
         refreshCooldownSec: 180
       },
+      baaTechnical: {
+        superclassPath: 'BAA technical superclass',
+        conversionContractClass: 'BAAConversionContract',
+        conversionContractVersionClass: 'BAAConversionContractVersion',
+        verificationInputContractClass: 'BAAVerificationInputContract',
+        verificationOutputContractClass: 'BAAVerificationOutputContract',
+        verificationEndpointClass: 'BAAVerificationEndpoint'
+      },
       executionLimits: {
         maxRowsDefault: 500,
         maxRowsPreviewDefault: 25,
@@ -2993,6 +3091,7 @@ function dynamicPagesClientScript() {
     var source = runtimeConfig && typeof runtimeConfig === 'object' && !Array.isArray(runtimeConfig) ? runtimeConfig : {};
     return Object.assign({}, defaults, source, {
       runtimeCache: Object.assign({}, defaults.runtimeCache, source.runtimeCache || {}),
+      baaTechnical: Object.assign({}, defaults.baaTechnical, source.baaTechnical || {}),
       executionLimits: Object.assign({}, defaults.executionLimits, source.executionLimits || {})
     });
   }
@@ -3689,10 +3788,14 @@ function dynamicPagesClientScript() {
   function normalizeMatchingBlock(block, index, selections, previousAlias) {
     block = block || {};
     selections = Array.isArray(selections) ? selections : [];
+    var baaSelection = selections.find(function (selection) { return selection && selection.alias === 'baaObjects'; }) || null;
+    var firstCmdbSelection = selections.find(function (selection) { return selection && selection.alias !== 'baaObjects'; }) || null;
     var fallbackLeft = index === 0
-      ? (selections[0] && selections[0].alias || objectSelectionAlias(0))
+      ? (baaSelection && baaSelection.alias || selections[0] && selections[0].alias || objectSelectionAlias(0))
       : previousAlias;
-    var fallbackRight = selections[index + 1] && selections[index + 1].alias || selections[1] && selections[1].alias || objectSelectionAlias(index + 1);
+    var fallbackRight = index === 0 && fallbackLeft === 'baaObjects'
+      ? (firstCmdbSelection && firstCmdbSelection.alias || objectSelectionAlias(0))
+      : (selections[index + 1] && selections[index + 1].alias || selections[1] && selections[1].alias || objectSelectionAlias(index + 1));
     var alias = String(block.as || block.alias || block.outputAlias || ('matchedObjects' + String(index + 2))).trim();
     var rawRules = Array.isArray(block.rules || block.where) ? (block.rules || block.where) : [];
     var rules = rawRules.map(normalizeMatchingRule).filter(function (rule) {
@@ -3710,10 +3813,11 @@ function dynamicPagesClientScript() {
 
   function normalizeObjectMatchingModel(model, spec) {
     spec = spec || defaultSpec();
-    var objectModel = inferObjectGroupModel(spec);
-    var selections = objectSelectionsFromModel(objectModel).map(function (selection, index) {
-      return normalizeObjectSelection(selection, index);
-    });
+    var selections = matchingSelectionsForSpec(spec);
+    if (selections.some(function (selection) { return selection && selection.alias === 'baaObjects'; })) {
+      selections = selections.filter(function (selection) { return selection && selection.alias === 'baaObjects'; })
+        .concat(selections.filter(function (selection) { return !selection || selection.alias !== 'baaObjects'; }));
+    }
     var expectedBlocks = Math.max(0, selections.length - 1);
     var sourceBlocks = model && Array.isArray(model.blocks) ? model.blocks.slice() : [];
     var previousAlias = '';
@@ -3785,7 +3889,10 @@ function dynamicPagesClientScript() {
 
   function objectSelectionIndexFromList(selections, alias) {
     var text = String(alias || '').trim();
-    var index = (Array.isArray(selections) ? selections : []).findIndex(function (selection, itemIndex) {
+    var cmdbSelections = (Array.isArray(selections) ? selections : []).filter(function (selection) {
+      return selection && selection.alias !== 'baaObjects' && selection.sourceType !== 'baa';
+    });
+    var index = cmdbSelections.findIndex(function (selection, itemIndex) {
       var selectionAlias = selection && (selection.alias || selection.as) || objectSelectionAlias(itemIndex);
       return selectionAlias === text;
     });
@@ -3817,8 +3924,29 @@ function dynamicPagesClientScript() {
 
   function formatObjectSelectionColumnLabel(spec, alias, field) {
     var text = String(field || '').trim();
+    if (String(alias || '') === 'baaObjects') return 'BAA.' + (text || 'candidate');
     var prefix = objectSelectionDisplayNameForAlias(spec || defaultSpec(), alias);
     return prefix + (text ? '.' + text : '');
+  }
+
+  function baaCandidateSelection(spec) {
+    if (!hasBaaInputSpec(spec || {})) return null;
+    return {
+      alias: 'baaObjects',
+      name: 'BAA candidates',
+      className: 'BAA',
+      sourceType: 'baa',
+      rules: []
+    };
+  }
+
+  function matchingSelectionsForSpec(spec) {
+    var selections = objectSelectionsFromModel(inferObjectGroupModel(spec || defaultSpec())).map(function (selection, index) {
+      return normalizeObjectSelection(selection, index);
+    });
+    var baa = baaCandidateSelection(spec || {});
+    if (baa && !selections.some(function (selection) { return selection.alias === baa.alias; })) selections.push(baa);
+    return selections;
   }
 
   function stripKnownSelectionPrefix(spec, alias, field) {
@@ -3960,11 +4088,14 @@ function dynamicPagesClientScript() {
   }
 
   function objectSelectionLabel(selection, index) {
+    if (selection && selection.sourceType === 'baa') return 'BAA candidates';
     return objectSelectionDisplayName(index || 0);
   }
 
   function selectionOptionRows(spec, selectedName) {
     var selections = objectSelectionsFromModel(inferObjectGroupModel(spec || defaultSpec()));
+    var baa = baaCandidateSelection(spec || {});
+    if (baa && !selections.some(function (selection) { return selection.alias === baa.alias; })) selections.push(baa);
     if (selectedName && !selections.some(function (selection) { return selection.alias === selectedName; })) {
       selections.unshift({ alias: selectedName, name: selectedName, className: sourceClassForAlias(spec || {}, selectedName), rules: [] });
     }
@@ -3985,6 +4116,16 @@ function dynamicPagesClientScript() {
   }
 
   function matchingColumnOptionRowsForSelection(spec, alias, prefixed, outputPrefix) {
+    if (String(alias || '') === 'baaObjects') {
+      var baaItems = baaColumnOptionRows(spec || defaultSpec());
+      var baaPrefix = prefixed ? (outputPrefix === undefined ? 'BAA.' : outputPrefix) : '';
+      return baaItems.map(function (item) {
+        return {
+          value: baaPrefix + item.value,
+          label: item.label
+        };
+      });
+    }
     var rows = selectionOptionRows(spec, alias);
     var selection = rows.find(function (item) { return item.alias === alias; }) || {};
     var prefix = prefixed ? (outputPrefix === undefined ? objectSelectionOutputPrefix(spec || defaultSpec(), alias) : outputPrefix) : '';
@@ -4005,6 +4146,32 @@ function dynamicPagesClientScript() {
     tableColumnsForAlias(spec || {}, alias).forEach(function (column) { add(column, column); });
     catalogScopePathOptions(selection.className || sourceClassForAlias(spec || {}, alias)).filter(Boolean).forEach(function (item) {
       add(item.value, item.label || item.value);
+    });
+    return items;
+  }
+
+  function baaColumnOptionRows(spec) {
+    var contract = baaContractForSpec(spec || {});
+    var items = [];
+    var seen = {};
+    function add(value, label) {
+      var text = String(value || '').trim();
+      if (!text || seen[text]) return;
+      seen[text] = true;
+      items.push({ value: text, label: label || text });
+    }
+    ['PlanIndex', 'Kind', 'ClassName', 'PageShapeKey', 'MappingKey', 'RelationBindingStatus'].forEach(function (column) {
+      add(column, 'BAA.' + column);
+    });
+    contract.objects.forEach(function (object) {
+      var alias = object.alias || object.className || 'candidate';
+      (object.payload || []).forEach(function (field) {
+        var name = field && field.name || '';
+        if (!name) return;
+        add('Payload.' + name, 'Payload.' + name);
+        add('BAA.' + alias + '.' + name, 'BAA.' + alias + '.' + name);
+        if (object.className) add('BAA.' + object.className + '.' + name, 'BAA.' + object.className + '.' + name);
+      });
     });
     return items;
   }
@@ -4190,6 +4357,26 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
+  function renderBaaObjectGroupSource(spec) {
+    if (!hasBaaInputSpec(spec || {})) return '';
+    var contract = baaContractForSpec(spec || {});
+    var objects = contract.objects || [];
+    var rows = objects.map(function (object) {
+      var fields = (object.payload || []).map(function (field) { return field && field.name || ''; }).filter(Boolean).join(', ');
+      return '<tr><td><strong>' + escapeHtml(object.className || object.alias || '') + '</strong></td><td>' + escapeHtml(fields || '-') + '</td></tr>';
+    }).join('');
+    return [
+      '<div class="object-selection">',
+      '<div class="section-title-row"><h3>' + escapeHtml(t('baaObjectGroupSource')) + '</h3><span class="muted">BAA candidates / baaObjects</span></div>',
+      '<p class="muted">' + escapeHtml(t('baaObjectGroupSourceHelp')) + '</p>',
+      '<div class="notice ok">BAA candidates -> ' + escapeHtml(defaultObjectSelectionName(0)) + '</div>',
+      objects.length
+        ? '<table class="compact"><thead><tr><th>' + escapeHtml(t('baaObjectClassName')) + '</th><th>' + escapeHtml(t('baaPayloadFields')) + '</th></tr></thead><tbody>' + rows + '</tbody></table>'
+        : '<div class="notice">' + escapeHtml(t('baaContractNoObjects')) + '</div>',
+      '</div>'
+    ].join('');
+  }
+
   function renderObjectGroupEditor(selected) {
     var spec = (selected && selected.spec) || defaultSpec();
     var model = inferObjectGroupModel(spec);
@@ -4197,6 +4384,7 @@ function dynamicPagesClientScript() {
     return [
       '<section class="section" id="cmdp-object-group-editor"><h2>' + t('objectGroupEditor') + '</h2>',
       '<p class="muted">' + t('objectGroupHelp') + '</p>',
+      renderBaaObjectGroupSource(spec),
       selections.map(renderObjectGroupSelection).join(''),
       renderObjectGroupDomainExamples(),
       renderObjectGroupRegexExamples(),
@@ -4329,6 +4517,7 @@ function dynamicPagesClientScript() {
         { section: 'versions', label: t('menuVersions') }
       ]),
       group(t('menuDesigner'), [
+        { section: 'baa-endpoint', label: t('menuBaaEndpoint') },
         { section: 'params', label: t('menuParams') },
         { section: 'object-group', label: t('menuObjectGroup') },
         { section: 'relations', label: t('menuRelations') },
@@ -4376,6 +4565,21 @@ function dynamicPagesClientScript() {
     renderNumberSetting('cmdp-runtime-refresh-cooldown-sec', 'runtimeRefreshCooldownSec', 'runtimeRefreshCooldownHelp', runtimeCache.refreshCooldownSec),
     '</div>'
   ].join('');
+  }
+
+  function renderBaaTechnicalFields(baaTechnical) {
+    var defaults = defaultRuntimeConfig().baaTechnical;
+    var cfg = Object.assign({}, defaults, baaTechnical || {});
+    return [
+      '<div class="settings-grid">',
+      '<label>' + t('baaTechnicalSuperclassPath') + '<input id="cmdp-baa-superclass-path" value="' + escapeHtml(cfg.superclassPath || '') + '"><span class="muted">' + escapeHtml(t('baaTechnicalSuperclassPathHelp')) + '</span></label>',
+      '<label>' + t('baaConversionContractClass') + '<input id="cmdp-baa-conversion-contract-class" value="' + escapeHtml(cfg.conversionContractClass || '') + '"></label>',
+      '<label>' + t('baaConversionContractVersionClass') + '<input id="cmdp-baa-conversion-contract-version-class" value="' + escapeHtml(cfg.conversionContractVersionClass || '') + '"></label>',
+      '<label>' + t('baaVerificationInputContractClass') + '<input id="cmdp-baa-verification-input-contract-class" value="' + escapeHtml(cfg.verificationInputContractClass || '') + '"></label>',
+      '<label>' + t('baaVerificationOutputContractClass') + '<input id="cmdp-baa-verification-output-contract-class" value="' + escapeHtml(cfg.verificationOutputContractClass || '') + '"></label>',
+      '<label>' + t('baaVerificationEndpointClass') + '<input id="cmdp-baa-verification-endpoint-class" value="' + escapeHtml(cfg.verificationEndpointClass || '') + '"></label>',
+      '</div>'
+    ].join('');
   }
 
   function renderExecutionLimitFields(executionLimits) {
@@ -4579,6 +4783,7 @@ function dynamicPagesClientScript() {
     config = config || { runtimeConfig: defaultRuntimeConfig(), exists: false };
     var runtimeConfig = normalizeRuntimeConfigForEditor(config.runtimeConfig || defaultRuntimeConfig());
     var runtimeCache = runtimeConfig.runtimeCache || defaultRuntimeConfig().runtimeCache;
+    var baaTechnical = runtimeConfig.baaTechnical || defaultRuntimeConfig().baaTechnical;
     var executionLimits = runtimeConfig.executionLimits || defaultRuntimeConfig().executionLimits;
     return [
       '<section class="section" id="cmdp-runtime-settings"><h2>' + t('runtimeSettings') + '</h2>',
@@ -4608,6 +4813,8 @@ function dynamicPagesClientScript() {
       '</select></label>',
       '<h3>' + t('runtimeCacheSettings') + '</h3>',
       renderRuntimeCacheFields(runtimeCache),
+      '<h3>' + t('baaTechnicalSettings') + '</h3>',
+      renderBaaTechnicalFields(baaTechnical),
       '</div>',
       '</section>'
     ].join('');
@@ -4717,6 +4924,215 @@ function dynamicPagesClientScript() {
     return '<div class="template-context" id="cmdp-template-context"><strong>' + t('editingTemplate') + '</strong><span class="code-inline">' + escapeHtml(selected.code || '') + '</span>' + escapeHtml(description) + '</div>';
   }
 
+  function isBaaVerificationSpec(spec) {
+    return Boolean(spec && spec.endpoint && spec.endpoint.kind === 'baaVerification');
+  }
+
+  function hasBaaInputSpec(spec) {
+    if (isBaaVerificationSpec(spec || {})) return true;
+    var contract = spec && spec.baaContract && typeof spec.baaContract === 'object' && !Array.isArray(spec.baaContract) ? spec.baaContract : null;
+    if (!contract) return false;
+    return Boolean(contract.sourceCode || contract.code || (Array.isArray(contract.objects) && contract.objects.length) || (Array.isArray(contract.classes) && contract.classes.length));
+  }
+
+  function baaContractForSpec(spec) {
+    var contract = spec && spec.baaContract && typeof spec.baaContract === 'object' && !Array.isArray(spec.baaContract) ? spec.baaContract : {};
+    var variables = Array.isArray(contract.contractParams)
+      ? contract.contractParams
+      : (Array.isArray(contract.variables) ? contract.variables : []);
+    var requestVariables = Array.isArray(contract.requestVariables) ? contract.requestVariables : [];
+    var objects = Array.isArray(contract.objects)
+      ? contract.objects
+      : (Array.isArray(contract.candidates) ? contract.candidates : (Array.isArray(contract.classes) ? contract.classes : []));
+    return {
+      code: String(contract.code || '').trim(),
+      version: String(contract.version || '').trim(),
+      description: String(contract.description || '').trim(),
+      variables: variables.map(normalizeBaaFieldDefinition).filter(function (field) { return field.name; }),
+      contractParams: variables.map(normalizeBaaFieldDefinition).filter(function (field) { return field.name; }),
+      requestVariables: requestVariables.map(normalizeBaaFieldDefinition).filter(function (field) { return field.name; }),
+      objects: objects.map(function (object, index) {
+        var payload = Array.isArray(object && object.payload)
+          ? object.payload
+          : (Array.isArray(object && object.fields) ? object.fields : (Array.isArray(object && object.attributes) ? object.attributes : []));
+        var className = String(object && (object.className || object.class || object.name) || '').trim();
+        return {
+          alias: String(object && object.alias || object && object.as || className || ('candidate' + String(index + 1))).trim(),
+          className: className,
+          description: String(object && object.description || '').trim(),
+          payload: payload.map(normalizeBaaFieldDefinition).filter(function (field) { return field.name; })
+        };
+      }).filter(function (object) { return object.alias || object.className || object.payload.length; })
+    };
+  }
+
+  function normalizeBaaFieldDefinition(field) {
+    field = field && typeof field === 'object' && !Array.isArray(field) ? field : {};
+    return {
+      name: String(field.name || field.field || '').trim(),
+      type: String(field.type || 'string').trim() || 'string',
+      required: Boolean(field.required || field.mandatory),
+      defaultValue: field.default !== undefined ? field.default : (field.defaultValue !== undefined ? field.defaultValue : ''),
+      example: field.example !== undefined ? field.example : '',
+      description: String(field.description || field.help || '').trim(),
+      listMode: String(field.listMode || 'none').trim() || 'none',
+      values: Array.isArray(field.values) ? field.values : []
+    };
+  }
+
+  function baaFieldLines(fields, includeDefault) {
+    return (Array.isArray(fields) ? fields : []).map(function (field) {
+      field = normalizeBaaFieldDefinition(field);
+      if (!field.name) return '';
+      var parts = [
+        field.name,
+        field.type || 'string',
+        field.required ? 'required' : 'optional'
+      ];
+      if (includeDefault) parts.push(field.defaultValue == null ? '' : String(field.defaultValue));
+      parts.push(field.example == null ? '' : String(field.example));
+      parts.push(field.description || '');
+      return parts.join(':');
+    }).filter(Boolean).join('\\n');
+  }
+
+  function parseBaaFieldLines(text, includeDefault) {
+    return String(text || '').split(/\\r?\\n/).map(function (line) {
+      var trimmed = line.trim();
+      if (!trimmed) return null;
+      var parts = trimmed.split(':');
+      var name = String(parts.shift() || '').trim();
+      var type = String(parts.shift() || 'string').trim() || 'string';
+      var requiredText = String(parts.shift() || '').trim().toLowerCase();
+      var required = ['required', 'true', '1', 'yes', 'да', 'обязательный'].indexOf(requiredText) !== -1;
+      var defaultValue = '';
+      if (includeDefault) defaultValue = parts.shift() || '';
+      var example = parts.shift() || '';
+      var description = parts.join(':').trim();
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(t('invalidParamName') + ': ' + name);
+      return {
+        name: name,
+        type: type,
+        required: required,
+        default: defaultValue,
+        example: example,
+        description: description
+      };
+    }).filter(Boolean);
+  }
+
+  function renderBaaContractSourceOptions(contract) {
+    var sourceCode = contract && contract.sourceCode || '';
+    var options = (state.baaInputContracts || []).map(function (item) {
+      var label = item.code + (item.description ? ' - ' + item.description : '') + (item.version ? ' v' + item.version : '');
+      return '<option value="' + escapeHtml(item.code || '') + '"' + (sourceCode === item.code || (!sourceCode && contract && contract.code === item.code) ? ' selected' : '') + '>' + escapeHtml(label) + '</option>';
+    }).join('');
+    return '<option value="">' + escapeHtml(t('baaContractSourceManual')) + '</option>' + options;
+  }
+
+  function renderBaaContractObjectRow(object, index, readOnly) {
+    object = object || {};
+    var disabled = readOnly ? ' readonly' : '';
+    var buttonDisabled = readOnly ? ' disabled' : '';
+    return [
+      '<div class="settings-block" data-baa-object-row>',
+      '<div class="row">',
+      '<label>' + t('baaObjectAlias') + '<input data-baa-object-field="alias" value="' + escapeHtml(object.alias || ('candidate' + String(index + 1))) + '"' + disabled + '></label>',
+      '<label>' + t('baaObjectClassName') + '<input data-baa-object-field="className" value="' + escapeHtml(object.className || '') + '"' + disabled + '></label>',
+      '</div>',
+      '<label>' + t('description') + '<input data-baa-object-field="description" value="' + escapeHtml(object.description || '') + '"' + disabled + '></label>',
+      '<label>' + t('baaPayloadFields') + '<textarea rows="6" data-baa-object-field="payload"' + disabled + '>' + escapeHtml(baaFieldLines(object.payload || [], false)) + '</textarea><span class="muted">' + escapeHtml(t('baaPayloadFieldsHelp')) + '</span></label>',
+      '<button data-action="clear-baa-object" type="button"' + buttonDisabled + '>' + t('clear') + '</button>',
+      '</div>'
+    ].join('');
+  }
+
+  function renderBaaExternalContractSummary(contract) {
+    contract = contract || {};
+    var objects = Array.isArray(contract.objects) ? contract.objects : [];
+    var params = Array.isArray(contract.contractParams)
+      ? contract.contractParams
+      : (Array.isArray(contract.variables) ? contract.variables : []);
+    var requestVariables = Array.isArray(contract.requestVariables) ? contract.requestVariables : [];
+    var rows = objects.map(function (object) {
+      var fields = (object.payload || []).map(function (field) {
+        var required = field.required ? '*' : '';
+        return (field.name || '') + required + (field.type ? ':' + field.type : '');
+      }).filter(Boolean).join(', ');
+      return '<tr><td><strong>' + escapeHtml(object.className || '') + '</strong></td><td>' + escapeHtml(object.alias || '') + '</td><td>' + escapeHtml(fields || '-') + '</td><td>' + escapeHtml(object.description || '') + '</td></tr>';
+    }).join('');
+    var paramRows = params.map(function (param) {
+      param = normalizeBaaFieldDefinition(param);
+      var listText = param.listMode && param.listMode !== 'none'
+        ? param.listMode + (param.values && param.values.length ? ': ' + param.values.join(', ') : '')
+        : '';
+      return '<tr><td><strong>' + escapeHtml(param.name || '') + '</strong></td><td>' + escapeHtml(param.description || '') + '</td><td>' + escapeHtml(param.type || '') + '</td><td>' + escapeHtml(param.required ? 'yes' : 'no') + '</td><td>' + escapeHtml(param.defaultValue || '') + '</td><td>' + escapeHtml(listText) + '</td></tr>';
+    }).join('');
+    var variableRows = requestVariables.map(function (variable) {
+      variable = normalizeBaaFieldDefinition(variable);
+      return '<tr><td><strong>' + escapeHtml(variable.name || '') + '</strong></td><td>' + escapeHtml(variable.description || '') + '</td><td>' + escapeHtml(variable.type || '') + '</td><td>' + escapeHtml(variable.required ? 'yes' : 'no') + '</td><td>' + escapeHtml(variable.defaultValue || '') + '</td></tr>';
+    }).join('');
+    return [
+      '<div class="baa-contract-summary">',
+      '<div class="baa-contract-meta">',
+      '<div><span>' + escapeHtml(t('baaContractCode')) + '</span><strong>' + escapeHtml(contract.code || '') + '</strong></div>',
+      '<div><span>' + escapeHtml(t('baaContractVersion')) + '</span><strong>' + escapeHtml(contract.version || '') + '</strong></div>',
+      '<div><span>' + escapeHtml(t('baaContractDescription')) + '</span><strong>' + escapeHtml(contract.description || '') + '</strong></div>',
+      '</div>',
+      '<div class="baa-usage-note"><strong>' + escapeHtml(t('baaContractUsage')) + '</strong><br>' + escapeHtml(t('baaContractUsageHelp')) + '</div>',
+      params.length
+        ? '<div><h4>' + escapeHtml(t('baaContractParams')) + '</h4><p class="muted">' + escapeHtml(t('baaContractParamsHelp')) + '</p><div class="table-wrap"><table class="baa-contract-table"><thead><tr><th>' + escapeHtml(t('paramName')) + '</th><th>' + escapeHtml(t('description')) + '</th><th>' + escapeHtml(t('type')) + '</th><th>' + escapeHtml(t('paramRequired')) + '</th><th>' + escapeHtml(t('paramDefault')) + '</th><th>List</th></tr></thead><tbody>' + paramRows + '</tbody></table></div></div>'
+        : '',
+      requestVariables.length
+        ? '<div><h4>' + escapeHtml(t('baaRequestVariables')) + '</h4><p class="muted">' + escapeHtml(t('baaRequestVariablesHelp')) + '</p><div class="table-wrap"><table class="baa-contract-table"><thead><tr><th>' + escapeHtml(t('paramName')) + '</th><th>' + escapeHtml(t('description')) + '</th><th>' + escapeHtml(t('type')) + '</th><th>' + escapeHtml(t('paramRequired')) + '</th><th>' + escapeHtml(t('paramDefault')) + '</th></tr></thead><tbody>' + variableRows + '</tbody></table></div></div>'
+        : '',
+      objects.length
+        ? '<div class="table-wrap"><table class="baa-contract-table"><thead><tr><th>' + escapeHtml(t('baaObjectClassName')) + '</th><th>' + escapeHtml(t('baaObjectAlias')) + '</th><th>' + escapeHtml(t('baaPayloadFields')) + '</th><th>' + escapeHtml(t('description')) + '</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+        : '<div class="notice">' + escapeHtml(t('baaContractNoObjects')) + '</div>',
+      '</div>'
+    ].join('');
+  }
+
+  function renderBaaEndpointEditor(selected) {
+    var spec = (selected && selected.spec) || defaultSpec();
+    var contract = state.baaContractDraft || baaContractForSpec(spec);
+    var externalContract = Boolean(contract.sourceCode);
+    var externalReadonly = externalContract ? ' readonly' : '';
+    if (!contract.objects.length && !contract.sourceCode) {
+      contract.objects = [{
+        alias: 'candidate1',
+        className: 'Router',
+        description: '',
+        payload: [
+          { name: 'Code', type: 'string', required: false, example: 'router047', description: 'Candidate code' },
+          { name: 'ipAddress', type: 'ipv4', required: false, example: '10.10.2.15', description: 'Candidate IPv4 address' }
+        ]
+      }];
+    }
+    return [
+      '<section class="section" id="cmdp-baa-endpoint-editor"><h2>' + escapeHtml(t('baaEndpointEditor')) + '</h2>',
+      '<p class="muted">' + escapeHtml(t('baaEndpointHelp')) + '</p>',
+      '<div class="settings-block"><h3>' + escapeHtml(t('baaContractSource')) + '</h3>',
+      '<div class="settings-grid">',
+      '<label>' + t('baaContractSource') + '<select id="cmdp-baa-contract-source">' + renderBaaContractSourceOptions(contract) + '</select></label>',
+      '<label>' + t('baaContractCode') + '<input id="cmdp-baa-contract-code" value="' + escapeHtml(contract.code || '') + '"' + externalReadonly + '></label>',
+      '<label>' + t('baaContractVersion') + '<input id="cmdp-baa-contract-version" value="' + escapeHtml(contract.version || '1') + '"' + externalReadonly + '></label>',
+      '</div>',
+      '<label>' + t('baaContractDescription') + '<input id="cmdp-baa-contract-description" value="' + escapeHtml(contract.description || '') + '"' + externalReadonly + '></label>',
+      '</div>',
+      externalContract ? '' : '<div class="settings-block"><h3>' + escapeHtml(t('baaContractVariables')) + '</h3>' +
+        '<label>' + t('baaContractVariables') + '<textarea id="cmdp-baa-contract-variables" rows="5">' + escapeHtml(baaFieldLines(contract.contractParams || contract.variables || [], true)) + '</textarea><span class="muted">' + escapeHtml(t('baaVariablesHelp')) + '</span></label>' +
+        '</div>',
+      '<div class="settings-block"><h3>' + escapeHtml(t('baaContractObjects')) + '</h3>',
+      '<p class="muted">' + escapeHtml(t('baaContractObjectsHelp')) + '</p>',
+      externalContract
+        ? renderBaaExternalContractSummary(contract)
+        : '<div id="cmdp-baa-object-rows">' + contract.objects.map(function (object, index) { return renderBaaContractObjectRow(object, index, false); }).join('') + '</div>',
+      '</div>',
+      '</section>'
+    ].join('');
+  }
+
   function runParamValueForRow(row) {
     var params = state.runParams || {};
     if (Object.prototype.hasOwnProperty.call(params, row.name)) return params[row.name];
@@ -4770,6 +5186,8 @@ function dynamicPagesClientScript() {
     if (type === 'integer') return 1;
     if (type === 'number') return 1;
     if (type === 'boolean') return true;
+    if (type === 'ipv4') return '10.10.2.15';
+    if (type === 'ipv4-cidr') return '10.10.2.0/24';
     if (type === 'date') return '2026-01-01';
     if (type === 'dateTime') return '2026-01-01T00:00:00Z';
     return 'test';
@@ -4830,12 +5248,130 @@ function dynamicPagesClientScript() {
 
   function renderEditorVisualizationResult(result) {
     if (!result) return '';
+    if (result.json && (result.json.status === 'completed' || result.json.status === 'error') && Array.isArray(result.json.tables) && Array.isArray(result.json.items)) {
+      return renderBaaVerificationResult(result);
+    }
     return '<section class="section" id="cmdp-result-section"><h2>' + t('result') + '</h2>' + renderRuntimeResult(result) + '</section>';
+  }
+
+  function defaultBaaRequest(selected) {
+    var spec = selected && selected.spec || defaultSpec();
+    var contract = baaContractForSpec(spec);
+    var contractParams = (contract.contractParams || contract.variables || []).map(normalizeBaaFieldDefinition).filter(function (field) { return field.name; });
+    var requestVariables = (contract.requestVariables || []).map(normalizeBaaFieldDefinition).filter(function (field) { return field.name; });
+    var endpointParams = runUrlParamsForTemplate(selected || {}, true);
+    contractParams.forEach(function (field) {
+      if (endpointParams[field.name] !== undefined && endpointParams[field.name] !== null && endpointParams[field.name] !== '') return;
+      endpointParams[field.name] = field.defaultValue !== undefined && field.defaultValue !== null && field.defaultValue !== ''
+        ? field.defaultValue
+        : (field.example !== undefined && field.example !== null && field.example !== '' ? field.example : sampleRunParamValue(field));
+    });
+    var variables = {};
+    var variableSources = [];
+    requestVariables.forEach(function (field) {
+      var value = field.defaultValue !== undefined && field.defaultValue !== null && field.defaultValue !== ''
+        ? field.defaultValue
+        : (field.example !== undefined && field.example !== null && field.example !== '' ? field.example : sampleRunParamValue(field));
+      variables[field.name] = value;
+      variableSources.push({
+        name: field.name,
+        sourceKind: field.sourceKind || 'constant',
+        sourceExpression: field.sourceExpression || '',
+        valuePresent: value !== undefined && value !== null && value !== ''
+      });
+    });
+    var objects = (contract.objects && contract.objects.length ? contract.objects : [{
+      alias: 'candidate1',
+      className: 'ACL',
+      payload: [
+        { name: 'Code', type: 'string', example: 'ACL-001' },
+        { name: 'destinationAddress', type: 'ipv4-cidr', example: '10.0.0.0/24' }
+      ]
+    }]).map(function (object, index) {
+      var payload = {};
+      (object.payload || []).forEach(function (field) {
+        payload[field.name] = field.example !== undefined && field.example !== null && field.example !== '' ? field.example : sampleRunParamValue(field);
+      });
+      return {
+        planIndex: index,
+        kind: object.alias || 'candidate',
+        className: object.className || object.alias || 'Candidate',
+        pageShapeKey: 'visio/pages/page1.xml:' + String(index + 1),
+        mappingKey: object.alias || object.className || 'candidate',
+        relationBindingStatus: 'candidate',
+        endpoints: {},
+        payload: payload,
+        attributeSources: []
+      };
+    });
+    return {
+      source: 'CMDB BAA',
+      inputContract: {
+        code: contract.code || 'contract-verification-input-v1',
+        version: contract.version || '1',
+        checksum: 'sha256...'
+      },
+      endpoint: {
+        code: readTemplateCode(selected) || 'verification-endpoint',
+        params: endpointParams
+      },
+      contractParams: contractParams,
+      variables: variables,
+      variableSources: variableSources,
+      plan: {
+        objects: objects,
+        missingAttributes: [],
+        skipped: []
+      }
+    };
+  }
+
+  function renderBaaRequestEditor(selected) {
+    var value = state.baaRequestDraft || pretty(defaultBaaRequest(selected));
+    return [
+      '<section class="section" id="cmdp-baa-request-editor"><h2>' + escapeHtml(t('baaRequestEditor')) + '</h2>',
+      '<p class="muted">' + escapeHtml(t('baaRequestHelp')) + '</p>',
+      '<textarea id="cmdp-baa-request" rows="16" spellcheck="false">' + escapeHtml(value) + '</textarea>',
+      '</section>'
+    ].join('');
+  }
+
+  function baaResultTableToRuntimeTable(table) {
+    var columns = Array.isArray(table && table.columns) ? table.columns : [];
+    var columnNames = columns.map(function (column) { return column && (column.name || column.key); }).filter(Boolean);
+    var labels = {};
+    columns.forEach(function (column) {
+      var name = column && (column.name || column.key);
+      if (name) labels[name] = column.title || column.label || name;
+    });
+    return {
+      name: table && table.code || '',
+      title: table && table.title || table && table.code || '',
+      columns: columnNames,
+      columnLabels: labels,
+      rows: Array.isArray(table && table.rows) ? table.rows : [],
+      emptyText: DEFAULT_EMPTY_RESULT_TEXT
+    };
+  }
+
+  function renderBaaVerificationResult(result) {
+    var body = result.json || {};
+    var html = '<section class="section" id="cmdp-result-section"><h2>' + t('result') + '</h2>';
+    html += renderNotice({ type: result.ok && body.success ? 'ok' : 'error', text: body.message || body.status || '' });
+    if (Array.isArray(body.items) && body.items.length) {
+      html += '<div class="settings-block"><h3>Items</h3><pre>' + escapeHtml(pretty(body.items)) + '</pre></div>';
+    }
+    var tables = Array.isArray(body.tables) ? body.tables.map(baaResultTableToRuntimeTable) : [];
+    if (tables.length) html += tables.map(renderResultTable).join('');
+    else html += '<pre>' + escapeHtml(pretty(body)) + '</pre>';
+    html += '</section>';
+    return html;
   }
 
   function renderTemplateRunSection(selected) {
     return [
       renderRunParamsEditor(selected),
+      renderBaaRequestEditor(selected),
       state.result ? renderEditorVisualizationResult(state.result) : ''
     ].join('');
   }
@@ -4914,6 +5450,7 @@ function dynamicPagesClientScript() {
     if (section === 'template') return renderTemplateEditor(selected);
     if (section === 'schema') return renderSchemaManager();
     if (section === 'versions') return renderVersions();
+    if (section === 'baa-endpoint') return renderBaaEndpointEditor(selected);
     if (section === 'object-group') return renderObjectGroupEditor(selected);
     if (section === 'relations') return renderRelationExpansionEditor(selected);
     if (section === 'final-view') return renderViewComposerEditor(selected);
@@ -4940,6 +5477,7 @@ function dynamicPagesClientScript() {
     if (section === 'template') return t('creatingTemplate');
     if (section === 'schema') return t('menuSchema');
     if (section === 'versions') return t('menuVersions');
+    if (section === 'baa-endpoint') return t('menuBaaEndpoint');
     if (section === 'params') return t('menuParams');
     if (section === 'object-group') return t('menuObjectGroup');
     if (section === 'relations') return t('menuRelations');
@@ -4980,6 +5518,7 @@ function dynamicPagesClientScript() {
   function sectionPersistsTemplate(section) {
     return [
       'template',
+      'baa-endpoint',
       'params',
       'object-group',
       'relations',
@@ -5005,6 +5544,9 @@ function dynamicPagesClientScript() {
       actions.push(renderActionButton('new-cmdb-build-view', t('templateKindCmdbBuildView')));
     } else if (section === 'template') {
       actions.push(renderActionButton('save-template', t('save'), { primary: true }));
+    } else if (section === 'baa-endpoint') {
+      actions.push(renderActionButton('add-baa-object', t('addBaaObject')));
+      actions.push(renderActionButton('apply-baa-endpoint', t('applyBaaEndpoint')));
     } else if (section === 'params') {
       actions.push(renderActionButton('add-param-row', t('addParam')));
       actions.push(renderActionButton('apply-params', t('applyParams'), { primary: true }));
@@ -5034,6 +5576,7 @@ function dynamicPagesClientScript() {
       actions.push(renderActionButton('visualize-editor', t('visualizeInEditor'), { primary: true }));
       actions.push(renderActionButton('force-refresh-editor', t('forceRefreshInEditor')));
       actions.push(renderActionButton('visualize-external', t('visualizeExternal')));
+      actions.push(renderActionButton('baa-verify-preview', t('baaVerifyPreview')));
       if (readTemplateCode(selected)) context = renderTemplateLaunchUrl(selected);
     } else if (section === 'selection') {
       actions.push(renderActionButton('add-selection-filter-row', t('addFilter')));
@@ -5518,6 +6061,7 @@ function dynamicPagesClientScript() {
   function sourceClassForAlias(spec, alias) {
     var name = String(alias || '');
     if (!name) return '';
+    if (name === 'baaObjects') return 'BAA';
     var steps = spec && Array.isArray(spec.steps) ? spec.steps : [];
     var enrichStep = steps.find(function (step) {
       return step && step.type === 'enrichRows' && step.as === name && step.from;
@@ -5632,6 +6176,9 @@ function dynamicPagesClientScript() {
     finalExtractionAliases(spec).forEach(function (alias) {
       add(alias, t('extractionFinalResult') + ' (' + alias + ')');
     });
+    if (hasBaaInputSpec(spec || {})) {
+      add('baaObjects', 'BAA candidates');
+    }
     (Array.isArray(tables) ? tables : []).forEach(function (table) {
       if (!table || !table.name) return;
       var isFinalRelation = relation && relation.output && relation.output.alias === table.name || relationStep && relationStep.as === table.name;
@@ -6730,7 +7277,11 @@ function dynamicPagesClientScript() {
         return { ok: true, status: 0, json: { parents: [] }, body: '' };
       }),
       namedRequest('config', apiPrefix + '/config?root=' + encodeURIComponent(state.root)),
-      namedRequest('templates', apiPrefix + '/templates?limit=100')
+      namedRequest('templates', apiPrefix + '/templates?limit=100'),
+      namedRequest('baaInputContracts', apiPrefix + '/baa/contracts?root=' + encodeURIComponent(state.root) + '&type=input').catch(function (error) {
+        clientLog('load-designer-optional-failed', 'baaInputContracts ' + (error && error.message ? error.message : String(error)));
+        return { ok: true, status: 0, json: { data: [] }, body: '' };
+      })
     ]).then(function (results) {
       clientLog('load-designer-results', results.map(function (item) { return item.status; }).join(','));
       state.session = results[0].json && results[0].json.session ? results[0].json.session : state.session;
@@ -6741,6 +7292,7 @@ function dynamicPagesClientScript() {
       if (!state.schemaParentDraft && state.schema && state.schema.rootParent) state.schemaParentDraft = state.schema.rootParent;
       state.config = results[3].json ? results[3].json.config : null;
       state.templates = results[4].json && results[4].json.data ? results[4].json.data : [];
+      state.baaInputContracts = results[5].json && Array.isArray(results[5].json.data) ? results[5].json.data : [];
       var accessDenied = [results[3], results[4]].find(resultIsPermissionDenied);
       if (accessDenied) {
         state.technicalSchemaAccessDenied = true;
@@ -7283,7 +7835,7 @@ function dynamicPagesClientScript() {
       if (!path) throw new Error(t('objectGroupNeedsPath'));
       if (!regex) throw new Error(t('objectGroupNeedsRegex'));
       try {
-        new RegExp(regex.replace(/\$\{param\.([A-Za-z_][A-Za-z0-9_]*)\}/g, ''));
+        new RegExp(regex.replace(/\$\{(param|var|contractparam)\.([A-Za-z_][A-Za-z0-9_]*)\}/g, ''));
       } catch (error) {
         throw new Error(t('objectGroupInvalidRegex') + ': ' + (error && error.message ? error.message : String(error)));
       }
@@ -7364,6 +7916,9 @@ function dynamicPagesClientScript() {
         as: objectSelectionAlias(index)
       };
     });
+    if (hasBaaInputSpec(previousSpec || {})) {
+      steps.unshift({ type: 'baaPlanObjects', as: 'baaObjects', payloadPrefix: 'Payload.' });
+    }
     var tables = selections.map(function (selection, index) {
       return {
         name: objectSelectionAlias(index),
@@ -7371,6 +7926,13 @@ function dynamicPagesClientScript() {
         columns: ['Class', 'Code', 'Description']
       };
     });
+    if (hasBaaInputSpec(previousSpec || {})) {
+      tables.unshift({
+        name: 'baaObjects',
+        title: 'BAA candidates',
+        columns: baaColumnOptionRows(previousSpec || {}).map(function (item) { return item.value; })
+      });
+    }
     var first = selections[0] || defaultObjectSelection(0, '');
     var visualSelections = selections.map(function (selection, index) {
       return {
@@ -7420,6 +7982,8 @@ function dynamicPagesClientScript() {
       result: {
         tables: tables
       },
+      endpoint: previousSpec && previousSpec.endpoint ? previousSpec.endpoint : (hasBaaInputSpec(previousSpec || {}) ? { kind: 'baaVerification' } : undefined),
+      baaContract: previousSpec && previousSpec.baaContract ? previousSpec.baaContract : undefined,
       publish: previousSpec && previousSpec.publish ? previousSpec.publish : undefined,
       cache: previousSpec && previousSpec.cache ? previousSpec.cache : undefined,
       defaults: previousSpec && previousSpec.defaults ? previousSpec.defaults : undefined
@@ -7531,7 +8095,7 @@ function dynamicPagesClientScript() {
 
   function readRelationExpansionFields() {
     var previousSpec = readCurrentSpec();
-    var selections = objectSelectionsFromModel(inferObjectGroupModel(previousSpec));
+    var selections = matchingSelectionsForSpec(previousSpec);
     if (selections.length < 2) throw new Error(t('matchingNeedsSelections'));
     var blocks = [];
     Array.prototype.slice.call(document.querySelectorAll('[data-matching-block]')).forEach(function (blockNode, index) {
@@ -7556,7 +8120,7 @@ function dynamicPagesClientScript() {
         [leftRegex, rightRegex].forEach(function (regex) {
           if (!regex) return;
           try {
-            new RegExp(regex.replace(/\$\{param\.([A-Za-z_][A-Za-z0-9_]*)\}/g, ''));
+            new RegExp(regex.replace(/\$\{(param|var|contractparam)\.([A-Za-z_][A-Za-z0-9_]*)\}/g, ''));
           } catch (error) {
             throw new Error(t('matchingInvalidRegex') + ': ' + (error && error.message ? error.message : String(error)));
           }
@@ -7586,6 +8150,7 @@ function dynamicPagesClientScript() {
     var sourceAlias = String(alias || '').trim();
     var field = String(column || '').trim();
     if (!sourceAlias || !field) return;
+    if (sourceAlias === 'baaObjects') return;
     field = stripKnownSelectionPrefix(readCurrentSpec(), sourceAlias, field);
     if (!columnsByAlias[sourceAlias]) columnsByAlias[sourceAlias] = [];
     if (columnsByAlias[sourceAlias].indexOf(field) === -1) columnsByAlias[sourceAlias].push(field);
@@ -7667,8 +8232,9 @@ function dynamicPagesClientScript() {
 
   function buildRelationExpansionSpec(model, previousSpec) {
     model = normalizeObjectMatchingModel(model, previousSpec || defaultSpec());
+    var cmdbSelections = model.selections.filter(function (selection) { return selection && selection.sourceType !== 'baa' && selection.alias !== 'baaObjects'; });
     var objectSpec = buildObjectGroupSpec({
-      selections: model.selections
+      selections: cmdbSelections
     }, previousSpec || defaultSpec());
     var specForLabels = objectSpec || previousSpec || defaultSpec();
     var columnsByAlias = collectMatchingSelectionColumns(model);
@@ -7678,6 +8244,9 @@ function dynamicPagesClientScript() {
       if (materializedColumns.length) copy.columns = buildSelectionColumnSpecs(materializedColumns);
       return copy;
     });
+    if (hasBaaInputSpec(previousSpec || {}) || model.selections.some(function (selection) { return selection && (selection.sourceType === 'baa' || selection.alias === 'baaObjects'); })) {
+      steps.unshift({ type: 'baaPlanObjects', as: 'baaObjects', payloadPrefix: 'Payload.' });
+    }
     model.blocks.forEach(function (block, index) {
       steps.push({
         type: 'matchRows',
@@ -7720,6 +8289,8 @@ function dynamicPagesClientScript() {
       result: {
         tables: resultTables
       },
+      endpoint: previousSpec && previousSpec.endpoint ? previousSpec.endpoint : (hasBaaInputSpec(previousSpec || {}) ? { kind: 'baaVerification' } : undefined),
+      baaContract: previousSpec && previousSpec.baaContract ? previousSpec.baaContract : undefined,
       publish: previousSpec && previousSpec.publish ? previousSpec.publish : undefined,
       cache: previousSpec && previousSpec.cache ? previousSpec.cache : undefined,
       defaults: previousSpec && previousSpec.defaults ? previousSpec.defaults : undefined
@@ -7776,6 +8347,7 @@ function dynamicPagesClientScript() {
     if (extractionStep) specData.spec = upsertExtractionStep(specData.spec, extractionStep);
     var selectionStep = readDataSelectionStepFields(false);
     if (selectionStep) specData.spec = upsertDataSelectionStep(specData.spec, selectionStep);
+    specData.spec = applyBaaEndpointToSpec(specData.spec, false);
     specData.spec = applyVisualizationToSpec(specData.spec, false);
     specData.spec = applyPublicationToSpec(specData.spec, false);
     specData.spec = applyCacheToSpec(specData.spec, false);
@@ -7811,6 +8383,113 @@ function dynamicPagesClientScript() {
       state.runParams = Object.assign({}, specData.examples);
       clearDraftExecutionState();
       state.message = { type: 'ok', text: t('paramsApplied') };
+      renderDesigner();
+    } catch (error) {
+      state.message = { type: 'error', text: error.message };
+      renderDesigner();
+    }
+  }
+
+  function hasBaaEndpointEditorFields() {
+    return hasField('cmdp-baa-contract-source') || hasField('cmdp-baa-contract-code') || hasField('cmdp-baa-contract-version');
+  }
+
+  function readBaaEndpointFields() {
+    var sourceCode = String(readValue('cmdp-baa-contract-source') || '').trim();
+    var sourceContract = sourceCode ? (state.baaInputContracts || []).find(function (item) { return item.code === sourceCode; }) : null;
+    if (sourceContract && sourceContract.contract) {
+      return {
+        kind: 'baaVerification',
+        contract: Object.assign({}, sourceContract.contract, {
+          code: sourceContract.code || sourceContract.contract.code || '',
+          version: sourceContract.version || sourceContract.contract.version || '',
+          description: sourceContract.description || sourceContract.contract.description || '',
+          variables: sourceContract.contract.contractParams || sourceContract.contract.variables || [],
+          contractParams: sourceContract.contract.contractParams || sourceContract.contract.variables || [],
+          requestVariables: sourceContract.contract.requestVariables || [],
+          sourceCode: sourceContract.code,
+          sourceClassName: sourceContract.className || ''
+        })
+      };
+    }
+    var variables = parseBaaFieldLines(readValue('cmdp-baa-contract-variables') || '', true);
+    var objects = Array.prototype.slice.call(document.querySelectorAll('[data-baa-object-row]')).map(function (row, index) {
+      var aliasField = row.querySelector('[data-baa-object-field="alias"]');
+      var classField = row.querySelector('[data-baa-object-field="className"]');
+      var descriptionField = row.querySelector('[data-baa-object-field="description"]');
+      var payloadField = row.querySelector('[data-baa-object-field="payload"]');
+      var alias = String(aliasField && aliasField.value || ('candidate' + String(index + 1))).trim();
+      var className = String(classField && classField.value || '').trim();
+      var payload = parseBaaFieldLines(payloadField && payloadField.value || '', false);
+      if (!alias && !className && !payload.length) return null;
+      if (!alias) throw new Error(t('fieldRequired', { label: t('baaObjectAlias') }));
+      return {
+        alias: alias,
+        className: className,
+        description: String(descriptionField && descriptionField.value || '').trim(),
+        payload: payload
+      };
+    }).filter(Boolean);
+    return {
+      kind: 'baaVerification',
+      contract: {
+        code: String(readValue('cmdp-baa-contract-code') || '').trim(),
+        version: String(readValue('cmdp-baa-contract-version') || '1').trim() || '1',
+        description: String(readValue('cmdp-baa-contract-description') || '').trim(),
+        sourceCode: sourceCode,
+        variables: variables,
+        contractParams: variables,
+        requestVariables: [],
+        objects: objects
+      }
+    };
+  }
+
+  function applyBaaContractSourceSelection(sourceCode) {
+    var code = String(sourceCode || '').trim();
+    var sourceContract = code ? (state.baaInputContracts || []).find(function (item) { return item.code === code; }) : null;
+    if (sourceContract && sourceContract.contract) {
+      state.baaContractDraft = Object.assign({}, sourceContract.contract, {
+        code: sourceContract.code || sourceContract.contract.code || '',
+        version: sourceContract.version || sourceContract.contract.version || '',
+        description: sourceContract.description || sourceContract.contract.description || '',
+        variables: sourceContract.contract.contractParams || sourceContract.contract.variables || [],
+        contractParams: sourceContract.contract.contractParams || sourceContract.contract.variables || [],
+        requestVariables: sourceContract.contract.requestVariables || [],
+        sourceCode: sourceContract.code,
+        sourceClassName: sourceContract.className || ''
+      });
+    } else {
+      var current = baaContractForSpec(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
+      current.sourceCode = '';
+      current.sourceClassName = '';
+      state.baaContractDraft = current;
+    }
+    clearDraftExecutionState({ clearExtractionSource: true });
+    renderDesigner();
+  }
+
+  function applyBaaEndpointToSpec(spec, required) {
+    if (!hasBaaEndpointEditorFields() && !required) return spec;
+    var next = cloneJsonValue(spec || defaultSpec(), defaultSpec());
+    var model = readBaaEndpointFields();
+    state.baaContractDraft = model.contract;
+    next.endpoint = Object.assign({}, next.endpoint || {}, { kind: 'baaVerification' });
+    next.baaContract = model.contract;
+    next.steps = Array.isArray(next.steps) ? next.steps.slice() : [];
+    var hasBaaStep = next.steps.some(function (step) { return step && step.type === 'baaPlanObjects' && step.as === 'baaObjects'; });
+    if (!hasBaaStep) next.steps.unshift({ type: 'baaPlanObjects', as: 'baaObjects', payloadPrefix: 'Payload.' });
+    return next;
+  }
+
+  function applyBaaEndpointEditor() {
+    try {
+      var specData = readSpecWithParamEditor();
+      specData.spec = applyBaaEndpointToSpec(specData.spec, true);
+      updateSelectedFromEditor(specData.spec);
+      state.runParams = Object.assign({}, specData.examples || {}, state.runParams || {});
+      clearDraftExecutionState();
+      state.message = { type: 'ok', text: t('baaEndpointApplied') };
       renderDesigner();
     } catch (error) {
       state.message = { type: 'error', text: error.message };
@@ -8108,6 +8787,27 @@ function dynamicPagesClientScript() {
   function addParamRow() {
     var body = document.getElementById('cmdp-param-rows');
     if (body) body.insertAdjacentHTML('beforeend', renderParamEditorRow({}));
+  }
+
+  function addBaaObjectRow() {
+    var container = document.getElementById('cmdp-baa-object-rows');
+    var index = container ? container.querySelectorAll('[data-baa-object-row]').length : 0;
+    if (container) container.insertAdjacentHTML('beforeend', renderBaaContractObjectRow({
+      alias: 'candidate' + String(index + 1),
+      className: '',
+      payload: [{ name: 'Code', type: 'string', required: false, example: '', description: '' }]
+    }, index));
+  }
+
+  function clearBaaObjectRow(button) {
+    var row = button && button.closest ? button.closest('[data-baa-object-row]') : null;
+    if (!row) return;
+    var container = row.parentElement;
+    if (container && container.querySelectorAll('[data-baa-object-row]').length <= 1) {
+      row.querySelectorAll('input,textarea').forEach(function (field) { field.value = ''; });
+      return;
+    }
+    row.remove();
   }
 
   function addObjectGroupScopeRuleRow(button) {
@@ -8440,9 +9140,27 @@ function dynamicPagesClientScript() {
     return next;
   }
 
+  function applyBaaTechnicalFields(runtimeConfig) {
+    var next = normalizeRuntimeConfigForEditor(runtimeConfig);
+    var fields = [
+      ['cmdp-baa-superclass-path', 'superclassPath'],
+      ['cmdp-baa-conversion-contract-class', 'conversionContractClass'],
+      ['cmdp-baa-conversion-contract-version-class', 'conversionContractVersionClass'],
+      ['cmdp-baa-verification-input-contract-class', 'verificationInputContractClass'],
+      ['cmdp-baa-verification-output-contract-class', 'verificationOutputContractClass'],
+      ['cmdp-baa-verification-endpoint-class', 'verificationEndpointClass']
+    ];
+    fields.forEach(function (item) {
+      if (!hasField(item[0])) return;
+      next.baaTechnical[item[1]] = String(readValue(item[0]) || '').trim() || defaultRuntimeConfig().baaTechnical[item[1]];
+    });
+    return next;
+  }
+
   function applyRuntimeConfigFields(runtimeConfig) {
     var next = applyRuntimeCacheFields(runtimeConfig);
     next = applyRuntimeExecutionLimitFields(next);
+    next = applyBaaTechnicalFields(next);
     return next;
   }
 
@@ -8531,6 +9249,7 @@ function dynamicPagesClientScript() {
   function selectTemplate(code) {
     state.selectedTemplate = state.templates.find(function (item) { return item.code === code; }) || null;
     state.objectGroupDraft = null;
+    state.baaContractDraft = null;
     state.relationDraft = null;
     state.viewComposerDraft = null;
     state.paramRowsDraft = null;
@@ -8560,6 +9279,7 @@ function dynamicPagesClientScript() {
       resultSchema: selected.resultSchema || {}
     };
     state.objectGroupDraft = null;
+    state.baaContractDraft = null;
     state.relationDraft = null;
     state.viewComposerDraft = null;
     state.paramRowsDraft = null;
@@ -8731,6 +9451,7 @@ function dynamicPagesClientScript() {
     state.runParams = built.params;
     state.selectedClass = built.params.className || built.params.referenceClass || state.selectedClass;
     state.objectGroupDraft = null;
+    state.baaContractDraft = null;
     state.relationDraft = null;
     state.viewComposerDraft = null;
     state.paramRowsDraft = null;
@@ -8775,6 +9496,7 @@ function dynamicPagesClientScript() {
     state.templateVersions = [];
     state.runParams = {};
     state.objectGroupDraft = null;
+    state.baaContractDraft = null;
     state.relationDraft = null;
     state.viewComposerDraft = null;
     state.paramRowsDraft = null;
@@ -8794,6 +9516,7 @@ function dynamicPagesClientScript() {
     state.templateVersions = [];
     state.runParams = {};
     state.objectGroupDraft = null;
+    state.baaContractDraft = null;
     state.relationDraft = null;
     state.viewComposerDraft = null;
     state.paramRowsDraft = null;
@@ -8823,6 +9546,7 @@ function dynamicPagesClientScript() {
     state.templateVersions = [];
     state.runParams = {};
     state.objectGroupDraft = null;
+    state.baaContractDraft = null;
     state.relationDraft = null;
     state.viewComposerDraft = null;
     state.paramRowsDraft = null;
@@ -8944,6 +9668,46 @@ function dynamicPagesClientScript() {
     }).then(function (result) {
       state.result = result;
       state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t('forceRefreshRunCompleted') : errorText(result) };
+      state.designerSection = 'run';
+      renderDesigner();
+    }).catch(function (error) {
+      state.message = { type: 'error', text: error.message || String(error) };
+      renderDesigner();
+    });
+  }
+
+  function readBaaRequestBody() {
+    var field = document.getElementById('cmdp-baa-request');
+    var text = field ? field.value : pretty(defaultBaaRequest(state.selectedTemplate || {}));
+    state.baaRequestDraft = text;
+    try {
+      return JSON.parse(text);
+    } catch (error) {
+      throw new Error('BAA request JSON is invalid: ' + (error && error.message ? error.message : String(error)));
+    }
+  }
+
+  function baaVerifyPreview() {
+    var code = readTemplateCode();
+    var body;
+    if (!code) {
+      state.message = { type: 'error', text: t('templateCodeRequired') };
+      renderDesigner();
+      return;
+    }
+    try {
+      body = readBaaRequestBody();
+    } catch (error) {
+      state.message = { type: 'error', text: error.message };
+      renderDesigner();
+      return;
+    }
+    request(apiPrefix + '/templates/' + encodeURIComponent(code) + '/baa-verify?maxRows=100', {
+      method: 'POST',
+      body: body
+    }).then(function (result) {
+      state.result = result;
+      state.message = { type: result.ok && result.json && result.json.success ? 'ok' : 'error', text: result.ok ? t('baaVerifyCompleted') : errorText(result) };
       state.designerSection = 'run';
       renderDesigner();
     }).catch(function (error) {
@@ -9150,9 +9914,13 @@ function dynamicPagesClientScript() {
     if (action === 'visualize-editor') visualizeInEditor();
     if (action === 'force-refresh-editor') forceRefreshInEditor();
     if (action === 'visualize-external') visualizeExternal();
+    if (action === 'baa-verify-preview') baaVerifyPreview();
     if (action === 'select-template') selectTemplate(target.getAttribute('data-code'));
     if (action === 'delete-template') deleteTemplate(target.getAttribute('data-code'));
     if (action === 'apply-object-group') applyObjectGroupEditor();
+    if (action === 'apply-baa-endpoint') applyBaaEndpointEditor();
+    if (action === 'add-baa-object') addBaaObjectRow();
+    if (action === 'clear-baa-object') clearBaaObjectRow(target);
     if (action === 'add-object-scope-row') addObjectGroupScopeRuleRow(target);
     if (action === 'add-object-selection') addObjectSelection();
     if (action === 'clear-object-scope-row') clearObjectGroupScopeRuleRow(target);
@@ -9224,6 +9992,10 @@ function dynamicPagesClientScript() {
     }
     if (target.id === 'cmdp-copy-template-source') {
       applyTemplateCopySource(target.value);
+      return;
+    }
+    if (target.id === 'cmdp-baa-contract-source') {
+      applyBaaContractSourceSelection(target.value);
       return;
     }
     if (target.id === 'cmdp-max-depth') {
@@ -10581,6 +11353,14 @@ function defaultRuntimeConfig() {
     runtimeCache: {
       refreshCooldownSec: Math.ceil(RUNTIME_REFRESH_COOLDOWN_MS / 1000)
     },
+    baaTechnical: {
+      superclassPath: 'BAA technical superclass',
+      conversionContractClass: 'BAAConversionContract',
+      conversionContractVersionClass: 'BAAConversionContractVersion',
+      verificationInputContractClass: 'BAAVerificationInputContract',
+      verificationOutputContractClass: 'BAAVerificationOutputContract',
+      verificationEndpointClass: 'BAAVerificationEndpoint'
+    },
     executionLimits: {
       maxRowsDefault: 500,
       maxRowsPreviewDefault: 25,
@@ -10689,6 +11469,7 @@ function mergeRuntimeConfigDefaults(runtimeConfig) {
   const source = runtimeConfig && typeof runtimeConfig === 'object' && !Array.isArray(runtimeConfig) ? runtimeConfig : {};
   return Object.assign({}, defaults, source, {
     runtimeCache: Object.assign({}, defaults.runtimeCache, source.runtimeCache || {}),
+    baaTechnical: Object.assign({}, defaults.baaTechnical, source.baaTechnical || {}),
     executionLimits: Object.assign({}, defaults.executionLimits, source.executionLimits || {})
   });
 }
@@ -10745,6 +11526,112 @@ async function getRuntimeConfig(authToken, root) {
     return defaultRuntimeConfig();
   }
   return sanitizeConfigCard(found.card, found.schema.root).runtimeConfig || defaultRuntimeConfig();
+}
+
+function baaTechnicalConfig(runtimeConfig) {
+  return mergeRuntimeConfigDefaults(runtimeConfig || defaultRuntimeConfig()).baaTechnical || defaultRuntimeConfig().baaTechnical;
+}
+
+function baaContractClassNameForType(runtimeConfig, type) {
+  const cfg = baaTechnicalConfig(runtimeConfig);
+  const kind = String(type || 'input').trim();
+  if (kind === 'conversion') return cfg.conversionContractClass;
+  if (kind === 'conversionVersion') return cfg.conversionContractVersionClass;
+  if (kind === 'output') return cfg.verificationOutputContractClass;
+  if (kind === 'endpoint') return cfg.verificationEndpointClass;
+  return cfg.verificationInputContractClass;
+}
+
+function jsonFieldValue(card, names, fallback = null) {
+  for (const name of names) {
+    if (card && card[name] !== undefined && card[name] !== null && card[name] !== '') {
+      return safeJsonValue(card[name], fallback);
+    }
+  }
+  return fallback;
+}
+
+function baaFieldListFromObject(value) {
+  if (Array.isArray(value)) return value.map((item) => normalizeBaaContractFieldServer(item)).filter((item) => item.name);
+  if (value && typeof value === 'object') {
+    return Object.entries(value).map(([name, definition]) => normalizeBaaContractFieldServer({
+      ...(definition && typeof definition === 'object' && !Array.isArray(definition) ? definition : { type: definition }),
+      name
+    })).filter((item) => item.name);
+  }
+  return [];
+}
+
+function normalizeBaaVariableSources(value) {
+  return Array.isArray(value) ? value.map((item) => {
+    const source = item && typeof item === 'object' && !Array.isArray(item) ? item : {};
+    return {
+      name: String(source.name || '').trim(),
+      sourceKind: String(source.sourceKind || '').trim(),
+      sourceExpression: String(source.sourceExpression || '').trim(),
+      valuePresent: Boolean(source.valuePresent)
+    };
+  }).filter((item) => item.name) : [];
+}
+
+function baaContractObjectsFromRaw(raw) {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const rawObjects = Array.isArray(source.objects)
+    ? source.objects
+    : (Array.isArray(source.candidates) ? source.candidates : (Array.isArray(source.classes) ? source.classes : []));
+  return rawObjects.map((object, index) => {
+    const item = object && typeof object === 'object' && !Array.isArray(object) ? object : {};
+    const className = String(item.className || item.class || item.name || '').trim();
+    return {
+      alias: String(item.alias || item.as || className || `candidate${index + 1}`).trim(),
+      className,
+      description: String(item.description || '').trim(),
+      payload: baaFieldListFromObject(item.payload || item.fields || item.attributes || [])
+    };
+  }).filter((object) => object.alias || object.className || object.payload.length);
+}
+
+function baaContractFromCard(card) {
+  const raw = jsonFieldValue(card, ['SchemaJson', 'ContractJson', 'SpecJson', 'InputContractJson', 'OutputContractJson', 'DefinitionJson', 'PayloadJson'], {}) || {};
+  const variables = baaFieldListFromObject(raw.contractParams || raw.variables || raw.params || raw.endpointParams || []);
+  const requestVariables = baaFieldListFromObject(raw.requestVariables || raw.verificationRequestVariables || []);
+  const objects = baaContractObjectsFromRaw(raw);
+  return {
+    code: String(raw.code || card.Code || card.BAAContractVersionCode || '').trim(),
+    version: String(raw.version || card.ContractVersion || card.Version || card.MajorVersion || '').trim(),
+    description: String(raw.description || card.Description || '').trim(),
+    variables,
+    contractParams: variables,
+    requestVariables,
+    objects
+  };
+}
+
+function sanitizeBaaContractCard(card, className) {
+  const contract = baaContractFromCard(card || {});
+  return {
+    id: card && card._id,
+    code: contract.code || String(card && card.Code || '').trim(),
+    description: contract.description || String(card && card.Description || '').trim(),
+    version: contract.version,
+    className,
+    contract,
+    resultInterpretation: jsonFieldValue(card, ['ResultInterpretationJson'], null)
+  };
+}
+
+async function listBaaContractCards(authToken, root, type) {
+  const runtimeConfig = await getRuntimeConfig(authToken, root);
+  const cfg = baaTechnicalConfig(runtimeConfig);
+  const className = validateCmdbuildIdentifier(baaContractClassNameForType(runtimeConfig, type), 'BAA contract class');
+  const cards = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}/cards?limit=1000`, authToken);
+  const data = Array.isArray(cards.json && cards.json.data) ? cards.json.data : [];
+  return {
+    type: String(type || 'input'),
+    className,
+    superclassPath: cfg.superclassPath || '',
+    data: data.map((card) => sanitizeBaaContractCard(card, className))
+  };
 }
 
 function truncateText(value, maxLength) {
@@ -10953,10 +11840,11 @@ function dependencyMapWithHash(spec) {
   return Object.assign({}, map, { hash });
 }
 
-function runtimeCacheKeyParts(root, template, params, sessionData, executionOptions, runtimeCacheConfig, templateCacheConfig, dependencyMap, accessProbe) {
+function runtimeCacheKeyParts(root, template, params, sessionData, executionOptions, runtimeCacheConfig, templateCacheConfig, dependencyMap, accessProbe, cacheContext = {}) {
   const userScope = runtimeUserCacheScope(sessionData);
   const specHash = hashJson(template.spec || {});
   const paramsHash = hashJson(params || {});
+  const contextHash = cacheContext && Object.keys(cacheContext).length ? hashJson(cacheContext) : '';
   const limitsHash = hashJson({
     maxRows: executionOptions.maxRows,
     maxClasses: executionOptions.maxClasses,
@@ -10978,7 +11866,8 @@ function runtimeCacheKeyParts(root, template, params, sessionData, executionOpti
     cacheScope,
     scopeMode: templateCacheConfig && templateCacheConfig.scopeMode || 'privateUser',
     dependencyMapHash: dependencyMap && dependencyMap.hash || hashJson({}),
-    visibilityHash: accessProbe && accessProbe.visibilityHash || ''
+    visibilityHash: accessProbe && accessProbe.visibilityHash || '',
+    contextHash
   };
   if (cacheScope !== 'endpoint') keyPayload.userScopeHash = userScopeHash;
   return {
@@ -10988,6 +11877,7 @@ function runtimeCacheKeyParts(root, template, params, sessionData, executionOpti
     specHash,
     paramsHash,
     limitsHash,
+    contextHash,
     cachePolicyHash,
     cacheScope,
     scopeMode: keyPayload.scopeMode,
@@ -11209,7 +12099,10 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
   const templateCacheConfig = normalizeTemplateCacheConfig(template.spec, runtimeCacheConfig);
   if (!templateCacheConfig.enabled || templateCacheConfig.scopeMode === 'disabled') {
     return {
-      result: await executeTemplateSpec(authToken, template.spec, params, executionOptions),
+      result: await executeTemplateSpec(authToken, template.spec, params, {
+        ...executionOptions,
+        baaRequest: options.baaRequest || null
+      }),
       cache: {
         enabled: false,
         scope: 'disabled',
@@ -11225,7 +12118,7 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
   }
   const resultTtlMs = templateCacheConfig.ttlSeconds * 1000;
   const refreshCooldownMs = runtimeCacheConfig.refreshCooldownSec * 1000;
-  const keyParts = runtimeCacheKeyParts(root, template, params, sessionData, executionOptions, runtimeCacheConfig, templateCacheConfig, dependencyMap, accessProbe);
+  const keyParts = runtimeCacheKeyParts(root, template, params, sessionData, executionOptions, runtimeCacheConfig, templateCacheConfig, dependencyMap, accessProbe, options.cacheContext || {});
   const refreshRequested = Boolean(options.refreshRequested);
   const forceRefreshRequested = Boolean(options.forceRefreshRequested);
   const cached = await cacheGetJson('runtime', keyParts.key, runtimeResultCache);
@@ -11276,7 +12169,8 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
   const promise = (async () => {
     const result = await executeTemplateSpec(authToken, template.spec, params, {
       ...executionOptions,
-      dependencyMap
+      dependencyMap,
+      baaRequest: options.baaRequest || null
     });
     const createdAt = Date.now();
     const newEntry = {
@@ -11285,6 +12179,7 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
       specHash: keyParts.specHash,
       paramsHash: keyParts.paramsHash,
       limitsHash: keyParts.limitsHash,
+      contextHash: keyParts.contextHash,
       cachePolicyHash: keyParts.cachePolicyHash,
       cacheScope: keyParts.cacheScope,
       scopeMode: keyParts.scopeMode,
@@ -11506,6 +12401,72 @@ function runtimeJsonResponsePayload(payload) {
   };
 }
 
+function inferBaaColumnType(rows, column) {
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const value = row && Object.prototype.hasOwnProperty.call(row, column) ? row[column] : undefined;
+    if (value === undefined || value === null || value === '') continue;
+    if (typeof value === 'boolean') return 'boolean';
+    if (typeof value === 'number') return Number.isInteger(value) ? 'integer' : 'number';
+    return 'string';
+  }
+  return 'string';
+}
+
+function baaTablesFromRuntimeResult(result) {
+  return visibleRuntimeResultTables(result && result.tables).map((table) => {
+    const columns = Array.isArray(table.columns) ? table.columns : [];
+    const labels = table.columnLabels && typeof table.columnLabels === 'object' && !Array.isArray(table.columnLabels) ? table.columnLabels : {};
+    const rows = Array.isArray(table.rows) ? table.rows : [];
+    return {
+      code: table.name || '',
+      title: runtimeResultTableTitle(table),
+      columns: columns.map((column) => ({
+        name: column,
+        title: labels[column] || column,
+        type: inferBaaColumnType(rows, column)
+      })),
+      rows: rows.map((row) => {
+        const output = {};
+        columns.forEach((column) => {
+          output[column] = row && row[column] !== undefined ? row[column] : null;
+        });
+        return output;
+      })
+    };
+  });
+}
+
+function baaResponseFromRuntimeResult(result, template) {
+  const tables = baaTablesFromRuntimeResult(result);
+  return baaEnvelope({
+    success: true,
+    status: 'completed',
+    title: template && (template.description || template.code) || '',
+    message: '',
+    tables,
+    items: [],
+    data: {}
+  });
+}
+
+function baaErrorCodeFromError(error) {
+  if (errorLooksPermissionDenied(error)) return 'CMDB_PERMISSION_DENIED';
+  const message = error && error.message ? String(error.message) : String(error || '');
+  if (/limit|maximum|maxRows|maxRestCalls|maxClasses|maxDomains/i.test(message)) return 'EXECUTION_LIMIT_EXCEEDED';
+  return 'EXECUTION_ERROR';
+}
+
+function baaErrorResponse(code, message, status = 'error', extraItems = []) {
+  return baaEnvelope({
+    success: false,
+    status,
+    message,
+    tables: [],
+    items: [baaErrorItem(code, message)].concat(extraItems || []),
+    data: {}
+  });
+}
+
 async function sendPublicSnapshotRun(res, requestUrl, templateCode) {
   const params = publicSnapshotParamsFromUrl(requestUrl);
   const jsonOutput = runtimeJsonOutputRequested(requestUrl);
@@ -11686,6 +12647,35 @@ function validateTemplateSpec(spec) {
   if (spec.kind !== undefined && spec.kind !== CMDB_BUILD_VIEW_KIND && spec.kind !== 'dsl') {
     errors.push({ path: '$.kind', message: `Template kind must be dsl or ${CMDB_BUILD_VIEW_KIND}.` });
   }
+  if (spec.endpoint !== undefined) {
+    if (!spec.endpoint || typeof spec.endpoint !== 'object' || Array.isArray(spec.endpoint)) {
+      errors.push({ path: '$.endpoint', message: 'Template endpoint settings must be an object.' });
+    } else if (spec.endpoint.kind !== undefined && !['runtime', 'baaVerification'].includes(spec.endpoint.kind)) {
+      errors.push({ path: '$.endpoint.kind', message: 'Endpoint kind must be runtime or baaVerification.' });
+    }
+  }
+  if (spec.baaContract !== undefined) {
+    if (!spec.baaContract || typeof spec.baaContract !== 'object' || Array.isArray(spec.baaContract)) {
+      errors.push({ path: '$.baaContract', message: 'BAA contract must be an object.' });
+    } else {
+      const contract = normalizeBaaContractServer(spec);
+      contract.variables.forEach((field) => {
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(field.name)) {
+          errors.push({ path: `$.baaContract.variables.${field.name}`, message: 'BAA variable name must be a Latin identifier.' });
+        }
+      });
+      contract.objects.forEach((object) => {
+        if (object.alias && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(object.alias)) {
+          errors.push({ path: `$.baaContract.objects.${object.alias}`, message: 'BAA object alias must be a Latin identifier.' });
+        }
+        object.payload.forEach((field) => {
+          if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(field.name)) {
+            errors.push({ path: `$.baaContract.objects.${object.alias}.payload.${field.name}`, message: 'BAA payload field name must be a Latin identifier.' });
+          }
+        });
+      });
+    }
+  }
   if (isCmdbBuildViewSpec(spec)) {
     errors.push(...validateCmdbBuildViewSpec(spec));
     return errors;
@@ -11705,6 +12695,10 @@ function validateTemplateSpec(spec) {
       if (step.type === 'findClassesByAttributeType') {
         if (!step.attributeType && !step.attributeTypeParam) {
           errors.push({ path, message: 'findClassesByAttributeType requires attributeType or attributeTypeParam.' });
+        }
+      } else if (step.type === 'baaPlanObjects') {
+        if (step.payloadPrefix !== undefined && typeof step.payloadPrefix !== 'string') {
+          errors.push({ path: `${path}.payloadPrefix`, message: 'baaPlanObjects payloadPrefix must be a string.' });
         }
       } else if (step.type === 'extractVariables' || step.type === 'extract') {
         if (!step.regex || typeof step.regex !== 'string') {
@@ -12422,6 +13416,275 @@ function executeExtractVariables(step, params, context, limits) {
   };
 }
 
+function baaErrorItem(code, message, level = 'error') {
+  return {
+    level,
+    code,
+    message: truncateText(message || code, 1000)
+  };
+}
+
+function baaEnvelope({ success, status, title = '', message = '', tables = [], items = [], data = {} }) {
+  const rows = (Array.isArray(tables) ? tables : []).reduce((count, table) => count + (Array.isArray(table.rows) ? table.rows.length : 0), 0);
+  return {
+    success: Boolean(success),
+    status: status || (success ? 'completed' : 'error'),
+    title: truncateText(title || '', 250),
+    message: truncateText(message || '', 2000),
+    summary: { rows },
+    tables: Array.isArray(tables) ? tables : [],
+    items: Array.isArray(items) ? items : [],
+    data: data && typeof data === 'object' && !Array.isArray(data) ? data : {}
+  };
+}
+
+function normalizeBaaObjectPayload(payload) {
+  return payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+}
+
+function normalizeBaaContractFieldServer(field) {
+  field = field && typeof field === 'object' && !Array.isArray(field) ? field : {};
+  return {
+    name: String(field.name || field.field || '').trim(),
+    type: String(field.type || 'string').trim() || 'string',
+    required: Boolean(field.required),
+    default: field.default !== undefined ? field.default : field.defaultValue,
+    example: field.example,
+    description: String(field.description || '').trim()
+  };
+}
+
+function normalizeBaaContractServer(spec) {
+  const contract = spec && spec.baaContract && typeof spec.baaContract === 'object' && !Array.isArray(spec.baaContract) ? spec.baaContract : {};
+  const objects = baaContractObjectsFromRaw(contract);
+  const variables = Array.isArray(contract.contractParams)
+    ? contract.contractParams
+    : (Array.isArray(contract.variables) ? contract.variables : []);
+  return {
+    code: String(contract.code || '').trim(),
+    version: String(contract.version || '').trim(),
+    variables: variables.map(normalizeBaaContractFieldServer).filter((field) => field.name),
+    contractParams: variables.map(normalizeBaaContractFieldServer).filter((field) => field.name),
+    objects
+  };
+}
+
+function baaContractParamsFromRequest(body) {
+  return Array.isArray(body && body.contractParams)
+    ? body.contractParams.map(normalizeBaaContractFieldServer).filter((field) => field.name)
+    : [];
+}
+
+function validateBaaTypedValue(value, type) {
+  if (value === undefined || value === null || value === '') return true;
+  const text = String(value).trim();
+  if (type === 'number') return !Number.isNaN(Number(text));
+  if (type === 'integer') return /^-?\d+$/.test(text);
+  if (type === 'boolean') return typeof value === 'boolean' || ['true', 'false', '1', '0', 'yes', 'no', 'да', 'нет'].includes(text.toLowerCase());
+  if (type === 'ipv4') return ipv4ToInt(text) !== null;
+  if (type === 'ipv4-cidr') return parseIpv4Network(text) !== null;
+  return true;
+}
+
+function validateBaaVerificationRequest(body, spec = null) {
+  const errors = [];
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return {
+      ok: false,
+      errors: [baaErrorItem('INVALID_REQUEST', 'Request body must be an object.')]
+    };
+  }
+  const plan = body.plan && typeof body.plan === 'object' && !Array.isArray(body.plan) ? body.plan : null;
+  if (!plan) {
+    errors.push(baaErrorItem('INVALID_REQUEST', 'Request body must contain plan object.'));
+  } else if (!Array.isArray(plan.objects)) {
+    errors.push(baaErrorItem('INVALID_REQUEST', 'plan.objects must be an array.'));
+  } else {
+    plan.objects.forEach((object, index) => {
+      if (!object || typeof object !== 'object' || Array.isArray(object)) {
+        errors.push(baaErrorItem('INVALID_REQUEST', `plan.objects[${index}] must be an object.`));
+        return;
+      }
+      if (object.payload !== undefined && (!object.payload || typeof object.payload !== 'object' || Array.isArray(object.payload))) {
+        errors.push(baaErrorItem('INVALID_REQUEST', `plan.objects[${index}].payload must be an object when provided.`));
+      }
+    });
+  }
+  const endpoint = body.endpoint && typeof body.endpoint === 'object' && !Array.isArray(body.endpoint) ? body.endpoint : {};
+  if (endpoint.params !== undefined && (!endpoint.params || typeof endpoint.params !== 'object' || Array.isArray(endpoint.params))) {
+    errors.push(baaErrorItem('INVALID_REQUEST', 'endpoint.params must be an object when provided.'));
+  }
+  if (body.variables !== undefined && (!body.variables || typeof body.variables !== 'object' || Array.isArray(body.variables))) {
+    errors.push(baaErrorItem('INVALID_REQUEST', 'variables must be an object when provided.'));
+  }
+  if (body.contractParams !== undefined && !Array.isArray(body.contractParams)) {
+    errors.push(baaErrorItem('INVALID_REQUEST', 'contractParams must be an array when provided.'));
+  }
+  const contract = normalizeBaaContractServer(spec || {});
+  const requestContractParams = baaContractParamsFromRequest(body);
+  const contractParamDefinitions = requestContractParams.length ? requestContractParams : contract.contractParams;
+  if (contract.objects.length || contractParamDefinitions.length) {
+    const endpointParams = endpoint.params && typeof endpoint.params === 'object' && !Array.isArray(endpoint.params) ? endpoint.params : {};
+    contractParamDefinitions.forEach((field) => {
+      const value = endpointParams[field.name];
+      if (field.required && (value === undefined || value === null || value === '')) {
+        errors.push(baaErrorItem('CONTRACT_VALIDATION_FAILED', `endpoint.params.${field.name} is required.`));
+      } else if (!validateBaaTypedValue(value, field.type)) {
+        errors.push(baaErrorItem('CONTRACT_VALIDATION_FAILED', `endpoint.params.${field.name} must be ${field.type}.`));
+      }
+    });
+    const contractObjects = contract.objects;
+    const requestObjects = plan && Array.isArray(plan.objects) ? plan.objects : [];
+    requestObjects.forEach((object, index) => {
+      const payload = normalizeBaaObjectPayload(object && object.payload);
+      const className = String(object && object.className || '').trim();
+      const kind = String(object && object.kind || '').trim();
+      const mappingKey = String(object && object.mappingKey || '').trim();
+      const matchedContract = contractObjects.find((item) => {
+        return item.alias === kind || item.alias === mappingKey || item.className === className;
+      });
+      if (!matchedContract) return;
+      matchedContract.payload.forEach((field) => {
+        const value = payload[field.name];
+        if (field.required && (value === undefined || value === null || value === '')) {
+          errors.push(baaErrorItem('CONTRACT_VALIDATION_FAILED', `plan.objects[${index}].payload.${field.name} is required.`));
+        } else if (!validateBaaTypedValue(value, field.type)) {
+          errors.push(baaErrorItem('CONTRACT_VALIDATION_FAILED', `plan.objects[${index}].payload.${field.name} must be ${field.type}.`));
+        }
+      });
+    });
+  }
+  return {
+    ok: errors.length === 0,
+    errors
+  };
+}
+
+function normalizedBaaRequestForCache(body) {
+  const plan = body && body.plan && typeof body.plan === 'object' && !Array.isArray(body.plan) ? body.plan : {};
+  const endpoint = body && body.endpoint && typeof body.endpoint === 'object' && !Array.isArray(body.endpoint) ? body.endpoint : {};
+  const inputContract = body && body.inputContract && typeof body.inputContract === 'object' && !Array.isArray(body.inputContract) ? body.inputContract : {};
+  return {
+    inputContract: {
+      code: inputContract.code || '',
+      version: inputContract.version || '',
+      checksum: inputContract.checksum || ''
+    },
+    endpoint: {
+      code: endpoint.code || '',
+      params: endpoint.params && typeof endpoint.params === 'object' && !Array.isArray(endpoint.params) ? endpoint.params : {}
+    },
+    contractParams: baaContractParamsFromRequest(body),
+    variables: body && body.variables && typeof body.variables === 'object' && !Array.isArray(body.variables) ? body.variables : {},
+    variableSources: normalizeBaaVariableSources(body && body.variableSources),
+    plan: {
+      objects: (Array.isArray(plan.objects) ? plan.objects : []).map((object) => ({
+        planIndex: object && object.planIndex !== undefined ? object.planIndex : '',
+        kind: object && object.kind || '',
+        className: object && object.className || '',
+        pageShapeKey: object && object.pageShapeKey || '',
+        mappingKey: object && object.mappingKey || '',
+        relationBindingStatus: object && object.relationBindingStatus || '',
+        payload: normalizeBaaObjectPayload(object && object.payload)
+      })),
+      missingAttributes: Array.isArray(plan.missingAttributes) ? plan.missingAttributes : [],
+      skipped: Array.isArray(plan.skipped) ? plan.skipped : []
+    }
+  };
+}
+
+function baaParamsFromRequest(body, spec = null) {
+  const endpoint = body && body.endpoint && typeof body.endpoint === 'object' && !Array.isArray(body.endpoint) ? body.endpoint : {};
+  const params = endpoint.params && typeof endpoint.params === 'object' && !Array.isArray(endpoint.params) ? { ...endpoint.params } : {};
+  const variables = body && body.variables && typeof body.variables === 'object' && !Array.isArray(body.variables) ? body.variables : {};
+  const contract = normalizeBaaContractServer(spec || {});
+  const requestContractParams = baaContractParamsFromRequest(body);
+  const contractParamDefinitions = requestContractParams.length ? requestContractParams : contract.contractParams;
+  for (const field of contractParamDefinitions) {
+    if (params[field.name] === undefined && field.default !== undefined && field.default !== '') params[field.name] = field.default;
+    if (params[field.name] !== undefined) {
+      params[`contractparam.${field.name}`] = params[field.name];
+      params[`var.${field.name}`] = params[field.name];
+    }
+  }
+  for (const [key, value] of Object.entries(variables)) {
+    if (!Object.prototype.hasOwnProperty.call(params, key)) params[key] = value;
+    params[`var.${key}`] = value;
+  }
+  return params;
+}
+
+function addBaaColumn(columns, column) {
+  if (column && !columns.includes(column)) columns.push(column);
+}
+
+function baaContractAliasesForObject(object, contract) {
+  const result = [];
+  const payload = normalizeBaaObjectPayload(object && object.payload);
+  const className = String(object && object.className || '').trim();
+  const kind = String(object && object.kind || '').trim();
+  const mappingKey = String(object && object.mappingKey || '').trim();
+  (contract && Array.isArray(contract.objects) ? contract.objects : []).forEach((item) => {
+    if (!item) return;
+    if (item.alias && (item.alias === kind || item.alias === mappingKey)) result.push(item.alias);
+    else if (item.className && item.className === className) result.push(item.alias || item.className);
+  });
+  if (!result.length) {
+    if (kind) result.push(kind);
+    if (className) result.push(className);
+  }
+  return Array.from(new Set(result.filter(Boolean))).filter((alias) => Object.keys(payload).length || alias);
+}
+
+function executeBaaPlanObjects(step, baaRequest, limits, contract = null) {
+  const plan = baaRequest && baaRequest.plan && typeof baaRequest.plan === 'object' && !Array.isArray(baaRequest.plan) ? baaRequest.plan : {};
+  const objects = Array.isArray(plan.objects) ? plan.objects : [];
+  const normalizedContract = normalizeBaaContractServer({ baaContract: contract || {} });
+  const columns = ['PlanIndex', 'Kind', 'ClassName', 'PageShapeKey', 'MappingKey', 'RelationBindingStatus'];
+  const payloadPrefix = step.payloadPrefix === undefined ? 'Payload.' : String(step.payloadPrefix);
+  normalizedContract.objects.forEach((object) => {
+    const aliases = [object.alias, object.className].filter(Boolean);
+    object.payload.forEach((field) => {
+      addBaaColumn(columns, `${payloadPrefix}${field.name}`);
+      aliases.forEach((alias) => addBaaColumn(columns, `BAA.${alias}.${field.name}`));
+    });
+  });
+  const rows = [];
+  for (const [index, object] of objects.entries()) {
+    if (!object || typeof object !== 'object' || Array.isArray(object)) continue;
+    const row = {
+      PlanIndex: object.planIndex === undefined || object.planIndex === null ? index : object.planIndex,
+      Kind: displayCardValue(object.kind || ''),
+      ClassName: displayCardValue(object.className || ''),
+      PageShapeKey: displayCardValue(object.pageShapeKey || ''),
+      MappingKey: displayCardValue(object.mappingKey || ''),
+      RelationBindingStatus: displayCardValue(object.relationBindingStatus || '')
+    };
+    const payload = normalizeBaaObjectPayload(object.payload);
+    const aliases = baaContractAliasesForObject(object, normalizedContract);
+    Object.keys(payload).sort().forEach((key) => {
+      const column = `${payloadPrefix}${key}`;
+      row[column] = displayCardValue(payload[key]);
+      addBaaColumn(columns, column);
+      aliases.forEach((alias) => {
+        const aliasColumn = `BAA.${alias}.${key}`;
+        row[aliasColumn] = displayCardValue(payload[key]);
+        addBaaColumn(columns, aliasColumn);
+      });
+      if (object.className) {
+        const classColumn = `BAA.${object.className}.${key}`;
+        row[classColumn] = displayCardValue(payload[key]);
+        addBaaColumn(columns, classColumn);
+      }
+    });
+    rows.push(row);
+    if (rows.length >= limits.maxRows) {
+      return { columns, rows, truncated: true };
+    }
+  }
+  return { columns, rows, truncated: false };
+}
+
 function resolveSelectionDriverRows(step, context, limits) {
   if (!step.from) return [{ __index: 0, __source: '' }];
   const source = context[step.from];
@@ -12593,7 +13856,11 @@ function normalizeSelectionExpected(value, caseSensitive) {
 }
 
 function substituteRegexParams(pattern, params) {
-  return String(pattern || '').replace(/\$\{param\.([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, name) => {
+  return String(pattern || '').replace(/\$\{(param|var)\.([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, scope, name) => {
+    if (scope === 'var' && params && Object.prototype.hasOwnProperty.call(params, `var.${name}`)) return String(params[`var.${name}`]);
+    return params && params[name] !== undefined && params[name] !== null ? String(params[name]) : '';
+  }).replace(/\$\{contractparam\.([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, name) => {
+    if (params && Object.prototype.hasOwnProperty.call(params, `contractparam.${name}`)) return String(params[`contractparam.${name}`]);
     return params && params[name] !== undefined && params[name] !== null ? String(params[name]) : '';
   });
 }
@@ -13666,6 +14933,7 @@ function resolveTemplateToken(token, leftRow, rightRow, params) {
   const scope = dotIndex === -1 ? '' : text.slice(0, dotIndex);
   const key = dotIndex === -1 ? text : text.slice(dotIndex + 1);
   if (scope === 'params') return displayCardValue(params[key]);
+  if (scope === 'contractparam') return displayCardValue(params && (Object.prototype.hasOwnProperty.call(params, `contractparam.${key}`) ? params[`contractparam.${key}`] : params[key]));
   if (scope === 'left') return displayCardValue(leftRow && leftRow[key]);
   if (scope === 'right') return displayCardValue(rightRow && rightRow[key]);
   if (leftRow && Object.prototype.hasOwnProperty.call(leftRow, text)) return displayCardValue(leftRow[text]);
@@ -13679,7 +14947,9 @@ function renderComposeTemplate(template, leftRow, rightRow, params) {
 }
 
 function renderRuntimeParamTemplate(template, params) {
-  return String(template || '').replace(/\$\{params?\.([A-Za-z_][A-Za-z0-9_]*)\}/g, (match, name) => displayCardValue(params && params[name]));
+  return String(template || '')
+    .replace(/\$\{params?\.([A-Za-z_][A-Za-z0-9_]*)\}/g, (match, name) => displayCardValue(params && params[name]))
+    .replace(/\$\{contractparam\.([A-Za-z_][A-Za-z0-9_]*)\}/g, (match, name) => displayCardValue(params && (Object.prototype.hasOwnProperty.call(params, `contractparam.${name}`) ? params[`contractparam.${name}`] : params[name])));
 }
 
 function getComposeColumnValue(column, leftRow, rightRow, params) {
@@ -14103,6 +15373,8 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
     try {
       if (step.type === 'findClassesByAttributeType') {
         context[step.as] = await executeFindClassesByAttributeType(cmdbuildExecRequest, step, effectiveParams, limits);
+      } else if (step.type === 'baaPlanObjects') {
+        context[step.as] = executeBaaPlanObjects(step, options.baaRequest || null, limits, spec.baaContract || null);
       } else if (step.type === 'extractVariables' || step.type === 'extract') {
         context[step.as] = executeExtractVariables(step, effectiveParams, context, limits);
       } else if (step.type === 'selectCards') {
@@ -14451,6 +15723,29 @@ async function handleBackend(req, res, requestUrl) {
       success: probe.success,
       ...probe
     });
+    return;
+  }
+
+  if (requestUrl.pathname === `${BACKEND_PREFIX}/baa/contracts`) {
+    if (!methodAllowed(req, res, 'GET')) return;
+    const root = requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
+    const type = requestUrl.searchParams.get('type') || 'input';
+    try {
+      const contracts = await listBaaContractCards(authToken, root, type);
+      sendJson(res, 200, {
+        success: true,
+        root,
+        ...contracts
+      });
+    } catch (error) {
+      sendJson(res, isPermissionDeniedStatus(error.cmdbuildStatus || error.statusCode) ? 403 : 502, {
+        success: false,
+        root,
+        type,
+        message: error.message || String(error),
+        cmdbuildStatus: error.cmdbuildStatus || error.statusCode || 0
+      });
+    }
     return;
   }
 
@@ -14824,7 +16119,7 @@ async function handleBackend(req, res, requestUrl) {
         });
         return;
       }
-      if (!['validate', 'preview', 'run', 'publish'].includes(templateAction)) {
+      if (!['validate', 'preview', 'run', 'publish', 'baa-verify'].includes(templateAction)) {
         sendJson(res, 404, {
           success: false,
           message: `Unknown template action: ${templateAction}`
@@ -14851,6 +16146,10 @@ async function handleBackend(req, res, requestUrl) {
         return;
       }
       if (!found.card) {
+        if (templateAction === 'baa-verify') {
+          sendJson(res, 404, baaErrorResponse('TEMPLATE_NOT_FOUND', `Template not found: ${templateCode}`));
+          return;
+        }
         sendJson(res, 404, {
           success: false,
           message: `Template not found: ${templateCode}`
@@ -14873,6 +16172,10 @@ async function handleBackend(req, res, requestUrl) {
         return;
       }
       if (errors.length) {
+        if (templateAction === 'baa-verify') {
+          sendJson(res, 400, baaErrorResponse('EXECUTION_ERROR', 'Template spec validation failed.', 'error', errors.map((error) => baaErrorItem('TEMPLATE_SPEC_INVALID', `${error.path}: ${error.message}`))));
+          return;
+        }
         sendJson(res, 400, {
           success: false,
           template: {
@@ -14886,7 +16189,22 @@ async function handleBackend(req, res, requestUrl) {
       }
 
       const body = runtimeReadOnly ? {} : await readJsonBody(req);
-      const params = runtimeReadOnly ? publicSnapshotParamsFromUrl(requestUrl) : body.params || {};
+      const isBaaVerify = templateAction === 'baa-verify';
+      if (isBaaVerify) {
+        const validation = validateBaaVerificationRequest(body, template.spec);
+        if (!validation.ok) {
+          sendJson(res, 400, baaEnvelope({
+            success: false,
+            status: 'error',
+            message: 'BAA verification request is invalid.',
+            tables: [],
+            items: validation.errors,
+            data: {}
+          }));
+          return;
+        }
+      }
+      const params = runtimeReadOnly ? publicSnapshotParamsFromUrl(requestUrl) : isBaaVerify ? baaParamsFromRequest(body, template.spec) : body.params || {};
       const jsonOutput = templateAction === 'run' && runtimeJsonOutputRequested(requestUrl);
       const session = await getSessionData(authToken);
       const username = session.data && session.data.username ? session.data.username : '';
@@ -14993,6 +16311,28 @@ async function handleBackend(req, res, requestUrl) {
             key: snapshot.key,
             paramsMode: publishConfig.paramsMode || 'exact'
           });
+        } else if (isBaaVerify && !cacheDisabled) {
+          const cached = await executeTemplateRunWithCache(authToken, root, template, params, session.data, executionOptions, {
+            refreshRequested,
+            forceRefreshRequested,
+            runtimeCacheConfig,
+            baaRequest: body,
+            cacheContext: { baa: normalizedBaaRequestForCache(body) }
+          });
+          result = cached.result;
+          cache = cached.cache;
+          logInfo('baa.verify.cache_result', {
+            requestId: req.cmdpRequestId || '',
+            templateCode: template.code,
+            username,
+            status: cache && cache.status || '',
+            scope: cache && cache.scope || '',
+            scopeMode: cache && cache.scopeMode || '',
+            backend: cache && cache.backend || '',
+            rowsCount: countResultRows(result),
+            refreshRequested: Boolean(refreshRequested),
+            forceRefreshRequested: Boolean(forceRefreshRequested)
+          });
         } else if (templateAction === 'run' && !cacheDisabled) {
           const cached = await executeTemplateRunWithCache(authToken, root, template, params, session.data, executionOptions, {
             refreshRequested,
@@ -15014,7 +16354,10 @@ async function handleBackend(req, res, requestUrl) {
             forceRefreshRequested: Boolean(forceRefreshRequested)
           });
         } else {
-          result = await executeTemplateSpec(authToken, template.spec, params, executionOptions);
+          result = await executeTemplateSpec(authToken, template.spec, params, {
+            ...executionOptions,
+            baaRequest: isBaaVerify ? body : null
+          });
         }
       } catch (error) {
         const permissionDenied = errorLooksPermissionDenied(error);
@@ -15027,6 +16370,12 @@ async function handleBackend(req, res, requestUrl) {
           permissionDenied,
           error: error && error.message ? error.message : String(error)
         });
+        if (isBaaVerify) {
+          const code = baaErrorCodeFromError(error);
+          const message = permissionDenied ? permissionDeniedText : (error && error.message ? error.message : String(error));
+          sendJson(res, permissionDenied ? 403 : 400, baaErrorResponse(code, message));
+          return;
+        }
         sendJson(res, permissionDenied ? 403 : 400, {
           success: false,
           action: templateAction,
@@ -15040,7 +16389,7 @@ async function handleBackend(req, res, requestUrl) {
         });
         return;
       }
-      if (templateAction === 'run' || templateAction === 'preview') {
+      if (templateAction === 'run' || templateAction === 'preview' || isBaaVerify) {
         logInfo('template.executed', {
           requestId: req.cmdpRequestId || '',
           action: templateAction,
@@ -15049,6 +16398,10 @@ async function handleBackend(req, res, requestUrl) {
           rowsCount: countResultRows(result),
           cacheStatus: cache && cache.status || (cacheDisabled ? 'disabled' : '')
         });
+      }
+      if (isBaaVerify) {
+        sendJson(res, 200, baaResponseFromRuntimeResult(result, template));
+        return;
       }
       const payload = {
         success: true,
@@ -15449,12 +16802,16 @@ if (isMainModule) {
 export {
   DEFAULT_TEMPLATE_CACHE_TTL_SEC,
   applyTemplateParamDefaults,
+  baaErrorResponse,
+  baaResponseFromRuntimeResult,
   buildResultCellMeta,
   buildTechnicalSchema,
   defaultRuntimeConfig,
   dependencyMapWithHash,
+  executeBaaPlanObjects,
   ipv4ValueMatches,
   loggingStatus,
+  normalizedBaaRequestForCache,
   normalizeLogFormat,
   normalizeLogLevel,
   normalizeLogTargets,
@@ -15471,5 +16828,6 @@ export {
   runtimeJsonResponsePayload,
   sanitizeRequestPath,
   schemaParentFromInput,
+  validateBaaVerificationRequest,
   isSafeRuntimeLinkUrl
 };

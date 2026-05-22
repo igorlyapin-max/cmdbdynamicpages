@@ -15,6 +15,7 @@ tags:
   - name: diagnostics
   - name: session
   - name: model
+  - name: baa
   - name: schema
   - name: templates
   - name: runtime
@@ -168,6 +169,32 @@ paths:
       responses:
         "200":
           description: Diagnostic visible-model hashes and endpoint statuses
+  /cmdbuild/custom-api/baa/contracts:
+    get:
+      tags: [baa]
+      summary: BAA technical contract cards
+      description: Reads saved BAA contract cards from the configured BAA technical classes. Class names and the superclass path are stored in `Cst_QueryToolConfig.RuntimeConfigJson.baaTechnical`.
+      parameters:
+        - name: root
+          in: query
+          schema:
+            type: string
+          example: Cst_QueryTool
+        - name: type
+          in: query
+          schema:
+            type: string
+            enum: [input, output, endpoint, conversion, conversionVersion]
+          example: input
+      responses:
+        "200":
+          description: BAA contract list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BaaContractsResponse"
+        "403":
+          description: Current CMDBuild user cannot read the configured BAA technical class
   /cmdbuild/custom-api/csrf:
     get:
       tags: [session]
@@ -398,7 +425,7 @@ paths:
                 $ref: "#/components/schemas/RuntimePermissionDenied"
     post:
       tags: [runtime]
-      summary: Direct runtime execution with audit
+      summary: Direct runtime execution
       description: Designer/API POST may request `forceRefresh` to rebuild the runtime cache without the user refresh cooldown. GET runtime does not accept forced refresh.
       security:
         - cmdbuildCookie: []
@@ -414,6 +441,53 @@ paths:
       responses:
         "200":
           description: Runtime result
+  /cmdbuild/custom-api/templates/{code}/baa-verify:
+    parameters:
+      - $ref: "#/components/parameters/TemplateCode"
+    post:
+      tags: [runtime]
+      summary: BAA verification exchange
+      description: Executes a saved template as a BAA verification endpoint under the current CMDBuild session from the reverse proxy. It uses the same cookie/session and CSRF requirements as other POST routes. endpoint.params are passed as template params; contractParams describes contract-level params available as contractparam.*; variables contains computed BAA request variables available as var.* and param.*; plan.objects are exposed through the baaPlanObjects DSL step. Runtime cache uses the template cache policy and adds the normalized BAA request body to the cache key.
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      parameters:
+        - name: refresh
+          in: query
+          schema:
+            type: string
+            enum: ["1"]
+        - name: noCache
+          in: query
+          schema:
+            type: string
+            enum: ["1"]
+        - name: forceRefresh
+          in: query
+          schema:
+            type: string
+            enum: ["1"]
+      requestBody:
+        $ref: "#/components/requestBodies/BaaVerificationRequest"
+      responses:
+        "200":
+          description: BAA verification result. success=true means the endpoint completed and returned data; BAA interprets rows using its endpoint definition.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BaaVerificationResponse"
+        "400":
+          description: Invalid request or execution error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BaaVerificationResponse"
+        "403":
+          description: Permission denied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BaaVerificationResponse"
   /cmdbuild/custom-api/templates/{code}/publish:
     parameters:
       - $ref: "#/components/parameters/TemplateCode"
@@ -531,6 +605,12 @@ components:
                 type: boolean
               bypassRefreshCooldown:
                 type: boolean
+    BaaVerificationRequest:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/BaaVerificationRequest"
   schemas:
     ApiResponse:
       type: object
@@ -643,6 +723,210 @@ components:
         permissionDeniedText:
           type: string
           example: Вам не хватает прав увидеть данные или интерфейс дизайнера
+    BaaVerificationRequest:
+      type: object
+      required: [plan]
+      properties:
+        source:
+          type: string
+          example: CMDB BAA
+        inputContract:
+          type: object
+          properties:
+            code:
+              type: string
+            version:
+              type: string
+            checksum:
+              type: string
+        endpoint:
+          type: object
+          properties:
+            code:
+              type: string
+            params:
+              type: object
+              additionalProperties: true
+        contractParams:
+          type: array
+          description: Contract-version parameter definitions. Runtime values are sent in endpoint.params and exposed to templates as contractparam.*.
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              description:
+                type: string
+              type:
+                type: string
+              required:
+                type: boolean
+              defaultValue:
+                type: string
+              listMode:
+                type: string
+              values:
+                type: array
+                items:
+                  type: string
+              help:
+                type: string
+        variables:
+          type: object
+          description: Computed BAA request variables. Values may be scalars or arrays and are exposed as var.* and param.* values.
+          additionalProperties: true
+        variableSources:
+          type: array
+          description: Diagnostic information showing how BAA computed each request variable.
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              sourceKind:
+                type: string
+              sourceExpression:
+                type: string
+              valuePresent:
+                type: boolean
+        plan:
+          type: object
+          required: [objects]
+          properties:
+            objects:
+              type: array
+              items:
+                type: object
+                properties:
+                  planIndex:
+                    oneOf:
+                      - type: integer
+                      - type: string
+                  kind:
+                    type: string
+                  className:
+                    type: string
+                  pageShapeKey:
+                    type: string
+                  mappingKey:
+                    type: string
+                  relationBindingStatus:
+                    type: string
+                  endpoints:
+                    type: object
+                    additionalProperties: true
+                  payload:
+                    type: object
+                    additionalProperties: true
+                  attributeSources:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+            missingAttributes:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+            skipped:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+    BaaVerificationResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        status:
+          type: string
+          enum: [completed, error]
+        title:
+          type: string
+        message:
+          type: string
+        summary:
+          type: object
+          properties:
+            rows:
+              type: integer
+        tables:
+          type: array
+          items:
+            type: object
+            properties:
+              code:
+                type: string
+              title:
+                type: string
+              columns:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                    title:
+                      type: string
+                    type:
+                      type: string
+              rows:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              level:
+                type: string
+                enum: [error, warning, info]
+              code:
+                type: string
+              message:
+                type: string
+        data:
+          type: object
+          additionalProperties: true
+    BaaContractsResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        root:
+          type: string
+        type:
+          type: string
+        className:
+          type: string
+        superclassPath:
+          type: string
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                oneOf:
+                  - type: integer
+                  - type: string
+              code:
+                type: string
+              description:
+                type: string
+              version:
+                type: string
+              className:
+                type: string
+              contract:
+                type: object
+                additionalProperties: true
+              resultInterpretation:
+                type: object
+                nullable: true
+                additionalProperties: true
     SchemaBootstrapRequest:
       type: object
       properties:

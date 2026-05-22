@@ -122,6 +122,8 @@ read на custom page CmdbDynamicPages
 
 Бизнес-данные читаются только в правах текущего пользователя CMDBuild.
 
+Интеграция `cmdbaa` через `POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify` использует те же runtime-права и ту же CMDBuild session cookie. Так как это POST, вызывающий UI/handler должен идти через same-origin reverse proxy и передавать `X-CMDBDynamicPages-CSRF`.
+
 ## 7. Nginx same-origin front
 
 Локальный запуск:

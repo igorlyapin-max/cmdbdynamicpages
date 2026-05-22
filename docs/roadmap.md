@@ -65,6 +65,8 @@ Done:
 - Runtime result caching is now controlled per template: `permissionOnly` shares endpoint results after a used-field permission probe, `visibilityHash` adds visible-id hashing for row-level scope, `privateUser` isolates by user/session, and `disabled` turns cache off.
 - The executor builds a used-field dependency map so `selectCards` materializes only attributes used by filters, matching, final data, or visualization.
 - Templates can be published as Redis static snapshots; runtime serves published snapshots without source-object permission checks and shows `Страница отсутствует для загрузки` when the snapshot is absent.
+- BAA verification endpoint `POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify` is implemented for `cmdbaa` exchange through the same reverse proxy and CMDBuild permission model.
+- DSL step `baaPlanObjects` materializes BAA `plan.objects` as a temporary table without runtime writes to CMDBuild.
 - Production health/readiness endpoints are implemented with strict Redis visibility checks and CMDBuild upstream reachability checks.
 - Redis password support is implemented through deployment secrets (`CMDBDYNAMIC_REDIS_PASSWORD_FILE` preferred) and Redis credentials are masked in health/status responses.
 - Russian documentation is maintained in parallel with the English documentation.
@@ -76,6 +78,7 @@ Not done:
 - Example templates are tracked separately from the implementation plan.
 - Deeper Playwright Runtime table checks for client-side search/sort and grouped table behavior are planned but not implemented.
 - Browser-level iframe rendering inside a real wiki page is planned when a stable local wiki test page is available.
+- Browser/API smoke for a live `cmdbaa` exchange will be added separately after the external scenario stabilizes.
 
 ## 1. CMDBuild Roles/Groups Check
 

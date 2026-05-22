@@ -126,3 +126,38 @@ flowchart TD
 - Redis недоступен: `/health/redis` и `/health/ready` возвращают `503`;
 - CMDBuild недоступен: `/health/ready` возвращает `503`;
 - backend process недоступен: liveness не получает ответ.
+
+## BP-005. BAA verification exchange
+
+```mermaid
+flowchart TD
+  BAA[cmdbaa UI/handler] -->|POST baa-verify, 8093 или same-origin front| API[cmdbdynamicpages Backend]
+  API -->|read template, 8090| C[CMDBuild REST]
+  API -->|business data REST, 8090| C
+  API -->|GET/SET runtime cache, 6379| R[Redis]
+  API --> BAA
+```
+
+Позитивный сценарий:
+
+1. `cmdbaa` вызывает `POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify` через тот же reverse proxy.
+2. Backend проверяет CMDBuild session cookie, same-origin headers и CSRF token.
+3. `endpoint.params` из BAA request body становятся параметрами шаблона.
+4. `plan.objects` материализуются в DSL через `baaPlanObjects`.
+5. Сохраненный шаблон выполняется под текущей CMDBuild-сессией.
+6. Runtime result адаптируется в BAA envelope с `success`, `status`, `summary`, `tables`, `items`, `data`.
+
+Негативные сценарии:
+
+- нет CMDBuild session cookie или сессия истекла: возвращается BAA envelope с ошибкой авторизации;
+- нет CSRF/same-origin для POST: endpoint отклоняется как state-changing вызов;
+- нет прав на реально используемый класс/атрибут: возвращается permission denied envelope, частичный результат по другим выборкам не отдается;
+- входное тело не содержит корректный `plan.objects`: возвращается invalid request envelope.
+
+Логирование:
+
+| Событие | Где фиксируется | Данные |
+| --- | --- | --- |
+| BAA runtime cache hit/miss | structured logger `baa.verify.cache_result` / `runtime.cache_result` | templateCode, username, cache status, rowsCount |
+| BAA execution success/failure | structured logger `template.executed` / `template.execution_failed` | requestId, action `baa-verify`, templateCode, status/error |
+| CSRF/same-origin отказ | backend logs | route, HTTP status; token не пишется |

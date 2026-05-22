@@ -289,6 +289,42 @@ http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/run/<templateCode>?param=value&js
 
 Runtime ссылки в ячейках строятся только из итоговых данных, metadata ячейки и входных параметров. Небезопасные URL-схемы `javascript:`, `data:` и `vbscript:` блокируются; в этом случае значение выводится обычным текстом.
 
+## BAA verification exchange
+
+Для интеграции с соседним `cmdbaa` добавлен runtime-вариант того же шаблона:
+
+```text
+POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify
+```
+
+Авторизация такая же, как у остальных state-changing endpoint'ов проекта: браузер или внешний UI должен идти через тот же reverse proxy, иметь текущую CMDBuild session cookie, проходить same-origin проверку `Origin`/`Referer` и передавать `X-CMDBDynamicPages-CSRF`. Backend не использует сервисную учетную запись для business-data чтения: есть права CMDBuild - есть данные, нет прав - возвращается permission denied envelope.
+
+Тело запроса содержит `contractParams`, `variables`, `variableSources`, `endpoint.params` и `plan.objects`. `contractParams` описывает параметры версии контракта (`contractparam.*`), а runtime-значения передаются в `endpoint.params`. `variables` содержит вычисленные BAA переменные отправки; значения могут быть скалярами или массивами и доступны в правилах как `${var.name}` и `${param.name}`. `variableSources` используется для диагностики и входит в ключ runtime cache. `plan.objects` можно использовать в DSL через шаг:
+
+```json
+{
+  "type": "baaPlanObjects",
+  "as": "baaObjects",
+  "payloadPrefix": "Payload."
+}
+```
+
+В Designer раздел `BAA endpoint` заранее описывает контракт входящих CMDB-like кандидатов: code/version, expected candidate classes, payload-поля и contract params. Этот контракт нужен, чтобы до реального POST-запроса выбирать поля BAA-кандидатов в сопоставлении. Шаг `baaPlanObjects` превращает объекты плана в таблицу с колонками `PlanIndex`, `Kind`, `ClassName`, `PageShapeKey`, `MappingKey`, `RelationBindingStatus`, `Payload.<field>` и `BAA.<alias>.<field>`. Дальше шаблон может использовать обычные выборки, сопоставления, итоговые данные и визуализацию. Ответ адаптируется в BAA envelope: `success`, `status`, `summary`, `tables`, `items`, `data`.
+
+Сохраненные BAA-контракты читаются из существующей BAA technical ветки CMDBuild. Путь к `BAA technical superclass` от root и имена классов задаются в `Общие настройки` и хранятся в `Cst_QueryToolConfig.RuntimeConfigJson.baaTechnical`:
+
+```text
+BAAConversionContract
+BAAConversionContractVersion
+BAAVerificationInputContract
+BAAVerificationOutputContract
+BAAVerificationEndpoint
+```
+
+Designer использует `BAAVerificationInputContract` как список сохраненных input contracts для раздела `BAA endpoint`. Поле `SchemaJson.classes[]` преобразуется во «Входящие объекты BAA»: `classes[].name` становится `className`, а `classes[].attributes[]` становятся доступными `payload`-полями для сопоставления.
+
+Кэширование использует cache policy конкретного шаблона. Так как payload BAA небольшой, отдельная политика не вводится: нормализованное тело BAA-запроса добавляется в ключ runtime cache, а TTL/режимы берутся из `spec.cache`.
+
 ## Кэширование
 
 Настройки кэша живут в шаблоне:

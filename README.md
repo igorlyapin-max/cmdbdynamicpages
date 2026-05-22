@@ -248,6 +248,42 @@ Cache TTL is a template setting. Manual refresh cooldown is a system Runtime set
 Designer preview is separate from the saved runtime cache: `Visualize in editor` runs `/draft/preview` against the current draft and does not read the final runtime result cache. The Run page also has `Refresh cache and show`, which calls saved-template `POST run` with `forceRefresh=true`; this rebuilds the runtime cache without the user refresh cooldown and requires CSRF, so iframe/read-only `GET run` cannot bypass the timer.
 For cross-origin iframe experiments, the dev reverse proxy can rewrite CMDBuild `Set-Cookie` headers with `CMDBDYNAMIC_PROXY_COOKIE_SAMESITE=None` and `CMDBDYNAMIC_PROXY_COOKIE_SECURE=true`. The recommended local iframe setup is the nginx same-origin proxy below, so this rewrite is normally not needed.
 
+### BAA verification exchange
+
+The `cmdbaa` integration uses the same saved template runtime through a dedicated endpoint:
+
+```text
+POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify
+```
+
+Authorization is the same as other state-changing project API routes: the caller must use the same reverse-proxy origin, send the current CMDBuild session cookie, pass same-origin `Origin`/`Referer` checks, and include `X-CMDBDynamicPages-CSRF`. The backend still reads CMDBuild business data with the current user's session. If the user has rights, data is returned; if a required class or attribute is denied, the response is a permission-denied BAA envelope.
+
+The request body provides `contractParams`, `variables`, `variableSources`, `endpoint.params`, and `plan.objects`. `contractParams` describes contract-version parameters (`contractparam.*`), while runtime values are sent in `endpoint.params`. `variables` contains computed BAA request variables; values can be scalars or arrays and are available in rules as `${var.name}` and `${param.name}`. `variableSources` is diagnostic and is included in the runtime cache key. `plan.objects` are exposed to the DSL through:
+
+```json
+{
+  "type": "baaPlanObjects",
+  "as": "baaObjects",
+  "payloadPrefix": "Payload."
+}
+```
+
+The Designer `BAA endpoint` section describes the input contract before real POST calls arrive: code/version, expected candidate classes, payload fields, and contract params. This lets the editor select BAA candidate fields while building matching rules. The step materializes BAA plan objects as a table with `PlanIndex`, `Kind`, `ClassName`, `PageShapeKey`, `MappingKey`, `RelationBindingStatus`, `Payload.<field>`, and `BAA.<alias>.<field>` columns. Existing selection, matching, final data, and visualization steps can then process that table. The endpoint adapts runtime result tables to the BAA envelope shape: `success`, `status`, `summary`, `tables`, `items`, and `data`.
+
+Saved BAA contracts are read from the existing CMDBuild BAA technical branch. The path to `BAA technical superclass` from the project root and class names are edited in General settings and stored in `Cst_QueryToolConfig.RuntimeConfigJson.baaTechnical`:
+
+```text
+BAAConversionContract
+BAAConversionContractVersion
+BAAVerificationInputContract
+BAAVerificationOutputContract
+BAAVerificationEndpoint
+```
+
+Designer uses `BAAVerificationInputContract` as the saved input-contract catalog for the `BAA endpoint` section. `SchemaJson.classes[]` is mapped to “Incoming BAA objects”: `classes[].name` becomes `className`, and `classes[].attributes[]` become available `payload` fields for matching.
+
+Caching follows the template cache policy. Because BAA request bodies are small, no separate cache policy is introduced: the normalized BAA request body is added to the runtime cache key, while TTL and sharing mode come from `spec.cache`.
+
 Redis dev helper:
 
 ```bash

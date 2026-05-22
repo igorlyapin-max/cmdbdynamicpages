@@ -37,6 +37,7 @@ flowchart LR
 | IF-007 | Browser | CMDBuild UI через proxy chain | HTTP `127.0.0.1:8093` -> `8090` | CMDBuild UI assets, custom page launcher | Нужен для входа и получения session cookie |
 | IF-008 | Monitoring/LB | cmdbdynamicpages Backend | HTTP `8093` или `8088` | `/health/live`, `/health/ready`, `/health/redis` JSON | Readiness возвращает `503` при Redis/CMDBuild проблемах |
 | IF-009 | cmdbdynamicpages Backend | Log collector / Syslog / ELK | stdout без порта; syslog `514` UDP/TCP; collector `5044/24224`; Elasticsearch `9200` | Structured operational events | Прямого Elasticsearch output из приложения нет; secrets маскируются |
+| IF-010 | cmdbaa / внешний UI через same-origin proxy | cmdbdynamicpages Backend | HTTP `8093` или `8088` | `POST /cmdbuild/custom-api/templates/{code}/baa-verify`, BAA request body, BAA envelope response | Требуется текущая CMDBuild cookie, same-origin headers и CSRF; бизнес-данные читаются в правах пользователя |
 
 ## Данные CMDBuild
 
@@ -48,11 +49,25 @@ flowchart LR
 | `Cst_QueryTemplate` | Шаблоны DSL |
 | `Cst_QueryTemplateVersion` | Версии шаблонов |
 
+Внешняя BAA technical ветка не создается bootstrap'ом проекта, но используется как источник контрактов:
+
+| Класс | Назначение |
+| --- | --- |
+| `BAAConversionContract` | Основной контракт конвертации |
+| `BAAConversionContractVersion` | Версии контракта конвертации |
+| `BAAVerificationInputContract` | Input contracts для `cmdbdynamicpages` BAA endpoint |
+| `BAAVerificationOutputContract` | Output contracts для `cmdbdynamicpages` BAA endpoint |
+| `BAAVerificationEndpoint` | Endpoint definitions и `ResultInterpretationJson` |
+
+Путь к BAA technical superclass от root и имена этих классов хранятся в `Cst_QueryToolConfig.RuntimeConfigJson.baaTechnical`.
+
 Business data читаются из существующих CMDBuild классов через DSL (`selectCards`, `expandRelations`, matching). Состав полей ограничивается used-field dependency map: backend запрашивает только атрибуты, реально используемые фильтрами, сопоставлением, итоговыми данными или визуализацией.
 
 Кэш каталога хранит metadata путей через `reference`/`domain`: имя домена, описание, кардинальность, направление, исходный и целевой класс. Эти данные используются в Designer для фильтрации выбора атрибутов по типу связи и не дают дополнительных прав на чтение CMDBuild.
 
 Runtime final table может содержать `cellMeta` по ячейкам: источник выборки, source class, source card id, attribute, domain path и производные внутренние URL на карточки, участвовавшие в строке (`sourceURLВыборка1`, `sourceURLВыборка2`, `sourceURLSelection1` и т.п.). Эти metadata используются только для отображения ссылок в UI, не содержат cookie/token/Redis secret и не пишутся в операционные логи.
+
+BAA verification exchange не добавляет runtime-классов в CMDBuild. Входные `endpoint.params` используются как параметры шаблона, а `plan.objects` превращаются шагом `baaPlanObjects` во временную таблицу с колонками `PlanIndex`, `Kind`, `ClassName`, `PageShapeKey`, `MappingKey`, `RelationBindingStatus` и `Payload.<field>`. Итоговые таблицы адаптируются в BAA envelope и не сохраняются в технической схеме. Если включен runtime cache шаблона, результат может временно храниться в Redis по `spec.cache.ttlSeconds`.
 
 Специальный шаблон `kind=cmdbBuildView` читает не business cards, а metadata модели CMDBuild: classes, class attributes, domains, domain attributes, lookup types и lookup values. Он выполняется тем же backend и тем же `CMDBuild-Authorization` текущего пользователя. Отдельная авторизация соседнего `../cmdbuild` приложения не используется. Protected-шаблон `CmdbBuildView` хранится в `Cst_QueryTemplate`, но удаление такого шаблона блокируется backend.
 

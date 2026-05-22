@@ -117,6 +117,32 @@ TTL шаблона хранится в секундах, но Designer пока�
 
 Designer draft preview намеренно не использует runtime cache: `Визуализировать в редакторе` вызывает `/cmdbuild/custom-api/draft/preview` и выполняет текущий несохраненный черновик. Для проверки сохраненного endpoint в разделе `Прогон` есть forced refresh: `POST /cmdbuild/custom-api/templates/:code/run` с `forceRefresh=true`. Forced refresh игнорирует пользовательский cooldown, но принимается только на CSRF-защищенном POST; read-only Runtime iframe `GET run` сохраняет поведение с таймером.
 
+## BAA verification exchange
+
+Для соседнего `cmdbaa` используется тот же runtime executor и та же модель авторизации, что у Designer/Runtime:
+
+```text
+POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify
+```
+
+Endpoint принимает BAA request body, валидирует минимальную структуру `contractParams`, `variables`, `variableSources`, `endpoint.params` и `plan.objects`, выполняет сохраненный шаблон под CMDBuild-сессией текущего пользователя и возвращает BAA envelope. `endpoint.params` становятся входными параметрами шаблона; параметры версии контракта доступны также как `${contractparam.name}`. `variables` становятся входными значениями `${var.name}`/`${param.name}` и могут быть массивами. `plan.objects` доступны через DSL step `baaPlanObjects`, который материализует их во внутреннюю таблицу без записи в CMDBuild.
+
+Внешние BAA-контракты не создаются bootstrap'ом `cmdbdynamicpages`. Они находятся в существующей BAA technical ветке CMDBuild под настраиваемым путем `RuntimeConfigJson.baaTechnical.superclassPath`. По умолчанию ожидаются классы:
+
+```text
+BAAConversionContract
+BAAConversionContractVersion
+BAAVerificationInputContract
+BAAVerificationOutputContract
+BAAVerificationEndpoint
+```
+
+`GET /cmdbuild/custom-api/baa/contracts?type=input` читает `BAAVerificationInputContract` в правах текущего пользователя и отдает Designer список сохраненных input contracts. Если у пользователя нет прав на эти классы, Designer остается доступен, но контракт можно описать вручную внутри шаблона.
+
+Права не обходятся: backend вызывает CMDBuild REST с `CMDBuild-Authorization` текущей сессии. Если CMDBuild отказывает по реально используемому классу/атрибуту, endpoint возвращает permission denied envelope и не отдает частичный результат по другим выборкам. Если данные просто не найдены в рамках видимости пользователя, возвращается успешный envelope с пустыми таблицами.
+
+Кэширование использует те же `spec.cache` настройки шаблона. Нормализованное BAA тело добавляется в runtime cache key как `cacheContext`, чтобы разные входные планы не делили один результат. Отдельного runtime-хранилища BAA нет: результат либо возвращается сразу, либо временно лежит в Redis runtime cache по TTL шаблона.
+
 ## Redis password
 
 Production Redis должен требовать пароль. Backend поддерживает три способа передачи секрета:
@@ -204,6 +230,7 @@ Root ограничивает только технические классы �
 - executor limits;
 - system manual refresh cooldown;
 - runtime defaults.
+- BAA technical superclass path and class names for external BAA contracts.
 
 Raw JSON в UI не показывается: Designer редактирует настройки через описанные поля.
 

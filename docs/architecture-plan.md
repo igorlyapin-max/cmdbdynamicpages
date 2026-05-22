@@ -115,6 +115,32 @@ Designer draft preview is intentionally cache-free: `Visualize in editor` calls 
 
 The executor builds a used-field dependency map from filters, matching rules, final data, and visualization settings. `selectCards` materializes only the base card identifiers plus the fields that are actually used downstream; unrelated attributes are not added to result rows and are not part of the cache probe.
 
+## BAA Verification Exchange
+
+The neighboring `cmdbaa` integration uses the same runtime executor and authorization model:
+
+```text
+POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify
+```
+
+The endpoint accepts a BAA request body, validates the minimal `endpoint.params` and `plan.objects` structure, executes the saved template under the current CMDBuild user session, and returns a BAA envelope. `endpoint.params` become template input parameters. `plan.objects` are exposed through the `baaPlanObjects` DSL step, which materializes them as an internal table without writing runtime data to CMDBuild.
+
+External BAA contracts are not created by the `cmdbdynamicpages` bootstrap. They live in the existing CMDBuild BAA technical branch under the path configured in `RuntimeConfigJson.baaTechnical.superclassPath`. Default class names are:
+
+```text
+BAAConversionContract
+BAAConversionContractVersion
+BAAVerificationInputContract
+BAAVerificationOutputContract
+BAAVerificationEndpoint
+```
+
+`GET /cmdbuild/custom-api/baa/contracts?type=input` reads `BAAVerificationInputContract` with the current user's permissions and supplies saved input contracts to Designer. If the current user cannot read these classes, Designer still works, but the BAA contract can be described manually inside the template.
+
+Permissions are not bypassed: the backend calls CMDBuild REST with the current session's `CMDBuild-Authorization`. If CMDBuild denies a class or attribute actually used by the template, the endpoint returns a permission-denied envelope and does not return partial results from the remaining selections. If no data is found inside the user's visibility, the endpoint returns a successful envelope with empty tables.
+
+Caching uses the same template `spec.cache` settings. The normalized BAA body is added to the runtime cache key as `cacheContext`, so different input plans do not share one result. There is no separate BAA runtime storage: results are either returned immediately or kept temporarily in Redis runtime cache according to the template TTL.
+
 ## Domain-aware Paths And Runtime Links
 
 The catalog cache stores path metadata in addition to class and attribute names: domain, domain description, cardinality, direction, source class, and target class. The Designer uses this metadata in Object group path pickers so editors can filter attributes/paths by relationship type when the same attribute name is reachable through multiple references/domains. This is only a picker aid over the current user's visible catalog; it does not expand CMDBuild permissions.

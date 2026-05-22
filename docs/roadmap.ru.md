@@ -35,6 +35,8 @@
 - TTL кэша шаблона редактируется в часах, default для новых шаблонов 8 часов.
 - System refresh cooldown хранится в `Cst_QueryToolConfig.RuntimeConfigJson.runtimeCache.refreshCooldownSec`.
 - Static snapshot publication сохраняет результат в Redis и отдает его без проверки прав зрителя на исходные объекты.
+- BAA verification endpoint `POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify` реализован для обмена с `cmdbaa` через тот же reverse proxy и те же права CMDBuild.
+- DSL step `baaPlanObjects` материализует `plan.objects` BAA-запроса во временную таблицу без runtime-записи в CMDBuild.
 - Production health/readiness endpoint'ы реализованы: live, ready, redis.
 - Redis password поддерживается через secret file/env/URL и маскируется в health/status ответах.
 - Nginx same-origin маршрут `/health/` проксируется в dynamicpages backend.
@@ -47,6 +49,7 @@
 - Примеры шаблонов ведутся отдельно от roadmap.
 - Глубокие Playwright Runtime table проверки для client-side search/sort и grouped table behavior пока не реализованы.
 - Browser-level проверка iframe внутри реальной wiki page запланирована, когда появится стабильная тестовая страница локальной wiki.
+- Browser/API smoke для живого `cmdbaa` exchange будет добавлен отдельно, когда внешний сценарий стабилизируется.
 
 ## 1. Проверка ролей и групп CMDBuild
 
