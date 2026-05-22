@@ -127,6 +127,8 @@ POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify
 
 Endpoint принимает BAA request body, валидирует минимальную структуру `contractParams`, `variables`, `variableSources`, `endpoint.params` и `plan.objects`, выполняет сохраненный шаблон под CMDBuild-сессией текущего пользователя и возвращает BAA envelope. `endpoint.params` становятся входными параметрами шаблона; параметры версии контракта доступны также как `${contractparam.name}`. `variables` становятся входными значениями `${var.name}`/`${param.name}` и могут быть массивами. `plan.objects` доступны через DSL step `baaPlanObjects`, который материализует их во внутреннюю таблицу без записи в CMDBuild.
 
+BAA-шаблоны не являются HTTP-view. `GET/POST /cmdbuild/custom-api/templates/:code/run`, `/cmdbuild/dynamicpages/ui/run/:code`, runtime iframe-ссылки и публикация статического снимка отклоняются/отключаются для `endpoint.kind=baaVerification`. В Designer остаются доступными настройка и проверка через `BAA endpoint`, `Извлечение`, `Кэширование` и `Прогон -> BAA verify`; runtime-only разделы визуального представления показываются отключенными.
+
 Внешние BAA-контракты не создаются bootstrap'ом `cmdbdynamicpages`. Они находятся в существующей BAA technical ветке CMDBuild под настраиваемым путем `RuntimeConfigJson.baaTechnical.superclassPath`. По умолчанию ожидаются классы:
 
 ```text
@@ -278,7 +280,7 @@ Backend и client блокируют небезопасные URL-схемы `ja
 - `dynamicUser` - HTML строится под правами текущего пользователя CMDBuild;
 - `staticSnapshot` - редактор публикует снимок в Redis, runtime отдает готовую страницу без повторной проверки прав на исходную модель.
 
-Шаблон `CmdbBuildView` считается protected/system: Designer скрывает удаление, а backend блокирует `DELETE` для protected-шаблонов. Настройки редактируются в Designer в разделе `CMDBuild model view`; внешний вид приводится к минималистичному runtime-представлению проекта, без отдельного login screen и без тяжелого UI соседнего проекта.
+Шаблон `CmdbBuildView` считается protected/system: Designer скрывает удаление, а backend блокирует `DELETE` для этого специального вида шаблона. Устаревший флаг `protected` у обычных DSL/BAA-шаблонов игнорируется и удаляется при сохранении. Настройки редактируются в Designer в разделе `CMDBuild model view`; внешний вид приводится к минималистичному runtime-представлению проекта, без отдельного login screen и без тяжелого UI соседнего проекта.
 
 ## Права редактора
 
@@ -332,6 +334,8 @@ Designer расположен по адресу:
 - `joinRows`;
 - `matchRows`;
 - model/domain operations.
+
+`selectCards` используется для business-data выборок и не является generic REST proxy. Визуальная `Группа объектов` компилирует правила scope в фильтры с `scope: include|exclude`, `path`, `negate`, `op` и `regex`/`value`. Операторы `exists`, `isIpv4` и `isIpv4Network` не используют правую часть; regex/value могут ссылаться на `${param.name}`. Если стартовый источник выборки является BAA payload, вместо `selectCards` генерируется `baaPlanObjects` с теми же правилами фильтрации.
 
 Executor ограничивает число строк, классов, доменов, REST-вызовов и глубину раскрытия связей.
 

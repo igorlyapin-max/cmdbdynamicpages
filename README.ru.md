@@ -227,6 +227,8 @@ Designer умеет:
 - задавать cache-политику конкретного шаблона;
 - прогонять шаблон в редакторе и в отдельной runtime-странице.
 
+В `Группе объектов` каждая выборка начинается с CMDBuild-класса или BAA payload-источника. Правило scope содержит действие включить/исключить, атрибут/путь, отдельное отрицание `!`, оператор и параметр. Поддержаны проверки заполненности, regex, равно/содержит/начинается/заканчивается, `is IP`, `is IP net` и IPv4 CIDR/range сравнения. Для `exists`, `is IP` и `is IP net` правый параметр не используется; в остальных случаях можно ссылаться на `${param.name}`.
+
 В `Группе объектов` список атрибутов/путей можно фильтровать по домену, кардинальности и направлению связи. Это помогает явно выбрать, через какой `reference`/`domain` пришел атрибут, если одинаковые имена полей доступны через разные связи. В разделе есть свернутая подсказка с примерами.
 
 В `Визуализации` колонку итоговых данных можно превратить в ссылку. Шаблон URL и текста поддерживает `${mysource.value}`, `${mysource.source}`, `${mysource.sourceClass}`, `${mysource.sourceId}`, `${mysource.attribute}`, `${mysource.domainPath}`, `${row.<column>}` и `${param.<name>}`. Для внутренних ссылок на карточки, участвовавшие в результате, есть готовые переменные `${mysource.sourceURLВыборка1}`, `${mysource.sourceURLВыборка2}`, `${mysource.sourceURLSelection1}` и так далее. Например: `${mysource.sourceURLВыборка2}`, `/cmdbuild/ui/#classes/${mysource.sourceClass}/cards/${mysource.sourceId}` или `/wiki/${param.city}/${mysource.value}`.
@@ -297,7 +299,9 @@ Runtime ссылки в ячейках строятся только из ито
 POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify
 ```
 
-Авторизация такая же, как у остальных state-changing endpoint'ов проекта: браузер или внешний UI должен идти через тот же reverse proxy, иметь текущую CMDBuild session cookie, проходить same-origin проверку `Origin`/`Referer` и передавать `X-CMDBDynamicPages-CSRF`. Backend не использует сервисную учетную запись для business-data чтения: есть права CMDBuild - есть данные, нет прав - возвращается permission denied envelope.
+BAA-шаблоны являются POST-only verification endpoint. Они не выводятся через `/cmdbuild/dynamicpages/ui/run/<templateCode>`, не подходят для iframe/runtime HTML-ссылок и не публикуются как статические view-снимки. В Designer runtime-only разделы для BAA-шаблонов отключены; используйте `BAA endpoint`, `Извлечение`, `Кэширование` и BAA verify preview в `Прогон`.
+
+Авторизация использует текущие права CMDBuild. В `cmdbaa` нужно указывать абсолютный URL на reverse proxy `cmdbdynamicpages`, например `http://127.0.0.1:8093/cmdbuild/custom-api/templates/netverify/baa-verify`; относительный path в `cmdbaa` резолвится от его `CMDBUILD_ORIGIN` и может уйти в прямой CMDBuild. Browser-вызовы используют CMDBuild session cookie, same-origin `Origin`/`Referer` и `X-CMDBDynamicPages-CSRF`; server-to-server вызов `cmdbaa` может передавать текущий `CMDBuild-Authorization` header. Backend не использует сервисную учетную запись для business-data чтения: есть права CMDBuild - есть данные, нет прав - возвращается permission denied envelope.
 
 Тело запроса содержит `contractParams`, `variables`, `variableSources`, `endpoint.params` и `plan.objects`. `contractParams` описывает параметры версии контракта (`contractparam.*`), а runtime-значения передаются в `endpoint.params`. `variables` содержит вычисленные BAA переменные отправки; значения могут быть скалярами или массивами и доступны в правилах как `${var.name}` и `${param.name}`. `variableSources` используется для диагностики и входит в ключ runtime cache. `plan.objects` можно использовать в DSL через шаг:
 

@@ -69,7 +69,9 @@ Runtime final table может содержать `cellMeta` по ячейкам
 
 BAA verification exchange не добавляет runtime-классов в CMDBuild. Входные `endpoint.params` используются как параметры шаблона, а `plan.objects` превращаются шагом `baaPlanObjects` во временную таблицу с колонками `PlanIndex`, `Kind`, `ClassName`, `PageShapeKey`, `MappingKey`, `RelationBindingStatus` и `Payload.<field>`. Итоговые таблицы адаптируются в BAA envelope и не сохраняются в технической схеме. Если включен runtime cache шаблона, результат может временно храниться в Redis по `spec.cache.ttlSeconds`.
 
-Специальный шаблон `kind=cmdbBuildView` читает не business cards, а metadata модели CMDBuild: classes, class attributes, domains, domain attributes, lookup types и lookup values. Он выполняется тем же backend и тем же `CMDBuild-Authorization` текущего пользователя. Отдельная авторизация соседнего `../cmdbuild` приложения не используется. Protected-шаблон `CmdbBuildView` хранится в `Cst_QueryTemplate`, но удаление такого шаблона блокируется backend.
+BAA endpoint не является HTML/runtime-view: для `endpoint.kind=baaVerification` обычные `/run` маршруты и публикация статического снимка отключены, а внешняя интеграция должна использовать только `POST /cmdbuild/custom-api/templates/{code}/baa-verify`.
+
+Специальный шаблон `kind=cmdbBuildView` читает не business cards, а metadata модели CMDBuild: classes, class attributes, domains, domain attributes, lookup types и lookup values. Он выполняется тем же backend и тем же `CMDBuild-Authorization` текущего пользователя. Отдельная авторизация соседнего `../cmdbuild` приложения не используется. Protected-шаблон `CmdbBuildView` хранится в `Cst_QueryTemplate`, но удаление такого шаблона блокируется backend; для обычных DSL/BAA-шаблонов служебный флаг `protected` не является признаком защиты.
 
 ## Данные Redis
 

@@ -125,6 +125,8 @@ POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify
 
 The endpoint accepts a BAA request body, validates the minimal `endpoint.params` and `plan.objects` structure, executes the saved template under the current CMDBuild user session, and returns a BAA envelope. `endpoint.params` become template input parameters. `plan.objects` are exposed through the `baaPlanObjects` DSL step, which materializes them as an internal table without writing runtime data to CMDBuild.
 
+BAA templates are not HTTP views. `GET/POST /cmdbuild/custom-api/templates/:code/run`, `/cmdbuild/dynamicpages/ui/run/:code`, runtime iframe links, and static snapshot publication are rejected/disabled for `endpoint.kind=baaVerification`. Designer keeps the configuration and verification path available through `BAA endpoint`, `Extraction`, `Caching`, and `Run -> BAA verify`, while runtime-only presentation sections are shown as disabled.
+
 External BAA contracts are not created by the `cmdbdynamicpages` bootstrap. They live in the existing CMDBuild BAA technical branch under the path configured in `RuntimeConfigJson.baaTechnical.superclassPath`. Default class names are:
 
 ```text
@@ -326,7 +328,7 @@ Execution modes are the same as for ordinary templates:
 - `dynamicUser` builds the HTML view under the current viewer's CMDBuild permissions;
 - `staticSnapshot` publishes a Redis snapshot under the editor's permissions and serves the stored page without source permission checks.
 
-The `CmdbBuildView` template is treated as protected/system: the Designer hides deletion and the backend rejects `DELETE` for protected templates. Settings are edited in the Designer `CMDBuild model view` section, and the runtime appearance is rendered with the project's compact/minimal visual style instead of the heavier standalone UI from `../cmdbuild`.
+The `CmdbBuildView` template is treated as protected/system: the Designer hides deletion and the backend rejects `DELETE` for that special template kind. A stale `protected` flag on ordinary DSL/BAA templates is ignored and removed during save. Settings are edited in the Designer `CMDBuild model view` section, and the runtime appearance is rendered with the project's compact/minimal visual style instead of the heavier standalone UI from `../cmdbuild`.
 
 ## Editor Permissions
 
@@ -578,7 +580,7 @@ Sample template:
 - `ProbeAttributeComparison`: finds classes by attribute type and compares class attribute sets by selected metadata fields such as `name` and `type`.
 - `ProbeClassSetOperations`: finds class sets by two attribute types, intersects them by class code, and joins the intersected set to the second attribute set.
 
-`selectCards` is the first business-data selection operation. It is intentionally not a generic REST proxy: the template declares a class source, filters, a result alias, and a limit. The backend then reads `/classes/:className/cards` with the current user's CMDBuild session, applies fixed/parameter/source-row filters, and returns a table result. Object-group scope filters can use `scope: include|exclude`, catalog `path`, and `regex`; regex text may include `${param.name}` placeholders resolved from template input parameters.
+`selectCards` is the first business-data selection operation. It is intentionally not a generic REST proxy: the template declares a class source, filters, a result alias, and a limit. The backend then reads `/classes/:className/cards` with the current user's CMDBuild session, applies fixed/parameter/source-row filters, and returns a table result. Object-group scope filters can use `scope: include|exclude`, catalog `path`, `negate`, `op`, and `regex`/`value`; regex and value text may include `${param.name}` placeholders resolved from template input parameters. `exists`, `isIpv4`, and `isIpv4Network` do not use a right-side value.
 
 `expandRelations` is the first card-level relation operation. It takes rows from a previous step, resolves source class/id columns, reads `/classes/:className/cards/:id/relations`, optionally filters by domain, target class, and direct/inverse direction, and reads related cards through `/classes/:relatedClass/cards/:relatedId` when related-card attributes are requested. It remains allowlisted DSL behavior, not a generic CMDBuild REST proxy.
 

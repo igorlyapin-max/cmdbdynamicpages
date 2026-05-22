@@ -14,13 +14,117 @@ import {
   normalizedBaaRequestForCache,
   normalizeRuntimeCacheConfig,
   normalizeTemplateCacheConfig,
+  normalizeTemplateSpecForStorage,
   renderCellTemplate,
   renderRuntimeParamTemplate,
   runtimeCacheKeyParts,
   runtimeJsonOutputRequested,
   runtimeJsonResponsePayload,
+  templateIsProtected,
   validateBaaVerificationRequest
 } from '../../scripts/dev-proxy-server.mjs';
+
+test('only CmdbBuildView templates are protected by spec protection flag', () => {
+  assert.equal(templateIsProtected({ code: 'CmdbBuildView', spec: { version: 1 } }), true);
+  assert.equal(templateIsProtected({ code: 'netverify', spec: { version: 1, protected: true, endpoint: { kind: 'baaVerification' } } }), false);
+  assert.equal(templateIsProtected({ code: 'ModelViewCopy', spec: { version: 1, kind: 'cmdbBuildView', protected: true } }), false);
+});
+
+test('non-special templates drop stale protected flags before storage', () => {
+  assert.deepEqual(
+    normalizeTemplateSpecForStorage({
+      version: 1,
+      protected: true,
+      system: { protected: true, owner: 'admin' },
+      endpoint: { kind: 'baaVerification' }
+    }),
+    {
+      version: 1,
+      system: { owner: 'admin' },
+      endpoint: { kind: 'baaVerification' },
+      steps: [{ type: 'baaPlanObjects', as: 'baaObjects', payloadPrefix: 'Payload.' }]
+    }
+  );
+  assert.deepEqual(
+    normalizeTemplateSpecForStorage({
+      version: 1,
+      kind: 'cmdbBuildView',
+      protected: true,
+      cmdbBuildView: { language: 'auto' },
+      endpoint: { kind: 'baaVerification' }
+    }, 'netverify'),
+    {
+      version: 1,
+      endpoint: { kind: 'baaVerification' },
+      steps: [{ type: 'baaPlanObjects', as: 'baaObjects', payloadPrefix: 'Payload.' }]
+    }
+  );
+  assert.deepEqual(
+    normalizeTemplateSpecForStorage({
+      version: 1,
+      endpoint: { kind: 'baaVerification' },
+      steps: [{ type: 'enrichRows', as: 'objectsView', from: 'objects', purpose: 'viewComposer', columns: [] }],
+      visualModel: { mode: 'viewComposer', source: { alias: 'objects' } }
+    }, 'netverify').steps,
+    [
+      { type: 'baaPlanObjects', as: 'objects', payloadPrefix: 'Payload.' },
+      { type: 'enrichRows', as: 'objectsView', from: 'objects', purpose: 'viewComposer', columns: [] }
+    ]
+  );
+  assert.deepEqual(
+    normalizeTemplateSpecForStorage({
+      version: 1,
+      endpoint: { kind: 'baaVerification' },
+      steps: [
+        { type: 'baaPlanObjects', as: 'objects', payloadPrefix: 'Payload.' },
+        { type: 'enrichRows', as: 'objectsView', from: 'objects', purpose: 'viewComposer', columns: [] }
+      ]
+    }, 'netverify').steps,
+    [
+      { type: 'baaPlanObjects', as: 'objects', payloadPrefix: 'Payload.' },
+      { type: 'enrichRows', as: 'objectsView', from: 'objects', purpose: 'viewComposer', columns: [] }
+    ]
+  );
+  assert.deepEqual(
+    normalizeTemplateSpecForStorage({
+      version: 1,
+      endpoint: { kind: 'baaVerification' },
+      steps: [
+        { type: 'selectCards', as: 'objects', className: 'Router' },
+        { type: 'enrichRows', as: 'objectsView', from: 'objects', purpose: 'viewComposer', columns: [] }
+      ]
+    }, 'netverify').steps,
+    [
+      { type: 'selectCards', as: 'objects', className: 'Router' },
+      { type: 'enrichRows', as: 'objectsView', from: 'objects', purpose: 'viewComposer', columns: [] }
+    ]
+  );
+});
+
+test('BAA plan objects can feed the objects alias used by final data', () => {
+  const table = executeBaaPlanObjects({ as: 'objects', payloadPrefix: 'Payload.' }, {
+    plan: {
+      objects: [{
+        kind: 'ACL',
+        className: 'ACL',
+        payload: { Code: 'ACL-001', ipaddress: '10.10.2.15' }
+      }]
+    }
+  }, { maxRows: 100 });
+
+  assert.deepEqual(table.rows, [{
+    PlanIndex: 0,
+    Kind: 'ACL',
+    ClassName: 'ACL',
+    PageShapeKey: '',
+    MappingKey: '',
+    RelationBindingStatus: '',
+    'Payload.Code': 'ACL-001',
+    'BAA.ACL.Code': 'ACL-001',
+    'Payload.ipaddress': '10.10.2.15',
+    'BAA.ACL.ipaddress': '10.10.2.15'
+  }]);
+});
 
 test('template params combine defaults and explicit values without clearing defaults on empty input', () => {
   const spec = {
@@ -414,6 +518,62 @@ test('ipv4 comparison operators cover address, CIDR and range cases', () => {
   assert.equal(ipv4ValueMatches('10.1.2.8', '10.1.2.1-10.1.2.20', 'ipv4InRange'), true);
   assert.equal(ipv4ValueMatches('10.1.2.0/24', '10.1.2.128/25', 'ipv4CidrContains'), true);
   assert.equal(ipv4ValueMatches('10.1.2.0/25', '10.1.2.128/25', 'ipv4CidrOverlaps'), false);
+});
+
+test('BAA plan object filters support negation and IP shape operators', () => {
+  const contract = {
+    objects: [{
+      alias: 'aclCandidate',
+      className: 'ACL',
+      payload: [
+        { name: 'Code', type: 'string' },
+        { name: 'sourceAddress', type: 'ipv4' },
+        { name: 'destinationAddress', type: 'ipv4-cidr' }
+      ]
+    }]
+  };
+  const request = {
+    plan: {
+      objects: [
+        {
+          kind: 'aclCandidate',
+          className: 'ACL',
+          payload: {
+            Code: 'ACL-001',
+            sourceAddress: '10.1.2.15',
+            destinationAddress: '10.1.2.0/24'
+          }
+        },
+        {
+          kind: 'aclCandidate',
+          className: 'ACL',
+          payload: {
+            Code: 'ACL-002',
+            sourceAddress: 'not-an-ip',
+            destinationAddress: 'plain-text'
+          }
+        }
+      ]
+    }
+  };
+
+  const onlyIp = executeBaaPlanObjects({
+    payloadPrefix: 'Payload.',
+    filters: [{ path: 'BAA.aclCandidate.sourceAddress', op: 'isIpv4' }]
+  }, request, { maxRows: 100 }, contract);
+  assert.deepEqual(onlyIp.rows.map((row) => row['BAA.aclCandidate.Code']), ['ACL-001']);
+
+  const notNetwork = executeBaaPlanObjects({
+    payloadPrefix: 'Payload.',
+    filters: [{ path: 'BAA.aclCandidate.destinationAddress', op: 'isIpv4Network', negate: true }]
+  }, request, { maxRows: 100 }, contract);
+  assert.deepEqual(notNetwork.rows.map((row) => row['BAA.aclCandidate.Code']), ['ACL-002']);
+
+  const legacyNotExists = executeBaaPlanObjects({
+    payloadPrefix: 'Payload.',
+    filters: [{ path: 'BAA.aclCandidate.missingField', op: 'notExists' }]
+  }, request, { maxRows: 100 }, contract);
+  assert.equal(legacyNotExists.rows.length, 2);
 });
 
 test('dependency map includes only fields used by selection, matching and final result', () => {

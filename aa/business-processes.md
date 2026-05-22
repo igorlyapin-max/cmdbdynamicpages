@@ -147,6 +147,8 @@ flowchart TD
 5. Сохраненный шаблон выполняется под текущей CMDBuild-сессией.
 6. Runtime result адаптируется в BAA envelope с `success`, `status`, `summary`, `tables`, `items`, `data`.
 
+BAA-шаблон не имеет HTML runtime-view: прямые `/dynamicpages/ui/run/<code>` и `/templates/<code>/run` для `endpoint.kind=baaVerification` не строят таблицу, а возвращают POST-only сообщение. Designer использует отдельный BAA verify preview с тестовым request body.
+
 Негативные сценарии:
 
 - нет CMDBuild session cookie или сессия истекла: возвращается BAA envelope с ошибкой авторизации;
