@@ -29,9 +29,14 @@ PROXY_PORT=8093
 CMDBUILD_ORIGIN=http://127.0.0.1:8090
 CMDBDYNAMIC_REDIS_URL=redis://127.0.0.1:6379/0
 CMDBDYNAMIC_REDIS_PASSWORD_FILE=/run/secrets/cmdbdynamicpages_redis_password
+CMDBDYNAMIC_REDIS_REQUIRED=true
+CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=true
+CMDBDYNAMICPAGES_CSRF_SECRET=<stable external secret>
 CMDP_LOG_TARGET=stdout
 CMDP_LOG_FORMAT=json
 ```
+
+В репозитории есть backend `Dockerfile` для container deployment. Образ запускается от пользователя `node`, слушает `8093` и использует `/health/live` как container healthcheck.
 
 Если платформа передает Redis secret только строкой, поддерживаются варианты:
 
@@ -162,14 +167,17 @@ Health endpoints:
 http://127.0.0.1:8093/health/live
 http://127.0.0.1:8093/health/ready
 http://127.0.0.1:8093/health/redis
+http://127.0.0.1:8093/metrics
 ```
 
-`/health/ready` в production должен видеть Redis и CMDBuild upstream.
+`/health/ready` в production должен видеть Redis и CMDBuild upstream. `/metrics` отдает агрегированные Prometheus counters/gauges и не должен использоваться как readiness gate.
 
 ## 9. Production notes
 
 - Не включать generic REST proxy.
 - Не логировать `cookie`, `authorization`, `CMDBuild-Authorization`, CSRF tokens и Redis password.
 - State-changing API должны проходить same-origin + CSRF.
+- Задавать `CMDBDYNAMICPAGES_CSRF_SECRET` из стабильного внешнего secret; random fallback предназначен только для local/dev.
+- Включать `CMDBDYNAMIC_REDIS_REQUIRED=true` для production scale-out или когда static snapshots входят в service contract.
 - Redis RDB snapshot нужен для static snapshot страниц.
 - Если static snapshot отсутствует в Redis, runtime отдаст сообщение `Страница отсутствует для загрузки`; администратор должен заново опубликовать снимок.

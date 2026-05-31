@@ -39,6 +39,8 @@
 - DSL step `baaPlanObjects` материализует `plan.objects` BAA-запроса во временную таблицу без runtime-записи в CMDBuild.
 - Production health/readiness endpoint'ы реализованы: live, ready, redis.
 - Redis password поддерживается через secret file/env/URL и маскируется в health/status ответах.
+- Docker runtime packaging, минимальный GitHub Actions CI, retry/backoff, execution throttling, graceful shutdown, keep-alive CMDBuild agents, security headers, Prometheus `/metrics`, Redis strict mode, regex guard и template `specHash` conflict guard реализованы как audit hardening.
+- `PROJECT_DOCUMENTATION.md`, audit remediation notes и начальные ADR фиксируют текущую карту документации и отложенные архитектурные решения.
 - Nginx same-origin маршрут `/health/` проксируется в dynamicpages backend.
 - Документация ведется на английском и русском.
 - Архитектурные артефакты ведутся в `aa/`.
@@ -50,6 +52,7 @@
 - Глубокие Playwright Runtime table проверки для client-side search/sort и grouped table behavior пока не реализованы.
 - Browser-level проверка iframe внутри реальной wiki page запланирована, когда появится стабильная тестовая страница локальной wiki.
 - Browser/API smoke для живого `cmdbaa` exchange будет добавлен отдельно, когда внешний сценарий стабилизируется.
+- Live-покрытие конфликта `expectedSpecHash` будет добавлено, когда появится стабильная write-test fixture.
 
 ## 1. Проверка ролей и групп CMDBuild
 

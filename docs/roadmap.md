@@ -69,6 +69,8 @@ Done:
 - DSL step `baaPlanObjects` materializes BAA `plan.objects` as a temporary table without runtime writes to CMDBuild.
 - Production health/readiness endpoints are implemented with strict Redis visibility checks and CMDBuild upstream reachability checks.
 - Redis password support is implemented through deployment secrets (`CMDBDYNAMIC_REDIS_PASSWORD_FILE` preferred) and Redis credentials are masked in health/status responses.
+- Docker runtime packaging, minimal GitHub Actions CI, retry/backoff, execution throttling, graceful shutdown, keep-alive CMDBuild agents, security headers, Prometheus `/metrics`, Redis strict mode, regex guard, and template `specHash` conflict guard are implemented as audit hardening.
+- `PROJECT_DOCUMENTATION.md`, audit remediation notes, and initial ADRs document the current documentation map and deferred architecture decisions.
 - Russian documentation is maintained in parallel with the English documentation.
 - Architecture artifacts are maintained under `aa/`.
 
@@ -79,6 +81,7 @@ Not done:
 - Deeper Playwright Runtime table checks for client-side search/sort and grouped table behavior are planned but not implemented.
 - Browser-level iframe rendering inside a real wiki page is planned when a stable local wiki test page is available.
 - Browser/API smoke for a live `cmdbaa` exchange will be added separately after the external scenario stabilizes.
+- Live `expectedSpecHash` conflict coverage will be added when a stable write-test template fixture is available.
 
 ## 1. CMDBuild Roles/Groups Check
 

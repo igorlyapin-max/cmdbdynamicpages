@@ -407,17 +407,19 @@ Production health/readiness endpoints are unauthenticated and are also available
 - `GET /health/live` returns `200` when the Node process can answer HTTP.
 - `GET /health/redis` performs a strict Redis `PING` and returns `503` when Redis is disabled or unavailable.
 - `GET /health/ready` checks process, Redis, and the CMDBuild upstream. It returns `503` if Redis is required and unavailable, or if CMDBuild is not reachable.
+- `GET /metrics` returns Prometheus text exposition with aggregate operational counters and gauges only.
 - `GET /cmdbuild/custom-api/cache/status` remains a diagnostic endpoint: it reports Redis visibility and memory fallback counters, but it intentionally returns `200` even when the app has fallen back to memory.
 - `GET /cmdbuild/custom-api/logging/status` returns the active log level, target and redaction settings without secrets.
 
 Readiness configuration:
 
 ```text
+CMDBDYNAMIC_REDIS_REQUIRED=false
 CMDBDYNAMIC_HEALTH_TIMEOUT_MS=2000
 CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=true
 ```
 
-`CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=false` can be used for local/dev operation without Redis. Production should keep Redis required when runtime cache and static snapshots are part of the service contract.
+`CMDBDYNAMIC_REDIS_REQUIRED=true` disables memory fallback for runtime cache and static snapshots: Redis read/write/delete failures fail the affected request with `503` instead of silently using process memory. It also makes readiness require Redis regardless of `CMDBDYNAMIC_HEALTH_REDIS_REQUIRED`. `CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=false` can still be used for local/dev operation without Redis when strict Redis mode is disabled. Production should keep Redis required when runtime cache and static snapshots are part of the service contract.
 
 ## Logging
 
@@ -441,7 +443,7 @@ CMDP_SYSLOG_PROTOCOL=udp
 CMDP_SYSLOG_FACILITY=local0
 ```
 
-`CMDP_LOG_TARGET=stdout,syslog` can be used when both outputs are required. Logged events include request completion, CSRF/same-origin rejection, Redis availability changes, CMDBuild upstream errors, runtime cache status, static snapshot publish/hit/miss, and template create/update/delete. Cookies, authorization headers, CSRF tokens and configured secret-like query parameters are redacted; runtime result rows and CMDBuild card payloads are not logged.
+`CMDP_LOG_TARGET=stdout,syslog` can be used when both outputs are required. Logged events include request completion, CSRF/same-origin rejection, Redis availability changes, CMDBuild upstream errors, runtime cache status, static snapshot publish/hit/miss, and template create/update/delete. Cookies, authorization headers, CSRF tokens and configured secret-like query parameters are redacted; runtime result rows and CMDBuild card payloads are not logged. `/metrics` exposes only aggregate counters/gauges and does not include cookies, tokens, user names, runtime rows or raw CMDBuild payloads.
 
 Important: URL routes after `#` are client-side only. CMDBuild may also normalize extra path segments after the custom page name. The preferred entry points are the direct `/cmdbuild/dynamicpages/ui/*` URLs. Use `cmdpMode` and `cmdpTemplate` query parameters before `#` only when entering through the CMDBuild custom page launcher.
 
@@ -456,6 +458,15 @@ maxTraversalDepth
 ```
 
 Each CMDBuild REST request also uses `CMDBUILD_REQUEST_TIMEOUT_MS`, default `10000`.
+
+Regex-based extraction and matching are bounded by:
+
+```text
+CMDBDYNAMIC_REGEX_MAX_PATTERN_LENGTH=500
+CMDBDYNAMIC_REGEX_MAX_INPUT_LENGTH=100000
+```
+
+Patterns over the configured length, obviously nested quantified groups, and oversized input strings are rejected before execution.
 
 Runtime executor defaults/caps are stored in `Cst_QueryToolConfig.RuntimeConfigJson`. Designer edits them as individual described fields in `Runtime-настройки`; the raw JSON is not shown in the UI. The stored shape is:
 
@@ -658,7 +669,7 @@ Runtime executions are not stored in CMDBuild technical classes. Preview, direct
 
 Designer can also validate and preview the current unsaved draft through `/cmdbuild/custom-api/draft/validate` and `/cmdbuild/custom-api/draft/preview`. Draft preview executes with the current user's CMDBuild permissions and shows an execution trace, but does not save templates or create versions.
 
-Template `create` and `update` write best-effort version snapshots into `Cst_QueryTemplateVersion`, and Designer shows the latest versions for the selected template.
+Template `create` and `update` write best-effort version snapshots into `Cst_QueryTemplateVersion`, and Designer shows the latest versions for the selected template. Template list/detail responses include `specHash`; Designer sends it back as `expectedSpecHash` on update. If the stored template changed meanwhile, update returns `409 template_version_conflict` with the current hash/template. API clients that omit `expectedSpecHash` keep the previous last-write-wins behavior.
 
 ## CMDBuild Upload Constraints
 
@@ -670,8 +681,11 @@ CMDBuild 4.1 validates uploaded JS with strict markers:
 
 ## Documentation
 
+- [Project documentation map](PROJECT_DOCUMENTATION.md)
 - [Architecture and implementation plan](docs/architecture-plan.md)
 - [Roadmap and current task state](docs/roadmap.md)
+- [Audit remediation 2026-05-31](docs/audit-remediation-2026-05-31.md)
+- [Architecture decisions](docs/adr/0001-zero-runtime-dependencies.md)
 - [Russian README](README.ru.md)
 - [Russian architecture plan](docs/architecture-plan.ru.md)
 - [Russian roadmap](docs/roadmap.ru.md)

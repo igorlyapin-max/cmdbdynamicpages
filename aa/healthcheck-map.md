@@ -8,6 +8,7 @@
 | HC-002 | IF-008, IF-005 | `GET /health/redis` | `8093` или `8088`; Redis `6379` | Redis `PING` вернул `PONG` | `503` | Redis, AUTH/password |
 | HC-003 | IF-008, IF-005, IF-004 | `GET /health/ready` | `8093` или `8088`; Redis `6379`; CMDBuild `8090` | Process OK, Redis OK, CMDBuild reachable | `503` | Redis, CMDBuild upstream |
 | HC-004 | IF-008 | `GET /cmdbuild/custom-api/cache/status` | `8093` или `8088` | Diagnostic response returned | Обычно `200` | Redis visibility + memory counters |
+| HC-005 | IF-008 | `GET /metrics` | `8093` | Prometheus text response returned | `5xx` | Readiness calculation, in-memory metric registry |
 
 ## Важное различие
 
@@ -19,7 +20,12 @@
 | --- | --- | --- |
 | `CMDBDYNAMIC_HEALTH_TIMEOUT_MS` | `2000` | Таймаут проверки CMDBuild upstream |
 | `CMDBDYNAMIC_HEALTH_REDIS_REQUIRED` | `true` | Если `true`, readiness падает при недоступном Redis |
+| `CMDBDYNAMIC_REDIS_REQUIRED` | `false` | Если `true`, Redis failures отключают memory fallback и делают Redis обязательным для readiness |
 | `CMDBDYNAMIC_REDIS_ENABLED` | `true` | Если Redis отключен, `/health/redis` вернет `503` |
+
+## Метрики
+
+`GET /metrics` не является readiness endpoint. Он отдает Prometheus text exposition с агрегированными counters/gauges и обновляет `cmdp_health_ready` через ту же readiness проверку, что и `GET /health/ready`.
 
 ## Пример ready ответа
 

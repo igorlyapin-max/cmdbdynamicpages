@@ -28,6 +28,16 @@ test('health ready endpoint returns a production readiness payload', { skip: ski
   assert.ok(json.cmdbuild);
 });
 
+test('metrics endpoint exposes aggregate Prometheus text only', { skip: skipWhenUnavailable }, async () => {
+  const result = await request('GET', `${proxyOrigin}/metrics`);
+
+  assert.equal(result.statusCode, 200);
+  assert.match(String(result.headers['content-type'] || ''), /^text\/plain/);
+  assert.match(result.body, /# TYPE cmdp_health_ready gauge/);
+  assert.match(result.body, /cmdp_health_ready [01]/);
+  assert.doesNotMatch(result.body, /cookie|authorization|csrf|secret|CMDBuild-Authorization/i);
+});
+
 test('logging status is protected by CMDBuild authentication', { skip: skipWhenUnavailable }, async () => {
   const result = await request('GET', `${proxyOrigin}/cmdbuild/custom-api/logging/status`);
 

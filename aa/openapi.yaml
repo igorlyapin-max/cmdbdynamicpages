@@ -63,6 +63,25 @@ paths:
                 $ref: "#/components/schemas/ReadyHealth"
         "503":
           description: Backend is not ready
+  /metrics:
+    get:
+      tags: [health]
+      security: []
+      summary: Prometheus metrics
+      description: Returns aggregate operational counters and gauges only; cookies, tokens, user names, runtime rows, and raw CMDBuild payloads are not exposed.
+      responses:
+        "200":
+          description: Prometheus text exposition
+          content:
+            text/plain; version=0.0.4:
+              schema:
+                type: string
+                example: |
+                  # HELP cmdp_health_ready Readiness status: 1 ready, 0 not ready.
+                  # TYPE cmdp_health_ready gauge
+                  cmdp_health_ready 1
+        "500":
+          description: Metrics rendering failed
   /cmdbuild/custom-api/cache/status:
     get:
       tags: [diagnostics]
@@ -301,6 +320,10 @@ paths:
       responses:
         "200":
           description: Template list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateListResponse"
     post:
       tags: [templates]
       summary: Create query template
@@ -325,6 +348,10 @@ paths:
       responses:
         "200":
           description: Template
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateResponse"
         "404":
           description: Template not found
     put:
@@ -342,6 +369,16 @@ paths:
       responses:
         "200":
           description: Template updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateResponse"
+        "409":
+          description: Template changed since the caller loaded it
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateVersionConflict"
     delete:
       tags: [templates]
       summary: Delete one template
@@ -1111,12 +1148,96 @@ components:
           type: object
           description: Template Spec JSON. Normal dynamic templates use the DSL steps/result model; special CMDBuild model view templates set `kind=cmdbBuildView` and store renderer settings under `cmdbBuildView`.
           additionalProperties: true
+        expectedSpecHash:
+          type: string
+          description: Optional optimistic update guard. If present on update, the backend returns 409 when the stored template spec hash differs.
+          pattern: "^[a-f0-9]{64}$"
         paramsSchema:
           type: object
           additionalProperties: true
         resultSchema:
           type: object
           additionalProperties: true
+    TemplateCard:
+      type: object
+      properties:
+        id:
+          oneOf:
+            - type: integer
+            - type: string
+        code:
+          type: string
+        description:
+          type: string
+        active:
+          type: boolean
+          nullable: true
+        spec:
+          type: object
+          additionalProperties: true
+        specHash:
+          type: string
+          description: SHA-256 hash of the normalized template spec used by Designer as expectedSpecHash on update.
+          pattern: "^[a-f0-9]{64}$"
+        paramsSchema:
+          type: object
+          nullable: true
+          additionalProperties: true
+        resultSchema:
+          type: object
+          nullable: true
+          additionalProperties: true
+        owner:
+          type: string
+        updatedAt:
+          type: string
+          nullable: true
+        protected:
+          type: boolean
+    TemplateResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            root:
+              type: string
+            className:
+              type: string
+            template:
+              $ref: "#/components/schemas/TemplateCard"
+            versionLog:
+              nullable: true
+              type: object
+              additionalProperties: true
+    TemplateListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            root:
+              type: string
+            className:
+              type: string
+            templates:
+              type: array
+              items:
+                $ref: "#/components/schemas/TemplateCard"
+    TemplateVersionConflict:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            reason:
+              type: string
+              enum: [template_version_conflict]
+            message:
+              type: string
+            expectedSpecHash:
+              type: string
+            currentSpecHash:
+              type: string
+            template:
+              $ref: "#/components/schemas/TemplateCard"
     DraftPayload:
       type: object
       required: [spec]

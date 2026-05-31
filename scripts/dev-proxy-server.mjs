@@ -1,9 +1,11 @@
 import http from 'node:http';
+import https from 'node:https';
 import crypto from 'node:crypto';
 import dgram from 'node:dgram';
 import fs from 'node:fs';
 import os from 'node:os';
 import net from 'node:net';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { URL, pathToFileURL } from 'node:url';
 import {
   CMDB_BUILD_VIEW_KIND,
@@ -52,16 +54,32 @@ const BACKEND_PREFIX = '/cmdbuild/custom-api';
 const DYNAMIC_UI_PREFIX = '/cmdbuild/dynamicpages/ui';
 const DEFAULT_TECHNICAL_ROOT = process.env.CMDBDYNAMICPAGES_ROOT || 'Cst_QueryTool';
 const CMDBUILD_REQUEST_TIMEOUT_MS = Number(process.env.CMDBUILD_REQUEST_TIMEOUT_MS || 10000);
+const CMDBUILD_RETRY_ENABLED = process.env.CMDBUILD_RETRY_ENABLED !== 'false';
+const CMDBUILD_RETRY_MAX_ATTEMPTS = Math.max(1, Math.min(5, Number(process.env.CMDBUILD_RETRY_MAX_ATTEMPTS || 3) || 3));
+const CMDBUILD_RETRY_BASE_DELAY_MS = Math.max(10, Number(process.env.CMDBUILD_RETRY_BASE_DELAY_MS || 120) || 120);
+const CMDBUILD_RETRY_MAX_DELAY_MS = Math.max(CMDBUILD_RETRY_BASE_DELAY_MS, Number(process.env.CMDBUILD_RETRY_MAX_DELAY_MS || 1200) || 1200);
+const CMDBUILD_AGENT_MAX_SOCKETS = Math.max(1, Number(process.env.CMDBUILD_AGENT_MAX_SOCKETS || 50) || 50);
+const CMDBUILD_AGENT_MAX_FREE_SOCKETS = Math.max(1, Number(process.env.CMDBUILD_AGENT_MAX_FREE_SOCKETS || 10) || 10);
 const CSRF_SECRET = process.env.CMDBDYNAMICPAGES_CSRF_SECRET || crypto.randomBytes(32).toString('hex');
 const DEV_CACHE_BUSTER = String(Date.now());
 const PROXY_COOKIE_SAMESITE = process.env.CMDBDYNAMIC_PROXY_COOKIE_SAMESITE || '';
 const PROXY_COOKIE_SECURE = process.env.CMDBDYNAMIC_PROXY_COOKIE_SECURE || 'false';
+const GRACEFUL_SHUTDOWN_TIMEOUT_MS = Math.max(1000, Number(process.env.CMDBDYNAMIC_SHUTDOWN_TIMEOUT_MS || 10000) || 10000);
+const SECURITY_HEADERS_ENABLED = process.env.CMDBDYNAMIC_SECURITY_HEADERS_ENABLED !== 'false';
+const SECURITY_CSP_FRAME_ANCESTORS = String(process.env.CMDBDYNAMIC_CSP_FRAME_ANCESTORS || "'self'").replace(/[\r\n]/g, ' ').trim();
+const SECURITY_HSTS_ENABLED = process.env.CMDBDYNAMIC_HSTS_ENABLED === 'true';
+const SECURITY_X_FRAME_OPTIONS = String(process.env.CMDBDYNAMIC_X_FRAME_OPTIONS || '').replace(/[\r\n]/g, ' ').trim();
 const DEFAULT_TEMPLATE_CACHE_TTL_HOURS = Math.min(24, Math.max(1, Number(process.env.CMDBDYNAMIC_TEMPLATE_CACHE_TTL_HOURS || 8) || 8));
 const DEFAULT_TEMPLATE_CACHE_TTL_SEC = Math.round(DEFAULT_TEMPLATE_CACHE_TTL_HOURS * 60 * 60);
 const RUNTIME_REFRESH_COOLDOWN_MS = Math.max(10_000, Number(process.env.CMDBDYNAMIC_REFRESH_COOLDOWN_MS || 3 * 60 * 1000) || 3 * 60 * 1000);
 const RUNTIME_CACHE_MAX_ENTRIES = Math.max(10, Number(process.env.CMDBDYNAMIC_RUNTIME_CACHE_MAX_ENTRIES || 100) || 100);
+const EXECUTION_THROTTLE_ENABLED = process.env.CMDBDYNAMIC_EXECUTION_THROTTLE_ENABLED !== 'false';
+const EXECUTION_THROTTLE_MAX_PER_SCOPE = Math.max(1, Number(process.env.CMDBDYNAMIC_EXECUTION_THROTTLE_MAX_PER_SCOPE || 2) || 2);
+const EXECUTION_THROTTLE_MAX_GLOBAL = Math.max(EXECUTION_THROTTLE_MAX_PER_SCOPE, Number(process.env.CMDBDYNAMIC_EXECUTION_THROTTLE_MAX_GLOBAL || 20) || 20);
+const EXECUTION_THROTTLE_RETRY_AFTER_SEC = Math.max(1, Number(process.env.CMDBDYNAMIC_EXECUTION_THROTTLE_RETRY_AFTER_SEC || 5) || 5);
 const HEALTH_TIMEOUT_MS = Math.max(500, Number(process.env.CMDBDYNAMIC_HEALTH_TIMEOUT_MS || 2000) || 2000);
-const HEALTH_REDIS_REQUIRED = process.env.CMDBDYNAMIC_HEALTH_REDIS_REQUIRED !== 'false';
+const REDIS_REQUIRED = process.env.CMDBDYNAMIC_REDIS_REQUIRED === 'true';
+const HEALTH_REDIS_REQUIRED = REDIS_REQUIRED || process.env.CMDBDYNAMIC_HEALTH_REDIS_REQUIRED !== 'false';
 const LOG_LEVEL = normalizeLogLevel(process.env.CMDP_LOG_LEVEL || 'info');
 const LOG_FORMAT = normalizeLogFormat(process.env.CMDP_LOG_FORMAT || 'json');
 const LOG_TARGETS = normalizeLogTargets(process.env.CMDP_LOG_TARGET || 'stdout');
@@ -77,6 +95,8 @@ const REDIS_ENABLED = process.env.CMDBDYNAMIC_REDIS_ENABLED !== 'false';
 const REDIS_KEY_PREFIX = process.env.CMDBDYNAMIC_REDIS_KEY_PREFIX || 'cmdp';
 const REDIS_TIMEOUT_MS = Math.max(100, Number(process.env.CMDBDYNAMIC_REDIS_TIMEOUT_MS || 500) || 500);
 const REDIS_RETRY_AFTER_MS = Math.max(1000, Number(process.env.CMDBDYNAMIC_REDIS_RETRY_AFTER_MS || 30000) || 30000);
+const REGEX_MAX_PATTERN_LENGTH = Math.max(16, Number(process.env.CMDBDYNAMIC_REGEX_MAX_PATTERN_LENGTH || 500) || 500);
+const REGEX_MAX_INPUT_LENGTH = Math.max(1024, Number(process.env.CMDBDYNAMIC_REGEX_MAX_INPUT_LENGTH || 100000) || 100000);
 const DEFAULT_EMPTY_RESULT_TEXT = 'В результате вашего запроса объекты не найдены';
 const DEFAULT_PERMISSION_DENIED_TEXT = 'Вам не хватает прав увидеть данные или интерфейс дизайнера';
 const SNAPSHOT_MISSING_TEXT = 'Страница отсутствует для загрузки';
@@ -95,6 +115,26 @@ const proxyLogs = [];
 const runtimeResultCache = new Map();
 const runtimeResultInFlight = new Map();
 const staticSnapshotCache = new Map();
+const requestContext = new AsyncLocalStorage();
+const cmdbuildHttpAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: CMDBUILD_AGENT_MAX_SOCKETS,
+  maxFreeSockets: CMDBUILD_AGENT_MAX_FREE_SOCKETS
+});
+const cmdbuildHttpsAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: CMDBUILD_AGENT_MAX_SOCKETS,
+  maxFreeSockets: CMDBUILD_AGENT_MAX_FREE_SOCKETS
+});
+const executionThrottleState = {
+  global: 0,
+  scopes: new Map()
+};
+const metricsState = {
+  counters: new Map(),
+  gauges: new Map()
+};
+let shuttingDown = false;
 const redisState = {
   available: null,
   lastError: '',
@@ -187,13 +227,54 @@ function sessionHashFromCookie(cookieHeader) {
 
 function routeKind(pathname) {
   if (isHealthPath(pathname)) return 'health';
+  if (isMetricsPath(pathname)) return 'metrics';
   if (pathname.startsWith(`${BACKEND_PREFIX}/`)) return 'backend';
   if (pathname === DYNAMIC_UI_PREFIX || pathname.startsWith(`${DYNAMIC_UI_PREFIX}/`)) return 'dynamic-ui';
   return 'cmdbuild-proxy';
 }
 
+function currentRequestId() {
+  const store = requestContext.getStore();
+  return store && store.requestId ? String(store.requestId) : '';
+}
+
+function httpTransportForTarget(target) {
+  return target.protocol === 'https:' ? https : http;
+}
+
+function cmdbuildAgentForTarget(target) {
+  return target.protocol === 'https:' ? cmdbuildHttpsAgent : cmdbuildHttpAgent;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function cmdbuildRequestCanRetry(method, retryOption) {
+  if (!CMDBUILD_RETRY_ENABLED || retryOption === false) return false;
+  if (retryOption === true) return true;
+  return ['GET', 'HEAD', 'OPTIONS'].includes(String(method || 'GET').toUpperCase());
+}
+
+function shouldRetryCmdbuildResult(result) {
+  const statusCode = Number(result && result.statusCode || 0);
+  return statusCode === 408 ||
+    statusCode === 429 ||
+    statusCode === 500 ||
+    statusCode === 502 ||
+    statusCode === 503 ||
+    statusCode === 504;
+}
+
+function cmdbuildRetryDelayMs(attempt, baseDelayMs = CMDBUILD_RETRY_BASE_DELAY_MS, maxDelayMs = CMDBUILD_RETRY_MAX_DELAY_MS, jitterRatio = 0.2) {
+  const exponential = Math.min(maxDelayMs, baseDelayMs * (2 ** Math.max(0, Number(attempt || 1) - 1)));
+  const jitter = jitterRatio > 0 ? Math.floor(exponential * jitterRatio * Math.random()) : 0;
+  return Math.min(maxDelayMs, exponential + jitter);
+}
+
 function shouldStructuredLogRequest(pathname) {
   return isHealthPath(pathname) ||
+    isMetricsPath(pathname) ||
     pathname.startsWith(`${BACKEND_PREFIX}/`) ||
     pathname === DYNAMIC_UI_PREFIX ||
     pathname.startsWith(`${DYNAMIC_UI_PREFIX}/`) ||
@@ -295,6 +376,100 @@ function loggingStatus() {
   };
 }
 
+const metricDefinitions = {
+  cmdp_http_requests_total: { type: 'counter', help: 'HTTP requests by route, method, and status class.' },
+  cmdp_http_request_duration_seconds_count: { type: 'counter', help: 'HTTP request duration observation count.' },
+  cmdp_http_request_duration_seconds_sum: { type: 'counter', help: 'HTTP request duration sum in seconds.' },
+  cmdp_cmdbuild_rest_requests_total: { type: 'counter', help: 'CMDBuild REST requests by method and status class.' },
+  cmdp_cmdbuild_rest_errors_total: { type: 'counter', help: 'CMDBuild REST errors by method and status class.' },
+  cmdp_cmdbuild_rest_retries_total: { type: 'counter', help: 'CMDBuild REST retry attempts.' },
+  cmdp_redis_errors_total: { type: 'counter', help: 'Redis command errors by reason.' },
+  cmdp_runtime_cache_hits_total: { type: 'counter', help: 'Runtime cache hits by backend.' },
+  cmdp_runtime_cache_misses_total: { type: 'counter', help: 'Runtime cache misses by backend.' },
+  cmdp_runtime_cache_build_seconds_count: { type: 'counter', help: 'Runtime cache build duration observation count.' },
+  cmdp_runtime_cache_build_seconds_sum: { type: 'counter', help: 'Runtime cache build duration sum in seconds.' },
+  cmdp_template_run_errors_total: { type: 'counter', help: 'Template execution failures by action and reason.' },
+  cmdp_execution_throttled_total: { type: 'counter', help: 'Template execution requests rejected by throttling.' },
+  cmdp_health_ready: { type: 'gauge', help: 'Readiness status: 1 ready, 0 not ready.' }
+};
+
+function metricLabelsKey(labels = {}) {
+  return Object.keys(labels)
+    .sort()
+    .map((name) => [name, String(labels[name])]);
+}
+
+function metricKey(name, labels = {}) {
+  return `${name}|${JSON.stringify(metricLabelsKey(labels))}`;
+}
+
+function incMetric(name, labels = {}, amount = 1) {
+  const key = metricKey(name, labels);
+  const current = metricsState.counters.get(key) || { name, labels: Object.fromEntries(metricLabelsKey(labels)), value: 0 };
+  current.value += Number(amount) || 0;
+  metricsState.counters.set(key, current);
+  return current.value;
+}
+
+function setMetricGauge(name, labels = {}, value = 0) {
+  const key = metricKey(name, labels);
+  metricsState.gauges.set(key, {
+    name,
+    labels: Object.fromEntries(metricLabelsKey(labels)),
+    value: Number(value) || 0
+  });
+}
+
+function observeMetricSeconds(name, labels = {}, seconds = 0) {
+  incMetric(`${name}_count`, labels, 1);
+  incMetric(`${name}_sum`, labels, Math.max(0, Number(seconds) || 0));
+}
+
+function statusClass(statusCode) {
+  const status = Number(statusCode) || 0;
+  if (status <= 0) return 'network';
+  return `${Math.floor(status / 100)}xx`;
+}
+
+function prometheusEscape(value) {
+  return String(value === undefined || value === null ? '' : value)
+    .replace(/\\/g, '\\\\')
+    .replace(/\n/g, '\\n')
+    .replace(/"/g, '\\"');
+}
+
+function prometheusSample(sample) {
+  const labels = Object.entries(sample.labels || {});
+  const suffix = labels.length
+    ? `{${labels.map(([name, value]) => `${name}="${prometheusEscape(value)}"`).join(',')}}`
+    : '';
+  return `${sample.name}${suffix} ${sample.value}`;
+}
+
+function renderPrometheusMetrics() {
+  const samples = [...metricsState.counters.values(), ...metricsState.gauges.values()]
+    .sort((left, right) => left.name.localeCompare(right.name) || JSON.stringify(left.labels).localeCompare(JSON.stringify(right.labels)));
+  const names = Array.from(new Set(samples.map((sample) => sample.name))).sort();
+  const lines = [];
+  for (const name of names) {
+    const definition = metricDefinitions[name] || { type: 'untyped', help: name };
+    lines.push(`# HELP ${name} ${definition.help}`);
+    lines.push(`# TYPE ${name} ${definition.type}`);
+    samples.filter((sample) => sample.name === name).forEach((sample) => lines.push(prometheusSample(sample)));
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+async function metricsPayload() {
+  try {
+    const readiness = await readinessPayload();
+    setMetricGauge('cmdp_health_ready', {}, readiness.ready ? 1 : 0);
+  } catch {
+    setMetricGauge('cmdp_health_ready', {}, 0);
+  }
+  return renderPrometheusMetrics();
+}
+
 function attachHttpRequestLogging(req, res, requestUrl) {
   if (!shouldStructuredLogRequest(requestUrl.pathname)) return;
   const requestId = truncateText(req.headers['x-request-id'] || crypto.randomUUID(), 120);
@@ -319,6 +494,15 @@ function attachHttpRequestLogging(req, res, requestUrl) {
       statusCode,
       durationMs: Date.now() - startedAt
     };
+    incMetric('cmdp_http_requests_total', {
+      route: common.route,
+      method: common.method,
+      status: statusClass(statusCode)
+    });
+    observeMetricSeconds('cmdp_http_request_duration_seconds', {
+      route: common.route,
+      method: common.method
+    }, fields.durationMs / 1000);
     if (statusCode >= 500) logError('http.request.finish', fields);
     else if (statusCode >= 400) logWarn('http.request.finish', fields);
     else logInfo('http.request.finish', fields);
@@ -424,9 +608,13 @@ function parseRedisReply(buffer, offset = 0) {
 }
 
 async function redisCommand(parts, options = {}) {
-  if (!REDIS_ENABLED) throw new Error('Redis is disabled.');
+  if (!REDIS_ENABLED) {
+    incMetric('cmdp_redis_errors_total', { reason: 'disabled' });
+    throw new Error('Redis is disabled.');
+  }
   const now = Date.now();
   if (!options.force && redisState.disabledUntil && redisState.disabledUntil > now) {
+    incMetric('cmdp_redis_errors_total', { reason: 'temporarily_unavailable' });
     throw new Error(redisState.lastError || 'Redis is temporarily unavailable.');
   }
   const config = parseRedisUrl(REDIS_URL);
@@ -448,6 +636,7 @@ async function redisCommand(parts, options = {}) {
       clearTimeout(timer);
       socket.destroy();
       if (error) {
+        incMetric('cmdp_redis_errors_total', { reason: 'command_failed' });
         const previousAvailable = redisState.available;
         const previousError = redisState.lastError;
         redisState.available = false;
@@ -505,6 +694,14 @@ function cacheKey(namespace, key) {
   return `${REDIS_KEY_PREFIX}:${namespace}:${key}`;
 }
 
+function redisRequiredError(error, operation, namespace) {
+  const message = error && error.message ? error.message : String(error || 'Redis is unavailable.');
+  const next = new Error(`Redis is required for ${namespace} cache ${operation}, but Redis is unavailable: ${message}`);
+  next.statusCode = 503;
+  next.redisRequired = true;
+  return next;
+}
+
 function memoryGet(map, key) {
   const entry = map.get(key);
   if (!entry) return null;
@@ -531,13 +728,24 @@ async function cacheGetJson(namespace, key, memoryMap) {
   if (REDIS_ENABLED) {
     try {
       const value = await redisCommand(['GET', cacheKey(namespace, key)]);
-      if (value) return { backend: 'redis', value: JSON.parse(value) };
+      if (value) {
+        if (namespace === 'runtime') incMetric('cmdp_runtime_cache_hits_total', { backend: 'redis' });
+        return { backend: 'redis', value: JSON.parse(value) };
+      }
+      if (namespace === 'runtime') incMetric('cmdp_runtime_cache_misses_total', { backend: 'redis' });
       return { backend: 'redis', value: null };
-    } catch {
+    } catch (error) {
+      if (REDIS_REQUIRED) throw redisRequiredError(error, 'read', namespace);
       // Redis fallback is expected in local dev when Redis is not started.
     }
+  } else if (REDIS_REQUIRED) {
+    throw redisRequiredError(new Error('Redis is disabled.'), 'read', namespace);
   }
-  return { backend: 'memory', value: memoryGet(memoryMap, key) };
+  const value = memoryGet(memoryMap, key);
+  if (namespace === 'runtime') {
+    incMetric(value ? 'cmdp_runtime_cache_hits_total' : 'cmdp_runtime_cache_misses_total', { backend: 'memory' });
+  }
+  return { backend: 'memory', value };
 }
 
 async function cacheSetJson(namespace, key, value, ttlMs, memoryMap) {
@@ -547,9 +755,12 @@ async function cacheSetJson(namespace, key, value, ttlMs, memoryMap) {
       if (ttlMs) args.push('PX', Math.max(1, Math.floor(ttlMs)));
       await redisCommand(args);
       return 'redis';
-    } catch {
+    } catch (error) {
+      if (REDIS_REQUIRED) throw redisRequiredError(error, 'write', namespace);
       // Fall through to in-memory fallback.
     }
+  } else if (REDIS_REQUIRED) {
+    throw redisRequiredError(new Error('Redis is disabled.'), 'write', namespace);
   }
   memorySet(memoryMap, key, value, ttlMs);
   return 'memory';
@@ -559,9 +770,12 @@ async function cacheDelete(namespace, key, memoryMap) {
   if (REDIS_ENABLED) {
     try {
       await redisCommand(['DEL', cacheKey(namespace, key)]);
-    } catch {
+    } catch (error) {
+      if (REDIS_REQUIRED) throw redisRequiredError(error, 'delete', namespace);
       // Ignore Redis delete failures; memory fallback is still cleared.
     }
+  } else if (REDIS_REQUIRED) {
+    throw redisRequiredError(new Error('Redis is disabled.'), 'delete', namespace);
   }
   memoryMap.delete(key);
 }
@@ -570,6 +784,7 @@ async function redisStatus(options = {}) {
   if (!REDIS_ENABLED) {
     return {
       enabled: false,
+      required: REDIS_REQUIRED,
       backend: 'memory',
       available: false,
       url: sanitizeRedisUrl(REDIS_URL),
@@ -581,6 +796,7 @@ async function redisStatus(options = {}) {
     const pong = await redisCommand(['PING'], options);
     return {
       enabled: true,
+      required: REDIS_REQUIRED,
       backend: 'redis',
       available: pong === 'PONG',
       url: sanitizeRedisUrl(REDIS_URL),
@@ -590,6 +806,7 @@ async function redisStatus(options = {}) {
   } catch (error) {
     return {
       enabled: true,
+      required: REDIS_REQUIRED,
       backend: 'memory',
       available: false,
       url: sanitizeRedisUrl(REDIS_URL),
@@ -621,6 +838,10 @@ function isHealthPath(pathname) {
   ].includes(pathname);
 }
 
+function isMetricsPath(pathname) {
+  return pathname === '/metrics';
+}
+
 function healthKindFromPath(pathname) {
   if (pathname.endsWith('/live')) return 'live';
   if (pathname.endsWith('/redis')) return 'redis';
@@ -641,13 +862,15 @@ function checkCmdbuildUpstream() {
         ...payload
       });
     };
-    const probeReq = http.request({
+    const transport = httpTransportForTarget(target);
+    const probeReq = transport.request({
       protocol: target.protocol,
       hostname: target.hostname,
       port: target.port,
       method: 'GET',
       path: `${target.pathname}${target.search}`,
-      headers: { accept: 'application/json' }
+      headers: { accept: 'application/json' },
+      agent: cmdbuildAgentForTarget(target)
     }, (probeRes) => {
       probeRes.resume();
       probeRes.on('end', () => {
@@ -955,22 +1178,54 @@ function getCookieValue(cookieHeader, name) {
   return '';
 }
 
-function sendJson(res, statusCode, payload) {
+function securityHeaders(extra = {}) {
+  const headers = {};
+  if (SECURITY_HEADERS_ENABLED) {
+    headers['x-content-type-options'] = 'nosniff';
+    headers['referrer-policy'] = 'same-origin';
+    headers['permissions-policy'] = 'camera=(), microphone=(), geolocation=()';
+    if (SECURITY_CSP_FRAME_ANCESTORS && SECURITY_CSP_FRAME_ANCESTORS !== 'false') {
+      headers['content-security-policy'] = `frame-ancestors ${SECURITY_CSP_FRAME_ANCESTORS}; base-uri 'self'; object-src 'none'`;
+    }
+    if (SECURITY_HSTS_ENABLED) {
+      headers['strict-transport-security'] = 'max-age=31536000; includeSubDomains';
+    }
+    if (SECURITY_X_FRAME_OPTIONS) {
+      headers['x-frame-options'] = SECURITY_X_FRAME_OPTIONS;
+    }
+  }
+  return {
+    ...headers,
+    ...extra
+  };
+}
+
+function sendJson(res, statusCode, payload, extraHeaders = {}) {
   const body = JSON.stringify(payload, null, 2);
-  res.writeHead(statusCode, {
+  res.writeHead(statusCode, securityHeaders({
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
-    'content-length': Buffer.byteLength(body)
-  });
+    'content-length': Buffer.byteLength(body),
+    ...extraHeaders
+  }));
   res.end(body);
 }
 
 function sendHtml(res, statusCode, body) {
-  res.writeHead(statusCode, {
+  res.writeHead(statusCode, securityHeaders({
     'content-type': 'text/html; charset=utf-8',
     'cache-control': 'no-store',
     'content-length': Buffer.byteLength(body)
-  });
+  }));
+  res.end(body);
+}
+
+function sendText(res, statusCode, body, contentType = 'text/plain; charset=utf-8') {
+  res.writeHead(statusCode, securityHeaders({
+    'content-type': contentType,
+    'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(body)
+  }));
   res.end(body);
 }
 
@@ -999,10 +1254,10 @@ function sendTechnicalSchemaAccessDeniedIfNeeded(res, details = {}) {
 }
 
 function redirect(res, location) {
-  res.writeHead(302, {
+  res.writeHead(302, securityHeaders({
     location,
     'cache-control': 'no-store'
-  });
+  }));
   res.end();
 }
 
@@ -7755,7 +8010,7 @@ function dynamicPagesClientScript() {
     if (!code) throw new Error(t('templateCodeRequired'));
     var specData = readSpecWithEditorBlocks();
     specData.spec = normalizeTemplateProtection(applyTemplateKindFromEditor(specData.spec));
-    return {
+    var payload = {
       code: code,
       description: readTemplateDescription(selected, code) || code,
       active: readTemplateActive(selected),
@@ -7763,6 +8018,8 @@ function dynamicPagesClientScript() {
       paramsSchema: readCurrentParamsSchema(selected.paramsSchema || {}),
       resultSchema: readCurrentResultSchema(selected.resultSchema || {})
     };
+    if (selected.specHash) payload.expectedSpecHash = selected.specHash;
+    return payload;
   }
 
   function applyTemplateKindFromEditor(spec) {
@@ -10595,6 +10852,76 @@ function readJsonBody(req, maxBytes = 64 * 1024) {
   });
 }
 
+function executionThrottleScopeKey({ sessionHash = '', authToken = '', remoteAddress = '', action = '', templateCode = '' } = {}) {
+  const actorHash = sessionHash ||
+    (authToken ? sha256Hex(authToken).slice(0, 16) : '') ||
+    sha256Hex(remoteAddress || 'anonymous').slice(0, 16);
+  return [
+    truncateText(action || 'execution', 80),
+    truncateText(templateCode || 'draft', 120),
+    actorHash
+  ].join('|');
+}
+
+function executionThrottleScopeFromRequest(req, details = {}) {
+  const rawAuthHeader = req.headers['cmdbuild-authorization'];
+  const authToken = Array.isArray(rawAuthHeader) ? rawAuthHeader[0] : rawAuthHeader;
+  return executionThrottleScopeKey({
+    sessionHash: sessionHashFromCookie(req.headers.cookie),
+    authToken: authToken || '',
+    remoteAddress: req.socket && req.socket.remoteAddress || '',
+    action: details.action || '',
+    templateCode: details.templateCode || ''
+  });
+}
+
+function acquireExecutionSlot(req, res, details = {}) {
+  if (!EXECUTION_THROTTLE_ENABLED) {
+    return { release() {} };
+  }
+
+  const scopeKey = executionThrottleScopeFromRequest(req, details);
+  const scopeCount = executionThrottleState.scopes.get(scopeKey) || 0;
+  if (executionThrottleState.global >= EXECUTION_THROTTLE_MAX_GLOBAL || scopeCount >= EXECUTION_THROTTLE_MAX_PER_SCOPE) {
+    incMetric('cmdp_execution_throttled_total', {
+      action: details.action || 'execution'
+    });
+    logWarn('execution.throttled', {
+      requestId: currentRequestId(),
+      action: details.action || '',
+      templateCode: details.templateCode || '',
+      scopeHash: sha256Hex(scopeKey).slice(0, 16),
+      scopeCount,
+      globalCount: executionThrottleState.global,
+      maxPerScope: EXECUTION_THROTTLE_MAX_PER_SCOPE,
+      maxGlobal: EXECUTION_THROTTLE_MAX_GLOBAL
+    });
+    sendJson(res, 429, {
+      success: false,
+      reason: 'execution_throttled',
+      message: 'Too many template executions are already running for this scope.',
+      retryAfterSec: EXECUTION_THROTTLE_RETRY_AFTER_SEC
+    }, {
+      'retry-after': String(EXECUTION_THROTTLE_RETRY_AFTER_SEC)
+    });
+    return null;
+  }
+
+  executionThrottleState.scopes.set(scopeKey, scopeCount + 1);
+  executionThrottleState.global += 1;
+  let released = false;
+  return {
+    release() {
+      if (released) return;
+      released = true;
+      const current = executionThrottleState.scopes.get(scopeKey) || 0;
+      if (current <= 1) executionThrottleState.scopes.delete(scopeKey);
+      else executionThrottleState.scopes.set(scopeKey, current - 1);
+      executionThrottleState.global = Math.max(0, executionThrottleState.global - 1);
+    }
+  };
+}
+
 function validateCmdbuildIdentifier(value, label) {
   const text = String(value || '').trim();
   if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(text)) {
@@ -11321,14 +11648,17 @@ function sanitizeUser(item) {
 function methodAllowed(req, res, methods) {
   const allowed = Array.isArray(methods) ? methods : [methods];
   if (allowed.includes(req.method)) return true;
-  res.writeHead(405, {
-    allow: allowed.join(', '),
-    'content-type': 'application/json; charset=utf-8'
-  });
-  res.end(JSON.stringify({
+  const body = JSON.stringify({
     success: false,
     message: `Method ${req.method} is not allowed for this route.`
-  }, null, 2));
+  }, null, 2);
+  res.writeHead(405, securityHeaders({
+    allow: allowed.join(', '),
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(body)
+  }));
+  res.end(body);
   return false;
 }
 
@@ -11358,8 +11688,70 @@ function buildListPath(basePath, requestUrl, defaults = {}) {
   return `${basePath}?${params.toString()}`;
 }
 
-function cmdbuildRequest(path, authToken, options = {}) {
+async function cmdbuildRequest(path, authToken, options = {}) {
+  const method = String(options.method || 'GET').toUpperCase();
+  const retryable = cmdbuildRequestCanRetry(method, options.retry);
+  const maxAttempts = retryable ? CMDBUILD_RETRY_MAX_ATTEMPTS : 1;
   const target = new URL(path, CMDBUILD_ORIGIN);
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const result = await cmdbuildRequestOnce(path, authToken, {
+        ...options,
+        method
+      });
+      if (attempt < maxAttempts && shouldRetryCmdbuildResult(result)) {
+        const retryDelayMs = cmdbuildRetryDelayMs(attempt);
+        incMetric('cmdp_cmdbuild_rest_retries_total', {
+          method,
+          reason: statusClass(result.statusCode)
+        });
+        logWarn('cmdbuild.request_retry', {
+          requestId: options.requestId || currentRequestId(),
+          method,
+          path: sanitizeRequestPath(target),
+          statusCode: result.statusCode,
+          attempt,
+          nextAttempt: attempt + 1,
+          delayMs: retryDelayMs
+        });
+        await delay(retryDelayMs);
+        continue;
+      }
+      return result;
+    } catch (error) {
+      lastError = error;
+      if (attempt < maxAttempts && retryable) {
+        const retryDelayMs = cmdbuildRetryDelayMs(attempt);
+        incMetric('cmdp_cmdbuild_rest_retries_total', {
+          method,
+          reason: 'network'
+        });
+        logWarn('cmdbuild.request_retry', {
+          requestId: options.requestId || currentRequestId(),
+          method,
+          path: sanitizeRequestPath(target),
+          error: error && error.message ? error.message : String(error),
+          attempt,
+          nextAttempt: attempt + 1,
+          delayMs: retryDelayMs
+        });
+        await delay(retryDelayMs);
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw lastError || new Error('CMDBuild request failed.');
+}
+
+function cmdbuildRequestOnce(path, authToken, options = {}) {
+  const target = new URL(path, CMDBUILD_ORIGIN);
+  if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+    return Promise.reject(new Error(`Unsupported CMDBuild protocol: ${target.protocol}`));
+  }
   const body = options.body === undefined ? null : JSON.stringify(options.body);
   const startedAt = Date.now();
   const headers = {
@@ -11367,19 +11759,25 @@ function cmdbuildRequest(path, authToken, options = {}) {
     'CMDBuild-Authorization': authToken,
     ...(options.headers || {})
   };
+  const requestId = options.requestId || headers['x-request-id'] || headers['X-Request-ID'] || currentRequestId();
+  if (requestId) {
+    headers['x-request-id'] = truncateText(requestId, 120);
+  }
   if (body !== null) {
     headers['content-type'] = 'application/json';
     headers['content-length'] = Buffer.byteLength(body);
   }
 
   return new Promise((resolve, reject) => {
-    const req = http.request({
+    const transport = httpTransportForTarget(target);
+    const req = transport.request({
       protocol: target.protocol,
       hostname: target.hostname,
       port: target.port,
       method: options.method || 'GET',
       path: `${target.pathname}${target.search}`,
-      headers
+      headers,
+      agent: cmdbuildAgentForTarget(target)
     }, (res) => {
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
@@ -11397,8 +11795,19 @@ function cmdbuildRequest(path, authToken, options = {}) {
           json,
           text
         };
+        incMetric('cmdp_cmdbuild_rest_requests_total', {
+          method: options.method || 'GET',
+          status: statusClass(result.statusCode)
+        });
+        if (!result.ok) {
+          incMetric('cmdp_cmdbuild_rest_errors_total', {
+            method: options.method || 'GET',
+            status: statusClass(result.statusCode)
+          });
+        }
         if (!result.ok && result.statusCode >= 500) {
           logWarn('cmdbuild.request_failed', {
+            requestId,
             method: options.method || 'GET',
             path: sanitizeRequestPath(target),
             statusCode: result.statusCode,
@@ -11409,7 +11818,12 @@ function cmdbuildRequest(path, authToken, options = {}) {
       });
     });
     req.on('error', (error) => {
+      incMetric('cmdp_cmdbuild_rest_errors_total', {
+        method: options.method || 'GET',
+        status: 'network'
+      });
       logError('cmdbuild.request_error', {
+        requestId,
         method: options.method || 'GET',
         path: sanitizeRequestPath(target),
         durationMs: Date.now() - startedAt,
@@ -11792,12 +12206,18 @@ function sanitizeTemplateCard(card) {
     description: card.Description || '',
     active: card.Active === undefined ? null : Boolean(card.Active),
     spec,
+    specHash: hashJson(spec || {}),
     paramsSchema: safeJsonValue(card.ParamsSchemaJson, null),
     resultSchema: safeJsonValue(card.ResultSchemaJson, null),
     owner: card.Owner || '',
     updatedAt: card.UpdatedAt || null,
     protected: templateIsProtected({ code, spec })
   };
+}
+
+function expectedSpecHashFromBody(body) {
+  const source = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+  return String(source.expectedSpecHash || source.ExpectedSpecHash || '').trim();
 }
 
 function templateIsProtected(template) {
@@ -11986,6 +12406,14 @@ function errorLooksPermissionDenied(error) {
   if (isPermissionDeniedStatus(status)) return true;
   const message = error && error.message ? String(error.message) : String(error || '');
   return /\bstatus\s+(401|403)\b/i.test(message) || /\b(401|403)\b/.test(message) && /CMDBuild|permission|access/i.test(message);
+}
+
+function templateExecutionErrorReason(error) {
+  if (error && error.redisRequired) return 'redis_required';
+  if (errorLooksPermissionDenied(error)) return 'permission_denied';
+  const message = error && error.message ? String(error.message) : String(error || '');
+  if (/limit|maximum|maxRows|maxRestCalls|maxClasses|maxDomains/i.test(message)) return 'execution_limit';
+  return 'execution_error';
 }
 
 function toPositiveInt(value, fallback, max) {
@@ -12752,11 +13180,15 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
   }
 
   const promise = (async () => {
+    const buildStartedAt = Date.now();
     const result = await executeTemplateSpec(authToken, template.spec, params, {
       ...executionOptions,
       dependencyMap,
       baaRequest: options.baaRequest || null
     });
+    observeMetricSeconds('cmdp_runtime_cache_build_seconds', {
+      scopeMode: templateCacheConfig.scopeMode
+    }, (Date.now() - buildStartedAt) / 1000);
     const createdAt = Date.now();
     const newEntry = {
       key: keyParts.key,
@@ -13059,7 +13491,7 @@ async function sendPublicSnapshotRun(res, requestUrl, templateCode) {
   try {
     lookup = await readStaticSnapshot(templateCode, params, { paramsMode: 'ignore' });
   } catch (error) {
-    sendJson(res, 400, {
+    sendJson(res, error.statusCode || 400, {
       success: false,
       message: error && error.message ? error.message : String(error)
     });
@@ -13305,6 +13737,11 @@ function validateTemplateSpec(spec) {
             if (filter.op !== undefined && !allowedOps.includes(filter.op)) {
               errors.push({ path: `${filterPath}.op`, message: `baaPlanObjects filter op must be one of: ${allowedOps.join(', ')}.` });
             }
+            if ((filter.op === 'matches' || filter.op === 'notMatches' || filter.regex !== undefined) && typeof filter.regex !== 'string') {
+              errors.push({ path: `${filterPath}.regex`, message: 'baaPlanObjects regex filter requires a regular expression string.' });
+            } else if (filter.regex !== undefined) {
+              errors.push(...validateRegexPattern(filter.regex, '', `${filterPath}.regex`, false));
+            }
             if (filter.negate !== undefined && typeof filter.negate !== 'boolean') {
               errors.push({ path: `${filterPath}.negate`, message: 'baaPlanObjects filter negate must be boolean.' });
             }
@@ -13314,11 +13751,7 @@ function validateTemplateSpec(spec) {
         if (!step.regex || typeof step.regex !== 'string') {
           errors.push({ path: `${path}.regex`, message: 'extractVariables requires a regular expression string.' });
         } else {
-          try {
-            new RegExp(step.regex, normalizeRegexFlags(step.flags, step.all !== false));
-          } catch (error) {
-            errors.push({ path: `${path}.regex`, message: `extractVariables regex is invalid: ${error.message}` });
-          }
+          errors.push(...validateRegexPattern(step.regex, step.flags, `${path}.regex`, step.all !== false));
         }
         if (!step.sourceParam && !step.from && !step.source && step.sourceValue === undefined) {
           errors.push({ path, message: 'extractVariables requires sourceParam, from, source, or sourceValue.' });
@@ -13355,6 +13788,8 @@ function validateTemplateSpec(spec) {
             }
             if ((filter.op === 'matches' || filter.op === 'notMatches' || filter.regex !== undefined) && typeof filter.regex !== 'string') {
               errors.push({ path: `${filterPath}.regex`, message: 'selectCards regex filter requires a regular expression string.' });
+            } else if (filter.regex !== undefined) {
+              errors.push(...validateRegexPattern(filter.regex, '', `${filterPath}.regex`, false));
             }
             if (filter.negate !== undefined && typeof filter.negate !== 'boolean') {
               errors.push({ path: `${filterPath}.negate`, message: 'selectCards filter negate must be boolean.' });
@@ -13485,6 +13920,12 @@ function validateTemplateSpec(spec) {
             if (!allowedOperators.includes(operator)) {
               errors.push({ path: `${rulePath}.operator`, message: `matchRows rule operator must be one of: ${allowedOperators.join(', ')}.` });
             }
+            [
+              [rule.leftRegex !== undefined ? rule.leftRegex : left.regex, `${rulePath}.left.regex`],
+              [rule.rightRegex !== undefined ? rule.rightRegex : right.regex, `${rulePath}.right.regex`]
+            ].forEach(([pattern, regexPath]) => {
+              if (pattern !== undefined && pattern !== '') errors.push(...validateRegexPattern(pattern, '', regexPath, false));
+            });
           });
         }
       } else if (step.type === 'joinRows' || step.type === 'intersectRows') {
@@ -13877,6 +14318,51 @@ function normalizeRegexFlags(flags, allMatches) {
   return result;
 }
 
+function stripRegexParamPlaceholders(pattern) {
+  return String(pattern || '').replace(/\$\{(param|var|contractparam)\.([A-Za-z_][A-Za-z0-9_]*)\}/g, '');
+}
+
+function regexHasNestedQuantifier(pattern) {
+  const text = stripRegexParamPlaceholders(pattern).replace(/\\./g, '');
+  return /\([^)]*(?:[*+]|\{\d+(?:,\d*)?\})[^)]*\)\s*(?:[*+]|\{\d+(?:,\d*)?\})/.test(text);
+}
+
+function validateRegexPattern(pattern, flags = '', path = '$.regex', allMatches = false) {
+  const text = String(pattern || '');
+  const errors = [];
+  if (text.length > REGEX_MAX_PATTERN_LENGTH) {
+    errors.push({ path, message: `Regex pattern exceeds ${REGEX_MAX_PATTERN_LENGTH} characters.` });
+  }
+  if (regexHasNestedQuantifier(text)) {
+    errors.push({ path, message: 'Regex pattern uses nested quantifiers that can cause excessive backtracking.' });
+  }
+  try {
+    new RegExp(stripRegexParamPlaceholders(text), normalizeRegexFlags(flags, allMatches));
+  } catch (error) {
+    errors.push({ path, message: `Regex is invalid: ${error.message}` });
+  }
+  return errors;
+}
+
+function assertRegexPatternAllowed(pattern, flags = '', path = '$.regex', allMatches = false) {
+  const errors = validateRegexPattern(pattern, flags, path, allMatches);
+  if (errors.length) {
+    const error = new Error(errors.map((item) => `${item.path}: ${item.message}`).join(' '));
+    error.statusCode = 400;
+    throw error;
+  }
+}
+
+function assertRegexInputAllowed(value, path = 'regex input') {
+  const text = String(value === undefined || value === null ? '' : value);
+  if (text.length > REGEX_MAX_INPUT_LENGTH) {
+    const error = new Error(`${path} exceeds ${REGEX_MAX_INPUT_LENGTH} characters.`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return text;
+}
+
 function getFilterExpected(filter, params) {
   if (Object.prototype.hasOwnProperty.call(filter, 'valueParam')) {
     return params[filter.valueParam];
@@ -13981,6 +14467,7 @@ function resolveExtractionSources(step, params, context) {
 }
 
 function executeExtractVariables(step, params, context, limits) {
+  assertRegexPatternAllowed(step.regex, step.flags, 'extractVariables.regex', step.all !== false);
   const regex = new RegExp(step.regex, normalizeRegexFlags(step.flags, step.all !== false));
   const columns = ['Source', 'Index', 'Match'];
   const rows = [];
@@ -13989,7 +14476,7 @@ function executeExtractVariables(step, params, context, limits) {
   for (const item of sources) {
     const values = Array.isArray(item.value) ? item.value : [item.value];
     for (const value of values) {
-      const text = String(value === undefined || value === null ? '' : value);
+      const text = assertRegexInputAllowed(value, 'extractVariables source');
       regex.lastIndex = 0;
       let match;
       let matchIndex = 0;
@@ -14297,8 +14784,10 @@ function baaRowMatchesSelectionFilter(row, filter, params) {
   else if (op === 'isIpv4') matched = parseIpv4ToInt(actual) !== null;
   else if (op === 'isIpv4Network') matched = isIpv4NetworkValue(actual);
   else if (op === 'matches') {
-    const regex = new RegExp(substituteRegexParams(filter.regex, params), caseSensitive ? '' : 'i');
-    matched = regex.test(actual);
+    const pattern = substituteRegexParams(filter.regex, params);
+    assertRegexPatternAllowed(pattern, '', 'baaPlanObjects.filter.regex', false);
+    const regex = new RegExp(pattern, caseSensitive ? '' : 'i');
+    matched = regex.test(assertRegexInputAllowed(actual, 'baaPlanObjects filter value'));
   } else {
     const expectedRaw = resolveSelectionExpected(filter, params, row);
     if (['ipv4InCidr', 'ipv4InRange', 'ipv4CidrOverlaps', 'ipv4CidrContains'].includes(op)) {
@@ -14671,9 +15160,11 @@ async function cardMatchesSelectionFilter(cmdbuildExecRequest, pathCache, classN
 
   let matched = false;
   if (op === 'matches') {
-    const regex = new RegExp(substituteRegexParams(filter.regex, params), caseSensitive ? '' : 'i');
+    const pattern = substituteRegexParams(filter.regex, params);
+    assertRegexPatternAllowed(pattern, '', 'selectCards.filter.regex', false);
+    const regex = new RegExp(pattern, caseSensitive ? '' : 'i');
     const values = pathValues || [displayCardValue(actualRaw)];
-    matched = values.some((value) => regex.test(String(value)));
+    matched = values.some((value) => regex.test(assertRegexInputAllowed(value, 'selectCards filter value')));
   } else if (op === 'exists') {
     matched = actualValues.length > 0;
   } else if (op === 'isIpv4') {
@@ -15423,8 +15914,9 @@ function extractMatchComparableValues(value, pattern, params, caseSensitive) {
   const values = Array.isArray(value) ? value : [value];
   const regexPattern = substituteRegexParams(pattern || '', params);
   const result = [];
+  if (regexPattern) assertRegexPatternAllowed(regexPattern, '', 'matchRows.regex', false);
   for (const item of values) {
-    const text = displayCardValue(item).trim();
+    const text = assertRegexInputAllowed(displayCardValue(item), 'matchRows value').trim();
     if (!regexPattern) {
       result.push(text);
       continue;
@@ -15527,7 +16019,9 @@ function scalarMatchRowsValues(leftValue, rightValue, operator, caseSensitive) {
   if (operator === 'contains') return normalizeComparableValue(leftValue, caseSensitive).includes(normalizeComparableValue(rightValue, caseSensitive));
   if (operator === 'regexMatch') {
     try {
-      return new RegExp(String(rightValue || ''), caseSensitive ? '' : 'i').test(String(leftValue || ''));
+      const pattern = String(rightValue || '');
+      assertRegexPatternAllowed(pattern, '', 'matchRows.regexMatch', false);
+      return new RegExp(pattern, caseSensitive ? '' : 'i').test(assertRegexInputAllowed(leftValue, 'matchRows regexMatch value'));
     } catch {
       return false;
     }
@@ -16685,6 +17179,11 @@ async function handleBackend(req, res, requestUrl) {
     const root = requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
     const runtimeConfig = await getRuntimeConfig(authToken, root);
     const executionLimits = normalizeExecutionLimitConfig(runtimeConfig);
+    const executionSlot = acquireExecutionSlot(req, res, {
+      action: 'draft-preview',
+      templateCode: template.code
+    });
+    if (!executionSlot) return;
     try {
       const result = await executeTemplateSpec(authToken, draft.spec, draft.params, {
         maxRows: getPositiveInt(requestUrl.searchParams, 'maxRows', executionLimits.maxRowsPreviewDefault, executionLimits.maxRowsMax),
@@ -16709,7 +17208,11 @@ async function handleBackend(req, res, requestUrl) {
     } catch (error) {
       const permissionDenied = errorLooksPermissionDenied(error);
       const permissionDeniedText = permissionDeniedTextFromSpec(draft.spec);
-      sendJson(res, permissionDenied ? 403 : 400, {
+      incMetric('cmdp_template_run_errors_total', {
+        action: 'draft-preview',
+        reason: templateExecutionErrorReason(error)
+      });
+      sendJson(res, permissionDenied ? 403 : (error.statusCode || 400), {
         success: false,
         action: draftAction,
         template,
@@ -16720,6 +17223,8 @@ async function handleBackend(req, res, requestUrl) {
           trace: error && Array.isArray(error.executionTrace) ? error.executionTrace : []
         }
       });
+    } finally {
+      executionSlot.release();
     }
     return;
   }
@@ -17036,6 +17541,11 @@ async function handleBackend(req, res, requestUrl) {
         }
       }
 
+      const executionSlot = acquireExecutionSlot(req, res, {
+        action: templateAction,
+        templateCode: template.code
+      });
+      if (!executionSlot) return;
       try {
         if (templateAction === 'publish') {
           result = await executeTemplateSpec(authToken, template.spec, params, executionOptions);
@@ -17106,6 +17616,10 @@ async function handleBackend(req, res, requestUrl) {
       } catch (error) {
         const permissionDenied = errorLooksPermissionDenied(error);
         const permissionDeniedText = permissionDeniedTextFromSpec(template.spec);
+        incMetric('cmdp_template_run_errors_total', {
+          action: templateAction,
+          reason: templateExecutionErrorReason(error)
+        });
         logWarn('template.execution_failed', {
           requestId: req.cmdpRequestId || '',
           action: templateAction,
@@ -17117,10 +17631,10 @@ async function handleBackend(req, res, requestUrl) {
         if (isBaaVerify) {
           const code = baaErrorCodeFromError(error);
           const message = permissionDenied ? permissionDeniedText : (error && error.message ? error.message : String(error));
-          sendJson(res, permissionDenied ? 403 : 400, baaErrorResponse(code, message));
+          sendJson(res, permissionDenied ? 403 : (error.statusCode || 400), baaErrorResponse(code, message));
           return;
         }
-        sendJson(res, permissionDenied ? 403 : 400, {
+        sendJson(res, permissionDenied ? 403 : (error.statusCode || 400), {
           success: false,
           action: templateAction,
           template: {
@@ -17132,6 +17646,8 @@ async function handleBackend(req, res, requestUrl) {
           permissionDeniedText: permissionDenied ? permissionDeniedText : undefined
         });
         return;
+      } finally {
+        executionSlot.release();
       }
       if (templateAction === 'run' || templateAction === 'preview' || isBaaVerify) {
         logInfo('template.executed', {
@@ -17282,6 +17798,19 @@ async function handleBackend(req, res, requestUrl) {
       }
 
       const body = await readJsonBody(req);
+      const expectedSpecHash = expectedSpecHashFromBody(body);
+      const currentTemplate = sanitizeTemplateCard(found.card);
+      if (expectedSpecHash && currentTemplate && currentTemplate.specHash !== expectedSpecHash) {
+        sendJson(res, 409, {
+          success: false,
+          reason: 'template_version_conflict',
+          message: `Template ${templateCode} was changed by another editor. Reload the template before saving.`,
+          expectedSpecHash,
+          currentSpecHash: currentTemplate.specHash,
+          template: currentTemplate
+        });
+        return;
+      }
       const session = await getSessionData(authToken);
       const payload = normalizeTemplatePayload(body, templateCode, session.data && session.data.username);
       const specErrors = validateTemplateSpec(safeJsonValue(payload.SpecJson, null));
@@ -17440,17 +17969,20 @@ function proxyToCmdbuild(req, res, requestUrl) {
   const target = new URL(req.url || '/', CMDBUILD_ORIGIN);
   const headers = { ...req.headers };
   headers.host = req.headers.host || `${LISTEN_HOST}:${LISTEN_PORT}`;
+  if (currentRequestId()) headers['x-request-id'] = currentRequestId();
   if (isCmdbuildUiCacheSensitive(requestUrl.pathname)) {
     headers['accept-encoding'] = 'identity';
   }
 
-  const proxyReq = http.request({
+  const transport = httpTransportForTarget(target);
+  const proxyReq = transport.request({
     protocol: target.protocol,
     hostname: target.hostname,
     port: target.port,
     method: req.method,
     path: `${target.pathname}${target.search}`,
-    headers
+    headers,
+    agent: cmdbuildAgentForTarget(target)
   }, (proxyRes) => {
     const shouldRewriteHtml = isCmdbuildUiEntry(requestUrl.pathname);
     const shouldRewriteManifest = isCmdbuildUiManifest(requestUrl.pathname);
@@ -17488,9 +18020,80 @@ function proxyToCmdbuild(req, res, requestUrl) {
   req.pipe(proxyReq);
 }
 
+function destroyOutboundAgents() {
+  cmdbuildHttpAgent.destroy();
+  cmdbuildHttpsAgent.destroy();
+}
+
+function installGracefulShutdown(serverInstance) {
+  let shutdownStarted = false;
+  const shutdown = (signal) => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    shuttingDown = true;
+    logWarn('app.shutdown_started', {
+      signal,
+      timeoutMs: GRACEFUL_SHUTDOWN_TIMEOUT_MS
+    });
+
+    const forceTimer = setTimeout(() => {
+      logError('app.shutdown_forced', {
+        signal,
+        timeoutMs: GRACEFUL_SHUTDOWN_TIMEOUT_MS
+      });
+      if (typeof serverInstance.closeAllConnections === 'function') {
+        serverInstance.closeAllConnections();
+      }
+      destroyOutboundAgents();
+      process.exit(1);
+    }, GRACEFUL_SHUTDOWN_TIMEOUT_MS);
+    if (typeof forceTimer.unref === 'function') forceTimer.unref();
+
+    serverInstance.close((error) => {
+      clearTimeout(forceTimer);
+      destroyOutboundAgents();
+      if (error) {
+        logError('app.shutdown_failed', {
+          signal,
+          error: error.message || String(error)
+        });
+        process.exit(1);
+      }
+      logInfo('app.shutdown_complete', { signal });
+      process.exit(0);
+    });
+
+    if (typeof serverInstance.closeIdleConnections === 'function') {
+      serverInstance.closeIdleConnections();
+    }
+  };
+
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => shutdown('SIGINT'));
+}
+
 const server = http.createServer((req, res) => {
   const requestUrl = new URL(req.url || '/', `http://${req.headers.host || `${LISTEN_HOST}:${LISTEN_PORT}`}`);
   attachHttpRequestLogging(req, res, requestUrl);
+  requestContext.enterWith({ requestId: req.cmdpRequestId || '' });
+  if (shuttingDown && requestUrl.pathname !== '/health/live') {
+    sendJson(res, 503, {
+      success: false,
+      status: 'shutting_down',
+      message: 'Server is shutting down.'
+    }, {
+      connection: 'close'
+    });
+    return;
+  }
+  if (isMetricsPath(requestUrl.pathname)) {
+    metricsPayload().then((body) => {
+      sendText(res, 200, body, 'text/plain; version=0.0.4; charset=utf-8');
+    }).catch((error) => {
+      sendText(res, 500, `# metrics error: ${prometheusEscape(error && error.message ? error.message : String(error))}\n`);
+    });
+    return;
+  }
   if (isHealthPath(requestUrl.pathname)) {
     handleHealth(req, res, requestUrl).catch((error) => {
       sendJson(res, 503, {
@@ -17538,6 +18141,7 @@ server.on('error', (error) => {
 const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (isMainModule) {
+  installGracefulShutdown(server);
   server.listen(LISTEN_PORT, LISTEN_HOST, () => {
     logInfo('app.started', {
       listen: `http://${LISTEN_HOST}:${LISTEN_PORT}`,
@@ -17560,9 +18164,14 @@ export {
   baaResponseFromRuntimeResult,
   buildResultCellMeta,
   buildTechnicalSchema,
+  cmdbuildRequestCanRetry,
+  cmdbuildRetryDelayMs,
   defaultRuntimeConfig,
   dependencyMapWithHash,
+  executionThrottleScopeKey,
+  expectedSpecHashFromBody,
   executeBaaPlanObjects,
+  incMetric,
   ipv4ValueMatches,
   loggingStatus,
   normalizedBaaRequestForCache,
@@ -17577,13 +18186,20 @@ export {
   redactByName,
   renderRuntimeParamTemplate,
   renderCellTemplate,
+  renderPrometheusMetrics,
   runtimeCacheKeyParts,
   runtimeCacheMeta,
   runtimeJsonOutputRequested,
   runtimeJsonResponsePayload,
+  redisRequiredError,
   sanitizeRequestPath,
+  sanitizeTemplateCard,
   schemaParentFromInput,
+  securityHeaders,
+  setMetricGauge,
+  shouldRetryCmdbuildResult,
   templateIsProtected,
+  validateRegexPattern,
   validateBaaVerificationRequest,
   isSafeRuntimeLinkUrl
 };
