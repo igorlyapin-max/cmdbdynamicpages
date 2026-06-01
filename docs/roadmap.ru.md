@@ -39,7 +39,7 @@
 - DSL step `baaPlanObjects` материализует `plan.objects` BAA-запроса во временную таблицу без runtime-записи в CMDBuild.
 - Production health/readiness endpoint'ы реализованы: live, ready, redis.
 - Redis password поддерживается через secret file/env/URL и маскируется в health/status ответах.
-- Docker runtime packaging, минимальный GitHub Actions CI, retry/backoff, execution throttling, graceful shutdown, keep-alive CMDBuild agents, security headers, Prometheus `/metrics`, Redis strict mode, regex guard и template `specHash` conflict guard реализованы как audit hardening.
+- Docker runtime packaging, минимальные GitHub Actions/GitLab CI, retry/backoff, execution throttling, graceful shutdown, keep-alive CMDBuild agents, security headers, nginx rate limiting, strict CMDBuild proxy allowlist, JSON mutation `Content-Type` checks, Prometheus `/metrics`, Redis strict mode, regex guard и template `specHash` conflict guard реализованы как audit hardening.
 - `PROJECT_DOCUMENTATION.md`, audit remediation notes и начальные ADR фиксируют текущую карту документации и отложенные архитектурные решения.
 - Nginx same-origin маршрут `/health/` проксируется в dynamicpages backend.
 - Документация ведется на английском и русском.

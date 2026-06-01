@@ -69,6 +69,7 @@ const SECURITY_HEADERS_ENABLED = process.env.CMDBDYNAMIC_SECURITY_HEADERS_ENABLE
 const SECURITY_CSP_FRAME_ANCESTORS = String(process.env.CMDBDYNAMIC_CSP_FRAME_ANCESTORS || "'self'").replace(/[\r\n]/g, ' ').trim();
 const SECURITY_HSTS_ENABLED = process.env.CMDBDYNAMIC_HSTS_ENABLED === 'true';
 const SECURITY_X_FRAME_OPTIONS = String(process.env.CMDBDYNAMIC_X_FRAME_OPTIONS || '').replace(/[\r\n]/g, ' ').trim();
+const PROXY_ALLOWLIST_STRICT = process.env.CMDP_PROXY_ALLOWLIST_STRICT !== 'false';
 const DEFAULT_TEMPLATE_CACHE_TTL_HOURS = Math.min(24, Math.max(1, Number(process.env.CMDBDYNAMIC_TEMPLATE_CACHE_TTL_HOURS || 8) || 8));
 const DEFAULT_TEMPLATE_CACHE_TTL_SEC = Math.round(DEFAULT_TEMPLATE_CACHE_TTL_HOURS * 60 * 60);
 const RUNTIME_REFRESH_COOLDOWN_MS = Math.max(10_000, Number(process.env.CMDBDYNAMIC_REFRESH_COOLDOWN_MS || 3 * 60 * 1000) || 3 * 60 * 1000);
@@ -1033,6 +1034,19 @@ function shouldLogProxyRequest(pathname) {
 
 function isCmdbDynamicPagesScript(pathname) {
   return pathname.endsWith('/view/custompages/CmdbDynamicPages/CmdbDynamicPages.js');
+}
+
+function pathMatchesPrefix(pathname, prefix) {
+  return pathname === prefix || pathname.startsWith(`${prefix}/`);
+}
+
+function isCmdbuildProxyPathAllowed(pathname, strict = PROXY_ALLOWLIST_STRICT) {
+  if (!strict) return true;
+  const pathText = String(pathname || '/');
+  return pathText === '/cmdbuild' ||
+    pathText === '/cmdbuild/' ||
+    pathMatchesPrefix(pathText, '/cmdbuild/ui') ||
+    pathMatchesPrefix(pathText, '/cmdbuild/services/rest');
 }
 
 function isCmdbuildUiEntry(pathname) {
@@ -10852,6 +10866,27 @@ function readJsonBody(req, maxBytes = 64 * 1024) {
   });
 }
 
+function isJsonContentType(value) {
+  const source = Array.isArray(value) ? value[0] : value;
+  const mediaType = String(source || '').split(';', 1)[0].trim().toLowerCase();
+  return mediaType === 'application/json' || (mediaType.startsWith('application/') && mediaType.endsWith('+json'));
+}
+
+function requireJsonContentType(req, res) {
+  if (isJsonContentType(req.headers['content-type'])) return true;
+  logWarn('security.content_type_rejected', {
+    requestId: req.cmdpRequestId || '',
+    method: req.method || '',
+    path: sanitizeReqUrl(req),
+    contentType: truncateText(String(req.headers['content-type'] || ''), 120)
+  });
+  sendJson(res, 415, {
+    success: false,
+    message: 'State-changing custom API calls with JSON bodies require Content-Type: application/json.'
+  });
+  return false;
+}
+
 function executionThrottleScopeKey({ sessionHash = '', authToken = '', remoteAddress = '', action = '', templateCode = '' } = {}) {
   const actorHash = sessionHash ||
     (authToken ? sha256Hex(authToken).slice(0, 16) : '') ||
@@ -17034,6 +17069,7 @@ async function handleBackend(req, res, requestUrl) {
   if (requestUrl.pathname === `${BACKEND_PREFIX}/schema/preview`) {
     if (!methodAllowed(req, res, 'POST')) return;
     if (!requireStateChangingRequest(req, res, authToken)) return;
+    if (!requireJsonContentType(req, res)) return;
     const body = await readJsonBody(req);
     const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
     const parent = schemaParentFromInput(body, requestUrl.searchParams.get('parent') || 'Class');
@@ -17050,6 +17086,7 @@ async function handleBackend(req, res, requestUrl) {
     if (!methodAllowed(req, res, 'POST')) return;
     if (!requireStateChangingRequest(req, res, authToken)) return;
     if (!(await requireAdminClassesModify(authToken, res))) return;
+    if (!requireJsonContentType(req, res)) return;
     const body = await readJsonBody(req);
     const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
     const parent = schemaParentFromInput(body, requestUrl.searchParams.get('parent') || 'Class');
@@ -17084,6 +17121,7 @@ async function handleBackend(req, res, requestUrl) {
 
     if (req.method === 'PUT') {
       if (!requireStateChangingRequest(req, res, authToken)) return;
+      if (!requireJsonContentType(req, res)) return;
       const body = await readJsonBody(req);
       const found = await findConfigCard(authToken, root);
       if (!found.response.ok) {
@@ -17136,6 +17174,7 @@ async function handleBackend(req, res, requestUrl) {
     }
     if (!methodAllowed(req, res, 'POST')) return;
     if (!requireStateChangingRequest(req, res, authToken)) return;
+    if (!requireJsonContentType(req, res)) return;
 
     let draft;
     try {
@@ -17252,6 +17291,7 @@ async function handleBackend(req, res, requestUrl) {
 
     if (req.method === 'POST') {
       if (!requireStateChangingRequest(req, res, authToken)) return;
+      if (!requireJsonContentType(req, res)) return;
       const body = await readJsonBody(req);
       const session = await getSessionData(authToken);
       const payload = normalizeTemplatePayload(body, null, session.data && session.data.username);
@@ -17355,6 +17395,7 @@ async function handleBackend(req, res, requestUrl) {
         if (templateAction === 'baa-verify') {
           if (!requireBaaStateChangingRequest(req, res, authToken, authSource)) return;
         } else if (!requireStateChangingRequest(req, res, authToken)) return;
+        if (!requireJsonContentType(req, res)) return;
       }
 
       const found = await findTemplateCard(authToken, root, templateCode);
@@ -17774,6 +17815,7 @@ async function handleBackend(req, res, requestUrl) {
 
     if (req.method === 'PUT') {
       if (!requireStateChangingRequest(req, res, authToken)) return;
+      if (!requireJsonContentType(req, res)) return;
       const found = await findTemplateCard(authToken, root, templateCode);
       if (!found.response.ok) {
         if (sendTechnicalSchemaAccessDeniedIfNeeded(res, {
@@ -17965,6 +18007,18 @@ async function handleDynamicPagesUi(req, res, requestUrl) {
 }
 
 function proxyToCmdbuild(req, res, requestUrl) {
+  if (!isCmdbuildProxyPathAllowed(requestUrl.pathname)) {
+    logWarn('security.proxy_path_rejected', {
+      requestId: req.cmdpRequestId || '',
+      method: req.method || '',
+      path: sanitizeRequestPath(requestUrl)
+    });
+    sendJson(res, 403, {
+      success: false,
+      message: 'CMDBuild proxy path is not allowed.'
+    });
+    return;
+  }
   logProxyRequest(req, requestUrl);
   const target = new URL(req.url || '/', CMDBUILD_ORIGIN);
   const headers = { ...req.headers };
@@ -18172,6 +18226,8 @@ export {
   expectedSpecHashFromBody,
   executeBaaPlanObjects,
   incMetric,
+  isCmdbuildProxyPathAllowed,
+  isJsonContentType,
   ipv4ValueMatches,
   loggingStatus,
   normalizedBaaRequestForCache,

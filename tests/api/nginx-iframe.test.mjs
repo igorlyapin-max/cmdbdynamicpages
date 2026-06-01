@@ -11,13 +11,20 @@ const runtimeTemplate = process.env.CMDBDYNAMIC_E2E_TEMPLATE || 'ProbeClassesByA
 const runtimeAttrType = process.env.CMDBDYNAMIC_E2E_ATTR_TYPE || 'reference';
 const cookieHeader = process.env.CMDBUILD_COOKIE_HEADER || readCookieJar(cookieJar);
 const nginxAvailable = await canReach(`${nginxOrigin}/health/live`);
-const skipWhenUnavailable = nginxAvailable ? false : `nginx same-origin front is not reachable at ${nginxOrigin}`;
+const skipWhenUnavailable = nginxAvailable ? false : `nginx same-origin front did not return healthy /health/live at ${nginxOrigin}`;
 
 test('nginx config keeps wiki and dynamicpages on the same origin', () => {
   const config = fs.readFileSync('nginx/cmdbdynamicpages-dev.conf', 'utf8');
 
   assert.match(config, /listen\s+8088;/);
+  assert.match(config, /limit_req_zone\s+\$binary_remote_addr\s+zone=cmdp_api:/);
+  assert.match(config, /limit_req_status\s+429;/);
+  assert.match(config, /location\s+\/cmdbuild\/custom-api\/\s*\{/);
+  assert.match(config, /limit_req\s+zone=cmdp_api\s+burst=30\s+nodelay;/);
+  assert.match(config, /location\s+\/cmdbuild\/dynamicpages\/\s*\{/);
+  assert.match(config, /limit_req\s+zone=cmdp_dynamicpages\s+burst=60\s+nodelay;/);
   assert.match(config, /location\s+\/cmdbuild\/\s*\{/);
+  assert.match(config, /limit_req\s+zone=cmdp_cmdbuild\s+burst=120\s+nodelay;/);
   assert.match(config, /proxy_pass\s+http:\/\/127\.0\.0\.1:8093\/cmdbuild\/;/);
   assert.match(config, /location\s+\/health\/\s*\{/);
   assert.match(config, /proxy_pass\s+http:\/\/127\.0\.0\.1:8093\/health\/;/);
@@ -57,7 +64,7 @@ test('wiki root is still served by nginx root proxy', { skip: skipWhenUnavailabl
 async function canReach(url) {
   try {
     const result = await request('GET', url, undefined, {}, 1500);
-    return result.statusCode > 0;
+    return result.statusCode === 200;
   } catch {
     return false;
   }

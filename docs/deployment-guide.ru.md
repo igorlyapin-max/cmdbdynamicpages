@@ -176,7 +176,9 @@ http://127.0.0.1:8093/metrics
 
 - Не включать generic REST proxy.
 - Не логировать `cookie`, `authorization`, `CMDBuild-Authorization`, CSRF tokens и Redis password.
-- State-changing API должны проходить same-origin + CSRF.
+- State-changing API должны проходить same-origin + CSRF и передавать `Content-Type: application/json`, если тело запроса JSON.
+- Оставлять `CMDP_PROXY_ALLOWLIST_STRICT=true`, если только контролируемое развертывание явно не требует проксировать дополнительные CMDBuild paths.
+- Применять reverse-proxy rate limiting, эквивалентный bundled nginx `limit_req` rules для `/cmdbuild/custom-api/`, `/cmdbuild/dynamicpages/` и общего `/cmdbuild/` traffic.
 - Задавать `CMDBDYNAMICPAGES_CSRF_SECRET` из стабильного внешнего secret; random fallback предназначен только для local/dev.
 - Включать `CMDBDYNAMIC_REDIS_REQUIRED=true` для production scale-out или когда static snapshots входят в service contract.
 - Redis RDB snapshot нужен для static snapshot страниц.

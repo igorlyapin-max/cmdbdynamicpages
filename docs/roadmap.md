@@ -69,7 +69,7 @@ Done:
 - DSL step `baaPlanObjects` materializes BAA `plan.objects` as a temporary table without runtime writes to CMDBuild.
 - Production health/readiness endpoints are implemented with strict Redis visibility checks and CMDBuild upstream reachability checks.
 - Redis password support is implemented through deployment secrets (`CMDBDYNAMIC_REDIS_PASSWORD_FILE` preferred) and Redis credentials are masked in health/status responses.
-- Docker runtime packaging, minimal GitHub Actions CI, retry/backoff, execution throttling, graceful shutdown, keep-alive CMDBuild agents, security headers, Prometheus `/metrics`, Redis strict mode, regex guard, and template `specHash` conflict guard are implemented as audit hardening.
+- Docker runtime packaging, minimal GitHub Actions/GitLab CI, retry/backoff, execution throttling, graceful shutdown, keep-alive CMDBuild agents, security headers, nginx rate limiting, strict CMDBuild proxy allowlist, JSON mutation `Content-Type` checks, Prometheus `/metrics`, Redis strict mode, regex guard, and template `specHash` conflict guard are implemented as audit hardening.
 - `PROJECT_DOCUMENTATION.md`, audit remediation notes, and initial ADRs document the current documentation map and deferred architecture decisions.
 - Russian documentation is maintained in parallel with the English documentation.
 - Architecture artifacts are maintained under `aa/`.

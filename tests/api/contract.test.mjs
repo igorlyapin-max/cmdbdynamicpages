@@ -59,6 +59,31 @@ test('state-changing custom API call without CSRF/session is rejected', { skip: 
   assert.ok([401, 403].includes(result.statusCode), `unexpected HTTP ${result.statusCode}`);
 });
 
+test('state-changing custom API rejects non-JSON content type', { skip: skipWhenUnavailable }, async () => {
+  const cookie = 'CMDBuild-Authorization=fake-content-type-token';
+  const csrfResult = await request('GET', `${proxyOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  assert.equal(csrfResult.statusCode, 200);
+  const csrfToken = JSON.parse(csrfResult.body).token;
+
+  const result = await request('POST', `${proxyOrigin}/cmdbuild/custom-api/draft/validate`, {
+    template: { code: 'WrongContentType', spec: { version: 1, steps: [], result: { tables: [] } } },
+    params: {}
+  }, {
+    cookie,
+    origin: proxyOrigin,
+    'x-cmdbdynamicpages-csrf': csrfToken,
+    'content-type': 'text/plain'
+  });
+
+  assert.equal(result.statusCode, 415);
+});
+
+test('CMDBuild proxy fallback rejects paths outside the allowlist', { skip: skipWhenUnavailable }, async () => {
+  const result = await request('GET', `${proxyOrigin}/cmdbuild/manager/html`);
+
+  assert.equal(result.statusCode, 403);
+});
+
 async function canReach(url) {
   try {
     const result = await request('GET', url, undefined, {}, 1500);
@@ -78,7 +103,7 @@ function request(method, url, body, extraHeaders = {}, timeoutMs = 5000) {
       ...extraHeaders
     };
     if (payload !== null) {
-      headers['content-type'] = 'application/json';
+      if (!hasHeader(headers, 'content-type')) headers['content-type'] = 'application/json';
       headers['content-length'] = Buffer.byteLength(payload);
     }
     const req = transport.request({
@@ -105,4 +130,9 @@ function request(method, url, body, extraHeaders = {}, timeoutMs = 5000) {
     if (payload !== null) req.write(payload);
     req.end();
   });
+}
+
+function hasHeader(headers, name) {
+  const normalized = String(name || '').toLowerCase();
+  return Object.keys(headers).some((key) => key.toLowerCase() === normalized);
 }

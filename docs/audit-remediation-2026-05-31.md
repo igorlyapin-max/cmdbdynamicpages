@@ -1,6 +1,6 @@
 # Audit Remediation 2026-05-31
 
-Источник: `/home/lsk/projects/audit/cmdb2custompages-audit-2026-05-31.md`.
+Источник: `/home/lsk/projects/audit/cmdbcustompages-audit-2026-05-31.md`.
 
 ## Закрыто в P0/P1
 
@@ -10,7 +10,7 @@
 | R-003 | Execution throttling добавлен для template execution. |
 | R-004 | Graceful shutdown добавлен для SIGTERM/SIGINT. |
 | R-005 | Добавлен backend `Dockerfile` с non-root user и healthcheck. |
-| R-006 | Добавлен минимальный GitHub Actions CI на `npm test`. |
+| R-006 | Добавлены минимальные GitHub Actions и GitLab CI на `npm test`. |
 | R-007 | Добавлен `CMDBDYNAMIC_REDIS_REQUIRED=true`, отключающий memory fallback. |
 | R-008 | Добавлен `/metrics` с Prometheus text exposition. |
 | R-012 | Добавлен keep-alive agent для CMDBuild REST/proxy calls. |
@@ -28,6 +28,7 @@
 | Нет ADR | Добавить короткие ADR для zero-deps, raw RESP Redis и текущей границы monolithic backend. |
 | Нет runbook/SLO baseline | Зафиксировать минимальные production checks, SLI candidates и alert inputs в deployment/testing/health/metrics docs. |
 | Недостаток test coverage | Добавить skip-safe API smoke для `/metrics`. |
+| Security perimeter hardening | Добавить nginx `limit_req`, strict allowlist для CMDBuild proxy fallback и `Content-Type: application/json` для JSON mutation endpoints. |
 
 ## Отложено как архитектурное
 
@@ -41,7 +42,7 @@
 - K8s/Helm/GitOps manifests;
 - distributed lock для schema bootstrap;
 - persistent audit log / DLQ;
-- full rate limiting per IP на reverse proxy boundary;
+- advanced production-specific rate limiting policies beyond bundled nginx config;
 - migration с raw RESP на node-redis/ioredis.
 
 ## Acceptance

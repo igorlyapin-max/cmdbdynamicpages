@@ -176,7 +176,9 @@ In production, `/health/ready` must see Redis and CMDBuild upstream. `/metrics` 
 
 - Do not enable a generic REST proxy.
 - Do not log `cookie`, `authorization`, `CMDBuild-Authorization`, CSRF tokens, or Redis password.
-- State-changing API calls must pass same-origin + CSRF checks.
+- State-changing API calls must pass same-origin + CSRF checks and send `Content-Type: application/json` when they carry a JSON body.
+- Keep `CMDP_PROXY_ALLOWLIST_STRICT=true` unless a controlled deployment explicitly needs to proxy additional CMDBuild paths.
+- Apply reverse-proxy rate limiting equivalent to the bundled nginx `limit_req` rules for `/cmdbuild/custom-api/`, `/cmdbuild/dynamicpages/`, and general `/cmdbuild/` traffic.
 - Set `CMDBDYNAMICPAGES_CSRF_SECRET` from an external stable secret; the random fallback is for local/dev only.
 - Set `CMDBDYNAMIC_REDIS_REQUIRED=true` for production scale-out or when static snapshots are part of the service contract.
 - Redis RDB snapshot is required for static snapshot pages.

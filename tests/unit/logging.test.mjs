@@ -7,6 +7,8 @@ import {
   executionThrottleScopeKey,
   expectedSpecHashFromBody,
   incMetric,
+  isCmdbuildProxyPathAllowed,
+  isJsonContentType,
   loggingStatus,
   normalizeLogFormat,
   normalizeLogLevel,
@@ -70,6 +72,24 @@ test('security headers are iframe-safe by default', () => {
   assert.match(headers['content-security-policy'], /frame-ancestors 'self'/);
   assert.equal(headers['x-frame-options'], undefined);
   assert.equal(headers['strict-transport-security'], undefined);
+});
+
+test('JSON content type helper accepts only JSON media types', () => {
+  assert.equal(isJsonContentType('application/json'), true);
+  assert.equal(isJsonContentType('application/json; charset=utf-8'), true);
+  assert.equal(isJsonContentType('application/vnd.api+json'), true);
+  assert.equal(isJsonContentType('text/plain'), false);
+  assert.equal(isJsonContentType(''), false);
+});
+
+test('CMDBuild proxy allowlist keeps UI and REST paths narrow', () => {
+  assert.equal(isCmdbuildProxyPathAllowed('/cmdbuild', true), true);
+  assert.equal(isCmdbuildProxyPathAllowed('/cmdbuild/ui/', true), true);
+  assert.equal(isCmdbuildProxyPathAllowed('/cmdbuild/services/rest/v3/classes', true), true);
+  assert.equal(isCmdbuildProxyPathAllowed('/cmdbuild/services', true), false);
+  assert.equal(isCmdbuildProxyPathAllowed('/cmdbuild/manager/html', true), false);
+  assert.equal(isCmdbuildProxyPathAllowed('/', true), false);
+  assert.equal(isCmdbuildProxyPathAllowed('/cmdbuild/manager/html', false), true);
 });
 
 test('CMDBuild retry helpers only retry safe transient requests by default', () => {
