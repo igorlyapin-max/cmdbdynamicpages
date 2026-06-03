@@ -660,6 +660,28 @@ if (writeMode) {
     return `versions=${json.data.length}`;
   });
 
+  await test('write template expectedSpecHash conflict', async () => {
+    const current = await request('GET', `${proxyOrigin}/cmdbuild/custom-api/templates/${encodeURIComponent(writeTemplate)}?root=${encodeURIComponent(root)}`);
+    assertStatus(current, 200);
+    const currentJson = getJson(current);
+    const currentTemplate = currentJson.template || {};
+    assert(currentTemplate.specHash && /^[a-f0-9]{64}$/.test(currentTemplate.specHash), 'Current template specHash is missing.');
+    const staleHash = currentTemplate.specHash === '0'.repeat(64) ? '1'.repeat(64) : '0'.repeat(64);
+    const result = await request('PUT', `${proxyOrigin}/cmdbuild/custom-api/templates/${encodeURIComponent(writeTemplate)}?root=${encodeURIComponent(root)}`, {
+      code: currentTemplate.code || writeTemplate,
+      description: currentTemplate.description || writeTemplate,
+      active: currentTemplate.active !== false,
+      spec: currentTemplate.spec,
+      expectedSpecHash: staleHash,
+      changeComment: 'write e2e conflict probe'
+    }, withCsrf(csrf));
+    assertStatus(result, 409);
+    const json = getJson(result);
+    assert(json.reason === 'template_version_conflict', 'Conflict response reason is invalid.');
+    assert(json.currentSpecHash === currentTemplate.specHash, 'Conflict response did not return current spec hash.');
+    return `current=${json.currentSpecHash.slice(0, 12)} expected=${json.expectedSpecHash.slice(0, 12)}`;
+  });
+
   await test('write template validate', async () => {
     const result = await request('POST', `${proxyOrigin}/cmdbuild/custom-api/templates/${encodeURIComponent(writeTemplate)}/validate?root=${encodeURIComponent(root)}`, {}, withCsrf(csrf));
     assertStatus(result, 200);

@@ -51,6 +51,7 @@ Done:
 - `npm run test:nginx` validates nginx config and same-origin wiki/dynamicpages routes through `localhost:8088`.
 - `npm run e2e` verifies session, logging diagnostics, schema readiness, CSRF rejection, draft preview without runtime cache, Runtime shell loading, saved-template run, cache hit, POST `forceRefresh`, and that GET runtime cannot force refresh.
 - `npm run e2e:write` creates or updates a stable smoke template and verifies save/version/runtime flow.
+- `npm run e2e:write` verifies `expectedSpecHash` conflict handling for stale template updates.
 - `npm run e2e:limited` logs in as local `mdavis` / `Helpdesk`, verifies runtime access, and verifies template create is rejected.
 - Designer caches the CMDBuild model catalog client-side and shows a header freshness lamp with manual sync; stale/yellow starts after 24 hours.
 - Designer has the first object-group visual mode for one or more named selections (`Выборка 1`, `Выборка 2`, ...), each compiled to its own `selectCards` result.
@@ -71,6 +72,7 @@ Done:
 - Redis password support is implemented through deployment secrets (`CMDBDYNAMIC_REDIS_PASSWORD_FILE` preferred) and Redis credentials are masked in health/status responses.
 - Docker runtime packaging, minimal GitHub Actions/GitLab CI, retry/backoff, execution throttling, graceful shutdown, keep-alive CMDBuild agents, security headers, nginx rate limiting, strict CMDBuild proxy allowlist, JSON mutation `Content-Type` checks, Prometheus `/metrics`, Redis strict mode, regex guard, and template `specHash` conflict guard are implemented as audit hardening.
 - `PROJECT_DOCUMENTATION.md`, audit remediation notes, and initial ADRs document the current documentation map and deferred architecture decisions.
+- `docs/runbook.md` documents deploy checks, rollback, diagnostics, incidents, SLI candidates, and alert inputs.
 - Russian documentation is maintained in parallel with the English documentation.
 - Architecture artifacts are maintained under `aa/`.
 
@@ -78,10 +80,10 @@ Not done:
 
 - No remaining core implementation items in the current plan.
 - Example templates are tracked separately from the implementation plan.
-- Deeper Playwright Runtime table checks for client-side search/sort and grouped table behavior are planned but not implemented.
-- Browser-level iframe rendering inside a real wiki page is planned when a stable local wiki test page is available.
+- Deeper Playwright Runtime table checks are implemented as skip-safe tests and depend on available live template fixtures for full coverage.
+- Browser-level iframe rendering inside a real wiki page is implemented as an optional smoke through `CMDBDYNAMIC_WIKI_IFRAME_URL`.
 - Browser/API smoke for a live `cmdbaa` exchange will be added separately after the external scenario stabilizes.
-- Live `expectedSpecHash` conflict coverage will be added when a stable write-test template fixture is available.
+- A stable local wiki page still needs to be maintained so the optional iframe smoke can run regularly.
 
 ## 1. CMDBuild Roles/Groups Check
 

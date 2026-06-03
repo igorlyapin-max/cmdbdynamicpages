@@ -6,6 +6,8 @@ import https from 'node:https';
 import { URL } from 'node:url';
 
 const proxyOrigin = process.env.CMDBDYNAMIC_PROXY || 'http://127.0.0.1:8093';
+const nginxOrigin = process.env.CMDBDYNAMIC_NGINX_ORIGIN || 'http://localhost:8088';
+const wikiIframeUrl = process.env.CMDBDYNAMIC_WIKI_IFRAME_URL || '';
 const cookieJar = process.env.CMDBUILD_COOKIE_JAR || '/tmp/cmdbuild-ui-cookie.txt';
 const runtimeTemplate = process.env.CMDBDYNAMIC_E2E_TEMPLATE || 'ProbeClassesByAttributeType';
 const runtimeAttrType = process.env.CMDBDYNAMIC_E2E_ATTR_TYPE || 'reference';
@@ -60,8 +62,7 @@ test('Designer run page exposes contextual buttons after selecting a template', 
 
 test('Runtime page renders the compact runtime shell and table area', { skip: skipReason }, async () => {
   await withPage(async (page) => {
-    const url = `${proxyOrigin}/cmdbuild/dynamicpages/ui/run/${encodeURIComponent(runtimeTemplate)}?attrType=${encodeURIComponent(runtimeAttrType)}`;
-    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    await page.goto(runtimeUrl(), { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('body.runtime-page', { timeout: 10_000 });
     await page.waitForSelector('main#app', { timeout: 10_000 });
     await page.waitForTimeout(500);
@@ -72,15 +73,182 @@ test('Runtime page renders the compact runtime shell and table area', { skip: sk
   });
 });
 
-async function withPage(fn) {
+test('Runtime table search and sort work on rendered rows', { skip: skipReason }, async (t) => {
+  await withPage(async (page) => {
+    await page.goto(runtimeUrl(), { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('body.runtime-page', { timeout: 10_000 });
+    await page.waitForSelector('main#app', { timeout: 10_000 });
+    await page.waitForTimeout(500);
+
+    const table = page.locator('[data-result-table]').first();
+    if (await table.count() === 0) {
+      t.skip('Runtime did not render a table for the current template.');
+      return;
+    }
+
+    const filter = table.locator('[data-result-filter]').first();
+    const sortButton = table.locator('[data-result-sort]').first();
+    const rowCount = await table.locator('tr[data-result-row]').count();
+    if (await filter.count() === 0 || await sortButton.count() === 0 || rowCount < 2) {
+      t.skip('Current runtime table does not expose filter/sort controls with at least two rows.');
+      return;
+    }
+
+    const filterToken = await bestFilterToken(table);
+    if (!filterToken) {
+      t.skip('Current runtime table has no selective cell text for filter verification.');
+      return;
+    }
+    await filter.fill(filterToken);
+    const visibleAfterFilter = await visibleRowTexts(table);
+    assert.ok(visibleAfterFilter.length >= 1, 'Filter hid every row.');
+    assert.ok(visibleAfterFilter.every((text) => text.toLowerCase().includes(filterToken.toLowerCase())), 'Filter left a non-matching row visible.');
+    await filter.fill('');
+
+    const before = await columnValuesForButton(table, sortButton);
+    const comparable = before.filter((value) => value !== '');
+    if (new Set(comparable).size < 2) {
+      t.skip('First sortable column does not have varied values.');
+      return;
+    }
+    await sortButton.click();
+    const desc = await columnValuesForButton(table, sortButton);
+    assert.deepEqual(desc, sortedValues(desc, 'desc'), 'Runtime sort button did not sort the column descending.');
+    await sortButton.click();
+    const asc = await columnValuesForButton(table, sortButton);
+    assert.deepEqual(asc, sortedValues(asc, 'asc'), 'Runtime sort button did not sort the column ascending.');
+  });
+});
+
+test('Runtime row grouping disables table controls', { skip: skipReason }, async (t) => {
+  await withPage(async (page) => {
+    await page.goto(runtimeUrl(), { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('body.runtime-page', { timeout: 10_000 });
+    await page.waitForSelector('main#app', { timeout: 10_000 });
+    await page.waitForTimeout(500);
+
+    const groupedTable = page.locator('[data-result-table]').filter({ has: page.locator('.cmdp-row-group-cell') }).first();
+    if (await groupedTable.count() === 0) {
+      t.skip('Current runtime template does not render a grouped table.');
+      return;
+    }
+
+    assert.equal(await groupedTable.locator('[data-result-filter]').count(), 0);
+    assert.equal(await groupedTable.locator('[data-result-sort]').count(), 0);
+    assert.ok(await groupedTable.locator('.result-table-note').isVisible());
+  });
+});
+
+test('Runtime subtable sorting stays local to each rendered group', { skip: skipReason }, async (t) => {
+  await withPage(async (page) => {
+    await page.goto(runtimeUrl(), { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('body.runtime-page', { timeout: 10_000 });
+    await page.waitForSelector('main#app', { timeout: 10_000 });
+    await page.waitForTimeout(500);
+
+    const table = page.locator('[data-result-table]').filter({ has: page.locator('[data-result-group]') }).first();
+    if (await table.count() === 0 || await table.locator('[data-result-group]').count() < 2 || await table.locator('[data-result-sort]').count() === 0) {
+      t.skip('Current runtime template does not render sortable split subtables.');
+      return;
+    }
+
+    const sortButton = table.locator('[data-result-sort]').first();
+    await sortButton.click();
+    const groups = await groupedColumnValuesForButton(table, sortButton);
+    if (groups.length < 2 || groups.some((group) => new Set(group.filter(Boolean)).size < 2)) {
+      t.skip('Rendered subtables do not have varied values for local sort verification.');
+      return;
+    }
+    groups.forEach((group) => {
+      assert.deepEqual(group, sortedValues(group, 'desc'));
+    });
+  });
+});
+
+test('Wiki page embeds runtime iframe in a browser context', { skip: playwright && wikiIframeUrl ? false : 'Set CMDBDYNAMIC_WIKI_IFRAME_URL and install Playwright to run browser-level wiki iframe smoke.' }, async () => {
+  await withPage(async (page) => {
+    await page.goto(wikiIframeUrl, { waitUntil: 'domcontentloaded' });
+    const frameHandle = page.frameLocator('iframe[src*="/cmdbuild/dynamicpages/ui/run/"]').first();
+    await frameHandle.locator('body').waitFor({ timeout: 10_000 });
+    const shellCount = await frameHandle.locator('.result-table-wrap, .notice').count();
+    assert.ok(shellCount > 0, 'Runtime iframe did not render a result table or notice.');
+  }, { cookieOrigin: originFromUrl(wikiIframeUrl) || nginxOrigin });
+});
+
+async function withPage(fn, options = {}) {
   const browser = await playwright.chromium.launch({ headless: true });
   try {
     const context = await browser.newContext();
-    await context.addCookies(cookiesForOrigin(cookieHeader, proxyOrigin));
+    await context.addCookies(cookiesForOrigin(cookieHeader, options.cookieOrigin || proxyOrigin));
     const page = await context.newPage();
     await fn(page);
   } finally {
     await browser.close();
+  }
+}
+
+function runtimeUrl() {
+  return `${proxyOrigin}/cmdbuild/dynamicpages/ui/run/${encodeURIComponent(runtimeTemplate)}?attrType=${encodeURIComponent(runtimeAttrType)}`;
+}
+
+async function bestFilterToken(table) {
+  const rows = await table.locator('tr[data-result-row]').evaluateAll((nodes) => nodes.map((row) => {
+    const cells = Array.from(row.querySelectorAll('td')).map((cell) => String(cell.textContent || '').trim()).filter(Boolean);
+    return { text: String(row.getAttribute('data-filter-text') || '').toLowerCase(), cells };
+  }));
+  const total = rows.length;
+  const candidates = [];
+  rows.forEach((row) => {
+    row.cells.forEach((cell) => {
+      const token = cell.trim();
+      if (token.length >= 2 && token.length <= 80) candidates.push(token);
+    });
+  });
+  const unique = Array.from(new Set(candidates));
+  unique.sort((left, right) => {
+    const leftCount = rows.filter((row) => row.text.includes(left.toLowerCase())).length;
+    const rightCount = rows.filter((row) => row.text.includes(right.toLowerCase())).length;
+    return leftCount - rightCount || left.length - right.length;
+  });
+  return unique.find((token) => {
+    const count = rows.filter((row) => row.text.includes(token.toLowerCase())).length;
+    return count > 0 && count < total;
+  }) || '';
+}
+
+async function visibleRowTexts(table) {
+  return await table.locator('tr[data-result-row]').evaluateAll((rows) => rows
+    .filter((row) => getComputedStyle(row).display !== 'none')
+    .map((row) => String(row.getAttribute('data-filter-text') || row.textContent || '')));
+}
+
+async function columnValuesForButton(table, sortButton) {
+  const index = Number(await sortButton.getAttribute('data-column-index') || 0);
+  return await table.locator('tbody').first().locator('tr[data-result-row]').evaluateAll((rows, columnIndex) => rows.map((row) => String(row.children[columnIndex] && row.children[columnIndex].textContent || '').trim()), index);
+}
+
+async function groupedColumnValuesForButton(table, sortButton) {
+  const index = Number(await sortButton.getAttribute('data-column-index') || 0);
+  return await table.locator('tbody').evaluateAll((bodies, columnIndex) => bodies.map((body) => Array.from(body.querySelectorAll('tr[data-result-row]')).map((row) => String(row.children[columnIndex] && row.children[columnIndex].textContent || '').trim())), index);
+}
+
+function sortedValues(values, direction) {
+  const multiplier = direction === 'desc' ? -1 : 1;
+  return values.slice().sort((left, right) => {
+    const leftNumber = Number(left);
+    const rightNumber = Number(right);
+    const result = !Number.isNaN(leftNumber) && !Number.isNaN(rightNumber) && left !== '' && right !== ''
+      ? leftNumber - rightNumber
+      : left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' });
+    return result * multiplier;
+  });
+}
+
+function originFromUrl(value) {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return '';
   }
 }
 

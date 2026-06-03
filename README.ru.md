@@ -171,6 +171,7 @@ Backend пишет структурированные операционные �
 CMDP_LOG_LEVEL=info
 CMDP_LOG_FORMAT=json
 CMDP_LOG_TARGET=stdout
+CMDP_DIAGNOSTIC_MODE=off
 CMDP_LOG_REDACT_HEADERS=cookie,authorization,cmdbuild-authorization,x-csrf-token,x-cmdbdynamicpages-csrf,set-cookie
 CMDP_LOG_REDACT_QUERY=password,passwd,pwd,token,secret,authorization,auth,csrf,x-cmdbdynamicpages-csrf
 ```
@@ -185,7 +186,16 @@ CMDP_SYSLOG_PROTOCOL=udp
 CMDP_SYSLOG_FACILITY=local0
 ```
 
-Если нужны оба канала, можно указать `CMDP_LOG_TARGET=stdout,syslog`. В логи попадают завершение HTTP-запросов, CSRF/same-origin отказы, изменение доступности Redis, ошибки CMDBuild upstream, runtime cache hit/miss/refresh, static snapshot publish/hit/miss и create/update/delete шаблонов. Cookie, authorization headers, CSRF token и secret-like query параметры маскируются. Runtime-строки результата и payload карточек CMDBuild в операционные логи не пишутся.
+`stdout` остается включенным даже при `CMDP_LOG_TARGET=syslog`. Если нужны оба канала явно, можно указать `CMDP_LOG_TARGET=stdout,syslog`. В логи попадают завершение HTTP-запросов, CSRF/same-origin отказы, изменение доступности Redis, ошибки CMDBuild upstream, runtime cache hit/miss/refresh, static snapshot publish/hit/miss и create/update/delete шаблонов. Cookie, authorization headers, CSRF token и secret-like query параметры маскируются. Runtime-строки результата и payload карточек CMDBuild в операционные логи не пишутся.
+
+Diagnostic mode выключен по умолчанию и включается без изменения кода:
+
+```text
+CMDP_DIAGNOSTIC_MODE=Basic
+CMDP_DIAGNOSTIC_MODE=Verbose
+```
+
+`Basic` пишет безопасные диагностические события через тот же structured logging pipeline. `Verbose` добавляет sanitized request и CMDBuild upstream diagnostics без request/response bodies, runtime rows, cookies, tokens, Redis password и raw CMDBuild payload. `Verbose` включать только временно на период диагностики. `/cmdbuild/custom-api/logging/status` показывает активный diagnostic mode и redaction policy без секретов.
 
 ## Designer
 

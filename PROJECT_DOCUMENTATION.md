@@ -6,6 +6,7 @@ This file is the short map for the project documentation set. It avoids copying 
 
 - [README](README.md): local development, current architecture, UI/runtime behavior, operational knobs.
 - [Deployment guide](docs/deployment-guide.md): production environment, Redis, CMDBuild permissions, post-deployment checks.
+- [Runbook](docs/runbook.md): deployment checks, rollback, diagnostics, incident triage, SLI and alert inputs.
 - [Testing plan](docs/testing-plan.md): available checks and remaining test gaps.
 - [Roadmap](docs/roadmap.md): current implementation status and planned test follow-ups.
 - [Changelog](CHANGELOG.md): release-facing change summary.
@@ -33,5 +34,6 @@ Russian mirrors are maintained for the main long-form docs:
 - [README.ru](README.ru.md)
 - [Architecture plan RU](docs/architecture-plan.ru.md)
 - [Deployment guide RU](docs/deployment-guide.ru.md)
+- [Runbook RU](docs/runbook.ru.md)
 - [Testing plan RU](docs/testing-plan.ru.md)
 - [Roadmap RU](docs/roadmap.ru.md)

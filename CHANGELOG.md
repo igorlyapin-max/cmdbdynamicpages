@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-06-03
+
+### Added
+
+- Added `CMDP_DIAGNOSTIC_MODE=off|Basic|Verbose` with safe structured diagnostic events and sanitized verbose diagnostics.
+- Added production startup validation for `CMDBDYNAMICPAGES_CSRF_SECRET`.
+- Added dependency-free `secret:scan`, `ci`, and ZIP build gates.
+- Added skip-safe Runtime table UI checks, optional browser-level wiki iframe smoke, write-mode `expectedSpecHash` conflict coverage, and production runbooks.
+
+### Changed
+
+- Kept `stdout` enabled for structured logs even when syslog is configured.
+- Updated GitHub Actions and GitLab CI to run the unified `npm run ci` gate.
+
 ## 2026-05-31
 
 ### Added

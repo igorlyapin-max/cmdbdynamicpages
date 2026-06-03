@@ -5,16 +5,18 @@ English branch. Russian branch: [testing-plan.ru.md](testing-plan.ru.md).
 ## Implemented
 
 - `npm run check`: syntax check for custom page, proxy, diagnostics, e2e, and validation scripts.
+- `npm run secret:scan`: scans repository text files for high-confidence committed secrets, excluding generated/runtime directories.
+- `npm run build:zip`: builds the CMDBuild custom page ZIP with the dependency-free Node builder.
+- `npm run ci`: runs `secret:scan`, `npm test`, and `build:zip`.
 - `npm run test:static`: validates required OpenAPI paths, local component references, and architecture artifact links.
-- `npm run test:unit`: covers cache configuration, cache key scope, refresh metadata, snapshot URL params, parameter defaults, IPv4 matching, dependency map, and logging redaction.
+- `npm run test:unit`: covers cache configuration, cache key scope, refresh metadata, snapshot URL params, parameter defaults, IPv4 matching, dependency map, logging redaction, diagnostic mode, and runtime config validation.
 - `npm run test:api`: skip-safe API contract smoke for `/health/*`, `/metrics`, protected logging status, and CSRF/session rejection against a running proxy.
-- `npm run test:ui`: skip-safe Playwright smoke for Designer template list, fixed menu/action bar, contextual Run buttons, and compact Runtime shell.
+- `npm run test:ui`: skip-safe Playwright smoke for Designer template list, fixed menu/action bar, contextual Run buttons, compact Runtime shell, runtime table search/sort, grouped-table control disabling, split-subtable local sorting, and optional real wiki iframe rendering through `CMDBDYNAMIC_WIKI_IFRAME_URL`.
 - `npm run test:nginx`: validates nginx config and checks same-origin wiki/dynamicpages routes through `localhost:8088`.
-- `npm run e2e`: extended to check logging diagnostics, draft preview without runtime cache, runtime cache hit, POST `forceRefresh`, and GET runtime not forcing refresh.
+- `npm run e2e`: checks logging diagnostics, draft preview without runtime cache, runtime cache hit, POST `forceRefresh`, GET runtime not forcing refresh, and write-mode `expectedSpecHash` conflict handling.
 
 ## Remaining
 
-- Add deeper Playwright Runtime table tests for client-side search/sort and disabled search/sort when row grouping is active.
-- Add browser-level iframe rendering assertion through a real wiki page when a stable test page is available in the local wiki.
 - Run live e2e with a fresh CMDBuild session or explicit `CMDBUILD_USERNAME`/`CMDBUILD_PASSWORD` when validating against a restarted environment.
-- Add live template update conflict coverage for `expectedSpecHash` when a stable write-test fixture is available.
+- Keep a stable local wiki page for `CMDBDYNAMIC_WIKI_IFRAME_URL` so optional browser-level iframe smoke can run regularly.
+- Add browser/API smoke for a live `cmdbaa` exchange after the external scenario stabilizes.

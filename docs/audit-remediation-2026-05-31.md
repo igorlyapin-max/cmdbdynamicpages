@@ -29,6 +29,7 @@
 | Нет runbook/SLO baseline | Зафиксировать минимальные production checks, SLI candidates и alert inputs в deployment/testing/health/metrics docs. |
 | Недостаток test coverage | Добавить skip-safe API smoke для `/metrics`. |
 | Security perimeter hardening | Добавить nginx `limit_req`, strict allowlist для CMDBuild proxy fallback и `Content-Type: application/json` для JSON mutation endpoints. |
+| Backlog modernization 2026-06-03 | Добавлены skip-safe Runtime UI table checks, optional browser wiki iframe smoke, write-mode `expectedSpecHash` conflict coverage и runbook/SLO baseline. |
 
 ## Отложено как архитектурное
 

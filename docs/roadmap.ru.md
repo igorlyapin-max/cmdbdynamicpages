@@ -41,6 +41,7 @@
 - Redis password поддерживается через secret file/env/URL и маскируется в health/status ответах.
 - Docker runtime packaging, минимальные GitHub Actions/GitLab CI, retry/backoff, execution throttling, graceful shutdown, keep-alive CMDBuild agents, security headers, nginx rate limiting, strict CMDBuild proxy allowlist, JSON mutation `Content-Type` checks, Prometheus `/metrics`, Redis strict mode, regex guard и template `specHash` conflict guard реализованы как audit hardening.
 - `PROJECT_DOCUMENTATION.md`, audit remediation notes и начальные ADR фиксируют текущую карту документации и отложенные архитектурные решения.
+- `docs/runbook.ru.md` фиксирует deploy checks, rollback, diagnostics, incidents, SLI candidates и alert inputs.
 - Nginx same-origin маршрут `/health/` проксируется в dynamicpages backend.
 - Документация ведется на английском и русском.
 - Архитектурные артефакты ведутся в `aa/`.
@@ -49,10 +50,10 @@
 
 - Нет оставшихся core implementation задач.
 - Примеры шаблонов ведутся отдельно от roadmap.
-- Глубокие Playwright Runtime table проверки для client-side search/sort и grouped table behavior пока не реализованы.
-- Browser-level проверка iframe внутри реальной wiki page запланирована, когда появится стабильная тестовая страница локальной wiki.
+- Глубокие Playwright Runtime table проверки реализованы как skip-safe tests и зависят от доступных live template fixtures для полного покрытия.
+- Browser-level проверка iframe внутри реальной wiki page реализована как optional smoke через `CMDBDYNAMIC_WIKI_IFRAME_URL`.
 - Browser/API smoke для живого `cmdbaa` exchange будет добавлен отдельно, когда внешний сценарий стабилизируется.
-- Live-покрытие конфликта `expectedSpecHash` будет добавлено, когда появится стабильная write-test fixture.
+- Стабильную local wiki page ещё нужно поддерживать, чтобы optional iframe smoke запускался регулярно.
 
 ## 1. Проверка ролей и групп CMDBuild
 

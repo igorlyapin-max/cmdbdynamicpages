@@ -26,7 +26,7 @@ flowchart TB
 | Режим | Настройка | Назначение | Примечание ИБ |
 | --- | --- | --- | --- |
 | Docker stdout | `CMDP_LOG_TARGET=stdout` | Базовый режим для контейнеров | Collector отвечает за доставку в ELK |
-| Syslog | `CMDP_LOG_TARGET=syslog` | VM/bare-metal, SIEM, существующий rsyslog/syslog-ng контур | UDP может терять сообщения; TCP предпочтительнее при строгих требованиях |
+| Syslog | `CMDP_LOG_TARGET=syslog` | VM/bare-metal, SIEM, существующий rsyslog/syslog-ng контур | `stdout` остается включенным; UDP может терять сообщения, TCP предпочтительнее при строгих требованиях |
 | Дублирование | `CMDP_LOG_TARGET=stdout,syslog` | Параллельная отправка в два контура | Следить за дублями в SIEM/ELK |
 
 ## Состав событий
@@ -38,6 +38,7 @@ flowchart TB
 - `runtime.cache_result` - cache hit/miss/refresh/join для runtime endpoint.
 - `snapshot.published`, `snapshot.hit`, `snapshot.miss` - публикация и выдача static snapshot.
 - `template.created`, `template.updated`, `template.deleted` и соответствующие `*_failed` - изменение шаблонов.
+- `diagnostic.*` - opt-in diagnostic events при `CMDP_DIAGNOSTIC_MODE=Basic|Verbose`.
 
 ## Маскирование
 
@@ -60,3 +61,5 @@ CMDP_LOG_REDACT_QUERY=password,passwd,pwd,token,secret,authorization,auth,csrf,x
 ## Диагностика
 
 `GET /cmdbuild/custom-api/logging/status` возвращает активный target, level, format и списки маскирования без секретов. Endpoint диагностический и не должен использоваться как readiness.
+
+`CMDP_DIAGNOSTIC_MODE=off` по умолчанию. `Basic` пишет безопасные diagnostic events без sensitive payload. `Verbose` добавляет sanitized HTTP и CMDBuild upstream diagnostics без request/response bodies, runtime rows, cookies, tokens, Redis password и raw CMDBuild payload; включать только временно.

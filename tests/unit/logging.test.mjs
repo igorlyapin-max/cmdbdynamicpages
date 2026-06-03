@@ -4,12 +4,14 @@ import assert from 'node:assert/strict';
 import {
   cmdbuildRequestCanRetry,
   cmdbuildRetryDelayMs,
+  diagnosticModeAllows,
   executionThrottleScopeKey,
   expectedSpecHashFromBody,
   incMetric,
   isCmdbuildProxyPathAllowed,
   isJsonContentType,
   loggingStatus,
+  normalizeDiagnosticMode,
   normalizeLogFormat,
   normalizeLogLevel,
   normalizeLogTargets,
@@ -18,10 +20,12 @@ import {
   redisRequiredError,
   renderPrometheusMetrics,
   sanitizeTemplateCard,
+  sanitizeHeaders,
   sanitizeRequestPath,
   setMetricGauge,
   securityHeaders,
   shouldRetryCmdbuildResult,
+  validateRuntimeConfig,
   validateRegexPattern
 } from '../../scripts/dev-proxy-server.mjs';
 
@@ -31,7 +35,18 @@ test('logging option normalizers keep only supported values', () => {
   assert.equal(normalizeLogFormat('text'), 'text');
   assert.equal(normalizeLogFormat('xml'), 'json');
   assert.deepEqual(normalizeLogTargets('stdout,syslog,stdout,bad'), ['stdout', 'syslog']);
+  assert.deepEqual(normalizeLogTargets('syslog'), ['stdout', 'syslog']);
   assert.deepEqual(normalizeLogTargets('bad'), ['stdout']);
+});
+
+test('diagnostic mode normalizers expose Basic and Verbose levels', () => {
+  assert.equal(normalizeDiagnosticMode('basic'), 'Basic');
+  assert.equal(normalizeDiagnosticMode('Verbose'), 'Verbose');
+  assert.equal(normalizeDiagnosticMode('unexpected'), 'off');
+  assert.equal(diagnosticModeAllows('Basic', 'Basic'), true);
+  assert.equal(diagnosticModeAllows('Verbose', 'Basic'), false);
+  assert.equal(diagnosticModeAllows('Verbose', 'Verbose'), true);
+  assert.equal(diagnosticModeAllows('Basic', 'off'), false);
 });
 
 test('redaction helpers mask configured header and query names', () => {
@@ -52,6 +67,20 @@ test('request path sanitizer redacts configured query secrets', () => {
   assert.doesNotMatch(path, /pwd/);
 });
 
+test('header sanitizer masks credentials and referer query secrets', () => {
+  const headers = sanitizeHeaders({
+    Authorization: 'secret-token',
+    Referer: 'http://127.0.0.1:8093/cmdbuild/ui/?token=secret&city=city49',
+    'User-Agent': 'unit-test'
+  });
+
+  assert.equal(headers.Authorization, '[REDACTED]');
+  assert.match(headers.Referer, /city=city49/);
+  assert.match(headers.Referer, /token=%5BREDACTED%5D/);
+  assert.doesNotMatch(headers.Referer, /secret/);
+  assert.equal(headers['User-Agent'], 'unit-test');
+});
+
 test('logging status is diagnostic and does not expose secret values', () => {
   const status = loggingStatus();
 
@@ -60,8 +89,32 @@ test('logging status is diagnostic and does not expose secret values', () => {
   assert.ok(Array.isArray(status.targets));
   assert.ok(Array.isArray(status.redactHeaders));
   assert.ok(Array.isArray(status.redactQuery));
+  assert.equal(typeof status.diagnostic.mode, 'string');
+  assert.deepEqual(status.diagnostic.levels, ['Basic', 'Verbose']);
   assert.equal(status.elk.directOutput, false);
   assert.match(status.elk.recommendedPipeline, /stdout\/syslog/);
+});
+
+test('runtime config validation fails closed for production CSRF secret', () => {
+  const invalid = validateRuntimeConfig({
+    nodeEnv: 'production',
+    csrfSecret: '',
+    logTargets: ['stdout'],
+    diagnosticMode: 'off'
+  });
+
+  assert.equal(invalid.ok, false);
+  assert.deepEqual(invalid.errors.map((item) => item.code), ['csrf_secret_required']);
+
+  const valid = validateRuntimeConfig({
+    nodeEnv: 'production',
+    csrfSecret: 'externally-managed-secret',
+    logTargets: ['stdout', 'syslog'],
+    diagnosticMode: 'Verbose'
+  });
+
+  assert.equal(valid.ok, true);
+  assert.deepEqual(valid.warnings.map((item) => item.code), ['verbose_diagnostic_in_production']);
 });
 
 test('security headers are iframe-safe by default', () => {

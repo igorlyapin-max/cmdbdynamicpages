@@ -8,4 +8,4 @@ npm_test:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH'
   script:
-    - npm test
+    - npm run ci

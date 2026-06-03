@@ -1106,6 +1106,26 @@ components:
               items:
                 type: string
                 enum: [stdout, syslog]
+            diagnostic:
+              type: object
+              properties:
+                mode:
+                  type: string
+                  enum: [off, Basic, Verbose]
+                enabled:
+                  type: boolean
+                levels:
+                  type: array
+                  items:
+                    type: string
+                    enum: [Basic, Verbose]
+                policy:
+                  type: object
+                  properties:
+                    basic:
+                      type: string
+                    verbose:
+                      type: string
             redactHeaders:
               type: array
               items:

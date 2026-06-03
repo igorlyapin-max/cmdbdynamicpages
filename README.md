@@ -429,6 +429,7 @@ The backend writes structured operational logs. Docker deployments should keep t
 CMDP_LOG_LEVEL=info
 CMDP_LOG_FORMAT=json
 CMDP_LOG_TARGET=stdout
+CMDP_DIAGNOSTIC_MODE=off
 CMDP_LOG_REDACT_HEADERS=cookie,authorization,cmdbuild-authorization,x-csrf-token,x-cmdbdynamicpages-csrf,set-cookie
 CMDP_LOG_REDACT_QUERY=password,passwd,pwd,token,secret,authorization,auth,csrf,x-cmdbdynamicpages-csrf
 ```
@@ -443,7 +444,16 @@ CMDP_SYSLOG_PROTOCOL=udp
 CMDP_SYSLOG_FACILITY=local0
 ```
 
-`CMDP_LOG_TARGET=stdout,syslog` can be used when both outputs are required. Logged events include request completion, CSRF/same-origin rejection, Redis availability changes, CMDBuild upstream errors, runtime cache status, static snapshot publish/hit/miss, and template create/update/delete. Cookies, authorization headers, CSRF tokens and configured secret-like query parameters are redacted; runtime result rows and CMDBuild card payloads are not logged. `/metrics` exposes only aggregate counters/gauges and does not include cookies, tokens, user names, runtime rows or raw CMDBuild payloads.
+`stdout` remains enabled even when `CMDP_LOG_TARGET=syslog` is configured. `CMDP_LOG_TARGET=stdout,syslog` can be used when both outputs are required explicitly. Logged events include request completion, CSRF/same-origin rejection, Redis availability changes, CMDBuild upstream errors, runtime cache status, static snapshot publish/hit/miss, and template create/update/delete. Cookies, authorization headers, CSRF tokens and configured secret-like query parameters are redacted; runtime result rows and CMDBuild card payloads are not logged. `/metrics` exposes only aggregate counters/gauges and does not include cookies, tokens, user names, runtime rows or raw CMDBuild payloads.
+
+Diagnostic mode is off by default and can be enabled without code changes:
+
+```text
+CMDP_DIAGNOSTIC_MODE=Basic
+CMDP_DIAGNOSTIC_MODE=Verbose
+```
+
+`Basic` emits safe diagnostic events through the same structured logging pipeline. `Verbose` adds sanitized request and CMDBuild upstream diagnostics without request/response bodies, runtime rows, cookies, tokens, Redis password, or raw CMDBuild payloads. Use `Verbose` only temporarily during troubleshooting. `/cmdbuild/custom-api/logging/status` returns the active diagnostic mode and redaction policy without secret values.
 
 Important: URL routes after `#` are client-side only. CMDBuild may also normalize extra path segments after the custom page name. The preferred entry points are the direct `/cmdbuild/dynamicpages/ui/*` URLs. Use `cmdpMode` and `cmdpTemplate` query parameters before `#` only when entering through the CMDBuild custom page launcher.
 

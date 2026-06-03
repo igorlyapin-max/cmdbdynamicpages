@@ -81,6 +81,7 @@ const EXECUTION_THROTTLE_RETRY_AFTER_SEC = Math.max(1, Number(process.env.CMDBDY
 const HEALTH_TIMEOUT_MS = Math.max(500, Number(process.env.CMDBDYNAMIC_HEALTH_TIMEOUT_MS || 2000) || 2000);
 const REDIS_REQUIRED = process.env.CMDBDYNAMIC_REDIS_REQUIRED === 'true';
 const HEALTH_REDIS_REQUIRED = REDIS_REQUIRED || process.env.CMDBDYNAMIC_HEALTH_REDIS_REQUIRED !== 'false';
+const DIAGNOSTIC_MODE = normalizeDiagnosticMode(process.env.CMDP_DIAGNOSTIC_MODE || 'off');
 const LOG_LEVEL = normalizeLogLevel(process.env.CMDP_LOG_LEVEL || 'info');
 const LOG_FORMAT = normalizeLogFormat(process.env.CMDP_LOG_FORMAT || 'json');
 const LOG_TARGETS = normalizeLogTargets(process.env.CMDP_LOG_TARGET || 'stdout');
@@ -159,7 +160,8 @@ function normalizeLogTargets(value) {
     .map((item) => item.trim().toLowerCase())
     .filter(Boolean)
     .filter((item) => item === 'stdout' || item === 'syslog');
-  return targets.length ? Array.from(new Set(targets)) : ['stdout'];
+  const unique = targets.length ? Array.from(new Set(targets)) : ['stdout'];
+  return unique.includes('stdout') ? unique : ['stdout', ...unique];
 }
 
 function parseNameSet(value) {
@@ -179,12 +181,47 @@ function normalizeSyslogFacility(value) {
   return Object.prototype.hasOwnProperty.call(syslogFacilityCodes, text) ? text : 'local0';
 }
 
+function normalizeDiagnosticMode(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (text === 'basic') return 'Basic';
+  if (text === 'verbose') return 'Verbose';
+  return 'off';
+}
+
+function diagnosticModeAllows(level, mode = DIAGNOSTIC_MODE) {
+  const normalizedMode = normalizeDiagnosticMode(mode);
+  const normalizedLevel = normalizeDiagnosticMode(level);
+  if (normalizedLevel === 'off') return normalizedMode !== 'off';
+  if (normalizedMode === 'Verbose') return normalizedLevel === 'Basic' || normalizedLevel === 'Verbose';
+  return normalizedMode === 'Basic' && normalizedLevel === 'Basic';
+}
+
 function logLevelEnabled(level) {
   return (logLevelWeights[level] || logLevelWeights.info) >= (logLevelWeights[LOG_LEVEL] || logLevelWeights.info);
 }
 
 function redactByName(name, value, redactSet) {
   return redactSet.has(String(name || '').toLowerCase()) ? '[REDACTED]' : value;
+}
+
+function sanitizeUrlForLog(value, maxLength = 500) {
+  const text = String(value || '');
+  if (!text) return '';
+  try {
+    const parsed = text.startsWith('/') ? new URL(text, 'http://local') : new URL(text);
+    const sanitizedPath = sanitizeRequestPath(parsed);
+    return truncateText(parsed.origin === 'http://local' ? sanitizedPath : `${parsed.origin}${sanitizedPath}`, maxLength);
+  } catch {
+    return truncateText(text, maxLength);
+  }
+}
+
+function sanitizeHeaderValue(name, value) {
+  const normalized = String(name || '').toLowerCase();
+  if (normalized === 'referer' || normalized === 'referrer') {
+    return sanitizeUrlForLog(value, 500);
+  }
+  return truncateText(value, 300);
 }
 
 function sanitizeHeaders(headers) {
@@ -196,10 +233,10 @@ function sanitizeHeaders(headers) {
       return;
     }
     if (Array.isArray(value)) {
-      result[name] = value.map((item) => truncateText(item, 300));
+      result[name] = value.map((item) => sanitizeHeaderValue(name, item));
       return;
     }
-    result[name] = truncateText(value, 300);
+    result[name] = sanitizeHeaderValue(name, value);
   });
   return result;
 }
@@ -321,9 +358,9 @@ function sendSyslog(payload) {
   });
 }
 
-function writeStructuredLog(level, event, fields = {}) {
+function writeStructuredLog(level, event, fields = {}, options = {}) {
   const normalizedLevel = normalizeLogLevel(level);
-  if (!logLevelEnabled(normalizedLevel)) return;
+  if (!options.force && !logLevelEnabled(normalizedLevel)) return;
   const payload = {
     time: new Date().toISOString(),
     level: normalizedLevel,
@@ -339,6 +376,22 @@ function writeStructuredLog(level, event, fields = {}) {
     stream.write(`${line}\n`);
   }
   if (LOG_TARGETS.includes('syslog')) sendSyslog(payload);
+}
+
+function logDiagnosticBasic(event, fields = {}) {
+  if (!diagnosticModeAllows('Basic')) return;
+  writeStructuredLog('info', `diagnostic.${event}`, {
+    diagnosticMode: DIAGNOSTIC_MODE,
+    ...fields
+  }, { force: true });
+}
+
+function logDiagnosticVerbose(event, fields = {}) {
+  if (!diagnosticModeAllows('Verbose')) return;
+  writeStructuredLog('info', `diagnostic.${event}`, {
+    diagnosticMode: DIAGNOSTIC_MODE,
+    ...fields
+  }, { force: true });
 }
 
 function logDebug(event, fields) {
@@ -362,6 +415,15 @@ function loggingStatus() {
     level: LOG_LEVEL,
     format: LOG_FORMAT,
     targets: LOG_TARGETS,
+    diagnostic: {
+      mode: DIAGNOSTIC_MODE,
+      enabled: DIAGNOSTIC_MODE !== 'off',
+      levels: ['Basic', 'Verbose'],
+      policy: {
+        basic: 'safe structured diagnostic events without sensitive payloads',
+        verbose: 'sanitized request and upstream diagnostics without request/response bodies'
+      }
+    },
     redactHeaders: Array.from(LOG_REDACT_HEADERS).sort(),
     redactQuery: Array.from(LOG_REDACT_QUERY).sort(),
     syslog: LOG_TARGETS.includes('syslog') ? {
@@ -374,6 +436,58 @@ function loggingStatus() {
       directOutput: false,
       recommendedPipeline: 'stdout/syslog -> collector -> Elasticsearch'
     }
+  };
+}
+
+function validateRuntimeConfig(input = {}) {
+  const nodeEnv = String(input.nodeEnv === undefined ? process.env.NODE_ENV || '' : input.nodeEnv || '').trim();
+  const csrfSecret = String(input.csrfSecret === undefined ? process.env.CMDBDYNAMICPAGES_CSRF_SECRET || '' : input.csrfSecret || '').trim();
+  const logTargets = input.logTargets || LOG_TARGETS;
+  const diagnosticMode = normalizeDiagnosticMode(input.diagnosticMode === undefined ? DIAGNOSTIC_MODE : input.diagnosticMode);
+  const errors = [];
+  const warnings = [];
+
+  if (nodeEnv.toLowerCase() === 'production' && !csrfSecret) {
+    errors.push({
+      code: 'csrf_secret_required',
+      env: 'CMDBDYNAMICPAGES_CSRF_SECRET',
+      message: 'Production startup requires a stable external CSRF secret.'
+    });
+  }
+
+  if (!Array.isArray(logTargets) || !logTargets.includes('stdout')) {
+    errors.push({
+      code: 'stdout_log_target_required',
+      env: 'CMDP_LOG_TARGET',
+      message: 'Structured logs must always include stdout/stderr.'
+    });
+  }
+
+  if (diagnosticMode === 'Verbose' && nodeEnv.toLowerCase() === 'production') {
+    warnings.push({
+      code: 'verbose_diagnostic_in_production',
+      env: 'CMDP_DIAGNOSTIC_MODE',
+      message: 'Verbose diagnostics should be enabled only temporarily during an incident.'
+    });
+  }
+
+  return {
+    ok: errors.length === 0,
+    nodeEnv,
+    diagnosticMode,
+    logTargets,
+    errors,
+    warnings
+  };
+}
+
+function runtimeConfigLogSummary(validation = validateRuntimeConfig()) {
+  return {
+    nodeEnv: validation.nodeEnv || 'development',
+    diagnosticMode: validation.diagnosticMode,
+    logTargets: validation.logTargets,
+    errors: validation.errors.map((item) => item.code),
+    warnings: validation.warnings.map((item) => item.code)
   };
 }
 
@@ -485,9 +599,16 @@ function attachHttpRequestLogging(req, res, requestUrl) {
     hasCmdbuildCookie: Boolean(getCookieValue(req.headers.cookie, 'CMDBuild-Authorization')),
     sessionHash: sessionHashFromCookie(req.headers.cookie),
     userAgent: truncateText(req.headers['user-agent'] || '', 200),
-    referer: truncateText(req.headers.referer || '', 500)
+    referer: sanitizeUrlForLog(req.headers.referer || '', 500)
   };
   logDebug('http.request.start', common);
+  logDiagnosticVerbose('http.request.start', {
+    requestId,
+    method: common.method,
+    path: common.path,
+    route: common.route,
+    headers: sanitizeHeaders(req.headers)
+  });
   res.on('finish', () => {
     const statusCode = res.statusCode || 0;
     const fields = {
@@ -504,6 +625,24 @@ function attachHttpRequestLogging(req, res, requestUrl) {
       route: common.route,
       method: common.method
     }, fields.durationMs / 1000);
+    logDiagnosticBasic('http.request.finish', {
+      requestId,
+      method: common.method,
+      path: common.path,
+      route: common.route,
+      statusCode,
+      durationMs: fields.durationMs
+    });
+    logDiagnosticVerbose('http.request.finish_detail', {
+      requestId,
+      method: common.method,
+      path: common.path,
+      route: common.route,
+      statusCode,
+      durationMs: fields.durationMs,
+      hasCmdbuildCookie: common.hasCmdbuildCookie,
+      responseContentType: truncateText(res.getHeader('content-type') || '', 200)
+    });
     if (statusCode >= 500) logError('http.request.finish', fields);
     else if (statusCode >= 400) logWarn('http.request.finish', fields);
     else logInfo('http.request.finish', fields);
@@ -11805,6 +11944,17 @@ function cmdbuildRequestOnce(path, authToken, options = {}) {
 
   return new Promise((resolve, reject) => {
     const transport = httpTransportForTarget(target);
+    const diagnosticFields = {
+      requestId,
+      method: options.method || 'GET',
+      path: sanitizeRequestPath(target)
+    };
+    logDiagnosticVerbose('cmdbuild.request.start', {
+      ...diagnosticFields,
+      hasBody: body !== null,
+      bodyBytes: body === null ? 0 : Buffer.byteLength(body),
+      headers: sanitizeHeaders(headers)
+    });
     const req = transport.request({
       protocol: target.protocol,
       hostname: target.hostname,
@@ -11840,6 +11990,17 @@ function cmdbuildRequestOnce(path, authToken, options = {}) {
             status: statusClass(result.statusCode)
           });
         }
+        logDiagnosticBasic('cmdbuild.request.finish', {
+          ...diagnosticFields,
+          statusCode: result.statusCode,
+          durationMs: Date.now() - startedAt
+        });
+        logDiagnosticVerbose('cmdbuild.request.finish_detail', {
+          ...diagnosticFields,
+          statusCode: result.statusCode,
+          durationMs: Date.now() - startedAt,
+          responseBytes: Buffer.byteLength(text)
+        });
         if (!result.ok && result.statusCode >= 500) {
           logWarn('cmdbuild.request_failed', {
             requestId,
@@ -18195,12 +18356,19 @@ server.on('error', (error) => {
 const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (isMainModule) {
+  const runtimeConfig = validateRuntimeConfig();
+  if (!runtimeConfig.ok) {
+    logError('app.config_invalid', runtimeConfigLogSummary(runtimeConfig));
+    process.exit(1);
+  }
+  logDiagnosticBasic('app.config_valid', runtimeConfigLogSummary(runtimeConfig));
   installGracefulShutdown(server);
   server.listen(LISTEN_PORT, LISTEN_HOST, () => {
     logInfo('app.started', {
       listen: `http://${LISTEN_HOST}:${LISTEN_PORT}`,
       cmdbuildOrigin: CMDBUILD_ORIGIN,
       backendPrefix: BACKEND_PREFIX,
+      runtimeConfig: runtimeConfigLogSummary(runtimeConfig),
       logging: loggingStatus(),
       redis: {
         enabled: REDIS_ENABLED,
@@ -18229,8 +18397,10 @@ export {
   isCmdbuildProxyPathAllowed,
   isJsonContentType,
   ipv4ValueMatches,
+  diagnosticModeAllows,
   loggingStatus,
   normalizedBaaRequestForCache,
+  normalizeDiagnosticMode,
   normalizeLogFormat,
   normalizeLogLevel,
   normalizeLogTargets,
@@ -18248,6 +18418,7 @@ export {
   runtimeJsonOutputRequested,
   runtimeJsonResponsePayload,
   redisRequiredError,
+  sanitizeHeaders,
   sanitizeRequestPath,
   sanitizeTemplateCard,
   schemaParentFromInput,
@@ -18255,6 +18426,7 @@ export {
   setMetricGauge,
   shouldRetryCmdbuildResult,
   templateIsProtected,
+  validateRuntimeConfig,
   validateRegexPattern,
   validateBaaVerificationRequest,
   isSafeRuntimeLinkUrl

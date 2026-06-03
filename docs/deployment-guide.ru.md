@@ -34,9 +34,11 @@ CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=true
 CMDBDYNAMICPAGES_CSRF_SECRET=<stable external secret>
 CMDP_LOG_TARGET=stdout
 CMDP_LOG_FORMAT=json
+CMDP_DIAGNOSTIC_MODE=off
 ```
 
 В репозитории есть backend `Dockerfile` для container deployment. Образ запускается от пользователя `node`, слушает `8093` и использует `/health/live` как container healthcheck.
+Production startup fail-closed, если не задан `CMDBDYNAMICPAGES_CSRF_SECRET`. `CMDP_DIAGNOSTIC_MODE=Verbose` включать только временно для incident diagnostics.
 
 Если платформа передает Redis secret только строкой, поддерживаются варианты:
 
@@ -150,6 +152,7 @@ http://localhost:8088/         -> http://127.0.0.1:3000/
 ## 8. Проверки после развертывания
 
 ```bash
+npm run ci
 npm test
 npm run test:api
 npm run test:nginx
@@ -176,6 +179,7 @@ http://127.0.0.1:8093/metrics
 
 - Не включать generic REST proxy.
 - Не логировать `cookie`, `authorization`, `CMDBuild-Authorization`, CSRF tokens и Redis password.
+- Держать `CMDP_DIAGNOSTIC_MODE=off` по умолчанию; `Basic` или временный `Verbose` включать только через deployment configuration.
 - State-changing API должны проходить same-origin + CSRF и передавать `Content-Type: application/json`, если тело запроса JSON.
 - Оставлять `CMDP_PROXY_ALLOWLIST_STRICT=true`, если только контролируемое развертывание явно не требует проксировать дополнительные CMDBuild paths.
 - Применять reverse-proxy rate limiting, эквивалентный bundled nginx `limit_req` rules для `/cmdbuild/custom-api/`, `/cmdbuild/dynamicpages/` и общего `/cmdbuild/` traffic.

@@ -5,16 +5,18 @@
 ## Реализовано
 
 - `npm run check`: syntax check custom page, proxy, diagnostics, e2e и validation scripts.
+- `npm run secret:scan`: сканирует repository text files на high-confidence committed secrets, исключая generated/runtime directories.
+- `npm run build:zip`: собирает CMDBuild custom page ZIP dependency-free Node builder'ом.
+- `npm run ci`: запускает `secret:scan`, `npm test` и `build:zip`.
 - `npm run test:static`: проверяет обязательные OpenAPI paths, локальные component references и ссылки архитектурных артефактов.
-- `npm run test:unit`: покрывает настройки кэша, scope ключей кэша, refresh metadata, параметры static snapshot URL, defaults параметров, IPv4-сопоставление, dependency map и маскирование логов.
+- `npm run test:unit`: покрывает настройки кэша, scope ключей кэша, refresh metadata, параметры static snapshot URL, defaults параметров, IPv4-сопоставление, dependency map, маскирование логов, diagnostic mode и runtime config validation.
 - `npm run test:api`: skip-safe API smoke для `/health/*`, `/metrics`, защищенного logging status и отказа state-changing вызовов без CSRF/session на запущенном proxy.
-- `npm run test:ui`: skip-safe Playwright smoke для списка шаблонов Designer, fixed menu/action bar, контекстных кнопок Run и компактной Runtime shell.
+- `npm run test:ui`: skip-safe Playwright smoke для списка шаблонов Designer, fixed menu/action bar, контекстных кнопок Run, компактной Runtime shell, runtime table search/sort, отключения grouped-table controls, split-subtable local sorting и опционального real wiki iframe rendering через `CMDBDYNAMIC_WIKI_IFRAME_URL`.
 - `npm run test:nginx`: проверяет nginx config и same-origin wiki/dynamicpages маршруты через `localhost:8088`.
-- `npm run e2e`: расширен проверками logging diagnostics, draft preview без runtime cache, runtime cache hit, POST `forceRefresh` и тем, что GET runtime не делает forced refresh.
+- `npm run e2e`: проверяет logging diagnostics, draft preview без runtime cache, runtime cache hit, POST `forceRefresh`, что GET runtime не делает forced refresh, и write-mode `expectedSpecHash` conflict handling.
 
 ## Осталось
 
-- Добавить более глубокие Playwright Runtime table tests для client-side search/sort и отключения search/sort при row grouping.
-- Добавить browser-level проверку iframe внутри реальной wiki page, когда в локальной wiki появится стабильная тестовая страница.
 - Для live e2e нужен свежий CMDBuild session cookie или явные `CMDBUILD_USERNAME`/`CMDBUILD_PASSWORD`.
-- Добавить live-проверку конфликта template update через `expectedSpecHash`, когда появится стабильная write-test fixture.
+- Поддерживать стабильную local wiki page для `CMDBDYNAMIC_WIKI_IFRAME_URL`, чтобы optional browser-level iframe smoke запускался регулярно.
+- Добавить browser/API smoke для live `cmdbaa` exchange после стабилизации внешнего сценария.
