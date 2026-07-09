@@ -4,10 +4,13 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   pull_request:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   test:
@@ -23,3 +26,39 @@ jobs:
 
       - name: Run CI gate
         run: npm run ci
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate container delivery files
+        run: node scripts/validate-container-delivery.mjs
+
+      - name: Validate compose templates
+        run: |
+          docker compose --env-file .env.example -f docker-compose.runtime.yml config >/dev/null
+          docker compose -f docker-compose.nginx.yml config >/dev/null
+
+      - name: Build Docker image
+        run: |
+          image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          raw_tag="${GITHUB_REF_NAME:-${GITHUB_SHA}}"
+          tag="$(echo "$raw_tag" | tr '[:upper:]' '[:lower:]' | tr '/:@' '---' | tr -cd 'a-z0-9_.-')"
+          if [ -z "$tag" ]; then tag="$GITHUB_SHA"; fi
+          docker build -t "$image:$tag" .
+          echo "CMDBDYNAMIC_CI_IMAGE=$image:$tag" >> "$GITHUB_ENV"
+
+      - name: Login to GHCR
+        if: github.event_name == 'push'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push Docker image
+        if: github.event_name == 'push'
+        run: docker push "$CMDBDYNAMIC_CI_IMAGE"

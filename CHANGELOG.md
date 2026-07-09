@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-07-09 - v0.1.0-static-baseline
+
+### Added
+
+- Added explicit static-baseline release handoff before MCP/LangGraph work.
+- Added GKM container delivery artifacts: image-only runtime compose, safe `.env.example`, admin deployment guide, and container delivery validation script.
+- Added CI container gates for Docker image build, compose validation, and registry push on release refs.
+- Added CMDBuild custom page launcher regression coverage for early redirect and hash-change routing.
+
+### Changed
+
+- Clarified that current runtime remains deterministic: saved `SpecJson` executes under the current CMDBuild session, while static snapshot output is served from Redis.
+- Kept MCP/LangGraph and diagram plans out of the baseline runtime release scope.
+
+### Known limitations
+
+- Browser upload of `dist/cmdbdynamicpages-custompage.zip` into a live authenticated CMDBuild session must be verified on the target contour.
+- GKM handoff requires an approved registry path, registry trust/CA setup, and real deployment secrets outside git.
+
 ## 2026-06-03
 
 ### Added

@@ -1,0 +1,45 @@
+services:
+  cmdbdynamicpages:
+    image: ${CMDBDYNAMIC_IMAGE}
+    container_name: cmdbdynamicpages-backend
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PROXY_HOST: ${PROXY_HOST:-0.0.0.0}
+      PROXY_PORT: ${PROXY_PORT:-8093}
+      CMDBUILD_ORIGIN: ${CMDBUILD_ORIGIN}
+      CMDBUILD_REQUEST_TIMEOUT_MS: ${CMDBUILD_REQUEST_TIMEOUT_MS:-10000}
+      CMDBDYNAMIC_REDIS_URL: ${CMDBDYNAMIC_REDIS_URL}
+      CMDBDYNAMIC_REDIS_PASSWORD_FILE: ${CMDBDYNAMIC_REDIS_PASSWORD_FILE:-/run/secrets/cmdbdynamicpages_redis_password}
+      CMDBDYNAMIC_REDIS_REQUIRED: ${CMDBDYNAMIC_REDIS_REQUIRED:-true}
+      CMDBDYNAMIC_HEALTH_REDIS_REQUIRED: ${CMDBDYNAMIC_HEALTH_REDIS_REQUIRED:-true}
+      CMDBDYNAMIC_HEALTH_TIMEOUT_MS: ${CMDBDYNAMIC_HEALTH_TIMEOUT_MS:-2000}
+      CMDBDYNAMIC_REDIS_KEY_PREFIX: ${CMDBDYNAMIC_REDIS_KEY_PREFIX:-cmdp}
+      CMDBDYNAMIC_REDIS_TIMEOUT_MS: ${CMDBDYNAMIC_REDIS_TIMEOUT_MS:-500}
+      CMDBDYNAMICPAGES_CSRF_SECRET: ${CMDBDYNAMICPAGES_CSRF_SECRET}
+      CMDP_PROXY_ALLOWLIST_STRICT: ${CMDP_PROXY_ALLOWLIST_STRICT:-true}
+      CMDP_LOG_LEVEL: ${CMDP_LOG_LEVEL:-info}
+      CMDP_LOG_FORMAT: ${CMDP_LOG_FORMAT:-json}
+      CMDP_LOG_TARGET: ${CMDP_LOG_TARGET:-stdout}
+      CMDP_DIAGNOSTIC_MODE: ${CMDP_DIAGNOSTIC_MODE:-off}
+      CMDP_LOG_REDACT_HEADERS: ${CMDP_LOG_REDACT_HEADERS:-cookie,authorization,cmdbuild-authorization,x-csrf-token,x-cmdbdynamicpages-csrf,set-cookie}
+      CMDP_LOG_REDACT_QUERY: ${CMDP_LOG_REDACT_QUERY:-password,passwd,pwd,token,secret,authorization,auth,csrf,x-cmdbdynamicpages-csrf}
+      CMDP_SYSLOG_HOST: ${CMDP_SYSLOG_HOST:-127.0.0.1}
+      CMDP_SYSLOG_PORT: ${CMDP_SYSLOG_PORT:-514}
+      CMDP_SYSLOG_PROTOCOL: ${CMDP_SYSLOG_PROTOCOL:-udp}
+      CMDP_SYSLOG_FACILITY: ${CMDP_SYSLOG_FACILITY:-local0}
+    volumes:
+      - type: bind
+        source: ${CMDBDYNAMIC_REDIS_PASSWORD_FILE_HOST:-./secrets/cmdbdynamicpages_redis_password}
+        target: /run/secrets/cmdbdynamicpages_redis_password
+        read_only: true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:${PROXY_PORT:-8093}/health/live || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s

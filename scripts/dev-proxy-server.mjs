@@ -1291,12 +1291,14 @@ function rewriteCmdbuildUiHtml(body) {
     'function buildQuery(params){var pairs=[];Object.keys(params||{}).forEach(function(k){if(params[k]===undefined||params[k]===null)return;pairs.push(encodeURIComponent(k)+"="+encodeURIComponent(String(params[k])));});return pairs.join("&");}',
     'function readHashRoute(){var h=window.location.hash||"";var marker="custompages/CmdbDynamicPages";var at=h.indexOf(marker);if(at===-1)return{path:[],params:{}};var suffix=h.slice(at+marker.length).replace(/^\\/+/, "");var query="";var qi=suffix.indexOf("?");if(qi!==-1){query=suffix.slice(qi+1);suffix=suffix.slice(0,qi);}return{path:suffix.split("/").filter(Boolean).map(decodeURIComponent),params:parseQuery(query)};}',
     'function dynamicTarget(){var query=parseQuery(window.location.search||"");var route=readHashRoute();var params={};Object.keys(route.params||{}).forEach(function(k){params[k]=route.params[k];});Object.keys(query||{}).forEach(function(k){params[k]=query[k];});var mode=params.cmdpMode||"";var code=params.cmdpTemplate||"";delete params.cmdpMode;delete params.cmdpTemplate;if(!code&&route.path&&route.path.length){if(route.path[0]==="designer"){mode="designer";}else{code=route.path[0];}}if(!(mode||code||(window.location.hash||"").indexOf("custompages/CmdbDynamicPages")!==-1))return"";var q=buildQuery(params);if(mode==="designer"||!code)return"/cmdbuild/dynamicpages/ui/designer"+(q?"?"+q:"");return"/cmdbuild/dynamicpages/ui/run/"+encodeURIComponent(code)+(q?"?"+q:"");}',
-    'var target=dynamicTarget();',
-    'if(target&&window.sessionStorage){window.sessionStorage.setItem(pendingKey,target);}',
+    'var redirecting="";',
     'var pending=window.sessionStorage&&window.sessionStorage.getItem(pendingKey)||"";',
+    'function rememberPending(target){if(target){pending=target;if(window.sessionStorage){window.sessionStorage.setItem(pendingKey,target);}}return pending;}',
     'function clearPending(){try{if(window.sessionStorage)window.sessionStorage.removeItem(pendingKey);}catch(e){}}',
     'function showPendingLink(){if(!pending||document.getElementById("cmdp-login-fallback-link")||!document.body)return;var a=document.createElement("a");a.id="cmdp-login-fallback-link";a.href=pending;a.textContent="Open CMDB Dynamic Pages";a.style.cssText="position:fixed;right:14px;bottom:14px;z-index:2147483647;background:#236c91;color:#fff;padding:9px 12px;border-radius:4px;text-decoration:none;font:600 13px Arial,sans-serif;box-shadow:0 6px 16px rgba(15,23,42,.18)";document.body.appendChild(a);}',
-    'if(pending){if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",showPendingLink);}else{showPendingLink();}fetch("/cmdbuild/custom-api/session",{credentials:"include",headers:{Accept:"application/json"}}).then(function(r){if(r.ok){clearPending();window.location.replace(pending);}}).catch(function(){});}',
+    'function tryPending(){rememberPending(dynamicTarget());if(!pending)return;if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",showPendingLink,{once:true});}else{showPendingLink();}fetch("/cmdbuild/custom-api/session",{credentials:"include",headers:{Accept:"application/json"}}).then(function(r){if(r.ok&&redirecting!==pending){var next=pending;redirecting=next;clearPending();window.location.replace(next);}}).catch(function(){});}',
+    'tryPending();',
+    'if(window.addEventListener){window.addEventListener("hashchange",tryPending);}',
     '}catch(e){}})();',
     '</script>'
   ].join('');

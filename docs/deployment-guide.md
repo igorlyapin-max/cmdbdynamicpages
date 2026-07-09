@@ -39,6 +39,7 @@ CMDP_DIAGNOSTIC_MODE=off
 
 The repository includes a backend `Dockerfile` for container deployment. The image runs as the `node` user, listens on `8093`, and uses `/health/live` as the container healthcheck.
 Production startup fails closed when `CMDBDYNAMICPAGES_CSRF_SECRET` is missing. `CMDP_DIAGNOSTIC_MODE=Verbose` should be enabled only temporarily during incident diagnostics.
+Admin-facing container handoff is documented in [CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md](CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md).
 
 If the platform can pass the Redis secret only as a string, these variants are supported:
 
@@ -153,6 +154,7 @@ This puts the wiki and runtime iframe on one origin, `localhost:8088`.
 
 ```bash
 npm run ci
+npm run container:check
 npm test
 npm run test:api
 npm run test:nginx

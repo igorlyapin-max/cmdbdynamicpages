@@ -39,6 +39,7 @@ CMDP_DIAGNOSTIC_MODE=off
 
 В репозитории есть backend `Dockerfile` для container deployment. Образ запускается от пользователя `node`, слушает `8093` и использует `/health/live` как container healthcheck.
 Production startup fail-closed, если не задан `CMDBDYNAMICPAGES_CSRF_SECRET`. `CMDP_DIAGNOSTIC_MODE=Verbose` включать только временно для incident diagnostics.
+Admin-facing container handoff описан отдельно: [CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md](CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md).
 
 Если платформа передает Redis secret только строкой, поддерживаются варианты:
 
@@ -149,10 +150,16 @@ http://localhost:8088/         -> http://127.0.0.1:3000/
 
 Так wiki и runtime iframe оказываются на одном origin `localhost:8088`.
 
+Если контур разворачивается совместно с WikiAI, используйте дополнительные
+договоренности из [wikiai-integration.ru.md](wikiai-integration.ru.md):
+WikiAI индексирует только anonymous `staticSnapshot`, а `dynamicUser` runtime
+остается live-контекстом текущего пользователя и не пишется в общий индекс.
+
 ## 8. Проверки после развертывания
 
 ```bash
 npm run ci
+npm run container:check
 npm test
 npm run test:api
 npm run test:nginx

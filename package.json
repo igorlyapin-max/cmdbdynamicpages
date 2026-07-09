@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "build:zip": "node scripts/build-custompage-zip.mjs",
-    "check": "node --check src/CmdbDynamicPages.js && node --check src/special-renderers/cmdb-build-view.mjs && node --check scripts/build-custompage-zip.mjs && node --check scripts/dev-proxy-server.mjs && node --check scripts/diagnose-custompage.mjs && node --check scripts/watch-client-log.mjs && node --check scripts/e2e-dynamicpages.mjs && node --check scripts/secret-scan.mjs && node --check scripts/validate-openapi.mjs && node --check scripts/validate-aa-links.mjs && node --check tests/unit/cmdb-build-view.test.mjs && node --check tests/api/contract.test.mjs && node --check tests/api/nginx-iframe.test.mjs && node --check tests/ui/playwright-smoke.test.mjs",
+    "check": "node --check src/CmdbDynamicPages.js && node --check src/special-renderers/cmdb-build-view.mjs && node --check scripts/build-custompage-zip.mjs && node --check scripts/dev-proxy-server.mjs && node --check scripts/diagnose-custompage.mjs && node --check scripts/watch-client-log.mjs && node --check scripts/e2e-dynamicpages.mjs && node --check scripts/secret-scan.mjs && node --check scripts/validate-openapi.mjs && node --check scripts/validate-aa-links.mjs && node --check tests/unit/cmdb-build-view.test.mjs && node --check tests/unit/custompage-launcher.test.mjs && node --check tests/api/contract.test.mjs && node --check tests/api/nginx-iframe.test.mjs && node --check tests/ui/playwright-smoke.test.mjs",
     "ci": "npm run secret:scan && npm test && npm run build:zip",
+    "container:check": "node scripts/validate-container-delivery.mjs && docker compose --env-file .env.example -f docker-compose.runtime.yml config >/dev/null && docker compose -f docker-compose.nginx.yml config >/dev/null",
     "secret:scan": "node scripts/secret-scan.mjs",
     "test": "npm run check && npm run test:static && npm run test:unit",
     "test:static": "node scripts/validate-openapi.mjs && node scripts/validate-aa-links.mjs",

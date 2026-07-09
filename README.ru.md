@@ -8,6 +8,9 @@
 - Runtime UI для запуска шаблона по URL и вывода результата таблицами в рамках прав текущего пользователя CMDBuild либо как опубликованный статический снимок.
 
 Пошаговая инструкция развертывания: [docs/deployment-guide.ru.md](docs/deployment-guide.ru.md).
+Контейнерная поставка для администраторов: [docs/CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md](docs/CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md).
+Интеграция с MediaWiki/WikiAI описана отдельно:
+[docs/wikiai-integration.ru.md](docs/wikiai-integration.ru.md).
 
 ## Текущая архитектура
 

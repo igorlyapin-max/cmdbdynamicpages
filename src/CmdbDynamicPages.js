@@ -105,11 +105,26 @@ function cmdbDynamicPagesRememberTarget(target) {
     }
 }
 
-function cmdbDynamicPagesOpenExternalUi() {
+var cmdbDynamicPagesRedirectTarget = '';
+
+function cmdbDynamicPagesOpenExternalUi(reason) {
     var target = cmdbDynamicPagesBuildTargetUrl();
+    if (!target) return;
     cmdbDynamicPagesRememberTarget(target);
-    cmdbDynamicPagesClientLog('launcher-redirect', target);
+    if (cmdbDynamicPagesRedirectTarget === target) return;
+    cmdbDynamicPagesRedirectTarget = target;
+    cmdbDynamicPagesClientLog('launcher-redirect', (reason ? reason + ': ' : '') + target);
     window.location.replace(target);
+}
+
+function cmdbDynamicPagesScheduleOpenExternalUi(reason) {
+    var target = cmdbDynamicPagesBuildTargetUrl();
+    if (!target) return;
+    cmdbDynamicPagesRememberTarget(target);
+    if (cmdbDynamicPagesRedirectTarget === target) return;
+    window.setTimeout(function () {
+        cmdbDynamicPagesOpenExternalUi(reason);
+    }, 0);
 }
 
 function cmdbDynamicPagesShouldAutoOpen() {
@@ -125,7 +140,15 @@ function cmdbDynamicPagesShouldAutoOpen() {
 cmdbDynamicPagesClientLog('script-loaded', 'launcher');
 
 if (cmdbDynamicPagesShouldAutoOpen()) {
-    window.setTimeout(cmdbDynamicPagesOpenExternalUi, 0);
+    cmdbDynamicPagesScheduleOpenExternalUi('initial-url');
+}
+
+if (window.addEventListener) {
+    window.addEventListener('hashchange', function () {
+        if (cmdbDynamicPagesShouldAutoOpen()) {
+            cmdbDynamicPagesScheduleOpenExternalUi('hashchange');
+        }
+    });
 }
 
 Ext.define('CMDBuildUI.view.custompages.CmdbDynamicPages.CmdbDynamicPages', {
@@ -149,9 +172,10 @@ Ext.define('CMDBuildUI.view.custompages.CmdbDynamicPages.CmdbDynamicPages', {
             '</div>'
         ].join('');
         this.callParent(arguments);
+        cmdbDynamicPagesScheduleOpenExternalUi('initComponent');
         this.on('afterrender', function () {
             cmdbDynamicPagesClientLog('afterrender', 'launcher');
-            window.setTimeout(cmdbDynamicPagesOpenExternalUi, 0);
+            cmdbDynamicPagesScheduleOpenExternalUi('afterrender');
         }, this, { single: true });
     }
 });
