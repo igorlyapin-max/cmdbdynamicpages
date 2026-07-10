@@ -38,6 +38,10 @@ const skipReason = playwright
       : loginError || 'CMDBuild session cookie is missing or invalid; set CMDBUILD_COOKIE_HEADER, refresh CMDBUILD_COOKIE_JAR, or set CMDBUILD_USERNAME/CMDBUILD_PASSWORD.'
     : `proxy is not reachable at ${proxyOrigin}`
   : 'Playwright is not installed; install it locally to run browser UI smoke tests.';
+const requireLiveUi = process.env.CMDBDYNAMIC_E2E_REQUIRED === '1' || Boolean(loginUsername && loginPassword && process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH);
+if (requireLiveUi && skipReason) {
+  throw new Error(`Browser UI smoke is required but cannot run: ${skipReason}`);
+}
 
 test('Designer opens on the template list with fixed menu and action bar', { skip: skipReason }, async () => {
   await withPage(async (page) => {
@@ -51,6 +55,27 @@ test('Designer opens on the template list with fixed menu and action bar', { ski
     assert.ok(await page.locator('.designer-actionbar').isVisible());
     assert.ok(await page.locator('.designer-actionbar button[data-action="new-template"]').isVisible());
     assert.ok(await page.locator('a[data-designer-section="schema"]').isVisible());
+  });
+});
+
+test('Designer blocks template-bound menu sections until a template is selected', { skip: skipReason }, async () => {
+  await withPage(async (page) => {
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer/cache`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.waitForSelector('#cmdp-template-list', { timeout: 10_000 });
+
+    assert.equal(await page.locator('#cmdp-cache-editor').count(), 0);
+    assert.match(new URL(page.url()).pathname, /\/cmdbuild\/dynamicpages\/ui\/designer\/?$/);
+    assert.match(await page.locator('.notice').first().innerText(), /Select or create a template|Выберите или создайте шаблон/);
+    await assertMenuLinkDisabled(page, 'cache');
+    await assertMenuLinkDisabled(page, 'assistant');
+
+    await page.locator('a[data-designer-section="cache"]').dispatchEvent('click');
+    await page.waitForSelector('#cmdp-template-list', { timeout: 10_000 });
+    assert.equal(await page.locator('#cmdp-cache-editor').count(), 0);
+
+    await page.locator('a[data-designer-section="schema"]').click();
+    await page.waitForSelector('#cmdp-schema-manager', { timeout: 10_000 });
   });
 });
 
@@ -127,6 +152,19 @@ test('Assistant generates an ARM by router Location object group and preview ren
     assert.match(assistantText, /\bARM\b/);
 
     await page.locator('button[data-action="assistant-apply-draft"]').first().click();
+    await page.locator('a[data-designer-section="extraction"]').click();
+    await page.waitForSelector('#cmdp-extraction-editor', { timeout: 10_000 });
+    const extractionOptions = await extractionResultOptions(page);
+    assert.ok(extractionOptions.some((item) => item.value === 'arms'), `Extraction source options do not include arms: ${JSON.stringify(extractionOptions)}`);
+    await page.locator('button[data-action="extract-template"]').first().click();
+    await page.waitForFunction(() => {
+      const rows = Array.from(document.querySelectorAll('#cmdp-extraction-editor tbody tr'));
+      return rows.some((row) => /ARM|АРМ/i.test(String(row.textContent || '')) && /300|Test City/i.test(String(row.textContent || '')));
+    }, null, { timeout: 60_000 });
+    const extractionRows = await extractionPreviewRows(page);
+    assert.ok(extractionRows.length > 0, 'Assistant draft extraction rendered no result rows.');
+    assert.ok(extractionRows.some((row) => /ARM|АРМ/i.test(row) && /300|Test City/i.test(row)), `Assistant draft extraction rows do not look like Test City 300 ARM cards: ${JSON.stringify(extractionRows.slice(0, 5))}`);
+
     await page.locator('a[data-designer-section="object-group"]').click();
     await page.waitForSelector('#cmdp-object-group-editor', { timeout: 10_000 });
     const selections = await objectGroupSelections(page);
@@ -166,6 +204,14 @@ test('Assistant generates an ARM by router Location object group and preview ren
     const rows = await visibleResultRows(page);
     assert.ok(rows.length > 0, 'Assistant preview rendered no result rows.');
     assert.ok(rows.some((row) => /ARM|АРМ/i.test(row) && /300|Test City/i.test(row)), `Assistant preview rows do not look like Test City 300 ARM cards: ${JSON.stringify(rows.slice(0, 5))}`);
+    const headerCells = await visibleResultHeaderCells(page);
+    const tableRows = await visibleResultTableRows(page);
+    const modelIndex = headerCells.indexOf('model');
+    const model2Index = headerCells.indexOf('model2');
+    assert.ok(modelIndex >= 0, `Assistant preview header cells do not include model: ${JSON.stringify(headerCells)}`);
+    assert.ok(model2Index >= 0, `Assistant preview header cells do not include model2: ${JSON.stringify(headerCells)}`);
+    assert.ok(tableRows.every((row) => row.length > modelIndex), `Assistant preview did not render model cells: ${JSON.stringify(tableRows.slice(0, 5))}`);
+    assert.ok(tableRows.every((row) => row.length > model2Index), `Assistant preview did not render model2 cells: ${JSON.stringify(tableRows.slice(0, 5))}`);
   });
 });
 
@@ -209,8 +255,12 @@ test('Runtime cache header stays readable on a narrow viewport', { skip: skipRea
     const title = page.locator('.result-table-title h3').first();
     if (await title.count()) {
       const titleBox = await title.boundingBox();
-      assert.ok(titleBox && titleBox.width >= 180, `Runtime cache table title is too narrow: ${JSON.stringify(titleBox)}`);
-      assert.ok((await title.innerText()).trim().length > 4, 'Runtime cache table title is unexpectedly empty.');
+      const titleText = (await title.innerText()).trim();
+      assert.ok(titleBox && titleBox.height <= 80, `Runtime cache table title may wrap per character: ${JSON.stringify(titleBox)}`);
+      if (titleText.length > 20) {
+        assert.ok(titleBox && titleBox.width >= 180, `Long runtime cache table title is too narrow: ${JSON.stringify({ titleText, titleBox })}`);
+      }
+      assert.ok(titleText.length > 4, 'Runtime cache table title is unexpectedly empty.');
     } else {
       const notice = page.locator('.runtime-notice-shell .notice').first();
       const noticeBox = await notice.boundingBox();
@@ -379,6 +429,17 @@ async function visibleResultRows(page) {
     .filter(Boolean));
 }
 
+async function visibleResultTableRows(page) {
+  return await page.locator('[data-result-table]').first().locator('tr[data-result-row]').evaluateAll((rows) => rows
+    .filter((row) => getComputedStyle(row).display !== 'none')
+    .map((row) => Array.from(row.querySelectorAll('td')).map((cell) => String(cell.textContent || '').replace(/\s+/g, ' ').trim())));
+}
+
+async function visibleResultHeaderCells(page) {
+  return await page.locator('[data-result-table]').first().locator('th').evaluateAll((headers) => headers
+    .map((header) => String(header.textContent || '').replace(/\s+/g, ' ').trim()));
+}
+
 async function visibleResultHeaders(page) {
   return await page.locator('[data-result-table]').first().locator('th').evaluateAll((headers) => headers
     .map((header) => String(header.textContent || '').replace(/\s+/g, ' ').trim())
@@ -398,6 +459,29 @@ async function launchUrlLayoutMetrics(page, selector) {
       whiteSpace: style.whiteSpace
     };
   });
+}
+
+async function assertMenuLinkDisabled(page, section) {
+  const link = page.locator(`a[data-designer-section="${section}"]`);
+  assert.equal(await link.getAttribute('aria-disabled'), 'true');
+  const className = await link.getAttribute('class');
+  assert.match(className || '', /\bdisabled\b/);
+}
+
+async function extractionResultOptions(page) {
+  return await page.locator('#cmdp-extraction-source option').evaluateAll((options) => options
+    .map((option) => ({
+      value: String(option.value || '').trim(),
+      text: String(option.textContent || '').replace(/\s+/g, ' ').trim()
+    }))
+    .filter((option) => option.value || option.text));
+}
+
+async function extractionPreviewRows(page) {
+  return await page.locator('#cmdp-extraction-editor tbody tr').evaluateAll((rows) => rows
+    .filter((row) => getComputedStyle(row).display !== 'none')
+    .map((row) => String(row.textContent || '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean));
 }
 
 async function viewComposerFieldOptions(page) {

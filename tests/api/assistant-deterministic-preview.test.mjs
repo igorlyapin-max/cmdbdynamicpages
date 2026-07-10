@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import http from 'node:http';
 import net from 'node:net';
 import { URL } from 'node:url';
@@ -79,6 +80,262 @@ test('draft preview executes exact router anchor before selecting ARM cards by L
   assert.equal(backend.exitCode, null);
 });
 
+test('template publish rejects unsaved static snapshot settings with actionable reason', async (t) => {
+  const spec = publishSpec({
+    publish: { mode: 'dynamicUser', paramsMode: 'exact', warningAccepted: false }
+  });
+  const mock = await startMockCmdbuild(t, {
+    templates: [
+      templateCard('DynamicPublishTemplate', spec)
+    ]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=publish-dynamic-test-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  assert.equal(csrf.statusCode, 200);
+
+  const publish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/DynamicPublishTemplate/publish`, {
+    params: {},
+    savedSpecHash: hashJson(spec)
+  }, {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token
+  });
+
+  assert.equal(publish.statusCode, 400, publish.body);
+  assert.equal(publish.json.success, false);
+  assert.equal(publish.json.reason, 'publication_settings_not_saved');
+  assert.match(publish.json.message, /Publication settings were not saved/);
+  assert.equal(publish.json.publish.mode, 'dynamicUser');
+  assert.equal(backend.exitCode, null);
+});
+
+test('template publish rejects stale saved spec hash before executing the snapshot', async (t) => {
+  const spec = publishSpec();
+  const mock = await startMockCmdbuild(t, {
+    templates: [
+      templateCard('StalePublishTemplate', spec)
+    ]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=publish-stale-test-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  assert.equal(csrf.statusCode, 200);
+
+  const publish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/StalePublishTemplate/publish`, {
+    params: {},
+    savedSpecHash: 'f'.repeat(64)
+  }, {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token
+  });
+
+  assert.equal(publish.statusCode, 409, publish.body);
+  assert.equal(publish.json.success, false);
+  assert.equal(publish.json.reason, 'publication_saved_spec_mismatch');
+  assert.equal(publish.json.savedSpecHash, undefined);
+  assert.ok(publish.json.currentSpecHash);
+  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/routerG/cards')), false);
+  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/ARM/cards')), false);
+  assert.equal(backend.exitCode, null);
+});
+
+test('template publish rejects missing saved spec hash before executing the snapshot', async (t) => {
+  const spec = publishSpec();
+  const mock = await startMockCmdbuild(t, {
+    templates: [
+      templateCard('MissingHashPublishTemplate', spec)
+    ]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=publish-missing-hash-test-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  assert.equal(csrf.statusCode, 200);
+
+  const publish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/MissingHashPublishTemplate/publish`, {
+    params: {}
+  }, {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token
+  });
+
+  assert.equal(publish.statusCode, 400, publish.body);
+  assert.equal(publish.json.success, false);
+  assert.equal(publish.json.reason, 'publication_saved_spec_hash_required');
+  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/routerG/cards')), false);
+  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/ARM/cards')), false);
+  assert.equal(backend.exitCode, null);
+});
+
+test('template publish rejects invalid saved spec hash without echoing it', async (t) => {
+  const spec = publishSpec();
+  const mock = await startMockCmdbuild(t, {
+    templates: [
+      templateCard('InvalidHashPublishTemplate', spec)
+    ]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=publish-invalid-hash-test-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  assert.equal(csrf.statusCode, 200);
+
+  const publish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/InvalidHashPublishTemplate/publish`, {
+    params: {},
+    savedSpecHash: 'not-a-spec-hash'
+  }, {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token
+  });
+
+  assert.equal(publish.statusCode, 400, publish.body);
+  assert.equal(publish.json.reason, 'publication_saved_spec_hash_required');
+  assert.equal(JSON.stringify(publish.json).includes('not-a-spec-hash'), false);
+  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/routerG/cards')), false);
+  assert.equal(backend.exitCode, null);
+});
+
+test('template publish denies users without explicit update permission before publication validation', async (t) => {
+  const spec = publishSpec({
+    publish: { mode: 'dynamicUser', paramsMode: 'exact', warningAccepted: false }
+  });
+  const mock = await startMockCmdbuild(t, {
+    templates: [
+      templateCard('DeniedPublishTemplate', spec, { canUpdate: false })
+    ]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=publish-denied-test-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  assert.equal(csrf.statusCode, 200);
+
+  const publish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/DeniedPublishTemplate/publish`, {
+    params: {},
+    savedSpecHash: hashJson(spec)
+  }, {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token
+  });
+
+  assert.equal(publish.statusCode, 403, publish.body);
+  assert.equal(publish.json.reason, 'technical_schema_access_denied');
+  assert.equal(publish.json.publish, undefined);
+  assert.equal(publish.json.template, undefined);
+  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/routerG/cards')), false);
+  assert.equal(backend.exitCode, null);
+});
+
+test('template publish fails closed when update permission flag is missing', async (t) => {
+  const spec = publishSpec();
+  const mock = await startMockCmdbuild(t, {
+    templates: [
+      templateCard('MissingPermissionPublishTemplate', spec, { includeCanUpdate: false })
+    ]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=missing-perm';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  assert.equal(csrf.statusCode, 200);
+
+  const publish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/MissingPermissionPublishTemplate/publish`, {
+    params: {},
+    savedSpecHash: hashJson(spec)
+  }, {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token
+  });
+
+  assert.equal(publish.statusCode, 403, publish.body);
+  assert.equal(publish.json.reason, 'technical_schema_access_denied');
+  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/routerG/cards')), false);
+  assert.equal(backend.exitCode, null);
+});
+
+test('template publish returns controlled client errors for malformed or null JSON bodies', async (t) => {
+  const spec = publishSpec();
+  const mock = await startMockCmdbuild(t, {
+    templates: [
+      templateCard('BadBodyPublishTemplate', spec)
+    ]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=publish-bad-body-test-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  assert.equal(csrf.statusCode, 200);
+  const headers = {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token,
+    'content-type': 'application/json'
+  };
+
+  const malformed = await requestRaw('POST', `${backendOrigin}/cmdbuild/custom-api/templates/BadBodyPublishTemplate/publish`, '{not json', headers);
+  assert.equal(malformed.statusCode, 400, malformed.body);
+  const malformedJson = JSON.parse(malformed.body);
+  assert.equal(malformedJson.reason, 'request_body_invalid_json');
+
+  const nullBody = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/BadBodyPublishTemplate/publish`, null, headers);
+  assert.equal(nullBody.statusCode, 400, nullBody.body);
+  assert.equal(nullBody.json.reason, 'request_body_must_be_object');
+  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/routerG/cards')), false);
+  assert.equal(backend.exitCode, null);
+});
+
+test('template publish executes static snapshot spec and returns published cache metadata', async (t) => {
+  const spec = publishSpec();
+  const mock = await startMockCmdbuild(t, {
+    templates: [
+      templateCard('StaticPublishTemplate', spec)
+    ]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=publish-static-test-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  assert.equal(csrf.statusCode, 200);
+
+  const publish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/StaticPublishTemplate/publish`, {
+    params: {},
+    savedSpecHash: hashJson(spec)
+  }, {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token
+  });
+
+  assert.equal(publish.statusCode, 200, publish.body);
+  assert.equal(publish.json.success, true);
+  assert.equal(publish.json.action, 'publish');
+  assert.equal(publish.json.cache.status, 'snapshot-published');
+  assert.equal(publish.json.cache.scope, 'staticSnapshot');
+  const table = publish.json.result.tables.find((item) => item.name === 'arms');
+  assert.ok(table, 'arms table is present');
+  assert.deepEqual(table.rows.map((row) => row.Code).sort(), ['ARM-001', 'ARM-002']);
+  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/routerG/cards')), true);
+  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/ARM/cards')), true);
+  assert.equal(backend.exitCode, null);
+});
+
 test('model metadata endpoints read inherited attributes with service scope', async (t) => {
   const mock = await startMockCmdbuild(t);
   const backendPort = await freePort();
@@ -119,8 +376,44 @@ test('model metadata endpoints read inherited attributes with service scope', as
   assert.equal(backend.exitCode, null);
 });
 
-async function startMockCmdbuild(t) {
+test('model class attributes endpoint preserves CMDBuild permission and missing statuses', async (t) => {
+  const mock = await startMockCmdbuild(t, {
+    attributeStatusByClass: {
+      ForbiddenClass: 403,
+      MissingClass: 404
+    }
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=metadata-status-test-token';
+
+  const forbidden = await requestJson(
+    'GET',
+    `${backendOrigin}/cmdbuild/custom-api/model/classes/ForbiddenClass/attributes`,
+    undefined,
+    { cookie }
+  );
+  assert.equal(forbidden.statusCode, 403, forbidden.body);
+  assert.equal(forbidden.json.success, false);
+  assert.equal(forbidden.json.cmdbuildStatus, 403);
+
+  const missing = await requestJson(
+    'GET',
+    `${backendOrigin}/cmdbuild/custom-api/model/classes/MissingClass/attributes`,
+    undefined,
+    { cookie }
+  );
+  assert.equal(missing.statusCode, 404, missing.body);
+  assert.equal(missing.json.success, false);
+  assert.equal(missing.json.cmdbuildStatus, 404);
+  assert.equal(backend.exitCode, null);
+});
+
+async function startMockCmdbuild(t, options = {}) {
   const requests = [];
+  const templateCards = Array.isArray(options.templates) ? options.templates : [];
+  const attributeStatusByClass = options.attributeStatusByClass || {};
   const server = http.createServer((req, res) => {
     const requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
     requests.push({
@@ -138,7 +431,8 @@ async function startMockCmdbuild(t) {
         data: [
           { _id: 1, name: 'routerG', description: 'Маршрутизатор', active: true },
           { _id: 2, name: 'ARM', description: 'АРМ', active: true },
-          { _id: 3, name: 'Cst_QueryToolConfig', description: 'Config', active: true }
+          { _id: 3, name: 'Cst_QueryToolConfig', description: 'Config', active: true },
+          { _id: 4, name: 'Cst_QueryTemplate', description: 'Template', active: true }
         ]
       });
       return;
@@ -149,6 +443,10 @@ async function startMockCmdbuild(t) {
         return;
       }
       const className = decodeURIComponent(requestUrl.pathname.split('/').at(-2));
+      if (attributeStatusByClass[className]) {
+        sendJson(res, attributeStatusByClass[className], { message: `attributes unavailable for ${className}` });
+        return;
+      }
       const fixtures = {
         routerG: [
           { name: 'Location', type: 'reference', targetClass: 'Location', inherited: false, active: true, _can_read: true },
@@ -162,7 +460,8 @@ async function startMockCmdbuild(t) {
           { name: 'model', type: 'string', inherited: true, active: true, _can_read: true },
           { name: 'model2', type: 'string', inherited: false, active: true, _can_read: true }
         ],
-        Cst_QueryToolConfig: []
+        Cst_QueryToolConfig: [],
+        Cst_QueryTemplate: []
       };
       sendJson(res, 200, { data: fixtures[className] || [] });
       return;
@@ -177,6 +476,10 @@ async function startMockCmdbuild(t) {
     }
     if (requestUrl.pathname === '/cmdbuild/services/rest/v3/classes/Cst_QueryToolConfig/cards') {
       sendJson(res, 200, { data: [] });
+      return;
+    }
+    if (requestUrl.pathname === '/cmdbuild/services/rest/v3/classes/Cst_QueryTemplate/cards') {
+      sendJson(res, 200, { data: paginate(requestUrl, templateCards) });
       return;
     }
     if (requestUrl.pathname === '/cmdbuild/services/rest/v3/classes/routerG/cards') {
@@ -242,6 +545,62 @@ async function startMockCmdbuild(t) {
     origin: `http://127.0.0.1:${address.port}`,
     requests
   };
+}
+
+function publishSpec(overrides = {}) {
+  return {
+    version: 1,
+    steps: [
+      {
+        type: 'selectCards',
+        as: 'routerAnchor',
+        className: 'routerG',
+        filters: [{ path: 'Description', op: 'equals', value: 'Маршрутизатор для Test City 300' }],
+        columns: ['Code', 'Description', 'Location'],
+        limit: 1
+      },
+      {
+        type: 'selectCards',
+        as: 'arms',
+        from: 'routerAnchor',
+        className: 'ARM',
+        filters: [{ path: 'Location', op: 'equals', valueColumn: 'Location' }],
+        columns: ['Code', 'Description', 'Location'],
+        limit: 100
+      }
+    ],
+    result: {
+      tables: [{ name: 'arms', columns: ['Code', 'Description', 'Location'] }]
+    },
+    publish: { mode: 'staticSnapshot', paramsMode: 'exact', warningAccepted: true },
+    ...overrides
+  };
+}
+
+function templateCard(code, spec, options = {}) {
+  const card = {
+    _id: code,
+    Code: code,
+    Description: code,
+    Active: true,
+    SpecJson: JSON.stringify(spec),
+    ParamsSchemaJson: '{}',
+    ResultSchemaJson: '{}',
+    Owner: 'preview-user',
+    UpdatedAt: '2026-07-10T00:00:00.000Z'
+  };
+  if (options.includeCanUpdate !== false) card._can_update = options.canUpdate === undefined ? true : Boolean(options.canUpdate);
+  return card;
+}
+
+function stableJsonStringify(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJsonStringify).join(',')}]`;
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJsonStringify(value[key])}`).join(',')}}`;
+}
+
+function hashJson(value) {
+  return crypto.createHash('sha256').update(stableJsonStringify(value)).digest('hex');
 }
 
 function paginate(requestUrl, rows) {
@@ -330,6 +689,41 @@ function request(method, url, body, extraHeaders = {}, timeoutMs = 5000) {
     req.on('timeout', () => req.destroy(new Error('request timeout')));
     req.on('error', reject);
     if (payload !== null) req.write(payload);
+    req.end();
+  });
+}
+
+function requestRaw(method, url, payload, extraHeaders = {}, timeoutMs = 5000) {
+  const target = new URL(url);
+  const text = payload === undefined || payload === null ? '' : String(payload);
+  return new Promise((resolve, reject) => {
+    const headers = {
+      accept: 'application/json,*/*',
+      ...extraHeaders,
+      'content-length': Buffer.byteLength(text)
+    };
+    const req = http.request({
+      method,
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port,
+      path: `${target.pathname}${target.search}`,
+      headers,
+      timeout: timeoutMs
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        resolve({
+          statusCode: res.statusCode || 0,
+          headers: res.headers,
+          body: Buffer.concat(chunks).toString('utf8')
+        });
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('request timeout')));
+    req.on('error', reject);
+    if (text) req.write(text);
     req.end();
   });
 }

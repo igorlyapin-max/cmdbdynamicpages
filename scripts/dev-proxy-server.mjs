@@ -1755,6 +1755,8 @@ function dynamicPagesClientScript() {
       copyFromTemplate: 'Copy from template',
       doNotCopy: 'Do not copy',
       noTemplateToCopy: 'No saved templates to copy.',
+      templateSelectionRequired: 'Select or create a template to open this section.',
+      publishSavedSpecHashMissing: 'Publication settings were saved, but the saved template version hash is missing. Reload the template and retry publishing.',
       copyFromTemplateHelp: 'Copies the constructor, input variables, final data and visualization settings. Code and description stay as entered for the new template.',
       templateCopyApplied: 'Template {code} copied into the new template draft.',
       yes: 'yes',
@@ -2430,6 +2432,8 @@ function dynamicPagesClientScript() {
       copyFromTemplate: 'Скопировать с шаблона',
       doNotCopy: 'Не копировать',
       noTemplateToCopy: 'Нет сохраненных шаблонов для копирования.',
+      templateSelectionRequired: 'Выберите или создайте шаблон, чтобы открыть этот раздел.',
+      publishSavedSpecHashMissing: 'Настройки публикации сохранены, но hash сохраненной версии шаблона отсутствует. Перезагрузите шаблон и повторите публикацию.',
       copyFromTemplateHelp: 'Копируются конструктор, входные переменные, итоговые данные и визуализация. Код и описание нового шаблона сохраняются как введены.',
       templateCopyApplied: 'Шаблон {code} скопирован в черновик нового шаблона.',
       yes: 'да',
@@ -2998,6 +3002,7 @@ function dynamicPagesClientScript() {
     catalogSyncing: false,
     catalogAttributeLoads: {},
     catalogAttributeLoaded: {},
+    catalogAttributeFailedAt: {},
     maxTraversalDepth: Math.max(1, Math.min(5, Number(readStorageValue('cmdbdynamicpages.maxTraversalDepth') || 2))),
     designerSection: normalizeDesignerSection(boot.designerSection || readDesignerSectionFromLocation()),
     templates: [],
@@ -3072,7 +3077,9 @@ function dynamicPagesClientScript() {
 
   function sectionNeedsSelectedTemplate(section) {
     return [
+      'template',
       'versions',
+      'assistant',
       'object-group',
       'relations',
       'final-view',
@@ -3080,25 +3087,40 @@ function dynamicPagesClientScript() {
       'params',
       'extraction',
       'run',
+      'cache',
       'publication',
       'selection',
       'visualization'
     ].indexOf(normalizeDesignerSection(section)) !== -1;
   }
 
-  function ensureTemplateListOnNewDesignerSession() {
-    if (state.selectedTemplate || !sectionNeedsSelectedTemplate(state.designerSection)) return false;
+  function canEnterDesignerSection(section) {
+    return Boolean(state.selectedTemplate || !sectionNeedsSelectedTemplate(section));
+  }
+
+  function redirectDesignerSectionToTemplates(options) {
+    options = options || {};
     state.designerSection = 'templates';
+    if (options.message !== false) state.message = { type: 'warning', text: t('templateSelectionRequired') };
     if (window.history && window.history.replaceState) {
       window.history.replaceState({ designerSection: 'templates' }, '', designerSectionUrl('templates'));
     }
     return true;
   }
 
+  function ensureTemplateListOnNewDesignerSession() {
+    if (state.selectedTemplate || !sectionNeedsSelectedTemplate(state.designerSection)) return false;
+    return redirectDesignerSectionToTemplates();
+  }
+
   function setDesignerSection(section, replace) {
     if (!captureVisibleDesignerState()) return;
     var normalized = normalizeDesignerSection(section);
-    if (!state.selectedTemplate && sectionNeedsSelectedTemplate(normalized)) normalized = 'templates';
+    if (!canEnterDesignerSection(normalized)) {
+      redirectDesignerSectionToTemplates();
+      renderDesigner();
+      return;
+    }
     state.designerSection = normalized;
     var url = designerSectionUrl(normalized);
     if (window.history && window.history.pushState) {
@@ -3278,19 +3300,22 @@ function dynamicPagesClientScript() {
     if (!name) return Promise.resolve(false);
     if (state.catalogAttributeLoaded[key]) return Promise.resolve(false);
     if (state.catalogAttributeLoads[key]) return state.catalogAttributeLoads[key];
+    var failedAt = Number(state.catalogAttributeFailedAt[key] || 0);
+    if (failedAt && Date.now() - failedAt < 5000) return Promise.resolve(false);
     state.catalogAttributeLoads[key] = request(apiPrefix + '/model/classes/' + encodeURIComponent(name) + '/attributes').then(function (result) {
       if (!result.ok || !result.json || !Array.isArray(result.json.data)) {
         throw new Error(errorText(result));
       }
+      delete state.catalogAttributeFailedAt[key];
       return mergeCatalogClassAttributes(name, result.json.data);
     }).catch(function (error) {
-      state.catalogAttributeLoaded[key] = true;
+      state.catalogAttributeFailedAt[key] = Date.now();
       state.message = {
         type: 'warning',
         text: t('catalogError') + ': ' + name + ' ' + (error && error.message ? error.message : String(error))
       };
       clientLog('catalog-attributes-error', name + ' ' + (error && error.message ? error.message : String(error)));
-      return false;
+      return 'failed';
     }).finally(function () {
       delete state.catalogAttributeLoads[key];
     });
@@ -3335,7 +3360,7 @@ function dynamicPagesClientScript() {
     var classes = viewComposerCatalogClassNames(selected.spec || defaultSpec());
     if (!classes.length) return;
     Promise.all(classes.map(ensureCatalogAttributesForClass)).then(function (results) {
-      if (results.some(Boolean) && normalizeDesignerSection(state.designerSection) === 'final-view') renderDesigner();
+      if ((results.some(function (item) { return item === true; }) || results.some(function (item) { return item === 'failed'; })) && normalizeDesignerSection(state.designerSection) === 'final-view') renderDesigner();
     });
   }
 
@@ -4940,7 +4965,7 @@ function dynamicPagesClientScript() {
   function inferObjectGroupModel(spec) {
     if (state.objectGroupDraft) return state.objectGroupDraft;
     spec = spec || defaultSpec();
-    var visual = spec.visualModel && spec.visualModel.mode === 'objectGroup' ? spec.visualModel : null;
+    var visual = getStoredVisualModel(spec, 'objectGroup');
     if (visual) {
       if (Array.isArray(visual.selections) && visual.selections.length) {
         var visualSelections = visual.selections.map(function (selection, index) {
@@ -5426,9 +5451,12 @@ function dynamicPagesClientScript() {
         links.map(function (link) {
           var section = normalizeDesignerSection(link.section);
           var classes = [];
+          var disabled = !canEnterDesignerSection(section);
           if (state.designerSection === section) classes.push('active');
+          if (disabled) classes.push('disabled');
           var classAttr = classes.length ? ' class="' + classes.join(' ') + '"' : '';
-          return '<a' + classAttr + ' href="' + escapeHtml(designerSectionUrl(section)) + '" data-designer-section="' + escapeHtml(section) + '">' + escapeHtml(link.label) + '</a>';
+          var disabledAttrs = disabled ? ' aria-disabled="true" tabindex="-1" data-disabled-template-section="true"' : '';
+          return '<a' + classAttr + disabledAttrs + ' href="' + escapeHtml(designerSectionUrl(section)) + '" data-designer-section="' + escapeHtml(section) + '">' + escapeHtml(link.label) + '</a>';
         }).join('') + '</div></div>';
     }
     return [
@@ -6193,6 +6221,10 @@ function dynamicPagesClientScript() {
 
   function renderDesignerSection(selected, config, templateRows) {
     var section = normalizeDesignerSection(state.designerSection);
+    if (!canEnterDesignerSection(section)) {
+      redirectDesignerSectionToTemplates();
+      section = 'templates';
+    }
     if (section === 'template') return renderTemplateEditor(selected);
     if (section === 'schema') return renderSchemaManager();
     if (section === 'versions') return renderVersions();
@@ -6373,6 +6405,9 @@ function dynamicPagesClientScript() {
       return;
     }
     var config = state.config || { runtimeConfig: defaultRuntimeConfig(), exists: false };
+    state.designerSection = normalizeDesignerSection(state.designerSection);
+    if (!canEnterDesignerSection(state.designerSection)) redirectDesignerSectionToTemplates();
+
     var selected = state.selectedTemplate || {
       code: '',
       description: '',
@@ -6392,7 +6427,6 @@ function dynamicPagesClientScript() {
         '<td>' + deleteAction + '</td></tr>';
     }).join('');
 
-    state.designerSection = normalizeDesignerSection(state.designerSection);
     app.innerHTML = [
       renderDesignerMenu(),
       '<div class="designer-main">',
@@ -8241,9 +8275,10 @@ function dynamicPagesClientScript() {
         state.selectedTemplate = state.templates.find(function (item) { return item.code === state.selectedTemplate.code; }) || null;
       }
       if (state.selectedTemplate) hydrateDesignerStateFromTemplate({ replaceRunParams: !state.runParams || Object.keys(state.runParams).length === 0 });
-      ensureTemplateListOnNewDesignerSession();
+      var redirectedToTemplates = ensureTemplateListOnNewDesignerSession();
       var failed = results.find(function (item) { return !item.ok; });
-      state.message = failed ? { type: 'error', text: errorText(failed) } : null;
+      if (failed) state.message = { type: 'error', text: errorText(failed) };
+      else if (!redirectedToTemplates || !state.message) state.message = null;
       return loadCatalogCache().then(function () {
         clientLog('load-designer-catalog', 'loaded');
         return fetchVersions(state.selectedTemplate && state.selectedTemplate.code).then(renderDesigner);
@@ -10747,10 +10782,18 @@ function dynamicPagesClientScript() {
     var savePath = exists ? apiPrefix + '/templates/' + encodeURIComponent(state.selectedTemplate.code) : apiPrefix + '/templates';
     request(savePath, { method: exists ? 'PUT' : 'POST', body: payload }).then(function (saveResult) {
       if (!saveResult.ok) throw new Error(errorText(saveResult));
-      state.selectedTemplate = saveResult.json.template;
-      return request(apiPrefix + '/templates/' + encodeURIComponent(payload.code) + '/publish', {
-      method: 'POST',
-      body: { params: params }
+      var savedTemplate = saveResult.json && saveResult.json.template ? saveResult.json.template : {};
+      state.selectedTemplate = savedTemplate;
+      if (!savedTemplate.specHash || !/^[0-9a-f]{64}$/i.test(String(savedTemplate.specHash))) {
+        throw new Error(t('publishSavedSpecHashMissing'));
+      }
+      var publishCode = savedTemplate.code || payload.code || code;
+      return request(apiPrefix + '/templates/' + encodeURIComponent(publishCode) + '/publish', {
+        method: 'POST',
+        body: {
+          params: params,
+          savedSpecHash: savedTemplate.specHash
+        }
       });
     }).then(function (result) {
       state.result = result;
@@ -10903,6 +10946,11 @@ function dynamicPagesClientScript() {
     var sectionLink = event.target.closest('[data-designer-section]');
     if (sectionLink && boot.mode !== 'runtime') {
       event.preventDefault();
+      if (sectionLink.getAttribute('aria-disabled') === 'true' || sectionLink.getAttribute('data-disabled-template-section') === 'true') {
+        redirectDesignerSectionToTemplates();
+        renderDesigner();
+        return;
+      }
       setDesignerSection(sectionLink.getAttribute('data-designer-section'));
       return;
     }
@@ -12500,6 +12548,27 @@ function sanitizeTemplateCard(card) {
 function expectedSpecHashFromBody(body) {
   const source = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
   return String(source.expectedSpecHash || source.ExpectedSpecHash || '').trim();
+}
+
+function isSpecHash(value) {
+  return /^[0-9a-f]{64}$/i.test(String(value || '').trim());
+}
+
+function specHashLogPrefix(value) {
+  const source = String(value || '').trim();
+  if (!source) return '';
+  return isSpecHash(source) ? source.toLowerCase().slice(0, 16) : sha256Hex(source).slice(0, 16);
+}
+
+function savedSpecHashInfoFromBody(body) {
+  const source = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+  const raw = String(source.savedSpecHash || source.SavedSpecHash || '').trim();
+  return {
+    rawPresent: Boolean(raw),
+    valid: isSpecHash(raw),
+    value: isSpecHash(raw) ? raw.toLowerCase() : '',
+    prefix: specHashLogPrefix(raw)
+  };
 }
 
 function templateIsProtected(template) {
@@ -19099,7 +19168,12 @@ async function handleBackend(req, res, requestUrl) {
     }
 
     const attributes = await readCmdbuildClassAttributes(authToken, className);
-    sendJson(res, attributes.response.ok ? 200 : 502, {
+    const statusCode = attributes.response.ok
+      ? 200
+      : [401, 403, 404].includes(attributes.response.statusCode)
+        ? attributes.response.statusCode
+        : 502;
+    sendJson(res, statusCode, {
       success: attributes.response.ok,
       cmdbuildStatus: attributes.response.statusCode,
       className,
@@ -19678,6 +19752,15 @@ async function handleBackend(req, res, requestUrl) {
         return;
       }
 
+      if (templateAction === 'publish' && (!found.card || found.card._can_update !== true)) {
+        sendTechnicalSchemaAccessDenied(res, {
+          root: found.schema.root,
+          className: found.schema.classNames.template,
+          cmdbuildStatus: 403
+        });
+        return;
+      }
+
       const template = sanitizeTemplateCard(found.card);
       const errors = validateTemplateSpec(template.spec);
       if (templateAction === 'validate') {
@@ -19705,7 +19788,29 @@ async function handleBackend(req, res, requestUrl) {
         return;
       }
 
-      const body = runtimeReadOnly ? {} : await readJsonBody(req);
+      let body = {};
+      if (!runtimeReadOnly) {
+        try {
+          body = await readJsonBody(req);
+        } catch (error) {
+          sendJson(res, 400, {
+            success: false,
+            action: templateAction,
+            reason: 'request_body_invalid_json',
+            message: error && error.message ? error.message : String(error)
+          });
+          return;
+        }
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          sendJson(res, 400, {
+            success: false,
+            action: templateAction,
+            reason: 'request_body_must_be_object',
+            message: 'Request body must be a JSON object.'
+          });
+          return;
+        }
+      }
       const params = runtimeReadOnly ? publicSnapshotParamsFromUrl(requestUrl) : body.params || {};
       const jsonOutput = templateAction === 'run' && runtimeJsonOutputRequested(requestUrl);
       const session = await getSessionData(authToken);
@@ -19714,6 +19819,7 @@ async function handleBackend(req, res, requestUrl) {
       const executionLimits = normalizeExecutionLimitConfig(runtimeConfig);
       const runtimeCacheConfig = normalizeRuntimeCacheConfig(runtimeConfig);
       const publishConfig = normalizePublishConfig(template.spec);
+      const savedSpecHash = savedSpecHashInfoFromBody(body);
       const maxRows = templateAction === 'preview'
         ? getPositiveInt(requestUrl.searchParams, 'maxRows', executionLimits.maxRowsPreviewDefault, executionLimits.maxRowsMax)
         : getPositiveInt(requestUrl.searchParams, 'maxRows', executionLimits.maxRowsDefault, executionLimits.maxRowsMax);
@@ -19776,19 +19882,58 @@ async function handleBackend(req, res, requestUrl) {
       }
 
       if (templateAction === 'publish') {
+        if (!savedSpecHash.valid) {
+          logWarn('snapshot.publish_missing_saved_spec_hash', {
+            requestId: req.cmdpRequestId || '',
+            templateCode: template.code,
+            username,
+            savedSpecHashPresent: savedSpecHash.rawPresent,
+            savedSpecHashPrefix: savedSpecHash.prefix
+          });
+          sendJson(res, 400, {
+            success: false,
+            action: templateAction,
+            reason: 'publication_saved_spec_hash_required',
+            message: 'Publication requires a valid saved template version hash. Save the template and retry publishing.'
+          });
+          return;
+        }
+        if (savedSpecHash.value !== template.specHash) {
+          logWarn('snapshot.publish_stale_spec', {
+            requestId: req.cmdpRequestId || '',
+            templateCode: template.code,
+            username,
+            savedSpecHashPrefix: savedSpecHash.prefix,
+            currentSpecHashPrefix: specHashLogPrefix(template.specHash)
+          });
+          sendJson(res, 409, {
+            success: false,
+            action: templateAction,
+            reason: 'publication_saved_spec_mismatch',
+            message: 'Publication settings were saved to a different template version. Reload the template and publish again.',
+            currentSpecHash: template.specHash,
+            template: {
+              code: template.code,
+              description: template.description,
+              active: template.active,
+              specHash: template.specHash
+            }
+          });
+          return;
+        }
         if (publishConfig.mode !== 'staticSnapshot' || !publishConfig.warningAccepted) {
           sendJson(res, 400, {
             success: false,
             action: templateAction,
-            message: 'Template publish.mode must be staticSnapshot and warningAccepted must be true.'
-          });
-          return;
-        }
-        if (found.card && found.card._can_update === false) {
-          sendTechnicalSchemaAccessDenied(res, {
-            root: found.schema.root,
-            className: found.schema.classNames.template,
-            cmdbuildStatus: 403
+            reason: 'publication_settings_not_saved',
+            message: 'Publication settings were not saved. Select static snapshot publication, accept the warning, save, and retry publishing.',
+            publish: publishConfig,
+            template: {
+              code: template.code,
+              description: template.description,
+              active: template.active,
+              specHash: template.specHash
+            }
           });
           return;
         }

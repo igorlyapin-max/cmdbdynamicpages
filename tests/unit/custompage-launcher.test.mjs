@@ -68,6 +68,89 @@ test('assistant draft generation renders an in-progress state before the request
   assert.match(generateSource, /stopAssistantGenerationTimer\(\)/);
 });
 
+test('designer blocks template-bound menu sections until a template is selected', () => {
+  const sectionNeedsStart = proxySource.indexOf('function sectionNeedsSelectedTemplate(section)');
+  const canEnterStart = proxySource.indexOf('function canEnterDesignerSection(section)');
+  const ensureStart = proxySource.indexOf('function ensureTemplateListOnNewDesignerSession()');
+  const menuStart = proxySource.indexOf('function renderDesignerMenu()');
+  const renderSectionStart = proxySource.indexOf('function renderDesignerSection(selected, config, templateRows)');
+  const titleStart = proxySource.indexOf('function designerSectionTitle(section)');
+  const clickStart = proxySource.indexOf("var sectionLink = event.target.closest('[data-designer-section]')");
+  const actionStart = proxySource.indexOf("var target = event.target.closest('[data-action]')");
+  assert.ok(sectionNeedsStart > -1);
+  assert.ok(canEnterStart > sectionNeedsStart);
+  assert.ok(ensureStart > canEnterStart);
+  assert.ok(menuStart > ensureStart);
+  assert.ok(renderSectionStart > menuStart);
+  assert.ok(titleStart > renderSectionStart);
+  assert.ok(clickStart > titleStart);
+  assert.ok(actionStart > clickStart);
+
+  const sectionNeedsSource = proxySource.slice(sectionNeedsStart, canEnterStart);
+  const menuSource = proxySource.slice(menuStart, renderSectionStart);
+  const renderSectionSource = proxySource.slice(renderSectionStart, titleStart);
+  const clickSource = proxySource.slice(clickStart, actionStart);
+  const loadDesignerStart = proxySource.indexOf('function loadDesigner()');
+  const fetchVersionsStart = proxySource.indexOf('function fetchVersions(code)');
+  assert.ok(loadDesignerStart > -1);
+  assert.ok(fetchVersionsStart > loadDesignerStart);
+  const loadDesignerSource = proxySource.slice(loadDesignerStart, fetchVersionsStart);
+
+  assert.match(sectionNeedsSource, /'template'/);
+  assert.match(sectionNeedsSource, /'assistant'/);
+  assert.match(sectionNeedsSource, /'cache'/);
+  assert.match(proxySource, /templateSelectionRequired/);
+  assert.match(proxySource, /function redirectDesignerSectionToTemplates/);
+  assert.match(menuSource, /aria-disabled="true"/);
+  assert.match(menuSource, /data-disabled-template-section="true"/);
+  assert.match(renderSectionSource, /if \(!canEnterDesignerSection\(section\)\)/);
+  assert.match(clickSource, /data-disabled-template-section/);
+  assert.match(clickSource, /redirectDesignerSectionToTemplates\(\)/);
+  assert.match(loadDesignerSource, /var redirectedToTemplates = ensureTemplateListOnNewDesignerSession\(\)/);
+  assert.match(loadDesignerSource, /else if \(!redirectedToTemplates \|\| !state\.message\) state\.message = null/);
+});
+
+test('snapshot publication saves static settings before publish and uses saved template version', () => {
+  const publishStart = proxySource.indexOf('function publishSnapshot()');
+  const launchStart = proxySource.indexOf('function refreshTemplateLaunchUrl()');
+  assert.ok(publishStart > -1);
+  assert.ok(launchStart > publishStart);
+  const publishSource = proxySource.slice(publishStart, launchStart);
+
+  assert.match(publishSource, /payload\.spec = applyPublicationToSpec\(payload\.spec, true\)/);
+  assert.match(publishSource, /request\(savePath, \{ method: exists \? 'PUT' : 'POST', body: payload \}\)/);
+  assert.match(publishSource, /var savedTemplate = saveResult\.json && saveResult\.json\.template \? saveResult\.json\.template : \{\}/);
+  assert.match(publishSource, /state\.selectedTemplate = savedTemplate/);
+  assert.match(publishSource, /publishSavedSpecHashMissing/);
+  assert.match(publishSource, /\^\[0-9a-f\]\{64\}\$/);
+  assert.match(publishSource, /var publishCode = savedTemplate\.code \|\| payload\.code \|\| code/);
+  assert.match(publishSource, /encodeURIComponent\(publishCode\) \+ '\/publish'/);
+  assert.match(publishSource, /savedSpecHash: savedTemplate\.specHash/);
+  assert.doesNotMatch(publishSource, /savedTemplate\.specHash \|\| ''/);
+  assert.doesNotMatch(publishSource, /encodeURIComponent\(payload\.code\) \+ '\/publish'/);
+});
+
+test('final view attribute lazy-load retries after transient class attribute errors', () => {
+  const ensureStart = proxySource.indexOf('function ensureCatalogAttributesForClass(className)');
+  const viewClassesStart = proxySource.indexOf('function viewComposerCatalogClassNames(spec)');
+  const ensureSectionStart = proxySource.indexOf('function ensureCatalogAttributesForDesignerSection()');
+  const extractLanguageStart = proxySource.indexOf('function extractLanguageFromValue(value)');
+  assert.ok(ensureStart > -1);
+  assert.ok(viewClassesStart > ensureStart);
+  assert.ok(ensureSectionStart > viewClassesStart);
+  assert.ok(extractLanguageStart > ensureSectionStart);
+  const ensureSource = proxySource.slice(ensureStart, viewClassesStart);
+  const ensureSectionSource = proxySource.slice(ensureSectionStart, extractLanguageStart);
+
+  assert.match(ensureSource, /request\(apiPrefix \+ '\/model\/classes\/' \+ encodeURIComponent\(name\) \+ '\/attributes'\)/);
+  assert.match(ensureSource, /state\.catalogAttributeFailedAt\[key\]/);
+  assert.match(ensureSource, /return mergeCatalogClassAttributes\(name, result\.json\.data\)/);
+  assert.match(ensureSource, /catch\(function \(error\)/);
+  assert.match(ensureSource, /return 'failed'/);
+  assert.match(ensureSectionSource, /item === 'failed'/);
+  assert.doesNotMatch(ensureSource, /catch\(function \(error\) \{\s*state\.catalogAttributeLoaded\[key\] = true/);
+});
+
 test('object group editor preserves assistant source-row selection fields', () => {
   const normalizeRuleStart = proxySource.indexOf('function normalizeObjectSelectionRule(rule)');
   const normalizeStart = proxySource.indexOf('function normalizeObjectSelection(selection, index)');
@@ -98,6 +181,8 @@ test('object group editor preserves assistant source-row selection fields', () =
   assert.match(normalizeSource, /function ensureObjectGroupValueColumnSources\(selections\)/);
   assert.match(normalizeSource, /stripObjectGroupSourceColumnPrefix\(sourceAlias/);
   assert.match(normalizeSource, /addObjectGroupSelectionColumn\(source\[sourceIndex\], column\)/);
+  assert.match(inferSource, /var visual = getStoredVisualModel\(spec, 'objectGroup'\)/);
+  assert.doesNotMatch(inferSource, /spec\.visualModel && spec\.visualModel\.mode === 'objectGroup'/);
   assert.match(inferSource, /var cardSteps = steps\.filter\(isDataSelectionStep\)/);
   assert.match(inferSource, /from: selection\.from \|\| ''/);
   assert.match(inferSource, /valueColumn: filter\.valueColumn \|\| filter\.sourceColumn \|\| filter\.fromColumn/);
