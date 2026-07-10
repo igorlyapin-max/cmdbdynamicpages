@@ -85,6 +85,7 @@ const DIAGNOSTIC_MODE = normalizeDiagnosticMode(process.env.CMDP_DIAGNOSTIC_MODE
 const LOG_LEVEL = normalizeLogLevel(process.env.CMDP_LOG_LEVEL || 'info');
 const LOG_FORMAT = normalizeLogFormat(process.env.CMDP_LOG_FORMAT || 'json');
 const LOG_TARGETS = normalizeLogTargets(process.env.CMDP_LOG_TARGET || 'stdout');
+const EXTERNAL_LOG_SINK = String(process.env.CMDP_EXTERNAL_LOG_SINK || '').trim();
 const LOG_REDACT_HEADERS = parseNameSet(process.env.CMDP_LOG_REDACT_HEADERS || 'cookie,authorization,cmdbuild-authorization,x-csrf-token,x-cmdbdynamicpages-csrf,set-cookie');
 const LOG_REDACT_QUERY = parseNameSet(process.env.CMDP_LOG_REDACT_QUERY || 'password,passwd,pwd,token,secret,authorization,auth,csrf,x-cmdbdynamicpages-csrf');
 const SYSLOG_HOST = process.env.CMDP_SYSLOG_HOST || '127.0.0.1';
@@ -102,8 +103,23 @@ const REGEX_MAX_INPUT_LENGTH = Math.max(1024, Number(process.env.CMDBDYNAMIC_REG
 const DEFAULT_EMPTY_RESULT_TEXT = 'В результате вашего запроса объекты не найдены';
 const DEFAULT_PERMISSION_DENIED_TEXT = 'Вам не хватает прав увидеть данные или интерфейс дизайнера';
 const SNAPSHOT_MISSING_TEXT = 'Страница отсутствует для загрузки';
-const BAA_POST_ONLY_TEXT = 'BAA templates are POST-only verification endpoints. Use /cmdbuild/custom-api/templates/<code>/baa-verify with a JSON request body.';
 const RUNTIME_SYSTEM_PARAMS = new Set(['json']);
+const LITELLM_BASE_URL = process.env.LITELLM_BASE_URL || process.env.CMDP_LITELLM_BASE_URL || 'http://127.0.0.1:4000/v1';
+const LITELLM_MODEL = process.env.LITELLM_MODEL || process.env.CMDP_LITELLM_MODEL || 'corp-openai-gpt-4.1-mini';
+const LITELLM_API_KEY = readOptionalSecretValue(process.env.LITELLM_API_KEY || process.env.CMDP_LITELLM_API_KEY, process.env.LITELLM_API_KEY_FILE || process.env.CMDP_LITELLM_API_KEY_FILE);
+const LITELLM_ALLOWED_BASE_URLS = normalizeLiteLLMAllowedBaseUrls(process.env.CMDP_LITELLM_ALLOWED_BASE_URLS || process.env.LITELLM_ALLOWED_BASE_URLS || LITELLM_BASE_URL);
+const ASSISTANT_TIMEOUT_MS = Math.max(1000, Number(process.env.CMDP_ASSISTANT_TIMEOUT_MS || 30000) || 30000);
+const ASSISTANT_MAX_TOKENS = Math.max(256, Math.min(8192, Number(process.env.CMDP_ASSISTANT_MAX_TOKENS || 2400) || 2400));
+const ASSISTANT_TEMPERATURE = Math.max(0, Math.min(1, Number(process.env.CMDP_ASSISTANT_TEMPERATURE || 0.1) || 0.1));
+const DEFAULT_ASSISTANT_SYSTEM_PROMPT = [
+  'Пользователь может называть CMDBuild классы, атрибуты, lookup значения и связи как по Code, так и по Description. При неоднозначности используй MCP context и явно предпочитай точное совпадение Code, затем Description.',
+  'Если пользователь называет класс по Code или Description, выбирай точное совпадение Code или точное совпадение Description. Более специализированный partial Description допустим только как fallback с явным warning, если точное совпадение не найдено в доступном MCP context.',
+  'Пользовательские формулировки могут ссылаться на атрибуты напрямую, на связи через domains, на reference-поля и на lookup-поля. Для lookup/reference/domain значений пользователь обычно оперирует отображаемым значением или Description связанного объекта, а не внутренним id. Не сравнивай такие поля как raw id, если по модели доступно человекочитаемое значение.',
+  'Атрибут может быть простым значением, lookup, reference или участником domain relation. Перед построением DSL проверь тип атрибута и выбирай путь чтения данных по модели CMDBuild, а не по названию поля.',
+  'Для DSL expandRelations поле domain должно содержать только CMDBuild domain name/Code из cmdbuild_relation_hints.domains[].name, а не Description связи. Description используй только для выбора подходящего domain name. Если domain name не найден, не заполняй domain и добавь warning.',
+  'Связи между объектами могут быть 1:N, N:1 и N:N. При анализе связей не останавливайся на первой найденной связи или первой карточке: учитывай все видимые связи и все подходящие related cards в пределах настроенных лимитов. Если связь неоднозначна, сформируй deterministic draft с явным domain/path и добавь warning.',
+  'Результат должен оставаться детерминированным, кэшируемым и исполняемым без LLM. Используй только поддерживаемый DSL v1 и read-only MCP context; не добавляй runtime LLM вызовы.'
+].join('\n\n');
 const STARTED_AT = new Date();
 const ABSOLUTE_EXECUTION_LIMITS = {
   maxRows: 2000,
@@ -112,6 +128,13 @@ const ABSOLUTE_EXECUTION_LIMITS = {
   maxRestCalls: 1000,
   maxTraversalDepth: 5
 };
+const DEFAULT_ASSISTANT_MCP_MAX_CONTEXT_BYTES = 12000;
+const DEFAULT_ASSISTANT_MCP_TIMEOUT_MS = 10000;
+const DEFAULT_ASSISTANT_MCP_MAX_CANDIDATE_CLASSES = 8;
+const ASSISTANT_MCP_MAX_CLASSES_ABSOLUTE = Math.max(1, Number(process.env.CMDP_ASSISTANT_MCP_MAX_CLASSES_ABSOLUTE || 5000) || 5000);
+const ASSISTANT_MCP_MAX_DOMAINS_ABSOLUTE = Math.max(1, Number(process.env.CMDP_ASSISTANT_MCP_MAX_DOMAINS_ABSOLUTE || 5000) || 5000);
+const ASSISTANT_MCP_MAX_CONTEXT_BYTES_ABSOLUTE = Math.max(1024, Number(process.env.CMDP_ASSISTANT_MCP_MAX_CONTEXT_BYTES_ABSOLUTE || 1048576) || 1048576);
+const ASSISTANT_MCP_TIMEOUT_MS_ABSOLUTE = Math.max(1000, Number(process.env.CMDP_ASSISTANT_MCP_TIMEOUT_MS_ABSOLUTE || 60000) || 60000);
 const clientLogs = [];
 const proxyLogs = [];
 const runtimeResultCache = new Map();
@@ -188,6 +211,54 @@ function normalizeDiagnosticMode(value) {
   return 'off';
 }
 
+function normalizeLiteLLMBaseUrl(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  try {
+    const parsed = new URL(text);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+    parsed.hash = '';
+    parsed.search = '';
+    return parsed.toString().replace(/\/+$/, '');
+  } catch {
+    return '';
+  }
+}
+
+function normalizeLiteLLMAllowedBaseUrls(value) {
+  return Array.from(new Set(String(value || '')
+    .split(',')
+    .map(normalizeLiteLLMBaseUrl)
+    .filter(Boolean)));
+}
+
+function liteLLMBaseUrlStatus(value) {
+  const fallback = normalizeLiteLLMBaseUrl(LITELLM_BASE_URL);
+  const requested = normalizeLiteLLMBaseUrl(value);
+  if (!requested || requested === fallback) {
+    return {
+      baseUrl: fallback,
+      requestedBaseUrl: requested,
+      allowed: true,
+      source: 'env'
+    };
+  }
+  if (LITELLM_ALLOWED_BASE_URLS.includes(requested)) {
+    return {
+      baseUrl: requested,
+      requestedBaseUrl: requested,
+      allowed: true,
+      source: 'runtimeConfig'
+    };
+  }
+  return {
+    baseUrl: fallback,
+    requestedBaseUrl: requested,
+    allowed: false,
+    source: 'blocked'
+  };
+}
+
 function diagnosticModeAllows(level, mode = DIAGNOSTIC_MODE) {
   const normalizedMode = normalizeDiagnosticMode(mode);
   const normalizedLevel = normalizeDiagnosticMode(level);
@@ -256,6 +327,10 @@ function sanitizeReqUrl(req) {
   } catch {
     return truncateText(req.url || '', 1000);
   }
+}
+
+function sanitizeDiagnosticHref(value) {
+  return sanitizeUrlForLog(value, 500);
 }
 
 function sessionHashFromCookie(cookieHeader) {
@@ -415,6 +490,7 @@ function loggingStatus() {
     level: LOG_LEVEL,
     format: LOG_FORMAT,
     targets: LOG_TARGETS,
+    externalSink: EXTERNAL_LOG_SINK || null,
     diagnostic: {
       mode: DIAGNOSTIC_MODE,
       enabled: DIAGNOSTIC_MODE !== 'off',
@@ -435,7 +511,8 @@ function loggingStatus() {
     elk: {
       directOutput: false,
       recommendedPipeline: 'stdout/syslog -> collector -> Elasticsearch'
-    }
+    },
+    assistant: assistantStatus()
   };
 }
 
@@ -443,6 +520,7 @@ function validateRuntimeConfig(input = {}) {
   const nodeEnv = String(input.nodeEnv === undefined ? process.env.NODE_ENV || '' : input.nodeEnv || '').trim();
   const csrfSecret = String(input.csrfSecret === undefined ? process.env.CMDBDYNAMICPAGES_CSRF_SECRET || '' : input.csrfSecret || '').trim();
   const logTargets = input.logTargets || LOG_TARGETS;
+  const externalLogSink = String(input.externalLogSink === undefined ? EXTERNAL_LOG_SINK : input.externalLogSink || '').trim();
   const diagnosticMode = normalizeDiagnosticMode(input.diagnosticMode === undefined ? DIAGNOSTIC_MODE : input.diagnosticMode);
   const errors = [];
   const warnings = [];
@@ -454,12 +532,26 @@ function validateRuntimeConfig(input = {}) {
       message: 'Production startup requires a stable external CSRF secret.'
     });
   }
+  if (nodeEnv.toLowerCase() === 'production' && /^(replace-me|changeme|change-me|secret|password)$/i.test(csrfSecret)) {
+    errors.push({
+      code: 'csrf_secret_placeholder',
+      env: 'CMDBDYNAMICPAGES_CSRF_SECRET',
+      message: 'Production startup requires a non-placeholder CSRF secret.'
+    });
+  }
 
   if (!Array.isArray(logTargets) || !logTargets.includes('stdout')) {
     errors.push({
       code: 'stdout_log_target_required',
       env: 'CMDP_LOG_TARGET',
       message: 'Structured logs must always include stdout/stderr.'
+    });
+  }
+  if (nodeEnv.toLowerCase() === 'production' && Array.isArray(logTargets) && !logTargets.includes('syslog') && !externalLogSink) {
+    errors.push({
+      code: 'external_log_sink_required',
+      env: 'CMDP_LOG_TARGET',
+      message: 'Production startup requires an external log sink: configure CMDP_LOG_TARGET=stdout,syslog or set CMDP_EXTERNAL_LOG_SINK for a platform collector/logging driver.'
     });
   }
 
@@ -476,6 +568,8 @@ function validateRuntimeConfig(input = {}) {
     nodeEnv,
     diagnosticMode,
     logTargets,
+    externalLogSink,
+    assistant: assistantStatus(),
     errors,
     warnings
   };
@@ -486,6 +580,7 @@ function runtimeConfigLogSummary(validation = validateRuntimeConfig()) {
     nodeEnv: validation.nodeEnv || 'development',
     diagnosticMode: validation.diagnosticMode,
     logTargets: validation.logTargets,
+    externalLogSink: validation.externalLogSink || '',
     errors: validation.errors.map((item) => item.code),
     warnings: validation.warnings.map((item) => item.code)
   };
@@ -671,6 +766,19 @@ function hashJson(value) {
 function readSecretValue(value, filePath) {
   if (filePath) return fs.readFileSync(filePath, 'utf8').trim();
   return String(value || '');
+}
+
+function readOptionalSecretValue(value, filePath) {
+  const directValue = String(value || '').trim();
+  if (directValue) return directValue;
+  const path = String(filePath || '').trim();
+  if (!path) return '';
+  try {
+    return fs.readFileSync(path, 'utf8').trim();
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return '';
+    throw error;
+  }
 }
 
 function parseRedisUrl(value) {
@@ -1105,58 +1213,9 @@ function cloneJsonValueServer(value, fallback = null) {
   }
 }
 
-function isBaaVerificationSpec(spec) {
-  return Boolean(spec && spec.endpoint && spec.endpoint.kind === 'baaVerification');
-}
-
 function addUniqueString(list, value) {
   const text = String(value || '').trim();
   if (text && !list.includes(text)) list.push(text);
-}
-
-function collectBaaSourceAliasesForMissingInputs(spec) {
-  const steps = spec && Array.isArray(spec.steps) ? spec.steps : [];
-  const produced = new Set(steps.map((step) => step && step.as).filter(Boolean));
-  const aliases = [];
-  steps.forEach((step) => {
-    if (!step || typeof step !== 'object') return;
-    if (step.type === 'enrichRows' && step.from && !produced.has(step.from)) addUniqueString(aliases, step.from);
-    if (step.type === 'matchRows') {
-      if (step.from && !produced.has(step.from)) addUniqueString(aliases, step.from);
-      if (step.with && !produced.has(step.with)) addUniqueString(aliases, step.with);
-    }
-  });
-
-  const visualModels = [];
-  if (spec && spec.visualModel && typeof spec.visualModel === 'object' && !Array.isArray(spec.visualModel)) {
-    visualModels.push(spec.visualModel);
-  }
-  if (spec && Array.isArray(spec.visualModels)) {
-    spec.visualModels.forEach((model) => {
-      if (model && typeof model === 'object' && !Array.isArray(model)) visualModels.push(model);
-    });
-  }
-  visualModels.forEach((model) => {
-    if (model.mode !== 'viewComposer') return;
-    const alias = model.sourceAlias || model.source && model.source.alias || '';
-    if (alias && !produced.has(alias)) addUniqueString(aliases, alias);
-  });
-
-  if (!steps.length && !steps.some((step) => step && step.type === 'baaPlanObjects') && !aliases.length) aliases.push('baaObjects');
-  return aliases;
-}
-
-function ensureBaaPlanObjectSourceSteps(spec) {
-  if (!isBaaVerificationSpec(spec)) return spec;
-  const next = cloneJsonValueServer(spec, spec);
-  const steps = Array.isArray(next.steps) ? next.steps.slice() : [];
-  const existing = new Set(steps.filter((step) => step && step.type === 'baaPlanObjects').map((step) => step.as).filter(Boolean));
-  const missingAliases = collectBaaSourceAliasesForMissingInputs({ ...next, steps }).filter((alias) => !existing.has(alias));
-  missingAliases.reverse().forEach((alias) => {
-    steps.unshift({ type: 'baaPlanObjects', as: alias, payloadPrefix: 'Payload.' });
-  });
-  next.steps = steps;
-  return next;
 }
 
 function shouldLogProxyRequest(pathname) {
@@ -1210,8 +1269,8 @@ function logProxyRequest(req, requestUrl) {
   appendBoundedLog(proxyLogs, {
     time: new Date().toISOString(),
     method: req.method || '',
-    path: truncateText(`${requestUrl.pathname}${requestUrl.search}`, 500),
-    referer: truncateText(req.headers.referer || '', 500),
+    path: sanitizeRequestPath(requestUrl),
+    referer: sanitizeUrlForLog(req.headers.referer || '', 500),
     userAgent: truncateText(req.headers['user-agent'] || '', 200)
   });
 }
@@ -1318,6 +1377,24 @@ function rewriteCmdbuildManifest(body) {
     return JSON.stringify(manifest);
   } catch {
     return body;
+  }
+}
+
+function readCustomPageLauncherScript() {
+  return fs.readFileSync(new URL('../src/CmdbDynamicPages.js', import.meta.url), 'utf8');
+}
+
+function serveCustomPageLauncherScript(req, res) {
+  if (!methodAllowed(req, res, 'GET')) return;
+  try {
+    sendText(res, 200, readCustomPageLauncherScript(), 'application/javascript; charset=utf-8');
+  } catch (error) {
+    logError('custompage.script_read_failed', {
+      requestId: req.cmdpRequestId || '',
+      path: 'src/CmdbDynamicPages.js',
+      error: error && error.message ? error.message : String(error)
+    });
+    sendText(res, 500, 'CMDB Dynamic Pages launcher script is unavailable.');
   }
 }
 
@@ -1440,7 +1517,15 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     templateCode,
     designerSection,
     publicRuntime,
-    apiPrefix: BACKEND_PREFIX
+    apiPrefix: BACKEND_PREFIX,
+    assistant: assistantStatus(),
+    assistantMcpCaps: {
+      maxClasses: ASSISTANT_MCP_MAX_CLASSES_ABSOLUTE,
+      maxDomains: ASSISTANT_MCP_MAX_DOMAINS_ABSOLUTE,
+      maxRelationDomains: ASSISTANT_MCP_MAX_DOMAINS_ABSOLUTE,
+      maxContextBytes: ASSISTANT_MCP_MAX_CONTEXT_BYTES_ABSOLUTE,
+      timeoutMs: ASSISTANT_MCP_TIMEOUT_MS_ABSOLUTE
+    }
   });
   const headerHtml = mode === 'runtime' ? '' : `
   <header>
@@ -1466,8 +1551,8 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     h1{font-size:18px;margin:0} h2{font-size:15px;margin:0 0 10px} h3{font-size:13px;margin:12px 0 6px;color:#334e68}
     p{margin:0 0 8px}.guide-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.guide-card{border:1px solid var(--line);padding:10px;background:#fbfdff}.guide-card h3{margin-top:0}.steps{margin:8px 0 0;padding-left:20px}.steps li{margin:4px 0}.code-inline{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:#f8fafc;border:1px solid var(--line);padding:1px 4px;border-radius:3px}
     main{padding:14px 16px}.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
-    .runtime-page{background:#fff}.runtime-page main{padding:8px}.runtime-page .result-table-wrap:first-child{margin-top:0}.runtime-page .notice{margin:0}.run-launch-url{display:flex;align-items:center;gap:6px;min-width:260px;max-width:100%;flex:1 1 420px}.run-launch-url span,.run-launch-params span{color:var(--muted);font-size:12px;white-space:nowrap}.run-launch-url a{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--accent);overflow-wrap:anywhere}.run-launch-params{display:flex;align-items:center;gap:6px;min-width:260px;max-width:100%;flex:1 1 100%;font-size:12px}.run-launch-params code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:#334e68;background:#f8fafc;border:1px solid var(--line);padding:2px 4px;overflow-wrap:anywhere;white-space:normal}
-    .designer-menu{position:fixed;left:16px;top:64px;bottom:14px;width:246px;overflow:auto;border:1px solid var(--line);background:#fff;padding:10px;display:grid;gap:10px;z-index:10}.designer-main{margin-left:266px}.designer-actionbar{position:sticky;top:0;z-index:30;border:1px solid var(--line);background:rgba(255,255,255,.96);box-shadow:0 6px 16px rgba(15,23,42,.08);padding:8px 10px;margin:0 0 12px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.designer-actionbar-title{font-weight:bold;color:#334e68;white-space:nowrap}.designer-actionbar-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;min-width:0;flex:1 1 auto}.designer-actionbar-context{display:flex;align-items:center;gap:8px;min-width:240px;max-width:100%;flex:1 1 420px}.designer-actionbar-context .run-launch-url{min-width:0;flex:1 1 auto}.menu-groups{display:grid;grid-template-columns:1fr;gap:10px}.menu-group strong{display:block;font-size:12px;color:#334e68;margin-bottom:6px}.menu-links{display:grid;grid-template-columns:1fr;gap:5px}.menu-links a{border:1px solid var(--line);background:#f8fafc;color:var(--text);padding:5px 7px;border-radius:4px;text-decoration:none;font-size:12px}.menu-links a.active{background:#e6f4f1;border-color:#86b7b3;color:#07575b;font-weight:bold}.menu-links a.disabled{background:#f4f6f8;color:#9aa5b1;border-color:#e4e7eb;cursor:not-allowed}.template-context{border:1px solid #b7d8d4;background:#f2faf8;padding:8px 10px;margin-bottom:12px}.template-context strong{margin-right:6px}.template-context .code-inline{font-weight:bold}
+    .runtime-page{background:#fff}.runtime-page main{padding:8px}.runtime-page .result-table-wrap:first-child{margin-top:0}.runtime-page .notice{margin:0}.run-launch-url{display:grid;grid-template-columns:max-content minmax(0,1fr);align-items:start;gap:4px 8px;min-width:0;max-width:100%;flex:1 1 420px}.run-launch-url span,.run-launch-params span{color:var(--muted);font-size:12px;white-space:nowrap}.run-launch-url a{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--accent);min-width:0;max-width:100%;word-break:normal;overflow-wrap:break-word;white-space:normal}.run-launch-params{display:grid;grid-template-columns:max-content minmax(0,1fr);align-items:start;gap:4px 8px;min-width:0;max-width:100%;flex:1 1 100%;font-size:12px}.run-launch-params code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:#334e68;background:#f8fafc;border:1px solid var(--line);padding:2px 4px;min-width:0;max-width:100%;word-break:normal;overflow-wrap:break-word;white-space:normal}
+    .designer-menu{position:fixed;left:16px;top:64px;bottom:14px;width:246px;overflow:auto;border:1px solid var(--line);background:#fff;padding:10px;display:grid;gap:10px;z-index:10}.designer-main{margin-left:266px}.designer-actionbar{position:sticky;top:0;z-index:30;border:1px solid var(--line);background:rgba(255,255,255,.96);box-shadow:0 6px 16px rgba(15,23,42,.08);padding:8px 10px;margin:0 0 12px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.designer-actionbar-title{font-weight:bold;color:#334e68;white-space:nowrap}.designer-actionbar-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;min-width:0;flex:1 1 auto}.designer-actionbar-context{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));align-items:start;gap:6px 12px;min-width:0;max-width:100%;flex:1 1 100%}.designer-actionbar-context .run-launch-url,.designer-actionbar-context .run-launch-params{grid-template-columns:1fr;min-width:0;flex:initial}.menu-groups{display:grid;grid-template-columns:1fr;gap:10px}.menu-group strong{display:block;font-size:12px;color:#334e68;margin-bottom:6px}.menu-links{display:grid;grid-template-columns:1fr;gap:5px}.menu-links a{border:1px solid var(--line);background:#f8fafc;color:var(--text);padding:5px 7px;border-radius:4px;text-decoration:none;font-size:12px}.menu-links a.active{background:#e6f4f1;border-color:#86b7b3;color:#07575b;font-weight:bold}.menu-links a.disabled{background:#f4f6f8;color:#9aa5b1;border-color:#e4e7eb;cursor:not-allowed}.template-context{border:1px solid #b7d8d4;background:#f2faf8;padding:8px 10px;margin-bottom:12px}.template-context strong{margin-right:6px}.template-context .code-inline{font-weight:bold}
     button,a.button{border:1px solid #9fb3c8;background:#fff;color:var(--text);padding:6px 10px;border-radius:4px;cursor:pointer;text-decoration:none;display:inline-block}
     button.primary,a.button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
     button.danger,a.button.danger{border-color:#f0b8b0;color:var(--danger);background:#fff7f5}
@@ -1495,10 +1580,9 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}.kpi{border:1px solid var(--line);padding:8px}.kpi span{display:block;color:var(--muted);font-size:12px}.kpi strong{display:block;font-size:14px}
     .pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 7px;color:var(--muted);font-size:12px}.pill.ok{border-color:#82c995;color:var(--ok)}.pill.error{border-color:#f0b8b0;color:var(--danger)}
     .model{display:grid;gap:10px;max-height:520px;overflow:auto}.muted{color:var(--muted)}pre{white-space:pre-wrap;background:#f8fafc;border:1px solid var(--line);padding:8px;overflow:auto}
-    .visual-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.visual-grid label{min-width:0}.visual-grid input,.visual-grid select{width:100%}.visualization-table{table-layout:fixed}.visualization-table th,.visualization-table td{overflow-wrap:anywhere}.visualization-table th:nth-child(1){width:30%}.visualization-table th:nth-child(2){width:14%}.visualization-table th:nth-child(3){width:15%}.visualization-table th:nth-child(4){width:26%}.visualization-table th:nth-child(5){width:15%}.visualization-table input,.visualization-table select{width:100%;min-width:0}.visualization-link-table{table-layout:fixed}.visualization-link-table th,.visualization-link-table td{overflow-wrap:anywhere}.visualization-link-table input,.visualization-link-table select{width:100%;min-width:0}.visual-row-groups{margin-top:10px;display:grid;gap:6px}.visual-row-group{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.visual-row-group label{flex:1 1 240px;min-width:0}.visual-row-group select{width:100%;min-width:0}.result-table-wrap{margin-top:8px}.result-table-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:6px;min-height:30px;margin:0 0 2px}.result-table-header{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 4px;min-height:30px}.result-table-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex:0 0 auto;flex-wrap:wrap}.result-table-filter{width:240px;max-width:min(52vw,320px);height:30px;padding:4px 7px}.runtime-cache-control{position:relative;display:inline-flex;align-items:center}.runtime-cache-button{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;font-size:18px;line-height:1}.runtime-cache-button[data-disabled="true"]{opacity:.55;cursor:default}.runtime-cache-button.refreshing{animation:cmdp-spin 1s linear infinite}.runtime-cache-tooltip{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:50;min-width:250px;max-width:min(86vw,420px);padding:8px 10px;border:1px solid var(--line);background:#1f2933;color:#fff;box-shadow:0 8px 22px rgba(15,23,42,.18);font-size:12px;line-height:1.35;text-align:left}.runtime-cache-tooltip span{display:block;white-space:nowrap}.runtime-cache-control:hover .runtime-cache-tooltip,.runtime-cache-control:focus-within .runtime-cache-tooltip{display:block}.result-table-title{display:flex;align-items:center;gap:8px;flex:1 1 auto;flex-wrap:wrap;min-width:0;margin:0}.result-table-title h3{margin:0;font-size:13px}.result-subtitle{font-size:12px;color:var(--muted);margin:10px 0 4px}.table-sort{border:0;background:transparent;padding:0;color:inherit;font:inherit;text-align:left}.table-sort:after{content:" ↕";font-size:10px;color:var(--muted)}.cmdp-density-compact th,.cmdp-density-compact td{padding:4px 6px}.cmdp-font-small{font-size:12px}.cmdp-font-normal{font-size:13px}.cmdp-font-large{font-size:15px}.cmdp-zebra tbody tr:nth-child(even) td{background:#fbfdff}.cmdp-row-group-cell{background:#f8fafc;font-weight:600;vertical-align:top}@keyframes cmdp-spin{to{transform:rotate(360deg)}}
+    .visual-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.visual-grid label{min-width:0}.visual-grid input,.visual-grid select{width:100%}.diagram-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.diagram-grid label{min-width:0}.diagram-grid input,.diagram-grid select{width:100%;min-width:0}.segmented-control{display:inline-flex;align-items:center;gap:0;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}.segmented-control label{margin:0;display:inline-flex;align-items:center;min-height:32px;padding:0 10px;border-right:1px solid var(--line);font-size:13px;cursor:pointer}.segmented-control label:last-child{border-right:0}.segmented-control input{position:absolute;opacity:0;pointer-events:none}.segmented-control label:has(input:checked){background:#e6f4f1;color:#07575b;font-weight:700}.assistant-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr);gap:12px}.assistant-status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.assistant-draft-preview pre{max-height:360px;overflow:auto}.assistant-busy{display:grid;gap:6px;border:1px solid #b7d8d4;background:#f2faf8;padding:8px 10px;margin:0 0 10px}.assistant-busy-head{display:flex;align-items:center;gap:8px;justify-content:space-between;flex-wrap:wrap}.assistant-busy-title{display:inline-flex;align-items:center;gap:8px;font-weight:700;color:#07575b}.assistant-busy-spinner{width:14px;height:14px;border:2px solid #b7d8d4;border-top-color:#236c91;border-radius:50%;animation:cmdp-spin .8s linear infinite}.assistant-busy-elapsed{font-variant-numeric:tabular-nums;color:#334e68;font-size:12px}.assistant-draft-preview[aria-busy="true"]{position:relative}button[disabled]{opacity:.58;cursor:not-allowed}@media(max-width:1100px){.assistant-grid{grid-template-columns:1fr}}.visualization-table{table-layout:fixed}.visualization-table th,.visualization-table td{overflow-wrap:anywhere}.visualization-table th:nth-child(1){width:30%}.visualization-table th:nth-child(2){width:14%}.visualization-table th:nth-child(3){width:15%}.visualization-table th:nth-child(4){width:26%}.visualization-table th:nth-child(5){width:15%}.visualization-table input,.visualization-table select{width:100%;min-width:0}.visualization-link-table{table-layout:fixed}.visualization-link-table th,.visualization-link-table td{overflow-wrap:anywhere}.visualization-link-table input,.visualization-link-table select{width:100%;min-width:0}.visual-row-groups{margin-top:10px;display:grid;gap:6px}.visual-row-group{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.visual-row-group label{flex:1 1 240px;min-width:0}.visual-row-group select{width:100%;min-width:0}.result-table-wrap{margin-top:8px}.result-table-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:6px;min-height:30px;margin:0 0 2px}.result-table-header{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 4px;min-height:30px;flex-wrap:wrap}.result-table-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex:0 0 auto;flex-wrap:wrap;min-width:30px}.result-table-filter{width:240px;max-width:min(52vw,320px);height:30px;padding:4px 7px}.runtime-cache-control{position:relative;display:inline-flex;align-items:center}.runtime-cache-button{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;font-size:18px;line-height:1}.runtime-cache-button[data-disabled="true"]{opacity:.55;cursor:default}.runtime-cache-button.refreshing{animation:cmdp-spin 1s linear infinite}.runtime-cache-tooltip{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:50;min-width:250px;max-width:min(86vw,420px);padding:8px 10px;border:1px solid var(--line);background:#1f2933;color:#fff;box-shadow:0 8px 22px rgba(15,23,42,.18);font-size:12px;line-height:1.35;text-align:left}.runtime-cache-tooltip span{display:block;white-space:nowrap}.runtime-cache-control:hover .runtime-cache-tooltip,.runtime-cache-control:focus-within .runtime-cache-tooltip{display:block}.runtime-notice-shell{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin:0 0 8px}.runtime-notice-shell .notice{flex:1 1 auto;min-width:160px;overflow-wrap:normal;word-break:normal}.runtime-notice-actions{display:flex;justify-content:flex-end;flex:0 0 auto}.result-table-title{display:flex;align-items:center;gap:8px;flex:1 1 16rem;flex-wrap:wrap;min-width:160px;margin:0}.result-table-title h3{margin:0;font-size:13px;overflow-wrap:normal;word-break:normal;white-space:normal}.result-subtitle{font-size:12px;color:var(--muted);margin:10px 0 4px}.table-sort{border:0;background:transparent;padding:0;color:inherit;font:inherit;text-align:left}.table-sort:after{content:" ↕";font-size:10px;color:var(--muted)}.cmdp-density-compact th,.cmdp-density-compact td{padding:4px 6px}.cmdp-font-small{font-size:12px}.cmdp-font-normal{font-size:13px}.cmdp-font-large{font-size:15px}.cmdp-zebra tbody tr:nth-child(even) td{background:#fbfdff}.cmdp-row-group-cell{background:#f8fafc;font-weight:600;vertical-align:top}@media(max-width:420px){.result-table-title{flex-basis:100%;min-width:0}.runtime-notice-shell .notice{min-width:0}}@keyframes cmdp-spin{to{transform:rotate(360deg)}}
     .cmdp-html-result{display:block}.cmdp-build-view{display:grid;gap:10px}.cmdp-build-toolbar{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border-bottom:1px solid var(--line);padding-bottom:6px}.cmdp-build-toolbar-main{display:grid;gap:5px;min-width:0}.cmdp-build-summary,.cmdp-build-nav{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.cmdp-build-nav a{color:var(--accent);text-decoration:none;font-size:12px}.cmdp-build-search{flex:0 0 260px;max-width:min(42vw,320px)}.cmdp-build-section{display:grid;gap:8px}.cmdp-build-section h2{font-size:15px;margin:8px 0 0}.cmdp-build-panel{border:1px solid var(--line);background:#fff;margin:0 0 8px}.cmdp-build-panel>summary{cursor:pointer;display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 10px;background:#fbfdff}.cmdp-build-title{font-weight:700}.cmdp-build-panel .table-wrap{border:0;border-top:1px solid var(--line)}.cmdp-build-table{width:100%;table-layout:auto}.cmdp-build-table th,.cmdp-build-table td{vertical-align:top}.cmdp-build-related,.cmdp-build-links{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:8px 10px}.cmdp-build-related a,.cmdp-build-links a{color:var(--accent);text-decoration:none}
     .settings-block{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}.settings-block:first-of-type{border-top:0;margin-top:0;padding-top:0}.settings-block h3{margin:0 0 8px}.settings-block h4{margin:0 0 7px;font-size:12px;color:#334e68}.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}.settings-grid label{display:grid;gap:4px;color:var(--muted);font-size:12px;min-width:0}.settings-grid input,.settings-grid select{width:100%;min-width:0}.checkbox-list{display:grid;gap:8px}.checkbox-stacked{align-items:flex-start!important}.checkbox-stacked>span{display:grid;gap:2px}.checkbox-stacked strong{font-size:12px;color:var(--text)}.visual-table-list{display:grid;gap:12px}.visual-table-panel{border:1px solid var(--line);background:#fbfdff;padding:10px}.visual-table-heading{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px}.visual-table-heading h3{margin:0}.visual-table-subblock{border-top:1px solid #e4e9f0;padding-top:9px;margin-top:9px}.run-param-list{display:grid;gap:8px}.run-param-row{display:grid;grid-template-columns:minmax(180px,1fr) minmax(220px,1.4fr);gap:10px;align-items:start;border:1px solid var(--line);background:#fbfdff;padding:8px}.run-param-main{display:grid;gap:3px;min-width:0}.run-param-main strong{font-size:13px}.run-param-meta{font-size:12px;color:var(--muted)}.run-param-value label{display:grid;gap:4px;color:var(--muted);font-size:12px}.run-param-value input,.run-param-value select{width:100%}.run-action-grid{display:grid;grid-template-columns:minmax(220px,max-content) minmax(280px,1fr);gap:10px;align-items:start}.run-action-buttons{display:flex;gap:8px;flex-wrap:wrap}
-    .baa-contract-summary{display:grid;gap:10px}.baa-contract-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.baa-contract-meta div{border:1px solid var(--line);background:#fbfdff;padding:8px;min-width:0}.baa-contract-meta span{display:block;color:var(--muted);font-size:11px;margin-bottom:3px}.baa-contract-meta strong{display:block;font-size:13px;overflow-wrap:anywhere}.baa-contract-table{width:100%;border-collapse:collapse;table-layout:fixed}.baa-contract-table th,.baa-contract-table td{border:1px solid var(--line);padding:6px;text-align:left;vertical-align:top;font-size:12px}.baa-contract-table th{background:#f0f4f8;color:#334e68}.baa-usage-note{border:1px solid #d9e2ec;background:#fbfdff;padding:8px;color:#334e68;font-size:12px;line-height:1.45}
     @media(max-width:1100px){.designer-menu{position:static;width:auto;overflow:visible;margin-bottom:12px}.designer-main{margin-left:0}.menu-groups{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}.menu-links{display:flex;flex-wrap:wrap}}
     @media(max-width:900px){.layout{grid-template-columns:1fr}main{padding:10px}header{height:auto;align-items:flex-start;gap:8px;flex-direction:column;padding:10px}.header-side{justify-content:flex-start}.designer-actionbar{align-items:flex-start}.designer-actionbar-actions{justify-content:flex-start}.designer-actionbar-context{flex-basis:100%}}
   </style>
@@ -1595,7 +1679,6 @@ function dynamicPagesClientScript() {
       menuExtraction: 'Extraction',
       menuSelection: 'Selection',
       menuTemplateRun: 'Run',
-      menuBaaEndpoint: 'BAA endpoint',
       menuObjectGroup: 'Object group',
       menuRelations: 'Object matching',
       menuFinalView: 'Final data',
@@ -1616,14 +1699,6 @@ function dynamicPagesClientScript() {
       configCard: 'Config card',
       defaultConfig: 'Default config',
       runtimeCacheSettings: 'Runtime cache',
-      baaTechnicalSettings: 'BAA technical contracts',
-      baaTechnicalSuperclassPath: 'BAA technical superclass path from root',
-      baaTechnicalSuperclassPathHelp: 'Path/name of the superclass branch where BAA contract classes are stored. It is used only to find external contracts, not as a business-data permission boundary.',
-      baaConversionContractClass: 'Conversion contract class',
-      baaConversionContractVersionClass: 'Conversion contract version class',
-      baaVerificationInputContractClass: 'Verification input contract class',
-      baaVerificationOutputContractClass: 'Verification output contract class',
-      baaVerificationEndpointClass: 'Verification endpoint class',
       runtimeRefreshCooldownSec: 'Refresh cooldown, seconds',
       runtimeRefreshCooldownHelp: 'Minimum delay before a runtime result can be rebuilt manually.',
       runtimeExecutionLimits: 'Execution limits',
@@ -1689,45 +1764,11 @@ function dynamicPagesClientScript() {
       visualizeInEditor: 'Visualize in editor',
       visualizeExternal: 'Visualize in separate page',
       forceRefreshInEditor: 'Refresh cache and show',
-      baaVerifyPreview: 'BAA verify',
-      baaEndpointEditor: 'BAA endpoint',
-      baaEndpointHelp: 'Describe the BAA input contract before building rules. plan.objects are incoming CMDB-like candidates, not CMDBuild cards.',
-      baaVerifyEndpointUrl: 'BAA verification URL',
-      baaVerifyEndpointUrlHelp: 'Use this absolute POST URL in cmdbaa. Runtime/designer URLs return HTML and must not be used as BAA verification endpoints. Browser calls use CMDBuild session cookie plus CSRF; server-to-server cmdbaa calls may send CMDBuild-Authorization header.',
-      baaContractCode: 'Contract code',
-      baaContractVersion: 'Contract version',
-      baaContractDescription: 'Contract description',
-      baaContractSource: 'Saved input contract',
-      baaContractSourceManual: 'Manual contract in template',
-      baaContractObjects: 'Incoming BAA objects',
-      baaContractObjectsHelp: 'These are not CMDBuild classes. They describe objects expected in POST plan.objects. Saved BAA input contracts are mapped from classes[] to this list.',
-      baaContractUsage: 'How to use this contract',
-      baaContractUsageHelp: 'In matching rules choose BAA candidates as a selection. Payload fields are available as Payload.<field> and BAA.<className>.<field>. After matching, use the final result in Final data and Visualization.',
-      baaContractNoObjects: 'The selected contract has no readable classes/attributes.',
-      baaContractVariables: 'BAA variables',
-      baaContractParams: 'Contract parameters',
-      baaContractParamsHelp: 'Contract parameters are defined by the input contract as contractparam.*. BAA sends their runtime values in endpoint.params.',
-      baaRequestVariables: 'Request variables',
-      baaRequestVariablesHelp: 'BAA computes these top-level variables before POST. They arrive in request.variables, can be scalar or array values, and are available as $' + '{var.name} and $' + '{param.name}.',
-      baaObjectAlias: 'Alias',
-      baaObjectClassName: 'Incoming class',
-      baaPayloadFields: 'Payload fields',
-      baaPayloadFieldsHelp: 'Fields expected in object Payload. Supported types include string, number, boolean, ipv4, ipv4-cidr.',
-      baaVariablesHelp: 'Variables from POST body are available as $' + '{var.name} and $' + '{param.name}.',
-      addBaaVariable: 'Add variable',
-      addBaaPayloadField: 'Add payload field',
-      addBaaObject: 'Add candidate type',
-      applyBaaEndpoint: 'Apply without saving',
-      baaEndpointApplied: 'BAA endpoint contract applied.',
-      baaContractValidationFailed: 'BAA contract validation failed.',
-      baaRequestEditor: 'BAA verification request',
-      baaRequestHelp: 'POST body for BAA verification exchange. endpoint.params are passed as template parameters; plan.objects are available through the baaPlanObjects DSL step.',
-      baaVerifyCompleted: 'BAA verification endpoint completed.',
-      baaVerifyRefreshPreview: 'Refresh BAA cache and verify',
-      baaPostOnlyMode: 'POST-only',
-      baaPostOnlyNotice: 'BAA templates are POST-only verification endpoints. They do not render HTML runtime pages or publish static view snapshots.',
-      baaSectionDisabled: 'This section is disabled for BAA templates. Use BAA endpoint, extraction, caching, and BAA verify preview.',
-      baaRunPostOnlyHelp: 'Use the BAA verification URL and a POST body. Runtime page links and iframe URLs are not available for this template type.',
+      assistantDraft: 'Assistant draft',
+      assistantPrompt: 'Describe the table or diagram you need.',
+      assistantDraftGenerated: 'Assistant draft generated.',
+      assistantDraftGeneratedApplied: 'Assistant draft generated and applied to the current template.',
+      assistantDraftApplied: 'Assistant draft applied.',
       runLaunchUrl: 'Template launch URL',
       runLaunchJsonUrl: 'JSON URL',
       runLaunchParams: 'Parameter variants',
@@ -1736,6 +1777,59 @@ function dynamicPagesClientScript() {
       runLaunchUrlHelp: 'Direct runtime URL for a link or iframe. Generated from declared input variables; missing defaults are replaced with test values. Add json=true to receive the same result as application/json.',
       visualizationRunCompleted: 'Visualization completed.',
       forceRefreshRunCompleted: 'Cache refreshed and result rendered.',
+      menuAssistant: 'Assistant',
+      assistantEditor: 'Assistant',
+      assistantHelp: 'Describe the CMDBuild table or diagram you need. The assistant can use read-only MCP model context and returns a deterministic Spec JSON draft.',
+      assistantTaskMode: 'Draft target',
+      assistantTaskTable: 'Table',
+      assistantTaskDiagram: 'Diagram',
+      assistantTaskBoth: 'Table and diagram',
+      assistantIntent: 'Prompt',
+      assistantGenerate: 'Generate draft',
+      assistantApplyDraft: 'Apply draft',
+      assistantDraftSpec: 'Generated Spec JSON',
+      assistantNoDraft: 'No assistant draft yet.',
+      assistantWarnings: 'Warnings',
+      assistantErrors: 'Validation errors',
+      assistantDiagnostics: 'Diagnostics',
+      assistantGeneratingTitle: 'Draft generation is running',
+      assistantGeneratingMessage: 'LLM/MCP request can take up to 60 seconds. The page is still working.',
+      assistantGeneratingElapsed: 'Running {seconds} s',
+      assistantPreviousDraftVisible: 'Previous draft is shown below until the new response arrives.',
+      assistantGenerateBusy: 'Generating...',
+      assistantStatusTitle: 'Assistant status',
+      assistantStatusEnabled: 'LLM enabled',
+      assistantStatusProvider: 'Provider',
+      assistantStatusBaseUrl: 'Base URL',
+      assistantStatusModel: 'Model',
+      assistantStatusApiKey: 'API key',
+      assistantStatusMcp: 'MCP context',
+      assistantMcpTools: 'MCP tools',
+      assistantStatusConfigured: 'configured',
+      assistantStatusMissing: 'missing',
+      assistantSettings: 'Assistant settings',
+      assistantLlmSettings: 'LLM',
+      assistantLlmEnabled: 'Enable LLM draft generation for this root',
+      assistantLlmBaseUrl: 'LiteLLM base URL',
+      assistantLlmModel: 'LiteLLM model',
+      assistantLlmDeploymentHelp: 'API key is deployment-managed through env or secret file and is never stored in RuntimeConfigJson.',
+      assistantPromptSettings: 'System prompt',
+      assistantSystemPrompt: 'Additional system prompt',
+      assistantSystemPromptHelp: 'Added to the backend system prompt when generating drafts. Do not store secrets or personal data here.',
+      assistantMcpSettings: 'MCP',
+      assistantMcpEnabled: 'Use MCP context',
+      assistantMcpAllowedTools: 'Allowed tools',
+      assistantMcpAllowedToolsHelp: 'Empty value means all supported MCP tools.',
+      assistantMcpMaxContextBytes: 'MCP context limit, bytes',
+      assistantMcpTimeoutMs: 'MCP timeout, ms',
+      assistantMcpMaxClasses: 'MCP class limit',
+      assistantMcpMaxClassesHelp: 'Maximum visible CMDBuild classes read for assistant context.',
+      assistantMcpMaxDomains: 'MCP domain limit',
+      assistantMcpMaxDomainsHelp: 'Maximum visible CMDBuild domains read for assistant model summary.',
+      assistantMcpMaxRelationDomains: 'Relation domain limit',
+      assistantMcpMaxRelationDomainsHelp: 'Maximum domains read by relation hints.',
+      assistantMcpMaxCandidateClasses: 'Candidate class limit',
+      assistantMcpMaxCandidateClassesHelp: 'Maximum candidate classes passed from model summary to the assistant.',
       publicationEditor: 'Publication',
       publicationHelp: 'Static snapshots are served from Redis without checking the viewer permissions for source CMDBuild objects.',
       publicationMode: 'Runtime mode',
@@ -1811,6 +1905,7 @@ function dynamicPagesClientScript() {
       extractionApplied: 'Extraction step applied to Spec JSON.',
       extractionPreviewReady: 'Extraction preview is ready.',
       extractionCompleted: 'Template extraction completed.',
+      extractionSelectedSourceEmpty: 'Selected extraction source {selected} returned 0 rows; {source} has {rows} rows.',
       extractionNeedsSource: 'Extraction source parameter is required.',
       extractionNeedsRegex: 'Extraction regular expression is required.',
       extractionNeedsAlias: 'Extraction result alias is required.',
@@ -1840,9 +1935,28 @@ function dynamicPagesClientScript() {
       selectionNeedsAlias: 'Data selection result alias is required.',
       selectionInvalidLimit: 'Data selection limit must be a positive integer.',
       visualizationEditor: 'Visualization',
-      visualizationEditorHelp: 'Configure visual presentation for the data tables prepared in Final data: empty text, table titles, grouping, sorting, filters, and base style.',
+      visualizationEditorHelp: 'Configure visual presentation for the data tables prepared in Final data and optional deterministic topology diagrams.',
       visualizationGlobal: 'Global presentation',
+      visualizationOutputMode: 'Runtime output',
+      visualizationOutputTables: 'Tables',
+      visualizationOutputDiagrams: 'Diagrams',
+      visualizationOutputBoth: 'Both',
       visualizationTables: 'Table presentation',
+      visualizationDiagrams: 'Diagram presentation',
+      visualizationDiagramName: 'Diagram name',
+      visualizationDiagramTitle: 'Diagram title',
+      visualizationDiagramNodesSource: 'Nodes source',
+      visualizationDiagramEdgesSource: 'Edges source',
+      visualizationDiagramNodeId: 'Node id field',
+      visualizationDiagramNodeLabel: 'Node label field',
+      visualizationDiagramNodeGroup: 'Node group field',
+      visualizationDiagramNodeHref: 'Node link field',
+      visualizationDiagramEdgeSource: 'Edge source field',
+      visualizationDiagramEdgeTarget: 'Edge target field',
+      visualizationDiagramEdgeLabel: 'Edge label field',
+      visualizationDiagramLayout: 'Layout',
+      visualizationDiagramMaxNodes: 'Max nodes',
+      visualizationDiagramMaxEdges: 'Max edges',
       visualizationMessages: 'Messages',
       visualizationBaseStyle: 'Base style',
       visualizationRuntimeBehavior: 'Runtime behavior',
@@ -1993,9 +2107,11 @@ function dynamicPagesClientScript() {
       catalogClassApplied: 'Class selected from cached catalog.',
       objectGroupEditor: 'Object group',
       objectGroupHelp: 'Build the object scope from a starting CMDBuild class and include/exclude rules.',
-      baaObjectGroupSource: 'BAA input source',
-      baaObjectGroupSourceHelp: 'Objects from POST plan.objects are available in the starting class list as BAA payload sources. Choose one of them when the selection must start from incoming data.',
       objectSelectionTitle: 'Selection name',
+      objectSelectionAlias: 'Result alias',
+      objectSelectionFrom: 'Source alias',
+      objectSelectionLimit: 'Limit',
+      objectSelectionColumns: 'Columns',
       objectSelectionDefault: 'Selection{number}',
       addObjectSelection: 'Add selection',
       objectGroupSourceClass: 'Source class',
@@ -2015,6 +2131,8 @@ function dynamicPagesClientScript() {
       objectGroupDomainExample3: 'Direction = inverse helps distinguish attributes reached from the opposite side of the domain.',
       objectGroupOperator: 'Operator',
       objectGroupValue: 'Value / regular expression',
+      objectGroupValueParam: 'Parameter',
+      objectGroupValueColumn: 'Source column',
       objectGroupValueHelp: 'Parameter is not used for exists, is IP, and is IP net. For matches it is a regular expression; for IPv4 comparisons it is CIDR/range/network on the right side.',
       objectGroupRegex: 'Value / regular expression',
       objectGroupRegexExamples: 'Regular expression examples',
@@ -2236,7 +2354,6 @@ function dynamicPagesClientScript() {
       menuExtraction: 'Извлечение',
       menuSelection: 'Выборка',
       menuTemplateRun: 'Прогон',
-      menuBaaEndpoint: 'BAA endpoint',
       menuObjectGroup: 'Группа объектов',
       menuRelations: 'Сопоставление с объектами',
       menuFinalView: 'Итоговые данные',
@@ -2257,14 +2374,6 @@ function dynamicPagesClientScript() {
       configCard: 'Карточка настроек',
       defaultConfig: 'Настройки по умолчанию',
       runtimeCacheSettings: 'Runtime-кэш',
-      baaTechnicalSettings: 'BAA technical contracts',
-      baaTechnicalSuperclassPath: 'Путь к BAA technical superclass от root',
-      baaTechnicalSuperclassPathHelp: 'Путь/имя ветки суперкласса, где лежат классы BAA-контрактов. Используется только для поиска внешних контрактов, не ограничивает права на business data.',
-      baaConversionContractClass: 'Класс conversion contract',
-      baaConversionContractVersionClass: 'Класс версий conversion contract',
-      baaVerificationInputContractClass: 'Класс verification input contract',
-      baaVerificationOutputContractClass: 'Класс verification output contract',
-      baaVerificationEndpointClass: 'Класс verification endpoint',
       runtimeRefreshCooldownSec: 'Пауза refresh, секунд',
       runtimeRefreshCooldownHelp: 'Минимальная пауза перед ручной перестройкой результата runtime-страницы.',
       runtimeExecutionLimits: 'Лимиты выполнения',
@@ -2330,45 +2439,11 @@ function dynamicPagesClientScript() {
       visualizeInEditor: 'Визуализировать в редакторе',
       visualizeExternal: 'Визуализировать в отдельной странице',
       forceRefreshInEditor: 'Обновить кэш и показать',
-      baaVerifyPreview: 'BAA verify',
-      baaEndpointEditor: 'BAA endpoint',
-      baaEndpointHelp: 'Опишите входной BAA-контракт до настройки правил. plan.objects - это входящие CMDB-like кандидаты, а не карточки CMDBuild.',
-      baaVerifyEndpointUrl: 'URL BAA verification',
-      baaVerifyEndpointUrlHelp: 'В cmdbaa нужно использовать этот абсолютный POST URL. Runtime/designer URL возвращают HTML и не подходят как BAA verification endpoint. Browser-вызовы используют CMDBuild session cookie и CSRF; server-to-server вызовы cmdbaa могут передавать CMDBuild-Authorization header.',
-      baaContractCode: 'Код контракта',
-      baaContractVersion: 'Версия контракта',
-      baaContractDescription: 'Описание контракта',
-      baaContractSource: 'Сохраненный input contract',
-      baaContractSourceManual: 'Ручной контракт в шаблоне',
-      baaContractObjects: 'Входящие объекты BAA',
-      baaContractObjectsHelp: 'Это не CMDBuild-классы. Здесь описаны объекты, ожидаемые в POST plan.objects. Сохраненные BAA input contracts преобразуются из classes[] в этот список.',
-      baaContractUsage: 'Как использовать этот контракт',
-      baaContractUsageHelp: 'В правилах сопоставления выберите BAA candidates как выборку. Payload-поля доступны как Payload.<поле> и BAA.<className>.<поле>. После сопоставления используйте конечный результат в Итоговых данных и Визуализации.',
-      baaContractNoObjects: 'В выбранном контракте нет читаемых classes/attributes.',
-      baaContractVariables: 'BAA variables',
-      baaContractParams: 'Параметры контракта',
-      baaContractParamsHelp: 'Параметры контракта описаны в input contract как contractparam.*. BAA передает runtime-значения в endpoint.params.',
-      baaRequestVariables: 'Переменные отправки',
-      baaRequestVariablesHelp: 'BAA вычисляет эти переменные верхнего уровня перед POST. Они приходят в request.variables, могут быть скаляром или массивом и доступны как $' + '{var.name} и $' + '{param.name}.',
-      baaObjectAlias: 'Alias',
-      baaObjectClassName: 'Входящий класс',
-      baaPayloadFields: 'Payload-поля',
-      baaPayloadFieldsHelp: 'Поля, ожидаемые в Payload объекта. Типы: string, number, boolean, ipv4, ipv4-cidr.',
-      baaVariablesHelp: 'Variables из POST body доступны как $' + '{var.name} и $' + '{param.name}.',
-      addBaaVariable: 'Добавить variable',
-      addBaaPayloadField: 'Добавить payload-поле',
-      addBaaObject: 'Добавить тип кандидата',
-      applyBaaEndpoint: 'Применить без сохранения',
-      baaEndpointApplied: 'BAA endpoint contract применен.',
-      baaContractValidationFailed: 'BAA contract validation failed.',
-      baaRequestEditor: 'BAA verification request',
-      baaRequestHelp: 'POST body для BAA verification exchange. endpoint.params передаются как параметры шаблона; plan.objects доступны через DSL step baaPlanObjects.',
-      baaVerifyCompleted: 'BAA verification endpoint выполнен.',
-      baaVerifyRefreshPreview: 'Обновить BAA-кэш и проверить',
-      baaPostOnlyMode: 'POST-only',
-      baaPostOnlyNotice: 'BAA-шаблоны являются POST-only verification endpoint. Они не выводят HTML runtime-страницы и не публикуют статические view-снимки.',
-      baaSectionDisabled: 'Этот раздел отключен для BAA-шаблонов. Используйте BAA endpoint, извлечение, кэширование и BAA verify preview.',
-      baaRunPostOnlyHelp: 'Используйте URL BAA verification и POST body. Runtime page links и iframe URL недоступны для этого типа шаблона.',
+      assistantDraft: 'Assistant draft',
+      assistantPrompt: 'Опишите таблицу или диаграмму, которую нужно получить.',
+      assistantDraftGenerated: 'Assistant draft сформирован.',
+      assistantDraftGeneratedApplied: 'Assistant draft сформирован и применен к текущему шаблону.',
+      assistantDraftApplied: 'Assistant draft применен.',
       runLaunchUrl: 'URL запуска шаблона',
       runLaunchJsonUrl: 'JSON URL',
       runLaunchParams: 'Варианты параметров',
@@ -2377,6 +2452,59 @@ function dynamicPagesClientScript() {
       runLaunchUrlHelp: 'Прямой runtime URL для ссылки или iframe. Строится из объявленных входных переменных; если default не задан, подставляется тестовое значение. Добавьте json=true, чтобы получить тот же результат как application/json.',
       visualizationRunCompleted: 'Визуализация выполнена.',
       forceRefreshRunCompleted: 'Кэш обновлен, результат показан.',
+      menuAssistant: 'Assistant',
+      assistantEditor: 'Assistant',
+      assistantHelp: 'Опишите таблицу или диаграмму CMDBuild. Assistant может использовать read-only MCP context по модели и возвращает детерминированный черновик Spec JSON.',
+      assistantTaskMode: 'Цель черновика',
+      assistantTaskTable: 'Таблица',
+      assistantTaskDiagram: 'Диаграмма',
+      assistantTaskBoth: 'Таблица и диаграмма',
+      assistantIntent: 'Промпт',
+      assistantGenerate: 'Сгенерировать черновик',
+      assistantApplyDraft: 'Применить черновик',
+      assistantDraftSpec: 'Сгенерированный Spec JSON',
+      assistantNoDraft: 'Черновик assistant еще не сформирован.',
+      assistantWarnings: 'Предупреждения',
+      assistantErrors: 'Ошибки валидации',
+      assistantDiagnostics: 'Диагностика',
+      assistantGeneratingTitle: 'Генерация черновика выполняется',
+      assistantGeneratingMessage: 'Запрос к LLM/MCP может занять до 60 секунд. Страница продолжает работать.',
+      assistantGeneratingElapsed: 'Выполняется {seconds} с',
+      assistantPreviousDraftVisible: 'Ниже показан предыдущий черновик до получения нового ответа.',
+      assistantGenerateBusy: 'Генерация...',
+      assistantStatusTitle: 'Статус assistant',
+      assistantStatusEnabled: 'LLM включен',
+      assistantStatusProvider: 'Provider',
+      assistantStatusBaseUrl: 'Base URL',
+      assistantStatusModel: 'Model',
+      assistantStatusApiKey: 'API key',
+      assistantStatusMcp: 'MCP context',
+      assistantMcpTools: 'MCP tools',
+      assistantStatusConfigured: 'настроен',
+      assistantStatusMissing: 'нет',
+      assistantSettings: 'Настройки assistant',
+      assistantLlmSettings: 'LLM',
+      assistantLlmEnabled: 'Включить LLM draft generation для этого root',
+      assistantLlmBaseUrl: 'LiteLLM base URL',
+      assistantLlmModel: 'LiteLLM model',
+      assistantLlmDeploymentHelp: 'API key задается через env или secret file контура и не хранится в RuntimeConfigJson.',
+      assistantPromptSettings: 'Системный промпт',
+      assistantSystemPrompt: 'Дополнительный системный промпт',
+      assistantSystemPromptHelp: 'Добавляется к backend system prompt при генерации draft. Не храните здесь секреты и персональные данные.',
+      assistantMcpSettings: 'MCP',
+      assistantMcpEnabled: 'Использовать MCP context',
+      assistantMcpAllowedTools: 'Разрешенные tools',
+      assistantMcpAllowedToolsHelp: 'Пустое значение означает все поддерживаемые MCP tools.',
+      assistantMcpMaxContextBytes: 'Лимит MCP context, bytes',
+      assistantMcpTimeoutMs: 'Timeout MCP, ms',
+      assistantMcpMaxClasses: 'Лимит MCP classes',
+      assistantMcpMaxClassesHelp: 'Максимум видимых CMDBuild классов, читаемых для assistant context.',
+      assistantMcpMaxDomains: 'Лимит MCP domains',
+      assistantMcpMaxDomainsHelp: 'Максимум видимых CMDBuild domains, читаемых для model summary.',
+      assistantMcpMaxRelationDomains: 'Лимит relation domains',
+      assistantMcpMaxRelationDomainsHelp: 'Максимум domains, читаемых для relation hints.',
+      assistantMcpMaxCandidateClasses: 'Лимит candidate classes',
+      assistantMcpMaxCandidateClassesHelp: 'Максимум candidate classes, передаваемых из model summary в assistant.',
       publicationEditor: 'Публикация',
       publicationHelp: 'Статические снимки отдаются из Redis без проверки прав зрителя на исходные CMDBuild-объекты.',
       publicationMode: 'Режим выполнения',
@@ -2452,6 +2580,7 @@ function dynamicPagesClientScript() {
       extractionApplied: 'Шаг извлечения применен к Spec JSON.',
       extractionPreviewReady: 'Предпросмотр извлечения готов.',
       extractionCompleted: 'Извлечение по шаблону выполнено.',
+      extractionSelectedSourceEmpty: 'Выбранный источник извлечения {selected} вернул 0 строк; {source} содержит {rows} строк.',
       extractionNeedsSource: 'Параметр-источник обязателен.',
       extractionNeedsRegex: 'Регулярное выражение извлечения обязательно.',
       extractionNeedsAlias: 'Алиас результата извлечения обязателен.',
@@ -2481,9 +2610,28 @@ function dynamicPagesClientScript() {
       selectionNeedsAlias: 'Алиас результата выбора данных обязателен.',
       selectionInvalidLimit: 'Лимит выбора данных должен быть положительным целым числом.',
       visualizationEditor: 'Визуализация',
-      visualizationEditorHelp: 'Настройте визуальное представление таблиц, подготовленных в Итоговых данных: пустой результат, заголовки, группировка, сортировка, фильтры и базовый стиль.',
+      visualizationEditorHelp: 'Настройте визуальное представление таблиц из Итоговых данных и optional deterministic topology diagrams.',
       visualizationGlobal: 'Общее представление',
+      visualizationOutputMode: 'Runtime-вывод',
+      visualizationOutputTables: 'Таблицы',
+      visualizationOutputDiagrams: 'Диаграммы',
+      visualizationOutputBoth: 'Оба',
       visualizationTables: 'Представление таблиц',
+      visualizationDiagrams: 'Представление диаграмм',
+      visualizationDiagramName: 'Имя диаграммы',
+      visualizationDiagramTitle: 'Заголовок диаграммы',
+      visualizationDiagramNodesSource: 'Источник узлов',
+      visualizationDiagramEdgesSource: 'Источник связей',
+      visualizationDiagramNodeId: 'Поле id узла',
+      visualizationDiagramNodeLabel: 'Поле label узла',
+      visualizationDiagramNodeGroup: 'Поле group узла',
+      visualizationDiagramNodeHref: 'Поле ссылки узла',
+      visualizationDiagramEdgeSource: 'Поле source связи',
+      visualizationDiagramEdgeTarget: 'Поле target связи',
+      visualizationDiagramEdgeLabel: 'Поле label связи',
+      visualizationDiagramLayout: 'Layout',
+      visualizationDiagramMaxNodes: 'Макс. узлов',
+      visualizationDiagramMaxEdges: 'Макс. связей',
       visualizationMessages: 'Сообщения',
       visualizationBaseStyle: 'Базовый стиль',
       visualizationRuntimeBehavior: 'Поведение runtime',
@@ -2634,9 +2782,11 @@ function dynamicPagesClientScript() {
       catalogClassApplied: 'Класс выбран из кэшированного каталога.',
       objectGroupEditor: 'Группа объектов',
       objectGroupHelp: 'Соберите scope объектов из стартового класса CMDBuild и правил включения/исключения.',
-      baaObjectGroupSource: 'BAA-вход',
-      baaObjectGroupSourceHelp: 'Объекты из POST plan.objects доступны в списке стартового класса как BAA payload-источники. Выберите их, если выборка должна начинаться с входящих данных.',
       objectSelectionTitle: 'Название выборки',
+      objectSelectionAlias: 'Alias результата',
+      objectSelectionFrom: 'Source alias',
+      objectSelectionLimit: 'Лимит',
+      objectSelectionColumns: 'Колонки',
       objectSelectionDefault: 'Выборка{number}',
       addObjectSelection: 'Добавить выборку',
       objectGroupSourceClass: 'Стартовый класс',
@@ -2656,6 +2806,8 @@ function dynamicPagesClientScript() {
       objectGroupDomainExample3: 'Направление = inverse помогает отличать атрибуты, пришедшие с обратной стороны домена.',
       objectGroupOperator: 'Оператор',
       objectGroupValue: 'Значение / регулярное выражение',
+      objectGroupValueParam: 'Параметр',
+      objectGroupValueColumn: 'Колонка источника',
       objectGroupValueHelp: 'Параметр не используется для exists, is IP и is IP net. Для matches это регулярное выражение; для IPv4-сравнений это CIDR/range/network справа.',
       objectGroupRegex: 'Значение / регулярное выражение',
       objectGroupRegexExamples: 'Примеры регулярных выражений',
@@ -2844,7 +2996,8 @@ function dynamicPagesClientScript() {
     catalog: null,
     catalogStatus: { state: 'missing', updatedAt: null, error: '' },
     catalogSyncing: false,
-    baaInputContracts: [],
+    catalogAttributeLoads: {},
+    catalogAttributeLoaded: {},
     maxTraversalDepth: Math.max(1, Math.min(5, Number(readStorageValue('cmdbdynamicpages.maxTraversalDepth') || 2))),
     designerSection: normalizeDesignerSection(boot.designerSection || readDesignerSectionFromLocation()),
     templates: [],
@@ -2855,12 +3008,17 @@ function dynamicPagesClientScript() {
     classCheckResult: null,
     classAttributes: [],
     objectGroupDraft: null,
-    baaContractDraft: null,
     relationDraft: null,
     viewComposerDraft: null,
     paramRowsDraft: null,
     extractionPreview: null,
     extractionSource: '',
+    assistantDraftIntent: '',
+    assistantTaskMode: 'both',
+    assistantDraftResult: null,
+    assistantGenerating: false,
+    assistantGeneratingStartedAt: 0,
+    assistantGenerationTimer: null,
     lastDraftPreviewOk: false,
     builderKind: 'classes',
     runParams: {},
@@ -2878,7 +3036,7 @@ function dynamicPagesClientScript() {
       'templates',
       'template',
       'versions',
-      'baa-endpoint',
+      'assistant',
       'object-group',
       'relations',
       'final-view',
@@ -2915,7 +3073,6 @@ function dynamicPagesClientScript() {
   function sectionNeedsSelectedTemplate(section) {
     return [
       'versions',
-      'baa-endpoint',
       'object-group',
       'relations',
       'final-view',
@@ -3085,6 +3242,100 @@ function dynamicPagesClientScript() {
   function loadCatalogCache() {
     return readCatalogCache().then(function (record) {
       applyCatalogCache(record);
+    });
+  }
+
+  function catalogAttributeLoadKey(className) {
+    return String(className || '').trim().toLowerCase();
+  }
+
+  function mergeCatalogClassAttributes(className, attributes) {
+    var name = String(className || '').trim();
+    if (!name) return false;
+    var catalog = state.catalog && typeof state.catalog === 'object' && !Array.isArray(state.catalog)
+      ? state.catalog
+      : { generatedAt: new Date().toISOString(), classes: [], domains: [], lookupTypes: [], counts: {} };
+    if (!Array.isArray(catalog.classes)) catalog.classes = [];
+    if (!catalog.counts || typeof catalog.counts !== 'object' || Array.isArray(catalog.counts)) catalog.counts = {};
+    state.catalog = catalog;
+    var owner = catalogClassByName(name);
+    if (!owner) {
+      owner = { name: name, description: name, attributes: [] };
+      catalog.classes.push(owner);
+    }
+    owner.attributes = Array.isArray(attributes) ? attributes.slice() : [];
+    catalog.counts.classes = catalog.classes.length;
+    catalog.counts.attributes = catalog.classes.reduce(function (total, item) {
+      return total + (Array.isArray(item && item.attributes) ? item.attributes.length : 0);
+    }, 0);
+    state.catalogAttributeLoaded[catalogAttributeLoadKey(name)] = true;
+    return true;
+  }
+
+  function ensureCatalogAttributesForClass(className) {
+    var name = String(className || '').trim();
+    var key = catalogAttributeLoadKey(name);
+    if (!name) return Promise.resolve(false);
+    if (state.catalogAttributeLoaded[key]) return Promise.resolve(false);
+    if (state.catalogAttributeLoads[key]) return state.catalogAttributeLoads[key];
+    state.catalogAttributeLoads[key] = request(apiPrefix + '/model/classes/' + encodeURIComponent(name) + '/attributes').then(function (result) {
+      if (!result.ok || !result.json || !Array.isArray(result.json.data)) {
+        throw new Error(errorText(result));
+      }
+      return mergeCatalogClassAttributes(name, result.json.data);
+    }).catch(function (error) {
+      state.catalogAttributeLoaded[key] = true;
+      state.message = {
+        type: 'warning',
+        text: t('catalogError') + ': ' + name + ' ' + (error && error.message ? error.message : String(error))
+      };
+      clientLog('catalog-attributes-error', name + ' ' + (error && error.message ? error.message : String(error)));
+      return false;
+    }).finally(function () {
+      delete state.catalogAttributeLoads[key];
+    });
+    return state.catalogAttributeLoads[key];
+  }
+
+  function viewComposerCatalogClassNames(spec) {
+    spec = spec || defaultSpec();
+    var aliases = [];
+    var classes = [];
+    function addAlias(alias) {
+      var text = String(alias || '').trim();
+      if (text && aliases.indexOf(text) === -1) aliases.push(text);
+    }
+    function addClass(className) {
+      var text = String(className || '').trim();
+      if (text && classes.indexOf(text) === -1) classes.push(text);
+    }
+    addAlias(finalBaseResultAlias(spec));
+    var viewModel = inferViewComposerModel(spec);
+    addAlias(viewModel && viewModel.sourceAlias);
+    var visual = getStoredVisualModel(spec, 'viewComposer');
+    addAlias(visual && visual.source && visual.source.alias);
+    aliases.forEach(function (alias) {
+      addClass(sourceClassForAlias(spec, alias));
+    });
+    if (!classes.length && Array.isArray(spec.steps)) {
+      for (var index = spec.steps.length - 1; index >= 0; index -= 1) {
+        var step = spec.steps[index] || {};
+        if (step.type === 'selectCards' && step.className) {
+          addClass(step.className);
+          break;
+        }
+      }
+    }
+    return classes;
+  }
+
+  function ensureCatalogAttributesForDesignerSection() {
+    if (boot.mode === 'runtime' || normalizeDesignerSection(state.designerSection) !== 'final-view') return;
+    var selected = state.selectedTemplate || { spec: defaultSpec() };
+    var classes = viewComposerCatalogClassNames(selected.spec || defaultSpec());
+    if (!classes.length) return;
+    Promise.all(classes.map(ensureCatalogAttributesForClass)).then(function (results) {
+      if (results.some(Boolean) && normalizeDesignerSection(state.designerSection) === 'final-view') renderDesigner();
     });
   }
 
@@ -3414,9 +3665,6 @@ function dynamicPagesClientScript() {
         updateSelectedFromEditor(specData.spec);
         state.runParams = Object.assign({}, specData.examples || {}, state.runParams || {});
       }
-      if (hasBaaEndpointEditorFields()) {
-        updateSelectedFromEditor(applyBaaEndpointToSpec(state.selectedTemplate.spec || defaultSpec(), false));
-      }
       if (document.querySelectorAll('[data-view-column-row]').length) {
         state.viewComposerDraft = captureViewComposerDraftFromDom();
       }
@@ -3428,6 +3676,11 @@ function dynamicPagesClientScript() {
       }
       if (hasField('cmdp-cmdb-build-language')) {
         updateSelectedFromEditor(applyCmdbBuildViewToSpec(state.selectedTemplate.spec || defaultCmdbBuildViewSpecClient(), false));
+      }
+      if (hasField('cmdp-assistant-intent')) {
+        state.assistantDraftIntent = readValue('cmdp-assistant-intent');
+        var taskField = document.querySelector('input[name="cmdp-assistant-task-mode"]:checked');
+        state.assistantTaskMode = normalizeOutputMode(taskField && taskField.value || state.assistantTaskMode);
       }
       if (hasField('cmdp-root')) state.schemaRootDraft = readValue('cmdp-root') || state.root;
       if (hasField('cmdp-schema-description')) state.schemaDescriptionDraft = readValue('cmdp-schema-description');
@@ -3578,18 +3831,41 @@ function dynamicPagesClientScript() {
     return spec;
   }
 
+  function defaultAssistantSystemPrompt() {
+    return [
+      'Пользователь может называть CMDBuild классы, атрибуты, lookup значения и связи как по Code, так и по Description. При неоднозначности используй MCP context и явно предпочитай точное совпадение Code, затем Description.',
+      'Пользовательские формулировки могут ссылаться на атрибуты напрямую, на связи через domains, на reference-поля и на lookup-поля. Для lookup/reference/domain значений пользователь обычно оперирует отображаемым значением или Description связанного объекта, а не внутренним id. Не сравнивай такие поля как raw id, если по модели доступно человекочитаемое значение.',
+      'Атрибут может быть простым значением, lookup, reference или участником domain relation. Перед построением DSL проверь тип атрибута и выбирай путь чтения данных по модели CMDBuild, а не по названию поля.',
+      'Для DSL expandRelations поле domain должно содержать только CMDBuild domain name/Code из cmdbuild_relation_hints.domains[].name, а не Description связи. Description используй только для выбора подходящего domain name. Если domain name не найден, не заполняй domain и добавь warning.',
+      'Связи между объектами могут быть 1:N, N:1 и N:N. При анализе связей не останавливайся на первой найденной связи или первой карточке: учитывай все видимые связи и все подходящие related cards в пределах настроенных лимитов. Если связь неоднозначна, сформируй deterministic draft с явным domain/path и добавь warning.',
+      'Результат должен оставаться детерминированным, кэшируемым и исполняемым без LLM. Используй только поддерживаемый DSL v1 и read-only MCP context; не добавляй runtime LLM вызовы.'
+    ].join('\\n\\n');
+  }
+
   function defaultRuntimeConfig() {
     return {
       runtimeCache: {
         refreshCooldownSec: 180
       },
-      baaTechnical: {
-        superclassPath: 'BAA technical superclass',
-        conversionContractClass: 'BAAConversionContract',
-        conversionContractVersionClass: 'BAAConversionContractVersion',
-        verificationInputContractClass: 'BAAVerificationInputContract',
-        verificationOutputContractClass: 'BAAVerificationOutputContract',
-        verificationEndpointClass: 'BAAVerificationEndpoint'
+      assistant: {
+        llm: {
+          enabled: Boolean(boot.assistant && boot.assistant.enabled),
+          baseUrl: boot.assistant && boot.assistant.baseUrl || '',
+          model: boot.assistant && boot.assistant.model || ''
+        },
+        mcp: {
+          enabled: true,
+          allowedTools: allMcpToolNames(),
+          maxContextBytes: 12000,
+          timeoutMs: 10000,
+          maxClasses: 100,
+          maxDomains: 100,
+          maxRelationDomains: 100,
+          maxCandidateClasses: 8
+        },
+        prompt: {
+          system: defaultAssistantSystemPrompt()
+        }
       },
       executionLimits: {
         maxRowsDefault: 500,
@@ -3610,11 +3886,33 @@ function dynamicPagesClientScript() {
   function normalizeRuntimeConfigForEditor(runtimeConfig) {
     var defaults = defaultRuntimeConfig();
     var source = runtimeConfig && typeof runtimeConfig === 'object' && !Array.isArray(runtimeConfig) ? runtimeConfig : {};
+    var sourceAssistant = source.assistant && typeof source.assistant === 'object' && !Array.isArray(source.assistant) ? source.assistant : {};
+    var defaultAssistant = defaults.assistant;
     return Object.assign({}, defaults, source, {
       runtimeCache: Object.assign({}, defaults.runtimeCache, source.runtimeCache || {}),
-      baaTechnical: Object.assign({}, defaults.baaTechnical, source.baaTechnical || {}),
+      assistant: Object.assign({}, defaultAssistant, sourceAssistant, {
+        llm: Object.assign({}, defaultAssistant.llm, sourceAssistant.llm || {}),
+        mcp: Object.assign({}, defaultAssistant.mcp, sourceAssistant.mcp || {}),
+        prompt: Object.assign({}, defaultAssistant.prompt, sourceAssistant.prompt || {})
+      }),
       executionLimits: Object.assign({}, defaults.executionLimits, source.executionLimits || {})
     });
+  }
+
+  function normalizeOutputMode(value) {
+    var mode = String(value || 'both').trim();
+    return ['tables', 'diagrams', 'both'].indexOf(mode) === -1 ? 'both' : mode;
+  }
+
+  function splitToolList(value) {
+    if (Array.isArray(value)) {
+      return value.map(function (item) { return String(item || '').trim(); }).filter(Boolean);
+    }
+    return String(value || '').split(',').map(function (item) { return item.trim(); }).filter(Boolean);
+  }
+
+  function allMcpToolNames() {
+    return ['cmdbuild_model_summary', 'cmdbuild_class_fields', 'cmdbuild_relation_hints', 'cmdbuild_template_context'];
   }
 
   function readPositiveIntField(id, label, fallback) {
@@ -4134,9 +4432,7 @@ function dynamicPagesClientScript() {
   }
 
   function renderScopePathOptions(className, selectedName) {
-    var options = isBaaSourceClassName(className)
-      ? baaScopePathOptionsForSource(readCurrentSpec(), className)
-      : catalogScopePathOptions(className);
+    var options = catalogScopePathOptions(className);
     if (selectedName && !options.some(function (item) { return item.value === selectedName; })) {
       options.unshift({ value: selectedName, label: selectedName, type: '' });
     }
@@ -4169,70 +4465,8 @@ function dynamicPagesClientScript() {
     }).join('');
   }
 
-  function baaSourceClassName(alias) {
-    var text = String(alias || '').trim();
-    return text ? '__baa__:' + text : '';
-  }
-
-  function isBaaSourceClassName(value) {
-    return String(value || '').indexOf('__baa__:') === 0;
-  }
-
-  function baaAliasFromSourceClassName(value) {
-    var text = String(value || '').trim();
-    return isBaaSourceClassName(text) ? text.slice('__baa__:'.length) : '';
-  }
-
-  function baaObjectDisplayName(object) {
-    object = object || {};
-    return object.className || object.alias || 'candidate';
-  }
-
-  function baaSourceOptionRows(spec) {
-    var contract = baaContractForSpec(spec || defaultSpec());
-    return (contract.objects || []).map(function (object, index) {
-      var alias = object.alias || object.className || ('candidate' + String(index + 1));
-      return {
-        value: baaSourceClassName(alias),
-        label: 'BAA: ' + baaObjectDisplayName(object),
-        alias: alias,
-        object: object
-      };
-    });
-  }
-
   function renderObjectGroupSourceClassOptions(selectedName) {
-    var options = renderClassOptions(selectedName);
-    var baaOptions = baaSourceOptionRows(readCurrentSpec()).map(function (item) {
-      return '<option value="' + escapeHtml(item.value || '') + '"' + (item.value === selectedName ? ' selected' : '') + '>' + escapeHtml(item.label || item.value || '') + '</option>';
-    }).join('');
-    if (isBaaSourceClassName(selectedName) && baaOptions.indexOf('value="' + escapeHtml(selectedName) + '"') === -1) {
-      baaOptions = '<option value="' + escapeHtml(selectedName) + '" selected>BAA: ' + escapeHtml(baaAliasFromSourceClassName(selectedName)) + '</option>' + baaOptions;
-    }
-    return options + (baaOptions ? '<optgroup label="BAA payload">' + baaOptions + '</optgroup>' : '');
-  }
-
-  function baaScopePathOptionsForSource(spec, sourceClassName) {
-    var alias = baaAliasFromSourceClassName(sourceClassName);
-    var contract = baaContractForSpec(spec || defaultSpec());
-    var object = (contract.objects || []).find(function (item) {
-      return item && (item.alias === alias || item.className === alias);
-    }) || {};
-    var result = [];
-    function add(value, label, type) {
-      if (!value || result.some(function (item) { return item.value === value; })) return;
-      result.push({ value: value, label: label || value, type: type || '' });
-    }
-    ['PlanIndex', 'Kind', 'ClassName', 'PageShapeKey', 'MappingKey', 'RelationBindingStatus'].forEach(function (column) {
-      add(column, 'BAA.' + column, 'string');
-    });
-    (object.payload || []).forEach(function (field) {
-      field = normalizeBaaFieldDefinition(field);
-      if (!field.name) return;
-      if (alias) add('BAA.' + alias + '.' + field.name, 'BAA.' + alias + '.' + field.name, field.type || '');
-      if (object.className) add('BAA.' + object.className + '.' + field.name, 'BAA.' + object.className + '.' + field.name, field.type || '');
-    });
-    return result;
+    return renderClassOptions(selectedName);
   }
 
   function renderDomainOptions(selectedName) {
@@ -4431,14 +4665,10 @@ function dynamicPagesClientScript() {
   function normalizeMatchingBlock(block, index, selections, previousAlias) {
     block = block || {};
     selections = Array.isArray(selections) ? selections : [];
-    var baaSelection = selections.find(function (selection) { return selection && selection.alias === 'baaObjects'; }) || null;
-    var firstCmdbSelection = selections.find(function (selection) { return selection && selection.alias !== 'baaObjects'; }) || null;
     var fallbackLeft = index === 0
-      ? (baaSelection && baaSelection.alias || selections[0] && selections[0].alias || objectSelectionAlias(0))
+      ? (selections[0] && selections[0].alias || objectSelectionAlias(0))
       : previousAlias;
-    var fallbackRight = index === 0 && fallbackLeft === 'baaObjects'
-      ? (firstCmdbSelection && firstCmdbSelection.alias || objectSelectionAlias(0))
-      : (selections[index + 1] && selections[index + 1].alias || selections[1] && selections[1].alias || objectSelectionAlias(index + 1));
+    var fallbackRight = selections[index + 1] && selections[index + 1].alias || selections[1] && selections[1].alias || objectSelectionAlias(index + 1);
     var alias = String(block.as || block.alias || block.outputAlias || ('matchedObjects' + String(index + 2))).trim();
     var rawRules = Array.isArray(block.rules || block.where) ? (block.rules || block.where) : [];
     var rules = rawRules.map(normalizeMatchingRule).filter(function (rule) {
@@ -4457,10 +4687,6 @@ function dynamicPagesClientScript() {
   function normalizeObjectMatchingModel(model, spec) {
     spec = spec || defaultSpec();
     var selections = matchingSelectionsForSpec(spec);
-    if (selections.some(function (selection) { return selection && selection.alias === 'baaObjects'; })) {
-      selections = selections.filter(function (selection) { return selection && selection.alias === 'baaObjects'; })
-        .concat(selections.filter(function (selection) { return !selection || selection.alias !== 'baaObjects'; }));
-    }
     var expectedBlocks = Math.max(0, selections.length - 1);
     var sourceBlocks = model && Array.isArray(model.blocks) ? model.blocks.slice() : [];
     var previousAlias = '';
@@ -4532,10 +4758,7 @@ function dynamicPagesClientScript() {
 
   function objectSelectionIndexFromList(selections, alias) {
     var text = String(alias || '').trim();
-    var cmdbSelections = (Array.isArray(selections) ? selections : []).filter(function (selection) {
-      return selection && selection.alias !== 'baaObjects' && selection.sourceType !== 'baa';
-    });
-    var index = cmdbSelections.findIndex(function (selection, itemIndex) {
+    var index = (Array.isArray(selections) ? selections : []).findIndex(function (selection, itemIndex) {
       var selectionAlias = selection && (selection.alias || selection.as) || objectSelectionAlias(itemIndex);
       return selectionAlias === text;
     });
@@ -4567,29 +4790,14 @@ function dynamicPagesClientScript() {
 
   function formatObjectSelectionColumnLabel(spec, alias, field) {
     var text = String(field || '').trim();
-    if (String(alias || '') === 'baaObjects') return 'BAA.' + (text || 'candidate');
     var prefix = objectSelectionDisplayNameForAlias(spec || defaultSpec(), alias);
     return prefix + (text ? '.' + text : '');
   }
 
-  function baaCandidateSelection(spec) {
-    if (!hasBaaInputSpec(spec || {})) return null;
-    return {
-      alias: 'baaObjects',
-      name: 'BAA candidates',
-      className: 'BAA',
-      sourceType: 'baa',
-      rules: []
-    };
-  }
-
   function matchingSelectionsForSpec(spec) {
-    var selections = objectSelectionsFromModel(inferObjectGroupModel(spec || defaultSpec())).map(function (selection, index) {
+    return objectSelectionsFromModel(inferObjectGroupModel(spec || defaultSpec())).map(function (selection, index) {
       return normalizeObjectSelection(selection, index);
     });
-    var baa = baaCandidateSelection(spec || {});
-    if (baa && !selections.some(function (selection) { return selection.alias === baa.alias || selection.sourceType === 'baa'; })) selections.push(baa);
-    return selections;
   }
 
   function stripKnownSelectionPrefix(spec, alias, field) {
@@ -4613,7 +4821,43 @@ function dynamicPagesClientScript() {
       name: defaultObjectSelectionName(index),
       alias: objectSelectionAlias(index),
       className: className || state.selectedClass || '',
+      from: '',
+      limit: 100,
+      columns: [],
       rules: [{ action: 'include', path: 'Code', regex: '.*' }]
+    };
+  }
+
+  function normalizeObjectSelectionColumns(value) {
+    if (Array.isArray(value)) {
+      return value.map(function (item) {
+        if (item && typeof item === 'object' && !Array.isArray(item)) return String(item.path || item.name || item.field || '').trim();
+        return String(item || '').trim();
+      }).filter(Boolean);
+    }
+    return String(value || '').split(',').map(function (item) { return item.trim(); }).filter(Boolean);
+  }
+
+  function objectSelectionColumnsText(selection) {
+    return normalizeObjectSelectionColumns(selection && selection.columns).join(', ');
+  }
+
+  function normalizeObjectSelectionRule(rule) {
+    rule = rule || {};
+    var operator = normalizeObjectGroupOperator(rule.op || rule.operator || (rule.regex !== undefined ? 'matches' : 'equals'));
+    var legacyValue = rule.value !== undefined ? rule.value : (rule.regex !== undefined ? rule.regex : '');
+    var regexValue = rule.regex !== undefined ? rule.regex : (operator === 'matches' && rule.value !== undefined ? rule.value : '');
+    var value = rule.value !== undefined ? rule.value : (operator !== 'matches' && rule.regex !== undefined ? rule.regex : '');
+    return {
+      action: rule && (rule.action === 'exclude' || rule.scope === 'exclude') ? 'exclude' : 'include',
+      path: rule && (rule.path || rule.field || rule.attribute || rule.column) || '',
+      negate: normalizeObjectGroupNegate(rule && (rule.negate !== undefined ? rule.negate : rule.not), rule && (rule.op || rule.operator)),
+      op: operator,
+      regex: String(regexValue === undefined || regexValue === null ? '' : regexValue),
+      value: String(value === undefined || value === null ? '' : value),
+      valueParam: String(rule.valueParam || rule.valuesParam || '').trim(),
+      valueColumn: String(rule.valueColumn || rule.sourceColumn || rule.fromColumn || '').trim(),
+      legacyValue: String(legacyValue === undefined || legacyValue === null ? '' : legacyValue)
     };
   }
 
@@ -4621,24 +4865,16 @@ function dynamicPagesClientScript() {
     selection = selection || {};
     var rules = Array.isArray(selection.rules || selection.scopeRules) ? (selection.rules || selection.scopeRules) : [];
     var className = String(selection.className || selection.source && selection.source.className || '').trim();
-    var baaObjectAlias = String(selection.baaObjectAlias || selection.source && selection.source.baaObjectAlias || baaAliasFromSourceClassName(className) || '').trim();
-    var sourceType = selection.sourceType === 'baa' || selection.source && selection.source.type === 'baa' || isBaaSourceClassName(className) ? 'baa' : 'cmdb';
-    if (sourceType === 'baa' && !className && baaObjectAlias) className = baaSourceClassName(baaObjectAlias);
+    var alias = String(selection.alias || selection.as || selection.output && selection.output.alias || objectSelectionAlias(index)).trim() || objectSelectionAlias(index);
+    var limit = Number(selection.limit !== undefined ? selection.limit : selection.source && selection.source.limit);
     return {
-      name: defaultObjectSelectionName(index),
-      alias: String(selection.alias || selection.as || objectSelectionAlias(index)).trim() || objectSelectionAlias(index),
+      name: String(selection.name || selection.title || selection.output && selection.output.title || defaultObjectSelectionName(index)).trim() || defaultObjectSelectionName(index),
+      alias: alias,
       className: className,
-      sourceType: sourceType,
-      baaObjectAlias: baaObjectAlias,
-      rules: rules.length ? rules.map(function (rule) {
-        return {
-          action: rule && (rule.action === 'exclude' || rule.scope === 'exclude') ? 'exclude' : 'include',
-          path: rule && (rule.path || rule.field || rule.attribute || rule.column) || '',
-          negate: normalizeObjectGroupNegate(rule && (rule.negate !== undefined ? rule.negate : rule.not), rule && (rule.op || rule.operator)),
-          op: normalizeObjectGroupOperator(rule && (rule.op || rule.operator || (rule.regex !== undefined ? 'matches' : 'matches'))),
-          regex: rule && (rule.regex !== undefined ? rule.regex : (rule.value !== undefined ? rule.value : '.*')) || '.*'
-        };
-      }) : [{ action: 'include', path: 'Code', regex: '.*' }]
+      from: String(selection.from || selection.source && selection.source.from || '').trim(),
+      limit: Number.isInteger(limit) && limit > 0 ? limit : 100,
+      columns: normalizeObjectSelectionColumns(selection.columns || selection.source && selection.source.columns || selection.output && selection.output.columns),
+      rules: rules.length ? rules.map(normalizeObjectSelectionRule) : [normalizeObjectSelectionRule({ action: 'include', path: 'Code', regex: '.*' })]
     };
   }
 
@@ -4656,6 +4892,51 @@ function dynamicPagesClientScript() {
     return selections.map(normalizeObjectSelection);
   }
 
+  function objectGroupFinalSelectionIndex(selections) {
+    var source = Array.isArray(selections) ? selections : [];
+    for (var index = source.length - 1; index >= 0; index -= 1) {
+      if (source[index] && source[index].from) return index;
+    }
+    return source.length ? source.length - 1 : -1;
+  }
+
+  function objectGroupFinalAliasFromSelections(selections) {
+    var index = objectGroupFinalSelectionIndex(selections);
+    if (index < 0) return '';
+    var selection = selections[index] || {};
+    return String(selection.alias || selection.as || selection.output && selection.output.alias || objectSelectionAlias(index)).trim();
+  }
+
+  function stripObjectGroupSourceColumnPrefix(sourceAlias, column) {
+    var text = String(column || '').trim();
+    var alias = String(sourceAlias || '').trim();
+    if (!alias || !text) return text;
+    if (text.indexOf(alias + '.') === 0) return text.slice(alias.length + 1);
+    if (text.indexOf(alias + '_') === 0) return text.slice(alias.length + 1);
+    return text;
+  }
+
+  function addObjectGroupSelectionColumn(selection, column) {
+    var text = String(column || '').trim();
+    if (!selection || !text) return;
+    selection.columns = normalizeObjectSelectionColumns(selection.columns);
+    if (selection.columns.indexOf(text) === -1) selection.columns.push(text);
+  }
+
+  function ensureObjectGroupValueColumnSources(selections) {
+    var source = Array.isArray(selections) ? selections : [];
+    source.forEach(function (selection) {
+      var sourceAlias = String(selection && selection.from || '').trim();
+      if (!sourceAlias) return;
+      var sourceIndex = objectSelectionIndexFromList(source, sourceAlias);
+      if (sourceIndex < 0 || !source[sourceIndex]) return;
+      (selection.rules || []).forEach(function (rule) {
+        var column = stripObjectGroupSourceColumnPrefix(sourceAlias, rule && (rule.valueColumn || rule.sourceColumn || rule.fromColumn));
+        if (column) addObjectGroupSelectionColumn(source[sourceIndex], column);
+      });
+    });
+  }
+
   function inferObjectGroupModel(spec) {
     if (state.objectGroupDraft) return state.objectGroupDraft;
     spec = spec || defaultSpec();
@@ -4667,8 +4948,9 @@ function dynamicPagesClientScript() {
             name: selection.name || selection.title,
             alias: selection.alias || selection.as,
             className: selection.className || selection.source && selection.source.className,
-            sourceType: selection.sourceType || selection.source && selection.source.type,
-            baaObjectAlias: selection.baaObjectAlias || selection.source && selection.source.baaObjectAlias,
+            from: selection.from || selection.source && selection.source.from,
+            limit: selection.limit || selection.source && selection.source.limit,
+            columns: selection.columns || selection.source && selection.source.columns || selection.output && selection.output.columns,
             rules: selection.scopeRules || selection.rules
           }, index);
         });
@@ -4700,26 +4982,48 @@ function dynamicPagesClientScript() {
       };
     }
 
-    var selection = getDataSelectionStep(spec);
-    var filters = Array.isArray(selection.filters || selection.where) ? (selection.filters || selection.where) : [];
-    var rules = filters.filter(function (filter) {
-      return filter && (filter.regex !== undefined || filter.path);
-    }).map(function (filter) {
+    var resultTables = spec && spec.result && Array.isArray(spec.result.tables) ? spec.result.tables : [];
+    var steps = spec && Array.isArray(spec.steps) ? spec.steps : [];
+    var cardSteps = steps.filter(isDataSelectionStep);
+    if (cardSteps.length) {
+      var selections = cardSteps.map(function (selection, index) {
+        var table = resultTables.find(function (item) { return item && item.name === selection.as; }) || {};
+        var filters = Array.isArray(selection.filters || selection.where) ? (selection.filters || selection.where) : [];
+        return normalizeObjectSelection({
+          name: table.title || table.label || defaultObjectSelectionName(index),
+          alias: selection.as || objectSelectionAlias(index),
+          className: selection.className || '',
+          from: selection.from || '',
+          limit: selection.limit,
+          columns: selection.columns || selection.cardColumns || selection.outputColumns || table.columns,
+          rules: filters.map(function (filter) {
+            return {
+              action: filter.scope === 'exclude' ? 'exclude' : 'include',
+              path: filter.path || filter.attribute || filter.column || filter.field || '',
+              negate: normalizeObjectGroupNegate(filter.negate !== undefined ? filter.negate : filter.not, filter.op),
+              op: normalizeObjectGroupOperator(filter.op || (filter.regex !== undefined ? 'matches' : 'equals')),
+              regex: filter.regex,
+              value: filter.value,
+              valueParam: filter.valueParam || filter.valuesParam,
+              valueColumn: filter.valueColumn || filter.sourceColumn || filter.fromColumn
+            };
+          })
+        }, index);
+      });
       return {
-        action: filter.scope === 'exclude' ? 'exclude' : 'include',
-        path: filter.path || filter.attribute || filter.column || filter.field || '',
-        negate: normalizeObjectGroupNegate(filter.negate !== undefined ? filter.negate : filter.not, filter.op),
-        op: normalizeObjectGroupOperator(filter.op || (filter.regex !== undefined ? 'matches' : 'equals')),
-        regex: filter.regex || '.*'
+        selections: selections,
+        className: selections[0] && selections[0].className || '',
+        rules: selections[0] && selections[0].rules || []
       };
-    });
+    }
+
     var model = {
-      className: selection.className || getSpecClassFallback(spec) || state.selectedClass || '',
-      rules: rules.length ? rules : [{ action: 'include', path: 'Code', regex: '.*' }]
+      className: getSpecClassFallback(spec) || state.selectedClass || '',
+      rules: [{ action: 'include', path: 'Code', regex: '.*' }]
     };
     model.selections = [normalizeObjectSelection({
       name: defaultObjectSelectionName(0),
-      alias: selection.as || 'objects',
+      alias: 'objects',
       className: model.className,
       rules: model.rules
     }, 0)];
@@ -4743,14 +5047,11 @@ function dynamicPagesClientScript() {
   }
 
   function objectSelectionLabel(selection, index) {
-    if (selection && selection.sourceType === 'baa') return selection.name || ('BAA: ' + (selection.baaObjectAlias || baaAliasFromSourceClassName(selection.className) || 'candidates'));
     return objectSelectionDisplayName(index || 0);
   }
 
   function selectionOptionRows(spec, selectedName) {
     var selections = objectSelectionsFromModel(inferObjectGroupModel(spec || defaultSpec()));
-    var baa = baaCandidateSelection(spec || {});
-    if (baa && !selections.some(function (selection) { return selection.alias === baa.alias || selection.sourceType === 'baa'; })) selections.push(baa);
     if (selectedName && !selections.some(function (selection) { return selection.alias === selectedName; })) {
       selections.unshift({ alias: selectedName, name: selectedName, className: sourceClassForAlias(spec || {}, selectedName), rules: [] });
     }
@@ -4771,16 +5072,6 @@ function dynamicPagesClientScript() {
   }
 
   function matchingColumnOptionRowsForSelection(spec, alias, prefixed, outputPrefix) {
-    if (String(alias || '') === 'baaObjects') {
-      var baaItems = baaColumnOptionRows(spec || defaultSpec());
-      var baaPrefix = prefixed ? (outputPrefix === undefined ? 'BAA.' : outputPrefix) : '';
-      return baaItems.map(function (item) {
-        return {
-          value: baaPrefix + item.value,
-          label: item.label
-        };
-      });
-    }
     var rows = selectionOptionRows(spec, alias);
     var selection = rows.find(function (item) { return item.alias === alias; }) || {};
     var prefix = prefixed ? (outputPrefix === undefined ? objectSelectionOutputPrefix(spec || defaultSpec(), alias) : outputPrefix) : '';
@@ -4801,31 +5092,6 @@ function dynamicPagesClientScript() {
     tableColumnsForAlias(spec || {}, alias).forEach(function (column) { add(column, column); });
     catalogScopePathOptions(selection.className || sourceClassForAlias(spec || {}, alias)).filter(Boolean).forEach(function (item) {
       add(item.value, item.label || item.value);
-    });
-    return items;
-  }
-
-  function baaColumnOptionRows(spec) {
-    var contract = baaContractForSpec(spec || {});
-    var items = [];
-    var seen = {};
-    function add(value, label) {
-      var text = String(value || '').trim();
-      if (!text || seen[text]) return;
-      seen[text] = true;
-      items.push({ value: text, label: label || text });
-    }
-    ['PlanIndex', 'Kind', 'ClassName', 'PageShapeKey', 'MappingKey', 'RelationBindingStatus'].forEach(function (column) {
-      add(column, 'BAA.' + column);
-    });
-    contract.objects.forEach(function (object) {
-      var alias = object.alias || object.className || 'candidate';
-      (object.payload || []).forEach(function (field) {
-        var name = field && field.name || '';
-        if (!name) return;
-        add('BAA.' + alias + '.' + name, 'BAA.' + alias + '.' + name);
-        if (object.className) add('BAA.' + object.className + '.' + name, 'BAA.' + object.className + '.' + name);
-      });
     });
     return items;
   }
@@ -4889,9 +5155,12 @@ function dynamicPagesClientScript() {
   function renderObjectGroupScopeRuleRow(rule, className) {
     rule = rule || {};
     var action = rule.action === 'exclude' ? 'exclude' : 'include';
-    var operator = normalizeObjectGroupOperator(rule.op || rule.operator || (rule.regex !== undefined ? 'matches' : 'matches'));
+    var operator = normalizeObjectGroupOperator(rule.op || rule.operator || (rule.regex !== undefined ? 'matches' : 'equals'));
     var negate = normalizeObjectGroupNegate(rule.negate !== undefined ? rule.negate : rule.not, rule.op || rule.operator);
     var valueDisabled = objectGroupOperatorUsesValue(operator) ? '' : ' disabled';
+    var value = operator === 'matches'
+      ? (rule.regex !== undefined && rule.regex !== '' ? rule.regex : (rule.value !== undefined ? rule.value : rule.legacyValue || ''))
+      : (rule.value !== undefined && rule.value !== '' ? rule.value : (rule.regex !== undefined ? rule.regex : rule.legacyValue || ''));
     return [
       '<tr data-object-scope-row>',
       '<td><select data-object-scope-field="action">',
@@ -4901,7 +5170,9 @@ function dynamicPagesClientScript() {
       '<td><select data-object-scope-field="path">' + renderScopePathOptions(className, rule.path || '') + '</select></td>',
       '<td><select data-object-scope-field="negate">' + renderObjectGroupNegationOptions(negate, operator) + '</select></td>',
       '<td><select data-object-scope-field="op">' + renderObjectGroupOperatorOptions(operator) + '</select></td>',
-      '<td><input data-object-scope-field="regex" value="' + escapeHtml(rule.regex || '') + '" placeholder="' + escapeHtml('$' + '{param.name}') + '"' + valueDisabled + '></td>',
+      '<td><input data-object-scope-field="value" value="' + escapeHtml(value == null ? '' : String(value)) + '" placeholder="' + escapeHtml('$' + '{param.name}') + '"' + valueDisabled + '></td>',
+      '<td><input data-object-scope-field="valueParam" value="' + escapeHtml(rule.valueParam || rule.valuesParam || '') + '"' + valueDisabled + '></td>',
+      '<td><input data-object-scope-field="valueColumn" value="' + escapeHtml(rule.valueColumn || rule.sourceColumn || rule.fromColumn || '') + '"' + valueDisabled + '></td>',
       '<td><button data-action="clear-object-scope-row">' + t('clear') + '</button></td>',
       '</tr>'
     ].join('');
@@ -5007,37 +5278,22 @@ function dynamicPagesClientScript() {
     var rowsId = index === 0 ? ' id="cmdp-object-scope-rows"' : '';
     return [
       '<div class="object-selection" data-object-selection data-object-selection-index="' + index + '">',
-      '<div class="row">',
+      '<div class="settings-grid">',
       '<label>' + t('objectSelectionTitle') + '<input data-object-selection-field="name" value="' + escapeHtml(selection.name || defaultObjectSelectionName(index)) + '"></label>',
+      '<label>' + t('objectSelectionAlias') + '<input data-object-selection-field="alias" value="' + escapeHtml(selection.alias || objectSelectionAlias(index)) + '"></label>',
       '<label>' + t('objectGroupSourceClass') + '<select' + classId + ' data-object-selection-field="className">' + renderObjectGroupSourceClassOptions(selection.className) + '</select></label>',
+      '<label>' + t('objectSelectionFrom') + '<input data-object-selection-field="from" value="' + escapeHtml(selection.from || '') + '"></label>',
+      '<label>' + t('objectSelectionLimit') + '<input data-object-selection-field="limit" value="' + escapeHtml(selection.limit == null ? '' : String(selection.limit)) + '"></label>',
+      '<label>' + t('objectSelectionColumns') + '<input data-object-selection-field="columns" value="' + escapeHtml(objectSelectionColumnsText(selection)) + '"></label>',
       '</div>',
       '<div class="section-title-row"><h3>' + escapeHtml(selection.name || defaultObjectSelectionName(index)) + '</h3>',
       '<button data-action="add-object-scope-row">' + t('addObjectGroupRule') + '</button></div>',
-      selection.sourceType === 'baa' ? '' : renderObjectGroupDomainFilters(selection),
-      '<table class="compact"><thead><tr><th>' + t('objectGroupScopeAction') + '</th><th>' + t('objectGroupPath') + '</th><th>' + t('objectGroupNegation') + '</th><th>' + t('objectGroupOperator') + '</th><th>' + t('objectGroupValue') + '</th><th></th></tr></thead>',
+      renderObjectGroupDomainFilters(selection),
+      '<table class="compact"><thead><tr><th>' + t('objectGroupScopeAction') + '</th><th>' + t('objectGroupPath') + '</th><th>' + t('objectGroupNegation') + '</th><th>' + t('objectGroupOperator') + '</th><th>' + t('objectGroupValue') + '</th><th>' + t('objectGroupValueParam') + '</th><th>' + t('objectGroupValueColumn') + '</th><th></th></tr></thead>',
       '<tbody' + rowsId + '>',
       ruleRows,
       '</tbody></table>',
       '<p class="muted">' + escapeHtml(t('objectGroupValueHelp')) + '</p>',
-      '</div>'
-    ].join('');
-  }
-
-  function renderBaaObjectGroupSource(spec) {
-    if (!hasBaaInputSpec(spec || {})) return '';
-    var contract = baaContractForSpec(spec || {});
-    var objects = contract.objects || [];
-    var rows = objects.map(function (object) {
-      var fields = (object.payload || []).map(function (field) { return field && field.name || ''; }).filter(Boolean).join(', ');
-      return '<tr><td><strong>' + escapeHtml(object.className || object.alias || '') + '</strong></td><td>' + escapeHtml(fields || '-') + '</td></tr>';
-    }).join('');
-    return [
-      '<div class="object-selection">',
-      '<div class="section-title-row"><h3>' + escapeHtml(t('baaObjectGroupSource')) + '</h3><span class="muted">BAA candidates / baaObjects</span></div>',
-      '<p class="muted">' + escapeHtml(t('baaObjectGroupSourceHelp')) + '</p>',
-      objects.length
-        ? '<table class="compact"><thead><tr><th>' + escapeHtml(t('baaObjectClassName')) + '</th><th>' + escapeHtml(t('baaPayloadFields')) + '</th></tr></thead><tbody>' + rows + '</tbody></table>'
-        : '<div class="notice">' + escapeHtml(t('baaContractNoObjects')) + '</div>',
       '</div>'
     ].join('');
   }
@@ -5049,7 +5305,6 @@ function dynamicPagesClientScript() {
     return [
       '<section class="section" id="cmdp-object-group-editor"><h2>' + t('objectGroupEditor') + '</h2>',
       '<p class="muted">' + t('objectGroupHelp') + '</p>',
-      renderBaaObjectGroupSource(spec),
       selections.map(renderObjectGroupSelection).join(''),
       renderObjectGroupDomainExamples(),
       renderObjectGroupRegexExamples(),
@@ -5170,13 +5425,10 @@ function dynamicPagesClientScript() {
       return '<div class="menu-group"><strong>' + escapeHtml(title) + '</strong><div class="menu-links">' +
         links.map(function (link) {
           var section = normalizeDesignerSection(link.section);
-          var disabled = sectionDisabledForBaa(section);
           var classes = [];
           if (state.designerSection === section) classes.push('active');
-          if (disabled) classes.push('disabled');
           var classAttr = classes.length ? ' class="' + classes.join(' ') + '"' : '';
-          var disabledAttrs = disabled ? ' aria-disabled="true" data-disabled="true" title="' + escapeHtml(t('baaSectionDisabled')) + '"' : '';
-          return '<a' + classAttr + disabledAttrs + ' href="' + escapeHtml(designerSectionUrl(section)) + '" data-designer-section="' + escapeHtml(section) + '">' + escapeHtml(link.label) + '</a>';
+          return '<a' + classAttr + ' href="' + escapeHtml(designerSectionUrl(section)) + '" data-designer-section="' + escapeHtml(section) + '">' + escapeHtml(link.label) + '</a>';
         }).join('') + '</div></div>';
     }
     return [
@@ -5184,10 +5436,10 @@ function dynamicPagesClientScript() {
       '<div class="menu-groups">',
       group(t('menuTemplates'), [
         { section: 'templates', label: t('menuTemplateList') },
-        { section: 'versions', label: t('menuVersions') }
+        { section: 'versions', label: t('menuVersions') },
+        { section: 'assistant', label: t('menuAssistant') }
       ]),
       group(t('menuDesigner'), [
-        { section: 'baa-endpoint', label: t('menuBaaEndpoint') },
         { section: 'params', label: t('menuParams') },
         { section: 'object-group', label: t('menuObjectGroup') },
         { section: 'relations', label: t('menuRelations') },
@@ -5229,27 +5481,145 @@ function dynamicPagesClientScript() {
     return '<label>' + t(labelKey) + '<input ' + attrs.join(' ') + '><span class="muted">' + escapeHtml(t(helpKey)) + '</span></label>';
   }
 
+  function assistantConfigForEditor(config) {
+    var runtimeConfig = normalizeRuntimeConfigForEditor(config && config.runtimeConfig || defaultRuntimeConfig());
+    return runtimeConfig.assistant || defaultRuntimeConfig().assistant;
+  }
+
+  function assistantEffectiveLimitValue(value, fallback, cap, min) {
+    min = min || 1;
+    var number = Number(value);
+    var raw = Number.isInteger(number) && number > 0 ? Math.max(min, number) : fallback;
+    var effective = Math.min(raw, cap || raw);
+    return {
+      raw: raw,
+      effective: effective,
+      clamped: raw !== effective
+    };
+  }
+
+  function assistantMcpLimitsStatus(mcp) {
+    var caps = boot.assistantMcpCaps || {};
+    var maxClasses = assistantEffectiveLimitValue(mcp.maxClasses, defaultRuntimeConfig().executionLimits.maxClassesDefault, caps.maxClasses || mcp.maxClasses || 1);
+    var maxDomains = assistantEffectiveLimitValue(mcp.maxDomains, defaultRuntimeConfig().executionLimits.maxDomainsDefault, caps.maxDomains || mcp.maxDomains || 1);
+    var maxContextBytes = assistantEffectiveLimitValue(mcp.maxContextBytes, defaultRuntimeConfig().assistant.mcp.maxContextBytes, caps.maxContextBytes || mcp.maxContextBytes || 1024, 1024);
+    function part(name, item) {
+      return name + '=' + (item.clamped ? item.raw + '->' + item.effective : item.effective);
+    }
+    return [
+      part('classes', maxClasses),
+      part('domains', maxDomains),
+      part('bytes', maxContextBytes)
+    ].join(', ');
+  }
+
+  function renderAssistantStatus(config) {
+    var assistant = assistantConfigForEditor(config);
+    var llm = assistant.llm || {};
+    var mcp = assistant.mcp || {};
+    var apiKeyConfigured = Boolean(boot.assistant && boot.assistant.apiKeyConfigured);
+    return [
+      '<section class="section"><h2>' + t('assistantStatusTitle') + '</h2>',
+      '<div class="assistant-status-grid">',
+      '<div><strong>' + t('assistantStatusEnabled') + '</strong><br><span class="pill ' + (llm.enabled ? 'ok' : '') + '">' + (llm.enabled ? t('yes') : t('no')) + '</span></div>',
+      '<div><strong>' + t('assistantStatusProvider') + '</strong><br><span class="code-inline">litellm</span></div>',
+      '<div><strong>' + t('assistantStatusBaseUrl') + '</strong><br><span class="code-inline">' + escapeHtml(llm.baseUrl || '') + '</span></div>',
+      '<div><strong>' + t('assistantStatusModel') + '</strong><br><span class="code-inline">' + escapeHtml(llm.model || '') + '</span></div>',
+      '<div><strong>' + t('assistantStatusApiKey') + '</strong><br><span class="pill ' + (apiKeyConfigured ? 'ok' : '') + '">' + escapeHtml(apiKeyConfigured ? t('assistantStatusConfigured') : t('assistantStatusMissing')) + '</span></div>',
+      '<div><strong>' + t('assistantStatusMcp') + '</strong><br><span class="pill ' + (mcp.enabled ? 'ok' : '') + '">' + (mcp.enabled ? t('yes') : t('no')) + '</span></div>',
+      '<div><strong>' + t('assistantMcpTools') + '</strong><br><span class="code-inline">' + escapeHtml(splitToolList(mcp.allowedTools).join(', ')) + '</span></div>',
+      '<div><strong>' + t('assistantMcpSettings') + '</strong><br><span class="code-inline">' + escapeHtml(assistantMcpLimitsStatus(mcp)) + '</span></div>',
+      '</div></section>'
+    ].join('');
+  }
+
+  function renderAssistantTaskMode(value) {
+    var selected = normalizeOutputMode(value || state.assistantTaskMode);
+    var items = [
+      ['tables', t('assistantTaskTable')],
+      ['diagrams', t('assistantTaskDiagram')],
+      ['both', t('assistantTaskBoth')]
+    ];
+    return '<div class="segmented-control" role="radiogroup" aria-label="' + escapeHtml(t('assistantTaskMode')) + '">' + items.map(function (item) {
+      return '<label><input type="radio" name="cmdp-assistant-task-mode" value="' + item[0] + '"' + (item[0] === selected ? ' checked' : '') + '> ' + escapeHtml(item[1]) + '</label>';
+    }).join('') + '</div>';
+  }
+
+  function assistantGenerationElapsedSeconds() {
+    if (!state.assistantGenerating || !state.assistantGeneratingStartedAt) return 0;
+    return Math.max(0, Math.floor((Date.now() - state.assistantGeneratingStartedAt) / 1000));
+  }
+
+  function assistantGenerationElapsedText() {
+    return t('assistantGeneratingElapsed', { seconds: assistantGenerationElapsedSeconds() });
+  }
+
+  function renderAssistantBusyNotice() {
+    if (!state.assistantGenerating) return '';
+    return [
+      '<div class="assistant-busy" role="status" aria-live="polite" data-assistant-busy>',
+      '<div class="assistant-busy-head">',
+      '<span class="assistant-busy-title"><span class="assistant-busy-spinner" aria-hidden="true"></span>' + escapeHtml(t('assistantGeneratingTitle')) + '</span>',
+      '<span class="assistant-busy-elapsed" data-assistant-elapsed>' + escapeHtml(assistantGenerationElapsedText()) + '</span>',
+      '</div>',
+      '<div class="muted">' + escapeHtml(t('assistantGeneratingMessage')) + '</div>',
+      state.assistantDraftResult ? '<div class="muted">' + escapeHtml(t('assistantPreviousDraftVisible')) + '</div>' : '',
+      '</div>'
+    ].join('');
+  }
+
+  function renderAssistantDraftResult() {
+    var result = state.assistantDraftResult;
+    var busy = renderAssistantBusyNotice();
+    if (!result) return '<div class="assistant-draft-preview" aria-busy="' + (state.assistantGenerating ? 'true' : 'false') + '">' + busy + '<div class="notice">' + escapeHtml(t('assistantNoDraft')) + '</div></div>';
+    var json = result.json || {};
+    var html = busy;
+    if (!result.ok) html += renderNotice({ type: 'error', text: errorText(result) });
+    if (Array.isArray(json.warnings) && json.warnings.length) {
+      html += '<h3>' + t('assistantWarnings') + '</h3><ul class="steps">' + json.warnings.map(function (item) { return '<li>' + escapeHtml(item) + '</li>'; }).join('') + '</ul>';
+    }
+    if (json.explanation) html += '<p>' + escapeHtml(json.explanation) + '</p>';
+    if (Array.isArray(json.errors) && json.errors.length) {
+      html += '<h3>' + t('assistantErrors') + '</h3><ul class="steps">' + json.errors.map(function (item) { return '<li>' + escapeHtml((item.path ? item.path + ': ' : '') + item.message) + '</li>'; }).join('') + '</ul>';
+    }
+    if (json.diagnostics) {
+      html += '<details class="help-details"><summary>' + t('assistantDiagnostics') + '</summary><pre>' + escapeHtml(pretty(json.diagnostics)) + '</pre></details>';
+    }
+    if (json.spec) html += '<h3>' + t('assistantDraftSpec') + '</h3><pre>' + escapeHtml(pretty(json.spec)) + '</pre>';
+    return '<div class="assistant-draft-preview" aria-busy="' + (state.assistantGenerating ? 'true' : 'false') + '">' + (html || '<pre>' + escapeHtml(pretty(json)) + '</pre>') + '</div>';
+  }
+
+  function renderAssistantEditor(selected, config) {
+    var intent = state.assistantDraftIntent || '';
+    var spec = selected && selected.spec ? selected.spec : defaultSpec();
+    var generateLabel = state.assistantGenerating ? t('assistantGenerateBusy') : t('assistantGenerate');
+    var generateDisabled = state.assistantGenerating ? ' disabled aria-disabled="true" aria-busy="true"' : '';
+    var applyDisabled = state.assistantGenerating ? ' disabled aria-disabled="true"' : '';
+    return [
+      '<section class="section" id="cmdp-assistant-editor"><h2>' + t('assistantEditor') + '</h2>',
+      '<p class="muted">' + t('assistantHelp') + '</p>',
+      '<div class="assistant-grid">',
+      '<div>',
+      '<label>' + t('assistantTaskMode') + '<br>' + renderAssistantTaskMode(state.assistantTaskMode) + '</label>',
+      '<label>' + t('assistantIntent') + '<textarea id="cmdp-assistant-intent" rows="9" style="width:100%">' + escapeHtml(intent) + '</textarea></label>',
+      '<div class="toolbar"><button class="primary" data-action="assistant-generate"' + generateDisabled + '>' + escapeHtml(generateLabel) + '</button><button data-action="assistant-apply-draft"' + applyDisabled + '>' + t('assistantApplyDraft') + '</button></div>',
+      '<details class="help-details"><summary>' + t('specJson') + '</summary><pre>' + escapeHtml(pretty(spec)) + '</pre></details>',
+      '</div>',
+      '<div>',
+      renderAssistantStatus(config),
+      '<section class="section"><h2>' + t('assistantDraftSpec') + '</h2>' + renderAssistantDraftResult() + '</section>',
+      '</div>',
+      '</div>',
+      '</section>'
+    ].join('');
+  }
+
   function renderRuntimeCacheFields(runtimeCache) {
   return [
     '<div class="visual-grid">',
     renderNumberSetting('cmdp-runtime-refresh-cooldown-sec', 'runtimeRefreshCooldownSec', 'runtimeRefreshCooldownHelp', runtimeCache.refreshCooldownSec),
     '</div>'
   ].join('');
-  }
-
-  function renderBaaTechnicalFields(baaTechnical) {
-    var defaults = defaultRuntimeConfig().baaTechnical;
-    var cfg = Object.assign({}, defaults, baaTechnical || {});
-    return [
-      '<div class="settings-grid">',
-      '<label>' + t('baaTechnicalSuperclassPath') + '<input id="cmdp-baa-superclass-path" value="' + escapeHtml(cfg.superclassPath || '') + '"><span class="muted">' + escapeHtml(t('baaTechnicalSuperclassPathHelp')) + '</span></label>',
-      '<label>' + t('baaConversionContractClass') + '<input id="cmdp-baa-conversion-contract-class" value="' + escapeHtml(cfg.conversionContractClass || '') + '"></label>',
-      '<label>' + t('baaConversionContractVersionClass') + '<input id="cmdp-baa-conversion-contract-version-class" value="' + escapeHtml(cfg.conversionContractVersionClass || '') + '"></label>',
-      '<label>' + t('baaVerificationInputContractClass') + '<input id="cmdp-baa-verification-input-contract-class" value="' + escapeHtml(cfg.verificationInputContractClass || '') + '"></label>',
-      '<label>' + t('baaVerificationOutputContractClass') + '<input id="cmdp-baa-verification-output-contract-class" value="' + escapeHtml(cfg.verificationOutputContractClass || '') + '"></label>',
-      '<label>' + t('baaVerificationEndpointClass') + '<input id="cmdp-baa-verification-endpoint-class" value="' + escapeHtml(cfg.verificationEndpointClass || '') + '"></label>',
-      '</div>'
-    ].join('');
   }
 
   function renderExecutionLimitFields(executionLimits) {
@@ -5449,12 +5819,45 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
+  function renderAssistantSettingsFields(assistant) {
+    assistant = assistant || defaultRuntimeConfig().assistant;
+    var llm = assistant.llm || {};
+    var mcp = assistant.mcp || {};
+    var prompt = assistant.prompt || {};
+    var systemPrompt = String(prompt.system || '').trim() || defaultRuntimeConfig().assistant.prompt.system;
+    return [
+      '<h3>' + t('assistantLlmSettings') + '</h3>',
+      '<div class="checkbox-list">',
+      '<label class="checkbox checkbox-stacked"><input id="cmdp-assistant-llm-enabled" type="checkbox" ' + (llm.enabled ? 'checked' : '') + '> <span><strong>' + t('assistantLlmEnabled') + '</strong><span class="muted">' + escapeHtml(t('assistantLlmDeploymentHelp')) + '</span></span></label>',
+      '</div>',
+      '<div class="visual-grid">',
+      '<label>' + t('assistantLlmBaseUrl') + '<input id="cmdp-assistant-llm-base-url" value="' + escapeHtml(llm.baseUrl || '') + '"></label>',
+      '<label>' + t('assistantLlmModel') + '<input id="cmdp-assistant-llm-model" value="' + escapeHtml(llm.model || '') + '"></label>',
+      '</div>',
+      '<h3>' + t('assistantPromptSettings') + '</h3>',
+      '<label>' + t('assistantSystemPrompt') + '<textarea id="cmdp-assistant-system-prompt" rows="10" style="width:100%">' + escapeHtml(systemPrompt) + '</textarea><span class="muted">' + escapeHtml(t('assistantSystemPromptHelp')) + '</span></label>',
+      '<h3>' + t('assistantMcpSettings') + '</h3>',
+      '<div class="checkbox-list">',
+      '<label class="checkbox checkbox-stacked"><input id="cmdp-assistant-mcp-enabled" type="checkbox" ' + (mcp.enabled ? 'checked' : '') + '> <span><strong>' + t('assistantMcpEnabled') + '</strong></span></label>',
+      '</div>',
+      '<div class="visual-grid">',
+      '<label>' + t('assistantMcpAllowedTools') + '<input id="cmdp-assistant-mcp-tools" value="' + escapeHtml(splitToolList(mcp.allowedTools).join(', ')) + '"><span class="muted">' + escapeHtml(t('assistantMcpAllowedToolsHelp')) + '</span></label>',
+      renderNumberSetting('cmdp-assistant-mcp-max-context-bytes', 'assistantMcpMaxContextBytes', 'assistantMcpMaxContextBytes', mcp.maxContextBytes || 12000, { min: 1024 }),
+      renderNumberSetting('cmdp-assistant-mcp-timeout-ms', 'assistantMcpTimeoutMs', 'assistantMcpTimeoutMs', mcp.timeoutMs || 10000, { min: 1000 }),
+      renderNumberSetting('cmdp-assistant-mcp-max-classes', 'assistantMcpMaxClasses', 'assistantMcpMaxClassesHelp', mcp.maxClasses || 100, { min: 1 }),
+      renderNumberSetting('cmdp-assistant-mcp-max-domains', 'assistantMcpMaxDomains', 'assistantMcpMaxDomainsHelp', mcp.maxDomains || 100, { min: 1 }),
+      renderNumberSetting('cmdp-assistant-mcp-max-relation-domains', 'assistantMcpMaxRelationDomains', 'assistantMcpMaxRelationDomainsHelp', mcp.maxRelationDomains || mcp.maxDomains || 100, { min: 1 }),
+      renderNumberSetting('cmdp-assistant-mcp-max-candidate-classes', 'assistantMcpMaxCandidateClasses', 'assistantMcpMaxCandidateClassesHelp', mcp.maxCandidateClasses || 8, { min: 1 }),
+      '</div>'
+    ].join('');
+  }
+
   function renderRuntimeSettings(config) {
     config = config || { runtimeConfig: defaultRuntimeConfig(), exists: false };
     var runtimeConfig = normalizeRuntimeConfigForEditor(config.runtimeConfig || defaultRuntimeConfig());
     var runtimeCache = runtimeConfig.runtimeCache || defaultRuntimeConfig().runtimeCache;
-    var baaTechnical = runtimeConfig.baaTechnical || defaultRuntimeConfig().baaTechnical;
     var executionLimits = runtimeConfig.executionLimits || defaultRuntimeConfig().executionLimits;
+    var assistant = runtimeConfig.assistant || defaultRuntimeConfig().assistant;
     return [
       '<section class="section" id="cmdp-runtime-settings"><h2>' + t('runtimeSettings') + '</h2>',
       '<span class="pill ' + (config.exists ? 'ok' : '') + '">' + (config.exists ? t('configCard') : t('defaultConfig')) + '</span>',
@@ -5463,6 +5866,8 @@ function dynamicPagesClientScript() {
       renderRuntimeCacheFields(runtimeCache),
       '<h3>' + t('runtimeExecutionLimits') + '</h3>',
       renderExecutionLimitFields(executionLimits),
+      '<h3>' + t('assistantSettings') + '</h3>',
+      renderAssistantSettingsFields(assistant),
       '</div>',
       '</section>'
     ].join('');
@@ -5483,8 +5888,6 @@ function dynamicPagesClientScript() {
       '</select></label>',
       '<h3>' + t('runtimeCacheSettings') + '</h3>',
       renderRuntimeCacheFields(runtimeCache),
-      '<h3>' + t('baaTechnicalSettings') + '</h3>',
-      renderBaaTechnicalFields(baaTechnical),
       '</div>',
       '</section>'
     ].join('');
@@ -5594,345 +5997,6 @@ function dynamicPagesClientScript() {
     return '<div class="template-context" id="cmdp-template-context"><strong>' + t('editingTemplate') + '</strong><span class="code-inline">' + escapeHtml(selected.code || '') + '</span>' + escapeHtml(description) + '</div>';
   }
 
-  function isBaaVerificationSpec(spec) {
-    return Boolean(spec && spec.endpoint && spec.endpoint.kind === 'baaVerification');
-  }
-
-  function selectedTemplateIsBaa(selected) {
-    var template = selected || state.selectedTemplate || {};
-    return isBaaVerificationSpec(template.spec || {});
-  }
-
-  function sectionDisabledForBaa(section, selected) {
-    if (!selectedTemplateIsBaa(selected)) return false;
-    return ['visualization', 'publication'].indexOf(normalizeDesignerSection(section)) !== -1;
-  }
-
-  function renderBaaDisabledSection() {
-    return '<section class="section"><div class="notice">' + escapeHtml(t('baaSectionDisabled')) + '</div></section>';
-  }
-
-  function hasBaaInputSpec(spec) {
-    if (isBaaVerificationSpec(spec || {})) return true;
-    var contract = spec && spec.baaContract && typeof spec.baaContract === 'object' && !Array.isArray(spec.baaContract) ? spec.baaContract : null;
-    if (!contract) return false;
-    return Boolean(contract.sourceCode || contract.code || (Array.isArray(contract.objects) && contract.objects.length) || (Array.isArray(contract.classes) && contract.classes.length));
-  }
-
-  function addUniqueString(list, value) {
-    var text = String(value || '').trim();
-    if (text && list.indexOf(text) === -1) list.push(text);
-  }
-
-  function collectBaaSourceAliasesForMissingInputs(spec) {
-    var steps = spec && Array.isArray(spec.steps) ? spec.steps : [];
-    var produced = {};
-    steps.forEach(function (step) {
-      if (step && step.as) produced[step.as] = true;
-    });
-    var aliases = [];
-    steps.forEach(function (step) {
-      if (!step || typeof step !== 'object') return;
-      if (step.type === 'enrichRows' && step.from && !produced[step.from]) addUniqueString(aliases, step.from);
-      if (step.type === 'matchRows') {
-        if (step.from && !produced[step.from]) addUniqueString(aliases, step.from);
-        if (step.with && !produced[step.with]) addUniqueString(aliases, step.with);
-      }
-    });
-    var visual = getStoredVisualModel(spec || {}, 'viewComposer');
-    var sourceAlias = visual && (visual.sourceAlias || visual.source && visual.source.alias) || '';
-    if (sourceAlias && !produced[sourceAlias]) addUniqueString(aliases, sourceAlias);
-    if (!steps.length && !steps.some(function (step) { return step && step.type === 'baaPlanObjects'; }) && !aliases.length) aliases.push('baaObjects');
-    return aliases;
-  }
-
-  function ensureBaaPlanObjectSourceSteps(spec) {
-    if (!isBaaVerificationSpec(spec || {})) return spec;
-    var next = cloneJsonValue(spec || defaultSpec(), defaultSpec());
-    var steps = Array.isArray(next.steps) ? next.steps.slice() : [];
-    var existing = {};
-    steps.forEach(function (step) {
-      if (step && step.type === 'baaPlanObjects' && step.as) existing[step.as] = true;
-    });
-    collectBaaSourceAliasesForMissingInputs(Object.assign({}, next, { steps: steps })).filter(function (alias) {
-      return !existing[alias];
-    }).reverse().forEach(function (alias) {
-      steps.unshift({ type: 'baaPlanObjects', as: alias, payloadPrefix: 'Payload.' });
-    });
-    next.steps = steps;
-    return next;
-  }
-
-  function baaContractForSpec(spec) {
-    var contract = spec && spec.baaContract && typeof spec.baaContract === 'object' && !Array.isArray(spec.baaContract) ? spec.baaContract : {};
-    var variables = Array.isArray(contract.contractParams)
-      ? contract.contractParams
-      : (Array.isArray(contract.variables) ? contract.variables : []);
-    var requestVariables = Array.isArray(contract.requestVariables) ? contract.requestVariables : [];
-    var objects = Array.isArray(contract.objects)
-      ? contract.objects
-      : (Array.isArray(contract.candidates) ? contract.candidates : (Array.isArray(contract.classes) ? contract.classes : []));
-    return {
-      code: String(contract.code || '').trim(),
-      version: String(contract.version || '').trim(),
-      description: String(contract.description || '').trim(),
-      variables: variables.map(normalizeBaaFieldDefinition).filter(function (field) { return field.name; }),
-      contractParams: variables.map(normalizeBaaFieldDefinition).filter(function (field) { return field.name; }),
-      requestVariables: requestVariables.map(normalizeBaaFieldDefinition).filter(function (field) { return field.name; }),
-      objects: objects.map(function (object, index) {
-        var payload = Array.isArray(object && object.payload)
-          ? object.payload
-          : (Array.isArray(object && object.fields) ? object.fields : (Array.isArray(object && object.attributes) ? object.attributes : []));
-        var className = String(object && (object.className || object.class || object.name) || '').trim();
-        return {
-          alias: String(object && object.alias || object && object.as || className || ('candidate' + String(index + 1))).trim(),
-          className: className,
-          description: String(object && object.description || '').trim(),
-          payload: payload.map(normalizeBaaFieldDefinition).filter(function (field) { return field.name; })
-        };
-      }).filter(function (object) { return object.alias || object.className || object.payload.length; })
-    };
-  }
-
-  function normalizeBaaFieldDefinition(field) {
-    field = field && typeof field === 'object' && !Array.isArray(field) ? field : {};
-    return {
-      name: String(field.name || field.field || '').trim(),
-      type: String(field.type || 'string').trim() || 'string',
-      required: Boolean(field.required || field.mandatory),
-      defaultValue: field.default !== undefined ? field.default : (field.defaultValue !== undefined ? field.defaultValue : ''),
-      example: field.example !== undefined ? field.example : '',
-      description: String(field.description || field.help || '').trim(),
-      listMode: String(field.listMode || 'none').trim() || 'none',
-      values: Array.isArray(field.values) ? field.values : []
-    };
-  }
-
-  function baaFieldLines(fields, includeDefault) {
-    return (Array.isArray(fields) ? fields : []).map(function (field) {
-      field = normalizeBaaFieldDefinition(field);
-      if (!field.name) return '';
-      var parts = [
-        field.name,
-        field.type || 'string',
-        field.required ? 'required' : 'optional'
-      ];
-      if (includeDefault) parts.push(field.defaultValue == null ? '' : String(field.defaultValue));
-      parts.push(field.example == null ? '' : String(field.example));
-      parts.push(field.description || '');
-      return parts.join(':');
-    }).filter(Boolean).join('\\n');
-  }
-
-  function parseBaaFieldLines(text, includeDefault) {
-    return String(text || '').split(/\\r?\\n/).map(function (line) {
-      var trimmed = line.trim();
-      if (!trimmed) return null;
-      var parts = trimmed.split(':');
-      var name = String(parts.shift() || '').trim();
-      var type = String(parts.shift() || 'string').trim() || 'string';
-      var requiredText = String(parts.shift() || '').trim().toLowerCase();
-      var required = ['required', 'true', '1', 'yes', 'да', 'обязательный'].indexOf(requiredText) !== -1;
-      var defaultValue = '';
-      if (includeDefault) defaultValue = parts.shift() || '';
-      var example = parts.shift() || '';
-      var description = parts.join(':').trim();
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(t('invalidParamName') + ': ' + name);
-      return {
-        name: name,
-        type: type,
-        required: required,
-        default: defaultValue,
-        example: example,
-        description: description
-      };
-    }).filter(Boolean);
-  }
-
-  function renderBaaFieldEditorRow(field, includeDefault, readOnly) {
-    field = normalizeBaaFieldDefinition(field);
-    var disabled = readOnly ? ' readonly' : '';
-    var buttonDisabled = readOnly ? ' disabled' : '';
-    var requiredValue = field.required ? 'true' : 'false';
-    var cells = [
-      '<td><input data-baa-field="name" value="' + escapeHtml(field.name || '') + '"' + disabled + '></td>',
-      '<td><input data-baa-field="type" value="' + escapeHtml(field.type || 'string') + '"' + disabled + '></td>',
-      '<td><select data-baa-field="required"' + (readOnly ? ' disabled' : '') + '><option value="false"' + (requiredValue === 'false' ? ' selected' : '') + '>' + escapeHtml(t('no')) + '</option><option value="true"' + (requiredValue === 'true' ? ' selected' : '') + '>' + escapeHtml(t('yes')) + '</option></select></td>'
-    ];
-    if (includeDefault) cells.push('<td><input data-baa-field="defaultValue" value="' + escapeHtml(field.defaultValue == null ? '' : String(field.defaultValue)) + '"' + disabled + '></td>');
-    cells.push(
-      '<td><input data-baa-field="example" value="' + escapeHtml(field.example == null ? '' : String(field.example)) + '"' + disabled + '></td>',
-      '<td><textarea rows="2" data-baa-field="description"' + disabled + '>' + escapeHtml(field.description || '') + '</textarea></td>',
-      '<td><button data-action="clear-baa-field-row" type="button"' + buttonDisabled + '>' + escapeHtml(t('clear')) + '</button></td>'
-    );
-    return '<tr data-baa-field-row>' + cells.join('') + '</tr>';
-  }
-
-  function renderBaaFieldEditorTable(fields, includeDefault, options) {
-    options = options || {};
-    var rows = (Array.isArray(fields) ? fields : []).map(function (field) {
-      return renderBaaFieldEditorRow(field, includeDefault, Boolean(options.readOnly));
-    }).join('');
-    if (!rows && !options.readOnly) rows = renderBaaFieldEditorRow({}, includeDefault, false);
-    var headers = [
-      t('paramName'),
-      t('type'),
-      t('paramRequired')
-    ];
-    if (includeDefault) headers.push(t('paramDefault'));
-    headers.push(t('paramExample'), t('description'), '');
-    return [
-      '<div class="table-wrap">',
-      '<table class="baa-contract-table baa-field-table" data-baa-field-table data-include-default="' + (includeDefault ? 'true' : 'false') + '">',
-      '<thead><tr>' + headers.map(function (header) { return '<th>' + escapeHtml(header) + '</th>'; }).join('') + '</tr></thead>',
-      '<tbody>' + rows + '</tbody>',
-      '</table>',
-      '</div>',
-      options.readOnly ? '' : '<button data-action="' + escapeHtml(options.addAction || 'add-baa-field-row') + '" type="button">' + escapeHtml(options.addLabel || t('add')) + '</button>'
-    ].join('');
-  }
-
-  function readBaaFieldEditorRows(container, includeDefault) {
-    return Array.prototype.slice.call((container || document).querySelectorAll('[data-baa-field-row]')).map(function (row) {
-      var name = String((row.querySelector('[data-baa-field="name"]') || {}).value || '').trim();
-      var type = String((row.querySelector('[data-baa-field="type"]') || {}).value || 'string').trim() || 'string';
-      var required = String((row.querySelector('[data-baa-field="required"]') || {}).value || '').trim() === 'true';
-      var defaultValueField = row.querySelector('[data-baa-field="defaultValue"]');
-      var defaultValue = includeDefault && defaultValueField ? defaultValueField.value : '';
-      var example = String((row.querySelector('[data-baa-field="example"]') || {}).value || '');
-      var description = String((row.querySelector('[data-baa-field="description"]') || {}).value || '').trim();
-      if (!name && !type && !defaultValue && !example && !description) return null;
-      if (!name) return null;
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(t('invalidParamName') + ': ' + name);
-      return {
-        name: name,
-        type: type,
-        required: required,
-        default: defaultValue,
-        defaultValue: defaultValue,
-        example: example,
-        description: description
-      };
-    }).filter(Boolean);
-  }
-
-  function renderBaaContractSourceOptions(contract) {
-    var sourceCode = contract && contract.sourceCode || '';
-    var options = (state.baaInputContracts || []).map(function (item) {
-      var label = item.code + (item.description ? ' - ' + item.description : '') + (item.version ? ' v' + item.version : '');
-      return '<option value="' + escapeHtml(item.code || '') + '"' + (sourceCode === item.code || (!sourceCode && contract && contract.code === item.code) ? ' selected' : '') + '>' + escapeHtml(label) + '</option>';
-    }).join('');
-    return '<option value="">' + escapeHtml(t('baaContractSourceManual')) + '</option>' + options;
-  }
-
-  function renderBaaContractObjectRow(object, index, readOnly) {
-    object = object || {};
-    var disabled = readOnly ? ' readonly' : '';
-    var buttonDisabled = readOnly ? ' disabled' : '';
-    return [
-      '<div class="settings-block" data-baa-object-row>',
-      '<div class="row">',
-      '<label>' + t('baaObjectAlias') + '<input data-baa-object-field="alias" value="' + escapeHtml(object.alias || ('candidate' + String(index + 1))) + '"' + disabled + '></label>',
-      '<label>' + t('baaObjectClassName') + '<input data-baa-object-field="className" value="' + escapeHtml(object.className || '') + '"' + disabled + '></label>',
-      '</div>',
-      '<label>' + t('description') + '<input data-baa-object-field="description" value="' + escapeHtml(object.description || '') + '"' + disabled + '></label>',
-      '<div data-baa-object-field="payload"><h4>' + escapeHtml(t('baaPayloadFields')) + '</h4><p class="muted">' + escapeHtml(t('baaPayloadFieldsHelp')) + '</p>' +
-        renderBaaFieldEditorTable(object.payload || [], false, { readOnly: readOnly, addAction: 'add-baa-payload-field', addLabel: t('addBaaPayloadField') }) + '</div>',
-      '<button data-action="clear-baa-object" type="button"' + buttonDisabled + '>' + t('clear') + '</button>',
-      '</div>'
-    ].join('');
-  }
-
-  function renderBaaExternalContractSummary(contract) {
-    contract = contract || {};
-    var objects = Array.isArray(contract.objects) ? contract.objects : [];
-    var params = Array.isArray(contract.contractParams)
-      ? contract.contractParams
-      : (Array.isArray(contract.variables) ? contract.variables : []);
-    var requestVariables = Array.isArray(contract.requestVariables) ? contract.requestVariables : [];
-    var rows = objects.map(function (object) {
-      var fields = (object.payload || []).map(function (field) {
-        var required = field.required ? '*' : '';
-        return (field.name || '') + required + (field.type ? ':' + field.type : '');
-      }).filter(Boolean).join(', ');
-      return '<tr><td><strong>' + escapeHtml(object.className || '') + '</strong></td><td>' + escapeHtml(object.alias || '') + '</td><td>' + escapeHtml(fields || '-') + '</td><td>' + escapeHtml(object.description || '') + '</td></tr>';
-    }).join('');
-    var paramRows = params.map(function (param) {
-      param = normalizeBaaFieldDefinition(param);
-      var listText = param.listMode && param.listMode !== 'none'
-        ? param.listMode + (param.values && param.values.length ? ': ' + param.values.join(', ') : '')
-        : '';
-      return '<tr><td><strong>' + escapeHtml(param.name || '') + '</strong></td><td>' + escapeHtml(param.description || '') + '</td><td>' + escapeHtml(param.type || '') + '</td><td>' + escapeHtml(param.required ? 'yes' : 'no') + '</td><td>' + escapeHtml(param.defaultValue || '') + '</td><td>' + escapeHtml(listText) + '</td></tr>';
-    }).join('');
-    var variableRows = requestVariables.map(function (variable) {
-      variable = normalizeBaaFieldDefinition(variable);
-      return '<tr><td><strong>' + escapeHtml(variable.name || '') + '</strong></td><td>' + escapeHtml(variable.description || '') + '</td><td>' + escapeHtml(variable.type || '') + '</td><td>' + escapeHtml(variable.required ? 'yes' : 'no') + '</td><td>' + escapeHtml(variable.defaultValue || '') + '</td></tr>';
-    }).join('');
-    return [
-      '<div class="baa-contract-summary">',
-      '<div class="baa-contract-meta">',
-      '<div><span>' + escapeHtml(t('baaContractCode')) + '</span><strong>' + escapeHtml(contract.code || '') + '</strong></div>',
-      '<div><span>' + escapeHtml(t('baaContractVersion')) + '</span><strong>' + escapeHtml(contract.version || '') + '</strong></div>',
-      '<div><span>' + escapeHtml(t('baaContractDescription')) + '</span><strong>' + escapeHtml(contract.description || '') + '</strong></div>',
-      '</div>',
-      '<div class="baa-usage-note"><strong>' + escapeHtml(t('baaContractUsage')) + '</strong><br>' + escapeHtml(t('baaContractUsageHelp')) + '</div>',
-      params.length
-        ? '<div><h4>' + escapeHtml(t('baaContractParams')) + '</h4><p class="muted">' + escapeHtml(t('baaContractParamsHelp')) + '</p><div class="table-wrap"><table class="baa-contract-table"><thead><tr><th>' + escapeHtml(t('paramName')) + '</th><th>' + escapeHtml(t('description')) + '</th><th>' + escapeHtml(t('type')) + '</th><th>' + escapeHtml(t('paramRequired')) + '</th><th>' + escapeHtml(t('paramDefault')) + '</th><th>List</th></tr></thead><tbody>' + paramRows + '</tbody></table></div></div>'
-        : '',
-      requestVariables.length
-        ? '<div><h4>' + escapeHtml(t('baaRequestVariables')) + '</h4><p class="muted">' + escapeHtml(t('baaRequestVariablesHelp')) + '</p><div class="table-wrap"><table class="baa-contract-table"><thead><tr><th>' + escapeHtml(t('paramName')) + '</th><th>' + escapeHtml(t('description')) + '</th><th>' + escapeHtml(t('type')) + '</th><th>' + escapeHtml(t('paramRequired')) + '</th><th>' + escapeHtml(t('paramDefault')) + '</th></tr></thead><tbody>' + variableRows + '</tbody></table></div></div>'
-        : '',
-      objects.length
-        ? '<div class="table-wrap"><table class="baa-contract-table"><thead><tr><th>' + escapeHtml(t('baaObjectClassName')) + '</th><th>' + escapeHtml(t('baaObjectAlias')) + '</th><th>' + escapeHtml(t('baaPayloadFields')) + '</th><th>' + escapeHtml(t('description')) + '</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
-        : '<div class="notice">' + escapeHtml(t('baaContractNoObjects')) + '</div>',
-      '</div>'
-    ].join('');
-  }
-
-  function renderBaaEndpointEditor(selected) {
-    var spec = (selected && selected.spec) || defaultSpec();
-    var contract = state.baaContractDraft || baaContractForSpec(spec);
-    var externalContract = Boolean(contract.sourceCode);
-    var templateCode = readTemplateCode(selected);
-    var verifyUrl = templateCode ? absoluteBaaVerifyUrl(templateCode) : '';
-    if (!contract.objects.length && !contract.sourceCode) {
-      contract.objects = [{
-        alias: 'candidate1',
-        className: 'Router',
-        description: '',
-        payload: [
-          { name: 'Code', type: 'string', required: false, example: 'router047', description: 'Candidate code' },
-          { name: 'ipAddress', type: 'ipv4', required: false, example: '10.10.2.15', description: 'Candidate IPv4 address' }
-        ]
-      }];
-    }
-    return [
-      '<section class="section" id="cmdp-baa-endpoint-editor"><h2>' + escapeHtml(t('baaEndpointEditor')) + '</h2>',
-      '<p class="muted">' + escapeHtml(t('baaEndpointHelp')) + '</p>',
-      verifyUrl ? '<div class="run-launch-url" title="' + escapeHtml(t('baaVerifyEndpointUrlHelp')) + '"><span>' + escapeHtml(t('baaVerifyEndpointUrl')) + '</span><code>' + escapeHtml(verifyUrl) + '</code></div>' : '',
-      '<p class="muted">' + escapeHtml(t('baaVerifyEndpointUrlHelp')) + '</p>',
-      '<div class="settings-block">',
-      '<div class="settings-grid">',
-      '<label>' + t('baaContractSource') + '<select id="cmdp-baa-contract-source">' + renderBaaContractSourceOptions(contract) + '</select></label>',
-      '<label>' + t('baaContractCode') + '<input id="cmdp-baa-contract-code" value="' + escapeHtml(contract.code || '') + '" readonly></label>',
-      '<label>' + t('baaContractVersion') + '<input id="cmdp-baa-contract-version" value="' + escapeHtml(contract.version || '1') + '" readonly></label>',
-      '</div>',
-      '<label>' + t('baaContractDescription') + '<input id="cmdp-baa-contract-description" value="' + escapeHtml(contract.description || '') + '" readonly></label>',
-      '</div>',
-      externalContract ? '' : '<div class="settings-block" id="cmdp-baa-contract-variables"><h3>' + escapeHtml(t('baaContractVariables')) + '</h3>' +
-        '<p class="muted">' + escapeHtml(t('baaVariablesHelp')) + '</p>' +
-        renderBaaFieldEditorTable(contract.contractParams || contract.variables || [], true, { addAction: 'add-baa-variable-row', addLabel: t('addBaaVariable') }) +
-        '</div>',
-      '<div class="settings-block"><h3>' + escapeHtml(t('baaContractObjects')) + '</h3>',
-      '<p class="muted">' + escapeHtml(t('baaContractObjectsHelp')) + '</p>',
-      externalContract
-        ? renderBaaExternalContractSummary(contract)
-        : '<div id="cmdp-baa-object-rows">' + contract.objects.map(function (object, index) { return renderBaaContractObjectRow(object, index, false); }).join('') + '</div>',
-      '</div>',
-      '</section>'
-    ].join('');
-  }
-
   function runParamValueForRow(row) {
     var params = state.runParams || {};
     if (Object.prototype.hasOwnProperty.call(params, row.name)) return params[row.name];
@@ -6031,13 +6095,6 @@ function dynamicPagesClientScript() {
   function renderTemplateLaunchUrl(selected) {
     var code = readTemplateCode(selected);
     if (!code) return '<div class="notice error">' + escapeHtml(t('templateCodeRequired')) + '</div>';
-    if (selectedTemplateIsBaa(selected)) {
-      var verifyUrl = absoluteBaaVerifyUrl(code);
-      return [
-        '<div class="run-launch-url" title="' + escapeHtml(t('baaVerifyEndpointUrlHelp')) + '"><span>' + escapeHtml(t('baaVerifyEndpointUrl')) + '</span><code>' + escapeHtml(verifyUrl) + '</code></div>',
-        '<div class="run-launch-params" title="' + escapeHtml(t('baaRunPostOnlyHelp')) + '"><span>' + escapeHtml(t('runLaunchParams')) + '</span><code>' + escapeHtml(t('baaPostOnlyNotice')) + '</code></div>'
-      ].join('');
-    }
     var params = runUrlParamsForTemplate(selected, false);
     var url = absoluteRuntimeTemplateUrl(code, params);
     var jsonParams = Object.assign({}, params, { json: 'true' });
@@ -6055,137 +6112,10 @@ function dynamicPagesClientScript() {
 
   function renderEditorVisualizationResult(result) {
     if (!result) return '';
-    if (result.json && (result.json.status === 'completed' || result.json.status === 'error') && Array.isArray(result.json.tables) && Array.isArray(result.json.items)) {
-      return renderBaaVerificationResult(result);
-    }
     return '<section class="section" id="cmdp-result-section"><h2>' + t('result') + '</h2>' + renderRuntimeResult(result) + '</section>';
   }
 
-  function defaultBaaRequest(selected) {
-    var spec = selected && selected.spec || defaultSpec();
-    var contract = baaContractForSpec(spec);
-    var contractParams = (contract.contractParams || contract.variables || []).map(normalizeBaaFieldDefinition).filter(function (field) { return field.name; });
-    var requestVariables = (contract.requestVariables || []).map(normalizeBaaFieldDefinition).filter(function (field) { return field.name; });
-    var endpointParams = runUrlParamsForTemplate(selected || {}, true);
-    contractParams.forEach(function (field) {
-      if (endpointParams[field.name] !== undefined && endpointParams[field.name] !== null && endpointParams[field.name] !== '') return;
-      endpointParams[field.name] = field.defaultValue !== undefined && field.defaultValue !== null && field.defaultValue !== ''
-        ? field.defaultValue
-        : (field.example !== undefined && field.example !== null && field.example !== '' ? field.example : sampleRunParamValue(field));
-    });
-    var variables = {};
-    var variableSources = [];
-    requestVariables.forEach(function (field) {
-      var value = field.defaultValue !== undefined && field.defaultValue !== null && field.defaultValue !== ''
-        ? field.defaultValue
-        : (field.example !== undefined && field.example !== null && field.example !== '' ? field.example : sampleRunParamValue(field));
-      variables[field.name] = value;
-      variableSources.push({
-        name: field.name,
-        sourceKind: field.sourceKind || 'constant',
-        sourceExpression: field.sourceExpression || '',
-        valuePresent: value !== undefined && value !== null && value !== ''
-      });
-    });
-    var objects = (contract.objects && contract.objects.length ? contract.objects : [{
-      alias: 'candidate1',
-      className: 'ACL',
-      payload: [
-        { name: 'Code', type: 'string', example: 'ACL-001' },
-        { name: 'destinationAddress', type: 'ipv4-cidr', example: '10.0.0.0/24' }
-      ]
-    }]).map(function (object, index) {
-      var payload = {};
-      (object.payload || []).forEach(function (field) {
-        payload[field.name] = field.example !== undefined && field.example !== null && field.example !== '' ? field.example : sampleRunParamValue(field);
-      });
-      return {
-        planIndex: index,
-        kind: object.alias || 'candidate',
-        className: object.className || object.alias || 'Candidate',
-        pageShapeKey: 'visio/pages/page1.xml:' + String(index + 1),
-        mappingKey: object.alias || object.className || 'candidate',
-        relationBindingStatus: 'candidate',
-        endpoints: {},
-        payload: payload,
-        attributeSources: []
-      };
-    });
-    return {
-      source: 'CMDB BAA',
-      inputContract: {
-        code: contract.code || 'contract-verification-input-v1',
-        version: contract.version || '1',
-        checksum: 'sha256...'
-      },
-      endpoint: {
-        code: readTemplateCode(selected) || 'verification-endpoint',
-        params: endpointParams
-      },
-      contractParams: contractParams,
-      variables: variables,
-      variableSources: variableSources,
-      plan: {
-        objects: objects,
-        missingAttributes: [],
-        skipped: []
-      }
-    };
-  }
-
-  function renderBaaRequestEditor(selected) {
-    var value = state.baaRequestDraft || pretty(defaultBaaRequest(selected));
-    return [
-      '<section class="section" id="cmdp-baa-request-editor"><h2>' + escapeHtml(t('baaRequestEditor')) + '</h2>',
-      '<p class="muted">' + escapeHtml(t('baaRequestHelp')) + '</p>',
-      '<textarea id="cmdp-baa-request" rows="16" spellcheck="false">' + escapeHtml(value) + '</textarea>',
-      '</section>'
-    ].join('');
-  }
-
-  function baaResultTableToRuntimeTable(table) {
-    var columns = Array.isArray(table && table.columns) ? table.columns : [];
-    var columnNames = columns.map(function (column) { return column && (column.name || column.key); }).filter(Boolean);
-    var labels = {};
-    columns.forEach(function (column) {
-      var name = column && (column.name || column.key);
-      if (name) labels[name] = column.title || column.label || name;
-    });
-    return {
-      name: table && table.code || '',
-      title: table && table.title || table && table.code || '',
-      columns: columnNames,
-      columnLabels: labels,
-      rows: Array.isArray(table && table.rows) ? table.rows : [],
-      emptyText: DEFAULT_EMPTY_RESULT_TEXT
-    };
-  }
-
-  function renderBaaVerificationResult(result) {
-    var body = result.json || {};
-    var html = '<section class="section" id="cmdp-result-section"><h2>' + t('result') + '</h2>';
-    html += renderNotice({ type: result.ok && body.success ? 'ok' : 'error', text: body.message || body.status || '' });
-    if (Array.isArray(body.items) && body.items.length) {
-      html += '<div class="settings-block"><h3>Items</h3><pre>' + escapeHtml(pretty(body.items)) + '</pre></div>';
-    }
-    var tables = Array.isArray(body.tables) ? body.tables.map(baaResultTableToRuntimeTable) : [];
-    if (tables.length) html += tables.map(renderResultTable).join('');
-    else html += '<pre>' + escapeHtml(pretty(body)) + '</pre>';
-    html += '</section>';
-    return html;
-  }
-
   function renderTemplateRunSection(selected) {
-    if (selectedTemplateIsBaa(selected)) {
-      return [
-        '<section class="section"><div class="notice">' + escapeHtml(t('baaPostOnlyNotice')) + '</div>',
-        renderTemplateLaunchUrl(selected),
-        '</section>',
-        renderRunParamsEditor(selected),
-        renderBaaRequestEditor(selected),
-        state.result ? renderEditorVisualizationResult(state.result) : ''
-      ].join('');
-    }
     return [
       renderRunParamsEditor(selected),
       state.result ? renderEditorVisualizationResult(state.result) : ''
@@ -6263,11 +6193,10 @@ function dynamicPagesClientScript() {
 
   function renderDesignerSection(selected, config, templateRows) {
     var section = normalizeDesignerSection(state.designerSection);
-    if (sectionDisabledForBaa(section, selected)) return renderBaaDisabledSection();
     if (section === 'template') return renderTemplateEditor(selected);
     if (section === 'schema') return renderSchemaManager();
     if (section === 'versions') return renderVersions();
-    if (section === 'baa-endpoint') return renderBaaEndpointEditor(selected);
+    if (section === 'assistant') return renderAssistantEditor(selected, config);
     if (section === 'object-group') return renderObjectGroupEditor(selected);
     if (section === 'relations') return renderRelationExpansionEditor(selected);
     if (section === 'final-view') return renderViewComposerEditor(selected);
@@ -6294,7 +6223,7 @@ function dynamicPagesClientScript() {
     if (section === 'template') return t('creatingTemplate');
     if (section === 'schema') return t('menuSchema');
     if (section === 'versions') return t('menuVersions');
-    if (section === 'baa-endpoint') return t('menuBaaEndpoint');
+    if (section === 'assistant') return t('menuAssistant');
     if (section === 'params') return t('menuParams');
     if (section === 'object-group') return t('menuObjectGroup');
     if (section === 'relations') return t('menuRelations');
@@ -6321,8 +6250,9 @@ function dynamicPagesClientScript() {
     var classAttr = classes.length ? ' class="' + classes.join(' ') + '"' : '';
     var typeAttr = options.type ? ' type="' + escapeHtml(options.type) + '"' : '';
     var disabledAttr = options.disabled ? ' disabled aria-disabled="true"' : '';
+    var busyAttr = options.busy ? ' aria-busy="true"' : '';
     var titleAttr = options.title ? ' title="' + escapeHtml(options.title) + '"' : '';
-    return '<button' + classAttr + typeAttr + disabledAttr + titleAttr + ' data-action="' + escapeHtml(action) + '">' + escapeHtml(label) + '</button>';
+    return '<button' + classAttr + typeAttr + disabledAttr + busyAttr + titleAttr + ' data-action="' + escapeHtml(action) + '">' + escapeHtml(label) + '</button>';
   }
 
   function renderActionLink(href, label, options) {
@@ -6335,7 +6265,6 @@ function dynamicPagesClientScript() {
   function sectionPersistsTemplate(section) {
     return [
       'template',
-      'baa-endpoint',
       'params',
       'object-group',
       'relations',
@@ -6355,17 +6284,20 @@ function dynamicPagesClientScript() {
       renderActionButton('refresh', t('refresh'))
     ];
     var context = '';
+    if (sectionPersistsTemplate(section) || section === 'run') {
+      actions.push(renderActionButton('assistant-draft', t('assistantDraft')));
+    }
 
-    if (sectionDisabledForBaa(section, selected)) {
-      actions.push(renderActionButton('baa-disabled', t('baaPostOnlyMode'), { disabled: true, title: t('baaSectionDisabled') }));
-    } else if (section === 'templates') {
+    if (section === 'templates') {
       actions.push(renderActionButton('new-template', t('newTemplate'), { primary: true }));
       actions.push(renderActionButton('new-cmdb-build-view', t('templateKindCmdbBuildView')));
+    } else if (section === 'assistant') {
+      actions.push(renderActionButton('assistant-generate', state.assistantGenerating ? t('assistantGenerateBusy') : t('assistantGenerate'), { primary: true, disabled: state.assistantGenerating, busy: state.assistantGenerating }));
+      actions.push(renderActionButton('assistant-apply-draft', t('assistantApplyDraft'), { disabled: state.assistantGenerating }));
+      actions.push(renderActionButton('draft-validate', t('validate')));
+      actions.push(renderActionButton('draft-preview', t('preview')));
     } else if (section === 'template') {
       actions.push(renderActionButton('save-template', t('save'), { primary: true }));
-    } else if (section === 'baa-endpoint') {
-      actions.push(renderActionButton('add-baa-object', t('addBaaObject')));
-      actions.push(renderActionButton('apply-baa-endpoint', t('applyBaaEndpoint')));
     } else if (section === 'params') {
       actions.push(renderActionButton('add-param-row', t('addParam')));
       actions.push(renderActionButton('apply-params', t('applyParams'), { primary: true }));
@@ -6392,17 +6324,9 @@ function dynamicPagesClientScript() {
       actions.push(renderActionButton('publish-snapshot', t('publishSnapshot'), { primary: true }));
       if (readTemplateCode(selected)) context = renderTemplateLaunchUrl(selected);
     } else if (section === 'run') {
-      if (selectedTemplateIsBaa(selected)) {
-        actions.push(renderActionButton('visualize-editor', t('visualizeInEditor'), { disabled: true, title: t('baaRunPostOnlyHelp') }));
-        actions.push(renderActionButton('force-refresh-editor', t('forceRefreshInEditor'), { disabled: true, title: t('baaRunPostOnlyHelp') }));
-        actions.push(renderActionButton('visualize-external', t('visualizeExternal'), { disabled: true, title: t('baaRunPostOnlyHelp') }));
-        actions.push(renderActionButton('baa-verify-preview', t('baaVerifyPreview'), { primary: true }));
-        actions.push(renderActionButton('baa-verify-refresh-preview', t('baaVerifyRefreshPreview')));
-      } else {
-        actions.push(renderActionButton('visualize-editor', t('visualizeInEditor'), { primary: true }));
-        actions.push(renderActionButton('force-refresh-editor', t('forceRefreshInEditor')));
-        actions.push(renderActionButton('visualize-external', t('visualizeExternal')));
-      }
+      actions.push(renderActionButton('visualize-editor', t('visualizeInEditor'), { primary: true }));
+      actions.push(renderActionButton('force-refresh-editor', t('forceRefreshInEditor')));
+      actions.push(renderActionButton('visualize-external', t('visualizeExternal')));
       if (readTemplateCode(selected)) context = renderTemplateLaunchUrl(selected);
     } else if (section === 'selection') {
       actions.push(renderActionButton('add-selection-filter-row', t('addFilter')));
@@ -6425,10 +6349,10 @@ function dynamicPagesClientScript() {
       actions.push(renderActionLink('/cmdbuild/ui/?cmdpMode=designer#custompages/CmdbDynamicPages', t('customPageLauncher')));
     }
 
-    if (sectionPersistsTemplate(section) && section !== 'template' && !sectionDisabledForBaa(section, selected)) {
+    if (sectionPersistsTemplate(section) && section !== 'template') {
       actions.push(renderActionButton('save-template', t('save')));
       actions.push(renderActionButton('validate-template', t('validate')));
-      actions.push(renderActionButton('preview-template', t('preview'), selectedTemplateIsBaa(selected) ? { disabled: true, title: t('baaRunPostOnlyHelp') } : {}));
+      actions.push(renderActionButton('preview-template', t('preview')));
     }
 
     return [
@@ -6480,6 +6404,7 @@ function dynamicPagesClientScript() {
     ].join('');
     hydrateVisualizationRowGroupOptions(app);
     applyObjectPathFilter(app);
+    ensureCatalogAttributesForDesignerSection();
   }
 
   function hydrateVisualizationRowGroupOptions(container) {
@@ -6729,6 +6654,15 @@ function dynamicPagesClientScript() {
     return relationVisual && relationVisual.output && relationVisual.output.alias || '';
   }
 
+  function getObjectGroupOutputAlias(spec) {
+    var visual = getStoredVisualModel(spec || {}, 'objectGroup');
+    if (!visual) return '';
+    var selections = objectSelectionsFromModel(visual);
+    var finalAlias = objectGroupFinalAliasFromSelections(selections);
+    if (finalAlias) return finalAlias;
+    return visual && visual.output && visual.output.alias || '';
+  }
+
   function finalExtractionAliases(spec) {
     spec = spec || defaultSpec();
     var aliases = [];
@@ -6738,6 +6672,7 @@ function dynamicPagesClientScript() {
     }
     add(getObjectMatchingOutputAlias(spec));
     add(getRelationOutputAlias(spec));
+    add(getObjectGroupOutputAlias(spec));
     add(getViewComposerOutputAlias(spec));
     if (aliases.length) {
       add(finalBaseResultAlias(spec));
@@ -6752,6 +6687,9 @@ function dynamicPagesClientScript() {
     if (matchingAlias) return matchingAlias;
     var relationAlias = getRelationOutputAlias(spec);
     if (relationAlias) return relationAlias;
+
+    var objectGroupAlias = getObjectGroupOutputAlias(spec);
+    if (objectGroupAlias) return objectGroupAlias;
 
     var viewAlias = getViewComposerOutputAlias(spec);
     var prepared = resultTablesForSpec(spec).filter(function (table) {
@@ -6781,6 +6719,19 @@ function dynamicPagesClientScript() {
     });
     if (prepared.length) return [prepared[prepared.length - 1]];
     return source.length ? [source[source.length - 1]] : [];
+  }
+
+  function visibleResultDiagrams(diagrams) {
+    return (Array.isArray(diagrams) ? diagrams : []).filter(function (diagram) {
+      return diagram && (Array.isArray(diagram.nodes) || Array.isArray(diagram.edges));
+    });
+  }
+
+  function resultOutputMode(resultBody) {
+    var presentation = resultBody && resultBody.presentation && typeof resultBody.presentation === 'object' && !Array.isArray(resultBody.presentation)
+      ? resultBody.presentation
+      : {};
+    return normalizeOutputMode(presentation.outputMode || resultBody && resultBody.outputMode || 'both');
   }
 
   function visualizationTablesForSpec(spec) {
@@ -6839,6 +6790,7 @@ function dynamicPagesClientScript() {
     return {
       emptyText: result.emptyText || presentation.emptyText || firstTableEmptyText || DEFAULT_EMPTY_RESULT_TEXT,
       permissionDeniedText: result.permissionDeniedText || presentation.permissionDeniedText || DEFAULT_PERMISSION_DENIED_TEXT,
+      outputMode: normalizeOutputMode(presentation.outputMode || result.outputMode || 'both'),
       fontSize: presentation.fontSize || 'normal',
       density: presentation.density || 'normal',
       zebra: presentation.zebra !== false,
@@ -6887,13 +6839,7 @@ function dynamicPagesClientScript() {
   function sourceClassForAlias(spec, alias) {
     var name = String(alias || '');
     if (!name) return '';
-    if (name === 'baaObjects') return 'BAA';
     var steps = spec && Array.isArray(spec.steps) ? spec.steps : [];
-    var baaStep = steps.find(function (step) {
-      return step && step.type === 'baaPlanObjects' && step.as === name;
-    });
-    if (baaStep && baaStep.objectAlias) return baaSourceClassName(baaStep.objectAlias);
-    if (baaStep) return 'BAA';
     var enrichStep = steps.find(function (step) {
       return step && step.type === 'enrichRows' && step.as === name && step.from;
     });
@@ -7007,9 +6953,6 @@ function dynamicPagesClientScript() {
     finalExtractionAliases(spec).forEach(function (alias) {
       add(alias, t('extractionFinalResult') + ' (' + alias + ')');
     });
-    if (hasBaaInputSpec(spec || {})) {
-      add('baaObjects', 'BAA candidates');
-    }
     (Array.isArray(tables) ? tables : []).forEach(function (table) {
       if (!table || !table.name) return;
       var isFinalRelation = relation && relation.output && relation.output.alias === table.name || relationStep && relationStep.as === table.name;
@@ -7047,6 +6990,25 @@ function dynamicPagesClientScript() {
       if (resultOptions.some(function (item) { return item.name === alias; })) return alias;
     }
     return resultOptions.length ? resultOptions[0].name : '';
+  }
+
+  function extractionSelectedSourceEmptyWarning(result, selectedName) {
+    var selected = String(selectedName || '').trim();
+    var tables = result && result.ok && result.json && result.json.result && Array.isArray(result.json.result.tables)
+      ? result.json.result.tables
+      : [];
+    if (!selected || !tables.length) return '';
+    var selectedTable = tables.find(function (table) { return table && table.name === selected; });
+    if (!selectedTable || Array.isArray(selectedTable.rows) && selectedTable.rows.length) return '';
+    var populatedTable = tables.find(function (table) {
+      return table && table.name !== selected && Array.isArray(table.rows) && table.rows.length;
+    });
+    if (!populatedTable) return '';
+    return t('extractionSelectedSourceEmpty', {
+      selected: selected,
+      source: populatedTable.name,
+      rows: populatedTable.rows.length
+    });
   }
 
   function renderExtractionResultOptions(selectedName, spec, tables) {
@@ -7267,6 +7229,63 @@ function dynamicPagesClientScript() {
       '<li><span class="code-inline">/wiki/$' + '{param.city}/$' + '{mysource.value}</span></li>',
       '</ul>',
       '</details>'
+    ].join('');
+  }
+
+  function renderOutputModeControl(selected) {
+    var mode = normalizeOutputMode(selected);
+    var items = [
+      ['tables', t('visualizationOutputTables')],
+      ['diagrams', t('visualizationOutputDiagrams')],
+      ['both', t('visualizationOutputBoth')]
+    ];
+    return '<div class="segmented-control" role="radiogroup" aria-label="' + escapeHtml(t('visualizationOutputMode')) + '">' + items.map(function (item) {
+      return '<label><input type="radio" name="cmdp-output-mode" value="' + item[0] + '"' + (item[0] === mode ? ' checked' : '') + '> ' + escapeHtml(item[1]) + '</label>';
+    }).join('') + '</div>';
+  }
+
+  function firstDiagramSpec(spec) {
+    var diagrams = spec && spec.result && Array.isArray(spec.result.diagrams) ? spec.result.diagrams : [];
+    return diagrams.find(function (diagram) { return diagram && typeof diagram === 'object' && !Array.isArray(diagram); }) || {};
+  }
+
+  function diagramSourceValue(diagram, kind) {
+    var source = diagram && diagram.source && typeof diagram.source === 'object' && !Array.isArray(diagram.source) ? diagram.source : {};
+    var section = diagram && diagram[kind] && typeof diagram[kind] === 'object' && !Array.isArray(diagram[kind]) ? diagram[kind] : {};
+    return String(source[kind] || section.from || diagram[kind + 'From'] || '').trim();
+  }
+
+  function diagramFieldValue(diagram, fieldName, fallback) {
+    var fields = diagram && diagram.fields && typeof diagram.fields === 'object' && !Array.isArray(diagram.fields) ? diagram.fields : {};
+    return String(fields[fieldName] || diagram[fieldName] || fallback || '').trim();
+  }
+
+  function renderDiagramEditor(spec, outputMode) {
+    if (outputMode === 'tables') return '';
+    var diagram = firstDiagramSpec(spec || defaultSpec());
+    var nodeSource = diagramSourceValue(diagram, 'nodes') || finalPresentationResultAlias(spec || defaultSpec()) || finalBaseResultAlias(spec || defaultSpec());
+    var edgeSource = diagramSourceValue(diagram, 'edges') || nodeSource;
+    var layout = diagram.layout && diagram.layout.type || 'topology';
+    return [
+      '<div class="settings-block" id="cmdp-diagram-editor">',
+      '<h3>' + t('visualizationDiagrams') + '</h3>',
+      '<div class="diagram-grid">',
+      '<label>' + t('visualizationDiagramName') + '<input id="cmdp-diagram-name" value="' + escapeHtml(diagram.name || 'topology') + '"></label>',
+      '<label>' + t('visualizationDiagramTitle') + '<input id="cmdp-diagram-title" value="' + escapeHtml(diagram.title || diagram.label || 'Topology') + '"></label>',
+      '<label>' + t('visualizationDiagramNodesSource') + '<select id="cmdp-diagram-nodes-source">' + renderAnyAliasOptions(nodeSource, spec) + '</select></label>',
+      '<label>' + t('visualizationDiagramEdgesSource') + '<select id="cmdp-diagram-edges-source">' + renderAnyAliasOptions(edgeSource, spec) + '</select></label>',
+      '<label>' + t('visualizationDiagramNodeId') + '<input id="cmdp-diagram-node-id" value="' + escapeHtml(diagramFieldValue(diagram, 'nodeId', 'id')) + '"></label>',
+      '<label>' + t('visualizationDiagramNodeLabel') + '<input id="cmdp-diagram-node-label" value="' + escapeHtml(diagramFieldValue(diagram, 'nodeLabel', 'label')) + '"></label>',
+      '<label>' + t('visualizationDiagramNodeGroup') + '<input id="cmdp-diagram-node-group" value="' + escapeHtml(diagramFieldValue(diagram, 'nodeGroup', 'group')) + '"></label>',
+      '<label>' + t('visualizationDiagramNodeHref') + '<input id="cmdp-diagram-node-href" value="' + escapeHtml(diagramFieldValue(diagram, 'nodeHref', 'href')) + '"></label>',
+      '<label>' + t('visualizationDiagramEdgeSource') + '<input id="cmdp-diagram-edge-source" value="' + escapeHtml(diagramFieldValue(diagram, 'edgeSource', 'source')) + '"></label>',
+      '<label>' + t('visualizationDiagramEdgeTarget') + '<input id="cmdp-diagram-edge-target" value="' + escapeHtml(diagramFieldValue(diagram, 'edgeTarget', 'target')) + '"></label>',
+      '<label>' + t('visualizationDiagramEdgeLabel') + '<input id="cmdp-diagram-edge-label" value="' + escapeHtml(diagramFieldValue(diagram, 'edgeLabel', 'label')) + '"></label>',
+      '<label>' + t('visualizationDiagramLayout') + '<select id="cmdp-diagram-layout"><option value="topology"' + (layout !== 'layered' ? ' selected' : '') + '>topology</option><option value="layered"' + (layout === 'layered' ? ' selected' : '') + '>layered</option></select></label>',
+      '<label>' + t('visualizationDiagramMaxNodes') + '<input id="cmdp-diagram-max-nodes" type="number" min="1" value="' + escapeHtml(String(diagram.maxNodes || diagram.limit && diagram.limit.maxNodes || diagram.limits && diagram.limits.maxNodes || 300)) + '"></label>',
+      '<label>' + t('visualizationDiagramMaxEdges') + '<input id="cmdp-diagram-max-edges" type="number" min="1" value="' + escapeHtml(String(diagram.maxEdges || diagram.limit && diagram.limit.maxEdges || diagram.limits && diagram.limits.maxEdges || 800)) + '"></label>',
+      '</div>',
+      '</div>'
     ].join('');
   }
 
@@ -7584,12 +7603,17 @@ function dynamicPagesClientScript() {
     var spec = (selected && selected.spec) || defaultSpec();
     var tables = visualizationTablesForSpec(spec);
     var presentation = getPresentationModel(spec);
+    var outputMode = normalizeOutputMode(presentation.outputMode);
     var rows = tables.map(function (table) {
       return renderVisualizationTableRow(table, presentation.tableSettings[table.name] || {}, spec);
     }).join('');
     return [
       '<section class="section" id="cmdp-visualization-editor"><h2>' + t('visualizationEditor') + '</h2>',
       '<p class="muted">' + t('visualizationEditorHelp') + '</p>',
+      '<div class="settings-block">',
+      '<h3>' + t('visualizationOutputMode') + '</h3>',
+      renderOutputModeControl(outputMode),
+      '</div>',
       '<div class="settings-block">',
       '<h3>' + t('visualizationMessages') + '</h3>',
       '<div class="settings-grid">',
@@ -7611,10 +7635,8 @@ function dynamicPagesClientScript() {
       '<label class="checkbox checkbox-stacked"><input id="cmdp-visual-filters" type="checkbox" ' + (presentation.filters ? 'checked' : '') + '> <span><strong>' + t('visualizationRuntimeFilters') + '</strong><span class="muted">' + escapeHtml(t('visualizationRuntimeFiltersHelp')) + '</span></span></label>',
       '<label class="checkbox checkbox-stacked"><input id="cmdp-visual-sortable" type="checkbox" ' + (presentation.sortable ? 'checked' : '') + '> <span><strong>' + t('visualizationSortable') + '</strong></span></label>',
       '</div></div>',
-      '<div class="settings-block">',
-      '<h3>' + t('visualizationTables') + '</h3>',
-      tables.length ? '<div class="visual-table-list" id="cmdp-visualization-rows">' + rows + '</div>' : '<div class="notice">' + t('visualizationNoTables') + '</div>',
-      '</div>',
+      outputMode === 'diagrams' ? '' : '<div class="settings-block"><h3>' + t('visualizationTables') + '</h3>' + (tables.length ? '<div class="visual-table-list" id="cmdp-visualization-rows">' + rows + '</div>' : '<div class="notice">' + t('visualizationNoTables') + '</div>') + '</div>',
+      renderDiagramEditor(spec, outputMode),
       '</section>'
     ].join('');
   }
@@ -7700,7 +7722,10 @@ function dynamicPagesClientScript() {
 
   function renderActionResult(result) {
     if (!result) return '';
-    var tables = visibleResultTables(result.json && result.json.result ? (result.json.result.tables || []) : []);
+    var resultBody = result.json && result.json.result ? result.json.result : null;
+    var outputMode = resultOutputMode(resultBody);
+    var tables = outputMode === 'diagrams' ? [] : visibleResultTables(resultBody ? (resultBody.tables || []) : []);
+    var diagrams = outputMode === 'tables' ? [] : visibleResultDiagrams(resultBody ? (resultBody.diagrams || []) : []);
     var trace = result.json && result.json.result ? (result.json.result.trace || []) : [];
     if (!result.ok) {
       var errorHtml = '<section class="section" id="cmdp-result-section">' + renderNotice({ type: 'error', text: errorText(result) });
@@ -7708,7 +7733,8 @@ function dynamicPagesClientScript() {
       return errorHtml + '</section>';
     }
     var html = '<section class="section" id="cmdp-result-section"><h2>' + t('result') + '</h2>';
-    if (tables.length) {
+    if (diagrams.length || tables.length) {
+      if (diagrams.length) html += diagrams.map(function (diagram) { return renderResultDiagram(diagram, ''); }).join('');
       html += tables.map(renderResultTable).join('');
     } else {
       html += '<pre>' + escapeHtml(pretty(result.json || {})) + '</pre>';
@@ -7814,13 +7840,89 @@ function dynamicPagesClientScript() {
     state.runtimeCountdownTimer = window.setInterval(refreshRuntimeCountdown, 1000);
   }
 
+  function renderResultDiagram(diagram, toolbarHtml) {
+    var nodes = Array.isArray(diagram.nodes) ? diagram.nodes.filter(function (node) { return node && node.id; }) : [];
+    var edges = Array.isArray(diagram.edges) ? diagram.edges.filter(function (edge) { return edge && edge.source && edge.target; }) : [];
+    var title = diagram.title || diagram.name || 'Topology';
+    if (!nodes.length) {
+      return '<div class="result-table-wrap" data-result-diagram><div class="result-table-header"><div class="result-table-title"><h3>' +
+        escapeHtml(title) + '</h3></div>' + (toolbarHtml ? '<div class="result-table-actions">' + toolbarHtml + '</div>' : '') +
+        '</div><div class="notice">' + escapeHtml(diagram.emptyText || DEFAULT_EMPTY_RESULT_TEXT) + '</div></div>';
+    }
+    var groups = [];
+    var grouped = {};
+    nodes.forEach(function (node) {
+      var group = String(node.group || t('noData'));
+      if (!grouped[group]) {
+        grouped[group] = [];
+        groups.push(group);
+      }
+      grouped[group].push(node);
+    });
+    var maxRows = groups.reduce(function (max, group) { return Math.max(max, grouped[group].length); }, 1);
+    var columnWidth = 220;
+    var rowHeight = 92;
+    var width = Math.max(680, groups.length * columnWidth + 80);
+    var height = Math.max(260, maxRows * rowHeight + 120);
+    var positions = {};
+    groups.forEach(function (group, groupIndex) {
+      var items = grouped[group];
+      var x = 40 + groupIndex * columnWidth + columnWidth / 2;
+      items.forEach(function (node, rowIndex) {
+        var y = 88 + rowIndex * rowHeight;
+        positions[node.id] = { x: x, y: y };
+      });
+    });
+    var edgeHtml = edges.map(function (edge) {
+      var from = positions[edge.source];
+      var to = positions[edge.target];
+      if (!from || !to) return '';
+      var midX = Math.round((from.x + to.x) / 2);
+      var midY = Math.round((from.y + to.y) / 2) - 8;
+      return '<line x1="' + from.x + '" y1="' + from.y + '" x2="' + to.x + '" y2="' + to.y + '" stroke="#6b7280" stroke-width="1.6" marker-end="url(#cmdp-arrow)"></line>' +
+        (edge.label ? '<text x="' + midX + '" y="' + midY + '" text-anchor="middle" font-size="11" fill="#374151">' + escapeHtml(edge.label) + '</text>' : '');
+    }).join('');
+    var groupHtml = groups.map(function (group, index) {
+      var x = 40 + index * columnWidth + columnWidth / 2;
+      return '<text x="' + x + '" y="32" text-anchor="middle" font-size="12" font-weight="700" fill="#374151">' + escapeHtml(group) + '</text>';
+    }).join('');
+    var nodeHtml = nodes.map(function (node) {
+      var pos = positions[node.id] || { x: 0, y: 0 };
+      var label = String(node.label || node.id);
+      var text = label.length > 28 ? label.slice(0, 25) + '...' : label;
+      var body = '<g><rect x="' + (pos.x - 70) + '" y="' + (pos.y - 22) + '" width="140" height="44" rx="7" fill="#ffffff" stroke="#2563eb" stroke-width="1.6"></rect>' +
+        '<text x="' + pos.x + '" y="' + (pos.y + 4) + '" text-anchor="middle" font-size="12" fill="#111827">' + escapeHtml(text) + '</text></g>';
+      return node.href && isSafeRuntimeLinkUrlClient(node.href)
+        ? '<a href="' + escapeHtml(node.href) + '">' + body + '</a>'
+        : body;
+    }).join('');
+    var warnings = Array.isArray(diagram.warnings) && diagram.warnings.length
+      ? '<div class="notice">' + escapeHtml(diagram.warnings.join(' ')) + '</div>'
+      : '';
+    return '<div class="result-table-wrap" data-result-diagram><div class="result-table-header"><div class="result-table-title"><h3>' +
+      escapeHtml(title) + '</h3></div>' + (toolbarHtml ? '<div class="result-table-actions">' + toolbarHtml + '</div>' : '') +
+      '</div><div style="overflow:auto"><svg role="img" aria-label="' + escapeHtml(title) + '" width="' + width + '" height="' + height + '" viewBox="0 0 ' + width + ' ' + height + '" style="max-width:100%;height:auto;background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px">' +
+      '<defs><marker id="cmdp-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#6b7280"></path></marker></defs>' +
+      groupHtml + edgeHtml + nodeHtml + '</svg></div>' + warnings + '</div>';
+  }
+
+  function renderRuntimeNotice(text, cacheHtml, type) {
+    var noticeClass = type === 'error' ? 'notice error' : 'notice';
+    return '<div class="runtime-notice-shell">' +
+      '<div class="' + noticeClass + '">' + escapeHtml(text || DEFAULT_EMPTY_RESULT_TEXT) + '</div>' +
+      (cacheHtml ? '<div class="runtime-notice-actions">' + cacheHtml + '</div>' : '') +
+      '</div>';
+  }
+
   function renderRuntimeResult(result) {
     if (!result) return '';
     var resultBody = result.json && result.json.result ? result.json.result : null;
-    var tables = visibleResultTables(resultBody ? (resultBody.tables || []) : []);
+    var outputMode = resultOutputMode(resultBody);
+    var tables = outputMode === 'diagrams' ? [] : visibleResultTables(resultBody ? (resultBody.tables || []) : []);
+    var diagrams = outputMode === 'tables' ? [] : visibleResultDiagrams(resultBody ? (resultBody.diagrams || []) : []);
     var cacheHtml = renderRuntimeCacheControl(result);
     if (!result.ok) {
-      return (cacheHtml ? '<div class="result-table-toolbar"><div class="result-table-actions">' + cacheHtml + '</div></div>' : '') + '<div class="notice error">' + escapeHtml(result.json && result.json.permissionDeniedText || errorText(result)) + '</div>';
+      return renderRuntimeNotice(result.json && result.json.permissionDeniedText || errorText(result), cacheHtml, 'error');
     }
     if (resultBody && resultBody.kind === 'html' && resultBody.htmlTrusted && resultBody.html) {
       return '<div class="result-table-wrap" data-result-table>' +
@@ -7828,10 +7930,19 @@ function dynamicPagesClientScript() {
         (cacheHtml ? '<div class="result-table-actions">' + cacheHtml + '</div>' : '') + '</div>' +
         '<div class="cmdp-html-result">' + resultBody.html + '</div></div>';
     }
-    if (tables.length) return tables.map(function (table, index) {
-      return renderResultTable(table, index === 0 ? cacheHtml : '');
-    }).join('');
-    return (cacheHtml ? '<div class="result-table-toolbar"><div class="result-table-actions">' + cacheHtml + '</div></div>' : '') + '<div class="notice">' + escapeHtml(resultBody && resultBody.emptyText || DEFAULT_EMPTY_RESULT_TEXT) + '</div>';
+    if (diagrams.length || tables.length) {
+      var cacheUsed = false;
+      return diagrams.map(function (diagram) {
+        var toolbar = cacheUsed ? '' : cacheHtml;
+        cacheUsed = cacheUsed || Boolean(toolbar);
+        return renderResultDiagram(diagram, toolbar);
+      }).concat(tables.map(function (table) {
+        var toolbar = cacheUsed ? '' : cacheHtml;
+        cacheUsed = cacheUsed || Boolean(toolbar);
+        return renderResultTable(table, toolbar);
+      })).join('');
+    }
+    return renderRuntimeNotice(resultBody && resultBody.emptyText || DEFAULT_EMPTY_RESULT_TEXT, cacheHtml);
   }
 
   function renderExecutionTrace(trace) {
@@ -8108,11 +8219,7 @@ function dynamicPagesClientScript() {
         return { ok: true, status: 0, json: { parents: [] }, body: '' };
       }),
       namedRequest('config', apiPrefix + '/config?root=' + encodeURIComponent(state.root)),
-      namedRequest('templates', apiPrefix + '/templates?limit=100'),
-      namedRequest('baaInputContracts', apiPrefix + '/baa/contracts?root=' + encodeURIComponent(state.root) + '&type=input').catch(function (error) {
-        clientLog('load-designer-optional-failed', 'baaInputContracts ' + (error && error.message ? error.message : String(error)));
-        return { ok: true, status: 0, json: { data: [] }, body: '' };
-      })
+      namedRequest('templates', apiPrefix + '/templates?limit=100')
     ]).then(function (results) {
       clientLog('load-designer-results', results.map(function (item) { return item.status; }).join(','));
       state.session = results[0].json && results[0].json.session ? results[0].json.session : state.session;
@@ -8123,7 +8230,6 @@ function dynamicPagesClientScript() {
       if (!state.schemaParentDraft && state.schema && state.schema.rootParent) state.schemaParentDraft = state.schema.rootParent;
       state.config = results[3].json ? results[3].json.config : null;
       state.templates = results[4].json && results[4].json.data ? results[4].json.data : [];
-      state.baaInputContracts = results[5].json && Array.isArray(results[5].json.data) ? results[5].json.data : [];
       var accessDenied = [results[3], results[4]].find(resultIsPermissionDenied);
       if (accessDenied) {
         state.technicalSchemaAccessDenied = true;
@@ -8535,17 +8641,51 @@ function dynamicPagesClientScript() {
   function readVisualizationSettings(required) {
     var hasGlobalFields = hasField('cmdp-visual-empty-text') || hasField('cmdp-visual-permission-denied-text') || hasField('cmdp-visual-font-size') || hasField('cmdp-visual-density');
     var rows = Array.prototype.slice.call(document.querySelectorAll('[data-visualization-row]'));
-    if (!hasGlobalFields && !rows.length && !required) return null;
+    var outputField = document.querySelector('input[name="cmdp-output-mode"]:checked');
+    var hasDiagramFields = hasField('cmdp-diagram-name') || hasField('cmdp-diagram-nodes-source') || hasField('cmdp-diagram-edges-source');
+    if (!hasGlobalFields && !rows.length && !hasDiagramFields && !outputField && !required) return null;
     var settings = {
       emptyText: String(readValue('cmdp-visual-empty-text') || '').trim() || DEFAULT_EMPTY_RESULT_TEXT,
       permissionDeniedText: String(readValue('cmdp-visual-permission-denied-text') || '').trim() || DEFAULT_PERMISSION_DENIED_TEXT,
+      outputMode: normalizeOutputMode(outputField && outputField.value || 'both'),
       fontSize: String(readValue('cmdp-visual-font-size') || 'normal').trim() || 'normal',
       density: String(readValue('cmdp-visual-density') || 'normal').trim() || 'normal',
       zebra: readChecked('cmdp-visual-zebra'),
       filters: readChecked('cmdp-visual-filters'),
       sortable: readChecked('cmdp-visual-sortable'),
-      tables: []
+      tables: [],
+      diagram: null
     };
+    if (hasDiagramFields && settings.outputMode !== 'tables') {
+      var diagramName = String(readValue('cmdp-diagram-name') || 'topology').trim() || 'topology';
+      var nodeSource = String(readValue('cmdp-diagram-nodes-source') || '').trim();
+      var edgeSource = String(readValue('cmdp-diagram-edges-source') || '').trim();
+      var maxNodes = readPositiveIntField('cmdp-diagram-max-nodes', t('visualizationDiagramMaxNodes'), 300);
+      var maxEdges = readPositiveIntField('cmdp-diagram-max-edges', t('visualizationDiagramMaxEdges'), 800);
+      settings.diagram = {
+        name: diagramName,
+        title: String(readValue('cmdp-diagram-title') || diagramName).trim() || diagramName,
+        type: 'topology',
+        source: {
+          nodes: nodeSource,
+          edges: edgeSource
+        },
+        fields: {
+          nodeId: String(readValue('cmdp-diagram-node-id') || 'id').trim() || 'id',
+          nodeLabel: String(readValue('cmdp-diagram-node-label') || 'label').trim() || 'label',
+          nodeGroup: String(readValue('cmdp-diagram-node-group') || 'group').trim() || 'group',
+          nodeHref: String(readValue('cmdp-diagram-node-href') || 'href').trim() || 'href',
+          edgeSource: String(readValue('cmdp-diagram-edge-source') || 'source').trim() || 'source',
+          edgeTarget: String(readValue('cmdp-diagram-edge-target') || 'target').trim() || 'target',
+          edgeLabel: String(readValue('cmdp-diagram-edge-label') || 'label').trim() || 'label'
+        },
+        layout: {
+          type: String(readValue('cmdp-diagram-layout') || 'topology').trim() === 'layered' ? 'layered' : 'topology'
+        },
+        maxNodes: maxNodes,
+        maxEdges: maxEdges
+      };
+    }
     rows.forEach(function (row) {
       var detailRow = row.nextElementSibling && row.nextElementSibling.hasAttribute('data-visualization-row-detail') ? row.nextElementSibling : row;
       function visualField(field) {
@@ -8615,6 +8755,7 @@ function dynamicPagesClientScript() {
     spec.result.presentation = {
       emptyText: settings.emptyText || DEFAULT_EMPTY_RESULT_TEXT,
       permissionDeniedText: settings.permissionDeniedText || DEFAULT_PERMISSION_DENIED_TEXT,
+      outputMode: normalizeOutputMode(settings.outputMode),
       fontSize: ['small', 'normal', 'large'].indexOf(settings.fontSize) === -1 ? 'normal' : settings.fontSize,
       density: settings.density === 'compact' ? 'compact' : 'normal',
       zebra: Boolean(settings.zebra),
@@ -8622,6 +8763,13 @@ function dynamicPagesClientScript() {
       sortable: Boolean(settings.sortable),
       tables: settings.tables
     };
+    if (settings.outputMode !== 'tables' && settings.diagram) {
+      var existingDiagrams = Array.isArray(spec.result.diagrams) ? spec.result.diagrams.slice() : [];
+      var restDiagrams = existingDiagrams.filter(function (diagram, index) {
+        return index > 0 && diagram && diagram.name !== settings.diagram.name;
+      });
+      spec.result.diagrams = [settings.diagram].concat(restDiagrams);
+    }
     var byName = {};
     settings.tables.forEach(function (item) { byName[item.name] = item; });
     spec.result.tables = Array.isArray(spec.result.tables) ? spec.result.tables.map(function (table) {
@@ -8662,29 +8810,39 @@ function dynamicPagesClientScript() {
       var pathElement = row.querySelector('[data-object-scope-field="path"]');
       var negateElement = row.querySelector('[data-object-scope-field="negate"]');
       var opElement = row.querySelector('[data-object-scope-field="op"]');
-      var regexElement = row.querySelector('[data-object-scope-field="regex"]');
+      var valueElement = row.querySelector('[data-object-scope-field="value"]') || row.querySelector('[data-object-scope-field="regex"]');
+      var valueParamElement = row.querySelector('[data-object-scope-field="valueParam"]');
+      var valueColumnElement = row.querySelector('[data-object-scope-field="valueColumn"]');
       var action = String(actionElement && actionElement.value || 'include').trim() === 'exclude' ? 'exclude' : 'include';
       var path = String(pathElement && pathElement.value || '').trim();
       var op = normalizeObjectGroupOperator(opElement && opElement.value || 'matches');
       var negate = normalizeObjectGroupNegate(negateElement && negateElement.value, opElement && opElement.value);
-      var regex = String(regexElement && regexElement.value || '').trim();
-      if (!path && !regex) return;
+      var value = String(valueElement && valueElement.value || '').trim();
+      var valueParam = String(valueParamElement && valueParamElement.value || '').trim();
+      var valueColumn = String(valueColumnElement && valueColumnElement.value || '').trim();
+      if (!path && !value && !valueParam && !valueColumn) return;
       if (!path) throw new Error(t('objectGroupNeedsPath'));
-      if (objectGroupOperatorUsesValue(op) && !regex) throw new Error(t('objectGroupNeedsRegex'));
+      if (objectGroupOperatorUsesValue(op) && !value && !valueParam && !valueColumn) throw new Error(t('objectGroupNeedsRegex'));
       if (op === 'matches') {
         try {
-          new RegExp(regex.replace(/\$\{(param|var|contractparam)\.([A-Za-z_][A-Za-z0-9_]*)\}/g, ''));
+          new RegExp(value.replace(/\$\{(param|var|contractparam)\.([A-Za-z_][A-Za-z0-9_]*)\}/g, ''));
         } catch (error) {
           throw new Error(t('objectGroupInvalidRegex') + ': ' + (error && error.message ? error.message : String(error)));
         }
       }
-      rules.push({
+      var rule = {
         action: action,
         path: path,
         negate: negate,
-        op: op,
-        regex: regex
-      });
+        op: op
+      };
+      if (value) {
+        if (op === 'matches') rule.regex = value;
+        else rule.value = value;
+      }
+      if (valueParam) rule.valueParam = valueParam;
+      if (valueColumn) rule.valueColumn = valueColumn;
+      rules.push(rule);
     });
     return rules;
   }
@@ -8709,16 +8867,25 @@ function dynamicPagesClientScript() {
 
     var selections = selectionNodes.map(function (node, index) {
       var nameField = node.querySelector('[data-object-selection-field="name"]');
+      var aliasField = node.querySelector('[data-object-selection-field="alias"]');
       var classField = node.querySelector('[data-object-selection-field="className"]');
+      var fromField = node.querySelector('[data-object-selection-field="from"]');
+      var limitField = node.querySelector('[data-object-selection-field="limit"]');
+      var columnsField = node.querySelector('[data-object-selection-field="columns"]');
       var className = String(classField && classField.value || '').trim();
+      var alias = String(aliasField && aliasField.value || '').trim() || objectSelectionAlias(index);
+      var limitText = String(limitField && limitField.value || '').trim();
       var rules = readObjectGroupScopeRows(node);
       if (!className) throw new Error(t('objectGroupNeedsClass'));
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias)) throw new Error(t('invalidParamName'));
+      if (limitText && (!/^[1-9][0-9]*$/.test(limitText))) throw new Error(t('selectionInvalidLimit'));
       return normalizeObjectSelection({
         name: String(nameField && nameField.value || '').trim() || defaultObjectSelectionName(index),
-        alias: objectSelectionAlias(index),
+        alias: alias,
         className: className,
-        sourceType: isBaaSourceClassName(className) ? 'baa' : 'cmdb',
-        baaObjectAlias: baaAliasFromSourceClassName(className),
+        from: String(fromField && fromField.value || '').trim(),
+        limit: limitText ? Number(limitText) : 100,
+        columns: normalizeObjectSelectionColumns(columnsField && columnsField.value),
         rules: rules.length ? rules : [{ action: 'include', path: 'Code', regex: '.*' }]
       }, index);
     });
@@ -8732,89 +8899,103 @@ function dynamicPagesClientScript() {
 
   function buildObjectGroupSpec(model, previousSpec) {
     var selections = objectSelectionsFromModel(model);
+    ensureObjectGroupValueColumnSources(selections);
+    var finalAlias = objectGroupFinalAliasFromSelections(selections);
     var params = previousSpec && previousSpec.params && typeof previousSpec.params === 'object' && !Array.isArray(previousSpec.params)
       ? JSON.parse(JSON.stringify(previousSpec.params))
       : {};
     selections.forEach(function (selection) {
       selection.rules.forEach(function (rule) {
-        String(rule.regex || '').replace(/\$\{param\.([A-Za-z_][A-Za-z0-9_]*)\}/g, function (_, name) {
+        String((rule.regex || '') + ' ' + (rule.value || '')).replace(/\$\{param\.([A-Za-z_][A-Za-z0-9_]*)\}/g, function (_, name) {
           if (!params[name]) params[name] = { type: 'string', required: true };
           return '';
         });
       });
     });
-    var hasBaaSelection = selections.some(function (selection) { return selection && (selection.sourceType === 'baa' || isBaaSourceClassName(selection.className)); });
     var steps = selections.map(function (selection, index) {
       var filters = selection.rules.map(function (rule) {
-        return {
+        var op = normalizeObjectGroupOperator(rule.op || rule.operator || (rule.regex !== undefined ? 'matches' : 'equals'));
+        var filter = {
           scope: rule.action === 'exclude' ? 'exclude' : 'include',
           path: rule.path,
           negate: normalizeObjectGroupNegate(rule.negate !== undefined ? rule.negate : rule.not, rule.op || rule.operator),
-          op: normalizeObjectGroupOperator(rule.op || rule.operator || 'matches'),
-          regex: rule.regex,
-          value: rule.regex
-          };
-        });
-      if (selection.sourceType === 'baa' || isBaaSourceClassName(selection.className)) {
-        return {
-          type: 'baaPlanObjects',
-          objectAlias: selection.baaObjectAlias || baaAliasFromSourceClassName(selection.className),
-          payloadPrefix: 'Payload.',
-          filters: filters,
-          as: objectSelectionAlias(index)
+          op: op
         };
-      }
-      return {
+        if (op === 'matches') {
+          filter.regex = rule.regex !== undefined && rule.regex !== '' ? rule.regex : (rule.value !== undefined && rule.value !== '' ? rule.value : '.*');
+        } else if (objectGroupOperatorUsesValue(op)) {
+          if (rule.valueParam) filter.valueParam = rule.valueParam;
+          if (rule.valueColumn) filter.valueColumn = rule.valueColumn;
+          if (rule.value !== undefined && rule.value !== '') filter.value = rule.value;
+          else if (rule.regex !== undefined && rule.regex !== '') filter.value = rule.regex;
+        }
+        return filter;
+      });
+      var alias = selection.alias || objectSelectionAlias(index);
+      var step = {
         type: 'selectCards',
         className: selection.className,
         filters: filters,
-        limit: 100,
-        as: objectSelectionAlias(index)
+        limit: selection.limit || 100,
+        as: alias
       };
+      if (selection.from) step.from = selection.from;
+      if (selection.columns && selection.columns.length) step.columns = selection.columns.slice();
+      return step;
     });
-    if (hasBaaInputSpec(previousSpec || {}) && !hasBaaSelection) {
-      steps.unshift({ type: 'baaPlanObjects', as: 'baaObjects', payloadPrefix: 'Payload.' });
-    }
-    var tables = selections.map(function (selection, index) {
-      if (selection.sourceType === 'baa' || isBaaSourceClassName(selection.className)) {
-        return {
-          name: objectSelectionAlias(index),
-          title: selection.name || defaultObjectSelectionName(index),
-          columns: baaScopePathOptionsForSource(previousSpec || {}, selection.className).map(function (item) { return item.value; })
-        };
+    var aliases = selections.map(function (selection, index) { return selection.alias || objectSelectionAlias(index); });
+    var finalSelectionIndex = aliases.indexOf(finalAlias);
+    var finalSelection = finalSelectionIndex >= 0 ? selections[finalSelectionIndex] : (selections[objectGroupFinalSelectionIndex(selections)] || selections[selections.length - 1] || {});
+    var previousTables = previousSpec && previousSpec.result && Array.isArray(previousSpec.result.tables) ? previousSpec.result.tables : [];
+    var preservedTables = previousTables.filter(function (table) {
+      return table && aliases.indexOf(table.name) !== -1;
+    });
+    var tables = preservedTables.length ? preservedTables.map(function (table) {
+      var selectionIndex = aliases.indexOf(table.name);
+      var selection = selections[selectionIndex] || {};
+      var next = Object.assign({}, table);
+      if (!Array.isArray(next.columns) || !next.columns.length) {
+        next.columns = selection.columns && selection.columns.length ? selection.columns.slice() : ['Class', 'Code', 'Description'];
       }
+      return next;
+    }) : selections.map(function (selection, index) {
+      var alias = selection.alias || objectSelectionAlias(index);
       return {
-        name: objectSelectionAlias(index),
+        name: alias,
         title: selection.name || defaultObjectSelectionName(index),
-        columns: ['Class', 'Code', 'Description']
+        columns: selection.columns && selection.columns.length ? selection.columns.slice() : ['Class', 'Code', 'Description']
       };
     });
-    if (hasBaaInputSpec(previousSpec || {}) && !hasBaaSelection) {
-      tables.unshift({
-        name: 'baaObjects',
-        title: 'BAA candidates',
-        columns: baaColumnOptionRows(previousSpec || {}).map(function (item) { return item.value; })
+    if (finalAlias && !tables.some(function (table) { return table && table.name === finalAlias; })) {
+      tables.push({
+        name: finalAlias,
+        title: finalSelection.name || defaultObjectSelectionName(finalSelectionIndex >= 0 ? finalSelectionIndex : 0),
+        columns: finalSelection.columns && finalSelection.columns.length ? finalSelection.columns.slice() : ['Class', 'Code', 'Description']
       });
     }
     var first = selections[0] || defaultObjectSelection(0, '');
     var visualSelections = selections.map(function (selection, index) {
+      var alias = selection.alias || objectSelectionAlias(index);
       return {
         name: selection.name || defaultObjectSelectionName(index),
-        alias: objectSelectionAlias(index),
+        alias: alias,
         className: selection.className,
-        sourceType: selection.sourceType,
-        baaObjectAlias: selection.baaObjectAlias || baaAliasFromSourceClassName(selection.className),
+        from: selection.from || '',
+        limit: selection.limit || 100,
+        columns: selection.columns && selection.columns.length ? selection.columns.slice() : [],
+        sourceType: 'cmdb',
         scopeRules: selection.rules,
         source: {
-          type: selection.sourceType,
+          type: 'cmdb',
           className: selection.className,
-          baaObjectAlias: selection.baaObjectAlias || baaAliasFromSourceClassName(selection.className),
-          limit: 100
+          from: selection.from || '',
+          limit: selection.limit || 100,
+          columns: selection.columns && selection.columns.length ? selection.columns.slice() : []
         },
         output: {
-          alias: objectSelectionAlias(index),
+          alias: alias,
           title: selection.name || defaultObjectSelectionName(index),
-          columns: ['Class', 'Code', 'Description']
+          columns: selection.columns && selection.columns.length ? selection.columns.slice() : ['Class', 'Code', 'Description']
         }
       };
     });
@@ -8829,12 +9010,14 @@ function dynamicPagesClientScript() {
         scopeRules: first.rules,
         source: {
           className: first.className,
-          limit: 100
+          from: first.from || '',
+          limit: first.limit || 100,
+          columns: first.columns && first.columns.length ? first.columns.slice() : []
         },
         output: {
-          alias: 'objects',
-          title: first.name || defaultObjectSelectionName(0),
-          columns: ['Class', 'Code', 'Description']
+          alias: finalAlias || first.alias || 'objects',
+          title: finalSelection.name || first.name || defaultObjectSelectionName(0),
+          columns: finalSelection.columns && finalSelection.columns.length ? finalSelection.columns.slice() : ['Class', 'Code', 'Description']
         },
         catalog: {
           maxTraversalDepth: Number(state.maxTraversalDepth) || 1
@@ -8849,8 +9032,7 @@ function dynamicPagesClientScript() {
       result: {
         tables: tables
       },
-      endpoint: previousSpec && previousSpec.endpoint ? previousSpec.endpoint : (hasBaaInputSpec(previousSpec || {}) ? { kind: 'baaVerification' } : undefined),
-      baaContract: previousSpec && previousSpec.baaContract ? previousSpec.baaContract : undefined,
+      endpoint: previousSpec && previousSpec.endpoint && previousSpec.endpoint.kind === 'runtime' ? previousSpec.endpoint : undefined,
       publish: previousSpec && previousSpec.publish ? previousSpec.publish : undefined,
       cache: previousSpec && previousSpec.cache ? previousSpec.cache : undefined,
       defaults: previousSpec && previousSpec.defaults ? previousSpec.defaults : undefined
@@ -8921,31 +9103,47 @@ function dynamicPagesClientScript() {
         var pathElement = row.querySelector('[data-object-scope-field="path"]');
         var negateElement = row.querySelector('[data-object-scope-field="negate"]');
         var opElement = row.querySelector('[data-object-scope-field="op"]');
-        var regexElement = row.querySelector('[data-object-scope-field="regex"]');
+        var valueElement = row.querySelector('[data-object-scope-field="value"]') || row.querySelector('[data-object-scope-field="regex"]');
+        var valueParamElement = row.querySelector('[data-object-scope-field="valueParam"]');
+        var valueColumnElement = row.querySelector('[data-object-scope-field="valueColumn"]');
         var path = String(pathElement && pathElement.value || '').trim();
-        var regex = String(regexElement && regexElement.value || '').trim();
-        if (!path && !regex) return;
-        rules.push({
+        var op = normalizeObjectGroupOperator(opElement && opElement.value || 'matches');
+        var value = String(valueElement && valueElement.value || '').trim();
+        var valueParam = String(valueParamElement && valueParamElement.value || '').trim();
+        var valueColumn = String(valueColumnElement && valueColumnElement.value || '').trim();
+        if (!path && !value && !valueParam && !valueColumn) return;
+        var rule = {
           action: String(actionElement && actionElement.value || 'include').trim() === 'exclude' ? 'exclude' : 'include',
           path: path,
           negate: normalizeObjectGroupNegate(negateElement && negateElement.value, opElement && opElement.value),
-          op: normalizeObjectGroupOperator(opElement && opElement.value || 'matches'),
-          regex: regex
-        });
+          op: op
+        };
+        if (value) {
+          if (op === 'matches') rule.regex = value;
+          else rule.value = value;
+        }
+        if (valueParam) rule.valueParam = valueParam;
+        if (valueColumn) rule.valueColumn = valueColumn;
+        rules.push(rule);
       });
       return rules;
     }
     var selectionNodes = Array.prototype.slice.call(document.querySelectorAll('[data-object-selection]'));
     var selections = selectionNodes.map(function (node, index) {
       var nameField = node.querySelector('[data-object-selection-field="name"]');
+      var aliasField = node.querySelector('[data-object-selection-field="alias"]');
       var classField = node.querySelector('[data-object-selection-field="className"]');
+      var fromField = node.querySelector('[data-object-selection-field="from"]');
+      var limitField = node.querySelector('[data-object-selection-field="limit"]');
+      var columnsField = node.querySelector('[data-object-selection-field="columns"]');
       var rules = captureRules(node);
       return normalizeObjectSelection({
         name: String(nameField && nameField.value || '').trim() || defaultObjectSelectionName(index),
-        alias: objectSelectionAlias(index),
+        alias: String(aliasField && aliasField.value || '').trim() || objectSelectionAlias(index),
         className: String(classField && classField.value || '').trim(),
-        sourceType: isBaaSourceClassName(classField && classField.value) ? 'baa' : 'cmdb',
-        baaObjectAlias: baaAliasFromSourceClassName(classField && classField.value),
+        from: String(fromField && fromField.value || '').trim(),
+        limit: String(limitField && limitField.value || '').trim() ? Number(limitField.value) : 100,
+        columns: normalizeObjectSelectionColumns(columnsField && columnsField.value),
         rules: rules.length ? rules : [{ action: 'include', path: 'Code', regex: '.*' }]
       }, index);
     });
@@ -9023,8 +9221,6 @@ function dynamicPagesClientScript() {
     var sourceAlias = String(alias || '').trim();
     var field = String(column || '').trim();
     if (!sourceAlias || !field) return;
-    if (sourceAlias === 'baaObjects') return;
-    if (isBaaSourceClassName(sourceClassForAlias(readCurrentSpec(), sourceAlias))) return;
     field = stripKnownSelectionPrefix(readCurrentSpec(), sourceAlias, field);
     if (!columnsByAlias[sourceAlias]) columnsByAlias[sourceAlias] = [];
     if (columnsByAlias[sourceAlias].indexOf(field) === -1) columnsByAlias[sourceAlias].push(field);
@@ -9106,9 +9302,8 @@ function dynamicPagesClientScript() {
 
   function buildRelationExpansionSpec(model, previousSpec) {
     model = normalizeObjectMatchingModel(model, previousSpec || defaultSpec());
-    var cmdbSelections = model.selections.filter(function (selection) { return selection && selection.alias !== 'baaObjects'; });
     var objectSpec = buildObjectGroupSpec({
-      selections: cmdbSelections
+      selections: model.selections
     }, previousSpec || defaultSpec());
     var specForLabels = objectSpec || previousSpec || defaultSpec();
     var columnsByAlias = collectMatchingSelectionColumns(model);
@@ -9118,9 +9313,6 @@ function dynamicPagesClientScript() {
       if (materializedColumns.length) copy.columns = buildSelectionColumnSpecs(materializedColumns);
       return copy;
     });
-    if (hasBaaInputSpec(previousSpec || {}) || model.selections.some(function (selection) { return selection && (selection.sourceType === 'baa' || selection.alias === 'baaObjects'); })) {
-      steps.unshift({ type: 'baaPlanObjects', as: 'baaObjects', payloadPrefix: 'Payload.' });
-    }
     model.blocks.forEach(function (block, index) {
       steps.push({
         type: 'matchRows',
@@ -9163,8 +9355,7 @@ function dynamicPagesClientScript() {
       result: {
         tables: resultTables
       },
-      endpoint: previousSpec && previousSpec.endpoint ? previousSpec.endpoint : (hasBaaInputSpec(previousSpec || {}) ? { kind: 'baaVerification' } : undefined),
-      baaContract: previousSpec && previousSpec.baaContract ? previousSpec.baaContract : undefined,
+      endpoint: previousSpec && previousSpec.endpoint && previousSpec.endpoint.kind === 'runtime' ? previousSpec.endpoint : undefined,
       publish: previousSpec && previousSpec.publish ? previousSpec.publish : undefined,
       cache: previousSpec && previousSpec.cache ? previousSpec.cache : undefined,
       defaults: previousSpec && previousSpec.defaults ? previousSpec.defaults : undefined
@@ -9221,7 +9412,6 @@ function dynamicPagesClientScript() {
     if (extractionStep) specData.spec = upsertExtractionStep(specData.spec, extractionStep);
     var selectionStep = readDataSelectionStepFields(false);
     if (selectionStep) specData.spec = upsertDataSelectionStep(specData.spec, selectionStep);
-    specData.spec = applyBaaEndpointToSpec(specData.spec, false);
     specData.spec = applyVisualizationToSpec(specData.spec, false);
     specData.spec = applyPublicationToSpec(specData.spec, false);
     specData.spec = applyCacheToSpec(specData.spec, false);
@@ -9258,121 +9448,6 @@ function dynamicPagesClientScript() {
       state.runParams = Object.assign({}, specData.examples);
       clearDraftExecutionState();
       state.message = { type: 'ok', text: t('paramsApplied') };
-      renderDesigner();
-    } catch (error) {
-      state.message = { type: 'error', text: error.message };
-      renderDesigner();
-    }
-  }
-
-  function hasBaaEndpointEditorFields() {
-    return hasField('cmdp-baa-contract-source') || hasField('cmdp-baa-contract-code') || hasField('cmdp-baa-contract-version');
-  }
-
-  function readBaaEndpointFields() {
-    var sourceCode = String(readValue('cmdp-baa-contract-source') || '').trim();
-    var sourceContract = sourceCode ? (state.baaInputContracts || []).find(function (item) { return item.code === sourceCode; }) : null;
-    if (sourceContract && sourceContract.contract) {
-      return {
-        kind: 'baaVerification',
-        contract: Object.assign({}, sourceContract.contract, {
-          code: sourceContract.code || sourceContract.contract.code || '',
-          version: sourceContract.version || sourceContract.contract.version || '',
-          description: sourceContract.description || sourceContract.contract.description || '',
-          variables: sourceContract.contract.contractParams || sourceContract.contract.variables || [],
-          contractParams: sourceContract.contract.contractParams || sourceContract.contract.variables || [],
-          requestVariables: sourceContract.contract.requestVariables || [],
-          sourceCode: sourceContract.code,
-          sourceClassName: sourceContract.className || ''
-        })
-      };
-    }
-    var variablesContainer = document.getElementById('cmdp-baa-contract-variables');
-    var variables = readBaaFieldEditorRows(variablesContainer, true);
-    var objects = Array.prototype.slice.call(document.querySelectorAll('[data-baa-object-row]')).map(function (row, index) {
-      var aliasField = row.querySelector('[data-baa-object-field="alias"]');
-      var classField = row.querySelector('[data-baa-object-field="className"]');
-      var descriptionField = row.querySelector('[data-baa-object-field="description"]');
-      var payloadField = row.querySelector('[data-baa-object-field="payload"]');
-      var alias = String(aliasField && aliasField.value || ('candidate' + String(index + 1))).trim();
-      var className = String(classField && classField.value || '').trim();
-      var payload = readBaaFieldEditorRows(payloadField, false);
-      if (!alias && !className && !payload.length) return null;
-      if (!alias) throw new Error(t('fieldRequired', { label: t('baaObjectAlias') }));
-      return {
-        alias: alias,
-        className: className,
-        description: String(descriptionField && descriptionField.value || '').trim(),
-        payload: payload
-      };
-    }).filter(Boolean);
-    return {
-      kind: 'baaVerification',
-      contract: {
-        code: String(readValue('cmdp-baa-contract-code') || '').trim(),
-        version: String(readValue('cmdp-baa-contract-version') || '1').trim() || '1',
-        description: String(readValue('cmdp-baa-contract-description') || '').trim(),
-        sourceCode: sourceCode,
-        variables: variables,
-        contractParams: variables,
-        requestVariables: [],
-        objects: objects
-      }
-    };
-  }
-
-  function applyBaaContractSourceSelection(sourceCode) {
-    var code = String(sourceCode || '').trim();
-    var sourceContract = code ? (state.baaInputContracts || []).find(function (item) { return item.code === code; }) : null;
-    if (sourceContract && sourceContract.contract) {
-      state.baaContractDraft = Object.assign({}, sourceContract.contract, {
-        code: sourceContract.code || sourceContract.contract.code || '',
-        version: sourceContract.version || sourceContract.contract.version || '',
-        description: sourceContract.description || sourceContract.contract.description || '',
-        variables: sourceContract.contract.contractParams || sourceContract.contract.variables || [],
-        contractParams: sourceContract.contract.contractParams || sourceContract.contract.variables || [],
-        requestVariables: sourceContract.contract.requestVariables || [],
-        sourceCode: sourceContract.code,
-        sourceClassName: sourceContract.className || ''
-      });
-    } else {
-      var current = baaContractForSpec(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
-      current.sourceCode = '';
-      current.sourceClassName = '';
-      state.baaContractDraft = current;
-    }
-    clearDraftExecutionState({ clearExtractionSource: true });
-    renderDesigner();
-  }
-
-  function applyBaaEndpointToSpec(spec, required) {
-    if (!hasBaaEndpointEditorFields() && !required) return spec;
-    var next = cloneJsonValue(spec || defaultSpec(), defaultSpec());
-    if (templateKindForSpec(next) === CMDB_BUILD_VIEW_KIND) {
-      var publish = next.publish;
-      var cache = next.cache;
-      var params = next.params;
-      next = defaultSpec();
-      if (publish) next.publish = publish;
-      if (cache) next.cache = cache;
-      if (params) next.params = params;
-    }
-    next = normalizeTemplateProtection(next);
-    var model = readBaaEndpointFields();
-    state.baaContractDraft = model.contract;
-    next.endpoint = Object.assign({}, next.endpoint || {}, { kind: 'baaVerification' });
-    next.baaContract = model.contract;
-    return ensureBaaPlanObjectSourceSteps(next);
-  }
-
-  function applyBaaEndpointEditor() {
-    try {
-      var specData = readSpecWithParamEditor();
-      specData.spec = applyBaaEndpointToSpec(specData.spec, true);
-      updateSelectedFromEditor(specData.spec);
-      state.runParams = Object.assign({}, specData.examples || {}, state.runParams || {});
-      clearDraftExecutionState();
-      state.message = { type: 'ok', text: t('baaEndpointApplied') };
       renderDesigner();
     } catch (error) {
       state.message = { type: 'error', text: error.message };
@@ -9487,7 +9562,11 @@ function dynamicPagesClientScript() {
       body: { template: payload, params: params }
     }).then(function (result) {
       state.extractionPreview = result;
-      state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t('extractionCompleted') : errorText(result) };
+      var sourceWarning = extractionSelectedSourceEmptyWarning(result, state.extractionSource);
+      state.message = {
+        type: result.ok ? (sourceWarning ? 'warning' : 'ok') : 'error',
+        text: result.ok ? (sourceWarning || t('extractionCompleted')) : errorText(result)
+      };
       renderDesigner();
     }).catch(function (error) {
       state.extractionPreview = null;
@@ -9672,48 +9751,6 @@ function dynamicPagesClientScript() {
     if (body) body.insertAdjacentHTML('beforeend', renderParamEditorRow({}));
   }
 
-  function addBaaObjectRow() {
-    var container = document.getElementById('cmdp-baa-object-rows');
-    var index = container ? container.querySelectorAll('[data-baa-object-row]').length : 0;
-    if (container) container.insertAdjacentHTML('beforeend', renderBaaContractObjectRow({
-      alias: 'candidate' + String(index + 1),
-      className: '',
-      payload: [{ name: 'Code', type: 'string', required: false, example: '', description: '' }]
-    }, index));
-  }
-
-  function addBaaFieldEditorRow(button, includeDefault) {
-    var scope = includeDefault
-      ? document.getElementById('cmdp-baa-contract-variables')
-      : button && button.closest && button.closest('[data-baa-object-field="payload"]');
-    var body = scope && scope.querySelector ? scope.querySelector('[data-baa-field-table] tbody') : null;
-    if (body) body.insertAdjacentHTML('beforeend', renderBaaFieldEditorRow({}, includeDefault, false));
-  }
-
-  function clearBaaFieldEditorRow(button) {
-    var row = button && button.closest ? button.closest('[data-baa-field-row]') : null;
-    if (!row) return;
-    var body = row.parentElement;
-    if (body && body.querySelectorAll('[data-baa-field-row]').length <= 1) {
-      row.querySelectorAll('input,textarea').forEach(function (field) { field.value = ''; });
-      row.querySelectorAll('select').forEach(function (field) { field.value = 'false'; });
-      return;
-    }
-    row.remove();
-  }
-
-  function clearBaaObjectRow(button) {
-    var row = button && button.closest ? button.closest('[data-baa-object-row]') : null;
-    if (!row) return;
-    var container = row.parentElement;
-    if (container && container.querySelectorAll('[data-baa-object-row]').length <= 1) {
-      row.querySelectorAll('input,textarea').forEach(function (field) { field.value = ''; });
-      row.querySelectorAll('select').forEach(function (field) { field.value = 'false'; });
-      return;
-    }
-    row.remove();
-  }
-
   function addObjectGroupScopeRuleRow(button) {
     var selection = button && button.closest ? button.closest('[data-object-selection]') : null;
     var body = selection ? selection.querySelector('tbody') : document.getElementById('cmdp-object-scope-rows');
@@ -9806,6 +9843,24 @@ function dynamicPagesClientScript() {
     var spec = state.selectedTemplate && state.selectedTemplate.spec ? state.selectedTemplate.spec : defaultSpec();
     var sourceAlias = finalBaseResultAlias(spec) || readValue('cmdp-view-source') || (state.viewComposerDraft && state.viewComposerDraft.sourceAlias) || '';
     if (body) body.insertAdjacentHTML('beforeend', renderViewComposerColumnRow({}, spec, sourceAlias));
+  }
+
+  function viewComposerColumnRowHasValue(row) {
+    if (!row) return false;
+    var field = row.querySelector('[data-view-column-field="field"]');
+    var title = row.querySelector('[data-view-column-field="title"]');
+    return Boolean(String(field && field.value || '').trim() || String(title && title.value || '').trim());
+  }
+
+  function ensureTrailingViewComposerColumnRow(target) {
+    if (!target || !target.closest) return;
+    var body = document.getElementById('cmdp-view-column-rows');
+    var row = target.closest('[data-view-column-row]');
+    if (!body || !row || !body.contains(row)) return;
+    var rows = Array.prototype.slice.call(body.querySelectorAll('[data-view-column-row]'));
+    if (!rows.length || rows[rows.length - 1] !== row) return;
+    if (!viewComposerColumnRowHasValue(row)) return;
+    addViewComposerColumnRow();
   }
 
   function clearViewComposerColumnRow(button) {
@@ -9911,6 +9966,93 @@ function dynamicPagesClientScript() {
       state.message = { type: 'error', text: error.message };
       renderDesigner();
     });
+  }
+
+  function openAssistantSection() {
+    setDesignerSection('assistant');
+  }
+
+  function refreshAssistantGenerationElapsed() {
+    var node = document.querySelector('[data-assistant-elapsed]');
+    if (node) node.textContent = assistantGenerationElapsedText();
+  }
+
+  function stopAssistantGenerationTimer() {
+    if (state.assistantGenerationTimer) {
+      window.clearInterval(state.assistantGenerationTimer);
+      state.assistantGenerationTimer = null;
+    }
+  }
+
+  function startAssistantGenerationTimer() {
+    stopAssistantGenerationTimer();
+    refreshAssistantGenerationElapsed();
+    state.assistantGenerationTimer = window.setInterval(refreshAssistantGenerationElapsed, 1000);
+  }
+
+  function generateAssistantDraft() {
+    if (state.assistantGenerating) return;
+    if (!captureVisibleDesignerState()) return;
+    var intent = String(state.assistantDraftIntent || '').trim();
+    if (!intent) {
+      state.message = { type: 'error', text: t('fieldRequired', { label: t('assistantIntent') }) };
+      renderDesigner();
+      return;
+    }
+    var currentSpec = state.selectedTemplate && state.selectedTemplate.spec ? state.selectedTemplate.spec : defaultSpec();
+    state.assistantGenerating = true;
+    state.assistantGeneratingStartedAt = Date.now();
+    state.message = { type: 'ok', text: t('assistantGeneratingTitle') };
+    renderDesigner();
+    startAssistantGenerationTimer();
+    request(apiPrefix + '/assistant/template-draft?root=' + encodeURIComponent(state.root || 'Cst_QueryTool'), {
+      method: 'POST',
+      timeoutMs: 60000,
+      body: {
+        intent: intent,
+        taskMode: state.assistantTaskMode,
+        currentSpec: currentSpec
+      }
+    }).then(function (result) {
+      state.assistantDraftResult = result;
+      if (result.ok && result.json && result.json.spec) {
+        state.objectGroupDraft = null;
+        state.relationDraft = null;
+        state.viewComposerDraft = null;
+        updateSelectedFromEditor(result.json.spec);
+        clearDraftExecutionState();
+        state.message = { type: 'ok', text: t('assistantDraftGeneratedApplied') };
+      } else {
+        state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t('assistantDraftGenerated') : errorText(result) };
+      }
+    }).catch(function (error) {
+      state.message = { type: 'error', text: error.message };
+    }).finally(function () {
+      state.assistantGenerating = false;
+      state.assistantGeneratingStartedAt = 0;
+      stopAssistantGenerationTimer();
+      renderDesigner();
+    });
+  }
+
+  function applyAssistantDraft() {
+    if (!captureVisibleDesignerState()) return;
+    var result = state.assistantDraftResult;
+    if (!result || !result.ok || !result.json || !result.json.spec) {
+      state.message = { type: 'error', text: t('assistantNoDraft') };
+      renderDesigner();
+      return;
+    }
+    state.objectGroupDraft = null;
+    state.relationDraft = null;
+    state.viewComposerDraft = null;
+    updateSelectedFromEditor(result.json.spec);
+    state.message = {
+      type: 'ok',
+      text: result.json.explanation ? t('assistantDraftApplied') + ' ' + result.json.explanation : t('assistantDraftApplied')
+    };
+    clearDraftExecutionState();
+    renderDesigner();
   }
 
   function runDraftAction(action) {
@@ -10044,27 +10186,36 @@ function dynamicPagesClientScript() {
     return next;
   }
 
-  function applyBaaTechnicalFields(runtimeConfig) {
+  function applyAssistantConfigFields(runtimeConfig) {
     var next = normalizeRuntimeConfigForEditor(runtimeConfig);
-    var fields = [
-      ['cmdp-baa-superclass-path', 'superclassPath'],
-      ['cmdp-baa-conversion-contract-class', 'conversionContractClass'],
-      ['cmdp-baa-conversion-contract-version-class', 'conversionContractVersionClass'],
-      ['cmdp-baa-verification-input-contract-class', 'verificationInputContractClass'],
-      ['cmdp-baa-verification-output-contract-class', 'verificationOutputContractClass'],
-      ['cmdp-baa-verification-endpoint-class', 'verificationEndpointClass']
-    ];
-    fields.forEach(function (item) {
-      if (!hasField(item[0])) return;
-      next.baaTechnical[item[1]] = String(readValue(item[0]) || '').trim() || defaultRuntimeConfig().baaTechnical[item[1]];
-    });
+    if (hasField('cmdp-assistant-llm-enabled')) {
+      next.assistant.llm.enabled = readChecked('cmdp-assistant-llm-enabled');
+      next.assistant.llm.baseUrl = readValue('cmdp-assistant-llm-base-url') || defaultRuntimeConfig().assistant.llm.baseUrl;
+      next.assistant.llm.model = readValue('cmdp-assistant-llm-model') || defaultRuntimeConfig().assistant.llm.model;
+    }
+    if (hasField('cmdp-assistant-system-prompt')) {
+      next.assistant.prompt = next.assistant.prompt || {};
+      next.assistant.prompt.system = String(readValue('cmdp-assistant-system-prompt') || '').trim() || defaultRuntimeConfig().assistant.prompt.system;
+    }
+    if (hasField('cmdp-assistant-mcp-enabled')) {
+      next.assistant.mcp.enabled = readChecked('cmdp-assistant-mcp-enabled');
+      next.assistant.mcp.allowedTools = splitToolList(readValue('cmdp-assistant-mcp-tools')).length
+        ? splitToolList(readValue('cmdp-assistant-mcp-tools'))
+        : defaultRuntimeConfig().assistant.mcp.allowedTools.slice();
+      next.assistant.mcp.maxContextBytes = readPositiveIntField('cmdp-assistant-mcp-max-context-bytes', t('assistantMcpMaxContextBytes'), next.assistant.mcp.maxContextBytes);
+      next.assistant.mcp.timeoutMs = readPositiveIntField('cmdp-assistant-mcp-timeout-ms', t('assistantMcpTimeoutMs'), next.assistant.mcp.timeoutMs);
+      next.assistant.mcp.maxClasses = readPositiveIntField('cmdp-assistant-mcp-max-classes', t('assistantMcpMaxClasses'), next.assistant.mcp.maxClasses);
+      next.assistant.mcp.maxDomains = readPositiveIntField('cmdp-assistant-mcp-max-domains', t('assistantMcpMaxDomains'), next.assistant.mcp.maxDomains);
+      next.assistant.mcp.maxRelationDomains = readPositiveIntField('cmdp-assistant-mcp-max-relation-domains', t('assistantMcpMaxRelationDomains'), next.assistant.mcp.maxRelationDomains);
+      next.assistant.mcp.maxCandidateClasses = readPositiveIntField('cmdp-assistant-mcp-max-candidate-classes', t('assistantMcpMaxCandidateClasses'), next.assistant.mcp.maxCandidateClasses);
+    }
     return next;
   }
 
   function applyRuntimeConfigFields(runtimeConfig) {
     var next = applyRuntimeCacheFields(runtimeConfig);
     next = applyRuntimeExecutionLimitFields(next);
-    next = applyBaaTechnicalFields(next);
+    next = applyAssistantConfigFields(next);
     return next;
   }
 
@@ -10153,7 +10304,6 @@ function dynamicPagesClientScript() {
   function selectTemplate(code) {
     state.selectedTemplate = state.templates.find(function (item) { return item.code === code; }) || null;
     state.objectGroupDraft = null;
-    state.baaContractDraft = null;
     state.relationDraft = null;
     state.viewComposerDraft = null;
     state.paramRowsDraft = null;
@@ -10183,7 +10333,6 @@ function dynamicPagesClientScript() {
       resultSchema: selected.resultSchema || {}
     };
     state.objectGroupDraft = null;
-    state.baaContractDraft = null;
     state.relationDraft = null;
     state.viewComposerDraft = null;
     state.paramRowsDraft = null;
@@ -10355,7 +10504,6 @@ function dynamicPagesClientScript() {
     state.runParams = built.params;
     state.selectedClass = built.params.className || built.params.referenceClass || state.selectedClass;
     state.objectGroupDraft = null;
-    state.baaContractDraft = null;
     state.relationDraft = null;
     state.viewComposerDraft = null;
     state.paramRowsDraft = null;
@@ -10400,7 +10548,6 @@ function dynamicPagesClientScript() {
     state.templateVersions = [];
     state.runParams = {};
     state.objectGroupDraft = null;
-    state.baaContractDraft = null;
     state.relationDraft = null;
     state.viewComposerDraft = null;
     state.paramRowsDraft = null;
@@ -10420,7 +10567,6 @@ function dynamicPagesClientScript() {
     state.templateVersions = [];
     state.runParams = {};
     state.objectGroupDraft = null;
-    state.baaContractDraft = null;
     state.relationDraft = null;
     state.viewComposerDraft = null;
     state.paramRowsDraft = null;
@@ -10450,7 +10596,6 @@ function dynamicPagesClientScript() {
     state.templateVersions = [];
     state.runParams = {};
     state.objectGroupDraft = null;
-    state.baaContractDraft = null;
     state.relationDraft = null;
     state.viewComposerDraft = null;
     state.paramRowsDraft = null;
@@ -10498,11 +10643,6 @@ function dynamicPagesClientScript() {
   function absoluteRuntimeTemplateUrl(code, params) {
     var origin = window.location && window.location.origin ? window.location.origin : '';
     return origin + runtimeTemplateUrl(code, params);
-  }
-
-  function absoluteBaaVerifyUrl(code) {
-    var origin = window.location && window.location.origin ? window.location.origin : '';
-    return origin + apiPrefix + '/templates/' + encodeURIComponent(code || '') + '/baa-verify';
   }
 
   function openRun(code, newTab) {
@@ -10577,47 +10717,6 @@ function dynamicPagesClientScript() {
     }).then(function (result) {
       state.result = result;
       state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t('forceRefreshRunCompleted') : errorText(result) };
-      state.designerSection = 'run';
-      renderDesigner();
-    }).catch(function (error) {
-      state.message = { type: 'error', text: error.message || String(error) };
-      renderDesigner();
-    });
-  }
-
-  function readBaaRequestBody() {
-    var field = document.getElementById('cmdp-baa-request');
-    var text = field ? field.value : pretty(defaultBaaRequest(state.selectedTemplate || {}));
-    state.baaRequestDraft = text;
-    try {
-      return JSON.parse(text);
-    } catch (error) {
-      throw new Error('BAA request JSON is invalid: ' + (error && error.message ? error.message : String(error)));
-    }
-  }
-
-  function baaVerifyPreview(forceRefresh) {
-    var code = readTemplateCode();
-    var body;
-    if (!code) {
-      state.message = { type: 'error', text: t('templateCodeRequired') };
-      renderDesigner();
-      return;
-    }
-    try {
-      body = readBaaRequestBody();
-      if (forceRefresh) body.forceRefresh = true;
-    } catch (error) {
-      state.message = { type: 'error', text: error.message };
-      renderDesigner();
-      return;
-    }
-    request(apiPrefix + '/templates/' + encodeURIComponent(code) + '/baa-verify?maxRows=100', {
-      method: 'POST',
-      body: body
-    }).then(function (result) {
-      state.result = result;
-      state.message = { type: result.ok && result.json && result.json.success ? 'ok' : 'error', text: result.ok ? t('baaVerifyCompleted') : errorText(result) };
       state.designerSection = 'run';
       renderDesigner();
     }).catch(function (error) {
@@ -10804,17 +10903,13 @@ function dynamicPagesClientScript() {
     var sectionLink = event.target.closest('[data-designer-section]');
     if (sectionLink && boot.mode !== 'runtime') {
       event.preventDefault();
-      if (sectionLink.getAttribute('data-disabled') === 'true') {
-        state.message = { type: 'error', text: t('baaSectionDisabled') };
-        renderDesigner();
-        return;
-      }
       setDesignerSection(sectionLink.getAttribute('data-designer-section'));
       return;
     }
     var target = event.target.closest('[data-action]');
     if (!target) return;
     event.preventDefault();
+    if (target.disabled || target.getAttribute('aria-disabled') === 'true') return;
     var action = target.getAttribute('data-action');
     if (action === 'runtime-refresh') {
       if (target.getAttribute('data-disabled') === 'true') return;
@@ -10826,20 +10921,15 @@ function dynamicPagesClientScript() {
     if (action === 'save-template') saveTemplate();
     if (action === 'validate-template') runDraftAction('validate');
     if (action === 'preview-template') runDraftAction('preview');
+    if (action === 'assistant-draft') openAssistantSection();
+    if (action === 'assistant-generate') generateAssistantDraft();
+    if (action === 'assistant-apply-draft') applyAssistantDraft();
     if (action === 'visualize-editor') visualizeInEditor();
     if (action === 'force-refresh-editor') forceRefreshInEditor();
     if (action === 'visualize-external') visualizeExternal();
-    if (action === 'baa-verify-preview') baaVerifyPreview();
-    if (action === 'baa-verify-refresh-preview') baaVerifyPreview(true);
     if (action === 'select-template') selectTemplate(target.getAttribute('data-code'));
     if (action === 'delete-template') deleteTemplate(target.getAttribute('data-code'));
     if (action === 'apply-object-group') applyObjectGroupEditor();
-    if (action === 'apply-baa-endpoint') applyBaaEndpointEditor();
-    if (action === 'add-baa-object') addBaaObjectRow();
-    if (action === 'add-baa-variable-row') addBaaFieldEditorRow(target, true);
-    if (action === 'add-baa-payload-field') addBaaFieldEditorRow(target, false);
-    if (action === 'clear-baa-field-row') clearBaaFieldEditorRow(target);
-    if (action === 'clear-baa-object') clearBaaObjectRow(target);
     if (action === 'add-object-scope-row') addObjectGroupScopeRuleRow(target);
     if (action === 'add-object-selection') addObjectSelection();
     if (action === 'clear-object-scope-row') clearObjectGroupScopeRuleRow(target);
@@ -10892,6 +10982,9 @@ function dynamicPagesClientScript() {
     if (event.target && event.target.matches && event.target.matches('[data-object-path-filter-field]')) {
       applyObjectPathFilter(event.target.closest('[data-object-selection]') || document);
     }
+    if (event.target && event.target.matches && event.target.matches('[data-view-column-field="title"]')) {
+      ensureTrailingViewComposerColumnRow(event.target);
+    }
   });
 
   document.addEventListener('change', function (event) {
@@ -10901,6 +10994,9 @@ function dynamicPagesClientScript() {
     if (event.target && event.target.matches && event.target.matches('[data-object-path-filter-field]')) {
       applyObjectPathFilter(event.target.closest('[data-object-selection]') || document);
     }
+    if (event.target && event.target.matches && event.target.matches('[data-view-column-field="field"], [data-view-column-field="title"]')) {
+      ensureTrailingViewComposerColumnRow(event.target);
+    }
   });
 
   document.addEventListener('change', function (event) {
@@ -10909,12 +11005,17 @@ function dynamicPagesClientScript() {
     if (target.matches && target.matches('[data-visualization-field="groupBy"], [data-visualization-field="splitSubtables"]')) {
       updateVisualizationGroupTitleDefault(target);
     }
-    if (target.id === 'cmdp-copy-template-source') {
-      applyTemplateCopySource(target.value);
+    if (target.matches && target.matches('input[name="cmdp-output-mode"]')) {
+      captureVisibleDesignerState();
+      renderDesigner();
       return;
     }
-    if (target.id === 'cmdp-baa-contract-source') {
-      applyBaaContractSourceSelection(target.value);
+    if (target.matches && target.matches('input[name="cmdp-assistant-task-mode"]')) {
+      state.assistantTaskMode = normalizeOutputMode(target.value);
+      return;
+    }
+    if (target.id === 'cmdp-copy-template-source') {
+      applyTemplateCopySource(target.value);
       return;
     }
     if (target.id === 'cmdp-max-depth') {
@@ -10940,18 +11041,18 @@ function dynamicPagesClientScript() {
       state.relationDraft = null;
       state.viewComposerDraft = null;
       clearDraftExecutionState({ clearExtractionSource: true });
-      if (!isBaaSourceClassName(target.value)) state.selectedClass = target.value;
-      var catalogClass = isBaaSourceClassName(target.value) ? null : catalogClassByName(target.value);
+      state.selectedClass = target.value;
+      var catalogClass = catalogClassByName(target.value);
       state.classAttributes = catalogClass && Array.isArray(catalogClass.attributes) ? catalogClass.attributes : [];
       renderDesigner();
     }
     if (target.matches && target.matches('[data-object-scope-field="op"]')) {
       var row = target.closest('[data-object-scope-row]');
-      var valueField = row && row.querySelector('[data-object-scope-field="regex"]');
-      if (valueField) {
-        valueField.disabled = !objectGroupOperatorUsesValue(target.value);
-        if (valueField.disabled) valueField.value = '';
-      }
+      var valueDisabled = !objectGroupOperatorUsesValue(target.value);
+      Array.prototype.slice.call(row ? row.querySelectorAll('[data-object-scope-field="value"], [data-object-scope-field="regex"], [data-object-scope-field="valueParam"], [data-object-scope-field="valueColumn"]') : []).forEach(function (field) {
+        field.disabled = valueDisabled;
+        if (field.disabled) field.value = '';
+      });
     }
     if (target.matches && target.matches('[data-matching-block-field="from"], [data-matching-block-field="with"]')) {
       var relationDraft = captureRelationDraftFromDom();
@@ -11329,7 +11430,7 @@ function requireSameOriginMutation(req, res) {
     method: req.method || '',
     path: sanitizeReqUrl(req),
     origin: truncateText(req.headers.origin || '', 500),
-    referer: truncateText(req.headers.referer || '', 500)
+    referer: sanitizeUrlForLog(req.headers.referer || '', 500)
   });
   sendJson(res, 403, {
     success: false,
@@ -11375,51 +11476,9 @@ function requireStateChangingRequest(req, res, authToken) {
   return requireSameOriginMutation(req, res) && requireCsrfToken(req, res, authToken);
 }
 
-function requireBaaStateChangingRequest(req, res, authToken, authSource = 'cookie') {
-  if (authSource === 'cmdbuild-authorization-header') {
-    return true;
-  }
-  if (!hasSameOriginMutationHeaders(req)) {
-    logWarn('security.same_origin_rejected', {
-      requestId: req.cmdpRequestId || '',
-      method: req.method || '',
-      path: sanitizeReqUrl(req),
-      origin: truncateText(req.headers.origin || '', 500),
-      referer: truncateText(req.headers.referer || '', 500)
-    });
-    sendJson(res, 403, baaErrorResponse('SAME_ORIGIN_REQUIRED', 'BAA verification calls require a same-origin Origin or Referer header.'));
-    return false;
-  }
-  const provided = req.headers['x-cmdbdynamicpages-csrf'];
-  if (!provided || !timingSafeEqualString(provided, getCsrfToken(authToken))) {
-    logWarn('security.csrf_rejected', {
-      requestId: req.cmdpRequestId || '',
-      method: req.method || '',
-      path: sanitizeReqUrl(req),
-      hasToken: Boolean(provided),
-      hasCmdbuildCookie: Boolean(authToken)
-    });
-    sendJson(res, 403, baaErrorResponse('CSRF_REQUIRED', 'BAA verification calls require a valid X-CMDBDynamicPages-CSRF token.'));
-    return false;
-  }
-  return true;
-}
-
-function isBaaVerifyBackendPath(pathname) {
-  const prefix = `${BACKEND_PREFIX}/templates/`;
-  if (!String(pathname || '').startsWith(prefix)) return false;
-  const suffix = String(pathname || '').slice(prefix.length);
-  const parts = suffix.split('/').filter(Boolean).map((part) => decodeURIComponent(part));
-  return parts.length === 2 && parts[1] === 'baa-verify';
-}
-
 function backendAuthFromRequest(req, requestUrl) {
   const cookieToken = getCookieValue(req.headers.cookie, 'CMDBuild-Authorization');
   if (cookieToken) return { token: cookieToken, source: 'cookie' };
-  const headerToken = String(req.headers['cmdbuild-authorization'] || '').trim();
-  if (headerToken && isBaaVerifyBackendPath(requestUrl.pathname)) {
-    return { token: headerToken, source: 'cmdbuild-authorization-header' };
-  }
   return { token: '', source: '' };
 }
 
@@ -11556,6 +11615,38 @@ function sanitizeAttribute(item) {
   };
 }
 
+function cmdbuildClassAttributesPath(className) {
+  return `/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}/attributes?scope=service&limit=1000`;
+}
+
+function sanitizeVisibleClassAttributes(items, options = {}) {
+  const requireReadable = options.requireReadable !== false;
+  return (Array.isArray(items) ? items : [])
+    .map(sanitizeAttribute)
+    .filter(Boolean)
+    .filter((attribute) => attribute.active !== false && (!requireReadable || !attribute.permissions || attribute.permissions._can_read !== false));
+}
+
+async function readCmdbuildClassAttributes(authToken, className, options = {}) {
+  const response = await cmdbuildRequest(cmdbuildClassAttributesPath(className), authToken);
+  return {
+    response,
+    attributes: response.ok
+      ? sanitizeVisibleClassAttributes(response.json && response.json.data, options)
+      : []
+  };
+}
+
+async function readExecutionClassAttributes(cmdbuildExecRequest, className, options = {}) {
+  const response = await cmdbuildExecRequest(cmdbuildClassAttributesPath(className));
+  return {
+    response,
+    attributes: response.ok
+      ? sanitizeVisibleClassAttributes(response.json && response.json.data, options)
+      : []
+  };
+}
+
 function sanitizeLookupType(item) {
   if (!item) return null;
   return {
@@ -11598,18 +11689,16 @@ async function buildModelCatalog(authToken, requestUrl) {
 
   if (classesResponse.ok && includeAttributes) {
     await mapLimit(classes, 5, async (item) => {
-      const attrs = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(item.name)}/attributes`, authToken);
-      if (!attrs.ok) {
+      const attrs = await readCmdbuildClassAttributes(authToken, item.name);
+      if (!attrs.response.ok) {
         item.attributes = [];
         attributeErrors.push({
           className: item.name,
-          cmdbuildStatus: attrs.statusCode
+          cmdbuildStatus: attrs.response.statusCode
         });
         return item;
       }
-      item.attributes = Array.isArray(attrs.json && attrs.json.data)
-        ? attrs.json.data.map(sanitizeAttribute).filter(Boolean).filter((attribute) => attribute.active !== false && (!attribute.permissions || attribute.permissions._can_read !== false))
-        : [];
+      item.attributes = attrs.attributes;
       attributeCount += item.attributes.length;
       return item;
     });
@@ -11700,18 +11789,16 @@ async function buildPermissionScopeProbe(authToken, requestUrl) {
 
   if (classesResponse.ok && includeAttributes) {
     await mapLimit(readableClasses.slice(0, maxAttributeClasses), 5, async (item) => {
-      const attrs = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(item.name)}/attributes`, authToken);
-      if (!attrs.ok) {
+      const attrs = await readCmdbuildClassAttributes(authToken, item.name);
+      if (!attrs.response.ok) {
         item.attributes = [];
         attributeErrors.push({
           className: item.name,
-          cmdbuildStatus: attrs.statusCode
+          cmdbuildStatus: attrs.response.statusCode
         });
         return;
       }
-      item.attributes = Array.isArray(attrs.json && attrs.json.data)
-        ? attrs.json.data.map(sanitizeAttribute).filter(Boolean).filter((attribute) => attribute.active !== false)
-        : [];
+      item.attributes = attrs.attributes;
     });
   }
 
@@ -12379,10 +12466,8 @@ function normalizeTemplateSpecForStorage(spec, code = '') {
   const templateCode = String(code || '').trim();
   if (templateCode === DEFAULT_CMDB_BUILD_VIEW_CODE && isCmdbBuildViewSpec(next)) return next;
 
-  if (next.kind === CMDB_BUILD_VIEW_KIND && next.endpoint && next.endpoint.kind === 'baaVerification') {
-    delete next.kind;
-    delete next.cmdbBuildView;
-  }
+  if (next.endpoint && next.endpoint.kind === 'baaVerification') delete next.endpoint;
+  delete next.baaContract;
   delete next.protected;
   if (next.system && typeof next.system === 'object' && !Array.isArray(next.system)) {
     const system = { ...next.system };
@@ -12390,7 +12475,6 @@ function normalizeTemplateSpecForStorage(spec, code = '') {
     if (Object.keys(system).length) next.system = system;
     else delete next.system;
   }
-  next = ensureBaaPlanObjectSourceSteps(next);
   return next;
 }
 
@@ -12556,13 +12640,25 @@ function defaultRuntimeConfig() {
     runtimeCache: {
       refreshCooldownSec: Math.ceil(RUNTIME_REFRESH_COOLDOWN_MS / 1000)
     },
-    baaTechnical: {
-      superclassPath: 'BAA technical superclass',
-      conversionContractClass: 'BAAConversionContract',
-      conversionContractVersionClass: 'BAAConversionContractVersion',
-      verificationInputContractClass: 'BAAVerificationInputContract',
-      verificationOutputContractClass: 'BAAVerificationOutputContract',
-      verificationEndpointClass: 'BAAVerificationEndpoint'
+    assistant: {
+      llm: {
+        enabled: false,
+        baseUrl: LITELLM_BASE_URL,
+        model: LITELLM_MODEL
+      },
+      mcp: {
+        enabled: true,
+        allowedTools: allMcpToolNames(),
+        maxContextBytes: DEFAULT_ASSISTANT_MCP_MAX_CONTEXT_BYTES,
+        timeoutMs: DEFAULT_ASSISTANT_MCP_TIMEOUT_MS,
+        maxClasses: 100,
+        maxDomains: 100,
+        maxRelationDomains: 100,
+        maxCandidateClasses: DEFAULT_ASSISTANT_MCP_MAX_CANDIDATE_CLASSES
+      },
+      prompt: {
+        system: DEFAULT_ASSISTANT_SYSTEM_PROMPT
+      }
     },
     executionLimits: {
       maxRowsDefault: 500,
@@ -12618,6 +12714,33 @@ function toPositiveInt(value, fallback, max) {
   const number = Number(value);
   if (!Number.isInteger(number) || number <= 0) return fallback;
   return Math.min(number, max);
+}
+
+function assistantLimitConfigValue(limitName, value, fallback, max, options = {}) {
+  const min = Math.max(1, Number(options.min || 1) || 1);
+  const fallbackValue = Math.max(min, Number(fallback || min) || min);
+  const rawNumber = Number(value);
+  const rawConfigured = Number.isInteger(rawNumber) && rawNumber > 0
+    ? Math.max(min, rawNumber)
+    : fallbackValue;
+  const absoluteCap = Math.max(min, Number(max || rawConfigured) || rawConfigured);
+  const effectiveLimit = Math.min(rawConfigured, absoluteCap);
+  return {
+    value: effectiveLimit,
+    detail: {
+      source: 'config',
+      tool: 'assistant.mcp',
+      limitName,
+      rawConfigured,
+      configuredLimit: effectiveLimit,
+      effectiveLimit,
+      requested: rawConfigured,
+      limit: effectiveLimit,
+      absoluteCap,
+      clamped: rawConfigured !== effectiveLimit,
+      clampedBy: rawConfigured !== effectiveLimit ? (options.clampedBy || 'assistant safety cap') : ''
+    }
+  };
 }
 
 function normalizeExecutionLimitConfig(runtimeConfig) {
@@ -12678,9 +12801,14 @@ function normalizeTemplateCacheConfig(spec, runtimeCacheConfig) {
 function mergeRuntimeConfigDefaults(runtimeConfig) {
   const defaults = defaultRuntimeConfig();
   const source = runtimeConfig && typeof runtimeConfig === 'object' && !Array.isArray(runtimeConfig) ? runtimeConfig : {};
+  const sourceAssistant = source.assistant && typeof source.assistant === 'object' && !Array.isArray(source.assistant) ? source.assistant : {};
   return Object.assign({}, defaults, source, {
     runtimeCache: Object.assign({}, defaults.runtimeCache, source.runtimeCache || {}),
-    baaTechnical: Object.assign({}, defaults.baaTechnical, source.baaTechnical || {}),
+    assistant: Object.assign({}, defaults.assistant, sourceAssistant, {
+      llm: Object.assign({}, defaults.assistant.llm, sourceAssistant.llm || {}),
+      mcp: Object.assign({}, defaults.assistant.mcp, sourceAssistant.mcp || {}),
+      prompt: Object.assign({}, defaults.assistant.prompt, sourceAssistant.prompt || {})
+    }),
     executionLimits: Object.assign({}, defaults.executionLimits, source.executionLimits || {})
   });
 }
@@ -12737,112 +12865,6 @@ async function getRuntimeConfig(authToken, root) {
     return defaultRuntimeConfig();
   }
   return sanitizeConfigCard(found.card, found.schema.root).runtimeConfig || defaultRuntimeConfig();
-}
-
-function baaTechnicalConfig(runtimeConfig) {
-  return mergeRuntimeConfigDefaults(runtimeConfig || defaultRuntimeConfig()).baaTechnical || defaultRuntimeConfig().baaTechnical;
-}
-
-function baaContractClassNameForType(runtimeConfig, type) {
-  const cfg = baaTechnicalConfig(runtimeConfig);
-  const kind = String(type || 'input').trim();
-  if (kind === 'conversion') return cfg.conversionContractClass;
-  if (kind === 'conversionVersion') return cfg.conversionContractVersionClass;
-  if (kind === 'output') return cfg.verificationOutputContractClass;
-  if (kind === 'endpoint') return cfg.verificationEndpointClass;
-  return cfg.verificationInputContractClass;
-}
-
-function jsonFieldValue(card, names, fallback = null) {
-  for (const name of names) {
-    if (card && card[name] !== undefined && card[name] !== null && card[name] !== '') {
-      return safeJsonValue(card[name], fallback);
-    }
-  }
-  return fallback;
-}
-
-function baaFieldListFromObject(value) {
-  if (Array.isArray(value)) return value.map((item) => normalizeBaaContractFieldServer(item)).filter((item) => item.name);
-  if (value && typeof value === 'object') {
-    return Object.entries(value).map(([name, definition]) => normalizeBaaContractFieldServer({
-      ...(definition && typeof definition === 'object' && !Array.isArray(definition) ? definition : { type: definition }),
-      name
-    })).filter((item) => item.name);
-  }
-  return [];
-}
-
-function normalizeBaaVariableSources(value) {
-  return Array.isArray(value) ? value.map((item) => {
-    const source = item && typeof item === 'object' && !Array.isArray(item) ? item : {};
-    return {
-      name: String(source.name || '').trim(),
-      sourceKind: String(source.sourceKind || '').trim(),
-      sourceExpression: String(source.sourceExpression || '').trim(),
-      valuePresent: Boolean(source.valuePresent)
-    };
-  }).filter((item) => item.name) : [];
-}
-
-function baaContractObjectsFromRaw(raw) {
-  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
-  const rawObjects = Array.isArray(source.objects)
-    ? source.objects
-    : (Array.isArray(source.candidates) ? source.candidates : (Array.isArray(source.classes) ? source.classes : []));
-  return rawObjects.map((object, index) => {
-    const item = object && typeof object === 'object' && !Array.isArray(object) ? object : {};
-    const className = String(item.className || item.class || item.name || '').trim();
-    return {
-      alias: String(item.alias || item.as || className || `candidate${index + 1}`).trim(),
-      className,
-      description: String(item.description || '').trim(),
-      payload: baaFieldListFromObject(item.payload || item.fields || item.attributes || [])
-    };
-  }).filter((object) => object.alias || object.className || object.payload.length);
-}
-
-function baaContractFromCard(card) {
-  const raw = jsonFieldValue(card, ['SchemaJson', 'ContractJson', 'SpecJson', 'InputContractJson', 'OutputContractJson', 'DefinitionJson', 'PayloadJson'], {}) || {};
-  const variables = baaFieldListFromObject(raw.contractParams || raw.variables || raw.params || raw.endpointParams || []);
-  const requestVariables = baaFieldListFromObject(raw.requestVariables || raw.verificationRequestVariables || []);
-  const objects = baaContractObjectsFromRaw(raw);
-  return {
-    code: String(raw.code || card.Code || card.BAAContractVersionCode || '').trim(),
-    version: String(raw.version || card.ContractVersion || card.Version || card.MajorVersion || '').trim(),
-    description: String(raw.description || card.Description || '').trim(),
-    variables,
-    contractParams: variables,
-    requestVariables,
-    objects
-  };
-}
-
-function sanitizeBaaContractCard(card, className) {
-  const contract = baaContractFromCard(card || {});
-  return {
-    id: card && card._id,
-    code: contract.code || String(card && card.Code || '').trim(),
-    description: contract.description || String(card && card.Description || '').trim(),
-    version: contract.version,
-    className,
-    contract,
-    resultInterpretation: jsonFieldValue(card, ['ResultInterpretationJson'], null)
-  };
-}
-
-async function listBaaContractCards(authToken, root, type) {
-  const runtimeConfig = await getRuntimeConfig(authToken, root);
-  const cfg = baaTechnicalConfig(runtimeConfig);
-  const className = validateCmdbuildIdentifier(baaContractClassNameForType(runtimeConfig, type), 'BAA contract class');
-  const cards = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}/cards?limit=1000`, authToken);
-  const data = Array.isArray(cards.json && cards.json.data) ? cards.json.data : [];
-  return {
-    type: String(type || 'input'),
-    className,
-    superclassPath: cfg.superclassPath || '',
-    data: data.map((card) => sanitizeBaaContractCard(card, className))
-  };
 }
 
 function truncateText(value, maxLength) {
@@ -12906,6 +12928,23 @@ function addPathColumnDependencies(target, columns) {
   }
 }
 
+function addResultDiagramDependencies(add, diagram) {
+  if (!diagram || typeof diagram !== 'object' || Array.isArray(diagram)) return;
+  const nodeSource = resultDiagramSourceName(diagram, 'nodes');
+  const edgeSource = resultDiagramSourceName(diagram, 'edges');
+  [
+    resultDiagramField(diagram, ['nodeId', 'id', 'idColumn'], 'id'),
+    resultDiagramField(diagram, ['nodeLabel', 'label', 'labelColumn'], 'label'),
+    resultDiagramField(diagram, ['nodeGroup', 'group', 'groupColumn'], 'group'),
+    resultDiagramField(diagram, ['nodeHref', 'href', 'url', 'urlColumn'], 'href')
+  ].forEach((field) => add(nodeSource, field));
+  [
+    resultDiagramField(diagram, ['edgeSource', 'source', 'sourceId', 'from'], 'source'),
+    resultDiagramField(diagram, ['edgeTarget', 'target', 'targetId', 'to'], 'target'),
+    resultDiagramField(diagram, ['edgeLabel', 'edgeTitle', 'label'], 'label')
+  ].forEach((field) => add(edgeSource, field));
+}
+
 function normalizeResultTableSettings(spec) {
   const result = spec && spec.result && typeof spec.result === 'object' && !Array.isArray(spec.result) ? spec.result : {};
   const presentation = result.presentation && typeof result.presentation === 'object' && !Array.isArray(result.presentation)
@@ -12942,6 +12981,10 @@ function buildAliasColumnDependencies(spec) {
     for (const group of Array.isArray(settings.rowGroups) ? settings.rowGroups : []) {
       add(table.name, group && (group.column || group.field || group.name));
     }
+  }
+
+  for (const diagram of Array.isArray(spec && spec.result && spec.result.diagrams) ? spec.result.diagrams : []) {
+    addResultDiagramDependencies(add, diagram);
   }
 
   for (const step of steps) {
@@ -13145,18 +13188,16 @@ function attributeReadable(attribute) {
 
 async function probeClassUsedFields(cmdbuildExecRequest, className, fields, limits, visibilityIds) {
   validateCmdbuildIdentifier(className, 'cache probe className');
-  const attributesResponse = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}/attributes`);
-  if (!attributesResponse.ok) {
+  const attributesResponse = await readExecutionClassAttributes(cmdbuildExecRequest, className);
+  if (!attributesResponse.response.ok) {
     return {
       ok: false,
-      cmdbuildStatus: attributesResponse.statusCode,
-      message: `CMDBuild attributes probe for ${className} failed with status ${attributesResponse.statusCode}.`
+      cmdbuildStatus: attributesResponse.response.statusCode,
+      message: `CMDBuild attributes probe for ${className} failed with status ${attributesResponse.response.statusCode}.`
     };
   }
 
-  const attributes = Array.isArray(attributesResponse.json && attributesResponse.json.data)
-    ? attributesResponse.json.data
-    : [];
+  const attributes = attributesResponse.attributes;
   const byName = new Map(attributes.map((attribute) => [String(attribute.name || '').toLowerCase(), attribute]));
   for (const field of fields || []) {
     const direct = directCardFieldFromPath(field);
@@ -13311,8 +13352,7 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
   if (!templateCacheConfig.enabled || templateCacheConfig.scopeMode === 'disabled') {
     return {
       result: await executeTemplateSpec(authToken, template.spec, params, {
-        ...executionOptions,
-        baaRequest: options.baaRequest || null
+        ...executionOptions
       }),
       cache: {
         enabled: false,
@@ -13381,8 +13421,7 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
     const buildStartedAt = Date.now();
     const result = await executeTemplateSpec(authToken, template.spec, params, {
       ...executionOptions,
-      dependencyMap,
-      baaRequest: options.baaRequest || null
+      dependencyMap
     });
     observeMetricSeconds('cmdp_runtime_cache_build_seconds', {
       scopeMode: templateCacheConfig.scopeMode
@@ -13542,6 +13581,18 @@ function visibleRuntimeResultTables(tables) {
   return source.length ? [source[source.length - 1]] : [];
 }
 
+function normalizeRuntimeOutputMode(value) {
+  const mode = String(value || 'both').trim();
+  return ['tables', 'diagrams', 'both'].includes(mode) ? mode : 'both';
+}
+
+function runtimeResultOutputMode(result) {
+  const presentation = result && result.presentation && typeof result.presentation === 'object' && !Array.isArray(result.presentation)
+    ? result.presentation
+    : {};
+  return normalizeRuntimeOutputMode(presentation.outputMode || result && result.outputMode || 'both');
+}
+
 function runtimeResultTableTitle(table) {
   return String(table && (table.title || table.label || table.name) || '');
 }
@@ -13575,6 +13626,7 @@ function runtimeJsonCellLinks(row, rowIndex, columns, table, params) {
 }
 
 function runtimeJsonTables(result, params = {}) {
+  if (runtimeResultOutputMode(result) === 'diagrams') return [];
   const tables = visibleRuntimeResultTables(result && result.tables);
   return tables.map((table) => {
     const columns = Array.isArray(table.columns) ? table.columns : [];
@@ -13601,6 +13653,32 @@ function runtimeJsonTables(result, params = {}) {
   });
 }
 
+function runtimeJsonDiagrams(result) {
+  if (runtimeResultOutputMode(result) === 'tables') return [];
+  const diagrams = Array.isArray(result && result.diagrams) ? result.diagrams : [];
+  return diagrams.map((diagram) => ({
+    name: String(diagram && diagram.name || ''),
+    title: String(diagram && (diagram.title || diagram.name) || ''),
+    type: String(diagram && diagram.type || 'topology'),
+    layout: diagram && diagram.layout && typeof diagram.layout === 'object' && !Array.isArray(diagram.layout)
+      ? cloneJsonValueServer(diagram.layout, {})
+      : { type: 'topology' },
+    nodes: Array.isArray(diagram && diagram.nodes) ? diagram.nodes.map((node) => ({
+      id: String(node && node.id || ''),
+      label: String(node && (node.label || node.id) || ''),
+      group: String(node && node.group || ''),
+      href: node && isSafeRuntimeLinkUrl(node.href) ? String(node.href) : ''
+    })).filter((node) => node.id) : [],
+    edges: Array.isArray(diagram && diagram.edges) ? diagram.edges.map((edge) => ({
+      source: String(edge && edge.source || ''),
+      target: String(edge && edge.target || ''),
+      label: String(edge && edge.label || '')
+    })).filter((edge) => edge.source && edge.target) : [],
+    warnings: Array.isArray(diagram && diagram.warnings) ? diagram.warnings.map((item) => String(item || '')).filter(Boolean) : [],
+    truncated: Boolean(diagram && diagram.truncated)
+  })).filter((diagram) => diagram.name || diagram.nodes.length || diagram.edges.length);
+}
+
 function runtimeJsonResponsePayload(payload) {
   const result = payload.result || { tables: [] };
   return {
@@ -13610,76 +13688,2239 @@ function runtimeJsonResponsePayload(payload) {
     template: payload.template || {},
     params: payload.params || {},
     tables: runtimeJsonTables(result, payload.params || {}),
+    diagrams: runtimeJsonDiagrams(result),
     emptyText: result.emptyText || DEFAULT_EMPTY_RESULT_TEXT,
     cache: payload.cache || null,
     html: result.kind === 'html' && result.htmlTrusted ? result.html : undefined
   };
 }
 
-function inferBaaColumnType(rows, column) {
-  for (const row of Array.isArray(rows) ? rows : []) {
-    const value = row && Object.prototype.hasOwnProperty.call(row, column) ? row[column] : undefined;
-    if (value === undefined || value === null || value === '') continue;
-    if (typeof value === 'boolean') return 'boolean';
-    if (typeof value === 'number') return Number.isInteger(value) ? 'integer' : 'number';
-    return 'string';
+function assistantStatus(runtimeConfig) {
+  const assistantConfig = normalizeAssistantRuntimeConfig(runtimeConfig || defaultRuntimeConfig());
+  const llm = assistantConfig.llm || {};
+  const enabledByConfig = llm.enabled !== false;
+  const baseUrlStatus = liteLLMBaseUrlStatus(llm.baseUrl);
+  return {
+    enabled: enabledByConfig,
+    enabledByConfig,
+    provider: 'litellm',
+    baseUrl: baseUrlStatus.baseUrl,
+    requestedBaseUrl: baseUrlStatus.requestedBaseUrl,
+    baseUrlAllowed: baseUrlStatus.allowed,
+    baseUrlSource: baseUrlStatus.source,
+    allowedBaseUrls: LITELLM_ALLOWED_BASE_URLS,
+    model: llm.model || LITELLM_MODEL,
+    apiKeyConfigured: Boolean(LITELLM_API_KEY)
+  };
+}
+
+function litellmEndpoint(path, baseUrl) {
+  const base = String(baseUrl || LITELLM_BASE_URL || '').trim().replace(/\/+$/, '') + '/';
+  return new URL(String(path || '').replace(/^\/+/, ''), base).toString();
+}
+
+function assistantIntentText(body) {
+  const parts = [
+    body && body.intent,
+    body && body.prompt,
+    body && body.query,
+    body && body.request
+  ].map((item) => String(item || '').trim()).filter(Boolean);
+  return truncateText(parts.join('\n'), 6000);
+}
+
+function ensureAssistantRequestIntent(body) {
+  if (assistantIntentText(body)) return;
+  const error = new Error('Template assistant intent is required.');
+  error.statusCode = 400;
+  error.code = 'assistant_intent_required';
+  throw error;
+}
+
+function ensureAssistantReady(runtimeConfig) {
+  const status = assistantStatus(runtimeConfig);
+  if (!status.enabled) {
+    const error = new Error('Template assistant is disabled in RuntimeConfigJson assistant.llm.enabled.');
+    error.statusCode = 503;
+    error.code = 'assistant_disabled';
+    throw error;
   }
-  return 'string';
+  if (!status.baseUrlAllowed) {
+    const error = new Error('LiteLLM base URL is not allowed by server configuration.');
+    error.statusCode = 400;
+    error.code = 'assistant_base_url_not_allowed';
+    throw error;
+  }
+  if (!LITELLM_API_KEY) {
+    const error = new Error('LiteLLM API key is not configured.');
+    error.statusCode = 503;
+    error.code = 'assistant_not_configured';
+    throw error;
+  }
+  return status;
 }
 
-function baaTablesFromRuntimeResult(result) {
-  return visibleRuntimeResultTables(result && result.tables).map((table) => {
-    const columns = Array.isArray(table.columns) ? table.columns : [];
-    const labels = table.columnLabels && typeof table.columnLabels === 'object' && !Array.isArray(table.columnLabels) ? table.columnLabels : {};
-    const rows = Array.isArray(table.rows) ? table.rows : [];
-    return {
-      code: table.name || '',
-      title: runtimeResultTableTitle(table),
-      columns: columns.map((column) => ({
-        name: column,
-        title: labels[column] || column,
-        type: inferBaaColumnType(rows, column)
-      })),
-      rows: rows.map((row) => {
-        const output = {};
-        columns.forEach((column) => {
-          output[column] = row && row[column] !== undefined ? row[column] : null;
-        });
-        return output;
+function stripJsonCodeFence(value) {
+  const text = String(value || '').trim();
+  const match = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(text);
+  return match ? match[1].trim() : text;
+}
+
+function assistantInvalidJsonError() {
+  const error = new Error('Assistant response did not contain parseable JSON.');
+  error.statusCode = 502;
+  error.code = 'assistant_invalid_json';
+  return error;
+}
+
+function jsonValueEndIndex(text, start) {
+  const open = text[start];
+  const close = open === '{' ? '}' : open === '[' ? ']' : '';
+  if (!close) return -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === open) {
+      depth += 1;
+      continue;
+    }
+    if (char === close) {
+      depth -= 1;
+      if (depth === 0) return index + 1;
+    }
+  }
+  return -1;
+}
+
+function parseFirstJsonValue(text) {
+  for (let start = 0; start < text.length; start += 1) {
+    const char = text[start];
+    if (char !== '{' && char !== '[') continue;
+    const end = jsonValueEndIndex(text, start);
+    if (end === -1) continue;
+    try {
+      return JSON.parse(text.slice(start, end));
+    } catch {
+      // Keep scanning; prose can contain JSON-like examples before the real draft.
+    }
+  }
+  throw assistantInvalidJsonError();
+}
+
+function parseAssistantJson(value) {
+  const text = stripJsonCodeFence(value);
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    return parseFirstJsonValue(text);
+  }
+}
+
+const MCP_TOOL_DEFINITIONS = [
+  {
+    name: 'cmdbuild_model_summary',
+    description: 'Read a bounded summary of visible CMDBuild classes and domains for the current user.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        maxClasses: { type: 'integer', minimum: 1, maximum: ASSISTANT_MCP_MAX_CLASSES_ABSOLUTE },
+        maxDomains: { type: 'integer', minimum: 1, maximum: ASSISTANT_MCP_MAX_DOMAINS_ABSOLUTE }
+      }
+    }
+  },
+  {
+    name: 'cmdbuild_class_fields',
+    description: 'Read attributes for one visible CMDBuild class.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        className: { type: 'string' }
+      },
+      required: ['className']
+    }
+  },
+  {
+    name: 'cmdbuild_relation_hints',
+    description: 'Read bounded domain/relation hints filtered by source or target class.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sourceClass: { type: 'string' },
+        targetClass: { type: 'string' },
+        maxDomains: { type: 'integer', minimum: 1, maximum: ASSISTANT_MCP_MAX_DOMAINS_ABSOLUTE }
+      }
+    }
+  },
+  {
+    name: 'cmdbuild_template_context',
+    description: 'Summarize the current template spec aliases, params, tables and diagrams.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        currentSpec: { type: 'object' }
+      }
+    }
+  }
+];
+
+function allMcpToolNames() {
+  return MCP_TOOL_DEFINITIONS.map((tool) => tool.name);
+}
+
+function normalizeToolListServer(value) {
+  if (Array.isArray(value)) return value.map((item) => String(item || '').trim()).filter(Boolean);
+  return String(value || '').split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function normalizeAssistantRuntimeConfig(runtimeConfig) {
+  const raw = runtimeConfig && typeof runtimeConfig === 'object' && !Array.isArray(runtimeConfig) ? runtimeConfig : {};
+  const rawAssistant = raw.assistant && typeof raw.assistant === 'object' && !Array.isArray(raw.assistant) ? raw.assistant : {};
+  const rawMcp = rawAssistant.mcp && typeof rawAssistant.mcp === 'object' && !Array.isArray(rawAssistant.mcp) ? rawAssistant.mcp : {};
+  const merged = mergeRuntimeConfigDefaults(runtimeConfig || defaultRuntimeConfig());
+  const executionLimits = normalizeExecutionLimitConfig(merged);
+  const assistant = merged.assistant || defaultRuntimeConfig().assistant;
+  const mcp = assistant.mcp && typeof assistant.mcp === 'object' && !Array.isArray(assistant.mcp) ? assistant.mcp : {};
+  const allowedExplicit = Object.prototype.hasOwnProperty.call(rawMcp, 'allowedTools');
+  const allowed = allowedExplicit ? normalizeToolListServer(rawMcp.allowedTools) : normalizeToolListServer(mcp.allowedTools);
+  const known = new Set(allMcpToolNames());
+  const filteredAllowed = allowed.filter((tool) => known.has(tool));
+  const invalidAllowedTools = allowed.filter((tool) => !known.has(tool));
+  const effectiveAllowedTools = allowedExplicit && allowed.length > 0 && filteredAllowed.length === 0
+    ? []
+    : (filteredAllowed.length ? filteredAllowed : allMcpToolNames());
+  const prompt = assistant.prompt && typeof assistant.prompt === 'object' && !Array.isArray(assistant.prompt) ? assistant.prompt : {};
+  const systemPrompt = String(prompt.system || '').trim() || DEFAULT_ASSISTANT_SYSTEM_PROMPT;
+  const maxClassesConfig = assistantLimitConfigValue(
+    'maxClasses',
+    Object.prototype.hasOwnProperty.call(rawMcp, 'maxClasses') ? mcp.maxClasses : undefined,
+    executionLimits.maxClassesDefault,
+    ASSISTANT_MCP_MAX_CLASSES_ABSOLUTE,
+    { clampedBy: 'CMDP_ASSISTANT_MCP_MAX_CLASSES_ABSOLUTE' }
+  );
+  const maxClasses = maxClassesConfig.value;
+  const maxDomainsConfig = assistantLimitConfigValue(
+    'maxDomains',
+    Object.prototype.hasOwnProperty.call(rawMcp, 'maxDomains') ? mcp.maxDomains : undefined,
+    executionLimits.maxDomainsDefault,
+    ASSISTANT_MCP_MAX_DOMAINS_ABSOLUTE,
+    { clampedBy: 'CMDP_ASSISTANT_MCP_MAX_DOMAINS_ABSOLUTE' }
+  );
+  const maxDomains = maxDomainsConfig.value;
+  const maxRelationDomainsConfig = assistantLimitConfigValue(
+    'maxRelationDomains',
+    Object.prototype.hasOwnProperty.call(rawMcp, 'maxRelationDomains') ? mcp.maxRelationDomains : undefined,
+    maxDomains,
+    ASSISTANT_MCP_MAX_DOMAINS_ABSOLUTE,
+    { clampedBy: 'CMDP_ASSISTANT_MCP_MAX_DOMAINS_ABSOLUTE' }
+  );
+  const maxRelationDomains = maxRelationDomainsConfig.value;
+  const maxCandidateClassesConfig = assistantLimitConfigValue(
+    'maxCandidateClasses',
+    mcp.maxCandidateClasses,
+    DEFAULT_ASSISTANT_MCP_MAX_CANDIDATE_CLASSES,
+    maxClasses,
+    { clampedBy: 'assistant.mcp.maxClasses' }
+  );
+  const maxCandidateClasses = maxCandidateClassesConfig.value;
+  const maxContextBytesConfig = assistantLimitConfigValue(
+    'maxContextBytes',
+    mcp.maxContextBytes,
+    DEFAULT_ASSISTANT_MCP_MAX_CONTEXT_BYTES,
+    ASSISTANT_MCP_MAX_CONTEXT_BYTES_ABSOLUTE,
+    { min: 1024, clampedBy: 'CMDP_ASSISTANT_MCP_MAX_CONTEXT_BYTES_ABSOLUTE' }
+  );
+  const timeoutMsConfig = assistantLimitConfigValue(
+    'timeoutMs',
+    mcp.timeoutMs,
+    DEFAULT_ASSISTANT_MCP_TIMEOUT_MS,
+    ASSISTANT_MCP_TIMEOUT_MS_ABSOLUTE,
+    { min: 1000, clampedBy: 'CMDP_ASSISTANT_MCP_TIMEOUT_MS_ABSOLUTE' }
+  );
+  const limitConfig = {
+    maxClasses: maxClassesConfig.detail,
+    maxDomains: maxDomainsConfig.detail,
+    maxRelationDomains: maxRelationDomainsConfig.detail,
+    maxCandidateClasses: maxCandidateClassesConfig.detail,
+    maxContextBytes: maxContextBytesConfig.detail,
+    timeoutMs: timeoutMsConfig.detail
+  };
+  const limitClamps = Object.values(limitConfig).filter((item) => item.clamped);
+  return {
+    llm: assistant.llm || {},
+    mcp: {
+      enabled: mcp.enabled !== false,
+      allowedTools: effectiveAllowedTools,
+      invalidAllowedTools,
+      maxContextBytes: maxContextBytesConfig.value,
+      timeoutMs: timeoutMsConfig.value,
+      maxClasses,
+      maxDomains,
+      maxRelationDomains,
+      maxCandidateClasses,
+      limitConfig,
+      limitClamps
+    },
+    prompt: {
+      system: systemPrompt
+    }
+  };
+}
+
+function mcpToolDefinitions(config) {
+  const configured = config && config.mcp && Array.isArray(config.mcp.allowedTools) ? config.mcp.allowedTools : allMcpToolNames();
+  const allowed = new Set(configured);
+  return MCP_TOOL_DEFINITIONS.filter((tool) => allowed.has(tool.name));
+}
+
+function mcpJsonRpcResult(id, result) {
+  return { jsonrpc: '2.0', id: id === undefined ? null : id, result };
+}
+
+function mcpJsonRpcError(id, code, message, data) {
+  return {
+    jsonrpc: '2.0',
+    id: id === undefined ? null : id,
+    error: {
+      code,
+      message,
+      data
+    }
+  };
+}
+
+function responseDataArray(response) {
+  return Array.isArray(response && response.json && response.json.data) ? response.json.data : [];
+}
+
+function responseTotalCount(response) {
+  const json = response && response.json && typeof response.json === 'object' && !Array.isArray(response.json) ? response.json : {};
+  const meta = json.meta && typeof json.meta === 'object' && !Array.isArray(json.meta) ? json.meta : {};
+  const values = [
+    json.total,
+    json.count,
+    json.size,
+    meta.total,
+    meta.count,
+    meta.size,
+    meta.totalCount,
+    meta.total_count
+  ];
+  const found = values.find((value) => Number.isFinite(Number(value)) && Number(value) >= 0);
+  return found === undefined ? null : Number(found);
+}
+
+function assistantLimitDiagnostic(input = {}) {
+  const returned = Number(input.returned || 0);
+  const limit = Number(input.limit || input.configuredLimit || 0);
+  const total = input.total === null || input.total === undefined ? null : Number(input.total);
+  const rawConfigured = input.rawConfigured === undefined ? null : Number(input.rawConfigured);
+  const effectiveLimit = input.effectiveLimit === undefined ? limit : Number(input.effectiveLimit);
+  const clamped = Boolean(input.clamped);
+  const limitHit = Boolean(
+    input.limitHit ||
+    clamped ||
+    input.truncated ||
+    input.timeout ||
+    limit > 0 && returned >= limit ||
+    total !== null && Number.isFinite(total) && total > returned
+  );
+  return {
+    source: input.source || 'assistant',
+    tool: input.tool || '',
+    limitName: input.limitName || 'limit',
+    configuredLimit: input.configuredLimit === undefined ? limit : Number(input.configuredLimit),
+    rawConfigured,
+    effectiveLimit,
+    requested: input.requested === undefined ? limit : Number(input.requested),
+    limit,
+    absoluteCap: input.absoluteCap === undefined ? null : Number(input.absoluteCap),
+    returned,
+    total,
+    limitHit,
+    clamped,
+    clampedBy: input.clampedBy || '',
+    truncated: Boolean(input.truncated),
+    timeout: Boolean(input.timeout),
+    reason: input.reason || ''
+  };
+}
+
+function assistantLimitDiagnosticKey(item) {
+  return [
+    item && item.source || '',
+    item && item.tool || '',
+    item && item.limitName || '',
+    item && item.reason || ''
+  ].join(':');
+}
+
+function addAssistantLimitDiagnostics(target, items) {
+  if (!Array.isArray(target) || !Array.isArray(items)) return;
+  const seen = new Set(target.map(assistantLimitDiagnosticKey));
+  items.forEach((item) => {
+    if (!item || !item.limitHit && !item.clamped && !item.truncated && !item.timeout) return;
+    const normalized = assistantLimitDiagnostic(item);
+    const key = assistantLimitDiagnosticKey(normalized);
+    if (seen.has(key)) return;
+    seen.add(key);
+    target.push(normalized);
+  });
+}
+
+function collectAssistantLimitDiagnostics(value, target = []) {
+  if (!value || typeof value !== 'object') return target;
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectAssistantLimitDiagnostics(item, target));
+    return target;
+  }
+  if (Array.isArray(value.limits)) {
+    value.limits.forEach((item) => {
+      if (item && typeof item === 'object' && !Array.isArray(item)) target.push(assistantLimitDiagnostic(item));
+    });
+  }
+  Object.values(value).forEach((item) => collectAssistantLimitDiagnostics(item, target));
+  return target;
+}
+
+function assistantLimitWarning(item) {
+  if (!item || !item.limitHit && !item.clamped && !item.truncated && !item.timeout) return '';
+  const tool = item.tool ? `${item.tool} ` : '';
+  if (item.clamped) {
+    const raw = item.rawConfigured === null || item.rawConfigured === undefined ? item.requested : item.rawConfigured;
+    const effective = item.effectiveLimit || item.configuredLimit || item.limit;
+    const by = item.clampedBy ? ` by ${item.clampedBy}${item.absoluteCap ? `=${item.absoluteCap}` : ''}` : '';
+    return `${tool}${item.limitName} was clamped: requested ${item.limitName}=${raw}, effective ${item.limitName}=${effective}${by}. Results may be incomplete.`;
+  }
+  if (item.timeout) {
+    return `${tool}${item.limitName} timeout reached: configured timeoutMs=${item.configuredLimit}. Results may be incomplete.`;
+  }
+  if (item.truncated || item.limitName === 'maxContextBytes') {
+    return `${tool}context limit reached: produced ${item.returned} bytes with configured maxContextBytes=${item.configuredLimit}. MCP context was truncated and results may be incomplete.`;
+  }
+  if (item.limitName === 'maxClasses') {
+    return `CMDBuild class context limit reached: returned ${item.returned} of configured maxClasses=${item.configuredLimit}. Results may be incomplete.`;
+  }
+  if (item.limitName === 'maxDomains' || item.limitName === 'maxRelationDomains') {
+    return `CMDBuild domain context limit reached: returned ${item.returned} of configured ${item.limitName}=${item.configuredLimit}. Results may be incomplete.`;
+  }
+  return `${tool}${item.limitName} limit reached: returned ${item.returned} of configured limit ${item.configuredLimit}. Results may be incomplete.`;
+}
+
+function assistantLimitWarningsFromDiagnostics(items) {
+  const warnings = [];
+  const seen = new Set();
+  (Array.isArray(items) ? items : []).forEach((item) => {
+    const warning = assistantLimitWarning(item);
+    if (!warning || seen.has(warning)) return;
+    seen.add(warning);
+    warnings.push(warning);
+  });
+  return warnings;
+}
+
+function logLimitDiagnostics(event, base, limits) {
+  (Array.isArray(limits) ? limits : []).forEach((item) => {
+    if (!item || !item.limitHit) return;
+    logWarn(event, {
+      ...base,
+      source: item.source || '',
+      tool: item.tool || '',
+      limitName: item.limitName || '',
+      configuredLimit: item.configuredLimit,
+      rawConfigured: item.rawConfigured,
+      effectiveLimit: item.effectiveLimit,
+      requested: item.requested,
+      limit: item.limit,
+      absoluteCap: item.absoluteCap,
+      clamped: Boolean(item.clamped),
+      clampedBy: item.clampedBy || '',
+      returned: item.returned,
+      total: item.total,
+      truncated: Boolean(item.truncated),
+      timeout: Boolean(item.timeout),
+      reason: item.reason || ''
+    });
+  });
+}
+
+function boundedMcpText(value, maxBytes) {
+  const text = JSON.stringify(value, null, 2);
+  const limit = Math.max(1024, Number(maxBytes || DEFAULT_ASSISTANT_MCP_MAX_CONTEXT_BYTES));
+  const bytes = Buffer.byteLength(text);
+  if (bytes <= limit) return { text, truncated: false, bytes, limit };
+  return {
+    text: text.slice(0, limit),
+    truncated: true,
+    bytes,
+    limit
+  };
+}
+
+function mcpTimeoutMs(config) {
+  return Math.max(1000, Math.min(60000, Number(config && config.mcp && config.mcp.timeoutMs || 10000) || 10000));
+}
+
+function withMcpTimeout(promise, config, toolName) {
+  let timeout;
+  const timeoutPromise = new Promise((resolve, reject) => {
+    timeout = setTimeout(() => {
+      const error = new Error(`MCP tool timed out: ${toolName || 'unknown'}`);
+      error.code = 'mcp_tool_timeout';
+      reject(error);
+    }, mcpTimeoutMs(config));
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeout));
+}
+
+function templateContextSummary(spec) {
+  const source = spec && typeof spec === 'object' && !Array.isArray(spec) ? spec : {};
+  const steps = Array.isArray(source.steps) ? source.steps : [];
+  const result = source.result && typeof source.result === 'object' && !Array.isArray(source.result) ? source.result : {};
+  return {
+    version: source.version || 1,
+    params: source.params && typeof source.params === 'object' && !Array.isArray(source.params) ? Object.keys(source.params) : [],
+    aliases: steps.map((step) => step && step.as).filter(Boolean),
+    steps: steps.map((step) => ({
+      type: step && step.type || '',
+      as: step && step.as || '',
+      from: step && step.from || '',
+      with: step && step.with || ''
+    })),
+    tables: Array.isArray(result.tables) ? result.tables.map((table) => ({
+      name: table && table.name || '',
+      columns: Array.isArray(table && table.columns) ? table.columns : []
+    })) : [],
+    diagrams: Array.isArray(result.diagrams) ? result.diagrams.map((diagram) => ({
+      name: diagram && diagram.name || '',
+      type: diagram && diagram.type || 'topology',
+      source: diagram && diagram.source || {}
+    })) : []
+  };
+}
+
+function classNamesFromTemplateSpec(spec) {
+  const source = spec && typeof spec === 'object' && !Array.isArray(spec) ? spec : {};
+  const steps = Array.isArray(source.steps) ? source.steps : [];
+  const values = [];
+  steps.forEach((step) => {
+    if (!step || typeof step !== 'object' || Array.isArray(step)) return;
+    ['className', 'targetClass', 'sourceClass'].forEach((key) => {
+      const value = step[key];
+      if (typeof value === 'string' && /^[A-Za-z][A-Za-z0-9_]*$/.test(value)) values.push(value);
+    });
+  });
+  return uniqueStrings(values).slice(0, 5);
+}
+
+async function mcpReadModelSummary(authToken, args, config) {
+  const mcp = config && config.mcp ? config.mcp : normalizeAssistantRuntimeConfig(defaultRuntimeConfig()).mcp;
+  const requestedClasses = Number(args && args.maxClasses || mcp.maxClasses);
+  const requestedDomains = Number(args && args.maxDomains || mcp.maxDomains);
+  const maxClasses = toPositiveInt(requestedClasses, mcp.maxClasses, mcp.maxClasses);
+  const maxDomains = toPositiveInt(requestedDomains, mcp.maxDomains, mcp.maxDomains);
+  const classes = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes?limit=${maxClasses}&detailed=true`, authToken);
+  const domains = await cmdbuildRequest(`/cmdbuild/services/rest/v3/domains?limit=${maxDomains}`, authToken);
+  if (!classes.ok) throw new Error(`CMDBuild classes request failed with status ${classes.statusCode}.`);
+  if (!domains.ok) throw new Error(`CMDBuild domains request failed with status ${domains.statusCode}.`);
+  const classItems = responseDataArray(classes).slice(0, maxClasses);
+  const domainItems = responseDataArray(domains).slice(0, maxDomains);
+  return {
+    limits: [
+      assistantLimitDiagnostic({
+        source: 'mcp',
+        tool: 'cmdbuild_model_summary',
+        limitName: 'maxClasses',
+        rawConfigured: mcp.limitConfig && mcp.limitConfig.maxClasses && mcp.limitConfig.maxClasses.rawConfigured,
+        configuredLimit: mcp.maxClasses,
+        effectiveLimit: mcp.maxClasses,
+        requested: requestedClasses,
+        limit: maxClasses,
+        absoluteCap: ASSISTANT_MCP_MAX_CLASSES_ABSOLUTE,
+        returned: classItems.length,
+        total: responseTotalCount(classes)
+      }),
+      assistantLimitDiagnostic({
+        source: 'mcp',
+        tool: 'cmdbuild_model_summary',
+        limitName: 'maxDomains',
+        rawConfigured: mcp.limitConfig && mcp.limitConfig.maxDomains && mcp.limitConfig.maxDomains.rawConfigured,
+        configuredLimit: mcp.maxDomains,
+        effectiveLimit: mcp.maxDomains,
+        requested: requestedDomains,
+        limit: maxDomains,
+        absoluteCap: ASSISTANT_MCP_MAX_DOMAINS_ABSOLUTE,
+        returned: domainItems.length,
+        total: responseTotalCount(domains)
       })
+    ],
+    classes: classItems.filter((item) => item && item._can_read !== false).map((item) => ({
+      name: item.name || '',
+      description: item._description_translation || item.description || '',
+      parent: item.parent || '',
+      canRead: item._can_read !== false
+    })),
+    domains: domainItems.map((item) => ({
+      name: item.name || '',
+      description: item._description_translation || item.description || '',
+      source: item.source || '',
+      destination: item.destination || '',
+      cardinality: item.cardinality || ''
+    }))
+  };
+}
+
+async function mcpReadClassFields(authToken, args) {
+  const className = validateCmdbuildIdentifier(args && args.className, 'className');
+  const attrs = await readCmdbuildClassAttributes(authToken, className);
+  if (!attrs.response.ok) throw new Error(`CMDBuild class attributes request failed with status ${attrs.response.statusCode}.`);
+  return {
+    className,
+    attributes: attrs.attributes.map((item) => ({
+      name: item.name || '',
+      description: item.description || '',
+      type: item.type || '',
+      targetClass: item.targetClass || item.target || '',
+      lookupType: item.lookupType || '',
+      mandatory: Boolean(item.mandatory),
+      inherited: Boolean(item.inherited)
+    }))
+  };
+}
+
+async function mcpReadRelationHints(authToken, args, config) {
+  const sourceClass = args && args.sourceClass ? validateCmdbuildIdentifier(args.sourceClass, 'sourceClass') : '';
+  const targetClass = args && args.targetClass ? validateCmdbuildIdentifier(args.targetClass, 'targetClass') : '';
+  const mcp = config && config.mcp ? config.mcp : normalizeAssistantRuntimeConfig(defaultRuntimeConfig()).mcp;
+  const requestedDomains = Number(args && args.maxDomains || mcp.maxRelationDomains || mcp.maxDomains);
+  const maxDomains = toPositiveInt(requestedDomains, mcp.maxRelationDomains || mcp.maxDomains, mcp.maxRelationDomains || mcp.maxDomains);
+  const domains = await cmdbuildRequest(`/cmdbuild/services/rest/v3/domains?limit=${maxDomains}`, authToken);
+  if (!domains.ok) throw new Error(`CMDBuild domains request failed with status ${domains.statusCode}.`);
+  const domainItems = responseDataArray(domains);
+  const filtered = domainItems.filter((item) => {
+    if (!item) return false;
+    if (sourceClass && item.source !== sourceClass && item.destination !== sourceClass) return false;
+    if (targetClass && item.source !== targetClass && item.destination !== targetClass) return false;
+    return true;
+  }).slice(0, maxDomains);
+  return {
+    sourceClass,
+    targetClass,
+    limits: [
+      assistantLimitDiagnostic({
+        source: 'mcp',
+        tool: 'cmdbuild_relation_hints',
+        limitName: 'maxRelationDomains',
+        rawConfigured: mcp.limitConfig && mcp.limitConfig.maxRelationDomains && mcp.limitConfig.maxRelationDomains.rawConfigured,
+        configuredLimit: mcp.maxRelationDomains || mcp.maxDomains,
+        effectiveLimit: mcp.maxRelationDomains || mcp.maxDomains,
+        requested: requestedDomains,
+        limit: maxDomains,
+        absoluteCap: ASSISTANT_MCP_MAX_DOMAINS_ABSOLUTE,
+        returned: domainItems.length,
+        total: responseTotalCount(domains)
+      })
+    ],
+    domains: filtered.map((item) => ({
+      name: item.name || '',
+      description: item._description_translation || item.description || '',
+      source: item.source || '',
+      destination: item.destination || '',
+      cardinality: item.cardinality || ''
+    }))
+  };
+}
+
+async function callMcpTool(authToken, name, args, config) {
+  const configured = config && config.mcp && Array.isArray(config.mcp.allowedTools) ? config.mcp.allowedTools : allMcpToolNames();
+  const allowed = new Set(configured);
+  if (!allowed.has(name)) {
+    const error = new Error(`MCP tool is not allowed: ${name}`);
+    error.code = 'mcp_tool_not_allowed';
+    throw error;
+  }
+  if (name === 'cmdbuild_model_summary') return mcpReadModelSummary(authToken, args || {}, config);
+  if (name === 'cmdbuild_class_fields') return mcpReadClassFields(authToken, args || {});
+  if (name === 'cmdbuild_relation_hints') return mcpReadRelationHints(authToken, args || {}, config);
+  if (name === 'cmdbuild_template_context') return templateContextSummary(args && (args.currentSpec || args.spec));
+  const error = new Error(`Unknown MCP tool: ${name}`);
+  error.code = 'mcp_tool_unknown';
+  throw error;
+}
+
+async function handleMcpJsonRpc(authToken, body, config) {
+  const id = body && Object.prototype.hasOwnProperty.call(body, 'id') ? body.id : null;
+  const method = String(body && body.method || '');
+  if (method === 'initialize') {
+    return mcpJsonRpcResult(id, {
+      protocolVersion: '2025-06-18',
+      serverInfo: { name: 'cmdbdynamicpages-cmdbuild-mcp', version: '0.1.0' },
+      capabilities: { tools: {} }
+    });
+  }
+  if (method === 'tools/list') {
+    return mcpJsonRpcResult(id, { tools: mcpToolDefinitions(config) });
+  }
+  if (method === 'tools/call') {
+    const params = body && body.params && typeof body.params === 'object' && !Array.isArray(body.params) ? body.params : {};
+    const name = String(params.name || '');
+    const args = params.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments) ? params.arguments : {};
+    try {
+      const result = await withMcpTimeout(callMcpTool(authToken, name, args, config), config, name);
+      const bounded = boundedMcpText(result, config && config.mcp && config.mcp.maxContextBytes);
+      const limitDiagnostics = collectAssistantLimitDiagnostics(result);
+      addAssistantLimitDiagnostics(limitDiagnostics, config && config.mcp && config.mcp.limitClamps || []);
+      if (bounded.truncated) {
+        limitDiagnostics.push(assistantLimitDiagnostic({
+          source: 'mcp',
+          tool: name,
+          limitName: 'maxContextBytes',
+          rawConfigured: config && config.mcp && config.mcp.limitConfig && config.mcp.limitConfig.maxContextBytes && config.mcp.limitConfig.maxContextBytes.rawConfigured,
+          configuredLimit: config && config.mcp && config.mcp.maxContextBytes,
+          effectiveLimit: config && config.mcp && config.mcp.maxContextBytes,
+          requested: bounded.bytes,
+          limit: bounded.limit,
+          absoluteCap: ASSISTANT_MCP_MAX_CONTEXT_BYTES_ABSOLUTE,
+          returned: bounded.bytes,
+          truncated: true
+        }));
+      }
+      return mcpJsonRpcResult(id, {
+        content: [{ type: 'text', text: bounded.text }],
+        structuredContent: bounded.truncated
+          ? { truncated: true, limits: limitDiagnostics.filter((item) => item.limitHit) }
+          : { ...result, limits: limitDiagnostics },
+        isError: false
+      });
+    } catch (error) {
+      return mcpJsonRpcError(id, -32602, error && error.message ? error.message : String(error), { code: error.code || 'mcp_tool_error' });
+    }
+  }
+  return mcpJsonRpcError(id, -32601, `Unsupported MCP method: ${method}`);
+}
+
+async function buildAssistantMcpContext(authToken, body, runtimeConfig) {
+  const config = normalizeAssistantRuntimeConfig(runtimeConfig);
+  if (!config.mcp.enabled) return { enabled: false, tools: [], results: [] };
+  const currentSpec = cloneJsonValueServer(body && (body.currentSpec || body.spec), {});
+  const toolNames = config.mcp.allowedTools;
+  const toolSet = new Set(toolNames);
+  const handledTools = new Set();
+  const intentText = assistantIntentText(body || {});
+  const intentTerms = assistantSearchTermsFromText(intentText);
+  const classMentions = assistantClassMentionsFromText(intentText);
+  const exactDescriptionFilters = assistantExactDescriptionFiltersFromText(intentText);
+  let classNames = classNamesFromTemplateSpec(currentSpec);
+  let modelSummary = null;
+  const results = [];
+  const warnings = [];
+  const diagnostics = {
+    intentTerms,
+    classMentions,
+    exactDescriptionFilters,
+    candidateClasses: [],
+    classFields: [],
+    limits: [],
+    effectiveLimits: {
+      maxClasses: config.mcp.maxClasses,
+      maxDomains: config.mcp.maxDomains,
+      maxRelationDomains: config.mcp.maxRelationDomains,
+      maxCandidateClasses: config.mcp.maxCandidateClasses,
+      maxContextBytes: config.mcp.maxContextBytes,
+      timeoutMs: config.mcp.timeoutMs
+    },
+    limitConfig: config.mcp.limitConfig || {}
+  };
+  const runTool = async (name, args) => {
+    try {
+      const result = await withMcpTimeout(callMcpTool(authToken, name, args, config), config, name);
+      addAssistantLimitDiagnostics(diagnostics.limits, collectAssistantLimitDiagnostics(result));
+      results.push({ tool: name, ok: true, result });
+      return result;
+    } catch (error) {
+      if (error && error.code === 'mcp_tool_timeout') {
+        addAssistantLimitDiagnostics(diagnostics.limits, [assistantLimitDiagnostic({
+          source: 'mcp',
+          tool: name,
+          limitName: 'timeoutMs',
+          rawConfigured: config.mcp.limitConfig && config.mcp.limitConfig.timeoutMs && config.mcp.limitConfig.timeoutMs.rawConfigured,
+          configuredLimit: config.mcp.timeoutMs,
+          effectiveLimit: config.mcp.timeoutMs,
+          requested: config.mcp.timeoutMs,
+          limit: config.mcp.timeoutMs,
+          absoluteCap: ASSISTANT_MCP_TIMEOUT_MS_ABSOLUTE,
+          timeout: true,
+          reason: 'tool-timeout'
+        })]);
+      }
+      results.push({ tool: name, ok: false, error: error && error.message ? error.message : String(error) });
+      return null;
+    }
+  };
+  addAssistantLimitDiagnostics(diagnostics.limits, config.mcp.limitClamps || []);
+
+  if (toolSet.has('cmdbuild_template_context')) {
+    handledTools.add('cmdbuild_template_context');
+    await runTool('cmdbuild_template_context', { currentSpec });
+  }
+  if (toolSet.has('cmdbuild_model_summary')) {
+    handledTools.add('cmdbuild_model_summary');
+    modelSummary = await runTool('cmdbuild_model_summary', { maxClasses: config.mcp.maxClasses, maxDomains: config.mcp.maxDomains });
+    const candidates = assistantCandidateClassesFromSummary(modelSummary, intentTerms, config.mcp.maxCandidateClasses);
+    diagnostics.candidateClasses = candidates.map((item) => ({
+      name: item.name,
+      description: item.description,
+      score: item.score,
+      matchedTerms: item.matchedTerms
+    }));
+    classNames = uniqueStrings(classNames.concat(candidates.map((item) => item.name)));
+  }
+  if (toolSet.has('cmdbuild_class_fields')) {
+    handledTools.add('cmdbuild_class_fields');
+    if (classNames.length) {
+      const classResults = [];
+      for (const className of classNames) {
+        try {
+          const result = await withMcpTimeout(callMcpTool(authToken, 'cmdbuild_class_fields', { className }, config), config, 'cmdbuild_class_fields');
+          classResults.push(result);
+          diagnostics.classFields.push({
+            className: result.className || className,
+            attributes: Array.isArray(result.attributes) ? result.attributes.length : 0
+          });
+        } catch (error) {
+          classResults.push({
+            className,
+            error: error && error.message ? error.message : String(error)
+          });
+          diagnostics.classFields.push({
+            className,
+            error: error && error.message ? error.message : String(error)
+          });
+        }
+      }
+      results.push({
+        tool: 'cmdbuild_class_fields',
+        ok: classResults.some((item) => item && !item.error),
+        result: classResults
+      });
+    }
+  }
+  if (toolSet.has('cmdbuild_relation_hints')) {
+    handledTools.add('cmdbuild_relation_hints');
+    await runTool('cmdbuild_relation_hints', { maxDomains: config.mcp.maxRelationDomains });
+  }
+  for (const name of toolNames) {
+    if (handledTools.has(name)) continue;
+    await runTool(name, {});
+  }
+  const bounded = boundedMcpText({ enabled: true, diagnostics, results }, config.mcp.maxContextBytes);
+  if (bounded.truncated) {
+    addAssistantLimitDiagnostics(diagnostics.limits, [assistantLimitDiagnostic({
+      source: 'assistant',
+      tool: 'buildAssistantMcpContext',
+      limitName: 'maxContextBytes',
+      rawConfigured: config.mcp.limitConfig && config.mcp.limitConfig.maxContextBytes && config.mcp.limitConfig.maxContextBytes.rawConfigured,
+      configuredLimit: config.mcp.maxContextBytes,
+      effectiveLimit: config.mcp.maxContextBytes,
+      requested: bounded.bytes,
+      limit: bounded.limit,
+      absoluteCap: ASSISTANT_MCP_MAX_CONTEXT_BYTES_ABSOLUTE,
+      returned: bounded.bytes,
+      truncated: true,
+      reason: 'assistant-context'
+    })]);
+  }
+  warnings.push(...assistantLimitWarningsFromDiagnostics(diagnostics.limits));
+  return {
+    enabled: true,
+    tools: toolNames,
+    truncated: bounded.truncated,
+    text: bounded.text,
+    diagnostics,
+    warnings
+  };
+}
+
+function assistantMessages(body, mcpContext, runtimeConfig) {
+  const intent = truncateText(body && body.intent || body && body.prompt || '', 4000);
+  const taskMode = normalizeRuntimeOutputMode(body && body.taskMode || body && body.outputMode || 'both');
+  const currentSpec = cloneJsonValueServer(body && (body.currentSpec || body.spec), {});
+  const assistantConfig = normalizeAssistantRuntimeConfig(runtimeConfig || defaultRuntimeConfig());
+  const system = [
+    'You are a CMDBuild custom page template assistant.',
+    'Return strict JSON only: {"spec": <DSL v1 spec>, "explanation": "...", "warnings": ["..."]}.',
+    'Return one JSON object only, with no prose, markdown, comments, examples, or extra text before or after it.',
+    'The top-level response must be an object, not an array or string.',
+    'Required response shape: {"spec":{"version":1,"steps":[...],"result":{"tables":[...]}},"explanation":"...","warnings":[]}.',
+    'The explanation text is not executable and never replaces spec.result; every draft must define at least one result table or diagram in the DSL.',
+    'Use deterministic CMDBuild DSL steps only. Do not use runtime LLM calls.',
+    'Allowed DSL v1 step types are: selectCards, filterRows, matchRows, expandRelations, joinRows, intersectRows, composeRows, enrichRows, traverseDomains, compareClassAttributes.',
+    'Never use unsupported pseudo steps such as findCard, findCards, searchCard, searchCards, queryCard, or queryCards.',
+    'To read CMDBuild cards, use selectCards with className, filters, as, and limit.',
+    'For matchRows, always use {"type":"matchRows","from":"leftAlias","with":"rightAlias","rules":[{"leftColumn":"...","rightColumn":"...","operator":"equals"}],"as":"matched"}. Never emit matchRows without from, with, and a non-empty rules array.',
+    'If you do not know the columns needed to match two sources, do not emit an empty matchRows step; add a warning instead.',
+    'For expandRelations.domain, use only CMDBuild domain identifiers from cmdbuild_relation_hints domains[].name; never write domain descriptions or user-facing relation labels into the DSL domain field.',
+    'If a relation description cannot be mapped to a CMDBuild domain name, omit expandRelations.domain and add a warning instead of inventing a domain value.',
+    'Use CMDBuild identifiers for className, targetClass, sourceClass, filter path/attribute, columns, and valueColumn/sourceColumn/fromColumn. User-facing descriptions from MCP context are hints only.',
+    'For class selection, prefer an exact class Description match for the user term over a specialized partial Description match. Use specialized classes only when the user explicitly names their full Description or Code.',
+    'When the request contains several class mentions, map each DSL step only to the class mention that describes that step. Do not let the target class mention change the source/anchor class mention.',
+    'When the user says a class instance has description "X" or с описанием "X", filter the source selectCards step with {"path":"Description","op":"equals","value":"X"}, not a broad contains filter.',
+    'When the user asks for target cards that have the same attribute value as a named source card, first select the named source card, then use a second selectCards step with "from":"sourceAlias" and a filter like {"path":"Location","op":"equals","valueColumn":"Location"}.',
+    'For same-attribute source-row filtering, prefer selectCards.from plus valueColumn/sourceColumn/fromColumn over matchRows; matchRows is for comparing two already materialized result sets.',
+    'Example source-row pattern: {"type":"selectCards","as":"anchor","className":"Router","filters":[{"path":"Description","op":"contains","value":"Router name"}],"columns":["Code","Description","Location"],"limit":5}, then {"type":"selectCards","as":"arms","from":"anchor","className":"Workstation","filters":[{"path":"Location","op":"equals","valueColumn":"Location"}],"columns":["Code","Description","Location"],"limit":100}.',
+    'For diagrams, use result.diagrams[] with type topology, source.nodes/source.edges, and fields nodeId/nodeLabel/nodeGroup/nodeHref/edgeSource/edgeTarget/edgeLabel.',
+    'Keep result.tables[] when the user asks for tables; add diagrams when graph/topology is requested.'
+  ].join('\n');
+  const user = JSON.stringify({
+    intent,
+    currentSpec,
+    taskMode,
+    mcpContext: mcpContext && mcpContext.enabled ? {
+      tools: mcpContext.tools,
+      truncated: Boolean(mcpContext.truncated),
+      warnings: Array.isArray(mcpContext.warnings) ? mcpContext.warnings : [],
+      limits: mcpContext.diagnostics && Array.isArray(mcpContext.diagnostics.limits) ? mcpContext.diagnostics.limits : [],
+      effectiveLimits: mcpContext.diagnostics && mcpContext.diagnostics.effectiveLimits || {},
+      data: mcpContext.text
+    } : { enabled: false },
+    constraints: {
+      runtimeCache: 'The result must stay deterministic and cacheable.',
+      endpointKind: 'runtime',
+      removedFeatures: ['BAA', 'baaPlanObjects', 'baaVerification']
+    }
+  }, null, 2);
+  return [
+    { role: 'system', content: system },
+    { role: 'system', content: assistantConfig.prompt.system },
+    { role: 'user', content: user }
+  ];
+}
+
+function isCmdbuildIdentifierText(value) {
+  return /^[A-Za-z][A-Za-z0-9_]*$/.test(String(value || '').trim());
+}
+
+function normalizedAssistantLookupText(value) {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function assistantSearchTermsFromText(value) {
+  const source = String(value || '');
+  const terms = [];
+  const seen = new Set();
+  const stopWords = new Set([
+    'find',
+    'all',
+    'card',
+    'cards',
+    'same',
+    'with',
+    'where',
+    'найди',
+    'найти',
+    'все',
+    'всех',
+    'карточки',
+    'карточек',
+    'которые',
+    'который',
+    'которая',
+    'находятся',
+    'находится',
+    'том',
+    'той',
+    'тот',
+    'та',
+    'же',
+    'что',
+    'для',
+    'этой',
+    'этого',
+    'этот',
+    'эта'
+  ]);
+  const add = (term) => {
+    const normalized = normalizedAssistantLookupText(term)
+      .replace(/^[^\p{L}\p{N}_]+|[^\p{L}\p{N}_]+$/gu, '');
+    if (!normalized || normalized.length < 2 || stopWords.has(normalized) || seen.has(normalized)) return;
+    seen.add(normalized);
+    terms.push(normalized);
+  };
+
+  const quoted = source.matchAll(/"([^"]+)"|'([^']+)'|«([^»]+)»/g);
+  for (const match of quoted) {
+    const phrase = match[1] || match[2] || match[3] || '';
+    add(phrase);
+    phrase.split(/[^\p{L}\p{N}_]+/u).forEach(add);
+  }
+  const tokenGroups = source.split(/[\n\r.;:!?()[\]{}]+/u).map((part) => (
+    part.split(/[^\p{L}\p{N}_]+/u)
+      .map((token) => normalizedAssistantLookupText(token).replace(/^[^\p{L}\p{N}_]+|[^\p{L}\p{N}_]+$/gu, ''))
+      .filter((token) => token && token.length >= 2 && !stopWords.has(token))
+  )).filter((tokens) => tokens.length);
+  tokenGroups.forEach((tokens) => tokens.forEach(add));
+  tokenGroups.forEach((tokens) => {
+    for (let size = Math.min(4, tokens.length); size >= 2; size -= 1) {
+      for (let index = 0; index <= tokens.length - size; index += 1) {
+        add(tokens.slice(index, index + size).join(' '));
+      }
+    }
+  });
+  return terms.slice(0, 40);
+}
+
+function assistantTrimClassMentionText(value) {
+  return String(value || '')
+    .replace(/\s+(?:котор(?:ый|ая|ое|ые|ого|ой|ых|ыми|ом|ую|ые)?|наход(?:ится|ятся)|с\s+описанием|с\s+description|где|что|that|which|with\s+description)(?=\s|$)[\s\S]*$/iu, '')
+    .trim();
+}
+
+function assistantClassMentionsFromText(value) {
+  const source = String(value || '');
+  const mentions = [];
+  const seen = new Set();
+  const add = (term) => {
+    const normalized = normalizedAssistantLookupText(term)
+      .replace(/^[^\p{L}\p{N}_]+|[^\p{L}\p{N}_]+$/gu, '');
+    if (!normalized || normalized.length < 2 || seen.has(normalized)) return;
+    seen.add(normalized);
+    mentions.push(normalized);
+  };
+  const quotedRegex = /(?:^|[^\p{L}\p{N}_])(?:экземпляр\s+)?класс(?:а|ов|ы|е|ом|у)?\s+(?:"([^"]+)"|'([^']+)'|«([^»]+)»)/giu;
+  for (const match of source.matchAll(quotedRegex)) {
+    add(match[1] || match[2] || match[3] || '');
+  }
+  const plainRegex = /(?:^|[^\p{L}\p{N}_])(?:экземпляр\s+)?класс(?:а|ов|ы|е|ом|у)?\s+([A-Za-zА-Яа-яЁё0-9_ -]+?)(?=\s+(?:котор|наход|с\s+описанием|с\s+description|где|что|that|which|with\s+description|и\s+экземпляр|и\s+класс)|[.,;:!?()[\]{}"«»]|$)/giu;
+  for (const match of source.matchAll(plainRegex)) {
+    add(assistantTrimClassMentionText(match[1] || ''));
+  }
+  return mentions.slice(0, 20);
+}
+
+function assistantExactDescriptionFiltersFromText(value) {
+  const source = String(value || '');
+  const filters = [];
+  const seen = new Set();
+  const add = (classMention, description) => {
+    const mention = assistantTrimClassMentionText(classMention);
+    const valueText = String(description || '').trim();
+    const normalizedMention = normalizedAssistantLookupText(mention);
+    const normalizedValue = normalizedAssistantLookupText(valueText);
+    const key = `${normalizedMention}:${normalizedValue}`;
+    if (!normalizedMention || !valueText || seen.has(key)) return;
+    seen.add(key);
+    filters.push({
+      classMention: normalizedMention,
+      description: valueText
+    });
+  };
+  const quotedClassRegex = /(?:экземпляр\s+)?класс(?:а|ов|ы|е|ом|у)?\s+(?:"([^"]+)"|'([^']+)'|«([^»]+)»)\s+с\s+(?:точн(?:ым|ое)\s+)?(?:описанием|description)\s+(?:"([^"]+)"|'([^']+)'|«([^»]+)»)/giu;
+  for (const match of source.matchAll(quotedClassRegex)) {
+    add(match[1] || match[2] || match[3] || '', match[4] || match[5] || match[6] || '');
+  }
+  const plainClassRegex = /(?:экземпляр\s+)?класс(?:а|ов|ы|е|ом|у)?\s+([A-Za-zА-Яа-яЁё0-9_ -]+?)\s+с\s+(?:точн(?:ым|ое)\s+)?(?:описанием|description)\s+(?:"([^"]+)"|'([^']+)'|«([^»]+)»)/giu;
+  for (const match of source.matchAll(plainClassRegex)) {
+    add(match[1] || '', match[2] || match[3] || match[4] || '');
+  }
+  return filters.slice(0, 20);
+}
+
+function assistantClassTextScore(classItem, terms) {
+  const name = normalizedAssistantLookupText(classItem && classItem.name);
+  const description = normalizedAssistantLookupText(classItem && classItem.description);
+  const parent = normalizedAssistantLookupText(classItem && classItem.parent);
+  if (!name) return { score: 0, matchedTerms: [] };
+  let score = 0;
+  const matchedTerms = [];
+  for (const term of terms || []) {
+    if (!term || /^\d+$/.test(term)) continue;
+    let matched = false;
+    if (name === term) {
+      score += 20;
+      matched = true;
+    } else if (name.includes(term)) {
+      score += 9;
+      matched = true;
+    } else if (term.includes(name) && name.length >= 3) {
+      score += 6;
+      matched = true;
+    }
+    if (description === term) {
+      score += 22;
+      matched = true;
+    } else if (description.includes(term)) {
+      score += 12;
+      matched = true;
+    } else if (term.includes(description) && description.length >= 3) {
+      score += 7;
+      matched = true;
+    }
+    if (parent && (parent === term || parent.includes(term))) {
+      score += 3;
+      matched = true;
+    }
+    if (matched && !matchedTerms.includes(term)) matchedTerms.push(term);
+  }
+  return { score, matchedTerms };
+}
+
+function assistantCandidateClassesFromSummary(summary, terms, limit = 8) {
+  const classes = Array.isArray(summary && summary.classes) ? summary.classes : [];
+  return classes
+    .map((item) => {
+      const name = String(item && (item.name || item.code || item.className) || '').trim();
+      if (!isCmdbuildIdentifierText(name)) return null;
+      const description = String(item && (item.description || item._description_translation || '') || '').trim();
+      const parent = String(item && item.parent || '').trim();
+      const scored = assistantClassTextScore({ name, description, parent }, terms);
+      if (!scored.score) return null;
+      return {
+        name,
+        description,
+        parent,
+        score: scored.score,
+        matchedTerms: scored.matchedTerms
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.score - left.score || left.name.localeCompare(right.name))
+    .slice(0, Math.max(1, Math.min(20, Number(limit || 8) || 8)));
+}
+
+function assistantSetLookupMapValue(map, key, value) {
+  const normalizedKey = normalizedAssistantLookupText(key);
+  const normalizedValue = String(value || '').trim();
+  if (!normalizedKey || !normalizedValue) return;
+  const existing = map.get(normalizedKey);
+  if (existing && existing !== normalizedValue) {
+    map.set(normalizedKey, '');
+    return;
+  }
+  if (existing === undefined) map.set(normalizedKey, normalizedValue);
+}
+
+function collectAssistantRelationDomainHints(value, hints) {
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectAssistantRelationDomainHints(item, hints));
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  if (Array.isArray(value.domains)) {
+    value.domains.forEach((domain) => {
+      if (!domain || typeof domain !== 'object' || Array.isArray(domain)) return;
+      const name = String(domain.name || domain.code || domain.domain || '').trim();
+      if (!isCmdbuildIdentifierText(name)) return;
+      hints.push({
+        name,
+        description: String(domain.description || domain._description_translation || '').trim()
+      });
+    });
+  }
+  Object.values(value).forEach((item) => collectAssistantRelationDomainHints(item, hints));
+}
+
+function assistantRelationDomainHints(options = {}) {
+  const hints = [];
+  if (Array.isArray(options.relationDomainHints)) {
+    options.relationDomainHints.forEach((domain) => {
+      if (!domain || typeof domain !== 'object' || Array.isArray(domain)) return;
+      const name = String(domain.name || domain.code || domain.domain || '').trim();
+      if (!isCmdbuildIdentifierText(name)) return;
+      hints.push({
+        name,
+        description: String(domain.description || domain._description_translation || '').trim()
+      });
+    });
+  }
+  const mcpText = options.mcpContext && typeof options.mcpContext.text === 'string' ? options.mcpContext.text : '';
+  if (mcpText) {
+    try {
+      collectAssistantRelationDomainHints(JSON.parse(mcpText), hints);
+    } catch {
+      // Ignore malformed/truncated MCP context; validation remains strict.
+    }
+  }
+  return hints;
+}
+
+function assistantRelationDomainMap(options = {}) {
+  const values = new Map();
+  assistantRelationDomainHints(options).forEach((domain) => {
+    [domain.name, domain.description].forEach((text) => {
+      const key = normalizedAssistantLookupText(text);
+      if (!key) return;
+      const existing = values.get(key);
+      if (existing && existing !== domain.name) {
+        values.set(key, '');
+        return;
+      }
+      if (existing === undefined) values.set(key, domain.name);
+    });
+  });
+  return values;
+}
+
+function normalizeAssistantExpandRelationsDomain(step, warnings, index, options = {}) {
+  if (!Object.prototype.hasOwnProperty.call(step, 'domain')) return step;
+  const domains = normalizeStringList(step.domain);
+  if (!domains.length) {
+    delete step.domain;
+    return step;
+  }
+  const domainMap = assistantRelationDomainMap(options);
+  const normalizedDomains = [];
+  domains.forEach((domain) => {
+    if (isCmdbuildIdentifierText(domain)) {
+      normalizedDomains.push(domain);
+      return;
+    }
+    const mapped = domainMap.get(normalizedAssistantLookupText(domain));
+    if (mapped && isCmdbuildIdentifierText(mapped)) {
+      normalizedDomains.push(mapped);
+      warnings.push(`Assistant normalized expandRelations domain "${domain}" to CMDBuild domain "${mapped}" at $.steps[${index}].`);
+      return;
+    }
+    warnings.push(`Assistant removed invalid expandRelations domain "${domain}" at $.steps[${index}] because it is not a CMDBuild identifier and no MCP domain name match was found.`);
+  });
+  const uniqueDomains = uniqueStrings(normalizedDomains);
+  if (uniqueDomains.length) {
+    step.domain = uniqueDomains.length === 1 ? uniqueDomains[0] : uniqueDomains;
+  } else {
+    delete step.domain;
+  }
+  return step;
+}
+
+function collectAssistantClassHints(value, hints) {
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectAssistantClassHints(item, hints));
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  const arrays = [];
+  if (Array.isArray(value.classes)) arrays.push(value.classes);
+  if (Array.isArray(value.candidateClasses)) arrays.push(value.candidateClasses);
+  arrays.forEach((items) => {
+    items.forEach((item) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return;
+      const name = String(item.name || item.code || item.className || '').trim();
+      if (!isCmdbuildIdentifierText(name)) return;
+      hints.push({
+        name,
+        description: String(item.description || item._description_translation || '').trim(),
+        parent: String(item.parent || '').trim()
+      });
+    });
+  });
+  Object.values(value).forEach((item) => collectAssistantClassHints(item, hints));
+}
+
+function assistantClassHints(options = {}) {
+  const hints = [];
+  if (Array.isArray(options.classHints)) collectAssistantClassHints({ classes: options.classHints }, hints);
+  if (options.mcpContext && options.mcpContext.diagnostics) collectAssistantClassHints(options.mcpContext.diagnostics, hints);
+  const mcpText = options.mcpContext && typeof options.mcpContext.text === 'string' ? options.mcpContext.text : '';
+  if (mcpText) {
+    try {
+      collectAssistantClassHints(JSON.parse(mcpText), hints);
+    } catch {
+      // Ignore malformed/truncated MCP context; validation remains strict.
+    }
+  }
+  const unique = new Map();
+  hints.forEach((hint) => {
+    const key = hint.name.toLowerCase();
+    if (!unique.has(key)) unique.set(key, hint);
+  });
+  return Array.from(unique.values());
+}
+
+function assistantClassMap(options = {}) {
+  const values = new Map();
+  assistantClassHints(options).forEach((item) => {
+    [item.name, item.description].forEach((text) => assistantSetLookupMapValue(values, text, item.name));
+  });
+  return values;
+}
+
+function collectAssistantClassFieldHints(value, hints) {
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectAssistantClassFieldHints(item, hints));
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  if (Array.isArray(value.attributes) && (value.className || value.name)) {
+    const className = String(value.className || value.name || '').trim();
+    if (isCmdbuildIdentifierText(className)) {
+      hints.push({
+        className,
+        attributes: value.attributes.map((attr) => {
+          if (!attr || typeof attr !== 'object' || Array.isArray(attr)) return null;
+          const name = String(attr.name || attr.code || attr.attribute || attr.field || '').trim();
+          if (!name) return null;
+          return {
+            name,
+            description: String(attr.description || attr._description_translation || '').trim()
+          };
+        }).filter(Boolean)
+      });
+    }
+  }
+  Object.values(value).forEach((item) => collectAssistantClassFieldHints(item, hints));
+}
+
+function assistantClassFieldHints(options = {}) {
+  const hints = [];
+  if (Array.isArray(options.classFieldHints)) collectAssistantClassFieldHints(options.classFieldHints, hints);
+  const mcpText = options.mcpContext && typeof options.mcpContext.text === 'string' ? options.mcpContext.text : '';
+  if (mcpText) {
+    try {
+      collectAssistantClassFieldHints(JSON.parse(mcpText), hints);
+    } catch {
+      // Ignore malformed/truncated MCP context; validation remains strict.
+    }
+  }
+  return hints;
+}
+
+function assistantClassFieldMap(options = {}, className = '') {
+  const classKey = normalizedAssistantLookupText(className);
+  const values = new Map();
+  [
+    { name: 'Code', description: 'Код' },
+    { name: 'Description', description: 'Описание' },
+    { name: 'Class', description: 'Класс' },
+    { name: '_id', description: 'ID' }
+  ].forEach((field) => {
+    assistantSetLookupMapValue(values, field.name, field.name);
+    assistantSetLookupMapValue(values, field.description, field.name);
+  });
+  assistantClassFieldHints(options).forEach((hint) => {
+    const hintClass = normalizedAssistantLookupText(hint.className);
+    if (classKey && hintClass && hintClass !== classKey) return;
+    (hint.attributes || []).forEach((field) => {
+      const name = String(field && field.name || '').trim();
+      if (!name) return;
+      assistantSetLookupMapValue(values, name, name);
+      assistantSetLookupMapValue(values, field.description, name);
+    });
+  });
+  return values;
+}
+
+function assistantNormalizationDiagnostics(options = {}) {
+  if (!options.state) return null;
+  if (!options.state.diagnostics) {
+    options.state.diagnostics = {
+      normalizedClasses: [],
+      normalizedFields: []
     };
+  }
+  return options.state.diagnostics;
+}
+
+function recordAssistantNormalizedClass(options, index, field, fromValue, toValue) {
+  const diagnostics = assistantNormalizationDiagnostics(options);
+  if (!diagnostics || fromValue === toValue) return;
+  diagnostics.normalizedClasses.push({
+    step: index,
+    field,
+    from: fromValue,
+    to: toValue
   });
 }
 
-function baaResponseFromRuntimeResult(result, template) {
-  const tables = baaTablesFromRuntimeResult(result);
-  return baaEnvelope({
-    success: true,
-    status: 'completed',
-    title: template && (template.description || template.code) || '',
-    message: '',
-    tables,
-    items: [],
-    data: {}
+function recordAssistantNormalizedField(options, index, field, className, fromValue, toValue) {
+  const diagnostics = assistantNormalizationDiagnostics(options);
+  if (!diagnostics || fromValue === toValue) return;
+  diagnostics.normalizedFields.push({
+    step: index,
+    field,
+    className: className || '',
+    from: fromValue,
+    to: toValue
   });
 }
 
-function baaErrorCodeFromError(error) {
-  if (errorLooksPermissionDenied(error)) return 'CMDB_PERMISSION_DENIED';
-  const message = error && error.message ? String(error.message) : String(error || '');
-  if (/limit|maximum|maxRows|maxRestCalls|maxClasses|maxDomains/i.test(message)) return 'EXECUTION_LIMIT_EXCEEDED';
-  return 'EXECUTION_ERROR';
+function recordAssistantClassSelectionDiagnostic(options, item) {
+  const diagnostics = assistantNormalizationDiagnostics(options);
+  if (!diagnostics) return;
+  if (!Array.isArray(diagnostics.classSelection)) diagnostics.classSelection = [];
+  diagnostics.classSelection.push(item);
 }
 
-function baaErrorResponse(code, message, status = 'error', extraItems = []) {
-  return baaEnvelope({
-    success: false,
-    status,
-    message,
-    tables: [],
-    items: [baaErrorItem(code, message)].concat(extraItems || []),
-    data: {}
+function recordAssistantResultRepair(options, item) {
+  const diagnostics = assistantNormalizationDiagnostics(options);
+  if (!diagnostics) return;
+  if (!Array.isArray(diagnostics.resultRepair)) diagnostics.resultRepair = [];
+  diagnostics.resultRepair.push(item);
+}
+
+function recordAssistantDescriptionFilterRepair(options, item) {
+  const diagnostics = assistantNormalizationDiagnostics(options);
+  if (!diagnostics) return;
+  if (!Array.isArray(diagnostics.descriptionFilterRepair)) diagnostics.descriptionFilterRepair = [];
+  diagnostics.descriptionFilterRepair.push(item);
+}
+
+function assistantNormalizationErrors(options = {}) {
+  if (!options.state) return [];
+  if (!Array.isArray(options.state.errors)) options.state.errors = [];
+  return options.state.errors;
+}
+
+function recordAssistantNormalizationError(options, path, message) {
+  const errors = assistantNormalizationErrors(options);
+  errors.push({ path, message });
+}
+
+function assistantIntentTermSet(options = {}) {
+  const values = [];
+  if (Array.isArray(options.intentTerms)) values.push(...options.intentTerms);
+  if (options.mcpContext && options.mcpContext.diagnostics && Array.isArray(options.mcpContext.diagnostics.intentTerms)) {
+    values.push(...options.mcpContext.diagnostics.intentTerms);
+  }
+  return new Set(values.map((item) => normalizedAssistantLookupText(item)).filter(Boolean));
+}
+
+function assistantClassMentionSet(options = {}) {
+  const values = [];
+  if (Array.isArray(options.classMentions)) values.push(...options.classMentions);
+  if (options.mcpContext && options.mcpContext.diagnostics && Array.isArray(options.mcpContext.diagnostics.classMentions)) {
+    values.push(...options.mcpContext.diagnostics.classMentions);
+  }
+  return new Set(values.map((item) => normalizedAssistantLookupText(item)).filter(Boolean));
+}
+
+function assistantExactDescriptionClassForMention(mention, options = {}) {
+  const normalizedMention = normalizedAssistantLookupText(mention);
+  if (!normalizedMention) return null;
+  const matches = assistantClassHints(options).filter((item) => (
+    normalizedAssistantLookupText(item.description) === normalizedMention ||
+    normalizedAssistantLookupText(item.name) === normalizedMention
+  ));
+  const uniqueNames = uniqueStrings(matches.map((item) => item.name));
+  if (uniqueNames.length !== 1) return null;
+  return matches.find((item) => item.name === uniqueNames[0]) || null;
+}
+
+function assistantContextLimitHit(options = {}, limitName = '') {
+  const limits = options.mcpContext && options.mcpContext.diagnostics && Array.isArray(options.mcpContext.diagnostics.limits)
+    ? options.mcpContext.diagnostics.limits
+    : [];
+  return limits.some((item) => item && item.limitHit && (!limitName || item.limitName === limitName));
+}
+
+function assistantMatchingMentionForSelectedClass(selected, options = {}) {
+  if (!selected) return '';
+  const mentions = Array.from(assistantClassMentionSet(options));
+  const selectedDescription = normalizedAssistantLookupText(selected.description);
+  const selectedName = normalizedAssistantLookupText(selected.name);
+  if (!mentions.length || !selectedDescription && !selectedName) return '';
+  const exact = mentions.find((mention) => mention === selectedDescription || mention === selectedName);
+  if (exact) return exact;
+  const partial = mentions.filter((mention) => (
+    mention.length >= 3 &&
+    selectedDescription &&
+    selectedDescription !== mention &&
+    selectedDescription.includes(mention)
+  ));
+  partial.sort((left, right) => right.length - left.length || left.localeCompare(right));
+  return partial[0] || '';
+}
+
+function assistantSemanticClassAction(original, selected, options = {}) {
+  if (!selected) return { type: 'keep' };
+  const termSet = assistantIntentTermSet(options);
+  const selectedName = normalizedAssistantLookupText(selected.name);
+  if (selectedName && termSet.has(selectedName)) return { type: 'keep' };
+  const mention = assistantMatchingMentionForSelectedClass(selected, options);
+  if (!mention) return { type: 'keep' };
+  const selectedDescription = normalizedAssistantLookupText(selected.description);
+  if (mention === selectedDescription || mention === selectedName) return { type: 'keep' };
+  const exactClass = assistantExactDescriptionClassForMention(mention, options);
+  if (exactClass && exactClass.name !== selected.name) {
+    return { type: 'replace', mention, target: exactClass };
+  }
+  if (exactClass && exactClass.name === selected.name) return { type: 'keep' };
+  const classLimitHit = assistantContextLimitHit(options, 'maxClasses');
+  return {
+    type: 'warn',
+    mention,
+    message: classLimitHit
+      ? `Assistant selected class "${selected.name}" with Description "${selected.description}" for class mention "${mention}", but this is only a specialized partial match and CMDBuild class context limit was reached, so an exact class may be missing from assistant context.`
+      : `Assistant selected class "${selected.name}" with Description "${selected.description}" for class mention "${mention}", but this is only a specialized partial match and no unique exact class Description match was found in MCP context.`
+  };
+}
+
+function normalizeAssistantClassNameValue(value, warnings, index, field, options = {}) {
+  const original = typeof value === 'string' ? value.trim() : '';
+  if (!original) return original;
+  const classHints = assistantClassHints(options);
+  const exactName = classHints.find((item) => normalizedAssistantLookupText(item.name) === normalizedAssistantLookupText(original));
+  if (exactName) {
+    const action = assistantSemanticClassAction(original, exactName, options);
+    if (action.type === 'replace' && action.target && isCmdbuildIdentifierText(action.target.name)) {
+      warnings.push(`Assistant normalized ${field} "${original}" to CMDBuild class "${action.target.name}" at $.steps[${index}] because class mention "${action.mention}" exactly matches class Description "${action.target.description}".`);
+      recordAssistantNormalizedClass(options, index, field, original, action.target.name);
+      recordAssistantClassSelectionDiagnostic(options, {
+        step: index,
+        field,
+        from: original,
+        to: action.target.name,
+        mention: action.mention,
+        reason: 'exact-description-for-same-mention'
+      });
+      return action.target.name;
+    }
+    if (action.type === 'warn') {
+      warnings.push(action.message);
+      recordAssistantClassSelectionDiagnostic(options, {
+        step: index,
+        field,
+        selected: original,
+        mention: action.mention,
+        reason: 'specialized-partial-without-exact-description'
+      });
+    }
+    return exactName.name;
+  }
+  const mapped = assistantClassMap(options).get(normalizedAssistantLookupText(original));
+  if (mapped && isCmdbuildIdentifierText(mapped)) {
+    warnings.push(`Assistant normalized ${field} "${original}" to CMDBuild class "${mapped}" at $.steps[${index}].`);
+    recordAssistantNormalizedClass(options, index, field, original, mapped);
+    return mapped;
+  }
+  return original;
+}
+
+function normalizeAssistantClassListField(step, field, warnings, index, options = {}) {
+  if (!Object.prototype.hasOwnProperty.call(step, field)) return;
+  const values = normalizeStringList(step[field]);
+  if (!values.length) {
+    delete step[field];
+    return;
+  }
+  const normalized = values.map((item) => normalizeAssistantClassNameValue(item, warnings, index, field, options)).filter(Boolean);
+  step[field] = Array.isArray(step[field]) ? uniqueStrings(normalized) : uniqueStrings(normalized).join(',');
+}
+
+function normalizeAssistantFieldPathValue(value, className, warnings, index, field, options = {}) {
+  const original = typeof value === 'string' ? value.trim() : '';
+  if (!original || original.startsWith('{')) return original;
+  const dotIndex = original.indexOf('.');
+  const head = dotIndex === -1 ? original : original.slice(0, dotIndex);
+  const suffix = dotIndex === -1 ? '' : original.slice(dotIndex);
+  const fieldHints = assistantClassFieldHints(options);
+  const exact = fieldHints
+    .filter((hint) => !className || normalizedAssistantLookupText(hint.className) === normalizedAssistantLookupText(className))
+    .flatMap((hint) => hint.attributes || [])
+    .find((attr) => normalizedAssistantLookupText(attr && attr.name) === normalizedAssistantLookupText(head));
+  if (exact && exact.name) return `${exact.name}${suffix}`;
+  const mapped = assistantClassFieldMap(options, className).get(normalizedAssistantLookupText(head));
+  if (mapped) {
+    const next = `${mapped}${suffix}`;
+    if (next !== original) {
+      const location = index >= 0 ? `$.steps[${index}]` : '$.result';
+      warnings.push(`Assistant normalized ${field} "${original}" to CMDBuild field "${next}" at ${location}.`);
+      recordAssistantNormalizedField(options, index, field, className, original, next);
+    }
+    return next;
+  }
+  return original;
+}
+
+function normalizeAssistantObjectFieldReference(object, keys, className, warnings, index, options = {}) {
+  keys.forEach((key) => {
+    if (!object || typeof object !== 'object' || Array.isArray(object) || typeof object[key] !== 'string') return;
+    object[key] = normalizeAssistantFieldPathValue(object[key], className, warnings, index, key, options);
   });
+}
+
+function normalizeAssistantColumnSpecs(columns, className, warnings, index, options = {}) {
+  if (!Array.isArray(columns)) return columns;
+  return columns.map((column) => {
+    if (typeof column === 'string') {
+      return normalizeAssistantFieldPathValue(column, className, warnings, index, 'columns', options);
+    }
+    if (!column || typeof column !== 'object' || Array.isArray(column)) return column;
+    const next = cloneJsonValueServer(column, column);
+    normalizeAssistantObjectFieldReference(next, ['path', 'field', 'column'], className, warnings, index, options);
+    return next;
+  });
+}
+
+function normalizeAssistantSelectCardsIdentifiers(step, warnings, index, options = {}) {
+  if (typeof step.className === 'string') {
+    step.className = normalizeAssistantClassNameValue(step.className, warnings, index, 'className', options);
+  }
+  const className = step.className || '';
+  const sourceClassName = step.from && options.state && options.state.aliasClasses
+    ? options.state.aliasClasses.get(step.from) || ''
+    : '';
+  const filters = Array.isArray(step.filters || step.where) ? (step.filters || step.where) : [];
+  const sourceColumns = [];
+  filters.forEach((filter) => {
+    if (!filter || typeof filter !== 'object' || Array.isArray(filter)) return;
+    normalizeAssistantObjectFieldReference(filter, ['path', 'attribute', 'column', 'field'], className, warnings, index, options);
+    normalizeAssistantObjectFieldReference(filter, ['valueColumn', 'sourceColumn', 'fromColumn'], sourceClassName || className, warnings, index, options);
+    ['valueColumn', 'sourceColumn', 'fromColumn'].forEach((field) => {
+      if (typeof filter[field] === 'string' && filter[field].trim()) sourceColumns.push(filter[field].trim());
+    });
+  });
+  ['columns', 'cardColumns', 'outputColumns'].forEach((field) => {
+    if (Array.isArray(step[field])) step[field] = normalizeAssistantColumnSpecs(step[field], className, warnings, index, options);
+  });
+  if (sourceColumns.length && step.from && options.state && options.state.aliasSteps && options.state.aliasSteps.has(step.from)) {
+    const sourceStep = options.state.aliasSteps.get(step.from);
+    if (sourceStep && sourceStep.type === 'selectCards') {
+      if (!Array.isArray(sourceStep.columns)) sourceStep.columns = [];
+      const added = [];
+      uniqueStrings(sourceColumns).forEach((column) => {
+        if (!sourceStep.columns.includes(column)) {
+          sourceStep.columns.push(column);
+          added.push(column);
+        }
+      });
+      if (added.length) warnings.push(`Assistant added source columns ${added.join(', ')} to $.steps source alias "${step.from}" for valueColumn filtering at $.steps[${index}].`);
+    }
+  }
+}
+
+function assistantExactDescriptionFilters(options = {}) {
+  const values = [];
+  if (Array.isArray(options.exactDescriptionFilters)) values.push(...options.exactDescriptionFilters);
+  const diagnostics = options.mcpContext && options.mcpContext.diagnostics ? options.mcpContext.diagnostics : {};
+  if (Array.isArray(diagnostics.exactDescriptionFilters)) values.push(...diagnostics.exactDescriptionFilters);
+  return values
+    .map((item) => ({
+      classMention: normalizedAssistantLookupText(item && item.classMention),
+      description: String(item && item.description || '').trim()
+    }))
+    .filter((item) => item.classMention && item.description);
+}
+
+function assistantClassMatchesMention(className, mention, options = {}) {
+  const normalizedClass = normalizedAssistantLookupText(className);
+  const normalizedMention = normalizedAssistantLookupText(mention);
+  if (!normalizedClass || !normalizedMention) return false;
+  if (normalizedClass === normalizedMention) return true;
+  const hint = assistantClassHints(options).find((item) => normalizedAssistantLookupText(item.name) === normalizedClass);
+  if (!hint) return false;
+  return normalizedAssistantLookupText(hint.description) === normalizedMention ||
+    normalizedAssistantLookupText(hint.name) === normalizedMention;
+}
+
+function assistantFilterFieldName(filter) {
+  return String(filter && (filter.path || filter.attribute || filter.column || filter.field) || '').trim();
+}
+
+function repairAssistantExactDescriptionFilter(step, warnings, index, options = {}) {
+  if (!step || step.type !== 'selectCards' || !step.className) return;
+  const exact = assistantExactDescriptionFilters(options).find((item) => assistantClassMatchesMention(step.className, item.classMention, options));
+  if (!exact) return;
+  if (!Array.isArray(step.filters)) step.filters = Array.isArray(step.where) ? step.where : [];
+  const descriptionFilters = step.filters.filter((filter) => normalizedAssistantLookupText(assistantFilterFieldName(filter)) === 'description');
+  const matchingFilter = descriptionFilters.find((filter) => normalizedAssistantLookupText(filter.value) === normalizedAssistantLookupText(exact.description));
+  if (matchingFilter) {
+    if (matchingFilter.op !== 'equals') {
+      const previousOp = matchingFilter.op || '';
+      matchingFilter.op = 'equals';
+      warnings.push(`Assistant tightened Description filter to equals for class "${step.className}" at $.steps[${index}] because the request used an exact description.`);
+      recordAssistantDescriptionFilterRepair(options, {
+        step: index,
+        className: step.className,
+        action: 'tightenedToEquals',
+        previousOp,
+        value: exact.description
+      });
+    }
+    return;
+  }
+  step.filters.push({
+    path: 'Description',
+    op: 'equals',
+    value: exact.description
+  });
+  warnings.push(`Assistant added exact Description filter for class "${step.className}" at $.steps[${index}] from the user request.`);
+  recordAssistantDescriptionFilterRepair(options, {
+    step: index,
+    className: step.className,
+    action: 'addedExactDescriptionFilter',
+    value: exact.description
+  });
+}
+
+function normalizeAssistantMatchRowsIdentifiers(step, warnings, index, options = {}) {
+  const leftClass = options.state && options.state.aliasClasses ? options.state.aliasClasses.get(step.from) || '' : '';
+  const rightClass = options.state && options.state.aliasClasses ? options.state.aliasClasses.get(step.with) || '' : '';
+  const rules = Array.isArray(step.rules || step.where) ? (step.rules || step.where) : [];
+  rules.forEach((rule) => {
+    if (!rule || typeof rule !== 'object' || Array.isArray(rule)) return;
+    normalizeAssistantObjectFieldReference(rule, ['leftColumn', 'leftField'], leftClass, warnings, index, options);
+    normalizeAssistantObjectFieldReference(rule, ['rightColumn', 'rightField'], rightClass, warnings, index, options);
+    if (rule.left && typeof rule.left === 'object' && !Array.isArray(rule.left)) {
+      normalizeAssistantObjectFieldReference(rule.left, ['column', 'field', 'path'], leftClass, warnings, index, options);
+    }
+    if (rule.right && typeof rule.right === 'object' && !Array.isArray(rule.right)) {
+      normalizeAssistantObjectFieldReference(rule.right, ['column', 'field', 'path'], rightClass, warnings, index, options);
+    }
+  });
+}
+
+function normalizeAssistantResultTables(source, warnings, options = {}) {
+  const tables = source && source.result && Array.isArray(source.result.tables) ? source.result.tables : [];
+  tables.forEach((table) => {
+    if (!table || typeof table !== 'object' || Array.isArray(table) || !Array.isArray(table.columns)) return;
+    const alias = String(table.name || table.source || '').trim();
+    const className = alias && options.state && options.state.aliasClasses ? options.state.aliasClasses.get(alias) || '' : '';
+    table.columns = table.columns.map((column) => (
+      typeof column === 'string'
+        ? normalizeAssistantFieldPathValue(column, className, warnings, -1, 'result.tables.columns', options)
+        : column
+    ));
+  });
+}
+
+const ASSISTANT_MATERIALIZED_STEP_TYPES = new Set([
+  'selectCards',
+  'filterRows',
+  'matchRows',
+  'expandRelations',
+  'joinRows',
+  'intersectRows',
+  'composeRows',
+  'enrichRows',
+  'traverseDomains',
+  'compareClassAttributes'
+]);
+
+function assistantResultHasOutput(result) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return false;
+  const tables = Array.isArray(result.tables) ? result.tables : [];
+  const diagrams = Array.isArray(result.diagrams) ? result.diagrams : [];
+  return tables.length > 0 || diagrams.length > 0;
+}
+
+function assistantResultRepairStep(steps) {
+  const source = Array.isArray(steps) ? steps : [];
+  for (let index = source.length - 1; index >= 0; index -= 1) {
+    const step = source[index];
+    if (!step || typeof step !== 'object' || Array.isArray(step)) continue;
+    const alias = typeof step.as === 'string' ? step.as.trim() : '';
+    if (!alias || !ASSISTANT_MATERIALIZED_STEP_TYPES.has(step.type)) continue;
+    return { step, index, alias };
+  }
+  return null;
+}
+
+function assistantResultRepairColumns(step) {
+  const rawColumns = Array.isArray(step && step.columns)
+    ? step.columns
+    : (Array.isArray(step && step.cardColumns)
+      ? step.cardColumns
+      : (Array.isArray(step && step.outputColumns) ? step.outputColumns : []));
+  const columns = rawColumns.filter((column) => typeof column === 'string' && column.trim()).map((column) => column.trim());
+  if (columns.length) return columns;
+  if (step && step.type === 'selectCards') return ['Code', 'Description'];
+  return [];
+}
+
+function repairAssistantMissingResultOutput(source, warnings, options = {}) {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return;
+  const taskMode = normalizeRuntimeOutputMode(options.taskMode || options.outputMode || 'both');
+  if (taskMode === 'diagrams') return;
+  if (assistantResultHasOutput(source.result)) return;
+  const repair = assistantResultRepairStep(source.steps);
+  if (!repair) return;
+  if (!source.result || typeof source.result !== 'object' || Array.isArray(source.result)) source.result = {};
+  const table = {
+    name: repair.alias,
+    columns: assistantResultRepairColumns(repair.step)
+  };
+  source.result.tables = [table];
+  const message = `Assistant did not define result.tables; added default table for step alias "${repair.alias}".`;
+  warnings.push(message);
+  recordAssistantResultRepair(options, {
+    path: '$.result.tables',
+    action: 'addedDefaultTable',
+    alias: repair.alias,
+    step: repair.index,
+    columns: table.columns
+  });
+}
+
+function assistantObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function assistantStringValue(value) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  return text || '';
+}
+
+function assistantFirstString(source, fields) {
+  const object = assistantObject(source);
+  for (const field of fields) {
+    const text = assistantStringValue(object[field]);
+    if (text) return { value: text, field };
+  }
+  return { value: '', field: '' };
+}
+
+function assistantMatchRowsAlias(step, side) {
+  if (side === 'left') {
+    const direct = assistantFirstString(step, ['leftSource', 'leftAlias', 'source', 'sourceAlias']);
+    if (direct.value) return { value: direct.value, field: direct.field, nested: '' };
+    const left = assistantFirstString(step.left, ['source', 'alias', 'from']);
+    if (left.value) return { value: left.value, field: left.field, nested: 'left' };
+    return { value: '', field: '', nested: '' };
+  }
+  const direct = assistantFirstString(step, ['rightSource', 'rightAlias', 'target', 'targetAlias']);
+  if (direct.value) return { value: direct.value, field: direct.field, nested: '' };
+  const right = assistantFirstString(step.right, ['source', 'alias', 'with']);
+  if (right.value) return { value: right.value, field: right.field, nested: 'right' };
+  return { value: '', field: '', nested: '' };
+}
+
+function assistantMatchRowsRuleFromColumns(leftColumn, rightColumn, source = {}) {
+  const left = assistantStringValue(leftColumn);
+  const right = assistantStringValue(rightColumn);
+  if (!left || !right) return null;
+  const sourceObject = assistantObject(source);
+  const rule = {
+    leftColumn: left,
+    rightColumn: right
+  };
+  const operator = assistantStringValue(sourceObject.operator || sourceObject.op);
+  if (operator) rule.operator = operator;
+  if (sourceObject.action !== undefined) rule.action = sourceObject.action;
+  if (sourceObject.scope !== undefined) rule.scope = sourceObject.scope;
+  if (sourceObject.negate !== undefined) rule.negate = sourceObject.negate;
+  if (sourceObject.not !== undefined) rule.not = sourceObject.not;
+  const leftObject = assistantObject(sourceObject.left);
+  const rightObject = assistantObject(sourceObject.right);
+  if (sourceObject.leftRegex !== undefined) rule.leftRegex = sourceObject.leftRegex;
+  if (sourceObject.rightRegex !== undefined) rule.rightRegex = sourceObject.rightRegex;
+  if (leftObject.regex !== undefined) rule.leftRegex = leftObject.regex;
+  if (rightObject.regex !== undefined) rule.rightRegex = rightObject.regex;
+  return rule;
+}
+
+function assistantMatchRowsRuleFromObject(value, fallback = {}, options = {}) {
+  const object = assistantObject(value);
+  if (!Object.keys(object).length) return null;
+  const left = assistantObject(object.left);
+  const right = assistantObject(object.right);
+  const allowRawSides = options.allowRawSides === true;
+  return assistantMatchRowsRuleFromColumns(
+    object.leftColumn || object.leftField || object.leftPath || object.leftKey || left.column || left.field || left.path || left.key || (allowRawSides ? object.left : ''),
+    object.rightColumn || object.rightField || object.rightPath || object.rightKey || right.column || right.field || right.path || right.key || (allowRawSides ? object.right : ''),
+    { ...fallback, ...object }
+  );
+}
+
+function assistantMatchRowsRuleFromPair(value, fallback = {}) {
+  if (typeof value === 'string') return assistantMatchRowsRuleFromColumns(value, value, fallback);
+  if (Array.isArray(value)) return assistantMatchRowsRuleFromColumns(value[0], value[1] === undefined ? value[0] : value[1], fallback);
+  return assistantMatchRowsRuleFromObject(value, fallback, { allowRawSides: true });
+}
+
+function assistantMatchRowsRulesFromValue(value, fallback = {}) {
+  if (Array.isArray(value)) {
+    return value.map((item) => assistantMatchRowsRuleFromPair(item, fallback)).filter(Boolean);
+  }
+  const rule = assistantMatchRowsRuleFromPair(value, fallback);
+  return rule ? [rule] : [];
+}
+
+function assistantMatchRowsRules(step) {
+  if (Array.isArray(step.rules) && step.rules.length) return [];
+  if (Array.isArray(step.where) && step.where.length) return step.where.filter((rule) => rule && typeof rule === 'object' && !Array.isArray(rule));
+
+  const fallback = {
+    operator: step.operator || step.op,
+    action: step.action,
+    scope: step.scope,
+    negate: step.negate,
+    not: step.not
+  };
+  const direct = assistantMatchRowsRuleFromObject(step, fallback);
+  if (direct) return [direct];
+
+  for (const field of ['on', 'keys', 'matchOn', 'joinOn']) {
+    if (!Object.prototype.hasOwnProperty.call(step, field)) continue;
+    const rules = assistantMatchRowsRulesFromValue(step[field], fallback);
+    if (rules.length) return rules;
+  }
+  return [];
+}
+
+function pruneAssistantMatchRowsHelperObject(step, key, keepFields) {
+  const object = assistantObject(step[key]);
+  if (!Object.keys(object).length) return;
+  keepFields.forEach((field) => {
+    delete object[field];
+  });
+  if (!Object.keys(object).length) delete step[key];
+}
+
+function normalizeAssistantMatchRowsStep(step, warnings, index) {
+  let normalizedAliases = false;
+  if (!assistantStringValue(step.from)) {
+    const from = assistantMatchRowsAlias(step, 'left');
+    if (from.value) {
+      step.from = from.value;
+      normalizedAliases = true;
+      if (!from.nested && from.field) delete step[from.field];
+    }
+  }
+  if (!assistantStringValue(step.with)) {
+    const rightAlias = assistantMatchRowsAlias(step, 'right');
+    if (rightAlias.value) {
+      step.with = rightAlias.value;
+      normalizedAliases = true;
+      if (!rightAlias.nested && rightAlias.field) delete step[rightAlias.field];
+    }
+  }
+
+  let normalizedRules = false;
+  if (!Array.isArray(step.rules) || !step.rules.length) {
+    const rules = assistantMatchRowsRules(step);
+    if (rules.length) {
+      step.rules = rules;
+      normalizedRules = true;
+      if (Array.isArray(step.where)) delete step.where;
+      ['on', 'keys', 'matchOn', 'joinOn', 'leftColumn', 'leftField', 'leftPath', 'leftKey', 'rightColumn', 'rightField', 'rightPath', 'rightKey'].forEach((field) => {
+        delete step[field];
+      });
+    }
+  }
+
+  if (normalizedRules) {
+    pruneAssistantMatchRowsHelperObject(step, 'left', ['column', 'field', 'path', 'key', 'regex']);
+    pruneAssistantMatchRowsHelperObject(step, 'right', ['column', 'field', 'path', 'key', 'regex']);
+  }
+  if (normalizedAliases) {
+    pruneAssistantMatchRowsHelperObject(step, 'left', ['source', 'alias', 'from']);
+    pruneAssistantMatchRowsHelperObject(step, 'right', ['source', 'alias', 'with']);
+  }
+  if (normalizedAliases || normalizedRules) {
+    warnings.push(`Assistant normalized matchRows ${[normalizedAliases ? 'aliases' : '', normalizedRules ? 'rules' : ''].filter(Boolean).join(' and ')} at $.steps[${index}].`);
+  }
+}
+
+function normalizeAssistantDraftStep(step, warnings, index, options = {}) {
+  if (!step || typeof step !== 'object' || Array.isArray(step)) return step;
+  const normalized = cloneJsonValueServer(step, {});
+  const type = String(normalized.type || '');
+  const selectCardAliases = new Set(['findCard', 'findCards', 'searchCard', 'searchCards', 'queryCard', 'queryCards']);
+  if (selectCardAliases.has(type)) {
+    normalized.type = 'selectCards';
+    warnings.push(`Assistant normalized unsupported step type ${type} to selectCards at $.steps[${index}].`);
+  }
+  if (normalized.type === 'selectCards') {
+    if (!normalized.className) {
+      const className = normalized.class || normalized.classCode;
+      if (typeof className === 'string' && className.trim()) {
+        normalized.className = className.trim();
+        if (normalized.class !== undefined) delete normalized.class;
+        if (normalized.classCode !== undefined) delete normalized.classCode;
+      }
+    }
+    if (!Array.isArray(normalized.filters) && Array.isArray(normalized.where)) {
+      normalized.filters = normalized.where;
+      delete normalized.where;
+    }
+    normalizeAssistantSelectCardsIdentifiers(normalized, warnings, index, options);
+    repairAssistantExactDescriptionFilter(normalized, warnings, index, options);
+  }
+  if (normalized.type === 'expandRelations') {
+    normalizeAssistantExpandRelationsDomain(normalized, warnings, index, options);
+    normalizeAssistantClassListField(normalized, 'sourceClass', warnings, index, options);
+    normalizeAssistantClassListField(normalized, 'targetClass', warnings, index, options);
+  }
+  if (normalized.type === 'matchRows') {
+    normalizeAssistantMatchRowsStep(normalized, warnings, index);
+    normalizeAssistantMatchRowsIdentifiers(normalized, warnings, index, options);
+  }
+  return normalized;
+}
+
+function isAssistantDraftObject(value) {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function assistantDraftSpecError(path, message) {
+  return {
+    path,
+    message
+  };
+}
+
+function assistantDraftSteps(source) {
+  return isAssistantDraftObject(source) && Array.isArray(source.steps) ? source.steps : null;
+}
+
+function assistantDraftSpecHasSteps(source) {
+  const steps = assistantDraftSteps(source);
+  return Boolean(steps && steps.length > 0);
+}
+
+function assistantDraftSpecCandidate(value) {
+  const source = safeJsonValue(value, value);
+  return assistantDraftSpecHasSteps(source);
+}
+
+function assistantIncompleteDraftSpecError(value, sourceLabel) {
+  const source = safeJsonValue(value, value);
+  if (!isAssistantDraftObject(source)) return null;
+  if (Array.isArray(source.steps) && source.steps.length === 0) {
+    return assistantDraftSpecError(`${sourceLabel}.steps`, 'Assistant response did not contain any DSL steps.');
+  }
+  if (
+    source.version !== undefined ||
+    source.steps !== undefined ||
+    isAssistantDraftObject(source.result) ||
+    source.kind === 'dsl'
+  ) {
+    return assistantDraftSpecError(`${sourceLabel}.steps`, 'Assistant response did not contain any DSL steps.');
+  }
+  return null;
+}
+
+function assistantDraftStepsArray(value) {
+  const source = safeJsonValue(value, value);
+  return Array.isArray(source) && source.length > 0 && source.every((step) => (
+    isAssistantDraftObject(step) && (
+      step.type !== undefined ||
+      step.as !== undefined ||
+      step.className !== undefined ||
+      step.class !== undefined ||
+      step.classCode !== undefined
+    )
+  ));
+}
+
+function wrapAssistantDraftSteps(steps, warnings, sourceLabel) {
+  warnings.push(`Assistant response returned ${sourceLabel} as steps[]; wrapped it into a DSL spec object.`);
+  return {
+    spec: {
+      version: 1,
+      steps,
+      result: {
+        tables: []
+      }
+    },
+    error: null
+  };
+}
+
+function extractAssistantDraftSpecFromValue(value, warnings, sourceLabel, depth = 0) {
+  const source = safeJsonValue(value, value);
+  if (assistantDraftSpecCandidate(source)) return { spec: source, error: null };
+  if (assistantDraftStepsArray(source)) return wrapAssistantDraftSteps(source, warnings, sourceLabel);
+  if (!isAssistantDraftObject(source) || depth > 2) return null;
+
+  const wrapperFields = ['spec', 'SpecJson', 'templateSpec', 'template', 'dsl', 'draft'];
+  for (const field of wrapperFields) {
+    if (!Object.prototype.hasOwnProperty.call(source, field)) continue;
+    const extracted = extractAssistantDraftSpecFromValue(source[field], warnings, `${sourceLabel}.${field}`, depth + 1);
+    if (extracted) {
+      if (!extracted.error && !['spec', 'SpecJson'].includes(field)) {
+        warnings.push(`Assistant extracted DSL spec from response field ${sourceLabel}.${field}.`);
+      }
+      return extracted;
+    }
+    const wrapperValue = safeJsonValue(source[field], source[field]);
+    if (isAssistantDraftObject(wrapperValue) && Object.keys(wrapperValue).length === 0) {
+      return {
+        spec: {},
+        error: assistantDraftSpecError(`${sourceLabel}.${field}.steps`, 'Assistant response did not contain any DSL steps.')
+      };
+    }
+  }
+  const incompleteError = assistantIncompleteDraftSpecError(source, sourceLabel);
+  if (incompleteError) return { spec: {}, error: incompleteError };
+  return null;
+}
+
+function extractAssistantDraftSpec(parsed) {
+  const warnings = [];
+  const extracted = extractAssistantDraftSpecFromValue(parsed, warnings, '$');
+  if (extracted && !extracted.error) return { spec: extracted.spec, warnings, error: null };
+  if (extracted && extracted.error) {
+    return {
+      spec: {},
+      warnings: ['Assistant response did not contain any DSL steps.'],
+      error: extracted.error
+    };
+  }
+  return {
+    spec: {},
+    warnings: ['Assistant response did not contain a DSL spec object.'],
+    error: {
+      path: '$',
+      message: 'Assistant response did not contain a DSL spec object.'
+    }
+  };
+}
+
+function normalizeAssistantDraftSpec(spec, options = {}) {
+  const source = cloneJsonValueServer(spec, spec);
+  const warnings = [];
+  const state = options.state || {
+    aliasClasses: new Map(),
+    aliasSteps: new Map(),
+    errors: [],
+    diagnostics: {
+      normalizedClasses: [],
+      normalizedFields: []
+    }
+  };
+  if (!state.aliasClasses) state.aliasClasses = new Map();
+  if (!state.aliasSteps) state.aliasSteps = new Map();
+  if (!Array.isArray(state.errors)) state.errors = [];
+  if (!state.diagnostics) state.diagnostics = { normalizedClasses: [], normalizedFields: [] };
+  const normalizedOptions = {
+    ...options,
+    state
+  };
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    return { spec: source, warnings, errors: state.errors, diagnostics: state.diagnostics };
+  }
+  if (Array.isArray(source.steps)) {
+    source.steps = source.steps.map((step, index) => {
+      const normalized = normalizeAssistantDraftStep(step, warnings, index, normalizedOptions);
+      if (normalized && normalized.type === 'selectCards' && normalized.as && normalized.className && isCmdbuildIdentifierText(normalized.className)) {
+        state.aliasClasses.set(normalized.as, normalized.className);
+        state.aliasSteps.set(normalized.as, normalized);
+      }
+      return normalized;
+    });
+  }
+  repairAssistantMissingResultOutput(source, warnings, normalizedOptions);
+  normalizeAssistantResultTables(source, warnings, normalizedOptions);
+  return { spec: source, warnings, errors: state.errors, diagnostics: state.diagnostics };
+}
+
+async function callLiteLLM(messages, runtimeConfig) {
+  const status = ensureAssistantReady(runtimeConfig);
+  if (typeof fetch !== 'function') {
+    const error = new Error('Global fetch API is not available in this Node.js runtime.');
+    error.statusCode = 503;
+    error.code = 'fetch_unavailable';
+    throw error;
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), ASSISTANT_TIMEOUT_MS);
+  try {
+    const response = await fetch(litellmEndpoint('chat/completions', status.baseUrl), {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${LITELLM_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: status.model,
+        messages,
+        temperature: ASSISTANT_TEMPERATURE,
+        max_tokens: ASSISTANT_MAX_TOKENS
+      }),
+      signal: controller.signal
+    });
+    const text = await response.text();
+    let json = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      json = null;
+    }
+    if (!response.ok) {
+      const error = new Error(json && (json.error && json.error.message || json.message) || `LiteLLM request failed with status ${response.status}.`);
+      error.statusCode = response.status;
+      error.code = 'litellm_error';
+      throw error;
+    }
+    const content = json && json.choices && json.choices[0] && json.choices[0].message
+      ? json.choices[0].message.content
+      : '';
+    if (!content) {
+      const error = new Error('LiteLLM response did not contain assistant content.');
+      error.statusCode = 502;
+      error.code = 'assistant_empty_response';
+      throw error;
+    }
+    return content;
+  } catch (error) {
+    if (error && error.name === 'AbortError') {
+      const timeoutError = new Error('LiteLLM request timed out.');
+      timeoutError.statusCode = 504;
+      timeoutError.code = 'assistant_timeout';
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function createAssistantTemplateDraft(body, options = {}) {
+  const runtimeConfig = options.runtimeConfig || defaultRuntimeConfig();
+  ensureAssistantRequestIntent(body);
+  ensureAssistantReady(runtimeConfig);
+  const mcpContext = await buildAssistantMcpContext(options.authToken || '', body || {}, runtimeConfig);
+  const content = await callLiteLLM(assistantMessages(body || {}, mcpContext, runtimeConfig), runtimeConfig);
+  const parsed = parseAssistantJson(content);
+  const parsedObject = isAssistantDraftObject(parsed) ? parsed : {};
+  const extractedDraft = extractAssistantDraftSpec(parsed);
+  const normalizedDraft = normalizeAssistantDraftSpec(extractedDraft.spec, {
+    mcpContext,
+    taskMode: body && (body.taskMode || body.outputMode)
+  });
+  const spec = normalizeTemplateSpecForStorage(normalizedDraft.spec);
+  const errors = extractedDraft.error ? [extractedDraft.error] : [
+    ...(Array.isArray(normalizedDraft.errors) ? normalizedDraft.errors : []),
+    ...validateTemplateSpec(spec)
+  ];
+  const warnings = [
+    ...(Array.isArray(mcpContext && mcpContext.warnings) ? mcpContext.warnings : []),
+    ...extractedDraft.warnings,
+    ...normalizedDraft.warnings,
+    ...(Array.isArray(parsedObject.warnings) ? parsedObject.warnings.map((item) => String(item || '')).filter(Boolean) : [])
+  ];
+  return {
+    success: errors.length === 0,
+    spec,
+    explanation: String(parsedObject.explanation || parsedObject.summary || ''),
+    warnings,
+    errors,
+    mcpContext: {
+      enabled: Boolean(mcpContext && mcpContext.enabled),
+      tools: mcpContext && Array.isArray(mcpContext.tools) ? mcpContext.tools : [],
+      truncated: Boolean(mcpContext && mcpContext.truncated)
+    },
+    diagnostics: {
+      mcp: mcpContext && mcpContext.diagnostics ? mcpContext.diagnostics : {},
+      normalization: normalizedDraft.diagnostics || {}
+    }
+  };
 }
 
 async function sendPublicSnapshotRun(res, requestUrl, templateCode) {
@@ -13865,31 +16106,12 @@ function validateTemplateSpec(spec) {
   if (spec.endpoint !== undefined) {
     if (!spec.endpoint || typeof spec.endpoint !== 'object' || Array.isArray(spec.endpoint)) {
       errors.push({ path: '$.endpoint', message: 'Template endpoint settings must be an object.' });
-    } else if (spec.endpoint.kind !== undefined && !['runtime', 'baaVerification'].includes(spec.endpoint.kind)) {
-      errors.push({ path: '$.endpoint.kind', message: 'Endpoint kind must be runtime or baaVerification.' });
+    } else if (spec.endpoint.kind !== undefined && spec.endpoint.kind !== 'runtime') {
+      errors.push({ path: '$.endpoint.kind', message: 'Endpoint kind must be runtime.' });
     }
   }
   if (spec.baaContract !== undefined) {
-    if (!spec.baaContract || typeof spec.baaContract !== 'object' || Array.isArray(spec.baaContract)) {
-      errors.push({ path: '$.baaContract', message: 'BAA contract must be an object.' });
-    } else {
-      const contract = normalizeBaaContractServer(spec);
-      contract.variables.forEach((field) => {
-        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(field.name)) {
-          errors.push({ path: `$.baaContract.variables.${field.name}`, message: 'BAA variable name must be a Latin identifier.' });
-        }
-      });
-      contract.objects.forEach((object) => {
-        if (object.alias && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(object.alias)) {
-          errors.push({ path: `$.baaContract.objects.${object.alias}`, message: 'BAA object alias must be a Latin identifier.' });
-        }
-        object.payload.forEach((field) => {
-          if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(field.name)) {
-            errors.push({ path: `$.baaContract.objects.${object.alias}.payload.${field.name}`, message: 'BAA payload field name must be a Latin identifier.' });
-          }
-        });
-      });
-    }
+    errors.push({ path: '$.baaContract', message: 'BAA contracts were removed from cmdbdynamicpages runtime specs.' });
   }
   if (isCmdbBuildViewSpec(spec)) {
     errors.push(...validateCmdbBuildViewSpec(spec));
@@ -13912,39 +16134,7 @@ function validateTemplateSpec(spec) {
           errors.push({ path, message: 'findClassesByAttributeType requires attributeType or attributeTypeParam.' });
         }
       } else if (step.type === 'baaPlanObjects') {
-        if (step.payloadPrefix !== undefined && typeof step.payloadPrefix !== 'string') {
-          errors.push({ path: `${path}.payloadPrefix`, message: 'baaPlanObjects payloadPrefix must be a string.' });
-        }
-        if (step.objectAlias !== undefined && typeof step.objectAlias !== 'string') {
-          errors.push({ path: `${path}.objectAlias`, message: 'baaPlanObjects objectAlias must be a string.' });
-        }
-        const filters = step.filters || step.where || [];
-        if (filters !== undefined && !Array.isArray(filters)) {
-          errors.push({ path: `${path}.filters`, message: 'baaPlanObjects filters must be an array.' });
-        } else {
-          const allowedOps = ['equals', 'notEquals', 'contains', 'startsWith', 'endsWith', 'in', 'exists', 'notExists', 'matches', 'notMatches', 'isIpv4', 'isIpv4Network', 'ipv4InCidr', 'ipv4InRange', 'ipv4CidrOverlaps', 'ipv4CidrContains'];
-          filters.forEach((filter, filterIndex) => {
-            const filterPath = `${path}.filters[${filterIndex}]`;
-            if (!filter || typeof filter !== 'object' || Array.isArray(filter)) {
-              errors.push({ path: filterPath, message: 'baaPlanObjects filter must be an object.' });
-              return;
-            }
-            if (!filter.attribute && !filter.column && !filter.field && !filter.path) {
-              errors.push({ path: `${filterPath}.path`, message: 'baaPlanObjects filter requires path.' });
-            }
-            if (filter.op !== undefined && !allowedOps.includes(filter.op)) {
-              errors.push({ path: `${filterPath}.op`, message: `baaPlanObjects filter op must be one of: ${allowedOps.join(', ')}.` });
-            }
-            if ((filter.op === 'matches' || filter.op === 'notMatches' || filter.regex !== undefined) && typeof filter.regex !== 'string') {
-              errors.push({ path: `${filterPath}.regex`, message: 'baaPlanObjects regex filter requires a regular expression string.' });
-            } else if (filter.regex !== undefined) {
-              errors.push(...validateRegexPattern(filter.regex, '', `${filterPath}.regex`, false));
-            }
-            if (filter.negate !== undefined && typeof filter.negate !== 'boolean') {
-              errors.push({ path: `${filterPath}.negate`, message: 'baaPlanObjects filter negate must be boolean.' });
-            }
-          });
-        }
+        errors.push({ path: `${path}.type`, message: 'baaPlanObjects was removed; use CMDBuild-backed select/filter/match steps.' });
       } else if (step.type === 'extractVariables' || step.type === 'extract') {
         if (!step.regex || typeof step.regex !== 'string') {
           errors.push({ path: `${path}.regex`, message: 'extractVariables requires a regular expression string.' });
@@ -14201,8 +16391,10 @@ function validateTemplateSpec(spec) {
     });
   }
 
-  if (!spec.result || !Array.isArray(spec.result.tables) || spec.result.tables.length === 0) {
-    errors.push({ path: '$.result.tables', message: 'Template spec must define at least one result table.' });
+  const resultTables = Array.isArray(spec.result && spec.result.tables) ? spec.result.tables : [];
+  const resultDiagrams = Array.isArray(spec.result && spec.result.diagrams) ? spec.result.diagrams : [];
+  if (!spec.result || (resultTables.length === 0 && resultDiagrams.length === 0)) {
+    errors.push({ path: '$.result', message: 'Template spec must define at least one result table or diagram.' });
   } else {
     if (spec.result.emptyText !== undefined && typeof spec.result.emptyText !== 'string') {
       errors.push({ path: '$.result.emptyText', message: 'Result emptyText must be a string.' });
@@ -14210,7 +16402,14 @@ function validateTemplateSpec(spec) {
     if (spec.result.permissionDeniedText !== undefined && typeof spec.result.permissionDeniedText !== 'string') {
       errors.push({ path: '$.result.permissionDeniedText', message: 'Result permissionDeniedText must be a string.' });
     }
-    spec.result.tables.forEach((table, index) => {
+    if (spec.result.presentation !== undefined) {
+      if (!spec.result.presentation || typeof spec.result.presentation !== 'object' || Array.isArray(spec.result.presentation)) {
+        errors.push({ path: '$.result.presentation', message: 'Result presentation must be an object.' });
+      } else if (spec.result.presentation.outputMode !== undefined && !['tables', 'diagrams', 'both'].includes(spec.result.presentation.outputMode)) {
+        errors.push({ path: '$.result.presentation.outputMode', message: 'Result presentation outputMode must be tables, diagrams, or both.' });
+      }
+    }
+    resultTables.forEach((table, index) => {
       const path = `$.result.tables[${index}]`;
       if (!table || typeof table !== 'object') {
         errors.push({ path, message: 'Result table must be an object.' });
@@ -14232,6 +16431,36 @@ function validateTemplateSpec(spec) {
         errors.push({ path: `${path}.emptyText`, message: 'Result table emptyText must be a string.' });
       }
     });
+    if (spec.result.diagrams !== undefined && !Array.isArray(spec.result.diagrams)) {
+      errors.push({ path: '$.result.diagrams', message: 'Result diagrams must be an array.' });
+    }
+    resultDiagrams.forEach((diagram, index) => {
+      const path = `$.result.diagrams[${index}]`;
+      if (!diagram || typeof diagram !== 'object' || Array.isArray(diagram)) {
+        errors.push({ path, message: 'Result diagram must be an object.' });
+        return;
+      }
+      if (!diagram.name || typeof diagram.name !== 'string') {
+        errors.push({ path: `${path}.name`, message: 'Result diagram must define a string name.' });
+      }
+      if (diagram.title !== undefined && typeof diagram.title !== 'string') {
+        errors.push({ path: `${path}.title`, message: 'Result diagram title must be a string.' });
+      }
+      const type = diagram.type || 'topology';
+      if (!['topology'].includes(type)) {
+        errors.push({ path: `${path}.type`, message: 'Result diagram type must be topology.' });
+      }
+      const nodeSource = resultDiagramSourceName(diagram, 'nodes');
+      const edgeSource = resultDiagramSourceName(diagram, 'edges');
+      if (!nodeSource && !edgeSource) {
+        errors.push({ path: `${path}.source`, message: 'Result diagram requires source.nodes/source.edges or nodes.from/edges.from.' });
+      }
+      if (diagram.layout !== undefined && (!diagram.layout || typeof diagram.layout !== 'object' || Array.isArray(diagram.layout))) {
+        errors.push({ path: `${path}.layout`, message: 'Result diagram layout must be an object.' });
+      } else if (diagram.layout && diagram.layout.type !== undefined && !['topology', 'layered'].includes(diagram.layout.type)) {
+        errors.push({ path: `${path}.layout.type`, message: 'Result diagram layout.type must be topology or layered.' });
+      }
+    });
   }
 
   return errors;
@@ -14246,6 +16475,124 @@ function projectRows(rows, columns) {
     });
     return projected;
   });
+}
+
+function resultDiagramSourceName(diagram, kind) {
+  const source = diagram && diagram.source && typeof diagram.source === 'object' && !Array.isArray(diagram.source) ? diagram.source : {};
+  const section = diagram && diagram[kind] && typeof diagram[kind] === 'object' && !Array.isArray(diagram[kind]) ? diagram[kind] : {};
+  return String(section.from || section.source || source[kind] || '').trim();
+}
+
+function resultDiagramField(diagram, names, fallback) {
+  const fields = diagram && diagram.fields && typeof diagram.fields === 'object' && !Array.isArray(diagram.fields) ? diagram.fields : {};
+  const nodes = diagram && diagram.nodes && typeof diagram.nodes === 'object' && !Array.isArray(diagram.nodes) ? diagram.nodes : {};
+  const edges = diagram && diagram.edges && typeof diagram.edges === 'object' && !Array.isArray(diagram.edges) ? diagram.edges : {};
+  for (const name of names) {
+    const value = fields[name] || nodes[name] || edges[name];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return fallback;
+}
+
+function rowValueByField(row, field, fallbacks = []) {
+  const keys = [field].concat(fallbacks).map((item) => String(item || '').trim()).filter(Boolean);
+  for (const key of keys) {
+    if (row && Object.prototype.hasOwnProperty.call(row, key)) return row[key];
+  }
+  const lowerLookup = new Map(Object.keys(row || {}).map((key) => [key.toLowerCase(), key]));
+  for (const key of keys) {
+    const realKey = lowerLookup.get(key.toLowerCase());
+    if (realKey && Object.prototype.hasOwnProperty.call(row, realKey)) return row[realKey];
+  }
+  return undefined;
+}
+
+function normalizeDiagramLimit(value, fallback, absolute) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number <= 0) return fallback;
+  return Math.min(number, absolute);
+}
+
+function buildTopologyDiagram(diagram, context, params, limits) {
+  const name = String(diagram.name || diagram.as || 'diagram').trim();
+  const titleTemplate = String(diagram.title || diagram.label || name);
+  const nodeSourceName = resultDiagramSourceName(diagram, 'nodes');
+  const edgeSourceName = resultDiagramSourceName(diagram, 'edges');
+  const nodeSource = context[nodeSourceName] || { rows: [] };
+  const edgeSource = context[edgeSourceName] || { rows: [] };
+  const nodeRows = Array.isArray(nodeSource.rows) ? nodeSource.rows : [];
+  const edgeRows = Array.isArray(edgeSource.rows) ? edgeSource.rows : [];
+  const maxNodes = normalizeDiagramLimit(diagram.maxNodes || diagram.limit && diagram.limit.maxNodes || diagram.limits && diagram.limits.maxNodes, Math.min(limits.maxRows || 500, 300), ABSOLUTE_EXECUTION_LIMITS.maxRows);
+  const maxEdges = normalizeDiagramLimit(diagram.maxEdges || diagram.limit && diagram.limit.maxEdges || diagram.limits && diagram.limits.maxEdges, Math.min((limits.maxRows || 500) * 2, 800), ABSOLUTE_EXECUTION_LIMITS.maxRows * 2);
+  const nodeIdField = resultDiagramField(diagram, ['nodeId', 'id', 'idColumn'], 'id');
+  const nodeLabelField = resultDiagramField(diagram, ['nodeLabel', 'label', 'labelColumn'], 'label');
+  const nodeGroupField = resultDiagramField(diagram, ['nodeGroup', 'group', 'groupColumn'], 'group');
+  const nodeHrefField = resultDiagramField(diagram, ['nodeHref', 'href', 'url', 'urlColumn'], 'href');
+  const edgeSourceField = resultDiagramField(diagram, ['edgeSource', 'source', 'sourceId', 'from'], 'source');
+  const edgeTargetField = resultDiagramField(diagram, ['edgeTarget', 'target', 'targetId', 'to'], 'target');
+  const edgeLabelField = resultDiagramField(diagram, ['edgeLabel', 'edgeTitle', 'label'], 'label');
+  const warnings = [];
+  const nodeMap = new Map();
+  const addNode = (idValue, sourceRow = null) => {
+    const id = String(idValue === undefined || idValue === null ? '' : idValue).trim();
+    if (!id || nodeMap.has(id) || nodeMap.size >= maxNodes) return Boolean(id && nodeMap.has(id));
+    const labelValue = sourceRow ? rowValueByField(sourceRow, nodeLabelField, ['Label', 'Code', 'Description', 'Name', nodeIdField]) : id;
+    const groupValue = sourceRow ? rowValueByField(sourceRow, nodeGroupField, ['Group', 'Class', 'Type', 'Kind']) : '';
+    const hrefValue = sourceRow ? rowValueByField(sourceRow, nodeHrefField, ['Href', 'Url', 'URL', 'sourceURL']) : '';
+    nodeMap.set(id, {
+      id,
+      label: String(labelValue === undefined || labelValue === null || labelValue === '' ? id : labelValue),
+      group: String(groupValue === undefined || groupValue === null ? '' : groupValue),
+      href: isSafeRuntimeLinkUrl(hrefValue) ? String(hrefValue) : ''
+    });
+    return true;
+  };
+
+  for (const row of nodeRows) {
+    if (nodeMap.size >= maxNodes) break;
+    addNode(rowValueByField(row, nodeIdField, ['Id', 'ID', '_id', 'Code', 'Name']), row);
+  }
+  const edges = [];
+  for (const row of edgeRows) {
+    if (edges.length >= maxEdges) break;
+    const source = String(rowValueByField(row, edgeSourceField, ['Source', 'SourceId', 'sourceId', 'from', 'From']) || '').trim();
+    const target = String(rowValueByField(row, edgeTargetField, ['Target', 'TargetId', 'targetId', 'to', 'To']) || '').trim();
+    if (!source || !target) {
+      warnings.push('Skipped edge without source or target.');
+      continue;
+    }
+    if (!nodeMap.has(source)) addNode(source);
+    if (!nodeMap.has(target)) addNode(target);
+    if (!nodeMap.has(source) || !nodeMap.has(target)) {
+      warnings.push(`Skipped edge ${source} -> ${target}: node limit reached.`);
+      continue;
+    }
+    const label = rowValueByField(row, edgeLabelField, ['Label', 'Type', 'Relation', 'Domain']);
+    edges.push({
+      source,
+      target,
+      label: label === undefined || label === null ? '' : String(label)
+    });
+  }
+  const truncated = nodeRows.length > nodeMap.size || edgeRows.length > edges.length;
+  if (truncated) warnings.push('Diagram was truncated by execution limits.');
+  return {
+    name,
+    title: renderRuntimeParamTemplate(titleTemplate, params),
+    type: 'topology',
+    layout: diagram.layout && typeof diagram.layout === 'object' && !Array.isArray(diagram.layout)
+      ? cloneJsonValueServer(diagram.layout, { type: 'topology' })
+      : { type: 'topology' },
+    nodes: Array.from(nodeMap.values()),
+    edges,
+    warnings: Array.from(new Set(warnings)),
+    truncated
+  };
+}
+
+function buildResultDiagrams(spec, context, params, limits) {
+  const diagrams = Array.isArray(spec && spec.result && spec.result.diagrams) ? spec.result.diagrams : [];
+  return diagrams.map((diagram) => buildTopologyDiagram(diagram || {}, context, params, limits));
 }
 
 function runtimeCardUrl(className, id) {
@@ -14714,236 +17061,6 @@ function executeExtractVariables(step, params, context, limits) {
   };
 }
 
-function baaErrorItem(code, message, level = 'error') {
-  return {
-    level,
-    code,
-    message: truncateText(message || code, 1000)
-  };
-}
-
-function baaEnvelope({ success, status, title = '', message = '', tables = [], items = [], data = {} }) {
-  const rows = (Array.isArray(tables) ? tables : []).reduce((count, table) => count + (Array.isArray(table.rows) ? table.rows.length : 0), 0);
-  return {
-    success: Boolean(success),
-    status: status || (success ? 'completed' : 'error'),
-    title: truncateText(title || '', 250),
-    message: truncateText(message || '', 2000),
-    summary: { rows },
-    tables: Array.isArray(tables) ? tables : [],
-    items: Array.isArray(items) ? items : [],
-    data: data && typeof data === 'object' && !Array.isArray(data) ? data : {}
-  };
-}
-
-function normalizeBaaObjectPayload(payload) {
-  return payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
-}
-
-function normalizeBaaContractFieldServer(field) {
-  field = field && typeof field === 'object' && !Array.isArray(field) ? field : {};
-  return {
-    name: String(field.name || field.field || '').trim(),
-    type: String(field.type || 'string').trim() || 'string',
-    required: Boolean(field.required),
-    default: field.default !== undefined ? field.default : field.defaultValue,
-    example: field.example,
-    description: String(field.description || '').trim()
-  };
-}
-
-function normalizeBaaContractServer(spec) {
-  const contract = spec && spec.baaContract && typeof spec.baaContract === 'object' && !Array.isArray(spec.baaContract) ? spec.baaContract : {};
-  const objects = baaContractObjectsFromRaw(contract);
-  const variables = Array.isArray(contract.contractParams)
-    ? contract.contractParams
-    : (Array.isArray(contract.variables) ? contract.variables : []);
-  return {
-    code: String(contract.code || '').trim(),
-    version: String(contract.version || '').trim(),
-    variables: variables.map(normalizeBaaContractFieldServer).filter((field) => field.name),
-    contractParams: variables.map(normalizeBaaContractFieldServer).filter((field) => field.name),
-    objects
-  };
-}
-
-function baaContractParamsFromRequest(body) {
-  return Array.isArray(body && body.contractParams)
-    ? body.contractParams.map(normalizeBaaContractFieldServer).filter((field) => field.name)
-    : [];
-}
-
-function validateBaaTypedValue(value, type) {
-  if (value === undefined || value === null || value === '') return true;
-  const text = String(value).trim();
-  if (type === 'number') return !Number.isNaN(Number(text));
-  if (type === 'integer') return /^-?\d+$/.test(text);
-  if (type === 'boolean') return typeof value === 'boolean' || ['true', 'false', '1', '0', 'yes', 'no', 'да', 'нет'].includes(text.toLowerCase());
-  if (type === 'ipv4') return ipv4ToInt(text) !== null;
-  if (type === 'ipv4-cidr') return parseIpv4Network(text) !== null;
-  return true;
-}
-
-function validateBaaVerificationRequest(body, spec = null) {
-  const errors = [];
-  if (!body || typeof body !== 'object' || Array.isArray(body)) {
-    return {
-      ok: false,
-      errors: [baaErrorItem('INVALID_REQUEST', 'Request body must be an object.')]
-    };
-  }
-  const plan = body.plan && typeof body.plan === 'object' && !Array.isArray(body.plan) ? body.plan : null;
-  if (!plan) {
-    errors.push(baaErrorItem('INVALID_REQUEST', 'Request body must contain plan object.'));
-  } else if (!Array.isArray(plan.objects)) {
-    errors.push(baaErrorItem('INVALID_REQUEST', 'plan.objects must be an array.'));
-  } else {
-    plan.objects.forEach((object, index) => {
-      if (!object || typeof object !== 'object' || Array.isArray(object)) {
-        errors.push(baaErrorItem('INVALID_REQUEST', `plan.objects[${index}] must be an object.`));
-        return;
-      }
-      if (object.payload !== undefined && (!object.payload || typeof object.payload !== 'object' || Array.isArray(object.payload))) {
-        errors.push(baaErrorItem('INVALID_REQUEST', `plan.objects[${index}].payload must be an object when provided.`));
-      }
-    });
-  }
-  const endpoint = body.endpoint && typeof body.endpoint === 'object' && !Array.isArray(body.endpoint) ? body.endpoint : {};
-  if (endpoint.params !== undefined && (!endpoint.params || typeof endpoint.params !== 'object' || Array.isArray(endpoint.params))) {
-    errors.push(baaErrorItem('INVALID_REQUEST', 'endpoint.params must be an object when provided.'));
-  }
-  if (body.variables !== undefined && (!body.variables || typeof body.variables !== 'object' || Array.isArray(body.variables))) {
-    errors.push(baaErrorItem('INVALID_REQUEST', 'variables must be an object when provided.'));
-  }
-  if (body.contractParams !== undefined && !Array.isArray(body.contractParams)) {
-    errors.push(baaErrorItem('INVALID_REQUEST', 'contractParams must be an array when provided.'));
-  }
-  const contract = normalizeBaaContractServer(spec || {});
-  const requestContractParams = baaContractParamsFromRequest(body);
-  const contractParamDefinitions = requestContractParams.length ? requestContractParams : contract.contractParams;
-  if (contract.objects.length || contractParamDefinitions.length) {
-    const endpointParams = endpoint.params && typeof endpoint.params === 'object' && !Array.isArray(endpoint.params) ? endpoint.params : {};
-    contractParamDefinitions.forEach((field) => {
-      const value = endpointParams[field.name];
-      if (field.required && (value === undefined || value === null || value === '')) {
-        errors.push(baaErrorItem('CONTRACT_VALIDATION_FAILED', `endpoint.params.${field.name} is required.`));
-      } else if (!validateBaaTypedValue(value, field.type)) {
-        errors.push(baaErrorItem('CONTRACT_VALIDATION_FAILED', `endpoint.params.${field.name} must be ${field.type}.`));
-      }
-    });
-    const contractObjects = contract.objects;
-    const requestObjects = plan && Array.isArray(plan.objects) ? plan.objects : [];
-    requestObjects.forEach((object, index) => {
-      const payload = normalizeBaaObjectPayload(object && object.payload);
-      const className = String(object && object.className || '').trim();
-      const kind = String(object && object.kind || '').trim();
-      const mappingKey = String(object && object.mappingKey || '').trim();
-      const matchedContract = contractObjects.find((item) => {
-        return item.alias === kind || item.alias === mappingKey || item.className === className;
-      });
-      if (!matchedContract) return;
-      matchedContract.payload.forEach((field) => {
-        const value = payload[field.name];
-        if (field.required && (value === undefined || value === null || value === '')) {
-          errors.push(baaErrorItem('CONTRACT_VALIDATION_FAILED', `plan.objects[${index}].payload.${field.name} is required.`));
-        } else if (!validateBaaTypedValue(value, field.type)) {
-          errors.push(baaErrorItem('CONTRACT_VALIDATION_FAILED', `plan.objects[${index}].payload.${field.name} must be ${field.type}.`));
-        }
-      });
-    });
-  }
-  return {
-    ok: errors.length === 0,
-    errors
-  };
-}
-
-function normalizedBaaRequestForCache(body) {
-  const plan = body && body.plan && typeof body.plan === 'object' && !Array.isArray(body.plan) ? body.plan : {};
-  const endpoint = body && body.endpoint && typeof body.endpoint === 'object' && !Array.isArray(body.endpoint) ? body.endpoint : {};
-  const inputContract = body && body.inputContract && typeof body.inputContract === 'object' && !Array.isArray(body.inputContract) ? body.inputContract : {};
-  return {
-    inputContract: {
-      code: inputContract.code || '',
-      version: inputContract.version || '',
-      checksum: inputContract.checksum || ''
-    },
-    endpoint: {
-      code: endpoint.code || '',
-      params: endpoint.params && typeof endpoint.params === 'object' && !Array.isArray(endpoint.params) ? endpoint.params : {}
-    },
-    contractParams: baaContractParamsFromRequest(body),
-    variables: body && body.variables && typeof body.variables === 'object' && !Array.isArray(body.variables) ? body.variables : {},
-    variableSources: normalizeBaaVariableSources(body && body.variableSources),
-    plan: {
-      objects: (Array.isArray(plan.objects) ? plan.objects : []).map((object) => ({
-        planIndex: object && object.planIndex !== undefined ? object.planIndex : '',
-        kind: object && object.kind || '',
-        className: object && object.className || '',
-        pageShapeKey: object && object.pageShapeKey || '',
-        mappingKey: object && object.mappingKey || '',
-        relationBindingStatus: object && object.relationBindingStatus || '',
-        payload: normalizeBaaObjectPayload(object && object.payload)
-      })),
-      missingAttributes: Array.isArray(plan.missingAttributes) ? plan.missingAttributes : [],
-      skipped: Array.isArray(plan.skipped) ? plan.skipped : []
-    }
-  };
-}
-
-function baaParamsFromRequest(body, spec = null) {
-  const endpoint = body && body.endpoint && typeof body.endpoint === 'object' && !Array.isArray(body.endpoint) ? body.endpoint : {};
-  const params = endpoint.params && typeof endpoint.params === 'object' && !Array.isArray(endpoint.params) ? { ...endpoint.params } : {};
-  const variables = body && body.variables && typeof body.variables === 'object' && !Array.isArray(body.variables) ? body.variables : {};
-  const contract = normalizeBaaContractServer(spec || {});
-  const requestContractParams = baaContractParamsFromRequest(body);
-  const contractParamDefinitions = requestContractParams.length ? requestContractParams : contract.contractParams;
-  for (const field of contractParamDefinitions) {
-    if (params[field.name] === undefined && field.default !== undefined && field.default !== '') params[field.name] = field.default;
-    if (params[field.name] !== undefined) {
-      params[`contractparam.${field.name}`] = params[field.name];
-      params[`var.${field.name}`] = params[field.name];
-    }
-  }
-  for (const [key, value] of Object.entries(variables)) {
-    if (!Object.prototype.hasOwnProperty.call(params, key)) params[key] = value;
-    params[`var.${key}`] = value;
-  }
-  return params;
-}
-
-function addBaaColumn(columns, column) {
-  if (column && !columns.includes(column)) columns.push(column);
-}
-
-function baaContractAliasesForObject(object, contract) {
-  const result = [];
-  const payload = normalizeBaaObjectPayload(object && object.payload);
-  const className = String(object && object.className || '').trim();
-  const kind = String(object && object.kind || '').trim();
-  const mappingKey = String(object && object.mappingKey || '').trim();
-  (contract && Array.isArray(contract.objects) ? contract.objects : []).forEach((item) => {
-    if (!item) return;
-    if (item.alias && (item.alias === kind || item.alias === mappingKey)) result.push(item.alias);
-    else if (item.className && item.className === className) result.push(item.alias || item.className);
-  });
-  if (!result.length) {
-    if (kind) result.push(kind);
-    if (className) result.push(className);
-  }
-  return Array.from(new Set(result.filter(Boolean))).filter((alias) => Object.keys(payload).length || alias);
-}
-
-function baaObjectMatchesSourceAlias(object, sourceAlias, contract) {
-  const alias = String(sourceAlias || '').trim();
-  if (!alias) return true;
-  const aliases = baaContractAliasesForObject(object, contract);
-  const className = String(object && object.className || '').trim();
-  const kind = String(object && object.kind || '').trim();
-  const mappingKey = String(object && object.mappingKey || '').trim();
-  return aliases.includes(alias) || className === alias || kind === alias || mappingKey === alias;
-}
-
 function normalizeObjectGroupFilterOperator(filter) {
   const raw = String(filter && filter.op || (filter && filter.regex !== undefined ? 'matches' : 'equals')).trim();
   if (raw === 'regexMatch') return 'matches';
@@ -14966,120 +17083,6 @@ function isIpv4NetworkValue(value) {
   if (!text) return false;
   if (!/[\/\-\s]/.test(text)) return false;
   return parseIpv4Network(text) !== null;
-}
-
-function baaRowMatchesSelectionFilter(row, filter, params) {
-  const path = filter && (filter.path || filter.attribute || filter.column || filter.field);
-  if (!path || typeof path !== 'string') {
-    throw new Error('baaPlanObjects filter requires path.');
-  }
-  const op = normalizeObjectGroupFilterOperator(filter);
-  const negate = normalizeObjectGroupFilterNegate(filter);
-  const caseSensitive = Boolean(filter.caseSensitive);
-  const actual = displayCardValue(row[path]);
-  let matched = false;
-  if (op === 'exists') matched = actual !== '';
-  else if (op === 'isIpv4') matched = parseIpv4ToInt(actual) !== null;
-  else if (op === 'isIpv4Network') matched = isIpv4NetworkValue(actual);
-  else if (op === 'matches') {
-    const pattern = substituteRegexParams(filter.regex, params);
-    assertRegexPatternAllowed(pattern, '', 'baaPlanObjects.filter.regex', false);
-    const regex = new RegExp(pattern, caseSensitive ? '' : 'i');
-    matched = regex.test(assertRegexInputAllowed(actual, 'baaPlanObjects filter value'));
-  } else {
-    const expectedRaw = resolveSelectionExpected(filter, params, row);
-    if (['ipv4InCidr', 'ipv4InRange', 'ipv4CidrOverlaps', 'ipv4CidrContains'].includes(op)) {
-      matched = ipv4ValueMatches(actual, displayCardValue(expectedRaw), op);
-    } else {
-      const expected = normalizeSelectionExpected(expectedRaw, caseSensitive);
-      const expectedValues = Array.isArray(expected) ? expected : [expected];
-      const actualValue = normalizeFilterValue(actual, caseSensitive);
-      if (op === 'equals') matched = expectedValues.includes(actualValue);
-      else if (op === 'contains') matched = actualValue.includes(expectedValues.join(','));
-      else if (op === 'startsWith') matched = actualValue.startsWith(expectedValues[0] || '');
-      else if (op === 'endsWith') matched = actualValue.endsWith(expectedValues[0] || '');
-      else if (op === 'in') matched = expectedValues.includes(actualValue);
-      else throw new Error(`Unsupported baaPlanObjects operator: ${op}`);
-    }
-  }
-  return negate ? !matched : matched;
-}
-
-function baaRowPassesSelectionFilters(row, filters, params) {
-  const normalized = Array.isArray(filters) ? filters : [];
-  const regularFilters = normalized.filter((filter) => !filter.scope);
-  const includeFilters = normalized.filter((filter) => filter.scope === 'include');
-  const excludeFilters = normalized.filter((filter) => filter.scope === 'exclude');
-
-  for (const filter of regularFilters) {
-    if (!baaRowMatchesSelectionFilter(row, filter, params)) return false;
-  }
-  if (includeFilters.length) {
-    let included = false;
-    for (const filter of includeFilters) {
-      if (baaRowMatchesSelectionFilter(row, filter, params)) {
-        included = true;
-        break;
-      }
-    }
-    if (!included) return false;
-  }
-  for (const filter of excludeFilters) {
-    if (baaRowMatchesSelectionFilter(row, filter, params)) return false;
-  }
-  return true;
-}
-
-function executeBaaPlanObjects(step, baaRequest, limits, contract = null, params = {}) {
-  const plan = baaRequest && baaRequest.plan && typeof baaRequest.plan === 'object' && !Array.isArray(baaRequest.plan) ? baaRequest.plan : {};
-  const objects = Array.isArray(plan.objects) ? plan.objects : [];
-  const normalizedContract = normalizeBaaContractServer({ baaContract: contract || {} });
-  const columns = ['PlanIndex', 'Kind', 'ClassName', 'PageShapeKey', 'MappingKey', 'RelationBindingStatus'];
-  const payloadPrefix = step.payloadPrefix === undefined ? 'Payload.' : String(step.payloadPrefix);
-  const sourceAlias = step.objectAlias || step.baaObjectAlias || step.kind || '';
-  normalizedContract.objects.forEach((object) => {
-    const aliases = [object.alias, object.className].filter(Boolean);
-    object.payload.forEach((field) => {
-      addBaaColumn(columns, `${payloadPrefix}${field.name}`);
-      aliases.forEach((alias) => addBaaColumn(columns, `BAA.${alias}.${field.name}`));
-    });
-  });
-  const rows = [];
-  for (const [index, object] of objects.entries()) {
-    if (!object || typeof object !== 'object' || Array.isArray(object)) continue;
-    if (!baaObjectMatchesSourceAlias(object, sourceAlias, normalizedContract)) continue;
-    const row = {
-      PlanIndex: object.planIndex === undefined || object.planIndex === null ? index : object.planIndex,
-      Kind: displayCardValue(object.kind || ''),
-      ClassName: displayCardValue(object.className || ''),
-      PageShapeKey: displayCardValue(object.pageShapeKey || ''),
-      MappingKey: displayCardValue(object.mappingKey || ''),
-      RelationBindingStatus: displayCardValue(object.relationBindingStatus || '')
-    };
-    const payload = normalizeBaaObjectPayload(object.payload);
-    const aliases = baaContractAliasesForObject(object, normalizedContract);
-    Object.keys(payload).sort().forEach((key) => {
-      const column = `${payloadPrefix}${key}`;
-      row[column] = displayCardValue(payload[key]);
-      addBaaColumn(columns, column);
-      aliases.forEach((alias) => {
-        const aliasColumn = `BAA.${alias}.${key}`;
-        row[aliasColumn] = displayCardValue(payload[key]);
-        addBaaColumn(columns, aliasColumn);
-      });
-      if (object.className) {
-        const classColumn = `BAA.${object.className}.${key}`;
-        row[classColumn] = displayCardValue(payload[key]);
-        addBaaColumn(columns, classColumn);
-      }
-    });
-    if (!baaRowPassesSelectionFilters(row, step.filters || step.where || [], params)) continue;
-    rows.push(row);
-    if (rows.length >= limits.maxRows) {
-      return { columns, rows, truncated: true };
-    }
-  }
-  return { columns, rows, truncated: false };
 }
 
 function resolveSelectionDriverRows(step, context, limits) {
@@ -15265,10 +17268,8 @@ function substituteRegexParams(pattern, params) {
 async function getPathClassAttributes(cmdbuildExecRequest, pathCache, className) {
   const key = String(className || '').toLowerCase();
   if (pathCache.attributes.has(key)) return pathCache.attributes.get(key);
-  const response = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}/attributes`);
-  const attributes = response.ok && Array.isArray(response.json && response.json.data)
-    ? response.json.data.map(sanitizeAttribute).filter(Boolean)
-    : [];
+  const response = await readExecutionClassAttributes(cmdbuildExecRequest, className);
+  const attributes = response.attributes;
   pathCache.attributes.set(key, attributes);
   return attributes;
 }
@@ -15445,9 +17446,10 @@ function buildSelectionResultRow(className, card, driverRow, columns, step) {
   return row;
 }
 
-function cardListPath(className, limit, fields) {
+function cardListPath(className, limit, fields, start = 0) {
   const query = new URLSearchParams();
   query.set('limit', String(limit));
+  if (start) query.set('start', String(start));
   const attributes = uniqueStrings((fields || [])
     .map(directCardFieldFromPath)
     .filter((field) => field && !CARD_BUILTIN_FIELDS.has(field)));
@@ -15455,10 +17457,41 @@ function cardListPath(className, limit, fields) {
   return `/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}/cards?${query.toString()}`;
 }
 
-async function requestCardsForSelection(cmdbuildExecRequest, className, limit, fields) {
-  const response = await cmdbuildExecRequest(cardListPath(className, limit, fields));
+async function requestCardsForSelection(cmdbuildExecRequest, className, limit, fields, start = 0) {
+  const response = await cmdbuildExecRequest(cardListPath(className, limit, fields, start));
   if (response.ok || !fields || !fields.length || isPermissionDeniedStatus(response.statusCode)) return response;
-  return cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}/cards?limit=${limit}`);
+  const query = new URLSearchParams();
+  query.set('limit', String(limit));
+  if (start) query.set('start', String(start));
+  return cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}/cards?${query.toString()}`);
+}
+
+function selectionScanLimit(step, filters, limits, resultLimit) {
+  const maxScan = Math.max(resultLimit, limits.maxRowsMax || limits.maxRows || resultLimit);
+  const explicit = toPositiveInt(step.scanLimit || step.searchLimit || step.fetchLimit, 0, maxScan);
+  if (explicit) return Math.max(resultLimit, explicit);
+  return Array.isArray(filters) && filters.length ? maxScan : resultLimit;
+}
+
+async function requestCardsForSelectionScan(cmdbuildExecRequest, className, scanLimit, fields) {
+  const limit = Math.max(1, Number(scanLimit) || 1);
+  const pageSize = Math.min(limit, 1000);
+  const rows = [];
+  let start = 0;
+  while (rows.length < limit) {
+    const pageLimit = Math.min(pageSize, limit - rows.length);
+    const response = await requestCardsForSelection(cmdbuildExecRequest, className, pageLimit, fields, start);
+    if (!response.ok) return response;
+    const pageRows = Array.isArray(response.json && response.json.data) ? response.json.data : [];
+    rows.push.apply(rows, pageRows);
+    if (pageRows.length < pageLimit) break;
+    start += pageRows.length;
+  }
+  return {
+    ok: true,
+    statusCode: 200,
+    json: { data: rows }
+  };
 }
 
 function selectionReadFields(step, requestedColumns) {
@@ -15472,6 +17505,7 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
   const driverRows = resolveSelectionDriverRows(step, context, limits);
   const maxRows = toPositiveInt(step.limit, limits.maxRows, limits.maxRows);
   const filters = Array.isArray(step.filters || step.where) ? (step.filters || step.where) : [];
+  const scanLimit = selectionScanLimit(step, filters, limits, maxRows);
   const dependency = dependencyMap && Array.isArray(dependencyMap.selections)
     ? dependencyMap.selections.find((item) => item && item.as === step.as)
     : null;
@@ -15498,7 +17532,7 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
     for (const className of targetClassNames) {
       validateCmdbuildIdentifier(className, 'selectCards className');
       if (!cardsByClass.has(className)) {
-        const cards = await requestCardsForSelection(cmdbuildExecRequest, className, maxRows, readFields);
+        const cards = await requestCardsForSelectionScan(cmdbuildExecRequest, className, scanLimit, readFields);
         if (!cards.ok) {
           throw new Error(`CMDBuild cards request for ${className} failed with status ${cards.statusCode}.`);
         }
@@ -16472,16 +18506,16 @@ async function executeFindClassesByAttributeType(cmdbuildExecRequest, step, para
   const classItems = Array.isArray(classes.json && classes.json.data) ? classes.json.data : [];
   for (const classItem of classItems.slice(0, limits.maxClasses)) {
     if (classItem._can_read === false) continue;
-    const attrs = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(classItem.name)}/attributes`);
-    if (!attrs.ok) continue;
-    const attrItems = Array.isArray(attrs.json && attrs.json.data) ? attrs.json.data : [];
+    const attrs = await readExecutionClassAttributes(cmdbuildExecRequest, classItem.name);
+    if (!attrs.response.ok) continue;
+    const attrItems = attrs.attributes;
     for (const attr of attrItems) {
-      if (attr.type !== attrType || attr._can_read === false || attr.active === false) continue;
+      if (attr.type !== attrType) continue;
       rows.push({
         Class: classItem.name,
         Description: classItem._description_translation || classItem.description || '',
         Attribute: attr.name,
-        AttributeDescription: attr._description_translation || attr.description || '',
+        AttributeDescription: attr.description || '',
         AttributeType: attr.type
       });
       if (rows.length >= limits.maxRows) {
@@ -16647,19 +18681,18 @@ function formatAttributeForCompare(attribute) {
 }
 
 async function readClassAttributeMap(cmdbuildExecRequest, className, compareFields, includeInherited) {
-  const attrs = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}/attributes`);
-  if (!attrs.ok) {
+  const attrs = await readExecutionClassAttributes(cmdbuildExecRequest, className);
+  if (!attrs.response.ok) {
     return {
       className,
       signatures: new Map(),
-      readStatus: attrs.statusCode
+      readStatus: attrs.response.statusCode
     };
   }
 
   const signatures = new Map();
-  const attrItems = Array.isArray(attrs.json && attrs.json.data) ? attrs.json.data : [];
+  const attrItems = attrs.attributes;
   for (const attr of attrItems) {
-    if (attr.active === false || attr._can_read === false) continue;
     if (!includeInherited && attr.inherited === true) continue;
     const signature = buildAttributeSignature(attr, compareFields);
     if (!signature) continue;
@@ -16671,7 +18704,7 @@ async function readClassAttributeMap(cmdbuildExecRequest, className, compareFiel
   return {
     className,
     signatures,
-    readStatus: attrs.statusCode
+    readStatus: attrs.response.statusCode
   };
 }
 
@@ -16759,6 +18792,7 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
     maxClassesMax,
     maxDomains: Math.min(options.maxDomains || 100, maxDomainsMax),
     maxRows: Math.min(options.maxRows || 500, maxRowsMax),
+    maxRowsMax,
     maxRestCalls: Math.min(options.maxRestCalls || 250, maxRestCallsMax),
     maxTraversalDepth: Math.min(options.maxTraversalDepth || maxTraversalDepthMax, maxTraversalDepthMax),
     traversalDepthDefault: Math.min(options.traversalDepthDefault || 1, maxTraversalDepthMax)
@@ -16777,8 +18811,6 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
     try {
       if (step.type === 'findClassesByAttributeType') {
         context[step.as] = await executeFindClassesByAttributeType(cmdbuildExecRequest, step, effectiveParams, limits);
-      } else if (step.type === 'baaPlanObjects') {
-        context[step.as] = executeBaaPlanObjects(step, options.baaRequest || null, limits, spec.baaContract || null, effectiveParams);
       } else if (step.type === 'extractVariables' || step.type === 'extract') {
         context[step.as] = executeExtractVariables(step, effectiveParams, context, limits);
       } else if (step.type === 'selectCards') {
@@ -16839,7 +18871,8 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
   const globalTablePresentations = Array.isArray(globalPresentation.tables) ? globalPresentation.tables : [];
   const defaultEmptyText = emptyResultTextFromSpec(spec);
   const defaultPermissionDeniedText = permissionDeniedTextFromSpec(spec);
-  const tables = spec.result.tables.map((table) => {
+  const resultTables = Array.isArray(spec.result && spec.result.tables) ? spec.result.tables : [];
+  const tables = resultTables.map((table) => {
     const source = context[table.name] || { columns: [], rows: [], truncated: false };
     const columns = Array.isArray(table.columns) && table.columns.length ? table.columns : source.columns;
     const sourceRows = Array.isArray(source.rows) ? source.rows : [];
@@ -16872,16 +18905,22 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
       truncated: Boolean(source.truncated)
     };
   });
+  const diagrams = buildResultDiagrams(spec, context, effectiveParams, limits);
 
   return {
     emptyText: defaultEmptyText,
     permissionDeniedText: defaultPermissionDeniedText,
+    presentation: {
+      ...globalPresentation,
+      outputMode: normalizeRuntimeOutputMode(globalPresentation.outputMode || 'both')
+    },
     limits: {
       ...limits,
       restCalls: cmdbuildExecRequest.getRestCalls(),
       requestTimeoutMs: CMDBUILD_REQUEST_TIMEOUT_MS
     },
     tables,
+    diagrams,
     trace
   };
 }
@@ -16890,6 +18929,7 @@ async function handleBackend(req, res, requestUrl) {
   const auth = backendAuthFromRequest(req, requestUrl);
   const authToken = auth.token;
   const authSource = auth.source;
+  const backendLogUser = authSource || '';
   if (isHealthPath(requestUrl.pathname)) {
     await handleHealth(req, res, requestUrl);
     return;
@@ -16925,10 +18965,6 @@ async function handleBackend(req, res, requestUrl) {
   }
 
   if (!authToken) {
-    if (isBaaVerifyBackendPath(requestUrl.pathname)) {
-      sendJson(res, 401, baaErrorResponse('AUTH_REQUIRED', 'BAA verification call did not include CMDBuild session cookie or CMDBuild-Authorization header.'));
-      return;
-    }
     sendJson(res, 401, {
       success: false,
       receivedCmdbuildCookie: false,
@@ -16940,6 +18976,7 @@ async function handleBackend(req, res, requestUrl) {
   if (requestUrl.pathname === `${BACKEND_PREFIX}/client-log`) {
     if (!methodAllowed(req, res, 'GET')) return;
     if (requestUrl.searchParams.get('clear') === '1') {
+      if (!requireStateChangingRequest(req, res, authToken)) return;
       clientLogs.length = 0;
     }
     const stage = requestUrl.searchParams.get('stage') || '';
@@ -16947,7 +18984,7 @@ async function handleBackend(req, res, requestUrl) {
       appendBoundedLog(clientLogs, {
         time: new Date().toISOString(),
         stage: truncateText(stage, 120),
-        href: truncateText(requestUrl.searchParams.get('href') || '', 500),
+        href: sanitizeDiagnosticHref(requestUrl.searchParams.get('href') || ''),
         message: truncateText(requestUrl.searchParams.get('message') || '', 500)
       });
     }
@@ -16961,6 +18998,7 @@ async function handleBackend(req, res, requestUrl) {
   if (requestUrl.pathname === `${BACKEND_PREFIX}/proxy-log`) {
     if (!methodAllowed(req, res, 'GET')) return;
     if (requestUrl.searchParams.get('clear') === '1') {
+      if (!requireStateChangingRequest(req, res, authToken)) return;
       proxyLogs.length = 0;
     }
     sendJson(res, 200, {
@@ -17060,15 +19098,13 @@ async function handleBackend(req, res, requestUrl) {
       return;
     }
 
-    const attributes = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}/attributes`, authToken);
-    sendJson(res, attributes.ok ? 200 : 502, {
-      success: attributes.ok,
-      cmdbuildStatus: attributes.statusCode,
+    const attributes = await readCmdbuildClassAttributes(authToken, className);
+    sendJson(res, attributes.response.ok ? 200 : 502, {
+      success: attributes.response.ok,
+      cmdbuildStatus: attributes.response.statusCode,
       className,
-      data: Array.isArray(attributes.json && attributes.json.data)
-        ? attributes.json.data.map(sanitizeAttribute)
-        : [],
-      meta: attributes.json && attributes.json.meta ? attributes.json.meta : null
+      data: attributes.attributes,
+      meta: attributes.response.json && attributes.response.json.meta ? attributes.response.json.meta : null
     });
     return;
   }
@@ -17133,29 +19169,6 @@ async function handleBackend(req, res, requestUrl) {
       success: probe.success,
       ...probe
     });
-    return;
-  }
-
-  if (requestUrl.pathname === `${BACKEND_PREFIX}/baa/contracts`) {
-    if (!methodAllowed(req, res, 'GET')) return;
-    const root = requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
-    const type = requestUrl.searchParams.get('type') || 'input';
-    try {
-      const contracts = await listBaaContractCards(authToken, root, type);
-      sendJson(res, 200, {
-        success: true,
-        root,
-        ...contracts
-      });
-    } catch (error) {
-      sendJson(res, isPermissionDeniedStatus(error.cmdbuildStatus || error.statusCode) ? 403 : 502, {
-        success: false,
-        root,
-        type,
-        message: error.message || String(error),
-        cmdbuildStatus: error.cmdbuildStatus || error.statusCode || 0
-      });
-    }
     return;
   }
 
@@ -17323,6 +19336,89 @@ async function handleBackend(req, res, requestUrl) {
     }
 
     methodAllowed(req, res, ['GET', 'PUT']);
+    return;
+  }
+
+  if (requestUrl.pathname === `${BACKEND_PREFIX}/mcp`) {
+    if (!methodAllowed(req, res, 'POST')) return;
+    if (!requireStateChangingRequest(req, res, authToken)) return;
+    if (!requireJsonContentType(req, res)) return;
+    const root = requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
+    const runtimeConfig = await getRuntimeConfig(authToken, root);
+    const assistantConfig = normalizeAssistantRuntimeConfig(runtimeConfig);
+    const body = await readJsonBody(req, 256 * 1024);
+    const response = await handleMcpJsonRpc(authToken, body, assistantConfig);
+    const mcpLimits = response.result && response.result.structuredContent
+      ? collectAssistantLimitDiagnostics(response.result.structuredContent).filter((item) => item.limitHit)
+      : [];
+    logLimitDiagnostics('mcp.limit_hit', {
+      requestId: req.cmdpRequestId || '',
+      authSource: backendLogUser,
+      method: body && body.method || ''
+    }, mcpLimits);
+    logInfo(response.error ? 'mcp.request.failed' : 'mcp.request.completed', {
+      requestId: req.cmdpRequestId || '',
+      authSource: backendLogUser,
+      method: body && body.method || '',
+      toolsAllowed: assistantConfig.mcp.allowedTools.length,
+      limitHits: mcpLimits.length,
+      errorCode: response.error && response.error.code || ''
+    });
+    sendJson(res, response.error ? 400 : 200, response);
+    return;
+  }
+
+  if (requestUrl.pathname === `${BACKEND_PREFIX}/assistant/template-draft`) {
+    if (!methodAllowed(req, res, 'POST')) return;
+    if (!requireStateChangingRequest(req, res, authToken)) return;
+    if (!requireJsonContentType(req, res)) return;
+    const body = await readJsonBody(req, 256 * 1024);
+    const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
+    const runtimeConfig = await getRuntimeConfig(authToken, root);
+    const assistantRuntimeStatus = assistantStatus(runtimeConfig);
+    try {
+      const draft = await createAssistantTemplateDraft(body, { authToken, runtimeConfig });
+      const assistantLimits = draft.diagnostics && draft.diagnostics.mcp && Array.isArray(draft.diagnostics.mcp.limits)
+        ? draft.diagnostics.mcp.limits.filter((item) => item && item.limitHit)
+        : [];
+      logLimitDiagnostics('assistant.limit_hit', {
+        requestId: req.cmdpRequestId || '',
+        authSource: backendLogUser,
+        root
+      }, assistantLimits);
+      logInfo(draft.success ? 'assistant.template_draft.completed' : 'assistant.template_draft.validation_failed', {
+        requestId: req.cmdpRequestId || '',
+        authSource: backendLogUser,
+        model: assistantRuntimeStatus.model,
+        root,
+        valid: Boolean(draft.success),
+        mcpEnabled: Boolean(draft.mcpContext && draft.mcpContext.enabled),
+        mcpTools: draft.mcpContext && Array.isArray(draft.mcpContext.tools) ? draft.mcpContext.tools.length : 0,
+        limitHits: assistantLimits.length,
+        errorsCount: Array.isArray(draft.errors) ? draft.errors.length : 0
+      });
+      sendJson(res, draft.success ? 200 : 422, {
+        action: 'assistant-template-draft',
+        ...draft,
+        assistant: assistantRuntimeStatus
+      });
+    } catch (error) {
+      logWarn('assistant.template_draft.failed', {
+        requestId: req.cmdpRequestId || '',
+        authSource: backendLogUser,
+        model: assistantRuntimeStatus.model,
+        root,
+        code: error.code || 'assistant_error',
+        statusCode: error.statusCode || 502
+      });
+      sendJson(res, error.statusCode || 502, {
+        success: false,
+        action: 'assistant-template-draft',
+        code: error.code || 'assistant_error',
+        message: error && error.message ? error.message : String(error),
+        assistant: assistantRuntimeStatus
+      });
+    }
     return;
   }
 
@@ -17545,7 +19641,7 @@ async function handleBackend(req, res, requestUrl) {
         });
         return;
       }
-      if (!['validate', 'preview', 'run', 'publish', 'baa-verify'].includes(templateAction)) {
+      if (!['validate', 'preview', 'run', 'publish'].includes(templateAction)) {
         sendJson(res, 404, {
           success: false,
           message: `Unknown template action: ${templateAction}`
@@ -17555,22 +19651,12 @@ async function handleBackend(req, res, requestUrl) {
       const runtimeReadOnly = templateAction === 'run' && req.method === 'GET';
       if (!methodAllowed(req, res, templateAction === 'run' ? ['GET', 'POST'] : 'POST')) return;
       if (!runtimeReadOnly) {
-        if (templateAction === 'baa-verify') {
-          if (!requireBaaStateChangingRequest(req, res, authToken, authSource)) return;
-        } else if (!requireStateChangingRequest(req, res, authToken)) return;
+        if (!requireStateChangingRequest(req, res, authToken)) return;
         if (!requireJsonContentType(req, res)) return;
       }
 
       const found = await findTemplateCard(authToken, root, templateCode);
       if (!found.response.ok) {
-        if (templateAction === 'baa-verify') {
-          const permissionDenied = found.response.statusCode === 401 || found.response.statusCode === 403;
-          sendJson(res, permissionDenied ? 403 : 502, baaErrorResponse(
-            permissionDenied ? 'CMDB_PERMISSION_DENIED' : 'CMDBUILD_ERROR',
-            permissionDenied ? DEFAULT_PERMISSION_DENIED_TEXT : `CMDBuild template lookup failed with status ${found.response.statusCode}.`
-          ));
-          return;
-        }
         if (sendTechnicalSchemaAccessDeniedIfNeeded(res, {
           cmdbuildStatus: found.response.statusCode,
           root: found.schema.root,
@@ -17585,10 +19671,6 @@ async function handleBackend(req, res, requestUrl) {
         return;
       }
       if (!found.card) {
-        if (templateAction === 'baa-verify') {
-          sendJson(res, 404, baaErrorResponse('TEMPLATE_NOT_FOUND', `Template not found: ${templateCode}`));
-          return;
-        }
         sendJson(res, 404, {
           success: false,
           message: `Template not found: ${templateCode}`
@@ -17611,10 +19693,6 @@ async function handleBackend(req, res, requestUrl) {
         return;
       }
       if (errors.length) {
-        if (templateAction === 'baa-verify') {
-          sendJson(res, 400, baaErrorResponse('EXECUTION_ERROR', 'Template spec validation failed.', 'error', errors.map((error) => baaErrorItem('TEMPLATE_SPEC_INVALID', `${error.path}: ${error.message}`))));
-          return;
-        }
         sendJson(res, 400, {
           success: false,
           template: {
@@ -17628,36 +19706,7 @@ async function handleBackend(req, res, requestUrl) {
       }
 
       const body = runtimeReadOnly ? {} : await readJsonBody(req);
-      const isBaaVerify = templateAction === 'baa-verify';
-      if (isBaaVerificationSpec(template.spec) && !isBaaVerify && ['preview', 'run', 'publish'].includes(templateAction)) {
-        sendJson(res, 409, {
-          success: false,
-          reason: 'baa_post_only',
-          message: BAA_POST_ONLY_TEXT,
-          template: {
-            code: template.code,
-            description: template.description,
-            active: template.active
-          },
-          baaVerifyUrl: `${BACKEND_PREFIX}/templates/${encodeURIComponent(template.code)}/baa-verify`
-        });
-        return;
-      }
-      if (isBaaVerify) {
-        const validation = validateBaaVerificationRequest(body, template.spec);
-        if (!validation.ok) {
-          sendJson(res, 400, baaEnvelope({
-            success: false,
-            status: 'error',
-            message: 'BAA verification request is invalid.',
-            tables: [],
-            items: validation.errors,
-            data: {}
-          }));
-          return;
-        }
-      }
-      const params = runtimeReadOnly ? publicSnapshotParamsFromUrl(requestUrl) : isBaaVerify ? baaParamsFromRequest(body, template.spec) : body.params || {};
+      const params = runtimeReadOnly ? publicSnapshotParamsFromUrl(requestUrl) : body.params || {};
       const jsonOutput = templateAction === 'run' && runtimeJsonOutputRequested(requestUrl);
       const session = await getSessionData(authToken);
       const username = session.data && session.data.username ? session.data.username : '';
@@ -17769,28 +19818,6 @@ async function handleBackend(req, res, requestUrl) {
             key: snapshot.key,
             paramsMode: publishConfig.paramsMode || 'exact'
           });
-        } else if (isBaaVerify && !cacheDisabled) {
-          const cached = await executeTemplateRunWithCache(authToken, root, template, params, session.data, executionOptions, {
-            refreshRequested,
-            forceRefreshRequested,
-            runtimeCacheConfig,
-            baaRequest: body,
-            cacheContext: { baa: normalizedBaaRequestForCache(body) }
-          });
-          result = cached.result;
-          cache = cached.cache;
-          logInfo('baa.verify.cache_result', {
-            requestId: req.cmdpRequestId || '',
-            templateCode: template.code,
-            username,
-            status: cache && cache.status || '',
-            scope: cache && cache.scope || '',
-            scopeMode: cache && cache.scopeMode || '',
-            backend: cache && cache.backend || '',
-            rowsCount: countResultRows(result),
-            refreshRequested: Boolean(refreshRequested),
-            forceRefreshRequested: Boolean(forceRefreshRequested)
-          });
         } else if (templateAction === 'run' && !cacheDisabled) {
           const cached = await executeTemplateRunWithCache(authToken, root, template, params, session.data, executionOptions, {
             refreshRequested,
@@ -17812,10 +19839,7 @@ async function handleBackend(req, res, requestUrl) {
             forceRefreshRequested: Boolean(forceRefreshRequested)
           });
         } else {
-          result = await executeTemplateSpec(authToken, template.spec, params, {
-            ...executionOptions,
-            baaRequest: isBaaVerify ? body : null
-          });
+          result = await executeTemplateSpec(authToken, template.spec, params, executionOptions);
         }
       } catch (error) {
         const permissionDenied = errorLooksPermissionDenied(error);
@@ -17832,12 +19856,6 @@ async function handleBackend(req, res, requestUrl) {
           permissionDenied,
           error: error && error.message ? error.message : String(error)
         });
-        if (isBaaVerify) {
-          const code = baaErrorCodeFromError(error);
-          const message = permissionDenied ? permissionDeniedText : (error && error.message ? error.message : String(error));
-          sendJson(res, permissionDenied ? 403 : (error.statusCode || 400), baaErrorResponse(code, message));
-          return;
-        }
         sendJson(res, permissionDenied ? 403 : (error.statusCode || 400), {
           success: false,
           action: templateAction,
@@ -17853,7 +19871,7 @@ async function handleBackend(req, res, requestUrl) {
       } finally {
         executionSlot.release();
       }
-      if (templateAction === 'run' || templateAction === 'preview' || isBaaVerify) {
+      if (templateAction === 'run' || templateAction === 'preview') {
         logInfo('template.executed', {
           requestId: req.cmdpRequestId || '',
           action: templateAction,
@@ -17862,10 +19880,6 @@ async function handleBackend(req, res, requestUrl) {
           rowsCount: countResultRows(result),
           cacheStatus: cache && cache.status || (cacheDisabled ? 'disabled' : '')
         });
-      }
-      if (isBaaVerify) {
-        sendJson(res, 200, baaResponseFromRuntimeResult(result, template));
-        return;
       }
       const payload = {
         success: true,
@@ -18148,16 +20162,6 @@ async function handleDynamicPagesUi(req, res, requestUrl) {
       await handleBackend(req, res, backendUrl);
       return;
     }
-    const root = requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
-    const found = await findTemplateCard(authToken, root, templateCode);
-    if (found.response.ok && found.card) {
-      const template = sanitizeTemplateCard(found.card);
-      if (isBaaVerificationSpec(template.spec)) {
-        const verifyUrl = `${requestUrl.origin}${BACKEND_PREFIX}/templates/${encodeURIComponent(templateCode)}/baa-verify`;
-        sendHtml(res, 409, `<!doctype html><html><head><meta charset="utf-8"><title>CMDB Dynamic Pages</title></head><body style="font-family:Arial,sans-serif;padding:24px"><h1>CMDB Dynamic Pages</h1><p>${htmlEscape(BAA_POST_ONLY_TEXT)}</p><p><strong>BAA verification URL:</strong> <code>${htmlEscape(verifyUrl)}</code></p><p><a href="/cmdbuild/dynamicpages/ui/designer">Open Designer</a></p></body></html>`);
-        return;
-      }
-    }
     sendHtml(res, 200, renderDynamicPagesShell({
       mode: 'runtime',
       session: sanitizeSession(session.data),
@@ -18180,6 +20184,10 @@ function proxyToCmdbuild(req, res, requestUrl) {
       success: false,
       message: 'CMDBuild proxy path is not allowed.'
     });
+    return;
+  }
+  if (isCmdbDynamicPagesScript(requestUrl.pathname)) {
+    serveCustomPageLauncherScript(req, res);
     return;
   }
   logProxyRequest(req, requestUrl);
@@ -18324,14 +20332,16 @@ const server = http.createServer((req, res) => {
   }
   if (requestUrl.pathname === DYNAMIC_UI_PREFIX || requestUrl.pathname.startsWith(`${DYNAMIC_UI_PREFIX}/`)) {
     handleDynamicPagesUi(req, res, requestUrl).catch((error) => {
+      const requestId = req.cmdpRequestId || '';
       logError('dynamic_ui.render_failed', {
-        requestId: req.cmdpRequestId || '',
+        requestId,
         path: requestUrl.pathname,
         message: error && error.message ? error.message : String(error),
         stack: error && error.stack ? error.stack : ''
       });
       const details = error && error.stack ? error.stack : (error && error.message ? error.message : String(error));
-      sendHtml(res, 500, `<!doctype html><html><head><meta charset="utf-8"><title>CMDB Dynamic Pages</title></head><body style="font-family:Arial,sans-serif;padding:24px"><h1>CMDB Dynamic Pages error</h1><pre>${htmlEscape(details)}</pre></body></html>`);
+      const publicDetails = diagnosticModeAllows('Verbose') ? details : `Unexpected dynamic UI error. Check backend logs with request id ${requestId || 'unavailable'}.`;
+      sendHtml(res, 500, `<!doctype html><html><head><meta charset="utf-8"><title>CMDB Dynamic Pages</title></head><body style="font-family:Arial,sans-serif;padding:24px"><h1>CMDB Dynamic Pages error</h1><pre>${htmlEscape(publicDetails)}</pre></body></html>`);
     });
     return;
   }
@@ -18384,37 +20394,46 @@ if (isMainModule) {
 export {
   DEFAULT_TEMPLATE_CACHE_TTL_SEC,
   applyTemplateParamDefaults,
-  baaErrorResponse,
-  baaResponseFromRuntimeResult,
+  assistantCandidateClassesFromSummary,
+  assistantClassMentionsFromText,
+  assistantLimitWarningsFromDiagnostics,
+  assistantMessages,
+  assistantSearchTermsFromText,
   buildResultCellMeta,
+  buildResultDiagrams,
   buildTechnicalSchema,
+  cmdbuildClassAttributesPath,
   cmdbuildRequestCanRetry,
   cmdbuildRetryDelayMs,
   defaultRuntimeConfig,
   dependencyMapWithHash,
   executionThrottleScopeKey,
   expectedSpecHashFromBody,
-  executeBaaPlanObjects,
+  extractAssistantDraftSpec,
   incMetric,
   isCmdbuildProxyPathAllowed,
   isJsonContentType,
   ipv4ValueMatches,
   diagnosticModeAllows,
   loggingStatus,
-  normalizedBaaRequestForCache,
   normalizeDiagnosticMode,
+  normalizeAssistantDraftSpec,
+  normalizeAssistantRuntimeConfig,
   normalizeLogFormat,
   normalizeLogLevel,
   normalizeLogTargets,
   normalizeRuntimeCacheConfig,
   normalizeTemplateCacheConfig,
   normalizeTemplateSpecForStorage,
+  parseAssistantJson,
   parseNameSet,
   publicSnapshotParamsFromUrl,
   redactByName,
   renderRuntimeParamTemplate,
   renderCellTemplate,
   renderPrometheusMetrics,
+  callLiteLLM,
+  mcpToolDefinitions,
   runtimeCacheKeyParts,
   runtimeCacheMeta,
   runtimeJsonOutputRequested,
@@ -18422,6 +20441,8 @@ export {
   redisRequiredError,
   sanitizeHeaders,
   sanitizeRequestPath,
+  sanitizeUrlForLog,
+  sanitizeVisibleClassAttributes,
   sanitizeTemplateCard,
   schemaParentFromInput,
   securityHeaders,
@@ -18429,7 +20450,7 @@ export {
   shouldRetryCmdbuildResult,
   templateIsProtected,
   validateRuntimeConfig,
+  validateTemplateSpec,
   validateRegexPattern,
-  validateBaaVerificationRequest,
   isSafeRuntimeLinkUrl
 };

@@ -20,7 +20,13 @@ const requiredEnv = [
   'CMDBDYNAMIC_REDIS_REQUIRED',
   'CMDBDYNAMIC_HEALTH_REDIS_REQUIRED',
   'CMDBDYNAMICPAGES_CSRF_SECRET',
+  'CMDP_ASSISTANT_ENABLED',
+  'LITELLM_BASE_URL',
+  'CMDP_LITELLM_ALLOWED_BASE_URLS',
+  'LITELLM_MODEL',
+  'LITELLM_API_KEY_FILE_HOST',
   'CMDP_LOG_TARGET',
+  'CMDP_EXTERNAL_LOG_SINK',
   'CMDP_DIAGNOSTIC_MODE'
 ];
 
@@ -60,6 +66,9 @@ rejectPattern('docker-compose.runtime.yml', /^\s*build\s*:/m, 'build directive')
 rejectPattern('docker-compose.nginx.yml', /^\s*build\s*:/m, 'build directive');
 requireText('docker-compose.runtime.yml', 'image: ${CMDBDYNAMIC_IMAGE}', 'prebuilt image reference');
 requireText('docker-compose.runtime.yml', '/health/live', 'container healthcheck');
+requireText('docker-compose.runtime.yml', 'LITELLM_API_KEY_FILE', 'LiteLLM assistant secret file wiring');
+requireText('docker-compose.runtime.yml', 'CMDP_EXTERNAL_LOG_SINK', 'external log sink wiring');
+requireText('docker-compose.runtime.yml', 'CMDP_LITELLM_ALLOWED_BASE_URLS', 'LiteLLM base URL allowlist wiring');
 requireText('Dockerfile', 'HEALTHCHECK', 'Docker HEALTHCHECK');
 requireText('Dockerfile', 'USER node', 'non-root runtime user');
 
@@ -71,6 +80,8 @@ requireText('Dockerfile', 'USER node', 'non-root runtime user');
   'PAM',
   '/health/ready',
   '/metrics',
+  'CMDP_EXTERNAL_LOG_SINK',
+  'CMDP_LITELLM_ALLOWED_BASE_URLS',
   'CMDP_DIAGNOSTIC_MODE=off'
 ].forEach((text) => requireText('docs/CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md', text));
 

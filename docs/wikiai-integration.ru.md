@@ -90,9 +90,9 @@ CMDBuild session.
 
 ## Исключения
 
-`endpoint.kind=baaVerification` является POST-only verification endpoint. Он не
-является HTML/runtime page, не публикуется как static view snapshot и не
-индексируется WikiAI как dynamic block.
+Legacy `endpoint.kind=baaVerification` удален из runtime/API surface. WikiAI
+должен индексировать только обычные runtime/static views, возвращающие таблицы
+и диаграммы под теми же cache/ACL правилами.
 
 ## Diagnostics And Logs
 

@@ -35,8 +35,9 @@
 - TTL кэша шаблона редактируется в часах, default для новых шаблонов 8 часов.
 - System refresh cooldown хранится в `Cst_QueryToolConfig.RuntimeConfigJson.runtimeCache.refreshCooldownSec`.
 - Static snapshot publication сохраняет результат в Redis и отдает его без проверки прав зрителя на исходные объекты.
-- BAA verification endpoint `POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify` реализован для обмена с `cmdbaa` через тот же reverse proxy и те же права CMDBuild.
-- DSL step `baaPlanObjects` материализует `plan.objects` BAA-запроса во временную таблицу без runtime-записи в CMDBuild.
+- BAA verification exchange удален из runtime/API surface; legacy BAA поля очищаются или отклоняются validation.
+- Static topology diagrams поддержаны через `result.diagrams` и рендерятся как SVG в runtime HTML плюс `diagrams[]` в runtime JSON.
+- Optional Designer `Assistant draft` использует настроенный LiteLLM-compatible endpoint и валидирует generated DSL перед применением.
 - Production health/readiness endpoint'ы реализованы: live, ready, redis.
 - Redis password поддерживается через secret file/env/URL и маскируется в health/status ответах.
 - Docker runtime packaging, минимальные GitHub Actions/GitLab CI, retry/backoff, execution throttling, graceful shutdown, keep-alive CMDBuild agents, security headers, nginx rate limiting, strict CMDBuild proxy allowlist, JSON mutation `Content-Type` checks, Prometheus `/metrics`, Redis strict mode, regex guard и template `specHash` conflict guard реализованы как audit hardening.
@@ -52,7 +53,7 @@
 - Примеры шаблонов ведутся отдельно от roadmap.
 - Глубокие Playwright Runtime table проверки реализованы как skip-safe tests и зависят от доступных live template fixtures для полного покрытия.
 - Browser-level проверка iframe внутри реальной wiki page реализована как optional smoke через `CMDBDYNAMIC_WIKI_IFRAME_URL`.
-- Browser/API smoke для живого `cmdbaa` exchange будет добавлен отдельно, когда внешний сценарий стабилизируется.
+- Browser smoke для согласованных заказчиком topology diagrams будет добавлен после стабилизации целевых layout.
 - Стабильную local wiki page ещё нужно поддерживать, чтобы optional iframe smoke запускался регулярно.
 
 ## 1. Проверка ролей и групп CMDBuild

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 
 import {
   cmdbuildRequestCanRetry,
@@ -22,6 +23,7 @@ import {
   sanitizeTemplateCard,
   sanitizeHeaders,
   sanitizeRequestPath,
+  sanitizeUrlForLog,
   setMetricGauge,
   securityHeaders,
   shouldRetryCmdbuildResult,
@@ -91,6 +93,10 @@ test('logging status is diagnostic and does not expose secret values', () => {
   assert.ok(Array.isArray(status.redactQuery));
   assert.equal(typeof status.diagnostic.mode, 'string');
   assert.deepEqual(status.diagnostic.levels, ['Basic', 'Verbose']);
+  assert.equal(status.assistant.enabled, false);
+  assert.equal(status.assistant.provider, 'litellm');
+  assert.equal(status.assistant.apiKeyConfigured, false);
+  assert.ok(status.externalSink === null || typeof status.externalSink === 'string');
   assert.equal(status.elk.directOutput, false);
   assert.match(status.elk.recommendedPipeline, /stdout\/syslog/);
 });
@@ -104,7 +110,18 @@ test('runtime config validation fails closed for production CSRF secret', () => 
   });
 
   assert.equal(invalid.ok, false);
-  assert.deepEqual(invalid.errors.map((item) => item.code), ['csrf_secret_required']);
+  assert.deepEqual(invalid.errors.map((item) => item.code), ['csrf_secret_required', 'external_log_sink_required']);
+
+  const placeholder = validateRuntimeConfig({
+    nodeEnv: 'production',
+    csrfSecret: 'replace-me',
+    logTargets: ['stdout'],
+    externalLogSink: 'docker-logging-driver',
+    diagnosticMode: 'off'
+  });
+
+  assert.equal(placeholder.ok, false);
+  assert.deepEqual(placeholder.errors.map((item) => item.code), ['csrf_secret_placeholder']);
 
   const valid = validateRuntimeConfig({
     nodeEnv: 'production',
@@ -115,6 +132,37 @@ test('runtime config validation fails closed for production CSRF secret', () => 
 
   assert.equal(valid.ok, true);
   assert.deepEqual(valid.warnings.map((item) => item.code), ['verbose_diagnostic_in_production']);
+  assert.equal(valid.assistant.enabled, false);
+  assert.equal(valid.assistant.apiKeyConfigured, false);
+});
+
+test('URL log sanitizer redacts sensitive query parameters', () => {
+  const redacted = sanitizeUrlForLog('http://example.local/ui?token=secret&plain=value#fragment');
+
+  assert.match(redacted, /token=%5BREDACTED%5D|token=\[REDACTED\]/);
+  assert.match(redacted, /plain=value/);
+  assert.doesNotMatch(redacted, /secret/);
+  assert.doesNotMatch(redacted, /fragment/);
+});
+
+test('missing optional LiteLLM secret file does not fail module import', () => {
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', "import('./scripts/dev-proxy-server.mjs').then(() => process.exit(0)).catch((error) => { console.error(error && error.stack || error); process.exit(1); });"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      NODE_ENV: 'test',
+      LITELLM_API_KEY: '',
+      CMDP_LITELLM_API_KEY: '',
+      LITELLM_API_KEY_FILE: '/tmp/cmdbdynamicpages-missing-litellm-key',
+      CMDP_LITELLM_API_KEY_FILE: '',
+      CMDBDYNAMIC_REDIS_PASSWORD_FILE: '',
+      REDIS_PASSWORD_FILE: '',
+      CMDP_LOG_LEVEL: 'silent'
+    },
+    encoding: 'utf8'
+  });
+
+  assert.equal(result.status, 0, result.stderr);
 });
 
 test('security headers are iframe-safe by default', () => {

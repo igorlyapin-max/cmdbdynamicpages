@@ -240,7 +240,7 @@ Designer умеет:
 - задавать cache-политику конкретного шаблона;
 - прогонять шаблон в редакторе и в отдельной runtime-странице.
 
-В `Группе объектов` каждая выборка начинается с CMDBuild-класса или BAA payload-источника. Правило scope содержит действие включить/исключить, атрибут/путь, отдельное отрицание `!`, оператор и параметр. Поддержаны проверки заполненности, regex, равно/содержит/начинается/заканчивается, `is IP`, `is IP net` и IPv4 CIDR/range сравнения. Для `exists`, `is IP` и `is IP net` правый параметр не используется; в остальных случаях можно ссылаться на `${param.name}`.
+В `Группе объектов` каждая выборка начинается с CMDBuild-класса. Правило scope содержит действие включить/исключить, атрибут/путь, отдельное отрицание `!`, оператор и параметр. Поддержаны проверки заполненности, regex, равно/содержит/начинается/заканчивается, `is IP`, `is IP net` и IPv4 CIDR/range сравнения. Для `exists`, `is IP` и `is IP net` правый параметр не используется; в остальных случаях можно ссылаться на `${param.name}`.
 
 В `Группе объектов` список атрибутов/путей можно фильтровать по домену, кардинальности и направлению связи. Это помогает явно выбрать, через какой `reference`/`domain` пришел атрибут, если одинаковые имена полей доступны через разные связи. В разделе есть свернутая подсказка с примерами.
 
@@ -304,43 +304,13 @@ http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/run/<templateCode>?param=value&js
 
 Runtime ссылки в ячейках строятся только из итоговых данных, metadata ячейки и входных параметров. Небезопасные URL-схемы `javascript:`, `data:` и `vbscript:` блокируются; в этом случае значение выводится обычным текстом.
 
-## BAA verification exchange
+## Диаграммы и assistant
 
-Для интеграции с соседним `cmdbaa` добавлен runtime-вариант того же шаблона:
+Runtime может возвращать не только таблицы, но и статические диаграммы в `result.diagrams`. Первый поддержанный тип - `topology`: он берет узлы и связи из уже подготовленных DSL aliases и рендерит один и тот же результат как SVG в HTML runtime и как `diagrams[]` в JSON runtime. Права CMDBuild, runtime cache, static snapshot и JSON/HTML поведение остаются такими же, как у таблиц.
 
-```text
-POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify
-```
+В Designer раздел `Visualization` имеет переключатель вывода: `Tables`, `Diagrams` или `Both`. Блок таблиц остается прежним для table-only шаблонов; редактор диаграмм появляется только для diagram-capable вывода и сохраняет настройки в `result.diagrams[]`.
 
-BAA-шаблоны являются POST-only verification endpoint. Они не выводятся через `/cmdbuild/dynamicpages/ui/run/<templateCode>`, не подходят для iframe/runtime HTML-ссылок и не публикуются как статические view-снимки. В Designer runtime-only разделы для BAA-шаблонов отключены; используйте `BAA endpoint`, `Извлечение`, `Кэширование` и BAA verify preview в `Прогон`.
-
-Авторизация использует текущие права CMDBuild. В `cmdbaa` нужно указывать абсолютный URL на reverse proxy `cmdbdynamicpages`, например `http://127.0.0.1:8093/cmdbuild/custom-api/templates/netverify/baa-verify`; относительный path в `cmdbaa` резолвится от его `CMDBUILD_ORIGIN` и может уйти в прямой CMDBuild. Browser-вызовы используют CMDBuild session cookie, same-origin `Origin`/`Referer` и `X-CMDBDynamicPages-CSRF`; server-to-server вызов `cmdbaa` может передавать текущий `CMDBuild-Authorization` header. Backend не использует сервисную учетную запись для business-data чтения: есть права CMDBuild - есть данные, нет прав - возвращается permission denied envelope.
-
-Тело запроса содержит `contractParams`, `variables`, `variableSources`, `endpoint.params` и `plan.objects`. `contractParams` описывает параметры версии контракта (`contractparam.*`), а runtime-значения передаются в `endpoint.params`. `variables` содержит вычисленные BAA переменные отправки; значения могут быть скалярами или массивами и доступны в правилах как `${var.name}` и `${param.name}`. `variableSources` используется для диагностики и входит в ключ runtime cache. `plan.objects` можно использовать в DSL через шаг:
-
-```json
-{
-  "type": "baaPlanObjects",
-  "as": "baaObjects",
-  "payloadPrefix": "Payload."
-}
-```
-
-В Designer раздел `BAA endpoint` заранее описывает контракт входящих CMDB-like кандидатов: code/version, expected candidate classes, payload-поля и contract params. Этот контракт нужен, чтобы до реального POST-запроса выбирать поля BAA-кандидатов в сопоставлении. Шаг `baaPlanObjects` превращает объекты плана в таблицу с колонками `PlanIndex`, `Kind`, `ClassName`, `PageShapeKey`, `MappingKey`, `RelationBindingStatus`, `Payload.<field>` и `BAA.<alias>.<field>`. Дальше шаблон может использовать обычные выборки, сопоставления, итоговые данные и визуализацию. Ответ адаптируется в BAA envelope: `success`, `status`, `summary`, `tables`, `items`, `data`.
-
-Сохраненные BAA-контракты читаются из существующей BAA technical ветки CMDBuild. Путь к `BAA technical superclass` от root и имена классов задаются в `Общие настройки` и хранятся в `Cst_QueryToolConfig.RuntimeConfigJson.baaTechnical`:
-
-```text
-BAAConversionContract
-BAAConversionContractVersion
-BAAVerificationInputContract
-BAAVerificationOutputContract
-BAAVerificationEndpoint
-```
-
-Designer использует `BAAVerificationInputContract` как список сохраненных input contracts для раздела `BAA endpoint`. Поле `SchemaJson.classes[]` преобразуется во «Входящие объекты BAA»: `classes[].name` становится `className`, а `classes[].attributes[]` становятся доступными `payload`-полями для сопоставления.
-
-Кэширование использует cache policy конкретного шаблона. Так как payload BAA небольшой, отдельная политика не вводится: нормализованное тело BAA-запроса добавляется в ключ runtime cache, а TTL/режимы берутся из `spec.cache`.
+В первом меню Designer есть раздел `Assistant`. Он обращается к LiteLLM-compatible `/v1/chat/completions` и просит модель подготовить deterministic template draft; backend валидирует возвращенный DSL перед применением в редакторе. Assistant может добавить bounded read-only контекст модели CMDBuild через tools `POST /cmdbuild/custom-api/mcp`, управляемые настройками `Cst_QueryToolConfig.RuntimeConfigJson.assistant.mcp`. Authoring-only настройка `Cst_QueryToolConfig.RuntimeConfigJson.assistant.prompt.system` добавляется к backend system prompt для локальных правил именования CMDBuild и семантики связей. Runtime rendering, runtime cache и static snapshot serving не вызывают LLM или MCP. Assistant выключен по умолчанию и включается настройкой Designer runtime `Cst_QueryToolConfig.RuntimeConfigJson.assistant.llm.enabled`; LiteLLM API key подается только через env или secret file. `CMDP_ASSISTANT_ENABLED` сохранен как deprecated no-op для старых deployment templates.
 
 ## Кэширование
 

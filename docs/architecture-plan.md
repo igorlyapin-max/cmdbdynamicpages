@@ -115,33 +115,9 @@ Designer draft preview is intentionally cache-free: `Visualize in editor` calls 
 
 The executor builds a used-field dependency map from filters, matching rules, final data, and visualization settings. `selectCards` materializes only the base card identifiers plus the fields that are actually used downstream; unrelated attributes are not added to result rows and are not part of the cache probe.
 
-## BAA Verification Exchange
+## Removed BAA Exchange
 
-The neighboring `cmdbaa` integration uses the same runtime executor and authorization model:
-
-```text
-POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify
-```
-
-The endpoint accepts a BAA request body, validates the minimal `endpoint.params` and `plan.objects` structure, executes the saved template under the current CMDBuild user session, and returns a BAA envelope. `endpoint.params` become template input parameters. `plan.objects` are exposed through the `baaPlanObjects` DSL step, which materializes them as an internal table without writing runtime data to CMDBuild.
-
-BAA templates are not HTTP views. `GET/POST /cmdbuild/custom-api/templates/:code/run`, `/cmdbuild/dynamicpages/ui/run/:code`, runtime iframe links, and static snapshot publication are rejected/disabled for `endpoint.kind=baaVerification`. Designer keeps the configuration and verification path available through `BAA endpoint`, `Extraction`, `Caching`, and `Run -> BAA verify`, while runtime-only presentation sections are shown as disabled.
-
-External BAA contracts are not created by the `cmdbdynamicpages` bootstrap. They live in the existing CMDBuild BAA technical branch under the path configured in `RuntimeConfigJson.baaTechnical.superclassPath`. Default class names are:
-
-```text
-BAAConversionContract
-BAAConversionContractVersion
-BAAVerificationInputContract
-BAAVerificationOutputContract
-BAAVerificationEndpoint
-```
-
-`GET /cmdbuild/custom-api/baa/contracts?type=input` reads `BAAVerificationInputContract` with the current user's permissions and supplies saved input contracts to Designer. If the current user cannot read these classes, Designer still works, but the BAA contract can be described manually inside the template.
-
-Permissions are not bypassed: the backend calls CMDBuild REST with the current session's `CMDBuild-Authorization`. If CMDBuild denies a class or attribute actually used by the template, the endpoint returns a permission-denied envelope and does not return partial results from the remaining selections. If no data is found inside the user's visibility, the endpoint returns a successful envelope with empty tables.
-
-Caching uses the same template `spec.cache` settings. The normalized BAA body is added to the runtime cache key as `cacheContext`, so different input plans do not share one result. There is no separate BAA runtime storage: results are either returned immediately or kept temporarily in Redis runtime cache according to the template TTL.
+The former neighboring `cmdbaa` verification exchange has been removed from the runtime surface. The backend no longer exposes `POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify`, the Designer no longer has a BAA endpoint editor, and `baaPlanObjects` is rejected during template validation. Legacy saved specs with `endpoint.kind=baaVerification` or `baaContract` are stripped on storage normalization and must be rebuilt as ordinary CMDBuild-backed object selections.
 
 ## Domain-aware Paths And Runtime Links
 
@@ -276,6 +252,7 @@ Implemented runtime config:
 - `PUT /cmdbuild/custom-api/config` upserts that card through the current user's CMDBuild permissions;
 - Designer shows `RuntimeConfigJson` as described form fields and saves the JSON object internally; the raw JSON textarea is not exposed;
 - Designer General settings expose `runtimeCache.refreshCooldownSec` as the system-wide manual refresh cooldown;
+- Designer Runtime settings expose `assistant.prompt.system`, `assistant.mcp` allowlist/context limits and show LiteLLM status from backend configuration;
 - `preview/run` use `RuntimeConfigJson.executionLimits` for default and capped executor limits;
 - `run` uses template `spec.cache.ttlSeconds` for result TTL and `RuntimeConfigJson.runtimeCache.refreshCooldownSec` for manual refresh cooldown.
 
@@ -285,6 +262,27 @@ Current `RuntimeConfigJson` shape:
 {
   "runtimeCache": {
     "refreshCooldownSec": 180
+  },
+  "assistant": {
+    "llm": {
+      "enabled": false,
+      "baseUrl": "http://litellm.example.local:4000/v1",
+      "model": "gpt-4.1-mini"
+    },
+    "prompt": {
+      "system": "Additional authoring-only system prompt for CMDBuild naming, lookup/reference/domain semantics, and relation traversal rules."
+    },
+    "mcp": {
+      "enabled": true,
+      "allowedTools": [
+        "cmdbuild_model_summary",
+        "cmdbuild_class_fields",
+        "cmdbuild_relation_hints",
+        "cmdbuild_template_context"
+      ],
+      "maxContextBytes": 12000,
+      "timeoutMs": 10000
+    }
   },
   "executionLimits": {
     "maxRowsDefault": 300,
@@ -301,6 +299,9 @@ Current `RuntimeConfigJson` shape:
   }
 }
 ```
+
+`POST /cmdbuild/custom-api/mcp` is an authoring-only read-only MCP JSON-RPC adapter for the Assistant. It runs under the current CMDBuild session, exposes only the configured tool allowlist, and returns bounded tool output. Runtime `GET run`, cached results, and static snapshots execute saved `SpecJson` without LLM/MCP calls.
+If `assistant.mcp.allowedTools` is missing or empty, the backend uses all tools declared in `MCP_TOOL_DEFINITIONS`.
 
 ## Special CMDBuild Model View Template
 
@@ -328,7 +329,7 @@ Execution modes are the same as for ordinary templates:
 - `dynamicUser` builds the HTML view under the current viewer's CMDBuild permissions;
 - `staticSnapshot` publishes a Redis snapshot under the editor's permissions and serves the stored page without source permission checks.
 
-The `CmdbBuildView` template is treated as protected/system: the Designer hides deletion and the backend rejects `DELETE` for that special template kind. A stale `protected` flag on ordinary DSL/BAA templates is ignored and removed during save. Settings are edited in the Designer `CMDBuild model view` section, and the runtime appearance is rendered with the project's compact/minimal visual style instead of the heavier standalone UI from `../cmdbuild`.
+The `CmdbBuildView` template is treated as protected/system: the Designer hides deletion and the backend rejects `DELETE` for that special template kind. A stale `protected` flag on ordinary DSL templates is ignored and removed during save. Settings are edited in the Designer `CMDBuild model view` section, and the runtime appearance is rendered with the project's compact/minimal visual style instead of the heavier standalone UI from `../cmdbuild`.
 
 ## Editor Permissions
 

@@ -117,33 +117,9 @@ TTL шаблона хранится в секундах, но Designer пока�
 
 Designer draft preview намеренно не использует runtime cache: `Визуализировать в редакторе` вызывает `/cmdbuild/custom-api/draft/preview` и выполняет текущий несохраненный черновик. Для проверки сохраненного endpoint в разделе `Прогон` есть forced refresh: `POST /cmdbuild/custom-api/templates/:code/run` с `forceRefresh=true`. Forced refresh игнорирует пользовательский cooldown, но принимается только на CSRF-защищенном POST; read-only Runtime iframe `GET run` сохраняет поведение с таймером.
 
-## BAA verification exchange
+## Удаленный BAA exchange
 
-Для соседнего `cmdbaa` используется тот же runtime executor и та же модель авторизации, что у Designer/Runtime:
-
-```text
-POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify
-```
-
-Endpoint принимает BAA request body, валидирует минимальную структуру `contractParams`, `variables`, `variableSources`, `endpoint.params` и `plan.objects`, выполняет сохраненный шаблон под CMDBuild-сессией текущего пользователя и возвращает BAA envelope. `endpoint.params` становятся входными параметрами шаблона; параметры версии контракта доступны также как `${contractparam.name}`. `variables` становятся входными значениями `${var.name}`/`${param.name}` и могут быть массивами. `plan.objects` доступны через DSL step `baaPlanObjects`, который материализует их во внутреннюю таблицу без записи в CMDBuild.
-
-BAA-шаблоны не являются HTTP-view. `GET/POST /cmdbuild/custom-api/templates/:code/run`, `/cmdbuild/dynamicpages/ui/run/:code`, runtime iframe-ссылки и публикация статического снимка отклоняются/отключаются для `endpoint.kind=baaVerification`. В Designer остаются доступными настройка и проверка через `BAA endpoint`, `Извлечение`, `Кэширование` и `Прогон -> BAA verify`; runtime-only разделы визуального представления показываются отключенными.
-
-Внешние BAA-контракты не создаются bootstrap'ом `cmdbdynamicpages`. Они находятся в существующей BAA technical ветке CMDBuild под настраиваемым путем `RuntimeConfigJson.baaTechnical.superclassPath`. По умолчанию ожидаются классы:
-
-```text
-BAAConversionContract
-BAAConversionContractVersion
-BAAVerificationInputContract
-BAAVerificationOutputContract
-BAAVerificationEndpoint
-```
-
-`GET /cmdbuild/custom-api/baa/contracts?type=input` читает `BAAVerificationInputContract` в правах текущего пользователя и отдает Designer список сохраненных input contracts. Если у пользователя нет прав на эти классы, Designer остается доступен, но контракт можно описать вручную внутри шаблона.
-
-Права не обходятся: backend вызывает CMDBuild REST с `CMDBuild-Authorization` текущей сессии. Если CMDBuild отказывает по реально используемому классу/атрибуту, endpoint возвращает permission denied envelope и не отдает частичный результат по другим выборкам. Если данные просто не найдены в рамках видимости пользователя, возвращается успешный envelope с пустыми таблицами.
-
-Кэширование использует те же `spec.cache` настройки шаблона. Нормализованное BAA тело добавляется в runtime cache key как `cacheContext`, чтобы разные входные планы не делили один результат. Отдельного runtime-хранилища BAA нет: результат либо возвращается сразу, либо временно лежит в Redis runtime cache по TTL шаблона.
+Прежний соседний `cmdbaa` verification exchange удален из runtime surface. Backend больше не публикует `POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify`, Designer больше не содержит BAA endpoint editor, а `baaPlanObjects` отклоняется валидацией шаблона. Устаревшие сохраненные specs с `endpoint.kind=baaVerification` или `baaContract` очищаются при storage normalization и должны быть пересобраны как обычные CMDBuild-backed выборки объектов.
 
 ## Redis password
 
@@ -231,10 +207,49 @@ Root ограничивает только технические классы �
 
 - executor limits;
 - system manual refresh cooldown;
+- настройки Assistant system prompt, MCP allowlist/context limits и отображаемый LiteLLM status;
 - runtime defaults.
-- BAA technical superclass path and class names for external BAA contracts.
 
 Raw JSON в UI не показывается: Designer редактирует настройки через описанные поля.
+
+Текущая форма настроек включает:
+
+```json
+{
+  "runtimeCache": {
+    "refreshCooldownSec": 180
+  },
+  "assistant": {
+    "llm": {
+      "enabled": false,
+      "baseUrl": "http://litellm.example.local:4000/v1",
+      "model": "gpt-4.1-mini"
+    },
+    "prompt": {
+      "system": "Дополнительный authoring-only system prompt для правил именования CMDBuild, lookup/reference/domain значений и обхода связей."
+    },
+    "mcp": {
+      "enabled": true,
+      "allowedTools": [
+        "cmdbuild_model_summary",
+        "cmdbuild_class_fields",
+        "cmdbuild_relation_hints",
+        "cmdbuild_template_context"
+      ],
+      "maxContextBytes": 12000,
+      "timeoutMs": 10000
+    }
+  },
+  "executionLimits": {
+    "maxRowsDefault": 500,
+    "maxRowsPreviewDefault": 25,
+    "maxRowsMax": 2000
+  }
+}
+```
+
+`POST /cmdbuild/custom-api/mcp` - authoring-only read-only MCP JSON-RPC adapter для Assistant. Он работает под текущей CMDBuild-сессией, публикует только настроенный allowlist tools и ограничивает размер tool output. Runtime `GET run`, кэшированные результаты и static snapshots исполняют сохраненный `SpecJson` без LLM/MCP вызовов.
+Если `assistant.mcp.allowedTools` отсутствует или пустой, backend использует все tools, объявленные в `MCP_TOOL_DEFINITIONS`.
 
 `Cst_QueryTemplate.SpecJson` хранит DSL шаблона, включая:
 
@@ -280,7 +295,7 @@ Backend и client блокируют небезопасные URL-схемы `ja
 - `dynamicUser` - HTML строится под правами текущего пользователя CMDBuild;
 - `staticSnapshot` - редактор публикует снимок в Redis, runtime отдает готовую страницу без повторной проверки прав на исходную модель.
 
-Шаблон `CmdbBuildView` считается protected/system: Designer скрывает удаление, а backend блокирует `DELETE` для этого специального вида шаблона. Устаревший флаг `protected` у обычных DSL/BAA-шаблонов игнорируется и удаляется при сохранении. Настройки редактируются в Designer в разделе `CMDBuild model view`; внешний вид приводится к минималистичному runtime-представлению проекта, без отдельного login screen и без тяжелого UI соседнего проекта.
+Шаблон `CmdbBuildView` считается protected/system: Designer скрывает удаление, а backend блокирует `DELETE` для этого специального вида шаблона. Устаревший флаг `protected` у обычных DSL-шаблонов игнорируется и удаляется при сохранении. Настройки редактируются в Designer в разделе `CMDBuild model view`; внешний вид приводится к минималистичному runtime-представлению проекта, без отдельного login screen и без тяжелого UI соседнего проекта.
 
 ## Права редактора
 
@@ -335,7 +350,7 @@ Designer расположен по адресу:
 - `matchRows`;
 - model/domain operations.
 
-`selectCards` используется для business-data выборок и не является generic REST proxy. Визуальная `Группа объектов` компилирует правила scope в фильтры с `scope: include|exclude`, `path`, `negate`, `op` и `regex`/`value`. Операторы `exists`, `isIpv4` и `isIpv4Network` не используют правую часть; regex/value могут ссылаться на `${param.name}`. Если стартовый источник выборки является BAA payload, вместо `selectCards` генерируется `baaPlanObjects` с теми же правилами фильтрации.
+`selectCards` используется для business-data выборок и не является generic REST proxy. Визуальная `Группа объектов` компилирует правила scope в фильтры с `scope: include|exclude`, `path`, `negate`, `op` и `regex`/`value`. Операторы `exists`, `isIpv4` и `isIpv4Network` не используют правую часть; regex/value могут ссылаться на `${param.name}`.
 
 Executor ограничивает число строк, классов, доменов, REST-вызовов и глубину раскрытия связей.
 

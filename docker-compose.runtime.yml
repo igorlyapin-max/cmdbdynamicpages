@@ -25,9 +25,15 @@ services:
       CMDP_LOG_LEVEL: ${CMDP_LOG_LEVEL:-info}
       CMDP_LOG_FORMAT: ${CMDP_LOG_FORMAT:-json}
       CMDP_LOG_TARGET: ${CMDP_LOG_TARGET:-stdout}
+      CMDP_EXTERNAL_LOG_SINK: ${CMDP_EXTERNAL_LOG_SINK:-}
       CMDP_DIAGNOSTIC_MODE: ${CMDP_DIAGNOSTIC_MODE:-off}
       CMDP_LOG_REDACT_HEADERS: ${CMDP_LOG_REDACT_HEADERS:-cookie,authorization,cmdbuild-authorization,x-csrf-token,x-cmdbdynamicpages-csrf,set-cookie}
       CMDP_LOG_REDACT_QUERY: ${CMDP_LOG_REDACT_QUERY:-password,passwd,pwd,token,secret,authorization,auth,csrf,x-cmdbdynamicpages-csrf}
+      CMDP_ASSISTANT_ENABLED: ${CMDP_ASSISTANT_ENABLED:-false}
+      LITELLM_BASE_URL: ${LITELLM_BASE_URL:-http://127.0.0.1:4000/v1}
+      CMDP_LITELLM_ALLOWED_BASE_URLS: ${CMDP_LITELLM_ALLOWED_BASE_URLS:-}
+      LITELLM_MODEL: ${LITELLM_MODEL:-corp-openai-gpt-4.1-mini}
+      LITELLM_API_KEY_FILE: ${LITELLM_API_KEY_FILE:-/run/secrets/cmdbdynamicpages_litellm_api_key}
       CMDP_SYSLOG_HOST: ${CMDP_SYSLOG_HOST:-127.0.0.1}
       CMDP_SYSLOG_PORT: ${CMDP_SYSLOG_PORT:-514}
       CMDP_SYSLOG_PROTOCOL: ${CMDP_SYSLOG_PROTOCOL:-udp}
@@ -36,6 +42,10 @@ services:
       - type: bind
         source: ${CMDBDYNAMIC_REDIS_PASSWORD_FILE_HOST:-./secrets/cmdbdynamicpages_redis_password}
         target: /run/secrets/cmdbdynamicpages_redis_password
+        read_only: true
+      - type: bind
+        source: ${LITELLM_API_KEY_FILE_HOST:-/dev/null}
+        target: /run/secrets/cmdbdynamicpages_litellm_api_key
         read_only: true
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:${PROXY_PORT:-8093}/health/live || exit 1"]

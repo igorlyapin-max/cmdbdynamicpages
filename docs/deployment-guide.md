@@ -130,7 +130,7 @@ read on custom page CmdbDynamicPages
 
 Business data is always read using the current CMDBuild user's permissions.
 
-The `cmdbaa` integration through `POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify` uses the same CMDBuild runtime permissions. Configure an absolute URL to the `cmdbdynamicpages` reverse proxy, for example `http://127.0.0.1:8093/cmdbuild/custom-api/templates/netverify/baa-verify`; a relative path in `cmdbaa` is resolved against its `CMDBUILD_ORIGIN`. Browser calls use the CMDBuild session cookie and `X-CMDBDynamicPages-CSRF`; server-to-server `cmdbaa` calls may pass the current `CMDBuild-Authorization` header.
+The optional LiteLLM assistant does not participate in runtime page rendering. Enable it only for Designer draft generation with `Cst_QueryToolConfig.RuntimeConfigJson.assistant.llm.enabled`, `LITELLM_BASE_URL`, `CMDP_LITELLM_ALLOWED_BASE_URLS`, `LITELLM_MODEL`, and `LITELLM_API_KEY_FILE` or `LITELLM_API_KEY`. Keep the API key outside git and route it through the deployment secret mechanism. RuntimeConfig base URLs outside the server-side allowlist are rejected before the API key is used. `CMDP_ASSISTANT_ENABLED` is deprecated and no longer gates assistant calls. Assistant MCP settings are stored in `Cst_QueryToolConfig.RuntimeConfigJson.assistant.mcp`; `/cmdbuild/custom-api/mcp` is read-only, current-user scoped, and should stay unavailable to unauthenticated callers through the normal CMDBuild cookie boundary.
 
 ## 7. Nginx same-origin front
 

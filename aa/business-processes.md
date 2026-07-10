@@ -127,39 +127,35 @@ flowchart TD
 - CMDBuild недоступен: `/health/ready` возвращает `503`;
 - backend process недоступен: liveness не получает ответ.
 
-## BP-005. BAA verification exchange
+## BP-005. Designer assistant draft
 
 ```mermaid
 flowchart TD
-  BAA[cmdbaa UI/handler] -->|POST baa-verify, 8093 или same-origin front| API[cmdbdynamicpages Backend]
-  API -->|read template, 8090| C[CMDBuild REST]
-  API -->|business data REST, 8090| C
-  API -->|GET/SET runtime cache, 6379| R[Redis]
-  API --> BAA
+  UI[Designer] -->|POST assistant/template-draft| API[cmdbdynamicpages Backend]
+  API -->|validate current session/CSRF| C[CMDBuild session]
+  API -->|chat completions| L[LiteLLM]
+  API -->|validate returned DSL| UI
 ```
 
 Позитивный сценарий:
 
-1. `cmdbaa` вызывает `POST /cmdbuild/custom-api/templates/<templateCode>/baa-verify` через тот же reverse proxy.
+1. Пользователь в Designer нажимает `Assistant draft` и описывает нужную таблицу или диаграмму.
 2. Backend проверяет CMDBuild session cookie, same-origin headers и CSRF token.
-3. `endpoint.params` из BAA request body становятся параметрами шаблона.
-4. `plan.objects` материализуются в DSL через `baaPlanObjects`.
-5. Сохраненный шаблон выполняется под текущей CMDBuild-сессией.
-6. Runtime result адаптируется в BAA envelope с `success`, `status`, `summary`, `tables`, `items`, `data`.
-
-BAA-шаблон не имеет HTML runtime-view: прямые `/dynamicpages/ui/run/<code>` и `/templates/<code>/run` для `endpoint.kind=baaVerification` не строят таблицу, а возвращают POST-only сообщение. Designer использует отдельный BAA verify preview с тестовым request body.
+3. Если `CMDP_ASSISTANT_ENABLED=false`, endpoint возвращает controlled disabled response.
+4. Если assistant включен, backend отправляет краткий intent и текущий draft context в LiteLLM-compatible `/v1/chat/completions`.
+5. Ответ модели парсится как JSON и валидируется тем же DSL validator, что обычный шаблон.
+6. Designer применяет только валидный deterministic draft; runtime pages не вызывают LLM.
 
 Негативные сценарии:
 
-- нет CMDBuild session cookie или сессия истекла: возвращается BAA envelope с ошибкой авторизации;
+- нет CMDBuild session cookie или сессия истекла: endpoint отклоняется как обычный protected API;
 - нет CSRF/same-origin для POST: endpoint отклоняется как state-changing вызов;
-- нет прав на реально используемый класс/атрибут: возвращается permission denied envelope, частичный результат по другим выборкам не отдается;
-- входное тело не содержит корректный `plan.objects`: возвращается invalid request envelope.
+- LiteLLM key не настроен при включенном assistant: readiness/config validation показывает ошибку;
+- модель вернула невалидный DSL: ответ не применяется в Designer.
 
 Логирование:
 
 | Событие | Где фиксируется | Данные |
 | --- | --- | --- |
-| BAA runtime cache hit/miss | structured logger `baa.verify.cache_result` / `runtime.cache_result` | templateCode, username, cache status, rowsCount |
-| BAA execution success/failure | structured logger `template.executed` / `template.execution_failed` | requestId, action `baa-verify`, templateCode, status/error |
+| Assistant draft request | structured logger `assistant.template_draft.*` | requestId, username/session hash, model, status/error |
 | CSRF/same-origin отказ | backend logs | route, HTTP status; token не пишется |

@@ -19,6 +19,7 @@ Runtime host не должен выполнять `npm install`, `npm run build`
   - pull image из private registry;
   - доступ backend к `CMDBUILD_ORIGIN`;
   - доступ backend к Redis;
+  - optional доступ backend к LiteLLM endpoint, если включен Designer assistant;
   - входящий доступ к `PROXY_PORT`, по умолчанию `8093`;
   - optional same-origin nginx front `8088`, если используется bundled nginx.
 - Redis должен быть production-grade и password-protected, если static snapshot или runtime cache входят в service contract.
@@ -39,10 +40,15 @@ cp .env.example .env
 - `CMDBDYNAMIC_REDIS_URL` - Redis endpoint без plaintext password в URL, если пароль передается файлом;
 - `CMDBDYNAMIC_REDIS_PASSWORD_FILE_HOST` - host path к secret file от PAM/platform;
 - `CMDBDYNAMICPAGES_CSRF_SECRET` - stable external secret из approved secret source;
+- `CMDP_ASSISTANT_ENABLED` - deprecated/no-op compatibility variable; фактическое включение Designer draft assistant хранится в `Cst_QueryToolConfig.RuntimeConfigJson.assistant.llm.enabled`;
+- `LITELLM_BASE_URL`, `LITELLM_MODEL`, `LITELLM_API_KEY_FILE_HOST` - optional LiteLLM assistant endpoint/model/API-key secret file;
+- `CMDP_LITELLM_ALLOWED_BASE_URLS` - server-side allowlist для LiteLLM-compatible endpoints; RuntimeConfig baseUrl не должен выводить API key за этот список;
+- `Cst_QueryToolConfig.RuntimeConfigJson.assistant.mcp` - runtime-настройки read-only MCP tools для Designer Assistant; secrets здесь не хранить;
 - `CMDP_LOG_TARGET` - `stdout` или `stdout,syslog`, если контур использует syslog sink;
+- `CMDP_EXTERNAL_LOG_SINK` - имя внешней доставки логов (`docker logging driver`, collector/sidecar, ELK/OpenSearch/syslog route), если `CMDP_LOG_TARGET` остается `stdout`;
 - `CMDP_SYSLOG_*` - только если включен syslog.
 
-`replace-me`, `registry.example.local`, `cmdbuild.example.local`, `redis.example.local` и `syslog.example.local` не являются рабочими значениями. Real `.env` файлы не коммитить.
+`replace-me`, `registry.example.local`, `cmdbuild.example.local`, `redis.example.local`, `litellm.example.local` и `syslog.example.local` не являются рабочими значениями. Real `.env` файлы не коммитить.
 
 ## Проверка compose template
 

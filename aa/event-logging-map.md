@@ -16,7 +16,7 @@
 | LOG-012 | IF-004/IF-005 | Static snapshot publish/hit/miss | structured logger `snapshot.*` | templateCode, username, backend, key/hash, rowsCount, paramsMode | Исходные CMDBuild-объекты и runtime rows не пишутся |
 | LOG-013 | IF-004 | Create/update/delete шаблона | structured logger `template.*` + `Cst_QueryTemplateVersion` | templateCode, username, cmdbuildStatus, versionLogged | `SpecJson` хранится в version class, но не пишется в операционный лог |
 | LOG-014 | IF-009 | Передача логов в ELK/SIEM | stdout/syslog -> collector | JSON event или RFC5424-like syslog message | Прямого подключения приложения к Elasticsearch нет |
-| LOG-015 | IF-010 | BAA verification exchange | structured logger `baa.verify.cache_result`, `template.executed`, `template.execution_failed` | requestId, action `baa-verify`, templateCode, username, cache status, rowsCount, status/error | BAA request body, runtime rows, cookie/token и CSRF token не пишутся |
+| LOG-015 | IF-010 | Designer assistant draft | structured logger `assistant.template_draft.*` | requestId, username/session hash, model, status/error | Prompt context, LiteLLM API key, cookie/token и CSRF token не пишутся |
 
 ## Обязательные события ИБ
 

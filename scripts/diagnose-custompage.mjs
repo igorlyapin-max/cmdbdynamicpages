@@ -51,6 +51,11 @@ const checks = [
       result.body.includes('cmdp-view-source') &&
       result.body.includes('cmdp-view-column-rows') &&
       result.body.includes('cmdp-visualization-rows') &&
+      result.body.includes('cmdp-assistant-editor') &&
+      result.body.includes('cmdp-assistant-llm-enabled') &&
+      result.body.includes('cmdp-assistant-mcp-enabled') &&
+      result.body.includes('cmdp-output-mode') &&
+      result.body.includes('cmdp-diagram-editor') &&
       result.body.includes('cmdp-test-workflow') &&
       result.body.includes('cmdp-max-depth') &&
       result.body.includes('CMDB Dynamic Pages') &&
@@ -66,6 +71,24 @@ const checks = [
       result.body.includes('window.CMDP_BOOT') &&
       result.body.includes('"designerSection":"object-group"') &&
       result.body.includes('cmdp-object-group-editor')
+  },
+  {
+    name: 'dynamic designer assistant route',
+    url: `${proxyOrigin}/cmdbuild/dynamicpages/ui/designer/assistant`,
+    expect: (result) => result.statusCode === 200 &&
+      result.body.includes('window.CMDP_BOOT') &&
+      result.body.includes('"designerSection":"assistant"') &&
+      result.body.includes('cmdp-assistant-editor') &&
+      result.body.includes('cmdp-assistant-intent')
+  },
+  {
+    name: 'dynamic designer visualization route',
+    url: `${proxyOrigin}/cmdbuild/dynamicpages/ui/designer/visualization`,
+    expect: (result) => result.statusCode === 200 &&
+      result.body.includes('window.CMDP_BOOT') &&
+      result.body.includes('"designerSection":"visualization"') &&
+      result.body.includes('cmdp-output-mode') &&
+      result.body.includes('cmdp-diagram-editor')
   },
   {
     name: 'dynamic designer general settings route',
