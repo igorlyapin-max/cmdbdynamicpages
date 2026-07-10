@@ -1,6 +1,6 @@
 # Возможное расширение: диаграммы и graph-runtime
 
-Статус: proposal / backlog. Документ фиксирует возможное расширение системы, а не утвержденный roadmap и не текущий runtime contract.
+Статус: baseline implemented / дальнейшее расширение. Документ фиксирует выбранную модель развития диаграмм внутри текущего runtime contract.
 
 Дата фиксации: 2026-07-09.
 
@@ -41,6 +41,44 @@
           "nodes": "GraphNodes",
           "edges": "GraphEdges"
         },
+        "nodeMappings": [
+          {
+            "from": "GraphNodes",
+            "fields": {
+              "id": "Id",
+              "label": "Label",
+              "group": "Vlan",
+              "parent": "Parent",
+              "nodeType": "Kind",
+              "href": "Href"
+            }
+          }
+        ],
+        "edgeMappings": [
+          {
+            "type": "object",
+            "from": "AclRows",
+            "fields": {
+              "source": "Source",
+              "target": "Target",
+              "label": "Port",
+              "edgeType": "Action",
+              "edgeDirection": "Direction"
+            }
+          }
+        ],
+        "groupMappings": [
+          {
+            "from": "Vlans",
+            "fields": { "id": "Vlan", "label": "Name" }
+          }
+        ],
+        "hierarchyMappings": [
+          {
+            "from": "Contains",
+            "fields": { "parent": "Parent", "child": "Child", "label": "Relation" }
+          }
+        ],
         "layout": {
           "type": "hierarchical"
         },
@@ -57,6 +95,12 @@
 
 `result.diagrams[]` должен ссылаться на результаты уже существующих DSL steps: `selectCards`, `expandRelations`, `traverseDomains`, `matchRows`, `enrichRows`, `composeRows`. Новые business-сущности в CMDBuild для nodes/edges не нужны на первом этапе.
 
+Для v1 mapping покрывает три обязательных семейства:
+
+- `groupMappings`: группировки по VLAN, location, ИС, lookup/status или другому признаку;
+- `hierarchyMappings`: containment/иерархия вроде server -> docker -> service;
+- `edgeMappings`: CMDBuild domains, reference attributes и relation-object классы вроде ACL/firewall/route/dependency.
+
 ## Реализация
 
 Минимальный v1:
@@ -67,6 +111,8 @@
 - добавить runtime JSON output, где рядом с `tables` возвращаются `diagrams`;
 - расширить Designer разделом `Диаграмма` / `Graph view`;
 - сохранить cache/static snapshot модель без отдельного graph storage.
+
+Текущий baseline содержит schema validation, deterministic graph builder, runtime HTML/JSON, отдельный Designer пункт `Diagram editor`, server-side D2 SVG render через binary и скачивание generated `.d2` source. Если D2 renderer недоступен, runtime page обязана показать явное предупреждение и fallback-диаграмму, а не молча подменять визуализацию. Runtime JSON не должен отдавать raw `.d2`, embedded structured metadata или raw SVG content; source экспортируется отдельным `d2=true` endpoint. Для public static snapshot raw `.d2` source доступен только при явном `publish.publicD2Source=true`.
 
 Graph builder должен:
 

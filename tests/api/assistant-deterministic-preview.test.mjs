@@ -80,6 +80,73 @@ test('draft preview executes exact router anchor before selecting ARM cards by L
   assert.equal(backend.exitCode, null);
 });
 
+test('template run exposes D2 source only through dedicated download endpoint', async (t) => {
+  const spec = {
+    version: 1,
+    steps: [
+      {
+        type: 'selectCards',
+        as: 'arms',
+        className: 'ARM',
+        columns: ['Code', 'Description', 'Location'],
+        limit: 2
+      }
+    ],
+    result: {
+      diagrams: [{
+        name: 'armsDiagram',
+        title: 'ARM diagram',
+        source: { nodes: 'arms' },
+        fields: {
+          nodeId: 'Code',
+          nodeLabel: 'Description',
+          nodeGroup: '_Location_description'
+        },
+        metadata: { embedInD2: true }
+      }]
+    }
+  };
+  const mock = await startMockCmdbuild(t, {
+    templates: [
+      templateCard('D2SourceTemplate', spec)
+    ]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-source-test-token';
+
+  const json = await requestJson(
+    'GET',
+    `${backendOrigin}/cmdbuild/custom-api/templates/D2SourceTemplate/run?json=true`,
+    undefined,
+    { cookie },
+    10_000
+  );
+  assert.equal(json.statusCode, 200, json.body);
+  assert.equal(json.json.success, true);
+  assert.equal(json.json.diagrams.length, 1);
+  assert.equal(json.json.diagrams[0].d2.source, undefined);
+  assert.equal(json.json.diagrams[0].d2.downloadAvailable, true);
+  assert.equal(json.json.diagrams[0].svg.content, undefined);
+  assert.equal(json.json.diagrams[0].nodes[0].data, undefined);
+
+  const source = await request(
+    'GET',
+    `${backendOrigin}/cmdbuild/custom-api/templates/D2SourceTemplate/run?d2=true&diagram=armsDiagram`,
+    undefined,
+    { cookie },
+    10_000
+  );
+  assert.equal(source.statusCode, 200, source.body);
+  assert.match(String(source.headers['content-type'] || ''), /text\/vnd\.d2/);
+  assert.match(String(source.headers['content-disposition'] || ''), /D2SourceTemplate-armsDiagram\.d2/);
+  assert.match(source.body, /vars: \{/);
+  assert.match(source.body, /cmdp: \{/);
+  assert.match(source.body, /ARM-001|ARM 001/);
+  assert.equal(backend.exitCode, null);
+});
+
 test('template publish rejects unsaved static snapshot settings with actionable reason', async (t) => {
   const spec = publishSpec({
     publish: { mode: 'dynamicUser', paramsMode: 'exact', warningAccepted: false }
@@ -410,6 +477,74 @@ test('model class attributes endpoint preserves CMDBuild permission and missing 
   assert.equal(backend.exitCode, null);
 });
 
+test('public snapshot D2 source requires explicit publication flag', async (t) => {
+  const blockedSpec = d2PublishSpec(false);
+  const allowedSpec = d2PublishSpec(true);
+  const mock = await startMockCmdbuild(t, {
+    templates: [
+      templateCard('D2PublicBlockedTemplate', blockedSpec),
+      templateCard('D2PublicAllowedTemplate', allowedSpec)
+    ]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=publish-d2-public-test-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  assert.equal(csrf.statusCode, 200);
+  const headers = {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token
+  };
+
+  const blockedPublish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/D2PublicBlockedTemplate/publish`, {
+    params: {},
+    savedSpecHash: hashJson(blockedSpec)
+  }, headers, 10_000);
+  assert.equal(blockedPublish.statusCode, 200, blockedPublish.body);
+
+  const blockedSource = await requestJson(
+    'GET',
+    `${backendOrigin}/cmdbuild/custom-api/public-snapshots/D2PublicBlockedTemplate/run?d2=true&diagram=armsDiagram`,
+    undefined,
+    {},
+    10_000
+  );
+  assert.equal(blockedSource.statusCode, 403, blockedSource.body);
+  assert.match(blockedSource.json.message, /not enabled/);
+
+  const blockedJson = await requestJson(
+    'GET',
+    `${backendOrigin}/cmdbuild/custom-api/public-snapshots/D2PublicBlockedTemplate/run?json=true`,
+    undefined,
+    {},
+    10_000
+  );
+  assert.equal(blockedJson.statusCode, 200, blockedJson.body);
+  assert.equal(blockedJson.json.diagrams[0].d2.source, undefined);
+  assert.equal(blockedJson.json.diagrams[0].d2.downloadAvailable, false);
+
+  const allowedPublish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/D2PublicAllowedTemplate/publish`, {
+    params: {},
+    savedSpecHash: hashJson(allowedSpec)
+  }, headers, 10_000);
+  assert.equal(allowedPublish.statusCode, 200, allowedPublish.body);
+
+  const allowedSource = await request(
+    'GET',
+    `${backendOrigin}/cmdbuild/custom-api/public-snapshots/D2PublicAllowedTemplate/run?d2=true&diagram=armsDiagram`,
+    undefined,
+    {},
+    10_000
+  );
+  assert.equal(allowedSource.statusCode, 200, allowedSource.body);
+  assert.match(String(allowedSource.headers['content-type'] || ''), /text\/vnd\.d2/);
+  assert.match(allowedSource.body, /vars: \{/);
+  assert.match(allowedSource.body, /cmdp: \{/);
+  assert.equal(backend.exitCode, null);
+});
+
 async function startMockCmdbuild(t, options = {}) {
   const requests = [];
   const templateCards = Array.isArray(options.templates) ? options.templates : [];
@@ -574,6 +709,35 @@ function publishSpec(overrides = {}) {
     },
     publish: { mode: 'staticSnapshot', paramsMode: 'exact', warningAccepted: true },
     ...overrides
+  };
+}
+
+function d2PublishSpec(publicD2Source) {
+  return {
+    version: 1,
+    steps: [
+      {
+        type: 'selectCards',
+        as: 'arms',
+        className: 'ARM',
+        columns: ['Code', 'Description', 'Location'],
+        limit: 2
+      }
+    ],
+    result: {
+      diagrams: [{
+        name: 'armsDiagram',
+        title: 'ARM diagram',
+        source: { nodes: 'arms' },
+        fields: {
+          nodeId: 'Code',
+          nodeLabel: 'Description',
+          nodeGroup: '_Location_description'
+        },
+        metadata: { embedInD2: true }
+      }]
+    },
+    publish: { mode: 'staticSnapshot', paramsMode: 'exact', warningAccepted: true, publicD2Source }
   };
 }
 

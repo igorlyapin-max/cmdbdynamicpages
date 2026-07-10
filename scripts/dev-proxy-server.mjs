@@ -5,6 +5,7 @@ import dgram from 'node:dgram';
 import fs from 'node:fs';
 import os from 'node:os';
 import net from 'node:net';
+import { spawn } from 'node:child_process';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { URL, pathToFileURL } from 'node:url';
 import {
@@ -103,7 +104,17 @@ const REGEX_MAX_INPUT_LENGTH = Math.max(1024, Number(process.env.CMDBDYNAMIC_REG
 const DEFAULT_EMPTY_RESULT_TEXT = 'В результате вашего запроса объекты не найдены';
 const DEFAULT_PERMISSION_DENIED_TEXT = 'Вам не хватает прав увидеть данные или интерфейс дизайнера';
 const SNAPSHOT_MISSING_TEXT = 'Страница отсутствует для загрузки';
-const RUNTIME_SYSTEM_PARAMS = new Set(['json']);
+const RUNTIME_SYSTEM_PARAMS = new Set(['json', 'd2', 'diagram']);
+const D2_RENDER_ENABLED = process.env.CMDP_D2_RENDER_ENABLED !== 'false';
+const D2_BINARY = String(process.env.CMDP_D2_BINARY || '/usr/local/bin/d2').trim() || '/usr/local/bin/d2';
+const D2_TIMEOUT_MS = Math.max(500, Number(process.env.CMDP_D2_TIMEOUT_MS || 3000) || 3000);
+const D2_MAX_INPUT_BYTES = Math.max(1024, Number(process.env.CMDP_D2_MAX_INPUT_BYTES || 2 * 1024 * 1024) || 2 * 1024 * 1024);
+const D2_MAX_OUTPUT_BYTES = Math.max(1024, Number(process.env.CMDP_D2_MAX_OUTPUT_BYTES || 10 * 1024 * 1024) || 10 * 1024 * 1024);
+const D2_MAX_DIAGRAMS = Math.max(1, Math.min(100, Number(process.env.CMDP_D2_MAX_DIAGRAMS || 8) || 8));
+const D2_CONCURRENCY = Math.max(1, Math.min(10, Number(process.env.CMDP_D2_CONCURRENCY || 2) || 2));
+const D2_LAYOUT = String(process.env.CMDP_D2_LAYOUT || 'dagre').trim() || 'dagre';
+const D2_LAYOUT_ALLOWLIST = parseNameSet(process.env.CMDP_D2_LAYOUT_ALLOWLIST || 'dagre,elk');
+const D2_RENDERER_UNAVAILABLE_TEXT = 'D2 renderer is unavailable; showing fallback diagram. D2 source is still available for download.';
 const LITELLM_BASE_URL = process.env.LITELLM_BASE_URL || process.env.CMDP_LITELLM_BASE_URL || 'http://127.0.0.1:4000/v1';
 const LITELLM_MODEL = process.env.LITELLM_MODEL || process.env.CMDP_LITELLM_MODEL || 'corp-openai-gpt-4.1-mini';
 const LITELLM_API_KEY = readOptionalSecretValue(process.env.LITELLM_API_KEY || process.env.CMDP_LITELLM_API_KEY, process.env.LITELLM_API_KEY_FILE || process.env.CMDP_LITELLM_API_KEY_FILE);
@@ -512,7 +523,8 @@ function loggingStatus() {
       directOutput: false,
       recommendedPipeline: 'stdout/syslog -> collector -> Elasticsearch'
     },
-    assistant: assistantStatus()
+    assistant: assistantStatus(),
+    d2: d2RendererConfigSummary()
   };
 }
 
@@ -554,6 +566,13 @@ function validateRuntimeConfig(input = {}) {
       message: 'Production startup requires an external log sink: configure CMDP_LOG_TARGET=stdout,syslog or set CMDP_EXTERNAL_LOG_SINK for a platform collector/logging driver.'
     });
   }
+  if (nodeEnv.toLowerCase() === 'production' && externalLogSink && /^(replace-me|changeme|change-me|placeholder|example|docker-logging-driver-or-collector|collector-id|replace-with-approved-collector-id)$/i.test(externalLogSink)) {
+    errors.push({
+      code: 'external_log_sink_placeholder',
+      env: 'CMDP_EXTERNAL_LOG_SINK',
+      message: 'Production startup requires a real external log sink name, not an example placeholder.'
+    });
+  }
 
   if (diagnosticMode === 'Verbose' && nodeEnv.toLowerCase() === 'production') {
     warnings.push({
@@ -570,6 +589,7 @@ function validateRuntimeConfig(input = {}) {
     logTargets,
     externalLogSink,
     assistant: assistantStatus(),
+    d2: d2RendererConfigSummary(),
     errors,
     warnings
   };
@@ -581,6 +601,7 @@ function runtimeConfigLogSummary(validation = validateRuntimeConfig()) {
     diagnosticMode: validation.diagnosticMode,
     logTargets: validation.logTargets,
     externalLogSink: validation.externalLogSink || '',
+    d2: validation.d2 || d2RendererConfigSummary(),
     errors: validation.errors.map((item) => item.code),
     warnings: validation.warnings.map((item) => item.code)
   };
@@ -598,6 +619,9 @@ const metricDefinitions = {
   cmdp_runtime_cache_misses_total: { type: 'counter', help: 'Runtime cache misses by backend.' },
   cmdp_runtime_cache_build_seconds_count: { type: 'counter', help: 'Runtime cache build duration observation count.' },
   cmdp_runtime_cache_build_seconds_sum: { type: 'counter', help: 'Runtime cache build duration sum in seconds.' },
+  cmdp_d2_render_errors_total: { type: 'counter', help: 'D2 render failures by reason.' },
+  cmdp_d2_render_seconds_count: { type: 'counter', help: 'D2 render duration observation count.' },
+  cmdp_d2_render_seconds_sum: { type: 'counter', help: 'D2 render duration sum in seconds.' },
   cmdp_template_run_errors_total: { type: 'counter', help: 'Template execution failures by action and reason.' },
   cmdp_execution_throttled_total: { type: 'counter', help: 'Template execution requests rejected by throttling.' },
   cmdp_health_ready: { type: 'gauge', help: 'Readiness status: 1 ready, 0 not ready.' }
@@ -629,6 +653,8 @@ function setMetricGauge(name, labels = {}, value = 0) {
     value: Number(value) || 0
   });
 }
+
+setMetricGauge('cmdp_health_ready', {}, 0);
 
 function observeMetricSeconds(name, labels = {}, seconds = 0) {
   incMetric(`${name}_count`, labels, 1);
@@ -671,12 +697,6 @@ function renderPrometheusMetrics() {
 }
 
 async function metricsPayload() {
-  try {
-    const readiness = await readinessPayload();
-    setMetricGauge('cmdp_health_ready', {}, readiness.ready ? 1 : 0);
-  } catch {
-    setMetricGauge('cmdp_health_ready', {}, 0);
-  }
   return renderPrometheusMetrics();
 }
 
@@ -761,6 +781,362 @@ function sha256Hex(value) {
 
 function hashJson(value) {
   return sha256Hex(stableJsonStringify(value));
+}
+
+function normalizeD2Layout(value) {
+  const text = String(value || D2_LAYOUT || 'dagre').trim().toLowerCase();
+  return D2_LAYOUT_ALLOWLIST.has(text) ? text : 'dagre';
+}
+
+function d2RendererConfig() {
+  return {
+    enabled: D2_RENDER_ENABLED,
+    required: D2_RENDER_ENABLED,
+    binary: D2_BINARY,
+    timeoutMs: D2_TIMEOUT_MS,
+    maxInputBytes: D2_MAX_INPUT_BYTES,
+    maxOutputBytes: D2_MAX_OUTPUT_BYTES,
+    maxDiagrams: D2_MAX_DIAGRAMS,
+    concurrency: D2_CONCURRENCY,
+    layout: normalizeD2Layout(D2_LAYOUT),
+    layoutAllowlist: Array.from(D2_LAYOUT_ALLOWLIST).sort()
+  };
+}
+
+function d2RendererConfigSummary() {
+  const config = d2RendererConfig();
+  return {
+    enabled: config.enabled,
+    required: config.required,
+    binary: config.binary,
+    timeoutMs: config.timeoutMs,
+    maxInputBytes: config.maxInputBytes,
+    maxOutputBytes: config.maxOutputBytes,
+    maxDiagrams: config.maxDiagrams,
+    concurrency: config.concurrency,
+    layout: config.layout,
+    layoutAllowlist: config.layoutAllowlist
+  };
+}
+
+function d2CacheContext() {
+  const config = d2RendererConfig();
+  return {
+    d2: {
+      enabled: config.enabled,
+      binary: config.binary,
+      timeoutMs: config.timeoutMs,
+      maxInputBytes: config.maxInputBytes,
+      maxOutputBytes: config.maxOutputBytes,
+      maxDiagrams: config.maxDiagrams,
+      concurrency: config.concurrency,
+      layout: config.layout,
+      layoutAllowlist: config.layoutAllowlist
+    }
+  };
+}
+
+function d2RenderError(reason, message, extra = {}) {
+  return {
+    rendered: false,
+    content: '',
+    reason,
+    renderError: truncateText(String(message || D2_RENDERER_UNAVAILABLE_TEXT), 500),
+    ...extra
+  };
+}
+
+function safeD2SvgReferenceValue(value) {
+  const text = String(value || '').trim();
+  if (!text) return true;
+  if (text.startsWith('#')) return true;
+  return text.startsWith('/') && !text.startsWith('//');
+}
+
+function d2ProcessEnv() {
+  return {
+    PATH: process.env.PATH || '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+    HOME: process.env.HOME || '/tmp',
+    TMPDIR: process.env.TMPDIR || '/tmp'
+  };
+}
+
+function runD2Process(args, input, options = {}) {
+  const config = d2RendererConfig();
+  const timeoutMs = Math.max(100, Number(options.timeoutMs || config.timeoutMs) || config.timeoutMs);
+  const maxOutputBytes = Math.max(1024, Number(options.maxOutputBytes || config.maxOutputBytes) || config.maxOutputBytes);
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let killedForOutput = false;
+    let child;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve({
+        elapsedMs: Date.now() - startedAt,
+        stdout: truncateText(stdout, maxOutputBytes),
+        stderr: truncateText(stderr, 4096),
+        ...result
+      });
+    };
+    const timer = setTimeout(() => {
+      if (child && !child.killed) child.kill('SIGKILL');
+      finish({
+        ok: false,
+        reason: 'timeout',
+        error: `D2 renderer timed out after ${timeoutMs}ms.`
+      });
+    }, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+
+    try {
+      child = spawn(config.binary, args, {
+        shell: false,
+        windowsHide: true,
+        env: d2ProcessEnv(),
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+    } catch (error) {
+      finish({
+        ok: false,
+        reason: 'spawn_error',
+        error: error && error.message ? error.message : String(error)
+      });
+      return;
+    }
+
+    child.stdout.on('data', (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > maxOutputBytes) {
+        killedForOutput = true;
+        if (!child.killed) child.kill('SIGKILL');
+        return;
+      }
+      stdout += chunk.toString('utf8');
+    });
+    child.stderr.on('data', (chunk) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes <= 4096) stderr += chunk.toString('utf8');
+    });
+    child.on('error', (error) => {
+      finish({
+        ok: false,
+        reason: error && error.code === 'ENOENT' ? 'binary_not_found' : 'process_error',
+        error: error && error.message ? error.message : String(error)
+      });
+    });
+    child.on('close', (code, signal) => {
+      if (killedForOutput) {
+        finish({
+          ok: false,
+          reason: 'output_limit',
+          error: `D2 renderer output exceeded ${maxOutputBytes} bytes.`
+        });
+        return;
+      }
+      if (code !== 0) {
+        finish({
+          ok: false,
+          reason: 'exit_code',
+          exitCode: code == null ? null : code,
+          signal: signal || '',
+          error: `D2 renderer exited with code ${code == null ? 'unknown' : code}${signal ? ` signal ${signal}` : ''}.`
+        });
+        return;
+      }
+      finish({
+        ok: true,
+        reason: 'ok'
+      });
+    });
+
+    if (input) child.stdin.write(input);
+    child.stdin.end();
+  });
+}
+
+function sanitizeD2Svg(svg) {
+  const text = String(svg || '');
+  const start = text.search(/<svg[\s>]/i);
+  const end = text.toLowerCase().lastIndexOf('</svg>');
+  if (start < 0 || end < start) return '';
+  let sanitized = text.slice(start, end + '</svg>'.length);
+  sanitized = sanitized.replace(/<\?xml[\s\S]*?\?>/gi, '');
+  sanitized = sanitized.replace(/<!doctype[\s\S]*?>/gi, '');
+  sanitized = sanitized.replace(/<script\b[\s\S]*?<\/script>/gi, '');
+  sanitized = sanitized.replace(/<(iframe|object|embed|foreignObject|style|animate|animateMotion|animateTransform|set|image|use|feImage)\b[\s\S]*?<\/\1>/gi, '');
+  sanitized = sanitized.replace(/<(iframe|object|embed|foreignObject|style|animate|animateMotion|animateTransform|set|image|use|feImage)\b[^>]*\/?>/gi, '');
+  sanitized = sanitized.replace(/\s+on[a-z]+\s*=\s*"[^"]*"/gi, '');
+  sanitized = sanitized.replace(/\s+on[a-z]+\s*=\s*'[^']*'/gi, '');
+  sanitized = sanitized.replace(/\s+on[a-z]+\s*=\s*[^\s>]+/gi, '');
+  sanitized = sanitized.replace(/\s+(href|xlink:href|src)\s*=\s*"([^"]*)"/gi, (match, _name, value) => safeD2SvgReferenceValue(value) ? match : '');
+  sanitized = sanitized.replace(/\s+(href|xlink:href|src)\s*=\s*'([^']*)'/gi, (match, _name, value) => safeD2SvgReferenceValue(value) ? match : '');
+  sanitized = sanitized.replace(/\s+(href|xlink:href|src)\s*=\s*([^\s>"']*)/gi, (match, _name, value) => safeD2SvgReferenceValue(value) ? match : '');
+  sanitized = sanitized.replace(/\s+style\s*=\s*"[^"]*(?:url\s*\(|expression\s*\(|@import)[^"]*"/gi, '');
+  sanitized = sanitized.replace(/\s+style\s*=\s*'[^']*(?:url\s*\(|expression\s*\(|@import)[^']*'/gi, '');
+  sanitized = sanitized.replace(/\s+style\s*=\s*[^\s>]*(?:url\s*\(|expression\s*\(|@import)[^\s>]*/gi, '');
+  if (!/data-cmdp-d2-rendered=/.test(sanitized)) {
+    sanitized = sanitized.replace(/<svg\b/i, '<svg data-cmdp-d2-rendered="true"');
+  }
+  return sanitized;
+}
+
+function d2LayoutForDiagram(diagram) {
+  const layout = diagram && diagram.layout && typeof diagram.layout === 'object' && !Array.isArray(diagram.layout) ? diagram.layout : {};
+  return normalizeD2Layout(layout.engine || layout.d2Layout || layout.layout || D2_LAYOUT);
+}
+
+async function renderD2SourceToSvg(source, diagram = {}) {
+  const config = d2RendererConfig();
+  if (!config.enabled) {
+    return d2RenderError('disabled', 'D2 renderer is disabled by CMDP_D2_RENDER_ENABLED=false.');
+  }
+  const d2Source = String(source || '');
+  const inputBytes = Buffer.byteLength(d2Source, 'utf8');
+  if (!d2Source.trim()) {
+    return d2RenderError('empty_source', 'D2 source is empty.');
+  }
+  if (inputBytes > config.maxInputBytes) {
+    return d2RenderError('input_limit', `D2 source exceeded ${config.maxInputBytes} bytes.`, { inputBytes });
+  }
+
+  const layout = d2LayoutForDiagram(diagram);
+  const result = await runD2Process([`--layout=${layout}`, '-', '-'], d2Source, config);
+  observeMetricSeconds('cmdp_d2_render_seconds', { layout }, result.elapsedMs / 1000);
+  if (!result.ok) {
+    incMetric('cmdp_d2_render_errors_total', { reason: result.reason || 'unknown' });
+    logWarn('d2.render_failed', {
+      requestId: currentRequestId(),
+      reason: result.reason || 'unknown',
+      binaryConfigured: Boolean(config.binary),
+      layout,
+      elapsedMs: result.elapsedMs,
+      inputBytes,
+      exitCode: result.exitCode == null ? undefined : result.exitCode,
+      signal: result.signal || undefined
+    });
+    return d2RenderError(result.reason || 'render_failed', result.error || D2_RENDERER_UNAVAILABLE_TEXT, {
+      layout,
+      inputBytes
+    });
+  }
+
+  const content = sanitizeD2Svg(result.stdout);
+  if (!content) {
+    incMetric('cmdp_d2_render_errors_total', { reason: 'invalid_svg' });
+    return d2RenderError('invalid_svg', 'D2 renderer did not return a valid SVG document.', {
+      layout,
+      inputBytes
+    });
+  }
+  return {
+    rendered: true,
+    content,
+    renderError: '',
+    reason: 'ok',
+    layout,
+    inputBytes,
+    outputBytes: Buffer.byteLength(content, 'utf8')
+  };
+}
+
+async function renderD2ArtifactsForDiagrams(diagrams) {
+  if (!Array.isArray(diagrams) || !diagrams.length) return diagrams;
+  const config = d2RendererConfig();
+  const renderable = diagrams
+    .map((diagram, index) => ({ diagram, index }))
+    .filter(({ diagram }) => diagram && diagram.d2 && typeof diagram.d2.source === 'string' && diagram.d2.source.trim());
+  const renderOptionsHash = hashJson(d2CacheContext());
+  const overflow = renderable.slice(config.maxDiagrams);
+  overflow.forEach(({ diagram }) => {
+    const warnings = Array.isArray(diagram.warnings) ? diagram.warnings.slice() : [];
+    warnings.push(`D2 render limit reached: rendered at most ${config.maxDiagrams} diagrams. This diagram was left as source-only.`);
+    diagram.warnings = Array.from(new Set(warnings));
+    diagram.svg = Object.assign({}, diagram.svg || {}, {
+      content: '',
+      rendered: false,
+      renderError: '',
+      renderReason: 'render_limit',
+      renderer: 'd2',
+      layout: d2LayoutForDiagram(diagram)
+    });
+    diagram.d2 = Object.assign({}, diagram.d2, {
+      renderOptionsHash
+    });
+  });
+  const queue = renderable.slice(0, config.maxDiagrams);
+  let cursor = 0;
+  async function next() {
+    while (cursor < queue.length) {
+      const current = queue[cursor];
+      cursor += 1;
+      const diagram = current.diagram;
+      if (!diagram || !diagram.d2 || typeof diagram.d2.source !== 'string' || !diagram.d2.source.trim()) continue;
+      const rendered = await renderD2SourceToSvg(diagram.d2.source, diagram);
+      diagram.svg = Object.assign({}, diagram.svg || {}, {
+        content: rendered.content || '',
+        rendered: Boolean(rendered.rendered),
+        renderError: rendered.rendered ? '' : rendered.renderError,
+        renderReason: rendered.reason || '',
+        renderer: 'd2',
+        layout: rendered.layout || d2LayoutForDiagram(diagram)
+      });
+      diagram.d2 = Object.assign({}, diagram.d2, {
+        renderOptionsHash
+      });
+      if (!rendered.rendered) {
+        const warnings = Array.isArray(diagram.warnings) ? diagram.warnings.slice() : [];
+        warnings.push(D2_RENDERER_UNAVAILABLE_TEXT);
+        if (rendered.renderError) warnings.push(`D2 render error: ${rendered.renderError}`);
+        diagram.warnings = Array.from(new Set(warnings));
+      }
+    }
+  }
+  const workers = Array.from({ length: Math.min(config.concurrency, queue.length) }, () => next());
+  await Promise.all(workers);
+  return diagrams;
+}
+
+let d2HealthCache = { checkedAt: 0, payload: null };
+
+async function d2RendererHealth({ force = false } = {}) {
+  const config = d2RendererConfig();
+  if (!config.enabled) {
+    return {
+      required: false,
+      enabled: false,
+      ok: true,
+      status: 'disabled',
+      binary: config.binary
+    };
+  }
+  const now = Date.now();
+  if (!force && d2HealthCache.payload && now - d2HealthCache.checkedAt < 15000) {
+    return d2HealthCache.payload;
+  }
+  const result = await runD2Process(['--version'], '', {
+    timeoutMs: Math.min(config.timeoutMs, 1500),
+    maxOutputBytes: 4096
+  });
+  const payload = {
+    required: true,
+    enabled: true,
+    ok: Boolean(result.ok),
+    status: result.ok ? 'ok' : 'unavailable',
+    binary: config.binary,
+    version: result.ok ? truncateText((result.stdout || '').trim(), 120) : '',
+    error: result.ok ? '' : truncateText(result.error || result.stderr || 'D2 renderer is unavailable.', 300),
+    reason: result.reason || '',
+    latencyMs: result.elapsedMs
+  };
+  d2HealthCache = { checkedAt: now, payload };
+  return payload;
 }
 
 function readSecretValue(value, filePath) {
@@ -1154,9 +1530,10 @@ function redisHealthCheck(redis) {
 }
 
 async function readinessPayload() {
-  const [redis, cmdbuild] = await Promise.all([
+  const [redis, cmdbuild, d2] = await Promise.all([
     redisStatus({ force: true }),
-    checkCmdbuildUpstream()
+    checkCmdbuildUpstream(),
+    d2RendererHealth()
   ]);
   const checks = {
     process: {
@@ -1169,9 +1546,13 @@ async function readinessPayload() {
       ok: Boolean(cmdbuild.ok),
       status: cmdbuild.ok ? 'ok' : 'unavailable',
       ...cmdbuild
+    },
+    d2: {
+      ...d2
     }
   };
-  const ready = checks.cmdbuild.ok && (!HEALTH_REDIS_REQUIRED || checks.redis.ok);
+  const ready = checks.cmdbuild.ok && (!HEALTH_REDIS_REQUIRED || checks.redis.ok) && (!checks.d2.required || checks.d2.ok);
+  setMetricGauge('cmdp_health_ready', {}, ready ? 1 : 0);
   return {
     ...baseHealthPayload(),
     status: ready ? 'ready' : 'not_ready',
@@ -1452,11 +1833,12 @@ function sendHtml(res, statusCode, body) {
   res.end(body);
 }
 
-function sendText(res, statusCode, body, contentType = 'text/plain; charset=utf-8') {
+function sendText(res, statusCode, body, contentType = 'text/plain; charset=utf-8', extraHeaders = {}) {
   res.writeHead(statusCode, securityHeaders({
     'content-type': contentType,
     'cache-control': 'no-store',
-    'content-length': Buffer.byteLength(body)
+    'content-length': Buffer.byteLength(body),
+    ...extraHeaders
   }));
   res.end(body);
 }
@@ -1580,7 +1962,7 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}.kpi{border:1px solid var(--line);padding:8px}.kpi span{display:block;color:var(--muted);font-size:12px}.kpi strong{display:block;font-size:14px}
     .pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 7px;color:var(--muted);font-size:12px}.pill.ok{border-color:#82c995;color:var(--ok)}.pill.error{border-color:#f0b8b0;color:var(--danger)}
     .model{display:grid;gap:10px;max-height:520px;overflow:auto}.muted{color:var(--muted)}pre{white-space:pre-wrap;background:#f8fafc;border:1px solid var(--line);padding:8px;overflow:auto}
-    .visual-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.visual-grid label{min-width:0}.visual-grid input,.visual-grid select{width:100%}.diagram-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.diagram-grid label{min-width:0}.diagram-grid input,.diagram-grid select{width:100%;min-width:0}.segmented-control{display:inline-flex;align-items:center;gap:0;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}.segmented-control label{margin:0;display:inline-flex;align-items:center;min-height:32px;padding:0 10px;border-right:1px solid var(--line);font-size:13px;cursor:pointer}.segmented-control label:last-child{border-right:0}.segmented-control input{position:absolute;opacity:0;pointer-events:none}.segmented-control label:has(input:checked){background:#e6f4f1;color:#07575b;font-weight:700}.assistant-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr);gap:12px}.assistant-status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.assistant-draft-preview pre{max-height:360px;overflow:auto}.assistant-busy{display:grid;gap:6px;border:1px solid #b7d8d4;background:#f2faf8;padding:8px 10px;margin:0 0 10px}.assistant-busy-head{display:flex;align-items:center;gap:8px;justify-content:space-between;flex-wrap:wrap}.assistant-busy-title{display:inline-flex;align-items:center;gap:8px;font-weight:700;color:#07575b}.assistant-busy-spinner{width:14px;height:14px;border:2px solid #b7d8d4;border-top-color:#236c91;border-radius:50%;animation:cmdp-spin .8s linear infinite}.assistant-busy-elapsed{font-variant-numeric:tabular-nums;color:#334e68;font-size:12px}.assistant-draft-preview[aria-busy="true"]{position:relative}button[disabled]{opacity:.58;cursor:not-allowed}@media(max-width:1100px){.assistant-grid{grid-template-columns:1fr}}.visualization-table{table-layout:fixed}.visualization-table th,.visualization-table td{overflow-wrap:anywhere}.visualization-table th:nth-child(1){width:30%}.visualization-table th:nth-child(2){width:14%}.visualization-table th:nth-child(3){width:15%}.visualization-table th:nth-child(4){width:26%}.visualization-table th:nth-child(5){width:15%}.visualization-table input,.visualization-table select{width:100%;min-width:0}.visualization-link-table{table-layout:fixed}.visualization-link-table th,.visualization-link-table td{overflow-wrap:anywhere}.visualization-link-table input,.visualization-link-table select{width:100%;min-width:0}.visual-row-groups{margin-top:10px;display:grid;gap:6px}.visual-row-group{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.visual-row-group label{flex:1 1 240px;min-width:0}.visual-row-group select{width:100%;min-width:0}.result-table-wrap{margin-top:8px}.result-table-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:6px;min-height:30px;margin:0 0 2px}.result-table-header{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 4px;min-height:30px;flex-wrap:wrap}.result-table-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex:0 0 auto;flex-wrap:wrap;min-width:30px}.result-table-filter{width:240px;max-width:min(52vw,320px);height:30px;padding:4px 7px}.runtime-cache-control{position:relative;display:inline-flex;align-items:center}.runtime-cache-button{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;font-size:18px;line-height:1}.runtime-cache-button[data-disabled="true"]{opacity:.55;cursor:default}.runtime-cache-button.refreshing{animation:cmdp-spin 1s linear infinite}.runtime-cache-tooltip{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:50;min-width:250px;max-width:min(86vw,420px);padding:8px 10px;border:1px solid var(--line);background:#1f2933;color:#fff;box-shadow:0 8px 22px rgba(15,23,42,.18);font-size:12px;line-height:1.35;text-align:left}.runtime-cache-tooltip span{display:block;white-space:nowrap}.runtime-cache-control:hover .runtime-cache-tooltip,.runtime-cache-control:focus-within .runtime-cache-tooltip{display:block}.runtime-notice-shell{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin:0 0 8px}.runtime-notice-shell .notice{flex:1 1 auto;min-width:160px;overflow-wrap:normal;word-break:normal}.runtime-notice-actions{display:flex;justify-content:flex-end;flex:0 0 auto}.result-table-title{display:flex;align-items:center;gap:8px;flex:1 1 16rem;flex-wrap:wrap;min-width:160px;margin:0}.result-table-title h3{margin:0;font-size:13px;overflow-wrap:normal;word-break:normal;white-space:normal}.result-subtitle{font-size:12px;color:var(--muted);margin:10px 0 4px}.table-sort{border:0;background:transparent;padding:0;color:inherit;font:inherit;text-align:left}.table-sort:after{content:" ↕";font-size:10px;color:var(--muted)}.cmdp-density-compact th,.cmdp-density-compact td{padding:4px 6px}.cmdp-font-small{font-size:12px}.cmdp-font-normal{font-size:13px}.cmdp-font-large{font-size:15px}.cmdp-zebra tbody tr:nth-child(even) td{background:#fbfdff}.cmdp-row-group-cell{background:#f8fafc;font-weight:600;vertical-align:top}@media(max-width:420px){.result-table-title{flex-basis:100%;min-width:0}.runtime-notice-shell .notice{min-width:0}}@keyframes cmdp-spin{to{transform:rotate(360deg)}}
+    .visual-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.visual-grid label{min-width:0}.visual-grid input,.visual-grid select{width:100%}.diagram-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.diagram-grid label{min-width:0}.diagram-grid input,.diagram-grid select{width:100%;min-width:0}.diagram-editor-sections{display:grid;gap:12px}.diagram-editor-block{display:grid;gap:8px;border-top:1px solid var(--line);padding-top:10px}.diagram-editor-block:first-child{border-top:0;padding-top:0}.diagram-editor-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.diagram-editor-block h4{margin:0;color:#334e68;font-size:12px}.diagram-mapping-table{table-layout:fixed}.diagram-mapping-table th,.diagram-mapping-table td{overflow-wrap:break-word}.diagram-mapping-table select,.diagram-mapping-table input{width:100%;min-width:0}.diagram-mapping-table select[multiple]{min-height:70px}.diagram-mapping-table .diagram-action-cell{width:44px;text-align:right}.diagram-mapping-detail-cell{background:#fbfdff}.diagram-mapping-detail{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;align-items:end}.diagram-mapping-detail label{min-width:0}.diagram-add-button{min-width:32px;padding:4px 8px;font-weight:700}.segmented-control{display:inline-flex;align-items:center;gap:0;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}.segmented-control label{margin:0;display:inline-flex;align-items:center;min-height:32px;padding:0 10px;border-right:1px solid var(--line);font-size:13px;cursor:pointer}.segmented-control label:last-child{border-right:0}.segmented-control input{position:absolute;opacity:0;pointer-events:none}.segmented-control label:has(input:checked){background:#e6f4f1;color:#07575b;font-weight:700}.assistant-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr);gap:12px}.assistant-status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.assistant-draft-preview pre{max-height:360px;overflow:auto}.assistant-busy{display:grid;gap:6px;border:1px solid #b7d8d4;background:#f2faf8;padding:8px 10px;margin:0 0 10px}.assistant-busy-head{display:flex;align-items:center;gap:8px;justify-content:space-between;flex-wrap:wrap}.assistant-busy-title{display:inline-flex;align-items:center;gap:8px;font-weight:700;color:#07575b}.assistant-busy-spinner{width:14px;height:14px;border:2px solid #b7d8d4;border-top-color:#236c91;border-radius:50%;animation:cmdp-spin .8s linear infinite}.assistant-busy-elapsed{font-variant-numeric:tabular-nums;color:#334e68;font-size:12px}.assistant-draft-preview[aria-busy="true"]{position:relative}button[disabled]{opacity:.58;cursor:not-allowed}@media(max-width:1100px){.assistant-grid{grid-template-columns:1fr}}.visualization-table{table-layout:fixed}.visualization-table th,.visualization-table td{overflow-wrap:anywhere}.visualization-table th:nth-child(1){width:30%}.visualization-table th:nth-child(2){width:14%}.visualization-table th:nth-child(3){width:15%}.visualization-table th:nth-child(4){width:26%}.visualization-table th:nth-child(5){width:15%}.visualization-table input,.visualization-table select{width:100%;min-width:0}.visualization-link-table{table-layout:fixed}.visualization-link-table th,.visualization-link-table td{overflow-wrap:anywhere}.visualization-link-table input,.visualization-link-table select{width:100%;min-width:0}.visual-row-groups{margin-top:10px;display:grid;gap:6px}.visual-row-group{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.visual-row-group label{flex:1 1 240px;min-width:0}.visual-row-group select{width:100%;min-width:0}.result-table-wrap{margin-top:8px}.result-table-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:6px;min-height:30px;margin:0 0 2px}.result-table-header{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 4px;min-height:30px;flex-wrap:wrap}.result-table-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex:0 0 auto;flex-wrap:wrap;min-width:30px}.cmdp-d2-svg{overflow:auto;background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:6px}.cmdp-d2-svg svg{max-width:100%;height:auto;display:block}.result-table-filter{width:240px;max-width:min(52vw,320px);height:30px;padding:4px 7px}.runtime-cache-control{position:relative;display:inline-flex;align-items:center}.runtime-cache-button{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;font-size:18px;line-height:1}.runtime-cache-button[data-disabled="true"]{opacity:.55;cursor:default}.runtime-cache-button.refreshing{animation:cmdp-spin 1s linear infinite}.runtime-cache-tooltip{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:50;min-width:250px;max-width:min(86vw,420px);padding:8px 10px;border:1px solid var(--line);background:#1f2933;color:#fff;box-shadow:0 8px 22px rgba(15,23,42,.18);font-size:12px;line-height:1.35;text-align:left}.runtime-cache-tooltip span{display:block;white-space:nowrap}.runtime-cache-control:hover .runtime-cache-tooltip,.runtime-cache-control:focus-within .runtime-cache-tooltip{display:block}.runtime-notice-shell{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin:0 0 8px}.runtime-notice-shell .notice{flex:1 1 auto;min-width:160px;overflow-wrap:normal;word-break:normal}.runtime-notice-actions{display:flex;justify-content:flex-end;flex:0 0 auto}.result-table-title{display:flex;align-items:center;gap:8px;flex:1 1 16rem;flex-wrap:wrap;min-width:160px;margin:0}.result-table-title h3{margin:0;font-size:13px;overflow-wrap:normal;word-break:normal;white-space:normal}.result-subtitle{font-size:12px;color:var(--muted);margin:10px 0 4px}.table-sort{border:0;background:transparent;padding:0;color:inherit;font:inherit;text-align:left}.table-sort:after{content:" ↕";font-size:10px;color:var(--muted)}.cmdp-density-compact th,.cmdp-density-compact td{padding:4px 6px}.cmdp-font-small{font-size:12px}.cmdp-font-normal{font-size:13px}.cmdp-font-large{font-size:15px}.cmdp-zebra tbody tr:nth-child(even) td{background:#fbfdff}.cmdp-row-group-cell{background:#f8fafc;font-weight:600;vertical-align:top}@media(max-width:420px){.result-table-title{flex-basis:100%;min-width:0}.runtime-notice-shell .notice{min-width:0}}@keyframes cmdp-spin{to{transform:rotate(360deg)}}
     .cmdp-html-result{display:block}.cmdp-build-view{display:grid;gap:10px}.cmdp-build-toolbar{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border-bottom:1px solid var(--line);padding-bottom:6px}.cmdp-build-toolbar-main{display:grid;gap:5px;min-width:0}.cmdp-build-summary,.cmdp-build-nav{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.cmdp-build-nav a{color:var(--accent);text-decoration:none;font-size:12px}.cmdp-build-search{flex:0 0 260px;max-width:min(42vw,320px)}.cmdp-build-section{display:grid;gap:8px}.cmdp-build-section h2{font-size:15px;margin:8px 0 0}.cmdp-build-panel{border:1px solid var(--line);background:#fff;margin:0 0 8px}.cmdp-build-panel>summary{cursor:pointer;display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 10px;background:#fbfdff}.cmdp-build-title{font-weight:700}.cmdp-build-panel .table-wrap{border:0;border-top:1px solid var(--line)}.cmdp-build-table{width:100%;table-layout:auto}.cmdp-build-table th,.cmdp-build-table td{vertical-align:top}.cmdp-build-related,.cmdp-build-links{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:8px 10px}.cmdp-build-related a,.cmdp-build-links a{color:var(--accent);text-decoration:none}
     .settings-block{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}.settings-block:first-of-type{border-top:0;margin-top:0;padding-top:0}.settings-block h3{margin:0 0 8px}.settings-block h4{margin:0 0 7px;font-size:12px;color:#334e68}.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}.settings-grid label{display:grid;gap:4px;color:var(--muted);font-size:12px;min-width:0}.settings-grid input,.settings-grid select{width:100%;min-width:0}.checkbox-list{display:grid;gap:8px}.checkbox-stacked{align-items:flex-start!important}.checkbox-stacked>span{display:grid;gap:2px}.checkbox-stacked strong{font-size:12px;color:var(--text)}.visual-table-list{display:grid;gap:12px}.visual-table-panel{border:1px solid var(--line);background:#fbfdff;padding:10px}.visual-table-heading{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px}.visual-table-heading h3{margin:0}.visual-table-subblock{border-top:1px solid #e4e9f0;padding-top:9px;margin-top:9px}.run-param-list{display:grid;gap:8px}.run-param-row{display:grid;grid-template-columns:minmax(180px,1fr) minmax(220px,1.4fr);gap:10px;align-items:start;border:1px solid var(--line);background:#fbfdff;padding:8px}.run-param-main{display:grid;gap:3px;min-width:0}.run-param-main strong{font-size:13px}.run-param-meta{font-size:12px;color:var(--muted)}.run-param-value label{display:grid;gap:4px;color:var(--muted);font-size:12px}.run-param-value input,.run-param-value select{width:100%}.run-action-grid{display:grid;grid-template-columns:minmax(220px,max-content) minmax(280px,1fr);gap:10px;align-items:start}.run-action-buttons{display:flex;gap:8px;flex-wrap:wrap}
     @media(max-width:1100px){.designer-menu{position:static;width:auto;overflow:visible;margin-bottom:12px}.designer-main{margin-left:0}.menu-groups{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}.menu-links{display:flex;flex-wrap:wrap}}
@@ -1682,6 +2064,7 @@ function dynamicPagesClientScript() {
       menuObjectGroup: 'Object group',
       menuRelations: 'Object matching',
       menuFinalView: 'Final data',
+      menuDiagram: 'Diagram editor',
       menuPublication: 'Publication',
       menuSchema: 'Schema',
       menuGeneralSettings: 'General settings',
@@ -1843,6 +2226,8 @@ function dynamicPagesClientScript() {
       publicationParamsModeHelp: 'Exact parameter set publishes the snapshot only for the current run parameters, for example city=city49. Ignore runtime parameters publishes one page for the template code; URL parameters are ignored and every viewer sees the same published result.',
       publicationWarning: 'Warning: users will see the published result without read permissions on the source CMDBuild objects.',
       publicationWarningAccepted: 'I understand and accept this publication mode',
+      publicationPublicD2Source: 'Allow public D2 source download',
+      publicationPublicD2SourceHelp: 'Keep disabled unless viewers may download raw .d2 with embedded structured diagram metadata.',
       applyPublication: 'Apply publication settings',
       publishSnapshot: 'Publish/update snapshot',
       publicationApplied: 'Publication settings applied to Spec JSON.',
@@ -1938,6 +2323,7 @@ function dynamicPagesClientScript() {
       selectionInvalidLimit: 'Data selection limit must be a positive integer.',
       visualizationEditor: 'Visualization',
       visualizationEditorHelp: 'Configure visual presentation for the data tables prepared in Final data and optional deterministic topology diagrams.',
+      diagramEditorHelp: 'Configure deterministic graph mappings over existing DSL aliases. Runtime executes the saved spec only; LLM/MCP is authoring-only.',
       visualizationGlobal: 'Global presentation',
       visualizationOutputMode: 'Runtime output',
       visualizationOutputTables: 'Tables',
@@ -1945,6 +2331,13 @@ function dynamicPagesClientScript() {
       visualizationOutputBoth: 'Both',
       visualizationTables: 'Table presentation',
       visualizationDiagrams: 'Diagram presentation',
+      diagramGeneralSettings: 'General diagram settings',
+      diagramNodes: 'Nodes',
+      diagramEdges: 'Edges',
+      diagramGroups: 'Groups',
+      diagramHierarchy: 'Hierarchy',
+      diagramAddMapping: 'Add mapping',
+      diagramMappingSourceRequired: 'Diagram mapping source is required.',
       visualizationDiagramName: 'Diagram name',
       visualizationDiagramTitle: 'Diagram title',
       visualizationDiagramNodesSource: 'Nodes source',
@@ -1952,13 +2345,35 @@ function dynamicPagesClientScript() {
       visualizationDiagramNodeId: 'Node id field',
       visualizationDiagramNodeLabel: 'Node label field',
       visualizationDiagramNodeGroup: 'Node group field',
+      visualizationDiagramNodeParent: 'Node parent field',
+      visualizationDiagramNodeType: 'Node type field',
       visualizationDiagramNodeHref: 'Node link field',
+      visualizationDiagramEdgeMappingType: 'Edge mapping type',
       visualizationDiagramEdgeSource: 'Edge source field',
       visualizationDiagramEdgeTarget: 'Edge target field',
       visualizationDiagramEdgeLabel: 'Edge label field',
+      visualizationDiagramEdgeKind: 'Edge kind field',
+      visualizationDiagramEdgeDirection: 'Edge direction field',
+      visualizationDiagramGroupsSource: 'Groups source',
+      visualizationDiagramGroupId: 'Group id field',
+      visualizationDiagramGroupLabel: 'Group label field',
+      visualizationDiagramGroupParent: 'Group parent field',
+      visualizationDiagramHierarchySource: 'Hierarchy source',
+      visualizationDiagramHierarchyChild: 'Hierarchy child field',
+      visualizationDiagramHierarchyParent: 'Hierarchy parent field',
+      visualizationDiagramHierarchyLabel: 'Hierarchy label field',
       visualizationDiagramLayout: 'Layout',
       visualizationDiagramMaxNodes: 'Max nodes',
       visualizationDiagramMaxEdges: 'Max edges',
+      visualizationDiagramEmbedD2: 'Embed structured data in D2',
+      visualizationDiagramEmbedSvg: 'Embed structured data in SVG',
+      visualizationDiagramMetadataMaxBytes: 'D2 metadata max bytes',
+      visualizationDiagramLabelTemplate: 'Composite label template',
+      visualizationDiagramLabelFields: 'Label attributes',
+      visualizationDiagramDataProfile: 'Data profile',
+      visualizationDiagramDataClass: 'Data class',
+      visualizationDiagramDataFields: 'Structured data attributes',
+      visualizationDiagramIncludeSourceRef: 'Include source reference',
       visualizationMessages: 'Messages',
       visualizationBaseStyle: 'Base style',
       visualizationRuntimeBehavior: 'Runtime behavior',
@@ -2261,6 +2676,10 @@ function dynamicPagesClientScript() {
       runtimeCacheScope: 'Scope',
       runtimeCacheKey: 'Cache key',
       runtimeCacheManualDisabled: 'Manual refresh is disabled',
+      d2DownloadSource: 'Download D2 source',
+      d2RendererUnavailable: 'D2 renderer is unavailable; showing fallback diagram. D2 source is still available for download.',
+      d2RenderError: 'D2 render error: {error}',
+      d2RenderedDiagram: 'D2 rendered diagram',
       runtimeTableControlsDisabledByGrouping: 'Sorting and filters are disabled because row grouping is enabled.',
       runtimeFilterPlaceholder: 'Search in visible rows',
       runtimeRefresh: 'Refresh',
@@ -2359,6 +2778,7 @@ function dynamicPagesClientScript() {
       menuObjectGroup: 'Группа объектов',
       menuRelations: 'Сопоставление с объектами',
       menuFinalView: 'Итоговые данные',
+      menuDiagram: 'Редактор диаграмм',
       menuPublication: 'Публикация',
       menuSchema: 'Схема',
       menuGeneralSettings: 'Общие настройки',
@@ -2520,6 +2940,8 @@ function dynamicPagesClientScript() {
       publicationParamsModeHelp: 'Точный набор параметров публикует снимок только для текущих параметров запуска, например city=city49. Если runtime-параметры игнорируются, публикуется одна страница на код шаблона: параметры URL не учитываются, и все зрители видят один опубликованный результат.',
       publicationWarning: 'Внимание: пользователи увидят опубликованный результат без прав чтения на исходные CMDBuild-объекты.',
       publicationWarningAccepted: 'Я понимаю и принимаю этот режим публикации',
+      publicationPublicD2Source: 'Разрешить публичное скачивание D2 source',
+      publicationPublicD2SourceHelp: 'Оставьте выключенным, если зрителям нельзя скачивать raw .d2 со встроенными structured diagram metadata.',
       applyPublication: 'Применить настройки публикации',
       publishSnapshot: 'Опубликовать/обновить снимок',
       publicationApplied: 'Настройки публикации применены к Spec JSON.',
@@ -2615,6 +3037,7 @@ function dynamicPagesClientScript() {
       selectionInvalidLimit: 'Лимит выбора данных должен быть положительным целым числом.',
       visualizationEditor: 'Визуализация',
       visualizationEditorHelp: 'Настройте визуальное представление таблиц из Итоговых данных и optional deterministic topology diagrams.',
+      diagramEditorHelp: 'Настройте детерминированный graph mapping поверх существующих DSL aliases. Runtime исполняет только сохраненный spec; LLM/MCP используется только при подготовке черновика.',
       visualizationGlobal: 'Общее представление',
       visualizationOutputMode: 'Runtime-вывод',
       visualizationOutputTables: 'Таблицы',
@@ -2622,6 +3045,13 @@ function dynamicPagesClientScript() {
       visualizationOutputBoth: 'Оба',
       visualizationTables: 'Представление таблиц',
       visualizationDiagrams: 'Представление диаграмм',
+      diagramGeneralSettings: 'Общие настройки диаграммы',
+      diagramNodes: 'Узлы',
+      diagramEdges: 'Связи',
+      diagramGroups: 'Группы',
+      diagramHierarchy: 'Иерархия',
+      diagramAddMapping: 'Добавить mapping',
+      diagramMappingSourceRequired: 'Источник mapping диаграммы обязателен.',
       visualizationDiagramName: 'Имя диаграммы',
       visualizationDiagramTitle: 'Заголовок диаграммы',
       visualizationDiagramNodesSource: 'Источник узлов',
@@ -2629,13 +3059,35 @@ function dynamicPagesClientScript() {
       visualizationDiagramNodeId: 'Поле id узла',
       visualizationDiagramNodeLabel: 'Поле label узла',
       visualizationDiagramNodeGroup: 'Поле group узла',
+      visualizationDiagramNodeParent: 'Поле parent узла',
+      visualizationDiagramNodeType: 'Поле type узла',
       visualizationDiagramNodeHref: 'Поле ссылки узла',
+      visualizationDiagramEdgeMappingType: 'Тип mapping связи',
       visualizationDiagramEdgeSource: 'Поле source связи',
       visualizationDiagramEdgeTarget: 'Поле target связи',
       visualizationDiagramEdgeLabel: 'Поле label связи',
+      visualizationDiagramEdgeKind: 'Поле kind связи',
+      visualizationDiagramEdgeDirection: 'Поле direction связи',
+      visualizationDiagramGroupsSource: 'Источник групп',
+      visualizationDiagramGroupId: 'Поле id группы',
+      visualizationDiagramGroupLabel: 'Поле label группы',
+      visualizationDiagramGroupParent: 'Поле parent группы',
+      visualizationDiagramHierarchySource: 'Источник иерархии',
+      visualizationDiagramHierarchyChild: 'Поле child иерархии',
+      visualizationDiagramHierarchyParent: 'Поле parent иерархии',
+      visualizationDiagramHierarchyLabel: 'Поле label иерархии',
       visualizationDiagramLayout: 'Layout',
       visualizationDiagramMaxNodes: 'Макс. узлов',
       visualizationDiagramMaxEdges: 'Макс. связей',
+      visualizationDiagramEmbedD2: 'Встроить structured data в D2',
+      visualizationDiagramEmbedSvg: 'Встроить structured data в SVG',
+      visualizationDiagramMetadataMaxBytes: 'Макс. bytes D2 metadata',
+      visualizationDiagramLabelTemplate: 'Составной label template',
+      visualizationDiagramLabelFields: 'Атрибуты label',
+      visualizationDiagramDataProfile: 'Data profile',
+      visualizationDiagramDataClass: 'Класс данных',
+      visualizationDiagramDataFields: 'Атрибуты structured data',
+      visualizationDiagramIncludeSourceRef: 'Включить source reference',
       visualizationMessages: 'Сообщения',
       visualizationBaseStyle: 'Базовый стиль',
       visualizationRuntimeBehavior: 'Поведение runtime',
@@ -2938,6 +3390,10 @@ function dynamicPagesClientScript() {
       runtimeCacheScope: 'Scope',
       runtimeCacheKey: 'Ключ кэша',
       runtimeCacheManualDisabled: 'Ручное обновление отключено',
+      d2DownloadSource: 'Скачать D2 source',
+      d2RendererUnavailable: 'D2 renderer недоступен; показана fallback-диаграмма. D2 source по-прежнему доступен для скачивания.',
+      d2RenderError: 'Ошибка D2 render: {error}',
+      d2RenderedDiagram: 'Диаграмма, отрендеренная D2',
       runtimeTableControlsDisabledByGrouping: 'Сортировка и фильтры отключены, потому что включена группировка строк.',
       runtimeFilterPlaceholder: 'Поиск по видимым строкам',
       runtimeRefresh: 'Обновить',
@@ -3045,6 +3501,7 @@ function dynamicPagesClientScript() {
       'object-group',
       'relations',
       'final-view',
+      'diagram',
       'cmdb-build-view',
       'params',
       'extraction',
@@ -3083,6 +3540,7 @@ function dynamicPagesClientScript() {
       'object-group',
       'relations',
       'final-view',
+      'diagram',
       'cmdb-build-view',
       'params',
       'extraction',
@@ -3558,6 +4016,22 @@ function dynamicPagesClientScript() {
     return apiPrefix + '/templates/' + encodeURIComponent(templateCode) + '/run' + (query ? '?' + query : '');
   }
 
+  function runtimeSystemParam(name) {
+    return ['lang', 'cmdpLang', 'json', 'd2', 'diagram', 'refresh', 'noCache', 'forceRefresh', 'bypassRefreshCooldown'].indexOf(String(name || '')) !== -1;
+  }
+
+  function runtimeD2DownloadPath(result, diagram, diagramIndex) {
+    var template = result && result.json && result.json.template ? result.json.template : {};
+    var templateCode = template.code || boot.templateCode || '';
+    if (!templateCode) return '';
+    var params = Object.assign({}, state.runParams || {});
+    params.d2 = 'true';
+    var selector = diagram && (diagram.name || diagram.title || diagram.d2 && diagram.d2.sourceHash) || '';
+    params.diagram = selector || String(Number.isFinite(diagramIndex) ? diagramIndex : 0);
+    if (boot.publicRuntime || result && result.downloadMode === 'public') return publicSnapshotRunPath(templateCode, params);
+    return runtimeRunPath(templateCode, params);
+  }
+
   function getCsrfToken() {
     if (csrfToken) return Promise.resolve(csrfToken);
     return fetch(apiPrefix + '/csrf', {
@@ -3693,6 +4167,9 @@ function dynamicPagesClientScript() {
       if (document.querySelectorAll('[data-view-column-row]').length) {
         state.viewComposerDraft = captureViewComposerDraftFromDom();
       }
+      if (hasField('cmdp-diagram-name') || document.querySelector('[data-diagram-mapping-row]')) {
+        updateSelectedFromEditor(applyVisualizationToSpec(state.selectedTemplate.spec || defaultSpec(), false));
+      }
       if (hasField('cmdp-publish-mode')) {
         updateSelectedFromEditor(applyPublicationToSpec(state.selectedTemplate.spec || defaultSpec(), false));
       }
@@ -3703,9 +4180,7 @@ function dynamicPagesClientScript() {
         updateSelectedFromEditor(applyCmdbBuildViewToSpec(state.selectedTemplate.spec || defaultCmdbBuildViewSpecClient(), false));
       }
       if (hasField('cmdp-assistant-intent')) {
-        state.assistantDraftIntent = readValue('cmdp-assistant-intent');
-        var taskField = document.querySelector('input[name="cmdp-assistant-task-mode"]:checked');
-        state.assistantTaskMode = normalizeOutputMode(taskField && taskField.value || state.assistantTaskMode);
+        updateSelectedFromEditor(applyAssistantDraftFromDomToSpec(state.selectedTemplate.spec || defaultSpec()));
       }
       if (hasField('cmdp-root')) state.schemaRootDraft = readValue('cmdp-root') || state.root;
       if (hasField('cmdp-schema-description')) state.schemaDescriptionDraft = readValue('cmdp-schema-description');
@@ -3724,7 +4199,7 @@ function dynamicPagesClientScript() {
     return {
       version: 1,
       params: { attrType: { type: 'string', required: true } },
-      publish: { mode: 'dynamicUser', paramsMode: 'exact', warningAccepted: false },
+      publish: { mode: 'dynamicUser', paramsMode: 'exact', warningAccepted: false, publicD2Source: false },
       cache: {
         enabled: true,
         scopeMode: 'permissionOnly',
@@ -3748,7 +4223,7 @@ function dynamicPagesClientScript() {
       kind: CMDB_BUILD_VIEW_KIND,
       protected: true,
       params: {},
-      publish: { mode: 'dynamicUser', paramsMode: 'ignore', warningAccepted: false },
+      publish: { mode: 'dynamicUser', paramsMode: 'ignore', warningAccepted: false, publicD2Source: false },
       cache: {
         enabled: true,
         scopeMode: 'permissionOnly',
@@ -3790,7 +4265,8 @@ function dynamicPagesClientScript() {
     return {
       mode: publish.mode === 'staticSnapshot' ? 'staticSnapshot' : 'dynamicUser',
       warningAccepted: Boolean(publish.warningAccepted),
-      paramsMode: publish.paramsMode === 'ignore' ? 'ignore' : 'exact'
+      paramsMode: publish.paramsMode === 'ignore' ? 'ignore' : 'exact',
+      publicD2Source: Boolean(publish.publicD2Source || publish.allowPublicD2Source)
     };
   }
 
@@ -3800,11 +4276,13 @@ function dynamicPagesClientScript() {
     var mode = String(readValue('cmdp-publish-mode') || 'dynamicUser') === 'staticSnapshot' ? 'staticSnapshot' : 'dynamicUser';
     var paramsMode = String(readValue('cmdp-publish-params-mode') || 'exact') === 'ignore' ? 'ignore' : 'exact';
     var warningAccepted = readChecked('cmdp-publish-warning-accepted');
+    var publicD2Source = readChecked('cmdp-publish-public-d2-source');
     if (mode === 'staticSnapshot' && !warningAccepted) throw new Error(t('publicationWarning'));
     spec.publish = {
       mode: mode,
       paramsMode: paramsMode,
-      warningAccepted: warningAccepted
+      warningAccepted: warningAccepted,
+      publicD2Source: publicD2Source
     };
     return spec;
   }
@@ -4057,6 +4535,9 @@ function dynamicPagesClientScript() {
     if (options.replaceRunParams || !state.runParams || Object.keys(state.runParams).length === 0) {
       state.runParams = getRunParamsFromSpec(spec);
     }
+    var assistantDraft = spec.assistantDraft && typeof spec.assistantDraft === 'object' && !Array.isArray(spec.assistantDraft) ? spec.assistantDraft : {};
+    state.assistantDraftIntent = String(assistantDraft.intent || '');
+    state.assistantTaskMode = normalizeOutputMode(assistantDraft.taskMode || state.assistantTaskMode || 'both');
     state.extractionPreview = null;
     state.lastDraftPreviewOk = false;
   }
@@ -5472,6 +5953,7 @@ function dynamicPagesClientScript() {
         { section: 'object-group', label: t('menuObjectGroup') },
         { section: 'relations', label: t('menuRelations') },
         { section: 'final-view', label: t('menuFinalView') },
+        { section: 'diagram', label: t('menuDiagram') },
         { section: 'cmdb-build-view', label: t('menuCmdbBuildView') }
       ]),
       group(t('menuRun'), [
@@ -6168,6 +6650,8 @@ function dynamicPagesClientScript() {
       '<option value="ignore"' + (publish.paramsMode === 'ignore' ? ' selected' : '') + '>' + t('publicationParamsIgnore') + '</option>',
       '</select><span class="muted">' + escapeHtml(t('publicationParamsModeHelp')) + '</span></label>',
       '<label class="checkbox"><input id="cmdp-publish-warning-accepted" type="checkbox" ' + (publish.warningAccepted ? 'checked' : '') + '> ' + t('publicationWarningAccepted') + '</label>',
+      '<label class="checkbox"><input id="cmdp-publish-public-d2-source" type="checkbox" ' + (publish.publicD2Source ? 'checked' : '') + '> ' + t('publicationPublicD2Source') + '</label>',
+      '<p class="muted">' + t('publicationPublicD2SourceHelp') + '</p>',
       '</div>',
       '</section>'
     ].join('');
@@ -6232,6 +6716,7 @@ function dynamicPagesClientScript() {
     if (section === 'object-group') return renderObjectGroupEditor(selected);
     if (section === 'relations') return renderRelationExpansionEditor(selected);
     if (section === 'final-view') return renderViewComposerEditor(selected);
+    if (section === 'diagram') return renderDiagramSectionEditor(selected);
     if (section === 'cmdb-build-view') return renderCmdbBuildViewEditor(selected);
     if (section === 'params') return renderParamsEditor(selected);
     if (section === 'extraction') return renderExtractionEditor(selected);
@@ -6260,6 +6745,7 @@ function dynamicPagesClientScript() {
     if (section === 'object-group') return t('menuObjectGroup');
     if (section === 'relations') return t('menuRelations');
     if (section === 'final-view') return t('menuFinalView');
+    if (section === 'diagram') return t('menuDiagram');
     if (section === 'cmdb-build-view') return t('menuCmdbBuildView');
     if (section === 'extraction') return t('menuExtraction');
     if (section === 'run') return t('menuTemplateRun');
@@ -6342,6 +6828,8 @@ function dynamicPagesClientScript() {
     } else if (section === 'final-view') {
       actions.push(renderActionButton('add-view-column-row', t('addViewColumn')));
       actions.push(renderActionButton('apply-view-composer', t('applyViewComposer'), { primary: true }));
+    } else if (section === 'diagram') {
+      actions.push(renderActionButton('apply-visualization', t('applyVisualization'), { primary: true }));
     } else if (section === 'cmdb-build-view') {
       actions.push(renderActionButton('apply-cmdb-build-view', t('apply'), { primary: true }));
     } else if (section === 'extraction') {
@@ -7289,35 +7777,270 @@ function dynamicPagesClientScript() {
     return String(source[kind] || section.from || diagram[kind + 'From'] || '').trim();
   }
 
+  function firstDiagramMapping(diagram, key) {
+    var mappings = diagram && Array.isArray(diagram[key]) ? diagram[key] : [];
+    if (!mappings.length && diagram && diagram[key] && typeof diagram[key] === 'object') mappings = [diagram[key]];
+    return mappings.find(function (mapping) { return mapping && typeof mapping === 'object' && !Array.isArray(mapping); }) || {};
+  }
+
+  function diagramMappingList(diagram, key) {
+    var mappings = diagram && Array.isArray(diagram[key]) ? diagram[key] : [];
+    if (!mappings.length && diagram && diagram[key] && typeof diagram[key] === 'object' && !Array.isArray(diagram[key])) mappings = [diagram[key]];
+    return mappings.filter(function (mapping) { return mapping && typeof mapping === 'object' && !Array.isArray(mapping); });
+  }
+
+  function diagramMappingSourceValue(mapping) {
+    var source = mapping && mapping.source && typeof mapping.source === 'object' && !Array.isArray(mapping.source) ? mapping.source : {};
+    return String(mapping && (mapping.from || mapping.alias || mapping.sourceAlias || source.from || source.alias || (typeof mapping.source === 'string' ? mapping.source : '')) || '').trim();
+  }
+
+  function diagramMappingFieldValue(mapping, names, fallback) {
+    var fields = mapping && mapping.fields && typeof mapping.fields === 'object' && !Array.isArray(mapping.fields) ? mapping.fields : {};
+    for (var index = 0; index < names.length; index += 1) {
+      var name = names[index];
+      var value = mapping && (mapping[name] || fields[name]);
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return fallback || '';
+  }
+
   function diagramFieldValue(diagram, fieldName, fallback) {
     var fields = diagram && diagram.fields && typeof diagram.fields === 'object' && !Array.isArray(diagram.fields) ? diagram.fields : {};
     return String(fields[fieldName] || diagram[fieldName] || fallback || '').trim();
   }
 
-  function renderDiagramEditor(spec, outputMode) {
-    if (outputMode === 'tables') return '';
-    var diagram = firstDiagramSpec(spec || defaultSpec());
-    var nodeSource = diagramSourceValue(diagram, 'nodes') || finalPresentationResultAlias(spec || defaultSpec()) || finalBaseResultAlias(spec || defaultSpec());
-    var edgeSource = diagramSourceValue(diagram, 'edges') || nodeSource;
+  function diagramMappingHasValue(mapping) {
+    if (!mapping || typeof mapping !== 'object' || Array.isArray(mapping)) return false;
+    if (diagramMappingSourceValue(mapping)) return true;
+    var type = String(mapping.type || mapping.kind || '').trim();
+    if (type && type !== 'generic') return true;
+    var fields = mapping.fields && typeof mapping.fields === 'object' && !Array.isArray(mapping.fields) ? mapping.fields : {};
+    return Object.keys(fields).some(function (key) { return String(fields[key] || '').trim(); });
+  }
+
+  function diagramMappingRowsForEditor(diagram, key, fallback) {
+    var rows = diagramMappingList(diagram, key).slice();
+    if (!rows.length && fallback && diagramMappingHasValue(fallback)) rows = [fallback];
+    if (!rows.length || diagramMappingHasValue(rows[rows.length - 1])) rows.push({});
+    return rows;
+  }
+
+  function diagramColumnOptionRowsForSource(spec, sourceAlias) {
+    var rows = matchingColumnOptionRowsForOutput(spec || defaultSpec(), sourceAlias).slice();
+    var seen = {};
+    rows.forEach(function (item) { if (item && item.value) seen[item.value] = true; });
+    ['Class', '_id', 'Code', 'Description', 'id', 'label', 'group', 'parent', 'href', 'source', 'target', 'child'].forEach(function (name) {
+      if (!seen[name]) {
+        seen[name] = true;
+        rows.push({ value: name, label: name });
+      }
+    });
+    return rows;
+  }
+
+  function renderDiagramFieldSelect(spec, sourceAlias, fieldName, selectedName) {
+    return '<select data-diagram-mapping-field="' + escapeHtml(fieldName) + '">' + renderMatchingColumnOptions(diagramColumnOptionRowsForSource(spec, sourceAlias), selectedName || '') + '</select>';
+  }
+
+  function diagramFieldListFromValue(value) {
+    if (Array.isArray(value)) {
+      return value.map(function (item) { return String(item || '').trim(); }).filter(Boolean);
+    }
+    return String(value || '').split(',').map(function (item) { return item.trim(); }).filter(Boolean);
+  }
+
+  function diagramMappingFieldListValue(mapping, rootName, fieldName) {
+    var fields = mapping && mapping.fields && typeof mapping.fields === 'object' && !Array.isArray(mapping.fields) ? mapping.fields : {};
+    return diagramFieldListFromValue(mapping && (mapping[rootName] || fields[rootName] || fields[fieldName]) || '');
+  }
+
+  function diagramMappingDataProfileForEditor(mapping) {
+    var profile = mapping && mapping.dataProfile && typeof mapping.dataProfile === 'object' && !Array.isArray(mapping.dataProfile)
+      ? mapping.dataProfile
+      : mapping && mapping.data && typeof mapping.data === 'object' && !Array.isArray(mapping.data)
+        ? mapping.data
+        : {};
+    return {
+      name: String(profile.name || mapping && mapping.dataProfileName || '').trim(),
+      className: String(profile.className || mapping && (mapping.className || mapping.sourceClass) || '').trim(),
+      fields: diagramFieldListFromValue(profile.fields || mapping && mapping.dataFields || ''),
+      includeSourceRef: profile.includeSourceRef !== false
+    };
+  }
+
+  function renderDiagramMultiFieldSelect(spec, sourceAlias, fieldName, selectedNames) {
+    var selected = {};
+    diagramFieldListFromValue(selectedNames).forEach(function (name) { selected[name] = true; });
+    var rows = diagramColumnOptionRowsForSource(spec, sourceAlias);
+    rows.forEach(function (row) { if (row && row.value && selected[row.value]) selected[row.value] = true; });
+    Object.keys(selected).forEach(function (value) {
+      if (!rows.some(function (row) { return row && row.value === value; })) rows.push({ value: value, label: value });
+    });
+    return '<select multiple data-diagram-mapping-field="' + escapeHtml(fieldName) + '">' + rows.map(function (item) {
+      var value = item && item.value || '';
+      return '<option value="' + escapeHtml(value) + '"' + (selected[value] ? ' selected' : '') + '>' + escapeHtml(item && item.label || value) + '</option>';
+    }).join('') + '</select>';
+  }
+
+  function renderDiagramMappingDetail(kind, mapping, index, spec, sourceAlias, colspan) {
+    var labelTemplate = diagramMappingFieldValue(mapping, ['labelTemplate'], '');
+    var labelField = diagramMappingFieldValue(mapping, kind === 'edges' ? ['edgeLabel', 'edgeTitle', 'label', 'labelColumn'] : ['nodeLabel', 'groupLabel', 'label', 'labelColumn'], 'label');
+    var labelFields = diagramMappingFieldListValue(mapping, 'labelFields', 'labelFields');
+    if (!labelFields.length && labelField) labelFields = [labelField];
+    var profile = diagramMappingDataProfileForEditor(mapping);
+    return [
+      '<tr data-diagram-mapping-detail data-diagram-mapping-kind="' + kind + '" data-diagram-mapping-index="' + index + '">',
+      '<td class="diagram-mapping-detail-cell" colspan="' + String(colspan) + '">',
+      '<div class="diagram-mapping-detail">',
+      '<label>' + t('visualizationDiagramLabelTemplate') + '<input data-diagram-mapping-field="labelTemplate" value="' + escapeHtml(labelTemplate) + '" placeholder="$' + '{Code} $' + '{Description}"></label>',
+      '<label>' + t('visualizationDiagramLabelFields') + renderDiagramMultiFieldSelect(spec, sourceAlias, 'labelFields', labelFields) + '</label>',
+      '<label>' + t('visualizationDiagramDataProfile') + '<input data-diagram-mapping-field="dataProfileName" value="' + escapeHtml(profile.name) + '"></label>',
+      '<label>' + t('visualizationDiagramDataClass') + '<input data-diagram-mapping-field="dataClassName" value="' + escapeHtml(profile.className) + '"></label>',
+      '<label>' + t('visualizationDiagramDataFields') + renderDiagramMultiFieldSelect(spec, sourceAlias, 'dataProfileFields', profile.fields) + '</label>',
+      '<label><input type="checkbox" data-diagram-mapping-field="dataIncludeSourceRef"' + (profile.includeSourceRef ? ' checked' : '') + '> ' + t('visualizationDiagramIncludeSourceRef') + '</label>',
+      '</div>',
+      '</td>',
+      '</tr>'
+    ].join('');
+  }
+
+  function renderDiagramSourceSelect(spec, selectedName) {
+    return '<select data-diagram-mapping-field="from">' + renderAnyAliasOptions(selectedName, spec) + '</select>';
+  }
+
+  function renderDiagramEdgeTypeOptions(selected) {
+    var value = String(selected || 'generic').trim() || 'generic';
+    return ['generic', 'domain', 'reference', 'object', 'relationObject', 'match', 'computed'].map(function (item) {
+      return '<option value="' + item + '"' + (value === item ? ' selected' : '') + '>' + item + '</option>';
+    }).join('');
+  }
+
+  function renderDiagramMappingRow(kind, mapping, index, spec) {
+    mapping = mapping || {};
+    var sourceAlias = diagramMappingSourceValue(mapping);
+    var cells = ['<td>' + renderDiagramSourceSelect(spec, sourceAlias) + '</td>'];
+    if (kind === 'nodes') {
+      cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'id', diagramMappingFieldValue(mapping, ['nodeId', 'id', 'idColumn'], 'id')) + '</td>');
+      cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'label', diagramMappingFieldValue(mapping, ['nodeLabel', 'label', 'labelColumn'], 'label')) + '</td>');
+      cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'group', diagramMappingFieldValue(mapping, ['nodeGroup', 'group', 'groupColumn', 'groupBy'], 'group')) + '</td>');
+      cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'parent', diagramMappingFieldValue(mapping, ['nodeParent', 'parent', 'parentId', 'parentColumn'], '')) + '</td>');
+      cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'nodeType', diagramMappingFieldValue(mapping, ['nodeType', 'typeColumn', 'classColumn', 'classNameColumn'], '')) + '</td>');
+      cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'href', diagramMappingFieldValue(mapping, ['nodeHref', 'href', 'url', 'urlColumn'], 'href')) + '</td>');
+    } else if (kind === 'edges') {
+      cells.push('<td><select data-diagram-mapping-field="type">' + renderDiagramEdgeTypeOptions(mapping.type || mapping.kind || 'generic') + '</select></td>');
+      cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'source', diagramMappingFieldValue(mapping, ['edgeSource', 'source', 'sourceId', 'sourceColumn', 'from'], 'source')) + '</td>');
+      cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'target', diagramMappingFieldValue(mapping, ['edgeTarget', 'target', 'targetId', 'targetColumn', 'to'], 'target')) + '</td>');
+      cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'label', diagramMappingFieldValue(mapping, ['edgeLabel', 'edgeTitle', 'label', 'labelColumn'], 'label')) + '</td>');
+      cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'edgeType', diagramMappingFieldValue(mapping, ['edgeType', 'kindColumn', 'typeColumn'], '')) + '</td>');
+      cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'edgeDirection', diagramMappingFieldValue(mapping, ['edgeDirection', 'directionColumn'], '')) + '</td>');
+    } else if (kind === 'groups') {
+      cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'id', diagramMappingFieldValue(mapping, ['groupId', 'id', 'idColumn', 'groupColumn'], 'id')) + '</td>');
+      cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'label', diagramMappingFieldValue(mapping, ['groupLabel', 'label', 'labelColumn'], 'label')) + '</td>');
+      cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'parent', diagramMappingFieldValue(mapping, ['groupParent', 'parent', 'parentColumn'], '')) + '</td>');
+    } else {
+      cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'child', diagramMappingFieldValue(mapping, ['child', 'childId', 'node', 'nodeId', 'source', 'sourceColumn'], 'child')) + '</td>');
+      cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'parent', diagramMappingFieldValue(mapping, ['parent', 'parentId', 'target', 'targetColumn'], 'parent')) + '</td>');
+      cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'label', diagramMappingFieldValue(mapping, ['edgeLabel', 'label', 'labelColumn'], 'label')) + '</td>');
+    }
+    cells.push('<td class="diagram-action-cell"><button type="button" data-action="clear-diagram-mapping-row" title="' + escapeHtml(t('clear')) + '">&times;</button></td>');
+    return '<tr data-diagram-mapping-row data-diagram-mapping-kind="' + kind + '" data-diagram-mapping-index="' + index + '">' + cells.join('') + '</tr>' +
+      renderDiagramMappingDetail(kind, mapping, index, spec, sourceAlias, cells.length);
+  }
+
+  function renderDiagramMappingTable(kind, titleKey, headers, rows, spec) {
+    return [
+      '<div class="diagram-editor-block" data-diagram-editor-section="' + kind + '">',
+      '<div class="diagram-editor-heading">',
+      '<h4>' + t(titleKey) + '</h4>',
+      '<button type="button" class="diagram-add-button" data-action="add-diagram-mapping-row" data-diagram-mapping-kind="' + kind + '" title="' + escapeHtml(t('diagramAddMapping')) + '">+</button>',
+      '</div>',
+      '<table class="compact diagram-mapping-table" data-diagram-mapping-table data-diagram-mapping-kind="' + kind + '">',
+      '<thead><tr>' + headers.map(function (label) { return '<th>' + escapeHtml(label) + '</th>'; }).join('') + '<th class="diagram-action-cell"></th></tr></thead>',
+      '<tbody data-diagram-mapping-body data-diagram-mapping-kind="' + kind + '">',
+      rows.map(function (row, index) { return renderDiagramMappingRow(kind, row, index, spec); }).join(''),
+      '</tbody>',
+      '</table>',
+      '</div>'
+    ].join('');
+  }
+
+  function renderDiagramEditor(spec, outputMode, options) {
+    options = options || {};
+    if (outputMode === 'tables' && !options.force) return '';
+    spec = spec || defaultSpec();
+    var diagram = firstDiagramSpec(spec);
+    var nodeMapping = firstDiagramMapping(diagram, 'nodeMappings');
+    var edgeMapping = firstDiagramMapping(diagram, 'edgeMappings');
+    var groupMapping = firstDiagramMapping(diagram, 'groupMappings');
+    var hierarchyMapping = firstDiagramMapping(diagram, 'hierarchyMappings');
+    var nodeSource = diagramMappingSourceValue(nodeMapping) || diagramSourceValue(diagram, 'nodes') || finalPresentationResultAlias(spec) || finalBaseResultAlias(spec);
+    var edgeSource = diagramMappingSourceValue(edgeMapping) || diagramSourceValue(diagram, 'edges') || nodeSource;
+    var groupSource = diagramMappingSourceValue(groupMapping);
+    var hierarchySource = diagramMappingSourceValue(hierarchyMapping);
     var layout = diagram.layout && diagram.layout.type || 'topology';
+    var metadata = diagram.metadata && typeof diagram.metadata === 'object' && !Array.isArray(diagram.metadata) ? diagram.metadata : {};
+    var metadataMaxBytes = Number(metadata.maxBytes || 200000);
+    if (!Number.isFinite(metadataMaxBytes) || metadataMaxBytes <= 0) metadataMaxBytes = 200000;
+    var nodeRows = diagramMappingRowsForEditor(diagram, 'nodeMappings', {
+      from: nodeSource,
+      fields: {
+        id: diagramFieldValue(diagram, 'nodeId', 'id'),
+        label: diagramFieldValue(diagram, 'nodeLabel', 'label'),
+        group: diagramFieldValue(diagram, 'nodeGroup', 'group'),
+        parent: diagramFieldValue(diagram, 'nodeParent', ''),
+        nodeType: diagramFieldValue(diagram, 'nodeType', ''),
+        href: diagramFieldValue(diagram, 'nodeHref', 'href')
+      }
+    });
+    var edgeRows = diagramMappingRowsForEditor(diagram, 'edgeMappings', {
+      type: edgeMapping.type || edgeMapping.kind || 'generic',
+      from: edgeSource,
+      fields: {
+        source: diagramFieldValue(diagram, 'edgeSource', 'source'),
+        target: diagramFieldValue(diagram, 'edgeTarget', 'target'),
+        label: diagramFieldValue(diagram, 'edgeLabel', 'label'),
+        edgeType: diagramFieldValue(diagram, 'edgeType', ''),
+        edgeDirection: diagramFieldValue(diagram, 'edgeDirection', '')
+      }
+    });
+    var groupRows = diagramMappingRowsForEditor(diagram, 'groupMappings', groupSource ? {
+      from: groupSource,
+      fields: {
+        id: diagramMappingFieldValue(groupMapping, ['groupId', 'id', 'idColumn', 'groupColumn'], 'id'),
+        label: diagramMappingFieldValue(groupMapping, ['groupLabel', 'label', 'labelColumn'], 'label'),
+        parent: diagramMappingFieldValue(groupMapping, ['groupParent', 'parent', 'parentColumn'], '')
+      }
+    } : null);
+    var hierarchyRows = diagramMappingRowsForEditor(diagram, 'hierarchyMappings', hierarchySource ? {
+      from: hierarchySource,
+      fields: {
+        child: diagramMappingFieldValue(hierarchyMapping, ['child', 'childId', 'node', 'nodeId', 'source', 'sourceColumn'], 'child'),
+        parent: diagramMappingFieldValue(hierarchyMapping, ['parent', 'parentId', 'target', 'targetColumn'], 'parent'),
+        label: diagramMappingFieldValue(hierarchyMapping, ['edgeLabel', 'label', 'labelColumn'], 'label')
+      }
+    } : null);
     return [
       '<div class="settings-block" id="cmdp-diagram-editor">',
       '<h3>' + t('visualizationDiagrams') + '</h3>',
+      '<p class="muted">' + t('diagramEditorHelp') + '</p>',
+      '<div class="diagram-editor-sections">',
+      '<div class="diagram-editor-block" data-diagram-editor-section="general">',
+      '<h4>' + t('diagramGeneralSettings') + '</h4>',
       '<div class="diagram-grid">',
       '<label>' + t('visualizationDiagramName') + '<input id="cmdp-diagram-name" value="' + escapeHtml(diagram.name || 'topology') + '"></label>',
       '<label>' + t('visualizationDiagramTitle') + '<input id="cmdp-diagram-title" value="' + escapeHtml(diagram.title || diagram.label || 'Topology') + '"></label>',
-      '<label>' + t('visualizationDiagramNodesSource') + '<select id="cmdp-diagram-nodes-source">' + renderAnyAliasOptions(nodeSource, spec) + '</select></label>',
-      '<label>' + t('visualizationDiagramEdgesSource') + '<select id="cmdp-diagram-edges-source">' + renderAnyAliasOptions(edgeSource, spec) + '</select></label>',
-      '<label>' + t('visualizationDiagramNodeId') + '<input id="cmdp-diagram-node-id" value="' + escapeHtml(diagramFieldValue(diagram, 'nodeId', 'id')) + '"></label>',
-      '<label>' + t('visualizationDiagramNodeLabel') + '<input id="cmdp-diagram-node-label" value="' + escapeHtml(diagramFieldValue(diagram, 'nodeLabel', 'label')) + '"></label>',
-      '<label>' + t('visualizationDiagramNodeGroup') + '<input id="cmdp-diagram-node-group" value="' + escapeHtml(diagramFieldValue(diagram, 'nodeGroup', 'group')) + '"></label>',
-      '<label>' + t('visualizationDiagramNodeHref') + '<input id="cmdp-diagram-node-href" value="' + escapeHtml(diagramFieldValue(diagram, 'nodeHref', 'href')) + '"></label>',
-      '<label>' + t('visualizationDiagramEdgeSource') + '<input id="cmdp-diagram-edge-source" value="' + escapeHtml(diagramFieldValue(diagram, 'edgeSource', 'source')) + '"></label>',
-      '<label>' + t('visualizationDiagramEdgeTarget') + '<input id="cmdp-diagram-edge-target" value="' + escapeHtml(diagramFieldValue(diagram, 'edgeTarget', 'target')) + '"></label>',
-      '<label>' + t('visualizationDiagramEdgeLabel') + '<input id="cmdp-diagram-edge-label" value="' + escapeHtml(diagramFieldValue(diagram, 'edgeLabel', 'label')) + '"></label>',
-      '<label>' + t('visualizationDiagramLayout') + '<select id="cmdp-diagram-layout"><option value="topology"' + (layout !== 'layered' ? ' selected' : '') + '>topology</option><option value="layered"' + (layout === 'layered' ? ' selected' : '') + '>layered</option></select></label>',
+      '<label>' + t('visualizationDiagramLayout') + '<select id="cmdp-diagram-layout"><option value="topology"' + (layout === 'topology' ? ' selected' : '') + '>topology</option><option value="layered"' + (layout === 'layered' ? ' selected' : '') + '>layered</option><option value="hierarchical"' + (layout === 'hierarchical' ? ' selected' : '') + '>hierarchical</option><option value="grouped"' + (layout === 'grouped' ? ' selected' : '') + '>grouped</option></select></label>',
       '<label>' + t('visualizationDiagramMaxNodes') + '<input id="cmdp-diagram-max-nodes" type="number" min="1" value="' + escapeHtml(String(diagram.maxNodes || diagram.limit && diagram.limit.maxNodes || diagram.limits && diagram.limits.maxNodes || 300)) + '"></label>',
       '<label>' + t('visualizationDiagramMaxEdges') + '<input id="cmdp-diagram-max-edges" type="number" min="1" value="' + escapeHtml(String(diagram.maxEdges || diagram.limit && diagram.limit.maxEdges || diagram.limits && diagram.limits.maxEdges || 800)) + '"></label>',
+      '<label>' + t('visualizationDiagramMetadataMaxBytes') + '<input id="cmdp-diagram-metadata-max-bytes" type="number" min="1" value="' + escapeHtml(String(metadataMaxBytes)) + '"></label>',
+      '<label><input id="cmdp-diagram-embed-d2" type="checkbox"' + (metadata.embedInD2 !== false ? ' checked' : '') + '> ' + t('visualizationDiagramEmbedD2') + '</label>',
+      '<label><input id="cmdp-diagram-embed-svg" type="checkbox"' + (metadata.embedInSvg !== false ? ' checked' : '') + '> ' + t('visualizationDiagramEmbedSvg') + '</label>',
+      '</div>',
+      '</div>',
+      renderDiagramMappingTable('nodes', 'diagramNodes', [t('visualizationDiagramNodesSource'), t('visualizationDiagramNodeId'), t('visualizationDiagramNodeLabel'), t('visualizationDiagramNodeGroup'), t('visualizationDiagramNodeParent'), t('visualizationDiagramNodeType'), t('visualizationDiagramNodeHref')], nodeRows, spec),
+      renderDiagramMappingTable('edges', 'diagramEdges', [t('visualizationDiagramEdgesSource'), t('visualizationDiagramEdgeMappingType'), t('visualizationDiagramEdgeSource'), t('visualizationDiagramEdgeTarget'), t('visualizationDiagramEdgeLabel'), t('visualizationDiagramEdgeKind'), t('visualizationDiagramEdgeDirection')], edgeRows, spec),
+      renderDiagramMappingTable('groups', 'diagramGroups', [t('visualizationDiagramGroupsSource'), t('visualizationDiagramGroupId'), t('visualizationDiagramGroupLabel'), t('visualizationDiagramGroupParent')], groupRows, spec),
+      renderDiagramMappingTable('hierarchy', 'diagramHierarchy', [t('visualizationDiagramHierarchySource'), t('visualizationDiagramHierarchyChild'), t('visualizationDiagramHierarchyParent'), t('visualizationDiagramHierarchyLabel')], hierarchyRows, spec),
       '</div>',
       '</div>'
     ].join('');
@@ -7675,6 +8398,22 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
+  function renderDiagramSectionEditor(selected) {
+    var spec = (selected && selected.spec) || defaultSpec();
+    var presentation = getPresentationModel(spec);
+    var outputMode = normalizeOutputMode(presentation.outputMode);
+    return [
+      '<section class="section" id="cmdp-diagram-section-editor"><h2>' + t('menuDiagram') + '</h2>',
+      '<p class="muted">' + t('diagramEditorHelp') + '</p>',
+      '<div class="settings-block">',
+      '<h3>' + t('visualizationOutputMode') + '</h3>',
+      renderOutputModeControl(outputMode === 'tables' ? 'both' : outputMode),
+      '</div>',
+      renderDiagramEditor(spec, outputMode, { force: true }),
+      '</section>'
+    ].join('');
+  }
+
   function renderTestWorkflow() {
     return [
       '<section class="section" id="cmdp-test-workflow"><h2>' + t('testWorkflow') + '</h2>',
@@ -7874,19 +8613,58 @@ function dynamicPagesClientScript() {
     state.runtimeCountdownTimer = window.setInterval(refreshRuntimeCountdown, 1000);
   }
 
-  function renderResultDiagram(diagram, toolbarHtml) {
+  function diagramHasD2Download(diagram) {
+    return Boolean(diagram && diagram.d2 && (diagram.d2.downloadAvailable || diagram.d2.source));
+  }
+
+  function renderDiagramToolbar(diagram, toolbarHtml, d2DownloadHref) {
+    var actions = [];
+    if (toolbarHtml) actions.push(toolbarHtml);
+    if (d2DownloadHref && diagramHasD2Download(diagram)) {
+      actions.push('<a class="button" data-d2-source-download href="' + escapeHtml(d2DownloadHref) + '" download>' + escapeHtml(t('d2DownloadSource')) + '</a>');
+    }
+    return actions.length ? '<div class="result-table-actions">' + actions.join('') + '</div>' : '';
+  }
+
+  function renderD2UnavailableNotice(diagram) {
+    if (!diagramHasD2Download(diagram)) return '';
+    var svg = diagram.svg && typeof diagram.svg === 'object' ? diagram.svg : {};
+    if (svg.rendered && svg.content) return '';
+    var text = t('d2RendererUnavailable');
+    if (svg.renderError) text += ' ' + t('d2RenderError', { error: svg.renderError });
+    return '<div class="notice" data-d2-render-unavailable>' + escapeHtml(text) + '</div>';
+  }
+
+  function renderD2SvgContent(diagram, title) {
+    var svg = diagram && diagram.svg && typeof diagram.svg === 'object' ? diagram.svg : {};
+    var content = String(svg.content || '').trim();
+    if (!svg.rendered || !content || !/^<svg[\s>]/i.test(content)) return '';
+    return '<div class="cmdp-d2-svg" data-d2-rendered-svg role="img" aria-label="' + escapeHtml(title || t('d2RenderedDiagram')) + '">' + content + '</div>';
+  }
+
+  function renderResultDiagram(diagram, toolbarHtml, d2DownloadHref) {
     var nodes = Array.isArray(diagram.nodes) ? diagram.nodes.filter(function (node) { return node && node.id; }) : [];
     var edges = Array.isArray(diagram.edges) ? diagram.edges.filter(function (edge) { return edge && edge.source && edge.target; }) : [];
     var title = diagram.title || diagram.name || 'Topology';
+    var toolbar = renderDiagramToolbar(diagram, toolbarHtml, d2DownloadHref);
+    var d2Svg = renderD2SvgContent(diagram, title);
+    var d2Notice = renderD2UnavailableNotice(diagram);
     if (!nodes.length) {
       return '<div class="result-table-wrap" data-result-diagram><div class="result-table-header"><div class="result-table-title"><h3>' +
-        escapeHtml(title) + '</h3></div>' + (toolbarHtml ? '<div class="result-table-actions">' + toolbarHtml + '</div>' : '') +
-        '</div><div class="notice">' + escapeHtml(diagram.emptyText || DEFAULT_EMPTY_RESULT_TEXT) + '</div></div>';
+        escapeHtml(title) + '</h3></div>' + toolbar +
+        '</div>' + (d2Svg || d2Notice + '<div class="notice">' + escapeHtml(diagram.emptyText || DEFAULT_EMPTY_RESULT_TEXT) + '</div>') + '</div>';
+    }
+    if (d2Svg) {
+      var renderedWarnings = Array.isArray(diagram.warnings) && diagram.warnings.length
+        ? '<div class="notice">' + escapeHtml(diagram.warnings.join(' ')) + '</div>'
+        : '';
+      return '<div class="result-table-wrap" data-result-diagram><div class="result-table-header"><div class="result-table-title"><h3>' +
+        escapeHtml(title) + '</h3></div>' + toolbar + '</div>' + d2Svg + renderedWarnings + '</div>';
     }
     var groups = [];
     var grouped = {};
     nodes.forEach(function (node) {
-      var group = String(node.group || t('noData'));
+      var group = String(node.group || node.parent || t('noData'));
       if (!grouped[group]) {
         grouped[group] = [];
         groups.push(group);
@@ -7911,10 +8689,11 @@ function dynamicPagesClientScript() {
       var from = positions[edge.source];
       var to = positions[edge.target];
       if (!from || !to) return '';
+      var label = edge.label || edge.kind || '';
       var midX = Math.round((from.x + to.x) / 2);
       var midY = Math.round((from.y + to.y) / 2) - 8;
       return '<line x1="' + from.x + '" y1="' + from.y + '" x2="' + to.x + '" y2="' + to.y + '" stroke="#6b7280" stroke-width="1.6" marker-end="url(#cmdp-arrow)"></line>' +
-        (edge.label ? '<text x="' + midX + '" y="' + midY + '" text-anchor="middle" font-size="11" fill="#374151">' + escapeHtml(edge.label) + '</text>' : '');
+        (label ? '<text x="' + midX + '" y="' + midY + '" text-anchor="middle" font-size="11" fill="#374151">' + escapeHtml(label) + '</text>' : '');
     }).join('');
     var groupHtml = groups.map(function (group, index) {
       var x = 40 + index * columnWidth + columnWidth / 2;
@@ -7924,8 +8703,10 @@ function dynamicPagesClientScript() {
       var pos = positions[node.id] || { x: 0, y: 0 };
       var label = String(node.label || node.id);
       var text = label.length > 28 ? label.slice(0, 25) + '...' : label;
+      var typeText = node.type ? String(node.type).slice(0, 30) : '';
       var body = '<g><rect x="' + (pos.x - 70) + '" y="' + (pos.y - 22) + '" width="140" height="44" rx="7" fill="#ffffff" stroke="#2563eb" stroke-width="1.6"></rect>' +
-        '<text x="' + pos.x + '" y="' + (pos.y + 4) + '" text-anchor="middle" font-size="12" fill="#111827">' + escapeHtml(text) + '</text></g>';
+        '<text x="' + pos.x + '" y="' + (pos.y + (typeText ? 0 : 4)) + '" text-anchor="middle" font-size="12" fill="#111827">' + escapeHtml(text) + '</text>' +
+        (typeText ? '<text x="' + pos.x + '" y="' + (pos.y + 15) + '" text-anchor="middle" font-size="10" fill="#6b7280">' + escapeHtml(typeText) + '</text>' : '') + '</g>';
       return node.href && isSafeRuntimeLinkUrlClient(node.href)
         ? '<a href="' + escapeHtml(node.href) + '">' + body + '</a>'
         : body;
@@ -7934,8 +8715,8 @@ function dynamicPagesClientScript() {
       ? '<div class="notice">' + escapeHtml(diagram.warnings.join(' ')) + '</div>'
       : '';
     return '<div class="result-table-wrap" data-result-diagram><div class="result-table-header"><div class="result-table-title"><h3>' +
-      escapeHtml(title) + '</h3></div>' + (toolbarHtml ? '<div class="result-table-actions">' + toolbarHtml + '</div>' : '') +
-      '</div><div style="overflow:auto"><svg role="img" aria-label="' + escapeHtml(title) + '" width="' + width + '" height="' + height + '" viewBox="0 0 ' + width + ' ' + height + '" style="max-width:100%;height:auto;background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px">' +
+      escapeHtml(title) + '</h3></div>' + toolbar +
+      '</div>' + d2Notice + '<div style="overflow:auto"><svg role="img" aria-label="' + escapeHtml(title) + '" width="' + width + '" height="' + height + '" viewBox="0 0 ' + width + ' ' + height + '" style="max-width:100%;height:auto;background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px">' +
       '<defs><marker id="cmdp-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#6b7280"></path></marker></defs>' +
       groupHtml + edgeHtml + nodeHtml + '</svg></div>' + warnings + '</div>';
   }
@@ -7966,10 +8747,11 @@ function dynamicPagesClientScript() {
     }
     if (diagrams.length || tables.length) {
       var cacheUsed = false;
-      return diagrams.map(function (diagram) {
+      return diagrams.map(function (diagram, diagramIndex) {
         var toolbar = cacheUsed ? '' : cacheHtml;
         cacheUsed = cacheUsed || Boolean(toolbar);
-        return renderResultDiagram(diagram, toolbar);
+        var d2DownloadHref = runtimeD2DownloadPath(result, diagram, diagramIndex);
+        return renderResultDiagram(diagram, toolbar, d2DownloadHref);
       }).concat(tables.map(function (table) {
         var toolbar = cacheUsed ? '' : cacheHtml;
         cacheUsed = cacheUsed || Boolean(toolbar);
@@ -8673,53 +9455,157 @@ function dynamicPagesClientScript() {
     };
   }
 
-  function readVisualizationSettings(required) {
+  function readDiagramMappingRows(kind) {
+    var rows = Array.prototype.slice.call(document.querySelectorAll('[data-diagram-mapping-row][data-diagram-mapping-kind="' + kind + '"]'));
+    var mappings = [];
+    rows.forEach(function (row) {
+      var detailRow = row.nextElementSibling && row.nextElementSibling.hasAttribute('data-diagram-mapping-detail') ? row.nextElementSibling : row;
+      function mappingField(name) {
+        return row.querySelector('[data-diagram-mapping-field="' + name + '"]') || detailRow.querySelector('[data-diagram-mapping-field="' + name + '"]');
+      }
+      function mappingValue(name) {
+        return String((mappingField(name) || {}).value || '').trim();
+      }
+      function mappingValues(name) {
+        var field = mappingField(name);
+        if (!field) return [];
+        if (field.options && field.multiple) {
+          return Array.prototype.slice.call(field.options).filter(function (option) { return option.selected; }).map(function (option) { return String(option.value || '').trim(); }).filter(Boolean);
+        }
+        return String(field.value || '').split(',').map(function (item) { return item.trim(); }).filter(Boolean);
+      }
+      function applyMappingDetails(mapping, fallbackLabelField) {
+        var labelTemplate = mappingValue('labelTemplate');
+        var labelFields = mappingValues('labelFields');
+        if (labelTemplate) mapping.labelTemplate = labelTemplate;
+        if (labelFields.length && !(labelFields.length === 1 && labelFields[0] === fallbackLabelField)) mapping.labelFields = labelFields;
+        var dataProfile = {};
+        var dataProfileName = mappingValue('dataProfileName');
+        var dataClassName = mappingValue('dataClassName');
+        var dataFields = mappingValues('dataProfileFields');
+        var includeSourceRefField = mappingField('dataIncludeSourceRef');
+        if (dataProfileName) dataProfile.name = dataProfileName;
+        if (dataClassName) dataProfile.className = dataClassName;
+        if (dataFields.length) dataProfile.fields = dataFields;
+        if (includeSourceRefField && includeSourceRefField.checked === false) dataProfile.includeSourceRef = false;
+        if (Object.keys(dataProfile).length) mapping.dataProfile = dataProfile;
+        return mapping;
+      }
+      var from = mappingValue('from');
+      var type = mappingValue('type') || 'generic';
+      if (!from && type === 'generic') return;
+      if (!from) throw new Error(t('diagramMappingSourceRequired'));
+      if (kind === 'nodes') {
+        var nodeFields = {
+          id: mappingValue('id') || 'id',
+          label: mappingValue('label') || 'label',
+          group: mappingValue('group') || 'group',
+          href: mappingValue('href') || 'href'
+        };
+        var parent = mappingValue('parent');
+        var nodeType = mappingValue('nodeType');
+        if (parent) nodeFields.parent = parent;
+        if (nodeType) nodeFields.nodeType = nodeType;
+        mappings.push(applyMappingDetails({ from: from, fields: nodeFields }, nodeFields.label));
+      } else if (kind === 'edges') {
+        var edgeFields = {
+          source: mappingValue('source') || 'source',
+          target: mappingValue('target') || 'target',
+          label: mappingValue('label') || 'label'
+        };
+        var edgeType = mappingValue('edgeType');
+        var edgeDirection = mappingValue('edgeDirection');
+        if (edgeType) edgeFields.edgeType = edgeType;
+        if (edgeDirection) edgeFields.edgeDirection = edgeDirection;
+        mappings.push(applyMappingDetails({ type: type || 'generic', from: from, fields: edgeFields }, edgeFields.label));
+      } else if (kind === 'groups') {
+        var groupFields = {
+          id: mappingValue('id') || 'id',
+          label: mappingValue('label') || 'label'
+        };
+        var groupParent = mappingValue('parent');
+        if (groupParent) groupFields.parent = groupParent;
+        mappings.push(applyMappingDetails({ from: from, fields: groupFields }, groupFields.label));
+      } else if (kind === 'hierarchy') {
+        mappings.push(applyMappingDetails({
+          from: from,
+          fields: {
+            child: mappingValue('child') || 'child',
+            parent: mappingValue('parent') || 'parent',
+            label: mappingValue('label') || 'label'
+          }
+        }, mappingValue('label') || 'label'));
+      }
+    });
+    return mappings;
+  }
+
+  function readVisualizationSettings(required, currentSpec) {
+    var currentPresentation = getPresentationModel(currentSpec || readCurrentSpec());
     var hasGlobalFields = hasField('cmdp-visual-empty-text') || hasField('cmdp-visual-permission-denied-text') || hasField('cmdp-visual-font-size') || hasField('cmdp-visual-density');
     var rows = Array.prototype.slice.call(document.querySelectorAll('[data-visualization-row]'));
     var outputField = document.querySelector('input[name="cmdp-output-mode"]:checked');
-    var hasDiagramFields = hasField('cmdp-diagram-name') || hasField('cmdp-diagram-nodes-source') || hasField('cmdp-diagram-edges-source');
+    var hasDiagramFields = hasField('cmdp-diagram-name') || Boolean(document.querySelector('[data-diagram-mapping-row]'));
     if (!hasGlobalFields && !rows.length && !hasDiagramFields && !outputField && !required) return null;
     var settings = {
-      emptyText: String(readValue('cmdp-visual-empty-text') || '').trim() || DEFAULT_EMPTY_RESULT_TEXT,
-      permissionDeniedText: String(readValue('cmdp-visual-permission-denied-text') || '').trim() || DEFAULT_PERMISSION_DENIED_TEXT,
-      outputMode: normalizeOutputMode(outputField && outputField.value || 'both'),
-      fontSize: String(readValue('cmdp-visual-font-size') || 'normal').trim() || 'normal',
-      density: String(readValue('cmdp-visual-density') || 'normal').trim() || 'normal',
-      zebra: readChecked('cmdp-visual-zebra'),
-      filters: readChecked('cmdp-visual-filters'),
-      sortable: readChecked('cmdp-visual-sortable'),
-      tables: [],
+      emptyText: hasField('cmdp-visual-empty-text') ? (String(readValue('cmdp-visual-empty-text') || '').trim() || DEFAULT_EMPTY_RESULT_TEXT) : currentPresentation.emptyText,
+      permissionDeniedText: hasField('cmdp-visual-permission-denied-text') ? (String(readValue('cmdp-visual-permission-denied-text') || '').trim() || DEFAULT_PERMISSION_DENIED_TEXT) : currentPresentation.permissionDeniedText,
+      outputMode: normalizeOutputMode(outputField && outputField.value || currentPresentation.outputMode || 'both'),
+      fontSize: hasField('cmdp-visual-font-size') ? (String(readValue('cmdp-visual-font-size') || 'normal').trim() || 'normal') : currentPresentation.fontSize,
+      density: hasField('cmdp-visual-density') ? (String(readValue('cmdp-visual-density') || 'normal').trim() || 'normal') : currentPresentation.density,
+      zebra: hasField('cmdp-visual-zebra') ? readChecked('cmdp-visual-zebra') : Boolean(currentPresentation.zebra),
+      filters: hasField('cmdp-visual-filters') ? readChecked('cmdp-visual-filters') : Boolean(currentPresentation.filters),
+      sortable: hasField('cmdp-visual-sortable') ? readChecked('cmdp-visual-sortable') : Boolean(currentPresentation.sortable),
+      tables: rows.length ? [] : currentPresentation.tables.slice(),
       diagram: null
     };
     if (hasDiagramFields && settings.outputMode !== 'tables') {
       var diagramName = String(readValue('cmdp-diagram-name') || 'topology').trim() || 'topology';
-      var nodeSource = String(readValue('cmdp-diagram-nodes-source') || '').trim();
-      var edgeSource = String(readValue('cmdp-diagram-edges-source') || '').trim();
       var maxNodes = readPositiveIntField('cmdp-diagram-max-nodes', t('visualizationDiagramMaxNodes'), 300);
       var maxEdges = readPositiveIntField('cmdp-diagram-max-edges', t('visualizationDiagramMaxEdges'), 800);
+      var metadataMaxBytes = readPositiveIntField('cmdp-diagram-metadata-max-bytes', t('visualizationDiagramMetadataMaxBytes'), 200000);
+      var nodeMappings = readDiagramMappingRows('nodes');
+      var edgeMappings = readDiagramMappingRows('edges');
+      var groupMappings = readDiagramMappingRows('groups');
+      var hierarchyMappings = readDiagramMappingRows('hierarchy');
+      var firstNodeFields = nodeMappings[0] && nodeMappings[0].fields || {};
+      var firstEdgeFields = edgeMappings[0] && edgeMappings[0].fields || {};
       settings.diagram = {
         name: diagramName,
         title: String(readValue('cmdp-diagram-title') || diagramName).trim() || diagramName,
         type: 'topology',
         source: {
-          nodes: nodeSource,
-          edges: edgeSource
+          nodes: nodeMappings[0] && nodeMappings[0].from || '',
+          edges: edgeMappings[0] && edgeMappings[0].from || ''
         },
         fields: {
-          nodeId: String(readValue('cmdp-diagram-node-id') || 'id').trim() || 'id',
-          nodeLabel: String(readValue('cmdp-diagram-node-label') || 'label').trim() || 'label',
-          nodeGroup: String(readValue('cmdp-diagram-node-group') || 'group').trim() || 'group',
-          nodeHref: String(readValue('cmdp-diagram-node-href') || 'href').trim() || 'href',
-          edgeSource: String(readValue('cmdp-diagram-edge-source') || 'source').trim() || 'source',
-          edgeTarget: String(readValue('cmdp-diagram-edge-target') || 'target').trim() || 'target',
-          edgeLabel: String(readValue('cmdp-diagram-edge-label') || 'label').trim() || 'label'
+          nodeId: firstNodeFields.id || 'id',
+          nodeLabel: firstNodeFields.label || 'label',
+          nodeGroup: firstNodeFields.group || 'group',
+          nodeParent: firstNodeFields.parent || '',
+          nodeType: firstNodeFields.nodeType || '',
+          nodeHref: firstNodeFields.href || 'href',
+          edgeSource: firstEdgeFields.source || 'source',
+          edgeTarget: firstEdgeFields.target || 'target',
+          edgeLabel: firstEdgeFields.label || 'label',
+          edgeType: firstEdgeFields.edgeType || '',
+          edgeDirection: firstEdgeFields.edgeDirection || ''
         },
         layout: {
-          type: String(readValue('cmdp-diagram-layout') || 'topology').trim() === 'layered' ? 'layered' : 'topology'
+          type: ['topology', 'layered', 'hierarchical', 'grouped'].indexOf(String(readValue('cmdp-diagram-layout') || 'topology').trim()) === -1 ? 'topology' : String(readValue('cmdp-diagram-layout') || 'topology').trim()
         },
         maxNodes: maxNodes,
-        maxEdges: maxEdges
+        maxEdges: maxEdges,
+        metadata: {
+          embedInD2: hasField('cmdp-diagram-embed-d2') ? readChecked('cmdp-diagram-embed-d2') : true,
+          embedInSvg: hasField('cmdp-diagram-embed-svg') ? readChecked('cmdp-diagram-embed-svg') : true,
+          maxBytes: metadataMaxBytes
+        }
       };
+      if (nodeMappings.length) settings.diagram.nodeMappings = nodeMappings;
+      if (edgeMappings.length) settings.diagram.edgeMappings = edgeMappings;
+      if (groupMappings.length) settings.diagram.groupMappings = groupMappings;
+      if (hierarchyMappings.length) settings.diagram.hierarchyMappings = hierarchyMappings;
     }
     rows.forEach(function (row) {
       var detailRow = row.nextElementSibling && row.nextElementSibling.hasAttribute('data-visualization-row-detail') ? row.nextElementSibling : row;
@@ -8782,7 +9668,7 @@ function dynamicPagesClientScript() {
   }
 
   function applyVisualizationToSpec(spec, required) {
-    var settings = readVisualizationSettings(required);
+    var settings = readVisualizationSettings(required, spec);
     if (!settings) return spec;
     spec.result = spec.result && typeof spec.result === 'object' && !Array.isArray(spec.result) ? spec.result : {};
     spec.result.emptyText = settings.emptyText || DEFAULT_EMPTY_RESULT_TEXT;
@@ -9441,6 +10327,29 @@ function dynamicPagesClientScript() {
     }
   }
 
+  function applyAssistantDraftToSpec(spec, intent, taskMode) {
+    var next = cloneSpecForEdit(spec || defaultSpec());
+    var prompt = String(intent === undefined || intent === null ? '' : intent);
+    var mode = normalizeOutputMode(taskMode || 'both');
+    if (prompt || mode !== 'both') {
+      next.assistantDraft = {
+        intent: prompt,
+        taskMode: mode
+      };
+    } else {
+      delete next.assistantDraft;
+    }
+    return next;
+  }
+
+  function applyAssistantDraftFromDomToSpec(spec) {
+    if (!hasField('cmdp-assistant-intent')) return spec;
+    var taskField = document.querySelector('input[name="cmdp-assistant-task-mode"]:checked');
+    state.assistantDraftIntent = readValue('cmdp-assistant-intent');
+    state.assistantTaskMode = normalizeOutputMode(taskField && taskField.value || state.assistantTaskMode);
+    return applyAssistantDraftToSpec(spec, state.assistantDraftIntent, state.assistantTaskMode);
+  }
+
   function readSpecWithEditorBlocks() {
     var specData = readSpecWithParamEditor();
     var extractionStep = readExtractionStepFields(false);
@@ -9451,6 +10360,7 @@ function dynamicPagesClientScript() {
     specData.spec = applyPublicationToSpec(specData.spec, false);
     specData.spec = applyCacheToSpec(specData.spec, false);
     specData.spec = applyCmdbBuildViewToSpec(specData.spec, false);
+    specData.spec = applyAssistantDraftFromDomToSpec(specData.spec);
     return specData;
   }
 
@@ -9909,6 +10819,81 @@ function dynamicPagesClientScript() {
     });
   }
 
+  function diagramMappingKindFromElement(element) {
+    return String(element && element.getAttribute && element.getAttribute('data-diagram-mapping-kind') || '').trim();
+  }
+
+  function diagramMappingRowHasDomValue(row) {
+    if (!row) return false;
+    var source = row.querySelector('[data-diagram-mapping-field="from"]');
+    if (source && String(source.value || '').trim()) return true;
+    var type = row.querySelector('[data-diagram-mapping-field="type"]');
+    return Boolean(type && String(type.value || '').trim() && String(type.value || '').trim() !== 'generic');
+  }
+
+  function reindexDiagramMappingRows(body) {
+    Array.prototype.slice.call((body || document).querySelectorAll('[data-diagram-mapping-row]')).forEach(function (row, index) {
+      row.setAttribute('data-diagram-mapping-index', String(index));
+      if (row.nextElementSibling && row.nextElementSibling.hasAttribute('data-diagram-mapping-detail')) {
+        row.nextElementSibling.setAttribute('data-diagram-mapping-index', String(index));
+      }
+    });
+  }
+
+  function addDiagramMappingRow(button) {
+    var kind = diagramMappingKindFromElement(button);
+    var body = document.querySelector('[data-diagram-mapping-body][data-diagram-mapping-kind="' + kind + '"]');
+    if (!kind || !body) return;
+    var rows = Array.prototype.slice.call(body.querySelectorAll('[data-diagram-mapping-row]'));
+    body.insertAdjacentHTML('beforeend', renderDiagramMappingRow(kind, {}, rows.length, state.selectedTemplate && state.selectedTemplate.spec || defaultSpec()));
+  }
+
+  function clearDiagramMappingRow(button) {
+    var row = button && button.closest ? button.closest('[data-diagram-mapping-row]') : null;
+    var body = row && row.parentElement;
+    if (!row || !body) return;
+    var rows = Array.prototype.slice.call(body.querySelectorAll('[data-diagram-mapping-row]'));
+    if (rows.length > 1) {
+      var detailRow = row.nextElementSibling && row.nextElementSibling.hasAttribute('data-diagram-mapping-detail') ? row.nextElementSibling : null;
+      row.remove();
+      if (detailRow) detailRow.remove();
+      reindexDiagramMappingRows(body);
+      return;
+    }
+    row.querySelectorAll('input,select').forEach(function (field) {
+      if (field.type === 'checkbox') field.checked = field.getAttribute('data-diagram-mapping-field') === 'dataIncludeSourceRef';
+      else field.value = field.getAttribute('data-diagram-mapping-field') === 'type' ? 'generic' : '';
+    });
+    if (row.nextElementSibling && row.nextElementSibling.hasAttribute('data-diagram-mapping-detail')) {
+      row.nextElementSibling.querySelectorAll('input,select').forEach(function (field) {
+        if (field.type === 'checkbox') field.checked = field.getAttribute('data-diagram-mapping-field') === 'dataIncludeSourceRef';
+        else field.value = '';
+      });
+    });
+  }
+
+  function ensureTrailingDiagramMappingRow(target) {
+    if (!target || !target.closest) return;
+    var row = target.closest('[data-diagram-mapping-row]');
+    var body = row && row.parentElement;
+    if (!row || !body) return;
+    var rows = Array.prototype.slice.call(body.querySelectorAll('[data-diagram-mapping-row]'));
+    if (!rows.length || rows[rows.length - 1] !== row) return;
+    if (!diagramMappingRowHasDomValue(row)) return;
+    var kind = diagramMappingKindFromElement(row);
+    body.insertAdjacentHTML('beforeend', renderDiagramMappingRow(kind, {}, rows.length, state.selectedTemplate && state.selectedTemplate.spec || defaultSpec()));
+  }
+
+  function refreshDiagramMappingEditorAfterSourceChange() {
+    try {
+      updateSelectedFromEditor(applyVisualizationToSpec(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(), false));
+      renderDesigner();
+    } catch (error) {
+      state.message = { type: 'error', text: error.message || String(error) };
+      renderDesigner();
+    }
+  }
+
   function refreshVisualizationRowGroupLabels(container) {
     Array.prototype.slice.call((container || document).querySelectorAll('[data-visualization-row-group]')).forEach(function (row, index) {
       var label = row.querySelector('[data-row-group-label]');
@@ -10054,7 +11039,7 @@ function dynamicPagesClientScript() {
         state.objectGroupDraft = null;
         state.relationDraft = null;
         state.viewComposerDraft = null;
-        updateSelectedFromEditor(result.json.spec);
+        updateSelectedFromEditor(applyAssistantDraftToSpec(result.json.spec, state.assistantDraftIntent, state.assistantTaskMode));
         clearDraftExecutionState();
         state.message = { type: 'ok', text: t('assistantDraftGeneratedApplied') };
       } else {
@@ -10081,7 +11066,7 @@ function dynamicPagesClientScript() {
     state.objectGroupDraft = null;
     state.relationDraft = null;
     state.viewComposerDraft = null;
-    updateSelectedFromEditor(result.json.spec);
+    updateSelectedFromEditor(applyAssistantDraftToSpec(result.json.spec, state.assistantDraftIntent, state.assistantTaskMode));
     state.message = {
       type: 'ok',
       text: result.json.explanation ? t('assistantDraftApplied') + ' ' + result.json.explanation : t('assistantDraftApplied')
@@ -10834,12 +11819,13 @@ function dynamicPagesClientScript() {
     var templateCode = boot.templateCode || '';
     var params = {};
     new URLSearchParams(window.location.search || '').forEach(function (value, key) {
-      if (key === 'lang' || key === 'cmdpLang') return;
+      if (runtimeSystemParam(key)) return;
       params[key] = value;
     });
     state.runParams = params;
     if (boot.publicRuntime) {
       request(publicSnapshotRunPath(templateCode, params)).then(function (result) {
+        result.downloadMode = 'public';
         state.runtimeRefreshInProgress = false;
         app.innerHTML = renderRuntimeResult(result);
         startRuntimeCountdown();
@@ -10850,9 +11836,11 @@ function dynamicPagesClientScript() {
       return;
     }
     request(runtimeRunPath(templateCode, params, Boolean(refresh))).then(function (result) {
+      result.downloadMode = 'template';
       state.runtimeRefreshInProgress = false;
       if (!result.ok && resultIsPermissionDenied(result)) {
         return request(publicSnapshotRunPath(templateCode, params)).then(function (publicResult) {
+          publicResult.downloadMode = 'public';
           app.innerHTML = publicResult.ok && publicResult.json && publicResult.json.snapshotFound ? renderRuntimeResult(publicResult) : renderRuntimeResult(result);
           startRuntimeCountdown();
         });
@@ -10997,6 +11985,8 @@ function dynamicPagesClientScript() {
     if (action === 'apply-selection') applyDataSelectionEditor();
     if (action === 'add-view-column-row') addViewComposerColumnRow();
     if (action === 'clear-view-column-row') clearViewComposerColumnRow(target);
+    if (action === 'add-diagram-mapping-row') addDiagramMappingRow(target);
+    if (action === 'clear-diagram-mapping-row') clearDiagramMappingRow(target);
     if (action === 'apply-view-composer') applyViewComposerEditor();
     if (action === 'add-visual-row-group') addVisualizationRowGroup(target);
     if (action === 'clear-visual-row-group') clearVisualizationRowGroup(target);
@@ -11033,6 +12023,9 @@ function dynamicPagesClientScript() {
     if (event.target && event.target.matches && event.target.matches('[data-view-column-field="title"]')) {
       ensureTrailingViewComposerColumnRow(event.target);
     }
+    if (event.target && event.target.matches && event.target.matches('[data-diagram-mapping-field]')) {
+      ensureTrailingDiagramMappingRow(event.target);
+    }
   });
 
   document.addEventListener('change', function (event) {
@@ -11045,6 +12038,9 @@ function dynamicPagesClientScript() {
     if (event.target && event.target.matches && event.target.matches('[data-view-column-field="field"], [data-view-column-field="title"]')) {
       ensureTrailingViewComposerColumnRow(event.target);
     }
+    if (event.target && event.target.matches && event.target.matches('[data-diagram-mapping-field]')) {
+      ensureTrailingDiagramMappingRow(event.target);
+    }
   });
 
   document.addEventListener('change', function (event) {
@@ -11056,6 +12052,11 @@ function dynamicPagesClientScript() {
     if (target.matches && target.matches('input[name="cmdp-output-mode"]')) {
       captureVisibleDesignerState();
       renderDesigner();
+      return;
+    }
+    if (target.matches && target.matches('[data-diagram-mapping-field="from"]')) {
+      ensureTrailingDiagramMappingRow(target);
+      refreshDiagramMappingEditorAfterSourceChange();
       return;
     }
     if (target.matches && target.matches('input[name="cmdp-assistant-task-mode"]')) {
@@ -12709,6 +13710,9 @@ function defaultRuntimeConfig() {
     runtimeCache: {
       refreshCooldownSec: Math.ceil(RUNTIME_REFRESH_COOLDOWN_MS / 1000)
     },
+    d2: {
+      render: d2RendererConfigSummary()
+    },
     assistant: {
       llm: {
         enabled: false,
@@ -12871,8 +13875,12 @@ function mergeRuntimeConfigDefaults(runtimeConfig) {
   const defaults = defaultRuntimeConfig();
   const source = runtimeConfig && typeof runtimeConfig === 'object' && !Array.isArray(runtimeConfig) ? runtimeConfig : {};
   const sourceAssistant = source.assistant && typeof source.assistant === 'object' && !Array.isArray(source.assistant) ? source.assistant : {};
+  const sourceD2 = source.d2 && typeof source.d2 === 'object' && !Array.isArray(source.d2) ? source.d2 : {};
   return Object.assign({}, defaults, source, {
     runtimeCache: Object.assign({}, defaults.runtimeCache, source.runtimeCache || {}),
+    d2: Object.assign({}, defaults.d2, sourceD2, {
+      render: Object.assign({}, defaults.d2.render, sourceD2.render || {})
+    }),
     assistant: Object.assign({}, defaults.assistant, sourceAssistant, {
       llm: Object.assign({}, defaults.assistant.llm, sourceAssistant.llm || {}),
       mcp: Object.assign({}, defaults.assistant.mcp, sourceAssistant.mcp || {}),
@@ -12969,6 +13977,8 @@ function directCardFieldFromPath(path) {
   const dotIndex = text.indexOf('.');
   const field = dotIndex === -1 ? text : text.slice(0, dotIndex);
   if (!field || field.includes('}') || field.includes('/')) return '';
+  const displayMatch = field.match(/^_([^_].*?)_description(?:_translation)?$/i);
+  if (displayMatch && displayMatch[1]) return displayMatch[1];
   return field;
 }
 
@@ -12999,19 +14009,68 @@ function addPathColumnDependencies(target, columns) {
 
 function addResultDiagramDependencies(add, diagram) {
   if (!diagram || typeof diagram !== 'object' || Array.isArray(diagram)) return;
+  const addMappingExtraDependencies = (source, mapping, fallbackLabel = '') => {
+    for (const field of diagramMappingLabelFields(mapping, fallbackLabel)) add(source, field);
+    for (const field of normalizeDiagramDataProfile(mapping).fields) add(source, field);
+  };
   const nodeSource = resultDiagramSourceName(diagram, 'nodes');
   const edgeSource = resultDiagramSourceName(diagram, 'edges');
   [
     resultDiagramField(diagram, ['nodeId', 'id', 'idColumn'], 'id'),
     resultDiagramField(diagram, ['nodeLabel', 'label', 'labelColumn'], 'label'),
-    resultDiagramField(diagram, ['nodeGroup', 'group', 'groupColumn'], 'group'),
-    resultDiagramField(diagram, ['nodeHref', 'href', 'url', 'urlColumn'], 'href')
+    resultDiagramField(diagram, ['nodeGroup', 'group', 'groupColumn'], ''),
+    resultDiagramField(diagram, ['nodeHref', 'href', 'url', 'urlColumn'], '')
   ].forEach((field) => add(nodeSource, field));
   [
     resultDiagramField(diagram, ['edgeSource', 'source', 'sourceId', 'from'], 'source'),
     resultDiagramField(diagram, ['edgeTarget', 'target', 'targetId', 'to'], 'target'),
-    resultDiagramField(diagram, ['edgeLabel', 'edgeTitle', 'label'], 'label')
+    resultDiagramField(diagram, ['edgeLabel', 'edgeTitle', 'label'], '')
   ].forEach((field) => add(edgeSource, field));
+  for (const mapping of normalizeDiagramMappingList(diagram.nodeMappings)) {
+    const source = diagramMappingSourceName(mapping);
+    const labelField = diagramMappingField(mapping, ['nodeLabel', 'label', 'labelColumn'], 'label');
+    [
+      diagramMappingField(mapping, ['nodeId', 'id', 'idColumn'], 'id'),
+      labelField,
+      diagramMappingField(mapping, ['nodeGroup', 'group', 'groupColumn', 'groupBy'], ''),
+      diagramMappingField(mapping, ['nodeParent', 'parent', 'parentId', 'parentColumn'], ''),
+      diagramMappingField(mapping, ['nodeType', 'typeColumn', 'classColumn', 'classNameColumn'], ''),
+      diagramMappingField(mapping, ['nodeHref', 'href', 'url', 'urlColumn'], '')
+    ].forEach((field) => add(source, field));
+    addMappingExtraDependencies(source, mapping, labelField);
+  }
+  for (const mapping of normalizeDiagramMappingList(diagram.edgeMappings)) {
+    const source = diagramMappingSourceName(mapping);
+    const labelField = diagramMappingField(mapping, ['edgeLabel', 'edgeTitle', 'label', 'labelColumn'], 'label');
+    [
+      diagramMappingField(mapping, ['edgeSource', 'source', 'sourceId', 'sourceColumn', 'from'], 'source'),
+      diagramMappingField(mapping, ['edgeTarget', 'target', 'targetId', 'targetColumn', 'to'], 'target'),
+      diagramMappingField(mapping, ['edgeLabel', 'edgeTitle', 'label', 'labelColumn'], ''),
+      diagramMappingField(mapping, ['edgeType', 'kindColumn', 'typeColumn'], ''),
+      diagramMappingField(mapping, ['edgeDirection', 'directionColumn'], '')
+    ].forEach((field) => add(source, field));
+    addMappingExtraDependencies(source, mapping, labelField);
+  }
+  for (const mapping of normalizeDiagramMappingList(diagram.groupMappings)) {
+    const source = diagramMappingSourceName(mapping);
+    const labelField = diagramMappingField(mapping, ['groupLabel', 'label', 'labelColumn'], 'label');
+    [
+      diagramMappingField(mapping, ['groupId', 'id', 'idColumn', 'groupColumn'], 'id'),
+      labelField,
+      diagramMappingField(mapping, ['groupParent', 'parent', 'parentColumn'], '')
+    ].forEach((field) => add(source, field));
+    addMappingExtraDependencies(source, mapping, labelField);
+  }
+  for (const mapping of normalizeDiagramMappingList(diagram.hierarchyMappings)) {
+    const source = diagramMappingSourceName(mapping);
+    const labelField = diagramMappingField(mapping, ['edgeLabel', 'label', 'labelColumn'], 'label');
+    [
+      diagramMappingField(mapping, ['child', 'childId', 'node', 'nodeId', 'source', 'sourceColumn'], 'child'),
+      diagramMappingField(mapping, ['parent', 'parentId', 'target', 'targetColumn'], 'parent'),
+      labelField
+    ].forEach((field) => add(source, field));
+    addMappingExtraDependencies(source, mapping, labelField);
+  }
 }
 
 function normalizeResultTableSettings(spec) {
@@ -13364,7 +14423,8 @@ async function probeTemplateAccess(authToken, spec, params, executionOptions, de
         ...executionOptions,
         maxRows: 1,
         maxRestCalls: Math.min(executionOptions.maxRestCalls || 250, 50),
-        dependencyMap
+        dependencyMap,
+        skipD2Render: true
       });
     } catch (error) {
       if (errorLooksPermissionDenied(error)) {
@@ -13515,7 +14575,7 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
         incomplete: Boolean(accessProbe.incomplete)
       },
       result: cloneJsonValueServer(result, { tables: [] }),
-      contentHash: hashJson(result && result.tables ? result.tables : result),
+      contentHash: runtimeResultContentHash(result),
       createdAt,
       lastServedAt: createdAt,
       expiresAt: createdAt + resultTtlMs,
@@ -13545,7 +14605,8 @@ function normalizePublishConfig(spec) {
   return {
     mode,
     warningAccepted: Boolean(publish.warningAccepted),
-    paramsMode: publish.paramsMode === 'ignore' ? 'ignore' : 'exact'
+    paramsMode: publish.paramsMode === 'ignore' ? 'ignore' : 'exact',
+    publicD2Source: publicD2SourceAllowed(publish)
   };
 }
 
@@ -13573,6 +14634,130 @@ function truthyRuntimeFlag(value) {
 
 function runtimeJsonOutputRequested(requestUrl) {
   return truthyRuntimeFlag(requestUrl && requestUrl.searchParams ? requestUrl.searchParams.get('json') : '');
+}
+
+function runtimeD2OutputRequested(requestUrl) {
+  return truthyRuntimeFlag(requestUrl && requestUrl.searchParams ? requestUrl.searchParams.get('d2') : '');
+}
+
+function safeAttachmentName(value, fallback = 'diagram') {
+  const text = displayCardValue(value).trim().replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 120);
+  return text || fallback;
+}
+
+function runtimeD2DiagramSelector(requestUrl) {
+  return String(requestUrl && requestUrl.searchParams ? requestUrl.searchParams.get('diagram') || '' : '').trim();
+}
+
+function runtimeD2DiagramHasSource(diagram) {
+  return Boolean(diagram && diagram.d2 && typeof diagram.d2.source === 'string' && diagram.d2.source.trim());
+}
+
+function publicD2SourceAllowed(publishConfig) {
+  return Boolean(publishConfig && (publishConfig.publicD2Source === true || publishConfig.allowPublicD2Source === true));
+}
+
+function runtimeD2DiagramMatches(diagram, selector, index) {
+  const value = String(selector || '').trim();
+  if (!value) return true;
+  const aliases = [
+    String(index),
+    String(index + 1),
+    diagram && diagram.name,
+    diagram && diagram.title,
+    diagram && diagram.d2 && diagram.d2.sourceHash
+  ].map((item) => String(item || '').trim()).filter(Boolean);
+  return aliases.includes(value);
+}
+
+function selectRuntimeD2Diagram(result, selector = '') {
+  const diagrams = Array.isArray(result && result.diagrams) ? result.diagrams : [];
+  if (!selector) return diagrams.find((diagram) => runtimeD2DiagramHasSource(diagram)) || null;
+  return diagrams.find((diagram, index) => runtimeD2DiagramHasSource(diagram) && runtimeD2DiagramMatches(diagram, selector, index)) || null;
+}
+
+function sendRuntimeD2Source(res, payload, options = {}) {
+  if (options.publicAllowed === false) {
+    sendJson(res, 403, {
+      success: false,
+      action: payload && payload.action || 'run',
+      template: payload && payload.template || {},
+      message: 'D2 source download is not enabled for this published snapshot.'
+    });
+    return;
+  }
+  const selector = String(options.selector || '').trim();
+  const diagram = selectRuntimeD2Diagram(payload && payload.result, selector);
+  if (!diagram) {
+    sendJson(res, 404, {
+      success: false,
+      action: payload && payload.action || 'run',
+      template: payload && payload.template || {},
+      message: selector
+        ? 'No D2 diagram source is available for the selected diagram.'
+        : 'No D2 diagram source is available for this template result.'
+    });
+    return;
+  }
+  const fileBase = `${safeAttachmentName(payload && payload.template && payload.template.code, 'template')}-${safeAttachmentName(diagram.name || 'diagram', 'diagram')}`;
+  sendText(res, 200, diagram.d2.source, 'text/vnd.d2; charset=utf-8', {
+    'content-disposition': `attachment; filename="${fileBase}.d2"`
+  });
+}
+
+function stripSensitiveDiagramArtifacts(result, options = {}) {
+  const includeSvgContent = options.includeSvgContent !== false;
+  const includeD2Source = options.includeD2Source === true;
+  const d2DownloadAllowed = options.d2DownloadAllowed !== false;
+  const next = cloneJsonValueServer(result || { tables: [] }, { tables: [] });
+  if (!Array.isArray(next.diagrams)) return next;
+  next.diagrams = next.diagrams.map((diagram) => {
+    if (!diagram || typeof diagram !== 'object' || Array.isArray(diagram)) return diagram;
+    delete diagram.data;
+    ['nodes', 'edges', 'groups'].forEach((collectionName) => {
+      if (!Array.isArray(diagram[collectionName])) return;
+      diagram[collectionName].forEach((item) => {
+        if (item && typeof item === 'object' && !Array.isArray(item)) delete item.data;
+      });
+    });
+    const d2 = diagram.d2 && typeof diagram.d2 === 'object' && !Array.isArray(diagram.d2) ? diagram.d2 : null;
+    if (d2) {
+      const source = typeof d2.source === 'string' ? d2.source : '';
+      diagram.d2 = {
+        sourceHash: String(d2.sourceHash || ''),
+        metadataBytes: Number.isFinite(Number(d2.metadataBytes)) ? Number(d2.metadataBytes) : 0,
+        metadataEmbedded: Boolean(d2.metadataEmbedded),
+        metadataMaxBytes: Number.isFinite(Number(d2.metadataMaxBytes)) ? Number(d2.metadataMaxBytes) : DEFAULT_D2_METADATA_MAX_BYTES,
+        renderOptionsHash: String(d2.renderOptionsHash || ''),
+        downloadAvailable: d2DownloadAllowed && Boolean(source.trim() || d2.downloadAvailable)
+      };
+      if (includeD2Source && source.trim()) diagram.d2.source = source;
+    }
+    const svg = diagram.svg && typeof diagram.svg === 'object' && !Array.isArray(diagram.svg) ? diagram.svg : null;
+    if (svg) {
+      diagram.svg = {
+        content: includeSvgContent ? String(svg.content || '') : '',
+        rendered: Boolean(svg.rendered),
+        renderError: String(svg.renderError || ''),
+        renderReason: String(svg.renderReason || ''),
+        renderer: String(svg.renderer || ''),
+        layout: String(svg.layout || ''),
+        metadataEmbedded: Boolean(svg.metadataEmbedded)
+      };
+    }
+    return diagram;
+  });
+  return next;
+}
+
+function runtimeDisplayResponsePayload(payload, options = {}) {
+  const next = cloneJsonValueServer(payload || {}, {});
+  next.result = stripSensitiveDiagramArtifacts(next.result || { tables: [] }, {
+    includeSvgContent: true,
+    includeD2Source: false,
+    d2DownloadAllowed: options.d2DownloadAllowed !== false
+  });
+  return next;
 }
 
 async function readStaticSnapshot(templateCode, params, publishConfig = { paramsMode: 'exact' }) {
@@ -13637,6 +14822,61 @@ function staticSnapshotCacheMeta(snapshot, status, backend, key) {
     specHash: snapshot && snapshot.specHash || '',
     sharedAcrossUsers: true
   };
+}
+
+function runtimeResultContentHash(result) {
+  const source = result && typeof result === 'object' && !Array.isArray(result) ? result : {};
+  const diagrams = Array.isArray(source.diagrams) ? source.diagrams.map((diagram) => ({
+    name: String(diagram && diagram.name || ''),
+    title: String(diagram && diagram.title || ''),
+    type: String(diagram && diagram.type || ''),
+    layout: diagram && diagram.layout || null,
+    nodes: Array.isArray(diagram && diagram.nodes) ? diagram.nodes.map((node) => ({
+      id: String(node && node.id || ''),
+      label: String(node && node.label || ''),
+      group: String(node && node.group || ''),
+      parent: String(node && node.parent || ''),
+      type: String(node && node.type || ''),
+      d2Id: String(node && node.d2Id || '')
+    })) : [],
+    edges: Array.isArray(diagram && diagram.edges) ? diagram.edges.map((edge) => ({
+      id: String(edge && (edge.id || edge.d2Id) || ''),
+      source: String(edge && edge.source || ''),
+      target: String(edge && edge.target || ''),
+      label: String(edge && edge.label || ''),
+      kind: String(edge && edge.kind || ''),
+      d2Id: String(edge && edge.d2Id || '')
+    })) : [],
+    groups: Array.isArray(diagram && diagram.groups) ? diagram.groups.map((group) => ({
+      id: String(group && group.id || ''),
+      label: String(group && group.label || ''),
+      parent: String(group && group.parent || ''),
+      d2Id: String(group && group.d2Id || '')
+    })) : [],
+    d2: diagram && diagram.d2 ? {
+      sourceHash: String(diagram.d2.sourceHash || ''),
+      renderOptionsHash: String(diagram.d2.renderOptionsHash || ''),
+      metadataBytes: Number(diagram.d2.metadataBytes || 0),
+      metadataEmbedded: Boolean(diagram.d2.metadataEmbedded)
+    } : null,
+    svg: diagram && diagram.svg ? {
+      rendered: Boolean(diagram.svg.rendered),
+      renderReason: String(diagram.svg.renderReason || ''),
+      renderer: String(diagram.svg.renderer || ''),
+      layout: String(diagram.svg.layout || ''),
+      contentHash: diagram.svg.content ? sha256Hex(diagram.svg.content) : ''
+    } : null,
+    warnings: Array.isArray(diagram && diagram.warnings) ? diagram.warnings.map((item) => String(item || '')).filter(Boolean) : [],
+    truncated: Boolean(diagram && diagram.truncated)
+  })) : [];
+  return hashJson({
+    kind: source.kind || '',
+    html: source.kind === 'html' && source.htmlTrusted ? sha256Hex(source.html || '') : '',
+    tables: Array.isArray(source.tables) ? source.tables : [],
+    diagrams,
+    outputMode: runtimeResultOutputMode(source),
+    emptyText: source.emptyText || ''
+  });
 }
 
 function isRawObjectGroupTableNameServer(name) {
@@ -13722,8 +14962,9 @@ function runtimeJsonTables(result, params = {}) {
   });
 }
 
-function runtimeJsonDiagrams(result) {
+function runtimeJsonDiagrams(result, options = {}) {
   if (runtimeResultOutputMode(result) === 'tables') return [];
+  const d2DownloadAllowed = options.d2DownloadAllowed !== false;
   const diagrams = Array.isArray(result && result.diagrams) ? result.diagrams : [];
   return diagrams.map((diagram) => ({
     name: String(diagram && diagram.name || ''),
@@ -13736,19 +14977,54 @@ function runtimeJsonDiagrams(result) {
       id: String(node && node.id || ''),
       label: String(node && (node.label || node.id) || ''),
       group: String(node && node.group || ''),
-      href: node && isSafeRuntimeLinkUrl(node.href) ? String(node.href) : ''
+      parent: String(node && node.parent || ''),
+      type: String(node && node.type || ''),
+      href: node && isSafeRuntimeLinkUrl(node.href) ? String(node.href) : '',
+      d2Id: String(node && node.d2Id || '')
     })).filter((node) => node.id) : [],
     edges: Array.isArray(diagram && diagram.edges) ? diagram.edges.map((edge) => ({
+      id: String(edge && edge.id || edge && edge.d2Id || ''),
       source: String(edge && edge.source || ''),
       target: String(edge && edge.target || ''),
-      label: String(edge && edge.label || '')
+      label: String(edge && edge.label || ''),
+      mappingType: String(edge && edge.mappingType || ''),
+      kind: String(edge && edge.kind || ''),
+      direction: String(edge && edge.direction || ''),
+      d2Id: String(edge && edge.d2Id || ''),
+      sourceD2Id: String(edge && edge.sourceD2Id || ''),
+      targetD2Id: String(edge && edge.targetD2Id || '')
     })).filter((edge) => edge.source && edge.target) : [],
+    groups: Array.isArray(diagram && diagram.groups) ? diagram.groups.map((group) => ({
+      id: String(group && group.id || ''),
+      label: String(group && (group.label || group.id) || ''),
+      parent: String(group && group.parent || ''),
+      d2Id: String(group && group.d2Id || '')
+    })).filter((group) => group.id) : [],
+    d2: diagram && diagram.d2 && typeof diagram.d2 === 'object' && !Array.isArray(diagram.d2)
+      ? {
+        sourceHash: String(diagram.d2.sourceHash || ''),
+        metadataBytes: Number.isFinite(Number(diagram.d2.metadataBytes)) ? Number(diagram.d2.metadataBytes) : 0,
+        metadataEmbedded: Boolean(diagram.d2.metadataEmbedded),
+        metadataMaxBytes: Number.isFinite(Number(diagram.d2.metadataMaxBytes)) ? Number(diagram.d2.metadataMaxBytes) : DEFAULT_D2_METADATA_MAX_BYTES,
+        renderOptionsHash: String(diagram.d2.renderOptionsHash || ''),
+        downloadAvailable: d2DownloadAllowed && Boolean(diagram.d2.downloadAvailable || String(diagram.d2.source || '').trim())
+      }
+      : undefined,
+    svg: diagram && diagram.svg && typeof diagram.svg === 'object' && !Array.isArray(diagram.svg)
+      ? {
+        rendered: Boolean(diagram.svg.rendered),
+        renderReason: String(diagram.svg.renderReason || ''),
+        renderer: String(diagram.svg.renderer || ''),
+        layout: String(diagram.svg.layout || ''),
+        metadataEmbedded: Boolean(diagram.svg.metadataEmbedded)
+      }
+      : undefined,
     warnings: Array.isArray(diagram && diagram.warnings) ? diagram.warnings.map((item) => String(item || '')).filter(Boolean) : [],
     truncated: Boolean(diagram && diagram.truncated)
   })).filter((diagram) => diagram.name || diagram.nodes.length || diagram.edges.length);
 }
 
-function runtimeJsonResponsePayload(payload) {
+function runtimeJsonResponsePayload(payload, options = {}) {
   const result = payload.result || { tables: [] };
   return {
     success: Boolean(payload.success),
@@ -13757,7 +15033,9 @@ function runtimeJsonResponsePayload(payload) {
     template: payload.template || {},
     params: payload.params || {},
     tables: runtimeJsonTables(result, payload.params || {}),
-    diagrams: runtimeJsonDiagrams(result),
+    diagrams: runtimeJsonDiagrams(result, {
+      d2DownloadAllowed: options.d2DownloadAllowed !== false
+    }),
     emptyText: result.emptyText || DEFAULT_EMPTY_RESULT_TEXT,
     cache: payload.cache || null,
     html: result.kind === 'html' && result.htmlTrusted ? result.html : undefined
@@ -14652,7 +15930,8 @@ function assistantMessages(body, mcpContext, runtimeConfig) {
     'When the user asks for target cards that have the same attribute value as a named source card, first select the named source card, then use a second selectCards step with "from":"sourceAlias" and a filter like {"path":"Location","op":"equals","valueColumn":"Location"}.',
     'For same-attribute source-row filtering, prefer selectCards.from plus valueColumn/sourceColumn/fromColumn over matchRows; matchRows is for comparing two already materialized result sets.',
     'Example source-row pattern: {"type":"selectCards","as":"anchor","className":"Router","filters":[{"path":"Description","op":"contains","value":"Router name"}],"columns":["Code","Description","Location"],"limit":5}, then {"type":"selectCards","as":"arms","from":"anchor","className":"Workstation","filters":[{"path":"Location","op":"equals","valueColumn":"Location"}],"columns":["Code","Description","Location"],"limit":100}.',
-    'For diagrams, use result.diagrams[] with type topology, source.nodes/source.edges, and fields nodeId/nodeLabel/nodeGroup/nodeHref/edgeSource/edgeTarget/edgeLabel.',
+    'For simple diagrams, use result.diagrams[] with type topology, source.nodes/source.edges, and fields nodeId/nodeLabel/nodeGroup/nodeHref/edgeSource/edgeTarget/edgeLabel.',
+    'For graph diagrams with grouping, hierarchy, CMDBuild domains, references, ACL/firewall/route/dependency classes, use deterministic result.diagrams[].nodeMappings, edgeMappings, groupMappings, and hierarchyMappings over existing DSL aliases. Do not output freeform D2 as the runtime spec.',
     'Keep result.tables[] when the user asks for tables; add diagrams when graph/topology is requested.'
   ].join('\n');
   const user = JSON.stringify({
@@ -15995,6 +17274,7 @@ async function createAssistantTemplateDraft(body, options = {}) {
 async function sendPublicSnapshotRun(res, requestUrl, templateCode) {
   const params = publicSnapshotParamsFromUrl(requestUrl);
   const jsonOutput = runtimeJsonOutputRequested(requestUrl);
+  const d2Output = runtimeD2OutputRequested(requestUrl);
   let lookup;
   try {
     lookup = await readStaticSnapshot(templateCode, params, { paramsMode: 'ignore' });
@@ -16016,7 +17296,14 @@ async function sendPublicSnapshotRun(res, requestUrl, templateCode) {
       result: { emptyText: SNAPSHOT_MISSING_TEXT, tables: [] },
       cache: staticSnapshotCacheMeta(null, 'snapshot-miss', lookup.backend, lookup.key)
     };
-    sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : payload);
+    if (d2Output) {
+      sendRuntimeD2Source(res, payload, {
+        selector: runtimeD2DiagramSelector(requestUrl),
+        publicAllowed: true
+      });
+      return;
+    }
+    sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : runtimeDisplayResponsePayload(payload));
     return;
   }
   const payload = {
@@ -16031,7 +17318,17 @@ async function sendPublicSnapshotRun(res, requestUrl, templateCode) {
     result: snapshot.result || { tables: [] },
     cache: staticSnapshotCacheMeta(snapshot, 'snapshot-hit', lookup.backend, lookup.key)
   };
-  sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : payload);
+  const sourceAllowed = publicD2SourceAllowed(snapshot.publish);
+  if (d2Output) {
+    sendRuntimeD2Source(res, payload, {
+      selector: runtimeD2DiagramSelector(requestUrl),
+      publicAllowed: sourceAllowed
+    });
+    return;
+  }
+  sendJson(res, 200, jsonOutput
+    ? runtimeJsonResponsePayload(payload, { d2DownloadAllowed: sourceAllowed })
+    : runtimeDisplayResponsePayload(payload, { d2DownloadAllowed: sourceAllowed }));
 }
 
 async function listTemplateCards(authToken, root, requestUrl) {
@@ -16120,6 +17417,12 @@ function validateTemplateSpec(spec) {
       }
       if (spec.publish.paramsMode !== undefined && !['exact', 'ignore'].includes(spec.publish.paramsMode)) {
         errors.push({ path: '$.publish.paramsMode', message: 'Publish paramsMode must be exact or ignore.' });
+      }
+      if (spec.publish.publicD2Source !== undefined && typeof spec.publish.publicD2Source !== 'boolean') {
+        errors.push({ path: '$.publish.publicD2Source', message: 'Publish publicD2Source must be boolean.' });
+      }
+      if (spec.publish.allowPublicD2Source !== undefined && typeof spec.publish.allowPublicD2Source !== 'boolean') {
+        errors.push({ path: '$.publish.allowPublicD2Source', message: 'Publish allowPublicD2Source must be boolean.' });
       }
       if (publish.mode === 'staticSnapshot' && !publish.warningAccepted) {
         errors.push({ path: '$.publish.warningAccepted', message: 'Static snapshot publication requires warningAccepted=true.' });
@@ -16521,14 +17824,82 @@ function validateTemplateSpec(spec) {
       }
       const nodeSource = resultDiagramSourceName(diagram, 'nodes');
       const edgeSource = resultDiagramSourceName(diagram, 'edges');
-      if (!nodeSource && !edgeSource) {
-        errors.push({ path: `${path}.source`, message: 'Result diagram requires source.nodes/source.edges or nodes.from/edges.from.' });
+      const nodeMappings = normalizeDiagramMappingList(diagram.nodeMappings);
+      const edgeMappings = normalizeDiagramMappingList(diagram.edgeMappings);
+      const groupMappings = normalizeDiagramMappingList(diagram.groupMappings);
+      const hierarchyMappings = normalizeDiagramMappingList(diagram.hierarchyMappings);
+      if (!nodeSource && !edgeSource && !nodeMappings.length && !edgeMappings.length && !groupMappings.length && !hierarchyMappings.length) {
+        errors.push({ path: `${path}.source`, message: 'Result diagram requires source nodes/edges or diagram mapping aliases.' });
       }
       if (diagram.layout !== undefined && (!diagram.layout || typeof diagram.layout !== 'object' || Array.isArray(diagram.layout))) {
         errors.push({ path: `${path}.layout`, message: 'Result diagram layout must be an object.' });
-      } else if (diagram.layout && diagram.layout.type !== undefined && !['topology', 'layered'].includes(diagram.layout.type)) {
-        errors.push({ path: `${path}.layout.type`, message: 'Result diagram layout.type must be topology or layered.' });
+      } else if (diagram.layout && diagram.layout.type !== undefined && !['topology', 'layered', 'hierarchical', 'grouped'].includes(diagram.layout.type)) {
+        errors.push({ path: `${path}.layout.type`, message: 'Result diagram layout.type must be topology, layered, hierarchical, or grouped.' });
       }
+      if (diagram.metadata !== undefined) {
+        if (!diagram.metadata || typeof diagram.metadata !== 'object' || Array.isArray(diagram.metadata)) {
+          errors.push({ path: `${path}.metadata`, message: 'Result diagram metadata must be an object.' });
+        } else {
+          if (diagram.metadata.embedInD2 !== undefined && typeof diagram.metadata.embedInD2 !== 'boolean') {
+            errors.push({ path: `${path}.metadata.embedInD2`, message: 'Result diagram metadata.embedInD2 must be a boolean.' });
+          }
+          if (diagram.metadata.embedInSvg !== undefined && typeof diagram.metadata.embedInSvg !== 'boolean') {
+            errors.push({ path: `${path}.metadata.embedInSvg`, message: 'Result diagram metadata.embedInSvg must be a boolean.' });
+          }
+          if (diagram.metadata.maxBytes !== undefined && (!Number.isInteger(Number(diagram.metadata.maxBytes)) || Number(diagram.metadata.maxBytes) <= 0)) {
+            errors.push({ path: `${path}.metadata.maxBytes`, message: 'Result diagram metadata.maxBytes must be a positive integer.' });
+          }
+        }
+      }
+      const mappingSources = [
+        ['nodeMappings', nodeMappings],
+        ['edgeMappings', edgeMappings],
+        ['groupMappings', groupMappings],
+        ['hierarchyMappings', hierarchyMappings]
+      ];
+      for (const [mappingKey, mappings] of mappingSources) {
+        if (diagram[mappingKey] !== undefined && !Array.isArray(diagram[mappingKey]) && (!diagram[mappingKey] || typeof diagram[mappingKey] !== 'object')) {
+          errors.push({ path: `${path}.${mappingKey}`, message: `Result diagram ${mappingKey} must be an array or object.` });
+          continue;
+        }
+        mappings.forEach((mapping, mappingIndex) => {
+          const mappingPath = `${path}.${mappingKey}[${mappingIndex}]`;
+          if (!diagramMappingSourceName(mapping)) {
+            errors.push({ path: mappingPath, message: `Result diagram ${mappingKey} mapping requires from/source alias.` });
+          }
+          if (mapping.labelTemplate !== undefined && typeof mapping.labelTemplate !== 'string') {
+            errors.push({ path: `${mappingPath}.labelTemplate`, message: 'Result diagram mapping labelTemplate must be a string.' });
+          }
+          if (mapping.labelFields !== undefined && !Array.isArray(mapping.labelFields) && typeof mapping.labelFields !== 'string') {
+            errors.push({ path: `${mappingPath}.labelFields`, message: 'Result diagram mapping labelFields must be an array or comma-separated string.' });
+          }
+          if (mapping.dataProfile !== undefined) {
+            if (!mapping.dataProfile || typeof mapping.dataProfile !== 'object' || Array.isArray(mapping.dataProfile)) {
+              errors.push({ path: `${mappingPath}.dataProfile`, message: 'Result diagram mapping dataProfile must be an object.' });
+            } else {
+              if (mapping.dataProfile.name !== undefined && typeof mapping.dataProfile.name !== 'string') {
+                errors.push({ path: `${mappingPath}.dataProfile.name`, message: 'Result diagram mapping dataProfile.name must be a string.' });
+              }
+              if (mapping.dataProfile.className !== undefined && typeof mapping.dataProfile.className !== 'string') {
+                errors.push({ path: `${mappingPath}.dataProfile.className`, message: 'Result diagram mapping dataProfile.className must be a string.' });
+              }
+              if (mapping.dataProfile.fields !== undefined && !Array.isArray(mapping.dataProfile.fields) && typeof mapping.dataProfile.fields !== 'string') {
+                errors.push({ path: `${mappingPath}.dataProfile.fields`, message: 'Result diagram mapping dataProfile.fields must be an array or comma-separated string.' });
+              }
+              if (mapping.dataProfile.includeSourceRef !== undefined && typeof mapping.dataProfile.includeSourceRef !== 'boolean') {
+                errors.push({ path: `${mappingPath}.dataProfile.includeSourceRef`, message: 'Result diagram mapping dataProfile.includeSourceRef must be a boolean.' });
+              }
+            }
+          }
+        });
+      }
+      const allowedEdgeMappingTypes = ['domain', 'reference', 'object', 'relationObject', 'relation-object', 'match', 'computed', 'generic', 'hierarchy'];
+      edgeMappings.forEach((mapping, mappingIndex) => {
+        const mappingType = String(mapping.type || mapping.kind || 'generic').trim();
+        if (mappingType && !allowedEdgeMappingTypes.includes(mappingType)) {
+          errors.push({ path: `${path}.edgeMappings[${mappingIndex}].type`, message: `Result diagram edge mapping type must be one of: ${allowedEdgeMappingTypes.join(', ')}.` });
+        }
+      });
     });
   }
 
@@ -16563,6 +17934,80 @@ function resultDiagramField(diagram, names, fallback) {
   return fallback;
 }
 
+function normalizeDiagramMappingList(value) {
+  if (Array.isArray(value)) return value.filter((item) => item && typeof item === 'object' && !Array.isArray(item));
+  if (value && typeof value === 'object' && !Array.isArray(value)) return [value];
+  return [];
+}
+
+function diagramMappingSourceName(mapping, fallback = '') {
+  if (!mapping || typeof mapping !== 'object' || Array.isArray(mapping)) return String(fallback || '').trim();
+  const source = mapping.source && typeof mapping.source === 'object' && !Array.isArray(mapping.source) ? mapping.source : {};
+  return String(mapping.from || mapping.alias || mapping.sourceAlias || source.from || source.alias || (typeof mapping.source === 'string' ? mapping.source : '') || fallback || '').trim();
+}
+
+function diagramMappingField(mapping, names, fallback = '') {
+  const fields = mapping && mapping.fields && typeof mapping.fields === 'object' && !Array.isArray(mapping.fields) ? mapping.fields : {};
+  for (const name of names) {
+    const value = mapping && (mapping[name] || fields[name]);
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return fallback;
+}
+
+function diagramConstantValue(mapping, names) {
+  for (const name of names) {
+    const value = mapping && mapping[name];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+function diagramRowsForMapping(context, mapping, fallbackSource = '') {
+  const sourceName = diagramMappingSourceName(mapping, fallbackSource);
+  const source = context[sourceName] || { rows: [] };
+  return {
+    sourceName,
+    rows: Array.isArray(source.rows) ? source.rows : []
+  };
+}
+
+function diagramRowDisplayValue(row, field, fallbacks = []) {
+  return displayCardValue(rowValueByField(row, field, fallbacks));
+}
+
+function diagramNodeMappings(diagram) {
+  const mappings = normalizeDiagramMappingList(diagram && diagram.nodeMappings);
+  if (mappings.length) return mappings;
+  const nodeSourceName = resultDiagramSourceName(diagram, 'nodes');
+  if (!nodeSourceName) return [];
+  return [{
+    from: nodeSourceName,
+    fields: {
+      id: resultDiagramField(diagram, ['nodeId', 'id', 'idColumn'], 'id'),
+      label: resultDiagramField(diagram, ['nodeLabel', 'label', 'labelColumn'], 'label'),
+      group: resultDiagramField(diagram, ['nodeGroup', 'group', 'groupColumn'], 'group'),
+      href: resultDiagramField(diagram, ['nodeHref', 'href', 'url', 'urlColumn'], 'href')
+    }
+  }];
+}
+
+function diagramEdgeMappings(diagram) {
+  const mappings = normalizeDiagramMappingList(diagram && diagram.edgeMappings);
+  if (mappings.length) return mappings;
+  const edgeSourceName = resultDiagramSourceName(diagram, 'edges');
+  if (!edgeSourceName) return [];
+  return [{
+    type: 'generic',
+    from: edgeSourceName,
+    fields: {
+      source: resultDiagramField(diagram, ['edgeSource', 'source', 'sourceId', 'from'], 'source'),
+      target: resultDiagramField(diagram, ['edgeTarget', 'target', 'targetId', 'to'], 'target'),
+      label: resultDiagramField(diagram, ['edgeLabel', 'edgeTitle', 'label'], 'label')
+    }
+  }];
+}
+
 function rowValueByField(row, field, fallbacks = []) {
   const keys = [field].concat(fallbacks).map((item) => String(item || '').trim()).filter(Boolean);
   for (const key of keys) {
@@ -16582,70 +18027,433 @@ function normalizeDiagramLimit(value, fallback, absolute) {
   return Math.min(number, absolute);
 }
 
+const DEFAULT_D2_METADATA_MAX_BYTES = 200000;
+const ABSOLUTE_D2_METADATA_MAX_BYTES = 5 * 1024 * 1024;
+
+function diagramMappingStringValue(mapping, names, fallback = '') {
+  const fields = mapping && mapping.fields && typeof mapping.fields === 'object' && !Array.isArray(mapping.fields) ? mapping.fields : {};
+  for (const name of names) {
+    const value = mapping && (mapping[name] || fields[name]);
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return fallback;
+}
+
+function normalizeDiagramFieldNames(value) {
+  return uniqueStrings(normalizeStringList(value));
+}
+
+function diagramMappingLabelFields(mapping, fallbackField = '') {
+  const fields = mapping && mapping.fields && typeof mapping.fields === 'object' && !Array.isArray(mapping.fields) ? mapping.fields : {};
+  const configured = normalizeDiagramFieldNames(mapping && (mapping.labelFields || fields.labelFields));
+  if (configured.length) return configured;
+  const fallback = String(fallbackField || '').trim();
+  return fallback ? [fallback] : [];
+}
+
+function diagramMappingLabelTemplate(mapping) {
+  return diagramMappingStringValue(mapping, ['labelTemplate'], '');
+}
+
+function renderDiagramRowTemplate(template, row, params, warnings, path) {
+  const source = row && typeof row === 'object' ? row : {};
+  return String(template || '').replace(/\$\{([^}]+)\}/g, (match, rawToken) => {
+    const token = String(rawToken || '').trim();
+    if (!token) return '';
+    if (token.startsWith('param.')) return displayCardValue(params && params[token.slice(6)]);
+    if (token.startsWith('params.')) return displayCardValue(params && params[token.slice(7)]);
+    const field = token.startsWith('row.') ? token.slice(4) : token;
+    const value = rowValueByField(source, field);
+    if (value === undefined) {
+      warnings.push(`Diagram label template ${path || ''} references missing field ${field}.`.trim());
+      return '';
+    }
+    return displayCardValue(value);
+  });
+}
+
+function diagramLabelForRow(row, mapping, fallbackField, fallbackValue, params, warnings, path) {
+  const template = diagramMappingLabelTemplate(mapping);
+  if (template) {
+    const rendered = renderDiagramRowTemplate(template, row, params, warnings, path).trim();
+    if (rendered) return rendered;
+  }
+  const fields = diagramMappingLabelFields(mapping, fallbackField);
+  if (fields.length > 1 || (fields.length === 1 && fields[0] !== fallbackField)) {
+    const rendered = fields.map((field) => diagramRowDisplayValue(row || {}, field)).filter(Boolean).join(' ').trim();
+    if (rendered) return rendered;
+  }
+  return displayCardValue(fallbackValue);
+}
+
+function normalizeDiagramDataProfile(mapping) {
+  const raw = mapping && mapping.dataProfile && typeof mapping.dataProfile === 'object' && !Array.isArray(mapping.dataProfile)
+    ? mapping.dataProfile
+    : mapping && mapping.data && typeof mapping.data === 'object' && !Array.isArray(mapping.data)
+      ? mapping.data
+      : {};
+  const fields = mapping && mapping.fields && typeof mapping.fields === 'object' && !Array.isArray(mapping.fields) ? mapping.fields : {};
+  return {
+    name: String(raw.name || mapping && mapping.dataProfileName || '').trim(),
+    className: String(raw.className || mapping && (mapping.className || mapping.sourceClass) || '').trim(),
+    fields: normalizeDiagramFieldNames(raw.fields || mapping && mapping.dataFields || fields.dataFields),
+    includeSourceRef: raw.includeSourceRef !== false
+  };
+}
+
+function diagramSourceRefFromRow(row, className = '') {
+  const source = row && typeof row === 'object' ? row : {};
+  return {
+    className: String(className || source.Class || source.className || source.sourceClass || source.targetClass || '').trim(),
+    id: displayCardValue(source._id || source.Id || source.id),
+    code: displayCardValue(source.Code || source.code),
+    description: displayCardValue(source.Description || source.description)
+  };
+}
+
+function safeDiagramDataValue(value) {
+  if (value === undefined) return null;
+  return cloneJsonValueServer(value, displayCardValue(value));
+}
+
+function buildDiagramObjectData(kind, id, label, sourceName, row, mapping, extra = {}) {
+  const profile = normalizeDiagramDataProfile(mapping);
+  const sourceRef = diagramSourceRefFromRow(row, profile.className);
+  const dataFields = uniqueStrings(profile.fields.concat(diagramMappingLabelFields(mapping, diagramMappingField(mapping, ['label'], ''))));
+  const fieldValues = {};
+  for (const field of dataFields) {
+    const raw = rowValueByField(row || {}, field);
+    if (raw === undefined) continue;
+    fieldValues[field] = {
+      value: safeDiagramDataValue(raw),
+      display: displayCardValue(raw)
+    };
+  }
+  const data = {
+    kind,
+    id: String(id || ''),
+    label: String(label || ''),
+    source: String(sourceName || ''),
+    profile: profile.name || undefined,
+    className: profile.className || sourceRef.className || undefined,
+    fields: fieldValues
+  };
+  if (profile.includeSourceRef) data.sourceRef = sourceRef;
+  return Object.assign(data, extra);
+}
+
+function diagramMetadataSettings(diagram) {
+  const metadata = diagram && diagram.metadata && typeof diagram.metadata === 'object' && !Array.isArray(diagram.metadata) ? diagram.metadata : {};
+  return {
+    embedInD2: metadata.embedInD2 !== false,
+    embedInSvg: metadata.embedInSvg !== false,
+    maxBytes: normalizeDiagramLimit(metadata.maxBytes, DEFAULT_D2_METADATA_MAX_BYTES, ABSOLUTE_D2_METADATA_MAX_BYTES)
+  };
+}
+
+function diagramD2Id(kind, value) {
+  const base = displayCardValue(value).trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 80);
+  const suffix = base || sha256Hex(`${kind}:${displayCardValue(value)}`).slice(0, 12);
+  return `${kind}_${/^[a-z_]/.test(suffix) ? suffix : `id_${suffix}`}`;
+}
+
+function d2Key(key) {
+  const text = String(key || '').trim();
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(text) ? text : JSON.stringify(text);
+}
+
+function d2Literal(value, indentLevel = 0) {
+  const indent = '  '.repeat(indentLevel);
+  const childIndent = '  '.repeat(indentLevel + 1);
+  if (value === null || value === undefined) return 'null';
+  if (typeof value === 'string') return JSON.stringify(value);
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  if (Array.isArray(value)) return `[${value.map((item) => d2Literal(item, indentLevel)).join(', ')}]`;
+  if (typeof value === 'object') {
+    const entries = Object.entries(value).filter(([, item]) => item !== undefined);
+    if (!entries.length) return '{}';
+    return `{\n${entries.map(([key, item]) => `${childIndent}${d2Key(key)}: ${d2Literal(item, indentLevel + 1)}`).join('\n')}\n${indent}}`;
+  }
+  return JSON.stringify(String(value));
+}
+
+function d2NodeClasses(prefix, item) {
+  const classes = [prefix];
+  const className = item && item.data && item.data.className;
+  if (className) classes.push(`cmdb_${diagramD2Id('class', className).replace(/^class_/, '')}`);
+  return classes;
+}
+
+function buildDiagramCmdpMetadata(diagramResult) {
+  const objects = {};
+  for (const node of Array.isArray(diagramResult.nodes) ? diagramResult.nodes : []) {
+    if (node && node.d2Id) objects[node.d2Id] = node.data || { kind: 'node', id: node.id, label: node.label };
+  }
+  for (const edge of Array.isArray(diagramResult.edges) ? diagramResult.edges : []) {
+    if (edge && edge.d2Id) objects[edge.d2Id] = edge.data || { kind: 'edge', source: edge.source, target: edge.target, label: edge.label };
+  }
+  for (const group of Array.isArray(diagramResult.groups) ? diagramResult.groups : []) {
+    if (group && group.d2Id) objects[group.d2Id] = group.data || { kind: 'group', id: group.id, label: group.label };
+  }
+  return {
+    version: 1,
+    format: 'cmdbcustompages.d2',
+    diagram: {
+      name: diagramResult.name,
+      title: diagramResult.title,
+      type: diagramResult.type,
+      layout: diagramResult.layout
+    },
+    counts: {
+      nodes: Array.isArray(diagramResult.nodes) ? diagramResult.nodes.length : 0,
+      edges: Array.isArray(diagramResult.edges) ? diagramResult.edges.length : 0,
+      groups: Array.isArray(diagramResult.groups) ? diagramResult.groups.length : 0
+    },
+    objects
+  };
+}
+
+function buildD2Source(diagramResult, cmdpMetadata) {
+  const lines = [];
+  if (cmdpMetadata) {
+    lines.push(`vars: ${d2Literal({ data: { cmdp: cmdpMetadata } })}`);
+    lines.push('');
+  }
+  for (const group of Array.isArray(diagramResult.groups) ? diagramResult.groups : []) {
+    if (!group || !group.d2Id) continue;
+    lines.push(`${d2Key(group.d2Id)}: ${d2Literal({
+      label: group.label || group.id,
+      class: d2NodeClasses('cmdp_group', group)
+    })}`);
+  }
+  for (const node of Array.isArray(diagramResult.nodes) ? diagramResult.nodes : []) {
+    if (!node || !node.d2Id) continue;
+    const shape = {
+      label: node.label || node.id,
+      class: d2NodeClasses('cmdp_node', node)
+    };
+    if (node.href) shape.link = node.href;
+    if (node.type) shape.tooltip = node.type;
+    lines.push(`${d2Key(node.d2Id)}: ${d2Literal(shape)}`);
+  }
+  for (const edge of Array.isArray(diagramResult.edges) ? diagramResult.edges : []) {
+    if (!edge || !edge.sourceD2Id || !edge.targetD2Id) continue;
+    lines.push(`${d2Key(edge.sourceD2Id)} -> ${d2Key(edge.targetD2Id)}: ${d2Literal({
+      label: edge.label || edge.kind || edge.mappingType || '',
+      class: ['cmdp_edge'].concat(edge.mappingType ? [`cmdp_${edge.mappingType}`] : [])
+    })}`);
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+function escapeXmlText(value) {
+  return String(value === undefined || value === null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function buildDiagramSvgMetadata(cmdpMetadata) {
+  return `<metadata id="cmdp-diagram-data" type="application/json">${escapeXmlText(JSON.stringify(cmdpMetadata))}</metadata>`;
+}
+
+function attachDiagramD2Artifacts(diagramResult, diagramSpec, warnings) {
+  const metadataSettings = diagramMetadataSettings(diagramSpec);
+  const cmdpMetadata = buildDiagramCmdpMetadata(diagramResult);
+  const metadataBytes = Buffer.byteLength(JSON.stringify(cmdpMetadata), 'utf8');
+  const withinLimit = metadataBytes <= metadataSettings.maxBytes;
+  if (!withinLimit) {
+    warnings.push(`D2 structured metadata size limit reached: produced ${metadataBytes} bytes with configured maxBytes=${metadataSettings.maxBytes}. Metadata was not embedded.`);
+  }
+  const embeddedMetadata = withinLimit ? cmdpMetadata : null;
+  const d2Source = buildD2Source(diagramResult, metadataSettings.embedInD2 ? embeddedMetadata : null);
+  diagramResult.data = cmdpMetadata;
+  diagramResult.d2 = {
+    source: d2Source,
+    sourceHash: hashJson(d2Source),
+    metadataBytes,
+    metadataEmbedded: Boolean(metadataSettings.embedInD2 && embeddedMetadata),
+    metadataMaxBytes: metadataSettings.maxBytes
+  };
+  diagramResult.svg = {
+    metadata: metadataSettings.embedInSvg && embeddedMetadata ? buildDiagramSvgMetadata(embeddedMetadata) : '',
+    metadataEmbedded: Boolean(metadataSettings.embedInSvg && embeddedMetadata)
+  };
+  return diagramResult;
+}
+
 function buildTopologyDiagram(diagram, context, params, limits) {
   const name = String(diagram.name || diagram.as || 'diagram').trim();
   const titleTemplate = String(diagram.title || diagram.label || name);
-  const nodeSourceName = resultDiagramSourceName(diagram, 'nodes');
-  const edgeSourceName = resultDiagramSourceName(diagram, 'edges');
-  const nodeSource = context[nodeSourceName] || { rows: [] };
-  const edgeSource = context[edgeSourceName] || { rows: [] };
-  const nodeRows = Array.isArray(nodeSource.rows) ? nodeSource.rows : [];
-  const edgeRows = Array.isArray(edgeSource.rows) ? edgeSource.rows : [];
   const maxNodes = normalizeDiagramLimit(diagram.maxNodes || diagram.limit && diagram.limit.maxNodes || diagram.limits && diagram.limits.maxNodes, Math.min(limits.maxRows || 500, 300), ABSOLUTE_EXECUTION_LIMITS.maxRows);
   const maxEdges = normalizeDiagramLimit(diagram.maxEdges || diagram.limit && diagram.limit.maxEdges || diagram.limits && diagram.limits.maxEdges, Math.min((limits.maxRows || 500) * 2, 800), ABSOLUTE_EXECUTION_LIMITS.maxRows * 2);
-  const nodeIdField = resultDiagramField(diagram, ['nodeId', 'id', 'idColumn'], 'id');
-  const nodeLabelField = resultDiagramField(diagram, ['nodeLabel', 'label', 'labelColumn'], 'label');
-  const nodeGroupField = resultDiagramField(diagram, ['nodeGroup', 'group', 'groupColumn'], 'group');
-  const nodeHrefField = resultDiagramField(diagram, ['nodeHref', 'href', 'url', 'urlColumn'], 'href');
-  const edgeSourceField = resultDiagramField(diagram, ['edgeSource', 'source', 'sourceId', 'from'], 'source');
-  const edgeTargetField = resultDiagramField(diagram, ['edgeTarget', 'target', 'targetId', 'to'], 'target');
-  const edgeLabelField = resultDiagramField(diagram, ['edgeLabel', 'edgeTitle', 'label'], 'label');
+  const maxGroups = normalizeDiagramLimit(diagram.maxGroups || diagram.limit && diagram.limit.maxGroups || diagram.limits && diagram.limits.maxGroups, Math.min(maxNodes, 100), ABSOLUTE_EXECUTION_LIMITS.maxRows);
   const warnings = [];
   const nodeMap = new Map();
-  const addNode = (idValue, sourceRow = null) => {
+  const groupMap = new Map();
+  const addGroup = (idValue, labelValue = '', parentValue = '', sourceRow = null, mapping = {}, sourceName = '') => {
+    const id = displayCardValue(idValue).trim();
+    if (!id) return false;
+    if (groupMap.has(id)) {
+      const existing = groupMap.get(id);
+      const label = displayCardValue(labelValue).trim();
+      const parent = displayCardValue(parentValue).trim();
+      if (label) existing.label = label;
+      if (parent) existing.parent = parent;
+      if (sourceRow) existing.data = buildDiagramObjectData('group', id, existing.label, sourceName, sourceRow, mapping, { parent: existing.parent });
+      return true;
+    }
+    if (groupMap.size >= maxGroups) {
+      warnings.push(`Skipped group ${id}: group limit reached.`);
+      return false;
+    }
+    const label = displayCardValue(labelValue || id).trim() || id;
+    const parent = displayCardValue(parentValue).trim();
+    groupMap.set(id, {
+      id,
+      label,
+      parent,
+      d2Id: diagramD2Id('group', id),
+      data: buildDiagramObjectData('group', id, label, sourceName, sourceRow, mapping, { parent })
+    });
+    return true;
+  };
+  const addNode = (idValue, sourceRow = null, mapping = {}, sourceName = '') => {
     const id = String(idValue === undefined || idValue === null ? '' : idValue).trim();
     if (!id || nodeMap.has(id) || nodeMap.size >= maxNodes) return Boolean(id && nodeMap.has(id));
-    const labelValue = sourceRow ? rowValueByField(sourceRow, nodeLabelField, ['Label', 'Code', 'Description', 'Name', nodeIdField]) : id;
-    const groupValue = sourceRow ? rowValueByField(sourceRow, nodeGroupField, ['Group', 'Class', 'Type', 'Kind']) : '';
-    const hrefValue = sourceRow ? rowValueByField(sourceRow, nodeHrefField, ['Href', 'Url', 'URL', 'sourceURL']) : '';
+    const labelField = diagramMappingField(mapping, ['nodeLabel', 'label', 'labelColumn'], 'label');
+    const groupField = diagramMappingField(mapping, ['nodeGroup', 'group', 'groupColumn', 'groupBy'], 'group');
+    const hrefField = diagramMappingField(mapping, ['nodeHref', 'href', 'url', 'urlColumn'], 'href');
+    const parentField = diagramMappingField(mapping, ['nodeParent', 'parent', 'parentId', 'parentColumn'], '');
+    const typeField = diagramMappingField(mapping, ['nodeType', 'typeColumn', 'classColumn', 'classNameColumn'], '');
+    const labelValue = sourceRow ? rowValueByField(sourceRow, labelField, ['Label', 'Code', 'Description', 'Name', 'id']) : id;
+    const groupValue = sourceRow ? rowValueByField(sourceRow, groupField, ['Group', 'Class', 'Type', 'Kind']) : '';
+    const hrefValue = sourceRow ? rowValueByField(sourceRow, hrefField, ['Href', 'Url', 'URL', 'sourceURL']) : '';
+    const parentValue = sourceRow && parentField ? rowValueByField(sourceRow, parentField, ['Parent', 'parent', 'ParentId', 'parentId']) : '';
+    const typeValue = sourceRow && typeField ? rowValueByField(sourceRow, typeField, ['Class', 'Type', 'Kind', 'sourceClass', 'targetClass']) : '';
+    const group = displayCardValue(groupValue).trim();
+    if (group) addGroup(group);
+    const label = diagramLabelForRow(sourceRow, mapping, labelField, labelValue === undefined || labelValue === null || labelValue === '' ? id : labelValue, params, warnings, `node ${id}`);
+    const parent = displayCardValue(parentValue).trim();
+    const type = displayCardValue(typeValue).trim() || diagramConstantValue(mapping, ['nodeTypeValue', 'typeValue', 'className']);
+    const href = isSafeRuntimeLinkUrl(hrefValue) ? String(hrefValue) : '';
     nodeMap.set(id, {
       id,
-      label: String(labelValue === undefined || labelValue === null || labelValue === '' ? id : labelValue),
-      group: String(groupValue === undefined || groupValue === null ? '' : groupValue),
-      href: isSafeRuntimeLinkUrl(hrefValue) ? String(hrefValue) : ''
+      label,
+      group,
+      parent,
+      type,
+      href,
+      d2Id: diagramD2Id('node', id),
+      data: buildDiagramObjectData('node', id, label, sourceName, sourceRow, mapping, { group, parent, type, href })
     });
     return true;
   };
 
-  for (const row of nodeRows) {
-    if (nodeMap.size >= maxNodes) break;
-    addNode(rowValueByField(row, nodeIdField, ['Id', 'ID', '_id', 'Code', 'Name']), row);
+  for (const mapping of diagramNodeMappings(diagram)) {
+    const idField = diagramMappingField(mapping, ['nodeId', 'id', 'idColumn'], 'id');
+    const source = diagramRowsForMapping(context, mapping);
+    for (const row of source.rows) {
+      if (nodeMap.size >= maxNodes) break;
+      addNode(rowValueByField(row, idField, ['Id', 'ID', '_id', 'Code', 'Name']), row, mapping, source.sourceName);
+    }
   }
   const edges = [];
-  for (const row of edgeRows) {
-    if (edges.length >= maxEdges) break;
-    const source = String(rowValueByField(row, edgeSourceField, ['Source', 'SourceId', 'sourceId', 'from', 'From']) || '').trim();
-    const target = String(rowValueByField(row, edgeTargetField, ['Target', 'TargetId', 'targetId', 'to', 'To']) || '').trim();
+  const addEdge = (sourceValue, targetValue, labelValue = '', mapping = {}, row = null, sourceName = '') => {
+    if (edges.length >= maxEdges) return false;
+    const source = displayCardValue(sourceValue).trim();
+    const target = displayCardValue(targetValue).trim();
     if (!source || !target) {
       warnings.push('Skipped edge without source or target.');
-      continue;
+      return false;
     }
     if (!nodeMap.has(source)) addNode(source);
     if (!nodeMap.has(target)) addNode(target);
     if (!nodeMap.has(source) || !nodeMap.has(target)) {
       warnings.push(`Skipped edge ${source} -> ${target}: node limit reached.`);
-      continue;
+      return false;
     }
-    const label = rowValueByField(row, edgeLabelField, ['Label', 'Type', 'Relation', 'Domain']);
-    edges.push({
+    const labelField = diagramMappingField(mapping, ['edgeLabel', 'edgeTitle', 'label', 'labelColumn'], 'label');
+    const edgeTypeField = diagramMappingField(mapping, ['edgeType', 'kindColumn', 'typeColumn'], '');
+    const directionField = diagramMappingField(mapping, ['edgeDirection', 'directionColumn'], '');
+    const mappingType = diagramConstantValue(mapping, ['type', 'mappingType']);
+    const kind = (row && edgeTypeField ? diagramRowDisplayValue(row, edgeTypeField, ['Type', 'Kind', 'Relation', 'Domain']) : '') || diagramConstantValue(mapping, ['kind', 'edgeKind']) || mappingType;
+    const direction = row && directionField ? diagramRowDisplayValue(row, directionField, ['Direction', 'direction']) : diagramConstantValue(mapping, ['direction']);
+    const label = diagramLabelForRow(row, mapping, labelField, labelValue, params, warnings, `edge ${source} -> ${target}`);
+    const sourceNode = nodeMap.get(source);
+    const targetNode = nodeMap.get(target);
+    const edgeId = diagramD2Id('edge', `${source}_${target}_${edges.length}_${label || kind || mappingType || 'edge'}`);
+    const edge = {
+      id: edgeId,
       source,
       target,
-      label: label === undefined || label === null ? '' : String(label)
-    });
+      label,
+      d2Id: edgeId,
+      sourceD2Id: sourceNode && sourceNode.d2Id || diagramD2Id('node', source),
+      targetD2Id: targetNode && targetNode.d2Id || diagramD2Id('node', target),
+      data: buildDiagramObjectData('edge', edgeId, label, sourceName, row, mapping, { source, target })
+    };
+    if (mappingType && mappingType !== 'generic') edge.mappingType = mappingType;
+    if (kind && kind !== 'generic') edge.kind = kind;
+    if (direction) edge.direction = direction;
+    edges.push(edge);
+    return true;
+  };
+  for (const mapping of diagramEdgeMappings(diagram)) {
+    const sourceField = diagramMappingField(mapping, ['edgeSource', 'source', 'sourceId', 'sourceColumn', 'from'], 'source');
+    const targetField = diagramMappingField(mapping, ['edgeTarget', 'target', 'targetId', 'targetColumn', 'to'], 'target');
+    const labelField = diagramMappingField(mapping, ['edgeLabel', 'edgeTitle', 'label', 'labelColumn'], 'label');
+    const source = diagramRowsForMapping(context, mapping);
+    for (const row of source.rows) {
+      if (edges.length >= maxEdges) break;
+      addEdge(
+        rowValueByField(row, sourceField, ['Source', 'SourceId', 'sourceId', 'from', 'From']),
+        rowValueByField(row, targetField, ['Target', 'TargetId', 'targetId', 'to', 'To']),
+        rowValueByField(row, labelField, ['Label', 'Type', 'Relation', 'Domain']),
+        mapping,
+        row,
+        source.sourceName
+      );
+    }
   }
-  const truncated = nodeRows.length > nodeMap.size || edgeRows.length > edges.length;
+  for (const mapping of normalizeDiagramMappingList(diagram.groupMappings)) {
+    const idField = diagramMappingField(mapping, ['groupId', 'id', 'idColumn', 'groupColumn'], 'id');
+    const labelField = diagramMappingField(mapping, ['groupLabel', 'label', 'labelColumn'], 'label');
+    const parentField = diagramMappingField(mapping, ['groupParent', 'parent', 'parentColumn'], '');
+    const source = diagramRowsForMapping(context, mapping);
+    for (const row of source.rows) {
+      addGroup(
+        rowValueByField(row, idField, ['Group', 'Code', 'Name', 'Description']),
+        diagramLabelForRow(row, mapping, labelField, rowValueByField(row, labelField, ['Label', 'Description', 'Name', 'Code']), params, warnings, 'group'),
+        parentField ? rowValueByField(row, parentField, ['Parent', 'parent']) : '',
+        row,
+        mapping,
+        source.sourceName
+      );
+    }
+  }
+  for (const mapping of normalizeDiagramMappingList(diagram.hierarchyMappings)) {
+    const childField = diagramMappingField(mapping, ['child', 'childId', 'node', 'nodeId', 'source', 'sourceColumn'], 'child');
+    const parentField = diagramMappingField(mapping, ['parent', 'parentId', 'target', 'targetColumn'], 'parent');
+    const labelField = diagramMappingField(mapping, ['edgeLabel', 'label', 'labelColumn'], 'label');
+    const source = diagramRowsForMapping(context, mapping);
+    for (const row of source.rows) {
+      if (edges.length >= maxEdges) break;
+      const child = displayCardValue(rowValueByField(row, childField, ['Child', 'child', 'Node', 'node', 'Source', 'source'])).trim();
+      const parent = displayCardValue(rowValueByField(row, parentField, ['Parent', 'parent', 'Target', 'target'])).trim();
+      if (!child || !parent) {
+        warnings.push('Skipped hierarchy row without child or parent.');
+        continue;
+      }
+      if (nodeMap.has(child) && !nodeMap.get(child).parent) nodeMap.get(child).parent = parent;
+      addEdge(parent, child, rowValueByField(row, labelField, ['Label', 'Relation', 'Type']) || diagramConstantValue(mapping, ['label']) || 'contains', Object.assign({}, mapping, { type: 'hierarchy' }), row, source.sourceName);
+    }
+  }
+  const groups = Array.from(groupMap.values());
+  const truncated = nodeMap.size >= maxNodes || edges.length >= maxEdges || groupMap.size >= maxGroups;
   if (truncated) warnings.push('Diagram was truncated by execution limits.');
-  return {
+  const result = {
     name,
     title: renderRuntimeParamTemplate(titleTemplate, params),
     type: 'topology',
@@ -16654,9 +18462,13 @@ function buildTopologyDiagram(diagram, context, params, limits) {
       : { type: 'topology' },
     nodes: Array.from(nodeMap.values()),
     edges,
-    warnings: Array.from(new Set(warnings)),
+    groups,
+    warnings: [],
     truncated
   };
+  attachDiagramD2Artifacts(result, diagram, warnings);
+  result.warnings = Array.from(new Set(warnings));
+  return result;
 }
 
 function buildResultDiagrams(spec, context, params, limits) {
@@ -18975,6 +20787,9 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
     };
   });
   const diagrams = buildResultDiagrams(spec, context, effectiveParams, limits);
+  if (!options.skipD2Render) {
+    await renderD2ArtifactsForDiagrams(diagrams);
+  }
 
   return {
     emptyText: defaultEmptyText,
@@ -19813,6 +21628,7 @@ async function handleBackend(req, res, requestUrl) {
       }
       const params = runtimeReadOnly ? publicSnapshotParamsFromUrl(requestUrl) : body.params || {};
       const jsonOutput = templateAction === 'run' && runtimeJsonOutputRequested(requestUrl);
+      const d2Output = templateAction === 'run' && runtimeD2OutputRequested(requestUrl);
       const session = await getSessionData(authToken);
       const username = session.data && session.data.username ? session.data.username : '';
       const runtimeConfig = await getRuntimeConfig(authToken, root);
@@ -19877,7 +21693,14 @@ async function handleBackend(req, res, requestUrl) {
           result,
           cache
         };
-        sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : payload);
+        if (d2Output) {
+          sendRuntimeD2Source(res, payload, {
+            selector: runtimeD2DiagramSelector(requestUrl),
+            publicAllowed: true
+          });
+          return;
+        }
+        sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : runtimeDisplayResponsePayload(payload));
         return;
       }
 
@@ -19963,11 +21786,12 @@ async function handleBackend(req, res, requestUrl) {
             key: snapshot.key,
             paramsMode: publishConfig.paramsMode || 'exact'
           });
-        } else if (templateAction === 'run' && !cacheDisabled) {
+        } else if (templateAction === 'run' && !cacheDisabled && !d2Output) {
           const cached = await executeTemplateRunWithCache(authToken, root, template, params, session.data, executionOptions, {
             refreshRequested,
             forceRefreshRequested,
-            runtimeCacheConfig
+            runtimeCacheConfig,
+            cacheContext: d2CacheContext()
           });
           result = cached.result;
           cache = cached.cache;
@@ -19984,7 +21808,10 @@ async function handleBackend(req, res, requestUrl) {
             forceRefreshRequested: Boolean(forceRefreshRequested)
           });
         } else {
-          result = await executeTemplateSpec(authToken, template.spec, params, executionOptions);
+          result = await executeTemplateSpec(authToken, template.spec, params, {
+            ...executionOptions,
+            skipD2Render: Boolean(d2Output)
+          });
         }
       } catch (error) {
         const permissionDenied = errorLooksPermissionDenied(error);
@@ -20038,7 +21865,14 @@ async function handleBackend(req, res, requestUrl) {
         result,
         cache
       };
-      sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : payload);
+      if (d2Output) {
+        sendRuntimeD2Source(res, payload, {
+          selector: runtimeD2DiagramSelector(requestUrl),
+          publicAllowed: true
+        });
+        return;
+      }
+      sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : runtimeDisplayResponsePayload(payload));
       return;
     }
 
@@ -20552,6 +22386,8 @@ export {
   cmdbuildRetryDelayMs,
   defaultRuntimeConfig,
   dependencyMapWithHash,
+  d2RendererConfigSummary,
+  d2RendererHealth,
   executionThrottleScopeKey,
   expectedSpecHashFromBody,
   extractAssistantDraftSpec,
@@ -20576,15 +22412,20 @@ export {
   redactByName,
   renderRuntimeParamTemplate,
   renderCellTemplate,
+  renderD2SourceToSvg,
   renderPrometheusMetrics,
   callLiteLLM,
   mcpToolDefinitions,
   runtimeCacheKeyParts,
   runtimeCacheMeta,
+  runtimeDisplayResponsePayload,
+  runtimeD2OutputRequested,
   runtimeJsonOutputRequested,
   runtimeJsonResponsePayload,
   redisRequiredError,
   sanitizeHeaders,
+  sanitizeD2Svg,
+  stripSensitiveDiagramArtifacts,
   sanitizeRequestPath,
   sanitizeUrlForLog,
   sanitizeVisibleClassAttributes,

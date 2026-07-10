@@ -123,6 +123,17 @@ test('runtime config validation fails closed for production CSRF secret', () => 
   assert.equal(placeholder.ok, false);
   assert.deepEqual(placeholder.errors.map((item) => item.code), ['csrf_secret_placeholder']);
 
+  const fakeSink = validateRuntimeConfig({
+    nodeEnv: 'production',
+    csrfSecret: 'externally-managed-secret',
+    logTargets: ['stdout'],
+    externalLogSink: 'docker-logging-driver-or-collector',
+    diagnosticMode: 'off'
+  });
+
+  assert.equal(fakeSink.ok, false);
+  assert.deepEqual(fakeSink.errors.map((item) => item.code), ['external_log_sink_placeholder']);
+
   const valid = validateRuntimeConfig({
     nodeEnv: 'production',
     csrfSecret: 'externally-managed-secret',

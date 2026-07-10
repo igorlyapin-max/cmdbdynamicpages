@@ -12,6 +12,7 @@ import {
   buildResultDiagrams,
   callLiteLLM,
   cmdbuildClassAttributesPath,
+  d2RendererConfigSummary,
   defaultRuntimeConfig,
   dependencyMapWithHash,
   extractAssistantDraftSpec,
@@ -27,8 +28,12 @@ import {
   renderCellTemplate,
   renderRuntimeParamTemplate,
   runtimeCacheKeyParts,
+  runtimeD2OutputRequested,
+  runtimeDisplayResponsePayload,
   runtimeJsonOutputRequested,
   runtimeJsonResponsePayload,
+  sanitizeD2Svg,
+  stripSensitiveDiagramArtifacts,
   sanitizeVisibleClassAttributes,
   templateIsProtected,
   validateTemplateSpec
@@ -205,6 +210,41 @@ test('runtime json output flag is an output mode and not a business parameter', 
   assert.equal(runtimeJsonOutputRequested(new URL('http://local/run?json=1')), true);
   assert.equal(runtimeJsonOutputRequested(new URL('http://local/run?json=yes')), true);
   assert.equal(runtimeJsonOutputRequested(new URL('http://local/run?json=false')), false);
+  assert.equal(runtimeD2OutputRequested(new URL('http://local/run?d2=true')), true);
+  assert.equal(runtimeD2OutputRequested(new URL('http://local/run?d2=1')), true);
+  assert.equal(runtimeD2OutputRequested(new URL('http://local/run?d2=false')), false);
+});
+
+test('publish D2 source flag is explicit and type-checked', () => {
+  assert.deepEqual(validateTemplateSpec({
+    version: 1,
+    publish: { mode: 'staticSnapshot', paramsMode: 'exact', warningAccepted: true, publicD2Source: true },
+    steps: [{ type: 'selectCards', as: 'objects', className: 'Server' }],
+    result: { tables: [{ name: 'objects', columns: ['Code'] }] }
+  }), []);
+
+  assert.deepEqual(validateTemplateSpec({
+    version: 1,
+    publish: { mode: 'staticSnapshot', paramsMode: 'exact', warningAccepted: true, publicD2Source: 'yes' },
+    steps: [{ type: 'selectCards', as: 'objects', className: 'Server' }],
+    result: { tables: [{ name: 'objects', columns: ['Code'] }] }
+  }), [{ path: '$.publish.publicD2Source', message: 'Publish publicD2Source must be boolean.' }]);
+});
+
+test('D2 renderer is enabled by default and SVG sanitizer strips unsafe content', () => {
+  const config = d2RendererConfigSummary();
+  assert.equal(config.enabled, true);
+  assert.equal(config.required, true);
+  assert.equal(config.binary, '/usr/local/bin/d2');
+  assert.equal(config.maxDiagrams, 8);
+  assert.equal(config.concurrency, 2);
+  assert.deepEqual(config.layoutAllowlist, ['dagre', 'elk']);
+
+  const sanitized = sanitizeD2Svg('<?xml version="1.0"?><svg onclick="alert(1)"><script>alert(1)</script><foreignObject><body>Bad</body></foreignObject><style>@import url(http://evil)</style><animate attributeName="x"></animate><image href="https://evil.local/a.png"></image><a href="javascript:alert(1)"><text>Bad</text></a><a href="ftp://evil.local/a"><text>FTP</text></a><a href="/cmdbuild/ui/#classes/Server/cards/1" style="fill:#111"><text>Good</text></a><text style="background:url(https://evil.local/a.png)">Styled</text></svg>');
+  assert.match(sanitized, /^<svg data-cmdp-d2-rendered="true"/);
+  assert.doesNotMatch(sanitized, /<script|onclick|javascript:|ftp:\/\/evil|foreignObject|<style|<animate|<image|https:\/\/evil|url\(/i);
+  assert.match(sanitized, /href="\/cmdbuild\/ui\/#classes\/Server\/cards\/1"/);
+  assert.match(sanitized, /style="fill:#111"/);
 });
 
 test('runtime json response exposes visible table rows and safe cell links', () => {
@@ -326,7 +366,18 @@ test('result diagrams build deterministic topology payloads and runtime json exp
   assert.equal(diagrams[0].nodes.length, 2);
   assert.equal(diagrams[0].nodes[0].href, '/cmdbuild/ui/#classes/Server/cards/1');
   assert.equal(diagrams[0].nodes[1].href, '');
-  assert.deepEqual(diagrams[0].edges, [{ source: 'srv-1', target: 'vlan-1', label: 'connected' }]);
+  assert.equal(diagrams[0].edges[0].source, 'srv-1');
+  assert.equal(diagrams[0].edges[0].target, 'vlan-1');
+  assert.equal(diagrams[0].edges[0].label, 'connected');
+  assert.match(diagrams[0].d2.source, /vars: \{/);
+  assert.match(diagrams[0].d2.source, /data: \{/);
+  assert.match(diagrams[0].d2.source, /cmdp: \{/);
+  assert.doesNotMatch(diagrams[0].d2.source, /base64|cmdp:metadata/i);
+  assert.match(diagrams[0].svg.metadata, /<metadata id="cmdp-diagram-data" type="application\/json">/);
+  diagrams[0].svg.content = '<svg data-cmdp-d2-rendered="true"><text>Rendered by D2</text></svg>';
+  diagrams[0].svg.rendered = true;
+  diagrams[0].svg.renderer = 'd2';
+  diagrams[0].svg.layout = 'dagre';
 
   const payload = runtimeJsonResponsePayload({
     success: true,
@@ -337,6 +388,151 @@ test('result diagrams build deterministic topology payloads and runtime json exp
   assert.equal(payload.diagrams.length, 1);
   assert.equal(payload.diagrams[0].nodes.length, 2);
   assert.equal(payload.diagrams[0].edges[0].label, 'connected');
+  assert.equal(payload.diagrams[0].d2.source, undefined);
+  assert.equal(payload.diagrams[0].d2.downloadAvailable, true);
+  assert.equal(payload.diagrams[0].d2.sourceHash, diagrams[0].d2.sourceHash);
+  assert.equal(payload.diagrams[0].d2.metadataEmbedded, true);
+  assert.equal(payload.diagrams[0].svg.metadataEmbedded, true);
+  assert.equal(payload.diagrams[0].svg.rendered, true);
+  assert.equal(payload.diagrams[0].svg.content, undefined);
+  assert.equal(payload.diagrams[0].svg.metadata, undefined);
+  assert.equal(payload.diagrams[0].svg.renderer, 'd2');
+
+  const displayPayload = runtimeDisplayResponsePayload({
+    success: true,
+    action: 'run',
+    template: { code: 'topology' },
+    result: { diagrams }
+  });
+  assert.equal(displayPayload.result.diagrams[0].d2.source, undefined);
+  assert.equal(displayPayload.result.diagrams[0].d2.downloadAvailable, true);
+  assert.match(displayPayload.result.diagrams[0].svg.content, /Rendered by D2/);
+  assert.equal(displayPayload.result.diagrams[0].nodes[0].data, undefined);
+});
+
+test('result diagrams build graph mappings for groups hierarchy and object relation edges', () => {
+  const spec = {
+    version: 1,
+    steps: [{ type: 'selectCards', as: 'graphNodes', className: 'Server', columns: ['Id', 'Label'] }],
+    result: {
+      diagrams: [{
+        name: 'infra',
+        title: 'Infrastructure graph',
+        nodeMappings: [{
+          from: 'graphNodes',
+          labelTemplate: '${Id} ${Label}',
+          labelFields: ['Id', 'Label'],
+          dataProfile: {
+            name: 'cmdb-node',
+            className: 'Server',
+            fields: ['Id', 'Label', 'Kind', 'Vlan']
+          },
+          fields: {
+            id: 'Id',
+            label: 'Label',
+            group: 'Vlan',
+            parent: 'Parent',
+            nodeType: 'Kind',
+            href: 'Href'
+          }
+        }],
+        edgeMappings: [{
+          type: 'object',
+          from: 'aclRows',
+          labelTemplate: '${Port} ${Action}',
+          dataProfile: {
+            name: 'cmdb-edge',
+            fields: ['Source', 'Target', 'Port', 'Action']
+          },
+          fields: {
+            source: 'Source',
+            target: 'Target',
+            label: 'Port',
+            edgeType: 'Action',
+            edgeDirection: 'Direction'
+          }
+        }],
+        groupMappings: [{
+          from: 'vlans',
+          labelFields: ['Vlan', 'Name'],
+          dataProfile: { fields: ['Vlan', 'Name'] },
+          fields: { id: 'Vlan', label: 'Name' }
+        }],
+        hierarchyMappings: [{
+          from: 'contains',
+          dataProfile: { fields: ['Parent', 'Child', 'Relation'] },
+          fields: { parent: 'Parent', child: 'Child', label: 'Relation' }
+        }],
+        layout: { type: 'hierarchical' },
+        maxNodes: 20,
+        maxEdges: 20,
+        metadata: {
+          embedInD2: true,
+          embedInSvg: true,
+          maxBytes: 200000
+        }
+      }]
+    }
+  };
+  assert.deepEqual(validateTemplateSpec(spec), []);
+
+  const diagrams = buildResultDiagrams(spec, {
+    graphNodes: {
+      rows: [
+        { Id: 'srv-1', Label: 'Server 1', Vlan: 'vlan-10', Kind: 'server', Href: '/cmdbuild/ui/#classes/Server/cards/1' },
+        { Id: 'docker-1', Label: 'Docker 1', Vlan: 'vlan-10', Parent: 'srv-1', Kind: 'container' },
+        { Id: 'svc-1', Label: 'Service 1', Vlan: 'vlan-10', Parent: 'docker-1', Kind: 'service' }
+      ]
+    },
+    aclRows: {
+      rows: [{ Source: 'srv-1', Target: 'svc-1', Port: '443/tcp', Action: 'allow', Direction: 'direct' }]
+    },
+    vlans: {
+      rows: [{ Vlan: 'vlan-10', Name: 'VLAN 10' }]
+    },
+    contains: {
+      rows: [
+        { Parent: 'srv-1', Child: 'docker-1', Relation: 'hosts' },
+        { Parent: 'docker-1', Child: 'svc-1', Relation: 'runs' }
+      ]
+    }
+  }, {}, { maxRows: 100 });
+
+  assert.equal(diagrams.length, 1);
+  assert.equal(diagrams[0].layout.type, 'hierarchical');
+  assert.equal(diagrams[0].nodes.length, 3);
+  assert.equal(diagrams[0].nodes.find((node) => node.id === 'srv-1').label, 'srv-1 Server 1');
+  assert.equal(diagrams[0].nodes.find((node) => node.id === 'srv-1').data.fields.Kind.display, 'server');
+  assert.equal(diagrams[0].nodes.find((node) => node.id === 'docker-1').parent, 'srv-1');
+  assert.equal(diagrams[0].nodes.find((node) => node.id === 'svc-1').type, 'service');
+  assert.equal(diagrams[0].groups[0].id, 'vlan-10');
+  assert.equal(diagrams[0].groups[0].label, 'vlan-10 VLAN 10');
+  assert.ok(diagrams[0].edges.some((edge) => edge.source === 'srv-1' && edge.target === 'svc-1' && edge.mappingType === 'object' && edge.kind === 'allow' && edge.direction === 'direct'));
+  assert.ok(diagrams[0].edges.some((edge) => edge.source === 'srv-1' && edge.target === 'docker-1' && edge.mappingType === 'hierarchy'));
+  assert.match(diagrams[0].d2.source, /vars: \{/);
+  assert.match(diagrams[0].d2.source, /cmdp: \{/);
+  assert.match(diagrams[0].d2.source, /node_srv_1/);
+  assert.equal(diagrams[0].data.objects.node_srv_1.fields.Kind.display, 'server');
+  assert.match(diagrams[0].svg.metadata, /cmdp-diagram-data/);
+
+  const payload = runtimeJsonResponsePayload({
+    success: true,
+    action: 'run',
+    template: { code: 'infra' },
+    result: { diagrams }
+  });
+  assert.equal(payload.diagrams[0].nodes.find((node) => node.id === 'docker-1').parent, 'srv-1');
+  assert.equal(payload.diagrams[0].groups[0].id, 'vlan-10');
+  assert.equal(payload.diagrams[0].edges.find((edge) => edge.mappingType === 'object').kind, 'allow');
+  assert.equal(payload.diagrams[0].nodes.find((node) => node.id === 'srv-1').data, undefined);
+  assert.equal(payload.diagrams[0].data, undefined);
+  assert.equal(payload.diagrams[0].d2.source, undefined);
+  assert.equal(payload.diagrams[0].d2.downloadAvailable, true);
+
+  const stripped = stripSensitiveDiagramArtifacts({ diagrams }, { includeSvgContent: false });
+  assert.equal(stripped.diagrams[0].nodes.find((node) => node.id === 'srv-1').data, undefined);
+  assert.equal(stripped.diagrams[0].svg.content, '');
+  assert.equal(stripped.diagrams[0].d2.downloadAvailable, true);
 });
 
 test('assistant MCP config keeps known allowed tools and bounded defaults', () => {
@@ -1597,19 +1793,26 @@ test('dependency map includes diagram source fields', () => {
       diagrams: [
         {
           name: 'topology',
-          source: {
-            nodes: 'nodes',
-            edges: 'edges'
-          },
-          fields: {
-            nodeId: 'NodeCode',
-            nodeLabel: 'NodeName',
-            nodeGroup: 'NodeType',
-            nodeHref: 'NodeUrl',
-            edgeSource: 'FromNode',
-            edgeTarget: 'ToNode',
-            edgeLabel: 'LinkName'
-          }
+          nodeMappings: [{
+            from: 'nodes',
+            labelFields: ['NodeName', 'NodeModel'],
+            dataProfile: { fields: ['NodeSerial'] },
+            fields: {
+              id: 'NodeCode',
+              label: 'NodeName',
+              group: '_Location_description',
+              href: 'NodeUrl'
+            }
+          }],
+          edgeMappings: [{
+            from: 'edges',
+            dataProfile: { fields: ['LinkProtocol'] },
+            fields: {
+              source: 'FromNode',
+              target: 'ToNode',
+              label: 'LinkName'
+            }
+          }]
         }
       ]
     }
@@ -1619,10 +1822,10 @@ test('dependency map includes diagram source fields', () => {
 
   assert.deepEqual(
     map.selections.find((item) => item.as === 'nodes').directFields.sort(),
-    ['Class', '_id', 'Code', 'Description', 'NodeCode', 'NodeName', 'NodeType', 'NodeUrl'].sort()
+    ['Class', '_id', 'Code', 'Description', 'NodeCode', 'NodeName', 'Location', 'NodeUrl', 'NodeModel', 'NodeSerial'].sort()
   );
   assert.deepEqual(
     map.selections.find((item) => item.as === 'edges').directFields.sort(),
-    ['Class', '_id', 'Code', 'Description', 'FromNode', 'ToNode', 'LinkName'].sort()
+    ['Class', '_id', 'Code', 'Description', 'FromNode', 'ToNode', 'LinkName', 'LinkProtocol'].sort()
   );
 });

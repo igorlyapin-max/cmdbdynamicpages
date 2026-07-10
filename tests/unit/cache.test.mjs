@@ -105,7 +105,40 @@ test('cache metadata exposes refresh cooldown and refresh permission', () => {
 });
 
 test('public snapshot URL params exclude runtime cache control switches', () => {
-  const url = new URL('http://127.0.0.1:8093/cmdbuild/custom-api/public-snapshots/test/run?city=city49&lang=ru&refresh=1&noCache=1&forceRefresh=1&bypassRefreshCooldown=1');
+  const url = new URL('http://127.0.0.1:8093/cmdbuild/custom-api/public-snapshots/test/run?city=city49&lang=ru&d2=true&diagram=infra&refresh=1&noCache=1&forceRefresh=1&bypassRefreshCooldown=1');
 
   assert.deepEqual(publicSnapshotParamsFromUrl(url), { city: 'city49' });
+});
+
+test('D2 renderer policy participates in runtime cache key context', () => {
+  const runtimeCache = normalizeRuntimeCacheConfig(defaultRuntimeConfig());
+  const dependencyMap = dependencyMapWithHash(baseSpec);
+  const template = { code: 'CacheProbe', active: true, spec: baseSpec };
+  const config = normalizeTemplateCacheConfig({ cache: { scopeMode: 'permissionOnly' } }, runtimeCache);
+
+  const dagre = runtimeCacheKeyParts('Cst_QueryTool', template, { city: 'city49' }, { username: 'alice' }, executionOptions, runtimeCache, config, dependencyMap, {}, {
+    d2: {
+      enabled: true,
+      layout: 'dagre',
+      layoutAllowlist: ['dagre', 'elk'],
+      maxInputBytes: 2097152,
+      maxOutputBytes: 10485760,
+      maxDiagrams: 8,
+      concurrency: 2
+    }
+  });
+  const elk = runtimeCacheKeyParts('Cst_QueryTool', template, { city: 'city49' }, { username: 'alice' }, executionOptions, runtimeCache, config, dependencyMap, {}, {
+    d2: {
+      enabled: true,
+      layout: 'elk',
+      layoutAllowlist: ['dagre', 'elk'],
+      maxInputBytes: 2097152,
+      maxOutputBytes: 10485760,
+      maxDiagrams: 8,
+      concurrency: 2
+    }
+  });
+
+  assert.notEqual(dagre.key, elk.key);
+  assert.notEqual(dagre.contextHash, elk.contextHash);
 });

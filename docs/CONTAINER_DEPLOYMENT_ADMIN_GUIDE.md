@@ -44,11 +44,14 @@ cp .env.example .env
 - `LITELLM_BASE_URL`, `LITELLM_MODEL`, `LITELLM_API_KEY_FILE_HOST` - optional LiteLLM assistant endpoint/model/API-key secret file;
 - `CMDP_LITELLM_ALLOWED_BASE_URLS` - server-side allowlist для LiteLLM-compatible endpoints; RuntimeConfig baseUrl не должен выводить API key за этот список;
 - `Cst_QueryToolConfig.RuntimeConfigJson.assistant.mcp` - runtime-настройки read-only MCP tools для Designer Assistant; secrets здесь не хранить;
+- `CMDP_D2_RENDER_ENABLED`, `CMDP_D2_BINARY`, `CMDP_D2_TIMEOUT_MS`, `CMDP_D2_MAX_INPUT_BYTES`, `CMDP_D2_MAX_OUTPUT_BYTES`, `CMDP_D2_MAX_DIAGRAMS`, `CMDP_D2_CONCURRENCY`, `CMDP_D2_LAYOUT`, `CMDP_D2_LAYOUT_ALLOWLIST` - обязательный по умолчанию server-side D2 SVG render. В штатном image binary уже лежит в `/usr/local/bin/d2`; при `CMDP_D2_RENDER_ENABLED=true` `/health/ready` требует рабочий binary;
 - `CMDP_LOG_TARGET` - `stdout` или `stdout,syslog`, если контур использует syslog sink;
 - `CMDP_EXTERNAL_LOG_SINK` - имя внешней доставки логов (`docker logging driver`, collector/sidecar, ELK/OpenSearch/syslog route), если `CMDP_LOG_TARGET` остается `stdout`;
 - `CMDP_SYSLOG_*` - только если включен syslog.
 
 `replace-me`, `registry.example.local`, `cmdbuild.example.local`, `redis.example.local`, `litellm.example.local` и `syslog.example.local` не являются рабочими значениями. Real `.env` файлы не коммитить.
+
+Для опубликованных static snapshots raw `.d2` source не отдается публичному endpoint по умолчанию. Если заказчик разрешает скачивание `.d2`, включайте `publish.publicD2Source=true` в шаблоне осознанно: source может содержать structured diagram metadata и бизнес-данные, уже зафиксированные в snapshot.
 
 ## Проверка compose template
 
@@ -100,7 +103,7 @@ docker logs --tail=100 cmdbdynamicpages-backend
 Ожидания:
 
 - `/health/live` возвращает `200`, если Node process отвечает;
-- `/health/ready` возвращает `200`, только если Redis и CMDBuild upstream доступны;
+- `/health/ready` возвращает `200`, только если Redis, CMDBuild upstream и обязательный D2 renderer доступны;
 - `/health/redis` возвращает `200` при доступном Redis;
 - `/metrics` возвращает Prometheus text без cookies, tokens, user names, runtime rows и raw CMDBuild payload;
 - Docker healthcheck использует `/health/live`.

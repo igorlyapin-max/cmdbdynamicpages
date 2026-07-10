@@ -371,12 +371,13 @@ State-changing custom API routes require a same-origin `Origin` or `Referer` hea
 `GET /cmdbuild/custom-api/auth/permission-scope` probes what permission-scope metadata is visible to the current CMDBuild session. It returns session role data, endpoint statuses for roles/users/groups/classes/domains, sampled readable classes/attributes, and a visible-model hash. That hash is diagnostic only; runtime result sharing is controlled explicitly by each template's `spec.cache.scopeMode`.
 
 Runtime iframe pages call `GET /cmdbuild/custom-api/templates/<code>/run?param=value`. This endpoint still requires the CMDBuild session cookie for dynamic templates, but it is read-only from CMDBuild's perspective and does not require `X-CMDBDynamicPages-CSRF`. `POST /cmdbuild/custom-api/templates/<code>/run` remains available for API/Designer checks and keeps CSRF protection. Both GET and POST runtime executions use standard backend logging only.
+For diagram templates, the same runtime endpoint renders generated `.d2` source through the server-side D2 binary and stores the resulting SVG in runtime cache/static snapshots. `GET /cmdbuild/custom-api/templates/<code>/run?d2=true&diagram=<name>&param=value` downloads the generated D2 source as `text/vnd.d2` for an authenticated viewer. Public static snapshots expose raw `.d2` only when the saved template has `publish.publicD2Source=true`.
 
 Production health/readiness endpoints are unauthenticated and are also available at root aliases `/health/live`, `/health/ready`, and `/health/redis`.
 
 - `GET /health/live` returns `200` when the Node process can answer HTTP.
 - `GET /health/redis` performs a strict Redis `PING` and returns `503` when Redis is disabled or unavailable.
-- `GET /health/ready` checks process, Redis, and the CMDBuild upstream. It returns `503` if Redis is required and unavailable, or if CMDBuild is not reachable.
+- `GET /health/ready` checks process, Redis, the CMDBuild upstream, and the D2 renderer when `CMDP_D2_RENDER_ENABLED=true`. It returns `503` if Redis is required and unavailable, CMDBuild is not reachable, or the required D2 binary cannot run.
 - `GET /metrics` returns Prometheus text exposition with aggregate operational counters and gauges only.
 - `GET /cmdbuild/custom-api/cache/status` remains a diagnostic endpoint: it reports Redis visibility and memory fallback counters, but it intentionally returns `200` even when the app has fallen back to memory.
 - `GET /cmdbuild/custom-api/logging/status` returns the active log level, target and redaction settings without secrets.
@@ -387,6 +388,15 @@ Readiness configuration:
 CMDBDYNAMIC_REDIS_REQUIRED=false
 CMDBDYNAMIC_HEALTH_TIMEOUT_MS=2000
 CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=true
+CMDP_D2_RENDER_ENABLED=true
+CMDP_D2_BINARY=/usr/local/bin/d2
+CMDP_D2_TIMEOUT_MS=3000
+CMDP_D2_MAX_INPUT_BYTES=2097152
+CMDP_D2_MAX_OUTPUT_BYTES=10485760
+CMDP_D2_MAX_DIAGRAMS=8
+CMDP_D2_CONCURRENCY=2
+CMDP_D2_LAYOUT=dagre
+CMDP_D2_LAYOUT_ALLOWLIST=dagre,elk
 ```
 
 `CMDBDYNAMIC_REDIS_REQUIRED=true` disables memory fallback for runtime cache and static snapshots: Redis read/write/delete failures fail the affected request with `503` instead of silently using process memory. It also makes readiness require Redis regardless of `CMDBDYNAMIC_HEALTH_REDIS_REQUIRED`. `CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=false` can still be used for local/dev operation without Redis when strict Redis mode is disabled. Production should keep Redis required when runtime cache and static snapshots are part of the service contract.
@@ -569,6 +579,7 @@ The visualization block edits `SpecJson.result.tables`. It controls what runtime
 ```
 
 Supported modes are `table`, `compact`, and `keyValue`. Visualization does not grant extra access; it only formats result aliases already produced by the DSL executor.
+Diagram results are rendered from deterministic D2 source by the server-side D2 binary, which is enabled by default in the container. If D2 rendering is unavailable, the runtime page shows an explicit warning, falls back to the built-in SVG topology view, and still exposes the `.d2` source download when the current permission/publication policy allows it. Runtime JSON omits raw `.d2`, embedded structured metadata, and raw SVG content; use the dedicated `d2=true` download endpoint for source export.
 The default empty-result text is `В результате вашего запроса объекты не найдены`. The default permission text is `Вам не хватает прав увидеть данные или интерфейс дизайнера`; the backend returns it when the current user cannot read the technical classes needed to load templates/settings, or when template execution hits a CMDBuild 401/403.
 For multi-selection templates, a `401/403` on any used selection class/attribute makes the whole runtime result a permission error. The runtime does not synthesize a partial table from the selections that did succeed, because that would change the meaning of the template.
 Table titles can be runtime templates such as `Маршрутизаторы города ${param.city}`. The value comes from the template input parameters, and visualization settings also control title alignment.
