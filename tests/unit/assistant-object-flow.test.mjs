@@ -1,0 +1,631 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import {
+  compileObjectFlowToSpec,
+  normalizeObjectFlow,
+  objectFlowStageSummaries,
+  validateObjectFlow
+} from '../../scripts/assistant-object-flow.mjs';
+import { validateTemplateSpec } from '../../scripts/dev-proxy-server.mjs';
+
+function validFlow() {
+  return {
+    version: 1,
+    selections: [
+      {
+        alias: 'routers',
+        name: 'Routers',
+        className: 'Router',
+        limit: 50,
+        columns: ['Code', 'Location'],
+        rules: [
+          { action: 'include', path: 'Status', op: 'equals', value: 'active' }
+        ]
+      },
+      {
+        alias: 'rooms',
+        name: 'Rooms',
+        className: 'Room',
+        rules: [
+          { action: 'include', path: 'Code', op: 'matches', regex: '^DC-' }
+        ]
+      },
+      {
+        alias: 'vlans',
+        name: 'VLANs',
+        className: 'Vlan',
+        rules: [
+          { action: 'exclude', path: 'Status', op: 'equals', value: 'retired' }
+        ]
+      }
+    ],
+    operations: [
+      {
+        type: 'match',
+        from: 'routers',
+        with: 'rooms',
+        as: 'routerRooms',
+        rightPrefix: 'Rooms.',
+        rules: [
+          {
+            action: 'include',
+            operator: 'equals',
+            leftColumn: 'Location',
+            rightColumn: 'Code'
+          }
+        ]
+      },
+      {
+        type: 'match',
+        from: 'routerRooms',
+        with: 'vlans',
+        as: 'routerRoomVlans',
+        rightPrefix: 'Vlans.',
+        rules: [
+          {
+            action: 'exclude',
+            negate: true,
+            operator: 'ipv4CidrOverlaps',
+            leftColumn: 'Rooms.Code',
+            leftRegex: '(.+)',
+            rightColumn: 'Location',
+            rightRegex: '(.+)'
+          }
+        ]
+      }
+    ]
+  };
+}
+
+test('normalizeObjectFlow derives stable ids without mutating the input', () => {
+  const input = validFlow();
+  const normalized = normalizeObjectFlow(input);
+
+  assert.equal(normalized.version, 1);
+  assert.deepEqual(normalized.selections.map((selection) => selection.id), [
+    'selection:routers',
+    'selection:rooms',
+    'selection:vlans'
+  ]);
+  assert.deepEqual(normalized.operations.map((operation) => operation.id), [
+    'match:routerRooms',
+    'match:routerRoomVlans'
+  ]);
+  assert.equal(normalized.selections[1].limit, 100);
+  assert.equal(input.selections[0].id, undefined);
+  assert.equal(input.operations[0].id, undefined);
+
+  const explicit = normalizeObjectFlow({
+    version: 1,
+    selections: [{
+      id: 'selection:kept',
+      alias: 'objects',
+      className: 'Asset',
+      rules: [{ action: 'include', path: 'Code', op: 'exists' }]
+    }],
+    blocks: []
+  });
+  assert.equal(explicit.selections[0].id, 'selection:kept');
+});
+
+test('validateObjectFlow accepts explicit operations and selection-only flows', () => {
+  assert.deepEqual(validateObjectFlow(validFlow()), []);
+  assert.deepEqual(validateObjectFlow({
+    version: 1,
+    selections: [{
+      alias: 'objects',
+      className: 'Asset',
+      rules: [{ action: 'include', path: 'Code', op: 'exists' }]
+    }],
+    blocks: []
+  }), []);
+  assert.deepEqual(validateObjectFlow({
+    version: 1,
+    selections: [{
+      id: 'selection:objects',
+      alias: 'renamedObjects',
+      className: 'Asset',
+      rules: [{ action: 'include', path: 'Code', op: 'exists' }]
+    }],
+    blocks: []
+  }), []);
+});
+
+test('validateObjectFlow reports ids, aliases, operation references, actions, and operators', () => {
+  const flow = normalizeObjectFlow(validFlow());
+  flow.selections[1].id = flow.selections[0].id;
+  flow.selections[1].alias = flow.selections[0].alias;
+  flow.selections[1].rules[0].action = 'maybe';
+  flow.selections[1].rules[0].op = 'unsupported';
+  flow.operations[0].from = 'wrong';
+  flow.operations[0].with = 'wrong';
+  flow.operations[0].rules = [];
+  flow.operations[1].from = 'wrong';
+  flow.operations[1].rules[0].operator = 'unsupported';
+
+  const errors = validateObjectFlow(flow);
+  const paths = errors.map((error) => error.path);
+
+  assert.ok(paths.includes('$.selections[1].id'));
+  assert.ok(paths.includes('$.selections[1].alias'));
+  assert.ok(paths.includes('$.selections[1].rules[0].action'));
+  assert.ok(paths.includes('$.selections[1].rules[0].op'));
+  assert.ok(paths.includes('$.operations[0].from'));
+  assert.ok(paths.includes('$.operations[0].with'));
+  assert.ok(paths.includes('$.operations[0].rules'));
+  assert.ok(paths.includes('$.operations[1].from'));
+  assert.ok(paths.includes('$.operations[1].rules[0].operator'));
+});
+
+test('validateObjectFlow accepts independent selections without a match operation', () => {
+  const flow = validFlow();
+  flow.operations = [];
+
+  assert.deepEqual(validateObjectFlow(flow), []);
+});
+
+test('compileObjectFlowToSpec replaces only managed object-flow state', () => {
+  const currentSpec = {
+    version: 1,
+    params: { city: { type: 'string', required: true } },
+    steps: [
+      { type: 'selectCards', purpose: 'objectGroup', className: 'Old', as: 'oldObjects' },
+      { type: 'filterRows', purpose: 'viewComposer', from: 'external', filters: [{ path: 'Code' }], as: 'visible' },
+      { type: 'matchRows', purpose: 'objectMatching', from: 'oldObjects', with: 'oldRight', rules: [{}], as: 'oldMatch' },
+      { type: 'matchRows', from: 'left', with: 'right', rules: [{ leftColumn: 'Code', rightColumn: 'Code' }], as: 'unrelatedMatch' }
+    ],
+    visualModel: { version: 1, mode: 'viewComposer', columns: [{ name: 'Code' }] },
+    visualModels: [
+      { version: 1, mode: 'presentation', marker: 'keep' },
+      { version: 1, mode: 'objectGroup', marker: 'old' },
+      { version: 1, mode: 'objectMatching', marker: 'old' }
+    ],
+    result: {
+      tables: [
+        { name: 'oldObjects', columns: ['Code'] },
+        { name: 'oldMatch', columns: ['Code'] },
+        { name: 'audit', columns: ['Event'], presentation: { sortColumn: 'Event' } }
+      ],
+      diagrams: [{ name: 'network', type: 'd2', source: 'nodes: {}' }],
+      presentation: { titleAlign: 'left' },
+      marker: 'keep'
+    },
+    cache: { enabled: true, ttlSeconds: 60 },
+    publish: { mode: 'dynamicUser' },
+    endpoint: { kind: 'runtime', code: 'object-flow' },
+    defaults: { city: 'msk' },
+    assistantDraft: { flowPrompts: { selections: {} } }
+  };
+  const inputSnapshot = structuredClone(currentSpec);
+  const flow = validFlow();
+  const flowSnapshot = structuredClone(flow);
+
+  const compiled = compileObjectFlowToSpec(currentSpec, flow);
+
+  assert.deepEqual(currentSpec, inputSnapshot);
+  assert.deepEqual(flow, flowSnapshot);
+  assert.deepEqual(compiled.params, currentSpec.params);
+  assert.deepEqual(compiled.cache, currentSpec.cache);
+  assert.deepEqual(compiled.publish, currentSpec.publish);
+  assert.deepEqual(compiled.endpoint, currentSpec.endpoint);
+  assert.deepEqual(compiled.defaults, currentSpec.defaults);
+  assert.deepEqual(compiled.assistantDraft, currentSpec.assistantDraft);
+  assert.deepEqual(compiled.result.diagrams, currentSpec.result.diagrams);
+  assert.deepEqual(compiled.result.presentation, currentSpec.result.presentation);
+  assert.equal(compiled.result.marker, 'keep');
+
+  assert.equal(compiled.steps.some((step) => step.as === 'oldObjects'), false);
+  assert.equal(compiled.steps.some((step) => step.as === 'oldMatch'), false);
+  assert.equal(compiled.steps.some((step) => step.as === 'visible'), true);
+  assert.equal(compiled.steps.some((step) => step.as === 'unrelatedMatch'), true);
+  assert.deepEqual(compiled.steps.filter((step) => step.purpose === 'objectGroup').map((step) => step.as), [
+    'routers',
+    'rooms',
+    'vlans'
+  ]);
+  assert.deepEqual(compiled.steps.filter((step) => step.purpose === 'objectMatching').map((step) => step.as), [
+    'routerRooms',
+    'routerRoomVlans'
+  ]);
+  assert.deepEqual(compiled.steps.map((step) => step.as), [
+    'routers',
+    'rooms',
+    'vlans',
+    'routerRooms',
+    'routerRoomVlans',
+    'visible',
+    'unrelatedMatch'
+  ]);
+  assert.ok(compiled.steps.findIndex((step) => step.as === 'vlans') < compiled.steps.findIndex((step) => step.as === 'routerRooms'));
+
+  const routers = compiled.steps.find((step) => step.as === 'routers');
+  const rooms = compiled.steps.find((step) => step.as === 'rooms');
+  const vlans = compiled.steps.find((step) => step.as === 'vlans');
+  assert.deepEqual(routers.filters, [{
+    scope: 'include',
+    path: 'Status',
+    negate: false,
+    op: 'equals',
+    value: 'active'
+  }]);
+  assert.deepEqual(routers.columns, [
+    { path: 'Code', as: 'Code', multiMode: 'join', separator: ', ', emptyRow: true },
+    { path: 'Location', as: 'Location', multiMode: 'join', separator: ', ', emptyRow: true }
+  ]);
+  assert.deepEqual(rooms.columns, [
+    { path: 'Code', as: 'Code', multiMode: 'join', separator: ', ', emptyRow: true }
+  ]);
+  assert.equal(Object.hasOwn(rooms, 'from'), false);
+  assert.equal(Object.hasOwn(rooms, 'includeSource'), false);
+  assert.equal(Object.hasOwn(rooms, 'deduplicateCards'), false);
+  assert.equal(rooms.filters.some((filter) => filter.valueColumn), false);
+  assert.deepEqual(vlans.columns, [
+    { path: 'Location', as: 'Location', multiMode: 'join', separator: ', ', emptyRow: true }
+  ]);
+
+  const firstMatch = compiled.steps.find((step) => step.as === 'routerRooms');
+  const secondMatch = compiled.steps.find((step) => step.as === 'routerRoomVlans');
+  assert.deepEqual(firstMatch, {
+    type: 'matchRows',
+    purpose: 'objectMatching',
+    from: 'routers',
+    with: 'rooms',
+    rules: [{
+      action: 'include',
+      negate: false,
+      operator: 'equals',
+      left: { column: 'Location', regex: '' },
+      right: { column: 'Code', regex: '' }
+    }],
+    caseSensitive: false,
+    rightPrefix: 'Rooms.',
+    as: 'routerRooms'
+  });
+  assert.equal(secondMatch.from, 'routerRooms');
+  assert.equal(secondMatch.with, 'vlans');
+
+  assert.deepEqual(compiled.visualModel, currentSpec.visualModel);
+  assert.deepEqual(compiled.visualModels.map((model) => model.mode), [
+    'presentation',
+    'objectGroup',
+    'objectMatching'
+  ]);
+  assert.equal(compiled.visualModels[1].selections[0].id, 'selection:routers');
+  assert.equal(compiled.visualModels[1].selections[1].from, '');
+  assert.equal(compiled.visualModels[1].selections[1].scopeRules.some((rule) => rule.path === 'Code' && rule.valueColumn === 'Location'), false);
+  assert.equal(compiled.visualModels[2].operations[1].id, 'match:routerRoomVlans');
+
+  assert.equal(compiled.result.tables.some((table) => table.name === 'oldObjects'), false);
+  assert.equal(compiled.result.tables.some((table) => table.name === 'oldMatch'), false);
+  assert.deepEqual(compiled.result.tables.find((table) => table.name === 'audit'), currentSpec.result.tables[2]);
+  const finalTable = compiled.result.tables.find((table) => table.name === 'routerRoomVlans');
+  assert.ok(finalTable.columns.includes('Rooms.Code'));
+  assert.ok(finalTable.columns.includes('Vlans.Location'));
+  assert.ok(finalTable.columns.includes('Vlans.Description'));
+});
+
+test('compileObjectFlowToSpec rejects invalid flows and unsupported Spec versions', () => {
+  const invalidFlow = validFlow();
+  invalidFlow.operations[0].with = 'missing';
+
+  assert.throws(
+    () => compileObjectFlowToSpec({ version: 1, steps: [] }, invalidFlow),
+    (error) => error.code === 'object_flow_invalid' && Array.isArray(error.errors)
+  );
+  assert.throws(
+    () => compileObjectFlowToSpec({ version: 2, steps: [] }, validFlow()),
+    (error) => error.code === 'object_flow_spec_version'
+  );
+});
+
+test('compileObjectFlowToSpec removes only the new-template starter query on first apply', () => {
+  const currentSpec = {
+    version: 1,
+    params: {
+      attrType: { type: 'string', required: true },
+      city: { type: 'string', required: false }
+    },
+    steps: [{ type: 'findClassesByAttributeType', attributeTypeParam: 'attrType', as: 'classes' }],
+    result: {
+      emptyText: 'No data',
+      tables: [{ name: 'classes', columns: ['Class', 'Description', 'Attribute', 'AttributeType'] }],
+      diagrams: [{ name: 'network', type: 'd2' }]
+    }
+  };
+
+  const compiled = compileObjectFlowToSpec(currentSpec, validFlow());
+
+  assert.equal(compiled.steps.some((step) => step.type === 'findClassesByAttributeType'), false);
+  assert.equal(compiled.result.tables.some((table) => table.name === 'classes'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(compiled.params, 'attrType'), false);
+  assert.deepEqual(compiled.params.city, currentSpec.params.city);
+  assert.deepEqual(compiled.result.diagrams, currentSpec.result.diagrams);
+  assert.equal(compiled.result.emptyText, 'No data');
+});
+
+test('compileObjectFlowToSpec supports a single selection without match steps', () => {
+  const compiled = compileObjectFlowToSpec({ version: 1, steps: [] }, {
+    version: 1,
+    selections: [{
+      alias: 'assets',
+      name: 'Assets',
+      className: 'Asset',
+      rules: [{ action: 'include', path: 'Code', op: 'exists' }]
+    }],
+    blocks: []
+  });
+
+  assert.deepEqual(compiled.steps.map((step) => [step.type, step.as]), [['selectCards', 'assets']]);
+  assert.equal(compiled.result.tables.some((table) => table.name === 'assets'), true);
+  assert.equal(compiled.visualModels.find((model) => model.mode === 'objectMatching').output.alias, '');
+  assert.deepEqual(validateTemplateSpec(compiled), []);
+});
+
+test('object flow compiles typed set operations and an explicit published table', () => {
+  const compiled = compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, {
+    version: 1,
+    selections: [
+      { alias: 'blueAssets', className: 'Asset', rules: [{ action: 'include', path: 'Code', op: 'exists' }] },
+      { alias: 'redAssets', className: 'Asset', rules: [{ action: 'include', path: 'Code', op: 'exists' }] }
+    ],
+    blocks: [{
+      from: 'blueAssets', with: 'redAssets', as: 'matchedAssets', rightPrefix: 'Red.',
+      rules: [{ action: 'include', operator: 'equals', leftColumn: 'Code', rightColumn: 'Code' }]
+    }],
+    setOperations: [{
+      id: 'set:activeAssets', type: 'difference', from: 'blueAssets', with: 'redAssets', as: 'activeAssets',
+      on: [{ left: 'Class', right: 'Class' }, { left: '_id', right: '_id' }], distinct: true, caseSensitive: false
+    }],
+    publishedAlias: 'activeAssets'
+  });
+
+  assert.deepEqual(compiled.steps.map((step) => [step.type, step.as]), [
+    ['selectCards', 'blueAssets'],
+    ['selectCards', 'redAssets'],
+    ['matchRows', 'matchedAssets'],
+    ['differenceRows', 'activeAssets']
+  ]);
+  const setStep = compiled.steps.find((step) => step.as === 'activeAssets');
+  assert.deepEqual(setStep.on, [{ left: 'Class', right: 'Class' }, { left: '_id', right: '_id' }]);
+  assert.equal(compiled.result.tables.find((table) => table.name === 'activeAssets').published, true);
+  assert.equal(compiled.result.tables.filter((table) => table.published).length, 1);
+  assert.ok(compiled.result.tables.find((table) => table.name === 'matchedAssets').columns.includes('Red.Code'));
+  assert.deepEqual(validateObjectFlow({
+    version: 1,
+    selections: [{ alias: 'assets', className: 'Asset', rules: [{ action: 'include', path: 'Code', op: 'exists' }] }],
+    blocks: [],
+    setOperations: [{ id: 'set:bad', type: 'union', from: 'assets', with: 'missing', as: 'allAssets', on: [] }],
+    publishedAlias: 'missing'
+  }).map((error) => error.path).sort(), ['$.operations[0].on', '$.operations[0].with', '$.publishedAlias']);
+});
+
+test('operations run only in declared order and can use an earlier set alias', () => {
+  const flow = validFlow();
+  flow.operations = [
+    {
+      id: 'set:allSites',
+      type: 'union',
+      from: 'routers',
+      with: 'rooms',
+      as: 'allSites',
+      on: [{ left: 'Code', right: 'Code' }],
+      distinct: true,
+      caseSensitive: false
+    },
+    {
+      id: 'match:siteVlans',
+      type: 'match',
+      from: 'allSites',
+      with: 'vlans',
+      as: 'siteVlans',
+      rightPrefix: 'Vlans.',
+      rules: [{ action: 'include', operator: 'equals', leftColumn: 'Code', rightColumn: 'Location' }]
+    }
+  ];
+  flow.publishedAlias = 'siteVlans';
+
+  const compiled = compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, flow);
+
+  assert.deepEqual(compiled.steps.map((step) => [step.type, step.as]), [
+    ['selectCards', 'routers'],
+    ['selectCards', 'rooms'],
+    ['selectCards', 'vlans'],
+    ['unionRows', 'allSites'],
+    ['matchRows', 'siteVlans']
+  ]);
+  assert.equal(compiled.steps[4].from, 'allSites');
+  assert.equal(compiled.steps[4].with, 'vlans');
+  assert.equal(compiled.result.tables.find((table) => table.name === 'siteVlans').published, true);
+});
+
+test('operations reject forward references and retain migrated saved operation order', () => {
+  const invalid = validFlow();
+  invalid.operations = [{
+    id: 'match:forward',
+    type: 'match',
+    from: 'later',
+    with: 'routers',
+    as: 'first',
+    rightPrefix: 'Routers.',
+    rules: [{ action: 'include', operator: 'equals', leftColumn: 'Code', rightColumn: 'Code' }]
+  }, {
+    id: 'set:later',
+    type: 'union',
+    from: 'rooms',
+    with: 'vlans',
+    as: 'later',
+    on: [{ left: 'Code', right: 'Code' }]
+  }];
+  assert.ok(validateObjectFlow(invalid).some((error) => error.path === '$.operations[0].from'));
+
+  const migrated = normalizeObjectFlow({
+    version: 1,
+    selections: validFlow().selections,
+    blocks: [{ from: 'routers', with: 'rooms', as: 'routerRooms', rules: [{ leftColumn: 'Code', rightColumn: 'Code' }] }],
+    setOperations: [{ type: 'union', from: 'routerRooms', with: 'vlans', as: 'allSites', on: [{ left: 'Code', right: 'Code' }] }]
+  });
+  assert.deepEqual(migrated.operations.map((operation) => [operation.type, operation.as]), [
+    ['match', 'routerRooms'],
+    ['union', 'allSites']
+  ]);
+});
+
+test('objectFlowStageSummaries returns deterministic cumulative columns', () => {
+  const summaries = objectFlowStageSummaries(validFlow());
+
+  assert.deepEqual(summaries.slice(0, 3), [
+    {
+      id: 'selection:routers',
+      kind: 'selection',
+      alias: 'routers',
+      className: 'Router',
+      columns: ['Class', '_id', 'Code', 'Description', 'Location']
+    },
+    {
+      id: 'selection:rooms',
+      kind: 'selection',
+      alias: 'rooms',
+      className: 'Room',
+      columns: ['Class', '_id', 'Code', 'Description']
+    },
+    {
+      id: 'selection:vlans',
+      kind: 'selection',
+      alias: 'vlans',
+      className: 'Vlan',
+      columns: ['Class', '_id', 'Code', 'Description']
+    }
+  ]);
+  assert.deepEqual(summaries[3], {
+    id: 'match:routerRooms',
+    kind: 'match',
+    alias: 'routerRooms',
+    columns: [
+      'Class', '_id', 'Code', 'Description',
+      'Location',
+      'Rooms.Class', 'Rooms._id', 'Rooms.Code', 'Rooms.Description'
+    ]
+  });
+  assert.ok(summaries[4].columns.includes('Rooms.Code'));
+  assert.ok(summaries[4].columns.includes('Vlans.Location'));
+});
+
+test('objectFlowStageSummaries exposes typed set-operation aliases for diagram mapping', () => {
+  const flow = validFlow();
+  flow.operations.push({
+    id: 'set:allInfrastructure',
+    type: 'union',
+    from: 'routers',
+    with: 'rooms',
+    as: 'allInfrastructure',
+    on: [{ left: 'Class', right: 'Class' }, { left: '_id', right: '_id' }]
+  });
+  flow.publishedAlias = 'allInfrastructure';
+
+  const stage = objectFlowStageSummaries(flow).find((item) => item.id === 'set:allInfrastructure');
+
+  assert.deepEqual(stage, {
+    id: 'set:allInfrastructure',
+    kind: 'set',
+    alias: 'allInfrastructure',
+    columns: ['Class', '_id', 'Code', 'Description', 'Location']
+  });
+});
+
+test('match stage summaries retain custom columns from every materialized selection', () => {
+  const flow = validFlow();
+  flow.selections[0].columns.push('RouterModel');
+  flow.selections[1].columns = ['RoomModel'];
+  flow.selections[2].columns = ['VlanModel'];
+
+  const compiled = compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, flow);
+  const summaries = objectFlowStageSummaries(flow);
+  const firstMatch = summaries.find((stage) => stage.id === 'match:routerRooms');
+  const finalMatch = summaries.find((stage) => stage.id === 'match:routerRoomVlans');
+  const finalTable = compiled.result.tables.find((table) => table.name === 'routerRoomVlans');
+
+  assert.ok(firstMatch.columns.includes('RouterModel'));
+  assert.ok(firstMatch.columns.includes('Rooms.RoomModel'));
+  assert.ok(finalMatch.columns.includes('RouterModel'));
+  assert.ok(finalMatch.columns.includes('Rooms.RoomModel'));
+  assert.ok(finalMatch.columns.includes('Vlans.VlanModel'));
+  assert.ok(finalTable.columns.includes('Vlans.VlanModel'));
+});
+
+test('object flow rejects unknown set operations and forward selection sources', () => {
+  const unknownSet = validFlow();
+  unknownSet.operations = [{
+    id: 'set:unsupported',
+    type: 'merge',
+    from: 'routers',
+    with: 'rooms',
+    as: 'unsupported',
+    on: [{ left: 'Code', right: 'Code' }]
+  }];
+  const normalized = normalizeObjectFlow(unknownSet);
+
+  assert.equal(normalized.operations[0].type, 'merge');
+  assert.ok(validateObjectFlow(normalized).some((error) => error.path === '$.operations[0].type'));
+
+  const forwardSelection = validFlow();
+  forwardSelection.selections[1].from = 'vlans';
+  assert.ok(validateObjectFlow(forwardSelection).some((error) => error.path === '$.selections[1].from'));
+});
+
+test('object flow rejects operation columns absent from intermediate materialized stages', () => {
+  const flow = validFlow();
+  flow.operations[1].rules[0].leftColumn = 'MissingIntermediateColumn';
+
+  const errors = validateObjectFlow(flow);
+  assert.ok(errors.some((error) => error.path === '$.operations[1].rules[0].leftColumn'));
+});
+
+test('object flow migrates only Object Group aliases recorded in stored visual models', () => {
+  const currentSpec = {
+    version: 1,
+    steps: [{ type: 'selectCards', className: 'OldAsset', as: 'oldAssets', filters: [], limit: 100 }],
+    visualModel: {
+      mode: 'objectGroup',
+      selections: [{ alias: 'oldAssets', className: 'OldAsset', scopeRules: [{ action: 'include', path: 'Code', op: 'exists' }] }]
+    },
+    visualModels: [{
+      mode: 'objectGroup',
+      selections: [{ alias: 'oldAssets', className: 'OldAsset', scopeRules: [{ action: 'include', path: 'Code', op: 'exists' }] }]
+    }],
+    result: { tables: [{ name: 'oldAssets', columns: ['Code'] }] }
+  };
+  const nextFlow = {
+    version: 1,
+    selections: [{ alias: 'assets', className: 'Asset', rules: [{ action: 'include', path: 'Code', op: 'exists' }] }],
+    operations: []
+  };
+
+  const compiled = compileObjectFlowToSpec(currentSpec, nextFlow);
+  assert.deepEqual(compiled.steps.map((step) => step.as), ['assets']);
+  assert.equal(compiled.result.tables.some((table) => table.name === 'oldAssets'), false);
+
+  assert.throws(
+    () => compileObjectFlowToSpec({
+      version: 1,
+      steps: [{ type: 'selectCards', className: 'OldAsset', as: 'assets', filters: [], limit: 100 }],
+      result: { tables: [{ name: 'assets', columns: ['Code'] }] }
+    }, nextFlow),
+    (error) => error.code === 'object_flow_migration_required'
+  );
+});
+
+test('object flow clears inherited published flags when no published alias is selected', () => {
+  const compiled = compileObjectFlowToSpec({
+    version: 1,
+    steps: [],
+    result: { tables: [{ name: 'assets', title: 'Assets', columns: ['Code'], published: true }] }
+  }, {
+    version: 1,
+    selections: [{ alias: 'assets', className: 'Asset', rules: [{ action: 'include', path: 'Code', op: 'exists' }] }],
+    operations: [],
+    publishedAlias: ''
+  });
+
+  assert.equal(Object.hasOwn(compiled.result.tables.find((table) => table.name === 'assets'), 'published'), false);
+});

@@ -18,17 +18,29 @@ RUN set -eux; \
   install -m 0755 "/tmp/d2-v${D2_VERSION}/bin/d2" /usr/local/bin/d2; \
   /usr/local/bin/d2 --version
 
+FROM golang:1.24-alpine AS d2-import-builder
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY cmd/cmdp-d2-import ./cmd/cmdp-d2-import
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/cmdp-d2-import ./cmd/cmdp-d2-import
+
 FROM node:20-alpine
 
 ENV NODE_ENV=production \
     PROXY_HOST=0.0.0.0 \
     PROXY_PORT=8093 \
     CMDP_D2_RENDER_ENABLED=true \
-    CMDP_D2_BINARY=/usr/local/bin/d2
+    CMDP_D2_BINARY=/usr/local/bin/d2 \
+    CMDP_D2_IMPORT_BINARY=/usr/local/bin/cmdp-d2-import
 
 WORKDIR /app
 
 COPY --from=d2 --chown=node:node /usr/local/bin/d2 /usr/local/bin/d2
+COPY --from=d2-import-builder --chown=node:node /out/cmdp-d2-import /usr/local/bin/cmdp-d2-import
 COPY --chown=node:node package.json ./
 COPY --chown=node:node src ./src
 COPY --chown=node:node scripts ./scripts
@@ -38,6 +50,6 @@ USER node
 EXPOSE 8093
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD node -e "const http=require('node:http');const port=process.env.PROXY_PORT||8093;const req=http.get({host:'127.0.0.1',port,path:'/health/live',timeout:2000},res=>{res.resume();process.exit(res.statusCode>=200&&res.statusCode<300?0:1)});req.on('timeout',()=>req.destroy(new Error('timeout')));req.on('error',()=>process.exit(1));"
+  CMD node -e "const http=require('node:http');const port=process.env.PROXY_PORT||8093;const req=http.get({host:'127.0.0.1',port,path:'/health/ready',timeout:2000},res=>{res.resume();process.exit(res.statusCode>=200&&res.statusCode<300?0:1)});req.on('timeout',()=>req.destroy(new Error('timeout')));req.on('error',()=>process.exit(1));"
 
 CMD ["node", "scripts/dev-proxy-server.mjs"]

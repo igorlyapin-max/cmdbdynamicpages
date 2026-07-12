@@ -19,6 +19,11 @@ tags:
   - name: templates
   - name: runtime
   - name: assistant
+    description: >
+      Authoring-only proposal APIs. Assistant owns object-flow proposals, D2
+      import interpretation, and selection-to-role proposals; responses never
+      mutate an editor draft. The legacy `/assistant/template-draft` and
+      `/assistant/diagram-import/complete` routes are unsupported and unplanned.
   - name: mcp
   - name: config
 security:
@@ -288,11 +293,14 @@ paths:
       responses:
         "200":
           description: Config saved
-  /cmdbuild/custom-api/assistant/template-draft:
+  /cmdbuild/custom-api/assistant/object-flow/plan:
     post:
       tags: [assistant]
-      summary: Generate deterministic template draft through LiteLLM
-      description: Authoring-only endpoint. The returned spec is validated by the same runtime DSL validator; runtime execution, cache and static snapshots do not call LLM.
+      summary: Propose a complete deterministic object flow
+      description: >
+        Authoring-only LLM proposal for the complete Selection -> Match ->
+        Selection flow. The response never changes the current spec and must
+        be explicitly applied through `/draft/object-flow/apply`.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -301,22 +309,63 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/AssistantDraftRequest"
+              $ref: "#/components/schemas/AssistantObjectFlowPlanRequest"
       responses:
         "200":
-          description: Valid template draft
+          description: Typed complete object-flow proposal
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/AssistantDraftResponse"
+                $ref: "#/components/schemas/AssistantObjectFlowPlanResponse"
+        "401":
+          description: CMDBuild session is invalid or expired
+        "403":
+          description: CSRF or template authoring permission check failed
+        "409":
+          description: Saved template changed before proposal generation
         "422":
-          description: Assistant returned a syntactically parsed draft that failed DSL validation
+          description: Assistant proposal failed deterministic object-flow validation
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/AssistantDraftResponse"
+                $ref: "#/components/schemas/AssistantObjectFlowPlanResponse"
+        "429":
+          description: Authoring execution throttle reached
         "503":
           description: Assistant is disabled or LiteLLM is not configured
+  /cmdbuild/custom-api/draft/object-flow/apply:
+    post:
+      tags: [templates]
+      summary: Apply a reviewed object flow to the editor draft
+      description: >
+        Deterministically validates and compiles reviewed selection and match
+        stages into a new editor spec. This endpoint does not call LLM and does
+        not save or publish the template. Every selection and every intermediate
+        match stage is returned as an eligible Diagram mapping source.
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ObjectFlowApplyRequest"
+      responses:
+        "200":
+          description: Validated editor spec and mapping-source list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ObjectFlowApplyResponse"
+        "401":
+          description: CMDBuild session is invalid or expired
+        "403":
+          description: CSRF or template authoring permission check failed
+        "409":
+          description: Editor draft or saved template changed before apply
+        "422":
+          description: Reviewed flow failed deterministic validation or compilation
   /cmdbuild/custom-api/mcp:
     post:
       tags: [mcp]
@@ -583,6 +632,151 @@ paths:
       responses:
         "200":
           description: Validation result
+  /cmdbuild/custom-api/draft/diagram-import/analyze:
+    post:
+      tags: [assistant]
+      summary: Analyze a self-contained D2 structure template
+      description: >
+        Read-only deterministic parser stage in the Assistant-owned D2 import
+        workflow. It requires a valid CMDBuild session and CSRF protection,
+        returns structural IR, rendered preview, and a signed review proposal,
+        and never changes or saves the template. Template write permission and
+        saved-template version are checked only by the explicit apply, save,
+        or publish operation.
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DiagramImportAnalyzeRequest"
+      responses:
+        "200":
+          description: Structural IR and merge proposal
+        "401":
+          description: CMDBuild session is invalid or expired
+        "403":
+          description: CSRF validation failed
+        "413":
+          description: Configured source, output, or element limit reached
+        "429":
+          description: D2 analysis execution throttle reached
+        "422":
+          description: D2 parse, compile, or import validation failed
+  /cmdbuild/custom-api/draft/diagram-import/apply:
+    post:
+      tags: [templates]
+      summary: Apply reviewed D2 class-role mappings to an editor draft
+      description: >
+        Diagram-owned deterministic apply stage. It accepts only explicitly
+        reviewed role settings and selection mappings, returns a new validated
+        Spec JSON, and does not call LLM, save, or publish the template.
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DiagramImportApplyRequest"
+      responses:
+        "200":
+          description: Validated editor Spec JSON
+        "401":
+          description: CMDBuild session is invalid or expired
+        "403":
+          description: Template update permission is missing
+        "409":
+          description: Editor draft, saved template, source, or signed proposal changed after D2 analysis
+        "429":
+          description: Authoring execution throttle reached
+        "422":
+          description: Role mappings or relation rules are unresolved, or the result spec is invalid
+  /cmdbuild/custom-api/assistant/diagram-import/interpret:
+    post:
+      tags: [assistant]
+      summary: Propose semantic interpretation of imported D2 roles
+      description: >
+        Authoring-only LLM proposal over a signed D2 import review context. Raw
+        D2 source, structural IR, and signed proposal internals are not forwarded
+        to the model. The response contains role semantics only and never changes
+        Diagram settings or the editor spec.
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AssistantDiagramImportInterpretRequest"
+      responses:
+        "200":
+          description: Semantic role proposals
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramImportInterpretResponse"
+        "401":
+          description: CMDBuild session is invalid or expired
+        "403":
+          description: Template create or update permission is missing
+        "409":
+          description: Saved template, source, or signed proposal changed after D2 analysis
+        "429":
+          description: Authoring execution throttle reached
+        "422":
+          description: Assistant semantic proposal failed deterministic validation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramImportInterpretResponse"
+        "503":
+          description: Assistant is disabled or LiteLLM is not configured
+  /cmdbuild/custom-api/assistant/diagram-import/map-selections:
+    post:
+      tags: [assistant]
+      summary: Propose object-flow sources for imported D2 roles
+      description: >
+        Authoring-only LLM proposal. Eligible sources include every object-flow
+        selection and every intermediate match stage. Returned mappings remain
+        proposals until the editor reviews them and explicitly applies the
+        deterministic settings in the Diagram-owned draft.
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AssistantDiagramImportMapSelectionsRequest"
+      responses:
+        "200":
+          description: Selection-to-role mapping proposals
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramImportMapSelectionsResponse"
+        "401":
+          description: CMDBuild session is invalid or expired
+        "403":
+          description: Template create or update permission is missing
+        "409":
+          description: Editor flow, saved template, source, or signed proposal changed
+        "429":
+          description: Authoring execution throttle reached
+        "422":
+          description: Assistant mapping proposal failed deterministic validation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramImportMapSelectionsResponse"
+        "503":
+          description: Assistant is disabled or LiteLLM is not configured
   /cmdbuild/custom-api/draft/preview:
     post:
       tags: [templates]
@@ -787,33 +981,42 @@ components:
             type: string
         truncated:
           type: boolean
-    AssistantDraftRequest:
+    AssistantObjectFlowPlanRequest:
       type: object
-      required: [intent]
+      additionalProperties: false
+      required: [templateCode, baseSpecHash, currentSpec, prompt]
       properties:
         root:
           type: string
-          example: Cst_QueryTool
-        intent:
+        templateCode:
           type: string
-        taskMode:
+          description: Existing template code; empty means a create-permission check.
+        baseSpecHash:
           type: string
-          enum: [tables, diagrams, both]
-          default: both
+          description: Saved template hash used for optimistic authoring conflict detection.
         currentSpec:
           type: object
           additionalProperties: true
-    AssistantDraftResponse:
+        prompt:
+          type: string
+          minLength: 1
+          description: Full author-provided data-flow intent, including selections and joins.
+    AssistantObjectFlowPlanResponse:
       type: object
+      additionalProperties: false
+      required: [success, action]
       properties:
         success:
           type: boolean
         action:
           type: string
-          example: assistant-template-draft
-        spec:
-          type: object
-          additionalProperties: true
+          enum: [assistant-object-flow-plan]
+        flow:
+          $ref: "#/components/schemas/ObjectFlowProposal"
+        code:
+          type: string
+        message:
+          type: string
         explanation:
           type: string
         warnings:
@@ -823,22 +1026,233 @@ components:
         errors:
           type: array
           items:
-            type: object
-            additionalProperties: true
-        assistant:
+            $ref: "#/components/schemas/AssistantProposalError"
+        diagnostics:
           type: object
           additionalProperties: true
-        mcpContext:
+    AssistantProposalError:
+      type: object
+      additionalProperties: false
+      required: [message]
+      properties:
+        path:
+          type: string
+        message:
+          type: string
+    ObjectFlowApplyRequest:
+      type: object
+      additionalProperties: false
+      required: [templateCode, baseSpecHash, currentSpec, flow]
+      properties:
+        root:
+          type: string
+        templateCode:
+          type: string
+        baseSpecHash:
+          type: string
+        currentSpec:
           type: object
-          properties:
-            enabled:
-              type: boolean
-            tools:
-              type: array
-              items:
+          additionalProperties: true
+        flow:
+          $ref: "#/components/schemas/ObjectFlowProposal"
+    ObjectFlowApplyResponse:
+      type: object
+      additionalProperties: false
+      required: [success, action, spec, specHash]
+      properties:
+        success:
+          type: boolean
+        action:
+          type: string
+          enum: [object-flow-apply]
+        spec:
+          type: object
+          additionalProperties: true
+        specHash:
+          type: string
+    ObjectFlowProposal:
+      type: object
+      additionalProperties: false
+      required: [version, selections, operations]
+      properties:
+        version:
+          type: integer
+          enum: [1]
+        selections:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ObjectFlowSelectionStage"
+        operations:
+          type: array
+          description: Ordered match and set operations. Every source alias must be materialized by a selection or an earlier operation.
+          items:
+            $ref: "#/components/schemas/ObjectFlowOperation"
+        publishedAlias:
+          type: string
+          description: Optional materialized alias selected for the published result table.
+        blocks:
+          type: array
+          description: Compatibility projection of match operations returned by the server.
+          items:
+            $ref: "#/components/schemas/ObjectFlowMatchStage"
+        setOperations:
+          type: array
+          description: Compatibility projection of set operations returned by the server.
+          items:
+            $ref: "#/components/schemas/ObjectFlowSetOperation"
+    ObjectFlowSourceRef:
+      type: object
+      additionalProperties: false
+      required: [id, kind, alias]
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          enum: [selection, match, set]
+        alias:
+          type: string
+        className:
+          type: string
+        columns:
+          type: array
+          items:
+            type: string
+    ObjectFlowSelectionStage:
+      type: object
+      additionalProperties: false
+      required: [id, name, alias, className, limit, columns, rules]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        alias:
+          type: string
+        className:
+          type: string
+          description: Permission-filtered CMDBuild catalog class selected by the author or proposal.
+        from:
+          type: string
+          description: Optional prior selection or match alias used by correlated filters.
+        limit:
+          type: integer
+          minimum: 1
+        columns:
+          type: array
+          items:
+            type: string
+        rules:
+          type: array
+          items:
+            $ref: "#/components/schemas/ObjectFlowSelectionRule"
+    ObjectFlowSelectionRule:
+      type: object
+      additionalProperties: false
+      required: [action, path, negate, op]
+      properties:
+        action:
+          type: string
+          enum: [include, exclude]
+        path:
+          type: string
+        negate:
+          type: boolean
+        op:
+          type: string
+          enum: [exists, notExists, matches, notMatches, equals, notEquals, in, contains, startsWith, endsWith, isIpv4, isIpv4Network, ipv4InCidr, ipv4InRange, ipv4CidrOverlaps, ipv4CidrContains]
+        regex:
+          type: string
+        value:
+          type: string
+        valueParam:
+          type: string
+        valueColumn:
+          type: string
+    ObjectFlowMatchStage:
+      type: object
+      additionalProperties: false
+      required: [id, from, with, as, rules]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [match]
+        from:
+          type: string
+          description: Selection or previous intermediate match alias.
+        with:
+          type: string
+          description: Selection alias joined into this stage.
+        as:
+          type: string
+          description: Stable output alias; this output is also a Diagram mapping source.
+        rightPrefix:
+          type: string
+        rules:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ObjectFlowMatchRule"
+    ObjectFlowSetOperation:
+      type: object
+      additionalProperties: false
+      required: [id, type, from, with, as, on, distinct, caseSensitive]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [union, difference, intersect]
+        from:
+          type: string
+        with:
+          type: string
+        as:
+          type: string
+        on:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            additionalProperties: false
+            required: [left, right]
+            properties:
+              left:
                 type: string
-            truncated:
-              type: boolean
+              right:
+                type: string
+        distinct:
+          type: boolean
+        caseSensitive:
+          type: boolean
+    ObjectFlowOperation:
+      oneOf:
+        - $ref: "#/components/schemas/ObjectFlowMatchStage"
+        - $ref: "#/components/schemas/ObjectFlowSetOperation"
+    ObjectFlowMatchRule:
+      type: object
+      additionalProperties: false
+      required: [action, negate, operator, leftColumn, rightColumn]
+      properties:
+        action:
+          type: string
+          enum: [include, exclude]
+        negate:
+          type: boolean
+        operator:
+          type: string
+          enum: [equals, notEquals, contains, regexMatch, ipv4InCidr, ipv4InRange, ipv4CidrOverlaps, ipv4CidrContains]
+        leftColumn:
+          type: string
+        leftRegex:
+          type: string
+        rightColumn:
+          type: string
+        rightRegex:
+          type: string
     McpJsonRpcRequest:
       type: object
       required: [jsonrpc, method]
@@ -1214,3 +1628,312 @@ components:
         params:
           type: object
           additionalProperties: true
+    DiagramImportAnalyzeRequest:
+      type: object
+      additionalProperties: false
+      required: [templateCode, currentSpec, d2Source]
+      properties:
+        root:
+          type: string
+        templateCode:
+          type: string
+        baseSpecHash:
+          type: string
+        currentSpec:
+          type: object
+          additionalProperties: true
+        d2Source:
+          type: string
+    DiagramImportApplyRequest:
+      type: object
+      additionalProperties: false
+      required: [currentSpec, proposal]
+      properties:
+        root:
+          type: string
+        currentSpec:
+          type: object
+          additionalProperties: true
+        proposal:
+          type: object
+          additionalProperties: true
+        roles:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramImportRoleOverride"
+        relationRules:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramImportRelationRule"
+        placementRules:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramImportPlacementRule"
+    AssistantDiagramImportInterpretRequest:
+      type: object
+      additionalProperties: false
+      required: [currentSpec, proposal, roles, prompt]
+      properties:
+        root:
+          type: string
+        currentSpec:
+          type: object
+          additionalProperties: true
+        proposal:
+          $ref: "#/components/schemas/DiagramImportProposalEnvelope"
+        prompt:
+          type: string
+          minLength: 1
+          description: Author guidance for semantic interpretation; no customer-specific default is part of the API contract.
+        roles:
+          type: array
+          description: Imported roles visible to semantic interpretation.
+          items:
+            $ref: "#/components/schemas/DiagramImportRoleOverride"
+        relationRules:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramImportRelationRule"
+        placementRules:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramImportPlacementRule"
+    AssistantDiagramImportInterpretResponse:
+      type: object
+      additionalProperties: false
+      required: [success, action]
+      properties:
+        success:
+          type: boolean
+        action:
+          type: string
+          enum: [assistant-diagram-import-interpret]
+        decisions:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramImportSemanticProposal"
+        code:
+          type: string
+        message:
+          type: string
+        unresolvedRoleIds:
+          type: array
+          items:
+            type: string
+        explanation:
+          type: string
+        warnings:
+          type: array
+          items:
+            type: string
+        errors:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantProposalError"
+        diagnostics:
+          type: object
+          additionalProperties: true
+    AssistantDiagramImportMapSelectionsRequest:
+      type: object
+      additionalProperties: false
+      required: [currentSpec, proposal, roles, prompt]
+      properties:
+        root:
+          type: string
+        currentSpec:
+          type: object
+          additionalProperties: true
+        proposal:
+          $ref: "#/components/schemas/DiagramImportProposalEnvelope"
+        prompt:
+          type: string
+          minLength: 1
+          description: Author guidance for selection-to-role mapping.
+        roles:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramImportRoleOverride"
+        relationRules:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramImportRelationRule"
+        placementRules:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramImportPlacementRule"
+        stages:
+          type: array
+          description: Optional client summary; the backend derives and validates the authoritative stages from currentSpec.
+          items:
+            $ref: "#/components/schemas/ObjectFlowSourceRef"
+    AssistantDiagramImportMapSelectionsResponse:
+      type: object
+      additionalProperties: false
+      required: [success, action]
+      properties:
+        success:
+          type: boolean
+        action:
+          type: string
+          enum: [assistant-diagram-import-map-selections]
+        mappings:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramSelectionMapping"
+        code:
+          type: string
+        message:
+          type: string
+        unresolvedRoleIds:
+          type: array
+          items:
+            type: string
+        explanation:
+          type: string
+        warnings:
+          type: array
+          items:
+            type: string
+        errors:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantProposalError"
+        diagnostics:
+          type: object
+          additionalProperties: true
+    DiagramImportProposalEnvelope:
+      type: object
+      description: Signed immutable class-aware IR v3 proposal produced by deterministic D2 analysis.
+      required: [version, proposalId, templateCode, baseSpecHash, editorSpecHash, signature]
+      additionalProperties: true
+      properties:
+        version:
+          type: integer
+          enum: [3]
+        proposalId:
+          type: string
+        templateCode:
+          type: string
+        baseSpecHash:
+          type: string
+        editorSpecHash:
+          type: string
+        createdAt:
+          type: integer
+          format: int64
+        signature:
+          type: string
+    DiagramImportRoleContext:
+      type: object
+      additionalProperties: false
+      required: [id, key]
+      properties:
+        id:
+          type: string
+        key:
+          type: string
+        label:
+          type: string
+        kind:
+          type: string
+        selectedSemantic:
+          type: string
+          nullable: true
+          enum: [object, composite, group, static]
+    DiagramImportSemanticProposal:
+      type: object
+      additionalProperties: false
+      required: [roleId, semantic]
+      properties:
+        roleId:
+          type: string
+        semantic:
+          type: string
+          enum: [object, composite, group, static]
+        confidence:
+          type: string
+          enum: [high, medium, low]
+        reason:
+          type: string
+    DiagramSelectionMapping:
+      type: object
+      additionalProperties: false
+      required: [roleId, source, mapping]
+      properties:
+        roleId:
+          type: string
+        source:
+          $ref: "#/components/schemas/ObjectFlowSourceRef"
+        mapping:
+          type: object
+          additionalProperties: true
+        confidence:
+          type: string
+          enum: [high, medium, low]
+        reason:
+          type: string
+    DiagramImportRoleOverride:
+      type: object
+      required: [id]
+      additionalProperties: true
+      properties:
+        id:
+          type: string
+        selectedSemantic:
+          type: string
+          nullable: true
+          enum: [object, composite, group, static]
+        exemplarKey:
+          type: string
+        mapping:
+          type: object
+          description: Explicit primary CMDBuild class plus optional related-class paths and structured fields. Source aliases are backend-managed.
+          additionalProperties: true
+    DiagramImportRelationHop:
+      type: object
+      required: [kind, name, targetClass]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum: [reference, domain]
+        name:
+          type: string
+        domain:
+          type: string
+          description: CMDBuild domain identifier backing a reference attribute, when exposed by the catalog.
+        targetClass:
+          type: string
+        direction:
+          type: string
+          enum: [direct, inverse, both]
+    DiagramImportRelationRule:
+      type: object
+      required: [id, kind, parentRoleId, childRoleId, path]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          enum: [connection, group, hierarchy]
+        parentRoleId:
+          type: string
+        childRoleId:
+          type: string
+        path:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/DiagramImportRelationHop"
+    DiagramImportPlacementRule:
+      type: object
+      required: [id, parentRoleId, childRoleId]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+        parentRoleId:
+          type: string
+        childRoleId:
+          type: string

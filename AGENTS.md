@@ -16,7 +16,7 @@ Keep these surfaces aligned when editing init/runtime docs:
 
 - Init markdown: `AGENTS.md`, `.kimi/AGENTS.md`, `.omk/prompts/root.md`, plus generated companion docs `DESIGN.md`, `GEMINI.md`, `CLAUDE.md`, `ROADMAP.md`, and `SECURITY.md`.
 - Skills: project portable skills live in `.agents/skills`; Kimi runtime skills live in `.kimi/skills`; init templates live under `templates/skills/agents` and `templates/skills/kimi`.
-- Default runtime preset: `.omk/runtime-preset.json` uses `omk-parallel-orchestrator` so agent/non-simple work prefers parallel worker, capability, review, QA, and security lanes; `.omk/runtime-presets.json` keeps `omk-core-verified` as the fallback/baseline preset and also includes `omk-ts-product` for strict TS/React/Next/Nest product work, `omk-worktree-team` for isolated parallel worktree lanes before merge, and `omk-release-guard` for secret/security/release evidence gates with narrowed MCP authority, strong hooks, and no auto-publish authority.
+- Default runtime preset: `.omk/runtime-preset.json` uses `omk-parallel-orchestrator` so agent/non-simple work can use parallel worker and capability lanes. Preset skill availability does not authorize automatic code review: reviewer agents and `$orchestrated-review` run only on an explicit user review request. `.omk/runtime-presets.json` keeps `omk-core-verified` as the fallback/baseline preset and also includes `omk-ts-product` for strict TS/React/Next/Nest product work, `omk-worktree-team` for isolated parallel worker lanes before merge, and `omk-release-guard` for secret/security/release evidence gates with narrowed MCP authority, strong hooks, and no auto-publish authority.
 - MCP: fresh init is project-scoped and writes only local `omk-project` into `.kimi/mcp.json` / `.omk/mcp.json`. `omk init --local-user` or `OMK_MCP_SCOPE=all OMK_SKILLS_SCOPE=all` reads user `~/.kimi/mcp.json` and `~/.kimi/skills` at runtime without copying personal/global files. `--import-user-skills` is a trusted local opt-in copy path.
 - Agents: generated agents extend the Okabe-compatible base with `SendDMail`. Default root aliases are `explorer`/`explore`, `planner`/`plan`, `router`, `architect`, `coder`, `reviewer`, `security`, `qa`, `tester`, `researcher`, `integrator`, `aggregator`, `interviewer`, `ontology`, and `vision-debugger`; each is scaffolded with MCP, skills, and hooks enabled. Use additional local roles such as `coordinator`, `docs`, `merger`, or `release` only when the current `.omk/agents/root.yaml` or harness exposes them.
 - Harness: chat agent mode writes `.omk/runs/<run-id>/chat-agent-harness.json`. Prompts carry compact MCP/skills/hooks counts; read the harness manifest for the full inventory, worker limits, authority boundaries, virtual DAG, and gate list.
@@ -109,7 +109,9 @@ Minimum policy:
 * Use the `explorer` subagent for repository discovery.
 * Use the `planner` subagent for architecture, refactor, migration, or risky changes.
 * Use `coder` for scoped implementation tasks.
-* Use `reviewer`, `qa`, or a review workflow before final completion.
+* Use `qa` only when independent quality-gate or test analysis materially helps; it is not an automatic code review.
+* Run reviewer agents, review skills, and `$orchestrated-review` only when the user explicitly requests a review of code, a diff, a branch, or a PR.
+* For ordinary implementation completion, inspect the final diff directly and run the applicable tests, build, runtime smoke, and security gates without invoking a reviewer.
 
 Do not use subagents for trivial one-line answers or simple command explanations.
 
@@ -122,9 +124,9 @@ Repo exploration                explorer
 Architecture / refactor plan    planner
 Implementation                  coder
 Bug investigation               explorer -> planner -> coder
-Code review                     reviewer skill or review agent
+Code review                     reviewer skill or review agent, only on explicit request
 Quality-gate analysis           qa or omk-quality-gate
-Docs/release work               docs/release role if exposed, else reviewer
+Docs/release work               docs/release role if exposed, else main agent
 UI / design work                explorer -> coder + design skill
 Security-sensitive changes      planner + security review
 ```

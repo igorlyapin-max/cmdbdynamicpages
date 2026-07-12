@@ -254,7 +254,23 @@ Runtime results can include deterministic static diagrams in `result.diagrams`. 
 
 Designer has a `Visualization` output switch: `Tables`, `Diagrams`, or `Both`. The table editor stays unchanged for table-only templates; the diagram editor appears only for diagram-capable output and stores its config in `result.diagrams[]`.
 
-Designer also has a first-menu `Assistant` section. It calls the configured LiteLLM-compatible `/v1/chat/completions` endpoint and asks the model to produce a deterministic template draft; the backend validates the returned DSL before the editor applies it. The assistant can include bounded read-only CMDBuild model context through `POST /cmdbuild/custom-api/mcp` tools controlled by `Cst_QueryToolConfig.RuntimeConfigJson.assistant.mcp`. The authoring-only `Cst_QueryToolConfig.RuntimeConfigJson.assistant.prompt.system` setting is appended to the backend system prompt for local CMDBuild naming and relation semantics. Runtime page rendering, runtime cache, and static snapshot serving never call LLM or MCP. The assistant is disabled by default and is enabled by the Designer runtime setting `Cst_QueryToolConfig.RuntimeConfigJson.assistant.llm.enabled`; LiteLLM API key is supplied only through env or a secret file. `CMDP_ASSISTANT_ENABLED` is kept as a deprecated no-op for older deployment templates.
+The D2 importer contract uses class-aware IR v3. Every used D2 `class` is one reusable visual role; exemplar object paths are not separate mappings. The author explicitly maps that role to a primary CMDBuild class and optional related classes through catalog-backed reference/domain paths. Untyped D2 containers remain structural roles. Grouping, hierarchy, connections, and static placement are explicit role rules; backend-managed DSL aliases are not exposed in this UI. Legacy D2 import proposals and mappings before IR v3 are unsupported, are not migrated automatically, and are not planned as compatibility modes.
+
+The approved authoring split is explicit: `Assistant` owns D2 import, semantic interpretation, object-flow selection/match proposals, and selection-to-role proposals. `Diagram` owns the accepted deterministic settings in `result.diagrams[]`, including applied node, edge, group, and hierarchy mappings. Object-flow LLM calls receive a sanitized stage-only flow context and return one typed `selection` or `block`, never a complete runtime Spec. Assistant responses never mutate the editor draft; the author reviews them and invokes a deterministic apply action. Every selection stage and every intermediate match stage is eligible as a Diagram mapping source.
+
+For an exact non-negated `include equals` match, the deterministic object-flow compiler also drives the right `selectCards` from the left stage and adds a mandatory `valueColumn` filter before the class scan. Correlated right cards are materialized once by CMDBuild class/card id, so repeated left keys do not multiply the later `matchRows` cross-product. The explicit `matchRows` stage remains in the pipeline and remains available as a Diagram source. This prevents a class result limit from discarding the matching cards before the join is evaluated. While a reviewed D2 proposal is pending, Diagram shows its mapping controls only; general deterministic diagram settings become editable after Apply so proposal review cannot silently change the analyzed spec hash.
+
+Typed authoring endpoints under `/cmdbuild/custom-api` are:
+
+- `POST /assistant/object-flow/selection` - propose one selection stage;
+- `POST /assistant/object-flow/match` - propose one intermediate match stage;
+- `POST /draft/object-flow/apply` - deterministically validate and apply the reviewed object flow to the draft;
+- `POST /assistant/diagram-import/interpret` - propose semantics for imported D2 roles;
+- `POST /assistant/diagram-import/map-selections` - propose mappings from selection or intermediate match stages to confirmed D2 roles.
+
+The deterministic D2 parser/analyzer remains separate from LLM interpretation, and reviewed D2 settings are applied only through the Diagram-owned draft path. The generic `POST /assistant/template-draft` route and mixed `POST /assistant/diagram-import/complete` route are removed from the public contract; legacy aliases are unsupported and unplanned.
+
+Assistant authoring calls use the configured LiteLLM-compatible `/v1/chat/completions` endpoint and may include bounded read-only CMDBuild model context through `POST /cmdbuild/custom-api/mcp` tools controlled by `Cst_QueryToolConfig.RuntimeConfigJson.assistant.mcp`. The authoring-only `Cst_QueryToolConfig.RuntimeConfigJson.assistant.prompt.system` setting may add deployment-specific naming and relation semantics without hardcoding customer classes in the default contract. Runtime page rendering, runtime cache construction, static snapshot serving, and publication never call LLM or MCP. The assistant is disabled by default and is enabled by `Cst_QueryToolConfig.RuntimeConfigJson.assistant.llm.enabled`; the LiteLLM API key is supplied only through env or a secret file. `CMDP_ASSISTANT_ENABLED` is kept as a deprecated no-op for older deployment templates. This section defines the approved API contract and does not claim runtime implementation verification.
 
 Redis dev helper:
 
@@ -377,7 +393,7 @@ Production health/readiness endpoints are unauthenticated and are also available
 
 - `GET /health/live` returns `200` when the Node process can answer HTTP.
 - `GET /health/redis` performs a strict Redis `PING` and returns `503` when Redis is disabled or unavailable.
-- `GET /health/ready` checks process, Redis, the CMDBuild upstream, and the D2 renderer when `CMDP_D2_RENDER_ENABLED=true`. It returns `503` if Redis is required and unavailable, CMDBuild is not reachable, or the required D2 binary cannot run.
+- `GET /health/ready` checks process, Redis, the CMDBuild upstream, the D2 renderer, and the D2 template import parser. It returns `503` if Redis is required and unavailable, CMDBuild is not reachable, or a required D2 binary cannot run.
 - `GET /metrics` returns Prometheus text exposition with aggregate operational counters and gauges only.
 - `GET /cmdbuild/custom-api/cache/status` remains a diagnostic endpoint: it reports Redis visibility and memory fallback counters, but it intentionally returns `200` even when the app has fallen back to memory.
 - `GET /cmdbuild/custom-api/logging/status` returns the active log level, target and redaction settings without secrets.
@@ -397,7 +413,17 @@ CMDP_D2_MAX_DIAGRAMS=8
 CMDP_D2_CONCURRENCY=2
 CMDP_D2_LAYOUT=dagre
 CMDP_D2_LAYOUT_ALLOWLIST=dagre,elk
+CMDP_D2_IMPORT_BINARY=/usr/local/bin/cmdp-d2-import
+CMDP_D2_IMPORT_TIMEOUT_MS=5000
+CMDP_D2_IMPORT_MAX_INPUT_BYTES=1048576
+CMDP_D2_IMPORT_MAX_OUTPUT_BYTES=4194304
+CMDP_D2_IMPORT_MAX_ELEMENTS=5000
+CMDP_D2_IMPORT_PROPOSAL_TTL_MS=1800000
+CMDP_D2_IMPORT_ASSISTANT_MAX_SPEC_BYTES=262144
+CMDP_TEMPLATE_REQUEST_MAX_BYTES=5767168
 ```
+
+`CMDP_D2_IMPORT_PROPOSAL_TTL_MS` bounds the analyze/review/apply window. Proposals are bound to the CMDBuild session and template version; expired or modified proposals must be analyzed again. `CMDP_D2_IMPORT_ASSISTANT_MAX_SPEC_BYTES` bounds the sanitized current spec sent to LiteLLM; retained raw D2 source, structural IR, template metadata, and composite `d2Template` are removed from that context. `CMDP_TEMPLATE_REQUEST_MAX_BYTES` is the shared request-body limit for draft preview and template create/update, and must be at least large enough for the configured D2 import source plus normalized IR.
 
 `CMDBDYNAMIC_REDIS_REQUIRED=true` disables memory fallback for runtime cache and static snapshots: Redis read/write/delete failures fail the affected request with `503` instead of silently using process memory. It also makes readiness require Redis regardless of `CMDBDYNAMIC_HEALTH_REDIS_REQUIRED`. `CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=false` can still be used for local/dev operation without Redis when strict Redis mode is disabled. Production should keep Redis required when runtime cache and static snapshots are part of the service contract.
 

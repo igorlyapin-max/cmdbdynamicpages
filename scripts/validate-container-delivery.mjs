@@ -74,7 +74,7 @@ requiredEnv.forEach((name) => {
 rejectPattern('docker-compose.runtime.yml', /^\s*build\s*:/m, 'build directive');
 rejectPattern('docker-compose.nginx.yml', /^\s*build\s*:/m, 'build directive');
 requireText('docker-compose.runtime.yml', 'image: ${CMDBDYNAMIC_IMAGE}', 'prebuilt image reference');
-requireText('docker-compose.runtime.yml', '/health/live', 'container healthcheck');
+requireText('docker-compose.runtime.yml', '/health/ready', 'container readiness healthcheck');
 requireText('docker-compose.runtime.yml', 'LITELLM_API_KEY_FILE', 'LiteLLM assistant secret file wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_EXTERNAL_LOG_SINK', 'external log sink wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_LITELLM_ALLOWED_BASE_URLS', 'LiteLLM base URL allowlist wiring');

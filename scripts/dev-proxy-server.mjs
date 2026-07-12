@@ -17,6 +17,12 @@ import {
   normalizeCmdbBuildViewConfig,
   validateCmdbBuildViewSpec
 } from '../src/special-renderers/cmdb-build-view.mjs';
+import {
+  compileObjectFlowToSpec,
+  normalizeObjectFlow,
+  objectFlowStageSummaries,
+  validateObjectFlow
+} from './assistant-object-flow.mjs';
 
 const syslogFacilityCodes = {
   kern: 0,
@@ -115,6 +121,14 @@ const D2_CONCURRENCY = Math.max(1, Math.min(10, Number(process.env.CMDP_D2_CONCU
 const D2_LAYOUT = String(process.env.CMDP_D2_LAYOUT || 'dagre').trim() || 'dagre';
 const D2_LAYOUT_ALLOWLIST = parseNameSet(process.env.CMDP_D2_LAYOUT_ALLOWLIST || 'dagre,elk');
 const D2_RENDERER_UNAVAILABLE_TEXT = 'D2 renderer is unavailable; showing fallback diagram. D2 source is still available for download.';
+const D2_IMPORT_BINARY = String(process.env.CMDP_D2_IMPORT_BINARY || '/usr/local/bin/cmdp-d2-import').trim() || '/usr/local/bin/cmdp-d2-import';
+const D2_IMPORT_TIMEOUT_MS = Math.max(500, Number(process.env.CMDP_D2_IMPORT_TIMEOUT_MS || 5000) || 5000);
+const D2_IMPORT_MAX_INPUT_BYTES = Math.max(1024, Number(process.env.CMDP_D2_IMPORT_MAX_INPUT_BYTES || 1024 * 1024) || 1024 * 1024);
+const D2_IMPORT_MAX_OUTPUT_BYTES = Math.max(1024, Number(process.env.CMDP_D2_IMPORT_MAX_OUTPUT_BYTES || 4 * 1024 * 1024) || 4 * 1024 * 1024);
+const D2_IMPORT_MAX_ELEMENTS = Math.max(1, Number(process.env.CMDP_D2_IMPORT_MAX_ELEMENTS || 5000) || 5000);
+const D2_IMPORT_PROPOSAL_TTL_MS = Math.max(60_000, Number(process.env.CMDP_D2_IMPORT_PROPOSAL_TTL_MS || 30 * 60 * 1000) || 30 * 60 * 1000);
+const D2_IMPORT_ASSISTANT_MAX_SPEC_BYTES = Math.max(1024, Number(process.env.CMDP_D2_IMPORT_ASSISTANT_MAX_SPEC_BYTES || 256 * 1024) || 256 * 1024);
+const TEMPLATE_REQUEST_MAX_BYTES = Math.max(64 * 1024, Number(process.env.CMDP_TEMPLATE_REQUEST_MAX_BYTES || D2_IMPORT_MAX_INPUT_BYTES + D2_IMPORT_MAX_OUTPUT_BYTES + 512 * 1024) || D2_IMPORT_MAX_INPUT_BYTES + D2_IMPORT_MAX_OUTPUT_BYTES + 512 * 1024);
 const LITELLM_BASE_URL = process.env.LITELLM_BASE_URL || process.env.CMDP_LITELLM_BASE_URL || 'http://127.0.0.1:4000/v1';
 const LITELLM_MODEL = process.env.LITELLM_MODEL || process.env.CMDP_LITELLM_MODEL || 'corp-openai-gpt-4.1-mini';
 const LITELLM_API_KEY = readOptionalSecretValue(process.env.LITELLM_API_KEY || process.env.CMDP_LITELLM_API_KEY, process.env.LITELLM_API_KEY_FILE || process.env.CMDP_LITELLM_API_KEY_FILE);
@@ -130,6 +144,31 @@ const DEFAULT_ASSISTANT_SYSTEM_PROMPT = [
   'Для DSL expandRelations поле domain должно содержать только CMDBuild domain name/Code из cmdbuild_relation_hints.domains[].name, а не Description связи. Description используй только для выбора подходящего domain name. Если domain name не найден, не заполняй domain и добавь warning.',
   'Связи между объектами могут быть 1:N, N:1 и N:N. При анализе связей не останавливайся на первой найденной связи или первой карточке: учитывай все видимые связи и все подходящие related cards в пределах настроенных лимитов. Если связь неоднозначна, сформируй deterministic draft с явным domain/path и добавь warning.',
   'Результат должен оставаться детерминированным, кэшируемым и исполняемым без LLM. Используй только поддерживаемый DSL v1 и read-only MCP context; не добавляй runtime LLM вызовы.'
+].join('\n\n');
+const DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT = [
+  'Ты планируешь полный детерминированный поток CMDBuild данных. Пользователь описывает его свободным текстом, обычно блоками «Выборка 1», «Выборка 2», «Соединяем», и все упоминаемые объекты считаются реальными CMDBuild классами, атрибутами, lookup/reference значениями или domain relations.',
+  'Сформируй выборки и упорядоченный список operations. Каждая выборка должна иметь один доступный CMDBuild class identifier, полезные колонки и хотя бы одно исполнимое правило. Операция бывает match, union, difference или intersect; она всегда явно указывает левый источник, правый источник, результатный alias и поля сравнения.',
+  'Нельзя добавлять совмещение только потому, что создано несколько выборок. Используй match, только если это требуется задачей. Каждый from и with ссылается на alias выборки либо на результат операции, сформированный раньше в том же списке. Не допускай forward reference или цикл.',
+  'Для union/difference/intersect используй явные ключи on. Для CMDB-карточек используй Class + _id; не сравнивай label или Description как идентичность карточки. publishedAlias указывает один materialized alias для таблицы, а узлы и рёбра диаграммы остаются отдельными mapping sources.',
+  'Если CMDBuild-выборку необходимо сузить значением из уже выбранной строки, это оформляется явно в самой выборке: from и rule.valueColumn. Не добавляй из match неявные фильтры, deduplication или source dependency. Не выполняй широкое сканирование, если пользователь запросил точную связанную карточку или значение.',
+  'Проверяй Code и Description по permission-filtered MCP context. Не выдумывай class, attribute, domain, alias или relation identifier. Lookup, reference и domain сравнивай по отображаемому значению или Description, если это поддерживается моделью, а не по raw id.',
+  'Связи 1:N, N:1 и N:N требуют анализа всех доступных связанных карточек и всех hops. Не выбирай первую попавшуюся связь. При неоднозначности верни warning и оставь только подтверждённый deterministic path.',
+  'Не используй неограниченные отрицательные выборки как «всё, что не относится к ИС». Для динамической группы или выборки нужен положительный ограниченный критерий: class, attribute, lookup/reference value или явный relation path.',
+  'Ты возвращаешь только typed ObjectFlowProposal, не Spec JSON, не D2 source, не runtime результат и не действие сохранения, публикации или выполнения.'
+].join('\n\n');
+const DEFAULT_ASSISTANT_DIAGRAM_INTERPRETATION_PROMPT = [
+  'Ты интерпретируешь только семантику структурных D2 roles. D2 class является переиспользуемым визуальным типом и не является CMDBuild class. D2 nesting является layout hint и не доказывает CMDB hierarchy или relation.',
+  'Выбирай только один semantic для каждой supplied role: object означает один динамический CMDB object на строку источника; composite означает один динамический объект, разворачиваемый в согласованную вложенную структуру; group означает динамический контейнер по положительному правилу включения; static означает layout-only контейнер, декоративный объект или неизвлекаемый элемент.',
+  'OS, hardware, сетевые параметры, lookup labels и подобные details по умолчанию являются attribute projection родительского объекта, а не самостоятельными CMDB nodes. Не превращай их в role без явного отдельного источника объектов.',
+  'Контейнер без положительного критерия membership остаётся static. Не интерпретируй «не относится к текущей ИС» как dynamic group без явного ограниченного CMDB признака или relation path.',
+  'Не выбирай CMDB classes, attributes, aliases, object-flow stages, relation paths или mapping. Не добавляй и не удаляй D2 elements. Верни только typed semantic decisions для supplied exact role ids.'
+].join('\n\n');
+const DEFAULT_ASSISTANT_DIAGRAM_MAPPING_PROMPT = [
+  'Ты сопоставляешь только уже подтверждённые динамические D2 roles с supplied deterministic object-flow stages. CMDB source — это selection или intermediate match result; D2 role — это визуальная роль, а не instance path и не CMDB class name.',
+  'Сопоставляй role только со stage, который действительно возвращает подходящие CMDB objects. Используй exact supplied role ids и stage ids. Не выдумывай classes, attributes, aliases, stages, domains, relations или D2 paths.',
+  'Для object/composite выбирай source с объектами нужного типа. Для group выбирай source только при наличии положительного membership rule. Static role не сопоставляй с выборкой.',
+  'Label template и structured data должны использовать только колонки выбранного stage. Attribute projection остаётся данными родительского объекта, пока не существует отдельный подтверждённый source.',
+  'Не меняй D2 source, семантику roles, flow, Spec JSON, save, publish или runtime execution. Верни только typed mapping proposals для supplied exact ids.'
 ].join('\n\n');
 const STARTED_AT = new Date();
 const ABSOLUTE_EXECUTION_LIMITS = {
@@ -150,7 +189,9 @@ const clientLogs = [];
 const proxyLogs = [];
 const runtimeResultCache = new Map();
 const runtimeResultInFlight = new Map();
+const runtimeCacheTemplateIndex = new Map();
 const staticSnapshotCache = new Map();
+const staticSnapshotTemplateIndex = new Map();
 const requestContext = new AsyncLocalStorage();
 const cmdbuildHttpAgent = new http.Agent({
   keepAlive: true,
@@ -619,9 +660,13 @@ const metricDefinitions = {
   cmdp_runtime_cache_misses_total: { type: 'counter', help: 'Runtime cache misses by backend.' },
   cmdp_runtime_cache_build_seconds_count: { type: 'counter', help: 'Runtime cache build duration observation count.' },
   cmdp_runtime_cache_build_seconds_sum: { type: 'counter', help: 'Runtime cache build duration sum in seconds.' },
+  cmdp_runtime_cache_invalidations_total: { type: 'counter', help: 'Runtime cache invalidations by backend and status.' },
   cmdp_d2_render_errors_total: { type: 'counter', help: 'D2 render failures by reason.' },
   cmdp_d2_render_seconds_count: { type: 'counter', help: 'D2 render duration observation count.' },
   cmdp_d2_render_seconds_sum: { type: 'counter', help: 'D2 render duration sum in seconds.' },
+  cmdp_d2_import_total: { type: 'counter', help: 'D2 import requests by status.' },
+  cmdp_d2_import_seconds_count: { type: 'counter', help: 'D2 import duration observation count.' },
+  cmdp_d2_import_seconds_sum: { type: 'counter', help: 'D2 import duration sum in seconds.' },
   cmdp_template_run_errors_total: { type: 'counter', help: 'Template execution failures by action and reason.' },
   cmdp_execution_throttled_total: { type: 'counter', help: 'Template execution requests rejected by throttling.' },
   cmdp_health_ready: { type: 'gauge', help: 'Readiness status: 1 ready, 0 not ready.' }
@@ -815,7 +860,8 @@ function d2RendererConfigSummary() {
     maxDiagrams: config.maxDiagrams,
     concurrency: config.concurrency,
     layout: config.layout,
-    layoutAllowlist: config.layoutAllowlist
+    layoutAllowlist: config.layoutAllowlist,
+    importer: d2ImportConfigSummary()
   };
 }
 
@@ -823,6 +869,7 @@ function d2CacheContext() {
   const config = d2RendererConfig();
   return {
     d2: {
+      sourceBuilderVersion: 3,
       enabled: config.enabled,
       binary: config.binary,
       timeoutMs: config.timeoutMs,
@@ -931,6 +978,14 @@ function runD2Process(args, input, options = {}) {
         error: error && error.message ? error.message : String(error)
       });
     });
+    child.stdin.on('error', (error) => {
+      if (child && !child.killed) child.kill('SIGKILL');
+      finish({
+        ok: false,
+        reason: 'stdin_error',
+        error: error && error.message ? error.message : String(error)
+      });
+    });
     child.on('close', (code, signal) => {
       if (killedForOutput) {
         finish({
@@ -959,6 +1014,1715 @@ function runD2Process(args, input, options = {}) {
     if (input) child.stdin.write(input);
     child.stdin.end();
   });
+}
+
+function d2ImportConfigSummary() {
+  return {
+    binary: D2_IMPORT_BINARY,
+    timeoutMs: D2_IMPORT_TIMEOUT_MS,
+    maxInputBytes: D2_IMPORT_MAX_INPUT_BYTES,
+    maxOutputBytes: D2_IMPORT_MAX_OUTPUT_BYTES,
+    maxElements: D2_IMPORT_MAX_ELEMENTS,
+    proposalTtlMs: D2_IMPORT_PROPOSAL_TTL_MS,
+    assistantMaxSpecBytes: D2_IMPORT_ASSISTANT_MAX_SPEC_BYTES,
+    templateRequestMaxBytes: TEMPLATE_REQUEST_MAX_BYTES
+  };
+}
+
+function runD2ImportProcess(source, options = {}) {
+  const config = d2ImportConfigSummary();
+  const timeoutMs = Math.max(100, Number(options.timeoutMs || config.timeoutMs) || config.timeoutMs);
+  const maxOutputBytes = Math.max(1024, Number(options.maxOutputBytes || config.maxOutputBytes) || config.maxOutputBytes);
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    let stdout = '';
+    let stderr = '';
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    let killedForOutput = false;
+    let child;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ elapsedMs: Date.now() - startedAt, stdout, stderr: truncateText(stderr, 4096), ...result });
+    };
+    const timer = setTimeout(() => {
+      if (child && !child.killed) child.kill('SIGKILL');
+      finish({ ok: false, reason: 'timeout', error: `D2 import timed out after ${timeoutMs}ms.` });
+    }, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+
+    try {
+      child = spawn(config.binary, [`--max-input-bytes=${config.maxInputBytes}`, `--max-elements=${config.maxElements}`], {
+        shell: false,
+        windowsHide: true,
+        env: d2ProcessEnv(),
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+    } catch (error) {
+      finish({ ok: false, reason: 'spawn_error', error: error && error.message ? error.message : String(error) });
+      return;
+    }
+    child.stdout.on('data', (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > maxOutputBytes) {
+        killedForOutput = true;
+        if (!child.killed) child.kill('SIGKILL');
+        return;
+      }
+      stdout += chunk.toString('utf8');
+    });
+    child.stderr.on('data', (chunk) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes <= 4096) stderr += chunk.toString('utf8');
+    });
+    child.on('error', (error) => {
+      finish({
+        ok: false,
+        reason: error && error.code === 'ENOENT' ? 'binary_not_found' : 'process_error',
+        error: error && error.message ? error.message : String(error)
+      });
+    });
+    child.stdin.on('error', (error) => {
+      if (child && !child.killed) child.kill('SIGKILL');
+      finish({
+        ok: false,
+        reason: 'stdin_error',
+        error: error && error.message ? error.message : String(error)
+      });
+    });
+    child.on('close', (code, signal) => {
+      if (killedForOutput) {
+        finish({ ok: false, reason: 'output_limit', error: `D2 import output exceeded ${maxOutputBytes} bytes.` });
+      } else if (code !== 0) {
+        finish({
+          ok: false,
+          reason: 'exit_code',
+          exitCode: code == null ? null : code,
+          signal: signal || '',
+          error: stderr.trim() || `D2 import exited with code ${code == null ? 'unknown' : code}.`
+        });
+      } else {
+        finish({ ok: true, reason: 'ok' });
+      }
+    });
+    child.stdin.end(source);
+  });
+}
+
+function normalizeDiagramImportElement(value, fallbackKey = '') {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const key = String(source.key || source.id || source.name || fallbackKey || '').trim();
+  return {
+    key,
+    label: String(source.label || source.title || key).trim(),
+    kind: String(source.kind || source.type || source.shape || '').trim(),
+    parentKey: String(source.parentKey || source.parent || '').trim(),
+    childKey: String(source.childKey || source.child || '').trim(),
+    childrenKeys: uniqueStrings(Array.isArray(source.childrenKeys) ? source.childrenKeys : Array.isArray(source.children) ? source.children : []),
+    groupKeys: uniqueStrings(Array.isArray(source.groupKeys) ? source.groupKeys : source.group ? [source.group] : []),
+    sourceKey: String(source.sourceKey || source.source || source.from || '').trim(),
+    targetKey: String(source.targetKey || source.target || source.to || '').trim(),
+    direction: String(source.direction || '').trim(),
+    classKeys: uniqueStrings(Array.isArray(source.classKeys) ? source.classKeys : Array.isArray(source.classes) ? source.classes : []),
+    suggestedRole: normalizeDiagramImportSemantic(source.suggestedRole),
+    selectedRole: normalizeDiagramImportSemantic(source.selectedRole),
+    semanticReason: truncateText(String(source.semanticReason || ''), 300),
+    bindingHint: source.bindingHint && typeof source.bindingHint === 'object' && !Array.isArray(source.bindingHint)
+      ? cloneJsonValueServer(source.bindingHint, {})
+      : source.binding && typeof source.binding === 'object' && !Array.isArray(source.binding)
+        ? cloneJsonValueServer(source.binding, {})
+        : {},
+    styleHints: {
+      ...(source.styleHints && typeof source.styleHints === 'object' && !Array.isArray(source.styleHints) ? cloneJsonValueServer(source.styleHints, {}) : {}),
+      ...(source.shape ? { shape: String(source.shape) } : {}),
+      ...(Array.isArray(source.classes) && source.classes.length ? { classes: source.classes.map((item) => String(item)).filter(Boolean) } : {}),
+      ...(source.href ? { href: String(source.href) } : {}),
+      ...(source.tooltip ? { tooltip: String(source.tooltip) } : {}),
+      ...(source.board ? { board: String(source.board) } : {}),
+      ...(source.style && typeof source.style === 'object' && !Array.isArray(source.style)
+        ? { style: cloneJsonValueServer(source.style, {}) }
+        : {})
+    },
+    provenance: Array.isArray(source.provenance) ? source.provenance.map((item) => truncateText(String(item || ''), 200)).filter(Boolean) : []
+  };
+}
+
+function normalizeDiagramImportSemantic(value) {
+  const semantic = String(value || '').trim();
+  if (semantic === 'decorative') return 'static';
+  return ['object', 'composite', 'group', 'static'].includes(semantic) ? semantic : '';
+}
+
+function normalizeDiagramImportClass(value, fallbackKey = '') {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const key = String(source.key || source.name || source.id || fallbackKey || '').trim();
+  const usageKeys = uniqueStrings(source.usageKeys || source.elementKeys || source.sampleElementKeys || source.usages || []);
+  const definition = source.definition && typeof source.definition === 'object' && !Array.isArray(source.definition)
+    ? source.definition
+    : {};
+  const definitionStyleHints = {
+    ...(definition.shape ? { shape: String(definition.shape) } : {}),
+    ...(definition.style && typeof definition.style === 'object' && !Array.isArray(definition.style)
+      ? { style: cloneJsonValueServer(definition.style, {}) }
+      : {})
+  };
+  return {
+    key,
+    label: String(source.label || source.description || key).trim(),
+    usageKeys,
+    usageCount: Math.max(usageKeys.length, Number(source.usageCount || 0)),
+    nodeCount: Number(source.nodeCount || source.usage && source.usage.nodes || 0),
+    containerCount: Number(source.containerCount || source.groupCount || source.usage && source.usage.groups || 0),
+    styleHints: source.styleHints && typeof source.styleHints === 'object' && !Array.isArray(source.styleHints)
+      ? cloneJsonValueServer(source.styleHints, {})
+      : source.style && typeof source.style === 'object' && !Array.isArray(source.style)
+        ? { style: cloneJsonValueServer(source.style, {}) }
+        : definitionStyleHints
+  };
+}
+
+function normalizeDiagramImportIr(raw, source) {
+  const input = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const rawElements = input.elements && typeof input.elements === 'object' && !Array.isArray(input.elements) ? input.elements : input;
+  const normalizeList = (value, prefix) => (Array.isArray(value) ? value : []).map((item, index) => normalizeDiagramImportElement(item, `${prefix}_${index + 1}`)).filter((item) => item.key);
+  const elements = {
+    nodes: normalizeList(rawElements.nodes, 'node'),
+    edges: normalizeList(rawElements.edges, 'edge'),
+    groups: normalizeList(rawElements.groups, 'group'),
+    hierarchies: normalizeList(rawElements.hierarchies || rawElements.hierarchy, 'hierarchy')
+  };
+  const rawClasses = Array.isArray(input.classes)
+    ? input.classes
+    : Array.isArray(rawElements.classes)
+      ? rawElements.classes
+      : [];
+  const classes = rawClasses.map((item, index) => normalizeDiagramImportClass(item, `class_${index + 1}`)).filter((item) => item.key);
+  const count = elements.nodes.length + elements.edges.length + elements.groups.length + elements.hierarchies.length;
+  if (count > D2_IMPORT_MAX_ELEMENTS) {
+    const error = new Error(`D2 import contains ${count} elements, exceeding configured maxElements=${D2_IMPORT_MAX_ELEMENTS}.`);
+    error.code = 'd2_import_element_limit';
+    error.statusCode = 413;
+    throw error;
+  }
+  return {
+    version: Number(input.version) >= 3 ? 3 : Number(input.version) >= 2 ? 2 : 1,
+    source: {
+      format: 'd2',
+      hash: sha256Hex(source),
+      parser: String(input.source && (input.source.parser || input.source.parserVersion) || input.parser || 'cmdp-d2-import').trim(),
+      lossless: Boolean(input.source && input.source.lossless)
+    },
+    template: input.template && typeof input.template === 'object' && !Array.isArray(input.template)
+      ? cloneJsonValueServer(input.template, {})
+      : input.diagram && typeof input.diagram === 'object' && !Array.isArray(input.diagram)
+        ? cloneJsonValueServer(input.diagram, {})
+        : {},
+    elements,
+    classes,
+    warnings: uniqueStrings(Array.isArray(input.warnings) ? input.warnings : [])
+  };
+}
+
+function diagramImportStableId(prefix, value) {
+  return `${prefix}_${sha256Hex(String(value || prefix)).slice(0, 16)}`;
+}
+
+function diagramImportMappingFingerprint(family, mapping) {
+  const fields = mapping && mapping.fields && typeof mapping.fields === 'object' && !Array.isArray(mapping.fields) ? mapping.fields : {};
+  const identityFields = family === 'nodeMappings'
+    ? [fields.id]
+    : family === 'edgeMappings'
+      ? [fields.source, fields.target]
+      : family === 'groupMappings'
+        ? [fields.id]
+        : [fields.child, fields.parent];
+  return hashJson({
+    family,
+    type: mapping && (mapping.type || mapping.kind) || '',
+    from: diagramMappingSourceName(mapping),
+    identityFields: identityFields.map((item) => String(item || '').trim())
+  });
+}
+
+function diagramImportMappingWithId(family, mapping, fallbackIndex = 0) {
+  const next = cloneJsonValueServer(mapping, {});
+  if (!next.id) next.id = diagramImportStableId('mapping', `${family}:${diagramImportMappingFingerprint(family, next)}:${fallbackIndex}`);
+  return next;
+}
+
+function diagramImportRoleBinding(family, element) {
+  const hint = element && element.bindingHint && typeof element.bindingHint === 'object' ? element.bindingHint : {};
+  const fields = hint.fields && typeof hint.fields === 'object' && !Array.isArray(hint.fields) ? cloneJsonValueServer(hint.fields, {}) : {};
+  const defaults = family === 'nodeMappings'
+    ? { id: 'id', label: 'label', group: 'group', href: 'href' }
+    : family === 'edgeMappings'
+      ? { source: 'source', target: 'target', label: 'label' }
+      : family === 'groupMappings'
+        ? { id: 'id', label: 'label' }
+        : { child: 'child', parent: 'parent', label: 'label' };
+  const roleKey = String(element && element.key || '').trim();
+  const mapping = {
+    id: diagramImportStableId('mapping', `${family}:${roleKey}`),
+    from: String(hint.from || hint.sourceAlias || hint.alias || '').trim(),
+    fields: { ...defaults, ...fields },
+    importRole: {
+      key: roleKey,
+      label: String(element && element.label || roleKey).trim(),
+      kind: String(element && element.kind || '').trim(),
+      semantic: String(element && element.semanticCandidate || (
+        family === 'groupMappings' ? 'group' :
+          family === 'nodeMappings' ? 'node' :
+            family === 'edgeMappings' ? 'edge' : 'hierarchy'
+      )),
+      parentKey: String(element && element.parentKey || '').trim(),
+      childKey: String(element && element.childKey || '').trim(),
+      sourceKey: String(element && element.sourceKey || '').trim(),
+      targetKey: String(element && element.targetKey || '').trim(),
+      styleHints: element && element.styleHints && typeof element.styleHints === 'object' && !Array.isArray(element.styleHints)
+        ? cloneJsonValueServer(element.styleHints, {})
+        : {}
+    }
+  };
+  if (family === 'edgeMappings') mapping.type = String(hint.type || hint.kind || 'generic').trim() || 'generic';
+  if (hint.labelTemplate) mapping.labelTemplate = String(hint.labelTemplate);
+  if (hint.dataProfile && typeof hint.dataProfile === 'object' && !Array.isArray(hint.dataProfile)) mapping.dataProfile = cloneJsonValueServer(hint.dataProfile, {});
+  if (element && element.d2Template && typeof element.d2Template === 'object' && !Array.isArray(element.d2Template)) {
+    mapping.d2Template = cloneJsonValueServer(element.d2Template, {});
+  }
+  return mapping;
+}
+
+function diagramImportRoleFamilies(ir) {
+  const compositeNodes = ir.elements.groups.map((group) => ({
+    ...group,
+    semanticCandidate: 'composite',
+    d2Template: diagramImportCompositeTemplate(ir.elements, group.key)
+  }));
+  return [
+    ['nodeMappings', ir.elements.nodes.concat(compositeNodes)],
+    ['edgeMappings', ir.elements.edges],
+    ['groupMappings', ir.elements.groups],
+    ['hierarchyMappings', ir.elements.hierarchies]
+  ];
+}
+
+function diagramImportStructureIndex(structure) {
+  const source = structure && typeof structure === 'object' && !Array.isArray(structure) ? structure : {};
+  const nodes = Array.isArray(source.nodes) ? source.nodes : [];
+  const groups = Array.isArray(source.groups) ? source.groups : [];
+  const edges = Array.isArray(source.edges) ? source.edges : [];
+  const hierarchies = Array.isArray(source.hierarchies) ? source.hierarchies : [];
+  const parentByKey = new Map();
+  const groupByKey = new Map(groups.filter((item) => item && item.key).map((item) => [String(item.key), item]));
+  for (const element of nodes.concat(groups)) {
+    const key = String(element && element.key || '').trim();
+    const parent = String(element && element.parentKey || '').trim();
+    if (key && parent) parentByKey.set(key, parent);
+  }
+  for (const hierarchy of hierarchies) {
+    const child = String(hierarchy && hierarchy.childKey || '').trim();
+    const parent = String(hierarchy && hierarchy.parentKey || '').trim();
+    if (child && parent && groupByKey.has(parent) && !parentByKey.has(child)) parentByKey.set(child, parent);
+  }
+  return { nodes, groups, edges, hierarchies, parentByKey, groupByKey };
+}
+
+function diagramImportAncestorGroups(key, index) {
+  const result = [];
+  const seen = new Set();
+  let current = String(key || '').trim();
+  while (current && index.parentByKey.has(current)) {
+    const parent = String(index.parentByKey.get(current) || '').trim();
+    if (!parent || seen.has(parent)) break;
+    seen.add(parent);
+    if (index.groupByKey.has(parent)) result.push(parent);
+    current = parent;
+  }
+  return result;
+}
+
+function diagramImportDescendantKeys(structure, rootKey) {
+  const index = diagramImportStructureIndex(structure);
+  const descendants = new Set([String(rootKey || '').trim()].filter(Boolean));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [child, parent] of index.parentByKey.entries()) {
+      if (parent === rootKey || descendants.has(parent)) {
+        if (!descendants.has(child)) {
+          descendants.add(child);
+          changed = true;
+        }
+      }
+    }
+  }
+  return descendants;
+}
+
+function diagramImportCompositeTemplate(structure, rootKey) {
+  const index = diagramImportStructureIndex(structure);
+  const descendants = diagramImportDescendantKeys(structure, rootKey);
+  const memberKeys = new Set([rootKey, ...descendants]);
+  return {
+    version: 1,
+    rootKey,
+    nodes: index.nodes.filter((item) => descendants.has(String(item && item.key || ''))).map((item) => cloneJsonValueServer(item, {})),
+    groups: index.groups.filter((item) => memberKeys.has(String(item && item.key || ''))).map((item) => cloneJsonValueServer(item, {})),
+    edges: index.edges.filter((item) => memberKeys.has(String(item && item.sourceKey || '')) && memberKeys.has(String(item && item.targetKey || ''))).map((item) => cloneJsonValueServer(item, {})),
+    hierarchies: index.hierarchies.filter((item) => memberKeys.has(String(item && item.parentKey || '')) && memberKeys.has(String(item && item.childKey || ''))).map((item) => cloneJsonValueServer(item, {}))
+  };
+}
+
+function diagramImportContainerRoles(ir) {
+  return (ir.elements.groups || []).map((group) => ({
+    key: String(group.key || '').trim(),
+    label: String(group.label || group.key || '').trim(),
+    suggestedRole: normalizeDiagramImportSemantic(group.suggestedRole) || 'group',
+    selectedRole: normalizeDiagramImportSemantic(group.selectedRole),
+    semanticReason: String(group.semanticReason || '').trim(),
+    options: ['composite', 'group', 'decorative']
+  }));
+}
+
+function diagramImportSemanticSelections(proposal, semanticOverrides = []) {
+  const overrides = new Map((Array.isArray(semanticOverrides) ? semanticOverrides : [])
+    .filter((item) => item && item.key)
+    .map((item) => [String(item.key), normalizeDiagramImportSemantic(item.semantic)]));
+  const selections = new Map();
+  for (const role of Array.isArray(proposal && proposal.containerRoles) ? proposal.containerRoles : []) {
+    const key = String(role && role.key || '').trim();
+    const selected = overrides.has(key) ? overrides.get(key) : normalizeDiagramImportSemantic(role && role.selectedRole);
+    selections.set(key, {
+      selected,
+      effective: selected || normalizeDiagramImportSemantic(role && role.suggestedRole) || 'group',
+      confirmed: Boolean(selected)
+    });
+  }
+  return selections;
+}
+
+function diagramImportSemanticConditions(family, element, structure) {
+  const index = diagramImportStructureIndex(structure);
+  const semantic = String(element && element.semanticCandidate || '').trim();
+  const conditions = [];
+  const addAncestors = (key) => {
+    for (const ancestor of diagramImportAncestorGroups(key, index)) {
+      conditions.push({ key: ancestor, allowed: ['group', 'decorative'] });
+    }
+  };
+  if (semantic === 'composite') {
+    conditions.push({ key: element.key, allowed: ['composite'] });
+    addAncestors(element.key);
+  } else if (family === 'groupMappings') {
+    conditions.push({ key: element.key, allowed: ['group'] });
+    addAncestors(element.key);
+  } else if (family === 'hierarchyMappings') {
+    if (index.groupByKey.has(element.parentKey)) conditions.push({ key: element.parentKey, allowed: ['group'] });
+    if (index.groupByKey.has(element.childKey)) conditions.push({ key: element.childKey, allowed: ['group'] });
+    addAncestors(element.parentKey || element.childKey);
+  } else if (family === 'edgeMappings') {
+    const sourceAncestors = (index.groupByKey.has(element.sourceKey) ? [String(element.sourceKey)] : []).concat(diagramImportAncestorGroups(element.sourceKey, index));
+    const targetAncestors = new Set((index.groupByKey.has(element.targetKey) ? [String(element.targetKey)] : []).concat(diagramImportAncestorGroups(element.targetKey, index)));
+    for (const ancestor of sourceAncestors) {
+      if (targetAncestors.has(ancestor)) conditions.push({ key: ancestor, allowed: ['group', 'decorative'] });
+    }
+  } else {
+    addAncestors(element.key);
+  }
+  return conditions;
+}
+
+function diagramImportBindingIsActive(binding, selections) {
+  if (binding && binding.retained) return true;
+  return (Array.isArray(binding && binding.semanticConditions) ? binding.semanticConditions : []).every((condition) => {
+    const selection = selections.get(String(condition && condition.key || ''));
+    return !selection || (Array.isArray(condition.allowed) && condition.allowed.includes(selection.effective));
+  });
+}
+
+function diagramImportContainerRoleIsRelevant(key, structure, selections) {
+  const index = diagramImportStructureIndex(structure);
+  return diagramImportAncestorGroups(key, index).every((ancestor) => {
+    const selection = selections.get(ancestor);
+    return !selection || selection.effective !== 'composite';
+  });
+}
+
+function diagramImportSpecAliases(spec) {
+  return uniqueStrings((Array.isArray(spec && spec.steps) ? spec.steps : []).map((step) => step && step.as).filter(Boolean));
+}
+
+function diagramImportStepDependencies(step) {
+  if (!step || typeof step !== 'object' || Array.isArray(step)) return [];
+  const dependencies = [];
+  for (const name of ['from', 'with', 'left', 'right', 'sourceAlias']) {
+    if (typeof step[name] === 'string') dependencies.push(step[name]);
+  }
+  if (typeof step.source === 'string') dependencies.push(step.source);
+  else if (step.source && typeof step.source === 'object' && !Array.isArray(step.source)) {
+    for (const name of ['alias', 'from', 'with', 'left', 'right']) {
+      if (typeof step.source[name] === 'string') dependencies.push(step.source[name]);
+    }
+  }
+  if (Array.isArray(step.sources)) {
+    for (const source of step.sources) {
+      if (typeof source === 'string') dependencies.push(source);
+      else if (source && typeof source === 'object' && typeof source.alias === 'string') dependencies.push(source.alias);
+    }
+  }
+  return uniqueStrings(dependencies);
+}
+
+function createDiagramImportProposalV2Legacy(currentSpec, ir, options = {}) {
+  const sourceSpec = cloneJsonValueServer(currentSpec, {});
+  const currentDiagrams = Array.isArray(sourceSpec.result && sourceSpec.result.diagrams) ? sourceSpec.result.diagrams : [];
+  const currentDiagram = currentDiagrams.find((item) => item && typeof item === 'object' && !Array.isArray(item)) || {};
+  const diagramId = String(currentDiagram.id || diagramImportStableId('diagram', currentDiagram.name || options.templateCode || 'topology')).trim();
+  const bindings = [];
+  const matchedIds = new Set();
+  let ignoredLegacyMappings = 0;
+  const previousSemantics = currentDiagram && currentDiagram.authoring && currentDiagram.authoring.d2Import && currentDiagram.authoring.d2Import.semantics && typeof currentDiagram.authoring.d2Import.semantics === 'object'
+    ? currentDiagram.authoring.d2Import.semantics
+    : {};
+  const containerRoles = diagramImportContainerRoles(ir).map((role) => ({
+    ...role,
+    selectedRole: role.selectedRole || normalizeDiagramImportSemantic(previousSemantics[role.key])
+  }));
+
+  for (const [family, elements] of diagramImportRoleFamilies(ir)) {
+    const existing = normalizeDiagramMappingList(currentDiagram[family])
+      .map((mapping, index) => diagramImportMappingWithId(family, mapping, index))
+      .filter((mapping) => {
+        const roleKey = String(mapping && mapping.importRole && mapping.importRole.key || '').trim();
+        if (roleKey) return true;
+        ignoredLegacyMappings += 1;
+        return false;
+      });
+    for (const element of elements) {
+      const proposed = diagramImportRoleBinding(family, element);
+      const semanticConditions = diagramImportSemanticConditions(family, element, ir.elements);
+      let match = existing.find((mapping) => mapping.id === proposed.id);
+      let confidence = match ? 'exact' : 'none';
+      if (!match) {
+        const roleMatches = existing.filter((mapping) => mapping.importRole && mapping.importRole.key === element.key);
+        if (roleMatches.length === 1) {
+          match = roleMatches[0];
+          confidence = 'exact';
+        }
+      }
+      if (!match && proposed.from) {
+        const fingerprint = diagramImportMappingFingerprint(family, proposed);
+        const strong = existing.filter((mapping) => diagramImportMappingFingerprint(family, mapping) === fingerprint);
+        if (strong.length === 1) {
+          match = strong[0];
+          confidence = 'strong';
+        } else if (strong.length > 1) {
+          confidence = 'ambiguous';
+        }
+      }
+      const mapping = match
+        ? {
+            ...cloneJsonValueServer(match, {}),
+            importRole: proposed.importRole,
+            ...(proposed.d2Template ? { d2Template: cloneJsonValueServer(proposed.d2Template, {}) } : {})
+          }
+        : proposed;
+      if (match) matchedIds.add(match.id);
+      const unresolved = [];
+      if (!diagramMappingSourceName(mapping)) unresolved.push('from');
+      bindings.push({
+        id: proposed.id,
+        family,
+        role: proposed.importRole,
+        confidence,
+        matchedMappingId: match && match.id || '',
+        mapping,
+        semanticConditions,
+        unresolved,
+        destructive: false
+      });
+    }
+    for (const mapping of existing) {
+      if (matchedIds.has(mapping.id)) continue;
+      bindings.push({
+        id: mapping.id,
+        family,
+        role: mapping.importRole || { key: '', label: mapping.id, kind: '' },
+        confidence: 'existing',
+        matchedMappingId: mapping.id,
+        mapping,
+        unresolved: [],
+        destructive: false,
+        retained: true
+      });
+    }
+  }
+
+  const semanticSelections = diagramImportSemanticSelections({ containerRoles });
+  bindings.forEach((binding) => {
+    binding.active = diagramImportBindingIsActive(binding, semanticSelections);
+  });
+  const unresolved = bindings
+    .filter((item) => item.active && item.unresolved.length)
+    .map((item) => ({ id: item.id, family: item.family, fields: item.unresolved }));
+  for (const role of containerRoles) {
+    if (diagramImportContainerRoleIsRelevant(role.key, ir.elements, semanticSelections) && !semanticSelections.get(role.key).confirmed) {
+      unresolved.push({ id: `semantic:${role.key}`, family: 'containerRoles', fields: ['semantic'] });
+    }
+  }
+
+  return {
+    version: 2,
+    proposalId: crypto.randomUUID(),
+    createdAt: Date.now(),
+    templateCode: String(options.templateCode || '').trim(),
+    baseSpecHash: String(options.baseSpecHash || '').trim(),
+    editorSpecHash: hashJson(sourceSpec),
+    existingAliases: diagramImportSpecAliases(sourceSpec),
+    source: ir.source,
+    sourceText: String(options.sourceText || ''),
+    template: ir.template,
+    structure: cloneJsonValueServer(ir.elements, {}),
+    containerRoles,
+    diagramId,
+    bindings,
+    unresolved,
+    warnings: uniqueStrings((ir.warnings || []).concat(ignoredLegacyMappings
+      ? [`Ignored ${ignoredLegacyMappings} existing diagram mappings without importRole; legacy mapping compatibility is not supported for D2 import v2.`]
+      : []))
+  };
+}
+
+function diagramImportRoleMapping(role, existing = {}) {
+  const source = existing && typeof existing === 'object' && !Array.isArray(existing) ? existing : {};
+  const stageSource = source.source && typeof source.source === 'object' && !Array.isArray(source.source) ? source.source : {};
+  const primary = source.primary && typeof source.primary === 'object' && !Array.isArray(source.primary) ? source.primary : {};
+  return {
+    id: String(source.id || diagramImportStableId('role_mapping', role.id)).trim(),
+    roleId: role.id,
+    source: {
+      stageId: String(stageSource.stageId || '').trim(),
+      alias: String(stageSource.alias || '').trim(),
+      kind: String(stageSource.kind || '').trim(),
+      className: String(stageSource.className || '').trim()
+    },
+    primary: {
+      className: String(primary.className || '').trim(),
+      idAttribute: String(primary.idAttribute || '_id').trim() || '_id',
+      labelTemplate: String(primary.labelTemplate || '${Description}'),
+      structuredFields: uniqueStrings(primary.structuredFields || ['Code', 'Description']),
+      filters: Array.isArray(primary.filters) ? cloneJsonValueServer(primary.filters, []) : []
+    },
+    related: (Array.isArray(source.related) ? source.related : []).map((item, index) => ({
+      id: String(item && item.id || diagramImportStableId('related', `${role.id}:${index}`)),
+      className: String(item && item.className || '').trim(),
+      path: (Array.isArray(item && item.path) ? item.path : []).map((hop) => ({
+        kind: String(hop && hop.kind || 'domain').trim(),
+        name: String(hop && (hop.name || hop.domain || hop.reference) || '').trim(),
+        domain: String(hop && hop.domain || '').trim(),
+        targetClass: String(hop && hop.targetClass || '').trim(),
+        direction: String(hop && hop.direction || 'both').trim() || 'both'
+      })).filter((hop) => hop.name),
+      structuredFields: uniqueStrings(item && item.structuredFields || ['Code', 'Description'])
+    })).filter((item) => item.className || item.path.length || item.structuredFields.length)
+  };
+}
+
+function diagramImportClassRoleDefinitions(ir) {
+  const elements = ir && ir.elements || { nodes: [], groups: [] };
+  const allElements = (elements.nodes || []).concat(elements.groups || []);
+  const declared = new Map((Array.isArray(ir && ir.classes) ? ir.classes : []).map((item) => [String(item.key || ''), item]));
+  for (const element of allElements) {
+    for (const classKey of Array.isArray(element && element.classKeys) ? element.classKeys : []) {
+      if (!declared.has(classKey)) declared.set(classKey, normalizeDiagramImportClass({ key: classKey }));
+    }
+  }
+  const roles = [];
+  for (const [classKey, definition] of declared.entries()) {
+    const usages = allElements.filter((item) => Array.isArray(item.classKeys) && item.classKeys.includes(classKey));
+    if (!usages.length) continue;
+    const containerUsages = usages.filter((item) => (elements.groups || []).some((group) => group.key === item.key));
+    const suggested = containerUsages.length
+      ? normalizeDiagramImportSemantic(containerUsages[0].suggestedRole) || 'group'
+      : 'object';
+    roles.push({
+      id: diagramImportStableId('d2_class', classKey),
+      kind: 'd2Class',
+      key: classKey,
+      label: definition.label || classKey,
+      elementKeys: usages.map((item) => item.key),
+      containerKeys: containerUsages.map((item) => item.key),
+      suggestedSemantic: suggested,
+      semanticReason: containerUsages.length
+        ? `D2 class is used by ${containerUsages.length} container object(s).`
+        : `D2 class is used by ${usages.length} leaf object(s).`,
+      options: containerUsages.length ? ['composite', 'group', 'static'] : ['object', 'static'],
+      exemplarKey: containerUsages.length === 1 ? containerUsages[0].key : '',
+      exemplarRequired: containerUsages.length > 1,
+      styleHints: cloneJsonValueServer(definition.styleHints, {})
+    });
+  }
+  for (const group of elements.groups || []) {
+    if (Array.isArray(group.classKeys) && group.classKeys.length) continue;
+    roles.push({
+      id: diagramImportStableId('d2_container', group.key),
+      kind: 'untypedContainer',
+      key: group.key,
+      label: group.label || group.key,
+      elementKeys: [group.key],
+      containerKeys: [group.key],
+      suggestedSemantic: 'static',
+      semanticReason: 'D2 container has no reusable D2 class and remains one structural layout role.',
+      options: ['static', 'group'],
+      exemplarKey: group.key,
+      exemplarRequired: false,
+      styleHints: cloneJsonValueServer(group.styleHints, {})
+    });
+  }
+  return roles;
+}
+
+function diagramImportV3Unresolved(roles, relationRules = [], placementRules = []) {
+  const unresolved = [];
+  for (const role of roles) {
+    const semantic = normalizeDiagramImportSemantic(role.selectedSemantic);
+    if (!semantic) unresolved.push({ id: role.id, family: 'roles', fields: ['semantic'] });
+    if (role.exemplarRequired && !role.exemplarKey) unresolved.push({ id: role.id, family: 'roles', fields: ['exemplarKey'] });
+    const primary = role.mapping && role.mapping.primary || {};
+    const source = role.mapping && role.mapping.source || {};
+    if (semantic && semantic !== 'static' && !String(source.stageId || '').trim()) {
+      unresolved.push({ id: role.id, family: 'roles', fields: ['source.stageId'] });
+    }
+    if (semantic === 'static' && primary.className && !source.stageId && !(Array.isArray(primary.filters) && primary.filters.length)) {
+      unresolved.push({ id: role.id, family: 'roles', fields: ['primary.filters'] });
+    }
+    for (const related of role.mapping && Array.isArray(role.mapping.related) ? role.mapping.related : []) {
+      if (!related.className || !related.path.length) unresolved.push({ id: related.id, family: 'related', fields: ['className', 'path'] });
+    }
+  }
+  for (const rule of Array.isArray(relationRules) ? relationRules : []) {
+    if (!rule || !rule.parentRoleId || !rule.childRoleId || !Array.isArray(rule.path) || !rule.path.length) {
+      unresolved.push({ id: rule && rule.id || 'relation', family: 'relationRules', fields: ['parentRoleId', 'childRoleId', 'path'] });
+    }
+  }
+  for (const rule of Array.isArray(placementRules) ? placementRules : []) {
+    if (!rule || !rule.parentRoleId || !rule.childRoleId) {
+      unresolved.push({ id: rule && rule.id || 'placement', family: 'placementRules', fields: ['parentRoleId', 'childRoleId'] });
+    }
+  }
+  return unresolved;
+}
+
+function createDiagramImportProposal(currentSpec, ir, options = {}) {
+  if (!ir || ir.version !== 3) {
+    const error = new Error('D2 importer result version is no longer supported. Rebuild the class-aware importer and analyze again.');
+    error.code = 'diagram_import_ir_version';
+    error.statusCode = 409;
+    throw error;
+  }
+  const sourceSpec = cloneJsonValueServer(currentSpec, {});
+  const currentDiagrams = Array.isArray(sourceSpec.result && sourceSpec.result.diagrams) ? sourceSpec.result.diagrams : [];
+  const currentDiagram = currentDiagrams.find((item) => item && typeof item === 'object' && !Array.isArray(item)) || {};
+  const previousImport = currentDiagram.authoring && currentDiagram.authoring.d2Import && currentDiagram.authoring.d2Import.version === 3
+    ? currentDiagram.authoring.d2Import
+    : {};
+  const previousRoles = new Map((Array.isArray(previousImport.roles) ? previousImport.roles : []).map((role) => [String(role.id || ''), role]));
+  const previousMappings = new Map((Array.isArray(previousImport.roleMappings) ? previousImport.roleMappings : []).map((mapping) => [String(mapping.roleId || ''), mapping]));
+  const roles = diagramImportClassRoleDefinitions(ir).map((role) => {
+    const previousRole = previousRoles.get(role.id) || {};
+    const selectedSemantic = normalizeDiagramImportSemantic(previousRole.selectedSemantic) || (role.suggestedSemantic === 'object' || role.suggestedSemantic === 'static' ? role.suggestedSemantic : '');
+    const exemplarKey = role.exemplarRequired
+      ? String(previousRole.exemplarKey || '').trim()
+      : role.exemplarKey;
+    return {
+      ...role,
+      selectedSemantic,
+      exemplarKey,
+      mapping: diagramImportRoleMapping(role, previousMappings.get(role.id))
+    };
+  });
+  const relationRules = Array.isArray(previousImport.relationRules) ? cloneJsonValueServer(previousImport.relationRules, []) : [];
+  const placementRules = Array.isArray(previousImport.placementRules) ? cloneJsonValueServer(previousImport.placementRules, []) : [];
+  const catalog = options.catalog && typeof options.catalog === 'object' ? options.catalog : null;
+  const warnings = [];
+  if (currentDiagram.authoring && currentDiagram.authoring.d2Import && currentDiagram.authoring.d2Import.version !== 3) {
+    warnings.push('Existing D2 authoring mappings use an unsupported legacy version and were not migrated. Review the class-based mappings again.');
+  }
+  return {
+    version: 3,
+    proposalId: crypto.randomUUID(),
+    createdAt: Date.now(),
+    templateCode: String(options.templateCode || '').trim(),
+    baseSpecHash: String(options.baseSpecHash || '').trim(),
+    editorSpecHash: hashJson(sourceSpec),
+    source: ir.source,
+    sourceText: String(options.sourceText || ''),
+    template: ir.template,
+    structure: cloneJsonValueServer(ir.elements, {}),
+    classes: cloneJsonValueServer(ir.classes, []),
+    catalogHash: catalog ? hashJson({ classes: catalog.classes, domains: catalog.domains }) : '',
+    roles,
+    relationRules,
+    placementRules,
+    diagramId: String(currentDiagram.id || diagramImportStableId('diagram', currentDiagram.name || options.templateCode || 'topology')).trim(),
+    unresolved: diagramImportV3Unresolved(roles, relationRules, placementRules),
+    warnings
+  };
+}
+
+function diagramImportProposalSignaturePayload(proposal) {
+  const payload = cloneJsonValueServer(proposal, {});
+  delete payload.signature;
+  return payload;
+}
+
+function signDiagramImportProposal(proposal, authToken) {
+  const next = cloneJsonValueServer(proposal, {});
+  next.signature = crypto
+    .createHmac('sha256', CSRF_SECRET)
+    .update(String(authToken || ''))
+    .update('\n')
+    .update(stableJsonStringify(diagramImportProposalSignaturePayload(next)))
+    .digest('hex');
+  return next;
+}
+
+function assertDiagramImportProposal(proposal, authToken) {
+  if (!proposal || typeof proposal !== 'object' || Array.isArray(proposal)) {
+    const error = new Error('Diagram import proposal is required.');
+    error.code = 'diagram_import_proposal_required';
+    error.statusCode = 422;
+    throw error;
+  }
+  if (proposal.version !== 3) {
+    const error = new Error('D2 import proposal version is no longer supported. Analyze the D2 source again.');
+    error.code = 'diagram_import_proposal_version';
+    error.statusCode = 409;
+    throw error;
+  }
+  const createdAt = Number(proposal.createdAt || 0);
+  if (!Number.isFinite(createdAt) || createdAt <= 0 || Date.now() - createdAt > D2_IMPORT_PROPOSAL_TTL_MS) {
+    const error = new Error('D2 import proposal expired. Analyze the D2 source again.');
+    error.code = 'diagram_import_proposal_expired';
+    error.statusCode = 409;
+    throw error;
+  }
+  const expected = signDiagramImportProposal(proposal, authToken).signature;
+  if (!proposal.signature || !timingSafeEqualString(proposal.signature, expected)) {
+    const error = new Error('D2 import proposal provenance is invalid. Analyze the D2 source again.');
+    error.code = 'diagram_import_proposal_invalid';
+    error.statusCode = 409;
+    throw error;
+  }
+  if (proposal.source && proposal.source.hash && sha256Hex(proposal.sourceText || '') !== proposal.source.hash) {
+    const error = new Error('D2 source changed after analysis. Analyze it again.');
+    error.code = 'diagram_import_source_conflict';
+    error.statusCode = 409;
+    throw error;
+  }
+  return proposal;
+}
+
+function diagramImportRequiredMappingFields(family) {
+  if (family === 'nodeMappings' || family === 'groupMappings') return ['id'];
+  if (family === 'edgeMappings') return ['source', 'target'];
+  if (family === 'hierarchyMappings') return ['child', 'parent'];
+  return [];
+}
+
+function diagramImportMappingWithOverride(binding, override) {
+  const raw = override && override.mapping && typeof override.mapping === 'object' && !Array.isArray(override.mapping)
+    ? override.mapping
+    : override && typeof override === 'object' && !Array.isArray(override)
+      ? override
+      : {};
+  const mapping = cloneJsonValueServer(binding && binding.mapping, {});
+  for (const name of ['from', 'source', 'sourceAlias', 'type', 'kind', 'labelTemplate']) {
+    if (Object.prototype.hasOwnProperty.call(raw, name)) mapping[name] = String(raw[name] || '').trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(raw, 'dataProfile') && raw.dataProfile && typeof raw.dataProfile === 'object' && !Array.isArray(raw.dataProfile)) {
+    mapping.dataProfile = cloneJsonValueServer(raw.dataProfile, {});
+  }
+  if (Object.prototype.hasOwnProperty.call(raw, 'fields')) {
+    mapping.fields = {};
+    if (raw.fields && typeof raw.fields === 'object' && !Array.isArray(raw.fields)) {
+      for (const [name, value] of Object.entries(raw.fields)) {
+        const text = String(value || '').trim();
+        if (text) mapping.fields[String(name)] = text;
+      }
+    }
+  }
+  mapping.id = String(binding && binding.mapping && binding.mapping.id || binding && binding.id || '').trim();
+  mapping.importRole = cloneJsonValueServer(binding && binding.role, {});
+  return mapping;
+}
+
+function diagramImportProposalWithOverrides(proposal, bindingOverrides = [], semanticOverrides = []) {
+  const next = cloneJsonValueServer(proposal, {});
+  const overrides = new Map((Array.isArray(bindingOverrides) ? bindingOverrides : [])
+    .filter((item) => item && item.id)
+    .map((item) => [String(item.id), item]));
+  const selections = diagramImportSemanticSelections(next, semanticOverrides);
+  next.containerRoles = (Array.isArray(next.containerRoles) ? next.containerRoles : []).map((role) => ({
+    ...role,
+    selectedRole: selections.get(String(role && role.key || '')) && selections.get(String(role && role.key || '')).selected || ''
+  }));
+  next.bindings = (Array.isArray(next.bindings) ? next.bindings : []).map((binding) => {
+    const override = overrides.get(String(binding && binding.id || '')) || {};
+    const mapping = diagramImportMappingWithOverride(binding, override);
+    const remove = override.remove === true;
+    const active = diagramImportBindingIsActive(binding, selections);
+    const unresolved = [];
+    if (active && !remove && !diagramMappingSourceName(mapping)) unresolved.push('from');
+    for (const field of diagramImportRequiredMappingFields(binding && binding.family)) {
+      if (active && !remove && !String(mapping.fields && mapping.fields[field] || '').trim()) unresolved.push(field);
+    }
+    return {
+      ...binding,
+      mapping,
+      remove,
+      active,
+      confidence: override.confidence === 'manual' ? 'manual' : binding.confidence,
+      unresolved: uniqueStrings(unresolved)
+    };
+  });
+  next.unresolved = next.bindings
+    .filter((binding) => binding && binding.active !== false && !binding.remove && binding.unresolved && binding.unresolved.length)
+    .map((binding) => ({ id: binding.id, family: binding.family, fields: binding.unresolved }));
+  for (const role of next.containerRoles) {
+    const selection = selections.get(String(role && role.key || ''));
+    if (!diagramImportContainerRoleIsRelevant(role.key, next.structure, selections)) continue;
+    if (!selection || !selection.confirmed) {
+      next.unresolved.push({ id: `semantic:${String(role && role.key || '')}`, family: 'containerRoles', fields: ['semantic'] });
+      continue;
+    }
+    if (selection.effective === 'composite') {
+      const descendants = diagramImportDescendantKeys(next.structure, role.key);
+      const boundaryEdge = (next.structure && Array.isArray(next.structure.edges) ? next.structure.edges : []).find((edge) => {
+        const sourceInside = descendants.has(String(edge && edge.sourceKey || ''));
+        const targetInside = descendants.has(String(edge && edge.targetKey || ''));
+        return sourceInside !== targetInside;
+      });
+      if (boundaryEdge) next.unresolved.push({ id: `semantic:${role.key}`, family: 'containerRoles', fields: ['boundaryEdge'] });
+    }
+  }
+  return next;
+}
+
+function diagramImportAssistantSpec(currentSpec, proposal = null) {
+  const next = cloneJsonValueServer(currentSpec, {});
+  next.result = next.result && typeof next.result === 'object' && !Array.isArray(next.result) ? next.result : {};
+  const diagrams = Array.isArray(next.result.diagrams) ? next.result.diagrams : [];
+  for (const diagram of diagrams) {
+    const d2Import = diagram && diagram.authoring && diagram.authoring.d2Import;
+    if (d2Import && typeof d2Import === 'object' && !Array.isArray(d2Import)) {
+      delete d2Import.source;
+      delete d2Import.structure;
+      delete d2Import.template;
+    }
+    for (const family of ['nodeMappings', 'edgeMappings', 'groupMappings', 'hierarchyMappings']) {
+      for (const mapping of normalizeDiagramMappingList(diagram[family])) delete mapping.d2Template;
+    }
+  }
+  if (proposal && proposal.version === 3) {
+    const diagram = diagrams.find((item) => item && typeof item === 'object' && !Array.isArray(item)) || { name: 'topology', type: 'topology' };
+    if (!diagrams.includes(diagram)) diagrams.push(diagram);
+    diagram.authoring = diagram.authoring && typeof diagram.authoring === 'object' && !Array.isArray(diagram.authoring) ? diagram.authoring : {};
+    diagram.authoring.d2Import = {
+      version: 3,
+      roles: (proposal.roles || []).map((role) => ({
+        id: role.id,
+        key: role.key,
+        kind: role.kind,
+        selectedSemantic: role.selectedSemantic
+      })),
+      roleMappings: (proposal.roles || []).map((role) => cloneJsonValueServer(role.mapping, {})),
+      relationRules: cloneJsonValueServer(proposal.relationRules, []),
+      placementRules: cloneJsonValueServer(proposal.placementRules, [])
+    };
+  }
+  next.result.diagrams = diagrams;
+  const inputBytes = Buffer.byteLength(stableJsonStringify(next), 'utf8');
+  if (inputBytes > D2_IMPORT_ASSISTANT_MAX_SPEC_BYTES) {
+    const error = new Error(`D2 assistant spec exceeded configured maxSpecBytes=${D2_IMPORT_ASSISTANT_MAX_SPEC_BYTES}.`);
+    error.code = 'd2_import_assistant_spec_limit';
+    error.statusCode = 413;
+    throw error;
+  }
+  return next;
+}
+
+function applyDiagramImportProposalV2Legacy(currentSpec, proposal, bindingOverrides = [], semanticOverrides = []) {
+  const sourceSpec = cloneJsonValueServer(currentSpec, {});
+  if (!proposal || typeof proposal !== 'object' || Array.isArray(proposal)) throw new Error('Diagram import proposal is required.');
+  if (proposal.editorSpecHash && hashJson(sourceSpec) !== proposal.editorSpecHash) {
+    const error = new Error('Template draft changed after D2 analysis. Analyze the D2 source again before applying it.');
+    error.code = 'diagram_import_editor_conflict';
+    error.statusCode = 409;
+    throw error;
+  }
+  const reviewProposal = diagramImportProposalWithOverrides(proposal, bindingOverrides, semanticOverrides);
+  sourceSpec.steps = Array.isArray(sourceSpec.steps) ? sourceSpec.steps.slice() : [];
+  const existingAliases = new Set(diagramImportSpecAliases(sourceSpec));
+  for (const step of Array.isArray(reviewProposal.dslSteps) ? reviewProposal.dslSteps : []) {
+    const alias = String(step && step.as || '').trim();
+    if (!alias || existingAliases.has(alias)) continue;
+    const missingDependencies = diagramImportStepDependencies(step).filter((dependency) => !existingAliases.has(dependency));
+    if (missingDependencies.length) {
+      const error = new Error('D2 import assistant produced a DSL step before its source aliases were available.');
+      error.code = 'diagram_import_dsl_dependency';
+      error.statusCode = 422;
+      error.details = [{ alias, fields: ['dslDependency'], dependencies: missingDependencies }];
+      throw error;
+    }
+    sourceSpec.steps.push(cloneJsonValueServer(step, {}));
+    existingAliases.add(alias);
+  }
+  if (reviewProposal.dslParams && typeof reviewProposal.dslParams === 'object' && !Array.isArray(reviewProposal.dslParams)) {
+    sourceSpec.params = sourceSpec.params && typeof sourceSpec.params === 'object' && !Array.isArray(sourceSpec.params) ? sourceSpec.params : {};
+    for (const [name, definition] of Object.entries(reviewProposal.dslParams)) {
+      if (sourceSpec.params[name] === undefined) sourceSpec.params[name] = cloneJsonValueServer(definition, definition);
+    }
+  }
+  const byFamily = new Map();
+  const unresolved = [];
+  for (const binding of Array.isArray(reviewProposal.bindings) ? reviewProposal.bindings : []) {
+    if (!binding || !binding.family) continue;
+    if (binding.active === false || binding.remove === true) continue;
+    if (binding.confidence === 'ambiguous') {
+      unresolved.push({ id: binding.id, family: binding.family, fields: ['ambiguous'] });
+      continue;
+    }
+    const mapping = cloneJsonValueServer(binding.mapping, {});
+    const sourceAlias = diagramMappingSourceName(mapping);
+    if (!sourceAlias) {
+      unresolved.push({ id: binding.id, family: binding.family, fields: ['from'] });
+      continue;
+    }
+    const missingFields = diagramImportRequiredMappingFields(binding.family).filter((field) => !String(mapping.fields && mapping.fields[field] || '').trim());
+    if (missingFields.length) {
+      unresolved.push({ id: binding.id, family: binding.family, fields: missingFields });
+      continue;
+    }
+    if (!existingAliases.has(sourceAlias)) {
+      unresolved.push({ id: binding.id, family: binding.family, fields: ['dslSource'] });
+      continue;
+    }
+    if (!byFamily.has(binding.family)) byFamily.set(binding.family, []);
+    byFamily.get(binding.family).push(mapping);
+  }
+  unresolved.push(...reviewProposal.unresolved.filter((item) => item && item.family === 'containerRoles'));
+  if (unresolved.length) {
+    const error = new Error('D2 import has unresolved mapping fields.');
+    error.code = 'diagram_import_unresolved';
+    error.statusCode = 422;
+    error.details = unresolved;
+    throw error;
+  }
+
+  sourceSpec.result = sourceSpec.result && typeof sourceSpec.result === 'object' && !Array.isArray(sourceSpec.result) ? sourceSpec.result : {};
+  const diagrams = Array.isArray(sourceSpec.result.diagrams) ? sourceSpec.result.diagrams.slice() : [];
+  const diagramIndex = diagrams.findIndex((item) => item && (item.id === proposal.diagramId || (!item.id && item.name)));
+  const previous = diagramIndex >= 0 ? diagrams[diagramIndex] : {};
+  const diagram = {
+    ...cloneJsonValueServer(previous, {}),
+    id: reviewProposal.diagramId,
+    name: String(previous.name || reviewProposal.template && (reviewProposal.template.name || reviewProposal.template.title) || 'topology').trim() || 'topology',
+    title: String(reviewProposal.template && reviewProposal.template.title || previous.title || 'Topology').trim() || 'Topology',
+    type: 'topology',
+    authoring: {
+      ...(previous.authoring && typeof previous.authoring === 'object' ? previous.authoring : {}),
+      d2Import: {
+        version: 2,
+        proposalId: reviewProposal.proposalId,
+        sourceHash: reviewProposal.source && reviewProposal.source.hash || '',
+        parser: reviewProposal.source && reviewProposal.source.parser || '',
+        source: String(reviewProposal.sourceText || ''),
+        importedAt: new Date().toISOString(),
+        template: cloneJsonValueServer(reviewProposal.template, {}),
+        structure: cloneJsonValueServer(reviewProposal.structure, {}),
+        semantics: Object.fromEntries((reviewProposal.containerRoles || []).map((role) => [role.key, role.selectedRole]))
+      }
+    }
+  };
+  for (const family of ['nodeMappings', 'edgeMappings', 'groupMappings', 'hierarchyMappings']) {
+    diagram[family] = byFamily.get(family) || [];
+  }
+  if (diagramIndex >= 0) diagrams[diagramIndex] = diagram;
+  else diagrams.push(diagram);
+  sourceSpec.result.diagrams = diagrams;
+  const errors = validateTemplateSpec(sourceSpec);
+  if (errors.length) {
+    const error = new Error('D2 import produced an invalid template spec.');
+    error.code = 'diagram_import_invalid_spec';
+    error.statusCode = 422;
+    error.details = errors;
+    throw error;
+  }
+  return sourceSpec;
+}
+
+function diagramImportV3WithOverrides(proposal, roleOverrides = [], relationRules, placementRules) {
+  const next = cloneJsonValueServer(proposal, {});
+  const overrides = new Map((Array.isArray(roleOverrides) ? roleOverrides : []).filter((item) => item && item.id).map((item) => [String(item.id), item]));
+  next.roles = (Array.isArray(next.roles) ? next.roles : []).map((role) => {
+    const override = overrides.get(String(role.id || '')) || {};
+    const selectedSemantic = normalizeDiagramImportSemantic(override.selectedSemantic || role.selectedSemantic);
+    const exemplarKey = String(override.exemplarKey || role.exemplarKey || '').trim();
+    const mapping = diagramImportRoleMapping(role, override.mapping || role.mapping || {});
+    return { ...role, selectedSemantic, exemplarKey, mapping };
+  });
+  if (Array.isArray(relationRules)) next.relationRules = cloneJsonValueServer(relationRules, []);
+  if (Array.isArray(placementRules)) next.placementRules = cloneJsonValueServer(placementRules, []);
+  next.unresolved = diagramImportV3Unresolved(next.roles, next.relationRules, next.placementRules);
+  return next;
+}
+
+function diagramImportManagedAlias(prefix, id) {
+  return `${prefix}_${sha256Hex(String(id || prefix)).slice(0, 12)}`;
+}
+
+function diagramImportStaticRoleRows(role, family) {
+  const structure = role && role.structure && typeof role.structure === 'object' ? role.structure : {};
+  const source = family === 'groupMappings'
+    ? Array.isArray(structure.groups) ? structure.groups : []
+    : Array.isArray(structure.nodes) ? structure.nodes : [];
+  const allowed = new Set(Array.isArray(role && role.elementKeys) ? role.elementKeys.map(String) : []);
+  return source.filter((item) => item && allowed.has(String(item.key || ''))).map((item) => ({
+    id: item.key,
+    _id: item.key,
+    Code: item.key,
+    Description: item.label || item.key,
+    Class: family === 'groupMappings' ? 'D2StaticContainer' : 'D2StaticNode',
+    ParentKey: item.parentKey || '',
+    GroupKey: Array.isArray(item.groupKeys) && item.groupKeys.length ? item.groupKeys[0] : item.parentKey || ''
+  }));
+}
+
+function diagramImportEnsureStepColumn(step, column) {
+  const name = String(column || '').trim();
+  if (!step || !name) return;
+  step.columns = uniqueStrings([].concat(step.columns || [], name));
+}
+
+function diagramImportCompileTraversal(options) {
+  const path = Array.isArray(options.path) ? options.path : [];
+  const steps = [];
+  let from = options.from;
+  let currentClass = options.startClass;
+  let sourceProducer = options.sourceProducer || null;
+  let rootIdField = '_id';
+  let targetIdField = '_id';
+  for (const [index, hop] of path.entries()) {
+    const alias = diagramImportManagedAlias(options.aliasPrefix || 'd2_path', `${options.id}:${index}`);
+    const nextHop = path[index + 1];
+    const columns = uniqueStrings(index === path.length - 1
+      ? options.finalColumns || []
+      : nextHop && nextHop.kind === 'reference' ? [nextHop.name] : []);
+    const relationDomain = String(hop.domain || (hop.kind === 'domain' ? hop.name : '')).trim();
+    if (hop.kind === 'reference' && !relationDomain) {
+      diagramImportEnsureStepColumn(sourceProducer, hop.name);
+      const step = {
+        type: 'selectCards',
+        as: alias,
+        from,
+        className: hop.targetClass,
+        columns,
+        filters: [{ path: 'Description', op: 'equals', valueColumn: hop.name }],
+        sourcePrefix: 'Root_',
+        managedBy: 'd2ImportV3'
+      };
+      steps.push(step);
+      rootIdField = `Root_${rootIdField}`;
+      targetIdField = '_id';
+      sourceProducer = step;
+    } else {
+      const step = {
+        type: 'expandRelations',
+        as: alias,
+        from,
+        sourceClass: index === 0 ? currentClass : undefined,
+        targetClass: hop.targetClass,
+        domain: relationDomain,
+        direction: hop.direction || 'both',
+        columns,
+        distinct: true,
+        sourcePrefix: 'Root_',
+        managedBy: 'd2ImportV3'
+      };
+      steps.push(step);
+      rootIdField = index === 0 ? 'SourceId' : `Root_${rootIdField}`;
+      targetIdField = 'RelatedId';
+      sourceProducer = step;
+    }
+    from = alias;
+    currentClass = hop.targetClass || currentClass;
+  }
+  return { alias: from, steps, rootIdField, targetIdField, targetClass: currentClass };
+}
+
+function diagramImportCompileRole(role) {
+  const semantic = normalizeDiagramImportSemantic(role.selectedSemantic);
+  const mapping = role.mapping || {};
+  const source = mapping.source || {};
+  const primary = mapping.primary || {};
+  const steps = [];
+  const primaryAlias = String(source.alias || '').trim() || (primary.className ? diagramImportManagedAlias('d2_primary', role.id) : '');
+  const relatedBindings = [];
+  if (primaryAlias && !source.alias) {
+    const columns = uniqueStrings(['Class', '_id', 'Code', 'Description', primary.idAttribute]
+      .concat(primary.structuredFields || [])
+      .concat(diagramTemplateFieldNames(primary.labelTemplate || '')));
+    steps.push({
+      type: 'selectCards',
+      as: primaryAlias,
+      className: primary.className,
+      columns,
+      filters: Array.isArray(primary.filters) ? cloneJsonValueServer(primary.filters, []) : [],
+      limit: semantic === 'static' ? 2 : undefined,
+      managedBy: 'd2ImportV3'
+    });
+  }
+  if (primaryAlias) {
+    for (const related of Array.isArray(mapping.related) ? mapping.related : []) {
+      const traversal = diagramImportCompileTraversal({
+        id: related.id,
+        aliasPrefix: 'd2_related',
+        from: primaryAlias,
+        startClass: primary.className,
+        sourceProducer: steps.find((step) => step.type === 'selectCards' && step.as === primaryAlias) || null,
+        path: related.path,
+        finalColumns: related.structuredFields
+      });
+      steps.push(...traversal.steps);
+      relatedBindings.push({
+        id: related.id,
+        className: related.className,
+        alias: traversal.alias === primaryAlias ? '' : traversal.alias,
+        rootIdField: traversal.rootIdField,
+        structuredFields: uniqueStrings(related.structuredFields || [])
+      });
+    }
+  }
+  const importRole = {
+    key: role.key,
+    label: role.label,
+    kind: role.kind,
+    semantic,
+    styleHints: cloneJsonValueServer(role.styleHints, {})
+  };
+  const runtimeMapping = {
+    id: mapping.id,
+    from: primaryAlias,
+    fields: { id: primary.idAttribute || '_id', label: 'Description' },
+    labelTemplate: primary.labelTemplate || '${Description}',
+    dataProfile: {
+      name: role.key,
+      className: primary.className || '',
+      fields: uniqueStrings((primary.structuredFields || []).concat(relatedBindings.flatMap((related) => related.structuredFields.map((field) => `${related.id}.${field}`)))),
+      includeSourceRef: true
+    },
+    relatedBindings,
+    disableImplicitGroup: true,
+    singleton: semantic === 'static' && Boolean(primaryAlias),
+    staticRows: !primaryAlias && semantic === 'static' ? [{
+      id: role.id,
+      _id: role.id,
+      Code: role.key,
+      Description: role.label,
+      Class: 'D2StaticContainer'
+    }] : [],
+    importRole
+  };
+  if (semantic === 'composite' && role.exemplarKey) {
+    runtimeMapping.d2Template = diagramImportCompositeTemplate(role.structure || {}, role.exemplarKey);
+  }
+  let runtimeMappings;
+  if (!primaryAlias && semantic === 'static' && role.kind === 'd2Class') {
+    runtimeMappings = ['nodeMappings', 'groupMappings'].map((family) => {
+      const staticRows = diagramImportStaticRoleRows(role, family);
+      if (!staticRows.length) return null;
+      return {
+        family,
+        mapping: {
+          ...cloneJsonValueServer(runtimeMapping, {}),
+          id: diagramImportStableId('mapping', `${mapping.id}:${family}`),
+          fields: family === 'groupMappings'
+            ? { id: '_id', label: 'Description', parent: 'ParentKey' }
+            : { id: '_id', label: 'Description', group: 'GroupKey' },
+          disableImplicitGroup: family === 'nodeMappings' ? false : runtimeMapping.disableImplicitGroup,
+          staticRows
+        }
+      };
+    }).filter(Boolean);
+  } else {
+    const family = semantic === 'group' || semantic === 'static' && (role.kind === 'untypedContainer' || (role.containerKeys || []).length)
+      ? 'groupMappings'
+      : 'nodeMappings';
+    runtimeMappings = [{ family, mapping: runtimeMapping }];
+  }
+  return { semantic, steps, primaryAlias, primaryStep: steps.find((step) => step.type === 'selectCards' && step.as === primaryAlias), runtimeMapping, runtimeMappings };
+}
+
+function diagramImportCompileRelationRule(rule, roleById, compiledByRoleId) {
+  const parentRole = roleById.get(String(rule.parentRoleId || ''));
+  const childRole = roleById.get(String(rule.childRoleId || ''));
+  const parentCompiled = parentRole && compiledByRoleId.get(parentRole.id);
+  if (!parentRole || !childRole || !parentCompiled || !parentCompiled.primaryAlias) return null;
+  const traversal = diagramImportCompileTraversal({
+    id: rule.id,
+    aliasPrefix: 'd2_rule',
+    from: parentCompiled.primaryAlias,
+    startClass: parentRole.mapping.primary.className,
+    sourceProducer: parentCompiled.primaryStep,
+    path: rule.path,
+    finalColumns: []
+  });
+  return {
+    rule: cloneJsonValueServer(rule, {}),
+    alias: traversal.alias,
+    steps: traversal.steps,
+    rootIdField: traversal.rootIdField,
+    targetIdField: traversal.targetIdField
+  };
+}
+
+function objectFlowFromSpecServer(spec) {
+  const models = Array.isArray(spec && spec.visualModels) ? spec.visualModels.slice() : [];
+  if (spec && spec.visualModel && typeof spec.visualModel === 'object' && !Array.isArray(spec.visualModel)) {
+    models.push(spec.visualModel);
+  }
+  const objectGroup = models.find((model) => model && model.mode === 'objectGroup') || {};
+  const objectMatching = models.find((model) => model && model.mode === 'objectMatching') || {};
+  const selections = Array.isArray(objectMatching.selections) && objectMatching.selections.length
+    ? objectMatching.selections
+    : (Array.isArray(objectGroup.selections) ? objectGroup.selections.map((selection) => ({
+      ...selection,
+      rules: selection && (selection.rules || selection.scopeRules) || []
+    })) : []);
+  const flow = {
+    selections,
+    publishedAlias: objectMatching.output && objectMatching.output.alias || ''
+  };
+  if (Array.isArray(objectMatching.operations)) {
+    flow.operations = objectMatching.operations;
+  } else {
+    flow.blocks = objectMatching.blocks || [];
+    flow.setOperations = objectMatching.setOperations || [];
+  }
+  return normalizeObjectFlow(flow);
+}
+
+function objectFlowMaterializedAliases(flow) {
+  const normalized = normalizeObjectFlow(flow);
+  return new Set(normalized.selections.concat(normalized.operations).map((stage) => String(stage && stage.alias || stage && stage.as || '').trim()).filter(Boolean));
+}
+
+function staleObjectFlowDiagramSourceErrors(currentSpec, nextFlow) {
+  const previousFlow = objectFlowFromSpecServer(currentSpec || {});
+  if (validateObjectFlow(previousFlow).length) return [];
+  const previousAliases = objectFlowMaterializedAliases(previousFlow);
+  if (!previousAliases.size) return [];
+  const nextAliases = objectFlowMaterializedAliases(nextFlow);
+  const diagrams = currentSpec && currentSpec.result && Array.isArray(currentSpec.result.diagrams) ? currentSpec.result.diagrams : [];
+  const errors = [];
+  const mappingFamilies = ['nodeMappings', 'edgeMappings', 'groupMappings', 'hierarchyMappings'];
+  diagrams.forEach((diagram, diagramIndex) => {
+    ['nodes', 'edges', 'groups', 'hierarchy'].forEach((kind) => {
+      const alias = resultDiagramSourceName(diagram, kind);
+      if (alias && previousAliases.has(alias) && !nextAliases.has(alias)) {
+        errors.push({
+          path: `$.result.diagrams[${diagramIndex}].source.${kind}`,
+          message: `Diagram source ${alias} is removed by this Object Flow. Remap the diagram before applying the flow.`
+        });
+      }
+    });
+    mappingFamilies.forEach((family) => {
+      normalizeDiagramMappingList(diagram && diagram[family]).forEach((mapping, mappingIndex) => {
+        const alias = diagramMappingSourceName(mapping);
+        if (alias && previousAliases.has(alias) && !nextAliases.has(alias)) {
+          errors.push({
+            path: `$.result.diagrams[${diagramIndex}].${family}[${mappingIndex}]`,
+            message: `Diagram mapping source ${alias} is removed by this Object Flow. Remap the diagram before applying the flow.`
+          });
+        }
+      });
+    });
+  });
+  return errors;
+}
+
+function validateDiagramImportV3Catalog(proposal, catalog, currentSpec = {}) {
+  const errors = [];
+  const classes = new Map((catalog && Array.isArray(catalog.classes) ? catalog.classes : []).map((item) => [String(item.name || ''), item]));
+  const domains = new Map((catalog && Array.isArray(catalog.domains) ? catalog.domains : []).map((item) => [String(item.name || ''), item]));
+  const classAttribute = (className, attributeName) => {
+    const owner = classes.get(String(className || ''));
+    return owner && Array.isArray(owner.attributes) ? owner.attributes.find((item) => String(item.name || '') === String(attributeName || '')) : null;
+  };
+  const flow = objectFlowFromSpecServer(currentSpec);
+  const flowErrors = validateObjectFlow(flow);
+  const stages = flowErrors.length ? [] : objectFlowStageSummaries(flow);
+  const stageById = new Map(stages.map((stage) => [String(stage.id || ''), stage]));
+  const validateClass = (className, path) => {
+    if (className && !classes.has(String(className))) errors.push({ path, message: `CMDBuild class ${className} is not readable in the current catalog.` });
+  };
+  const validatePath = (startClass, path, basePath) => {
+    let currentClass = String(startClass || '');
+    for (const [index, hop] of (Array.isArray(path) ? path : []).entries()) {
+      const hopPath = `${basePath}[${index}]`;
+      if (hop.kind === 'reference') {
+        const attribute = classAttribute(currentClass, hop.name);
+        if (!attribute || !isReferenceAttribute(attribute)) errors.push({ path: `${hopPath}.name`, message: `Reference ${currentClass}.${hop.name} is not readable.` });
+        if (hop.domain && !domains.has(String(hop.domain))) errors.push({ path: `${hopPath}.domain`, message: `CMDBuild domain ${hop.domain} backing reference ${currentClass}.${hop.name} is not readable.` });
+        currentClass = String(hop.targetClass || attribute && (attribute.targetClass || attribute.targetType) || '');
+      } else {
+        const domain = domains.get(String(hop.name || ''));
+        if (!domain) errors.push({ path: `${hopPath}.name`, message: `CMDBuild domain ${hop.name} is not readable.` });
+        currentClass = String(hop.targetClass || currentClass);
+      }
+      validateClass(currentClass, `${hopPath}.targetClass`);
+    }
+    return currentClass;
+  };
+  for (const [roleIndex, role] of (proposal.roles || []).entries()) {
+    const primary = role.mapping && role.mapping.primary || {};
+    const source = role.mapping && role.mapping.source || {};
+    const basePath = `$.roles[${roleIndex}].mapping`;
+    const semantic = normalizeDiagramImportSemantic(role.selectedSemantic);
+    if (semantic && semantic !== 'static') {
+      const stage = stageById.get(String(source.stageId || ''));
+      if (!stage) {
+        errors.push({ path: `${basePath}.source.stageId`, message: `Object-flow stage ${source.stageId || '(empty)'} is not available in the current deterministic spec.` });
+      } else {
+        if (source.alias && String(source.alias) !== String(stage.alias)) errors.push({ path: `${basePath}.source.alias`, message: `Object-flow alias is derived from stage ${stage.id} and must be ${stage.alias}.` });
+        const available = new Set((stage.columns || []).map(String));
+        const fields = uniqueStrings([primary.idAttribute].concat(primary.structuredFields || []).concat(diagramTemplateFieldNames(primary.labelTemplate || '')))
+          .map((field) => String(field).replace(/^primary\./, ''));
+        for (const field of fields) {
+          if (field && !available.has(field)) errors.push({ path: `${basePath}.primary`, message: `Field ${field} is not materialized by object-flow stage ${stage.id}.` });
+        }
+      }
+    }
+    validateClass(primary.className, `${basePath}.primary.className`);
+    if (primary.className) {
+      for (const field of uniqueStrings([primary.idAttribute].concat(primary.structuredFields || []).concat(diagramTemplateFieldNames(primary.labelTemplate || '')))) {
+        const plain = String(field || '').replace(/^primary\./, '');
+        if (plain && !['_id', 'Code', 'Description', 'Class'].includes(plain) && !classAttribute(primary.className, plain)) {
+          errors.push({ path: `${basePath}.primary`, message: `Attribute ${primary.className}.${plain} is not readable.` });
+        }
+      }
+    }
+    for (const [relatedIndex, related] of (role.mapping && role.mapping.related || []).entries()) {
+      validateClass(related.className, `${basePath}.related[${relatedIndex}].className`);
+      const resolved = validatePath(primary.className, related.path, `${basePath}.related[${relatedIndex}].path`);
+      if (related.className && resolved && resolved !== related.className) {
+        errors.push({ path: `${basePath}.related[${relatedIndex}].className`, message: `Relation path resolves to ${resolved}, not ${related.className}.` });
+      }
+    }
+  }
+  const roleById = new Map((proposal.roles || []).map((role) => [String(role.id), role]));
+  for (const [index, rule] of (proposal.relationRules || []).entries()) {
+    const parent = roleById.get(String(rule.parentRoleId || ''));
+    const child = roleById.get(String(rule.childRoleId || ''));
+    const parentClass = parent && parent.mapping && parent.mapping.primary && parent.mapping.primary.className;
+    const childClass = child && child.mapping && child.mapping.primary && child.mapping.primary.className;
+    const resolved = validatePath(parentClass, rule.path, `$.relationRules[${index}].path`);
+    if (childClass && resolved && resolved !== childClass) errors.push({ path: `$.relationRules[${index}].childRoleId`, message: `Relation path resolves to ${resolved}, not ${childClass}.` });
+  }
+  return errors;
+}
+
+function applyDiagramImportProposal(currentSpec, proposal, roleOverrides = [], relationRules, placementRules) {
+  const sourceSpec = cloneJsonValueServer(currentSpec, {});
+  if (!proposal || proposal.version !== 3) {
+    const error = new Error('D2 import proposal version is no longer supported. Analyze the D2 source again.');
+    error.code = 'diagram_import_proposal_version';
+    error.statusCode = 409;
+    throw error;
+  }
+  if (proposal.editorSpecHash && hashJson(sourceSpec) !== proposal.editorSpecHash) {
+    const error = new Error('Template draft changed after D2 analysis. Analyze the D2 source again before applying it.');
+    error.code = 'diagram_import_editor_conflict';
+    error.statusCode = 409;
+    throw error;
+  }
+  const reviewed = diagramImportV3WithOverrides(proposal, roleOverrides, relationRules, placementRules);
+  if (reviewed.unresolved.length) {
+    const error = new Error('D2 class mapping has unresolved fields.');
+    error.code = 'diagram_import_unresolved';
+    error.statusCode = 422;
+    error.details = reviewed.unresolved;
+    throw error;
+  }
+  const roleById = new Map(reviewed.roles.map((role) => [String(role.id), role]));
+  const compiledByRoleId = new Map();
+  for (const role of reviewed.roles) {
+    role.structure = reviewed.structure;
+    compiledByRoleId.set(role.id, diagramImportCompileRole(role));
+  }
+  const compiledRules = (reviewed.relationRules || []).map((rule) => diagramImportCompileRelationRule(rule, roleById, compiledByRoleId)).filter(Boolean);
+  const managedSteps = Array.from(compiledByRoleId.values()).flatMap((item) => item.steps).concat(compiledRules.flatMap((item) => item.steps));
+  sourceSpec.steps = (Array.isArray(sourceSpec.steps) ? sourceSpec.steps : []).filter((step) => step && step.managedBy !== 'd2ImportV3').concat(managedSteps);
+  sourceSpec.result = sourceSpec.result && typeof sourceSpec.result === 'object' && !Array.isArray(sourceSpec.result) ? sourceSpec.result : {};
+  const diagrams = Array.isArray(sourceSpec.result.diagrams) ? sourceSpec.result.diagrams.slice() : [];
+  const diagramIndex = diagrams.findIndex((item) => item && (item.id === reviewed.diagramId || (!item.id && item.name)));
+  const previous = diagramIndex >= 0 ? diagrams[diagramIndex] : {};
+  const nodeMappings = [];
+  const groupMappings = [];
+  for (const compiled of compiledByRoleId.values()) {
+    for (const item of compiled.runtimeMappings || []) {
+      if (item.family === 'groupMappings') groupMappings.push(item.mapping);
+      else nodeMappings.push(item.mapping);
+    }
+  }
+  const edgeMappings = [];
+  const hierarchyMappings = [];
+  const classRelationRules = [];
+  for (const compiled of compiledRules) {
+    const rule = compiled.rule;
+    const parentRole = roleById.get(String(rule.parentRoleId || ''));
+    const childRole = roleById.get(String(rule.childRoleId || ''));
+    const mapping = {
+      id: diagramImportStableId('mapping', rule.id),
+      from: compiled.alias,
+      fields: rule.kind === 'hierarchy'
+        ? { parent: compiled.rootIdField, child: compiled.targetIdField, label: 'Domain' }
+        : { source: compiled.rootIdField, target: compiled.targetIdField, label: 'Domain' },
+      importRole: {
+        key: rule.id,
+        semantic: rule.kind || 'connection',
+        parentKey: parentRole && parentRole.key || '',
+        childKey: childRole && childRole.key || '',
+        sourceKey: parentRole && parentRole.key || '',
+        targetKey: childRole && childRole.key || ''
+      }
+    };
+    if (rule.kind === 'hierarchy') hierarchyMappings.push(mapping);
+    else if (rule.kind === 'group') classRelationRules.push({
+      ...rule,
+      alias: compiled.alias,
+      sourceField: compiled.rootIdField,
+      targetField: compiled.targetIdField,
+      parentRoleKey: parentRole && parentRole.key || '',
+      childRoleKey: childRole && childRole.key || ''
+    });
+    else edgeMappings.push({ ...mapping, type: 'domain' });
+  }
+  const diagram = {
+    ...cloneJsonValueServer(previous, {}),
+    id: reviewed.diagramId,
+    name: String(previous.name || reviewed.template && (reviewed.template.name || reviewed.template.title) || 'topology').trim() || 'topology',
+    title: String(reviewed.template && reviewed.template.title || previous.title || 'Topology').trim() || 'Topology',
+    type: 'topology',
+    nodeMappings,
+    groupMappings,
+    edgeMappings,
+    hierarchyMappings,
+    classRelationRules,
+    placementRules: (reviewed.placementRules || []).map((rule) => {
+      const parentRole = roleById.get(String(rule.parentRoleId || ''));
+      const childRole = roleById.get(String(rule.childRoleId || ''));
+      const parentCompiled = parentRole && compiledByRoleId.get(parentRole.id);
+      const parentStaticRows = parentCompiled
+        ? (parentCompiled.runtimeMappings || []).filter((item) => item.family === 'groupMappings').flatMap((item) => item.mapping.staticRows || [])
+        : [];
+      return {
+        ...cloneJsonValueServer(rule, {}),
+        parentRoleKey: parentRole && parentRole.key || '',
+        childRoleKey: childRole && childRole.key || '',
+        parentBusinessId: parentStaticRows.length === 1 ? String(parentStaticRows[0]._id || parentStaticRows[0].id || '') : parentRole && parentRole.id || ''
+      };
+    }),
+    authoring: {
+      ...(previous.authoring && typeof previous.authoring === 'object' ? previous.authoring : {}),
+      d2Import: {
+        version: 3,
+        proposalId: reviewed.proposalId,
+        sourceHash: reviewed.source && reviewed.source.hash || '',
+        parser: reviewed.source && reviewed.source.parser || '',
+        source: String(reviewed.sourceText || ''),
+        importedAt: new Date().toISOString(),
+        template: cloneJsonValueServer(reviewed.template, {}),
+        structure: cloneJsonValueServer(reviewed.structure, {}),
+        classes: cloneJsonValueServer(reviewed.classes, []),
+        roles: reviewed.roles.map((role) => ({
+          id: role.id,
+          kind: role.kind,
+          key: role.key,
+          label: role.label,
+          selectedSemantic: role.selectedSemantic,
+          exemplarKey: role.exemplarKey
+        })),
+        roleMappings: reviewed.roles.map((role) => cloneJsonValueServer(role.mapping, {})),
+        relationRules: cloneJsonValueServer(reviewed.relationRules, []),
+        placementRules: cloneJsonValueServer(reviewed.placementRules, [])
+      }
+    }
+  };
+  if (diagramIndex >= 0) diagrams[diagramIndex] = diagram;
+  else diagrams.push(diagram);
+  sourceSpec.result.diagrams = diagrams;
+  const errors = validateTemplateSpec(sourceSpec);
+  if (errors.length) {
+    const error = new Error('D2 class mapping produced an invalid deterministic template spec.');
+    error.code = 'diagram_import_invalid_spec';
+    error.statusCode = 422;
+    error.details = errors;
+    throw error;
+  }
+  return sourceSpec;
+}
+
+function completeDiagramImportV3FromSpec(proposal, assistantSpec) {
+  const next = cloneJsonValueServer(proposal, {});
+  const diagram = assistantSpec && assistantSpec.result && Array.isArray(assistantSpec.result.diagrams)
+    ? assistantSpec.result.diagrams.find((item) => item && typeof item === 'object' && !Array.isArray(item)) || {}
+    : {};
+  const imported = diagram.authoring && diagram.authoring.d2Import && diagram.authoring.d2Import.version === 3
+    ? diagram.authoring.d2Import
+    : {};
+  const mappings = new Map((Array.isArray(imported.roleMappings) ? imported.roleMappings : []).map((mapping) => [String(mapping.roleId || ''), mapping]));
+  next.roles = (next.roles || []).map((role) => {
+    const candidate = mappings.get(String(role.id || ''));
+    if (!candidate) return role;
+    const mapping = diagramImportRoleMapping(role, candidate);
+    mapping.id = role.mapping && role.mapping.id || mapping.id;
+    mapping.roleId = role.id;
+    return { ...role, mapping };
+  });
+  if (Array.isArray(imported.relationRules)) next.relationRules = cloneJsonValueServer(imported.relationRules, []);
+  if (Array.isArray(imported.placementRules)) next.placementRules = cloneJsonValueServer(imported.placementRules, []);
+  next.unresolved = diagramImportV3Unresolved(next.roles, next.relationRules, next.placementRules);
+  if (!mappings.size) next.warnings = uniqueStrings([...(next.warnings || []), 'Assistant returned no class-based D2 roleMappings; manual catalog mapping is still required.']);
+  return next;
+}
+
+function completeDiagramImportProposalFromSpec(proposal, assistantSpec) {
+  const next = cloneJsonValueServer(proposal, {});
+  const diagrams = Array.isArray(assistantSpec && assistantSpec.result && assistantSpec.result.diagrams) ? assistantSpec.result.diagrams : [];
+  const assistantDiagram = diagrams.find((item) => item && typeof item === 'object' && !Array.isArray(item)) || {};
+  for (const family of ['nodeMappings', 'edgeMappings', 'groupMappings', 'hierarchyMappings']) {
+    const candidates = normalizeDiagramMappingList(assistantDiagram[family]);
+    const consumed = new Set();
+    for (const binding of next.bindings.filter((item) => item && item.family === family && Array.isArray(item.unresolved) && item.unresolved.length)) {
+      let index = candidates.findIndex((mapping, candidateIndex) => !consumed.has(candidateIndex) && mapping && mapping.id === binding.id);
+      if (index < 0) {
+        index = candidates.findIndex((mapping, candidateIndex) => !consumed.has(candidateIndex) && mapping && mapping.importRole && binding.role && mapping.importRole.key === binding.role.key);
+      }
+      if (index < 0) continue;
+      consumed.add(index);
+      const candidate = cloneJsonValueServer(candidates[index], {});
+      const protectedTemplate = binding.mapping && binding.mapping.d2Template
+        ? cloneJsonValueServer(binding.mapping.d2Template, null)
+        : null;
+      delete candidate.d2Template;
+      delete candidate.importRole;
+      delete candidate.id;
+      binding.mapping = {
+        ...binding.mapping,
+        ...candidate,
+        id: String(binding.mapping && binding.mapping.id || candidate.id || binding.id),
+        importRole: binding.role,
+        fields: { ...(binding.mapping && binding.mapping.fields || {}), ...(candidate.fields || {}) }
+      };
+      if (protectedTemplate) binding.mapping.d2Template = protectedTemplate;
+      binding.unresolved = diagramMappingSourceName(binding.mapping) ? [] : ['from'];
+      for (const field of diagramImportRequiredMappingFields(binding.family)) {
+        if (!String(binding.mapping.fields && binding.mapping.fields[field] || '').trim()) binding.unresolved.push(field);
+      }
+      binding.unresolved = uniqueStrings(binding.unresolved);
+      binding.confidence = 'assistant';
+    }
+  }
+  const assistantSteps = Array.isArray(assistantSpec && assistantSpec.steps) ? assistantSpec.steps : [];
+  const assistantByAlias = new Map(assistantSteps.filter((step) => step && step.as).map((step) => [String(step.as), step]));
+  const existingAliases = new Set(Array.isArray(next.existingAliases) ? next.existingAliases : []);
+  const neededAliases = new Set(next.bindings.map((binding) => diagramMappingSourceName(binding && binding.mapping)).filter(Boolean));
+  const selectedAliases = new Set();
+  const includeAlias = (alias) => {
+    const name = String(alias || '').trim();
+    if (!name || existingAliases.has(name) || selectedAliases.has(name)) return;
+    const step = assistantByAlias.get(name);
+    if (!step) return;
+    diagramImportStepDependencies(step).forEach(includeAlias);
+    selectedAliases.add(name);
+  };
+  neededAliases.forEach(includeAlias);
+  const availableAliases = new Set(existingAliases);
+  next.dslSteps = [];
+  for (const step of assistantSteps.filter((item) => item && selectedAliases.has(String(item.as)))) {
+    const missingDependencies = diagramImportStepDependencies(step).filter((dependency) => !availableAliases.has(dependency));
+    if (missingDependencies.length) {
+      next.warnings = uniqueStrings([...(next.warnings || []), `Assistant DSL alias ${String(step.as || '')} was skipped because dependencies are not available in order: ${missingDependencies.join(', ')}.`]);
+      continue;
+    }
+    next.dslSteps.push(cloneJsonValueServer(step, {}));
+    availableAliases.add(String(step.as));
+  }
+  next.dslParams = assistantSpec && assistantSpec.params && typeof assistantSpec.params === 'object' && !Array.isArray(assistantSpec.params)
+    ? cloneJsonValueServer(assistantSpec.params, {})
+    : {};
+  next.bindings.forEach((binding) => {
+    const sourceAlias = diagramMappingSourceName(binding && binding.mapping);
+    if (sourceAlias && !availableAliases.has(sourceAlias)) binding.unresolved = uniqueStrings([...(binding.unresolved || []), 'dslSource']);
+  });
+  next.unresolved = next.bindings.filter((item) => item && item.unresolved && item.unresolved.length).map((item) => ({ id: item.id, family: item.family, fields: item.unresolved }));
+  return next;
+}
+
+async function analyzeD2ImportSource(source, currentSpec, options = {}) {
+  const text = String(source || '');
+  const inputBytes = Buffer.byteLength(text, 'utf8');
+  if (!text.trim()) {
+    const error = new Error('D2 source is required.');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (inputBytes > D2_IMPORT_MAX_INPUT_BYTES) {
+    const error = new Error(`D2 import source exceeded configured maxInputBytes=${D2_IMPORT_MAX_INPUT_BYTES}.`);
+    error.code = 'd2_import_input_limit';
+    error.statusCode = 413;
+    throw error;
+  }
+  const result = await runD2ImportProcess(text);
+  if (!result.ok) {
+    const error = new Error(result.error || 'D2 import failed.');
+    error.code = `d2_import_${result.reason || 'failed'}`;
+    error.statusCode = result.reason === 'output_limit' ? 413 : 422;
+    throw error;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(result.stdout);
+  } catch {
+    const error = new Error('D2 import helper returned invalid JSON.');
+    error.code = 'd2_import_invalid_output';
+    error.statusCode = 502;
+    throw error;
+  }
+  const sourceErrors = parsed && parsed.source && Array.isArray(parsed.source.errors) ? parsed.source.errors : [];
+  if (sourceErrors.length) {
+    const first = sourceErrors[0] || {};
+    const error = new Error(first.message || 'D2 import source is invalid.');
+    error.code = `d2_import_${first.code || 'source_error'}`;
+    error.statusCode = first.code === 'input_limit_exceeded' || first.code === 'element_limit_exceeded' ? 413 : 422;
+    error.details = sourceErrors;
+    throw error;
+  }
+  const ir = normalizeDiagramImportIr(parsed, text);
+  return {
+    ir,
+    proposal: createDiagramImportProposal(currentSpec, ir, { ...options, sourceText: text }),
+    diagnostics: {
+      elapsedMs: result.elapsedMs,
+      inputBytes,
+      elements: Object.values(ir.elements).reduce((count, items) => count + items.length, 0)
+    }
+  };
 }
 
 function sanitizeD2Svg(svg) {
@@ -1046,6 +2810,17 @@ async function renderD2SourceToSvg(source, diagram = {}) {
   };
 }
 
+async function renderD2ImportPreview(source) {
+  const rendered = await renderD2SourceToSvg(source, {});
+  return {
+    rendered: Boolean(rendered.rendered),
+    content: rendered.rendered ? String(rendered.content || '') : '',
+    reason: rendered.reason || (rendered.rendered ? 'ok' : 'render_failed'),
+    renderError: rendered.rendered ? '' : String(rendered.renderError || D2_RENDERER_UNAVAILABLE_TEXT),
+    layout: rendered.layout || normalizeD2Layout(D2_LAYOUT)
+  };
+}
+
 async function renderD2ArtifactsForDiagrams(diagrams) {
   if (!Array.isArray(diagrams) || !diagrams.length) return diagrams;
   const config = d2RendererConfig();
@@ -1064,7 +2839,8 @@ async function renderD2ArtifactsForDiagrams(diagrams) {
       renderError: '',
       renderReason: 'render_limit',
       renderer: 'd2',
-      layout: d2LayoutForDiagram(diagram)
+      layout: d2LayoutForDiagram(diagram),
+      metadataEmbedded: false
     });
     diagram.d2 = Object.assign({}, diagram.d2, {
       renderOptionsHash
@@ -1079,13 +2855,17 @@ async function renderD2ArtifactsForDiagrams(diagrams) {
       const diagram = current.diagram;
       if (!diagram || !diagram.d2 || typeof diagram.d2.source !== 'string' || !diagram.d2.source.trim()) continue;
       const rendered = await renderD2SourceToSvg(diagram.d2.source, diagram);
+      const embeddedSvg = rendered.rendered
+        ? embedDiagramSvgMetadata(rendered.content || '', diagram.svg && diagram.svg.metadata)
+        : { content: rendered.content || '', embedded: false };
       diagram.svg = Object.assign({}, diagram.svg || {}, {
-        content: rendered.content || '',
+        content: embeddedSvg.content,
         rendered: Boolean(rendered.rendered),
         renderError: rendered.rendered ? '' : rendered.renderError,
         renderReason: rendered.reason || '',
         renderer: 'd2',
-        layout: rendered.layout || d2LayoutForDiagram(diagram)
+        layout: rendered.layout || d2LayoutForDiagram(diagram),
+        metadataEmbedded: embeddedSvg.embedded
       });
       diagram.d2 = Object.assign({}, diagram.d2, {
         renderOptionsHash
@@ -1104,6 +2884,7 @@ async function renderD2ArtifactsForDiagrams(diagrams) {
 }
 
 let d2HealthCache = { checkedAt: 0, payload: null };
+let d2ImportHealthCache = { checkedAt: 0, payload: null };
 
 async function d2RendererHealth({ force = false } = {}) {
   const config = d2RendererConfig();
@@ -1136,6 +2917,31 @@ async function d2RendererHealth({ force = false } = {}) {
     latencyMs: result.elapsedMs
   };
   d2HealthCache = { checkedAt: now, payload };
+  return payload;
+}
+
+async function d2ImporterHealth({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && d2ImportHealthCache.payload && now - d2ImportHealthCache.checkedAt < 15000) return d2ImportHealthCache.payload;
+  const result = await runD2ImportProcess('health: Health\n', {
+    timeoutMs: Math.min(D2_IMPORT_TIMEOUT_MS, 1500),
+    maxOutputBytes: 64 * 1024
+  });
+  let parsed = null;
+  try { parsed = result.ok ? JSON.parse(result.stdout) : null; } catch { parsed = null; }
+  const errors = parsed && parsed.source && Array.isArray(parsed.source.errors) ? parsed.source.errors : [];
+  const ok = Boolean(result.ok && parsed && parsed.version === 3 && errors.length === 0);
+  const payload = {
+    required: true,
+    ok,
+    status: ok ? 'ok' : 'unavailable',
+    binary: D2_IMPORT_BINARY,
+    parser: parsed && parsed.source && (parsed.source.parser || parsed.source.parserVersion) || 'd2-v0.7.1',
+    error: ok ? '' : truncateText(result.error || errors[0] && errors[0].message || 'D2 importer is unavailable.', 300),
+    reason: result.reason || '',
+    latencyMs: result.elapsedMs
+  };
+  d2ImportHealthCache = { checkedAt: now, payload };
   return payload;
 }
 
@@ -1404,6 +3210,119 @@ async function cacheDelete(namespace, key, memoryMap) {
   memoryMap.delete(key);
 }
 
+function runtimeTemplateIndexId(root, templateCode) {
+  return hashJson({ root: String(root || ''), templateCode: String(templateCode || '') });
+}
+
+async function registerRuntimeTemplateCacheKey(root, templateCode, key, ttlMs) {
+  const indexId = runtimeTemplateIndexId(root, templateCode);
+  if (!runtimeCacheTemplateIndex.has(indexId)) runtimeCacheTemplateIndex.set(indexId, new Set());
+  runtimeCacheTemplateIndex.get(indexId).add(key);
+  if (!REDIS_ENABLED) return;
+  const indexKey = cacheKey('runtime-index', indexId);
+  try {
+    await redisCommand(['SADD', indexKey, key]);
+    await redisCommand(['EXPIRE', indexKey, Math.max(60, Math.ceil(Number(ttlMs || DEFAULT_TEMPLATE_CACHE_TTL_SEC * 1000) / 1000) + 60)]);
+  } catch (error) {
+    if (REDIS_REQUIRED) throw redisRequiredError(error, 'index', 'runtime');
+  }
+}
+
+async function invalidateTemplateRuntimeCache(root, templateCode) {
+  const indexId = runtimeTemplateIndexId(root, templateCode);
+  const keys = new Set(runtimeCacheTemplateIndex.get(indexId) || []);
+  const indexKey = cacheKey('runtime-index', indexId);
+  let backend = 'memory';
+  let redisError = '';
+  if (REDIS_ENABLED) {
+    try {
+      const redisKeys = await redisCommand(['SMEMBERS', indexKey]);
+      for (const key of Array.isArray(redisKeys) ? redisKeys : []) keys.add(String(key));
+      for (const key of keys) await redisCommand(['DEL', cacheKey('runtime', key)]);
+      await redisCommand(['DEL', indexKey]);
+      backend = 'redis';
+    } catch (error) {
+      redisError = error && error.message ? error.message : String(error);
+    }
+  }
+  for (const key of keys) {
+    runtimeResultCache.delete(key);
+    runtimeResultInFlight.delete(key);
+  }
+  if (redisError) runtimeCacheTemplateIndex.set(indexId, new Set(keys));
+  else runtimeCacheTemplateIndex.delete(indexId);
+  incMetric('cmdp_runtime_cache_invalidations_total', { backend, status: redisError ? 'partial' : 'ok' });
+  if (redisError) {
+    logError('runtime.cache_invalidation_failed', {
+      root: truncateText(String(root || ''), 120),
+      templateCode: truncateText(String(templateCode || ''), 120),
+      required: REDIS_REQUIRED,
+      errorName: 'redis_error'
+    });
+  }
+  return {
+    invalidated: keys.size,
+    backend,
+    required: REDIS_REQUIRED,
+    complete: !redisError,
+    error: redisError ? 'Redis cache invalidation failed.' : ''
+  };
+}
+
+function staticSnapshotTemplateIndexId(root, templateCode) {
+  return hashJson({ root: String(root || ''), templateCode: String(templateCode || '') });
+}
+
+async function registerStaticSnapshotCacheKey(root, templateCode, key) {
+  const indexId = staticSnapshotTemplateIndexId(root, templateCode);
+  if (!staticSnapshotTemplateIndex.has(indexId)) staticSnapshotTemplateIndex.set(indexId, new Set());
+  staticSnapshotTemplateIndex.get(indexId).add(key);
+  if (!REDIS_ENABLED) return;
+  try {
+    await redisCommand(['SADD', cacheKey('snapshot-index', indexId), key]);
+  } catch (error) {
+    if (REDIS_REQUIRED) throw redisRequiredError(error, 'index', 'snapshot');
+  }
+}
+
+async function invalidateTemplateStaticSnapshots(root, templateCode) {
+  const indexId = staticSnapshotTemplateIndexId(root, templateCode);
+  const keys = new Set(staticSnapshotTemplateIndex.get(indexId) || []);
+  const indexKey = cacheKey('snapshot-index', indexId);
+  let backend = 'memory';
+  let redisError = '';
+  if (REDIS_ENABLED) {
+    try {
+      const redisKeys = await redisCommand(['SMEMBERS', indexKey]);
+      for (const key of Array.isArray(redisKeys) ? redisKeys : []) keys.add(String(key));
+      for (const key of keys) await redisCommand(['DEL', cacheKey('snapshot', key)]);
+      await redisCommand(['DEL', indexKey]);
+      backend = 'redis';
+    } catch (error) {
+      redisError = error && error.message ? error.message : String(error);
+    }
+  }
+  for (const key of keys) staticSnapshotCache.delete(key);
+  if (redisError) staticSnapshotTemplateIndex.set(indexId, new Set(keys));
+  else staticSnapshotTemplateIndex.delete(indexId);
+  incMetric('cmdp_static_snapshot_invalidations_total', { backend, status: redisError ? 'partial' : 'ok' });
+  if (redisError) {
+    logError('snapshot.cache_invalidation_failed', {
+      root: truncateText(String(root || ''), 120),
+      templateCode: truncateText(String(templateCode || ''), 120),
+      required: REDIS_REQUIRED,
+      errorName: 'redis_error'
+    });
+  }
+  return {
+    invalidated: keys.size,
+    backend,
+    required: REDIS_REQUIRED,
+    complete: !redisError,
+    error: redisError ? 'Redis snapshot invalidation failed.' : ''
+  };
+}
+
 async function redisStatus(options = {}) {
   if (!REDIS_ENABLED) {
     return {
@@ -1530,10 +3449,11 @@ function redisHealthCheck(redis) {
 }
 
 async function readinessPayload() {
-  const [redis, cmdbuild, d2] = await Promise.all([
+  const [redis, cmdbuild, d2, d2Import] = await Promise.all([
     redisStatus({ force: true }),
     checkCmdbuildUpstream(),
-    d2RendererHealth()
+    d2RendererHealth(),
+    d2ImporterHealth()
   ]);
   const checks = {
     process: {
@@ -1549,9 +3469,12 @@ async function readinessPayload() {
     },
     d2: {
       ...d2
+    },
+    d2Import: {
+      ...d2Import
     }
   };
-  const ready = checks.cmdbuild.ok && (!HEALTH_REDIS_REQUIRED || checks.redis.ok) && (!checks.d2.required || checks.d2.ok);
+  const ready = checks.cmdbuild.ok && (!HEALTH_REDIS_REQUIRED || checks.redis.ok) && (!checks.d2.required || checks.d2.ok) && (!checks.d2Import.required || checks.d2Import.ok);
   setMetricGauge('cmdp_health_ready', {}, ready ? 1 : 0);
   return {
     ...baseHealthPayload(),
@@ -1962,7 +3885,10 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}.kpi{border:1px solid var(--line);padding:8px}.kpi span{display:block;color:var(--muted);font-size:12px}.kpi strong{display:block;font-size:14px}
     .pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 7px;color:var(--muted);font-size:12px}.pill.ok{border-color:#82c995;color:var(--ok)}.pill.error{border-color:#f0b8b0;color:var(--danger)}
     .model{display:grid;gap:10px;max-height:520px;overflow:auto}.muted{color:var(--muted)}pre{white-space:pre-wrap;background:#f8fafc;border:1px solid var(--line);padding:8px;overflow:auto}
-    .visual-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.visual-grid label{min-width:0}.visual-grid input,.visual-grid select{width:100%}.diagram-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.diagram-grid label{min-width:0}.diagram-grid input,.diagram-grid select{width:100%;min-width:0}.diagram-editor-sections{display:grid;gap:12px}.diagram-editor-block{display:grid;gap:8px;border-top:1px solid var(--line);padding-top:10px}.diagram-editor-block:first-child{border-top:0;padding-top:0}.diagram-editor-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.diagram-editor-block h4{margin:0;color:#334e68;font-size:12px}.diagram-mapping-table{table-layout:fixed}.diagram-mapping-table th,.diagram-mapping-table td{overflow-wrap:break-word}.diagram-mapping-table select,.diagram-mapping-table input{width:100%;min-width:0}.diagram-mapping-table select[multiple]{min-height:70px}.diagram-mapping-table .diagram-action-cell{width:44px;text-align:right}.diagram-mapping-detail-cell{background:#fbfdff}.diagram-mapping-detail{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;align-items:end}.diagram-mapping-detail label{min-width:0}.diagram-add-button{min-width:32px;padding:4px 8px;font-weight:700}.segmented-control{display:inline-flex;align-items:center;gap:0;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}.segmented-control label{margin:0;display:inline-flex;align-items:center;min-height:32px;padding:0 10px;border-right:1px solid var(--line);font-size:13px;cursor:pointer}.segmented-control label:last-child{border-right:0}.segmented-control input{position:absolute;opacity:0;pointer-events:none}.segmented-control label:has(input:checked){background:#e6f4f1;color:#07575b;font-weight:700}.assistant-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr);gap:12px}.assistant-status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.assistant-draft-preview pre{max-height:360px;overflow:auto}.assistant-busy{display:grid;gap:6px;border:1px solid #b7d8d4;background:#f2faf8;padding:8px 10px;margin:0 0 10px}.assistant-busy-head{display:flex;align-items:center;gap:8px;justify-content:space-between;flex-wrap:wrap}.assistant-busy-title{display:inline-flex;align-items:center;gap:8px;font-weight:700;color:#07575b}.assistant-busy-spinner{width:14px;height:14px;border:2px solid #b7d8d4;border-top-color:#236c91;border-radius:50%;animation:cmdp-spin .8s linear infinite}.assistant-busy-elapsed{font-variant-numeric:tabular-nums;color:#334e68;font-size:12px}.assistant-draft-preview[aria-busy="true"]{position:relative}button[disabled]{opacity:.58;cursor:not-allowed}@media(max-width:1100px){.assistant-grid{grid-template-columns:1fr}}.visualization-table{table-layout:fixed}.visualization-table th,.visualization-table td{overflow-wrap:anywhere}.visualization-table th:nth-child(1){width:30%}.visualization-table th:nth-child(2){width:14%}.visualization-table th:nth-child(3){width:15%}.visualization-table th:nth-child(4){width:26%}.visualization-table th:nth-child(5){width:15%}.visualization-table input,.visualization-table select{width:100%;min-width:0}.visualization-link-table{table-layout:fixed}.visualization-link-table th,.visualization-link-table td{overflow-wrap:anywhere}.visualization-link-table input,.visualization-link-table select{width:100%;min-width:0}.visual-row-groups{margin-top:10px;display:grid;gap:6px}.visual-row-group{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.visual-row-group label{flex:1 1 240px;min-width:0}.visual-row-group select{width:100%;min-width:0}.result-table-wrap{margin-top:8px}.result-table-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:6px;min-height:30px;margin:0 0 2px}.result-table-header{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 4px;min-height:30px;flex-wrap:wrap}.result-table-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex:0 0 auto;flex-wrap:wrap;min-width:30px}.cmdp-d2-svg{overflow:auto;background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:6px}.cmdp-d2-svg svg{max-width:100%;height:auto;display:block}.result-table-filter{width:240px;max-width:min(52vw,320px);height:30px;padding:4px 7px}.runtime-cache-control{position:relative;display:inline-flex;align-items:center}.runtime-cache-button{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;font-size:18px;line-height:1}.runtime-cache-button[data-disabled="true"]{opacity:.55;cursor:default}.runtime-cache-button.refreshing{animation:cmdp-spin 1s linear infinite}.runtime-cache-tooltip{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:50;min-width:250px;max-width:min(86vw,420px);padding:8px 10px;border:1px solid var(--line);background:#1f2933;color:#fff;box-shadow:0 8px 22px rgba(15,23,42,.18);font-size:12px;line-height:1.35;text-align:left}.runtime-cache-tooltip span{display:block;white-space:nowrap}.runtime-cache-control:hover .runtime-cache-tooltip,.runtime-cache-control:focus-within .runtime-cache-tooltip{display:block}.runtime-notice-shell{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin:0 0 8px}.runtime-notice-shell .notice{flex:1 1 auto;min-width:160px;overflow-wrap:normal;word-break:normal}.runtime-notice-actions{display:flex;justify-content:flex-end;flex:0 0 auto}.result-table-title{display:flex;align-items:center;gap:8px;flex:1 1 16rem;flex-wrap:wrap;min-width:160px;margin:0}.result-table-title h3{margin:0;font-size:13px;overflow-wrap:normal;word-break:normal;white-space:normal}.result-subtitle{font-size:12px;color:var(--muted);margin:10px 0 4px}.table-sort{border:0;background:transparent;padding:0;color:inherit;font:inherit;text-align:left}.table-sort:after{content:" ↕";font-size:10px;color:var(--muted)}.cmdp-density-compact th,.cmdp-density-compact td{padding:4px 6px}.cmdp-font-small{font-size:12px}.cmdp-font-normal{font-size:13px}.cmdp-font-large{font-size:15px}.cmdp-zebra tbody tr:nth-child(even) td{background:#fbfdff}.cmdp-row-group-cell{background:#f8fafc;font-weight:600;vertical-align:top}@media(max-width:420px){.result-table-title{flex-basis:100%;min-width:0}.runtime-notice-shell .notice{min-width:0}}@keyframes cmdp-spin{to{transform:rotate(360deg)}}
+    .visual-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.visual-grid label{min-width:0}.visual-grid input,.visual-grid select{width:100%}.diagram-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.diagram-grid label{min-width:0}.diagram-grid input,.diagram-grid select{width:100%;min-width:0}.diagram-editor-sections{display:grid;gap:12px}.diagram-editor-block{display:grid;gap:8px;border-top:1px solid var(--line);padding-top:10px}.diagram-editor-block:first-child{border-top:0;padding-top:0}.diagram-editor-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.diagram-editor-block h4{margin:0;color:#334e68;font-size:12px}.diagram-mapping-table{table-layout:fixed}.diagram-mapping-table th,.diagram-mapping-table td{overflow-wrap:break-word}.diagram-mapping-table select,.diagram-mapping-table input{width:100%;min-width:0}.diagram-mapping-table select[multiple]{min-height:70px}.diagram-mapping-table .diagram-action-cell{width:44px;text-align:right}.diagram-mapping-detail-cell{background:#fbfdff}.diagram-mapping-detail{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;align-items:end}.diagram-mapping-detail label{min-width:0}.diagram-template-field{grid-column:span 2}.diagram-template-suggestions,.diagram-derived-fields{display:grid;gap:4px;align-self:start}.diagram-token-list{display:flex;gap:4px;flex-wrap:wrap}.diagram-token-button,.diagram-token-pill{display:inline-flex;align-items:center;max-width:180px;border:1px solid var(--line);border-radius:999px;padding:2px 7px;background:#fff;color:#334e68;font-size:12px;line-height:1.35;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.diagram-token-button{cursor:pointer}.diagram-token-button:hover{border-color:#9fb3c8;background:#f8fafc}.diagram-add-button{min-width:32px;padding:4px 8px;font-weight:700}.segmented-control{display:inline-flex;align-items:center;gap:0;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}.segmented-control label{margin:0;display:inline-flex;align-items:center;min-height:32px;padding:0 10px;border-right:1px solid var(--line);font-size:13px;cursor:pointer}.segmented-control label:last-child{border-right:0}.segmented-control input{position:absolute;opacity:0;pointer-events:none}.segmented-control label:has(input:checked){background:#e6f4f1;color:#07575b;font-weight:700}.assistant-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr);gap:12px}.assistant-status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.assistant-draft-preview pre{max-height:360px;overflow:auto}.assistant-busy{display:grid;gap:6px;border:1px solid #b7d8d4;background:#f2faf8;padding:8px 10px;margin:0 0 10px}.assistant-busy-head{display:flex;align-items:center;gap:8px;justify-content:space-between;flex-wrap:wrap}.assistant-busy-title{display:inline-flex;align-items:center;gap:8px;font-weight:700;color:#07575b}.assistant-busy-spinner{width:14px;height:14px;border:2px solid #b7d8d4;border-top-color:#236c91;border-radius:50%;animation:cmdp-spin .8s linear infinite}.assistant-busy-elapsed{font-variant-numeric:tabular-nums;color:#334e68;font-size:12px}.assistant-draft-preview[aria-busy="true"]{position:relative}button[disabled]{opacity:.58;cursor:not-allowed}@media(max-width:1100px){.assistant-grid{grid-template-columns:1fr}}.visualization-table{table-layout:fixed}.visualization-table th,.visualization-table td{overflow-wrap:anywhere}.visualization-table th:nth-child(1){width:30%}.visualization-table th:nth-child(2){width:14%}.visualization-table th:nth-child(3){width:15%}.visualization-table th:nth-child(4){width:26%}.visualization-table th:nth-child(5){width:15%}.visualization-table input,.visualization-table select{width:100%;min-width:0}.visualization-link-table{table-layout:fixed}.visualization-link-table th,.visualization-link-table td{overflow-wrap:anywhere}.visualization-link-table input,.visualization-link-table select{width:100%;min-width:0}.visual-row-groups{margin-top:10px;display:grid;gap:6px}.visual-row-group{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.visual-row-group label{flex:1 1 240px;min-width:0}.visual-row-group select{width:100%;min-width:0}.result-table-wrap{margin-top:8px}.result-table-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:6px;min-height:30px;margin:0 0 2px}.result-table-header{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 4px;min-height:30px;flex-wrap:wrap}.result-table-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex:0 0 auto;flex-wrap:wrap;min-width:30px}.cmdp-d2-svg{overflow:auto;background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:6px}.cmdp-d2-svg svg{max-width:100%;height:auto;display:block}.result-table-filter{width:240px;max-width:min(52vw,320px);height:30px;padding:4px 7px}.runtime-cache-control{position:relative;display:inline-flex;align-items:center}.runtime-cache-button{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;font-size:18px;line-height:1}.runtime-cache-button[data-disabled="true"]{opacity:.55;cursor:default}.runtime-cache-button.refreshing{animation:cmdp-spin 1s linear infinite}.runtime-cache-tooltip{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:50;min-width:250px;max-width:min(86vw,420px);padding:8px 10px;border:1px solid var(--line);background:#1f2933;color:#fff;box-shadow:0 8px 22px rgba(15,23,42,.18);font-size:12px;line-height:1.35;text-align:left}.runtime-cache-tooltip span{display:block;white-space:nowrap}.runtime-cache-control:hover .runtime-cache-tooltip,.runtime-cache-control:focus-within .runtime-cache-tooltip{display:block}.runtime-notice-shell{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin:0 0 8px}.runtime-notice-shell .notice{flex:1 1 auto;min-width:160px;overflow-wrap:normal;word-break:normal}.runtime-notice-actions{display:flex;justify-content:flex-end;flex:0 0 auto}.result-table-title{display:flex;align-items:center;gap:8px;flex:1 1 16rem;flex-wrap:wrap;min-width:160px;margin:0}.result-table-title h3{margin:0;font-size:13px;overflow-wrap:normal;word-break:normal;white-space:normal}.result-subtitle{font-size:12px;color:var(--muted);margin:10px 0 4px}.table-sort{border:0;background:transparent;padding:0;color:inherit;font:inherit;text-align:left}.table-sort:after{content:" ↕";font-size:10px;color:var(--muted)}.cmdp-density-compact th,.cmdp-density-compact td{padding:4px 6px}.cmdp-font-small{font-size:12px}.cmdp-font-normal{font-size:13px}.cmdp-font-large{font-size:15px}.cmdp-zebra tbody tr:nth-child(even) td{background:#fbfdff}.cmdp-row-group-cell{background:#f8fafc;font-weight:600;vertical-align:top}@media(max-width:700px){.diagram-template-field{grid-column:span 1}}@media(max-width:420px){.result-table-title{flex-basis:100%;min-width:0}.runtime-notice-shell .notice{min-width:0}}@keyframes cmdp-spin{to{transform:rotate(360deg)}}
+    .diagram-import-shell{display:grid;gap:8px;border:1px solid var(--line);padding:10px;background:#fbfdff}.diagram-import-source{width:100%;min-height:140px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.diagram-import-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.diagram-import-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:6px}.diagram-import-shell>.table-wrap{max-width:100%;overflow-x:auto}.diagram-import-binding-table{table-layout:fixed;min-width:900px}.diagram-import-binding-table th,.diagram-import-binding-table td{overflow-wrap:normal;word-break:normal}.diagram-import-binding-table select,.diagram-import-binding-table input{width:100%;min-width:0}.diagram-import-status{font-size:12px;font-weight:700}.diagram-import-status.ready{color:var(--ok)}.diagram-import-status.unresolved,.diagram-import-status.ambiguous{color:var(--warn)}.diagram-import-status.inactive{color:var(--muted)}.diagram-import-preview{min-width:0}.diagram-import-preview-canvas{display:grid;place-items:center;min-height:240px;border:1px solid var(--line);background:#fff;padding:8px;overflow:auto}.diagram-import-preview-canvas>.cmdp-d2-svg{width:100%;min-height:220px;margin:0}.diagram-import-preview[data-diagram-import-preview-state="stale"] .diagram-import-preview-canvas{background:#fffdf5;border-color:#e5c36e}.diagram-import-preview[data-diagram-import-preview-state="loading"] .diagram-import-preview-canvas{background:#f2faf8}.diagram-import-preview[data-diagram-import-preview-state="error"] .diagram-import-preview-canvas{background:#fff7f5;border-color:#f0b8b0}
+    .cmdp-diagram-viewport{display:grid;gap:6px;min-width:0}.cmdp-diagram-viewport-controls{display:flex;align-items:center;justify-content:flex-end;gap:4px;min-height:30px}.cmdp-diagram-viewport-button{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;font-size:16px;line-height:1}.cmdp-diagram-viewport-reset{min-width:52px;width:auto;padding:0 7px;font-size:12px;font-variant-numeric:tabular-nums}.cmdp-diagram-viewport-scale{min-width:42px;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums;text-align:right}.cmdp-diagram-viewport-canvas{min-width:0;min-height:220px;max-height:70vh;overflow:auto;touch-action:none;cursor:grab;background:#fff;border:1px solid #e5e7eb;border-radius:8px}.cmdp-diagram-viewport-canvas.is-panning{cursor:grabbing;user-select:none}.cmdp-diagram-viewport-stage{position:relative;min-width:1px;min-height:1px}.cmdp-diagram-viewport-content{display:inline-block;transform-origin:0 0}.cmdp-diagram-viewport-content .cmdp-d2-svg{overflow:visible;margin:0}.cmdp-diagram-viewport-content .cmdp-d2-svg svg{max-width:none!important;height:auto;display:block}.diagram-import-preview-canvas>.cmdp-diagram-viewport{width:100%;min-height:220px}.diagram-import-preview-canvas .cmdp-diagram-viewport-canvas{min-height:220px}
+    .assistant-flow-stage,.assistant-d2-prompt,#cmdp-assistant-object-flow{display:grid;gap:8px}.assistant-flow-stage textarea,.assistant-d2-prompt textarea,#cmdp-assistant-object-flow textarea{width:100%;min-height:112px}
     .cmdp-html-result{display:block}.cmdp-build-view{display:grid;gap:10px}.cmdp-build-toolbar{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border-bottom:1px solid var(--line);padding-bottom:6px}.cmdp-build-toolbar-main{display:grid;gap:5px;min-width:0}.cmdp-build-summary,.cmdp-build-nav{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.cmdp-build-nav a{color:var(--accent);text-decoration:none;font-size:12px}.cmdp-build-search{flex:0 0 260px;max-width:min(42vw,320px)}.cmdp-build-section{display:grid;gap:8px}.cmdp-build-section h2{font-size:15px;margin:8px 0 0}.cmdp-build-panel{border:1px solid var(--line);background:#fff;margin:0 0 8px}.cmdp-build-panel>summary{cursor:pointer;display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 10px;background:#fbfdff}.cmdp-build-title{font-weight:700}.cmdp-build-panel .table-wrap{border:0;border-top:1px solid var(--line)}.cmdp-build-table{width:100%;table-layout:auto}.cmdp-build-table th,.cmdp-build-table td{vertical-align:top}.cmdp-build-related,.cmdp-build-links{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:8px 10px}.cmdp-build-related a,.cmdp-build-links a{color:var(--accent);text-decoration:none}
     .settings-block{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}.settings-block:first-of-type{border-top:0;margin-top:0;padding-top:0}.settings-block h3{margin:0 0 8px}.settings-block h4{margin:0 0 7px;font-size:12px;color:#334e68}.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}.settings-grid label{display:grid;gap:4px;color:var(--muted);font-size:12px;min-width:0}.settings-grid input,.settings-grid select{width:100%;min-width:0}.checkbox-list{display:grid;gap:8px}.checkbox-stacked{align-items:flex-start!important}.checkbox-stacked>span{display:grid;gap:2px}.checkbox-stacked strong{font-size:12px;color:var(--text)}.visual-table-list{display:grid;gap:12px}.visual-table-panel{border:1px solid var(--line);background:#fbfdff;padding:10px}.visual-table-heading{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px}.visual-table-heading h3{margin:0}.visual-table-subblock{border-top:1px solid #e4e9f0;padding-top:9px;margin-top:9px}.run-param-list{display:grid;gap:8px}.run-param-row{display:grid;grid-template-columns:minmax(180px,1fr) minmax(220px,1.4fr);gap:10px;align-items:start;border:1px solid var(--line);background:#fbfdff;padding:8px}.run-param-main{display:grid;gap:3px;min-width:0}.run-param-main strong{font-size:13px}.run-param-meta{font-size:12px;color:var(--muted)}.run-param-value label{display:grid;gap:4px;color:var(--muted);font-size:12px}.run-param-value input,.run-param-value select{width:100%}.run-action-grid{display:grid;grid-template-columns:minmax(220px,max-content) minmax(280px,1fr);gap:10px;align-items:start}.run-action-buttons{display:flex;gap:8px;flex-wrap:wrap}
     @media(max-width:1100px){.designer-menu{position:static;width:auto;overflow:visible;margin-bottom:12px}.designer-main{margin-left:0}.menu-groups{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}.menu-links{display:flex;flex-wrap:wrap}}
@@ -2153,6 +4079,7 @@ function dynamicPagesClientScript() {
       assistantPrompt: 'Describe the table or diagram you need.',
       assistantDraftGenerated: 'Assistant draft generated.',
       assistantDraftGeneratedApplied: 'Assistant draft generated and applied to the current template.',
+      assistantResponseStale: 'Assistant response belongs to an older template revision and was discarded.',
       assistantDraftApplied: 'Assistant draft applied.',
       runLaunchUrl: 'Template launch URL',
       runLaunchJsonUrl: 'JSON URL',
@@ -2182,14 +4109,39 @@ function dynamicPagesClientScript() {
       assistantGeneratingElapsed: 'Running {seconds} s',
       assistantPreviousDraftVisible: 'Previous draft is shown below until the new response arrives.',
       assistantGenerateBusy: 'Generating...',
+      assistantDataFlowTitle: 'Data flow',
+      assistantDataFlowHelp: 'Describe the full deterministic chain in one text: selections, then explicit matching or set operations. Review it in Object Group and Relations after applying.',
+      assistantDataFlowPrompt: 'Data flow description',
+      assistantGenerateFlow: 'Plan data flow',
+      assistantFlowReady: 'Data flow proposal is ready.',
+      assistantNoFlowProposal: 'Generate a data flow proposal first.',
+      assistantSelectionStage: 'Selection {number}',
+      assistantMatchingStage: 'Matching rule {number}',
+      assistantSelectionPrompt: 'Selection prompt',
+      assistantMatchingPrompt: 'Matching rule prompt',
+      assistantGenerateSelection: 'Suggest selection',
+      assistantGenerateMatching: 'Suggest matching rule',
+      assistantAddStage: 'Add matching rule and selection',
+      assistantRemoveStage: 'Remove stage',
+      assistantApplyFlow: 'Apply data flow to draft',
+      assistantFlowApplied: 'Deterministic data flow was applied to the current draft.',
+      assistantDiagramStructureTitle: 'D2 structure interpretation',
+      assistantDiagramStructureHelp: 'Analyze D2 deterministically, then ask the assistant to suggest semantics for unresolved roles.',
+      assistantDiagramInterpretPrompt: 'How should diagram objects and containers be interpreted?',
+      assistantDiagramInterpret: 'Interpret structure',
+      assistantDiagramMappingTitle: 'Map selections to D2 roles',
+      assistantDiagramMappingHelp: 'Map any selection or intermediate matching result to a confirmed D2 role.',
+      assistantDiagramMappingPrompt: 'How should selection results be mapped to diagram roles?',
+      assistantDiagramMap: 'Suggest mapping',
+      assistantDiagramAnalysisRequired: 'Analyze D2 deterministically first.',
+      assistantProposalOnly: 'Assistant output is a proposal. Review it and apply explicitly.',
+      diagramImportedStatus: 'Imported D2 status',
+      diagramEditInAssistant: 'Edit D2 import in Assistant',
       assistantStatusTitle: 'Assistant status',
       assistantStatusEnabled: 'LLM enabled',
-      assistantStatusProvider: 'Provider',
-      assistantStatusBaseUrl: 'Base URL',
-      assistantStatusModel: 'Model',
       assistantStatusApiKey: 'API key',
-      assistantStatusMcp: 'MCP context',
       assistantMcpTools: 'MCP tools',
+      assistantMcpAllTools: 'all supported tools',
       assistantStatusConfigured: 'configured',
       assistantStatusMissing: 'missing',
       assistantSettings: 'Assistant settings',
@@ -2201,6 +4153,9 @@ function dynamicPagesClientScript() {
       assistantPromptSettings: 'System prompt',
       assistantSystemPrompt: 'Additional system prompt',
       assistantSystemPromptHelp: 'Added to the backend system prompt when generating drafts. Do not store secrets or personal data here.',
+      assistantObjectFlowSystemPrompt: 'Data flow assistant system prompt',
+      assistantDiagramInterpretSystemPrompt: 'D2 interpretation system prompt',
+      assistantDiagramMappingSystemPrompt: 'D2 mapping system prompt',
       assistantMcpSettings: 'MCP',
       assistantMcpEnabled: 'Use MCP context',
       assistantMcpAllowedTools: 'Allowed tools',
@@ -2245,6 +4200,7 @@ function dynamicPagesClientScript() {
       cacheApply: 'Apply cache settings',
       cacheApplied: 'Cache settings applied to Spec JSON.',
       cachePermissionOnlyHelp: 'Fast default: a user can reuse the endpoint cache after a lightweight probe of the classes and attributes used by the template.',
+      cachePermissionOnlyWarning: 'Use Permission only only when source cards have no record-level ACL. For record-level ACL choose Visibility hash or Private per user.',
       cacheVisibilityHashHelp: 'Stricter: also hashes visible card ids before sharing a result.',
       cachePrivateUserHelp: 'Safest: result cache is isolated by CMDBuild user/session scope.',
       deleteTemplate: 'Delete',
@@ -2338,6 +4294,82 @@ function dynamicPagesClientScript() {
       diagramHierarchy: 'Hierarchy',
       diagramAddMapping: 'Add mapping',
       diagramMappingSourceRequired: 'Diagram mapping source is required.',
+      diagramImportTitle: 'Import or replace D2 template',
+      diagramImportHelp: 'Analyze a self-contained D2 source, review class roles and relation rules, then apply it to the current template draft. Do not place secrets in D2 source because it is retained in template versions.',
+      diagramImportSource: 'D2 source',
+      diagramImportFile: 'Open .d2',
+      diagramImportAnalyze: 'Analyze D2',
+      diagramImportAssistant: 'Complete with Assistant',
+      diagramImportApply: 'Apply reviewed mapping',
+      diagramImportAnalyzing: 'D2 analysis is running.',
+      diagramImportPreviewTitle: 'D2 preview',
+      diagramViewportControls: 'Diagram controls for {title}',
+      diagramViewportPan: 'Drag to move the diagram',
+      diagramZoomOut: 'Zoom out',
+      diagramZoomReset: 'Reset scale to 100%',
+      diagramZoomIn: 'Zoom in',
+      diagramZoomLevel: '{percent}%',
+      diagramImportPreviewUnavailable: 'D2 preview is unavailable: {error}',
+      diagramImportPreviewEmpty: 'Analyze D2 source to render the diagram preview.',
+      diagramImportPreviewStale: 'This preview belongs to the previous D2 source. Analyze again to update it.',
+      diagramImportAssistantRunning: 'Assistant is completing unresolved class-role mappings.',
+      diagramImportReady: 'D2 import proposal is ready.',
+      diagramImportApplied: 'D2 mapping was applied to the current draft. Run preview before saving.',
+      diagramImportNodes: 'Nodes',
+      diagramImportEdges: 'Edges',
+      diagramImportGroups: 'Groups',
+      diagramImportHierarchy: 'Hierarchy',
+      diagramImportUnresolved: 'Unresolved',
+      diagramImportRole: 'D2 role',
+      diagramImportFamily: 'Type',
+      diagramImportStatus: 'Status',
+      diagramImportSourceAlias: 'DSL source',
+      diagramImportFields: 'Fields JSON',
+      diagramImportNoProposal: 'Analyze D2 source first.',
+      diagramImportStale: 'D2 source changed after analysis. Analyze it again.',
+      diagramImportRetained: 'Retained existing mapping',
+      diagramImportPreviewRequired: 'Preview the imported diagram draft successfully before saving.',
+      diagramImportCacheInvalidationPartial: 'Template was saved, but runtime cache invalidation was incomplete. Check Redis and retry before publishing.',
+      diagramImportReviewBlocked: 'Resolve every class role, exemplar, relation path, and singleton filter before applying the mapping.',
+      diagramImportAccept: 'Accept suggestion',
+      diagramImportRemoveRetained: 'Remove retained mapping',
+      diagramImportContainerSemantics: 'Type and container semantics',
+      diagramImportTypeOrContainer: 'D2 type / container',
+      diagramImportKind: 'Kind',
+      diagramImportExemplar: 'D2 exemplar',
+      diagramImportBasis: 'Basis',
+      diagramImportActions: 'Actions',
+      diagramImportD2Class: 'D2 class',
+      diagramImportUntypedContainer: 'Untyped container',
+      diagramImportSemanticObject: 'Object',
+      diagramImportSemanticConfirm: 'Confirm suggested type',
+      diagramImportSemanticComposite: 'Composite node',
+      diagramImportSemanticGroup: 'Dynamic group',
+      diagramImportSemanticDecorative: 'Static object / container',
+      diagramImportSemanticReason: 'Suggestion: {role}. {reason}',
+      diagramImportSemanticsHelpTitle: 'What do these semantics mean?',
+      diagramImportSemanticsHelpObject: 'Object: one rendered object per primary CMDBuild card.',
+      diagramImportSemanticsHelpComposite: 'Composite: one object per primary card; related cards enrich its label, structured data, and D2 subtree.',
+      diagramImportSemanticsHelpGroup: 'Dynamic group: one group per primary card; child placement is driven by explicit domain/reference rules.',
+      diagramImportSemanticsHelpStatic: 'Static object or container: preserve the selected D2 exemplar. An optional CMDBuild mapping must return exactly one card.',
+      diagramImportClassMappings: 'CMDBuild class mappings',
+      diagramImportPrimaryClass: 'Primary CMDBuild class',
+      diagramImportIdAttribute: 'Id attribute',
+      diagramImportLabelTemplate: 'Composite label template',
+      diagramImportStructuredFields: 'Structured attributes',
+      diagramImportRelatedClasses: 'Related classes',
+      diagramImportRelatedClass: 'Related CMDBuild class',
+      diagramImportRelationPath: 'Domain / reference',
+      diagramImportDirection: 'Direction',
+      diagramImportAddRelated: 'Add related class',
+      diagramImportRelationRules: 'Grouping, hierarchy and connection rules',
+      diagramImportRuleKind: 'Rule type',
+      diagramImportParentRole: 'Parent / source role',
+      diagramImportChildRole: 'Child / target role',
+      diagramImportAddRule: 'Add rule',
+      diagramImportPlacementRules: 'Static container placement',
+      diagramImportAddPlacement: 'Add placement rule',
+      diagramImportInactive: 'Not used for selected container semantics',
       visualizationDiagramName: 'Diagram name',
       visualizationDiagramTitle: 'Diagram title',
       visualizationDiagramNodesSource: 'Nodes source',
@@ -2369,10 +4401,11 @@ function dynamicPagesClientScript() {
       visualizationDiagramEmbedSvg: 'Embed structured data in SVG',
       visualizationDiagramMetadataMaxBytes: 'D2 metadata max bytes',
       visualizationDiagramLabelTemplate: 'Composite label template',
-      visualizationDiagramLabelFields: 'Label attributes',
+      visualizationDiagramLabelSuggestions: 'Template fields',
       visualizationDiagramDataProfile: 'Data profile',
-      visualizationDiagramDataClass: 'Data class',
       visualizationDiagramDataFields: 'Structured data attributes',
+      visualizationDiagramDerivedDataFields: 'Structured data from source',
+      visualizationDiagramExtraDataFields: 'Additional structured data attributes',
       visualizationDiagramIncludeSourceRef: 'Include source reference',
       visualizationMessages: 'Messages',
       visualizationBaseStyle: 'Base style',
@@ -2538,14 +4571,14 @@ function dynamicPagesClientScript() {
       objectGroupInclude: 'Include in scope',
       objectGroupExclude: 'Exclude from scope',
       objectGroupPath: 'Class attribute/path',
+      objectGroupPathHintFilters: 'Path suggestion filters',
+      objectGroupPathHintFiltersHelp: 'These controls only narrow the Class attribute/path suggestions. They do not change the template data or query.',
       objectGroupDomainFilter: 'Domain',
+      objectGroupDomainFilterHelp: 'Domain keeps paths that go through the selected CMDBuild domain.',
       objectGroupCardinalityFilter: 'Cardinality',
+      objectGroupCardinalityFilterHelp: 'Cardinality keeps paths for the selected relationship multiplicity.',
       objectGroupDirectionFilter: 'Direction',
-      objectGroupDomainExamples: 'Domain path examples',
-      objectGroupDomainExamplesHelp: 'Use these filters when the same attribute name can be reached through different references or domains and the template must keep only paths from a specific relationship type.',
-      objectGroupDomainExample1: 'Domain = NetworkACL keeps paths that came through that CMDBuild domain.',
-      objectGroupDomainExample2: 'Cardinality = N:N leaves only paths that can return several related cards.',
-      objectGroupDomainExample3: 'Direction = inverse helps distinguish attributes reached from the opposite side of the domain.',
+      objectGroupDirectionFilterHelp: 'Direction keeps direct or inverse paths from the source class.',
       objectGroupOperator: 'Operator',
       objectGroupValue: 'Value / regular expression',
       objectGroupValueParam: 'Parameter',
@@ -2570,8 +4603,8 @@ function dynamicPagesClientScript() {
       objectGroupOperatorExists: 'exists',
       objectGroupOperatorIsIpv4: 'is IP',
       objectGroupOperatorIsIpv4Network: 'is IP net',
-      relationEditor: 'Object matching',
-      relationHelp: 'Match object selections to each other. The first block compares two selections; each next block compares the previous result with another selection.',
+      relationEditor: 'Data sets and matching',
+      relationHelp: 'Materialize matches and set operations. Every alias can be published as a table or used as a diagram source.',
       relationSourceClass: 'Source class',
       relationParam: 'Input parameter',
       relationParamExample: 'Example',
@@ -2598,6 +4631,9 @@ function dynamicPagesClientScript() {
       relationNeedsAlias: 'Object matching requires a result alias.',
       relationNeedsColumn: 'Object matching requires at least one related-card column.',
       matchingNeedsSelections: 'Add at least two object selections first.',
+      flowOperations: 'Flow operations',
+      flowOperationsHelp: 'Add matching and set operations explicitly. An operation can use only aliases declared above it.',
+      addMatchingBlock: 'Add matching block',
       matchingBlock: 'Matching block {number}',
       matchingFirstPair: 'First pair of selections',
       matchingPreviousResult: 'Previous result',
@@ -2630,9 +4666,32 @@ function dynamicPagesClientScript() {
       matchingExampleInput: 'Example',
       matchingExampleResult: 'Result',
       addMatchingRule: 'Add rule',
+      clearMatchingBlock: 'Remove matching block',
+      setOperations: 'Set operations',
+      setOperationsHelp: 'Union, difference, and intersection compare rows by explicit keys. They do not create diagram edges by themselves.',
+      addSetOperation: 'Add set operation',
+      setOperation: 'Set operation {number}',
+      setOperationType: 'Operation',
+      setOperationUnion: 'Union',
+      setOperationDifference: 'Difference',
+      setOperationIntersect: 'Intersection',
+      setOperationFrom: 'Left set',
+      setOperationWith: 'Right set',
+      setOperationAlias: 'Result alias',
+      setOperationDistinct: 'Remove duplicate keys',
+      setOperationKeys: 'Identity keys',
+      setOperationLeftKey: 'Left column',
+      setOperationRightKey: 'Right column',
+      addSetOperationKey: 'Add key',
+      publishedTable: 'Published table',
+      publishedTableHelp: 'This is the only table rendered in tables and both modes. Diagram mappings may use every materialized alias.',
       matchingNeedsRule: 'Object matching requires at least one rule in every block.',
       matchingNeedsColumn: 'Object matching rule requires both attributes.',
       matchingInvalidRegex: 'Object matching extraction regex is invalid.',
+      relationOperationSourceRequired: 'Each flow operation requires both source aliases.',
+      relationOperationSourceOrder: 'A flow operation can reference only a selection or an earlier operation alias.',
+      relationOperationAliasRequired: 'Each flow operation requires a unique result alias.',
+      relationOperationRemoveBlocked: 'Cannot remove {alias}: later operations use it ({operations}).',
       model: 'Model',
       classes: 'Classes',
       class: 'Class',
@@ -2867,6 +4926,7 @@ function dynamicPagesClientScript() {
       assistantPrompt: 'Опишите таблицу или диаграмму, которую нужно получить.',
       assistantDraftGenerated: 'Assistant draft сформирован.',
       assistantDraftGeneratedApplied: 'Assistant draft сформирован и применен к текущему шаблону.',
+      assistantResponseStale: 'Ответ Assistant относится к предыдущей ревизии шаблона и был отброшен.',
       assistantDraftApplied: 'Assistant draft применен.',
       runLaunchUrl: 'URL запуска шаблона',
       runLaunchJsonUrl: 'JSON URL',
@@ -2876,8 +4936,8 @@ function dynamicPagesClientScript() {
       runLaunchUrlHelp: 'Прямой runtime URL для ссылки или iframe. Строится из объявленных входных переменных; если default не задан, подставляется тестовое значение. Добавьте json=true, чтобы получить тот же результат как application/json.',
       visualizationRunCompleted: 'Визуализация выполнена.',
       forceRefreshRunCompleted: 'Кэш обновлен, результат показан.',
-      menuAssistant: 'Assistant',
-      assistantEditor: 'Assistant',
+      menuAssistant: 'Ассистент',
+      assistantEditor: 'Ассистент',
       assistantHelp: 'Опишите таблицу или диаграмму CMDBuild. Assistant может использовать read-only MCP context по модели и возвращает детерминированный черновик Spec JSON.',
       assistantTaskMode: 'Цель черновика',
       assistantTaskTable: 'Таблица',
@@ -2896,14 +4956,39 @@ function dynamicPagesClientScript() {
       assistantGeneratingElapsed: 'Выполняется {seconds} с',
       assistantPreviousDraftVisible: 'Ниже показан предыдущий черновик до получения нового ответа.',
       assistantGenerateBusy: 'Генерация...',
-      assistantStatusTitle: 'Статус assistant',
+      assistantDataFlowTitle: 'Поток данных',
+      assistantDataFlowHelp: 'Опишите всю детерминированную цепочку одним текстом: выборки, затем явные сопоставления или операции множеств. После применения проверьте её в Группе объектов и Связях.',
+      assistantDataFlowPrompt: 'Описание выборок и соединений',
+      assistantGenerateFlow: 'Сформировать поток данных',
+      assistantFlowReady: 'Предложение потока данных готово.',
+      assistantNoFlowProposal: 'Сначала сформируйте предложение потока данных.',
+      assistantSelectionStage: 'Выборка {number}',
+      assistantMatchingStage: 'Правило совмещения {number}',
+      assistantSelectionPrompt: 'Промпт выборки',
+      assistantMatchingPrompt: 'Промпт правила совмещения',
+      assistantGenerateSelection: 'Предложить выборку',
+      assistantGenerateMatching: 'Предложить правило совмещения',
+      assistantAddStage: 'Добавить правило совмещения и выборку',
+      assistantRemoveStage: 'Удалить этап',
+      assistantApplyFlow: 'Применить цепочку к draft',
+      assistantFlowApplied: 'Детерминированная цепочка данных применена к текущему draft.',
+      assistantDiagramStructureTitle: 'Интерпретация структуры D2',
+      assistantDiagramStructureHelp: 'Сначала выполните детерминированный анализ D2, затем запросите у Assistant семантику незаполненных ролей.',
+      assistantDiagramInterpretPrompt: 'Как интерпретировать объекты и контейнеры диаграммы?',
+      assistantDiagramInterpret: 'Интерпретировать структуру',
+      assistantDiagramMappingTitle: 'Mapping выборок на D2 roles',
+      assistantDiagramMappingHelp: 'Сопоставьте любую выборку или промежуточный результат совмещения с подтвержденной D2 role.',
+      assistantDiagramMappingPrompt: 'Как сопоставить результаты выборок с объектами диаграммы?',
+      assistantDiagramMap: 'Предложить mapping',
+      assistantDiagramAnalysisRequired: 'Сначала выполните детерминированный анализ D2.',
+      assistantProposalOnly: 'Результат Assistant является предложением. Проверьте его и примените явно.',
+      diagramImportedStatus: 'Статус импортированного D2',
+      diagramEditInAssistant: 'Редактировать D2 import в Assistant',
+      assistantStatusTitle: 'Статус ассистента',
       assistantStatusEnabled: 'LLM включен',
-      assistantStatusProvider: 'Provider',
-      assistantStatusBaseUrl: 'Base URL',
-      assistantStatusModel: 'Model',
       assistantStatusApiKey: 'API key',
-      assistantStatusMcp: 'MCP context',
       assistantMcpTools: 'MCP tools',
+      assistantMcpAllTools: 'все поддерживаемые tools',
       assistantStatusConfigured: 'настроен',
       assistantStatusMissing: 'нет',
       assistantSettings: 'Настройки assistant',
@@ -2915,6 +5000,9 @@ function dynamicPagesClientScript() {
       assistantPromptSettings: 'Системный промпт',
       assistantSystemPrompt: 'Дополнительный системный промпт',
       assistantSystemPromptHelp: 'Добавляется к backend system prompt при генерации draft. Не храните здесь секреты и персональные данные.',
+      assistantObjectFlowSystemPrompt: 'Системный промпт Assistant потока данных',
+      assistantDiagramInterpretSystemPrompt: 'Системный промпт интерпретации D2',
+      assistantDiagramMappingSystemPrompt: 'Системный промпт mapping D2',
       assistantMcpSettings: 'MCP',
       assistantMcpEnabled: 'Использовать MCP context',
       assistantMcpAllowedTools: 'Разрешенные tools',
@@ -2959,6 +5047,7 @@ function dynamicPagesClientScript() {
       cacheApply: 'Применить настройки кэша',
       cacheApplied: 'Настройки кэша применены к Spec JSON.',
       cachePermissionOnlyHelp: 'Быстрый режим по умолчанию: пользователь получает endpoint-cache после легкого probe по классам и атрибутам, которые реально использует шаблон.',
+      cachePermissionOnlyWarning: 'Режим «Только проверка прав» используйте только без построчных ACL на карточках. При построчных ACL выберите Visibility hash или персональный кэш.',
       cacheVisibilityHashHelp: 'Более строгий режим: перед шарингом дополнительно считается hash видимых id карточек.',
       cachePrivateUserHelp: 'Самый безопасный режим: кэш результата изолирован по пользователю/сессии CMDBuild.',
       deleteTemplate: 'Удалить',
@@ -3052,6 +5141,82 @@ function dynamicPagesClientScript() {
       diagramHierarchy: 'Иерархия',
       diagramAddMapping: 'Добавить mapping',
       diagramMappingSourceRequired: 'Источник mapping диаграммы обязателен.',
+      diagramImportTitle: 'Импортировать или заменить D2 template',
+      diagramImportHelp: 'Проанализируйте self-contained D2 source, проверьте роли классов и правила связей, затем примените их к текущему template draft. Не помещайте секреты в D2 source: он сохраняется в версиях template.',
+      diagramImportSource: 'D2 source',
+      diagramImportFile: 'Открыть .d2',
+      diagramImportAnalyze: 'Анализировать D2',
+      diagramImportAssistant: 'Дозаполнить Assistant',
+      diagramImportApply: 'Применить проверенный mapping',
+      diagramImportAnalyzing: 'Выполняется анализ D2.',
+      diagramImportPreviewTitle: 'Предпросмотр D2',
+      diagramViewportControls: 'Управление диаграммой {title}',
+      diagramViewportPan: 'Перетаскивайте для перемещения диаграммы',
+      diagramZoomOut: 'Уменьшить масштаб',
+      diagramZoomReset: 'Сбросить масштаб до 100%',
+      diagramZoomIn: 'Увеличить масштаб',
+      diagramZoomLevel: '{percent}%',
+      diagramImportPreviewUnavailable: 'Предпросмотр D2 недоступен: {error}',
+      diagramImportPreviewEmpty: 'Выполните анализ D2 source, чтобы построить предпросмотр диаграммы.',
+      diagramImportPreviewStale: 'Этот предпросмотр относится к предыдущему D2 source. Выполните анализ повторно, чтобы его обновить.',
+      diagramImportAssistantRunning: 'Assistant заполняет незавершенные сопоставления ролей классов.',
+      diagramImportReady: 'D2 import proposal готов.',
+      diagramImportApplied: 'D2 mapping применен к текущему draft. Выполните preview перед сохранением.',
+      diagramImportNodes: 'Узлы',
+      diagramImportEdges: 'Связи',
+      diagramImportGroups: 'Группы',
+      diagramImportHierarchy: 'Иерархия',
+      diagramImportUnresolved: 'Не заполнено',
+      diagramImportRole: 'Роль D2',
+      diagramImportFamily: 'Тип',
+      diagramImportStatus: 'Статус',
+      diagramImportSourceAlias: 'DSL источник',
+      diagramImportFields: 'Поля JSON',
+      diagramImportNoProposal: 'Сначала выполните анализ D2 source.',
+      diagramImportStale: 'D2 source изменился после анализа. Выполните анализ повторно.',
+      diagramImportRetained: 'Сохранённый текущий mapping',
+      diagramImportPreviewRequired: 'Перед сохранением успешно выполните preview импортированного draft диаграммы.',
+      diagramImportCacheInvalidationPartial: 'Template сохранён, но runtime cache инвалидирован не полностью. Проверьте Redis и повторите перед публикацией.',
+      diagramImportReviewBlocked: 'Заполните каждую роль класса, exemplar, путь связи и singleton-фильтр перед применением mapping.',
+      diagramImportAccept: 'Подтвердить предложение',
+      diagramImportRemoveRetained: 'Удалить сохранённый mapping',
+      diagramImportContainerSemantics: 'Семантика типов и контейнеров',
+      diagramImportTypeOrContainer: 'D2 тип / контейнер',
+      diagramImportKind: 'Вид',
+      diagramImportExemplar: 'D2 exemplar',
+      diagramImportBasis: 'Основание',
+      diagramImportActions: 'Действия',
+      diagramImportD2Class: 'D2 class',
+      diagramImportUntypedContainer: 'Нетипизированный контейнер',
+      diagramImportSemanticObject: 'Объект',
+      diagramImportSemanticConfirm: 'Подтвердите предложенный тип',
+      diagramImportSemanticComposite: 'Составной узел',
+      diagramImportSemanticGroup: 'Динамическая группа',
+      diagramImportSemanticDecorative: 'Статический объект / контейнер',
+      diagramImportSemanticReason: 'Предложение: {role}. {reason}',
+      diagramImportSemanticsHelpTitle: 'Что означают эти семантики?',
+      diagramImportSemanticsHelpObject: 'Объект: отдельный визуальный объект для каждой primary-карточки CMDBuild.',
+      diagramImportSemanticsHelpComposite: 'Составной узел: один объект на primary-карточку; связанные карточки дополняют label, structured data и D2 subtree.',
+      diagramImportSemanticsHelpGroup: 'Динамическая группа: одна группа на primary-карточку; состав детей определяется явными правилами domain/reference.',
+      diagramImportSemanticsHelpStatic: 'Статический объект или контейнер: сохраняется выбранный D2 exemplar. Необязательное CMDBuild-сопоставление обязано вернуть ровно одну карточку.',
+      diagramImportClassMappings: 'Сопоставление классов CMDBuild',
+      diagramImportPrimaryClass: 'Основной класс CMDBuild',
+      diagramImportIdAttribute: 'Атрибут id',
+      diagramImportLabelTemplate: 'Составной label template',
+      diagramImportStructuredFields: 'Атрибуты structured data',
+      diagramImportRelatedClasses: 'Связанные классы',
+      diagramImportRelatedClass: 'Связанный класс CMDBuild',
+      diagramImportRelationPath: 'Domain / reference',
+      diagramImportDirection: 'Направление',
+      diagramImportAddRelated: 'Добавить связанный класс',
+      diagramImportRelationRules: 'Правила группировки, иерархии и связей',
+      diagramImportRuleKind: 'Тип правила',
+      diagramImportParentRole: 'Родительская / исходная роль',
+      diagramImportChildRole: 'Дочерняя / целевая роль',
+      diagramImportAddRule: 'Добавить правило',
+      diagramImportPlacementRules: 'Размещение в статических контейнерах',
+      diagramImportAddPlacement: 'Добавить правило размещения',
+      diagramImportInactive: 'Не используется при выбранной семантике контейнера',
       visualizationDiagramName: 'Имя диаграммы',
       visualizationDiagramTitle: 'Заголовок диаграммы',
       visualizationDiagramNodesSource: 'Источник узлов',
@@ -3083,10 +5248,11 @@ function dynamicPagesClientScript() {
       visualizationDiagramEmbedSvg: 'Встроить structured data в SVG',
       visualizationDiagramMetadataMaxBytes: 'Макс. bytes D2 metadata',
       visualizationDiagramLabelTemplate: 'Составной label template',
-      visualizationDiagramLabelFields: 'Атрибуты label',
+      visualizationDiagramLabelSuggestions: 'Поля template',
       visualizationDiagramDataProfile: 'Data profile',
-      visualizationDiagramDataClass: 'Класс данных',
       visualizationDiagramDataFields: 'Атрибуты structured data',
+      visualizationDiagramDerivedDataFields: 'Structured data из источника',
+      visualizationDiagramExtraDataFields: 'Дополнительные атрибуты structured data',
       visualizationDiagramIncludeSourceRef: 'Включить source reference',
       visualizationMessages: 'Сообщения',
       visualizationBaseStyle: 'Базовый стиль',
@@ -3252,14 +5418,14 @@ function dynamicPagesClientScript() {
       objectGroupInclude: 'Включить в scope',
       objectGroupExclude: 'Исключить из scope',
       objectGroupPath: 'Атрибут/путь класса',
+      objectGroupPathHintFilters: 'Фильтры подсказок путей',
+      objectGroupPathHintFiltersHelp: 'Сужают только подсказки в поле «Атрибут/путь класса». Данные и запрос шаблона не меняются.',
       objectGroupDomainFilter: 'Домен',
+      objectGroupDomainFilterHelp: 'Оставляет пути через выбранный CMDBuild domain.',
       objectGroupCardinalityFilter: 'Кардинальность',
+      objectGroupCardinalityFilterHelp: 'Оставляет пути с выбранной кратностью отношения.',
       objectGroupDirectionFilter: 'Направление',
-      objectGroupDomainExamples: 'Примеры путей через домены',
-      objectGroupDomainExamplesHelp: 'Используйте эти фильтры, когда одно и то же имя атрибута доступно через разные reference/domain и в шаблоне нужно оставить только пути от конкретного типа связи.',
-      objectGroupDomainExample1: 'Домен = NetworkACL оставляет пути, пришедшие через этот домен CMDBuild.',
-      objectGroupDomainExample2: 'Кардинальность = N:N оставляет только пути, которые могут вернуть несколько связанных карточек.',
-      objectGroupDomainExample3: 'Направление = inverse помогает отличать атрибуты, пришедшие с обратной стороны домена.',
+      objectGroupDirectionFilterHelp: 'Оставляет прямые или обратные пути от стартового класса.',
       objectGroupOperator: 'Оператор',
       objectGroupValue: 'Значение / регулярное выражение',
       objectGroupValueParam: 'Параметр',
@@ -3284,8 +5450,8 @@ function dynamicPagesClientScript() {
       objectGroupOperatorExists: 'заполнено',
       objectGroupOperatorIsIpv4: 'is IP',
       objectGroupOperatorIsIpv4Network: 'is IP net',
-      relationEditor: 'Сопоставление с объектами',
-      relationHelp: 'Сопоставьте выборки объектов между собой. Первый блок сравнивает две выборки, каждый следующий блок сравнивает предыдущий результат с очередной выборкой.',
+      relationEditor: 'Наборы и сопоставления',
+      relationHelp: 'Материализуйте сопоставления и операции множеств. Каждый alias можно опубликовать таблицей или использовать источником диаграммы.',
       relationSourceClass: 'Исходный класс',
       relationParam: 'Входной параметр',
       relationParamExample: 'Пример',
@@ -3312,6 +5478,9 @@ function dynamicPagesClientScript() {
       relationNeedsAlias: 'Для сопоставления с объектами нужен алиас результата.',
       relationNeedsColumn: 'Для сопоставления с объектами нужна хотя бы одна колонка связанной карточки.',
       matchingNeedsSelections: 'Сначала добавьте минимум две выборки объектов.',
+      flowOperations: 'Операции потока',
+      flowOperationsHelp: 'Добавляйте сопоставления и операции множеств явно. Операция использует только aliases, объявленные выше неё.',
+      addMatchingBlock: 'Добавить блок сопоставления',
       matchingBlock: 'Блок сопоставления {number}',
       matchingFirstPair: 'Первая пара выборок',
       matchingPreviousResult: 'Предыдущий результат',
@@ -3344,9 +5513,32 @@ function dynamicPagesClientScript() {
       matchingExampleInput: 'Пример',
       matchingExampleResult: 'Результат',
       addMatchingRule: 'Добавить правило',
+      clearMatchingBlock: 'Удалить блок сопоставления',
+      setOperations: 'Операции множеств',
+      setOperationsHelp: 'Объединение, разность и пересечение сравнивают строки по явным ключам. Сами по себе они не создают рёбра диаграммы.',
+      addSetOperation: 'Добавить операцию множеств',
+      setOperation: 'Операция множеств {number}',
+      setOperationType: 'Операция',
+      setOperationUnion: 'Объединение',
+      setOperationDifference: 'Разность',
+      setOperationIntersect: 'Пересечение',
+      setOperationFrom: 'Левый набор',
+      setOperationWith: 'Правый набор',
+      setOperationAlias: 'Alias результата',
+      setOperationDistinct: 'Убирать дубликаты ключей',
+      setOperationKeys: 'Ключи идентичности',
+      setOperationLeftKey: 'Колонка слева',
+      setOperationRightKey: 'Колонка справа',
+      addSetOperationKey: 'Добавить ключ',
+      publishedTable: 'Публикуемая таблица',
+      publishedTableHelp: 'Это единственная таблица в режимах «таблицы» и «оба». Маппинги диаграммы могут использовать любой materialized alias.',
       matchingNeedsRule: 'В каждом блоке сопоставления нужно хотя бы одно правило.',
       matchingNeedsColumn: 'В правиле сопоставления нужны оба атрибута.',
       matchingInvalidRegex: 'Regex вырезки в сопоставлении некорректен.',
+      relationOperationSourceRequired: 'Для каждой операции потока нужны оба исходных alias.',
+      relationOperationSourceOrder: 'Операция потока может ссылаться только на выборку или alias более ранней операции.',
+      relationOperationAliasRequired: 'Для каждой операции потока нужен уникальный alias результата.',
+      relationOperationRemoveBlocked: 'Нельзя удалить {alias}: он используется следующими операциями ({operations}).',
       model: 'Модель',
       classes: 'Классы',
       class: 'Класс',
@@ -3480,6 +5672,28 @@ function dynamicPagesClientScript() {
     assistantGenerating: false,
     assistantGeneratingStartedAt: 0,
     assistantGenerationTimer: null,
+    assistantObjectFlowPrompt: '',
+    assistantFlowProposal: null,
+    assistantFlowExplanation: '',
+    assistantFlowWarnings: [],
+    assistantFlowBusy: false,
+    assistantDiagramInterpretPrompt: '',
+    assistantDiagramMappingPrompt: '',
+    assistantDiagramInterpretBusy: false,
+    assistantDiagramMappingBusy: false,
+    assistantDiagramInterpretResult: null,
+    assistantDiagramMappingResult: null,
+    diagramImportSource: '',
+      diagramImportProposal: null,
+      diagramImportSignedProposal: null,
+      diagramImportIr: null,
+      diagramImportPreview: null,
+      diagramImportPreviewSource: '',
+      diagramImportPreviewError: '',
+      diagramImportBusy: false,
+    diagramImportAssistantBusy: false,
+    diagramImportStale: false,
+    diagramImportAppliedPendingPreview: false,
     lastDraftPreviewOk: false,
     builderKind: 'classes',
     runParams: {},
@@ -3939,8 +6153,22 @@ function dynamicPagesClientScript() {
     return response.text().then(function (body) {
       var json = null;
       try { json = body ? JSON.parse(body) : null; } catch (error) { json = null; }
-      return { ok: response.ok, status: response.status, json: json, body: body };
+      return {
+        ok: response.ok,
+        status: response.status,
+        json: json,
+        body: body,
+        retryAfter: response.headers && response.headers.get ? response.headers.get('Retry-After') || '' : ''
+      };
     });
+  }
+
+  function requestRetryDelayMs(result, attempt) {
+    var retryAfter = String(result && result.retryAfter || '').trim();
+    if (/^\d+(?:\.\d+)?$/.test(retryAfter)) return Math.max(100, Math.min(5000, Math.round(Number(retryAfter) * 1000)));
+    var retryDate = Date.parse(retryAfter);
+    if (Number.isFinite(retryDate)) return Math.max(100, Math.min(5000, retryDate - Date.now()));
+    return Math.min(2000, 250 * Math.pow(2, attempt));
   }
 
   function errorText(result) {
@@ -3973,6 +6201,7 @@ function dynamicPagesClientScript() {
     var timeoutMs = Math.max(1000, Number(options.timeoutMs || 15000));
     var controller = window.AbortController ? new AbortController() : null;
     var timeoutId = null;
+    var maxRetries = method === 'GET' ? Math.max(0, Math.min(3, Number(options.maxRetries === undefined ? 2 : options.maxRetries) || 0)) : 0;
     var fetchOptions = {
       method: method,
       credentials: 'include',
@@ -3983,12 +6212,17 @@ function dynamicPagesClientScript() {
       fetchOptions.headers['Content-Type'] = 'application/json';
       fetchOptions.body = JSON.stringify(options.body);
     }
-    var execute = function () {
+    var execute = function (attempt) {
       timeoutId = window.setTimeout(function () {
         if (controller) controller.abort();
       }, timeoutMs);
       return fetch(path, fetchOptions).then(parseResponse).then(function (result) {
         window.clearTimeout(timeoutId);
+        if (attempt < maxRetries && [429, 502, 503, 504].indexOf(result.status) !== -1) {
+          return new Promise(function (resolve) {
+            window.setTimeout(resolve, requestRetryDelayMs(result, attempt));
+          }).then(function () { return execute(attempt + 1); });
+        }
         return result;
       }).catch(function (error) {
         window.clearTimeout(timeoutId);
@@ -3996,10 +6230,10 @@ function dynamicPagesClientScript() {
         throw error;
       });
     };
-    if (method === 'GET') return execute();
+    if (method === 'GET') return execute(0);
     return getCsrfToken().then(function (token) {
       fetchOptions.headers['X-CMDBDynamicPages-CSRF'] = token;
-      return execute();
+      return execute(0);
     });
   }
 
@@ -4167,7 +6401,13 @@ function dynamicPagesClientScript() {
       if (document.querySelectorAll('[data-view-column-row]').length) {
         state.viewComposerDraft = captureViewComposerDraftFromDom();
       }
-      if (hasField('cmdp-diagram-name') || document.querySelector('[data-diagram-mapping-row]')) {
+      if (document.getElementById('cmdp-assistant-object-flow')) {
+        captureAssistantPromptsFromDom();
+      }
+      if (hasField('cmdp-diagram-import-source') || document.querySelector('[data-diagram-import-binding-row], [data-diagram-import-role-mapping], [data-diagram-import-semantic]')) {
+        captureDiagramImportProposalFromDom();
+      }
+      if (!state.diagramImportProposal && (hasField('cmdp-diagram-name') || document.querySelector('[data-diagram-mapping-row]'))) {
         updateSelectedFromEditor(applyVisualizationToSpec(state.selectedTemplate.spec || defaultSpec(), false));
       }
       if (hasField('cmdp-publish-mode')) {
@@ -4193,6 +6433,15 @@ function dynamicPagesClientScript() {
       renderDesigner();
       return false;
     }
+  }
+
+  function captureAssistantPromptsFromDom() {
+    var objectFlow = document.getElementById('cmdp-assistant-object-flow-prompt');
+    if (objectFlow) state.assistantObjectFlowPrompt = String(objectFlow.value || '');
+    var interpret = document.getElementById('cmdp-assistant-diagram-interpret-prompt');
+    var mapping = document.getElementById('cmdp-assistant-diagram-mapping-prompt');
+    if (interpret) state.assistantDiagramInterpretPrompt = String(interpret.value || '');
+    if (mapping) state.assistantDiagramMappingPrompt = String(mapping.value || '');
   }
 
   function defaultSpec() {
@@ -4345,6 +6594,18 @@ function dynamicPagesClientScript() {
     ].join('\\n\\n');
   }
 
+  function defaultAssistantObjectFlowPrompt() {
+    return ${JSON.stringify(DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT)};
+  }
+
+  function defaultAssistantDiagramInterpretationPrompt() {
+    return ${JSON.stringify(DEFAULT_ASSISTANT_DIAGRAM_INTERPRETATION_PROMPT)};
+  }
+
+  function defaultAssistantDiagramMappingPrompt() {
+    return ${JSON.stringify(DEFAULT_ASSISTANT_DIAGRAM_MAPPING_PROMPT)};
+  }
+
   function defaultRuntimeConfig() {
     return {
       runtimeCache: {
@@ -4367,7 +6628,10 @@ function dynamicPagesClientScript() {
           maxCandidateClasses: 8
         },
         prompt: {
-          system: defaultAssistantSystemPrompt()
+          system: defaultAssistantSystemPrompt(),
+          objectFlow: defaultAssistantObjectFlowPrompt(),
+          diagramInterpretation: defaultAssistantDiagramInterpretationPrompt(),
+          diagramMapping: defaultAssistantDiagramMappingPrompt()
         }
       },
       executionLimits: {
@@ -4538,13 +6802,38 @@ function dynamicPagesClientScript() {
     var assistantDraft = spec.assistantDraft && typeof spec.assistantDraft === 'object' && !Array.isArray(spec.assistantDraft) ? spec.assistantDraft : {};
     state.assistantDraftIntent = String(assistantDraft.intent || '');
     state.assistantTaskMode = normalizeOutputMode(assistantDraft.taskMode || state.assistantTaskMode || 'both');
+    state.assistantObjectFlowPrompt = String(assistantDraft.objectFlowPrompt || '');
+    state.assistantFlowProposal = null;
+    state.assistantFlowExplanation = '';
+    state.assistantFlowWarnings = [];
+    state.assistantDiagramInterpretPrompt = String(assistantDraft.diagramInterpretPrompt || '');
+    state.assistantDiagramMappingPrompt = String(assistantDraft.diagramMappingPrompt || '');
+    state.assistantFlowBusy = false;
+    state.assistantDiagramInterpretBusy = false;
+    state.assistantDiagramMappingBusy = false;
+    state.assistantDiagramInterpretResult = null;
+    state.assistantDiagramMappingResult = null;
+    var diagram = firstDiagramSpec(spec);
+    var d2Import = diagram.authoring && diagram.authoring.d2Import && typeof diagram.authoring.d2Import === 'object' ? diagram.authoring.d2Import : {};
+    state.diagramImportSource = String(d2Import.source || '');
+    state.diagramImportProposal = null;
+    state.diagramImportSignedProposal = null;
+    state.diagramImportIr = null;
+    state.diagramImportPreview = null;
+    state.diagramImportPreviewSource = '';
+    state.diagramImportPreviewError = '';
+    state.diagramImportBusy = false;
+    state.diagramImportAssistantBusy = false;
+    state.diagramImportStale = false;
+    state.diagramImportAppliedPendingPreview = false;
     state.extractionPreview = null;
     state.lastDraftPreviewOk = false;
   }
 
   function renderNotice(message) {
     if (!message || !message.text) return '';
-    return '<div class="notice ' + escapeHtml(message.type || '') + '">' + escapeHtml(message.text) + '</div>';
+    var error = message.type === 'error';
+    return '<div class="notice ' + escapeHtml(message.type || '') + '"' + (error ? ' role="alert" aria-live="assertive"' : ' aria-live="polite"') + '>' + escapeHtml(message.text) + '</div>';
   }
 
   function renderKpi(label, value) {
@@ -4953,6 +7242,90 @@ function dynamicPagesClientScript() {
     }).join('');
   }
 
+  function diagramImportRelationPathSignature(path) {
+    return (Array.isArray(path) ? path : []).map(function (hop) {
+      return [hop.kind || 'domain', hop.name || '', hop.domain || '', hop.targetClass || '', hop.direction || 'both'].join(':');
+    }).join('>');
+  }
+
+  function catalogRelationPathOptions(className) {
+    var result = [];
+    var seen = {};
+    var maxDepth = Math.max(1, Math.min(5, Number(state.maxTraversalDepth) || 1));
+
+    function add(path, labels) {
+      var signature = diagramImportRelationPathSignature(path);
+      if (!signature || seen[signature]) return;
+      seen[signature] = true;
+      result.push({ signature: signature, path: cloneJsonValue(path, []), label: labels.join(' > ') });
+    }
+
+    function domainDirectionForClass(domain, ownerName) {
+      if (domainSources(domain).indexOf(ownerName) !== -1) return 'direct';
+      if (domainDestinations(domain).indexOf(ownerName) !== -1) return 'inverse';
+      return 'both';
+    }
+
+    function visit(owner, path, labels, visited) {
+      if (!owner || path.length >= maxDepth) return;
+      var ownerKey = String(owner.name || '').toLowerCase();
+      var nextVisited = Object.assign({}, visited || {});
+      nextVisited[ownerKey] = true;
+      (owner.attributes || []).forEach(function (attribute) {
+        if (!isReferenceAttribute(attribute)) return;
+        var targetClass = String(attribute.targetClass || attribute.targetType || '').trim();
+        if (!targetClass) return;
+        var nextPath = path.concat([{ kind: 'reference', name: attribute.name, domain: attribute.domain || '', targetClass: targetClass, direction: attribute.direction || 'direct' }]);
+        var nextLabels = labels.concat([attribute.name + ' -> ' + targetClass + (attribute.domain ? ' {' + attribute.domain + '}' : '')]);
+        add(nextPath, nextLabels);
+        var target = catalogClassByName(targetClass);
+        if (target && !nextVisited[targetClass.toLowerCase()]) visit(target, nextPath, nextLabels, nextVisited);
+      });
+      catalogDomains().forEach(function (domain) {
+        domainRelatedClasses(domain, owner.name).forEach(function (targetClass) {
+          var direction = domainDirectionForClass(domain, owner.name);
+          var nextPath = path.concat([{ kind: 'domain', name: domain.name || '', targetClass: targetClass, direction: direction }]);
+          var nextLabels = labels.concat(['{' + (domain.name || '') + ':' + targetClass + '} ' + direction]);
+          add(nextPath, nextLabels);
+          var target = catalogClassByName(targetClass);
+          if (target && !nextVisited[String(targetClass).toLowerCase()]) visit(target, nextPath, nextLabels, nextVisited);
+        });
+      });
+    }
+
+    visit(catalogClassByName(className), [], [], {});
+    return result;
+  }
+
+  function renderDiagramImportRelationPathOptions(className, selectedPath) {
+    var selectedSignature = diagramImportRelationPathSignature(selectedPath);
+    var options = catalogRelationPathOptions(className);
+    if (selectedSignature && !options.some(function (item) { return item.signature === selectedSignature; })) {
+      options.unshift({
+        signature: selectedSignature,
+        path: cloneJsonValue(selectedPath, []),
+        label: (selectedPath || []).map(function (hop) { return hop.name || ''; }).filter(Boolean).join(' > ') || selectedSignature
+      });
+    }
+    return '<option value=""></option>' + options.map(function (item) {
+      return '<option value="' + escapeHtml(item.signature) + '" data-relation-path="' + escapeHtml(JSON.stringify(item.path)) + '"' +
+        (item.signature === selectedSignature ? ' selected' : '') + '>' + escapeHtml(item.label) + '</option>';
+    }).join('');
+  }
+
+  function diagramImportPathFromOption(option, direction) {
+    if (!option) return [];
+    var path = [];
+    try {
+      path = JSON.parse(String(option.getAttribute('data-relation-path') || '[]'));
+    } catch (error) {
+      path = [];
+    }
+    if (!Array.isArray(path)) return [];
+    if (path.length === 1 && direction) path[0].direction = direction;
+    return path;
+  }
+
   function renderAttributeOptions(className, selectedName) {
     var options = catalogAttributeOptions(className);
     if (selectedName && !options.some(function (item) { return item.name === selectedName; })) {
@@ -5168,24 +7541,109 @@ function dynamicPagesClientScript() {
     };
   }
 
-  function normalizeMatchingBlock(block, index, selections, previousAlias) {
+  function setOperationTypes() {
+    return ['union', 'difference', 'intersect'];
+  }
+
+  function normalizeSetOperationKeyPairs(value) {
+    var source = Array.isArray(value) ? value : [value];
+    return source.map(function (item) {
+      if (typeof item === 'string') return { left: item, right: item };
+      if (Array.isArray(item)) return { left: String(item[0] || '').trim(), right: String(item[1] || '').trim() };
+      item = item && typeof item === 'object' ? item : {};
+      return {
+        left: String(item.left || item.leftColumn || item.from || item.column || '').trim(),
+        right: String(item.right || item.rightColumn || item.with || item.column || '').trim()
+      };
+    }).filter(function (item) { return item.left && item.right; });
+  }
+
+  function operationSourceAliases(selections, operations) {
+    var sourceAliases = (selections || []).map(function (selection, selectionIndex) {
+      return selection.alias || objectSelectionAlias(selectionIndex);
+    }).concat((operations || []).map(function (operation) { return operation && operation.as; })).filter(Boolean);
+    return sourceAliases.filter(function (alias, index) { return sourceAliases.indexOf(alias) === index; });
+  }
+
+  function defaultSetOperation(index, selections, operations) {
+    var sourceAliases = operationSourceAliases(selections, operations);
+    return {
+      id: 'set:set' + String(index + 1),
+      type: 'union',
+      from: sourceAliases[0] || '',
+      with: sourceAliases[1] || sourceAliases[0] || '',
+      as: 'set' + String(index + 1),
+      on: [{ left: 'Class', right: 'Class' }, { left: '_id', right: '_id' }],
+      distinct: true,
+      caseSensitive: false
+    };
+  }
+
+  function normalizeSetOperation(block, index, selections, operations) {
+    var fallback = defaultSetOperation(index, selections, operations);
+    block = block || {};
+    var has = function (name) { return Object.prototype.hasOwnProperty.call(block, name); };
+    var explicit = function (names, defaultValue) {
+      for (var nameIndex = 0; nameIndex < names.length; nameIndex += 1) {
+        if (has(names[nameIndex])) return String(block[names[nameIndex]] === undefined || block[names[nameIndex]] === null ? '' : block[names[nameIndex]]).trim();
+      }
+      return defaultValue;
+    };
+    var type = explicit(['type', 'operation'], fallback.type).toLowerCase();
+    var keys = has('on') || has('keys')
+      ? normalizeSetOperationKeyPairs(has('on') ? block.on : block.keys)
+      : fallback.on;
+    return {
+      id: explicit(['id'], fallback.id),
+      type: type,
+      from: explicit(['from', 'leftAlias'], fallback.from),
+      with: explicit(['with', 'rightAlias'], fallback.with),
+      as: explicit(['as', 'alias', 'outputAlias'], fallback.as),
+      on: keys,
+      distinct: block.distinct !== false,
+      caseSensitive: Boolean(block.caseSensitive)
+    };
+  }
+
+  function defaultMatchingBlock(index, selections, operations) {
+    var sourceAliases = operationSourceAliases(selections, operations);
+    var from = sourceAliases[0] || '';
+    var withAlias = sourceAliases[1] || sourceAliases[0] || '';
+    return {
+      id: 'match:matchedObjects' + String(index + 1),
+      from: from,
+      with: withAlias,
+      as: 'matchedObjects' + String(index + 1),
+      rightPrefix: objectSelectionOutputPrefixFromList(selections, withAlias),
+      rules: [defaultMatchingRule()]
+    };
+  }
+
+  function normalizeMatchingBlock(block, index, selections, operations) {
     block = block || {};
     selections = Array.isArray(selections) ? selections : [];
-    var fallbackLeft = index === 0
-      ? (selections[0] && selections[0].alias || objectSelectionAlias(0))
-      : previousAlias;
-    var fallbackRight = selections[index + 1] && selections[index + 1].alias || selections[1] && selections[1].alias || objectSelectionAlias(index + 1);
-    var alias = String(block.as || block.alias || block.outputAlias || ('matchedObjects' + String(index + 2))).trim();
+    var fallback = defaultMatchingBlock(index, selections, operations);
+    var has = function (name) { return Object.prototype.hasOwnProperty.call(block, name); };
+    var explicit = function (names, defaultValue) {
+      for (var nameIndex = 0; nameIndex < names.length; nameIndex += 1) {
+        if (has(names[nameIndex])) return String(block[names[nameIndex]] === undefined || block[names[nameIndex]] === null ? '' : block[names[nameIndex]]).trim();
+      }
+      return defaultValue;
+    };
+    var alias = explicit(['as', 'alias', 'outputAlias'], fallback.as);
     var rawRules = Array.isArray(block.rules || block.where) ? (block.rules || block.where) : [];
     var rules = rawRules.map(normalizeMatchingRule).filter(function (rule) {
       return rule.leftColumn || rule.rightColumn || rule.leftRegex || rule.rightRegex;
     });
     if (!rules.length) rules = [defaultMatchingRule()];
+    var withAlias = explicit(['with', 'rightAlias'], fallback.with);
     return {
-      from: String(block.from || block.leftAlias || fallbackLeft || '').trim(),
-      with: String(block.with || block.rightAlias || fallbackRight || '').trim(),
-      as: alias || ('matchedObjects' + String(index + 2)),
-      rightPrefix: String(block.rightPrefix || objectSelectionOutputPrefixFromList(selections, String(block.with || block.rightAlias || fallbackRight || ''))).trim(),
+      id: explicit(['id'], 'match:' + (alias || fallback.as)),
+      type: 'match',
+      from: explicit(['from', 'leftAlias'], fallback.from),
+      with: withAlias,
+      as: alias,
+      rightPrefix: explicit(['rightPrefix'], objectSelectionOutputPrefixFromList(selections, withAlias)),
       rules: rules
     };
   }
@@ -5193,24 +7651,36 @@ function dynamicPagesClientScript() {
   function normalizeObjectMatchingModel(model, spec) {
     spec = spec || defaultSpec();
     var selections = matchingSelectionsForSpec(spec);
-    var expectedBlocks = Math.max(0, selections.length - 1);
-    var sourceBlocks = model && Array.isArray(model.blocks) ? model.blocks.slice() : [];
-    var previousAlias = '';
-    var blocks = [];
-    for (var index = 0; index < expectedBlocks; index += 1) {
-      var block = normalizeMatchingBlock(sourceBlocks[index], index, selections, previousAlias);
-      if (index > 0) block.from = previousAlias;
-      if (!block.rightPrefix) block.rightPrefix = objectSelectionOutputPrefixFromList(selections, block.with);
-      blocks.push(block);
-      previousAlias = block.as;
+    var sourceOperations = model && Array.isArray(model.operations)
+      ? model.operations.slice()
+      : [].concat(
+        model && Array.isArray(model.blocks) ? model.blocks.map(function (block) { return Object.assign({ type: 'match' }, block); }) : [],
+        model && Array.isArray(model.setOperations) ? model.setOperations : []
+      );
+    var operations = [];
+    sourceOperations.forEach(function (operation, index) {
+      var type = String(operation && (operation.type || operation.operation) || 'match').trim().toLowerCase();
+      var normalized = type === 'match'
+        ? normalizeMatchingBlock(operation, index, selections, operations)
+        : normalizeSetOperation(operation, index, selections, operations);
+      operations.push(normalized);
+    });
+    var blocks = operations.filter(function (operation) { return operation.type === 'match'; });
+    var setOperations = operations.filter(function (operation) { return operation.type !== 'match'; });
+    var publishedAlias = String(model && model.output && model.output.alias || '').trim();
+    if (!publishedAlias && spec && spec.result && Array.isArray(spec.result.tables)) {
+      var published = spec.result.tables.find(function (table) { return table && table.published === true; });
+      publishedAlias = String(published && published.name || '').trim();
     }
     return {
       version: 1,
       mode: 'objectMatching',
       selections: selections,
+      operations: operations,
       blocks: blocks,
+      setOperations: setOperations,
       output: {
-        alias: blocks.length ? blocks[blocks.length - 1].as : '',
+        alias: publishedAlias || (operations[operations.length - 1] || {}).as || '',
         title: t('extractionFinalResult')
       }
     };
@@ -5222,16 +7692,32 @@ function dynamicPagesClientScript() {
     var objectMatching = getStoredVisualModel(spec, 'objectMatching');
     if (objectMatching) return normalizeObjectMatchingModel(objectMatching, spec);
 
-    var matchSteps = getObjectMatchingSteps(spec);
-    if (matchSteps.length) {
+    var operationSteps = (spec.steps || []).filter(function (step) {
+      return step && step.purpose === 'objectMatching' && (step.type === 'matchRows' || ['unionRows', 'differenceRows', 'intersectRows'].indexOf(step.type) !== -1);
+    });
+    if (operationSteps.length) {
       return normalizeObjectMatchingModel({
-        blocks: matchSteps.map(function (step) {
+        operations: operationSteps.map(function (step) {
+          if (step.type === 'matchRows') {
+            return {
+              id: step.id || 'match:' + step.as,
+              type: 'match',
+              from: step.from,
+              with: step.with,
+              as: step.as,
+              rightPrefix: step.rightPrefix,
+              rules: step.rules
+            };
+          }
           return {
+            id: step.id || 'set:' + step.as,
+            type: String(step.type || '').replace(/Rows$/, ''),
             from: step.from,
             with: step.with,
             as: step.as,
-            rightPrefix: step.rightPrefix,
-            rules: step.rules
+            on: step.on,
+            distinct: step.distinct,
+            caseSensitive: step.caseSensitive
           };
         })
       }, spec);
@@ -5323,9 +7809,11 @@ function dynamicPagesClientScript() {
   }
 
   function defaultObjectSelection(index, className) {
+    var alias = objectSelectionAlias(index);
     return {
+      id: 'selection:' + alias,
       name: defaultObjectSelectionName(index),
-      alias: objectSelectionAlias(index),
+      alias: alias,
       className: className || state.selectedClass || '',
       from: '',
       limit: 100,
@@ -5374,6 +7862,7 @@ function dynamicPagesClientScript() {
     var alias = String(selection.alias || selection.as || selection.output && selection.output.alias || objectSelectionAlias(index)).trim() || objectSelectionAlias(index);
     var limit = Number(selection.limit !== undefined ? selection.limit : selection.source && selection.source.limit);
     return {
+      id: String(selection.id || ('selection:' + alias)).trim(),
       name: String(selection.name || selection.title || selection.output && selection.output.title || defaultObjectSelectionName(index)).trim() || defaultObjectSelectionName(index),
       alias: alias,
       className: className,
@@ -5610,7 +8099,19 @@ function dynamicPagesClientScript() {
     var matchStep = getObjectMatchingSteps(spec || {}).find(function (step) {
       return step && step.as === name;
     });
-    if (!matchStep) return matchingColumnOptionRowsForSelection(spec, name, false);
+    if (!matchStep) {
+      var setStep = (spec && Array.isArray(spec.steps) ? spec.steps : []).find(function (step) {
+        return step && ['unionRows', 'differenceRows', 'intersectRows'].indexOf(step.type) !== -1 && step.as === name;
+      });
+      if (!setStep) return matchingColumnOptionRowsForSelection(spec, name, false);
+      var leftColumns = matchingColumnOptionRowsForOutput(spec, setStep.from, seenAliases);
+      if (setStep.type !== 'unionRows') return leftColumns;
+      var rightColumns = matchingColumnOptionRowsForOutput(spec, setStep.with, seenAliases);
+      rightColumns.forEach(function (item) {
+        if (!leftColumns.some(function (existing) { return existing.value === item.value; })) leftColumns.push(item);
+      });
+      return leftColumns;
+    }
     var result = matchingColumnOptionRowsForOutput(spec, matchStep.from, seenAliases);
     var rightPrefix = matchStep.rightPrefix || objectSelectionOutputPrefix(spec || defaultSpec(), matchStep.with);
     matchingColumnOptionRowsForSelection(spec, matchStep.with, true, rightPrefix).filter(Boolean).forEach(function (item) {
@@ -5684,41 +8185,50 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
-  function objectGroupDomainFilterOptions(className, selected, field) {
+  function objectGroupPathHintOptions(className) {
+    return catalogScopePathOptions(className).filter(function (item) {
+      return !!(item && (item.domain || item.cardinality || item.direction));
+    });
+  }
+
+  function objectGroupPathHintFiltersAvailable(pathOptions) {
+    var provenance = {};
+    (pathOptions || []).forEach(function (item) {
+      var signature = [item.domain || '', item.cardinality || '', item.direction || ''].join('\u0000');
+      provenance[signature] = true;
+    });
+    return Object.keys(provenance).length > 1;
+  }
+
+  function objectGroupPathHintFilterOptions(pathOptions, field) {
     var values = [];
-    catalogScopePathOptions(className).forEach(function (item) {
+    (pathOptions || []).forEach(function (item) {
       var value = String(item && item[field] || '').trim();
       if (value && values.indexOf(value) === -1) values.push(value);
     });
     values.sort();
-    if (selected && values.indexOf(selected) === -1) values.unshift(selected);
     return '<option value=""></option>' + values.map(function (value) {
-      return '<option value="' + escapeHtml(value) + '"' + (value === selected ? ' selected' : '') + '>' + escapeHtml(value) + '</option>';
+      return '<option value="' + escapeHtml(value) + '">' + escapeHtml(value) + '</option>';
     }).join('');
   }
 
-  function renderObjectGroupDomainFilters(selection) {
-    selection = selection || {};
-    var className = selection.className || '';
+  function renderObjectGroupPathHintFilters(className) {
+    var pathOptions = objectGroupPathHintOptions(className);
+    if (!objectGroupPathHintFiltersAvailable(pathOptions)) return '';
     return [
-      '<div class="settings-grid" data-object-path-filter style="margin:8px 0">',
-      '<label>' + t('objectGroupDomainFilter') + '<select data-object-path-filter-field="domain">' + objectGroupDomainFilterOptions(className, selection.domainFilter || '', 'domain') + '</select></label>',
-      '<label>' + t('objectGroupCardinalityFilter') + '<select data-object-path-filter-field="cardinality">' + objectGroupDomainFilterOptions(className, selection.cardinalityFilter || '', 'cardinality') + '</select></label>',
-      '<label>' + t('objectGroupDirectionFilter') + '<select data-object-path-filter-field="direction">' + objectGroupDomainFilterOptions(className, selection.directionFilter || '', 'direction') + '</select></label>',
-      '</div>'
-    ].join('');
-  }
-
-  function renderObjectGroupDomainExamples() {
-    return [
-      '<details style="margin-top:12px;border-top:1px solid var(--line);padding-top:8px">',
-      '<summary>' + t('objectGroupDomainExamples') + '</summary>',
-      '<div class="muted" style="margin-top:8px">' + escapeHtml(t('objectGroupDomainExamplesHelp')) + '</div>',
+      '<details class="object-group-path-hint-filters" data-object-path-filter style="margin:8px 0">',
+      '<summary>' + escapeHtml(t('objectGroupPathHintFilters')) + '</summary>',
+      '<div class="muted" style="margin-top:8px">' + escapeHtml(t('objectGroupPathHintFiltersHelp')) + '</div>',
       '<ul class="steps">',
-      '<li>' + escapeHtml(t('objectGroupDomainExample1')) + '</li>',
-      '<li>' + escapeHtml(t('objectGroupDomainExample2')) + '</li>',
-      '<li>' + escapeHtml(t('objectGroupDomainExample3')) + '</li>',
+      '<li>' + escapeHtml(t('objectGroupDomainFilter')) + ': ' + escapeHtml(t('objectGroupDomainFilterHelp')) + '</li>',
+      '<li>' + escapeHtml(t('objectGroupCardinalityFilter')) + ': ' + escapeHtml(t('objectGroupCardinalityFilterHelp')) + '</li>',
+      '<li>' + escapeHtml(t('objectGroupDirectionFilter')) + ': ' + escapeHtml(t('objectGroupDirectionFilterHelp')) + '</li>',
       '</ul>',
+      '<div class="settings-grid">',
+      '<label>' + t('objectGroupDomainFilter') + '<select data-object-path-filter-field="domain">' + objectGroupPathHintFilterOptions(pathOptions, 'domain') + '</select></label>',
+      '<label>' + t('objectGroupCardinalityFilter') + '<select data-object-path-filter-field="cardinality">' + objectGroupPathHintFilterOptions(pathOptions, 'cardinality') + '</select></label>',
+      '<label>' + t('objectGroupDirectionFilter') + '<select data-object-path-filter-field="direction">' + objectGroupPathHintFilterOptions(pathOptions, 'direction') + '</select></label>',
+      '</div>',
       '</details>'
     ].join('');
   }
@@ -5783,7 +8293,7 @@ function dynamicPagesClientScript() {
     var classId = index === 0 ? ' id="cmdp-object-class"' : '';
     var rowsId = index === 0 ? ' id="cmdp-object-scope-rows"' : '';
     return [
-      '<div class="object-selection" data-object-selection data-object-selection-index="' + index + '">',
+      '<div class="object-selection" data-object-selection data-object-selection-index="' + index + '" data-object-selection-id="' + escapeHtml(selection.id || ('selection:' + selection.alias)) + '">',
       '<div class="settings-grid">',
       '<label>' + t('objectSelectionTitle') + '<input data-object-selection-field="name" value="' + escapeHtml(selection.name || defaultObjectSelectionName(index)) + '"></label>',
       '<label>' + t('objectSelectionAlias') + '<input data-object-selection-field="alias" value="' + escapeHtml(selection.alias || objectSelectionAlias(index)) + '"></label>',
@@ -5794,7 +8304,7 @@ function dynamicPagesClientScript() {
       '</div>',
       '<div class="section-title-row"><h3>' + escapeHtml(selection.name || defaultObjectSelectionName(index)) + '</h3>',
       '<button data-action="add-object-scope-row">' + t('addObjectGroupRule') + '</button></div>',
-      renderObjectGroupDomainFilters(selection),
+      renderObjectGroupPathHintFilters(selection.className),
       '<table class="compact"><thead><tr><th>' + t('objectGroupScopeAction') + '</th><th>' + t('objectGroupPath') + '</th><th>' + t('objectGroupNegation') + '</th><th>' + t('objectGroupOperator') + '</th><th>' + t('objectGroupValue') + '</th><th>' + t('objectGroupValueParam') + '</th><th>' + t('objectGroupValueColumn') + '</th><th></th></tr></thead>',
       '<tbody' + rowsId + '>',
       ruleRows,
@@ -5812,7 +8322,6 @@ function dynamicPagesClientScript() {
       '<section class="section" id="cmdp-object-group-editor"><h2>' + t('objectGroupEditor') + '</h2>',
       '<p class="muted">' + t('objectGroupHelp') + '</p>',
       selections.map(renderObjectGroupSelection).join(''),
-      renderObjectGroupDomainExamples(),
       renderObjectGroupRegexExamples(),
       '</section>'
     ].join('');
@@ -5878,24 +8387,80 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
-  function renderObjectMatchingBlock(block, index, model, spec) {
-    block = normalizeMatchingBlock(block, index, model.selections, index > 0 && model.blocks[index - 1] ? model.blocks[index - 1].as : '');
-    var leftOptions = matchingLeftColumnOptions(spec, model, index, block);
-    var rightOptions = matchingRightColumnOptions(spec, block);
+  function flowOperations(model) {
+    return model && Array.isArray(model.operations) ? model.operations : [];
+  }
+
+  function operationLabel(operation, index, matchIndex, setIndex) {
+    return operation && operation.type === 'match'
+      ? t('matchingBlock', { number: matchIndex + 1 })
+      : t('setOperation', { number: setIndex + 1 });
+  }
+
+  function priorMaterializedAliasRows(model, operationIndex) {
+    var rows = [];
+    (model.selections || []).forEach(function (selection, index) {
+      rows.push({ alias: selection.alias || objectSelectionAlias(index), label: objectSelectionLabel(selection, index) });
+    });
+    flowOperations(model).slice(0, operationIndex).forEach(function (operation, index) {
+      var earlier = flowOperations(model).slice(0, index);
+      var matchIndex = earlier.filter(function (item) { return item.type === 'match'; }).length;
+      var setIndex = earlier.length - matchIndex;
+      rows.push({ alias: operation.as, label: operationLabel(operation, index, matchIndex, setIndex) });
+    });
+    return rows.filter(function (row, index) {
+      return row.alias && rows.findIndex(function (candidate) { return candidate.alias === row.alias; }) === index;
+    });
+  }
+
+  function renderPriorMaterializedAliasOptions(model, operationIndex, selectedName) {
+    var rows = priorMaterializedAliasRows(model, operationIndex);
+    return '<option value=""></option>' + rows.map(function (row) {
+      return '<option value="' + escapeHtml(row.alias) + '"' + (row.alias === selectedName ? ' selected' : '') + '>' + escapeHtml(row.label + ' [' + row.alias + ']') + '</option>';
+    }).join('');
+  }
+
+  function flowColumnOptionRows(model, spec, alias, operationIndex, seenAliases) {
+    seenAliases = seenAliases || {};
+    var name = String(alias || '').trim();
+    if (!name || seenAliases[name]) return [];
+    seenAliases[name] = true;
+    var selection = (model.selections || []).find(function (item, index) { return (item.alias || objectSelectionAlias(index)) === name; });
+    if (selection) return matchingColumnOptionRowsForSelection(spec, name, false);
+    var operation = flowOperations(model).slice(0, operationIndex).find(function (item) { return item && item.as === name; });
+    if (!operation) return matchingColumnOptionRowsForOutput(spec, name);
+    var left = flowColumnOptionRows(model, spec, operation.from, operationIndex, seenAliases);
+    if (operation.type === 'match') {
+      var prefix = operation.rightPrefix || objectSelectionOutputPrefix(spec || defaultSpec(), operation.with);
+      flowColumnOptionRows(model, spec, operation.with, operationIndex, seenAliases).forEach(function (item) {
+        var value = prefix + item.value;
+        if (!left.some(function (existing) { return existing.value === value; })) left.push({ value: value, label: prefix + item.label });
+      });
+      return left;
+    }
+    if (operation.type === 'union') {
+      flowColumnOptionRows(model, spec, operation.with, operationIndex, seenAliases).forEach(function (item) {
+        if (!left.some(function (existing) { return existing.value === item.value; })) left.push(item);
+      });
+    }
+    return left;
+  }
+
+  function renderObjectMatchingBlock(block, operationIndex, matchIndex, model, spec) {
+    block = normalizeMatchingBlock(block, operationIndex, model.selections, flowOperations(model).slice(0, operationIndex));
+    var leftOptions = flowColumnOptionRows(model, spec, block.from, operationIndex);
+    var rightOptions = flowColumnOptionRows(model, spec, block.with, operationIndex);
     var rows = (block.rules && block.rules.length ? block.rules : [defaultMatchingRule()]).map(function (rule) {
       return renderMatchingRuleRow(rule, leftOptions, rightOptions);
     }).join('');
-    var leftControl = index === 0
-      ? '<label>' + t('matchingLeftSelection') + '<select data-matching-block-field="from">' + renderSelectionAliasOptions(spec, block.from) + '</select></label>'
-      : '<label>' + t('matchingPreviousResult') + '<input data-matching-block-field="from" value="' + escapeHtml(block.from || '') + '" readonly></label>';
     return [
-      '<div class="matching-block" data-matching-block data-matching-block-index="' + index + '">',
-      '<div class="section-title-row"><h3>' + t('matchingBlock', { number: index + 1 }) + '</h3>',
-      '<button data-action="add-matching-rule-row">' + t('addMatchingRule') + '</button></div>',
+      '<div class="matching-block" data-flow-operation="match" data-flow-operation-index="' + operationIndex + '" data-matching-block data-matching-block-id="' + escapeHtml(block.id || ('match:' + block.as)) + '">',
+      '<div class="section-title-row"><h3>' + t('matchingBlock', { number: matchIndex + 1 }) + '</h3>',
+      '<div><button data-action="add-matching-rule-row">' + t('addMatchingRule') + '</button><button data-action="clear-matching-block" type="button" aria-label="' + escapeHtml(t('clearMatchingBlock') + ': ' + (block.as || String(matchIndex + 1))) + '">' + t('clearMatchingBlock') + '</button></div></div>',
       '<div class="row">',
-      leftControl,
-      '<label>' + t('matchingRightSelection') + '<select data-matching-block-field="with">' + renderSelectionAliasOptions(spec, block.with) + '</select></label>',
-      '<input type="hidden" data-matching-block-field="as" value="' + escapeHtml(block.as || ('matchedObjects' + String(index + 2))) + '">',
+      '<label>' + t('matchingLeftSelection') + '<select data-matching-block-field="from">' + renderPriorMaterializedAliasOptions(model, operationIndex, block.from) + '</select></label>',
+      '<label>' + t('matchingRightSelection') + '<select data-matching-block-field="with">' + renderPriorMaterializedAliasOptions(model, operationIndex, block.with) + '</select></label>',
+      '<label>' + t('setOperationAlias') + '<input data-matching-block-field="as" value="' + escapeHtml(block.as || ('matchedObjects' + String(matchIndex + 1))) + '"></label>',
       '</div>',
       '<div class="matching-rule-list" data-matching-rule-list>',
       rows,
@@ -5903,6 +8468,90 @@ function dynamicPagesClientScript() {
       '<p class="muted">' + t('matchingRegexHelp') + '</p>',
       '<p class="muted">' + t('matchingIpv4Help') + '</p>',
       renderMatchingIpv4Examples(),
+      '</div>'
+    ].join('');
+  }
+
+  function materializedAliasRows(model) {
+    var rows = [];
+    (model.selections || []).forEach(function (selection, index) {
+      rows.push({ alias: selection.alias || objectSelectionAlias(index), label: objectSelectionLabel(selection, index) });
+    });
+    flowOperations(model).forEach(function (operation, index) {
+      var earlier = flowOperations(model).slice(0, index);
+      var matchIndex = earlier.filter(function (item) { return item.type === 'match'; }).length;
+      var setIndex = earlier.length - matchIndex;
+      rows.push({ alias: operation.as, label: operationLabel(operation, index, matchIndex, setIndex) });
+    });
+    return rows.filter(function (row, index) {
+      return row.alias && rows.findIndex(function (candidate) { return candidate.alias === row.alias; }) === index;
+    });
+  }
+
+  function renderMaterializedAliasOptions(model, selectedName) {
+    var rows = materializedAliasRows(model);
+    if (selectedName && !rows.some(function (row) { return row.alias === selectedName; })) rows.unshift({ alias: selectedName, label: selectedName });
+    return '<option value=""></option>' + rows.map(function (row) {
+      return '<option value="' + escapeHtml(row.alias) + '"' + (row.alias === selectedName ? ' selected' : '') + '>' + escapeHtml(row.label + ' [' + row.alias + ']') + '</option>';
+    }).join('');
+  }
+
+  function setOperationColumnOptions(spec, model, operationIndex, alias, selectedName) {
+    var options = flowColumnOptionRows(model, spec, alias, operationIndex);
+    ['Class', '_id', 'Code', 'Description'].forEach(function (column) {
+      if (!options.some(function (item) { return item.value === column; })) options.push({ value: column, label: column });
+    });
+    return renderMatchingColumnOptions(options, selectedName);
+  }
+
+  function renderSetOperationTypeOptions(selected) {
+    var labels = {
+      union: t('setOperationUnion'),
+      difference: t('setOperationDifference'),
+      intersect: t('setOperationIntersect')
+    };
+    return setOperationTypes().map(function (type) {
+      return '<option value="' + type + '"' + (type === selected ? ' selected' : '') + '>' + escapeHtml(labels[type]) + '</option>';
+    }).join('');
+  }
+
+  function renderSetOperationKeyRow(key, operation, model, operationIndex, spec) {
+    key = key || { left: 'Class', right: 'Class' };
+    return [
+      '<tr data-set-operation-key>',
+      '<td><select data-set-operation-key-field="left">' + setOperationColumnOptions(spec, model, operationIndex, operation.from, key.left) + '</select></td>',
+      '<td><select data-set-operation-key-field="right">' + setOperationColumnOptions(spec, model, operationIndex, operation.with, key.right) + '</select></td>',
+      '<td><button data-action="clear-set-operation-key" type="button" aria-label="' + escapeHtml(t('clear') + ': ' + key.left + ' / ' + key.right) + '">' + t('clear') + '</button></td>',
+      '</tr>'
+    ].join('');
+  }
+
+  function renderSetOperation(operation, operationIndex, setIndex, model, spec) {
+    operation = normalizeSetOperation(operation, operationIndex, model.selections, flowOperations(model).slice(0, operationIndex));
+    var keys = operation.on && operation.on.length ? operation.on : [{ left: 'Class', right: 'Class' }, { left: '_id', right: '_id' }];
+    return [
+      '<div class="matching-block" data-flow-operation="' + escapeHtml(operation.type) + '" data-flow-operation-index="' + operationIndex + '" data-set-operation data-set-operation-id="' + escapeHtml(operation.id) + '">',
+      '<div class="section-title-row"><h3>' + t('setOperation', { number: setIndex + 1 }) + '</h3><button data-action="clear-set-operation" type="button" aria-label="' + escapeHtml(t('clear') + ': ' + (operation.as || String(setIndex + 1))) + '">' + t('clear') + '</button></div>',
+      '<div class="settings-grid">',
+      '<label>' + t('setOperationType') + '<select data-set-operation-field="type">' + renderSetOperationTypeOptions(operation.type) + '</select></label>',
+      '<label>' + t('setOperationFrom') + '<select data-set-operation-field="from">' + renderPriorMaterializedAliasOptions(model, operationIndex, operation.from) + '</select></label>',
+      '<label>' + t('setOperationWith') + '<select data-set-operation-field="with">' + renderPriorMaterializedAliasOptions(model, operationIndex, operation.with) + '</select></label>',
+      '<label>' + t('setOperationAlias') + '<input data-set-operation-field="as" value="' + escapeHtml(operation.as) + '"></label>',
+      '<label class="checkbox checkbox-stacked"><input data-set-operation-field="distinct" type="checkbox"' + (operation.distinct !== false ? ' checked' : '') + '> <span><strong>' + t('setOperationDistinct') + '</strong></span></label>',
+      '</div>',
+      '<div class="section-title-row"><h4>' + t('setOperationKeys') + '</h4><button data-action="add-set-operation-key" type="button">' + t('addSetOperationKey') + '</button></div>',
+      '<table class="compact"><thead><tr><th>' + t('setOperationLeftKey') + '</th><th>' + t('setOperationRightKey') + '</th><th></th></tr></thead><tbody>',
+      keys.map(function (key) { return renderSetOperationKeyRow(key, operation, model, operationIndex, spec); }).join(''),
+      '</tbody></table>',
+      '</div>'
+    ].join('');
+  }
+
+  function renderPublishedTableControl(model) {
+    return [
+      '<div class="settings-block" data-result-set-output>',
+      '<h3>' + t('publishedTable') + '</h3>',
+      '<label>' + t('publishedTable') + '<select data-result-set-field="publishedAlias">' + renderMaterializedAliasOptions(model, model.output && model.output.alias || '') + '</select><span class="muted">' + escapeHtml(t('publishedTableHelp')) + '</span></label>',
       '</div>'
     ].join('');
   }
@@ -5921,7 +8570,17 @@ function dynamicPagesClientScript() {
     return [
       '<section class="section" id="cmdp-relation-expansion-editor"><h2>' + t('relationEditor') + '</h2>',
       '<p class="muted">' + t('relationHelp') + '</p>',
-      model.blocks.map(function (block, index) { return renderObjectMatchingBlock(block, index, model, spec); }).join(''),
+      '<div class="settings-block"><div class="section-title-row"><h3>' + t('flowOperations') + '</h3><div><button data-action="add-matching-block" type="button">' + t('addMatchingBlock') + '</button><button data-action="add-set-operation" type="button">' + t('addSetOperation') + '</button></div></div><p class="muted">' + t('flowOperationsHelp') + '</p>',
+      flowOperations(model).map(function (operation, index) {
+        var earlier = flowOperations(model).slice(0, index);
+        var matchIndex = earlier.filter(function (item) { return item.type === 'match'; }).length;
+        var setIndex = earlier.length - matchIndex;
+        return operation.type === 'match'
+          ? renderObjectMatchingBlock(operation, index, matchIndex, model, spec)
+          : renderSetOperation(operation, index, setIndex, model, spec);
+      }).join(''),
+      '</div>',
+      renderPublishedTableControl(model),
       '</section>'
     ].join('');
   }
@@ -5996,49 +8655,18 @@ function dynamicPagesClientScript() {
     return runtimeConfig.assistant || defaultRuntimeConfig().assistant;
   }
 
-  function assistantEffectiveLimitValue(value, fallback, cap, min) {
-    min = min || 1;
-    var number = Number(value);
-    var raw = Number.isInteger(number) && number > 0 ? Math.max(min, number) : fallback;
-    var effective = Math.min(raw, cap || raw);
-    return {
-      raw: raw,
-      effective: effective,
-      clamped: raw !== effective
-    };
-  }
-
-  function assistantMcpLimitsStatus(mcp) {
-    var caps = boot.assistantMcpCaps || {};
-    var maxClasses = assistantEffectiveLimitValue(mcp.maxClasses, defaultRuntimeConfig().executionLimits.maxClassesDefault, caps.maxClasses || mcp.maxClasses || 1);
-    var maxDomains = assistantEffectiveLimitValue(mcp.maxDomains, defaultRuntimeConfig().executionLimits.maxDomainsDefault, caps.maxDomains || mcp.maxDomains || 1);
-    var maxContextBytes = assistantEffectiveLimitValue(mcp.maxContextBytes, defaultRuntimeConfig().assistant.mcp.maxContextBytes, caps.maxContextBytes || mcp.maxContextBytes || 1024, 1024);
-    function part(name, item) {
-      return name + '=' + (item.clamped ? item.raw + '->' + item.effective : item.effective);
-    }
-    return [
-      part('classes', maxClasses),
-      part('domains', maxDomains),
-      part('bytes', maxContextBytes)
-    ].join(', ');
-  }
-
   function renderAssistantStatus(config) {
     var assistant = assistantConfigForEditor(config);
     var llm = assistant.llm || {};
     var mcp = assistant.mcp || {};
     var apiKeyConfigured = Boolean(boot.assistant && boot.assistant.apiKeyConfigured);
+    var tools = splitToolList(mcp.allowedTools);
     return [
       '<section class="section"><h2>' + t('assistantStatusTitle') + '</h2>',
       '<div class="assistant-status-grid">',
       '<div><strong>' + t('assistantStatusEnabled') + '</strong><br><span class="pill ' + (llm.enabled ? 'ok' : '') + '">' + (llm.enabled ? t('yes') : t('no')) + '</span></div>',
-      '<div><strong>' + t('assistantStatusProvider') + '</strong><br><span class="code-inline">litellm</span></div>',
-      '<div><strong>' + t('assistantStatusBaseUrl') + '</strong><br><span class="code-inline">' + escapeHtml(llm.baseUrl || '') + '</span></div>',
-      '<div><strong>' + t('assistantStatusModel') + '</strong><br><span class="code-inline">' + escapeHtml(llm.model || '') + '</span></div>',
       '<div><strong>' + t('assistantStatusApiKey') + '</strong><br><span class="pill ' + (apiKeyConfigured ? 'ok' : '') + '">' + escapeHtml(apiKeyConfigured ? t('assistantStatusConfigured') : t('assistantStatusMissing')) + '</span></div>',
-      '<div><strong>' + t('assistantStatusMcp') + '</strong><br><span class="pill ' + (mcp.enabled ? 'ok' : '') + '">' + (mcp.enabled ? t('yes') : t('no')) + '</span></div>',
-      '<div><strong>' + t('assistantMcpTools') + '</strong><br><span class="code-inline">' + escapeHtml(splitToolList(mcp.allowedTools).join(', ')) + '</span></div>',
-      '<div><strong>' + t('assistantMcpSettings') + '</strong><br><span class="code-inline">' + escapeHtml(assistantMcpLimitsStatus(mcp)) + '</span></div>',
+      '<div><strong>' + t('assistantMcpTools') + '</strong><br><span class="code-inline">' + escapeHtml(tools.length ? tools.join(', ') : t('assistantMcpAllTools')) + '</span></div>',
       '</div></section>'
     ].join('');
   }
@@ -6099,27 +8727,44 @@ function dynamicPagesClientScript() {
     return '<div class="assistant-draft-preview" aria-busy="' + (state.assistantGenerating ? 'true' : 'false') + '">' + (html || '<pre>' + escapeHtml(pretty(json)) + '</pre>') + '</div>';
   }
 
+  function renderAssistantFlowEditor() {
+    var proposal = state.assistantFlowProposal;
+    var preview = '';
+    if (proposal) {
+      var selections = Array.isArray(proposal.selections) ? proposal.selections : [];
+      var operations = Array.isArray(proposal.operations) ? proposal.operations : [];
+      preview = '<div class="assistant-draft-preview"><h4>' + escapeHtml(t('assistantFlowReady')) + '</h4><p>' + escapeHtml(state.assistantFlowExplanation || '') + '</p><ul class="steps">'
+        + selections.map(function (selection, index) {
+          var detail = (selection.className || '') + (selection.from ? ' <- ' + selection.from : '');
+          return '<li>' + escapeHtml((selection.name || t('assistantSelectionStage', { number: index + 1 })) + ': ' + detail) + '</li>';
+        }).join('')
+        + operations.map(function (operation) {
+          return '<li>' + escapeHtml((operation.type === 'match' ? 'match' : operation.type || 'union') + ': ' + (operation.from || '') + ' + ' + (operation.with || '') + ' -> ' + (operation.as || '')) + '</li>';
+        }).join('')
+        + (proposal.publishedAlias ? '<li>' + escapeHtml(t('publishedTable') + ': ' + proposal.publishedAlias) + '</li>' : '')
+        + (state.assistantFlowWarnings.length ? '<li>' + escapeHtml(t('assistantWarnings') + ': ' + state.assistantFlowWarnings.join(' ')) + '</li>' : '')
+        + '</ul></div>';
+    }
+    return [
+      '<div class="diagram-editor-block" id="cmdp-assistant-object-flow" aria-busy="' + (state.assistantFlowBusy ? 'true' : 'false') + '">',
+      '<div class="diagram-editor-heading"><h3>' + t('assistantDataFlowTitle') + '</h3></div>',
+      '<p class="muted">' + t('assistantDataFlowHelp') + '</p>',
+      '<label>' + t('assistantDataFlowPrompt') + '<textarea id="cmdp-assistant-object-flow-prompt" rows="10"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(state.assistantObjectFlowPrompt || '') + '</textarea></label>',
+      '<div class="toolbar"><button type="button" data-action="assistant-flow-generate"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(state.assistantFlowBusy ? t('assistantGenerateBusy') : t('assistantGenerateFlow')) + '</button><button type="button" class="primary" data-action="assistant-flow-apply"' + (!proposal || state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantApplyFlow')) + '</button></div>',
+      preview,
+      '<p class="muted">' + t('assistantProposalOnly') + '</p>',
+      '</div>'
+    ].join('');
+  }
+
   function renderAssistantEditor(selected, config) {
-    var intent = state.assistantDraftIntent || '';
     var spec = selected && selected.spec ? selected.spec : defaultSpec();
-    var generateLabel = state.assistantGenerating ? t('assistantGenerateBusy') : t('assistantGenerate');
-    var generateDisabled = state.assistantGenerating ? ' disabled aria-disabled="true" aria-busy="true"' : '';
-    var applyDisabled = state.assistantGenerating ? ' disabled aria-disabled="true"' : '';
     return [
       '<section class="section" id="cmdp-assistant-editor"><h2>' + t('assistantEditor') + '</h2>',
-      '<p class="muted">' + t('assistantHelp') + '</p>',
-      '<div class="assistant-grid">',
-      '<div>',
-      '<label>' + t('assistantTaskMode') + '<br>' + renderAssistantTaskMode(state.assistantTaskMode) + '</label>',
-      '<label>' + t('assistantIntent') + '<textarea id="cmdp-assistant-intent" rows="9" style="width:100%">' + escapeHtml(intent) + '</textarea></label>',
-      '<div class="toolbar"><button class="primary" data-action="assistant-generate"' + generateDisabled + '>' + escapeHtml(generateLabel) + '</button><button data-action="assistant-apply-draft"' + applyDisabled + '>' + t('assistantApplyDraft') + '</button></div>',
-      '<details class="help-details"><summary>' + t('specJson') + '</summary><pre>' + escapeHtml(pretty(spec)) + '</pre></details>',
-      '</div>',
-      '<div>',
+      '<p class="muted">' + t('assistantProposalOnly') + '</p>',
       renderAssistantStatus(config),
-      '<section class="section"><h2>' + t('assistantDraftSpec') + '</h2>' + renderAssistantDraftResult() + '</section>',
-      '</div>',
-      '</div>',
+      renderAssistantFlowEditor(),
+      renderDiagramImportWorkbench(spec),
       '</section>'
     ].join('');
   }
@@ -6335,6 +8980,9 @@ function dynamicPagesClientScript() {
     var mcp = assistant.mcp || {};
     var prompt = assistant.prompt || {};
     var systemPrompt = String(prompt.system || '').trim() || defaultRuntimeConfig().assistant.prompt.system;
+    var objectFlowPrompt = String(prompt.objectFlow || '').trim() || defaultRuntimeConfig().assistant.prompt.objectFlow;
+    var diagramInterpretationPrompt = String(prompt.diagramInterpretation || '').trim() || defaultRuntimeConfig().assistant.prompt.diagramInterpretation;
+    var diagramMappingPrompt = String(prompt.diagramMapping || '').trim() || defaultRuntimeConfig().assistant.prompt.diagramMapping;
     return [
       '<h3>' + t('assistantLlmSettings') + '</h3>',
       '<div class="checkbox-list">',
@@ -6346,6 +8994,9 @@ function dynamicPagesClientScript() {
       '</div>',
       '<h3>' + t('assistantPromptSettings') + '</h3>',
       '<label>' + t('assistantSystemPrompt') + '<textarea id="cmdp-assistant-system-prompt" rows="10" style="width:100%">' + escapeHtml(systemPrompt) + '</textarea><span class="muted">' + escapeHtml(t('assistantSystemPromptHelp')) + '</span></label>',
+      '<label>' + t('assistantObjectFlowSystemPrompt') + '<textarea id="cmdp-assistant-object-flow-system-prompt" rows="8" style="width:100%">' + escapeHtml(objectFlowPrompt) + '</textarea></label>',
+      '<label>' + t('assistantDiagramInterpretSystemPrompt') + '<textarea id="cmdp-assistant-diagram-interpret-system-prompt" rows="8" style="width:100%">' + escapeHtml(diagramInterpretationPrompt) + '</textarea></label>',
+      '<label>' + t('assistantDiagramMappingSystemPrompt') + '<textarea id="cmdp-assistant-diagram-mapping-system-prompt" rows="8" style="width:100%">' + escapeHtml(diagramMappingPrompt) + '</textarea></label>',
       '<h3>' + t('assistantMcpSettings') + '</h3>',
       '<div class="checkbox-list">',
       '<label class="checkbox checkbox-stacked"><input id="cmdp-assistant-mcp-enabled" type="checkbox" ' + (mcp.enabled ? 'checked' : '') + '> <span><strong>' + t('assistantMcpEnabled') + '</strong></span></label>',
@@ -6677,6 +9328,7 @@ function dynamicPagesClientScript() {
       '<div class="form">',
       '<label class="checkbox"><input id="cmdp-cache-enabled" type="checkbox" ' + (cache.enabled ? 'checked' : '') + '> ' + t('cacheEnabled') + '</label>',
       '<label>' + t('cacheScopeMode') + '<select id="cmdp-cache-scope-mode">' + renderCacheScopeOptions(cache.scopeMode) + '</select></label>',
+      '<div class="notice warning">' + escapeHtml(t('cachePermissionOnlyWarning')) + '</div>',
       '<div class="notice">' + escapeHtml(t('cachePermissionOnlyHelp')) + '<br>' + escapeHtml(t('cacheVisibilityHashHelp')) + '<br>' + escapeHtml(t('cachePrivateUserHelp')) + '</div>',
       '<div class="row">',
       '<label>' + t('cacheTtlHours') + '<input id="cmdp-cache-ttl-hours" type="number" min="0.01" max="24" step="0.01" value="' + escapeHtml(cacheTtlHoursForInput(cache)) + '"></label>',
@@ -6789,6 +9441,7 @@ function dynamicPagesClientScript() {
       'final-view',
       'cmdb-build-view',
       'selection',
+      'diagram',
       'visualization',
       'cache',
       'publication'
@@ -6802,6 +9455,7 @@ function dynamicPagesClientScript() {
       renderActionButton('refresh', t('refresh'))
     ];
     var context = '';
+    var importedDiagramNeedsPreview = state.diagramImportStale || (state.diagramImportAppliedPendingPreview && !state.lastDraftPreviewOk);
     if (sectionPersistsTemplate(section) || section === 'run') {
       actions.push(renderActionButton('assistant-draft', t('assistantDraft')));
     }
@@ -6810,12 +9464,10 @@ function dynamicPagesClientScript() {
       actions.push(renderActionButton('new-template', t('newTemplate'), { primary: true }));
       actions.push(renderActionButton('new-cmdb-build-view', t('templateKindCmdbBuildView')));
     } else if (section === 'assistant') {
-      actions.push(renderActionButton('assistant-generate', state.assistantGenerating ? t('assistantGenerateBusy') : t('assistantGenerate'), { primary: true, disabled: state.assistantGenerating, busy: state.assistantGenerating }));
-      actions.push(renderActionButton('assistant-apply-draft', t('assistantApplyDraft'), { disabled: state.assistantGenerating }));
       actions.push(renderActionButton('draft-validate', t('validate')));
       actions.push(renderActionButton('draft-preview', t('preview')));
     } else if (section === 'template') {
-      actions.push(renderActionButton('save-template', t('save'), { primary: true }));
+      actions.push(renderActionButton('save-template', t('save'), { primary: true, disabled: importedDiagramNeedsPreview, title: importedDiagramNeedsPreview ? t('diagramImportPreviewRequired') : '' }));
     } else if (section === 'params') {
       actions.push(renderActionButton('add-param-row', t('addParam')));
       actions.push(renderActionButton('apply-params', t('applyParams'), { primary: true }));
@@ -6870,7 +9522,7 @@ function dynamicPagesClientScript() {
     }
 
     if (sectionPersistsTemplate(section) && section !== 'template') {
-      actions.push(renderActionButton('save-template', t('save')));
+      actions.push(renderActionButton('save-template', t('save'), { disabled: importedDiagramNeedsPreview, title: importedDiagramNeedsPreview ? t('diagramImportPreviewRequired') : '' }));
       actions.push(renderActionButton('validate-template', t('validate')));
       actions.push(renderActionButton('preview-template', t('preview')));
     }
@@ -6926,6 +9578,7 @@ function dynamicPagesClientScript() {
     ].join('');
     hydrateVisualizationRowGroupOptions(app);
     applyObjectPathFilter(app);
+    initializeDiagramViewports(app);
     ensureCatalogAttributesForDesignerSection();
   }
 
@@ -7236,6 +9889,8 @@ function dynamicPagesClientScript() {
 
   function visibleResultTables(tables) {
     var source = Array.isArray(tables) ? tables : [];
+    var published = source.filter(function (table) { return table && table.name && table.published === true; });
+    if (published.length) return [published[0]];
     var prepared = source.filter(function (table) {
       return table && table.name && !isRawObjectGroupTableName(table.name);
     });
@@ -7371,6 +10026,16 @@ function dynamicPagesClientScript() {
       return step && step.type === 'matchRows' && step.as === name && step.from;
     });
     if (matchStep) return sourceClassForAlias(spec, matchStep.from);
+
+    var setStep = steps.find(function (step) {
+      return step && ['unionRows', 'differenceRows', 'intersectRows'].indexOf(step.type) !== -1 && step.as === name && step.from;
+    });
+    if (setStep) {
+      var leftClass = sourceClassForAlias(spec, setStep.from);
+      if (setStep.type !== 'unionRows') return leftClass;
+      var rightClass = sourceClassForAlias(spec, setStep.with);
+      return leftClass && leftClass === rightClass ? leftClass : '';
+    }
 
     var selection = steps.find(function (step) {
       return step && step.type === 'selectCards' && step.as === name;
@@ -7798,7 +10463,9 @@ function dynamicPagesClientScript() {
     var fields = mapping && mapping.fields && typeof mapping.fields === 'object' && !Array.isArray(mapping.fields) ? mapping.fields : {};
     for (var index = 0; index < names.length; index += 1) {
       var name = names[index];
-      var value = mapping && (mapping[name] || fields[name]);
+      var fieldValue = fields[name];
+      if (typeof fieldValue === 'string' && fieldValue.trim()) return fieldValue.trim();
+      var value = mapping && mapping[name];
       if (typeof value === 'string' && value.trim()) return value.trim();
     }
     return fallback || '';
@@ -7849,6 +10516,30 @@ function dynamicPagesClientScript() {
     return String(value || '').split(',').map(function (item) { return item.trim(); }).filter(Boolean);
   }
 
+  function uniqueDiagramFieldNames(values) {
+    var result = [];
+    var seen = {};
+    (Array.isArray(values) ? values : []).forEach(function (value) {
+      var text = String(value || '').trim();
+      if (!text || seen[text]) return;
+      seen[text] = true;
+      result.push(text);
+    });
+    return result;
+  }
+
+  function diagramTemplateFieldNames(template) {
+    var fields = [];
+    String(template || '').replace(/\$\{([^}]+)\}/g, function (match, rawToken) {
+      var token = String(rawToken || '').trim();
+      if (!token || token.indexOf('param.') === 0 || token.indexOf('params.') === 0) return match;
+      if (token.indexOf('row.') === 0) token = token.slice(4);
+      if (token) fields.push(token);
+      return match;
+    });
+    return uniqueDiagramFieldNames(fields);
+  }
+
   function diagramMappingFieldListValue(mapping, rootName, fieldName) {
     var fields = mapping && mapping.fields && typeof mapping.fields === 'object' && !Array.isArray(mapping.fields) ? mapping.fields : {};
     return diagramFieldListFromValue(mapping && (mapping[rootName] || fields[rootName] || fields[fieldName]) || '');
@@ -7882,21 +10573,55 @@ function dynamicPagesClientScript() {
     }).join('') + '</select>';
   }
 
+  function renderDiagramTemplateSuggestions(spec, sourceAlias) {
+    var rows = diagramColumnOptionRowsForSource(spec, sourceAlias).filter(function (item) { return item && item.value; }).slice(0, 36);
+    if (!rows.length) return '';
+    return '<div class="diagram-template-suggestions"><span class="muted">' + escapeHtml(t('visualizationDiagramLabelSuggestions')) + '</span><div class="diagram-token-list">' +
+      rows.map(function (item) {
+        var value = item.value || '';
+        return '<button type="button" class="diagram-token-button" data-action="insert-diagram-template-token" data-template-token="' + escapeHtml(value) + '" title="$' + '{' + escapeHtml(value) + '}">' + escapeHtml(item.label || value) + '</button>';
+      }).join('') + '</div></div>';
+  }
+
+  function diagramMappingDerivedFieldNames(kind, mapping) {
+    var fields = mapping && mapping.fields && typeof mapping.fields === 'object' && !Array.isArray(mapping.fields) ? mapping.fields : {};
+    var names = ['Class', '_id', 'Code', 'Description', 'sourceClass', 'targetClass', 'domain', 'direction'];
+    function add(value) {
+      var text = String(value || '').trim();
+      if (text) names.push(text);
+    }
+    if (kind === 'nodes') {
+      ['id', 'label', 'group', 'parent', 'nodeType', 'href'].forEach(function (name) { add(fields[name] || mapping && mapping[name]); });
+    } else if (kind === 'edges') {
+      ['source', 'target', 'label', 'edgeType', 'edgeDirection'].forEach(function (name) { add(fields[name] || mapping && mapping[name]); });
+    } else if (kind === 'groups') {
+      ['id', 'label', 'parent'].forEach(function (name) { add(fields[name] || mapping && mapping[name]); });
+    } else {
+      ['child', 'parent', 'label'].forEach(function (name) { add(fields[name] || mapping && mapping[name]); });
+    }
+    diagramTemplateFieldNames(mapping && mapping.labelTemplate).forEach(add);
+    return uniqueDiagramFieldNames(names);
+  }
+
+  function renderDiagramDerivedDataFields(kind, mapping) {
+    var fields = diagramMappingDerivedFieldNames(kind, mapping);
+    if (!fields.length) return '';
+    return '<div class="diagram-derived-fields"><span class="muted">' + escapeHtml(t('visualizationDiagramDerivedDataFields')) + '</span><div class="diagram-token-list">' +
+      fields.map(function (field) { return '<span class="diagram-token-pill" title="' + escapeHtml(field) + '">' + escapeHtml(field) + '</span>'; }).join('') +
+      '</div></div>';
+  }
+
   function renderDiagramMappingDetail(kind, mapping, index, spec, sourceAlias, colspan) {
     var labelTemplate = diagramMappingFieldValue(mapping, ['labelTemplate'], '');
-    var labelField = diagramMappingFieldValue(mapping, kind === 'edges' ? ['edgeLabel', 'edgeTitle', 'label', 'labelColumn'] : ['nodeLabel', 'groupLabel', 'label', 'labelColumn'], 'label');
-    var labelFields = diagramMappingFieldListValue(mapping, 'labelFields', 'labelFields');
-    if (!labelFields.length && labelField) labelFields = [labelField];
     var profile = diagramMappingDataProfileForEditor(mapping);
     return [
       '<tr data-diagram-mapping-detail data-diagram-mapping-kind="' + kind + '" data-diagram-mapping-index="' + index + '">',
       '<td class="diagram-mapping-detail-cell" colspan="' + String(colspan) + '">',
       '<div class="diagram-mapping-detail">',
-      '<label>' + t('visualizationDiagramLabelTemplate') + '<input data-diagram-mapping-field="labelTemplate" value="' + escapeHtml(labelTemplate) + '" placeholder="$' + '{Code} $' + '{Description}"></label>',
-      '<label>' + t('visualizationDiagramLabelFields') + renderDiagramMultiFieldSelect(spec, sourceAlias, 'labelFields', labelFields) + '</label>',
+      '<label class="diagram-template-field">' + t('visualizationDiagramLabelTemplate') + '<input data-diagram-mapping-field="labelTemplate" value="' + escapeHtml(labelTemplate) + '" placeholder="$' + '{Code} $' + '{Description}">' + renderDiagramTemplateSuggestions(spec, sourceAlias) + '</label>',
       '<label>' + t('visualizationDiagramDataProfile') + '<input data-diagram-mapping-field="dataProfileName" value="' + escapeHtml(profile.name) + '"></label>',
-      '<label>' + t('visualizationDiagramDataClass') + '<input data-diagram-mapping-field="dataClassName" value="' + escapeHtml(profile.className) + '"></label>',
-      '<label>' + t('visualizationDiagramDataFields') + renderDiagramMultiFieldSelect(spec, sourceAlias, 'dataProfileFields', profile.fields) + '</label>',
+      renderDiagramDerivedDataFields(kind, mapping),
+      '<label>' + t('visualizationDiagramExtraDataFields') + renderDiagramMultiFieldSelect(spec, sourceAlias, 'dataProfileFields', profile.fields) + '</label>',
       '<label><input type="checkbox" data-diagram-mapping-field="dataIncludeSourceRef"' + (profile.includeSourceRef ? ' checked' : '') + '> ' + t('visualizationDiagramIncludeSourceRef') + '</label>',
       '</div>',
       '</td>',
@@ -7917,6 +10642,7 @@ function dynamicPagesClientScript() {
 
   function renderDiagramMappingRow(kind, mapping, index, spec) {
     mapping = mapping || {};
+    var importRole = mapping.importRole && typeof mapping.importRole === 'object' && !Array.isArray(mapping.importRole) ? mapping.importRole : {};
     var sourceAlias = diagramMappingSourceValue(mapping);
     var cells = ['<td>' + renderDiagramSourceSelect(spec, sourceAlias) + '</td>'];
     if (kind === 'nodes') {
@@ -7943,7 +10669,7 @@ function dynamicPagesClientScript() {
       cells.push('<td>' + renderDiagramFieldSelect(spec, sourceAlias, 'label', diagramMappingFieldValue(mapping, ['edgeLabel', 'label', 'labelColumn'], 'label')) + '</td>');
     }
     cells.push('<td class="diagram-action-cell"><button type="button" data-action="clear-diagram-mapping-row" title="' + escapeHtml(t('clear')) + '">&times;</button></td>');
-    return '<tr data-diagram-mapping-row data-diagram-mapping-kind="' + kind + '" data-diagram-mapping-index="' + index + '">' + cells.join('') + '</tr>' +
+    return '<tr data-diagram-mapping-row data-diagram-mapping-kind="' + kind + '" data-diagram-mapping-index="' + index + '" data-diagram-mapping-id="' + escapeHtml(mapping.id || '') + '" data-import-role-key="' + escapeHtml(importRole.key || '') + '" data-import-role-label="' + escapeHtml(importRole.label || '') + '" data-import-role-kind="' + escapeHtml(importRole.kind || '') + '">' + cells.join('') + '</tr>' +
       renderDiagramMappingDetail(kind, mapping, index, spec, sourceAlias, cells.length);
   }
 
@@ -7964,11 +10690,467 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
+  function diagramImportFamilyLabel(family) {
+    if (family === 'nodeMappings') return t('diagramImportNodes');
+    if (family === 'edgeMappings') return t('diagramImportEdges');
+    if (family === 'groupMappings') return t('diagramImportGroups');
+    return t('diagramImportHierarchy');
+  }
+
+  function diagramImportSemanticLabel(semantic) {
+    if (semantic === 'object') return t('diagramImportSemanticObject');
+    if (semantic === 'composite') return t('diagramImportSemanticComposite');
+    if (semantic === 'static' || semantic === 'decorative') return t('diagramImportSemanticDecorative');
+    return t('diagramImportSemanticGroup');
+  }
+
+  function diagramImportClientSemanticSelections(proposal) {
+    var selections = {};
+    (proposal && Array.isArray(proposal.containerRoles) ? proposal.containerRoles : []).forEach(function (role) {
+      var selected = ['composite', 'group', 'decorative'].indexOf(role && role.selectedRole) >= 0 ? role.selectedRole : '';
+      var suggested = ['composite', 'group', 'decorative'].indexOf(role && role.suggestedRole) >= 0 ? role.suggestedRole : 'group';
+      selections[String(role && role.key || '')] = { selected: selected, effective: selected || suggested, confirmed: Boolean(selected) };
+    });
+    return selections;
+  }
+
+  function diagramImportClientBindingActive(binding, selections) {
+    if (binding && binding.retained) return true;
+    return (binding && Array.isArray(binding.semanticConditions) ? binding.semanticConditions : []).every(function (condition) {
+      var selection = selections[String(condition && condition.key || '')];
+      return !selection || Array.isArray(condition.allowed) && condition.allowed.indexOf(selection.effective) >= 0;
+    });
+  }
+
+  function diagramImportClientRoleRelevant(role, proposal, selections) {
+    var groups = proposal && proposal.structure && Array.isArray(proposal.structure.groups) ? proposal.structure.groups : [];
+    var byKey = {};
+    groups.forEach(function (group) { if (group && group.key) byKey[String(group.key)] = group; });
+    var current = role;
+    var seen = {};
+    while (current && current.parentKey) {
+      var parentKey = String(current.parentKey);
+      if (seen[parentKey]) break;
+      seen[parentKey] = true;
+      if (selections[parentKey] && selections[parentKey].effective === 'composite') return false;
+      current = byKey[parentKey];
+    }
+    return true;
+  }
+
+  function diagramImportClientDescendants(proposal, rootKey) {
+    var structure = proposal && proposal.structure || {};
+    var elements = (Array.isArray(structure.nodes) ? structure.nodes : []).concat(Array.isArray(structure.groups) ? structure.groups : []);
+    var parentByKey = {};
+    elements.forEach(function (element) {
+      if (element && element.key && element.parentKey) parentByKey[String(element.key)] = String(element.parentKey);
+    });
+    (Array.isArray(structure.hierarchies) ? structure.hierarchies : []).forEach(function (relation) {
+      if (relation && relation.childKey && relation.parentKey && !parentByKey[String(relation.childKey)]) parentByKey[String(relation.childKey)] = String(relation.parentKey);
+    });
+    var descendants = {};
+    descendants[String(rootKey || '')] = true;
+    var changed = true;
+    while (changed) {
+      changed = false;
+      Object.keys(parentByKey).forEach(function (child) {
+        if ((parentByKey[child] === rootKey || descendants[parentByKey[child]]) && !descendants[child]) {
+          descendants[child] = true;
+          changed = true;
+        }
+      });
+    }
+    return descendants;
+  }
+
+  function refreshDiagramImportSemanticState(proposal) {
+    if (!proposal) return proposal;
+    if (proposal.version === 3) {
+      proposal.unresolved = [];
+      (Array.isArray(proposal.roles) ? proposal.roles : []).forEach(function (role) {
+        var semantic = String(role.selectedSemantic || '');
+        var primary = role.mapping && role.mapping.primary || {};
+        var source = role.mapping && role.mapping.source || {};
+        if (!semantic) proposal.unresolved.push({ id: role.id, family: 'roles', fields: ['semantic'] });
+        if (role.exemplarRequired && !role.exemplarKey) proposal.unresolved.push({ id: role.id, family: 'roles', fields: ['exemplarKey'] });
+        if (semantic && semantic !== 'static' && !String(source.stageId || '').trim()) proposal.unresolved.push({ id: role.id, family: 'roles', fields: ['source.stageId'] });
+        if (semantic === 'static' && primary.className && !source.stageId && !(Array.isArray(primary.filters) && primary.filters.length)) proposal.unresolved.push({ id: role.id, family: 'roles', fields: ['primary.filters'] });
+        (role.mapping && Array.isArray(role.mapping.related) ? role.mapping.related : []).forEach(function (related) {
+          if (!related.className || !Array.isArray(related.path) || !related.path.length) proposal.unresolved.push({ id: related.id, family: 'related', fields: ['className', 'path'] });
+        });
+      });
+      (Array.isArray(proposal.relationRules) ? proposal.relationRules : []).forEach(function (rule) {
+        if (!rule.parentRoleId || !rule.childRoleId || !Array.isArray(rule.path) || !rule.path.length) proposal.unresolved.push({ id: rule.id, family: 'relationRules', fields: ['parentRoleId', 'childRoleId', 'path'] });
+      });
+      (Array.isArray(proposal.placementRules) ? proposal.placementRules : []).forEach(function (rule) {
+        if (!rule.parentRoleId || !rule.childRoleId) proposal.unresolved.push({ id: rule.id, family: 'placementRules', fields: ['parentRoleId', 'childRoleId'] });
+      });
+      return proposal;
+    }
+    var selections = diagramImportClientSemanticSelections(proposal);
+    (Array.isArray(proposal.bindings) ? proposal.bindings : []).forEach(function (binding) {
+      binding.active = diagramImportClientBindingActive(binding, selections);
+      if (binding.active !== false && !binding.remove) {
+        var mapping = binding.mapping || {};
+        var fields = mapping.fields && typeof mapping.fields === 'object' && !Array.isArray(mapping.fields) ? mapping.fields : {};
+        var required = binding.family === 'edgeMappings'
+          ? ['source', 'target']
+          : binding.family === 'hierarchyMappings'
+            ? ['child', 'parent']
+            : ['id'];
+        binding.unresolved = diagramMappingSourceValue(mapping) ? [] : ['from'];
+        required.forEach(function (name) { if (!String(fields[name] || '').trim()) binding.unresolved.push(name); });
+      } else {
+        binding.unresolved = [];
+      }
+    });
+    proposal.unresolved = (Array.isArray(proposal.bindings) ? proposal.bindings : []).filter(function (binding) {
+      return binding && binding.active !== false && !binding.remove && binding.unresolved && binding.unresolved.length;
+    }).map(function (binding) {
+      return { id: binding.id, family: binding.family, fields: binding.unresolved.slice() };
+    });
+    (Array.isArray(proposal.containerRoles) ? proposal.containerRoles : []).forEach(function (role) {
+      var selection = selections[String(role && role.key || '')];
+      var group = proposal.structure && Array.isArray(proposal.structure.groups) && proposal.structure.groups.find(function (item) { return String(item && item.key || '') === String(role && role.key || ''); });
+      if (diagramImportClientRoleRelevant(group || role, proposal, selections) && (!selection || !selection.confirmed)) {
+        proposal.unresolved.push({ id: 'semantic:' + String(role && role.key || ''), family: 'containerRoles', fields: ['semantic'] });
+      } else if (selection && selection.effective === 'composite') {
+        var descendants = diagramImportClientDescendants(proposal, String(role && role.key || ''));
+        var edges = proposal.structure && Array.isArray(proposal.structure.edges) ? proposal.structure.edges : [];
+        var boundaryEdge = edges.some(function (edge) {
+          return Boolean(descendants[String(edge && edge.sourceKey || '')]) !== Boolean(descendants[String(edge && edge.targetKey || '')]);
+        });
+        if (boundaryEdge) proposal.unresolved.push({ id: 'semantic:' + String(role && role.key || ''), family: 'containerRoles', fields: ['boundaryEdge'] });
+      }
+    });
+    return proposal;
+  }
+
+  function renderDiagramImportRoleOptions(roles, selectedId, predicate) {
+    return '<option value=""></option>' + (Array.isArray(roles) ? roles : []).filter(function (role) {
+      return !predicate || predicate(role);
+    }).map(function (role) {
+      return '<option value="' + escapeHtml(role.id || '') + '"' + (String(role.id || '') === String(selectedId || '') ? ' selected' : '') + '>' +
+        escapeHtml((role.label || role.key || role.id) + ' [' + (role.key || '') + ']') + '</option>';
+    }).join('');
+  }
+
+  function renderDiagramImportSemanticsHelp() {
+    return '<details class="diagram-import-help"><summary>' + escapeHtml(t('diagramImportSemanticsHelpTitle')) + '</summary><div class="notice">' +
+      '<p>' + escapeHtml(t('diagramImportSemanticsHelpObject')) + '</p>' +
+      '<p>' + escapeHtml(t('diagramImportSemanticsHelpComposite')) + '</p>' +
+      '<p>' + escapeHtml(t('diagramImportSemanticsHelpGroup')) + '</p>' +
+      '<p>' + escapeHtml(t('diagramImportSemanticsHelpStatic')) + '</p></div></details>';
+  }
+
+  function renderDiagramImportAttributeMultiSelect(className, selectedNames, fieldAttribute) {
+    var selected = {};
+    (Array.isArray(selectedNames) ? selectedNames : []).forEach(function (name) { selected[String(name || '')] = true; });
+    var options = catalogAttributeOptions(className);
+    Object.keys(selected).forEach(function (name) {
+      if (name && !options.some(function (item) { return item && item.name === name; })) options.push({ name: name, type: '' });
+    });
+    return '<select multiple ' + fieldAttribute + '>' + options.map(function (item) {
+      var name = String(item && item.name || '');
+      var label = name + (item && item.type ? ' : ' + item.type : '');
+      return '<option value="' + escapeHtml(name) + '"' + (selected[name] ? ' selected' : '') + '>' + escapeHtml(label) + '</option>';
+    }).join('') + '</select>';
+  }
+
+  function renderDiagramImportLabelSuggestions(role, spec) {
+    var mapping = role && role.mapping || {};
+    var primary = mapping.primary || {};
+    var source = mapping.source || {};
+    var stage = diagramImportStageById(spec || defaultSpec(), source.stageId) || {};
+    var rows = (stage.columns || []).map(function (name) { return { value: name, label: name }; }).concat(catalogAttributeOptions(primary.className || '').map(function (item) {
+      return { value: item.name, label: item.name };
+    }));
+    (Array.isArray(mapping.related) ? mapping.related : []).forEach(function (related) {
+      var prefix = String(related && related.id || '').trim();
+      if (!prefix) return;
+      catalogAttributeOptions(related.className || '').forEach(function (item) {
+        rows.push({ value: prefix + '.' + item.name, label: prefix + '.' + item.name });
+      });
+    });
+    rows = rows.filter(function (item, index) {
+      return item.value && rows.findIndex(function (candidate) { return candidate.value === item.value; }) === index;
+    }).slice(0, 36);
+    if (!rows.length) return '';
+    return '<div class="diagram-template-suggestions"><span class="muted">' + escapeHtml(t('visualizationDiagramLabelSuggestions')) + '</span><div class="diagram-token-list">' + rows.map(function (item) {
+      return '<button type="button" class="diagram-token-button" data-action="insert-diagram-template-token" data-template-token="' + escapeHtml(item.value) + '" title="$' + '{' + escapeHtml(item.value) + '}">' + escapeHtml(item.label) + '</button>';
+    }).join('') + '</div></div>';
+  }
+
+  function diagramImportStageRows(spec) {
+    return assistantFlowStageSummaries(assistantFlowModel(spec || defaultSpec()), spec || defaultSpec());
+  }
+
+  function renderDiagramImportStageOptions(spec, selectedId) {
+    return '<option value=""></option>' + diagramImportStageRows(spec).map(function (stage) {
+      var label = stage.kind === 'match'
+        ? t('matchingBlock', { number: stage.index + 1 })
+        : stage.kind === 'set'
+          ? t('setOperation', { number: stage.index + 1 })
+          : stage.label || stage.alias;
+      return '<option value="' + escapeHtml(stage.id || '') + '"' + (String(stage.id || '') === String(selectedId || '') ? ' selected' : '') + '>' + escapeHtml(label + ' [' + stage.alias + ']') + '</option>';
+    }).join('');
+  }
+
+  function diagramImportStageById(spec, stageId) {
+    return diagramImportStageRows(spec).find(function (stage) { return String(stage.id || '') === String(stageId || ''); }) || null;
+  }
+
+  function renderDiagramImportStageFields(spec, stageId, selectedNames, attribute) {
+    var selected = {};
+    (Array.isArray(selectedNames) ? selectedNames : []).forEach(function (name) { selected[String(name || '')] = true; });
+    var stage = diagramImportStageById(spec, stageId) || {};
+    var columns = uniqueList((stage.columns || []).concat(Object.keys(selected)));
+    return '<select multiple ' + attribute + '>' + columns.map(function (name) {
+      return '<option value="' + escapeHtml(name) + '"' + (selected[name] ? ' selected' : '') + '>' + escapeHtml(name) + '</option>';
+    }).join('') + '</select>';
+  }
+
+  function renderDiagramImportV3Semantics(proposal) {
+    var roles = proposal && Array.isArray(proposal.roles) ? proposal.roles : [];
+    if (!roles.length) return '';
+    var rows = roles.map(function (role) {
+      var selected = String(role.selectedSemantic || '');
+      var options = (Array.isArray(role.options) ? role.options : ['object', 'composite', 'group', 'static']).map(function (semantic) {
+        return '<option value="' + semantic + '"' + (selected === semantic ? ' selected' : '') + '>' + escapeHtml(diagramImportSemanticLabel(semantic)) + '</option>';
+      }).join('');
+      var roleUnresolved = (proposal.unresolved || []).some(function (item) { return String(item && item.id || '') === String(role.id || ''); });
+      var status = roleUnresolved ? t('diagramImportUnresolved') : t('diagramImportReady');
+      var exemplarKeys = Array.isArray(role.containerKeys) && role.containerKeys.length ? role.containerKeys : role.elementKeys || [];
+      var exemplar = role.exemplarRequired
+        ? '<select data-diagram-import-exemplar="' + escapeHtml(role.id || '') + '"><option value=""></option>' + exemplarKeys.map(function (key) {
+          return '<option value="' + escapeHtml(key) + '"' + (String(role.exemplarKey || '') === String(key) ? ' selected' : '') + '>' + escapeHtml(key) + '</option>';
+        }).join('') + '</select>'
+        : '<span class="muted">' + escapeHtml(role.exemplarKey || '-') + '</span>';
+      return '<tr data-diagram-import-role-row="' + escapeHtml(role.id || '') + '">' +
+        '<td><strong>' + escapeHtml(role.label || role.key) + '</strong><div class="muted">' + escapeHtml(role.key || '') + '</div></td>' +
+        '<td>' + escapeHtml(role.kind === 'd2Class' ? t('diagramImportD2Class') : t('diagramImportUntypedContainer')) + '</td>' +
+        '<td><select data-diagram-import-semantic="' + escapeHtml(role.id || '') + '">' + options + '</select></td>' +
+        '<td>' + exemplar + '</td>' +
+        '<td><span class="diagram-import-status ' + (roleUnresolved ? 'unresolved' : 'ready') + '">' + escapeHtml(status) + '</span></td>' +
+        '<td class="muted">' + escapeHtml(role.semanticReason || '') + '</td></tr>';
+    }).join('');
+    return '<div class="diagram-editor-block"><div class="diagram-editor-heading"><h4>' + t('diagramImportContainerSemantics') + '</h4></div>' +
+      '<div class="table-wrap"><table class="compact"><thead><tr><th>' + t('diagramImportTypeOrContainer') + '</th><th>' + t('diagramImportKind') + '</th><th>' + t('diagramImportContainerSemantics') + '</th><th>' + t('diagramImportExemplar') + '</th><th>' + t('diagramImportStatus') + '</th><th>' + t('diagramImportBasis') + '</th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
+      renderDiagramImportSemanticsHelp() + '</div>';
+  }
+
+  function renderDiagramImportRelatedRow(role, related, index) {
+    var mapping = role.mapping || {};
+    var primary = mapping.primary || {};
+    var relationPath = related && Array.isArray(related.path) ? related.path : [];
+    var hop = relationPath[0] || {};
+    return '<tr data-diagram-import-related-row="' + index + '">' +
+      '<td><select data-diagram-import-related-field="className">' + renderClassOptions(related && related.className || '') + '</select></td>' +
+      '<td><select data-diagram-import-related-field="path">' + renderDiagramImportRelationPathOptions(primary.className || '', relationPath) + '</select></td>' +
+      '<td><select data-diagram-import-related-field="direction">' + renderRelationDirectionOptions(hop.direction || 'both') + '</select></td>' +
+      '<td>' + renderDiagramImportAttributeMultiSelect(related && related.className || '', related && related.structuredFields || [], 'data-diagram-import-related-field="structuredFields"') + '</td>' +
+      '<td><button type="button" class="icon-button" data-action="diagram-import-remove-related" title="' + escapeHtml(t('remove')) + '">×</button></td></tr>';
+  }
+
+  function renderDiagramImportRoleMapping(role, spec) {
+    var mapping = role.mapping || {};
+    var primary = mapping.primary || {};
+    var source = mapping.source || {};
+    var stage = diagramImportStageById(spec || defaultSpec(), source.stageId) || {};
+    var filter = Array.isArray(primary.filters) && primary.filters[0] || {};
+    var related = Array.isArray(mapping.related) ? mapping.related : [];
+    var expanded = role.selectedSemantic !== 'static';
+    return '<details class="diagram-editor-block" data-diagram-import-role-mapping="' + escapeHtml(role.id || '') + '"' + (expanded ? ' open' : '') + '><summary><strong>' + escapeHtml(role.label || role.key) + '</strong> <span class="muted">' + escapeHtml(role.key || '') + '</span></summary>' +
+      '<div class="diagram-grid">' +
+      '<label>' + t('diagramImportSourceAlias') + '<select data-diagram-import-role-field="source.stageId">' + renderDiagramImportStageOptions(spec || defaultSpec(), source.stageId || '') + '</select></label>' +
+      '<label>' + t('diagramImportPrimaryClass') + '<input data-diagram-import-role-field="primary.className" value="' + escapeHtml(primary.className || stage.className || '') + '" readonly></label>' +
+      '<label>' + t('diagramImportIdAttribute') + '<select data-diagram-import-role-field="primary.idAttribute">' + (stage.columns ? stage.columns.map(function (name) { return '<option value="' + escapeHtml(name) + '"' + (String(primary.idAttribute || '_id') === name ? ' selected' : '') + '>' + escapeHtml(name) + '</option>'; }).join('') : renderAttributeOptions(primary.className || '', primary.idAttribute || '_id')) + '</select></label>' +
+      '<label>' + t('diagramImportLabelTemplate') + '<input data-diagram-import-role-field="primary.labelTemplate" value="' + escapeHtml(primary.labelTemplate || '\${Description}') + '"></label>' +
+      renderDiagramImportLabelSuggestions(role, spec) +
+      '<label>' + t('diagramImportStructuredFields') + (source.stageId ? renderDiagramImportStageFields(spec || defaultSpec(), source.stageId, primary.structuredFields || [], 'data-diagram-import-role-field="primary.structuredFields"') : renderDiagramImportAttributeMultiSelect(primary.className || '', primary.structuredFields || [], 'data-diagram-import-role-field="primary.structuredFields"')) + '</label>' +
+      '<label>' + t('objectGroupAttribute') + '<select data-diagram-import-role-field="primary.filter.path">' + renderAttributeOptions(primary.className || '', filter.path || '') + '</select></label>' +
+      '<label>' + t('objectGroupOperator') + '<select data-diagram-import-role-field="primary.filter.op"><option value="equals"' + (filter.op === 'equals' ? ' selected' : '') + '>equals</option><option value="contains"' + (filter.op === 'contains' ? ' selected' : '') + '>contains</option></select></label>' +
+      '<label>' + t('objectGroupValue') + '<input data-diagram-import-role-field="primary.filter.value" value="' + escapeHtml(filter.value || '') + '"></label>' +
+      '</div><div class="diagram-editor-heading"><h5>' + t('diagramImportRelatedClasses') + '</h5><button type="button" class="diagram-add-button" data-action="diagram-import-add-related" title="' + escapeHtml(t('diagramImportAddRelated')) + '">+</button></div>' +
+      '<div class="table-wrap"><table class="compact"><thead><tr><th>' + t('diagramImportRelatedClass') + '</th><th>' + t('diagramImportRelationPath') + '</th><th>' + t('diagramImportDirection') + '</th><th>' + t('diagramImportStructuredFields') + '</th><th>' + t('diagramImportActions') + '</th></tr></thead><tbody data-diagram-import-related-body>' +
+      related.map(function (item, index) { return renderDiagramImportRelatedRow(role, item, index); }).join('') + '</tbody></table></div></details>';
+  }
+
+  function renderDiagramImportRelationRules(proposal) {
+    var roles = proposal.roles || [];
+    var rows = (proposal.relationRules || []).map(function (rule, index) {
+      var parent = roles.find(function (role) { return role.id === rule.parentRoleId; }) || {};
+      var parentClass = parent.mapping && parent.mapping.primary && parent.mapping.primary.className || '';
+      var hop = Array.isArray(rule.path) && rule.path[0] || {};
+      return '<tr data-diagram-import-rule-row="' + index + '"><td><select data-diagram-import-rule-field="kind"><option value="connection"' + (rule.kind === 'connection' ? ' selected' : '') + '>connection</option><option value="group"' + (rule.kind === 'group' ? ' selected' : '') + '>group</option><option value="hierarchy"' + (rule.kind === 'hierarchy' ? ' selected' : '') + '>hierarchy</option></select></td>' +
+        '<td><select data-diagram-import-rule-field="parentRoleId">' + renderDiagramImportRoleOptions(roles, rule.parentRoleId) + '</select></td>' +
+        '<td><select data-diagram-import-rule-field="childRoleId">' + renderDiagramImportRoleOptions(roles, rule.childRoleId) + '</select></td>' +
+        '<td><select data-diagram-import-rule-field="path">' + renderDiagramImportRelationPathOptions(parentClass, rule.path || []) + '</select></td>' +
+        '<td><select data-diagram-import-rule-field="direction">' + renderRelationDirectionOptions(hop.direction || 'both') + '</select></td>' +
+        '<td><button type="button" class="icon-button" data-action="diagram-import-remove-rule" title="' + escapeHtml(t('remove')) + '">×</button></td></tr>';
+    }).join('');
+    return '<div class="diagram-editor-block"><div class="diagram-editor-heading"><h4>' + t('diagramImportRelationRules') + '</h4><button type="button" class="diagram-add-button" data-action="diagram-import-add-rule" title="' + escapeHtml(t('diagramImportAddRule')) + '">+</button></div>' +
+      '<div class="table-wrap"><table class="compact"><thead><tr><th>' + t('diagramImportRuleKind') + '</th><th>' + t('diagramImportParentRole') + '</th><th>' + t('diagramImportChildRole') + '</th><th>' + t('diagramImportRelationPath') + '</th><th>' + t('diagramImportDirection') + '</th><th>' + t('diagramImportActions') + '</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>';
+  }
+
+  function renderDiagramImportPlacementRules(proposal) {
+    var roles = proposal.roles || [];
+    var visibleRules = (proposal.placementRules || []).slice();
+    visibleRules.push({ id: '', parentRoleId: '', childRoleId: '', trailing: true });
+    var rows = visibleRules.map(function (rule, index) {
+      return '<tr data-diagram-import-placement-row="' + index + '"><td><select data-diagram-import-placement-field="parentRoleId">' + renderDiagramImportRoleOptions(roles, rule.parentRoleId, function (role) { return role.kind === 'untypedContainer'; }) + '</select></td>' +
+        '<td><select data-diagram-import-placement-field="childRoleId">' + renderDiagramImportRoleOptions(roles, rule.childRoleId) + '</select></td>' +
+        '<td><button type="button" class="icon-button" data-action="diagram-import-remove-placement" title="' + escapeHtml(t('remove')) + '">×</button></td></tr>';
+    }).join('');
+    return '<div class="diagram-editor-block"><div class="diagram-editor-heading"><h4>' + t('diagramImportPlacementRules') + '</h4><button type="button" class="diagram-add-button" data-action="diagram-import-add-placement" title="' + escapeHtml(t('diagramImportAddPlacement')) + '">+</button></div>' +
+      '<div class="table-wrap"><table class="compact"><thead><tr><th>' + t('diagramImportParentRole') + '</th><th>' + t('diagramImportChildRole') + '</th><th>' + t('diagramImportActions') + '</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>';
+  }
+
+  function renderDiagramImportProposal(spec) {
+    var proposal = state.diagramImportProposal;
+    if (!proposal) return '';
+    refreshDiagramImportSemanticState(proposal);
+    var counts = state.diagramImportIr && state.diagramImportIr.elements || {};
+    var warnings = Array.isArray(proposal.warnings) ? proposal.warnings.filter(Boolean) : [];
+    return [
+      warnings.map(function (warning) { return '<div class="notice" data-diagram-import-warning>' + escapeHtml(warning) + '</div>'; }).join(''),
+      '<div class="diagram-import-summary">',
+      renderKpi(t('diagramImportNodes'), String((counts.nodes || []).length)),
+      renderKpi(t('diagramImportEdges'), String((counts.edges || []).length)),
+      renderKpi(t('diagramImportGroups'), String((counts.groups || []).length)),
+      renderKpi(t('diagramImportUnresolved'), String((proposal.unresolved || []).length)),
+      '</div>',
+      renderDiagramImportV3Semantics(proposal),
+      '<div class="diagram-editor-heading"><h4>' + t('diagramImportClassMappings') + '</h4></div>',
+      (proposal.roles || []).map(function (role) { return renderDiagramImportRoleMapping(role, spec); }).join(''),
+      renderDiagramImportRelationRules(proposal),
+      renderDiagramImportPlacementRules(proposal)
+    ].join('');
+  }
+
+  function renderDiagramImportAssistantProposal(spec) {
+    var proposal = state.diagramImportProposal;
+    if (!proposal) return '';
+    refreshDiagramImportSemanticState(proposal);
+    var counts = state.diagramImportIr && state.diagramImportIr.elements || {};
+    var warnings = Array.isArray(proposal.warnings) ? proposal.warnings.filter(Boolean) : [];
+    return [
+      warnings.map(function (warning) { return '<div class="notice" data-diagram-import-warning>' + escapeHtml(warning) + '</div>'; }).join(''),
+      '<div class="diagram-import-summary">',
+      renderKpi(t('diagramImportNodes'), String((counts.nodes || []).length)),
+      renderKpi(t('diagramImportEdges'), String((counts.edges || []).length)),
+      renderKpi(t('diagramImportGroups'), String((counts.groups || []).length)),
+      renderKpi(t('diagramImportUnresolved'), String((proposal.unresolved || []).length)),
+      '</div>',
+      '<p class="muted">' + escapeHtml(t('assistantProposalOnly')) + '</p>'
+    ].join('');
+  }
+
+  function renderDiagramImportDeterministicMappings(spec) {
+    var proposal = state.diagramImportProposal;
+    if (!proposal) return '';
+    refreshDiagramImportSemanticState(proposal);
+    var busy = state.diagramImportBusy || state.diagramImportAssistantBusy || state.assistantDiagramMappingBusy;
+    var blocked = state.diagramImportStale || (proposal.unresolved || []).length > 0;
+    return [
+      '<div class="diagram-editor-block" data-diagram-editor-section="d2-mappings">',
+      renderDiagramImportV3Semantics(proposal),
+      '<div class="diagram-editor-heading"><h4>' + t('diagramImportClassMappings') + '</h4></div>',
+      (proposal.roles || []).map(function (role) { return renderDiagramImportRoleMapping(role, spec); }).join(''),
+      renderDiagramImportRelationRules(proposal),
+      renderDiagramImportPlacementRules(proposal),
+      '<div class="toolbar"><button type="button" class="primary" data-action="diagram-import-apply"' + (busy || blocked ? ' disabled' : '') + '>' + t('diagramImportApply') + '</button>',
+      '<button type="button" data-action="open-assistant-d2">' + t('diagramEditInAssistant') + '</button></div>',
+      blocked ? '<div class="muted" role="status">' + escapeHtml(t('diagramImportReviewBlocked')) + '</div>' : '',
+      '</div>'
+    ].join('');
+  }
+
+  function renderImportedD2Status(diagram) {
+    var imported = diagram && diagram.authoring && diagram.authoring.d2Import;
+    if (!imported) return '';
+    var roles = Array.isArray(imported.roles) ? imported.roles : [];
+    return '<div class="diagram-editor-block"><div class="diagram-editor-heading"><h4>' + t('diagramImportedStatus') + '</h4><button type="button" data-action="open-assistant-d2">' + t('diagramEditInAssistant') + '</button></div><div class="assistant-status-grid"><div><strong>version</strong><br><span class="code-inline">' + escapeHtml(String(imported.version || '')) + '</span></div><div><strong>source hash</strong><br><span class="code-inline">' + escapeHtml(String(imported.sourceHash || '').slice(0, 16)) + '</span></div><div><strong>roles</strong><br><span class="code-inline">' + escapeHtml(String(roles.length)) + '</span></div><div><strong>preview</strong><br><span class="pill ' + (!state.diagramImportAppliedPendingPreview || state.lastDraftPreviewOk ? 'ok' : '') + '">' + escapeHtml(state.diagramImportAppliedPendingPreview && !state.lastDraftPreviewOk ? t('diagramImportPreviewRequired') : t('diagramImportReady')) + '</span></div></div></div>';
+  }
+
+  function renderDiagramImportWorkbench(spec) {
+    var busy = state.diagramImportBusy || state.diagramImportAssistantBusy || state.assistantDiagramInterpretBusy || state.assistantDiagramMappingBusy;
+    var proposal = state.diagramImportProposal;
+    var semanticBlocked = Boolean(proposal) && (proposal.unresolved || []).some(function (item) {
+      return item && (item.family === 'containerRoles' || item.family === 'roles' && (item.fields || []).some(function (field) { return field === 'semantic' || field === 'exemplarKey' || field === 'boundaryEdge'; }));
+    });
+    return [
+      '<div class="diagram-editor-block" data-diagram-editor-section="import">',
+      '<div class="diagram-editor-heading"><h4>' + t('diagramImportTitle') + '</h4></div>',
+      '<div class="diagram-import-shell" aria-busy="' + (busy ? 'true' : 'false') + '">',
+      '<div class="muted">' + t('diagramImportHelp') + '</div>',
+      '<label>' + t('diagramImportSource') + '<textarea id="cmdp-diagram-import-source" class="diagram-import-source" spellcheck="false"' + (busy ? ' disabled' : '') + '>' + escapeHtml(state.diagramImportSource || '') + '</textarea></label>',
+      '<div class="diagram-import-toolbar">',
+      '<label>' + t('diagramImportFile') + '<input id="cmdp-diagram-import-file" type="file" accept=".d2,text/plain"' + (busy ? ' disabled' : '') + '></label>',
+      '<button type="button" data-action="diagram-import-analyze"' + (busy ? ' disabled' : '') + '>' + t('diagramImportAnalyze') + '</button>',
+      busy ? '<span class="assistant-busy-title" role="status" aria-live="polite"><span class="assistant-busy-spinner" aria-hidden="true"></span>' + escapeHtml(state.diagramImportBusy ? t('diagramImportAnalyzing') : t('diagramImportAssistantRunning')) + '</span>' : '',
+      '</div>',
+      '<div data-diagram-import-stale class="diagram-import-status unresolved" role="status" aria-live="polite"' + (state.diagramImportStale ? '' : ' hidden') + '>' + escapeHtml(t('diagramImportStale')) + '</div>',
+      renderDiagramImportPreview(),
+      '<div class="assistant-d2-prompt"><h4>' + t('assistantDiagramStructureTitle') + '</h4><p class="muted">' + t('assistantDiagramStructureHelp') + '</p><label>' + t('assistantDiagramInterpretPrompt') + '<textarea id="cmdp-assistant-diagram-interpret-prompt" rows="4">' + escapeHtml(state.assistantDiagramInterpretPrompt || '') + '</textarea></label><div class="toolbar"><button type="button" data-action="assistant-diagram-interpret"' + (busy || !proposal || state.diagramImportStale ? ' disabled' : '') + '>' + t('assistantDiagramInterpret') + '</button></div></div>',
+      '<div class="assistant-d2-prompt"><h4>' + t('assistantDiagramMappingTitle') + '</h4><p class="muted">' + t('assistantDiagramMappingHelp') + '</p><label>' + t('assistantDiagramMappingPrompt') + '<textarea id="cmdp-assistant-diagram-mapping-prompt" rows="4">' + escapeHtml(state.assistantDiagramMappingPrompt || '') + '</textarea></label><div class="toolbar"><button type="button" data-action="assistant-diagram-map"' + (busy || !proposal || state.diagramImportStale || semanticBlocked ? ' disabled' : '') + '>' + t('assistantDiagramMap') + '</button></div>' + (!proposal ? '<p class="muted">' + escapeHtml(t('assistantDiagramAnalysisRequired')) + '</p>' : '') + '</div>',
+      renderDiagramImportAssistantProposal(spec),
+      '</div>',
+      '</div>'
+    ].join('');
+  }
+
+  function renderDiagramImportPreview() {
+    var preview = state.diagramImportPreview;
+    var title = t('diagramImportPreviewTitle');
+    var previewError = String(state.diagramImportPreviewError || '');
+    var content = String(preview && preview.content || '').trim();
+    var hasSvg = Boolean(preview && preview.rendered && /^<svg[\\s>]/i.test(content));
+    var stale = Boolean(preview && state.diagramImportPreviewSource && state.diagramImportPreviewSource !== state.diagramImportSource);
+    var stateName = state.diagramImportBusy ? 'loading' : stale ? 'stale' : hasSvg ? 'rendered' : previewError || preview ? 'error' : 'empty';
+    var status = state.diagramImportBusy
+      ? t('diagramImportAnalyzing')
+      : previewError
+        ? previewError
+      : stale
+        ? t('diagramImportPreviewStale')
+        : hasSvg
+          ? t('diagramImportReady')
+          : preview
+            ? t('diagramImportPreviewUnavailable', { error: String(preview.renderError || preview.reason || t('d2RendererUnavailable')) })
+            : t('diagramImportPreviewEmpty');
+    var body = '';
+    if (hasSvg) {
+      body = renderDiagramViewport('<div class="cmdp-d2-svg" data-d2-rendered-svg role="img" aria-label="' + escapeHtml(title) + '">' + content + '</div>', title);
+    } else if (state.diagramImportBusy) {
+      body = '<div class="assistant-busy-title"><span class="assistant-busy-spinner" aria-hidden="true"></span>' + escapeHtml(t('diagramImportAnalyzing')) + '</div>';
+    } else {
+      body = '<span class="muted">' + escapeHtml(status) + '</span>';
+    }
+    return '<div class="diagram-editor-block diagram-import-preview" data-diagram-import-preview data-diagram-import-preview-state="' + escapeHtml(stateName) + '" aria-busy="' + (state.diagramImportBusy ? 'true' : 'false') + '"><div class="diagram-editor-heading"><h4>' + escapeHtml(title) + '</h4></div><div class="diagram-import-preview-canvas">' + body + '</div><div class="muted" data-diagram-import-preview-status role="status" aria-live="polite">' + escapeHtml(status) + '</div></div>';
+  }
+
+  function syncDiagramImportPreviewStaleState() {
+    var previewElement = document.querySelector('[data-diagram-import-preview]');
+    if (!previewElement || !state.diagramImportPreview) return;
+    var stale = Boolean(state.diagramImportPreviewSource && state.diagramImportPreviewSource !== state.diagramImportSource);
+    if (!stale) return;
+    previewElement.setAttribute('data-diagram-import-preview-state', 'stale');
+    previewElement.setAttribute('aria-busy', 'false');
+    var status = previewElement.querySelector('[data-diagram-import-preview-status]');
+    if (status) status.textContent = t('diagramImportPreviewStale');
+  }
+
   function renderDiagramEditor(spec, outputMode, options) {
     options = options || {};
     if (outputMode === 'tables' && !options.force) return '';
     spec = spec || defaultSpec();
     var diagram = firstDiagramSpec(spec);
+    var classBasedD2Import = Boolean(
+      diagram && diagram.authoring && diagram.authoring.d2Import && diagram.authoring.d2Import.version === 3 ||
+      state.diagramImportProposal && state.diagramImportProposal.version === 3
+    );
+    var pendingD2Import = Boolean(state.diagramImportProposal && state.diagramImportProposal.version === 3);
     var nodeMapping = firstDiagramMapping(diagram, 'nodeMappings');
     var edgeMapping = firstDiagramMapping(diagram, 'edgeMappings');
     var groupMapping = firstDiagramMapping(diagram, 'groupMappings');
@@ -8024,23 +11206,25 @@ function dynamicPagesClientScript() {
       '<h3>' + t('visualizationDiagrams') + '</h3>',
       '<p class="muted">' + t('diagramEditorHelp') + '</p>',
       '<div class="diagram-editor-sections">',
-      '<div class="diagram-editor-block" data-diagram-editor-section="general">',
-      '<h4>' + t('diagramGeneralSettings') + '</h4>',
-      '<div class="diagram-grid">',
-      '<label>' + t('visualizationDiagramName') + '<input id="cmdp-diagram-name" value="' + escapeHtml(diagram.name || 'topology') + '"></label>',
-      '<label>' + t('visualizationDiagramTitle') + '<input id="cmdp-diagram-title" value="' + escapeHtml(diagram.title || diagram.label || 'Topology') + '"></label>',
-      '<label>' + t('visualizationDiagramLayout') + '<select id="cmdp-diagram-layout"><option value="topology"' + (layout === 'topology' ? ' selected' : '') + '>topology</option><option value="layered"' + (layout === 'layered' ? ' selected' : '') + '>layered</option><option value="hierarchical"' + (layout === 'hierarchical' ? ' selected' : '') + '>hierarchical</option><option value="grouped"' + (layout === 'grouped' ? ' selected' : '') + '>grouped</option></select></label>',
-      '<label>' + t('visualizationDiagramMaxNodes') + '<input id="cmdp-diagram-max-nodes" type="number" min="1" value="' + escapeHtml(String(diagram.maxNodes || diagram.limit && diagram.limit.maxNodes || diagram.limits && diagram.limits.maxNodes || 300)) + '"></label>',
-      '<label>' + t('visualizationDiagramMaxEdges') + '<input id="cmdp-diagram-max-edges" type="number" min="1" value="' + escapeHtml(String(diagram.maxEdges || diagram.limit && diagram.limit.maxEdges || diagram.limits && diagram.limits.maxEdges || 800)) + '"></label>',
-      '<label>' + t('visualizationDiagramMetadataMaxBytes') + '<input id="cmdp-diagram-metadata-max-bytes" type="number" min="1" value="' + escapeHtml(String(metadataMaxBytes)) + '"></label>',
-      '<label><input id="cmdp-diagram-embed-d2" type="checkbox"' + (metadata.embedInD2 !== false ? ' checked' : '') + '> ' + t('visualizationDiagramEmbedD2') + '</label>',
-      '<label><input id="cmdp-diagram-embed-svg" type="checkbox"' + (metadata.embedInSvg !== false ? ' checked' : '') + '> ' + t('visualizationDiagramEmbedSvg') + '</label>',
-      '</div>',
-      '</div>',
-      renderDiagramMappingTable('nodes', 'diagramNodes', [t('visualizationDiagramNodesSource'), t('visualizationDiagramNodeId'), t('visualizationDiagramNodeLabel'), t('visualizationDiagramNodeGroup'), t('visualizationDiagramNodeParent'), t('visualizationDiagramNodeType'), t('visualizationDiagramNodeHref')], nodeRows, spec),
-      renderDiagramMappingTable('edges', 'diagramEdges', [t('visualizationDiagramEdgesSource'), t('visualizationDiagramEdgeMappingType'), t('visualizationDiagramEdgeSource'), t('visualizationDiagramEdgeTarget'), t('visualizationDiagramEdgeLabel'), t('visualizationDiagramEdgeKind'), t('visualizationDiagramEdgeDirection')], edgeRows, spec),
-      renderDiagramMappingTable('groups', 'diagramGroups', [t('visualizationDiagramGroupsSource'), t('visualizationDiagramGroupId'), t('visualizationDiagramGroupLabel'), t('visualizationDiagramGroupParent')], groupRows, spec),
-      renderDiagramMappingTable('hierarchy', 'diagramHierarchy', [t('visualizationDiagramHierarchySource'), t('visualizationDiagramHierarchyChild'), t('visualizationDiagramHierarchyParent'), t('visualizationDiagramHierarchyLabel')], hierarchyRows, spec),
+      renderImportedD2Status(diagram),
+      pendingD2Import ? '' : '<div class="diagram-editor-block" data-diagram-editor-section="general">',
+      pendingD2Import ? '' : '<h4>' + t('diagramGeneralSettings') + '</h4>',
+      pendingD2Import ? '' : '<div class="diagram-grid">',
+      pendingD2Import ? '' : '<label>' + t('visualizationDiagramName') + '<input id="cmdp-diagram-name" value="' + escapeHtml(diagram.name || 'topology') + '"></label>',
+      pendingD2Import ? '' : '<label>' + t('visualizationDiagramTitle') + '<input id="cmdp-diagram-title" value="' + escapeHtml(diagram.title || diagram.label || 'Topology') + '"></label>',
+      pendingD2Import ? '' : '<label>' + t('visualizationDiagramLayout') + '<select id="cmdp-diagram-layout"><option value="topology"' + (layout === 'topology' ? ' selected' : '') + '>topology</option><option value="layered"' + (layout === 'layered' ? ' selected' : '') + '>layered</option><option value="hierarchical"' + (layout === 'hierarchical' ? ' selected' : '') + '>hierarchical</option><option value="grouped"' + (layout === 'grouped' ? ' selected' : '') + '>grouped</option></select></label>',
+      pendingD2Import ? '' : '<label>' + t('visualizationDiagramMaxNodes') + '<input id="cmdp-diagram-max-nodes" type="number" min="1" value="' + escapeHtml(String(diagram.maxNodes || diagram.limit && diagram.limit.maxNodes || diagram.limits && diagram.limits.maxNodes || 300)) + '"></label>',
+      pendingD2Import ? '' : '<label>' + t('visualizationDiagramMaxEdges') + '<input id="cmdp-diagram-max-edges" type="number" min="1" value="' + escapeHtml(String(diagram.maxEdges || diagram.limit && diagram.limit.maxEdges || diagram.limits && diagram.limits.maxEdges || 800)) + '"></label>',
+      pendingD2Import ? '' : '<label>' + t('visualizationDiagramMetadataMaxBytes') + '<input id="cmdp-diagram-metadata-max-bytes" type="number" min="1" value="' + escapeHtml(String(metadataMaxBytes)) + '"></label>',
+      pendingD2Import ? '' : '<label><input id="cmdp-diagram-embed-d2" type="checkbox"' + (metadata.embedInD2 !== false ? ' checked' : '') + '> ' + t('visualizationDiagramEmbedD2') + '</label>',
+      pendingD2Import ? '' : '<label><input id="cmdp-diagram-embed-svg" type="checkbox"' + (metadata.embedInSvg !== false ? ' checked' : '') + '> ' + t('visualizationDiagramEmbedSvg') + '</label>',
+      pendingD2Import ? '' : '</div>',
+      pendingD2Import ? '' : '</div>',
+      renderDiagramImportDeterministicMappings(spec),
+      classBasedD2Import ? '' : renderDiagramMappingTable('nodes', 'diagramNodes', [t('visualizationDiagramNodesSource'), t('visualizationDiagramNodeId'), t('visualizationDiagramNodeLabel'), t('visualizationDiagramNodeGroup'), t('visualizationDiagramNodeParent'), t('visualizationDiagramNodeType'), t('visualizationDiagramNodeHref')], nodeRows, spec),
+      classBasedD2Import ? '' : renderDiagramMappingTable('edges', 'diagramEdges', [t('visualizationDiagramEdgesSource'), t('visualizationDiagramEdgeMappingType'), t('visualizationDiagramEdgeSource'), t('visualizationDiagramEdgeTarget'), t('visualizationDiagramEdgeLabel'), t('visualizationDiagramEdgeKind'), t('visualizationDiagramEdgeDirection')], edgeRows, spec),
+      classBasedD2Import ? '' : renderDiagramMappingTable('groups', 'diagramGroups', [t('visualizationDiagramGroupsSource'), t('visualizationDiagramGroupId'), t('visualizationDiagramGroupLabel'), t('visualizationDiagramGroupParent')], groupRows, spec),
+      classBasedD2Import ? '' : renderDiagramMappingTable('hierarchy', 'diagramHierarchy', [t('visualizationDiagramHierarchySource'), t('visualizationDiagramHierarchyChild'), t('visualizationDiagramHierarchyParent'), t('visualizationDiagramHierarchyLabel')], hierarchyRows, spec),
       '</div>',
       '</div>'
     ].join('');
@@ -8507,7 +11691,9 @@ function dynamicPagesClientScript() {
     }
     var html = '<section class="section" id="cmdp-result-section"><h2>' + t('result') + '</h2>';
     if (diagrams.length || tables.length) {
-      if (diagrams.length) html += diagrams.map(function (diagram) { return renderResultDiagram(diagram, ''); }).join('');
+      if (diagrams.length) html += diagrams.map(function (diagram, diagramIndex) {
+        return renderResultDiagram(diagram, renderDraftD2DownloadAction(diagram, diagramIndex), '');
+      }).join('');
       html += tables.map(renderResultTable).join('');
     } else {
       html += '<pre>' + escapeHtml(pretty(result.json || {})) + '</pre>';
@@ -8613,8 +11799,154 @@ function dynamicPagesClientScript() {
     state.runtimeCountdownTimer = window.setInterval(refreshRuntimeCountdown, 1000);
   }
 
+  var DIAGRAM_VIEWPORT_MIN_SCALE = 0.25;
+  var DIAGRAM_VIEWPORT_MAX_SCALE = 3;
+  var DIAGRAM_VIEWPORT_SCALE_STEP = 0.25;
+
+  function renderDiagramViewport(content, title) {
+    var accessibleTitle = title || t('d2RenderedDiagram');
+    return [
+      '<div class="cmdp-diagram-viewport" data-diagram-viewport data-diagram-viewport-scale="1">',
+      '<div class="cmdp-diagram-viewport-controls" role="group" aria-label="' + escapeHtml(t('diagramViewportControls', { title: accessibleTitle })) + '">',
+      '<button type="button" class="cmdp-diagram-viewport-button" data-action="diagram-zoom-out" title="' + escapeHtml(t('diagramZoomOut')) + '" aria-label="' + escapeHtml(t('diagramZoomOut')) + '">&#8722;</button>',
+      '<button type="button" class="cmdp-diagram-viewport-button cmdp-diagram-viewport-reset" data-action="diagram-zoom-reset" title="' + escapeHtml(t('diagramZoomReset')) + '" aria-label="' + escapeHtml(t('diagramZoomReset')) + '">100%</button>',
+      '<button type="button" class="cmdp-diagram-viewport-button" data-action="diagram-zoom-in" title="' + escapeHtml(t('diagramZoomIn')) + '" aria-label="' + escapeHtml(t('diagramZoomIn')) + '">+</button>',
+      '<span class="cmdp-diagram-viewport-scale" data-diagram-viewport-scale-label aria-live="polite">100%</span>',
+      '</div>',
+      '<div class="cmdp-diagram-viewport-canvas" data-diagram-viewport-canvas tabindex="0" aria-label="' + escapeHtml(t('diagramViewportPan')) + '"><div class="cmdp-diagram-viewport-stage" data-diagram-viewport-stage><div class="cmdp-diagram-viewport-content" data-diagram-viewport-content>' + content + '</div></div></div>',
+      '</div>'
+    ].join('');
+  }
+
+  function diagramViewportScale(viewport) {
+    var value = Number(viewport && viewport.getAttribute('data-diagram-viewport-scale'));
+    return Number.isFinite(value) && value > 0 ? value : 1;
+  }
+
+  function diagramViewportSize(content) {
+    var svg = content && content.querySelector ? content.querySelector('svg') : null;
+    if (!svg) return null;
+    var viewBox = String(svg.getAttribute('viewBox') || '').trim().split(/[\\s,]+/).map(Number);
+    var widthValue = String(svg.getAttribute('width') || '').trim();
+    var heightValue = String(svg.getAttribute('height') || '').trim();
+    var width = /^\\d+(?:\\.\\d+)?(?:px)?$/i.test(widthValue) ? Number.parseFloat(widthValue) : 0;
+    var height = /^\\d+(?:\\.\\d+)?(?:px)?$/i.test(heightValue) ? Number.parseFloat(heightValue) : 0;
+    if ((!width || !height) && viewBox.length === 4 && viewBox[2] > 0 && viewBox[3] > 0) {
+      width = width || viewBox[2];
+      height = height || viewBox[3];
+    }
+    if (width > 0) svg.style.width = Math.ceil(width) + 'px';
+    if (height > 0) svg.style.height = Math.ceil(height) + 'px';
+    var measured = content.getBoundingClientRect();
+    return {
+      width: Math.max(1, Math.ceil(measured.width || width || 1)),
+      height: Math.max(1, Math.ceil(measured.height || height || 1))
+    };
+  }
+
+  function setDiagramViewportScale(viewport, scale) {
+    if (!viewport) return;
+    var content = viewport.querySelector('[data-diagram-viewport-content]');
+    var stage = viewport.querySelector('[data-diagram-viewport-stage]');
+    var label = viewport.querySelector('[data-diagram-viewport-scale-label]');
+    var baseWidth = Number(viewport.getAttribute('data-diagram-viewport-base-width'));
+    var baseHeight = Number(viewport.getAttribute('data-diagram-viewport-base-height'));
+    if (!content || !stage || !Number.isFinite(baseWidth) || !Number.isFinite(baseHeight)) return;
+    var next = Math.min(DIAGRAM_VIEWPORT_MAX_SCALE, Math.max(DIAGRAM_VIEWPORT_MIN_SCALE, scale));
+    next = Math.round(next / DIAGRAM_VIEWPORT_SCALE_STEP) * DIAGRAM_VIEWPORT_SCALE_STEP;
+    var percent = Math.round(next * 100);
+    viewport.setAttribute('data-diagram-viewport-scale', String(next));
+    content.style.transform = 'scale(' + next + ')';
+    stage.style.width = Math.ceil(baseWidth * next) + 'px';
+    stage.style.height = Math.ceil(baseHeight * next) + 'px';
+    if (label) label.textContent = t('diagramZoomLevel', { percent: percent });
+    Array.prototype.slice.call(viewport.querySelectorAll('[data-action="diagram-zoom-out"]')).forEach(function (button) { button.disabled = next <= DIAGRAM_VIEWPORT_MIN_SCALE; });
+    Array.prototype.slice.call(viewport.querySelectorAll('[data-action="diagram-zoom-in"]')).forEach(function (button) { button.disabled = next >= DIAGRAM_VIEWPORT_MAX_SCALE; });
+  }
+
+  function initializeDiagramViewport(viewport) {
+    if (!viewport || viewport.getAttribute('data-diagram-viewport-ready') === 'true') return;
+    var content = viewport.querySelector('[data-diagram-viewport-content]');
+    var canvas = viewport.querySelector('[data-diagram-viewport-canvas]');
+    if (!content || !canvas || !content.querySelector('svg')) return;
+    var size = diagramViewportSize(content);
+    if (!size) return;
+    viewport.setAttribute('data-diagram-viewport-ready', 'true');
+    viewport.setAttribute('data-diagram-viewport-base-width', String(size.width));
+    viewport.setAttribute('data-diagram-viewport-base-height', String(size.height));
+    setDiagramViewportScale(viewport, 1);
+    var pointer = null;
+    canvas.addEventListener('pointerdown', function (event) {
+      if (event.pointerType === 'mouse' && event.button !== 0) return;
+      pointer = { id: event.pointerId, x: event.clientX, y: event.clientY, left: canvas.scrollLeft, top: canvas.scrollTop, dragged: false };
+      canvas.setPointerCapture(event.pointerId);
+      canvas.classList.add('is-panning');
+    });
+    canvas.addEventListener('pointermove', function (event) {
+      if (!pointer || pointer.id !== event.pointerId) return;
+      var deltaX = event.clientX - pointer.x;
+      var deltaY = event.clientY - pointer.y;
+      if (!pointer.dragged && Math.abs(deltaX) + Math.abs(deltaY) < 4) return;
+      pointer.dragged = true;
+      canvas.scrollLeft = pointer.left - deltaX;
+      canvas.scrollTop = pointer.top - deltaY;
+      event.preventDefault();
+    });
+    function finishPointer(event) {
+      if (!pointer || pointer.id !== event.pointerId) return;
+      if (pointer.dragged) canvas.setAttribute('data-diagram-viewport-suppress-click', 'true');
+      pointer = null;
+      canvas.classList.remove('is-panning');
+      if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    }
+    canvas.addEventListener('pointerup', finishPointer);
+    canvas.addEventListener('pointercancel', finishPointer);
+    canvas.addEventListener('click', function (event) {
+      if (canvas.getAttribute('data-diagram-viewport-suppress-click') !== 'true') return;
+      canvas.removeAttribute('data-diagram-viewport-suppress-click');
+      event.preventDefault();
+      event.stopPropagation();
+    }, true);
+  }
+
+  function initializeDiagramViewports(container) {
+    Array.prototype.slice.call((container || document).querySelectorAll('[data-diagram-viewport]')).forEach(initializeDiagramViewport);
+  }
+
+  function adjustDiagramViewportScale(button, change) {
+    var viewport = button && button.closest ? button.closest('[data-diagram-viewport]') : null;
+    if (viewport) setDiagramViewportScale(viewport, change === 'reset' ? 1 : diagramViewportScale(viewport) + change);
+  }
+
   function diagramHasD2Download(diagram) {
     return Boolean(diagram && diagram.d2 && (diagram.d2.downloadAvailable || diagram.d2.source));
+  }
+
+  function renderDraftD2DownloadAction(diagram, diagramIndex) {
+    if (!diagram || !diagram.d2 || typeof diagram.d2.source !== 'string' || !diagram.d2.source.trim()) return '';
+    return '<button type="button" class="button" data-action="download-draft-d2" data-diagram-index="' +
+      escapeHtml(String(diagramIndex)) + '">' + escapeHtml(t('d2DownloadSource')) + '</button>';
+  }
+
+  function downloadDraftD2Source(button) {
+    var resultBody = state.result && state.result.json && state.result.json.result;
+    var diagrams = resultBody && Array.isArray(resultBody.diagrams) ? resultBody.diagrams : [];
+    var index = Number(button && button.getAttribute('data-diagram-index'));
+    var diagram = Number.isInteger(index) && index >= 0 ? diagrams[index] : null;
+    var source = diagram && diagram.d2 && typeof diagram.d2.source === 'string' ? diagram.d2.source : '';
+    if (!source.trim()) return;
+    var templateCode = String(state.selectedTemplate && state.selectedTemplate.code || 'template');
+    var diagramName = String(diagram.name || diagram.title || 'diagram');
+    var fileBase = (templateCode + '-' + diagramName).toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'diagram';
+    var url = URL.createObjectURL(new Blob([source], { type: 'text/vnd.d2;charset=utf-8' }));
+    var link = document.createElement('a');
+    link.href = url;
+    link.download = fileBase + '.d2';
+    link.hidden = true;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(function () { URL.revokeObjectURL(url); }, 0);
   }
 
   function renderDiagramToolbar(diagram, toolbarHtml, d2DownloadHref) {
@@ -8638,8 +11970,8 @@ function dynamicPagesClientScript() {
   function renderD2SvgContent(diagram, title) {
     var svg = diagram && diagram.svg && typeof diagram.svg === 'object' ? diagram.svg : {};
     var content = String(svg.content || '').trim();
-    if (!svg.rendered || !content || !/^<svg[\s>]/i.test(content)) return '';
-    return '<div class="cmdp-d2-svg" data-d2-rendered-svg role="img" aria-label="' + escapeHtml(title || t('d2RenderedDiagram')) + '">' + content + '</div>';
+    if (!svg.rendered || !content || !/^<svg[\\s>]/i.test(content)) return '';
+    return renderDiagramViewport('<div class="cmdp-d2-svg" data-d2-rendered-svg role="img" aria-label="' + escapeHtml(title || t('d2RenderedDiagram')) + '">' + content + '</div>', title);
   }
 
   function renderResultDiagram(diagram, toolbarHtml, d2DownloadHref) {
@@ -8714,11 +12046,12 @@ function dynamicPagesClientScript() {
     var warnings = Array.isArray(diagram.warnings) && diagram.warnings.length
       ? '<div class="notice">' + escapeHtml(diagram.warnings.join(' ')) + '</div>'
       : '';
+    var fallbackSvg = '<svg role="img" aria-label="' + escapeHtml(title) + '" width="' + width + '" height="' + height + '" viewBox="0 0 ' + width + ' ' + height + '">' +
+      '<defs><marker id="cmdp-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#6b7280"></path></marker></defs>' +
+      groupHtml + edgeHtml + nodeHtml + '</svg>';
     return '<div class="result-table-wrap" data-result-diagram><div class="result-table-header"><div class="result-table-title"><h3>' +
       escapeHtml(title) + '</h3></div>' + toolbar +
-      '</div>' + d2Notice + '<div style="overflow:auto"><svg role="img" aria-label="' + escapeHtml(title) + '" width="' + width + '" height="' + height + '" viewBox="0 0 ' + width + ' ' + height + '" style="max-width:100%;height:auto;background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px">' +
-      '<defs><marker id="cmdp-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#6b7280"></path></marker></defs>' +
-      groupHtml + edgeHtml + nodeHtml + '</svg></div>' + warnings + '</div>';
+      '</div>' + d2Notice + renderDiagramViewport(fallbackSvg, title) + warnings + '</div>';
   }
 
   function renderRuntimeNotice(text, cacheHtml, type) {
@@ -8750,7 +12083,8 @@ function dynamicPagesClientScript() {
       return diagrams.map(function (diagram, diagramIndex) {
         var toolbar = cacheUsed ? '' : cacheHtml;
         cacheUsed = cacheUsed || Boolean(toolbar);
-        var d2DownloadHref = runtimeD2DownloadPath(result, diagram, diagramIndex);
+        if (result.downloadMode === 'draft') toolbar += renderDraftD2DownloadAction(diagram, diagramIndex);
+        var d2DownloadHref = result.downloadMode === 'draft' ? '' : runtimeD2DownloadPath(result, diagram, diagramIndex);
         return renderResultDiagram(diagram, toolbar, d2DownloadHref);
       }).concat(tables.map(function (table) {
         var toolbar = cacheUsed ? '' : cacheHtml;
@@ -9035,7 +12369,7 @@ function dynamicPagesClientScript() {
         return { ok: true, status: 0, json: { parents: [] }, body: '' };
       }),
       namedRequest('config', apiPrefix + '/config?root=' + encodeURIComponent(state.root)),
-      namedRequest('templates', apiPrefix + '/templates?limit=100')
+      namedRequest('templates', apiPrefix + '/templates?limit=1000')
     ]).then(function (results) {
       clientLog('load-designer-results', results.map(function (item) { return item.status; }).join(','));
       state.session = results[0].json && results[0].json.session ? results[0].json.session : state.session;
@@ -9458,6 +12792,9 @@ function dynamicPagesClientScript() {
   function readDiagramMappingRows(kind) {
     var rows = Array.prototype.slice.call(document.querySelectorAll('[data-diagram-mapping-row][data-diagram-mapping-kind="' + kind + '"]'));
     var mappings = [];
+    var family = kind === 'nodes' ? 'nodeMappings' : kind === 'edges' ? 'edgeMappings' : kind === 'groups' ? 'groupMappings' : 'hierarchyMappings';
+    var storedDiagram = firstDiagramSpec(readCurrentSpec());
+    var storedMappings = Array.isArray(storedDiagram[family]) ? storedDiagram[family] : storedDiagram[family] && typeof storedDiagram[family] === 'object' ? [storedDiagram[family]] : [];
     rows.forEach(function (row) {
       var detailRow = row.nextElementSibling && row.nextElementSibling.hasAttribute('data-diagram-mapping-detail') ? row.nextElementSibling : row;
       function mappingField(name) {
@@ -9474,18 +12811,24 @@ function dynamicPagesClientScript() {
         }
         return String(field.value || '').split(',').map(function (item) { return item.trim(); }).filter(Boolean);
       }
-      function applyMappingDetails(mapping, fallbackLabelField) {
+      function applyMappingDetails(mapping) {
+        var mappingId = String(row.getAttribute('data-diagram-mapping-id') || '').trim();
+        var importRoleKey = String(row.getAttribute('data-import-role-key') || '').trim();
+        var stored = mappingId && storedMappings.find(function (item) { return item && String(item.id || '') === mappingId; });
+        mapping = Object.assign({}, stored ? cloneJsonValue(stored, {}) : {}, mapping);
+        if (mappingId) mapping.id = mappingId;
+        if (!mapping.importRole && importRoleKey) mapping.importRole = {
+          key: importRoleKey,
+          label: String(row.getAttribute('data-import-role-label') || importRoleKey).trim(),
+          kind: String(row.getAttribute('data-import-role-kind') || '').trim()
+        };
         var labelTemplate = mappingValue('labelTemplate');
-        var labelFields = mappingValues('labelFields');
         if (labelTemplate) mapping.labelTemplate = labelTemplate;
-        if (labelFields.length && !(labelFields.length === 1 && labelFields[0] === fallbackLabelField)) mapping.labelFields = labelFields;
         var dataProfile = {};
         var dataProfileName = mappingValue('dataProfileName');
-        var dataClassName = mappingValue('dataClassName');
         var dataFields = mappingValues('dataProfileFields');
         var includeSourceRefField = mappingField('dataIncludeSourceRef');
         if (dataProfileName) dataProfile.name = dataProfileName;
-        if (dataClassName) dataProfile.className = dataClassName;
         if (dataFields.length) dataProfile.fields = dataFields;
         if (includeSourceRefField && includeSourceRefField.checked === false) dataProfile.includeSourceRef = false;
         if (Object.keys(dataProfile).length) mapping.dataProfile = dataProfile;
@@ -9506,7 +12849,7 @@ function dynamicPagesClientScript() {
         var nodeType = mappingValue('nodeType');
         if (parent) nodeFields.parent = parent;
         if (nodeType) nodeFields.nodeType = nodeType;
-        mappings.push(applyMappingDetails({ from: from, fields: nodeFields }, nodeFields.label));
+        mappings.push(applyMappingDetails({ from: from, fields: nodeFields }));
       } else if (kind === 'edges') {
         var edgeFields = {
           source: mappingValue('source') || 'source',
@@ -9517,7 +12860,7 @@ function dynamicPagesClientScript() {
         var edgeDirection = mappingValue('edgeDirection');
         if (edgeType) edgeFields.edgeType = edgeType;
         if (edgeDirection) edgeFields.edgeDirection = edgeDirection;
-        mappings.push(applyMappingDetails({ type: type || 'generic', from: from, fields: edgeFields }, edgeFields.label));
+        mappings.push(applyMappingDetails({ type: type || 'generic', from: from, fields: edgeFields }));
       } else if (kind === 'groups') {
         var groupFields = {
           id: mappingValue('id') || 'id',
@@ -9525,7 +12868,7 @@ function dynamicPagesClientScript() {
         };
         var groupParent = mappingValue('parent');
         if (groupParent) groupFields.parent = groupParent;
-        mappings.push(applyMappingDetails({ from: from, fields: groupFields }, groupFields.label));
+        mappings.push(applyMappingDetails({ from: from, fields: groupFields }));
       } else if (kind === 'hierarchy') {
         mappings.push(applyMappingDetails({
           from: from,
@@ -9534,7 +12877,7 @@ function dynamicPagesClientScript() {
             parent: mappingValue('parent') || 'parent',
             label: mappingValue('label') || 'label'
           }
-        }, mappingValue('label') || 'label'));
+        }));
       }
     });
     return mappings;
@@ -9560,6 +12903,7 @@ function dynamicPagesClientScript() {
       diagram: null
     };
     if (hasDiagramFields && settings.outputMode !== 'tables') {
+      var storedDiagram = firstDiagramSpec(currentSpec || readCurrentSpec());
       var diagramName = String(readValue('cmdp-diagram-name') || 'topology').trim() || 'topology';
       var maxNodes = readPositiveIntField('cmdp-diagram-max-nodes', t('visualizationDiagramMaxNodes'), 300);
       var maxEdges = readPositiveIntField('cmdp-diagram-max-edges', t('visualizationDiagramMaxEdges'), 800);
@@ -9571,6 +12915,7 @@ function dynamicPagesClientScript() {
       var firstNodeFields = nodeMappings[0] && nodeMappings[0].fields || {};
       var firstEdgeFields = edgeMappings[0] && edgeMappings[0].fields || {};
       settings.diagram = {
+        id: String(storedDiagram.id || '').trim() || undefined,
         name: diagramName,
         title: String(readValue('cmdp-diagram-title') || diagramName).trim() || diagramName,
         type: 'topology',
@@ -9602,6 +12947,22 @@ function dynamicPagesClientScript() {
           maxBytes: metadataMaxBytes
         }
       };
+      var classBasedD2Import = Boolean(storedDiagram.authoring && storedDiagram.authoring.d2Import && storedDiagram.authoring.d2Import.version === 3);
+      if (classBasedD2Import) {
+        settings.diagram = Object.assign(cloneJsonValue(storedDiagram, {}), {
+          name: diagramName,
+          title: String(readValue('cmdp-diagram-title') || diagramName).trim() || diagramName,
+          type: 'topology',
+          layout: settings.diagram.layout,
+          maxNodes: maxNodes,
+          maxEdges: maxEdges,
+          metadata: settings.diagram.metadata
+        });
+      }
+      if (!settings.diagram.id) delete settings.diagram.id;
+      if (storedDiagram.authoring && typeof storedDiagram.authoring === 'object' && !Array.isArray(storedDiagram.authoring)) {
+        settings.diagram.authoring = cloneJsonValue(storedDiagram.authoring, {});
+      }
       if (nodeMappings.length) settings.diagram.nodeMappings = nodeMappings;
       if (edgeMappings.length) settings.diagram.edgeMappings = edgeMappings;
       if (groupMappings.length) settings.diagram.groupMappings = groupMappings;
@@ -9801,6 +13162,7 @@ function dynamicPagesClientScript() {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias)) throw new Error(t('invalidParamName'));
       if (limitText && (!/^[1-9][0-9]*$/.test(limitText))) throw new Error(t('selectionInvalidLimit'));
       return normalizeObjectSelection({
+        id: String(node.getAttribute('data-object-selection-id') || '').trim(),
         name: String(nameField && nameField.value || '').trim() || defaultObjectSelectionName(index),
         alias: alias,
         className: className,
@@ -10089,53 +13451,111 @@ function dynamicPagesClientScript() {
     var previousSpec = readCurrentSpec();
     var selections = matchingSelectionsForSpec(previousSpec);
     if (selections.length < 2) throw new Error(t('matchingNeedsSelections'));
-    var blocks = [];
-    Array.prototype.slice.call(document.querySelectorAll('[data-matching-block]')).forEach(function (blockNode, index) {
-      var fromField = blockNode.querySelector('[data-matching-block-field="from"]');
-      var withField = blockNode.querySelector('[data-matching-block-field="with"]');
-      var asField = blockNode.querySelector('[data-matching-block-field="as"]');
-      var rules = [];
-      Array.prototype.slice.call(blockNode.querySelectorAll('[data-matching-rule-row]')).forEach(function (row) {
-        var actionElement = row.querySelector('[data-matching-rule-field="action"]');
-        var leftColumnElement = row.querySelector('[data-matching-rule-field="leftColumn"]');
-        var leftRegexElement = row.querySelector('[data-matching-rule-field="leftRegex"]');
-        var negateElement = row.querySelector('[data-matching-rule-field="negate"]');
-        var operatorElement = row.querySelector('[data-matching-rule-field="operator"]');
-        var rightColumnElement = row.querySelector('[data-matching-rule-field="rightColumn"]');
-        var rightRegexElement = row.querySelector('[data-matching-rule-field="rightRegex"]');
-        var leftColumn = String(leftColumnElement && leftColumnElement.value || '').trim();
-        var rightColumn = String(rightColumnElement && rightColumnElement.value || '').trim();
-        var leftRegex = String(leftRegexElement && leftRegexElement.value || '').trim();
-        var rightRegex = String(rightRegexElement && rightRegexElement.value || '').trim();
-        if (!leftColumn && !rightColumn && !leftRegex && !rightRegex) return;
-        if (!leftColumn || !rightColumn) throw new Error(t('matchingNeedsColumn'));
-        [leftRegex, rightRegex].forEach(function (regex) {
-          if (!regex) return;
-          try {
-            new RegExp(regex.replace(/\$\{(param|var|contractparam)\.([A-Za-z_][A-Za-z0-9_]*)\}/g, ''));
-          } catch (error) {
-            throw new Error(t('matchingInvalidRegex') + ': ' + (error && error.message ? error.message : String(error)));
-          }
+    var operations = [];
+    Array.prototype.slice.call(document.querySelectorAll('[data-flow-operation]')).forEach(function (operationNode, index) {
+      var type = String(operationNode.getAttribute('data-flow-operation') || '').trim().toLowerCase();
+      if (type === 'match') {
+        var fromField = operationNode.querySelector('[data-matching-block-field="from"]');
+        var withField = operationNode.querySelector('[data-matching-block-field="with"]');
+        var asField = operationNode.querySelector('[data-matching-block-field="as"]');
+        var rules = [];
+        Array.prototype.slice.call(operationNode.querySelectorAll('[data-matching-rule-row]')).forEach(function (row) {
+          var actionElement = row.querySelector('[data-matching-rule-field="action"]');
+          var leftColumnElement = row.querySelector('[data-matching-rule-field="leftColumn"]');
+          var leftRegexElement = row.querySelector('[data-matching-rule-field="leftRegex"]');
+          var negateElement = row.querySelector('[data-matching-rule-field="negate"]');
+          var operatorElement = row.querySelector('[data-matching-rule-field="operator"]');
+          var rightColumnElement = row.querySelector('[data-matching-rule-field="rightColumn"]');
+          var rightRegexElement = row.querySelector('[data-matching-rule-field="rightRegex"]');
+          var leftColumn = String(leftColumnElement && leftColumnElement.value || '').trim();
+          var rightColumn = String(rightColumnElement && rightColumnElement.value || '').trim();
+          var leftRegex = String(leftRegexElement && leftRegexElement.value || '').trim();
+          var rightRegex = String(rightRegexElement && rightRegexElement.value || '').trim();
+          if (!leftColumn && !rightColumn && !leftRegex && !rightRegex) return;
+          if (!leftColumn || !rightColumn) throw new Error(t('matchingNeedsColumn'));
+          [leftRegex, rightRegex].forEach(function (regex) {
+            if (!regex) return;
+            try {
+              new RegExp(regex.replace(/\$\{(param|var|contractparam)\.([A-Za-z_][A-Za-z0-9_]*)\}/g, ''));
+            } catch (error) {
+              throw new Error(t('matchingInvalidRegex') + ': ' + (error && error.message ? error.message : String(error)));
+            }
+          });
+          rules.push({
+            action: String(actionElement && actionElement.value || 'include').trim() === 'exclude' ? 'exclude' : 'include',
+            negate: normalizeMatchingNegate(negateElement && negateElement.value),
+            operator: normalizeMatchingOperator(operatorElement && operatorElement.value || 'equals'),
+            leftColumn: leftColumn,
+            leftRegex: leftRegex,
+            rightColumn: rightColumn,
+            rightRegex: rightRegex
+          });
         });
-        rules.push({
-          action: String(actionElement && actionElement.value || 'include').trim() === 'exclude' ? 'exclude' : 'include',
-          negate: normalizeMatchingNegate(negateElement && negateElement.value),
-          operator: normalizeMatchingOperator(operatorElement && operatorElement.value || 'equals'),
-          leftColumn: leftColumn,
-          leftRegex: leftRegex,
-          rightColumn: rightColumn,
-          rightRegex: rightRegex
-        });
+        if (!rules.length) throw new Error(t('matchingNeedsRule'));
+        operations.push(normalizeMatchingBlock({
+          id: String(operationNode.getAttribute('data-matching-block-id') || '').trim(),
+          type: 'match',
+          from: String(fromField && fromField.value || '').trim(),
+          with: String(withField && withField.value || '').trim(),
+          as: String(asField && asField.value || '').trim(),
+          rules: rules
+        }, index, selections, operations));
+        return;
+      }
+      var setFromField = operationNode.querySelector('[data-set-operation-field="from"]');
+      var setWithField = operationNode.querySelector('[data-set-operation-field="with"]');
+      var setAsField = operationNode.querySelector('[data-set-operation-field="as"]');
+      var distinctField = operationNode.querySelector('[data-set-operation-field="distinct"]');
+      var on = [];
+      Array.prototype.slice.call(operationNode.querySelectorAll('[data-set-operation-key]')).forEach(function (keyNode) {
+        var leftField = keyNode.querySelector('[data-set-operation-key-field="left"]');
+        var rightField = keyNode.querySelector('[data-set-operation-key-field="right"]');
+        var left = String(leftField && leftField.value || '').trim();
+        var right = String(rightField && rightField.value || '').trim();
+        if (left && right) on.push({ left: left, right: right });
       });
-      if (!rules.length) throw new Error(t('matchingNeedsRule'));
-      blocks.push(normalizeMatchingBlock({
-        from: String(fromField && fromField.value || '').trim(),
-        with: String(withField && withField.value || '').trim(),
-        as: String(asField && asField.value || '').trim(),
-        rules: rules
-      }, index, selections, index > 0 && blocks[index - 1] ? blocks[index - 1].as : ''));
+      if (!on.length) throw new Error(t('setOperationKeys'));
+      operations.push(normalizeSetOperation({
+        id: String(operationNode.getAttribute('data-set-operation-id') || '').trim(),
+        type: type,
+        from: String(setFromField && setFromField.value || '').trim(),
+        with: String(setWithField && setWithField.value || '').trim(),
+        as: String(setAsField && setAsField.value || '').trim(),
+        on: on,
+        distinct: Boolean(distinctField && distinctField.checked)
+      }, index, selections, operations));
     });
-    return normalizeObjectMatchingModel({ blocks: blocks }, previousSpec);
+    var outputField = document.querySelector('[data-result-set-field="publishedAlias"]');
+    var model = normalizeObjectMatchingModel({
+      operations: operations,
+      output: { alias: String(outputField && outputField.value || '').trim() }
+    }, previousSpec);
+    validateRelationOperationTopology(model);
+    return model;
+  }
+
+  function validateRelationOperationTopology(model) {
+    var selectionAliases = [];
+    (model.selections || []).forEach(function (selection) {
+      var alias = String(selection && selection.alias || '').trim();
+      var from = String(selection && selection.from || '').trim();
+      if (from && selectionAliases.indexOf(from) === -1) throw new Error(t('relationOperationSourceOrder'));
+      if (alias) selectionAliases.push(alias);
+    });
+    var availableAliases = selectionAliases.slice();
+    flowOperations(model).forEach(function (operation) {
+      var from = String(operation && operation.from || '').trim();
+      var withAlias = String(operation && operation.with || '').trim();
+      var alias = String(operation && operation.as || '').trim();
+      if (!from || !withAlias) throw new Error(t('relationOperationSourceRequired'));
+      if (availableAliases.indexOf(from) === -1 || availableAliases.indexOf(withAlias) === -1) {
+        throw new Error(t('relationOperationSourceOrder'));
+      }
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias) || availableAliases.indexOf(alias) !== -1) {
+        throw new Error(t('relationOperationAliasRequired'));
+      }
+      availableAliases.push(alias);
+    });
   }
 
   function addSelectionMaterializedColumn(columnsByAlias, alias, column) {
@@ -10149,23 +13569,14 @@ function dynamicPagesClientScript() {
 
   function collectMatchingSelectionColumns(model) {
     var columnsByAlias = {};
-    var firstLeftAlias = model.blocks[0] && model.blocks[0].from || model.selections[0] && model.selections[0].alias || 'objects';
-    model.blocks.forEach(function (block, index) {
-      (block.rules || []).forEach(function (rule) {
-        if (index === 0) addSelectionMaterializedColumn(columnsByAlias, block.from, rule.leftColumn);
-        else model.selections.forEach(function (selection, selectionIndex) {
-          var alias = selection.alias || objectSelectionAlias(selectionIndex);
-          var leftColumn = String(rule.leftColumn || '');
-          if (alias && (leftColumn.indexOf(alias + '_') === 0 || leftColumn.indexOf(objectSelectionOutputPrefixFromList(model.selections, alias)) === 0)) {
-            addSelectionMaterializedColumn(columnsByAlias, alias, rule.leftColumn);
-          }
-        });
-        if (index > 0 && !model.selections.some(function (selection, selectionIndex) {
-          var alias = selection.alias || objectSelectionAlias(selectionIndex);
-          var leftColumn = String(rule.leftColumn || '');
-          return alias && (leftColumn.indexOf(alias + '_') === 0 || leftColumn.indexOf(objectSelectionOutputPrefixFromList(model.selections, alias)) === 0);
-        })) addSelectionMaterializedColumn(columnsByAlias, firstLeftAlias, rule.leftColumn);
-        addSelectionMaterializedColumn(columnsByAlias, block.with, rule.rightColumn);
+    var selectionAliases = (model.selections || []).map(function (selection, index) {
+      return selection.alias || objectSelectionAlias(index);
+    });
+    flowOperations(model).forEach(function (operation) {
+      if (operation.type !== 'match') return;
+      (operation.rules || []).forEach(function (rule) {
+        if (selectionAliases.indexOf(operation.from) !== -1) addSelectionMaterializedColumn(columnsByAlias, operation.from, rule.leftColumn);
+        if (selectionAliases.indexOf(operation.with) !== -1) addSelectionMaterializedColumn(columnsByAlias, operation.with, rule.rightColumn);
       });
     });
     return columnsByAlias;
@@ -10177,50 +13588,6 @@ function dynamicPagesClientScript() {
     });
   }
 
-  function matchingResultColumnNames(model) {
-    if (!model.blocks.length) return [];
-    var columns = [];
-    function add(column) {
-      var text = String(column || '').trim();
-      if (text && columns.indexOf(text) === -1) columns.push(text);
-    }
-    ['Class', '_id', 'Code', 'Description'].forEach(add);
-    model.blocks.forEach(function (block) {
-      (block.rules || []).forEach(function (rule) {
-        add(rule.leftColumn);
-        add((block.rightPrefix || block.with + '_') + rule.rightColumn);
-      });
-      ['Class', '_id', 'Code', 'Description'].forEach(function (column) {
-        add((block.rightPrefix || block.with + '_') + column);
-      });
-    });
-    return columns;
-  }
-
-  function matchingResultColumnLabels(model, spec) {
-    var labels = {};
-    if (!model.blocks.length) return labels;
-    var firstAlias = model.blocks[0] && model.blocks[0].from || model.selections[0] && model.selections[0].alias || 'objects';
-    ['Class', '_id', 'Code', 'Description'].forEach(function (column) {
-      labels[column] = formatObjectSelectionColumnLabel(spec || defaultSpec(), firstAlias, column);
-    });
-    model.blocks.forEach(function (block) {
-      var prefix = block.rightPrefix || objectSelectionOutputPrefix(spec || defaultSpec(), block.with);
-      (block.rules || []).forEach(function (rule) {
-        if (rule.leftColumn && !labels[rule.leftColumn]) {
-          labels[rule.leftColumn] = rule.leftColumn.indexOf('.') !== -1 ? rule.leftColumn : formatObjectSelectionColumnLabel(spec || defaultSpec(), firstAlias, rule.leftColumn);
-        }
-        if (rule.rightColumn) {
-          labels[prefix + rule.rightColumn] = formatObjectSelectionColumnLabel(spec || defaultSpec(), block.with, rule.rightColumn);
-        }
-      });
-      ['Class', '_id', 'Code', 'Description'].forEach(function (column) {
-        labels[prefix + column] = formatObjectSelectionColumnLabel(spec || defaultSpec(), block.with, column);
-      });
-    });
-    return labels;
-  }
-
   function buildRelationExpansionSpec(model, previousSpec) {
     model = normalizeObjectMatchingModel(model, previousSpec || defaultSpec());
     var objectSpec = buildObjectGroupSpec({
@@ -10228,45 +13595,72 @@ function dynamicPagesClientScript() {
     }, previousSpec || defaultSpec());
     var specForLabels = objectSpec || previousSpec || defaultSpec();
     var columnsByAlias = collectMatchingSelectionColumns(model);
-    var steps = (objectSpec.steps || []).map(function (step) {
+    var selectionSteps = (objectSpec.steps || []).map(function (step) {
       var copy = Object.assign({}, step);
       var materializedColumns = columnsByAlias[copy.as] || [];
-      if (materializedColumns.length) copy.columns = buildSelectionColumnSpecs(materializedColumns);
+      if (materializedColumns.length) copy.columns = buildSelectionColumnSpecs(normalizeObjectSelectionColumns(copy.columns).concat(materializedColumns));
       return copy;
     });
-    model.blocks.forEach(function (block, index) {
-      steps.push({
-        type: 'matchRows',
+    var operations = flowOperations(model);
+    var operationSteps = operations.map(function (operation) {
+      if (operation.type === 'match') {
+        return {
+          type: 'matchRows',
+          purpose: 'objectMatching',
+          from: operation.from,
+          with: operation.with,
+          rules: operation.rules.map(function (rule) {
+            return {
+              action: rule.action === 'exclude' ? 'exclude' : 'include',
+              negate: normalizeMatchingNegate(rule.negate),
+              operator: normalizeMatchingOperator(rule.operator || 'equals'),
+              left: { column: rule.leftColumn, regex: rule.leftRegex },
+              right: { column: rule.rightColumn, regex: rule.rightRegex }
+            };
+          }),
+          caseSensitive: false,
+          rightPrefix: operation.rightPrefix || objectSelectionOutputPrefix(specForLabels, operation.with),
+          as: operation.as
+        };
+      }
+      return {
+        type: operation.type + 'Rows',
         purpose: 'objectMatching',
-        from: index === 0 ? block.from : model.blocks[index - 1].as,
-        with: block.with,
-        rules: block.rules.map(function (rule) {
-          return {
-            action: rule.action === 'exclude' ? 'exclude' : 'include',
-            negate: normalizeMatchingNegate(rule.negate),
-            operator: normalizeMatchingOperator(rule.operator || 'equals'),
-            left: {
-              column: rule.leftColumn,
-              regex: rule.leftRegex
-            },
-            right: {
-              column: rule.rightColumn,
-              regex: rule.rightRegex
-            }
-          };
-        }),
-        caseSensitive: false,
-        rightPrefix: block.rightPrefix || objectSelectionOutputPrefix(specForLabels, block.with),
-        as: block.as
+        from: operation.from,
+        with: operation.with,
+        on: operation.on.map(function (key) { return { left: key.left, right: key.right }; }),
+        distinct: operation.distinct !== false,
+        caseSensitive: Boolean(operation.caseSensitive),
+        as: operation.as
+      };
+    });
+    var steps = selectionSteps.concat(operationSteps);
+    var finalAlias = model.output && model.output.alias || (operations[operations.length - 1] || {}).as || '';
+    var resultTables = objectSpec.result && objectSpec.result.tables ? objectSpec.result.tables.slice() : [];
+    operations.forEach(function (operation, index) {
+      if (resultTables.some(function (table) { return table && table.name === operation.as; })) return;
+      var columnRows = flowColumnOptionRows(model, specForLabels, operation.as, operations.length);
+      resultTables.push({
+        name: operation.as,
+        title: operation.as === finalAlias ? t('extractionFinalResult') : operation.type === 'match' ? t('matchingBlock', { number: index + 1 }) : operation.as,
+        columns: columnRows.map(function (item) { return item.value; }),
+        columnLabels: columnRows.reduce(function (labels, item) { labels[item.value] = item.label; return labels; }, {})
       });
     });
-    var finalAlias = model.output && model.output.alias || model.blocks[model.blocks.length - 1] && model.blocks[model.blocks.length - 1].as || '';
-    var resultTables = (objectSpec.result && objectSpec.result.tables ? objectSpec.result.tables.slice() : []).concat(finalAlias ? [{
-      name: finalAlias,
-      title: t('extractionFinalResult'),
-      columns: matchingResultColumnNames(model),
-      columnLabels: matchingResultColumnLabels(model, specForLabels)
-    }] : []);
+    if (finalAlias && !resultTables.some(function (table) { return table && table.name === finalAlias; })) {
+      resultTables.push({
+        name: finalAlias,
+        title: t('extractionFinalResult'),
+        columns: flowColumnOptionRows(model, specForLabels, finalAlias, operations.length).map(function (item) { return item.value; })
+      });
+    }
+    if (finalAlias) {
+      resultTables.forEach(function (table) {
+        if (!table) return;
+        if (table.name === finalAlias) table.published = true;
+        else delete table.published;
+      });
+    }
     var spec = {
       version: 1,
       params: objectSpec.params || {},
@@ -10274,7 +13668,8 @@ function dynamicPagesClientScript() {
       visualModels: objectSpec.visualModels || [],
       steps: steps,
       result: {
-        tables: resultTables
+        tables: resultTables,
+        diagrams: previousSpec && previousSpec.result && Array.isArray(previousSpec.result.diagrams) ? previousSpec.result.diagrams : undefined
       },
       endpoint: previousSpec && previousSpec.endpoint && previousSpec.endpoint.kind === 'runtime' ? previousSpec.endpoint : undefined,
       publish: previousSpec && previousSpec.publish ? previousSpec.publish : undefined,
@@ -10288,7 +13683,9 @@ function dynamicPagesClientScript() {
       version: 1,
       mode: 'objectMatching',
       selections: model.selections,
+      operations: operations,
       blocks: model.blocks,
+      setOperations: model.setOperations,
       output: {
         alias: finalAlias,
         title: t('extractionFinalResult')
@@ -10376,6 +13773,9 @@ function dynamicPagesClientScript() {
     var selected = state.selectedTemplate || {};
     var code = readTemplateCode(selected);
     var normalizedSpec = normalizeTemplateProtection(spec);
+    if (state.diagramImportProposal && JSON.stringify(selected.spec || {}) !== JSON.stringify(normalizedSpec)) {
+      state.diagramImportStale = true;
+    }
     state.selectedTemplate = Object.assign({}, selected, {
       code: code || selected.code || '',
       description: readTemplateDescription(selected, code) || selected.description || '',
@@ -10384,6 +13784,7 @@ function dynamicPagesClientScript() {
       paramsSchema: readCurrentParamsSchema(selected.paramsSchema || {}),
       resultSchema: readCurrentResultSchema(selected.resultSchema || {})
     });
+    syncImportedDiagramSaveGate();
   }
 
   function applyParamsEditor() {
@@ -10724,14 +14125,114 @@ function dynamicPagesClientScript() {
     var blockNode = button && button.closest ? button.closest('[data-matching-block]') : null;
     if (!blockNode) return;
     var body = blockNode.querySelector('[data-matching-rule-list]') || blockNode.querySelector('tbody');
-    var blockIndex = Number(blockNode.getAttribute('data-matching-block-index') || 0);
+    var operationIndex = Number(blockNode.getAttribute('data-flow-operation-index') || -1);
     var draft = captureRelationDraftFromDom();
-    var block = draft.blocks && draft.blocks[blockIndex] || {};
+    var block = draft.operations && draft.operations[operationIndex] || {};
     var spec = readCurrentSpec();
-    var leftOptions = matchingLeftColumnOptions(spec, draft, blockIndex, block);
-    var rightOptions = matchingRightColumnOptions(spec, block);
+    var leftOptions = flowColumnOptionRows(draft, spec, block.from, operationIndex);
+    var rightOptions = flowColumnOptionRows(draft, spec, block.with, operationIndex);
     clearDraftExecutionState({ clearExtractionSource: true });
     if (body) body.insertAdjacentHTML('beforeend', renderMatchingRuleRow(defaultMatchingRule(), leftOptions, rightOptions));
+  }
+
+  function updateRelationDraft(mutator) {
+    var draft = captureRelationDraftFromDom();
+    mutator(draft);
+    state.relationDraft = normalizeObjectMatchingModel(draft, readCurrentSpec());
+    clearDraftExecutionState({ clearExtractionSource: true });
+    renderDesigner();
+  }
+
+  function addSetOperation() {
+    updateRelationDraft(function (draft) {
+      draft.operations = Array.isArray(draft.operations) ? draft.operations : [];
+      draft.operations.push(defaultSetOperation(draft.operations.length, draft.selections, draft.operations));
+    });
+  }
+
+  function addMatchingBlock() {
+    updateRelationDraft(function (draft) {
+      draft.operations = Array.isArray(draft.operations) ? draft.operations : [];
+      draft.operations.push(defaultMatchingBlock(draft.operations.length, draft.selections, draft.operations));
+    });
+  }
+
+  function clearSetOperation(button) {
+    var node = button && button.closest ? button.closest('[data-set-operation]') : null;
+    var index = Number(node && node.getAttribute('data-flow-operation-index') || -1);
+    if (index < 0) return;
+    removeRelationOperation(index);
+  }
+
+  function addSetOperationKey(button) {
+    var node = button && button.closest ? button.closest('[data-set-operation]') : null;
+    var index = Number(node && node.getAttribute('data-flow-operation-index') || -1);
+    if (index < 0) return;
+    updateRelationDraft(function (draft) {
+      var operation = draft.operations[index];
+      operation.on = Array.isArray(operation.on) ? operation.on : [];
+      operation.on.push({ left: 'Class', right: 'Class' });
+    });
+  }
+
+  function clearSetOperationKey(button) {
+    var keyNode = button && button.closest ? button.closest('[data-set-operation-key]') : null;
+    var operationNode = button && button.closest ? button.closest('[data-set-operation]') : null;
+    var operationIndex = Number(operationNode && operationNode.getAttribute('data-flow-operation-index') || -1);
+    if (!keyNode || operationIndex < 0) return;
+    var keyIndex = Array.prototype.indexOf.call(keyNode.parentElement.children, keyNode);
+    updateRelationDraft(function (draft) {
+      var operation = draft.operations[operationIndex];
+      if (operation && Array.isArray(operation.on) && operation.on.length > 1) operation.on.splice(keyIndex, 1);
+    });
+  }
+
+  function clearMatchingBlock(button) {
+    var node = button && button.closest ? button.closest('[data-matching-block]') : null;
+    var index = Number(node && node.getAttribute('data-flow-operation-index') || -1);
+    if (index < 0) return;
+    removeRelationOperation(index);
+  }
+
+  function removeRelationOperation(index) {
+    var draft = captureRelationDraftFromDom();
+    var removed = draft.operations && draft.operations[index] || {};
+    var alias = String(removed.as || '').trim();
+    var dependents = (draft.operations || []).slice(index + 1).filter(function (operation) {
+      return operation && (operation.from === alias || operation.with === alias);
+    }).map(function (operation) { return String(operation.as || '').trim(); }).filter(Boolean);
+    if (alias && dependents.length) {
+      state.message = { type: 'error', text: t('relationOperationRemoveBlocked', { alias: alias, operations: dependents.join(', ') }) };
+      renderDesigner();
+      return;
+    }
+    updateRelationDraft(function (nextDraft) {
+      nextDraft.operations.splice(index, 1);
+      if (nextDraft.output && nextDraft.output.alias && !materializedAliasRows(nextDraft).some(function (row) { return row.alias === nextDraft.output.alias; })) {
+        nextDraft.output.alias = '';
+      }
+    });
+  }
+
+  function refreshRelationOperationAliases() {
+    var outputField = document.querySelector('[data-result-set-field="publishedAlias"]');
+    if (!outputField) return;
+    var draft = captureRelationDraftFromDom();
+    state.relationDraft = normalizeObjectMatchingModel(draft, readCurrentSpec());
+    var selectedAlias = String(outputField.value || '').trim();
+    outputField.innerHTML = renderMaterializedAliasOptions(state.relationDraft, selectedAlias);
+    document.querySelectorAll('[data-flow-operation]').forEach(function (node) {
+      var index = Number(node.getAttribute('data-flow-operation-index') || -1);
+      var isMatch = node.getAttribute('data-flow-operation') === 'match';
+      ['from', 'with'].forEach(function (fieldName) {
+        var field = node.querySelector(isMatch
+          ? '[data-matching-block-field="' + fieldName + '"]'
+          : '[data-set-operation-field="' + fieldName + '"]');
+        if (!field) return;
+        var selected = String(field.value || '').trim();
+        field.innerHTML = renderPriorMaterializedAliasOptions(state.relationDraft, index, selected);
+      });
+    });
   }
 
   function clearObjectGroupScopeRuleRow(button) {
@@ -10840,10 +14341,30 @@ function dynamicPagesClientScript() {
     });
   }
 
+  function insertDiagramTemplateToken(button) {
+    var token = String(button && button.getAttribute('data-template-token') || '').trim();
+    var detailRow = button && button.closest ? button.closest('[data-diagram-mapping-detail]') : null;
+    var roleMapping = button && button.closest ? button.closest('[data-diagram-import-role-mapping]') : null;
+    var input = detailRow
+      ? detailRow.querySelector('[data-diagram-mapping-field="labelTemplate"]')
+      : roleMapping
+        ? roleMapping.querySelector('[data-diagram-import-role-field="primary.labelTemplate"]')
+        : null;
+    if (!token || !input) return;
+    var text = '$' + '{' + token + '}';
+    var start = Number.isInteger(input.selectionStart) ? input.selectionStart : String(input.value || '').length;
+    var end = Number.isInteger(input.selectionEnd) ? input.selectionEnd : start;
+    input.value = String(input.value || '').slice(0, start) + text + String(input.value || '').slice(end);
+    input.focus();
+    if (input.setSelectionRange) input.setSelectionRange(start + text.length, start + text.length);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
   function addDiagramMappingRow(button) {
     var kind = diagramMappingKindFromElement(button);
     var body = document.querySelector('[data-diagram-mapping-body][data-diagram-mapping-kind="' + kind + '"]');
     if (!kind || !body) return;
+    markImportedDiagramChanged();
     var rows = Array.prototype.slice.call(body.querySelectorAll('[data-diagram-mapping-row]'));
     body.insertAdjacentHTML('beforeend', renderDiagramMappingRow(kind, {}, rows.length, state.selectedTemplate && state.selectedTemplate.spec || defaultSpec()));
   }
@@ -10852,6 +14373,7 @@ function dynamicPagesClientScript() {
     var row = button && button.closest ? button.closest('[data-diagram-mapping-row]') : null;
     var body = row && row.parentElement;
     if (!row || !body) return;
+    markImportedDiagramChanged();
     var rows = Array.prototype.slice.call(body.querySelectorAll('[data-diagram-mapping-row]'));
     if (rows.length > 1) {
       var detailRow = row.nextElementSibling && row.nextElementSibling.hasAttribute('data-diagram-mapping-detail') ? row.nextElementSibling : null;
@@ -10869,7 +14391,7 @@ function dynamicPagesClientScript() {
         if (field.type === 'checkbox') field.checked = field.getAttribute('data-diagram-mapping-field') === 'dataIncludeSourceRef';
         else field.value = '';
       });
-    });
+    }
   }
 
   function ensureTrailingDiagramMappingRow(target) {
@@ -10882,6 +14404,400 @@ function dynamicPagesClientScript() {
     if (!diagramMappingRowHasDomValue(row)) return;
     var kind = diagramMappingKindFromElement(row);
     body.insertAdjacentHTML('beforeend', renderDiagramMappingRow(kind, {}, rows.length, state.selectedTemplate && state.selectedTemplate.spec || defaultSpec()));
+  }
+
+  function diagramImportSelectedValues(field) {
+    if (!field) return [];
+    if (field.multiple) {
+      return Array.prototype.slice.call(field.options || []).filter(function (option) { return option.selected; }).map(function (option) {
+        return String(option.value || '').trim();
+      }).filter(Boolean);
+    }
+    return splitToolList(String(field.value || ''));
+  }
+
+  function captureDiagramImportProposalFromDom(manualBindingId) {
+    var proposal = state.diagramImportProposal;
+    if (!proposal) return proposal;
+    if (proposal.version === 3) {
+      var roleMappingVisible = Boolean(document.querySelector('[data-diagram-import-role-mapping]'));
+      if (roleMappingVisible) (Array.isArray(proposal.roles) ? proposal.roles : []).forEach(function (role) {
+        var semanticField = document.querySelector('[data-diagram-import-semantic="' + String(role.id || '').replace(/"/g, '\\"') + '"]');
+        if (semanticField) role.selectedSemantic = String(semanticField.value || '').trim();
+        var exemplarField = document.querySelector('[data-diagram-import-exemplar="' + String(role.id || '').replace(/"/g, '\\"') + '"]');
+        if (exemplarField) role.exemplarKey = String(exemplarField.value || '').trim();
+        var container = document.querySelector('[data-diagram-import-role-mapping="' + String(role.id || '').replace(/"/g, '\\"') + '"]');
+        if (!container) return;
+        var value = function (name) {
+          var field = container.querySelector('[data-diagram-import-role-field="' + name + '"]');
+          return String(field && field.value || '').trim();
+        };
+        var primary = role.mapping && role.mapping.primary || {};
+        var sourceStageId = value('source.stageId');
+        var sourceStage = diagramImportStageById(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(), sourceStageId);
+        primary.className = value('primary.className') || sourceStage && sourceStage.className || '';
+        primary.idAttribute = value('primary.idAttribute') || '_id';
+        primary.labelTemplate = value('primary.labelTemplate') || '\${Description}';
+        primary.structuredFields = diagramImportSelectedValues(container.querySelector('[data-diagram-import-role-field="primary.structuredFields"]'));
+        var filterPath = value('primary.filter.path');
+        var filterValue = value('primary.filter.value');
+        primary.filters = filterPath && filterValue ? [{ path: filterPath, op: value('primary.filter.op') || 'equals', value: filterValue }] : [];
+        role.mapping = role.mapping || {};
+        role.mapping.source = sourceStageId ? {
+          stageId: sourceStageId,
+          alias: sourceStage && sourceStage.alias || '',
+          kind: sourceStage && sourceStage.kind || '',
+          className: sourceStage && sourceStage.className || ''
+        } : {};
+        role.mapping.primary = primary;
+        role.mapping.related = Array.prototype.slice.call(container.querySelectorAll('[data-diagram-import-related-row]')).map(function (row, index) {
+          var field = function (name) { return row.querySelector('[data-diagram-import-related-field="' + name + '"]'); };
+          var pathField = field('path');
+          var option = pathField && pathField.options[pathField.selectedIndex];
+          var className = String(field('className') && field('className').value || '').trim();
+          var direction = String(field('direction') && field('direction').value || 'both');
+          return {
+            id: role.mapping.related[index] && role.mapping.related[index].id || 'related_' + String(index + 1),
+            className: className,
+            path: diagramImportPathFromOption(option, direction),
+            structuredFields: diagramImportSelectedValues(field('structuredFields'))
+          };
+        }).filter(function (item) { return item.className || item.path.length || item.structuredFields.length; });
+      });
+      var relationRuleRows = Array.prototype.slice.call(document.querySelectorAll('[data-diagram-import-rule-row]'));
+      if (relationRuleRows.length) proposal.relationRules = relationRuleRows.map(function (row, index) {
+        var field = function (name) { return row.querySelector('[data-diagram-import-rule-field="' + name + '"]'); };
+        var pathField = field('path');
+        var option = pathField && pathField.options[pathField.selectedIndex];
+        var direction = String(field('direction') && field('direction').value || 'both');
+        return {
+          id: proposal.relationRules[index] && proposal.relationRules[index].id || 'relation_rule_' + String(index + 1),
+          kind: String(field('kind') && field('kind').value || 'connection'),
+          parentRoleId: String(field('parentRoleId') && field('parentRoleId').value || ''),
+          childRoleId: String(field('childRoleId') && field('childRoleId').value || ''),
+          path: diagramImportPathFromOption(option, direction)
+        };
+      });
+      var placementRuleRows = Array.prototype.slice.call(document.querySelectorAll('[data-diagram-import-placement-row]'));
+      if (placementRuleRows.length) proposal.placementRules = placementRuleRows.map(function (row, index) {
+        var field = function (name) { return row.querySelector('[data-diagram-import-placement-field="' + name + '"]'); };
+        return {
+          id: proposal.placementRules[index] && proposal.placementRules[index].id || 'placement_rule_' + String(index + 1),
+          parentRoleId: String(field('parentRoleId') && field('parentRoleId').value || ''),
+          childRoleId: String(field('childRoleId') && field('childRoleId').value || '')
+        };
+      }).filter(function (rule) { return rule.parentRoleId || rule.childRoleId; });
+      refreshDiagramImportSemanticState(proposal);
+      state.diagramImportProposal = proposal;
+      var sourceV3 = document.getElementById('cmdp-diagram-import-source');
+      if (sourceV3) state.diagramImportSource = sourceV3.value;
+      return proposal;
+    }
+    if (!Array.isArray(proposal.bindings)) return proposal;
+    (Array.isArray(proposal.containerRoles) ? proposal.containerRoles : []).forEach(function (role) {
+      var field = document.querySelector('[data-diagram-import-semantic="' + String(role.key || '').replace(/"/g, '\\"') + '"]');
+      if (field) role.selectedRole = String(field.value || '').trim();
+    });
+    refreshDiagramImportSemanticState(proposal);
+    var spec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
+    proposal.bindings.forEach(function (binding) {
+      var row = document.querySelector('[data-diagram-import-binding-row="' + binding.id + '"]');
+      if (!row) return;
+      var mapping = cloneJsonValue(binding.mapping || {}, {});
+      mapping.fields = mapping.fields && typeof mapping.fields === 'object' && !Array.isArray(mapping.fields) ? mapping.fields : {};
+      var previousSource = String(mapping.from || '').trim();
+      Array.prototype.slice.call(row.querySelectorAll('[data-diagram-import-field]')).forEach(function (field) {
+        var name = String(field.getAttribute('data-diagram-import-field') || '').trim();
+        if (name === 'remove') {
+          binding.remove = Boolean(field.checked);
+          return;
+        }
+        var value = String(field.value || '').trim();
+        if (name === 'from') mapping.from = value;
+        else if (value) mapping.fields[name] = value;
+        else delete mapping.fields[name];
+      });
+      if (mapping.from && mapping.from !== previousSource) {
+        var allowedFields = matchingColumnOptionRowsForOutput(spec, mapping.from).map(function (item) { return item && item.value; }).filter(Boolean);
+        Object.keys(mapping.fields).forEach(function (name) {
+          if (allowedFields.indexOf(mapping.fields[name]) === -1) delete mapping.fields[name];
+        });
+      }
+      binding.mapping = mapping;
+      binding.unresolved = binding.remove || binding.active === false ? [] : (mapping.from ? [] : ['from']);
+      var requiredFields = binding.family === 'edgeMappings'
+        ? ['source', 'target']
+        : binding.family === 'hierarchyMappings'
+          ? ['child', 'parent']
+          : ['id'];
+      requiredFields.forEach(function (name) {
+        if (binding.active !== false && !binding.remove && !String(mapping.fields[name] || '').trim()) binding.unresolved.push(name);
+      });
+      if (mapping.from && (binding.confidence === 'none' || String(binding.id) === String(manualBindingId || ''))) binding.confidence = 'manual';
+    });
+    refreshDiagramImportSemanticState(proposal);
+    state.diagramImportProposal = proposal;
+    var source = document.getElementById('cmdp-diagram-import-source');
+    if (source) state.diagramImportSource = source.value;
+    return proposal;
+  }
+
+  function diagramImportBindingOverrides(proposal) {
+    if (proposal && proposal.version === 3) {
+      return (proposal.roles || []).map(function (role) {
+        return {
+          id: role.id,
+          selectedSemantic: role.selectedSemantic,
+          exemplarKey: role.exemplarKey,
+          mapping: cloneJsonValue(role.mapping || {}, {})
+        };
+      });
+    }
+    return (proposal && Array.isArray(proposal.bindings) ? proposal.bindings : []).map(function (binding) {
+      return {
+        id: binding.id,
+        mapping: cloneJsonValue(binding.mapping || {}, {}),
+        remove: binding.remove === true,
+        confidence: binding.confidence === 'manual' ? 'manual' : binding.confidence
+      };
+    });
+  }
+
+  function diagramImportSemanticOverrides(proposal) {
+    return (proposal && Array.isArray(proposal.containerRoles) ? proposal.containerRoles : []).map(function (role) {
+      return { key: String(role.key || ''), semantic: String(role.selectedRole || '') };
+    });
+  }
+
+  function acceptDiagramImportBinding(button) {
+    if (state.diagramImportBusy || state.diagramImportAssistantBusy) return;
+    var id = String(button && button.getAttribute('data-binding-id') || '').trim();
+    var proposal = captureDiagramImportProposalFromDom(id);
+    var binding = proposal && proposal.bindings && proposal.bindings.find(function (item) { return String(item.id) === id; });
+    if (binding && !binding.remove && binding.mapping && binding.mapping.from) binding.confidence = 'manual';
+    renderDesigner();
+  }
+
+  function mutateDiagramImportV3(action, target) {
+    var proposal = captureDiagramImportProposalFromDom();
+    if (!proposal || proposal.version !== 3) return;
+    if (action === 'diagram-import-add-related') {
+      var container = target.closest('[data-diagram-import-role-mapping]');
+      var roleId = String(container && container.getAttribute('data-diagram-import-role-mapping') || '');
+      var role = (proposal.roles || []).find(function (item) { return String(item.id) === roleId; });
+      if (role) {
+        role.mapping.related = Array.isArray(role.mapping.related) ? role.mapping.related : [];
+        role.mapping.related.push({ id: 'related_' + Date.now(), className: '', path: [], structuredFields: ['Code', 'Description'] });
+      }
+    } else if (action === 'diagram-import-remove-related') {
+      var relatedContainer = target.closest('[data-diagram-import-role-mapping]');
+      var relatedRoleId = String(relatedContainer && relatedContainer.getAttribute('data-diagram-import-role-mapping') || '');
+      var relatedRole = (proposal.roles || []).find(function (item) { return String(item.id) === relatedRoleId; });
+      var relatedRow = target.closest('[data-diagram-import-related-row]');
+      var relatedIndex = Number(relatedRow && relatedRow.getAttribute('data-diagram-import-related-row'));
+      if (relatedRole && Number.isInteger(relatedIndex)) relatedRole.mapping.related.splice(relatedIndex, 1);
+    } else if (action === 'diagram-import-add-rule') {
+      proposal.relationRules = Array.isArray(proposal.relationRules) ? proposal.relationRules : [];
+      proposal.relationRules.push({ id: 'relation_rule_' + Date.now(), kind: 'connection', parentRoleId: '', childRoleId: '', path: [] });
+    } else if (action === 'diagram-import-remove-rule') {
+      var ruleRow = target.closest('[data-diagram-import-rule-row]');
+      var ruleIndex = Number(ruleRow && ruleRow.getAttribute('data-diagram-import-rule-row'));
+      if (Number.isInteger(ruleIndex)) proposal.relationRules.splice(ruleIndex, 1);
+    } else if (action === 'diagram-import-add-placement') {
+      proposal.placementRules = Array.isArray(proposal.placementRules) ? proposal.placementRules : [];
+      proposal.placementRules.push({ id: 'placement_rule_' + Date.now(), parentRoleId: '', childRoleId: '' });
+    } else if (action === 'diagram-import-remove-placement') {
+      var placementRow = target.closest('[data-diagram-import-placement-row]');
+      var placementIndex = Number(placementRow && placementRow.getAttribute('data-diagram-import-placement-row'));
+      if (Number.isInteger(placementIndex)) proposal.placementRules.splice(placementIndex, 1);
+    }
+    refreshDiagramImportSemanticState(proposal);
+    renderDesigner();
+  }
+
+  function diagramImportProposalHasReviewBlocker(proposal) {
+    refreshDiagramImportSemanticState(proposal);
+    if (proposal && proposal.version === 3) return state.diagramImportStale || Boolean((proposal.unresolved || []).length);
+    var bindings = proposal && Array.isArray(proposal.bindings) ? proposal.bindings : [];
+    return state.diagramImportStale || (proposal.unresolved || []).some(function (item) { return item && item.family === 'containerRoles'; }) || bindings.some(function (binding) {
+      return binding && binding.active !== false && !binding.remove && ((binding.unresolved && binding.unresolved.length) || binding.confidence === 'ambiguous');
+    });
+  }
+
+  function persistedDiagramImportSource() {
+    var diagram = firstDiagramSpec(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
+    var d2Import = diagram && diagram.authoring && diagram.authoring.d2Import;
+    return String(d2Import && d2Import.source || '');
+  }
+
+  function markImportedDiagramChanged() {
+    if (!persistedDiagramImportSource() && !state.diagramImportAppliedPendingPreview) return;
+    state.lastDraftPreviewOk = false;
+    state.diagramImportAppliedPendingPreview = true;
+    syncImportedDiagramSaveGate();
+  }
+
+  function syncImportedDiagramSaveGate() {
+    var blocked = Boolean(state.diagramImportProposal) || state.diagramImportStale || (state.diagramImportAppliedPendingPreview && !state.lastDraftPreviewOk);
+    Array.prototype.slice.call(document.querySelectorAll('[data-action="save-template"]')).forEach(function (button) {
+      button.disabled = blocked;
+      button.setAttribute('aria-disabled', blocked ? 'true' : 'false');
+      button.title = blocked
+        ? t(state.diagramImportStale ? 'diagramImportStale' : state.diagramImportProposal ? 'diagramImportReviewBlocked' : 'diagramImportPreviewRequired')
+        : '';
+    });
+  }
+
+  function analyzeDiagramImport() {
+    if (state.diagramImportBusy || state.diagramImportAssistantBusy) return;
+    if (!captureVisibleDesignerState()) return;
+    var source = document.getElementById('cmdp-diagram-import-source');
+    state.diagramImportSource = String(source && source.value || state.diagramImportSource || '');
+    if (!state.diagramImportSource.trim()) {
+      state.message = { type: 'error', text: t('fieldRequired', { label: t('diagramImportSource') }) };
+      renderDesigner();
+      return;
+    }
+    state.diagramImportBusy = true;
+    state.diagramImportProposal = null;
+    state.diagramImportSignedProposal = null;
+    state.diagramImportIr = null;
+    state.diagramImportPreviewError = '';
+    state.diagramImportStale = false;
+    var requestTemplate = state.selectedTemplate;
+    state.message = { type: 'ok', text: t('diagramImportAnalyzing') };
+    renderDesigner();
+    var requestSource = state.diagramImportSource;
+    request(apiPrefix + '/draft/diagram-import/analyze', {
+      method: 'POST',
+      timeoutMs: 30000,
+      body: {
+        root: state.root,
+        templateCode: state.selectedTemplate && state.selectedTemplate.code || '',
+        baseSpecHash: state.selectedTemplate && state.selectedTemplate.specHash || '',
+        currentSpec: state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(),
+        d2Source: requestSource
+      }
+    }).then(function (result) {
+      if (state.selectedTemplate !== requestTemplate) throw new Error(t('assistantResponseStale'));
+      if (!result.ok || !result.json || !result.json.proposal) throw new Error(errorText(result));
+      state.diagramImportSignedProposal = cloneJsonValue(result.json.proposal, null);
+      state.diagramImportProposal = cloneJsonValue(result.json.proposal, null);
+      state.diagramImportIr = result.json.ir || null;
+      if (state.diagramImportSource === requestSource) {
+        state.diagramImportPreview = cloneJsonValue(result.json.preview, null);
+        state.diagramImportPreviewSource = requestSource;
+        state.diagramImportPreviewError = '';
+      }
+      if (result.json.catalog) {
+        var catalogRecord = { catalog: result.json.catalog, updatedAt: result.json.catalog.generatedAt || new Date().toISOString() };
+        applyCatalogCache(catalogRecord);
+        writeCatalogCache(result.json.catalog);
+      }
+      state.diagramImportStale = state.diagramImportSource !== requestSource;
+      state.message = { type: state.diagramImportStale ? 'error' : 'ok', text: state.diagramImportStale ? t('diagramImportStale') : t('diagramImportReady') };
+    }).catch(function (error) {
+      var message = String(error && error.message || error || t('requestFailed')).slice(0, 500);
+      state.diagramImportPreviewError = message;
+      state.message = { type: 'error', text: message };
+    }).finally(function () {
+      state.diagramImportBusy = false;
+      renderDesigner();
+    });
+  }
+
+  function completeDiagramImportWithAssistant() {
+    if (state.diagramImportBusy || state.diagramImportAssistantBusy) return;
+    if (!captureVisibleDesignerState()) return;
+    var proposal = captureDiagramImportProposalFromDom();
+    if (!proposal) {
+      state.message = { type: 'error', text: t('diagramImportNoProposal') };
+      renderDesigner();
+      return;
+    }
+    if (state.diagramImportStale) {
+      state.message = { type: 'error', text: t('diagramImportStale') };
+      renderDesigner();
+      return;
+    }
+    state.diagramImportAssistantBusy = true;
+    state.message = { type: 'ok', text: t('diagramImportAssistantRunning') };
+    renderDesigner();
+    var requestSource = state.diagramImportSource;
+    request(apiPrefix + '/assistant/diagram-import/complete?root=' + encodeURIComponent(state.root || 'Cst_QueryTool'), {
+      method: 'POST',
+      timeoutMs: 60000,
+      body: {
+        root: state.root,
+        currentSpec: state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(),
+        proposal: state.diagramImportSignedProposal,
+        roles: diagramImportBindingOverrides(proposal),
+        relationRules: cloneJsonValue(proposal.relationRules || [], []),
+        placementRules: cloneJsonValue(proposal.placementRules || [], [])
+      }
+    }).then(function (result) {
+      if (!result.ok || !result.json || !result.json.proposal) throw new Error(errorText(result));
+      state.diagramImportSignedProposal = cloneJsonValue(result.json.proposal, null);
+      state.diagramImportProposal = cloneJsonValue(result.json.proposal, null);
+      state.diagramImportStale = state.diagramImportSource !== requestSource;
+      state.message = { type: state.diagramImportStale ? 'error' : 'ok', text: state.diagramImportStale ? t('diagramImportStale') : (result.json.explanation || t('diagramImportReady')) };
+    }).catch(function (error) {
+      state.message = { type: 'error', text: error.message || String(error) };
+    }).finally(function () {
+      state.diagramImportAssistantBusy = false;
+      renderDesigner();
+    });
+  }
+
+  function applyDiagramImport() {
+    if (state.diagramImportBusy || state.diagramImportAssistantBusy) return;
+    if (!captureVisibleDesignerState()) return;
+    var proposal = captureDiagramImportProposalFromDom();
+    if (!proposal) {
+      state.message = { type: 'error', text: t('diagramImportNoProposal') };
+      renderDesigner();
+      return;
+    }
+    if (diagramImportProposalHasReviewBlocker(proposal)) {
+      state.message = { type: 'error', text: state.diagramImportStale ? t('diagramImportStale') : t('diagramImportReviewBlocked') };
+      renderDesigner();
+      return;
+    }
+    var requestTemplate = state.selectedTemplate;
+    var requestSignedProposal = state.diagramImportSignedProposal;
+    state.diagramImportBusy = true;
+    renderDesigner();
+    request(apiPrefix + '/draft/diagram-import/apply', {
+      method: 'POST',
+      timeoutMs: 30000,
+      body: {
+        root: state.root,
+        currentSpec: state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(),
+        proposal: state.diagramImportSignedProposal,
+        roles: diagramImportBindingOverrides(proposal),
+        relationRules: cloneJsonValue(proposal.relationRules || [], []),
+        placementRules: cloneJsonValue(proposal.placementRules || [], [])
+      }
+    }).then(function (result) {
+      if (state.selectedTemplate !== requestTemplate || state.diagramImportSignedProposal !== requestSignedProposal) throw new Error(t('assistantResponseStale'));
+      if (!result.ok || !result.json || !result.json.spec) throw new Error(errorText(result));
+      updateSelectedFromEditor(assistantSpecWithPrompts(result.json.spec));
+    state.diagramImportProposal = null;
+    state.diagramImportSignedProposal = null;
+    state.diagramImportIr = null;
+    state.diagramImportPreview = null;
+    state.diagramImportPreviewSource = '';
+    state.diagramImportPreviewError = '';
+    state.lastDraftPreviewOk = false;
+      state.diagramImportAppliedPendingPreview = true;
+      state.diagramImportStale = false;
+      state.message = { type: 'ok', text: t('diagramImportApplied') };
+    }).catch(function (error) {
+      state.message = { type: 'error', text: error.message || String(error) };
+    }).finally(function () {
+      state.diagramImportBusy = false;
+      renderDesigner();
+    });
   }
 
   function refreshDiagramMappingEditorAfterSourceChange() {
@@ -10962,6 +14878,21 @@ function dynamicPagesClientScript() {
   }
 
   function saveTemplate() {
+    if (state.diagramImportProposal) {
+      state.message = { type: 'error', text: t(state.diagramImportStale ? 'diagramImportStale' : 'diagramImportReviewBlocked') };
+      renderDesigner();
+      return;
+    }
+    if (state.diagramImportStale) {
+      state.message = { type: 'error', text: t('diagramImportStale') };
+      renderDesigner();
+      return;
+    }
+    if (state.diagramImportAppliedPendingPreview && !state.lastDraftPreviewOk) {
+      state.message = { type: 'error', text: t('diagramImportPreviewRequired') };
+      renderDesigner();
+      return;
+    }
     var payload;
     try { payload = readEditorPayload(); } catch (error) {
       state.message = { type: 'error', text: error.message };
@@ -10974,14 +14905,21 @@ function dynamicPagesClientScript() {
     request(path, { method: exists ? 'PUT' : 'POST', body: payload }).then(function (result) {
       if (!result.ok) throw new Error(errorText(result));
       state.selectedTemplate = result.json.template;
-      state.message = { type: 'ok', text: t('saved') };
+      var saveMessage = result.json.cacheInvalidation && result.json.cacheInvalidation.complete === false
+        ? { type: 'error', text: t('diagramImportCacheInvalidationPartial') }
+        : { type: 'ok', text: t('saved') };
+      state.message = saveMessage;
       state.paramRowsDraft = null;
       state.lastDraftPreviewOk = false;
+      state.diagramImportAppliedPendingPreview = false;
       if (wasCreating) {
         state.designerSection = 'templates';
         if (window.history && window.history.pushState) window.history.pushState({ designerSection: 'templates' }, '', designerSectionUrl('templates'));
       }
-      return loadDesigner();
+      return loadDesigner().then(function () {
+        state.message = saveMessage;
+        renderDesigner();
+      });
     }).catch(function (error) {
       state.message = { type: 'error', text: error.message };
       renderDesigner();
@@ -10990,6 +14928,201 @@ function dynamicPagesClientScript() {
 
   function openAssistantSection() {
     setDesignerSection('assistant');
+  }
+
+  function assistantCompletionText(json, fallback) {
+    var parts = [String(json && json.explanation || fallback || '').trim()].filter(Boolean);
+    var warnings = json && Array.isArray(json.warnings) ? json.warnings.map(function (item) { return String(item || '').trim(); }).filter(Boolean) : [];
+    if (warnings.length) parts.push(t('assistantWarnings') + ': ' + warnings.join(' '));
+    return parts.join(' ');
+  }
+
+  function captureAssistantObjectFlow() {
+    captureAssistantPromptsFromDom();
+    if (!state.assistantFlowProposal) throw new Error(t('assistantNoFlowProposal'));
+    return cloneJsonValue(state.assistantFlowProposal, { version: 1, selections: [], blocks: [] });
+  }
+
+  function assistantSpecWithPrompts(spec) {
+    var next = cloneSpecForEdit(spec || defaultSpec());
+    next.assistantDraft = Object.assign({}, next.assistantDraft || {}, {
+      objectFlowPrompt: String(state.assistantObjectFlowPrompt || ''),
+      diagramInterpretPrompt: String(state.assistantDiagramInterpretPrompt || ''),
+      diagramMappingPrompt: String(state.assistantDiagramMappingPrompt || '')
+    });
+    delete next.assistantDraft.flowPrompts;
+    delete next.assistantDraft.intent;
+    delete next.assistantDraft.taskMode;
+    return next;
+  }
+
+  function generateAssistantObjectFlow() {
+    if (state.assistantFlowBusy) return;
+    captureAssistantPromptsFromDom();
+    var prompt = String(state.assistantObjectFlowPrompt || '').trim();
+    if (!prompt) {
+      state.message = { type: 'error', text: t('fieldRequired', { label: t('assistantDataFlowPrompt') }) };
+      renderDesigner();
+      return;
+    }
+    var requestTemplate = state.selectedTemplate;
+    var requestPrompt = prompt;
+    state.assistantFlowBusy = true;
+    state.assistantFlowProposal = null;
+    state.assistantFlowExplanation = '';
+    state.assistantFlowWarnings = [];
+    state.message = { type: 'ok', text: t('assistantGeneratingTitle') };
+    renderDesigner();
+    request(apiPrefix + '/assistant/object-flow/plan?root=' + encodeURIComponent(state.root || 'Cst_QueryTool'), {
+      method: 'POST', timeoutMs: 60000,
+      body: {
+        prompt: prompt,
+        currentSpec: state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(),
+        templateCode: state.selectedTemplate && state.selectedTemplate.code || '',
+        baseSpecHash: state.selectedTemplate && state.selectedTemplate.specHash || ''
+      }
+    }).then(function (result) {
+      if (state.selectedTemplate !== requestTemplate || state.assistantObjectFlowPrompt !== requestPrompt) throw new Error(t('assistantResponseStale'));
+      if (!result.ok || !result.json || !result.json.flow) throw new Error(errorText(result));
+      state.assistantFlowProposal = cloneJsonValue(result.json.flow, { version: 1, selections: [], blocks: [] });
+      state.assistantFlowExplanation = String(result.json.explanation || '');
+      state.assistantFlowWarnings = Array.isArray(result.json.warnings) ? result.json.warnings.map(String).filter(Boolean) : [];
+      state.message = { type: 'ok', text: assistantCompletionText(result.json, t('assistantFlowReady')) };
+    }).catch(function (error) {
+      state.message = { type: 'error', text: error.message || String(error) };
+    }).finally(function () {
+      state.assistantFlowBusy = false;
+      renderDesigner();
+    });
+  }
+
+  function applyAssistantObjectFlow() {
+    var flow;
+    try { flow = captureAssistantObjectFlow(); } catch (error) {
+      state.message = { type: 'error', text: error.message || String(error) };
+      renderDesigner();
+      return;
+    }
+    var requestTemplate = state.selectedTemplate;
+    request(apiPrefix + '/draft/object-flow/apply', {
+      method: 'POST', timeoutMs: 30000,
+      body: {
+        root: state.root,
+        currentSpec: state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(),
+        flow: flow,
+        templateCode: state.selectedTemplate && state.selectedTemplate.code || '',
+        baseSpecHash: state.selectedTemplate && state.selectedTemplate.specHash || ''
+      }
+    }).then(function (result) {
+      if (state.selectedTemplate !== requestTemplate) throw new Error(t('assistantResponseStale'));
+      if (!result.ok || !result.json || !result.json.spec) throw new Error(errorText(result));
+      updateSelectedFromEditor(assistantSpecWithPrompts(result.json.spec));
+      state.objectGroupDraft = null;
+      state.relationDraft = null;
+      state.assistantFlowProposal = null;
+      state.assistantFlowExplanation = '';
+      state.assistantFlowWarnings = [];
+      if (state.diagramImportProposal) state.diagramImportStale = true;
+      clearDraftExecutionState({ clearExtractionSource: true });
+      state.message = { type: 'ok', text: t('assistantFlowApplied') };
+    }).catch(function (error) {
+      state.message = { type: 'error', text: error.message || String(error) };
+    }).finally(function () { renderDesigner(); });
+  }
+
+  function assistantDiagramRequest(kind) {
+    if (state.assistantDiagramInterpretBusy || state.assistantDiagramMappingBusy || !state.diagramImportSignedProposal) return;
+    if (!captureVisibleDesignerState()) return;
+    var proposal = state.diagramImportProposal;
+    var prompt = kind === 'interpret' ? state.assistantDiagramInterpretPrompt.trim() : state.assistantDiagramMappingPrompt.trim();
+    if (!prompt) {
+      state.message = { type: 'error', text: t('fieldRequired', { label: kind === 'interpret' ? t('assistantDiagramInterpretPrompt') : t('assistantDiagramMappingPrompt') }) };
+      renderDesigner();
+      return;
+    }
+    if (kind === 'interpret') state.assistantDiagramInterpretBusy = true;
+    else state.assistantDiagramMappingBusy = true;
+    var requestTemplate = state.selectedTemplate;
+    var requestProposal = state.diagramImportProposal;
+    state.message = { type: 'ok', text: t('assistantGeneratingTitle') };
+    renderDesigner();
+    var body = {
+      prompt: prompt,
+      currentSpec: state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(),
+      proposal: state.diagramImportSignedProposal,
+      roles: diagramImportBindingOverrides(proposal),
+      relationRules: cloneJsonValue(proposal.relationRules || [], []),
+      placementRules: cloneJsonValue(proposal.placementRules || [], [])
+    };
+    if (kind === 'map') body.stages = assistantFlowStageSummaries(assistantFlowModel(body.currentSpec), body.currentSpec);
+    request(apiPrefix + '/assistant/diagram-import/' + (kind === 'interpret' ? 'interpret' : 'map-selections') + '?root=' + encodeURIComponent(state.root || 'Cst_QueryTool'), { method: 'POST', timeoutMs: 60000, body: body }).then(function (result) {
+      if (state.selectedTemplate !== requestTemplate || state.diagramImportProposal !== requestProposal) throw new Error(t('assistantResponseStale'));
+      if (!result.ok || !result.json) throw new Error(errorText(result));
+      if (kind === 'interpret') {
+        state.assistantDiagramInterpretResult = result.json;
+        (result.json.decisions || []).forEach(function (decision) {
+          var role = (proposal.roles || []).find(function (item) { return item.id === decision.roleId; });
+          if (role && decision.semantic) role.selectedSemantic = decision.semantic;
+          if (role && decision.reason) role.semanticReason = decision.reason;
+        });
+      } else {
+        state.assistantDiagramMappingResult = result.json;
+        (result.json.mappings || []).forEach(function (candidate) {
+          var role = (proposal.roles || []).find(function (item) { return item.id === candidate.roleId; });
+          if (!role) return;
+          role.mapping = Object.assign({}, role.mapping || {}, candidate.mapping || {}, { source: candidate.source || candidate.mapping && candidate.mapping.source || {} });
+        });
+      }
+      refreshDiagramImportSemanticState(proposal);
+      state.diagramImportProposal = proposal;
+      state.message = { type: 'ok', text: assistantCompletionText(result.json, t('assistantDraftGenerated')) };
+    }).catch(function (error) {
+      state.message = { type: 'error', text: error.message || String(error) };
+    }).finally(function () {
+      state.assistantDiagramInterpretBusy = false;
+      state.assistantDiagramMappingBusy = false;
+      renderDesigner();
+    });
+  }
+
+  function assistantFlowModel(spec) {
+    return inferRelationExpansionModel(spec || defaultSpec());
+  }
+
+  function assistantFlowStageSummaries(model, spec) {
+    var summaries = [];
+    var columnsByAlias = {};
+    (model.selections || []).forEach(function (selection, index) {
+      var columns = uniqueList(['Class', '_id', 'Code', 'Description'].concat(selection.columns || []));
+      summaries.push({ id: selection.id, kind: 'selection', index: index, label: selection.name || defaultObjectSelectionName(index), alias: selection.alias, className: selection.className, columns: columns });
+      columnsByAlias[selection.alias] = columns;
+    });
+    var matchIndex = 0;
+    var setIndex = 0;
+    flowOperations(model).forEach(function (operation) {
+      var leftColumns = columnsByAlias[operation.from] || [];
+      var rightColumns = columnsByAlias[operation.with] || [];
+      var columns;
+      if (operation.type === 'match') {
+        columns = leftColumns.slice();
+        var prefix = operation.rightPrefix || objectSelectionOutputPrefix(spec || defaultSpec(), operation.with);
+        rightColumns.forEach(function (column) {
+          if (columns.indexOf(prefix + column) === -1) columns.push(prefix + column);
+        });
+        (operation.rules || []).forEach(function (rule) {
+          if (rule.leftColumn && columns.indexOf(rule.leftColumn) === -1) columns.push(rule.leftColumn);
+          if (rule.rightColumn && columns.indexOf(prefix + rule.rightColumn) === -1) columns.push(prefix + rule.rightColumn);
+        });
+        summaries.push({ id: operation.id, kind: 'match', index: matchIndex, label: t('matchingBlock', { number: matchIndex + 1 }), alias: operation.as, columns: columns });
+        matchIndex += 1;
+      } else {
+        columns = operation.type === 'union' ? uniqueList(leftColumns.concat(rightColumns)) : leftColumns.slice();
+        summaries.push({ id: operation.id, kind: 'set', index: setIndex, label: t('setOperation', { number: setIndex + 1 }), alias: operation.as, className: sourceClassForAlias(spec || defaultSpec(), operation.as), columns: columns });
+        setIndex += 1;
+      }
+      columnsByAlias[operation.as] = columns;
+    });
+    return summaries;
   }
 
   function refreshAssistantGenerationElapsed() {
@@ -11096,8 +15229,10 @@ function dynamicPagesClientScript() {
       method: 'POST',
       body: { template: payload, params: params }
     }).then(function (result) {
+      result.downloadMode = 'draft';
       state.result = result;
       state.lastDraftPreviewOk = action === 'preview' && result.ok;
+      if (state.lastDraftPreviewOk) state.diagramImportAppliedPendingPreview = false;
       state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t(action === 'validate' ? 'draftValidateCompleted' : 'draftPreviewCompleted') : errorText(result) };
       state.designerSection = 'run';
       if (window.history && window.history.pushState) window.history.pushState({ designerSection: 'run' }, '', designerSectionUrl('run'));
@@ -11216,6 +15351,11 @@ function dynamicPagesClientScript() {
     if (hasField('cmdp-assistant-system-prompt')) {
       next.assistant.prompt = next.assistant.prompt || {};
       next.assistant.prompt.system = String(readValue('cmdp-assistant-system-prompt') || '').trim() || defaultRuntimeConfig().assistant.prompt.system;
+      next.assistant.prompt.objectFlow = String(readValue('cmdp-assistant-object-flow-system-prompt') || '').trim() || defaultRuntimeConfig().assistant.prompt.objectFlow;
+      next.assistant.prompt.diagramInterpretation = String(readValue('cmdp-assistant-diagram-interpret-system-prompt') || '').trim() || defaultRuntimeConfig().assistant.prompt.diagramInterpretation;
+      next.assistant.prompt.diagramMapping = String(readValue('cmdp-assistant-diagram-mapping-system-prompt') || '').trim() || defaultRuntimeConfig().assistant.prompt.diagramMapping;
+      delete next.assistant.prompt.selection;
+      delete next.assistant.prompt.matching;
     }
     if (hasField('cmdp-assistant-mcp-enabled')) {
       next.assistant.mcp.enabled = readChecked('cmdp-assistant-mcp-enabled');
@@ -11287,7 +15427,7 @@ function dynamicPagesClientScript() {
     state.catalogSyncing = true;
     state.catalogStatus = Object.assign({}, state.catalogStatus || {}, { state: 'syncing', error: '' });
     renderDesigner();
-    request(apiPrefix + '/model/catalog?maxClasses=500&maxDomains=500&includeAttributes=true').then(function (result) {
+    request(apiPrefix + '/model/catalog?includeAttributes=true&root=' + encodeURIComponent(state.root || 'Cst_QueryTool')).then(function (result) {
       if (!result.ok || !result.json || !result.json.catalog) {
         throw new Error(errorText(result));
       }
@@ -11350,7 +15490,8 @@ function dynamicPagesClientScript() {
       active: selected.active !== false,
       spec: version.spec || selected.spec || defaultSpec(),
       paramsSchema: selected.paramsSchema || {},
-      resultSchema: selected.resultSchema || {}
+      resultSchema: selected.resultSchema || {},
+      specHash: selected.specHash
     };
     state.objectGroupDraft = null;
     state.relationDraft = null;
@@ -11691,8 +15832,10 @@ function dynamicPagesClientScript() {
       method: 'POST',
       body: { template: payload, params: params }
     }).then(function (result) {
+      result.downloadMode = 'draft';
       state.result = result;
       state.lastDraftPreviewOk = result.ok;
+      if (result.ok) state.diagramImportAppliedPendingPreview = false;
       state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t('visualizationRunCompleted') : errorText(result) };
       state.designerSection = 'run';
       if (window.history && window.history.pushState) window.history.pushState({ designerSection: 'run' }, '', designerSectionUrl('run'));
@@ -11811,6 +15954,11 @@ function dynamicPagesClientScript() {
     if (paramsText) paramsText.textContent = runParamVariantsText(params);
   }
 
+  function renderRuntimeIntoApp(result) {
+    app.innerHTML = renderRuntimeResult(result);
+    initializeDiagramViewports(app);
+  }
+
   function loadRuntime(refresh) {
     updateChrome();
     if (state.runtimeCountdownTimer) window.clearInterval(state.runtimeCountdownTimer);
@@ -11827,7 +15975,7 @@ function dynamicPagesClientScript() {
       request(publicSnapshotRunPath(templateCode, params)).then(function (result) {
         result.downloadMode = 'public';
         state.runtimeRefreshInProgress = false;
-        app.innerHTML = renderRuntimeResult(result);
+        renderRuntimeIntoApp(result);
         startRuntimeCountdown();
       }).catch(function (error) {
         state.runtimeRefreshInProgress = false;
@@ -11841,11 +15989,11 @@ function dynamicPagesClientScript() {
       if (!result.ok && resultIsPermissionDenied(result)) {
         return request(publicSnapshotRunPath(templateCode, params)).then(function (publicResult) {
           publicResult.downloadMode = 'public';
-          app.innerHTML = publicResult.ok && publicResult.json && publicResult.json.snapshotFound ? renderRuntimeResult(publicResult) : renderRuntimeResult(result);
+          renderRuntimeIntoApp(publicResult.ok && publicResult.json && publicResult.json.snapshotFound ? publicResult : result);
           startRuntimeCountdown();
         });
       }
-      app.innerHTML = renderRuntimeResult(result);
+      renderRuntimeIntoApp(result);
       startRuntimeCountdown();
     }).catch(function (error) {
       state.runtimeRefreshInProgress = false;
@@ -11951,6 +16099,10 @@ function dynamicPagesClientScript() {
       if (target.getAttribute('data-disabled') === 'true') return;
       loadRuntime(true);
     }
+    if (action === 'download-draft-d2') downloadDraftD2Source(target);
+    if (action === 'diagram-zoom-out') adjustDiagramViewportScale(target, -DIAGRAM_VIEWPORT_SCALE_STEP);
+    if (action === 'diagram-zoom-reset') adjustDiagramViewportScale(target, 'reset');
+    if (action === 'diagram-zoom-in') adjustDiagramViewportScale(target, DIAGRAM_VIEWPORT_SCALE_STEP);
     if (action === 'refresh') refreshDesigner();
     if (action === 'new-template') newTemplate();
     if (action === 'new-cmdb-build-view') newCmdbBuildViewTemplate();
@@ -11960,6 +16112,12 @@ function dynamicPagesClientScript() {
     if (action === 'assistant-draft') openAssistantSection();
     if (action === 'assistant-generate') generateAssistantDraft();
     if (action === 'assistant-apply-draft') applyAssistantDraft();
+    if (action === 'assistant-flow-generate') generateAssistantObjectFlow();
+    if (action === 'assistant-flow-apply') applyAssistantObjectFlow();
+    if (action === 'assistant-diagram-interpret') assistantDiagramRequest('interpret');
+    if (action === 'assistant-diagram-map') assistantDiagramRequest('map');
+    if (action === 'open-assistant-d2') setDesignerSection('assistant');
+    if (action === 'open-diagram-editor') setDesignerSection('diagram');
     if (action === 'visualize-editor') visualizeInEditor();
     if (action === 'force-refresh-editor') forceRefreshInEditor();
     if (action === 'visualize-external') visualizeExternal();
@@ -11970,8 +16128,14 @@ function dynamicPagesClientScript() {
     if (action === 'add-object-selection') addObjectSelection();
     if (action === 'clear-object-scope-row') clearObjectGroupScopeRuleRow(target);
     if (action === 'apply-relation-expansion') applyRelationExpansionEditor();
+    if (action === 'add-matching-block') addMatchingBlock();
     if (action === 'add-matching-rule-row') addMatchingRuleRow(target);
     if (action === 'clear-matching-rule-row') clearMatchingRuleRow(target);
+    if (action === 'clear-matching-block') clearMatchingBlock(target);
+    if (action === 'add-set-operation') addSetOperation();
+    if (action === 'clear-set-operation') clearSetOperation(target);
+    if (action === 'add-set-operation-key') addSetOperationKey(target);
+    if (action === 'clear-set-operation-key') clearSetOperationKey(target);
     if (action === 'apply-cmdb-build-view') applyCmdbBuildViewEditor();
     if (action === 'add-param-row') addParamRow();
     if (action === 'apply-params') applyParamsEditor();
@@ -11987,6 +16151,12 @@ function dynamicPagesClientScript() {
     if (action === 'clear-view-column-row') clearViewComposerColumnRow(target);
     if (action === 'add-diagram-mapping-row') addDiagramMappingRow(target);
     if (action === 'clear-diagram-mapping-row') clearDiagramMappingRow(target);
+    if (action === 'insert-diagram-template-token') insertDiagramTemplateToken(target);
+    if (action === 'diagram-import-analyze') analyzeDiagramImport();
+    if (action === 'diagram-import-assistant') completeDiagramImportWithAssistant();
+    if (action === 'diagram-import-apply') applyDiagramImport();
+    if (action === 'diagram-import-accept-binding') acceptDiagramImportBinding(target);
+    if (['diagram-import-add-related', 'diagram-import-remove-related', 'diagram-import-add-rule', 'diagram-import-remove-rule', 'diagram-import-add-placement', 'diagram-import-remove-placement'].indexOf(action) >= 0) mutateDiagramImportV3(action, target);
     if (action === 'apply-view-composer') applyViewComposerEditor();
     if (action === 'add-visual-row-group') addVisualizationRowGroup(target);
     if (action === 'clear-visual-row-group') clearVisualizationRowGroup(target);
@@ -12011,6 +16181,17 @@ function dynamicPagesClientScript() {
   });
 
   document.addEventListener('input', function (event) {
+    if (event.target && event.target.id === 'cmdp-assistant-object-flow-prompt') {
+      state.assistantObjectFlowPrompt = String(event.target.value || '');
+      state.assistantFlowProposal = null;
+      state.assistantFlowExplanation = '';
+      state.assistantFlowWarnings = [];
+      var flowApplyButton = document.querySelector('button[data-action="assistant-flow-apply"]');
+      if (flowApplyButton) flowApplyButton.disabled = true;
+    }
+    if (event.target && event.target.closest && event.target.closest('#cmdp-diagram-editor') && event.target.id !== 'cmdp-diagram-import-source' && event.target.id !== 'cmdp-diagram-import-file' && !(event.target.matches && event.target.matches('[data-diagram-import-field]'))) {
+      markImportedDiagramChanged();
+    }
     if (event.target && event.target.matches && event.target.matches('[data-result-filter]')) {
       applyRenderedTableFilter(event.target);
     }
@@ -12020,15 +16201,38 @@ function dynamicPagesClientScript() {
     if (event.target && event.target.matches && event.target.matches('[data-object-path-filter-field]')) {
       applyObjectPathFilter(event.target.closest('[data-object-selection]') || document);
     }
+    if (event.target && event.target.matches && event.target.matches('[data-set-operation-field="as"], [data-matching-block-field="as"]')) {
+      refreshRelationOperationAliases();
+    }
     if (event.target && event.target.matches && event.target.matches('[data-view-column-field="title"]')) {
       ensureTrailingViewComposerColumnRow(event.target);
     }
     if (event.target && event.target.matches && event.target.matches('[data-diagram-mapping-field]')) {
+      markImportedDiagramChanged();
       ensureTrailingDiagramMappingRow(event.target);
+    }
+    if (event.target && event.target.id === 'cmdp-diagram-import-source') {
+      state.diagramImportSource = String(event.target.value || '');
+      var analyzedSource = state.diagramImportProposal ? String(state.diagramImportProposal.sourceText || '') : persistedDiagramImportSource();
+      state.diagramImportStale = state.diagramImportSource !== analyzedSource;
+      state.diagramImportPreviewError = '';
+      syncDiagramImportPreviewStaleState();
+      syncImportedDiagramSaveGate();
+      var staleStatus = document.querySelector('[data-diagram-import-stale]');
+      if (staleStatus) staleStatus.hidden = !state.diagramImportStale;
+      var interpretButton = document.querySelector('[data-action="assistant-diagram-interpret"]');
+      var mappingButton = document.querySelector('[data-action="assistant-diagram-map"]');
+      if (interpretButton) interpretButton.disabled = state.diagramImportStale || !state.diagramImportProposal;
+      if (mappingButton) mappingButton.disabled = state.diagramImportStale || !state.diagramImportProposal;
+      var applyButton = document.querySelector('[data-action="diagram-import-apply"]');
+      if (applyButton) applyButton.disabled = !state.diagramImportProposal || diagramImportProposalHasReviewBlocker(state.diagramImportProposal);
     }
   });
 
   document.addEventListener('change', function (event) {
+    if (event.target && event.target.closest && event.target.closest('#cmdp-diagram-editor') && event.target.id !== 'cmdp-diagram-import-source' && event.target.id !== 'cmdp-diagram-import-file' && !(event.target.matches && event.target.matches('[data-diagram-import-field]'))) {
+      markImportedDiagramChanged();
+    }
     if (event.target && event.target.matches && event.target.matches('[data-run-param-field]')) {
       refreshTemplateLaunchUrl();
     }
@@ -12039,6 +16243,7 @@ function dynamicPagesClientScript() {
       ensureTrailingViewComposerColumnRow(event.target);
     }
     if (event.target && event.target.matches && event.target.matches('[data-diagram-mapping-field]')) {
+      markImportedDiagramChanged();
       ensureTrailingDiagramMappingRow(event.target);
     }
   });
@@ -12050,6 +16255,7 @@ function dynamicPagesClientScript() {
       updateVisualizationGroupTitleDefault(target);
     }
     if (target.matches && target.matches('input[name="cmdp-output-mode"]')) {
+      markImportedDiagramChanged();
       captureVisibleDesignerState();
       renderDesigner();
       return;
@@ -12057,6 +16263,51 @@ function dynamicPagesClientScript() {
     if (target.matches && target.matches('[data-diagram-mapping-field="from"]')) {
       ensureTrailingDiagramMappingRow(target);
       refreshDiagramMappingEditorAfterSourceChange();
+      return;
+    }
+    if (target.matches && target.matches('[data-diagram-import-semantic], [data-diagram-import-exemplar]')) {
+      var proposal = state.diagramImportProposal;
+      var key = String(target.getAttribute('data-diagram-import-semantic') || target.getAttribute('data-diagram-import-exemplar') || '');
+      var role = proposal && proposal.version === 3
+        ? Array.isArray(proposal.roles) && proposal.roles.find(function (item) { return String(item && item.id || '') === key; })
+        : proposal && Array.isArray(proposal.containerRoles) && proposal.containerRoles.find(function (item) { return String(item && item.key || '') === key; });
+      if (role) {
+        if (proposal.version === 3 && target.hasAttribute('data-diagram-import-exemplar')) role.exemplarKey = String(target.value || '');
+        else if (proposal.version === 3) role.selectedSemantic = String(target.value || '');
+        else role.selectedRole = String(target.value || '');
+      }
+      refreshDiagramImportSemanticState(proposal);
+      renderDesigner();
+      return;
+    }
+    if (target.matches && target.matches('[data-diagram-import-role-field], [data-diagram-import-related-field], [data-diagram-import-rule-field], [data-diagram-import-placement-field]')) {
+      captureDiagramImportProposalFromDom();
+      renderDesigner();
+      return;
+    }
+    if (target.matches && target.matches('[data-diagram-import-field]')) {
+      captureDiagramImportProposalFromDom(target.getAttribute('data-diagram-import-binding'));
+      renderDesigner();
+      return;
+    }
+    if (target.id === 'cmdp-diagram-import-file') {
+      var file = target.files && target.files[0];
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function () {
+        state.diagramImportSource = String(reader.result || '');
+        state.diagramImportProposal = null;
+        state.diagramImportSignedProposal = null;
+        state.diagramImportIr = null;
+        state.diagramImportPreviewError = '';
+        state.diagramImportStale = state.diagramImportSource !== persistedDiagramImportSource();
+        renderDesigner();
+      };
+      reader.onerror = function () {
+        state.message = { type: 'error', text: reader.error && reader.error.message || 'Cannot read D2 file.' };
+        renderDesigner();
+      };
+      reader.readAsText(file);
       return;
     }
     if (target.matches && target.matches('input[name="cmdp-assistant-task-mode"]')) {
@@ -12135,7 +16386,10 @@ function readJsonBody(req, maxBytes = 64 * 1024) {
     req.on('data', (chunk) => {
       size += chunk.length;
       if (size > maxBytes) {
-        reject(new Error('Request body is too large.'));
+        const error = new Error(`Request body exceeded configured maxBytes=${maxBytes}.`);
+        error.code = 'request_body_limit';
+        error.statusCode = 413;
+        reject(error);
         req.destroy();
         return;
       }
@@ -12150,11 +16404,36 @@ function readJsonBody(req, maxBytes = 64 * 1024) {
       try {
         resolve(JSON.parse(text));
       } catch {
-        reject(new Error('Request body must be valid JSON.'));
+        const error = new Error('Request body must be valid JSON.');
+        error.code = 'invalid_json_body';
+        error.statusCode = 400;
+        reject(error);
       }
     });
     req.on('error', reject);
   });
+}
+
+async function readJsonObjectBody(req, res, maxBytes = 64 * 1024) {
+  try {
+    const body = await readJsonBody(req, maxBytes);
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      sendJson(res, 400, {
+        success: false,
+        code: 'invalid_json_body',
+        message: 'Request body must be a JSON object.'
+      });
+      return null;
+    }
+    return body;
+  } catch (error) {
+    sendJson(res, error.statusCode || 400, {
+      success: false,
+      code: error.code || 'invalid_json_body',
+      message: error.message || String(error)
+    });
+    return null;
+  }
 }
 
 function isJsonContentType(value) {
@@ -12719,6 +16998,16 @@ async function mapLimit(items, concurrency, fn) {
   });
   await Promise.all(workers);
   return result;
+}
+
+async function configuredModelCatalogRequestUrl(authToken, root, requestUrl) {
+  const next = new URL(requestUrl.toString());
+  const runtimeConfig = await getRuntimeConfig(authToken, root || DEFAULT_TECHNICAL_ROOT);
+  const assistantConfig = normalizeAssistantRuntimeConfig(runtimeConfig);
+  if (!next.searchParams.has('maxClasses')) next.searchParams.set('maxClasses', String(assistantConfig.mcp.maxClasses));
+  if (!next.searchParams.has('maxDomains')) next.searchParams.set('maxDomains', String(assistantConfig.mcp.maxDomains));
+  if (!next.searchParams.has('includeAttributes')) next.searchParams.set('includeAttributes', 'true');
+  return next;
 }
 
 async function buildModelCatalog(authToken, requestUrl) {
@@ -13474,6 +17763,120 @@ async function getSessionData(authToken) {
   };
 }
 
+async function requireValidBackendSession(authToken, res) {
+  const session = await getSessionData(authToken);
+  if (session.response.ok && session.data) return session;
+  const upstreamStatus = Number(session.response.statusCode || 0);
+  sendJson(res, upstreamStatus === 401 || upstreamStatus === 403 ? 401 : 502, {
+    success: false,
+    reason: 'cmdbuild_session_invalid',
+    cmdbuildStatus: upstreamStatus,
+    message: upstreamStatus === 401 || upstreamStatus === 403
+      ? 'CMDBuild session is invalid or expired.'
+      : 'CMDBuild session validation is unavailable.'
+  });
+  return null;
+}
+
+async function requireTemplateClassPermission(authToken, res, schema, permission) {
+  const classAccess = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(schema.classNames.template)}`, authToken);
+  if (!classAccess.ok) {
+    sendJson(res, 502, {
+      success: false,
+      reason: 'template_permission_check_failed',
+      cmdbuildStatus: classAccess.statusCode,
+      message: `Template class ${permission} permission could not be verified.`
+    });
+    return false;
+  }
+  if (!classAccess.json || !classAccess.json.data || classAccess.json.data[permission] !== true) {
+    sendJson(res, 403, {
+      success: false,
+      reason: permission === '_can_create' ? 'template_create_forbidden' : 'template_update_forbidden',
+      message: `Template class does not grant ${permission} to the current CMDBuild session.`
+    });
+    return false;
+  }
+  return true;
+}
+
+async function requireDiagramAuthoringContext(authToken, res, root, templateCode, expectedSpecHash = '') {
+  const session = await requireValidBackendSession(authToken, res);
+  if (!session) return null;
+  const code = String(templateCode || '').trim();
+  if (!code) {
+    let schema;
+    try {
+      schema = buildTechnicalSchema(root);
+    } catch (error) {
+      sendJson(res, 400, { success: false, reason: 'invalid_technical_root', message: error.message || String(error) });
+      return null;
+    }
+    if (!await requireTemplateClassPermission(authToken, res, schema, '_can_create')) return null;
+    return { session, template: null };
+  }
+  let found;
+  try {
+    found = await findTemplateCard(authToken, root, code);
+  } catch (error) {
+    sendJson(res, 400, { success: false, reason: 'invalid_template_code', message: error.message || String(error) });
+    return null;
+  }
+  if (!found.response.ok) {
+    sendJson(res, 502, {
+      success: false,
+      reason: 'template_permission_check_failed',
+      cmdbuildStatus: found.response.statusCode,
+      message: 'Template authoring permission could not be verified.'
+    });
+    return null;
+  }
+  if (!found.card) {
+    if (!await requireTemplateClassPermission(authToken, res, found.schema, '_can_create')) return null;
+    return { session, template: null };
+  }
+  if (found.card._can_update !== true) {
+    sendJson(res, 403, {
+      success: false,
+      reason: 'template_update_forbidden',
+      message: `Template ${code} is not writable for the current CMDBuild session.`
+    });
+    return null;
+  }
+  const template = found.card ? sanitizeTemplateCard(found.card) : null;
+  const expected = String(expectedSpecHash || '').trim();
+  if (!expected) {
+    sendJson(res, 409, {
+      success: false,
+      reason: 'template_version_required',
+      message: `Template ${code} requires baseSpecHash for authoring. Reload it before continuing.`,
+      currentSpecHash: template.specHash,
+      template
+    });
+    return null;
+  }
+  if (!isSpecHash(expected)) {
+    sendJson(res, 400, {
+      success: false,
+      reason: 'template_version_invalid',
+      message: 'baseSpecHash must be a SHA-256 hex value.'
+    });
+    return null;
+  }
+  if (template.specHash !== expected) {
+    sendJson(res, 409, {
+      success: false,
+      reason: 'template_version_conflict',
+      message: `Template ${code} was changed by another editor. Reload it before continuing the authoring operation.`,
+      expectedSpecHash: expected,
+      currentSpecHash: template.specHash,
+      template
+    });
+    return null;
+  }
+  return { session, template };
+}
+
 async function requireAdminClassesModify(authToken, res) {
   const session = await getSessionData(authToken);
   const privileges = session.data && session.data.rolePrivileges ? session.data.rolePrivileges : {};
@@ -13730,7 +18133,10 @@ function defaultRuntimeConfig() {
         maxCandidateClasses: DEFAULT_ASSISTANT_MCP_MAX_CANDIDATE_CLASSES
       },
       prompt: {
-        system: DEFAULT_ASSISTANT_SYSTEM_PROMPT
+        system: DEFAULT_ASSISTANT_SYSTEM_PROMPT,
+        objectFlow: DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT,
+        diagramInterpretation: DEFAULT_ASSISTANT_DIAGRAM_INTERPRETATION_PROMPT,
+        diagramMapping: DEFAULT_ASSISTANT_DIAGRAM_MAPPING_PROMPT
       }
     },
     executionLimits: {
@@ -14010,8 +18416,10 @@ function addPathColumnDependencies(target, columns) {
 function addResultDiagramDependencies(add, diagram) {
   if (!diagram || typeof diagram !== 'object' || Array.isArray(diagram)) return;
   const addMappingExtraDependencies = (source, mapping, fallbackLabel = '') => {
+    for (const field of diagramTemplateFieldNames(diagramMappingLabelTemplate(mapping))) add(source, field);
     for (const field of diagramMappingLabelFields(mapping, fallbackLabel)) add(source, field);
     for (const field of normalizeDiagramDataProfile(mapping).fields) add(source, field);
+    for (const field of diagramCompositeTemplateFieldNames(mapping)) add(source, field);
   };
   const nodeSource = resultDiagramSourceName(diagram, 'nodes');
   const edgeSource = resultDiagramSourceName(diagram, 'edges');
@@ -14559,6 +18967,8 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
     const newEntry = {
       key: keyParts.key,
       keyShort: keyParts.keyShort,
+      root: String(root || ''),
+      templateCode: String(template.code || ''),
       specHash: keyParts.specHash,
       paramsHash: keyParts.paramsHash,
       limitsHash: keyParts.limitsHash,
@@ -14584,6 +18994,7 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
       allowManualRefresh: templateCacheConfig.allowManualRefresh
     };
     newEntry.cacheBackend = await cacheSetJson('runtime', keyParts.key, newEntry, resultTtlMs, runtimeResultCache);
+    await registerRuntimeTemplateCacheKey(root, template.code, keyParts.key, resultTtlMs);
     return newEntry;
   })();
 
@@ -14717,7 +19128,10 @@ function stripSensitiveDiagramArtifacts(result, options = {}) {
     ['nodes', 'edges', 'groups'].forEach((collectionName) => {
       if (!Array.isArray(diagram[collectionName])) return;
       diagram[collectionName].forEach((item) => {
-        if (item && typeof item === 'object' && !Array.isArray(item)) delete item.data;
+        if (item && typeof item === 'object' && !Array.isArray(item)) {
+          delete item.data;
+          delete item.d2Template;
+        }
       });
     });
     const d2 = diagram.d2 && typeof diagram.d2 === 'object' && !Array.isArray(diagram.d2) ? diagram.d2 : null;
@@ -14797,6 +19211,7 @@ async function writeStaticSnapshot(root, template, params, result, sessionData, 
     result: cloneJsonValueServer(result, { tables: [] })
   };
   const backend = await cacheSetJson('snapshot', key, snapshot, 0, staticSnapshotCache);
+  await registerStaticSnapshotCacheKey(root, template.code, key);
   return {
     key,
     backend,
@@ -14885,6 +19300,8 @@ function isRawObjectGroupTableNameServer(name) {
 
 function visibleRuntimeResultTables(tables) {
   const source = Array.isArray(tables) ? tables : [];
+  const published = source.filter((table) => table && table.name && table.published === true);
+  if (published.length) return [published[0]];
   const prepared = source.filter((table) => table && table.name && !isRawObjectGroupTableNameServer(table.name));
   if (prepared.length) return [prepared[prepared.length - 1]];
   return source.length ? [source[source.length - 1]] : [];
@@ -15324,7 +19741,10 @@ function normalizeAssistantRuntimeConfig(runtimeConfig) {
       limitClamps
     },
     prompt: {
-      system: systemPrompt
+      system: systemPrompt,
+      objectFlow: String(prompt.objectFlow || '').trim() || DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT,
+      diagramInterpretation: String(prompt.diagramInterpretation || '').trim() || DEFAULT_ASSISTANT_DIAGRAM_INTERPRETATION_PROMPT,
+      diagramMapping: String(prompt.diagramMapping || '').trim() || DEFAULT_ASSISTANT_DIAGRAM_MAPPING_PROMPT
     }
   };
 }
@@ -15898,6 +20318,7 @@ async function buildAssistantMcpContext(authToken, body, runtimeConfig) {
     tools: toolNames,
     truncated: bounded.truncated,
     text: bounded.text,
+    results,
     diagnostics,
     warnings
   };
@@ -15908,6 +20329,12 @@ function assistantMessages(body, mcpContext, runtimeConfig) {
   const taskMode = normalizeRuntimeOutputMode(body && body.taskMode || body && body.outputMode || 'both');
   const currentSpec = cloneJsonValueServer(body && (body.currentSpec || body.spec), {});
   const assistantConfig = normalizeAssistantRuntimeConfig(runtimeConfig || defaultRuntimeConfig());
+  const taskPromptKey = {
+    objectFlow: 'objectFlow',
+    diagramInterpretation: 'diagramInterpretation',
+    diagramMapping: 'diagramMapping'
+  }[String(body && body.assistantTask || '')];
+  const taskSystemPrompt = taskPromptKey ? String(assistantConfig.prompt[taskPromptKey] || '').trim() : '';
   const system = [
     'You are a CMDBuild custom page template assistant.',
     'Return strict JSON only: {"spec": <DSL v1 spec>, "explanation": "...", "warnings": ["..."]}.',
@@ -15955,6 +20382,7 @@ function assistantMessages(body, mcpContext, runtimeConfig) {
   return [
     { role: 'system', content: system },
     { role: 'system', content: assistantConfig.prompt.system },
+    ...(taskSystemPrompt ? [{ role: 'system', content: taskSystemPrompt }] : []),
     { role: 'user', content: user }
   ];
 }
@@ -17271,6 +21699,704 @@ async function createAssistantTemplateDraft(body, options = {}) {
   };
 }
 
+function assistantObjectFlowContextSpec(flow) {
+  const normalized = normalizeObjectFlow(flow);
+  const selectionSteps = normalized.selections.map((selection) => {
+    const step = {
+      type: 'selectCards',
+      purpose: 'objectGroup',
+      as: selection.alias,
+      limit: selection.limit,
+      filters: selection.rules.map((rule) => ({
+        scope: rule.action,
+        path: rule.path,
+        negate: rule.negate,
+        op: rule.op,
+        ...(rule.value ? { value: rule.value } : {}),
+        ...(rule.regex ? { regex: rule.regex } : {}),
+        ...(rule.valueParam ? { valueParam: rule.valueParam } : {}),
+        ...(rule.valueColumn ? { valueColumn: rule.valueColumn } : {})
+      }))
+    };
+    if (selection.className) step.className = selection.className;
+    if (selection.from) step.from = selection.from;
+    if (selection.columns.length) step.columns = selection.columns.slice();
+    return step;
+  });
+  const operationSteps = normalized.operations.map((operation) => operation.type === 'match'
+    ? {
+      type: 'matchRows',
+      purpose: 'objectMatching',
+      from: operation.from,
+      with: operation.with,
+      as: operation.as,
+      rightPrefix: operation.rightPrefix,
+      rules: operation.rules.map((rule) => ({
+        action: rule.action,
+        negate: rule.negate,
+        operator: rule.operator,
+        leftColumn: rule.leftColumn,
+        leftRegex: rule.leftRegex,
+        rightColumn: rule.rightColumn,
+        rightRegex: rule.rightRegex
+      }))
+    }
+    : {
+      type: `${operation.type}Rows`,
+      purpose: 'objectMatching',
+      from: operation.from,
+      with: operation.with,
+      on: operation.on,
+      distinct: operation.distinct,
+      caseSensitive: operation.caseSensitive,
+      as: operation.as
+    });
+  const steps = selectionSteps.concat(operationSteps);
+  return {
+    version: 1,
+    steps,
+    result: {
+      tables: normalized.selections.map((selection) => ({
+        name: selection.alias,
+        columns: selection.columns.length ? selection.columns.slice() : ['Class', '_id', 'Code', 'Description']
+      }))
+    }
+  };
+}
+
+function assistantTypedSelectionStep(candidate, current, warnings) {
+  const source = candidate && typeof candidate === 'object' && !Array.isArray(candidate) ? candidate : {};
+  for (const [field, expected] of [['id', current.id], ['alias', current.alias], ['from', current.from]]) {
+    if (source[field] !== undefined && String(source[field] || '') !== String(expected || '')) {
+      warnings.push(`Assistant ${field} was ignored for locked stage ${current.id}; expected ${String(expected || '(empty)')}.`);
+    }
+  }
+  return {
+    type: 'selectCards',
+    purpose: 'objectGroup',
+    as: current.alias,
+    className: String(source.className || source.class || source.classCode || ''),
+    ...(current.from ? { from: current.from } : {}),
+    limit: Number(source.limit) > 0 ? Number(source.limit) : current.limit,
+    columns: Array.isArray(source.columns) ? source.columns : current.columns,
+    filters: (Array.isArray(source.rules) ? source.rules : Array.isArray(source.filters) ? source.filters : []).map((rule) => ({
+      action: rule && rule.action === 'exclude' || rule && rule.scope === 'exclude' ? 'exclude' : 'include',
+      path: String(rule && (rule.path || rule.field || rule.attribute || rule.column) || ''),
+      negate: Boolean(rule && (rule.negate || rule.not)),
+      op: String(rule && (rule.op || rule.operator) || 'equals'),
+      ...(rule && rule.regex !== undefined ? { regex: String(rule.regex) } : {}),
+      ...(rule && rule.value !== undefined ? { value: String(rule.value) } : {}),
+      ...(rule && rule.valueParam ? { valueParam: String(rule.valueParam) } : {}),
+      ...(rule && (rule.valueColumn || rule.sourceColumn || rule.fromColumn)
+        ? { valueColumn: String(rule.valueColumn || rule.sourceColumn || rule.fromColumn) }
+        : {})
+    }))
+  };
+}
+
+function assistantTypedMatchStep(candidate, current, warnings) {
+  const source = candidate && typeof candidate === 'object' && !Array.isArray(candidate) ? candidate : {};
+  for (const [field, expected] of [['id', current.id], ['from', current.from], ['with', current.with], ['as', current.as]]) {
+    if (source[field] !== undefined && String(source[field] || '') !== String(expected || '')) {
+      warnings.push(`Assistant ${field} was ignored for locked stage ${current.id}; expected ${String(expected || '(empty)')}.`);
+    }
+  }
+  return {
+    type: 'matchRows',
+    purpose: 'objectMatching',
+    from: current.from,
+    with: current.with,
+    as: current.as,
+    rightPrefix: String(source.rightPrefix || current.rightPrefix || ''),
+    rules: (Array.isArray(source.rules) ? source.rules : []).map((rule) => ({
+      action: rule && rule.action === 'exclude' || rule && rule.scope === 'exclude' ? 'exclude' : 'include',
+      negate: Boolean(rule && (rule.negate || rule.not)),
+      operator: String(rule && (rule.operator || rule.op) || 'equals'),
+      leftColumn: String(rule && (rule.leftColumn || rule.left && (rule.left.column || rule.left.field)) || ''),
+      leftRegex: String(rule && (rule.leftRegex || rule.left && rule.left.regex) || ''),
+      rightColumn: String(rule && (rule.rightColumn || rule.right && (rule.right.column || rule.right.field)) || ''),
+      rightRegex: String(rule && (rule.rightRegex || rule.right && rule.right.regex) || '')
+    }))
+  };
+}
+
+function assistantObjectFlowStageMessages(input, mcpContext, runtimeConfig) {
+  const selectionTask = input.kind === 'selection';
+  const assistantConfig = normalizeAssistantRuntimeConfig(runtimeConfig || defaultRuntimeConfig());
+  const taskPrompt = String(assistantConfig.prompt[selectionTask ? 'selection' : 'matching'] || '').trim();
+  const responseContract = selectionTask
+    ? '{"selection":{"id":"selection:<identifier>","name":"...","alias":"<identifier>","className":"<CMDBuild identifier>","from":"","limit":100,"columns":["Code"],"rules":[{"action":"include","path":"Code","negate":false,"op":"equals","value":"...","regex":"","valueParam":"","valueColumn":""}]},"explanation":"...","warnings":[]}'
+    : '{"block":{"id":"match:<identifier>","from":"<locked alias>","with":"<locked alias>","as":"<locked alias>","rightPrefix":"Selection 2.","rules":[{"action":"include","negate":false,"operator":"equals","leftColumn":"Code","leftRegex":"","rightColumn":"Code","rightRegex":""}]},"explanation":"...","warnings":[]}';
+  const system = [
+    'You are a CMDBuild deterministic object-flow stage assistant.',
+    `Return exactly one JSON object matching this contract: ${responseContract}`,
+    'Return no markdown, comments, prose, DSL spec wrapper, or fields outside that contract.',
+    'Use only permission-filtered CMDBuild class and attribute identifiers present in MCP context.',
+    'Keep the supplied stage id and topology fields exactly unchanged.',
+    'Every selection and match proposal must contain at least one executable rule.',
+    'Do not save, publish, execute, or mutate the template.'
+  ].join('\n');
+  const user = JSON.stringify({
+    prompt: truncateText(input.prompt, 4000),
+    stage: input.current,
+    deterministicFlow: assistantObjectFlowContextSpec(input.flow),
+    mcpContext: mcpContext && mcpContext.enabled ? {
+      tools: mcpContext.tools,
+      truncated: Boolean(mcpContext.truncated),
+      warnings: mcpContext.warnings || [],
+      limits: mcpContext.diagnostics && mcpContext.diagnostics.limits || [],
+      data: mcpContext.text
+    } : { enabled: false }
+  });
+  return [
+    { role: 'system', content: system },
+    { role: 'system', content: assistantConfig.prompt.system },
+    ...(taskPrompt ? [{ role: 'system', content: taskPrompt }] : []),
+    { role: 'user', content: user }
+  ];
+}
+
+async function createAssistantObjectFlowStageDraft(input, options = {}) {
+  const runtimeConfig = options.runtimeConfig || defaultRuntimeConfig();
+  ensureAssistantRequestIntent({ prompt: input.prompt });
+  ensureAssistantReady(runtimeConfig);
+  const contextSpec = assistantObjectFlowContextSpec(input.flow);
+  const mcpContext = await buildAssistantMcpContext(options.authToken || '', {
+    prompt: input.prompt,
+    currentSpec: contextSpec
+  }, runtimeConfig);
+  const content = await callLiteLLM(assistantObjectFlowStageMessages(input, mcpContext, runtimeConfig), runtimeConfig);
+  const parsed = parseAssistantJson(content);
+  const parsedObject = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  const key = input.kind === 'selection' ? 'selection' : 'block';
+  const candidate = parsedObject[key];
+  const warnings = [
+    ...(mcpContext.warnings || []),
+    ...(Array.isArray(parsedObject.warnings) ? parsedObject.warnings.map((item) => String(item || '')).filter(Boolean) : [])
+  ];
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    return {
+      success: false,
+      suggestion: null,
+      explanation: String(parsedObject.explanation || ''),
+      warnings,
+      errors: [{ path: `$.${key}`, message: `Assistant response must contain one ${key} object.` }],
+      diagnostics: { mcp: mcpContext.diagnostics || {} }
+    };
+  }
+  const step = input.kind === 'selection'
+    ? assistantTypedSelectionStep(candidate, input.current, warnings)
+    : assistantTypedMatchStep(candidate, input.current, warnings);
+  const targetType = input.kind === 'selection' ? 'selectCards' : 'matchRows';
+  const targetAlias = input.kind === 'selection' ? input.current.alias : input.current.as;
+  const stageSpec = cloneJsonValueServer(contextSpec, {});
+  const targetIndex = stageSpec.steps.findIndex((item) => item && item.type === targetType && String(item.as || '') === String(targetAlias || ''));
+  if (targetIndex < 0) {
+    return {
+      success: false,
+      suggestion: null,
+      explanation: String(parsedObject.explanation || ''),
+      warnings,
+      errors: [{ path: '$.stage', message: `Locked object-flow stage ${input.current.id} is missing from deterministic context.` }],
+      diagnostics: { mcp: mcpContext.diagnostics || {} }
+    };
+  }
+  stageSpec.steps[targetIndex] = step;
+  const normalized = normalizeAssistantDraftSpec(stageSpec, { mcpContext, taskMode: 'tables' });
+  const spec = normalizeTemplateSpecForStorage(normalized.spec);
+  const errors = [
+    ...(Array.isArray(normalized.errors) ? normalized.errors : []),
+    ...validateTemplateSpec(spec)
+  ];
+  warnings.push(...normalized.warnings);
+  const suggestion = errors.length
+    ? null
+    : input.kind === 'selection'
+      ? assistantSelectionSuggestionFromSpec(spec, input.current.id, input.current.alias, input.index)
+      : assistantMatchSuggestionFromSpec(spec, input.current.id, input.current.as, input.index);
+  if (!suggestion && !errors.length) errors.push({ path: `$.${key}`, message: `Assistant response did not produce the locked ${key} stage.` });
+  return {
+    success: errors.length === 0 && Boolean(suggestion),
+    suggestion,
+    explanation: String(parsedObject.explanation || ''),
+    warnings: uniqueStrings(warnings),
+    errors,
+    diagnostics: {
+      mcp: mcpContext.diagnostics || {},
+      normalization: normalized.diagnostics || {}
+    }
+  };
+}
+
+function assistantObjectFlowMessages(input, mcpContext, runtimeConfig) {
+  const assistantConfig = normalizeAssistantRuntimeConfig(runtimeConfig || defaultRuntimeConfig());
+  const system = [
+    'You are a CMDBuild deterministic object-flow planning assistant.',
+    'Return exactly one JSON object: {"flow":{"version":1,"selections":[...],"operations":[...],"publishedAlias":"..."},"explanation":"...","warnings":[...]}.',
+    'Return no markdown, comments, prose outside JSON, DSL Spec wrapper, D2 source, or fields outside that contract.',
+    'Every selection must use a CMDBuild class identifier, a stable selection:<identifier> id, a unique alias, useful columns, and a non-empty rules array.',
+    'operations is an ordered list. Use type "match" for a match block or union/difference/intersect for a set operation. Every operation from/with must refer to a selection alias or an operation alias materialized earlier in this exact list; forward references and cycles are invalid.',
+    'A match operation needs stable match:<identifier> id, unique output alias, and a non-empty rules array with leftColumn, rightColumn, and operator. A set operation needs stable set:<identifier> id, unique output alias, and non-empty on key pairs. Use Class + _id keys for CMDB cards.',
+    'Use only permission-filtered CMDBuild class and attribute identifiers present in MCP context. Do not invent identifiers, aliases, domains, relation paths, or unsupported operations.',
+    'Selection source filtering is explicit: only set selection.from and a rule.valueColumn when the requested CMDBuild selection itself must be constrained by a prior selection. Never infer filters, joins, deduplication, or operations that were not requested.',
+    'Do not save, publish, execute, or mutate the template.'
+  ].join('\n');
+  const currentFlow = objectFlowFromSpecServer(input.currentSpec || {});
+  const user = JSON.stringify({
+    prompt: truncateText(input.prompt, 4000),
+    currentDeterministicFlow: assistantObjectFlowContextSpec(currentFlow),
+    mcpContext: mcpContext && mcpContext.enabled ? {
+      tools: mcpContext.tools,
+      truncated: Boolean(mcpContext.truncated),
+      warnings: mcpContext.warnings || [],
+      limits: mcpContext.diagnostics && mcpContext.diagnostics.limits || [],
+      data: mcpContext.text
+    } : { enabled: false }
+  });
+  return [
+    { role: 'system', content: system },
+    { role: 'system', content: assistantConfig.prompt.system },
+    { role: 'system', content: assistantConfig.prompt.objectFlow },
+    { role: 'user', content: user }
+  ];
+}
+
+function assistantObjectFlowCatalogErrors(flow, mcpContext) {
+  const results = Array.isArray(mcpContext && mcpContext.results) ? mcpContext.results : [];
+  const summary = results.find((item) => item && item.tool === 'cmdbuild_model_summary' && item.ok && item.result);
+  const availableClasses = new Set(Array.isArray(summary && summary.result && summary.result.classes)
+    ? summary.result.classes.map((item) => String(item && item.name || '')).filter(Boolean)
+    : []);
+  const fieldsByClass = new Map();
+  results.filter((item) => item && item.tool === 'cmdbuild_class_fields' && item.ok && Array.isArray(item.result)).forEach((item) => {
+    item.result.forEach((entry) => {
+      if (!entry || !entry.className || !Array.isArray(entry.attributes)) return;
+      fieldsByClass.set(String(entry.className), new Set(entry.attributes.map((attribute) => String(attribute && attribute.name || '')).filter(Boolean)));
+    });
+  });
+  if (!availableClasses.size) return [];
+  const errors = [];
+  const builtin = new Set(['Class', '_id', 'Id', 'Code', 'Description']);
+  const selectionsByAlias = new Map(flow.selections.map((selection) => [selection.alias, selection]));
+  const validateSelectionField = (alias, field, path) => {
+    const selection = selectionsByAlias.get(alias);
+    if (!selection || !field || builtin.has(field)) return;
+    const fields = fieldsByClass.get(selection.className);
+    if (fields && !fields.has(field)) {
+      errors.push({ path, message: `CMDBuild attribute ${selection.className}.${field} is not present in the available MCP field context.` });
+    }
+  };
+  flow.selections.forEach((selection, index) => {
+    const basePath = `$.flow.selections[${index}]`;
+    if (!availableClasses.has(selection.className)) {
+      errors.push({ path: `${basePath}.className`, message: `CMDBuild class ${selection.className || '(empty)'} is not present in the available MCP model context.` });
+      return;
+    }
+    const fields = fieldsByClass.get(selection.className);
+    if (!fields) return;
+    uniqueStrings(selection.columns.concat(selection.rules.map((rule) => rule.path))).forEach((field) => {
+      if (!field || builtin.has(field) || fields.has(field)) return;
+      errors.push({ path: `${basePath}`, message: `CMDBuild attribute ${selection.className}.${field} is not present in the available MCP field context.` });
+    });
+  });
+  flow.operations.forEach((operation, index) => {
+    const basePath = `$.flow.operations[${index}]`;
+    if (operation.type === 'match') {
+      operation.rules.forEach((rule, ruleIndex) => {
+        validateSelectionField(operation.from, rule.leftColumn, `${basePath}.rules[${ruleIndex}].leftColumn`);
+        validateSelectionField(operation.with, rule.rightColumn, `${basePath}.rules[${ruleIndex}].rightColumn`);
+      });
+      return;
+    }
+    operation.on.forEach((key, keyIndex) => {
+      validateSelectionField(operation.from, key.left, `${basePath}.on[${keyIndex}].left`);
+      validateSelectionField(operation.with, key.right, `${basePath}.on[${keyIndex}].right`);
+    });
+  });
+  return errors;
+}
+
+function assistantFlowTextCandidate(...values) {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const nested = assistantFlowTextCandidate(value.name, value.code, value.id);
+      if (nested) return nested;
+    }
+  }
+  return '';
+}
+
+function assistantFlowIdentifier(value, fallback) {
+  const text = String(value || '').replace(/^(?:selection|match|set):/i, '').replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+|_+$/g, '');
+  const normalized = text && /^[A-Za-z_]/.test(text) ? text : fallback;
+  return normalized || 'objects';
+}
+
+function assistantFlowOperator(value, fallback) {
+  const operator = String(value || '').trim();
+  if (operator === '=' || operator.toLowerCase() === 'equal') return 'equals';
+  if (operator.toLowerCase() === 'not_equal') return 'notEquals';
+  return operator || fallback;
+}
+
+function assistantFlowSetKeys(value) {
+  const source = Array.isArray(value) ? value : [value];
+  return source.map((item) => {
+    if (typeof item === 'string') return { left: item, right: item };
+    if (Array.isArray(item)) return { left: assistantFlowTextCandidate(item[0]), right: assistantFlowTextCandidate(item[1]) };
+    return {
+      left: assistantFlowTextCandidate(item && (item.left || item.leftColumn || item.from || item.column)),
+      right: assistantFlowTextCandidate(item && (item.right || item.rightColumn || item.with || item.column))
+    };
+  }).filter((item) => item.left && item.right);
+}
+
+function assistantObjectFlowCandidate(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const rawSelections = Array.isArray(source.selections) ? source.selections : [];
+  const rawOperations = Array.isArray(source.operations) ? source.operations : [];
+  const warnings = [];
+  const usedAliases = new Set();
+  const selections = rawSelections.map((rawSelection, index) => {
+    const item = rawSelection && typeof rawSelection === 'object' && !Array.isArray(rawSelection) ? rawSelection : {};
+    const className = assistantFlowTextCandidate(item.className, item.classCode, item.classId, item.class, item.cmdbuildClass);
+    const baseAlias = assistantFlowIdentifier(assistantFlowTextCandidate(item.alias, item.as, item.outputAlias, item.id, className), `selection${index + 1}`);
+    let alias = baseAlias;
+    let duplicateIndex = 2;
+    while (usedAliases.has(alias)) {
+      alias = `${baseAlias}_${duplicateIndex}`;
+      duplicateIndex += 1;
+    }
+    usedAliases.add(alias);
+    const rawRules = Array.isArray(item.rules) ? item.rules : (Array.isArray(item.filters) ? item.filters : []);
+    const columns = Array.isArray(item.columns) ? item.columns : (Array.isArray(item.attributes) ? item.attributes : (Array.isArray(item.fields) ? item.fields : []));
+    return {
+      id: `selection:${assistantFlowIdentifier(item.id || alias, alias)}`,
+      name: assistantFlowTextCandidate(item.name, item.title) || `Selection ${index + 1}`,
+      alias,
+      className,
+      from: assistantFlowTextCandidate(item.from, item.sourceAlias, item.leftAlias),
+      limit: Number(item.limit) || 100,
+      columns: columns.map((column) => assistantFlowTextCandidate(column, column && column.name, column && column.path)).filter(Boolean),
+      rules: rawRules.map((rule) => ({
+        action: rule && (rule.action === 'exclude' || rule.scope === 'exclude') ? 'exclude' : 'include',
+        path: assistantFlowTextCandidate(rule && rule.path, rule && rule.field, rule && rule.attribute, rule && rule.column),
+        negate: Boolean(rule && (rule.negate || rule.not)),
+        op: assistantFlowOperator(assistantFlowTextCandidate(rule && rule.op, rule && rule.operator), 'equals'),
+        regex: rule && rule.regex !== undefined ? String(rule.regex) : '',
+        value: rule && rule.value !== undefined ? String(rule.value) : '',
+        valueParam: assistantFlowTextCandidate(rule && rule.valueParam, rule && rule.parameter),
+        valueColumn: assistantFlowTextCandidate(rule && rule.valueColumn, rule && rule.sourceColumn, rule && rule.fromColumn)
+      }))
+    };
+  });
+  const operations = rawOperations.map((rawOperation, index) => {
+    const item = rawOperation && typeof rawOperation === 'object' && !Array.isArray(rawOperation) ? rawOperation : {};
+    const type = String(item.type || item.operation || '').trim().toLowerCase();
+    const isMatch = type === 'match';
+    const output = assistantFlowIdentifier(assistantFlowTextCandidate(item.as, item.alias, item.outputAlias, item.id), isMatch ? `matched${index + 1}` : `set${index + 1}`);
+    if (usedAliases.has(output)) warnings.push(`Assistant operation output alias ${output} duplicates an existing alias.`);
+    usedAliases.add(output);
+    if (isMatch) {
+      const rawRules = Array.isArray(item.rules) ? item.rules : (Array.isArray(item.matches) ? item.matches : []);
+      return {
+        type: 'match',
+        id: `match:${assistantFlowIdentifier(item.id || output, output)}`,
+        from: assistantFlowTextCandidate(item.from, item.leftAlias, item.leftSource),
+        with: assistantFlowTextCandidate(item.with, item.rightAlias, item.rightSource),
+        as: output,
+        rightPrefix: assistantFlowTextCandidate(item.rightPrefix, item.prefix) || `${output}_`,
+        rules: rawRules.map((rule) => ({
+          action: rule && (rule.action === 'exclude' || rule.scope === 'exclude') ? 'exclude' : 'include',
+          negate: Boolean(rule && (rule.negate || rule.not)),
+          operator: assistantFlowOperator(assistantFlowTextCandidate(rule && rule.operator, rule && rule.op), 'equals'),
+          leftColumn: assistantFlowTextCandidate(rule && rule.leftColumn, rule && rule.left && (rule.left.column || rule.left.field), rule && rule.leftField),
+          leftRegex: assistantFlowTextCandidate(rule && rule.leftRegex, rule && rule.left && rule.left.regex),
+          rightColumn: assistantFlowTextCandidate(rule && rule.rightColumn, rule && rule.right && (rule.right.column || rule.right.field), rule && rule.rightField),
+          rightRegex: assistantFlowTextCandidate(rule && rule.rightRegex, rule && rule.right && rule.right.regex)
+        }))
+      };
+    }
+    return {
+      id: `set:${assistantFlowIdentifier(item.id || output, output)}`,
+      type,
+      from: assistantFlowTextCandidate(item.from, item.leftAlias, item.leftSource),
+      with: assistantFlowTextCandidate(item.with, item.rightAlias, item.rightSource),
+      as: output,
+      on: assistantFlowSetKeys(item.on || item.keys),
+      distinct: item.distinct !== false,
+      caseSensitive: Boolean(item.caseSensitive)
+    };
+  });
+  const publishedAlias = assistantFlowTextCandidate(
+    source.publishedAlias,
+    source.tableOutputAlias,
+    source.output && source.output.table && (source.output.table.source || source.output.table.alias),
+    source.output && source.output.alias
+  );
+  return { flow: normalizeObjectFlow({ version: source.version, selections, operations, publishedAlias }), warnings };
+}
+
+async function createAssistantObjectFlowDraft(input, options = {}) {
+  const runtimeConfig = options.runtimeConfig || defaultRuntimeConfig();
+  ensureAssistantRequestIntent({ prompt: input.prompt });
+  ensureAssistantReady(runtimeConfig);
+  const currentFlow = objectFlowFromSpecServer(input.currentSpec || {});
+  const contextSpec = assistantObjectFlowContextSpec(currentFlow);
+  const mcpContext = await buildAssistantMcpContext(options.authToken || '', {
+    prompt: input.prompt,
+    currentSpec: contextSpec
+  }, runtimeConfig);
+  const content = await callLiteLLM(assistantObjectFlowMessages(input, mcpContext, runtimeConfig), runtimeConfig);
+  const parsed = parseAssistantJson(content);
+  const parsedObject = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  const candidate = assistantObjectFlowCandidate(parsedObject.flow || {});
+  const warnings = uniqueStrings([
+    ...(mcpContext.warnings || []),
+    ...candidate.warnings,
+    ...(Array.isArray(parsedObject.warnings) ? parsedObject.warnings.map((item) => String(item || '')).filter(Boolean) : [])
+  ]);
+  const flow = candidate.flow;
+  const errors = validateObjectFlow(flow).concat(assistantObjectFlowCatalogErrors(flow, mcpContext));
+  return {
+    success: errors.length === 0,
+    flow: errors.length ? null : flow,
+    explanation: String(parsedObject.explanation || ''),
+    warnings,
+    errors,
+    diagnostics: { mcp: mcpContext.diagnostics || {} }
+  };
+}
+
+function assistantSelectionSuggestionFromSpec(spec, stageId, expectedAlias, stageIndex = 0) {
+  const steps = Array.isArray(spec && spec.steps) ? spec.steps : [];
+  const candidates = steps.filter((step) => step && step.type === 'selectCards');
+  const step = candidates.find((candidate) => String(candidate.as || '') === String(expectedAlias || ''));
+  if (!step) return null;
+  return {
+    id: String(stageId || `selection:${step.as || 'objects'}`),
+    name: String(step.title || step.name || `Selection ${Number(stageIndex || 0) + 1}`),
+    alias: String(step.as || (Number(stageIndex || 0) === 0 ? 'objects' : `objects${Number(stageIndex || 0) + 1}`)),
+    className: String(step.className || ''),
+    from: String(step.from || ''),
+    limit: Number.isInteger(Number(step.limit)) && Number(step.limit) > 0 ? Number(step.limit) : 100,
+    columns: uniqueStrings((Array.isArray(step.columns) ? step.columns : []).map((column) => typeof column === 'string' ? column : column && (column.path || column.field || column.name))),
+    rules: (Array.isArray(step.filters) ? step.filters : []).map((filter) => ({
+      action: filter && (filter.action === 'exclude' || filter.scope === 'exclude') ? 'exclude' : 'include',
+      path: String(filter && (filter.path || filter.field || filter.attribute || filter.column) || ''),
+      negate: Boolean(filter && (filter.negate || filter.not)),
+      op: String(filter && (filter.op || filter.operator) || 'equals'),
+      value: filter && filter.value !== undefined ? String(filter.value) : '',
+      regex: filter && filter.regex !== undefined ? String(filter.regex) : '',
+      valueParam: String(filter && filter.valueParam || ''),
+      valueColumn: String(filter && (filter.valueColumn || filter.sourceColumn || filter.fromColumn) || '')
+    })).filter((rule) => rule.path)
+  };
+}
+
+function assistantMatchSuggestionFromSpec(spec, stageId, expectedAlias, stageIndex = 0) {
+  const steps = Array.isArray(spec && spec.steps) ? spec.steps : [];
+  const candidates = steps.filter((step) => step && step.type === 'matchRows');
+  const step = candidates.find((candidate) => String(candidate.as || '') === String(expectedAlias || ''));
+  if (!step) return null;
+  return {
+    id: String(stageId || `match:${step.as || 'matched'}`),
+    from: String(step.from || ''),
+    with: String(step.with || ''),
+    as: String(step.as || `matchedObjects${Number(stageIndex || 0) + 2}`),
+    rightPrefix: String(step.rightPrefix || ''),
+    rules: (Array.isArray(step.rules) ? step.rules : []).map((rule) => ({
+      action: rule && rule.action === 'exclude' ? 'exclude' : 'include',
+      negate: Boolean(rule && (rule.negate || rule.not)),
+      operator: String(rule && (rule.operator || rule.op) || 'equals'),
+      leftColumn: String(rule && (rule.leftColumn || rule.left && (rule.left.column || rule.left.field)) || ''),
+      leftRegex: String(rule && (rule.leftRegex || rule.left && rule.left.regex) || ''),
+      rightColumn: String(rule && (rule.rightColumn || rule.right && (rule.right.column || rule.right.field)) || ''),
+      rightRegex: String(rule && (rule.rightRegex || rule.right && rule.right.regex) || '')
+    })).filter((rule) => rule.leftColumn && rule.rightColumn)
+  };
+}
+
+function assistantDiagramImportPayload(spec) {
+  const diagrams = Array.isArray(spec && spec.result && spec.result.diagrams) ? spec.result.diagrams : [];
+  const diagram = diagrams.find((item) => item && item.authoring && item.authoring.d2Import) || {};
+  return diagram.authoring && diagram.authoring.d2Import || {};
+}
+
+function assistantDiagramSemanticDecisions(spec, proposal) {
+  const imported = assistantDiagramImportPayload(spec);
+  const allowedRoles = new Map((proposal.roles || []).map((role) => [String(role.id || ''), role]));
+  return (Array.isArray(imported.roles) ? imported.roles : []).map((candidate) => {
+    const role = allowedRoles.get(String(candidate && candidate.id || ''));
+    const semantic = normalizeDiagramImportSemantic(candidate && (candidate.selectedSemantic || candidate.semantic));
+    if (!role || !semantic || !Array.isArray(role.options) || !role.options.includes(semantic)) return null;
+    return {
+      roleId: role.id,
+      semantic,
+      confidence: ['high', 'medium', 'low'].includes(candidate.confidence) ? candidate.confidence : 'medium',
+      reason: truncateText(String(candidate.reason || candidate.semanticReason || ''), 1000)
+    };
+  }).filter(Boolean);
+}
+
+function assistantDiagramSelectionMappings(spec, proposal, stages) {
+  const imported = assistantDiagramImportPayload(spec);
+  const roleIds = new Set((proposal.roles || []).map((role) => String(role.id || '')));
+  const stageById = new Map((Array.isArray(stages) ? stages : []).map((stage) => [String(stage.id || ''), stage]));
+  return (Array.isArray(imported.roleMappings) ? imported.roleMappings : []).map((candidate) => {
+    const roleId = String(candidate && candidate.roleId || '');
+    const source = candidate && candidate.source && typeof candidate.source === 'object' ? candidate.source : {};
+    const stage = stageById.get(String(source.stageId || candidate.stageId || ''));
+    if (!roleIds.has(roleId) || !stage) return null;
+    const available = new Set(Array.isArray(stage.columns) ? stage.columns.map(String) : []);
+    const primary = candidate.primary && typeof candidate.primary === 'object' ? cloneJsonValueServer(candidate.primary, {}) : {};
+    primary.className = String(primary.className || stage.className || '');
+    primary.idAttribute = available.has(String(primary.idAttribute || '')) ? String(primary.idAttribute) : (available.has('_id') ? '_id' : Array.from(available)[0] || '_id');
+    primary.structuredFields = uniqueStrings(primary.structuredFields || []).filter((field) => available.has(String(field)));
+    primary.labelTemplate = String(primary.labelTemplate || '${Description}');
+    return {
+      roleId,
+      source: { stageId: stage.id, alias: stage.alias, kind: stage.kind, className: stage.className || '' },
+      mapping: {
+        id: String(candidate.id || diagramImportStableId('role_mapping', roleId)),
+        roleId,
+        source: { stageId: stage.id, alias: stage.alias, kind: stage.kind, className: stage.className || '' },
+        primary,
+        related: Array.isArray(candidate.related) ? candidate.related : []
+      },
+      confidence: ['high', 'medium', 'low'].includes(candidate.confidence) ? candidate.confidence : 'medium'
+    };
+  }).filter(Boolean);
+}
+
+function assistantDiagramStageMessages(input, runtimeConfig) {
+  const mapTask = input.kind === 'mapping';
+  const assistantConfig = normalizeAssistantRuntimeConfig(runtimeConfig || defaultRuntimeConfig());
+  const taskPrompt = String(assistantConfig.prompt[mapTask ? 'diagramMapping' : 'diagramInterpretation'] || '').trim();
+  const contract = mapTask
+    ? '{"mappings":[{"roleId":"<exact role id>","stageId":"<exact stage id>","confidence":"high|medium|low","reason":"..."}],"explanation":"...","warnings":[]}'
+    : '{"decisions":[{"roleId":"<exact role id>","semantic":"object|composite|group|static","confidence":"high|medium|low","reason":"..."}],"explanation":"...","warnings":[]}';
+  const system = [
+    'You are a D2 diagram authoring assistant.',
+    `Return exactly one JSON object matching this contract: ${contract}`,
+    'Return no markdown, comments, prose, runtime Spec, D2 source, or fields outside that contract.',
+    'Use only exact role ids and stage ids supplied in the user payload.',
+    mapTask
+      ? 'Map dynamic D2 roles to existing deterministic object-flow stages. Do not invent stages, classes, fields, or aliases.'
+      : 'Interpret D2 roles only. Do not choose CMDBuild classes, attributes, aliases, or object-flow stages.',
+    'Do not save, publish, execute, or mutate the template.'
+  ].join('\n');
+  const user = JSON.stringify({
+    prompt: truncateText(input.prompt, 4000),
+    roles: input.roles,
+    ...(mapTask ? { stages: input.stages } : {})
+  });
+  return [
+    { role: 'system', content: system },
+    { role: 'system', content: assistantConfig.prompt.system },
+    ...(taskPrompt ? [{ role: 'system', content: taskPrompt }] : []),
+    { role: 'user', content: user }
+  ];
+}
+
+async function createAssistantDiagramStageDraft(input, runtimeConfig) {
+  ensureAssistantRequestIntent({ prompt: input.prompt });
+  ensureAssistantReady(runtimeConfig);
+  const content = await callLiteLLM(assistantDiagramStageMessages(input, runtimeConfig), runtimeConfig);
+  const parsed = parseAssistantJson(content);
+  const parsedObject = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  const warnings = Array.isArray(parsedObject.warnings)
+    ? parsedObject.warnings.map((item) => String(item || '')).filter(Boolean)
+    : [];
+  const roleById = new Map((input.roles || []).map((role) => [String(role.id || ''), role]));
+  const stageById = new Map((input.stages || []).map((stage) => [String(stage.id || ''), stage]));
+  const errors = [];
+  const seenRoles = new Set();
+  let items = [];
+  if (input.kind === 'interpretation') {
+    const candidates = Array.isArray(parsedObject.decisions) ? parsedObject.decisions : [];
+    items = candidates.map((candidate, index) => {
+      const roleId = String(candidate && candidate.roleId || '');
+      const role = roleById.get(roleId);
+      const semantic = normalizeDiagramImportSemantic(candidate && (candidate.semantic || candidate.selectedSemantic));
+      if (!role) {
+        errors.push({ path: `$.decisions[${index}].roleId`, message: `Unknown D2 role id ${roleId || '(empty)'}.` });
+        return null;
+      }
+      if (seenRoles.has(roleId)) {
+        errors.push({ path: `$.decisions[${index}].roleId`, message: `D2 role ${roleId} was returned more than once.` });
+        return null;
+      }
+      seenRoles.add(roleId);
+      if (!semantic || !Array.isArray(role.options) || !role.options.includes(semantic)) {
+        errors.push({ path: `$.decisions[${index}].semantic`, message: `Semantic ${semantic || '(empty)'} is not allowed for D2 role ${roleId}.` });
+        return null;
+      }
+      return {
+        roleId,
+        semantic,
+        confidence: ['high', 'medium', 'low'].includes(candidate.confidence) ? candidate.confidence : 'medium',
+        reason: truncateText(String(candidate.reason || ''), 1000)
+      };
+    }).filter(Boolean);
+  } else {
+    const candidates = Array.isArray(parsedObject.mappings) ? parsedObject.mappings : [];
+    items = candidates.map((candidate, index) => {
+      const roleId = String(candidate && candidate.roleId || '');
+      const stageId = String(candidate && (candidate.stageId || candidate.source && candidate.source.stageId) || '');
+      const role = roleById.get(roleId);
+      const stage = stageById.get(stageId);
+      if (!role) {
+        errors.push({ path: `$.mappings[${index}].roleId`, message: `Unknown D2 role id ${roleId || '(empty)'}.` });
+        return null;
+      }
+      if (seenRoles.has(roleId)) {
+        errors.push({ path: `$.mappings[${index}].roleId`, message: `D2 role ${roleId} was returned more than once.` });
+        return null;
+      }
+      seenRoles.add(roleId);
+      if (!stage) {
+        errors.push({ path: `$.mappings[${index}].stageId`, message: `Unknown object-flow stage id ${stageId || '(empty)'}.` });
+        return null;
+      }
+      const available = new Set(Array.isArray(stage.columns) ? stage.columns.map(String) : []);
+      const idAttribute = available.has('_id') ? '_id' : Array.from(available)[0] || '_id';
+      const primary = {
+        className: String(stage.className || ''),
+        idAttribute,
+        labelTemplate: available.has('Description') ? '${Description}' : `\${${idAttribute}}`,
+        structuredFields: []
+      };
+      const source = { stageId: stage.id, alias: stage.alias, kind: stage.kind, className: stage.className || '' };
+      return {
+        roleId,
+        source,
+        mapping: {
+          id: diagramImportStableId('role_mapping', roleId),
+          roleId,
+          source,
+          primary,
+          related: []
+        },
+        confidence: ['high', 'medium', 'low'].includes(candidate.confidence) ? candidate.confidence : 'medium',
+        reason: truncateText(String(candidate.reason || ''), 1000)
+      };
+    }).filter(Boolean);
+  }
+  const key = input.kind === 'interpretation' ? 'decisions' : 'mappings';
+  if (!Array.isArray(parsedObject[key])) errors.push({ path: `$.${key}`, message: `Assistant response must contain a ${key} array.` });
+  if (!items.length && !errors.length) errors.push({ path: `$.${key}`, message: `Assistant returned no valid ${key}.` });
+  return {
+    success: errors.length === 0 && items.length > 0,
+    items,
+    explanation: String(parsedObject.explanation || ''),
+    warnings: uniqueStrings(warnings),
+    errors,
+    diagnostics: { contract: 'typed-d2-stage-v1' }
+  };
+}
+
 async function sendPublicSnapshotRun(res, requestUrl, templateCode) {
   const params = publicSnapshotParamsFromUrl(requestUrl);
   const jsonOutput = runtimeJsonOutputRequested(requestUrl);
@@ -17286,7 +22412,8 @@ async function sendPublicSnapshotRun(res, requestUrl, templateCode) {
     return;
   }
   const snapshot = lookup.snapshot;
-  if (!snapshot) {
+  const published = snapshot && snapshot.publish && snapshot.publish.mode === 'staticSnapshot' && snapshot.publish.warningAccepted === true;
+  if (!published) {
     const payload = {
       success: true,
       snapshotFound: false,
@@ -17397,6 +22524,93 @@ function templateParamHasDefault(definition) {
     return definition.defaultValue !== undefined && definition.defaultValue !== null && String(definition.defaultValue).trim() !== '';
   }
   return false;
+}
+
+function validateDiagramD2Template(template, path) {
+  const errors = [];
+  if (!template || typeof template !== 'object' || Array.isArray(template)) {
+    return [{ path, message: 'Result diagram mapping d2Template must be an object.' }];
+  }
+  if (template.version !== 1) errors.push({ path: `${path}.version`, message: 'Result diagram mapping d2Template supports version 1 only.' });
+  const rootKey = typeof template.rootKey === 'string' ? template.rootKey.trim() : '';
+  if (!rootKey) errors.push({ path: `${path}.rootKey`, message: 'Result diagram mapping d2Template requires rootKey.' });
+  const families = {};
+  for (const family of ['nodes', 'groups', 'edges', 'hierarchies']) {
+    if (template[family] !== undefined && !Array.isArray(template[family])) {
+      errors.push({ path: `${path}.${family}`, message: `Result diagram mapping d2Template.${family} must be an array.` });
+    }
+    families[family] = Array.isArray(template[family]) ? template[family] : [];
+  }
+  const elementCount = Object.values(families).reduce((count, items) => count + items.length, 0);
+  if (elementCount > D2_IMPORT_MAX_ELEMENTS) {
+    errors.push({ path, message: `Result diagram mapping d2Template exceeds configured maxElements=${D2_IMPORT_MAX_ELEMENTS}.` });
+  }
+  const bytes = Buffer.byteLength(stableJsonStringify(template), 'utf8');
+  if (bytes > D2_IMPORT_MAX_OUTPUT_BYTES) {
+    errors.push({ path, message: `Result diagram mapping d2Template exceeds configured maxOutputBytes=${D2_IMPORT_MAX_OUTPUT_BYTES}.` });
+  }
+  const keys = new Set();
+  const groupKeys = new Set();
+  for (const [family, items] of [['nodes', families.nodes], ['groups', families.groups]]) {
+    items.forEach((element, index) => {
+      const key = String(element && element.key || '').trim();
+      if (!key) {
+        errors.push({ path: `${path}.${family}[${index}].key`, message: 'D2 template element key is required.' });
+      } else if (keys.has(key)) {
+        errors.push({ path: `${path}.${family}[${index}].key`, message: `Duplicate D2 template element key: ${key}.` });
+      } else {
+        keys.add(key);
+        if (family === 'groups') groupKeys.add(key);
+      }
+    });
+  }
+  if (rootKey && !groupKeys.has(rootKey)) errors.push({ path: `${path}.rootKey`, message: 'D2 template rootKey must identify a group element.' });
+  const inferredParents = new Map();
+  families.groups.forEach((group) => {
+    for (const child of Array.isArray(group && group.childrenKeys) ? group.childrenKeys : []) {
+      if (child) inferredParents.set(String(child), String(group.key || ''));
+    }
+  });
+  families.hierarchies.forEach((relation) => {
+    if (relation && relation.childKey && relation.parentKey) inferredParents.set(String(relation.childKey), String(relation.parentKey));
+  });
+  const parentByKey = new Map();
+  for (const [family, items] of [['nodes', families.nodes], ['groups', families.groups]]) {
+    items.forEach((element, index) => {
+      const key = String(element && element.key || '').trim();
+      const parent = String(element && (element.parentKey || inferredParents.get(key)) || '').trim();
+      if (!key || key === rootKey) return;
+      if (!parent || !groupKeys.has(parent)) errors.push({ path: `${path}.${family}[${index}].parentKey`, message: `D2 template element ${key} must reference an internal parent group.` });
+      else parentByKey.set(key, parent);
+    });
+  }
+  for (const key of parentByKey.keys()) {
+    const seen = new Set([key]);
+    let current = key;
+    while (parentByKey.has(current)) {
+      current = parentByKey.get(current);
+      if (seen.has(current)) {
+        errors.push({ path, message: `D2 template hierarchy contains a cycle at ${current}.` });
+        break;
+      }
+      seen.add(current);
+    }
+  }
+  families.edges.forEach((edge, index) => {
+    const source = String(edge && edge.sourceKey || '').trim();
+    const target = String(edge && edge.targetKey || '').trim();
+    if (!keys.has(source)) errors.push({ path: `${path}.edges[${index}].sourceKey`, message: `D2 template edge source does not exist: ${source}.` });
+    if (!keys.has(target)) errors.push({ path: `${path}.edges[${index}].targetKey`, message: `D2 template edge target does not exist: ${target}.` });
+    const direction = String(edge && edge.direction || '->').trim();
+    if (!['->', '<-', '<->', '--'].includes(direction)) errors.push({ path: `${path}.edges[${index}].direction`, message: `Unsupported D2 template edge direction: ${direction}.` });
+  });
+  families.hierarchies.forEach((relation, index) => {
+    const parent = String(relation && relation.parentKey || '').trim();
+    const child = String(relation && relation.childKey || '').trim();
+    if (!groupKeys.has(parent)) errors.push({ path: `${path}.hierarchies[${index}].parentKey`, message: `D2 template hierarchy parent is not a group: ${parent}.` });
+    if (!keys.has(child)) errors.push({ path: `${path}.hierarchies[${index}].childKey`, message: `D2 template hierarchy child does not exist: ${child}.` });
+  });
+  return errors;
 }
 
 function validateTemplateSpec(spec) {
@@ -17688,7 +22902,7 @@ function validateTemplateSpec(spec) {
             });
           });
         }
-      } else if (step.type === 'joinRows' || step.type === 'intersectRows') {
+      } else if (step.type === 'joinRows' || step.type === 'intersectRows' || step.type === 'unionRows' || step.type === 'differenceRows') {
         if (!step.from || typeof step.from !== 'string') {
           errors.push({ path: `${path}.from`, message: `${step.type} requires a left source alias in "from".` });
         }
@@ -17781,6 +22995,7 @@ function validateTemplateSpec(spec) {
         errors.push({ path: '$.result.presentation.outputMode', message: 'Result presentation outputMode must be tables, diagrams, or both.' });
       }
     }
+    let publishedTableCount = 0;
     resultTables.forEach((table, index) => {
       const path = `$.result.tables[${index}]`;
       if (!table || typeof table !== 'object') {
@@ -17802,7 +23017,14 @@ function validateTemplateSpec(spec) {
       if (table.emptyText !== undefined && typeof table.emptyText !== 'string') {
         errors.push({ path: `${path}.emptyText`, message: 'Result table emptyText must be a string.' });
       }
+      if (table.published !== undefined && typeof table.published !== 'boolean') {
+        errors.push({ path: `${path}.published`, message: 'Result table published must be a boolean.' });
+      }
+      if (table.published === true) publishedTableCount += 1;
     });
+    if (publishedTableCount > 1) {
+      errors.push({ path: '$.result.tables', message: 'Only one result table can be published.' });
+    }
     if (spec.result.diagrams !== undefined && !Array.isArray(spec.result.diagrams)) {
       errors.push({ path: '$.result.diagrams', message: 'Result diagrams must be an array.' });
     }
@@ -17814,6 +23036,9 @@ function validateTemplateSpec(spec) {
       }
       if (!diagram.name || typeof diagram.name !== 'string') {
         errors.push({ path: `${path}.name`, message: 'Result diagram must define a string name.' });
+      }
+      if (diagram.id !== undefined && (typeof diagram.id !== 'string' || !/^[A-Za-z][A-Za-z0-9_-]*$/.test(diagram.id))) {
+        errors.push({ path: `${path}.id`, message: 'Result diagram id must be a stable identifier.' });
       }
       if (diagram.title !== undefined && typeof diagram.title !== 'string') {
         errors.push({ path: `${path}.title`, message: 'Result diagram title must be a string.' });
@@ -17857,6 +23082,7 @@ function validateTemplateSpec(spec) {
         ['groupMappings', groupMappings],
         ['hierarchyMappings', hierarchyMappings]
       ];
+      const mappingIds = new Set();
       for (const [mappingKey, mappings] of mappingSources) {
         if (diagram[mappingKey] !== undefined && !Array.isArray(diagram[mappingKey]) && (!diagram[mappingKey] || typeof diagram[mappingKey] !== 'object')) {
           errors.push({ path: `${path}.${mappingKey}`, message: `Result diagram ${mappingKey} must be an array or object.` });
@@ -17864,14 +23090,32 @@ function validateTemplateSpec(spec) {
         }
         mappings.forEach((mapping, mappingIndex) => {
           const mappingPath = `${path}.${mappingKey}[${mappingIndex}]`;
-          if (!diagramMappingSourceName(mapping)) {
+          if (mapping.id !== undefined && (typeof mapping.id !== 'string' || !/^[A-Za-z][A-Za-z0-9_-]*$/.test(mapping.id))) {
+            errors.push({ path: `${mappingPath}.id`, message: 'Result diagram mapping id must be a stable identifier.' });
+          } else if (mapping.id && mappingIds.has(mapping.id)) {
+            errors.push({ path: `${mappingPath}.id`, message: `Duplicate result diagram mapping id: ${mapping.id}.` });
+          } else if (mapping.id) {
+            mappingIds.add(mapping.id);
+          }
+          if (!diagramMappingSourceName(mapping) && !(Array.isArray(mapping.staticRows) && mapping.staticRows.length)) {
             errors.push({ path: mappingPath, message: `Result diagram ${mappingKey} mapping requires from/source alias.` });
+          }
+          if (mapping.staticRows !== undefined && !Array.isArray(mapping.staticRows)) {
+            errors.push({ path: `${mappingPath}.staticRows`, message: 'Result diagram mapping staticRows must be an array.' });
           }
           if (mapping.labelTemplate !== undefined && typeof mapping.labelTemplate !== 'string') {
             errors.push({ path: `${mappingPath}.labelTemplate`, message: 'Result diagram mapping labelTemplate must be a string.' });
           }
           if (mapping.labelFields !== undefined && !Array.isArray(mapping.labelFields) && typeof mapping.labelFields !== 'string') {
             errors.push({ path: `${mappingPath}.labelFields`, message: 'Result diagram mapping labelFields must be an array or comma-separated string.' });
+          }
+          if (mapping.d2Template !== undefined) {
+            errors.push(...validateDiagramD2Template(mapping.d2Template, `${mappingPath}.d2Template`));
+            if (mapping.d2Template && typeof mapping.d2Template === 'object' && !Array.isArray(mapping.d2Template)) {
+              if (!mapping.importRole || mapping.importRole.semantic !== 'composite') {
+                errors.push({ path: `${mappingPath}.importRole.semantic`, message: 'Result diagram mapping with d2Template requires composite importRole semantic.' });
+              }
+            }
           }
           if (mapping.dataProfile !== undefined) {
             if (!mapping.dataProfile || typeof mapping.dataProfile !== 'object' || Array.isArray(mapping.dataProfile)) {
@@ -17949,7 +23193,9 @@ function diagramMappingSourceName(mapping, fallback = '') {
 function diagramMappingField(mapping, names, fallback = '') {
   const fields = mapping && mapping.fields && typeof mapping.fields === 'object' && !Array.isArray(mapping.fields) ? mapping.fields : {};
   for (const name of names) {
-    const value = mapping && (mapping[name] || fields[name]);
+    const fieldValue = fields[name];
+    if (typeof fieldValue === 'string' && fieldValue.trim()) return fieldValue.trim();
+    const value = mapping && mapping[name];
     if (typeof value === 'string' && value.trim()) return value.trim();
   }
   return fallback;
@@ -17963,12 +23209,59 @@ function diagramConstantValue(mapping, names) {
   return '';
 }
 
+function diagramImportRelationRootId(row, preferredField = '') {
+  if (preferredField) {
+    const preferred = displayCardValue(row && row[preferredField]).trim();
+    if (preferred) return preferred;
+  }
+  const candidates = Object.keys(row || {}).filter((key) => /(?:^|_)SourceId$/.test(key)).sort((left, right) => right.length - left.length);
+  for (const key of candidates) {
+    const value = displayCardValue(row && row[key]).trim();
+    if (value) return value;
+  }
+  const prefixedIds = Object.keys(row || {}).filter((key) => key !== '_id' && /_id$/.test(key)).sort((left, right) => right.length - left.length);
+  for (const key of prefixedIds) {
+    const value = displayCardValue(row && row[key]).trim();
+    if (value) return value;
+  }
+  return displayCardValue(row && (row.SourceId || row._id)).trim();
+}
+
+function assembleDiagramClassRoleRows(context, mapping, sourceRows) {
+  const relatedBindings = Array.isArray(mapping && mapping.relatedBindings) ? mapping.relatedBindings : [];
+  if (!relatedBindings.length) return sourceRows;
+  return sourceRows.map((sourceRow) => {
+    const row = { ...(sourceRow && typeof sourceRow === 'object' ? sourceRow : {}) };
+    const primaryId = displayCardValue(row._id || row.Id || row.id).trim();
+    for (const [key, value] of Object.entries(sourceRow || {})) row[`primary.${key}`] = safeDiagramDataValue(value);
+    for (const related of relatedBindings) {
+      const relatedRows = context[related.alias] && Array.isArray(context[related.alias].rows) ? context[related.alias].rows : [];
+      const matches = relatedRows.filter((item) => diagramImportRelationRootId(item, related.rootIdField) === primaryId);
+      for (const field of uniqueStrings(related.structuredFields || [])) {
+        const values = [];
+        for (const item of matches) {
+          const value = rowValueByField(item, field);
+          if (value === undefined) continue;
+          const signature = stableJsonStringify(value);
+          if (!values.some((existing) => stableJsonStringify(existing) === signature)) values.push(safeDiagramDataValue(value));
+        }
+        row[`${related.id}.${field}`] = values.length <= 1 ? values[0] ?? null : values;
+      }
+    }
+    return row;
+  });
+}
+
 function diagramRowsForMapping(context, mapping, fallbackSource = '') {
   const sourceName = diagramMappingSourceName(mapping, fallbackSource);
-  const source = context[sourceName] || { rows: [] };
+  const source = sourceName ? context[sourceName] || { rows: [] } : { rows: Array.isArray(mapping && mapping.staticRows) ? mapping.staticRows : [] };
+  const rows = assembleDiagramClassRoleRows(context, mapping, Array.isArray(source.rows) ? source.rows : []);
+  if (mapping && mapping.singleton && rows.length !== 1) {
+    throw new Error(`Static D2 container mapping ${mapping.id || ''} requires exactly one CMDBuild card, received ${rows.length}.`);
+  }
   return {
     sourceName,
-    rows: Array.isArray(source.rows) ? source.rows : []
+    rows
   };
 }
 
@@ -18033,7 +23326,9 @@ const ABSOLUTE_D2_METADATA_MAX_BYTES = 5 * 1024 * 1024;
 function diagramMappingStringValue(mapping, names, fallback = '') {
   const fields = mapping && mapping.fields && typeof mapping.fields === 'object' && !Array.isArray(mapping.fields) ? mapping.fields : {};
   for (const name of names) {
-    const value = mapping && (mapping[name] || fields[name]);
+    const fieldValue = fields[name];
+    if (typeof fieldValue === 'string' && fieldValue.trim()) return fieldValue.trim();
+    const value = mapping && mapping[name];
     if (typeof value === 'string' && value.trim()) return value.trim();
   }
   return fallback;
@@ -18053,6 +23348,31 @@ function diagramMappingLabelFields(mapping, fallbackField = '') {
 
 function diagramMappingLabelTemplate(mapping) {
   return diagramMappingStringValue(mapping, ['labelTemplate'], '');
+}
+
+function diagramTemplateFieldNames(template) {
+  const fields = [];
+  String(template || '').replace(/\$\{([^}]+)\}/g, (match, rawToken) => {
+    let token = String(rawToken || '').trim();
+    if (!token || token.startsWith('param.') || token.startsWith('params.')) return match;
+    if (token.startsWith('row.')) token = token.slice(4);
+    if (token) fields.push(token);
+    return match;
+  });
+  return uniqueStrings(fields);
+}
+
+function diagramCompositeTemplateFieldNames(mapping) {
+  const template = mapping && mapping.d2Template && typeof mapping.d2Template === 'object' && !Array.isArray(mapping.d2Template)
+    ? mapping.d2Template
+    : {};
+  const fields = [];
+  for (const family of ['nodes', 'groups', 'edges']) {
+    for (const element of Array.isArray(template[family]) ? template[family] : []) {
+      diagramTemplateFieldNames(element && element.label).forEach((field) => fields.push(field));
+    }
+  }
+  return uniqueStrings(fields);
 }
 
 function renderDiagramRowTemplate(template, row, params, warnings, path) {
@@ -18084,6 +23404,64 @@ function diagramLabelForRow(row, mapping, fallbackField, fallbackValue, params, 
     if (rendered) return rendered;
   }
   return displayCardValue(fallbackValue);
+}
+
+function materializeDiagramCompositeTemplate(template, row, params, warnings, path) {
+  if (!template || typeof template !== 'object' || Array.isArray(template)) return undefined;
+  const next = cloneJsonValueServer(template, {});
+  for (const family of ['nodes', 'groups', 'edges']) {
+    next[family] = (Array.isArray(next[family]) ? next[family] : []).map((element) => {
+      const item = cloneJsonValueServer(element, {});
+      if (typeof item.label === 'string' && item.label.includes('${')) {
+        item.label = renderDiagramRowTemplate(item.label, row || {}, params || {}, warnings, `${path || 'composite'} ${item.key || item.id || ''}`);
+      }
+      return item;
+    });
+  }
+  return next;
+}
+
+function diagramMappingStructuredFields(kind, mapping) {
+  const fields = mapping && mapping.fields && typeof mapping.fields === 'object' && !Array.isArray(mapping.fields) ? mapping.fields : {};
+  const result = [
+    'Class',
+    '_id',
+    'Code',
+    'Description',
+    'sourceClass',
+    'targetClass',
+    'domain',
+    'direction'
+  ];
+  const add = (value) => addUniqueString(result, value);
+  if (kind === 'node') {
+    [
+      diagramMappingField(mapping, ['nodeId', 'id', 'idColumn'], 'id'),
+      diagramMappingField(mapping, ['nodeLabel', 'label', 'labelColumn'], 'label'),
+      diagramMappingField(mapping, ['nodeGroup', 'group', 'groupColumn', 'groupBy'], ''),
+      diagramMappingField(mapping, ['nodeParent', 'parent', 'parentId', 'parentColumn'], ''),
+      diagramMappingField(mapping, ['nodeType', 'typeColumn', 'classColumn', 'classNameColumn'], ''),
+      diagramMappingField(mapping, ['nodeHref', 'href', 'url', 'urlColumn'], '')
+    ].forEach(add);
+  } else if (kind === 'edge') {
+    [
+      diagramMappingField(mapping, ['edgeSource', 'source', 'sourceId', 'sourceColumn', 'from'], 'source'),
+      diagramMappingField(mapping, ['edgeTarget', 'target', 'targetId', 'targetColumn', 'to'], 'target'),
+      diagramMappingField(mapping, ['edgeLabel', 'edgeTitle', 'label', 'labelColumn'], 'label'),
+      diagramMappingField(mapping, ['edgeType', 'kindColumn', 'typeColumn'], ''),
+      diagramMappingField(mapping, ['edgeDirection', 'directionColumn'], ''),
+      fields.child,
+      fields.parent
+    ].forEach(add);
+  } else if (kind === 'group') {
+    [
+      diagramMappingField(mapping, ['groupId', 'id', 'idColumn', 'groupColumn'], 'id'),
+      diagramMappingField(mapping, ['groupLabel', 'label', 'labelColumn'], 'label'),
+      diagramMappingField(mapping, ['groupParent', 'parent', 'parentColumn'], '')
+    ].forEach(add);
+  }
+  diagramTemplateFieldNames(diagramMappingLabelTemplate(mapping)).forEach(add);
+  return uniqueStrings(result);
 }
 
 function normalizeDiagramDataProfile(mapping) {
@@ -18119,7 +23497,9 @@ function safeDiagramDataValue(value) {
 function buildDiagramObjectData(kind, id, label, sourceName, row, mapping, extra = {}) {
   const profile = normalizeDiagramDataProfile(mapping);
   const sourceRef = diagramSourceRefFromRow(row, profile.className);
-  const dataFields = uniqueStrings(profile.fields.concat(diagramMappingLabelFields(mapping, diagramMappingField(mapping, ['label'], ''))));
+  const dataFields = uniqueStrings(profile.fields
+    .concat(diagramMappingStructuredFields(kind, mapping))
+    .concat(diagramMappingLabelFields(mapping, diagramMappingField(mapping, ['label'], ''))));
   const fieldValues = {};
   for (const field of dataFields) {
     const raw = rowValueByField(row || {}, field);
@@ -18152,14 +23532,14 @@ function diagramMetadataSettings(diagram) {
 }
 
 function diagramD2Id(kind, value) {
-  const base = displayCardValue(value).trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 80);
-  const suffix = base || sha256Hex(`${kind}:${displayCardValue(value)}`).slice(0, 12);
-  return `${kind}_${/^[a-z_]/.test(suffix) ? suffix : `id_${suffix}`}`;
+  const source = displayCardValue(value).trim();
+  const base = source.toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 64) || 'id';
+  return `${kind}_${base}_${sha256Hex(`${kind}:${source}`).slice(0, 12)}`;
 }
 
 function d2Key(key) {
   const text = String(key || '').trim();
-  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(text) ? text : JSON.stringify(text);
+  return /^[A-Za-z_][A-Za-z0-9_-]*$/.test(text) ? text : JSON.stringify(text);
 }
 
 function d2Literal(value, indentLevel = 0) {
@@ -18169,7 +23549,7 @@ function d2Literal(value, indentLevel = 0) {
   if (typeof value === 'string') return JSON.stringify(value);
   if (typeof value === 'number' && Number.isFinite(value)) return String(value);
   if (typeof value === 'boolean') return value ? 'true' : 'false';
-  if (Array.isArray(value)) return `[${value.map((item) => d2Literal(item, indentLevel)).join(', ')}]`;
+  if (Array.isArray(value)) return `[${value.map((item) => d2Literal(item, indentLevel)).join('; ')}]`;
   if (typeof value === 'object') {
     const entries = Object.entries(value).filter(([, item]) => item !== undefined);
     if (!entries.length) return '{}';
@@ -18188,13 +23568,20 @@ function d2NodeClasses(prefix, item) {
 function buildDiagramCmdpMetadata(diagramResult) {
   const objects = {};
   for (const node of Array.isArray(diagramResult.nodes) ? diagramResult.nodes : []) {
-    if (node && node.d2Id) objects[node.d2Id] = node.data || { kind: 'node', id: node.id, label: node.label };
+    if (node && node.d2Id) objects[node.d2Path || node.d2Id] = node.data || { kind: 'node', id: node.id, label: node.label };
   }
   for (const edge of Array.isArray(diagramResult.edges) ? diagramResult.edges : []) {
     if (edge && edge.d2Id) objects[edge.d2Id] = edge.data || { kind: 'edge', source: edge.source, target: edge.target, label: edge.label };
   }
   for (const group of Array.isArray(diagramResult.groups) ? diagramResult.groups : []) {
-    if (group && group.d2Id) objects[group.d2Id] = group.data || { kind: 'group', id: group.id, label: group.label };
+    if (group && group.d2Id) objects[group.d2Path || group.d2Id] = group.data || { kind: 'group', id: group.id, label: group.label };
+  }
+  const importRoles = {};
+  for (const item of [].concat(Array.isArray(diagramResult.nodes) ? diagramResult.nodes : [], Array.isArray(diagramResult.groups) ? diagramResult.groups : [])) {
+    const role = item && item.importRole && typeof item.importRole === 'object' && !Array.isArray(item.importRole) ? item.importRole : {};
+    const semantic = normalizeDiagramImportSemantic(role.semantic);
+    const target = String(item && (item.d2Path || item.d2Id) || '').trim();
+    if (semantic && target) importRoles[target] = { semantic, sourceRole: String(role.key || '') };
   }
   return {
     version: 1,
@@ -18210,39 +23597,164 @@ function buildDiagramCmdpMetadata(diagramResult) {
       edges: Array.isArray(diagramResult.edges) ? diagramResult.edges.length : 0,
       groups: Array.isArray(diagramResult.groups) ? diagramResult.groups.length : 0
     },
+    ...(Object.keys(importRoles).length ? { import: { roles: importRoles } } : {}),
     objects
   };
 }
 
+function diagramTemplateShape(element, labelOverride, classes = []) {
+  const hints = element && element.styleHints && typeof element.styleHints === 'object' && !Array.isArray(element.styleHints)
+    ? element.styleHints
+    : {};
+  const shape = {
+    label: labelOverride === undefined ? String(element && element.label || '') : String(labelOverride || '')
+  };
+  if (hints.shape) shape.shape = String(hints.shape);
+  const mergedClasses = uniqueStrings(classes.concat(Array.isArray(hints.classes) ? hints.classes : []));
+  if (mergedClasses.length) shape.class = mergedClasses;
+  if (hints.style && typeof hints.style === 'object' && !Array.isArray(hints.style) && Object.keys(hints.style).length) {
+    shape.style = cloneJsonValueServer(hints.style, {});
+  }
+  if (hints.href && isSafeRuntimeLinkUrl(hints.href)) shape.link = String(hints.href);
+  if (hints.tooltip) shape.tooltip = String(hints.tooltip);
+  return shape;
+}
+
+function diagramTemplateLocalKey(key, parentKey) {
+  const full = String(key || '').trim();
+  const parent = String(parentKey || '').trim();
+  if (parent && full.startsWith(`${parent}.`)) return full.slice(parent.length + 1);
+  const parts = full.split('.');
+  return parts[parts.length - 1] || full;
+}
+
+function buildCompositeD2Object(node) {
+  const template = node && node.d2Template && typeof node.d2Template === 'object' && !Array.isArray(node.d2Template) ? node.d2Template : null;
+  if (!template || !template.rootKey) return null;
+  const groups = new Map((Array.isArray(template.groups) ? template.groups : []).filter((item) => item && item.key).map((item) => [String(item.key), item]));
+  const nodes = (Array.isArray(template.nodes) ? template.nodes : []).filter((item) => item && item.key);
+  const childrenByParent = new Map();
+  const parentHints = new Map();
+  for (const group of groups.values()) {
+    for (const childKey of Array.isArray(group.childrenKeys) ? group.childrenKeys : []) {
+      if (childKey) parentHints.set(String(childKey), String(group.key));
+    }
+  }
+  for (const relation of Array.isArray(template.hierarchies) ? template.hierarchies : []) {
+    if (relation && relation.childKey && relation.parentKey) parentHints.set(String(relation.childKey), String(relation.parentKey));
+  }
+  for (const element of nodes.concat(Array.from(groups.values()))) {
+    const parent = String(element && (element.parentKey || parentHints.get(String(element.key))) || '').trim();
+    if (!parent) continue;
+    if (!childrenByParent.has(parent)) childrenByParent.set(parent, []);
+    childrenByParent.get(parent).push(element);
+  }
+  const root = groups.get(String(template.rootKey)) || { key: String(template.rootKey), label: node.label };
+  const build = (element, rootElement, seen = new Set()) => {
+    const key = String(element && element.key || '').trim();
+    if (!key || seen.has(key)) return {};
+    const nextSeen = new Set(seen);
+    nextSeen.add(key);
+    const shape = diagramTemplateShape(
+      element,
+      rootElement ? node.label : undefined,
+      rootElement ? d2NodeClasses('cmdp_node', node) : []
+    );
+    if (rootElement && node.href) shape.link = node.href;
+    for (const child of childrenByParent.get(key) || []) {
+      shape[diagramTemplateLocalKey(child.key, key)] = build(child, false, nextSeen);
+    }
+    return shape;
+  };
+  return { template, shape: build(root, true) };
+}
+
+function compositeD2Path(rootD2Id, elementKey, templateRootKey) {
+  const full = String(elementKey || '').trim();
+  const root = String(templateRootKey || '').trim();
+  const relative = full === root ? '' : full.startsWith(`${root}.`) ? full.slice(root.length + 1) : full;
+  return [d2Path(rootD2Id)].concat(relative ? relative.split('.').map(d2Key) : []).join('.');
+}
+
+function d2Path(value) {
+  return String(value || '').split('.').filter(Boolean).map(d2Key).join('.');
+}
+
 function buildD2Source(diagramResult, cmdpMetadata) {
   const lines = [];
+  const groups = (Array.isArray(diagramResult.groups) ? diagramResult.groups : []).filter((group) => group && group.d2Id);
+  const nodes = (Array.isArray(diagramResult.nodes) ? diagramResult.nodes : []).filter((node) => node && node.d2Id);
+  const groupById = new Map(groups.map((group) => [String(group.id), group]));
+  const childGroups = new Map();
+  const nodesByGroup = new Map();
+  const renderedGroups = new Set();
+  const renderedNodes = new Set();
+  const compositeEdges = [];
+  for (const group of groups) {
+    const parent = String(group.parent || '').trim();
+    if (!parent || !groupById.has(parent)) continue;
+    if (!childGroups.has(parent)) childGroups.set(parent, []);
+    childGroups.get(parent).push(group);
+  }
+  for (const node of nodes) {
+    const group = String(node.group || '').trim();
+    if (!group || !groupById.has(group)) continue;
+    if (!nodesByGroup.has(group)) nodesByGroup.set(group, []);
+    nodesByGroup.get(group).push(node);
+  }
+  const buildNodeShape = (node) => {
+    renderedNodes.add(node.id);
+    const composite = buildCompositeD2Object(node);
+    if (composite) {
+      for (const edge of Array.isArray(composite.template.edges) ? composite.template.edges : []) {
+        const source = compositeD2Path(node.d2Path || node.d2Id, edge.sourceKey, composite.template.rootKey);
+        const target = compositeD2Path(node.d2Path || node.d2Id, edge.targetKey, composite.template.rootKey);
+        const edgeShape = diagramTemplateShape(edge);
+        delete edgeShape.shape;
+        compositeEdges.push(`${source} ${edge.direction || '->'} ${target}: ${d2Literal(edgeShape)}`);
+      }
+      return composite.shape;
+    }
+    const shape = diagramTemplateShape(node, node.label || node.id, d2NodeClasses('cmdp_node', node));
+    if (node.href) shape.link = node.href;
+    if (node.type && !shape.tooltip) shape.tooltip = node.type;
+    return shape;
+  };
+  const buildGroupShape = (group, stack = new Set()) => {
+    if (stack.has(group.id)) return diagramTemplateShape(group, group.label || group.id, d2NodeClasses('cmdp_group', group));
+    const nextStack = new Set(stack);
+    nextStack.add(group.id);
+    renderedGroups.add(group.id);
+    const shape = diagramTemplateShape(group, group.label || group.id, d2NodeClasses('cmdp_group', group));
+    for (const child of childGroups.get(String(group.id)) || []) {
+      shape[child.d2Id] = buildGroupShape(child, nextStack);
+    }
+    for (const node of nodesByGroup.get(String(group.id)) || []) {
+      shape[node.d2Id] = buildNodeShape(node);
+    }
+    return shape;
+  };
   if (cmdpMetadata) {
     lines.push(`vars: ${d2Literal({ data: { cmdp: cmdpMetadata } })}`);
     lines.push('');
   }
-  for (const group of Array.isArray(diagramResult.groups) ? diagramResult.groups : []) {
-    if (!group || !group.d2Id) continue;
-    lines.push(`${d2Key(group.d2Id)}: ${d2Literal({
-      label: group.label || group.id,
-      class: d2NodeClasses('cmdp_group', group)
-    })}`);
+  for (const group of groups) {
+    const parent = String(group.parent || '').trim();
+    if (parent && groupById.has(parent)) continue;
+    lines.push(`${d2Key(group.d2Id)}: ${d2Literal(buildGroupShape(group))}`);
   }
-  for (const node of Array.isArray(diagramResult.nodes) ? diagramResult.nodes : []) {
-    if (!node || !node.d2Id) continue;
-    const shape = {
-      label: node.label || node.id,
-      class: d2NodeClasses('cmdp_node', node)
-    };
-    if (node.href) shape.link = node.href;
-    if (node.type) shape.tooltip = node.type;
-    lines.push(`${d2Key(node.d2Id)}: ${d2Literal(shape)}`);
+  for (const group of groups) {
+    if (!renderedGroups.has(group.id)) lines.push(`${d2Key(group.d2Id)}: ${d2Literal(buildGroupShape(group))}`);
   }
+  for (const node of nodes) {
+    if (!renderedNodes.has(node.id)) lines.push(`${d2Key(node.d2Id)}: ${d2Literal(buildNodeShape(node))}`);
+  }
+  lines.push(...compositeEdges);
   for (const edge of Array.isArray(diagramResult.edges) ? diagramResult.edges : []) {
     if (!edge || !edge.sourceD2Id || !edge.targetD2Id) continue;
-    lines.push(`${d2Key(edge.sourceD2Id)} -> ${d2Key(edge.targetD2Id)}: ${d2Literal({
-      label: edge.label || edge.kind || edge.mappingType || '',
-      class: ['cmdp_edge'].concat(edge.mappingType ? [`cmdp_${edge.mappingType}`] : [])
-    })}`);
+    const edgeShape = diagramTemplateShape(edge, edge.label || edge.kind || edge.mappingType || '', ['cmdp_edge'].concat(edge.mappingType ? [`cmdp_${edge.mappingType}`] : []));
+    delete edgeShape.shape;
+    lines.push(`${d2Path(edge.sourceD2Id)} -> ${d2Path(edge.targetD2Id)}: ${d2Literal(edgeShape)}`);
   }
   return `${lines.join('\n')}\n`;
 }
@@ -18256,6 +23768,20 @@ function escapeXmlText(value) {
 
 function buildDiagramSvgMetadata(cmdpMetadata) {
   return `<metadata id="cmdp-diagram-data" type="application/json">${escapeXmlText(JSON.stringify(cmdpMetadata))}</metadata>`;
+}
+
+function embedDiagramSvgMetadata(content, metadata) {
+  const svg = String(content || '');
+  const block = String(metadata || '');
+  if (!svg || !block || /<metadata\b[^>]*\bid=["']cmdp-diagram-data["']/i.test(svg)) {
+    return { content: svg, embedded: Boolean(block && /<metadata\b[^>]*\bid=["']cmdp-diagram-data["']/i.test(svg)) };
+  }
+  let embedded = false;
+  const next = svg.replace(/<svg\b[^>]*>/i, (opening) => {
+    embedded = true;
+    return `${opening}${block}`;
+  });
+  return { content: next, embedded };
 }
 
 function attachDiagramD2Artifacts(diagramResult, diagramSpec, warnings) {
@@ -18278,9 +23804,35 @@ function attachDiagramD2Artifacts(diagramResult, diagramSpec, warnings) {
   };
   diagramResult.svg = {
     metadata: metadataSettings.embedInSvg && embeddedMetadata ? buildDiagramSvgMetadata(embeddedMetadata) : '',
-    metadataEmbedded: Boolean(metadataSettings.embedInSvg && embeddedMetadata)
+    metadataEmbedded: false
   };
   return diagramResult;
+}
+
+function assignDiagramD2Paths(nodes, groups, warnings = []) {
+  const groupById = new Map((Array.isArray(groups) ? groups : []).filter((group) => group && group.id).map((group) => [String(group.id), group]));
+  const pathCache = new Map();
+  const resolveGroupPath = (group, stack = new Set()) => {
+    const id = String(group && group.id || '').trim();
+    if (!id) return '';
+    if (pathCache.has(id)) return pathCache.get(id);
+    if (stack.has(id)) {
+      warnings.push(`Diagram group hierarchy cycle detected at ${id}; rendered as a root group.`);
+      pathCache.set(id, group.d2Id);
+      return group.d2Id;
+    }
+    const nextStack = new Set(stack);
+    nextStack.add(id);
+    const parent = groupById.get(String(group.parent || '').trim());
+    const path = parent ? `${resolveGroupPath(parent, nextStack)}.${group.d2Id}` : group.d2Id;
+    pathCache.set(id, path);
+    return path;
+  };
+  for (const group of groupById.values()) group.d2Path = resolveGroupPath(group);
+  for (const node of Array.isArray(nodes) ? nodes : []) {
+    const group = groupById.get(String(node && node.group || '').trim());
+    node.d2Path = group ? `${group.d2Path}.${node.d2Id}` : node.d2Id;
+  }
 }
 
 function buildTopologyDiagram(diagram, context, params, limits) {
@@ -18291,17 +23843,32 @@ function buildTopologyDiagram(diagram, context, params, limits) {
   const maxGroups = normalizeDiagramLimit(diagram.maxGroups || diagram.limit && diagram.limit.maxGroups || diagram.limits && diagram.limits.maxGroups, Math.min(maxNodes, 100), ABSOLUTE_EXECUTION_LIMITS.maxRows);
   const warnings = [];
   const nodeMap = new Map();
+  const nodeBusinessIndex = new Map();
+  let expandedShapeCount = 0;
+  let expandedShapeLimitHit = false;
   const groupMap = new Map();
+  const groupBusinessIndex = new Map();
   const addGroup = (idValue, labelValue = '', parentValue = '', sourceRow = null, mapping = {}, sourceName = '') => {
-    const id = displayCardValue(idValue).trim();
-    if (!id) return false;
+    const businessId = displayCardValue(idValue).trim();
+    const importRole = mapping && mapping.importRole && typeof mapping.importRole === 'object' && !Array.isArray(mapping.importRole)
+      ? cloneJsonValueServer(mapping.importRole, {})
+      : {};
+    const roleKey = String(importRole.key || '').trim();
+    const roleScope = roleKey ? String(mapping.id || roleKey || sourceName || 'group').trim() : '';
+    const id = roleScope ? `${roleScope}:${businessId}` : businessId;
+    const styleHints = importRole.styleHints && typeof importRole.styleHints === 'object' && !Array.isArray(importRole.styleHints)
+      ? cloneJsonValueServer(importRole.styleHints, {})
+      : {};
+    if (!businessId) return false;
     if (groupMap.has(id)) {
       const existing = groupMap.get(id);
       const label = displayCardValue(labelValue).trim();
       const parent = displayCardValue(parentValue).trim();
       if (label) existing.label = label;
       if (parent) existing.parent = parent;
-      if (sourceRow) existing.data = buildDiagramObjectData('group', id, existing.label, sourceName, sourceRow, mapping, { parent: existing.parent });
+      if (Object.keys(importRole).length) existing.importRole = importRole;
+      if (Object.keys(styleHints).length) existing.styleHints = styleHints;
+      if (sourceRow) existing.data = buildDiagramObjectData('group', id, existing.label, sourceName, sourceRow, mapping, { businessId, parent: existing.parent });
       return true;
     }
     if (groupMap.size >= maxGroups) {
@@ -18312,66 +23879,124 @@ function buildTopologyDiagram(diagram, context, params, limits) {
     const parent = displayCardValue(parentValue).trim();
     groupMap.set(id, {
       id,
+      businessId,
       label,
       parent,
       d2Id: diagramD2Id('group', id),
-      data: buildDiagramObjectData('group', id, label, sourceName, sourceRow, mapping, { parent })
+      importRole,
+      styleHints,
+      data: buildDiagramObjectData('group', id, label, sourceName, sourceRow, mapping, { businessId, parent })
     });
+    if (!groupBusinessIndex.has(businessId)) groupBusinessIndex.set(businessId, []);
+    groupBusinessIndex.get(businessId).push(id);
     return true;
   };
   const addNode = (idValue, sourceRow = null, mapping = {}, sourceName = '') => {
-    const id = String(idValue === undefined || idValue === null ? '' : idValue).trim();
-    if (!id || nodeMap.has(id) || nodeMap.size >= maxNodes) return Boolean(id && nodeMap.has(id));
+    const businessId = String(idValue === undefined || idValue === null ? '' : idValue).trim();
+    const composite = mapping && mapping.d2Template && typeof mapping.d2Template === 'object' && !Array.isArray(mapping.d2Template);
+    const importRole = mapping && mapping.importRole && typeof mapping.importRole === 'object' && !Array.isArray(mapping.importRole)
+      ? cloneJsonValueServer(mapping.importRole, {})
+      : {};
+    const roleKey = String(importRole.key || '').trim();
+    const roleScope = String(mapping && (mapping.id || roleKey) || sourceName || 'composite').trim();
+    const id = composite || roleKey ? `${roleScope}:${businessId}` : businessId;
+    const templateShapeCount = composite
+      ? Math.max(1, (mapping.d2Template.nodes || []).length + (mapping.d2Template.groups || []).length)
+      : 1;
+    if (!businessId || nodeMap.has(id)) return Boolean(id && nodeMap.has(id));
+    if (nodeMap.size >= maxNodes || expandedShapeCount + templateShapeCount > maxNodes) {
+      expandedShapeLimitHit = true;
+      warnings.push(`Skipped node ${businessId}: expanded composite shape limit maxNodes=${maxNodes} reached.`);
+      return false;
+    }
     const labelField = diagramMappingField(mapping, ['nodeLabel', 'label', 'labelColumn'], 'label');
     const groupField = diagramMappingField(mapping, ['nodeGroup', 'group', 'groupColumn', 'groupBy'], 'group');
     const hrefField = diagramMappingField(mapping, ['nodeHref', 'href', 'url', 'urlColumn'], 'href');
     const parentField = diagramMappingField(mapping, ['nodeParent', 'parent', 'parentId', 'parentColumn'], '');
     const typeField = diagramMappingField(mapping, ['nodeType', 'typeColumn', 'classColumn', 'classNameColumn'], '');
     const labelValue = sourceRow ? rowValueByField(sourceRow, labelField, ['Label', 'Code', 'Description', 'Name', 'id']) : id;
-    const groupValue = sourceRow ? rowValueByField(sourceRow, groupField, ['Group', 'Class', 'Type', 'Kind']) : '';
+    const groupValue = sourceRow
+      ? rowValueByField(sourceRow, groupField, mapping && mapping.disableImplicitGroup ? [] : ['Group', 'Class', 'Type', 'Kind'])
+      : '';
     const hrefValue = sourceRow ? rowValueByField(sourceRow, hrefField, ['Href', 'Url', 'URL', 'sourceURL']) : '';
     const parentValue = sourceRow && parentField ? rowValueByField(sourceRow, parentField, ['Parent', 'parent', 'ParentId', 'parentId']) : '';
     const typeValue = sourceRow && typeField ? rowValueByField(sourceRow, typeField, ['Class', 'Type', 'Kind', 'sourceClass', 'targetClass']) : '';
     const group = displayCardValue(groupValue).trim();
-    if (group) addGroup(group);
     const label = diagramLabelForRow(sourceRow, mapping, labelField, labelValue === undefined || labelValue === null || labelValue === '' ? id : labelValue, params, warnings, `node ${id}`);
     const parent = displayCardValue(parentValue).trim();
     const type = displayCardValue(typeValue).trim() || diagramConstantValue(mapping, ['nodeTypeValue', 'typeValue', 'className']);
     const href = isSafeRuntimeLinkUrl(hrefValue) ? String(hrefValue) : '';
     nodeMap.set(id, {
       id,
+      businessId,
       label,
       group,
       parent,
       type,
       href,
+      importRole,
+      styleHints: importRole.styleHints && typeof importRole.styleHints === 'object' && !Array.isArray(importRole.styleHints)
+        ? cloneJsonValueServer(importRole.styleHints, {})
+        : {},
+      d2Template: materializeDiagramCompositeTemplate(mapping && mapping.d2Template, sourceRow, params, warnings, `node ${id}`),
       d2Id: diagramD2Id('node', id),
-      data: buildDiagramObjectData('node', id, label, sourceName, sourceRow, mapping, { group, parent, type, href })
+      data: buildDiagramObjectData('node', id, label, sourceName, sourceRow, mapping, { businessId, group, parent, type, href })
     });
+    if (!nodeBusinessIndex.has(businessId)) nodeBusinessIndex.set(businessId, []);
+    nodeBusinessIndex.get(businessId).push(id);
+    expandedShapeCount += templateShapeCount;
     return true;
   };
 
-  for (const mapping of diagramNodeMappings(diagram)) {
+  const activeNodeMappings = diagramNodeMappings(diagram);
+  let diagramNodeSourceRows = 0;
+  for (const mapping of activeNodeMappings) {
     const idField = diagramMappingField(mapping, ['nodeId', 'id', 'idColumn'], 'id');
     const source = diagramRowsForMapping(context, mapping);
+    diagramNodeSourceRows += source.rows.length;
     for (const row of source.rows) {
-      if (nodeMap.size >= maxNodes) break;
-      addNode(rowValueByField(row, idField, ['Id', 'ID', '_id', 'Code', 'Name']), row, mapping, source.sourceName);
+      if (nodeMap.size >= maxNodes || expandedShapeCount >= maxNodes) break;
+      const added = addNode(rowValueByField(row, idField, ['Id', 'ID', '_id', 'Code', 'Name']), row, mapping, source.sourceName);
+      if (!added && mapping.d2Template) break;
     }
   }
+  if (activeNodeMappings.length && diagramNodeSourceRows && nodeMap.size === 0) {
+    warnings.push(`Diagram node mappings produced no nodes (mappings=${activeNodeMappings.length}, sourceRows=${diagramNodeSourceRows}).`);
+  }
   const edges = [];
+  const resolveNodeId = (value, preferredRoleKey = '') => {
+    const id = displayCardValue(value).trim();
+    const candidates = nodeBusinessIndex.get(id) || [];
+    const roleKey = String(preferredRoleKey || '').trim();
+    if (roleKey) {
+      const roleMatches = candidates.filter((candidate) => String(nodeMap.get(candidate) && nodeMap.get(candidate).importRole && nodeMap.get(candidate).importRole.key || '') === roleKey);
+      if (roleMatches.length === 1) return roleMatches[0];
+    }
+    if (nodeMap.has(id)) return id;
+    return candidates.length === 1 ? candidates[0] : '';
+  };
   const addEdge = (sourceValue, targetValue, labelValue = '', mapping = {}, row = null, sourceName = '') => {
     if (edges.length >= maxEdges) return false;
-    const source = displayCardValue(sourceValue).trim();
-    const target = displayCardValue(targetValue).trim();
-    if (!source || !target) {
+    const sourceBusinessId = displayCardValue(sourceValue).trim();
+    const targetBusinessId = displayCardValue(targetValue).trim();
+    if (!sourceBusinessId || !targetBusinessId) {
       warnings.push('Skipped edge without source or target.');
       return false;
     }
-    if (!nodeMap.has(source)) addNode(source);
-    if (!nodeMap.has(target)) addNode(target);
-    if (!nodeMap.has(source) || !nodeMap.has(target)) {
-      warnings.push(`Skipped edge ${source} -> ${target}: node limit reached.`);
+    const edgeImportRole = mapping && mapping.importRole && typeof mapping.importRole === 'object' && !Array.isArray(mapping.importRole)
+      ? mapping.importRole
+      : {};
+    const hierarchyMapping = String(mapping && (mapping.type || mapping.mappingType) || '') === 'hierarchy';
+    const sourceRoleKey = hierarchyMapping ? edgeImportRole.parentKey : edgeImportRole.sourceKey;
+    const targetRoleKey = hierarchyMapping ? edgeImportRole.childKey : edgeImportRole.targetKey;
+    let source = resolveNodeId(sourceBusinessId, sourceRoleKey);
+    let target = resolveNodeId(targetBusinessId, targetRoleKey);
+    if (!source && !(nodeBusinessIndex.get(sourceBusinessId) || []).length) addNode(sourceBusinessId);
+    if (!target && !(nodeBusinessIndex.get(targetBusinessId) || []).length) addNode(targetBusinessId);
+    source = resolveNodeId(sourceBusinessId, sourceRoleKey);
+    target = resolveNodeId(targetBusinessId, targetRoleKey);
+    if (!source || !target) {
+      warnings.push(`Skipped edge ${sourceBusinessId} -> ${targetBusinessId}: node target is missing, ambiguous, or node limit was reached.`);
       return false;
     }
     const labelField = diagramMappingField(mapping, ['edgeLabel', 'edgeTitle', 'label', 'labelColumn'], 'label');
@@ -18392,8 +24017,14 @@ function buildTopologyDiagram(diagram, context, params, limits) {
       d2Id: edgeId,
       sourceD2Id: sourceNode && sourceNode.d2Id || diagramD2Id('node', source),
       targetD2Id: targetNode && targetNode.d2Id || diagramD2Id('node', target),
+      importRole: mapping && mapping.importRole && typeof mapping.importRole === 'object' && !Array.isArray(mapping.importRole)
+        ? cloneJsonValueServer(mapping.importRole, {})
+        : {},
       data: buildDiagramObjectData('edge', edgeId, label, sourceName, row, mapping, { source, target })
     };
+    edge.styleHints = edge.importRole.styleHints && typeof edge.importRole.styleHints === 'object' && !Array.isArray(edge.importRole.styleHints)
+      ? cloneJsonValueServer(edge.importRole.styleHints, {})
+      : {};
     if (mappingType && mappingType !== 'generic') edge.mappingType = mappingType;
     if (kind && kind !== 'generic') edge.kind = kind;
     if (direction) edge.direction = direction;
@@ -18433,6 +24064,60 @@ function buildTopologyDiagram(diagram, context, params, limits) {
       );
     }
   }
+  const resolveGroupId = (value, preferredRoleKey = '', excludedId = '') => {
+    const businessId = displayCardValue(value).trim();
+    const candidates = (groupBusinessIndex.get(businessId) || []).filter((candidate) => candidate !== excludedId);
+    const roleKey = String(preferredRoleKey || '').trim();
+    if (roleKey) {
+      const roleMatches = candidates.filter((candidate) => String(groupMap.get(candidate) && groupMap.get(candidate).importRole && groupMap.get(candidate).importRole.key || '') === roleKey);
+      if (roleMatches.length === 1) return roleMatches[0];
+    }
+    if (groupMap.has(businessId) && businessId !== excludedId) return businessId;
+    return candidates.length === 1 ? candidates[0] : '';
+  };
+  for (const group of groupMap.values()) {
+    if (!group.parent) continue;
+    const resolvedParent = resolveGroupId(group.parent, group.importRole && group.importRole.parentKey, group.id);
+    if (resolvedParent) group.parent = resolvedParent;
+    else if ((groupBusinessIndex.get(displayCardValue(group.parent).trim()) || []).length > 1) {
+      warnings.push(`Skipped ambiguous parent group ${group.parent} for group ${group.businessId || group.id}.`);
+      group.parent = '';
+    }
+  }
+  for (const node of nodeMap.values()) {
+    if (!node.group) continue;
+    let resolvedGroup = resolveGroupId(node.group, node.importRole && node.importRole.parentKey);
+    if (!resolvedGroup && !(groupBusinessIndex.get(displayCardValue(node.group).trim()) || []).length) {
+      addGroup(node.group);
+      resolvedGroup = resolveGroupId(node.group);
+    }
+    if (resolvedGroup) node.group = resolvedGroup;
+    else {
+      warnings.push(`Skipped ambiguous group ${node.group} for node ${node.businessId || node.id}.`);
+      node.group = '';
+    }
+  }
+  for (const rule of Array.isArray(diagram.classRelationRules) ? diagram.classRelationRules : []) {
+    const rows = context[rule.alias] && Array.isArray(context[rule.alias].rows) ? context[rule.alias].rows : [];
+    for (const row of rows) {
+      const parentBusinessId = displayCardValue(rowValueByField(row, rule.sourceField || 'SourceId')).trim();
+      const childBusinessId = displayCardValue(rowValueByField(row, rule.targetField || 'RelatedId')).trim();
+      const parentGroupId = resolveGroupId(parentBusinessId, rule.parentRoleKey);
+      const childNodeId = resolveNodeId(childBusinessId, rule.childRoleKey);
+      if (parentGroupId && childNodeId) nodeMap.get(childNodeId).group = parentGroupId;
+      else warnings.push(`Skipped D2 group placement ${parentBusinessId} -> ${childBusinessId}: mapped group or child node was not found.`);
+    }
+  }
+  for (const rule of Array.isArray(diagram.placementRules) ? diagram.placementRules : []) {
+    const parentGroupId = resolveGroupId(rule.parentBusinessId, rule.parentRoleKey);
+    if (!parentGroupId) {
+      warnings.push(`Skipped static D2 placement for ${rule.parentRoleKey || rule.parentRoleId}: container was not found.`);
+      continue;
+    }
+    for (const node of nodeMap.values()) {
+      if (String(node.importRole && node.importRole.key || '') === String(rule.childRoleKey || '')) node.group = parentGroupId;
+    }
+  }
   for (const mapping of normalizeDiagramMappingList(diagram.hierarchyMappings)) {
     const childField = diagramMappingField(mapping, ['child', 'childId', 'node', 'nodeId', 'source', 'sourceColumn'], 'child');
     const parentField = diagramMappingField(mapping, ['parent', 'parentId', 'target', 'targetColumn'], 'parent');
@@ -18446,12 +24131,23 @@ function buildTopologyDiagram(diagram, context, params, limits) {
         warnings.push('Skipped hierarchy row without child or parent.');
         continue;
       }
-      if (nodeMap.has(child) && !nodeMap.get(child).parent) nodeMap.get(child).parent = parent;
+      const role = mapping && mapping.importRole && typeof mapping.importRole === 'object' && !Array.isArray(mapping.importRole) ? mapping.importRole : {};
+      const childNodeId = resolveNodeId(child, role.childKey);
+      const parentNodeId = resolveNodeId(parent, role.parentKey);
+      if (childNodeId && !nodeMap.get(childNodeId).parent) nodeMap.get(childNodeId).parent = parentNodeId || parent;
       addEdge(parent, child, rowValueByField(row, labelField, ['Label', 'Relation', 'Type']) || diagramConstantValue(mapping, ['label']) || 'contains', Object.assign({}, mapping, { type: 'hierarchy' }), row, source.sourceName);
     }
   }
   const groups = Array.from(groupMap.values());
-  const truncated = nodeMap.size >= maxNodes || edges.length >= maxEdges || groupMap.size >= maxGroups;
+  const nodes = Array.from(nodeMap.values());
+  assignDiagramD2Paths(nodes, groups, warnings);
+  for (const edge of edges) {
+    const sourceNode = nodeMap.get(edge.source);
+    const targetNode = nodeMap.get(edge.target);
+    edge.sourceD2Id = sourceNode && (sourceNode.d2Path || sourceNode.d2Id) || edge.sourceD2Id;
+    edge.targetD2Id = targetNode && (targetNode.d2Path || targetNode.d2Id) || edge.targetD2Id;
+  }
+  const truncated = expandedShapeLimitHit || expandedShapeCount >= maxNodes || edges.length >= maxEdges || groupMap.size >= maxGroups;
   if (truncated) warnings.push('Diagram was truncated by execution limits.');
   const result = {
     name,
@@ -18460,9 +24156,13 @@ function buildTopologyDiagram(diagram, context, params, limits) {
     layout: diagram.layout && typeof diagram.layout === 'object' && !Array.isArray(diagram.layout)
       ? cloneJsonValueServer(diagram.layout, { type: 'topology' })
       : { type: 'topology' },
-    nodes: Array.from(nodeMap.values()),
+    nodes,
+    expandedShapeCount,
     edges,
     groups,
+    importSemantics: diagram && diagram.authoring && diagram.authoring.d2Import && diagram.authoring.d2Import.semantics && typeof diagram.authoring.d2Import.semantics === 'object'
+      ? cloneJsonValueServer(diagram.authoring.d2Import.semantics, {})
+      : {},
     warnings: [],
     truncated
   };
@@ -19359,11 +25059,14 @@ async function requestCardsForSelectionScan(cmdbuildExecRequest, className, scan
   const pageSize = Math.min(limit, 1000);
   const rows = [];
   let start = 0;
+  let knownTotal = null;
   while (rows.length < limit) {
     const pageLimit = Math.min(pageSize, limit - rows.length);
     const response = await requestCardsForSelection(cmdbuildExecRequest, className, pageLimit, fields, start);
     if (!response.ok) return response;
     const pageRows = Array.isArray(response.json && response.json.data) ? response.json.data : [];
+    const metaTotal = Number(response.json && response.json.meta && (response.json.meta.total ?? response.json.meta.count));
+    if (Number.isFinite(metaTotal) && metaTotal >= 0) knownTotal = metaTotal;
     rows.push.apply(rows, pageRows);
     if (pageRows.length < pageLimit) break;
     start += pageRows.length;
@@ -19371,7 +25074,8 @@ async function requestCardsForSelectionScan(cmdbuildExecRequest, className, scan
   return {
     ok: true,
     statusCode: 200,
-    json: { data: rows }
+    json: { data: rows },
+    truncated: rows.length >= limit && (knownTotal === null || rows.length < knownTotal)
   };
 }
 
@@ -19396,7 +25100,10 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
   const readFields = selectionReadFields(step, requestedColumns);
   const columns = [];
   const rows = [];
+  const deduplicateCards = step.deduplicateCards === true || step.dedupeCards === true;
+  const seenCards = new Set();
   const cardsByClass = new Map();
+  let scanTruncated = false;
   const classesCache = { loaded: false, classes: [], ok: false };
   const resolvedClassCache = new Map();
   const pathCache = { attributes: new Map(), cards: new Map(), relations: new Map() };
@@ -19417,11 +25124,23 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
         if (!cards.ok) {
           throw new Error(`CMDBuild cards request for ${className} failed with status ${cards.statusCode}.`);
         }
-        cardsByClass.set(className, Array.isArray(cards.json && cards.json.data) ? cards.json.data : []);
+        cardsByClass.set(className, {
+          rows: Array.isArray(cards.json && cards.json.data) ? cards.json.data : [],
+          truncated: Boolean(cards.truncated)
+        });
       }
 
-      for (const card of cardsByClass.get(className)) {
+      const classCards = cardsByClass.get(className);
+      scanTruncated = scanTruncated || Boolean(classCards && classCards.truncated);
+      for (const card of classCards && classCards.rows || []) {
         if (!await cardPassesSelectionFilters(cmdbuildExecRequest, pathCache, className, card, filters, params, driverRow)) continue;
+        if (deduplicateCards) {
+          const cardIdentity = card && card._id !== undefined && card._id !== null
+            ? `${className}:${String(card._id)}`
+            : `${className}:${stableJsonStringify(card || {})}`;
+          if (seenCards.has(cardIdentity)) continue;
+          seenCards.add(cardIdentity);
+        }
         const row = buildSelectionResultRow(className, card, driverRow, columns, step);
         await materializeRowPathColumns(cmdbuildExecRequest, pathCache, row, className, card, requestedColumns, columns);
         rows.push(row);
@@ -19439,7 +25158,7 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
   return {
     columns,
     rows,
-    truncated: false
+    truncated: scanTruncated
   };
 }
 
@@ -19989,6 +25708,82 @@ function executeIntersectRows(step, context, limits) {
 
   return {
     columns: inferColumns(left),
+    rows,
+    truncated: Boolean(left.truncated || right.truncated)
+  };
+}
+
+function setOperationColumns(left, right) {
+  return uniqueStrings(inferColumns(left).concat(inferColumns(right)));
+}
+
+function projectSetOperationRow(row, columns) {
+  const projected = {};
+  for (const column of columns) projected[column] = row && row[column] !== undefined ? row[column] : null;
+  return projected;
+}
+
+function executeUnionRows(step, context, limits) {
+  const left = context[step.from];
+  const right = context[step.with];
+  if (!left) throw new Error(`unionRows source not found: ${step.from}`);
+  if (!right) throw new Error(`unionRows source not found: ${step.with}`);
+
+  const keyPairs = normalizeRowOperationKeys(step);
+  const columns = setOperationColumns(left, right);
+  const distinct = step.distinct !== false;
+  const rows = [];
+  const seen = new Set();
+  const append = (sourceRows, keyColumns) => {
+    for (const row of Array.isArray(sourceRows) ? sourceRows : []) {
+      const key = buildRowOperationKey(row, keyColumns, step.caseSensitive === true);
+      if (distinct && seen.has(key)) continue;
+      if (distinct) seen.add(key);
+      rows.push(projectSetOperationRow(row, columns));
+      if (rows.length >= limits.maxRows) return true;
+    }
+    return false;
+  };
+
+  const leftColumns = keyPairs.map((pair) => pair.left);
+  const rightColumns = keyPairs.map((pair) => pair.right);
+  const truncated = append(left.rows, leftColumns) || append(right.rows, rightColumns);
+  return {
+    columns,
+    rows,
+    truncated: truncated || Boolean(left.truncated || right.truncated)
+  };
+}
+
+function executeDifferenceRows(step, context, limits) {
+  const left = context[step.from];
+  const right = context[step.with];
+  if (!left) throw new Error(`differenceRows source not found: ${step.from}`);
+  if (!right) throw new Error(`differenceRows source not found: ${step.with}`);
+
+  const keyPairs = normalizeRowOperationKeys(step);
+  const leftColumns = keyPairs.map((pair) => pair.left);
+  const rightColumns = keyPairs.map((pair) => pair.right);
+  const rightIndex = buildRowIndex(Array.isArray(right.rows) ? right.rows : [], rightColumns, step.caseSensitive === true);
+  const distinct = step.distinct !== false;
+  const seen = new Set();
+  const columns = inferColumns(left);
+  const rows = [];
+  for (const row of Array.isArray(left.rows) ? left.rows : []) {
+    const key = buildRowOperationKey(row, leftColumns, step.caseSensitive === true);
+    if (rightIndex.has(key) || (distinct && seen.has(key))) continue;
+    if (distinct) seen.add(key);
+    rows.push(projectSetOperationRow(row, columns));
+    if (rows.length >= limits.maxRows) {
+      return {
+        columns,
+        rows,
+        truncated: true
+      };
+    }
+  }
+  return {
+    columns,
     rows,
     truncated: Boolean(left.truncated || right.truncated)
   };
@@ -20704,6 +26499,10 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
         context[step.as] = executeJoinRows(step, context, limits);
       } else if (step.type === 'intersectRows') {
         context[step.as] = executeIntersectRows(step, context, limits);
+      } else if (step.type === 'unionRows') {
+        context[step.as] = executeUnionRows(step, context, limits);
+      } else if (step.type === 'differenceRows') {
+        context[step.as] = executeDifferenceRows(step, context, limits);
       } else if (step.type === 'matchRows') {
         context[step.as] = executeMatchRows(step, effectiveParams, context, limits);
       } else if (step.type === 'composeRows' || step.type === 'compose') {
@@ -20774,6 +26573,7 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
     delete presentation.tables;
     return {
       name: table.name,
+      published: table.published === true,
       title: renderedTitle || titleParam || table.name,
       titleParam: table.titleParam || '',
       mode: namedPresentation.mode || table.mode || table.view || 'table',
@@ -20916,6 +26716,7 @@ async function handleBackend(req, res, requestUrl) {
 
   if (requestUrl.pathname === `${BACKEND_PREFIX}/csrf`) {
     if (!methodAllowed(req, res, 'GET')) return;
+    if (!await requireValidBackendSession(authToken, res)) return;
     sendJson(res, 200, {
       success: true,
       token: getCsrfToken(authToken)
@@ -20925,7 +26726,8 @@ async function handleBackend(req, res, requestUrl) {
 
   if (requestUrl.pathname === `${BACKEND_PREFIX}/model/catalog`) {
     if (!methodAllowed(req, res, 'GET')) return;
-    const catalog = await buildModelCatalog(authToken, requestUrl);
+    const configuredRequestUrl = await configuredModelCatalogRequestUrl(authToken, requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT, requestUrl);
+    const catalog = await buildModelCatalog(authToken, configuredRequestUrl);
     sendJson(res, catalog.statusCode, {
       success: catalog.success,
       cmdbuildStatus: catalog.cmdbuildStatus,
@@ -21257,57 +27059,328 @@ async function handleBackend(req, res, requestUrl) {
     return;
   }
 
-  if (requestUrl.pathname === `${BACKEND_PREFIX}/assistant/template-draft`) {
+  if (requestUrl.pathname === `${BACKEND_PREFIX}/draft/diagram-import/analyze`) {
     if (!methodAllowed(req, res, 'POST')) return;
     if (!requireStateChangingRequest(req, res, authToken)) return;
     if (!requireJsonContentType(req, res)) return;
-    const body = await readJsonBody(req, 256 * 1024);
+    const body = await readJsonObjectBody(req, res, D2_IMPORT_MAX_INPUT_BYTES + 512 * 1024);
+    if (!body) return;
     const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
-    const runtimeConfig = await getRuntimeConfig(authToken, root);
-    const assistantRuntimeStatus = assistantStatus(runtimeConfig);
+    if (!await requireValidBackendSession(authToken, res)) return;
+    const slot = acquireExecutionSlot(req, res, { action: 'd2-import-analyze', templateCode: body.templateCode });
+    if (!slot) return;
+    const startedAt = Date.now();
     try {
-      const draft = await createAssistantTemplateDraft(body, { authToken, runtimeConfig });
-      const assistantLimits = draft.diagnostics && draft.diagnostics.mcp && Array.isArray(draft.diagnostics.mcp.limits)
-        ? draft.diagnostics.mcp.limits.filter((item) => item && item.limitHit)
-        : [];
-      logLimitDiagnostics('assistant.limit_hit', {
+      const catalogRequestUrl = await configuredModelCatalogRequestUrl(authToken, root, new URL('http://127.0.0.1/model/catalog?includeAttributes=true'));
+      const catalogResult = await buildModelCatalog(authToken, catalogRequestUrl);
+      if (!catalogResult.success) {
+        const catalogError = new Error('CMDBuild class catalog is unavailable for D2 class mapping.');
+        catalogError.code = 'diagram_import_catalog_unavailable';
+        catalogError.statusCode = 502;
+        throw catalogError;
+      }
+      const result = await analyzeD2ImportSource(body.d2Source, body.currentSpec, {
+        templateCode: body.templateCode,
+        baseSpecHash: body.baseSpecHash,
+        catalog: catalogResult.catalog
+      });
+      const preview = await renderD2ImportPreview(body.d2Source);
+      result.proposal = signDiagramImportProposal(result.proposal, authToken);
+      incMetric('cmdp_d2_import_total', { status: result.proposal.unresolved.length ? 'incomplete' : 'ready' });
+      observeMetricSeconds('cmdp_d2_import_seconds', {}, (Date.now() - startedAt) / 1000);
+      logInfo('d2.import.analyzed', {
+        requestId: req.cmdpRequestId || '',
+        templateCode: truncateText(String(body.templateCode || ''), 120),
+        sourceHashPrefix: result.ir.source.hash.slice(0, 12),
+        elements: result.diagnostics.elements,
+        unresolved: result.proposal.unresolved.length,
+        classRoles: result.proposal.roles.length,
+        suggestedComposite: result.proposal.roles.filter((role) => role.suggestedSemantic === 'composite').length,
+        previewRendered: preview.rendered,
+        previewReason: preview.reason,
+        elapsedMs: result.diagnostics.elapsedMs
+      });
+      sendJson(res, 200, { success: true, action: 'diagram-import-analyze', ...result, preview, catalog: catalogResult.catalog });
+    } catch (error) {
+      incMetric('cmdp_d2_import_total', { status: error.code || 'failed' });
+      observeMetricSeconds('cmdp_d2_import_seconds', {}, (Date.now() - startedAt) / 1000);
+      logWarn('d2.import.failed', {
+        requestId: req.cmdpRequestId || '',
+        templateCode: truncateText(String(body.templateCode || ''), 120),
+        code: error.code || 'd2_import_failed',
+        statusCode: error.statusCode || 422
+      });
+      sendJson(res, error.statusCode || 422, {
+        success: false,
+        action: 'diagram-import-analyze',
+        code: error.code || 'd2_import_failed',
+        message: error.message || String(error),
+        errors: error.details || []
+      });
+    } finally {
+      slot.release();
+    }
+    return;
+  }
+
+  if (requestUrl.pathname === `${BACKEND_PREFIX}/draft/diagram-import/apply`) {
+    if (!methodAllowed(req, res, 'POST')) return;
+    if (!requireStateChangingRequest(req, res, authToken)) return;
+    if (!requireJsonContentType(req, res)) return;
+    const body = await readJsonObjectBody(req, res, D2_IMPORT_MAX_OUTPUT_BYTES + D2_IMPORT_MAX_INPUT_BYTES + 512 * 1024);
+    if (!body) return;
+    const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
+    const proposal = body.proposal;
+    if (!await requireDiagramAuthoringContext(authToken, res, root, proposal && proposal.templateCode, proposal && proposal.baseSpecHash)) return;
+    const slot = acquireExecutionSlot(req, res, { action: 'd2-import-apply', templateCode: proposal && proposal.templateCode });
+    if (!slot) return;
+    try {
+      assertDiagramImportProposal(proposal, authToken);
+      const reviewedProposal = diagramImportV3WithOverrides(proposal, body.roles, body.relationRules, body.placementRules);
+      const catalogRequestUrl = await configuredModelCatalogRequestUrl(authToken, root, new URL('http://127.0.0.1/model/catalog?includeAttributes=true'));
+      const catalogResult = await buildModelCatalog(authToken, catalogRequestUrl);
+      if (!catalogResult.success) {
+        const catalogError = new Error('CMDBuild class catalog is unavailable for D2 class mapping.');
+        catalogError.code = 'diagram_import_catalog_unavailable';
+        catalogError.statusCode = 502;
+        throw catalogError;
+      }
+      const catalogErrors = validateDiagramImportV3Catalog(reviewedProposal, catalogResult.catalog, body.currentSpec);
+      if (catalogErrors.length) {
+        const catalogError = new Error('D2 class mapping does not match the readable CMDBuild catalog.');
+        catalogError.code = 'diagram_import_catalog_validation';
+        catalogError.statusCode = 422;
+        catalogError.details = catalogErrors;
+        throw catalogError;
+      }
+      const spec = applyDiagramImportProposal(body.currentSpec, proposal, body.roles, body.relationRules, body.placementRules);
+      const semanticCounts = (Array.isArray(body.roles) ? body.roles : []).reduce((counts, item) => {
+        const semantic = normalizeDiagramImportSemantic(item && item.selectedSemantic);
+        if (semantic) counts[semantic] = (counts[semantic] || 0) + 1;
+        return counts;
+      }, {});
+      logInfo('d2.import.applied', {
+        requestId: req.cmdpRequestId || '',
+        templateCode: truncateText(String(proposal && proposal.templateCode || ''), 120),
+        compositeRoles: semanticCounts.composite || 0,
+        groupRoles: semanticCounts.group || 0,
+        staticRoles: semanticCounts.static || 0
+      });
+      sendJson(res, 200, {
+        success: true,
+        action: 'diagram-import-apply',
+        spec,
+        specHash: hashJson(spec),
+        warnings: proposal && proposal.warnings || []
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode || 422, {
+        success: false,
+        action: 'diagram-import-apply',
+        code: error.code || 'diagram_import_apply_failed',
+        message: error.message || String(error),
+        errors: error.details || []
+      });
+    } finally {
+      slot.release();
+    }
+    return;
+  }
+
+  if (requestUrl.pathname === `${BACKEND_PREFIX}/assistant/object-flow/selection` || requestUrl.pathname === `${BACKEND_PREFIX}/assistant/object-flow/match`) {
+    sendJson(res, 410, { success: false, code: 'assistant_contract_removed', message: 'Stage-by-stage object-flow contracts are not supported. Use /assistant/object-flow/plan.' });
+    return;
+  }
+
+  if (requestUrl.pathname === `${BACKEND_PREFIX}/assistant/object-flow/plan`) {
+    if (!methodAllowed(req, res, 'POST')) return;
+    if (!requireStateChangingRequest(req, res, authToken)) return;
+    if (!requireJsonContentType(req, res)) return;
+    const body = await readJsonObjectBody(req, res, 256 * 1024);
+    if (!body) return;
+    const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
+    if (!await requireDiagramAuthoringContext(authToken, res, root, body.templateCode, body.baseSpecHash)) return;
+    const runtimeConfig = await getRuntimeConfig(authToken, root);
+    const slot = acquireExecutionSlot(req, res, { action: 'assistant-object-flow-plan', templateCode: body.templateCode });
+    if (!slot) return;
+    try {
+      const draft = await createAssistantObjectFlowDraft({
+        prompt: String(body.prompt || ''),
+        currentSpec: body.currentSpec || {}
+      }, { authToken, runtimeConfig });
+      const draftLimits = collectAssistantLimitDiagnostics(draft.diagnostics || {}).filter((item) => item.limitHit);
+      logLimitDiagnostics('assistant.object_flow.limit_hit', {
         requestId: req.cmdpRequestId || '',
         authSource: backendLogUser,
         root
-      }, assistantLimits);
-      logInfo(draft.success ? 'assistant.template_draft.completed' : 'assistant.template_draft.validation_failed', {
+      }, draftLimits);
+      if (!draft.success) {
+        sendJson(res, 422, {
+          success: false,
+          action: 'assistant-object-flow-plan',
+          code: 'assistant_object_flow_invalid',
+          message: 'Assistant response did not pass deterministic object-flow validation.',
+          warnings: draft.warnings || [],
+          errors: draft.errors || [],
+          diagnostics: draft.diagnostics || {}
+        });
+        return;
+      }
+      logInfo('assistant.object_flow.plan.completed', {
         requestId: req.cmdpRequestId || '',
         authSource: backendLogUser,
-        model: assistantRuntimeStatus.model,
         root,
-        valid: Boolean(draft.success),
-        mcpEnabled: Boolean(draft.mcpContext && draft.mcpContext.enabled),
-        mcpTools: draft.mcpContext && Array.isArray(draft.mcpContext.tools) ? draft.mcpContext.tools.length : 0,
-        limitHits: assistantLimits.length,
-        errorsCount: Array.isArray(draft.errors) ? draft.errors.length : 0
+        selections: draft.flow.selections.length,
+        matches: draft.flow.blocks.length,
+        setOperations: draft.flow.setOperations.length,
+        publishedAlias: draft.flow.publishedAlias
       });
-      sendJson(res, draft.success ? 200 : 422, {
-        action: 'assistant-template-draft',
-        ...draft,
-        assistant: assistantRuntimeStatus
+      sendJson(res, 200, {
+        success: true,
+        action: 'assistant-object-flow-plan',
+        flow: draft.flow,
+        explanation: draft.explanation || '',
+        warnings: draft.warnings || [],
+        diagnostics: draft.diagnostics || {}
       });
     } catch (error) {
-      logWarn('assistant.template_draft.failed', {
+      sendJson(res, error.statusCode || 502, { success: false, action: 'assistant-object-flow-plan', code: error.code || 'assistant_error', message: error.message || String(error) });
+    } finally {
+      slot.release();
+    }
+    return;
+  }
+
+  if (requestUrl.pathname === `${BACKEND_PREFIX}/draft/object-flow/apply`) {
+    if (!methodAllowed(req, res, 'POST')) return;
+    if (!requireStateChangingRequest(req, res, authToken)) return;
+    if (!requireJsonContentType(req, res)) return;
+    const body = await readJsonObjectBody(req, res, 512 * 1024);
+    if (!body) return;
+    const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
+    if (!await requireDiagramAuthoringContext(authToken, res, root, body.templateCode, body.baseSpecHash)) return;
+    try {
+      const flow = normalizeObjectFlow(body.flow || {});
+      const errors = validateObjectFlow(flow);
+      if (errors.length) {
+        const error = new Error('Object-flow proposal failed deterministic validation.');
+        error.statusCode = 422;
+        error.code = 'object_flow_invalid';
+        error.details = errors;
+        throw error;
+      }
+      const diagramSourceErrors = staleObjectFlowDiagramSourceErrors(body.currentSpec || {}, flow);
+      if (diagramSourceErrors.length) {
+        const error = new Error('Object-flow would leave Diagram mappings with removed source aliases.');
+        error.statusCode = 422;
+        error.code = 'object_flow_diagram_source_stale';
+        error.details = diagramSourceErrors;
+        throw error;
+      }
+      const spec = compileObjectFlowToSpec(body.currentSpec || {}, flow);
+      const specErrors = validateTemplateSpec(spec);
+      if (specErrors.length) {
+        const error = new Error('Object-flow compiler produced an invalid template spec.');
+        error.statusCode = 422;
+        error.code = 'object_flow_spec_invalid';
+        error.details = specErrors;
+        throw error;
+      }
+      logInfo('assistant.object_flow.applied', {
         requestId: req.cmdpRequestId || '',
         authSource: backendLogUser,
-        model: assistantRuntimeStatus.model,
-        root,
-        code: error.code || 'assistant_error',
-        statusCode: error.statusCode || 502
+        selections: flow.selections.length,
+        matches: flow.blocks.length,
+        setOperations: flow.setOperations.length,
+        publishedAlias: flow.publishedAlias
       });
-      sendJson(res, error.statusCode || 502, {
-        success: false,
-        action: 'assistant-template-draft',
-        code: error.code || 'assistant_error',
-        message: error && error.message ? error.message : String(error),
-        assistant: assistantRuntimeStatus
-      });
+      sendJson(res, 200, { success: true, action: 'object-flow-apply', spec, specHash: hashJson(spec) });
+    } catch (error) {
+      sendJson(res, error.statusCode || 422, { success: false, code: error.code || 'object_flow_invalid', message: error.message || String(error), errors: error.details || [] });
     }
+    return;
+  }
+
+  if (requestUrl.pathname === `${BACKEND_PREFIX}/assistant/diagram-import/interpret` || requestUrl.pathname === `${BACKEND_PREFIX}/assistant/diagram-import/map-selections`) {
+    if (!methodAllowed(req, res, 'POST')) return;
+    if (!requireStateChangingRequest(req, res, authToken)) return;
+    if (!requireJsonContentType(req, res)) return;
+    const body = await readJsonObjectBody(req, res, D2_IMPORT_MAX_OUTPUT_BYTES + 512 * 1024);
+    if (!body) return;
+    const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
+    const proposalInput = body.proposal;
+    if (!await requireDiagramAuthoringContext(authToken, res, root, proposalInput && proposalInput.templateCode, proposalInput && proposalInput.baseSpecHash)) return;
+    const mapTask = requestUrl.pathname.endsWith('/map-selections');
+    const slot = acquireExecutionSlot(req, res, { action: mapTask ? 'd2-map-selections' : 'd2-interpret', templateCode: proposalInput && proposalInput.templateCode });
+    if (!slot) return;
+    try {
+      assertDiagramImportProposal(proposalInput, authToken);
+      if (!proposalInput.editorSpecHash || hashJson(body.currentSpec) !== proposalInput.editorSpecHash) {
+        const error = new Error('Template draft changed after D2 analysis. Analyze the D2 source again before using Assistant.');
+        error.code = 'diagram_import_editor_conflict';
+        error.statusCode = 409;
+        throw error;
+      }
+      const reviewProposal = diagramImportV3WithOverrides(proposalInput, body.roles, body.relationRules, body.placementRules);
+      let stages = [];
+      if (mapTask) {
+        const flow = objectFlowFromSpecServer(body.currentSpec);
+        const flowErrors = validateObjectFlow(flow);
+        if (flowErrors.length) {
+          const error = new Error('Selection flow must be applied before diagram mapping.');
+          error.code = 'object_flow_invalid';
+          error.statusCode = 422;
+          error.details = flowErrors;
+          throw error;
+        }
+        stages = objectFlowStageSummaries(flow);
+      }
+      const roles = reviewProposal.roles.map((role) => ({
+        id: role.id,
+        d2Key: role.key,
+        kind: role.kind,
+        selectedSemantic: role.selectedSemantic,
+        options: role.options
+      }));
+      const runtimeConfig = await getRuntimeConfig(authToken, root);
+      const draft = await createAssistantDiagramStageDraft({
+        kind: mapTask ? 'mapping' : 'interpretation',
+        prompt: String(body.prompt || '').trim(),
+        roles,
+        stages
+      }, runtimeConfig);
+      if (!draft.success) {
+        sendJson(res, 422, {
+          success: false,
+          action: mapTask ? 'assistant-diagram-import-map-selections' : 'assistant-diagram-import-interpret',
+          code: 'assistant_diagram_stage_invalid',
+          message: 'Assistant response did not pass deterministic diagram proposal validation.',
+          warnings: draft.warnings || [],
+          errors: draft.errors || [],
+          diagnostics: draft.diagnostics || {}
+        });
+        return;
+      }
+      const resultItems = draft.items;
+      sendJson(res, resultItems.length ? 200 : 422, {
+        success: resultItems.length > 0,
+        action: mapTask ? 'assistant-diagram-import-map-selections' : 'assistant-diagram-import-interpret',
+        ...(mapTask ? { mappings: resultItems } : { decisions: resultItems }),
+        explanation: draft.explanation || '',
+        warnings: draft.warnings || [],
+        errors: resultItems.length ? [] : [{ path: '$', message: mapTask ? 'Assistant returned no valid selection mappings.' : 'Assistant returned no valid semantic decisions.' }],
+        diagnostics: draft.diagnostics || {}
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode || 502, { success: false, action: mapTask ? 'assistant-diagram-import-map-selections' : 'assistant-diagram-import-interpret', code: error.code || 'assistant_error', message: error.message || String(error), errors: error.details || [] });
+    } finally {
+      slot.release();
+    }
+    return;
+  }
+
+  if (requestUrl.pathname === `${BACKEND_PREFIX}/assistant/diagram-import/complete` || requestUrl.pathname === `${BACKEND_PREFIX}/assistant/template-draft`) {
+    sendJson(res, 410, { success: false, code: 'assistant_contract_removed', message: 'This generic Assistant contract is not supported. Use the typed object-flow and diagram Assistant endpoints.' });
     return;
   }
 
@@ -21326,9 +27399,9 @@ async function handleBackend(req, res, requestUrl) {
 
     let draft;
     try {
-      draft = normalizeDraftTemplateBody(await readJsonBody(req));
+      draft = normalizeDraftTemplateBody(await readJsonBody(req, TEMPLATE_REQUEST_MAX_BYTES));
     } catch (error) {
-      sendJson(res, 400, {
+      sendJson(res, error.statusCode || 400, {
         success: false,
         action: draftAction,
         message: error && error.message ? error.message : String(error)
@@ -21390,7 +27463,11 @@ async function handleBackend(req, res, requestUrl) {
         action: draftAction,
         template,
         params: draft.params,
-        result
+        result: stripSensitiveDiagramArtifacts(result, {
+          includeSvgContent: true,
+          includeD2Source: true,
+          d2DownloadAllowed: true
+        })
       });
     } catch (error) {
       const permissionDenied = errorLooksPermissionDenied(error);
@@ -21440,7 +27517,7 @@ async function handleBackend(req, res, requestUrl) {
     if (req.method === 'POST') {
       if (!requireStateChangingRequest(req, res, authToken)) return;
       if (!requireJsonContentType(req, res)) return;
-      const body = await readJsonBody(req);
+      const body = await readJsonBody(req, TEMPLATE_REQUEST_MAX_BYTES);
       const session = await getSessionData(authToken);
       const payload = normalizeTemplatePayload(body, null, session.data && session.data.username);
       const specErrors = validateTemplateSpec(safeJsonValue(payload.SpecJson, null));
@@ -21786,7 +27863,7 @@ async function handleBackend(req, res, requestUrl) {
             key: snapshot.key,
             paramsMode: publishConfig.paramsMode || 'exact'
           });
-        } else if (templateAction === 'run' && !cacheDisabled && !d2Output) {
+        } else if (templateAction === 'run' && !cacheDisabled) {
           const cached = await executeTemplateRunWithCache(authToken, root, template, params, session.data, executionOptions, {
             refreshRequested,
             forceRefreshRequested,
@@ -21922,17 +27999,29 @@ async function handleBackend(req, res, requestUrl) {
       const deleted = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(found.schema.classNames.template)}/cards/${encodeURIComponent(cardId)}`, authToken, {
         method: 'DELETE'
       });
+      const cacheInvalidation = deleted.ok
+        ? await Promise.all([
+          invalidateTemplateRuntimeCache(found.schema.root, templateCode),
+          invalidateTemplateStaticSnapshots(found.schema.root, templateCode)
+        ])
+        : null;
       logInfo(deleted.ok ? 'template.deleted' : 'template.delete_failed', {
         requestId: req.cmdpRequestId || '',
         templateCode,
-        cmdbuildStatus: deleted.statusCode
+        cmdbuildStatus: deleted.statusCode,
+        runtimeCacheInvalidated: cacheInvalidation && cacheInvalidation[0].invalidated || 0,
+        staticSnapshotsInvalidated: cacheInvalidation && cacheInvalidation[1].invalidated || 0
       });
       sendJson(res, deleted.ok ? 200 : 502, {
         success: deleted.ok,
         cmdbuildStatus: deleted.statusCode,
         root: found.schema.root,
         className: found.schema.classNames.template,
-        template: sanitizeTemplateCard(found.card)
+        template: sanitizeTemplateCard(found.card),
+        cacheInvalidation: cacheInvalidation && {
+          runtime: cacheInvalidation[0],
+          staticSnapshots: cacheInvalidation[1]
+        }
       });
       return;
     }
@@ -21995,7 +28084,7 @@ async function handleBackend(req, res, requestUrl) {
         return;
       }
 
-      const body = await readJsonBody(req);
+      const body = await readJsonBody(req, TEMPLATE_REQUEST_MAX_BYTES);
       const expectedSpecHash = expectedSpecHashFromBody(body);
       const currentTemplate = sanitizeTemplateCard(found.card);
       if (expectedSpecHash && currentTemplate && currentTemplate.specHash !== expectedSpecHash) {
@@ -22027,12 +28116,21 @@ async function handleBackend(req, res, requestUrl) {
       const versionLog = updated.ok
         ? await writeTemplateVersion(authToken, found.schema.root, payload.Code, safeJsonValue(payload.SpecJson, null), session.data && session.data.username, body.changeComment || 'update')
         : null;
+      const cacheInvalidation = updated.ok
+        ? await Promise.all([
+          invalidateTemplateRuntimeCache(found.schema.root, payload.Code),
+          invalidateTemplateStaticSnapshots(found.schema.root, payload.Code)
+        ])
+        : null;
       logInfo(updated.ok ? 'template.updated' : 'template.update_failed', {
         requestId: req.cmdpRequestId || '',
         templateCode: payload.Code,
         username: session.data && session.data.username || '',
         cmdbuildStatus: updated.statusCode,
-        versionLogged: Boolean(versionLog)
+        versionLogged: Boolean(versionLog),
+        runtimeCacheInvalidated: cacheInvalidation && cacheInvalidation[0].invalidated || 0,
+        staticSnapshotsInvalidated: cacheInvalidation && cacheInvalidation[1].invalidated || 0,
+        cacheInvalidationComplete: cacheInvalidation ? cacheInvalidation.every((item) => item.complete) : false
       });
       sendJson(res, updated.ok ? 200 : 502, {
         success: updated.ok,
@@ -22040,7 +28138,11 @@ async function handleBackend(req, res, requestUrl) {
         root: found.schema.root,
         className: found.schema.classNames.template,
         template: sanitizeTemplateCard(updated.json && updated.json.data),
-        versionLog
+        versionLog,
+        cacheInvalidation: cacheInvalidation && {
+          runtime: cacheInvalidation[0],
+          staticSnapshots: cacheInvalidation[1]
+        }
       });
       return;
     }
@@ -22375,11 +28477,17 @@ export {
   applyTemplateParamDefaults,
   assistantCandidateClassesFromSummary,
   assistantClassMentionsFromText,
+  assistantObjectFlowCandidate,
+  assistantObjectFlowMessages,
+  assistantDiagramSelectionMappings,
+  assistantDiagramSemanticDecisions,
   assistantLimitWarningsFromDiagnostics,
   assistantMessages,
   assistantSearchTermsFromText,
+  assertDiagramImportProposal,
   buildResultCellMeta,
   buildResultDiagrams,
+  createDiagramImportProposal,
   buildTechnicalSchema,
   cmdbuildClassAttributesPath,
   cmdbuildRequestCanRetry,
@@ -22387,7 +28495,11 @@ export {
   defaultRuntimeConfig,
   dependencyMapWithHash,
   d2RendererConfigSummary,
+  d2CacheContext,
+  d2ImportConfigSummary,
+  d2ImporterHealth,
   d2RendererHealth,
+  embedDiagramSvgMetadata,
   executionThrottleScopeKey,
   expectedSpecHashFromBody,
   extractAssistantDraftSpec,
@@ -22404,6 +28516,8 @@ export {
   normalizeLogLevel,
   normalizeLogTargets,
   normalizeRuntimeCacheConfig,
+  normalizeDiagramImportIr,
+  diagramImportAssistantSpec,
   normalizeTemplateCacheConfig,
   normalizeTemplateSpecForStorage,
   parseAssistantJson,
@@ -22413,11 +28527,14 @@ export {
   renderRuntimeParamTemplate,
   renderCellTemplate,
   renderD2SourceToSvg,
+  applyDiagramImportProposal,
+  completeDiagramImportV3FromSpec,
   renderPrometheusMetrics,
   callLiteLLM,
   mcpToolDefinitions,
   runtimeCacheKeyParts,
   runtimeCacheMeta,
+  invalidateTemplateRuntimeCache,
   runtimeDisplayResponsePayload,
   runtimeD2OutputRequested,
   runtimeJsonOutputRequested,

@@ -79,18 +79,49 @@ test('Designer blocks template-bound menu sections until a template is selected'
   });
 });
 
-test('Designer run page exposes contextual buttons after selecting a template', { skip: skipReason }, async (t) => {
-  const template = await firstTemplateCode(cookieHeader);
-  if (!template) {
-    t.skip('No saved templates are visible to the current CMDBuild user.');
-    return;
-  }
+test('Assistant keeps prompts separate from deterministic Designer controls', { skip: skipReason }, async () => {
+  await withPage(async (page) => {
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.locator('#cmdp-language').selectOption('ru');
+    await page.locator('button[data-action="new-template"]').click();
+    await page.waitForSelector('#cmdp-template-editor', { timeout: 10_000 });
+    await page.locator('#cmdp-code').fill('AssistantPromptOnlyUiSmoke');
+    await page.locator('#cmdp-description').fill('Assistant prompt-only UI smoke');
+    await page.locator('a[data-designer-section="assistant"]').click();
+    await page.waitForSelector('#cmdp-assistant-editor', { timeout: 10_000 });
 
+    assert.equal((await page.locator('a[data-designer-section="assistant"]').innerText()).trim(), 'Ассистент');
+    assert.equal((await page.locator('#cmdp-assistant-editor h2').first().innerText()).trim(), 'Ассистент');
+    assert.match(await page.locator('#cmdp-assistant-editor').innerText(), /Статус ассистента/);
+    assert.doesNotMatch(await page.locator('#cmdp-assistant-editor').innerText(), /Provider|Base URL|Model|MCP context/);
+    assert.equal(await page.locator('[data-object-selection], [data-matching-block], [data-matching-rule-row], [data-diagram-import-role-mapping]').count(), 0);
+    assert.equal(await page.locator('#cmdp-assistant-diagram-mapping-prompt').count(), 1);
+    assert.equal(await page.locator('button[data-action="assistant-diagram-map"]').isDisabled(), true);
+
+    const flowPrompt = page.locator('#cmdp-assistant-object-flow-prompt');
+    assert.equal(await flowPrompt.isVisible(), true);
+    assert.equal(await page.locator('[data-assistant-flow-selection], [data-assistant-flow-match]').count(), 0);
+    const promptWidth = await flowPrompt.evaluate((node) => {
+      const rect = node.getBoundingClientRect();
+      const parentRect = node.parentElement.getBoundingClientRect();
+      return { width: rect.width, parentWidth: parentRect.width };
+    });
+    assert.ok(promptWidth.width >= promptWidth.parentWidth - 1, JSON.stringify(promptWidth));
+  });
+});
+
+test('Designer run page exposes contextual buttons after selecting a template', { skip: skipReason }, async (t) => {
   await withPage(async (page) => {
     await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector(`#cmdp-designer-menu`, { timeout: 10_000 });
-    const selector = `[data-action="select-template"][data-code="${cssEscape(template)}"]`;
-    await page.locator(selector).first().click();
+    await page.waitForSelector('#cmdp-template-list', { timeout: 10_000 });
+    const visibleTemplates = page.locator('[data-action="select-template"][data-code]');
+    if (await visibleTemplates.count() === 0) {
+      t.skip('No saved templates are visible to the current CMDBuild user.');
+      return;
+    }
+    await visibleTemplates.first().click();
     await page.locator('a[data-designer-section="run"]').click();
     await page.waitForSelector('.designer-actionbar', { timeout: 10_000 });
 
@@ -112,6 +143,19 @@ test('Designer cache launch URLs do not collapse into one-character columns', { 
     await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
     const selector = `[data-action="select-template"][data-code="${cssEscape(runtimeCacheLayoutTemplate)}"]`;
+    if (await page.locator(selector).count() === 0) {
+      const diagnostic = await page.evaluate(async () => {
+        const response = await fetch('/cmdbuild/custom-api/templates?limit=1000', { credentials: 'same-origin' });
+        const json = await response.json().catch(() => ({}));
+        return {
+          url: location.href,
+          status: response.status,
+          apiCodes: Array.isArray(json.data) ? json.data.map((item) => item.code || item.Code || '') : [],
+          listText: document.querySelector('#cmdp-template-list')?.textContent || ''
+        };
+      });
+      assert.fail(`Template row is absent after Designer load: ${JSON.stringify(diagnostic)}`);
+    }
     await page.locator(selector).first().click();
     await page.locator('a[data-designer-section="cache"]').click();
     await page.waitForSelector('#cmdp-cache-editor', { timeout: 10_000 });
@@ -129,6 +173,414 @@ test('Designer cache launch URLs do not collapse into one-character columns', { 
   });
 });
 
+test('Relations Apply keeps 3-stage dependency order and custom match columns', { skip: skipReason, timeout: 90_000 }, async () => {
+  await withPage(async (page) => {
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.locator('button[data-action="new-template"]').click();
+    await page.waitForSelector('#cmdp-template-editor', { timeout: 10_000 });
+    await page.locator('#cmdp-code').fill('ThreeStageRelationsUiSmoke');
+    await page.locator('#cmdp-description').fill('Three stage Relations UI smoke');
+    await page.locator('a[data-designer-section="object-group"]').click();
+    await page.waitForSelector('#cmdp-object-group-editor', { timeout: 10_000 });
+
+    for (let index = 0; index < 3; index += 1) {
+      if (index > 0) await page.locator('button[data-action="add-object-selection"]').click();
+      const selection = page.locator('[data-object-selection]').nth(index);
+      if (await selection.locator('[data-object-selection-field="className"] option[value="ARM"]').count() === 0) {
+        await page.locator('#cmdp-catalog-header').click();
+        await selection.locator('[data-object-selection-field="className"] option[value="ARM"]').waitFor({ state: 'attached', timeout: 60_000 });
+      }
+      await selection.locator('[data-object-selection-field="className"]').selectOption('ARM');
+      await selection.locator('[data-object-selection-field="columns"]').fill(index === 0 ? 'model' : index === 1 ? 'model2' : 'Location');
+    }
+    await page.locator('button[data-action="apply-object-group"]').click();
+    await page.locator('a[data-designer-section="relations"]').click();
+    await page.waitForSelector('#cmdp-relation-expansion-editor', { timeout: 10_000 });
+    assert.equal(await page.locator('[data-matching-block]').count(), 0);
+    await page.locator('button[data-action="add-matching-block"]').click();
+    let matchingBlock = page.locator('[data-matching-block]').first();
+    assert.deepEqual(await matchingBlock.locator('[data-matching-block-field="from"] option').evaluateAll((options) => options.map((option) => option.value).filter(Boolean)), ['objects', 'objects2', 'objects3']);
+    await matchingBlock.locator('[data-matching-block-field="from"]').selectOption('objects');
+    await matchingBlock.locator('[data-matching-block-field="with"]').selectOption('objects2');
+    await matchingBlock.locator('[data-matching-block-field="as"]').fill('matchedObjects');
+    await page.locator('button[data-action="add-matching-block"]').click();
+    matchingBlock = page.locator('[data-matching-block]').nth(1);
+    assert.deepEqual(await matchingBlock.locator('[data-matching-block-field="from"] option').evaluateAll((options) => options.map((option) => option.value).filter(Boolean)), ['objects', 'objects2', 'objects3', 'matchedObjects']);
+    await matchingBlock.locator('[data-matching-block-field="from"]').selectOption('matchedObjects');
+    await matchingBlock.locator('[data-matching-block-field="with"]').selectOption('objects3');
+    await matchingBlock.locator('[data-matching-block-field="as"]').fill('matchedObjects3');
+    await page.locator('button[data-action="add-set-operation"]').click();
+    const setOperation = page.locator('[data-set-operation]').first();
+    assert.deepEqual(await setOperation.locator('[data-set-operation-field="from"] option').evaluateAll((options) => options.map((option) => option.value).filter(Boolean)), ['objects', 'objects2', 'objects3', 'matchedObjects', 'matchedObjects3']);
+    await setOperation.locator('[data-set-operation-field="type"]').selectOption('union');
+    await setOperation.locator('[data-set-operation-field="from"]').selectOption('objects');
+    await setOperation.locator('[data-set-operation-field="with"]').selectOption('objects2');
+    await setOperation.locator('[data-set-operation-field="as"]').fill('allArms');
+    await page.locator('[data-result-set-field="publishedAlias"]').selectOption('allArms');
+    await page.locator('button[data-action="apply-relation-expansion"]').click();
+
+    await page.locator('a[data-designer-section="assistant"]').click();
+    const previewRequestPromise = page.waitForRequest((request) => request.url().includes('/cmdbuild/custom-api/draft/preview'));
+    const previewResponsePromise = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/draft/preview'));
+    await page.locator('button[data-action="draft-preview"]').click();
+    const [previewRequest, previewResponse] = await Promise.all([previewRequestPromise, previewResponsePromise]);
+    const payload = previewRequest.postDataJSON();
+    const spec = payload?.template?.spec || {};
+    assert.deepEqual(spec.steps?.map((step) => step.as), ['objects', 'objects2', 'objects3', 'matchedObjects', 'matchedObjects3', 'allArms']);
+    assert.equal(spec.steps?.some((step) => Object.hasOwn(step, 'includeSource')), false);
+    assert.equal(spec.steps?.some((step) => Object.hasOwn(step, 'deduplicateCards')), false);
+    assert.equal(spec.steps?.find((step) => step.as === 'matchedObjects3')?.from, 'matchedObjects');
+    assert.equal(spec.steps?.find((step) => step.as === 'matchedObjects3')?.with, 'objects3');
+    const finalTable = spec.result?.tables?.find((table) => table.name === 'matchedObjects3');
+    assert.equal(finalTable?.columns?.includes('model'), true, JSON.stringify(finalTable));
+    assert.ok(finalTable?.columns?.some((column) => String(column).endsWith('model2')), JSON.stringify(finalTable));
+    assert.ok(finalTable?.columns?.some((column) => String(column).endsWith('Location')), JSON.stringify(finalTable));
+    assert.equal(spec.result?.tables?.find((table) => table.name === 'allArms')?.published, true);
+    const previewStatus = previewResponse.status();
+    assert.equal(previewStatus, 200, previewStatus === 200 ? '' : await previewResponse.text());
+
+    await page.locator('a[data-designer-section="relations"]').click();
+    await page.locator('button[data-action="clear-matching-block"]').first().click();
+    assert.equal(await page.locator('[data-matching-block]').count(), 2);
+    await page.locator('[role="alert"]').waitFor({ timeout: 10_000 });
+    assert.match(await page.locator('[role="alert"]').innerText(), /Cannot remove matchedObjects/);
+
+    await page.locator('[data-set-operation-field="from"]').selectOption('');
+    await page.locator('button[data-action="apply-relation-expansion"]').click();
+    await page.locator('[role="alert"]').waitFor({ timeout: 10_000 });
+    assert.match(await page.locator('[role="alert"]').innerText(), /requires both source aliases/);
+  });
+});
+
+test('Object Group keeps path suggestion filters conditional and out of the Spec', { skip: skipReason, timeout: 90_000 }, async () => {
+  await withPage(async (page) => {
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.locator('#cmdp-language').selectOption('ru');
+    await page.locator('button[data-action="new-template"]').click();
+    await page.waitForSelector('#cmdp-template-editor', { timeout: 10_000 });
+    await page.locator('#cmdp-code').fill('ObjectGroupPathHintUiSmoke');
+    await page.locator('#cmdp-description').fill('Object group path hint UI smoke');
+    await page.locator('a[data-designer-section="object-group"]').click();
+    await page.waitForSelector('#cmdp-object-group-editor', { timeout: 10_000 });
+
+    const selection = page.locator('[data-object-selection]').first();
+    const classField = selection.locator('[data-object-selection-field="className"]');
+    if (await classField.locator('option[value="ARM"]').count() === 0) {
+      await page.locator('#cmdp-catalog-header').click();
+      await classField.locator('option[value="ARM"]').waitFor({ state: 'attached', timeout: 60_000 });
+    }
+    await classField.selectOption('ARM');
+
+    const provenance = await selection.locator('[data-object-scope-field="path"]').first().evaluate((field) => {
+      const values = Array.from(field.options)
+        .map((option) => [option.dataset.domain || '', option.dataset.cardinality || '', option.dataset.direction || ''])
+        .filter((parts) => parts.some(Boolean));
+      return new Set(values.map((parts) => parts.join('\u0000'))).size;
+    });
+    const filters = selection.locator('details[data-object-path-filter]');
+    assert.equal(await filters.count(), provenance > 1 ? 1 : 0);
+    if (provenance > 1) {
+      assert.equal(await filters.evaluate((node) => node.open), false);
+      await filters.locator('summary').click();
+      assert.match(await filters.innerText(), /Сужают только подсказки в поле «Атрибут\/путь класса»/);
+      assert.match(await filters.innerText(), /Домен:|Кардинальность:|Направление:/);
+    }
+
+    await page.locator('button[data-action="apply-object-group"]').click();
+    await page.locator('a[data-designer-section="assistant"]').click();
+    const previewRequestPromise = page.waitForRequest((request) => request.url().includes('/cmdbuild/custom-api/draft/preview'));
+    const previewResponsePromise = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/draft/preview'));
+    await page.locator('button[data-action="draft-preview"]').click();
+    const previewRequest = await previewRequestPromise;
+    const spec = previewRequest.postDataJSON()?.template?.spec || {};
+    for (const step of spec.steps || []) {
+      assert.equal(Object.hasOwn(step, 'domainFilter'), false);
+      assert.equal(Object.hasOwn(step, 'cardinalityFilter'), false);
+      assert.equal(Object.hasOwn(step, 'directionFilter'), false);
+    }
+    const previewResponse = await previewResponsePromise;
+    assert.equal(previewResponse.status(), 200, await previewResponse.text());
+  });
+});
+
+test('Designer renders D2 import preview before structure interpretation', { skip: skipReason, timeout: 60_000 }, async () => {
+  await withPage(async (page) => {
+    const pageErrors = [];
+    page.on('pageerror', (error) => pageErrors.push(error.message || String(error)));
+    await page.goto(`${nginxOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.locator('button[data-action="new-template"]').click();
+    await page.waitForSelector('#cmdp-template-editor', { timeout: 10_000 });
+    await page.locator('#cmdp-code').fill('D2ImportPreviewUiSmoke');
+    await page.locator('#cmdp-description').fill('D2 import preview UI smoke');
+    await page.locator('a[data-designer-section="assistant"]').click();
+    await page.waitForSelector('#cmdp-assistant-editor', { timeout: 10_000 });
+    const importPreview = page.locator('[data-diagram-import-preview]');
+    assert.equal(await importPreview.count(), 1);
+    assert.equal(await importPreview.getAttribute('data-diagram-import-preview-state'), 'empty');
+    assert.equal(await importPreview.isVisible(), true);
+    assert.ok((await importPreview.boundingBox())?.height >= 240, 'Empty D2 preview area is not visibly reserved.');
+    await page.locator('#cmdp-diagram-import-source').fill([
+      'direction: right',
+      'router: Router',
+      'switch: Switch',
+      'gateway: Gateway',
+      'database: Database',
+      'service: Service',
+      'router -> switch: uplink',
+      'switch -> gateway',
+      'gateway -> database',
+      'database -> service'
+    ].join('\n'));
+
+    const analyzeResponsePromise = page.waitForResponse((response) => response.url().includes('/draft/diagram-import/analyze'));
+    await page.locator('button[data-action="diagram-import-analyze"]').click();
+    const analyzeResponse = await analyzeResponsePromise;
+    const analyzeBody = await analyzeResponse.json();
+    assert.equal(analyzeResponse.status(), 200, `D2 preview analysis failed: ${JSON.stringify(analyzeBody)}`);
+    assert.equal(analyzeBody.preview?.rendered, true, `D2 preview was not rendered: ${JSON.stringify(analyzeBody.preview)}`);
+
+    assert.equal(await importPreview.getAttribute('data-diagram-import-preview-state'), 'rendered');
+    assert.equal(await importPreview.locator('[data-d2-rendered-svg]').count(), 1);
+    assert.equal(await importPreview.locator('[data-d2-rendered-svg]').isVisible(), true);
+    assert.ok((await importPreview.locator('[data-d2-rendered-svg]').boundingBox())?.height >= 220, 'Rendered D2 SVG has no visible height.');
+    const viewport = importPreview.locator('[data-diagram-viewport]');
+    const viewportCanvas = viewport.locator('[data-diagram-viewport-canvas]');
+    assert.equal(await viewport.count(), 1);
+    assert.equal(await viewport.locator('button[data-action="diagram-zoom-out"]').count(), 1);
+    assert.equal(await viewport.locator('button[data-action="diagram-zoom-reset"]').count(), 1);
+    assert.equal(await viewport.locator('button[data-action="diagram-zoom-in"]').count(), 1);
+    await viewport.locator('button[data-action="diagram-zoom-in"]').click();
+    assert.equal(await viewport.locator('[data-diagram-viewport-scale-label]').innerText(), '125%');
+    for (let index = 0; index < 7; index += 1) await viewport.locator('button[data-action="diagram-zoom-in"]').click();
+    assert.equal(await viewport.locator('[data-diagram-viewport-scale-label]').innerText(), '300%');
+    assert.equal(await viewportCanvas.evaluate((canvas) => canvas.scrollWidth > canvas.clientWidth || canvas.scrollHeight > canvas.clientHeight), true);
+    await viewportCanvas.scrollIntoViewIfNeeded();
+    const canvasBox = await viewportCanvas.boundingBox();
+    assert.ok(canvasBox);
+    const beforePan = await viewportCanvas.evaluate((canvas) => ({
+      scrollLeft: canvas.scrollLeft,
+      scrollTop: canvas.scrollTop,
+      scrollWidth: canvas.scrollWidth,
+      scrollHeight: canvas.scrollHeight,
+      clientWidth: canvas.clientWidth,
+      clientHeight: canvas.clientHeight
+    }));
+    await page.mouse.move(canvasBox.x + canvasBox.width * 0.7, canvasBox.y + canvasBox.height * 0.7);
+    await page.mouse.down();
+    await page.mouse.move(canvasBox.x + canvasBox.width * 0.25, canvasBox.y + canvasBox.height * 0.25);
+    await page.mouse.up();
+    const afterPan = await viewportCanvas.evaluate((canvas) => ({ scrollLeft: canvas.scrollLeft, scrollTop: canvas.scrollTop }));
+    assert.equal(afterPan.scrollLeft > beforePan.scrollLeft || afterPan.scrollTop > beforePan.scrollTop, true, 'Expected drag to pan viewport: ' + JSON.stringify({ beforePan, afterPan }));
+    await viewport.locator('button[data-action="diagram-zoom-reset"]').click();
+    assert.equal(await viewport.locator('[data-diagram-viewport-scale-label]').innerText(), '100%');
+    const previewBeforeInterpretation = await page.locator('#cmdp-assistant-editor').evaluate((root) => {
+      const preview = root.querySelector('[data-diagram-import-preview]');
+      const interpretation = root.querySelector('.assistant-d2-prompt');
+      return Boolean(preview && interpretation && (preview.compareDocumentPosition(interpretation) & Node.DOCUMENT_POSITION_FOLLOWING));
+    });
+    assert.equal(previewBeforeInterpretation, true, 'D2 preview must be rendered before D2 structure interpretation.');
+
+    await page.locator('#cmdp-diagram-import-source').fill('router: Router\nswitch: Switch\nrouter -> switch: changed uplink');
+    assert.equal(await page.locator('[data-diagram-import-stale]:visible').count(), 1);
+    assert.equal(await importPreview.getAttribute('data-diagram-import-preview-state'), 'stale');
+    assert.equal(await importPreview.locator('[data-d2-rendered-svg]').isVisible(), true);
+    assert.match(await importPreview.locator('[data-diagram-import-preview-status]').innerText(), /previous|предыдущему/i);
+    assert.deepEqual(pageErrors, []);
+  }, { cookieOrigin: nginxOrigin });
+});
+
+test('Designer analyzes and applies a reviewed D2 structure template', { skip: skipReason, timeout: 180_000 }, async () => {
+  await withPage(async (page) => {
+    const pageErrors = [];
+    page.on('pageerror', (error) => pageErrors.push(error.message || String(error)));
+    await page.goto(`${nginxOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.locator('button[data-action="new-template"]').click();
+    await page.waitForSelector('#cmdp-template-editor', { timeout: 10_000 });
+    await page.locator('#cmdp-code').fill('D2AssistantMappingUiSmoke');
+    await page.locator('#cmdp-description').fill('D2 Assistant mapping UI smoke');
+    await page.locator('a[data-designer-section="object-group"]').click();
+    await page.waitForSelector('#cmdp-object-group-editor', { timeout: 10_000 });
+    const firstSelection = page.locator('[data-object-selection]').first();
+    if (await firstSelection.locator('[data-object-selection-field="className"] option[value="ARM"]').count() === 0) {
+      await page.locator('#cmdp-catalog-header').click();
+      await firstSelection.locator('[data-object-selection-field="className"] option[value="ARM"]').waitFor({ state: 'attached', timeout: 60_000 });
+    }
+    await firstSelection.locator('[data-object-selection-field="name"]').fill('Workstations');
+    await firstSelection.locator('[data-object-selection-field="alias"]').fill('workstations');
+    await firstSelection.locator('[data-object-selection-field="className"]').selectOption('ARM');
+    await firstSelection.locator('[data-object-selection-field="columns"]').fill('Code, Description, model, model2');
+    await page.locator('button[data-action="apply-object-group"]').click();
+    await page.locator('a[data-designer-section="assistant"]').click();
+    await page.waitForSelector('#cmdp-assistant-editor', { timeout: 10_000 });
+    assert.equal(await page.locator('[data-object-selection], [data-matching-block]').count(), 0);
+    assert.equal(await page.locator('#cmdp-diagram-import-source').count(), 1);
+    assert.equal(await page.locator('#cmdp-assistant-diagram-mapping-prompt').count(), 1);
+    assert.equal(await page.locator('button[data-action="assistant-diagram-map"]').isDisabled(), true);
+    await page.locator('#cmdp-diagram-import-source').fill([
+      'classes: { workstation: { shape: person } }',
+      'users: "Пользователи и отдельные подключения" {',
+      '  operator: "Рабочее место оператора" { class: workstation }',
+      '  administrator: "Рабочее место администратора" { class: workstation }',
+      '}'
+    ].join('\n'));
+    const analyzeResponsePromise = page.waitForResponse((response) => response.url().includes('/draft/diagram-import/analyze'));
+    await page.locator('button[data-action="diagram-import-analyze"]').click();
+    assert.equal(await page.locator('#cmdp-diagram-import-source').isDisabled(), true);
+    const analyzeResponse = await analyzeResponsePromise;
+    const analyzeBody = await analyzeResponse.json();
+    assert.equal(analyzeResponse.status(), 200, `D2 analyze failed: ${JSON.stringify(analyzeBody)}`);
+    assert.equal(analyzeBody.preview?.rendered, true, `D2 import preview was not rendered: ${JSON.stringify(analyzeBody.preview)}`);
+    const importPreview = page.locator('[data-diagram-import-preview]');
+    assert.equal(await importPreview.count(), 1);
+    assert.equal(await importPreview.locator('[data-d2-rendered-svg]').count(), 1);
+    const previewBeforeInterpretation = await page.locator('#cmdp-assistant-editor').evaluate((root) => {
+      const preview = root.querySelector('[data-diagram-import-preview]');
+      const interpretation = root.querySelector('.assistant-d2-prompt');
+      return Boolean(preview && interpretation && (preview.compareDocumentPosition(interpretation) & Node.DOCUMENT_POSITION_FOLLOWING));
+    });
+    assert.equal(previewBeforeInterpretation, true, 'D2 preview must be rendered before D2 structure interpretation.');
+    const analyzedRoles = analyzeBody.proposal?.roles || [];
+    assert.deepEqual(analyzedRoles.map((role) => role.key).sort(), ['users', 'workstation']);
+    assert.equal(analyzedRoles.some((role) => role.key === 'users.operator' || role.key === 'users.administrator'), false);
+    const workstationRole = analyzedRoles.find((role) => role.key === 'workstation');
+    const usersRole = analyzedRoles.find((role) => role.key === 'users');
+    assert.ok(workstationRole);
+    assert.ok(usersRole);
+    assert.equal(await page.locator('[data-diagram-import-role-row], [data-diagram-import-role-mapping], [data-diagram-import-rule-row], [data-diagram-import-placement-row]').count(), 0);
+    assert.equal(await page.locator('button[data-action="diagram-import-apply"]').count(), 0);
+    assert.equal(await page.locator('button[data-action="assistant-diagram-map"]').isEnabled(), true);
+
+    await page.locator('#cmdp-assistant-diagram-interpret-prompt').fill('Интерпретируй workstation как объект, а users как статический контейнер. Не меняй role id.');
+    const interpretResponsePromise = page.waitForResponse((response) => response.url().includes('/assistant/diagram-import/interpret'));
+    await page.locator('button[data-action="assistant-diagram-interpret"]').click();
+    const interpretResponse = await interpretResponsePromise;
+    const interpretBody = await interpretResponse.json();
+    assert.equal(interpretResponse.status(), 200, `D2 interpretation Assistant failed: ${JSON.stringify(interpretBody)}`);
+    assert.ok(interpretBody.decisions?.length > 0, JSON.stringify(interpretBody));
+    assert.equal(interpretBody.decisions?.find((item) => item.roleId === workstationRole.id)?.semantic, 'object', JSON.stringify(interpretBody));
+    assert.equal(await page.locator('#cmdp-assistant-editor').count(), 1);
+    assert.equal(await page.locator('#cmdp-diagram-section-editor').count(), 0);
+
+    await page.locator('#cmdp-assistant-diagram-mapping-prompt').fill('Сопоставь workstation с выборкой Workstations, users оставь статическим. Используй только доступные stage id.');
+    const mappingResponsePromise = page.waitForResponse((response) => response.url().includes('/assistant/diagram-import/map-selections'));
+    await page.locator('button[data-action="assistant-diagram-map"]').click();
+    const mappingResponse = await mappingResponsePromise;
+    const mappingBody = await mappingResponse.json();
+    assert.equal(mappingResponse.status(), 200, `D2 mapping Assistant failed: ${JSON.stringify(mappingBody)}`);
+    assert.ok(mappingBody.mappings?.some((item) => item.source?.stageId === 'selection:workstations'), JSON.stringify(mappingBody));
+
+    const analyzedSource = await page.locator('#cmdp-diagram-import-source').inputValue();
+    await page.locator('#cmdp-diagram-import-source').fill(`${analyzedSource}\n# changed`);
+    assert.equal(await page.locator('[data-diagram-import-stale]:visible').count(), 1);
+    assert.equal(await page.locator('[data-diagram-import-preview]').getAttribute('data-diagram-import-preview-state'), 'stale');
+    assert.equal(await page.locator('[data-diagram-import-preview] [data-d2-rendered-svg]').isVisible(), true);
+    assert.equal(await page.locator('button[data-action="assistant-diagram-map"]').isDisabled(), true);
+    const refreshAnalyzeResponsePromise = page.waitForResponse((response) => response.url().includes('/draft/diagram-import/analyze'));
+    await page.locator('button[data-action="diagram-import-analyze"]').click();
+    const refreshAnalyzeResponse = await refreshAnalyzeResponsePromise;
+    const refreshAnalyzeBody = await refreshAnalyzeResponse.json();
+    assert.equal(refreshAnalyzeResponse.status(), 200, `D2 reanalyze failed: ${JSON.stringify(refreshAnalyzeBody)}`);
+    const refreshedRoles = refreshAnalyzeBody.proposal?.roles || [];
+    const refreshedWorkstation = refreshedRoles.find((role) => role.key === 'workstation');
+    const refreshedUsers = refreshedRoles.find((role) => role.key === 'users');
+    await page.locator('a[data-designer-section="diagram"]').click();
+    await page.waitForSelector('#cmdp-diagram-editor', { timeout: 10_000 });
+    assert.equal(await page.locator('#cmdp-diagram-import-source').count(), 0);
+    assert.equal(await page.locator(`[data-diagram-import-semantic="${cssEscape(refreshedWorkstation.id)}"]`).inputValue(), 'object');
+    assert.equal(await page.locator(`[data-diagram-import-semantic="${cssEscape(refreshedUsers.id)}"]`).inputValue(), 'static');
+    assert.equal(await page.locator('.diagram-import-help summary').count(), 1);
+    assert.match(await page.locator('.diagram-import-help summary').textContent(), /семантик|semantic/i);
+    const workstationMapping = `[data-diagram-import-role-mapping="${cssEscape(refreshedWorkstation.id)}"]`;
+    const sourceStage = page.locator(`${workstationMapping} [data-diagram-import-role-field="source.stageId"]`);
+    const sourceOptions = await sourceStage.locator('option').evaluateAll((options) => options.map((option) => option.value).filter(Boolean));
+    assert.ok(sourceOptions.includes('selection:workstations'), `Workstation selection is absent from D2 mapping sources: ${JSON.stringify(sourceOptions)}`);
+    await sourceStage.selectOption('selection:workstations');
+    const primaryClass = page.locator(`${workstationMapping} [data-diagram-import-role-field="primary.className"]`);
+    assert.equal(await primaryClass.inputValue(), 'ARM');
+    await page.waitForSelector(`${workstationMapping} [data-diagram-import-role-field="primary.structuredFields"] option[value="model"]`, { state: 'attached', timeout: 10_000 });
+    await page.locator(`${workstationMapping} [data-diagram-import-role-field="primary.structuredFields"]`).selectOption(['Code', 'Description', 'model', 'model2']);
+    const labelInput = page.locator(`${workstationMapping} [data-diagram-import-role-field="primary.labelTemplate"]`);
+    await labelInput.fill('${Code} ${Description}');
+    assert.ok(await page.locator(`${workstationMapping} [data-action="insert-diagram-template-token"]`).count() > 0);
+    assert.equal(await page.locator('[data-diagram-import-placement-row]').count(), 1, `Trailing placement row is absent. pageErrors=${JSON.stringify(pageErrors)}`);
+    await page.locator('[data-diagram-import-placement-row] [data-diagram-import-placement-field="parentRoleId"]').first().selectOption(refreshedUsers.id);
+    await page.locator('[data-diagram-import-placement-row] [data-diagram-import-placement-field="childRoleId"]').first().selectOption(refreshedWorkstation.id);
+    assert.equal(await page.locator('button[data-action="diagram-import-apply"]').isEnabled(), true);
+    const applyResponsePromise = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/draft/diagram-import/apply'));
+    await page.locator('button[data-action="diagram-import-apply"]').click();
+    const applyResponse = await applyResponsePromise;
+    const applyBody = await applyResponse.json();
+    assert.equal(applyResponse.status(), 200, `D2 mapping apply failed: ${JSON.stringify(applyBody)}`);
+    await page.waitForFunction(() => /mapping.*applied|mapping.*применен/i.test(String(document.querySelector('.notice') && document.querySelector('.notice').textContent || '')), null, { timeout: 30_000 });
+    assert.equal(await page.locator('[data-diagram-mapping-row]').count(), 0);
+    assert.equal(await page.locator('button[data-action="save-template"]').isDisabled(), true);
+    const previewRequestPromise = page.waitForRequest((request) => request.url().includes('/cmdbuild/custom-api/draft/preview'));
+    const previewResponsePromise = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/draft/preview'));
+    await page.locator('button[data-action="preview-template"]').click();
+    const previewRequest = await previewRequestPromise;
+    const previewRequestBody = previewRequest.postDataJSON();
+    const requestedDiagrams = previewRequestBody?.template?.spec?.result?.diagrams || [];
+    assert.equal(requestedDiagrams.length, 1, `Draft preview lost imported diagram: ${JSON.stringify(requestedDiagrams)}`);
+    assert.equal(requestedDiagrams[0].authoring?.d2Import?.version, 3);
+    assert.equal(requestedDiagrams[0].nodeMappings?.[0]?.importRole?.key, 'workstation');
+    assert.equal(requestedDiagrams[0].groupMappings?.[0]?.importRole?.key, 'users');
+    assert.deepEqual(requestedDiagrams[0].authoring?.d2Import?.roles?.map((role) => role.key).sort(), ['users', 'workstation']);
+    assert.equal(requestedDiagrams[0].nodeMappings?.[0]?.dataProfile?.fields?.includes('model2'), true);
+    const previewResponse = await previewResponsePromise;
+    const previewBody = await previewResponse.json();
+    const previewDiagrams = previewBody?.result?.diagrams || [];
+    assert.equal(previewDiagrams.length, 1, `Draft preview returned no diagram: ${JSON.stringify({ trace: previewBody?.result?.trace, tables: previewBody?.result?.tables?.map((table) => ({ name: table.name, rows: table.rows?.length })) })}`);
+    assert.ok(previewDiagrams[0].nodes?.length > 0, `Draft preview returned an empty diagram: ${JSON.stringify({
+      warnings: previewDiagrams[0].warnings || [],
+      trace: previewBody?.result?.trace,
+      tables: previewBody?.result?.tables?.map((table) => ({ name: table.name, rows: table.rows?.length })),
+      nodeMappings: requestedDiagrams[0]?.nodeMappings,
+      groupMappings: requestedDiagrams[0]?.groupMappings
+    })}`);
+    assert.equal(previewDiagrams[0].svg?.rendered, true, JSON.stringify(previewDiagrams[0].warnings || []));
+    assert.match(previewDiagrams[0].svg?.content || '', /^<svg[\s>]/i);
+    assert.equal(previewBody?.result?.presentation?.outputMode, 'both');
+    await page.waitForSelector('#cmdp-result-section', { timeout: 30_000 });
+    await page.waitForTimeout(100);
+    const renderedSvgCount = await page.locator('[data-d2-rendered-svg]').count();
+    const resultSectionHtml = await page.locator('#cmdp-result-section').innerHTML();
+    assert.equal(renderedSvgCount, 1, `Draft SVG is absent in UI: ${resultSectionHtml.slice(0, 1200)}`);
+    const renderedSvg = await page.locator('[data-d2-rendered-svg]').first().innerHTML();
+    assert.match(renderedSvg, /АРМ|ARM/i);
+    assert.doesNotMatch(renderedSvg, /Рабочее место оператора|Рабочее место администратора/);
+    const draftDownload = page.locator('button[data-action="download-draft-d2"]').first();
+    assert.equal(await draftDownload.isVisible(), true);
+    const [download] = await Promise.all([
+      page.waitForEvent('download'),
+      draftDownload.click()
+    ]);
+    assert.match(download.suggestedFilename(), /\.d2$/);
+    await page.locator('a[data-designer-section="diagram"]').click();
+    assert.equal(await page.locator('[data-diagram-mapping-row]').count(), 0);
+    await page.locator('#cmdp-diagram-title').fill('Changed after preview');
+    assert.equal(await page.locator('button[data-action="save-template"]').isDisabled(), true);
+    await page.locator('a[data-designer-section="assistant"]').click();
+    const reopenAnalyzeResponsePromise = page.waitForResponse((response) => response.url().includes('/draft/diagram-import/analyze'));
+    await page.locator('button[data-action="diagram-import-analyze"]').click();
+    const reopenAnalyzeResponse = await reopenAnalyzeResponsePromise;
+    const reopenAnalyzeBody = await reopenAnalyzeResponse.json();
+    assert.equal(reopenAnalyzeResponse.status(), 200, `D2 reopen analyze failed: ${JSON.stringify(reopenAnalyzeBody)}`);
+    assert.equal(reopenAnalyzeBody.proposal?.roles?.length, 2);
+    await page.locator('a[data-designer-section="diagram"]').click();
+    const reopenedWorkstationMapping = `[data-diagram-import-role-mapping="${cssEscape(refreshedWorkstation.id)}"]`;
+    assert.equal(await page.locator(`${reopenedWorkstationMapping} [data-diagram-import-role-field="primary.className"]`).inputValue(), 'ARM');
+    const reopenedStructuredFields = await page.locator(`${reopenedWorkstationMapping} [data-diagram-import-role-field="primary.structuredFields"]`).evaluate((select) => Array.from(select.selectedOptions).map((option) => option.value));
+    assert.ok(reopenedStructuredFields.includes('model2'), JSON.stringify(reopenedStructuredFields));
+    assert.equal(await page.locator('#cmdp-diagram-title').count(), 0);
+    assert.equal(await page.locator('button[data-action="save-template"]').isDisabled(), true);
+    assert.deepEqual(pageErrors, []);
+  }, { cookieOrigin: nginxOrigin });
+});
+
 test('Assistant generates an ARM by router Location object group and preview renders rows', { skip: skipReason, timeout: 180_000 }, async () => {
   await withPage(async (page) => {
     await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
@@ -140,27 +592,43 @@ test('Assistant generates an ARM by router Location object group and preview ren
     await page.locator('a[data-designer-section="assistant"]').click();
     await page.waitForSelector('#cmdp-assistant-editor', { timeout: 10_000 });
 
-    await page.locator('input[name="cmdp-assistant-task-mode"][value="tables"]').check({ force: true });
-    await page.locator('#cmdp-assistant-intent').fill(assistantIntent);
-    await page.locator('button[data-action="assistant-generate"]').first().click();
-    await page.locator('[data-assistant-busy]').waitFor({ timeout: 10_000 });
-    await page.locator('button[data-action="assistant-generate"]:not([disabled])').first().waitFor({ timeout: 140_000 });
+    await page.locator('#cmdp-assistant-object-flow-prompt').fill([
+      'Выборка 1: найти экземпляр класса "маршрутизатор" с точным описанием "Маршрутизатор для Test City 300", вернуть Code, Description и Location.',
+      'Выборка 2: найти все карточки класса АРМ, вернуть Code, Description, Location, model и model2.',
+      'Соединяем: оставить только АРМ, у которых Location равен Location выбранного маршрутизатора.'
+    ].join('\n'));
+    assert.equal(await page.locator('button[data-action="assistant-flow-apply"]').isDisabled(), true);
+    const flowResponsePromise = page.waitForResponse((response) => response.url().includes('/assistant/object-flow/plan'));
+    await page.locator('button[data-action="assistant-flow-generate"]').click();
+    const flowResponse = await flowResponsePromise;
+    const flowBody = await flowResponse.json();
+    assert.equal(flowResponse.status(), 200, JSON.stringify(flowBody));
+    assert.equal(flowBody.flow?.selections?.[0]?.className, 'routerG');
+    assert.equal(flowBody.flow?.selections?.[1]?.className, 'ARM');
+    assert.ok(flowBody.flow?.selections?.[0]?.rules?.some((rule) => rule.path === 'Description' && rule.op === 'equals' && rule.value === 'Маршрутизатор для Test City 300'), JSON.stringify(flowBody));
+    assert.deepEqual(flowBody.flow?.blocks?.[0]?.rules?.map((rule) => ({ left: rule.leftColumn, right: rule.rightColumn, operator: rule.operator })), [{ left: 'Location', right: 'Location', operator: 'equals' }]);
+    assert.equal(await page.locator('[data-object-selection], [data-matching-block], [data-matching-rule-row]').count(), 0);
+    await page.locator('button[data-action="assistant-flow-apply"]').click();
+    await page.waitForFunction(() => /цепочк|data flow/i.test(String(document.querySelector('.notice')?.textContent || '')), null, { timeout: 30_000 });
 
-    const assistantText = await page.locator('#cmdp-assistant-editor').innerText();
-    assert.doesNotMatch(assistantText, /Validation errors|Template spec must|routerCore|Маршрутизатор ядра/);
-    assert.match(assistantText, /routerG/);
-    assert.match(assistantText, /\bARM\b/);
-
-    await page.locator('button[data-action="assistant-apply-draft"]').first().click();
     await page.locator('a[data-designer-section="extraction"]').click();
     await page.waitForSelector('#cmdp-extraction-editor', { timeout: 10_000 });
     const extractionOptions = await extractionResultOptions(page);
-    assert.ok(extractionOptions.some((item) => item.value === 'arms'), `Extraction source options do not include arms: ${JSON.stringify(extractionOptions)}`);
+    const finalExtractionSource = extractionOptions.find((item) => /^Final result/.test(item.text))?.value || '';
+    assert.ok(finalExtractionSource, `Extraction source options do not include a final matching stage: ${JSON.stringify(extractionOptions)}`);
+    const extractionResponsePromise = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/draft/preview'));
     await page.locator('button[data-action="extract-template"]').first().click();
-    await page.waitForFunction(() => {
-      const rows = Array.from(document.querySelectorAll('#cmdp-extraction-editor tbody tr'));
-      return rows.some((row) => /ARM|АРМ/i.test(String(row.textContent || '')) && /300|Test City/i.test(String(row.textContent || '')));
-    }, null, { timeout: 60_000 });
+    const extractionResponse = await extractionResponsePromise;
+    const extractionBody = await extractionResponse.json();
+    assert.equal(extractionResponse.status(), 200, `Assistant extraction failed: ${JSON.stringify(extractionBody)}`);
+    const extractionTables = extractionBody?.result?.tables || [];
+    const finalExtractionTable = extractionTables.find((table) => table.name === finalExtractionSource);
+    const extractionResultRows = finalExtractionTable?.rows || [];
+    assert.ok(
+      extractionResultRows.some((row) => /ARM|АРМ/i.test(JSON.stringify(row)) && /300|Test City/i.test(JSON.stringify(row))),
+      `Assistant final extraction JSON has no Test City 300 ARM rows: ${JSON.stringify({ source: finalExtractionSource, trace: extractionBody?.result?.trace, tables: extractionTables })}`
+    );
+    await page.waitForSelector('#cmdp-extraction-editor tbody tr', { timeout: 10_000 });
     const extractionRows = await extractionPreviewRows(page);
     assert.ok(extractionRows.length > 0, 'Assistant draft extraction rendered no result rows.');
     assert.ok(extractionRows.some((row) => /ARM|АРМ/i.test(row) && /300|Test City/i.test(row)), `Assistant draft extraction rows do not look like Test City 300 ARM cards: ${JSON.stringify(extractionRows.slice(0, 5))}`);
@@ -173,23 +641,33 @@ test('Assistant generates an ARM by router Location object group and preview ren
     assert.ok(routerSelection, `routerG object selection was not rendered: ${JSON.stringify(selections)}`);
     assert.ok(armSelection, `ARM object selection was not rendered: ${JSON.stringify(selections)}`);
     assert.ok(routerSelection.rules.some((rule) => rule.path === 'Description' && rule.op === 'equals' && rule.value === 'Маршрутизатор для Test City 300'), `routerG selection has no exact Description filter: ${JSON.stringify(routerSelection.rules)}`);
-    assert.ok(armSelection.from, `ARM selection is not linked to the router anchor: ${JSON.stringify(armSelection)}`);
-    assert.ok(armSelection.rules.some((rule) => rule.path === 'Location' && rule.op === 'equals' && rule.valueColumn === 'Location'), `ARM selection has no Location valueColumn filter: ${JSON.stringify(armSelection.rules)}`);
+    await page.locator('a[data-designer-section="relations"]').click();
+    await page.waitForSelector('[data-matching-block]', { timeout: 10_000 });
+    const matchRule = await page.locator('[data-matching-rule-row]').first().evaluate((row) => ({
+      left: row.querySelector('[data-matching-rule-field="leftColumn"]')?.value || '',
+      right: row.querySelector('[data-matching-rule-field="rightColumn"]')?.value || '',
+      operator: row.querySelector('[data-matching-rule-field="operator"]')?.value || ''
+    }));
+    assert.equal(matchRule.left, 'Location');
+    assert.equal(matchRule.right, 'Location');
+    assert.equal(matchRule.operator, 'equals');
 
-    await page.locator('button[data-action="apply-object-group"]').first().click();
     await page.locator('a[data-designer-section="final-view"]').click();
     await page.waitForSelector('#cmdp-view-composer-editor', { timeout: 10_000 });
     await page.waitForFunction(() => {
       const values = Array.from(document.querySelectorAll('[data-view-column-field="field"] option')).map((option) => option.value);
-      return values.includes('model') && values.includes('model2');
+      return values.some((value) => value === 'model' || /[._]model$/.test(value))
+        && values.some((value) => value === 'model2' || /[._]model2$/.test(value));
     }, null, { timeout: 30_000 });
     const finalFieldOptions = await viewComposerFieldOptions(page);
-    assert.ok(finalFieldOptions.includes('model'), `Final data field options do not include model: ${JSON.stringify(finalFieldOptions)}`);
-    assert.ok(finalFieldOptions.includes('model2'), `Final data field options do not include model2: ${JSON.stringify(finalFieldOptions)}`);
+    const modelField = finalFieldOptions.find((field) => field === 'model' || /[._]model$/.test(field));
+    const model2Field = finalFieldOptions.find((field) => field === 'model2' || /[._]model2$/.test(field));
+    assert.ok(modelField, `Final data field options do not include model: ${JSON.stringify(finalFieldOptions)}`);
+    assert.ok(model2Field, `Final data field options do not include model2: ${JSON.stringify(finalFieldOptions)}`);
     const finalRowsBeforeAutoAdd = await page.locator('[data-view-column-row]').count();
     await setViewComposerColumns(page, [
-      { field: 'model', title: 'model' },
-      { field: 'model2', title: 'model2' }
+      { field: modelField, title: 'model' },
+      { field: model2Field, title: 'model2' }
     ]);
     const finalRowsAfterAutoAdd = await page.locator('[data-view-column-row]').count();
     assert.ok(finalRowsAfterAutoAdd >= finalRowsBeforeAutoAdd + 2, `Final data did not auto-add rows after filling the last empty row: before=${finalRowsBeforeAutoAdd} after=${finalRowsAfterAutoAdd}`);
@@ -614,21 +1092,9 @@ async function hasValidSession(cookie) {
   }
 }
 
-async function firstTemplateCode(cookie) {
-  try {
-    const result = await request('GET', `${proxyOrigin}/cmdbuild/custom-api/templates?limit=1`, undefined, { cookie });
-    if (result.statusCode !== 200) return '';
-    const json = JSON.parse(result.body || '{}');
-    const data = Array.isArray(json.data) ? json.data : [];
-    return data[0] && data[0].code || data[0] && data[0].Code || '';
-  } catch {
-    return '';
-  }
-}
-
 async function templateCodeExists(cookie, code) {
   try {
-    const result = await request('GET', `${proxyOrigin}/cmdbuild/custom-api/templates?limit=100`, undefined, { cookie });
+    const result = await request('GET', `${proxyOrigin}/cmdbuild/custom-api/templates?limit=1000`, undefined, { cookie });
     if (result.statusCode !== 200) return false;
     const json = JSON.parse(result.body || '{}');
     const data = Array.isArray(json.data) ? json.data : [];
