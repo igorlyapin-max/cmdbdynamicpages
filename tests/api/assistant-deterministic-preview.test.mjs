@@ -378,6 +378,8 @@ test('typed object-flow apply compiles deterministic stages and removed Assistan
 });
 
 test('full object-flow planning returns a validated proposal without mutating the editor spec', async (t) => {
+  const initialSpec = { version: 1, steps: [], result: { tables: [] } };
+  const templateCode = 'AssistantOutputLabels';
   const llm = await startLiteLlmStub(t, {
     flow: {
       version: 1,
@@ -405,6 +407,7 @@ test('full object-flow planning returns a validated proposal without mutating th
     }
   });
   const mock = await startMockCmdbuild(t, {
+    templates: [templateCard(templateCode, initialSpec)],
     configCards: [{
       _id: 1,
       Code: 'Cst_QueryTool',
@@ -421,11 +424,12 @@ test('full object-flow planning returns a validated proposal without mutating th
   const backendOrigin = `http://127.0.0.1:${backendPort}`;
   const cookie = 'CMDBuild-Authorization=object-flow-plan-token';
   const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const planRequest = objectFlowPlanRequest('маршрутизатор с описанием Маршрутизатор для Test City 300. АРМ в том же Location.');
   const response = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/plan`, {
-    templateCode: '',
-    baseSpecHash: '',
-    currentSpec: { version: 1, steps: [], result: { tables: [] } },
-    ...objectFlowPlanRequest('маршрутизатор с описанием Маршрутизатор для Test City 300. АРМ в том же Location.')
+    templateCode,
+    baseSpecHash: hashJson(initialSpec),
+    currentSpec: initialSpec,
+    ...planRequest
   }, {
     cookie,
     origin: backendOrigin,
@@ -443,6 +447,101 @@ test('full object-flow planning returns a validated proposal without mutating th
     on: [{ left: 'Class', right: 'Class' }, { left: '_id', right: '_id' }], distinct: true, caseSensitive: false
   });
   assert.equal(response.json.flow.publishedAlias, 'allAssets');
+  assert.deepEqual(response.json.outputBindings, [{ blockId: 'block-1', alias: 'allAssets' }]);
+  assert.deepEqual(response.json.diagnostics.objectFlow.outputBindingErrors, []);
+  const rejectedApply = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/object-flow/apply`, {
+    templateCode,
+    baseSpecHash: hashJson(initialSpec),
+    currentSpec: initialSpec,
+    flow: response.json.flow,
+    assistantObjectFlowIntent: planRequest.intent,
+    assistantOutputBindings: []
+  }, {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token
+  });
+  assert.equal(rejectedApply.statusCode, 422, rejectedApply.body);
+  assert.equal(rejectedApply.json.code, 'assistant_output_bindings_invalid');
+  const applied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/object-flow/apply`, {
+    templateCode,
+    baseSpecHash: hashJson(initialSpec),
+    currentSpec: initialSpec,
+    flow: response.json.flow,
+    assistantObjectFlowIntent: planRequest.intent,
+    assistantOutputBindings: response.json.outputBindings
+  }, {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token
+  });
+  assert.equal(applied.statusCode, 200, applied.body);
+  const outputManifest = applied.json.spec.visualModels.find((model) => model.mode === 'objectMatching').outputs;
+  const ownershipManifest = applied.json.spec.visualModels.find((model) => model.mode === 'objectMatching').assistantOutputManifest;
+  assert.deepEqual(ownershipManifest, {
+    version: 1,
+    blocks: [{ id: 'block-1', name: 'Result', order: 1 }]
+  });
+  assert.deepEqual(outputManifest.map((output) => [output.alias, output.label, output.assistantBlockId, output.assistantBlockIds]), [
+    ['routers', 'Result: Выборка 1', 'block-1', ['block-1']],
+    ['arms', 'Result: Выборка 2', 'block-1', ['block-1']],
+    ['matchedObjects', 'Result: Сопоставление 1', 'block-1', ['block-1']],
+    ['allAssets', 'Result', 'block-1', ['block-1']]
+  ]);
+  assert.equal(applied.json.spec.result.tables.find((table) => table.name === 'routers').title, 'Result: Выборка 1');
+  assert.equal(applied.json.spec.result.tables.find((table) => table.name === 'arms').title, 'Result: Выборка 2');
+  assert.equal(applied.json.spec.result.tables.find((table) => table.name === 'allAssets').title, 'Result');
+  assert.equal(applied.json.spec.result.tables.find((table) => table.name === 'matchedObjects').title, 'Result: Сопоставление 1');
+  const saved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}`, {
+    code: templateCode,
+    spec: applied.json.spec,
+    expectedSpecHash: hashJson(initialSpec)
+  }, {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token
+  });
+  assert.equal(saved.statusCode, 200, saved.body);
+  const reloaded = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/templates?root=Cst_QueryTool`, undefined, { cookie });
+  assert.equal(reloaded.statusCode, 200, reloaded.body);
+  const reloadedSpec = reloaded.json.data.find((template) => template.code === templateCode)?.spec;
+  assert.ok(reloadedSpec, reloaded.body);
+  assert.deepEqual(
+    reloadedSpec.visualModels.find((model) => model.mode === 'objectMatching').outputs.map((output) => [output.alias, output.label]),
+    outputManifest.map((output) => [output.alias, output.label])
+  );
+  assert.deepEqual(
+    reloadedSpec.visualModels.find((model) => model.mode === 'objectMatching').assistantOutputManifest,
+    ownershipManifest
+  );
+  assert.deepEqual(
+    reloadedSpec.result.tables.map((table) => [table.name, table.title]),
+    applied.json.spec.result.tables.map((table) => [table.name, table.title])
+  );
+  const duplicateNameIntent = {
+    context: '',
+    blocks: [
+      ...planRequest.intent.blocks,
+      {
+        ...planRequest.intent.blocks[0],
+        id: 'block-2',
+        name: ' result ',
+        uses: []
+      }
+    ]
+  };
+  const duplicateName = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+    templateCode,
+    baseSpecHash: hashJson(initialSpec),
+    currentSpec: initialSpec,
+    intent: duplicateNameIntent
+  }, {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token
+  });
+  assert.equal(duplicateName.statusCode, 400, duplicateName.body);
+  assert.equal(duplicateName.json.code, 'assistant_object_flow_intent_invalid');
   assert.equal(llm.requests, 1);
   assert.equal(backend.exitCode, null);
 });
@@ -620,6 +719,104 @@ test('semantic-plan retry resumes the LLM stage from a saved MCP context after a
   assert.equal(retriedPlan.json.semanticPlan.blocks[0].resultContract.outputClass, 'IS');
   assert.equal(mock.requests.filter((item) => item.pathname === '/cmdbuild/services/rest/v3/classes').length, modelReadsAfterContext, 'retry must not read the MCP catalog again');
   assert.equal(llm.requests, 2);
+  assert.equal(backend.exitCode, null);
+});
+
+test('object-flow retry reuses the completed semantic-plan checkpoint after a LiteLLM timeout', async (t) => {
+  const intent = objectFlowIntentFromText('Выбрать ИС по параметру isName.', {
+    name: 'Information systems',
+    entities: 'Информационная система',
+    expectedResult: 'Список информационных систем.'
+  });
+  const semanticPlan = {
+    version: 1,
+    blocks: [{
+      id: 'block-1', name: 'Information systems', summary: 'ИС по параметру isName.',
+      resolvedEntities: ['IS'], relationPaths: [], dependencies: [], expectedResult: 'Список информационных систем.',
+      resultContract: { outputKind: 'sourceCards', outputClass: 'IS' }, warnings: []
+    }],
+    explanation: 'Семантический план сформирован.', warnings: []
+  };
+  const flow = {
+    version: 1,
+    selections: [{
+      id: 'selection:systems', name: 'Information systems', alias: 'systems', className: 'IS', from: '', limit: 100,
+      columns: ['Code', 'Description', 'Name'],
+      rules: [{ action: 'include', path: 'Name', negate: false, op: 'equals', regex: '', value: '', valueParam: 'isName', valueColumn: '' }]
+    }],
+    operations: [],
+    publishedAlias: 'systems'
+  };
+  const llm = await startLiteLlmStub(t, {
+    delays: [0, 1200, 0],
+    responses: [semanticPlan, { flow, explanation: 'Поток сформирован.', warnings: [] }]
+  });
+  const mock = await startMockCmdbuild(t, {
+    classes: [
+      { _id: 1, name: 'IS', description: 'Информационная система', parent: 'Class', active: true },
+      { _id: 2, name: 'Cst_QueryToolConfig', description: 'Config', active: true },
+      { _id: 3, name: 'Cst_QueryTemplate', description: 'Template', active: true }
+    ],
+    attributesByClass: { IS: [{ name: 'Name', type: 'string', active: true, _can_read: true }] },
+    configCards: [{
+      _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true,
+      RuntimeConfigJson: JSON.stringify({
+        assistant: {
+          llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' },
+          mcp: { timeoutMs: 1000 },
+          semanticPlan: { checkpointTtlSec: 300 }
+        }
+      })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=flow-retry-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const resumeId = 'object-flow-retry-checkpoint-token';
+  const requestBody = {
+    resumeId,
+    templateCode: '', baseSpecHash: '',
+    currentSpec: { version: 1, params: { isName: { type: 'string' } }, steps: [], result: { tables: [] } },
+    intent,
+    semanticPlan
+  };
+
+  const context = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+    ...requestBody,
+    stage: 'context'
+  }, headers);
+  assert.equal(context.statusCode, 202, context.body);
+  const semantic = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+    ...requestBody,
+    stage: 'plan'
+  }, headers);
+  assert.equal(semantic.statusCode, 200, semantic.body);
+  assert.equal(semantic.json.resume.resumeId, resumeId);
+  const modelReadsAfterSemantic = mock.requests.filter((item) => item.pathname === '/cmdbuild/services/rest/v3/classes').length;
+
+  const firstDraft = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/plan`, {
+    ...requestBody,
+    semanticPlan: semantic.json.semanticPlan
+  }, headers, 5000);
+  assert.equal(firstDraft.statusCode, 504, firstDraft.body);
+  assert.equal(firstDraft.json.retryable, true);
+  assert.equal(firstDraft.json.resume.resumeId, resumeId);
+  assert.equal(firstDraft.json.diagnostics.stage, 'flowDraft');
+  assert.equal(firstDraft.json.diagnostics.mcpContextReused, true);
+
+  const retriedDraft = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/plan`, {
+    ...requestBody,
+    semanticPlan: semantic.json.semanticPlan
+  }, headers, 5000);
+  assert.equal(retriedDraft.statusCode, 200, retriedDraft.body);
+  assert.equal(retriedDraft.json.flow.publishedAlias, 'systems');
+  assert.equal(retriedDraft.json.resume.resumeId, resumeId);
+  assert.equal(retriedDraft.json.diagnostics.objectFlow.mcpContextReused, true);
+  assert.equal(mock.requests.filter((item) => item.pathname === '/cmdbuild/services/rest/v3/classes').length, modelReadsAfterSemantic, 'flow retry must not read the MCP catalog again');
+  assert.equal(llm.requests, 3);
   assert.equal(backend.exitCode, null);
 });
 

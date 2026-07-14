@@ -4203,14 +4203,23 @@ function dynamicPagesClientScript() {
       assistantFlowExtractionCandidateHelp: 'Uses this result as the default source in Extraction. It does not publish the table.',
       assistantFlowExtractionCandidateOption: '{label} (extraction candidate)',
       assistantFlowExtractionCandidateUnresolved: 'The extraction candidate has no resolved deterministic result yet. Generate and apply the data flow first.',
+      assistantFlowOutputManifestInvalid: 'Assistant result labels are incomplete. Generate and apply the data flow again before using Extraction.',
+      assistantFlowOwnershipIncomplete: 'The data flow cannot be applied because Assistant result ownership is incomplete.',
+      assistantFlowOwnershipIncompleteAction: 'Regenerate the flow so every named data block resolves to one deterministic result.',
+      assistantFlowDuplicateBlockName: 'Data block name "{name}" must be unique.',
+      assistantFlowDuplicateBlockNameAction: 'Rename duplicate data blocks before preparing the semantic plan.',
       assistantFlowExtractionCandidateNone: 'No extraction candidate',
       assistantFlowRemoveBlock: 'Remove data block',
       assistantFlowAddBlock: 'Add data block',
       assistantPrepareSemanticPlan: 'Prepare semantic plan',
       assistantRetrySemanticPlan: 'Retry saved LLM stage',
+      assistantRetryFlowPlan: 'Retry flow generation',
       assistantSemanticPlanPaused: 'Semantic plan is paused.',
       assistantSemanticPlanRetryReady: 'CMDB context was saved. Retry will continue from the LLM stage.',
       assistantSemanticPlanRetryUnknown: 'The request was interrupted. Retry will reuse saved CMDB context when it is available.',
+      assistantFlowPlanPaused: 'Flow generation is paused.',
+      assistantFlowPlanRetryReady: 'CMDB context and the semantic plan were saved. Retry will generate only the deterministic flow draft.',
+      assistantFlowPlanRetryGateway: 'The reverse proxy ended the request before the backend diagnostic response. CMDB context and the semantic plan were saved; retry will generate only the flow draft.',
       assistantSemanticPlanReady: 'Semantic plan is ready for review.',
       assistantSemanticPlanRejected: 'Semantic plan was rejected.',
       assistantFlowDragBlock: 'Drag to reorder',
@@ -5141,14 +5150,23 @@ function dynamicPagesClientScript() {
       assistantFlowExtractionCandidateHelp: 'Использует этот результат как источник по умолчанию в «Извлечении». Таблица при этом не публикуется.',
       assistantFlowExtractionCandidateOption: '{label} (кандидат на извлечение)',
       assistantFlowExtractionCandidateUnresolved: 'У кандидата на извлечение пока нет определенного детерминированного результата. Сформируйте и примените поток данных.',
+      assistantFlowOutputManifestInvalid: 'Подписи результатов Assistant неполны. Сформируйте и примените поток данных повторно перед использованием «Извлечения».',
+      assistantFlowOwnershipIncomplete: 'Поток данных нельзя применить: не определена принадлежность результатов Assistant.',
+      assistantFlowOwnershipIncompleteAction: 'Сформируйте поток повторно так, чтобы каждый именованный блок данных имел один детерминированный результат.',
+      assistantFlowDuplicateBlockName: 'Название блока данных «{name}» должно быть уникальным.',
+      assistantFlowDuplicateBlockNameAction: 'Переименуйте повторяющиеся блоки данных перед подготовкой семантического плана.',
       assistantFlowExtractionCandidateNone: 'Не выбирать кандидата на извлечение',
       assistantFlowRemoveBlock: 'Удалить блок данных',
       assistantFlowAddBlock: 'Добавить блок данных',
       assistantPrepareSemanticPlan: 'Подготовить семантический план',
       assistantRetrySemanticPlan: 'Повторить сохраненный этап LLM',
+      assistantRetryFlowPlan: 'Повторить формирование потока',
       assistantSemanticPlanPaused: 'Семантический план приостановлен.',
       assistantSemanticPlanRetryReady: 'Контекст CMDB сохранен. Повтор продолжит работу с этапа LLM.',
       assistantSemanticPlanRetryUnknown: 'Запрос был прерван. Повтор использует сохраненный CMDB context, когда он доступен.',
+      assistantFlowPlanPaused: 'Формирование потока приостановлено.',
+      assistantFlowPlanRetryReady: 'Контекст CMDB и семантический план сохранены. Повтор сформирует только детерминированный черновик потока.',
+      assistantFlowPlanRetryGateway: 'Reverse proxy завершил запрос до диагностического ответа backend. Контекст CMDB и семантический план сохранены; повтор сформирует только черновик потока.',
       assistantSemanticPlanReady: 'Семантический план готов к проверке.',
       assistantSemanticPlanRejected: 'Семантический план отклонен.',
       assistantFlowDragBlock: 'Перетащить для изменения порядка',
@@ -5937,6 +5955,7 @@ function dynamicPagesClientScript() {
       assistantFlowExplanation: '',
     assistantFlowWarnings: [],
     assistantFlowCandidateOutput: null,
+    assistantFlowOutputBindings: [],
     assistantFlowBusy: false,
     assistantFlowRequestGeneration: 0,
     assistantFlowExpandedBlockIds: {},
@@ -6756,6 +6775,17 @@ function dynamicPagesClientScript() {
     };
   }
 
+  function assistantObjectFlowDuplicateNameError(blocks) {
+    var seen = {};
+    for (var index = 0; index < (blocks || []).length; index += 1) {
+      var name = String(blocks[index] && blocks[index].name || '').trim();
+      var key = name.replace(/\s+/g, ' ').toLocaleLowerCase('ru-RU');
+      if (!key || seen[key]) return name || (blocks[index] && blocks[index].id) || String(index + 1);
+      seen[key] = true;
+    }
+    return '';
+  }
+
   function assistantObjectFlowDependencyDiagnostics(blocks) {
     var positions = {};
     var byId = {};
@@ -6835,6 +6865,7 @@ function dynamicPagesClientScript() {
     state.assistantFlowExplanation = '';
     state.assistantFlowWarnings = [];
     state.assistantFlowCandidateOutput = null;
+    state.assistantFlowOutputBindings = [];
   }
 
   function captureAssistantPromptsFromDom() {
@@ -9616,9 +9647,11 @@ function dynamicPagesClientScript() {
       + (proposal.operations || []).map(function (operation) { return '<li>' + escapeHtml(operation.type + ': ' + (operation.domain || operation.from || '')) + '</li>'; }).join('')
       + '</ul></div>' : '';
     var feedback = state.assistantFlowFeedback && typeof state.assistantFlowFeedback === 'object' ? state.assistantFlowFeedback : null;
-    var retryAvailable = Boolean(state.assistantFlowResume && state.assistantFlowResume.retryable);
+    var semanticPlanRetryAvailable = Boolean(state.assistantFlowResume && state.assistantFlowResume.retryable && state.assistantFlowResume.retryStage !== 'flowDraft');
+    var flowPlanRetryAvailable = Boolean(state.assistantFlowResume && state.assistantFlowResume.retryable && state.assistantFlowResume.retryStage === 'flowDraft');
+    var retryAvailable = semanticPlanRetryAvailable || flowPlanRetryAvailable;
     var technical = state.assistantFlowErrors.length ? '<details class="help-details"><summary>' + escapeHtml(t('assistantFlowTechnicalDetails')) + '</summary><pre>' + escapeHtml(pretty({ errors: state.assistantFlowErrors, diagnostics: state.assistantFlowDiagnostics, rejectedFlow: state.assistantFlowRejected })) + '</pre></details>' : '';
-    var errorHeading = retryAvailable ? t('assistantSemanticPlanPaused') : state.assistantFlowErrorStage === 'semanticPlan' ? t('assistantSemanticPlanRejected') : t('assistantFlowRejected');
+    var errorHeading = flowPlanRetryAvailable ? t('assistantFlowPlanPaused') : retryAvailable ? t('assistantSemanticPlanPaused') : state.assistantFlowErrorStage === 'semanticPlan' ? t('assistantSemanticPlanRejected') : t('assistantFlowRejected');
     var errors = state.assistantFlowErrors.length || feedback ? '<div class="assistant-draft-preview notice warning" data-assistant-flow-rejected><h4>' + escapeHtml(errorHeading) + '</h4>'
       + (feedback && feedback.summary ? '<p>' + escapeHtml(feedback.summary) + '</p>' : '')
       + (feedback && Array.isArray(feedback.causes) && feedback.causes.length ? '<h5>' + escapeHtml(t('assistantFlowRootCause')) + '</h5><ul class="steps">' + feedback.causes.map(function (cause) { return '<li>' + escapeHtml(String(cause && cause.message || '')) + '</li>'; }).join('') + '</ul>' : '')
@@ -9639,7 +9672,7 @@ function dynamicPagesClientScript() {
       '<div id="cmdp-assistant-object-flow-intent" aria-busy="' + (state.assistantFlowBusy ? 'true' : 'false') + '">' + candidateControl + blockRows + '</div>',
       '<div class="toolbar"><button type="button" data-action="assistant-flow-block-add"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantFlowAddBlock')) + '</button></div>',
       '<p id="cmdp-assistant-prompt-autosave-status" class="muted" role="status" aria-live="polite"' + (assistantPromptAutosaveText() ? '' : ' hidden') + '>' + escapeHtml(assistantPromptAutosaveText()) + '</p>',
-      '<div class="toolbar"><button type="button" data-action="assistant-flow-prepare"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(state.assistantFlowBusy ? t('assistantGenerateBusy') : t('assistantPrepareSemanticPlan')) + '</button>' + (retryAvailable ? '<button type="button" data-action="assistant-flow-prepare-retry"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantRetrySemanticPlan')) + '</button>' : '') + '<button type="button" data-action="assistant-flow-generate"' + (!semanticPlan || state.assistantFlowBusy || (semanticPlan.blocks || []).some(function (block) { return !block || !block.resultContract || block.resultContract.outputKind === 'unresolved'; }) ? ' disabled' : '') + '>' + escapeHtml(t('assistantGenerateFlow')) + '</button><button type="button" data-action="assistant-flow-preview"' + (!proposal || state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantFlowPreview')) + '</button><button type="button" class="primary" data-action="assistant-flow-apply"' + (applyDisabled ? ' disabled' : '') + '>' + escapeHtml(t('assistantApplyFlow')) + '</button></div>',
+      '<div class="toolbar"><button type="button" data-action="assistant-flow-prepare"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(state.assistantFlowBusy ? t('assistantGenerateBusy') : t('assistantPrepareSemanticPlan')) + '</button>' + (semanticPlanRetryAvailable ? '<button type="button" data-action="assistant-flow-prepare-retry"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantRetrySemanticPlan')) + '</button>' : '') + '<button type="button" data-action="assistant-flow-generate"' + (!semanticPlan || state.assistantFlowBusy || (semanticPlan.blocks || []).some(function (block) { return !block || !block.resultContract || block.resultContract.outputKind === 'unresolved'; }) ? ' disabled' : '') + '>' + escapeHtml(t('assistantGenerateFlow')) + '</button>' + (flowPlanRetryAvailable ? '<button type="button" data-action="assistant-flow-generate-retry"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantRetryFlowPlan')) + '</button>' : '') + '<button type="button" data-action="assistant-flow-preview"' + (!proposal || state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantFlowPreview')) + '</button><button type="button" class="primary" data-action="assistant-flow-apply"' + (applyDisabled ? ' disabled' : '') + '>' + escapeHtml(t('assistantApplyFlow')) + '</button></div>',
       semanticPreview,
       flowPreview,
       previewParams,
@@ -10354,6 +10387,13 @@ function dynamicPagesClientScript() {
     ];
     var context = '';
     var importedDiagramNeedsPreview = state.diagramImportStale || (state.diagramImportAppliedPendingPreview && !state.lastDraftPreviewOk);
+    var templateSelected = Boolean(state.selectedTemplate);
+    var saveDisabled = importedDiagramNeedsPreview || !templateSelected;
+    var saveTitle = importedDiagramNeedsPreview
+      ? t('diagramImportPreviewRequired')
+      : !templateSelected
+        ? t('templateSelectionRequired')
+        : '';
     if (sectionPersistsTemplate(section) || section === 'run') {
       actions.push(renderActionButton('assistant-draft', t('assistantDraft')));
     }
@@ -10361,11 +10401,13 @@ function dynamicPagesClientScript() {
     if (section === 'templates') {
       actions.push(renderActionButton('new-template', t('newTemplate'), { primary: true }));
       actions.push(renderActionButton('new-cmdb-build-view', t('templateKindCmdbBuildView')));
+      actions.push(renderActionButton('save-template', t('save'), { disabled: saveDisabled, title: saveTitle }));
     } else if (section === 'assistant') {
+      actions.push(renderActionButton('save-template', t('save'), { primary: true, disabled: saveDisabled, title: saveTitle }));
       actions.push(renderActionButton('draft-validate', t('validate')));
       actions.push(renderActionButton('draft-preview', t('preview')));
     } else if (section === 'template') {
-      actions.push(renderActionButton('save-template', t('save'), { primary: true, disabled: importedDiagramNeedsPreview, title: importedDiagramNeedsPreview ? t('diagramImportPreviewRequired') : '' }));
+      actions.push(renderActionButton('save-template', t('save'), { primary: true, disabled: saveDisabled, title: saveTitle }));
     } else if (section === 'params') {
       actions.push(renderActionButton('add-param-row', t('addParam')));
       actions.push(renderActionButton('apply-params', t('applyParams'), { primary: true }));
@@ -10383,7 +10425,12 @@ function dynamicPagesClientScript() {
     } else if (section === 'cmdb-build-view') {
       actions.push(renderActionButton('apply-cmdb-build-view', t('apply'), { primary: true }));
     } else if (section === 'extraction') {
-      actions.push(renderActionButton('extract-template', t('extractByTemplate'), { primary: true }));
+      var extractionManifest = assistantObjectFlowOutputManifest(selected && selected.spec || defaultSpec());
+      actions.push(renderActionButton('extract-template', t('extractByTemplate'), {
+        primary: true,
+        disabled: extractionManifest.assistantManaged && Boolean(extractionManifest.error),
+        title: extractionManifest.assistantManaged && extractionManifest.error ? t('assistantFlowOutputManifestInvalid') : ''
+      }));
     } else if (section === 'visualization') {
       actions.push(renderActionButton('apply-visualization', t('applyVisualization'), { primary: true }));
     } else if (section === 'cache') {
@@ -10420,7 +10467,7 @@ function dynamicPagesClientScript() {
     }
 
     if (sectionPersistsTemplate(section) && section !== 'template') {
-      actions.push(renderActionButton('save-template', t('save'), { disabled: importedDiagramNeedsPreview, title: importedDiagramNeedsPreview ? t('diagramImportPreviewRequired') : '' }));
+      actions.push(renderActionButton('save-template', t('save'), { disabled: saveDisabled, title: saveTitle }));
       actions.push(renderActionButton('validate-template', t('validate')));
       actions.push(renderActionButton('preview-template', t('preview')));
     }
@@ -10650,6 +10697,11 @@ function dynamicPagesClientScript() {
   function aliasDisplayLabel(alias, spec) {
     var name = String(alias || '');
     if (!name) return '';
+    var assistantManifest = assistantObjectFlowOutputManifest(spec || {});
+    if (assistantManifest.assistantManaged) {
+      var assistantOutput = assistantManifest.outputs.find(function (output) { return output.alias === name; });
+      return assistantOutput ? assistantOutput.label : assistantManifest.error ? t('assistantFlowOutputManifestInvalid') : '';
+    }
     var visual = getStoredVisualModel(spec || {}, 'objectGroup');
     var selections = visual && Array.isArray(visual.selections) ? visual.selections : [];
     var selection = selections.find(function (item) {
@@ -10737,13 +10789,11 @@ function dynamicPagesClientScript() {
   }
 
   function assistantExtractionCandidate(spec) {
-    var draft = spec && spec.assistantDraft && typeof spec.assistantDraft === 'object' && !Array.isArray(spec.assistantDraft) ? spec.assistantDraft : {};
-    var intent = normalizeAssistantObjectFlowIntentClient(draft.objectFlowIntent);
-    var blockId = String(intent.extractionCandidateBlockId || '');
-    var alias = String(intent.extractionCandidateAlias || '');
-    if (!blockId || !alias) return null;
-    var block = intent.blocks.find(function (item) { return item.id === blockId; });
-    return block ? { blockId: blockId, alias: alias, label: block.name || alias } : null;
+    var manifest = assistantObjectFlowOutputManifest(spec);
+    var candidate = manifest && manifest.extractionCandidate;
+    if (!manifest.assistantManaged || manifest.error || !candidate) return null;
+    var block = manifest.blocks.find(function (item) { return item.id === candidate.blockId; });
+    return block ? { blockId: candidate.blockId, alias: candidate.alias, label: block.name || candidate.alias } : null;
   }
 
   function assistantExtractionCandidateLabel(alias, label, candidate) {
@@ -10751,29 +10801,89 @@ function dynamicPagesClientScript() {
     return t('assistantFlowExtractionCandidateOption', { label: label || candidate.label || alias });
   }
 
-  function objectFlowOutputManifest(spec) {
+  function assistantObjectFlowOutputManifest(spec) {
     var objectMatching = getStoredVisualModel(spec || {}, 'objectMatching');
     var outputs = objectMatching && Array.isArray(objectMatching.outputs) ? objectMatching.outputs : [];
-    if (!outputs.length) return [];
+    var persisted = objectMatching && objectMatching.assistantOutputManifest && typeof objectMatching.assistantOutputManifest === 'object'
+      ? objectMatching.assistantOutputManifest
+      : null;
+    var assistantDraft = spec && spec.assistantDraft && typeof spec.assistantDraft === 'object' && !Array.isArray(spec.assistantDraft)
+      ? spec.assistantDraft
+      : {};
+    var intent = normalizeAssistantObjectFlowIntentClient(assistantDraft.objectFlowIntent);
+    var hasCompiledFlow = Boolean(objectMatching && (
+      (Array.isArray(objectMatching.selections) && objectMatching.selections.length)
+      || (Array.isArray(objectMatching.operations) && objectMatching.operations.length)
+    ));
+    var isAssistantFlow = Boolean(outputs.some(function (output) { return output && output.assistantManaged === true; }) || (intent.blocks.length && hasCompiledFlow));
+    if (!isAssistantFlow) return { assistantManaged: false, error: '', outputs: [] };
+    if (!objectMatching || !outputs.length || !persisted || Number(persisted.version) !== 1 || !Array.isArray(persisted.blocks) || !persisted.blocks.length) {
+      return { assistantManaged: true, error: 'missing manifest', outputs: [] };
+    }
     var availableAliases = {};
     ((spec && spec.steps) || []).forEach(function (step) {
       if (step && step.as) availableAliases[String(step.as)] = true;
     });
+    var expectedAliases = {};
+    (Array.isArray(objectMatching.selections) ? objectMatching.selections : []).forEach(function (selection) {
+      if (selection && selection.alias) expectedAliases[String(selection.alias)] = true;
+    });
+    (Array.isArray(objectMatching.operations) ? objectMatching.operations : []).forEach(function (operation) {
+      if (operation && operation.as) expectedAliases[String(operation.as)] = true;
+    });
+    var knownBlockIds = {};
+    var knownBlockNames = {};
+    var invalid = false;
+    var blocks = persisted.blocks.map(function (raw, index) {
+      var id = String(raw && raw.id || '').trim();
+      var name = String(raw && raw.name || '').trim();
+      var nameKey = name.replace(/\s+/g, ' ').toLocaleLowerCase('ru-RU');
+      if (!id || !name || knownBlockIds[id] || knownBlockNames[nameKey] || Number(raw && raw.order || index + 1) !== index + 1) invalid = true;
+      knownBlockIds[id] = true;
+      knownBlockNames[nameKey] = true;
+      return { id: id, name: name, order: index + 1 };
+    });
     var seen = {};
-    return outputs.map(function (output) {
+    var manifest = outputs.map(function (output) {
       var alias = String(output && output.alias || '').trim();
-      if (!alias || !availableAliases[alias] || seen[alias]) return null;
+      var ownerIds = Array.isArray(output && output.assistantBlockIds)
+        ? output.assistantBlockIds.map(function (id) { return String(id || '').trim(); }).filter(Boolean)
+        : [String(output && output.assistantBlockId || '').trim()].filter(Boolean);
+      if (!alias || !availableAliases[alias] || !expectedAliases[alias] || seen[alias]
+        || !output || output.assistantManaged !== true || !String(output.label || '').trim()
+        || !ownerIds.length || ownerIds.some(function (id) { return !knownBlockIds[id]; })) {
+        invalid = true;
+        return null;
+      }
       seen[alias] = true;
       return {
         alias: alias,
         label: String(output && output.label || alias).trim() || alias,
-        published: output && output.published === true
+        published: output && output.published === true,
+        assistantManaged: true,
+        assistantBlockId: ownerIds[0],
+        assistantBlockIds: ownerIds
       };
     }).filter(Boolean);
+    if (Object.keys(expectedAliases).some(function (alias) { return !seen[alias]; })) invalid = true;
+    var rawCandidate = persisted.extractionCandidate && typeof persisted.extractionCandidate === 'object' ? persisted.extractionCandidate : null;
+    var candidate = rawCandidate ? { blockId: String(rawCandidate.blockId || '').trim(), alias: String(rawCandidate.alias || '').trim() } : null;
+    if (candidate && (!candidate.blockId || !candidate.alias || !knownBlockIds[candidate.blockId] || !seen[candidate.alias])) invalid = true;
+    return { assistantManaged: true, error: invalid ? 'invalid manifest' : '', outputs: invalid ? [] : manifest, blocks: invalid ? [] : blocks, extractionCandidate: invalid ? null : candidate };
+  }
+
+  function objectFlowOutputManifest(spec) {
+    return assistantObjectFlowOutputManifest(spec).outputs;
   }
 
   function finalExtractionAliases(spec) {
     spec = spec || defaultSpec();
+    var assistantManifest = assistantObjectFlowOutputManifest(spec);
+    if (assistantManifest.assistantManaged) {
+      if (assistantManifest.error) return [];
+      var managedPublished = assistantManifest.outputs.filter(function (output) { return output.published; }).map(function (output) { return output.alias; });
+      return managedPublished.length ? managedPublished : [assistantManifest.outputs[assistantManifest.outputs.length - 1].alias];
+    }
     var objectFlowOutputs = objectFlowOutputManifest(spec);
     if (objectFlowOutputs.length) {
       var published = objectFlowOutputs.filter(function (output) { return output.published; }).map(function (output) { return output.alias; });
@@ -11074,12 +11184,11 @@ function dynamicPagesClientScript() {
       var baseLabel = label || aliasDisplayLabel(text, spec) || text;
       result.push({ name: text, label: assistantExtractionCandidateLabel(text, baseLabel, candidate) });
     }
-    var objectFlowOutputs = objectFlowOutputManifest(spec);
-    if (objectFlowOutputs.length) {
-      objectFlowOutputs.forEach(function (output) {
-        add(output.alias, output.published
-          ? t('extractionFinalResult') + ': ' + output.label
-          : output.label);
+    var assistantManifest = assistantObjectFlowOutputManifest(spec);
+    if (assistantManifest.assistantManaged) {
+      if (assistantManifest.error) return result;
+      assistantManifest.outputs.forEach(function (output) {
+        add(output.alias, output.label);
       });
       return result;
     }
@@ -11178,13 +11287,15 @@ function dynamicPagesClientScript() {
       : [];
     var specTables = spec && spec.result && Array.isArray(spec.result.tables) ? spec.result.tables : [];
     var optionTables = previewTables.length ? previewTables : specTables;
+    var assistantManifest = assistantObjectFlowOutputManifest(spec);
     var options = renderExtractionResultOptions(state.extractionSource, spec, optionTables);
     return [
       '<section class="section" id="cmdp-extraction-editor"><h2>' + t('extractionEditor') + '</h2>',
+      assistantManifest.assistantManaged && assistantManifest.error ? '<div class="notice error" role="alert">' + escapeHtml(t('assistantFlowOutputManifestInvalid')) + '</div>' : '',
       '<div class="row">',
       options ? '<label>' + t('extractionResultSource') + '<select id="cmdp-extraction-source">' + options + '</select></label>' : '',
       '</div>',
-      renderExtractionPreview(spec),
+      assistantManifest.assistantManaged && assistantManifest.error ? '' : renderExtractionPreview(spec),
       '</section>'
     ].join('');
   }
@@ -15057,6 +15168,8 @@ function dynamicPagesClientScript() {
     try {
       payload = readEditorPayload();
       params = readRunParams();
+      var assistantManifest = assistantObjectFlowOutputManifest(payload.spec);
+      if (assistantManifest.assistantManaged && assistantManifest.error) throw new Error(t('assistantFlowOutputManifestInvalid'));
       var specTables = payload.spec && payload.spec.result && Array.isArray(payload.spec.result.tables) ? payload.spec.result.tables : [];
       state.extractionSource = preferredExtractionResultName(payload.spec, specTables, readValue('cmdp-extraction-source') || state.extractionSource || '');
       payload.spec = ensureExtractionPreviewTable(payload.spec, state.extractionSource);
@@ -16263,7 +16376,7 @@ function dynamicPagesClientScript() {
   }
 
   function setAssistantSemanticPlanRetryState(resume, diagnostics, checkpointConfirmed) {
-    state.assistantFlowResume = Object.assign({}, resume || {}, { retryable: true, checkpointConfirmed: Boolean(checkpointConfirmed) });
+    state.assistantFlowResume = Object.assign({}, resume || {}, { retryable: true, retryStage: 'semanticPlan', checkpointConfirmed: Boolean(checkpointConfirmed) });
     state.assistantFlowRejected = null;
     state.assistantFlowErrors = [];
     state.assistantFlowDiagnostics = diagnostics && typeof diagnostics === 'object' ? diagnostics : {};
@@ -16275,11 +16388,33 @@ function dynamicPagesClientScript() {
     state.message = { type: 'error', text: state.assistantFlowFeedback.action };
   }
 
+  function setAssistantObjectFlowPlanRetryState(resume, diagnostics, transport) {
+    state.assistantFlowResume = Object.assign({}, resume || {}, { retryable: true, retryStage: 'flowDraft', checkpointConfirmed: true });
+    state.assistantFlowRejected = null;
+    state.assistantFlowErrors = [];
+    state.assistantFlowDiagnostics = diagnostics && typeof diagnostics === 'object' ? diagnostics : {};
+    state.assistantFlowFeedback = {
+      summary: t('assistantFlowPlanPaused'),
+      action: transport === 'gateway' ? t('assistantFlowPlanRetryGateway') : t('assistantFlowPlanRetryReady')
+    };
+    state.assistantFlowErrorStage = 'flowDraft';
+    state.message = { type: 'error', text: state.assistantFlowFeedback.action };
+  }
+
   function prepareAssistantObjectFlowSemanticPlan(retry) {
     if (state.assistantFlowBusy) return;
     captureAssistantPromptsFromDom();
     var requestSpec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
     var intent = cloneJsonValue(state.assistantObjectFlowIntent, { context: '', blocks: [] });
+    var duplicateName = assistantObjectFlowDuplicateNameError(intent.blocks);
+    if (duplicateName) {
+      state.assistantFlowFeedback = { summary: t('assistantFlowDuplicateBlockName'), action: t('assistantFlowDuplicateBlockNameAction') };
+      state.assistantFlowErrors = [{ path: '$.assistantDraft.objectFlowIntent.blocks', message: t('assistantFlowDuplicateBlockName', { name: duplicateName }) }];
+      state.assistantFlowErrorStage = 'semanticPlan';
+      state.message = { type: 'error', text: t('assistantFlowDuplicateBlockName', { name: duplicateName }) };
+      renderDesigner();
+      return;
+    }
     var previousResume = retry && assistantSemanticPlanResumeMatches(state.assistantFlowResume, intent, requestSpec) ? state.assistantFlowResume : null;
     var resume = previousResume || {
       resumeId: newAssistantSemanticPlanResumeId(),
@@ -16333,7 +16468,8 @@ function dynamicPagesClientScript() {
         if (!result.ok || !result.json || !result.json.semanticPlan) throw new Error(errorText(result));
         var staleError = assistantTemplateRevisionError(requestRevision);
         if (staleError) throw staleError;
-        state.assistantFlowResume = null;
+        resume = Object.assign({}, resume, result.json.resume || {}, { checkpointConfirmed: true, retryable: false, retryStage: '' });
+        state.assistantFlowResume = resume;
         state.assistantFlowSemanticPlan = cloneJsonValue(result.json.semanticPlan, { version: 1, blocks: [] });
         state.assistantFlowExplanation = String(result.json.explanation || '');
         state.assistantFlowWarnings = Array.isArray(result.json.warnings) ? result.json.warnings.map(String).filter(Boolean) : [];
@@ -16343,7 +16479,7 @@ function dynamicPagesClientScript() {
 
     requestSemanticPlanStage(previousResume ? 'plan' : 'context').catch(function (error) {
       if (!assistantTemplateRevisionMismatch(requestRevision)) {
-        setAssistantSemanticPlanRetryState(resume, {}, false);
+        setAssistantSemanticPlanRetryState(resume, {}, Boolean(resume && resume.checkpointConfirmed));
         return;
       }
       state.message = { type: 'error', text: error.message || String(error) };
@@ -16353,10 +16489,23 @@ function dynamicPagesClientScript() {
     });
   }
 
-  function generateAssistantObjectFlow() {
+  function generateAssistantObjectFlow(retry) {
     if (state.assistantFlowBusy || !state.assistantFlowSemanticPlan) return;
     captureAssistantPromptsFromDom();
     var requestSpec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
+    var resume = assistantSemanticPlanResumeMatches(state.assistantFlowResume, state.assistantObjectFlowIntent, requestSpec) && state.assistantFlowResume.checkpointConfirmed
+      ? state.assistantFlowResume
+      : null;
+    if (!resume) {
+      state.assistantFlowFeedback = {
+        summary: t('assistantFlowPlanPaused'),
+        action: t('assistantSemanticPlanRetryUnknown')
+      };
+      state.assistantFlowErrorStage = 'flowDraft';
+      state.message = { type: 'error', text: state.assistantFlowFeedback.action };
+      renderDesigner();
+      return;
+    }
     var requestGeneration = Number(state.assistantFlowRequestGeneration || 0) + 1;
     state.assistantFlowRequestGeneration = requestGeneration;
     var requestRevision = assistantTemplateRevisionSnapshot(state.selectedTemplate, requestSpec, requestGeneration);
@@ -16370,11 +16519,13 @@ function dynamicPagesClientScript() {
     state.assistantFlowPreview = null;
     state.assistantFlowCanApply = false;
     state.assistantFlowCandidateOutput = null;
+    state.assistantFlowOutputBindings = [];
     state.message = { type: 'ok', text: t('assistantGeneratingTitle') };
     renderDesigner();
     request(apiPrefix + '/assistant/object-flow/plan?root=' + encodeURIComponent(state.root || 'Cst_QueryTool'), {
-      method: 'POST', timeoutMs: assistantRequestTimeoutMs(2),
+      method: 'POST', timeoutMs: assistantRequestTimeoutMs(1),
       body: {
+        resumeId: resume.resumeId,
         intent: state.assistantObjectFlowIntent,
         semanticPlan: state.assistantFlowSemanticPlan,
         currentSpec: requestSpec,
@@ -16384,6 +16535,14 @@ function dynamicPagesClientScript() {
     }).then(function (result) {
       var mismatch = assistantTemplateRevisionMismatch(requestRevision);
       if (mismatch === 'request') throw assistantTemplateRevisionError(requestRevision);
+      if (!result.ok && result.json && result.json.retryable) {
+        setAssistantObjectFlowPlanRetryState(Object.assign({}, resume, result.json.resume || {}), result.json.diagnostics, 'backend');
+        return;
+      }
+      if (!result.ok && result.status === 504) {
+        setAssistantObjectFlowPlanRetryState(resume, {}, 'gateway');
+        return;
+      }
       if (!result.ok && result.json && result.json.code === 'assistant_object_flow_invalid') {
         state.assistantFlowRejected = result.json.rejectedFlow && typeof result.json.rejectedFlow === 'object' ? cloneJsonValue(result.json.rejectedFlow, { version: 1, selections: [], operations: [] }) : null;
         state.assistantFlowErrors = Array.isArray(result.json.errors) ? result.json.errors : [];
@@ -16403,10 +16562,25 @@ function dynamicPagesClientScript() {
       state.assistantFlowCandidateOutput = result.json.extractionCandidate && typeof result.json.extractionCandidate === 'object'
         ? { blockId: String(result.json.extractionCandidate.blockId || ''), alias: String(result.json.extractionCandidate.alias || '') }
         : null;
-      state.assistantFlowFeedback = null;
-      state.assistantFlowErrorStage = '';
-      state.message = { type: 'ok', text: assistantCompletionText(result.json, t('assistantFlowReady')) };
+      state.assistantFlowOutputBindings = Array.isArray(result.json.outputBindings)
+        ? result.json.outputBindings.map(function (binding) {
+          return { blockId: String(binding && binding.blockId || ''), alias: String(binding && binding.alias || '') };
+        }).filter(function (binding) { return binding.blockId && binding.alias; })
+        : [];
+      state.assistantFlowErrors = Array.isArray(result.json.ownershipErrors) ? result.json.ownershipErrors : [];
+      state.assistantFlowFeedback = state.assistantFlowErrors.length
+        ? { summary: t('assistantFlowOwnershipIncomplete'), action: t('assistantFlowOwnershipIncompleteAction') }
+        : null;
+      state.assistantFlowErrorStage = state.assistantFlowErrors.length ? 'ownership' : '';
+      state.assistantFlowResume = Object.assign({}, resume, { retryable: false, retryStage: '' });
+      state.message = state.assistantFlowErrors.length
+        ? { type: 'error', text: t('assistantFlowOwnershipIncomplete') }
+        : { type: 'ok', text: assistantCompletionText(result.json, t('assistantFlowReady')) };
     }).catch(function (error) {
+      if (resume && /^Request timeout:/.test(String(error && error.message || ''))) {
+        setAssistantObjectFlowPlanRetryState(resume, {}, 'gateway');
+        return;
+      }
       state.message = { type: 'error', text: error.message || String(error) };
     }).finally(function () {
       if (Number(state.assistantFlowRequestGeneration || 0) === requestGeneration) state.assistantFlowBusy = false;
@@ -16437,6 +16611,8 @@ function dynamicPagesClientScript() {
       method: 'POST', timeoutMs: 60000,
       body: {
         flow: state.assistantFlowProposal,
+        assistantOutputBindings: state.assistantFlowOutputBindings,
+        assistantObjectFlowIntent: state.assistantObjectFlowIntent,
         currentSpec: requestSpec,
         params: params,
         templateCode: state.selectedTemplate && state.selectedTemplate.code || '',
@@ -16485,6 +16661,7 @@ function dynamicPagesClientScript() {
     );
     var requestFlowFingerprint = stableClientJsonStringify(flow);
     var requestIntentFingerprint = stableClientJsonStringify(state.assistantObjectFlowIntent);
+    var requestOutputBindingsFingerprint = stableClientJsonStringify(state.assistantFlowOutputBindings);
     state.assistantFlowBusy = true;
     state.message = { type: 'ok', text: t('assistantGeneratingTitle') };
     renderDesigner();
@@ -16494,6 +16671,8 @@ function dynamicPagesClientScript() {
         root: state.root,
         currentSpec: requestSpec,
         flow: flow,
+        assistantOutputBindings: state.assistantFlowOutputBindings,
+        assistantObjectFlowIntent: state.assistantObjectFlowIntent,
         templateCode: state.selectedTemplate && state.selectedTemplate.code || '',
         baseSpecHash: state.selectedTemplate && state.selectedTemplate.specHash || ''
       }
@@ -16501,7 +16680,8 @@ function dynamicPagesClientScript() {
       var mismatch = assistantTemplateRevisionMismatch(requestRevision);
       if (mismatch === 'request') throw assistantTemplateRevisionError(requestRevision);
       if (stableClientJsonStringify(state.assistantFlowProposal) !== requestFlowFingerprint
-        || stableClientJsonStringify(state.assistantObjectFlowIntent) !== requestIntentFingerprint) {
+        || stableClientJsonStringify(state.assistantObjectFlowIntent) !== requestIntentFingerprint
+        || stableClientJsonStringify(state.assistantFlowOutputBindings) !== requestOutputBindingsFingerprint) {
         throw assistantTemplateRevisionError(Object.assign({}, requestRevision, { requestGeneration: -1 }));
       }
       if (!result.ok || !result.json || !result.json.spec) throw new Error(errorText(result));
@@ -16528,6 +16708,7 @@ function dynamicPagesClientScript() {
       state.assistantFlowExplanation = '';
       state.assistantFlowWarnings = [];
       state.assistantFlowCandidateOutput = null;
+      state.assistantFlowOutputBindings = [];
       if (state.diagramImportProposal) state.diagramImportStale = true;
       clearDraftExecutionState({ clearExtractionSource: true });
       state.message = { type: 'ok', text: t('assistantFlowApplied') };
@@ -17640,6 +17821,7 @@ function dynamicPagesClientScript() {
     if (action === 'assistant-flow-prepare') prepareAssistantObjectFlowSemanticPlan();
     if (action === 'assistant-flow-prepare-retry') prepareAssistantObjectFlowSemanticPlan(true);
     if (action === 'assistant-flow-generate') generateAssistantObjectFlow();
+    if (action === 'assistant-flow-generate-retry') generateAssistantObjectFlow(true);
     if (action === 'assistant-flow-preview') previewAssistantObjectFlow();
     if (action === 'assistant-flow-apply') applyAssistantObjectFlow();
     if (action === 'assistant-flow-block-add') addAssistantObjectFlowBlock();
@@ -19838,7 +20020,17 @@ function normalizeAssistantObjectFlowIntent(value, options = {}) {
       error.code = 'assistant_object_flow_intent_incomplete';
       throw error;
     }
+    const knownNames = new Set();
     blocks.forEach((block, index) => {
+      const normalizedName = block.name.trim().replace(/\s+/g, ' ').toLocaleLowerCase('ru-RU');
+      if (!normalizedName || knownNames.has(normalizedName)) {
+        const error = new Error(`assistantDraft.objectFlowIntent.blocks[${index}].name must be a unique non-empty user-facing result name.`);
+        error.statusCode = 400;
+        error.code = 'assistant_object_flow_intent_invalid';
+        throw error;
+      }
+      knownNames.add(normalizedName);
+      block.name = block.name.trim();
       ['name', 'entities', 'algorithm', 'expectedResult'].forEach((field) => {
         if (block[field].trim()) return;
         const error = new Error(`assistantDraft.objectFlowIntent.blocks[${index}].${field} is required.`);
@@ -25527,6 +25719,48 @@ async function createAssistantObjectFlowSemanticPlan(input, options = {}) {
   }
 }
 
+async function loadAssistantObjectFlowSemanticCheckpoint(input, options = {}) {
+  const checkpointOptions = options.checkpoint && options.checkpoint.resumeId ? options.checkpoint : null;
+  if (!checkpointOptions) return null;
+  const intent = normalizeAssistantObjectFlowIntent(input.intent, { requireComplete: true });
+  const inputHash = assistantSemanticPlanCheckpointInputHash(input, intent);
+  const cached = await cacheGetJson('assistant-semantic-plan', checkpointOptions.key, assistantSemanticPlanCheckpointCache);
+  const checkpoint = cached.value;
+  if (!checkpoint) {
+    const error = new Error('Saved CMDB context has expired. Prepare the semantic plan again before generating the flow.');
+    error.statusCode = 409;
+    error.code = 'assistant_semantic_plan_resume_expired';
+    throw error;
+  }
+  if (String(checkpoint.inputHash || '') !== inputHash) {
+    const error = new Error('Saved CMDB context belongs to different template data. Prepare the semantic plan again before generating the flow.');
+    error.statusCode = 409;
+    error.code = 'assistant_semantic_plan_resume_mismatch';
+    throw error;
+  }
+  if (!checkpoint.mcpContext || !checkpoint.semanticPlan) {
+    const error = new Error('Saved semantic plan is incomplete. Prepare the semantic plan again before generating the flow.');
+    error.statusCode = 409;
+    error.code = 'assistant_semantic_plan_resume_incomplete';
+    throw error;
+  }
+  if (hashJson(input.semanticPlan || {}) !== hashJson(checkpoint.semanticPlan)) {
+    const error = new Error('The semantic plan changed after its CMDB context was saved. Prepare the semantic plan again before generating the flow.');
+    error.statusCode = 409;
+    error.code = 'assistant_semantic_plan_resume_mismatch';
+    throw error;
+  }
+  return {
+    checkpoint,
+    cacheBackend: cached.backend,
+    resume: assistantSemanticPlanCheckpointSummary(checkpoint, {
+      resumeId: checkpointOptions.resumeId,
+      mcpContextReused: true,
+      ttlMs: options.ttlMs
+    })
+  };
+}
+
 function assistantObjectFlowMessages(input, mcpContext, runtimeConfig, relationRequirements = null, matchRequirements = []) {
   const assistantConfig = normalizeAssistantRuntimeConfig(runtimeConfig || defaultRuntimeConfig());
   const resultContracts = assistantResultContractRequirements(input && input.semanticPlan, input && input.intent);
@@ -26490,9 +26724,9 @@ function assistantResultContractErrors(flow, semanticPlan, intent) {
   return [];
 }
 
-export function assistantExtractionCandidateOutput(flow, semanticPlan, intent) {
+function assistantObjectFlowBlockOutput(flow, semanticPlan, intent, blockId) {
   const normalizedIntent = normalizeAssistantObjectFlowIntent(intent);
-  const candidateBlockId = String(normalizedIntent.extractionCandidateBlockId || '');
+  const candidateBlockId = String(blockId || '');
   if (!candidateBlockId) return null;
   const candidateBlock = normalizedIntent.blocks.find((block) => block.id === candidateBlockId);
   const contracts = assistantResultContractRequirements(semanticPlan, normalizedIntent);
@@ -26500,6 +26734,10 @@ export function assistantExtractionCandidateOutput(flow, semanticPlan, intent) {
   const aliases = assistantObjectFlowAliasClasses(flow || { selections: [], operations: [] });
   const selections = Array.isArray(flow && flow.selections) ? flow.selections : [];
   const operations = Array.isArray(flow && flow.operations) ? flow.operations : [];
+  const publishedAlias = String(flow && flow.publishedAlias || '');
+  if (candidateBlock && normalizedIntent.blocks.at(-1)?.id === candidateBlockId && aliases.has(publishedAlias)) {
+    return { blockId: candidateBlockId, alias: publishedAlias, label: candidateBlock.name };
+  }
   const primary = contracts.at(-1);
   const memo = new Map();
   const resolving = new Set();
@@ -26585,12 +26823,236 @@ export function assistantExtractionCandidateOutput(flow, semanticPlan, intent) {
       const classOnly = selections.filter((selection) => selection && selection.className === contract.outputClass && !selection.from);
       alias = uniqueAlias((named.length ? named : classOnly).map((selection) => String(selection.alias || '')));
     }
+    if (!alias && candidateBlock) {
+      const named = selections.filter((selection) => selection && String(selection.name || '') === candidateBlock.name);
+      alias = uniqueAlias(named.map((selection) => String(selection.alias || '')));
+    }
     resolving.delete(blockId);
     memo.set(blockId, alias);
     return alias;
   };
   const alias = resolve(candidateBlockId);
   return alias && candidateBlock ? { blockId: candidateBlockId, alias, label: candidateBlock.name } : null;
+}
+
+export function assistantExtractionCandidateOutput(flow, semanticPlan, intent) {
+  const normalizedIntent = normalizeAssistantObjectFlowIntent(intent);
+  return assistantObjectFlowBlockOutput(flow, semanticPlan, normalizedIntent, normalizedIntent.extractionCandidateBlockId);
+}
+
+function assistantObjectFlowOutputBindings(flow, semanticPlan, intent) {
+  const normalizedIntent = normalizeAssistantObjectFlowIntent(intent, { requireComplete: true });
+  const aliases = new Set(objectFlowResultOutputs(flow).map((output) => output.alias));
+  const bindings = [];
+  const errors = [];
+  const usedAliases = new Set();
+  normalizedIntent.blocks.forEach((block) => {
+    const output = assistantObjectFlowBlockOutput(flow, semanticPlan, normalizedIntent, block.id);
+    if (!output || !aliases.has(output.alias)) {
+      errors.push({
+        code: 'assistant_output_binding_missing',
+        path: '$.flow',
+        blockId: block.id,
+        blockName: block.name,
+        message: `Assistant block ${block.name} does not have one unique materialized result alias.`
+      });
+      return;
+    }
+    if (usedAliases.has(output.alias)) {
+      errors.push({
+        code: 'assistant_output_binding_duplicate_alias',
+        path: '$.flow',
+        blockId: block.id,
+        blockName: block.name,
+        alias: output.alias,
+        message: `Assistant block ${block.name} resolves to result alias ${output.alias}, which is already assigned to another named block.`
+      });
+      return;
+    }
+    usedAliases.add(output.alias);
+    bindings.push({ blockId: block.id, alias: output.alias });
+  });
+  const finalBinding = bindings.find((binding) => binding.blockId === normalizedIntent.blocks.at(-1)?.id);
+  if (!errors.length && (!finalBinding || finalBinding.alias !== String(flow && flow.publishedAlias || ''))) {
+    errors.push({
+      code: 'assistant_output_binding_final',
+      path: '$.flow.publishedAlias',
+      blockId: normalizedIntent.blocks.at(-1)?.id || '',
+      blockName: normalizedIntent.blocks.at(-1)?.name || '',
+      message: 'The final named Assistant block must resolve to the published result alias.'
+    });
+  }
+  if (!errors.length) {
+    const metadata = assistantOutputBindingMetadata(flow, normalizedIntent, bindings);
+    errors.push(...metadata.errors);
+  }
+  return { bindings, errors };
+}
+
+function assistantOutputBindingMetadata(flow, intent, bindings) {
+  const normalizedIntent = normalizeAssistantObjectFlowIntent(intent, { requireComplete: true });
+  const outputs = objectFlowResultOutputs(flow);
+  const outputAliases = new Set(outputs.map((output) => output.alias));
+  const blockById = new Map(normalizedIntent.blocks.map((block) => [block.id, block]));
+  const errors = [];
+  const directByAlias = new Map();
+  const boundBlockIds = new Set();
+  if (!Array.isArray(bindings) || bindings.length !== normalizedIntent.blocks.length) {
+    return { metadata: [], errors: [{ code: 'assistant_output_bindings_invalid', path: '$.assistantOutputBindings', message: 'Assistant output bindings must contain one entry for every named data block.' }] };
+  }
+  bindings.forEach((raw, index) => {
+    const blockId = String(raw && raw.blockId || '').trim();
+    const alias = String(raw && raw.alias || '').trim();
+    const block = blockById.get(blockId);
+    if (!block || !alias || !outputAliases.has(alias) || boundBlockIds.has(blockId) || directByAlias.has(alias)) {
+      errors.push({ code: 'assistant_output_bindings_invalid', path: `$.assistantOutputBindings[${index}]`, message: 'Assistant output bindings must map each named block to one unique materialized alias.' });
+      return;
+    }
+    boundBlockIds.add(blockId);
+    directByAlias.set(alias, block);
+  });
+  if (boundBlockIds.size !== normalizedIntent.blocks.length) {
+    errors.push({ code: 'assistant_output_bindings_invalid', path: '$.assistantOutputBindings', message: 'Assistant output bindings must include every named data block.' });
+  }
+  const finalBlock = normalizedIntent.blocks.at(-1);
+  const finalBinding = bindings.find((binding) => String(binding && binding.blockId || '') === String(finalBlock && finalBlock.id || ''));
+  if (!finalBinding || String(finalBinding.alias || '') !== String(flow && flow.publishedAlias || '')) {
+    errors.push({ code: 'assistant_output_bindings_final', path: '$.flow.publishedAlias', message: 'The final named Assistant block must map to the published result alias.' });
+  }
+  if (errors.length) return { metadata: [], errors };
+
+  const consumerAliases = new Map(outputs.map((output) => [output.alias, new Set()]));
+  const connectAliases = (from, to) => {
+    const source = String(from || '');
+    const target = String(to || '');
+    if (source && target && consumerAliases.has(source) && outputAliases.has(target)) {
+      consumerAliases.get(source).add(target);
+    }
+  };
+  (flow && Array.isArray(flow.selections) ? flow.selections : []).forEach((selection) => connectAliases(selection && selection.from, selection && selection.alias));
+  (flow && Array.isArray(flow.operations) ? flow.operations : []).forEach((operation) => {
+    const target = operation && operation.as;
+    connectAliases(operation && operation.from, target);
+    connectAliases(operation && operation.with, target);
+  });
+  const blockOrder = new Map(normalizedIntent.blocks.map((block, index) => [block.id, index]));
+  const ownersMemo = new Map();
+  const owners = (alias) => {
+    if (ownersMemo.has(alias)) return ownersMemo.get(alias);
+    const direct = directByAlias.get(alias);
+    if (direct) return [direct];
+    const queue = [{ alias, distance: 0 }];
+    const distances = new Map([[alias, 0]]);
+    const found = [];
+    let nearestDistance = null;
+    while (queue.length) {
+      const current = queue.shift();
+      if (nearestDistance !== null && current.distance >= nearestDistance) continue;
+      Array.from(consumerAliases.get(current.alias) || []).forEach((target) => {
+        const nextDistance = current.distance + 1;
+        if (nearestDistance !== null && nextDistance > nearestDistance) return;
+        const targetOwner = directByAlias.get(target);
+        if (targetOwner) {
+          if (nearestDistance === null) nearestDistance = nextDistance;
+          if (nextDistance === nearestDistance) found.push(targetOwner);
+          return;
+        }
+        const knownDistance = distances.get(target);
+        if (knownDistance !== undefined && knownDistance <= nextDistance) return;
+        distances.set(target, nextDistance);
+        queue.push({ alias: target, distance: nextDistance });
+      });
+    }
+    const unique = Array.from(new Map(found.map((block) => [block.id, block])).values())
+      .sort((left, right) => Number(blockOrder.get(left.id) || 0) - Number(blockOrder.get(right.id) || 0));
+    ownersMemo.set(alias, unique);
+    return unique;
+  };
+  const stageLabels = {
+    selection: 'Выборка',
+    relation: 'Соединение',
+    existsRelated: 'Отбор по связи',
+    match: 'Сопоставление',
+    set: 'Операция множеств'
+  };
+  const stageCounters = new Map();
+  const metadata = outputs.map((output) => {
+    const direct = directByAlias.get(output.alias);
+    if (direct) {
+      return {
+        alias: output.alias,
+        label: direct.name,
+        assistantBlockId: direct.id,
+        assistantBlockIds: [direct.id]
+      };
+    }
+    const stageOwners = owners(output.alias);
+    const resolvedOwners = stageOwners.length ? stageOwners : normalizedIntent.blocks.length === 1 ? [normalizedIntent.blocks[0]] : [];
+    if (!resolvedOwners.length) {
+      errors.push({ code: 'assistant_output_stage_unowned', path: '$.flow', alias: output.alias, message: `Materialized Assistant stage ${output.alias} is not owned by a named data block.` });
+      return null;
+    }
+    const ownerIds = resolvedOwners.map((block) => block.id);
+    const counterKey = `${ownerIds.join('|')}\u0000${output.kind}`;
+    const ordinal = (stageCounters.get(counterKey) || 0) + 1;
+    stageCounters.set(counterKey, ordinal);
+    return {
+      alias: output.alias,
+      label: `${resolvedOwners.map((block) => block.name).join(' / ')}: ${stageLabels[output.kind] || 'Этап'} ${ordinal}`,
+      assistantBlockId: ownerIds[0],
+      assistantBlockIds: ownerIds
+    };
+  }).filter(Boolean);
+  return { metadata, errors };
+}
+
+function assistantOutputManifestForRequest(flow, bindings, requestedIntent) {
+  const hasIntent = requestedIntent !== undefined && requestedIntent !== null;
+  const hasBindings = bindings !== undefined && bindings !== null;
+  if (!hasIntent && !hasBindings) return null;
+  if (!hasIntent || !Array.isArray(bindings)) {
+    const error = new Error('Assistant-managed object flow requires both the named block intent and complete output bindings.');
+    error.statusCode = 422;
+    error.code = 'assistant_output_manifest_invalid';
+    error.details = [{
+      code: 'assistant_output_manifest_invalid',
+      path: '$.assistantOutputBindings',
+      message: 'Assistant-managed object flow must include the current named blocks and one output binding per block.'
+    }];
+    throw error;
+  }
+  const intent = normalizeAssistantObjectFlowIntent(requestedIntent, { requireComplete: true });
+  const resolved = assistantOutputBindingMetadata(flow, intent, bindings);
+  const candidateBinding = intent.extractionCandidateBlockId
+    ? bindings.find((binding) => String(binding && binding.blockId || '') === intent.extractionCandidateBlockId)
+    : null;
+  if (intent.extractionCandidateBlockId && (!candidateBinding || !String(candidateBinding.alias || '').trim())) {
+    resolved.errors.push({
+      code: 'assistant_output_manifest_invalid',
+      path: '$.assistantObjectFlowIntent.extractionCandidateBlockId',
+      message: 'Assistant extraction candidate must resolve to a bound deterministic result alias.'
+    });
+  }
+  if (resolved.errors.length) {
+    const error = new Error(resolved.errors[0].message);
+    error.statusCode = 422;
+    error.code = resolved.errors[0].code || 'assistant_output_manifest_invalid';
+    error.details = resolved.errors;
+    throw error;
+  }
+  return {
+    outputMetadata: resolved.metadata,
+    assistantOutputManifest: {
+      version: 1,
+      blocks: intent.blocks.map((block, index) => ({ id: block.id, name: block.name, order: index + 1 })),
+      ...(candidateBinding ? {
+        extractionCandidate: {
+          blockId: intent.extractionCandidateBlockId,
+          alias: String(candidateBinding.alias).trim()
+        }
+      } : {})
+    }
+  };
 }
 
 function assistantUnexpectedRelationErrors(flow, requirements, resultContracts = []) {
@@ -27770,6 +28232,61 @@ function assistantObjectFlowSemanticContextRequirements(semanticPlan) {
   return { classNames: Array.from(classNames), domainNames: Array.from(domainNames) };
 }
 
+function assistantObjectFlowMcpContextForSemanticPlan(mcpContext, semanticPlan, runtimeConfig) {
+  if (!mcpContext || !Array.isArray(mcpContext.results)) return mcpContext;
+  const requirements = assistantObjectFlowSemanticContextRequirements(semanticPlan);
+  if (!requirements.classNames.length && !requirements.domainNames.length) return mcpContext;
+  const sourceDiagnostics = mcpContext.diagnostics && typeof mcpContext.diagnostics === 'object' ? mcpContext.diagnostics : {};
+  const classNames = new Set(requirements.classNames);
+  const domainNames = new Set(requirements.domainNames);
+  const relationPaths = (Array.isArray(sourceDiagnostics.relationPaths) ? sourceDiagnostics.relationPaths : []).filter((path) => {
+    const domain = String(path && path.domain || '');
+    const sourceClass = String(path && path.sourceClass || '');
+    const targetClass = String(path && path.targetClass || '');
+    return domainNames.has(domain) || classNames.has(sourceClass) || classNames.has(targetClass);
+  });
+  const diagnostics = {
+    ...sourceDiagnostics,
+    contextClassNames: requirements.classNames.slice(),
+    requestedContextDomainNames: requirements.domainNames.slice(),
+    relationPaths,
+    objectFlowPlanContext: {
+      source: 'semantic-plan-checkpoint',
+      classCount: requirements.classNames.length,
+      domainCount: requirements.domainNames.length
+    }
+  };
+  const payload = assistantObjectFlowMcpPayload(mcpContext.results, diagnostics);
+  const assistantConfig = normalizeAssistantRuntimeConfig(runtimeConfig);
+  const bounded = boundedMcpText(payload, assistantConfig.mcp.maxContextBytes);
+  const limits = Array.isArray(sourceDiagnostics.limits) ? sourceDiagnostics.limits.slice() : [];
+  const warnings = Array.isArray(mcpContext.warnings) ? mcpContext.warnings.slice() : [];
+  if (bounded.truncated) {
+    const limit = assistantLimitDiagnostic({
+      source: 'assistant',
+      tool: 'assistantObjectFlowMcpContextForSemanticPlan',
+      limitName: 'maxContextBytes',
+      rawConfigured: assistantConfig.mcp.limitConfig && assistantConfig.mcp.limitConfig.maxContextBytes && assistantConfig.mcp.limitConfig.maxContextBytes.rawConfigured,
+      configuredLimit: assistantConfig.mcp.maxContextBytes,
+      effectiveLimit: assistantConfig.mcp.maxContextBytes,
+      returned: bounded.limit,
+      total: bounded.bytes,
+      truncated: true,
+      reason: 'object-flow-checkpoint-context'
+    });
+    addAssistantLimitDiagnostics(limits, [limit]);
+    warnings.push(`Object-flow checkpoint context limit reached: produced ${bounded.bytes} bytes with configured maxContextBytes=${assistantConfig.mcp.maxContextBytes}. Results may be incomplete.`);
+  }
+  diagnostics.limits = limits;
+  return {
+    ...mcpContext,
+    text: bounded.text,
+    truncated: Boolean(mcpContext.truncated || bounded.truncated),
+    diagnostics,
+    warnings: uniqueStrings(warnings)
+  };
+}
+
 function assistantDeterministicSelectionRules(block, className, availableParameters, mcpContext = null) {
   const rawText = [block && block.algorithm, block && block.expectedResult].filter(Boolean).join('\n');
   const text = normalizedAssistantLookupText(rawText);
@@ -27962,13 +28479,16 @@ async function createAssistantObjectFlowDraft(input, options = {}) {
   const contextSpec = assistantObjectFlowContextSpec(currentFlow);
   const planningText = assistantObjectFlowIntentPlanningText(intent);
   const semanticContext = assistantObjectFlowSemanticContextRequirements(input.semanticPlan);
-  const mcpContext = await buildAssistantMcpContext(options.authToken || '', {
-    prompt: planningText,
-    currentSpec: contextSpec,
-    mcpContextScope: 'objectFlow',
-    assistantContextClassNames: semanticContext.classNames,
-    assistantContextDomainNames: semanticContext.domainNames
-  }, runtimeConfig);
+  const checkpointMcpContext = options.mcpContext && typeof options.mcpContext === 'object' ? options.mcpContext : null;
+  const mcpContext = checkpointMcpContext
+    ? assistantObjectFlowMcpContextForSemanticPlan(checkpointMcpContext, input.semanticPlan, runtimeConfig)
+    : await buildAssistantMcpContext(options.authToken || '', {
+      prompt: planningText,
+      currentSpec: contextSpec,
+      mcpContextScope: 'objectFlow',
+      assistantContextClassNames: semanticContext.classNames,
+      assistantContextDomainNames: semanticContext.domainNames
+    }, runtimeConfig);
   const semanticPlan = normalizeAssistantObjectFlowSemanticPlan(input.semanticPlan, intent, {
     mcpContext,
     maxReferencePathDepth: normalizeAssistantRuntimeConfig(runtimeConfig).semanticPlan.maxReferencePathDepth
@@ -28050,6 +28570,10 @@ async function createAssistantObjectFlowDraft(input, options = {}) {
         .concat(assistantMatchRequirementsErrors(flow, matchRequirements));
     }
   }
+  const outputBindingResult = errors.length ? { bindings: [], errors: [] } : assistantObjectFlowOutputBindings(flow, semanticPlan, intent);
+  if (!errors.length && outputBindingResult.errors.length) {
+    warnings.push('Не удалось однозначно связать подписи Assistant со всеми именованными блоками данных. Детерминированный поток доступен с текущими подписями результатов.');
+  }
   const objectFlowDiagnostics = assistantObjectFlowValidationDiagnostics(flow, errors);
   const extractionCandidate = errors.length ? null : assistantExtractionCandidateOutput(flow, semanticPlan, intent);
   if (!errors.length && intent.extractionCandidateBlockId && !extractionCandidate) {
@@ -28062,12 +28586,15 @@ async function createAssistantObjectFlowDraft(input, options = {}) {
     explanation: errors.length ? String(parsedObject.explanation || '') : (warnings.some((warning) => /rebuilt it deterministically/i.test(warning)) ? 'Детерминированный поток собран из подтвержденного семантического контракта.' : String(parsedObject.explanation || '')),
     warnings,
     extractionCandidate,
+    outputBindings: errors.length || outputBindingResult.errors.length ? [] : outputBindingResult.bindings,
     errors: objectFlowDiagnostics.errors,
     diagnostics: {
       mcp: mcpContext.diagnostics || {},
       objectFlow: {
+        mcpContextReused: Boolean(checkpointMcpContext),
         aliases: objectFlowDiagnostics.aliases,
         normalizations: classRecovery.normalizations,
+        outputBindingErrors: outputBindingResult.errors,
         relationRequirements,
         matchRequirements,
         businessAttributeMatches: businessAttributeMatches.map((item) => ({
@@ -33320,14 +33847,39 @@ async function handleBackend(req, res, requestUrl) {
     const planContext = await resolveAssistantObjectFlowPlanContext(authToken, res, root, body.templateCode);
     if (!planContext) return;
     const runtimeConfig = await getRuntimeConfig(authToken, root);
+    const resumeId = body.resumeId ? normalizeAssistantSemanticPlanResumeId(body.resumeId) : '';
+    const checkpointScope = resumeId ? executionThrottleScopeFromRequest(req, {
+      action: 'assistant-object-flow-semantic-plan-checkpoint',
+      templateCode: body.templateCode
+    }) : '';
+    const checkpointOptions = resumeId ? {
+      root,
+      resumeId,
+      key: assistantSemanticPlanCheckpointKey({ root, scope: checkpointScope, resumeId })
+    } : null;
     const slot = acquireExecutionSlot(req, res, { action: 'assistant-object-flow-plan', templateCode: body.templateCode });
     if (!slot) return;
+    let checkpoint = null;
     try {
+      checkpoint = await loadAssistantObjectFlowSemanticCheckpoint({
+        intent: body.intent,
+        semanticPlan: body.semanticPlan,
+        currentSpec: body.currentSpec || {},
+        templateCode: body.templateCode || '',
+        baseSpecHash: body.baseSpecHash || ''
+      }, {
+        checkpoint: checkpointOptions,
+        ttlMs: assistantSemanticPlanCheckpointTtlMs(runtimeConfig)
+      });
       const draft = await createAssistantObjectFlowDraft({
         intent: body.intent,
         semanticPlan: body.semanticPlan,
         currentSpec: body.currentSpec || {}
-      }, { authToken, runtimeConfig });
+      }, {
+        authToken,
+        runtimeConfig,
+        mcpContext: checkpoint && checkpoint.checkpoint && checkpoint.checkpoint.mcpContext
+      });
       const draftLimits = collectAssistantLimitDiagnostics(draft.diagnostics || {}).filter((item) => item.limitHit);
       logLimitDiagnostics('assistant.object_flow.limit_hit', {
         requestId: req.cmdpRequestId || '',
@@ -33364,23 +33916,61 @@ async function handleBackend(req, res, requestUrl) {
         requestId: req.cmdpRequestId || '',
         authSource: backendLogUser,
         root,
+        mcpContextReused: Boolean(checkpoint),
+        resumeIdHash: checkpoint ? sha256Hex(resumeId).slice(0, 16) : '',
         selections: draft.flow.selections.length,
         matches: draft.flow.blocks.length,
         setOperations: draft.flow.setOperations.length,
         publishedAlias: draft.flow.publishedAlias
       });
+      const ownershipErrors = Array.isArray(draft.diagnostics && draft.diagnostics.objectFlow && draft.diagnostics.objectFlow.outputBindingErrors)
+        ? draft.diagnostics.objectFlow.outputBindingErrors
+        : [];
       sendJson(res, 200, {
         success: true,
         action: 'assistant-object-flow-plan',
         flow: draft.flow,
-        canApply: planContext.canApply,
+        canApply: planContext.canApply && ownershipErrors.length === 0,
         explanation: draft.explanation || '',
         warnings: draft.warnings || [],
         extractionCandidate: draft.extractionCandidate || null,
-        diagnostics: draft.diagnostics || {}
+        outputBindings: draft.outputBindings || [],
+        ownershipErrors,
+        diagnostics: {
+          ...(draft.diagnostics || {}),
+          resume: checkpoint && checkpoint.resume || null
+        },
+        resume: checkpoint && checkpoint.resume || null
       });
     } catch (error) {
-      sendJson(res, error.statusCode || 502, { success: false, action: 'assistant-object-flow-plan', code: error.code || 'assistant_error', message: error.message || String(error) });
+      const retryable = assistantSemanticPlanRetryable(error) && Boolean(checkpoint && checkpoint.resume);
+      const resume = retryable ? checkpoint.resume : null;
+      const stage = checkpoint ? 'flowDraft' : 'checkpoint';
+      logWarn('assistant.object_flow.plan.rejected', {
+        requestId: req.cmdpRequestId || '',
+        authSource: backendLogUser,
+        root,
+        templateCode: truncateText(String(body.templateCode || ''), 120),
+        stage,
+        retryable,
+        mcpContextReused: Boolean(checkpoint),
+        resumeIdHash: resume ? sha256Hex(resumeId).slice(0, 16) : '',
+        statusCode: Number(error && error.statusCode || 0),
+        code: String(error && error.code || '')
+      });
+      sendJson(res, error.statusCode || 502, {
+        success: false,
+        action: 'assistant-object-flow-plan',
+        code: error.code || 'assistant_error',
+        message: error.message || String(error),
+        retryable,
+        resume,
+        diagnostics: {
+          stage,
+          mcpContextReused: Boolean(checkpoint),
+          configuredTimeoutMs: assistantLiteLlmTimeoutMs(runtimeConfig)
+        }
+      });
     } finally {
       slot.release();
     }
@@ -33417,8 +34007,13 @@ async function handleBackend(req, res, requestUrl) {
         error.details = diagramSourceErrors;
         throw error;
       }
-      const spec = compileObjectFlowToSpec(body.currentSpec || {}, flow);
-      const outputs = new Map(objectFlowResultOutputs(flow).map((output) => [output.alias, output]));
+      const assistantOutput = assistantOutputManifestForRequest(flow, body.assistantOutputBindings, body.assistantObjectFlowIntent);
+      const outputMetadata = assistantOutput ? assistantOutput.outputMetadata : [];
+      const spec = compileObjectFlowToSpec(body.currentSpec || {}, flow, {
+        outputMetadata,
+        ...(assistantOutput ? { assistantOutputManifest: assistantOutput.assistantOutputManifest } : {})
+      });
+      const outputs = new Map(objectFlowResultOutputs(flow, outputMetadata).map((output) => [output.alias, output]));
       const previewSpec = {
         ...spec,
         steps: (spec.steps || []).filter((step) => step && outputs.has(step.as)),
@@ -33534,7 +34129,11 @@ async function handleBackend(req, res, requestUrl) {
         error.details = diagramSourceErrors;
         throw error;
       }
-      const spec = compileObjectFlowToSpec(body.currentSpec || {}, flow);
+      const assistantOutput = assistantOutputManifestForRequest(flow, body.assistantOutputBindings, body.assistantObjectFlowIntent);
+      const spec = compileObjectFlowToSpec(body.currentSpec || {}, flow, {
+        outputMetadata: assistantOutput ? assistantOutput.outputMetadata : [],
+        ...(assistantOutput ? { assistantOutputManifest: assistantOutput.assistantOutputManifest } : {})
+      });
       const specErrors = validateTemplateSpec(spec);
       if (specErrors.length) {
         const error = new Error('Object-flow compiler produced an invalid template spec.');

@@ -28,7 +28,10 @@ test('Assistant browser deadline follows the configured MCP timeout with backend
   const semanticRouteStart = proxySource.indexOf('/assistant/object-flow/semantic-plan');
   assert.match(proxySource.slice(semanticRouteStart, semanticRouteStart + 600), /timeoutMs: assistantRequestTimeoutMs\(1\)/);
   const flowRouteStart = proxySource.indexOf('/assistant/object-flow/plan');
-  assert.match(proxySource.slice(flowRouteStart, flowRouteStart + 600), /timeoutMs: assistantRequestTimeoutMs\(2\)/);
+  assert.match(proxySource.slice(flowRouteStart, flowRouteStart + 900), /timeoutMs: assistantRequestTimeoutMs\(1\)/);
+  assert.match(proxySource.slice(flowRouteStart, flowRouteStart + 900), /resumeId: resume\.resumeId/);
+  assert.match(proxySource, /function setAssistantObjectFlowPlanRetryState/);
+  assert.match(proxySource, /assistant-flow-generate-retry/);
   assert.match(proxySource, /const contextDeadlineAt = contextStartedAt \+ contextTimeoutMs/);
   assert.match(proxySource, /MCP context collection stopped after/);
   assert.doesNotMatch(proxySource, /CMDP_ASSISTANT_TIMEOUT_MS/);
@@ -184,7 +187,7 @@ test('Assistant prompt-only autosave uses an isolated template endpoint and igno
 test('typed assistant flow renders one in-progress proposal before deterministic apply', () => {
   const renderStart = proxySource.indexOf('function renderAssistantFlowEditor(');
   const editorStart = proxySource.indexOf('function renderAssistantEditor(');
-  const generateStart = proxySource.indexOf('function generateAssistantObjectFlow()');
+  const generateStart = proxySource.indexOf('function generateAssistantObjectFlow(retry)');
   const applyStart = proxySource.indexOf('function applyAssistantObjectFlow()');
   assert.ok(renderStart > -1);
   assert.ok(editorStart > renderStart);
@@ -336,6 +339,28 @@ test('designer blocks template-bound menu sections until a template is selected'
   assert.match(clickSource, /redirectDesignerSectionToTemplates\(\)/);
   assert.match(loadDesignerSource, /var redirectedToTemplates = ensureTemplateListOnNewDesignerSession\(\)/);
   assert.match(loadDesignerSource, /else if \(!redirectedToTemplates \|\| !state\.message\) state\.message = null/);
+});
+
+test('designer action bar exposes template save in Assistant and Templates', () => {
+  const actionBarStart = proxySource.indexOf('function renderDesignerActionBar(selected)');
+  const actionBarEnd = proxySource.indexOf('function renderDesigner()', actionBarStart);
+  assert.ok(actionBarStart > -1);
+  assert.ok(actionBarEnd > actionBarStart);
+
+  const actionBarSource = proxySource.slice(actionBarStart, actionBarEnd);
+  const templatesStart = actionBarSource.indexOf("if (section === 'templates')");
+  const assistantStart = actionBarSource.indexOf("else if (section === 'assistant')");
+  const templateEditorStart = actionBarSource.indexOf("else if (section === 'template')");
+  assert.ok(templatesStart > -1);
+  assert.ok(assistantStart > templatesStart);
+  assert.ok(templateEditorStart > assistantStart);
+
+  const templatesSource = actionBarSource.slice(templatesStart, assistantStart);
+  const assistantSource = actionBarSource.slice(assistantStart, templateEditorStart);
+  assert.match(actionBarSource, /var templateSelected = Boolean\(state\.selectedTemplate\)/);
+  assert.match(actionBarSource, /templateSelectionRequired/);
+  assert.match(templatesSource, /renderActionButton\('save-template', t\('save'\)/);
+  assert.match(assistantSource, /renderActionButton\('save-template', t\('save'\), \{ primary: true/);
 });
 
 test('diagram editor renders repeatable mapping tables with source-dependent field selects', () => {
@@ -855,6 +880,40 @@ test('object group final alias drives extraction defaults and diagnostics', () =
   assert.match(extractSource, /var sourceWarning = extractionSelectedSourceEmptyWarning\(result, state\.extractionSource\)/);
   assert.match(extractSource, /type: result\.ok \? \(sourceWarning \? 'warning' : 'ok'\) : 'error'/);
   assert.match(extractSource, /sourceWarning \|\| t\('extractionCompleted'\)/);
+});
+
+test('Assistant extraction uses the persisted user-label manifest and never falls back to aliases', () => {
+  const manifestStart = proxySource.indexOf('function assistantObjectFlowOutputManifest(spec)');
+  const outputManifestStart = proxySource.indexOf('function objectFlowOutputManifest(spec)', manifestStart);
+  const finalAliasesStart = proxySource.indexOf('function finalExtractionAliases(spec)', outputManifestStart);
+  const extractionOptionsStart = proxySource.indexOf('function extractionResultOptions(spec, tables)', finalAliasesStart);
+  const renderStart = proxySource.indexOf('function renderExtractionEditor(selected)', extractionOptionsStart);
+  const extractionStart = proxySource.indexOf('function extractByTemplate()', renderStart);
+  const selectionStart = proxySource.indexOf('function applyDataSelectionEditor()', extractionStart);
+  assert.ok(manifestStart > -1);
+  assert.ok(outputManifestStart > manifestStart);
+  assert.ok(finalAliasesStart > outputManifestStart);
+  assert.ok(extractionOptionsStart > finalAliasesStart);
+  assert.ok(renderStart > extractionOptionsStart);
+  assert.ok(extractionStart > renderStart);
+  assert.ok(selectionStart > extractionStart);
+
+  const manifestSource = proxySource.slice(manifestStart, outputManifestStart);
+  const finalAliasesSource = proxySource.slice(finalAliasesStart, extractionOptionsStart);
+  const optionsSource = proxySource.slice(extractionOptionsStart, renderStart);
+  const renderSource = proxySource.slice(renderStart, extractionStart);
+  const extractionSource = proxySource.slice(extractionStart, selectionStart);
+
+  assert.match(manifestSource, /output\.assistantManaged !== true/);
+  assert.match(manifestSource, /assistantBlockIds/);
+  assert.match(manifestSource, /assistantOutputManifest/);
+  assert.match(manifestSource, /persisted\.blocks/);
+  assert.match(manifestSource, /var hasCompiledFlow = Boolean\(objectMatching/);
+  assert.match(manifestSource, /error: invalid \? 'invalid manifest'/);
+  assert.match(finalAliasesSource, /if \(assistantManifest\.error\) return \[\]/);
+  assert.match(optionsSource, /if \(assistantManifest\.error\) return result/);
+  assert.match(renderSource, /assistantFlowOutputManifestInvalid/);
+  assert.match(extractionSource, /assistantManifest\.assistantManaged && assistantManifest\.error/);
 });
 
 test('Relations Apply preserves explicit operation order and source-driven columns', () => {

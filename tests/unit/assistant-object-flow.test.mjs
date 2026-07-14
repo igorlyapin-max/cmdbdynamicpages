@@ -697,6 +697,88 @@ test('Object Flow persists an ordered output manifest without claiming unrelated
   assert.equal(compiled.result.tables.find((table) => table.name === 'routerRoomVlans').published, true);
 });
 
+test('Assistant output metadata gives named blocks ownership of visible tables without changing aliases', () => {
+  const flow = validFlow();
+  flow.publishedAlias = 'routerRoomVlans';
+  const outputMetadata = [
+    { alias: 'routers', label: 'Маршрутизаторы', assistantBlockId: 'block-1' },
+    { alias: 'rooms', label: 'Помещения', assistantBlockId: 'block-2' },
+    { alias: 'vlans', label: 'VLAN текущей ИС', assistantBlockId: 'block-3' },
+    { alias: 'routerRooms', label: 'VLAN текущей ИС: Сопоставление 1', assistantBlockId: 'block-3', assistantBlockIds: ['block-3'] },
+    { alias: 'routerRoomVlans', label: 'Список VLAN', assistantBlockId: 'block-4' }
+  ];
+  const assistantOutputManifest = {
+    version: 1,
+    blocks: [
+      { id: 'block-1', name: 'Маршрутизаторы', order: 1 },
+      { id: 'block-2', name: 'Помещения', order: 2 },
+      { id: 'block-3', name: 'VLAN текущей ИС', order: 3 },
+      { id: 'block-4', name: 'Список VLAN', order: 4 }
+    ]
+  };
+  const compiled = compileObjectFlowToSpec({
+    version: 1,
+    steps: [],
+    result: { tables: [{ name: 'routerRoomVlans', title: 'Final result', published: true }] }
+  }, flow, { outputMetadata, assistantOutputManifest });
+  const outputs = objectFlowResultOutputs(flow, outputMetadata);
+
+  assert.deepEqual(outputs.map((output) => output.alias), [
+    'routers', 'rooms', 'vlans', 'routerRooms', 'routerRoomVlans'
+  ]);
+  assert.deepEqual(outputs.map((output) => output.label), [
+    'Маршрутизаторы', 'Помещения', 'VLAN текущей ИС', 'VLAN текущей ИС: Сопоставление 1', 'Список VLAN'
+  ]);
+  assert.equal(outputs.every((output) => output.assistantManaged), true);
+  assert.deepEqual(outputs.map((output) => [output.alias, output.assistantBlockId, output.assistantBlockIds]), [
+    ['routers', 'block-1', ['block-1']],
+    ['rooms', 'block-2', ['block-2']],
+    ['vlans', 'block-3', ['block-3']],
+    ['routerRooms', 'block-3', ['block-3']],
+    ['routerRoomVlans', 'block-4', ['block-4']]
+  ]);
+  assert.equal(compiled.result.tables.find((table) => table.name === 'routerRooms').title, 'VLAN текущей ИС: Сопоставление 1');
+  assert.equal(compiled.result.tables.find((table) => table.name === 'routerRoomVlans').title, 'Список VLAN');
+  assert.equal(compiled.visualModels.find((model) => model.mode === 'objectMatching').output.title, 'Список VLAN');
+  assert.deepEqual(compiled.visualModels.find((model) => model.mode === 'objectMatching').assistantOutputManifest, assistantOutputManifest);
+});
+
+test('Assistant output metadata requires a complete persisted ownership manifest', () => {
+  const flow = validFlow();
+  flow.publishedAlias = 'routerRoomVlans';
+  const completeMetadata = objectFlowResultOutputs(flow).map((output, index) => ({
+    alias: output.alias,
+    label: `Result ${index + 1}`,
+    assistantBlockId: 'block-1'
+  }));
+  const currentSpec = { version: 1, steps: [], result: { tables: [] } };
+
+  assert.throws(
+    () => compileObjectFlowToSpec(currentSpec, flow, { outputMetadata: completeMetadata }),
+    { code: 'assistant_output_manifest_invalid' }
+  );
+  assert.throws(
+    () => compileObjectFlowToSpec(currentSpec, flow, {
+      outputMetadata: completeMetadata.slice(0, -1),
+      assistantOutputManifest: { version: 1, blocks: [{ id: 'block-1', name: 'Result', order: 1 }] }
+    }),
+    { code: 'object_flow_output_metadata_invalid' }
+  );
+  assert.throws(
+    () => compileObjectFlowToSpec(currentSpec, flow, {
+      outputMetadata: completeMetadata,
+      assistantOutputManifest: {
+        version: 1,
+        blocks: [
+          { id: 'block-1', name: 'Result', order: 1 },
+          { id: 'block-2', name: ' result ', order: 2 }
+        ]
+      }
+    }),
+    { code: 'assistant_output_manifest_invalid' }
+  );
+});
+
 test('match stage summaries retain custom columns from every materialized selection', () => {
   const flow = validFlow();
   flow.selections[0].columns.push('RouterModel');

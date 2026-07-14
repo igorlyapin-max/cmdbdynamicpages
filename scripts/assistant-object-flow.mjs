@@ -115,6 +115,28 @@
  * @property {string} label
  * @property {'selection' | 'match' | 'set' | 'relation' | 'existsRelated'} kind
  * @property {boolean} published
+ * @property {boolean=} assistantManaged
+ * @property {string=} assistantBlockId
+ * @property {string[]=} assistantBlockIds
+ */
+
+/**
+ * Persisted ownership catalog for an Assistant-authored Object Flow. Outputs
+ * remain in objectMatching.outputs; this catalog makes their owners available
+ * after save/reload without depending on the editable prompt draft.
+ *
+ * @typedef {object} AssistantOutputManifest
+ * @property {number} version
+ * @property {Array<{id: string, name: string, order: number}>} blocks
+ * @property {{blockId: string, alias: string}=} extractionCandidate
+ */
+
+/**
+ * @typedef {object} ObjectFlowOutputMetadata
+ * @property {string} alias
+ * @property {string} label
+ * @property {string=} assistantBlockId
+ * @property {string[]=} assistantBlockIds
  */
 
 const BASE_RESULT_COLUMNS = ['Class', '_id', 'Code', 'Description'];
@@ -1117,8 +1139,52 @@ function visualSelection(selection) {
  * @param {ObjectFlow} flow
  * @returns {{objectGroup: Record<string, unknown>, objectMatching: Record<string, unknown>}}
  */
-function objectFlowVisualModels(flow) {
+function normalizeAssistantOutputManifest(value, outputs) {
+  if (value === undefined || value === null) {
+    if (outputs.some((output) => output.assistantManaged)) {
+      throw contractError('Assistant-managed object-flow outputs require a persisted ownership manifest.', 'assistant_output_manifest_invalid', 422);
+    }
+    return null;
+  }
+  if (!isRecord(value) || Number(value.version) !== 1 || !Array.isArray(value.blocks) || !value.blocks.length) {
+    throw contractError('Assistant ownership manifest must contain version 1 and named blocks.', 'assistant_output_manifest_invalid', 422);
+  }
+  const seenIds = new Set();
+  const seenNames = new Set();
+  const blocks = value.blocks.map((raw, index) => {
+    if (!isRecord(raw)) {
+      throw contractError(`Assistant ownership manifest block ${index + 1} must be an object.`, 'assistant_output_manifest_invalid', 422);
+    }
+    const id = text(raw.id);
+    const name = text(raw.name);
+    const normalizedName = name.trim().replace(/\s+/g, ' ').toLocaleLowerCase('ru-RU');
+    if (!id || !normalizedName || seenIds.has(id) || seenNames.has(normalizedName) || Number(raw.order) !== index + 1) {
+      throw contractError('Assistant ownership manifest block ids and names must be unique and non-empty.', 'assistant_output_manifest_invalid', 422);
+    }
+    seenIds.add(id);
+    seenNames.add(normalizedName);
+    return { id, name: name.trim(), order: index + 1 };
+  });
+  const knownBlockIds = new Set(blocks.map((block) => block.id));
+  if (outputs.some((output) => !output.assistantManaged || !output.assistantBlockIds?.length || output.assistantBlockIds.some((id) => !knownBlockIds.has(id)))) {
+    throw contractError('Assistant ownership manifest must own every materialized Assistant result.', 'assistant_output_manifest_invalid', 422);
+  }
+  const rawCandidate = isRecord(value.extractionCandidate) ? value.extractionCandidate : null;
+  const blockId = text(rawCandidate?.blockId);
+  const alias = text(rawCandidate?.alias);
+  if (Boolean(blockId) !== Boolean(alias) || (blockId && (!knownBlockIds.has(blockId) || !outputs.some((output) => output.alias === alias)))) {
+    throw contractError('Assistant ownership manifest extraction candidate must reference a known block and result.', 'assistant_output_manifest_invalid', 422);
+  }
+  return {
+    version: 1,
+    blocks,
+    ...(blockId ? { extractionCandidate: { blockId, alias } } : {})
+  };
+}
+
+function objectFlowVisualModels(flow, outputs, assistantOutputManifest = null) {
   const groupSelections = flow.selections.map(visualSelection);
+  const publishedOutput = outputs.find((output) => output.published);
   return {
     objectGroup: {
       version: 1,
@@ -1132,10 +1198,11 @@ function objectFlowVisualModels(flow) {
       operations: cloneJsonValue(flow.operations),
       blocks: cloneJsonValue(flow.blocks),
       setOperations: cloneJsonValue(flow.setOperations),
-      outputs: objectFlowResultOutputs(flow),
+      outputs,
+      ...(assistantOutputManifest ? { assistantOutputManifest: cloneJsonValue(assistantOutputManifest) } : {}),
       output: {
         alias: flow.publishedAlias,
-        title: 'Final result'
+        title: publishedOutput?.label || 'Final result'
       }
     }
   };
@@ -1172,13 +1239,14 @@ function replaceObjectFlowVisualModels(currentModels, objectGroup, objectMatchin
  * @param {Map<string, Record<string, unknown>>} existingByName
  * @returns {Record<string, unknown>[]}
  */
-function generatedResultTables(flow, existingByName) {
-  const outputs = objectFlowResultOutputs(flow);
+function generatedResultTables(flow, existingByName, outputs) {
   const outputByAlias = new Map(outputs.map((output) => [output.alias, output]));
   const tables = flow.selections.map((selection) => ({
     ...(existingByName.get(selection.alias) || {}),
     name: selection.alias,
-    title: text(existingByName.get(selection.alias)?.title) || outputByAlias.get(selection.alias)?.label || selection.name,
+    title: outputByAlias.get(selection.alias)?.assistantManaged
+      ? outputByAlias.get(selection.alias)?.label
+      : text(existingByName.get(selection.alias)?.title) || outputByAlias.get(selection.alias)?.label || selection.name,
     columns: selection.columns.length ? selection.columns.slice() : BASE_RESULT_COLUMNS.slice()
   }));
   const stages = objectFlowStageSummaries(flow);
@@ -1187,7 +1255,9 @@ function generatedResultTables(flow, existingByName) {
     tables.push({
       ...existing,
       name: stage.alias,
-      title: text(existing.title) || outputByAlias.get(stage.alias)?.label || stage.alias,
+      title: outputByAlias.get(stage.alias)?.assistantManaged
+        ? outputByAlias.get(stage.alias)?.label
+        : text(existing.title) || outputByAlias.get(stage.alias)?.label || stage.alias,
       columns: stage.columns,
       ...(stage.kind === 'match' ? { columnLabels: resultColumnLabels(stage.columns) } : {})
     });
@@ -1207,8 +1277,39 @@ function generatedResultTables(flow, existingByName) {
  * @param {unknown} flow
  * @returns {ObjectFlowResultOutput[]}
  */
-export function objectFlowResultOutputs(flow) {
+export function objectFlowResultOutputs(flow, outputMetadata = []) {
   const normalized = normalizeObjectFlow(flow);
+  const materializedAliases = new Set(orderedObjectFlowStages(normalized).ordered.map((stage) => (
+    stage.kind === 'selection' ? stage.item.alias : stage.item.as
+  )).filter(Boolean));
+  const metadataByAlias = new Map();
+  if (!Array.isArray(outputMetadata)) {
+    throw contractError('Object-flow output metadata must be an array.', 'object_flow_output_metadata_invalid', 422);
+  }
+  for (const raw of outputMetadata) {
+    if (!isRecord(raw)) {
+      throw contractError('Object-flow output metadata entries must be objects.', 'object_flow_output_metadata_invalid', 422);
+    }
+    const alias = text(raw.alias);
+    const label = text(raw.label);
+    const assistantBlockId = text(raw.assistantBlockId);
+    const assistantBlockIds = uniqueStrings(Array.isArray(raw.assistantBlockIds)
+      ? raw.assistantBlockIds.map((item) => text(item))
+      : assistantBlockId ? [assistantBlockId] : []);
+    if (!alias || !materializedAliases.has(alias) || !label || metadataByAlias.has(alias)) {
+      throw contractError('Object-flow output metadata must define one non-empty label for each known alias.', 'object_flow_output_metadata_invalid', 422);
+    }
+    metadataByAlias.set(alias, {
+      label,
+      assistantBlockId: assistantBlockId || assistantBlockIds[0] || '',
+      assistantBlockIds
+    });
+  }
+  if (metadataByAlias.size && (metadataByAlias.size !== materializedAliases.size
+    || Array.from(materializedAliases).some((alias) => !metadataByAlias.has(alias))
+    || Array.from(metadataByAlias.values()).some((metadata) => !metadata.assistantBlockIds.length))) {
+    throw contractError('Assistant output metadata must own every materialized alias exactly once.', 'object_flow_output_metadata_invalid', 422);
+  }
   const outputs = [];
   let matchIndex = 0;
   let relationIndex = 0;
@@ -1233,11 +1334,17 @@ export function objectFlowResultOutputs(flow) {
       setIndex += 1;
       label = `Операция множеств ${setIndex}`;
     }
+    const metadata = metadataByAlias.get(alias);
     outputs.push({
       alias,
-      label,
+      label: metadata?.label || label,
       kind: stage.kind === 'selection' ? 'selection' : stage.item.type === 'relation' ? 'relation' : stage.item.type === 'existsRelated' ? 'existsRelated' : stage.item.type === 'match' ? 'match' : 'set',
-      published: Boolean(normalized.publishedAlias && normalized.publishedAlias === alias)
+      published: Boolean(normalized.publishedAlias && normalized.publishedAlias === alias),
+      ...(metadata ? {
+        assistantManaged: true,
+        ...(metadata.assistantBlockId ? { assistantBlockId: metadata.assistantBlockId } : {}),
+        ...(metadata.assistantBlockIds.length ? { assistantBlockIds: metadata.assistantBlockIds } : {})
+      } : {})
     });
   }
   return outputs;
@@ -1340,7 +1447,7 @@ function contractError(message, code, statusCode, errors) {
  * @param {unknown} flow
  * @returns {Record<string, unknown>}
  */
-export function compileObjectFlowToSpec(currentSpec, flow) {
+export function compileObjectFlowToSpec(currentSpec, flow, options = {}) {
   if (!isRecord(currentSpec) || currentSpec.version !== 1) {
     throw contractError('Object flow compilation requires current Spec version 1.', 'object_flow_spec_version', 409);
   }
@@ -1390,7 +1497,9 @@ export function compileObjectFlowToSpec(currentSpec, flow) {
     delete spec.params.attrType;
   }
 
-  const models = objectFlowVisualModels(executableFlow);
+  const outputs = objectFlowResultOutputs(executableFlow, options.outputMetadata || []);
+  const assistantOutputManifest = normalizeAssistantOutputManifest(options.assistantOutputManifest, outputs);
+  const models = objectFlowVisualModels(executableFlow, outputs, assistantOutputManifest);
   const currentModels = Array.isArray(spec.visualModels) ? spec.visualModels : [];
   spec.visualModels = replaceObjectFlowVisualModels(currentModels, models.objectGroup, models.objectMatching);
   if (isRecord(spec.visualModel) && spec.visualModel.mode === 'objectGroup') spec.visualModel = models.objectGroup;
@@ -1405,7 +1514,7 @@ export function compileObjectFlowToSpec(currentSpec, flow) {
   for (const table of currentTables) {
     if (isRecord(table) && text(table.name)) existingByName.set(text(table.name), table);
   }
-  const generatedTables = generatedResultTables(executableFlow, existingByName);
+  const generatedTables = generatedResultTables(executableFlow, existingByName, outputs);
   const relatedTableNames = new Set(oldManagedAliases);
   for (const table of generatedTables) relatedTableNames.add(text(table.name));
   result.tables = replaceObjectFlowTables(currentTables, relatedTableNames, generatedTables);
