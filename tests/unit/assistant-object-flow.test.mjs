@@ -4,10 +4,23 @@ import assert from 'node:assert/strict';
 import {
   compileObjectFlowToSpec,
   normalizeObjectFlow,
+  objectFlowResultOutputs,
   objectFlowStageSummaries,
   validateObjectFlow
 } from '../../scripts/assistant-object-flow.mjs';
-import { validateTemplateSpec } from '../../scripts/dev-proxy-server.mjs';
+import {
+  assistantObjectFlowMessages,
+  assistantObjectFlowCandidate,
+  assistantIpv4MatchRequirements,
+  assistantMatchRequirementsErrors,
+  assistantRelationRequirements,
+  assistantRelationRequirementsErrors,
+  assistantObjectFlowIncompleteFieldErrors,
+  assistantResultContractErrors,
+  assistantRestoreObjectFlowSelectionClasses,
+  assistantObjectFlowValidationFeedback,
+  validateTemplateSpec
+} from '../../scripts/dev-proxy-server.mjs';
 
 function validFlow() {
   return {
@@ -163,6 +176,134 @@ test('validateObjectFlow accepts independent selections without a match operatio
   flow.operations = [];
 
   assert.deepEqual(validateObjectFlow(flow), []);
+});
+
+test('object flow compiles a typed domain relation without inventing a match attribute', () => {
+  const flow = {
+    version: 1,
+    selections: [{
+      id: 'selection:informationSystems',
+      name: 'Information systems',
+      alias: 'informationSystems',
+      className: 'IS',
+      limit: 1,
+      columns: ['Name'],
+      rules: [{ action: 'include', path: 'Name', op: 'equals', valueParam: 'isName' }]
+    }],
+    operations: [{
+      id: 'relation:ipRanges',
+      type: 'relation',
+      from: 'informationSystems',
+      as: 'ipRanges',
+      domain: 'ISZabbixMonitoringDomain',
+      targetClass: 'ipRange',
+      direction: 'source',
+      columns: ['range'],
+      limit: 100,
+      distinct: true
+    }],
+    publishedAlias: 'ipRanges'
+  };
+
+  assert.deepEqual(validateObjectFlow(flow), []);
+  const compiled = compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, flow);
+  const relation = compiled.steps.find((step) => step.type === 'expandRelations');
+  assert.deepEqual(relation, {
+    type: 'expandRelations',
+    purpose: 'objectMatching',
+    from: 'informationSystems',
+    domain: 'ISZabbixMonitoringDomain',
+    targetClass: 'ipRange',
+    direction: 'source',
+    columns: ['range'],
+    limit: 100,
+    distinct: true,
+    as: 'ipRanges'
+  });
+  assert.equal(compiled.result.tables.find((table) => table.name === 'ipRanges').published, true);
+  assert.equal(compiled.result.tables.find((table) => table.name === 'ipRanges').columns.includes('range'), true);
+  assert.equal(compiled.steps.some((step) => step.type === 'matchRows'), false);
+});
+
+test('object flow schedules a source-driven IPv4 selection after its relation output', () => {
+  const flow = {
+    version: 1,
+    selections: [{
+      id: 'selection:informationSystems', name: 'Information systems', alias: 'informationSystems', className: 'IS', limit: 1, columns: ['Name'],
+      rules: [{ action: 'include', path: 'Name', op: 'equals', valueParam: 'isName' }]
+    }, {
+      id: 'selection:aclsInRanges', name: 'ACL in selected ranges', alias: 'aclsInRanges', className: 'ACL', from: 'ipRanges', limit: 100,
+      columns: ['ipaddress', 'dipaddress'],
+      rules: [
+        { action: 'include', path: 'ipaddress', op: 'ipv4InCidr', valueColumn: 'range' },
+        { action: 'include', path: 'dipaddress', op: 'ipv4InCidr', valueColumn: 'range' }
+      ]
+    }],
+    operations: [{
+      id: 'relation:ipRanges', type: 'relation', from: 'informationSystems', as: 'ipRanges', domain: 'ISZabbixMonitoringDomain',
+      targetClass: 'ipRange', direction: 'source', columns: ['range'], limit: 100, distinct: true
+    }],
+    publishedAlias: 'aclsInRanges'
+  };
+
+  assert.deepEqual(validateObjectFlow(flow), []);
+  const compiled = compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, flow);
+  assert.deepEqual(compiled.steps.map((step) => [step.type, step.as]), [
+    ['selectCards', 'informationSystems'],
+    ['expandRelations', 'ipRanges'],
+    ['selectCards', 'aclsInRanges']
+  ]);
+  const acls = compiled.steps.at(-1);
+  assert.equal(acls.from, 'ipRanges');
+  assert.deepEqual(acls.filters.map((filter) => [filter.scope, filter.path, filter.op, filter.valueColumn]), [
+    ['include', 'ipaddress', 'ipv4InCidr', 'range'],
+    ['include', 'dipaddress', 'ipv4InCidr', 'range']
+  ]);
+});
+
+test('object flow compiles a relation-aware existence match without changing the retained source schema', () => {
+  const flow = {
+    version: 1,
+    selections: [{
+      id: 'selection:externalSystems', name: 'External systems', alias: 'externalSystems', className: 'IS', limit: 100, columns: ['isExt'],
+      rules: [{ action: 'include', path: 'isExt', op: 'equals', value: 'true' }]
+    }, {
+      id: 'selection:acls', name: 'ACL', alias: 'acls', className: 'ACL', limit: 100, columns: [],
+      rules: [{ action: 'include', path: 'Code', op: 'matches', regex: '.*' }]
+    }],
+    operations: [{
+      id: 'existsRelated:externalSystemsWithAcl', type: 'existsRelated', from: 'externalSystems', with: 'acls', as: 'externalSystemsWithAcl',
+      domain: 'ISIpRange', targetClass: 'ipRange', direction: 'source', columns: ['range'], limit: 100, distinct: true,
+      rules: [{ action: 'include', operator: 'ipv4InCidr', leftColumn: 'ipaddress', rightColumn: 'range' }]
+    }],
+    publishedAlias: 'externalSystemsWithAcl'
+  };
+
+  assert.deepEqual(validateObjectFlow(flow), []);
+  const compiled = compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, flow);
+  const operation = compiled.steps.find((step) => step.type === 'existsRelatedRows');
+  assert.deepEqual(operation, {
+    type: 'existsRelatedRows',
+    purpose: 'objectMatching',
+    from: 'externalSystems',
+    with: 'acls',
+    domain: 'ISIpRange',
+    targetClass: 'ipRange',
+    direction: 'source',
+    columns: ['range'],
+    limit: 100,
+    distinct: true,
+    rules: [{
+      action: 'include', negate: false, operator: 'ipv4InCidr',
+      left: { column: 'ipaddress', regex: '' }, right: { column: 'range', regex: '' }
+    }],
+    caseSensitive: false,
+    as: 'externalSystemsWithAcl'
+  });
+  assert.deepEqual(objectFlowStageSummaries(flow).at(-1), {
+    id: 'existsRelated:externalSystemsWithAcl', kind: 'existsRelated', alias: 'externalSystemsWithAcl',
+    columns: ['Class', '_id', 'Code', 'Description', 'isExt']
+  });
 });
 
 test('compileObjectFlowToSpec replaces only managed object-flow state', () => {
@@ -533,6 +674,29 @@ test('objectFlowStageSummaries exposes typed set-operation aliases for diagram m
   });
 });
 
+test('Object Flow persists an ordered output manifest without claiming unrelated tables', () => {
+  const flow = validFlow();
+  flow.publishedAlias = 'routerRoomVlans';
+  const outputs = objectFlowResultOutputs(flow);
+  const compiled = compileObjectFlowToSpec({
+    version: 1,
+    steps: [{ type: 'selectCards', className: 'ARM', as: 'targetARM', filters: [], limit: 100 }],
+    result: { tables: [{ name: 'targetARM', title: 'Manual ARM target', published: true }] }
+  }, flow);
+
+  assert.deepEqual(outputs.map((output) => [output.alias, output.label, output.kind, output.published]), [
+    ['routers', 'Routers', 'selection', false],
+    ['rooms', 'Rooms', 'selection', false],
+    ['vlans', 'VLANs', 'selection', false],
+    ['routerRooms', 'Сопоставление 1', 'match', false],
+    ['routerRoomVlans', 'Сопоставление 2', 'match', true]
+  ]);
+  const manifest = compiled.visualModels.find((model) => model.mode === 'objectMatching').outputs;
+  assert.deepEqual(manifest, outputs);
+  assert.equal(compiled.result.tables.find((table) => table.name === 'targetARM').published, undefined);
+  assert.equal(compiled.result.tables.find((table) => table.name === 'routerRoomVlans').published, true);
+});
+
 test('match stage summaries retain custom columns from every materialized selection', () => {
   const flow = validFlow();
   flow.selections[0].columns.push('RouterModel');
@@ -579,6 +743,269 @@ test('object flow rejects operation columns absent from intermediate materialize
 
   const errors = validateObjectFlow(flow);
   assert.ok(errors.some((error) => error.path === '$.operations[1].rules[0].leftColumn'));
+});
+
+test('relation requirements preserve confirmed inherited-domain hops without fixing aliases or output', () => {
+  const prompt = 'Выборка 1\nДля информационной системы (ИС) имя которой равно параметру отчета isName, выбираем все связанные объекты ipRange\n\nВыборка 2\nДля ipRange из выборки 1 получить все VLAN которые с ними связаны';
+  const mcpContext = {
+    enabled: true,
+    diagnostics: {
+      candidateClasses: [
+        { name: 'IS', description: 'Информационная система', score: 22, matchedTerms: ['информационной', 'системы'] },
+        { name: 'C2M_ServiceComputeCluster', description: 'Сервис ИС', score: 12, matchedTerms: ['информационной'] },
+        { name: 'ipRange', description: 'IP range', score: 68, matchedTerms: ['iprange'] },
+        { name: 'vlan', description: 'VLAN', score: 42, matchedTerms: ['vlan'] }
+      ],
+      relationPaths: [
+        { domain: 'ISZabbixMonitoringDomain', direction: 'source', sourceClass: 'IS', targetClass: 'ipRange', sourceRoot: 'IS', targetRoot: 'ZabbixMonitoring', sourceEndpoint: ['IS'], targetEndpoint: ['ZabbixMonitoring', 'ipRange'] },
+        { domain: 'super2super', direction: 'source', sourceClass: 'IS', targetClass: 'ipRange', sourceRoot: 'super', targetRoot: 'super', sourceEndpoint: ['super', 'IS'], targetEndpoint: ['super', 'ipRange'] },
+        { domain: 'Vlan2super', direction: 'destination', sourceClass: 'ipRange', targetClass: 'vlan', sourceRoot: 'ZabbixMonitoring', targetRoot: 'vlan', sourceEndpoint: ['ZabbixMonitoring', 'ipRange'], targetEndpoint: ['vlan'] },
+        { domain: 'super2super', direction: 'source', sourceClass: 'ipRange', targetClass: 'vlan', sourceRoot: 'super', targetRoot: 'super', sourceEndpoint: ['super', 'ipRange'], targetEndpoint: ['super', 'vlan'] }
+      ]
+    },
+    tools: [],
+    warnings: [],
+    text: ''
+  };
+
+  const requirements = assistantRelationRequirements(prompt, mcpContext);
+  assert.deepEqual(requirements, {
+    kind: 'relationRequirements',
+    chains: [{ operations: [
+      { sourceClass: 'IS', domain: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source' },
+      { sourceClass: 'ipRange', domain: 'Vlan2super', targetClass: 'vlan', direction: 'destination' }
+    ] }]
+  });
+  const messages = assistantObjectFlowMessages({ prompt, currentSpec: { version: 1, params: { isName: { type: 'string' } } } }, mcpContext, {}, requirements);
+  assert.match(messages.at(-1).content, /"relationRequirements"/);
+  assert.match(messages.at(-1).content, /"ipRange"/);
+  assert.ok(messages.some((message) => /Binding deterministic requirements/.test(message.content)));
+  assert.ok(messages.some((message) => /do not change direction/.test(message.content)));
+  const errors = assistantRelationRequirementsErrors({ selections: [{ alias: 'IS_by_isName', className: 'IS' }], operations: [], publishedAlias: '' }, requirements);
+  assert.equal(errors.length, 1);
+  assert.deepEqual(errors[0].expectedRelationRequirements, requirements);
+});
+
+test('relation requirements allow an IPv4 ACL match after confirmed relation hops', () => {
+  const prompt = [
+    'Выборка 1\nДля информационной системы (ИС) выбираем связанные объекты ipRange.',
+    'Выборка 2\nДля ipRange из выборки 1 получить все VLAN которые с ними связаны.',
+    'Выборка 3\nПолучить ACL, у которых Source ipaddress или Destination ipaddress входит в сеть range из ipRange.'
+  ].join('\n\n');
+  const mcpContext = {
+    diagnostics: {
+      candidateClasses: [
+        { name: 'IS', description: 'Информационная система', score: 22, matchedTerms: ['информационной', 'системы'] },
+        { name: 'ipRange', description: 'IP range', score: 68, matchedTerms: ['iprange'] },
+        { name: 'vlan', description: 'VLAN', score: 42, matchedTerms: ['vlan'] },
+        { name: 'ACL', description: 'ACL', score: 42, matchedTerms: ['acl'] },
+        { name: 'IpAddress', description: 'IP address', score: 42, matchedTerms: ['ipaddress'] }
+      ],
+      relationPaths: [
+        { domain: 'ISZabbixMonitoringDomain', direction: 'source', sourceClass: 'IS', targetClass: 'ipRange', sourceRoot: 'IS', targetRoot: 'ZabbixMonitoring', sourceEndpoint: ['IS'], targetEndpoint: ['ZabbixMonitoring', 'ipRange'] },
+        { domain: 'Vlan2super', direction: 'destination', sourceClass: 'ipRange', targetClass: 'vlan', sourceRoot: 'ZabbixMonitoring', targetRoot: 'vlan', sourceEndpoint: ['ZabbixMonitoring', 'ipRange'], targetEndpoint: ['vlan'] },
+        { domain: 'aclLine', direction: 'source', sourceClass: 'vlan', targetClass: 'ACL', sourceRoot: 'ZabbixMonitoring', targetRoot: 'ACL', sourceEndpoint: ['ZabbixMonitoring', 'vlan'], targetEndpoint: ['ACL'] },
+        { domain: 'aclLine', direction: 'destination', sourceClass: 'ACL', targetClass: 'IpAddress', sourceRoot: 'ACL', targetRoot: 'ZabbixMonitoring', sourceEndpoint: ['ACL'], targetEndpoint: ['ZabbixMonitoring', 'IpAddress'] }
+      ]
+    },
+    results: [{
+      tool: 'cmdbuild_class_fields',
+      ok: true,
+      result: [
+        { className: 'ipRange', attributes: [{ name: 'range', description: 'Range' }] },
+        { className: 'ACL', attributes: [
+          { name: 'ipaddress', description: 'Source ipaddress' },
+          { name: 'dipaddress', description: 'Destination ipaddress' }
+        ] }
+      ]
+    }]
+  };
+  const requirements = assistantRelationRequirements(prompt, mcpContext);
+  assert.deepEqual(requirements, {
+    kind: 'relationRequirements',
+    chains: [{ operations: [
+      { sourceClass: 'IS', domain: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source' },
+      { sourceClass: 'ipRange', domain: 'Vlan2super', targetClass: 'vlan', direction: 'destination' }
+    ] }]
+  });
+
+  const flow = {
+    selections: [
+      { alias: 'informationSystems', className: 'IS' },
+      { alias: 'acls', className: 'ACL' }
+    ],
+    operations: [
+      { type: 'relation', from: 'informationSystems', as: 'ipRanges', domain: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source' },
+      { type: 'relation', from: 'ipRanges', as: 'vlans', domain: 'Vlan2super', targetClass: 'vlan', direction: 'destination' },
+      {
+        type: 'match', from: 'acls', with: 'ipRanges', as: 'matchingAcls',
+        rules: [
+          { action: 'include', operator: 'ipv4InCidr', leftColumn: 'dipaddress', rightColumn: 'range' },
+          { action: 'include', operator: 'ipv4InCidr', leftColumn: 'ipaddress', rightColumn: 'range' }
+        ]
+      }
+    ]
+  };
+  assert.deepEqual(assistantRelationRequirementsErrors(flow, requirements), []);
+  const matchRequirements = assistantIpv4MatchRequirements(prompt, mcpContext, requirements);
+  assert.deepEqual(matchRequirements, [{
+    kind: 'ipv4Membership', selectionClass: 'ACL', relationClass: 'ipRange', sourceFields: ['ipaddress', 'dipaddress'], networkField: 'range', operator: 'ipv4InCidr'
+  }]);
+  assert.deepEqual(assistantMatchRequirementsErrors(flow, matchRequirements), []);
+
+  const sourceDrivenFlow = {
+    selections: [
+      { alias: 'informationSystems', className: 'IS' },
+      {
+        alias: 'aclsInRanges', className: 'ACL', from: 'ipRanges', rules: [
+          { action: 'include', path: 'ipaddress', op: 'ipv4InCidr', valueColumn: 'range' },
+          { action: 'include', path: 'dipaddress', op: 'ipv4InCidr', valueColumn: 'range' }
+        ]
+      }
+    ],
+    operations: [
+      { type: 'relation', from: 'informationSystems', as: 'ipRanges', domain: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source' },
+      { type: 'relation', from: 'ipRanges', as: 'vlans', domain: 'Vlan2super', targetClass: 'vlan', direction: 'destination' }
+    ]
+  };
+  assert.deepEqual(assistantMatchRequirementsErrors(sourceDrivenFlow, matchRequirements), []);
+
+  flow.operations.splice(2, 0, {
+    type: 'relation', from: 'ipRanges', as: 'aclsByRelation', domain: 'aclLine', targetClass: 'ACL', direction: 'source'
+  });
+  const errors = assistantRelationRequirementsErrors(flow, requirements);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /not confirmed/);
+  assert.deepEqual(errors[0].actualRelation, {
+    sourceClasses: ['ipRange'],
+    domain: 'aclLine',
+    targetClass: 'ACL',
+    direction: 'source',
+    from: 'ipRanges',
+    as: 'aclsByRelation'
+  });
+  const feedback = assistantObjectFlowValidationFeedback(errors);
+  assert.match(feedback.summary, /aclLine/);
+  assert.match(feedback.action, /сравнение атрибутов/);
+  assert.ok(feedback.confirmedRelations.some((path) => path.includes('ISZabbixMonitoringDomain')));
+});
+
+test('object-flow rejection reports a missing required field as the root cause and lists dependent stages', () => {
+  const flow = {
+    version: 1,
+    selections: [
+      { name: 'Результат 1', alias: 'IS_by_Name', className: '', from: '', rules: [] },
+      { name: 'Результат 2', alias: 'ipRange_from_IS', className: '', from: 'IS_by_Name', rules: [] }
+    ],
+    operations: [
+      { type: 'existsRelated', from: 'ipRange_from_IS', with: '', as: 'ACL_with_ip_in_ipRange', domain: 'aclLine', targetClass: 'ACL', rules: [] },
+      { type: 'relation', from: 'ACL_with_ip_in_ipRange', as: 'IS_from_ACL_outside_ipRange', domain: 'aclLine', targetClass: 'IS', direction: 'destination' }
+    ]
+  };
+  const errors = assistantObjectFlowIncompleteFieldErrors(flow).concat([{
+    path: '$.flow.relationRequirements',
+    expectedRelationRequirements: {
+      kind: 'relationRequirements',
+      chains: [{ operations: [{ sourceClass: 'IS', domain: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source' }] }]
+    }
+  }]);
+  const feedback = assistantObjectFlowValidationFeedback(errors, { flow });
+
+  assert.equal(feedback.causes[0].kind, 'missingClass');
+  assert.match(feedback.summary, /Результат 1/);
+  assert.match(feedback.causes[0].message, /CMDBuild class/);
+  assert.deepEqual(feedback.affectedStages.map((stage) => stage.label), [
+    'Результат 1',
+    'Результат 2',
+    'Операция 1 (ACL_with_ip_in_ipRange)',
+    'Операция 2 (IS_from_ACL_outside_ipRange)'
+  ]);
+  assert.ok(feedback.confirmedRelations.some((relation) => relation.includes('ISZabbixMonitoringDomain')));
+});
+
+test('source-card result contract explains the missing comparison set without exposing aliases as the instruction', () => {
+  const intent = {
+    context: '',
+    blocks: [
+      { id: 'result-3', name: 'Результат 3', entities: 'ACL', algorithm: 'Выбрать ACL.', expectedResult: 'Список ACL.', uses: [] },
+      { id: 'external-is', name: 'Внешние ИС', entities: 'ИС и связанные ipRange.', algorithm: 'Оставить ИС по ACL из Результата 3.', expectedResult: 'Список ИС.', uses: ['result-3'] }
+    ]
+  };
+  const semanticPlan = {
+    blocks: [{ id: 'result-3', name: 'Результат 3', resultContract: { outputKind: 'sourceCards', outputClass: 'ACL', relationPredicates: [] } }, {
+      id: 'external-is', name: 'Внешние ИС', resultContract: {
+        outputKind: 'sourceCards', outputClass: 'IS', relationPredicates: [{
+          sourceClass: 'IS', relatedClass: 'ipRange', comparisonBlockId: 'result-3', comparisonClass: 'ACL',
+          domain: 'ISIpRange', direction: 'source', comparisonFields: ['ipaddress', 'dipaddress'], relatedField: 'range', operator: 'ipv4InCidr'
+        }]
+      }
+    }]
+  };
+  const flow = {
+    selections: [
+      { alias: 'result3Acl', className: 'ACL' },
+      { alias: 'externalIs', className: 'IS' }
+    ],
+    operations: [{ type: 'existsRelated', from: 'externalIs', with: '', as: 'externalIsWithAcl', domain: 'ISIpRange', targetClass: 'ipRange', direction: 'source', rules: [] }],
+    publishedAlias: 'externalIsWithAcl'
+  };
+
+  const errors = assistantResultContractErrors(flow, semanticPlan, intent);
+  const feedback = assistantObjectFlowValidationFeedback(errors, { flow });
+
+  assert.equal(errors[0].code, 'assistant_result_contract_missing_with');
+  assert.equal(feedback.causes[0].kind, 'resultContractMissingWith');
+  assert.match(feedback.summary, /списка IS/);
+  assert.match(feedback.causes[0].message, /Сохраняемый набор: IS/);
+  assert.match(feedback.action, /Результат 3/);
+  assert.doesNotMatch(feedback.action, /externalIsWithAcl/);
+});
+
+test('object-flow restores an omitted class only from an exact alias hint in confirmed MCP context', () => {
+  const candidate = assistantObjectFlowCandidate({
+    selections: [
+      { alias: 'IS_by_Name', className: '', rules: [{ path: 'Name', op: 'equals', valueParam: 'isName' }] },
+      { alias: 'ipRange_from_IS', className: '', from: 'IS_by_Name', rules: [{ path: 'Code', op: 'matches', regex: '.*' }] }
+    ],
+    operations: []
+  });
+  const recovery = assistantRestoreObjectFlowSelectionClasses(candidate.flow, {
+    blocks: [{ resolvedEntities: ['IS', 'ipRange', 'ACL'] }]
+  }, {
+    results: [{
+      tool: 'cmdbuild_model_summary',
+      ok: true,
+      result: { classes: [{ name: 'IS' }, { name: 'ipRange' }, { name: 'ACL' }] }
+    }]
+  }, {
+    kind: 'relationRequirements',
+    chains: [{ operations: [{ sourceClass: 'IS', targetClass: 'ipRange' }] }]
+  });
+
+  assert.deepEqual(candidate.flow.selections.map((selection) => selection.className), ['IS', 'ipRange']);
+  assert.equal(recovery.normalizations.length, 2);
+  assert.match(recovery.warnings.join(' '), /exact alias hint/);
+});
+
+test('object-flow candidate keeps operation aliases when an LLM duplicates them as selections', () => {
+  const candidate = assistantObjectFlowCandidate({
+    selections: [
+      { alias: 'is', className: 'IS', rules: [{ path: 'Name', op: 'equals', valueParam: 'isName' }] },
+      { alias: 'ipRange', className: 'ipRange' },
+      { alias: 'acl', className: 'ACL' }
+    ],
+    operations: [
+      { type: 'relation', from: 'is', as: 'ipRange', domain: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source' },
+      { type: 'match', from: 'acl', with: 'ipRange', as: 'acl', rules: [{ operator: 'ipv4InCidr', leftColumn: 'ipaddress', rightColumn: 'range' }] }
+    ]
+  });
+  assert.deepEqual(candidate.flow.selections.map((selection) => selection.alias), ['is', 'ipRangeSelection', 'aclSelection']);
+  assert.deepEqual(candidate.flow.operations.map((operation) => [operation.from, operation.with, operation.as]), [
+    ['is', undefined, 'ipRange'],
+    ['aclSelection', 'ipRange', 'acl']
+  ]);
+  assert.ok(candidate.warnings.some((warning) => /renamed standalone selection alias ipRange/.test(warning)));
+  assert.ok(candidate.warnings.some((warning) => /renamed standalone selection alias acl/.test(warning)));
 });
 
 test('object flow migrates only Object Group aliases recorded in stored visual models', () => {
@@ -628,4 +1055,14 @@ test('object flow clears inherited published flags when no published alias is se
   });
 
   assert.equal(Object.hasOwn(compiled.result.tables.find((table) => table.name === 'assets'), 'published'), false);
+});
+
+test('object flow does not publish the final operation when no alias is selected', () => {
+  const flow = validFlow();
+  const compiled = compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, flow);
+  const objectMatching = compiled.visualModels.find((model) => model.mode === 'objectMatching');
+
+  assert.equal(objectMatching.output.alias, '');
+  assert.ok(objectMatching.outputs.every((output) => output.published === false));
+  assert.equal(compiled.result.tables.some((table) => table.published), false);
 });

@@ -54,7 +54,38 @@
  * @property {boolean} caseSensitive
  */
 /**
- * @typedef {(ObjectFlowMatchBlock & {type: 'match'}) | ObjectFlowSetOperation} ObjectFlowOperation
+ * @typedef {object} ObjectFlowRelationOperation
+ * @property {string} id
+ * @property {'relation'} type
+ * @property {string} from
+ * @property {string} as
+ * @property {string} domain
+ * @property {string} targetClass
+ * @property {'both' | 'source' | 'destination' | 'direct' | 'inverse'} direction
+ * @property {string[]} columns
+ * @property {number} limit
+ * @property {boolean} distinct
+ */
+/**
+ * A relation-aware semi-join. It retains cards from `from` only where at
+ * least one related card satisfies a rule against a row from `with`.
+ *
+ * @typedef {object} ObjectFlowExistsRelatedOperation
+ * @property {string} id
+ * @property {'existsRelated'} type
+ * @property {string} from
+ * @property {string} with
+ * @property {string} as
+ * @property {string} domain
+ * @property {string} targetClass
+ * @property {'both' | 'source' | 'destination' | 'direct' | 'inverse'} direction
+ * @property {string[]} columns
+ * @property {number} limit
+ * @property {boolean} distinct
+ * @property {ObjectFlowMatchRule[]} rules
+ */
+/**
+ * @typedef {(ObjectFlowMatchBlock & {type: 'match'}) | ObjectFlowSetOperation | ObjectFlowRelationOperation | ObjectFlowExistsRelatedOperation} ObjectFlowOperation
  */
 /**
  * @typedef {object} ObjectFlow
@@ -73,10 +104,17 @@
 /**
  * @typedef {object} ObjectFlowStageSummary
  * @property {string} id
- * @property {'selection' | 'match' | 'set'} kind
+ * @property {'selection' | 'match' | 'set' | 'relation' | 'existsRelated'} kind
  * @property {string} alias
  * @property {string=} className
  * @property {string[]} columns
+ */
+/**
+ * @typedef {object} ObjectFlowResultOutput
+ * @property {string} alias
+ * @property {string} label
+ * @property {'selection' | 'match' | 'set' | 'relation' | 'existsRelated'} kind
+ * @property {boolean} published
  */
 
 const BASE_RESULT_COLUMNS = ['Class', '_id', 'Code', 'Description'];
@@ -117,7 +155,10 @@ const CLASS_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_]*$/;
 const SELECTION_ID_PATTERN = /^selection:[A-Za-z_][A-Za-z0-9_]*$/;
 const MATCH_ID_PATTERN = /^match:[A-Za-z_][A-Za-z0-9_]*$/;
 const SET_OPERATION_ID_PATTERN = /^set:[A-Za-z_][A-Za-z0-9_]*$/;
+const RELATION_OPERATION_ID_PATTERN = /^relation:[A-Za-z_][A-Za-z0-9_]*$/;
+const EXISTS_RELATED_OPERATION_ID_PATTERN = /^existsRelated:[A-Za-z_][A-Za-z0-9_]*$/;
 const SET_OPERATION_TYPES = new Set(['union', 'difference', 'intersect']);
+const RELATION_DIRECTIONS = new Set(['both', 'source', 'destination', 'direct', 'inverse']);
 
 /**
  * @param {unknown} value
@@ -312,6 +353,52 @@ function normalizeSetOperation(value) {
 }
 
 /**
+ * @param {unknown} value
+ * @returns {ObjectFlowRelationOperation}
+ */
+function normalizeRelationOperation(value) {
+  const operation = isRecord(value) ? value : {};
+  const as = text(operation.as || operation.alias || operation.outputAlias);
+  const rawLimit = operation.limit === undefined || operation.limit === null || operation.limit === '' ? 100 : Number(operation.limit);
+  return {
+    id: text(operation.id) || `relation:${as}`,
+    type: 'relation',
+    from: text(operation.from || operation.sourceAlias || operation.source),
+    as,
+    domain: text(operation.domain || operation.domainName || operation.domainCode),
+    targetClass: text(operation.targetClass || operation.className || operation.target),
+    direction: /** @type {ObjectFlowRelationOperation['direction']} */ (text(operation.direction).toLowerCase() || 'both'),
+    columns: normalizeColumns(operation.columns || operation.relatedColumns || operation.attributes),
+    limit: rawLimit,
+    distinct: operation.distinct !== false
+  };
+}
+
+/**
+ * @param {unknown} value
+ * @returns {ObjectFlowExistsRelatedOperation}
+ */
+function normalizeExistsRelatedOperation(value) {
+  const operation = isRecord(value) ? value : {};
+  const as = text(operation.as || operation.alias || operation.outputAlias);
+  const rawLimit = operation.limit === undefined || operation.limit === null || operation.limit === '' ? 100 : Number(operation.limit);
+  return {
+    id: text(operation.id) || `existsRelated:${as}`,
+    type: 'existsRelated',
+    from: text(operation.from || operation.sourceAlias || operation.source),
+    with: text(operation.with || operation.comparisonAlias || operation.comparisonSource),
+    as,
+    domain: text(operation.domain || operation.domainName || operation.domainCode),
+    targetClass: text(operation.targetClass || operation.className || operation.target),
+    direction: /** @type {ObjectFlowExistsRelatedOperation['direction']} */ (text(operation.direction).toLowerCase() || 'both'),
+    columns: normalizeColumns(operation.columns || operation.relatedColumns || operation.attributes),
+    limit: rawLimit,
+    distinct: operation.distinct !== false,
+    rules: Array.isArray(operation.rules) ? operation.rules.map(normalizeMatchRule) : []
+  };
+}
+
+/**
  * Normalize an ordered data-flow operation. Older flows keep their separate
  * blocks/setOperations arrays and are converted by normalizeObjectFlow.
  *
@@ -324,6 +411,8 @@ function normalizeOperation(value) {
   if (type === 'match' || (!type && (Array.isArray(operation.rules) || operation.rightPrefix !== undefined))) {
     return { ...normalizeMatchBlock(operation), type: 'match' };
   }
+  if (type === 'relation' || type === 'expandrelation' || type === 'expandrelations') return normalizeRelationOperation(operation);
+  if (type === 'existsrelated' || type === 'existsrelatedrows') return normalizeExistsRelatedOperation(operation);
   return normalizeSetOperation(operation);
 }
 
@@ -350,7 +439,7 @@ export function normalizeObjectFlow(flow) {
       : [],
     operations,
     blocks: operations.filter((operation) => operation.type === 'match'),
-    setOperations: operations.filter((operation) => operation.type !== 'match'),
+    setOperations: operations.filter((operation) => SET_OPERATION_TYPES.has(operation.type)),
     publishedAlias: text(source.publishedAlias || source.tableOutputAlias)
   };
 }
@@ -362,6 +451,80 @@ export function normalizeObjectFlow(flow) {
  */
 function addError(errors, path, message) {
   errors.push({ path, message });
+}
+
+/**
+ * @typedef {{kind: 'selection' | 'operation', item: ObjectFlowSelection | ObjectFlowOperation, index: number, path: string, alias: string, dependencies: string[]}} ObjectFlowStage
+ */
+
+/**
+ * Object-flow JSON keeps selections and operations in separate arrays for the
+ * editor, while runtime execution must respect the actual data dependencies.
+ * A selection may therefore be driven by a relation/match result.
+ *
+ * @param {ObjectFlow} flow
+ * @returns {ObjectFlowStage[]}
+ */
+function objectFlowStages(flow) {
+  return [
+    ...flow.selections.map((selection, index) => ({
+      kind: /** @type {'selection'} */ ('selection'),
+      item: selection,
+      index,
+      path: `$.selections[${index}]`,
+      alias: selection.alias,
+      dependencies: selection.from ? [selection.from] : []
+    })),
+    ...flow.operations.map((operation, index) => ({
+      kind: /** @type {'operation'} */ ('operation'),
+      item: operation,
+      index,
+      path: `$.operations[${index}]`,
+      alias: operation.as,
+      dependencies: uniqueStrings([operation.from, operation.type === 'relation' ? '' : operation.with])
+    }))
+  ];
+}
+
+/**
+ * @param {ObjectFlow} flow
+ * @returns {{ordered: ObjectFlowStage[], unresolved: ObjectFlowStage[]}}
+ */
+function orderedObjectFlowStages(flow) {
+  const pending = objectFlowStages(flow);
+  const materialized = new Set();
+  /** @type {ObjectFlowStage[]} */
+  const ordered = [];
+  while (pending.length) {
+    const index = pending.findIndex((stage) => stage.dependencies.every((alias) => materialized.has(alias)));
+    if (index < 0) break;
+    const [stage] = pending.splice(index, 1);
+    ordered.push(stage);
+    if (stage.alias) materialized.add(stage.alias);
+  }
+  return { ordered, unresolved: pending };
+}
+
+/**
+ * @param {ObjectFlowOperation} operation
+ * @param {Map<string, string[]>} materializedColumns
+ * @returns {string[]}
+ */
+function operationOutputColumns(operation, materializedColumns) {
+  const leftColumns = materializedColumns.get(operation.from) || [];
+  const rightColumns = materializedColumns.get(operation.with) || [];
+  if (operation.type === 'relation') {
+    return uniqueStrings([
+      'SourceClass', 'SourceId', 'SourceCode', 'SourceDescription',
+      'Domain', 'RelationId', 'RelationDirection', 'RelationSourceSide',
+      'RelatedClass', 'RelatedId'
+    ].concat(BASE_RESULT_COLUMNS, operation.columns));
+  }
+  if (operation.type === 'match') {
+    return uniqueStrings(leftColumns.concat(rightColumns.map((column) => `${operation.rightPrefix}${column}`)));
+  }
+  if (operation.type === 'existsRelated') return leftColumns.slice();
+  return operation.type === 'union' ? uniqueStrings(leftColumns.concat(rightColumns)) : leftColumns.slice();
 }
 
 /**
@@ -392,10 +555,23 @@ export function validateObjectFlow(flow) {
   /** @type {Map<string, string>} */
   const aliases = new Map();
   /** @type {Map<string, string>} */
-  const selectionAliases = new Map();
-  /** @type {Map<string, string[]>} */
-  const materializedColumns = new Map();
+  const declaredAliases = new Map();
+  /** @type {Map<string, number>} */
+  const selectionAliasIndexes = new Map();
+  /** @type {Map<string, number>} */
+  const operationAliasIndexes = new Map();
   const matchingColumns = collectMatchingSelectionColumns(normalized);
+
+  normalized.selections.forEach((selection, index) => {
+    if (!selection.alias || !IDENTIFIER_PATTERN.test(selection.alias)) return;
+    if (!declaredAliases.has(selection.alias)) declaredAliases.set(selection.alias, `$.selections[${index}]`);
+    if (!selectionAliasIndexes.has(selection.alias)) selectionAliasIndexes.set(selection.alias, index);
+  });
+  normalized.operations.forEach((operation, index) => {
+    if (!operation.as || !IDENTIFIER_PATTERN.test(operation.as)) return;
+    if (!declaredAliases.has(operation.as)) declaredAliases.set(operation.as, `$.operations[${index}]`);
+    if (!operationAliasIndexes.has(operation.as)) operationAliasIndexes.set(operation.as, index);
+  });
 
   normalized.selections.forEach((selection, index) => {
     const path = `$.selections[${index}]`;
@@ -414,14 +590,13 @@ export function validateObjectFlow(flow) {
     } else {
       aliases.set(selection.alias, `${path}.alias`);
     }
-    if (selection.from && !selectionAliases.has(selection.from)) {
-      addError(errors, `${path}.from`, 'Selection from must reference an earlier selection alias.');
-    }
-    if (selection.alias && IDENTIFIER_PATTERN.test(selection.alias) && !selectionAliases.has(selection.alias)) {
-      selectionAliases.set(selection.alias, `${path}.alias`);
-      materializedColumns.set(selection.alias, uniqueStrings(
-        BASE_RESULT_COLUMNS.concat(selection.columns, matchingColumns.get(selection.alias) || [])
-      ));
+    if (selection.from) {
+      const sourceSelectionIndex = selectionAliasIndexes.get(selection.from);
+      if (sourceSelectionIndex !== undefined && sourceSelectionIndex >= index) {
+        addError(errors, `${path}.from`, 'Selection from must reference an earlier selection or an operation output.');
+      } else if (sourceSelectionIndex === undefined && !operationAliasIndexes.has(selection.from)) {
+        addError(errors, `${path}.from`, 'Selection from must reference a declared materialized alias.');
+      }
     }
     if (!selection.className || !CLASS_NAME_PATTERN.test(selection.className)) {
       addError(errors, `${path}.className`, 'Selection className must be a CMDBuild identifier.');
@@ -449,9 +624,17 @@ export function validateObjectFlow(flow) {
   normalized.operations.forEach((operation, index) => {
     const path = `$.operations[${index}]`;
     const isMatch = operation.type === 'match';
-    const idPattern = isMatch ? MATCH_ID_PATTERN : SET_OPERATION_ID_PATTERN;
+    const isRelation = operation.type === 'relation';
+    const isExistsRelated = operation.type === 'existsRelated';
+    const idPattern = isMatch ? MATCH_ID_PATTERN : isRelation ? RELATION_OPERATION_ID_PATTERN : isExistsRelated ? EXISTS_RELATED_OPERATION_ID_PATTERN : SET_OPERATION_ID_PATTERN;
     if (!idPattern.test(operation.id)) {
-      addError(errors, `${path}.id`, isMatch ? 'Match id must be a stable match:<identifier> value.' : 'Set operation id must be a stable set:<identifier> value.');
+      addError(errors, `${path}.id`, isMatch
+        ? 'Match id must be a stable match:<identifier> value.'
+        : isRelation
+          ? 'Relation id must be a stable relation:<identifier> value.'
+          : isExistsRelated
+            ? 'Related-existence id must be a stable existsRelated:<identifier> value.'
+          : 'Set operation id must be a stable set:<identifier> value.');
     }
     if (ids.has(operation.id)) {
       addError(errors, `${path}.id`, `Object flow id must be unique; already used at ${ids.get(operation.id)}.`);
@@ -459,19 +642,38 @@ export function validateObjectFlow(flow) {
       ids.set(operation.id, `${path}.id`);
     }
     if (!operation.as || !IDENTIFIER_PATTERN.test(operation.as)) {
-      addError(errors, `${path}.as`, `${isMatch ? 'Match' : 'Set operation'} output alias must be a non-empty identifier.`);
+      addError(errors, `${path}.as`, `${isMatch ? 'Match' : isRelation ? 'Relation' : isExistsRelated ? 'Related-existence' : 'Set operation'} output alias must be a non-empty identifier.`);
     } else if (aliases.has(operation.as)) {
       addError(errors, `${path}.as`, `Object flow alias must be unique; already used at ${aliases.get(operation.as)}.`);
     }
-    if (!operation.from || !aliases.has(operation.from)) {
-      addError(errors, `${path}.from`, 'Operation from must reference an alias declared earlier in the flow.');
-    }
-    if (!operation.with || !aliases.has(operation.with)) {
-      addError(errors, `${path}.with`, 'Operation with must reference an alias declared earlier in the flow.');
-    }
-    if (isMatch) {
+    const validateOperationSource = (alias, field) => {
+      if (!alias || !declaredAliases.has(alias)) {
+        addError(errors, `${path}.${field}`, 'Operation ' + field + ' must reference a declared materialized alias.');
+        return;
+      }
+      const sourceOperationIndex = operationAliasIndexes.get(alias);
+      if (sourceOperationIndex !== undefined && sourceOperationIndex >= index) {
+        addError(errors, `${path}.${field}`, 'Operation ' + field + ' must reference an alias declared earlier in the flow.');
+      }
+    };
+    validateOperationSource(operation.from, 'from');
+    if (!isRelation) validateOperationSource(operation.with, 'with');
+    if (isRelation) {
+      if (!operation.domain || !CLASS_NAME_PATTERN.test(operation.domain)) {
+        addError(errors, `${path}.domain`, 'Relation operation domain must be a CMDBuild identifier.');
+      }
+      if (!operation.targetClass || !CLASS_NAME_PATTERN.test(operation.targetClass)) {
+        addError(errors, `${path}.targetClass`, 'Relation operation targetClass must be a CMDBuild identifier.');
+      }
+      if (!RELATION_DIRECTIONS.has(operation.direction)) {
+        addError(errors, `${path}.direction`, 'Relation operation direction must be one of both, source, destination, direct, inverse.');
+      }
+      if (!Number.isInteger(operation.limit) || operation.limit <= 0) {
+        addError(errors, `${path}.limit`, 'Relation operation limit must be a positive integer.');
+      }
+    } else if (isMatch || isExistsRelated) {
       if (!operation.rules.length) {
-        addError(errors, `${path}.rules`, 'Match block requires a non-empty rules array.');
+        addError(errors, `${path}.rules`, isExistsRelated ? 'Related-existence operation requires a non-empty rules array.' : 'Match block requires a non-empty rules array.');
       }
       operation.rules.forEach((rule, ruleIndex) => {
         const rulePath = `${path}.rules[${ruleIndex}]`;
@@ -479,20 +681,79 @@ export function validateObjectFlow(flow) {
         if (!MATCH_OPERATORS.includes(rule.operator)) addError(errors, `${rulePath}.operator`, `Match rule operator must be one of: ${MATCH_OPERATORS.join(', ')}.`);
         if (!rule.leftColumn) addError(errors, `${rulePath}.leftColumn`, 'Match rule requires leftColumn.');
         if (!rule.rightColumn) addError(errors, `${rulePath}.rightColumn`, 'Match rule requires rightColumn.');
-        const leftColumns = materializedColumns.get(operation.from);
-        const rightColumns = materializedColumns.get(operation.with);
-        if (rule.leftColumn && leftColumns && !leftColumns.includes(rule.leftColumn)) {
-          addError(errors, `${rulePath}.leftColumn`, `Match rule column ${rule.leftColumn} is not materialized by source ${operation.from}.`);
-        }
-        if (rule.rightColumn && rightColumns && !rightColumns.includes(rule.rightColumn)) {
-          addError(errors, `${rulePath}.rightColumn`, `Match rule column ${rule.rightColumn} is not materialized by source ${operation.with}.`);
-        }
       });
+      if (isExistsRelated) {
+        if (!operation.domain || !CLASS_NAME_PATTERN.test(operation.domain)) {
+          addError(errors, `${path}.domain`, 'Related-existence operation domain must be a CMDBuild identifier.');
+        }
+        if (!operation.targetClass || !CLASS_NAME_PATTERN.test(operation.targetClass)) {
+          addError(errors, `${path}.targetClass`, 'Related-existence operation targetClass must be a CMDBuild identifier.');
+        }
+        if (!RELATION_DIRECTIONS.has(operation.direction)) {
+          addError(errors, `${path}.direction`, 'Related-existence operation direction must be one of both, source, destination, direct, inverse.');
+        }
+        if (!Number.isInteger(operation.limit) || operation.limit <= 0) {
+          addError(errors, `${path}.limit`, 'Related-existence operation limit must be a positive integer.');
+        }
+      }
     } else {
       if (!SET_OPERATION_TYPES.has(operation.type)) addError(errors, `${path}.type`, 'Set operation type must be union, difference, or intersect.');
       if (!operation.on.length) addError(errors, `${path}.on`, 'Set operation requires at least one left/right key pair.');
-      const leftColumns = materializedColumns.get(operation.from);
-      const rightColumns = materializedColumns.get(operation.with);
+      // Column checks run after all stages have been ordered by their real
+      // data dependencies below.
+    }
+    if (operation.as && IDENTIFIER_PATTERN.test(operation.as) && !aliases.has(operation.as)) aliases.set(operation.as, `${path}.as`);
+  });
+
+  const stageOrder = orderedObjectFlowStages(normalized);
+  const orderedAliases = new Set(stageOrder.ordered.map((stage) => stage.alias));
+  for (const stage of stageOrder.unresolved) {
+    const item = stage.item;
+    const dependencies = stage.dependencies.filter((alias) => declaredAliases.has(alias) && !orderedAliases.has(alias));
+    for (const dependency of dependencies) {
+      const field = stage.kind === 'selection' ? 'from' : dependency === item.from ? 'from' : 'with';
+      addError(errors, `${stage.path}.${field}`, 'Data-flow dependency is cyclic or cannot be materialized before this stage.');
+    }
+  }
+
+  /** @type {Map<string, string[]>} */
+  const materializedColumns = new Map();
+  for (const stage of stageOrder.ordered) {
+    if (stage.kind === 'selection') {
+      const selection = /** @type {ObjectFlowSelection} */ (stage.item);
+      const sourceColumns = selection.from ? materializedColumns.get(selection.from) : undefined;
+      for (const [ruleIndex, rule] of selection.rules.entries()) {
+        if (rule.valueColumn && sourceColumns && !sourceColumns.includes(rule.valueColumn)) {
+          addError(errors, `${stage.path}.rules[${ruleIndex}].valueColumn`, `Selection valueColumn ${rule.valueColumn} is not materialized by source ${selection.from}.`);
+        }
+      }
+      materializedColumns.set(selection.alias, uniqueStrings(
+        BASE_RESULT_COLUMNS.concat(selection.columns, matchingColumns.get(selection.alias) || [])
+      ));
+      continue;
+    }
+
+    const operation = /** @type {ObjectFlowOperation} */ (stage.item);
+    const isMatch = operation.type === 'match';
+    const isExistsRelated = operation.type === 'existsRelated';
+    const leftColumns = materializedColumns.get(operation.from);
+    const rightColumns = materializedColumns.get(operation.with);
+    const path = stage.path;
+    if (isMatch || isExistsRelated) {
+      operation.rules.forEach((rule, ruleIndex) => {
+        const rulePath = `${path}.rules[${ruleIndex}]`;
+        const ruleLeftColumns = isExistsRelated ? rightColumns : leftColumns;
+        const ruleRightColumns = isExistsRelated
+          ? uniqueStrings(BASE_RESULT_COLUMNS.concat(operation.columns))
+          : rightColumns;
+        if (rule.leftColumn && ruleLeftColumns && !ruleLeftColumns.includes(rule.leftColumn)) {
+          addError(errors, `${rulePath}.leftColumn`, `${isExistsRelated ? 'Related-existence' : 'Match'} rule column ${rule.leftColumn} is not materialized by source ${isExistsRelated ? operation.with : operation.from}.`);
+        }
+        if (rule.rightColumn && ruleRightColumns && !ruleRightColumns.includes(rule.rightColumn)) {
+          addError(errors, `${rulePath}.rightColumn`, `${isExistsRelated ? 'Related-existence' : 'Match'} rule column ${rule.rightColumn} is not materialized by ${isExistsRelated ? 'related class' : `source ${operation.with}`}.`);
+        }
+      });
+    } else if (operation.type !== 'relation') {
       operation.on.forEach((key, keyIndex) => {
         if (leftColumns && !leftColumns.includes(key.left)) {
           addError(errors, `${path}.on[${keyIndex}].left`, `Set operation key ${key.left} is not materialized by source ${operation.from}.`);
@@ -502,20 +763,10 @@ export function validateObjectFlow(flow) {
         }
       });
     }
-    if (operation.as && IDENTIFIER_PATTERN.test(operation.as) && !aliases.has(operation.as)) {
-      aliases.set(operation.as, `${path}.as`);
-      const leftColumns = materializedColumns.get(operation.from) || [];
-      const rightColumns = materializedColumns.get(operation.with) || [];
-      const outputColumns = isMatch
-        ? uniqueStrings(leftColumns.concat(rightColumns.map((column) => `${operation.rightPrefix}${column}`)))
-        : operation.type === 'union'
-          ? uniqueStrings(leftColumns.concat(rightColumns))
-          : leftColumns.slice();
-      materializedColumns.set(operation.as, outputColumns);
-    }
-  });
+    materializedColumns.set(operation.as, operationOutputColumns(operation, materializedColumns));
+  }
 
-  if (normalized.publishedAlias && !aliases.has(normalized.publishedAlias)) {
+  if (normalized.publishedAlias && !declaredAliases.has(normalized.publishedAlias)) {
     addError(errors, '$.publishedAlias', 'Published table alias must reference an existing materialized alias.');
   }
 
@@ -618,14 +869,18 @@ function collectMatchingSelectionColumns(flow) {
   };
 
   for (const operation of flow.operations) {
-    if (operation.type !== 'match') continue;
+    if (operation.type !== 'match' && operation.type !== 'existsRelated') continue;
     for (const rule of operation.rules) {
       // Only direct selection sources can have their projection amended here.
       // Columns from an earlier match/set result are already explicit output
       // columns of that materialized operation and must not be guessed back to
       // a CMDBuild selection.
-      if (selectionForAlias(flow, operation.from)) add(operation.from, rule.leftColumn);
-      if (selectionForAlias(flow, operation.with)) add(operation.with, rule.rightColumn);
+      if (operation.type === 'existsRelated') {
+        if (selectionForAlias(flow, operation.with)) add(operation.with, rule.leftColumn);
+      } else {
+        if (selectionForAlias(flow, operation.from)) add(operation.from, rule.leftColumn);
+        if (selectionForAlias(flow, operation.with)) add(operation.with, rule.rightColumn);
+      }
     }
   }
   return columnsByAlias;
@@ -660,7 +915,7 @@ function compileSelectionRule(rule) {
  */
 function compileObjectFlowSteps(flow) {
   const matchingColumns = collectMatchingSelectionColumns(flow);
-  const selectionSteps = flow.selections.map((selection) => {
+  const compileSelection = (selection) => {
     const filters = selection.rules.map(compileSelectionRule);
     /** @type {Record<string, unknown>} */
     const step = {
@@ -679,8 +934,8 @@ function compileObjectFlowSteps(flow) {
       step.columns = selection.columns.slice();
     }
     return step;
-  });
-  const operationSteps = flow.operations.map((operation) => {
+  };
+  const compileOperation = (operation) => {
     if (operation.type === 'match') {
       return {
         type: 'matchRows',
@@ -699,6 +954,43 @@ function compileObjectFlowSteps(flow) {
         as: operation.as
       };
     }
+    if (operation.type === 'relation') {
+      return {
+        type: 'expandRelations',
+        purpose: 'objectMatching',
+        from: operation.from,
+        domain: operation.domain,
+        targetClass: operation.targetClass,
+        direction: operation.direction,
+        columns: operation.columns.slice(),
+        limit: operation.limit,
+        distinct: operation.distinct,
+        as: operation.as
+      };
+    }
+    if (operation.type === 'existsRelated') {
+      return {
+        type: 'existsRelatedRows',
+        purpose: 'objectMatching',
+        from: operation.from,
+        with: operation.with,
+        domain: operation.domain,
+        targetClass: operation.targetClass,
+        direction: operation.direction,
+        columns: uniqueStrings(operation.columns.concat(operation.rules.map((rule) => rule.rightColumn))),
+        limit: operation.limit,
+        distinct: operation.distinct,
+        rules: operation.rules.map((rule) => ({
+          action: rule.action,
+          negate: rule.negate,
+          operator: rule.operator,
+          left: { column: rule.leftColumn, regex: rule.leftRegex },
+          right: { column: rule.rightColumn, regex: rule.rightRegex }
+        })),
+        caseSensitive: false,
+        as: operation.as
+      };
+    }
     return {
       type: `${operation.type}Rows`,
       purpose: 'objectMatching',
@@ -709,8 +1001,12 @@ function compileObjectFlowSteps(flow) {
       caseSensitive: operation.caseSensitive,
       as: operation.as
     };
-  });
-  return selectionSteps.concat(operationSteps);
+  };
+  return orderedObjectFlowStages(flow).ordered.map((stage) => (
+    stage.kind === 'selection'
+      ? compileSelection(/** @type {ObjectFlowSelection} */ (stage.item))
+      : compileOperation(/** @type {ObjectFlowOperation} */ (stage.item))
+  ));
 }
 
 /**
@@ -823,7 +1119,6 @@ function visualSelection(selection) {
  */
 function objectFlowVisualModels(flow) {
   const groupSelections = flow.selections.map(visualSelection);
-  const finalOperation = flow.operations[flow.operations.length - 1];
   return {
     objectGroup: {
       version: 1,
@@ -837,8 +1132,9 @@ function objectFlowVisualModels(flow) {
       operations: cloneJsonValue(flow.operations),
       blocks: cloneJsonValue(flow.blocks),
       setOperations: cloneJsonValue(flow.setOperations),
+      outputs: objectFlowResultOutputs(flow),
       output: {
-        alias: flow.publishedAlias || finalOperation && finalOperation.as || '',
+        alias: flow.publishedAlias,
         title: 'Final result'
       }
     }
@@ -877,22 +1173,21 @@ function replaceObjectFlowVisualModels(currentModels, objectGroup, objectMatchin
  * @returns {Record<string, unknown>[]}
  */
 function generatedResultTables(flow, existingByName) {
+  const outputs = objectFlowResultOutputs(flow);
+  const outputByAlias = new Map(outputs.map((output) => [output.alias, output]));
   const tables = flow.selections.map((selection) => ({
     ...(existingByName.get(selection.alias) || {}),
     name: selection.alias,
-    title: text(existingByName.get(selection.alias)?.title) || selection.name,
+    title: text(existingByName.get(selection.alias)?.title) || outputByAlias.get(selection.alias)?.label || selection.name,
     columns: selection.columns.length ? selection.columns.slice() : BASE_RESULT_COLUMNS.slice()
   }));
-  const finalOperation = flow.operations[flow.operations.length - 1];
   const stages = objectFlowStageSummaries(flow);
-  let matchIndex = 0;
   for (const stage of stages.filter((item) => item.kind !== 'selection')) {
-    if (stage.kind === 'match') matchIndex += 1;
     const existing = existingByName.get(stage.alias) || {};
     tables.push({
       ...existing,
       name: stage.alias,
-      title: text(existing.title) || (stage.alias === finalOperation?.as ? 'Final result' : stage.kind === 'match' ? `Match ${matchIndex}` : stage.alias),
+      title: text(existing.title) || outputByAlias.get(stage.alias)?.label || stage.alias,
       columns: stage.columns,
       ...(stage.kind === 'match' ? { columnLabels: resultColumnLabels(stage.columns) } : {})
     });
@@ -902,6 +1197,50 @@ function generatedResultTables(flow, existingByName) {
     if (flow.publishedAlias && text(table.name) === flow.publishedAlias) table.published = true;
   });
   return tables;
+}
+
+/**
+ * Persist the visible, materialized outputs of the Assistant flow. This is
+ * intentionally independent from result.tables so unrelated hand-authored
+ * tables are never mistaken for Object Flow stages.
+ *
+ * @param {unknown} flow
+ * @returns {ObjectFlowResultOutput[]}
+ */
+export function objectFlowResultOutputs(flow) {
+  const normalized = normalizeObjectFlow(flow);
+  const outputs = [];
+  let matchIndex = 0;
+  let relationIndex = 0;
+  let existsRelatedIndex = 0;
+  let setIndex = 0;
+  for (const stage of orderedObjectFlowStages(normalized).ordered) {
+    const alias = stage.kind === 'selection' ? stage.item.alias : stage.item.as;
+    if (!alias) continue;
+    let label = alias;
+    if (stage.kind === 'selection') {
+      label = text(stage.item.name) || alias;
+    } else if (stage.item.type === 'match') {
+      matchIndex += 1;
+      label = `Сопоставление ${matchIndex}`;
+    } else if (stage.item.type === 'relation') {
+      relationIndex += 1;
+      label = stage.item.domain ? `Связь ${relationIndex}: ${stage.item.domain}` : `Связь ${relationIndex}`;
+    } else if (stage.item.type === 'existsRelated') {
+      existsRelatedIndex += 1;
+      label = `Отбор по связям ${existsRelatedIndex}`;
+    } else {
+      setIndex += 1;
+      label = `Операция множеств ${setIndex}`;
+    }
+    outputs.push({
+      alias,
+      label,
+      kind: stage.kind === 'selection' ? 'selection' : stage.item.type === 'relation' ? 'relation' : stage.item.type === 'existsRelated' ? 'existsRelated' : stage.item.type === 'match' ? 'match' : 'set',
+      published: Boolean(normalized.publishedAlias && normalized.publishedAlias === alias)
+    });
+  }
+  return outputs;
 }
 
 /**
@@ -922,6 +1261,29 @@ function storedObjectGroupAliases(spec) {
     for (const selection of model.selections) {
       if (!isRecord(selection)) continue;
       const alias = text(selection.alias || isRecord(selection.output) && selection.output.alias);
+      if (alias) aliases.add(alias);
+    }
+  }
+  return aliases;
+}
+
+/**
+ * Return result aliases explicitly owned by a prior Object Flow manifest.
+ * Unlike unmarked result tables, these aliases are safe to replace on the
+ * next Assistant apply.
+ *
+ * @param {Record<string, unknown>} spec
+ * @returns {Set<string>}
+ */
+function storedObjectFlowOutputAliases(spec) {
+  const models = [];
+  if (Array.isArray(spec.visualModels)) models.push(...spec.visualModels);
+  if (isRecord(spec.visualModel)) models.push(spec.visualModel);
+  const aliases = new Set();
+  for (const model of models) {
+    if (!isRecord(model) || text(model.mode) !== 'objectMatching' || !Array.isArray(model.outputs)) continue;
+    for (const output of model.outputs) {
+      const alias = isRecord(output) ? text(output.alias) : '';
       if (alias) aliases.add(alias);
     }
   }
@@ -1021,6 +1383,7 @@ export function compileObjectFlowToSpec(currentSpec, flow) {
       .filter(Boolean)
   );
   storedGroupAliases.forEach((alias) => oldManagedAliases.add(alias));
+  storedObjectFlowOutputAliases(spec).forEach((alias) => oldManagedAliases.add(alias));
   const generatedSteps = compileObjectFlowSteps(executableFlow);
   spec.steps = replaceManagedSteps(replacesNewTemplateStarter ? [] : currentSteps, generatedSteps, storedGroupAliases);
   if (replacesNewTemplateStarter && isRecord(spec.params) && Object.prototype.hasOwnProperty.call(spec.params, 'attrType')) {
@@ -1046,6 +1409,15 @@ export function compileObjectFlowToSpec(currentSpec, flow) {
   const relatedTableNames = new Set(oldManagedAliases);
   for (const table of generatedTables) relatedTableNames.add(text(table.name));
   result.tables = replaceObjectFlowTables(currentTables, relatedTableNames, generatedTables);
+  if (normalized.publishedAlias) {
+    result.tables = result.tables.map((table) => {
+      if (!isRecord(table)) return table;
+      const next = { ...table };
+      if (text(next.name) === normalized.publishedAlias) next.published = true;
+      else delete next.published;
+      return next;
+    });
+  }
   spec.result = result;
 
   return spec;
@@ -1061,20 +1433,35 @@ export function compileObjectFlowToSpec(currentSpec, flow) {
 export function objectFlowStageSummaries(flow) {
   const normalized = normalizeObjectFlow(flow);
   /** @type {ObjectFlowStageSummary[]} */
-  const summaries = normalized.selections.map((selection) => ({
-    id: selection.id,
-    kind: 'selection',
-    alias: selection.alias,
-    className: selection.className,
-    columns: uniqueStrings(BASE_RESULT_COLUMNS.concat(selection.columns))
-  }));
-  const columnsByAlias = new Map(summaries.map((stage) => [stage.alias, stage.columns]));
-  normalized.operations.forEach((operation) => {
+  const summaries = [];
+  const columnsByAlias = new Map();
+  for (const stage of orderedObjectFlowStages(normalized).ordered) {
+    if (stage.kind === 'selection') {
+      const selection = /** @type {ObjectFlowSelection} */ (stage.item);
+      const summary = {
+        id: selection.id,
+        kind: /** @type {'selection'} */ ('selection'),
+        alias: selection.alias,
+        className: selection.className,
+        columns: uniqueStrings(BASE_RESULT_COLUMNS.concat(selection.columns))
+      };
+      summaries.push(summary);
+      columnsByAlias.set(selection.alias, summary.columns);
+      continue;
+    }
+    const operation = /** @type {ObjectFlowOperation} */ (stage.item);
     const leftColumns = columnsByAlias.get(operation.from) || [];
     const rightColumns = columnsByAlias.get(operation.with) || [];
     let columns;
     let kind;
-    if (operation.type === 'match') {
+    if (operation.type === 'relation') {
+      kind = 'relation';
+      columns = uniqueStrings([
+        'SourceClass', 'SourceId', 'SourceCode', 'SourceDescription',
+        'Domain', 'RelationId', 'RelationDirection', 'RelationSourceSide',
+        'RelatedClass', 'RelatedId'
+      ].concat(BASE_RESULT_COLUMNS, operation.columns));
+    } else if (operation.type === 'match') {
       kind = 'match';
       columns = leftColumns.slice();
       for (const column of rightColumns) {
@@ -1086,6 +1473,9 @@ export function objectFlowStageSummaries(flow) {
         const rightColumn = `${operation.rightPrefix}${rule.rightColumn}`;
         if (rule.rightColumn && !columns.includes(rightColumn)) columns.push(rightColumn);
       }
+    } else if (operation.type === 'existsRelated') {
+      kind = 'existsRelated';
+      columns = leftColumns.slice();
     } else {
       kind = 'set';
       columns = operation.type === 'union' ? uniqueStrings(leftColumns.concat(rightColumns)) : leftColumns.slice();
@@ -1098,6 +1488,6 @@ export function objectFlowStageSummaries(flow) {
     };
     summaries.push(summary);
     columnsByAlias.set(operation.as, columns);
-  });
+  }
   return summaries;
 }

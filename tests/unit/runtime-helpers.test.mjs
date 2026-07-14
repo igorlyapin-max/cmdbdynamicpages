@@ -7,7 +7,9 @@ import {
   assistantClassMentionsFromText,
   assistantDiagramSelectionMappings,
   assistantDiagramSemanticDecisions,
+  assistantExtractionCandidateOutput,
   assistantLimitWarningsFromDiagnostics,
+  assistantLiteLlmTimeoutMs,
   assistantMessages,
   assistantObjectFlowCandidate,
   assistantObjectFlowMessages,
@@ -30,6 +32,7 @@ import {
   isSafeRuntimeLinkUrl,
   mcpToolDefinitions,
   normalizeAssistantDraftSpec,
+  normalizeAssistantObjectFlowIntent,
   normalizeAssistantRuntimeConfig,
   normalizeRuntimeCacheConfig,
   normalizeDiagramImportIr,
@@ -1246,6 +1249,9 @@ test('assistant MCP config keeps known allowed tools and bounded defaults', () =
   assert.deepEqual(config.mcp.allowedTools, ['cmdbuild_model_summary', 'cmdbuild_template_context']);
   assert.equal(config.mcp.maxContextBytes, 999999);
   assert.equal(config.mcp.timeoutMs, 1000);
+  assert.equal(assistantLiteLlmTimeoutMs({ assistant: { mcp: { timeoutMs: 1 } } }), 1000);
+  assert.equal(assistantLiteLlmTimeoutMs({ assistant: { mcp: { timeoutMs: 60000 } } }), 60000);
+  assert.equal(assistantLiteLlmTimeoutMs({ assistant: { mcp: { timeoutMs: 60001 } } }), 60000);
   assert.equal(config.mcp.maxClasses, 375);
   assert.equal(config.mcp.maxDomains, 225);
   assert.equal(config.mcp.maxRelationDomains, 175);
@@ -1401,7 +1407,9 @@ test('assistant prompt config has default and preserves custom system prompt', (
 test('object-flow planning messages keep the full-flow contract and configured prompt separate from user input', () => {
   const messages = assistantObjectFlowMessages(
     {
-      prompt: 'Выборка 1: серверы. Выборка 2: IP. Соединяем по ссылке.',
+      intent: { context: '', blocks: [{ id: 'servers', name: 'Servers', entities: 'Servers', algorithm: 'Select servers.', expectedResult: 'Server cards', uses: [] }] },
+      semanticPlan: { version: 1, blocks: [] },
+      planningText: 'Business data block: Servers.',
       currentSpec: { version: 1, steps: [], result: { tables: [] } }
     },
     { enabled: false },
@@ -1416,11 +1424,82 @@ test('object-flow planning messages keep the full-flow contract and configured p
   );
 
   assert.equal(messages.length, 4);
-  assert.match(messages[0].content, /"flow"/);
-  assert.equal(messages[1].content, 'Custom common CMDB rule.');
-  assert.equal(messages[2].content, 'Custom full-flow CMDB rule.');
-  assert.match(messages[3].content, /Выборка 1/);
+  assert.equal(messages[0].content, 'Custom common CMDB rule.');
+  assert.equal(messages[1].content, 'Custom full-flow CMDB rule.');
+  assert.match(messages[2].content, /"flow"/);
+  assert.match(messages[3].content, /Business data block/);
   assert.doesNotMatch(messages[3].content, /Custom full-flow CMDB rule/);
+
+  const parameterMessages = assistantObjectFlowMessages(
+    {
+      intent: { context: '', blocks: [{ id: 'is', name: 'Information systems', entities: 'ИС', algorithm: 'Найти ИС по параметру isName.', expectedResult: 'ИС', uses: [] }] },
+      semanticPlan: { version: 1, blocks: [] },
+      planningText: 'Найти ИС по параметру isName.',
+      currentSpec: {
+        version: 1,
+        params: [{ name: 'isName', label: 'Information system', type: 'string', required: true }],
+        steps: [],
+        result: { tables: [] }
+      }
+    },
+    { enabled: false },
+    defaultRuntimeConfig()
+  );
+  assert.match(parameterMessages[2].content, /availableParameters/);
+  assert.match(parameterMessages[3].content, /"name":"isName"/);
+});
+
+test('object-flow intent keeps forward block dependencies and rejects only unknown or self references', () => {
+  const intent = normalizeAssistantObjectFlowIntent({
+    context: '',
+    extractionCandidateBlockId: 'applications',
+    extractionCandidateAlias: 'applicationsResult',
+    blocks: [
+      { id: 'applications', name: 'Applications', entities: 'Application', algorithm: 'Select applications.', expectedResult: 'Applications.', uses: ['networks'] },
+      { id: 'networks', name: 'Networks', entities: 'ipRange', algorithm: 'Select networks.', expectedResult: 'Networks.', uses: [] }
+    ]
+  });
+  assert.deepEqual(intent.blocks[0].uses, ['networks']);
+  assert.equal(intent.extractionCandidateBlockId, 'applications');
+  assert.equal(intent.extractionCandidateAlias, 'applicationsResult');
+  assert.throws(
+    () => normalizeAssistantObjectFlowIntent({ context: '', blocks: [{ id: 'applications', name: 'Applications', entities: 'Application', algorithm: 'Select applications.', expectedResult: 'Applications.', uses: ['missing'] }] }),
+    /another declared block/
+  );
+  assert.throws(
+    () => normalizeAssistantObjectFlowIntent({ context: '', blocks: [{ id: 'applications', name: 'Applications', entities: 'Application', algorithm: 'Select applications.', expectedResult: 'Applications.', uses: ['applications'] }] }),
+    /another declared block/
+  );
+  assert.throws(
+    () => normalizeAssistantObjectFlowIntent({ context: '', extractionCandidateBlockId: 'missing', blocks: [{ id: 'applications', name: 'Applications', entities: 'Application', algorithm: 'Select applications.', expectedResult: 'Applications.', uses: [] }] }),
+    /extractionCandidateBlockId/
+  );
+});
+
+test('Assistant extraction candidate resolves its semantic block to a validated relation alias', () => {
+  const intent = normalizeAssistantObjectFlowIntent({
+    context: '',
+    extractionCandidateBlockId: 'ranges',
+    blocks: [
+      { id: 'systems', name: 'Information systems', entities: 'IS', algorithm: 'Select information systems.', expectedResult: 'IS cards.', uses: [] },
+      { id: 'ranges', name: 'IP ranges', entities: 'ipRange', algorithm: 'Select ranges related to the selected IS.', expectedResult: 'ipRange cards.', uses: ['systems'] }
+    ]
+  });
+  const semanticPlan = {
+    version: 1,
+    blocks: [
+      { id: 'systems', name: 'Information systems', resultContract: { outputKind: 'sourceCards', outputClass: 'IS', dependencyPaths: [], relationPredicates: [], attributePredicates: [], referencePathPredicates: [] } },
+      { id: 'ranges', name: 'IP ranges', resultContract: { outputKind: 'sourceCards', outputClass: 'ipRange', dependencyPaths: [{ comparisonBlockId: 'systems', sourceClass: 'IS', domain: 'ISZabbixMonitoringDomain', direction: 'source', targetClass: 'ipRange' }], relationPredicates: [], attributePredicates: [], referencePathPredicates: [] } }
+    ]
+  };
+  const output = assistantExtractionCandidateOutput({
+    version: 1,
+    selections: [{ id: 'selection:selectedSystems', name: 'Information systems', alias: 'selectedSystems', className: 'IS', from: '', limit: 100, columns: [], rules: [] }],
+    operations: [{ id: 'relation:selectedRanges', type: 'relation', from: 'selectedSystems', as: 'selectedRanges', domain: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source', columns: [], limit: 100, distinct: true }],
+    publishedAlias: 'selectedRanges'
+  }, semanticPlan, intent);
+
+  assert.deepEqual(output, { blockId: 'ranges', alias: 'selectedRanges', label: 'IP ranges' });
 });
 
 test('object-flow proposal adapter accepts equivalent LLM field names before strict validation', () => {
@@ -1464,6 +1543,59 @@ test('object-flow proposal adapter accepts equivalent LLM field names before str
   assert.deepEqual(candidate.flow.selections[1].rules[0], {
     action: 'include', path: 'Location', negate: false, op: 'equals', regex: '', value: '', valueParam: '', valueColumn: 'Location'
   });
+});
+
+test('object-flow proposal adapter normalizes common relation direction aliases before validation', () => {
+  const candidate = assistantObjectFlowCandidate({
+    version: 1,
+    selections: [{
+      id: 'systems',
+      className: 'IS',
+      alias: 'systems',
+      columns: ['Name'],
+      rules: [{ path: 'Name', valueParam: 'isName' }]
+    }],
+    operations: [{
+      operation: 'relation',
+      id: 'ranges',
+      from: 'systems',
+      as: 'ranges',
+      domain: 'ISZabbixMonitoringDomain',
+      targetClass: 'ipRange',
+      direction: 'source-to-target',
+      columns: ['range']
+    }]
+  });
+
+  assert.equal(candidate.flow.operations[0].type, 'relation');
+  assert.equal(candidate.flow.operations[0].direction, 'source');
+  assert.deepEqual(candidate.warnings, []);
+});
+
+test('object-flow proposal adapter repairs empty selection rules with an explicit warning', () => {
+  const candidate = assistantObjectFlowCandidate({
+    version: 1,
+    selections: [{
+      id: 'arms',
+      className: 'ARM',
+      alias: 'arms',
+      columns: ['Code'],
+      rules: [{}]
+    }],
+    operations: []
+  });
+
+  assert.deepEqual(candidate.flow.selections[0].rules, [{
+    action: 'include',
+    path: 'Code',
+    negate: false,
+    op: 'matches',
+    regex: '.*',
+    value: '',
+    valueParam: '',
+    valueColumn: ''
+  }]);
+  assert.match(candidate.warnings.join(' '), /selection arms had no usable filter/);
 });
 
 test('assistant messages include configured system prompt without changing user payload', () => {
@@ -1798,6 +1930,18 @@ test('assistant intent terms and model summary select relevant CMDBuild classes'
   }, terms, 5);
 
   assert.deepEqual(candidates.map((item) => item.name).sort(), ['Router', 'Workstation']);
+});
+
+test('assistant resolves a short Cyrillic class acronym only as an exact Code match', () => {
+  const candidates = assistantCandidateClassesFromSummary({
+    classes: [
+      { name: 'IS', description: 'Информационная система' },
+      { name: 'C2MService', description: 'Сервис ИС' },
+      { name: 'C2MSystem', description: 'Подсистема' }
+    ]
+  }, ['ис'], 5);
+
+  assert.deepEqual(candidates.map((item) => item.name), ['IS']);
 });
 
 test('assistant class selection prefers exact generic description over specialized partial description', () => {

@@ -6,6 +6,34 @@ import vm from 'node:vm';
 const launcherSource = fs.readFileSync('src/CmdbDynamicPages.js', 'utf8');
 const proxySource = fs.readFileSync('scripts/dev-proxy-server.mjs', 'utf8');
 
+test('Assistant browser deadline follows the configured MCP timeout with backend response grace', () => {
+  const helperStart = proxySource.indexOf('function assistantRequestTimeoutMs(backendPhases)');
+  const helperEnd = proxySource.indexOf('function publicSnapshotRunPath', helperStart);
+  const helperSource = proxySource.slice(helperStart, helperEnd);
+
+  assert.ok(helperStart >= 0, 'Assistant timeout helper is missing.');
+  assert.match(helperSource, /assistant\.mcp\.timeoutMs/);
+  assert.match(helperSource, /boot\.assistantMcpCaps/);
+  assert.match(helperSource, /boot\.assistantTimeoutGraceMs/);
+  assert.match(helperSource, /backendTimeout \* phases \+ grace/);
+  [
+    '/assistant/diagram-import/complete',
+    '/assistant/diagram-import/',
+    '/assistant/template-draft'
+  ].forEach((route) => {
+    const routeStart = proxySource.indexOf(route);
+    assert.ok(routeStart >= 0, `Assistant route ${route} is missing.`);
+    assert.match(proxySource.slice(routeStart, routeStart + 420), /timeoutMs: assistantRequestTimeoutMs\(\)/);
+  });
+  const semanticRouteStart = proxySource.indexOf('/assistant/object-flow/semantic-plan');
+  assert.match(proxySource.slice(semanticRouteStart, semanticRouteStart + 600), /timeoutMs: assistantRequestTimeoutMs\(1\)/);
+  const flowRouteStart = proxySource.indexOf('/assistant/object-flow/plan');
+  assert.match(proxySource.slice(flowRouteStart, flowRouteStart + 600), /timeoutMs: assistantRequestTimeoutMs\(2\)/);
+  assert.match(proxySource, /const contextDeadlineAt = contextStartedAt \+ contextTimeoutMs/);
+  assert.match(proxySource, /MCP context collection stopped after/);
+  assert.doesNotMatch(proxySource, /CMDP_ASSISTANT_TIMEOUT_MS/);
+});
+
 function generatedDynamicPagesClientScript() {
   const start = proxySource.indexOf('function dynamicPagesClientScript()');
   const end = proxySource.indexOf('\nfunction readJsonBody', start);
@@ -19,11 +47,12 @@ function generatedDynamicPagesClientScript() {
     'DEFAULT_PERMISSION_DENIED_TEXT',
     'DEFAULT_TEMPLATE_CACHE_TTL_SEC',
     'DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT',
+    'DEFAULT_ASSISTANT_OBJECT_FLOW_SEMANTIC_PROMPT',
     'DEFAULT_ASSISTANT_DIAGRAM_INTERPRETATION_PROMPT',
     'DEFAULT_ASSISTANT_DIAGRAM_MAPPING_PROMPT',
     factorySource
   );
-  return factory('empty result', 'permission denied', 3600, 'object flow prompt', 'diagram interpretation prompt', 'diagram mapping prompt')();
+  return factory('empty result', 'permission denied', 3600, 'object flow prompt', 'semantic plan prompt', 'diagram interpretation prompt', 'diagram mapping prompt')();
 }
 
 test('generated Dynamic Pages client script parses as browser JavaScript', () => {
@@ -35,6 +64,16 @@ test('generated Dynamic Pages client script parses as browser JavaScript', () =>
   assert.doesNotThrow(() => {
     new vm.Script(clientScript, { filename: 'dynamic-pages-client.js' });
   });
+});
+
+test('Assistant persists the configurable reference-path depth setting', () => {
+  assert.match(proxySource, /DEFAULT_ASSISTANT_REFERENCE_PATH_MAX_DEPTH/);
+  assert.match(proxySource, /CMDP_ASSISTANT_REFERENCE_PATH_MAX_DEPTH_ABSOLUTE/);
+  assert.match(proxySource, /var semanticPlan = assistant\.semanticPlan \|\| \{\};/);
+  assert.match(proxySource, /cmdp-assistant-semantic-plan-max-reference-path-depth/);
+  assert.match(proxySource, /assistantSemanticPlanMaxReferencePathDepthHelp/);
+  assert.match(proxySource, /next\.assistant\.semanticPlan\.maxReferencePathDepth = readPositiveIntField/);
+  assert.match(proxySource, /maxReferencePathDepth: maxReferencePathDepthConfig\.value/);
 });
 
 test('CMDBuild custom page launcher redirects without relying only on afterrender', () => {
@@ -113,6 +152,35 @@ test('assistant prompt and task mode persist in template spec metadata', () => {
   assert.match(applySource, /applyAssistantDraftToSpec\(result\.json\.spec, state\.assistantDraftIntent, state\.assistantTaskMode\)/);
 });
 
+test('Assistant prompt-only autosave uses an isolated template endpoint and ignores prompt metadata in flow staleness checks', () => {
+  const autosaveStart = proxySource.indexOf('function autosaveAssistantPrompts()');
+  const scheduleStart = proxySource.indexOf('function scheduleAssistantPromptAutosave()');
+  const flowSnapshotStart = proxySource.indexOf('function assistantTemplateRevisionSnapshot(template, spec, requestGeneration)');
+  const applyDraftStart = proxySource.indexOf('function applyAssistantDraftToSpec(spec, intent, taskMode)');
+  const serverDraftStart = proxySource.indexOf("if (templateAction === 'assistant-draft')");
+  const serverVersionsStart = proxySource.indexOf("if (templateAction === 'versions')");
+  assert.ok(autosaveStart > -1);
+  assert.ok(scheduleStart > autosaveStart);
+  assert.ok(flowSnapshotStart > -1);
+  assert.ok(applyDraftStart > flowSnapshotStart);
+  assert.ok(serverDraftStart > -1);
+  assert.ok(serverVersionsStart > serverDraftStart);
+
+  const autosaveSource = proxySource.slice(autosaveStart, scheduleStart);
+  const flowSnapshotSource = proxySource.slice(flowSnapshotStart, applyDraftStart);
+  const serverDraftSource = proxySource.slice(serverDraftStart, serverVersionsStart);
+  assert.match(autosaveSource, /\/templates\/.*\/assistant-draft/);
+  assert.match(autosaveSource, /baseSpecHash/);
+  assert.match(autosaveSource, /assistantDraft: draft/);
+  assert.match(flowSnapshotSource, /assistantSpecWithoutPromptDraft/);
+  assert.match(serverDraftSource, /methodAllowed\(req, res, 'PUT'\)/);
+  assert.match(serverDraftSource, /normalizeAssistantPromptDraft/);
+  assert.match(serverDraftSource, /templatePayloadWithAssistantPromptDraft/);
+  assert.doesNotMatch(serverDraftSource, /writeTemplateVersion/);
+  assert.doesNotMatch(serverDraftSource, /invalidateTemplateRuntimeCache/);
+  assert.doesNotMatch(serverDraftSource, /invalidateTemplateStaticSnapshots/);
+});
+
 test('typed assistant flow renders one in-progress proposal before deterministic apply', () => {
   const renderStart = proxySource.indexOf('function renderAssistantFlowEditor(');
   const editorStart = proxySource.indexOf('function renderAssistantEditor(');
@@ -129,18 +197,73 @@ test('typed assistant flow renders one in-progress proposal before deterministic
   assert.match(proxySource, /assistantGeneratingTitle/);
   assert.match(renderSource, /assistantGenerateBusy/);
   assert.match(renderSource, /state\.assistantFlowBusy/);
-  assert.match(renderSource, /cmdp-assistant-object-flow-prompt/);
+  assert.match(renderSource, /cmdp-assistant-object-flow-intent/);
+  assert.match(renderSource, /assistant-flow-prepare/);
+  assert.match(renderSource, /assistant-flow-block-add/);
+  assert.match(renderSource, /assistant-flow-drag-handle/);
+  assert.match(renderSource, /assistant-flow-disclosure/);
+  assert.match(renderSource, /assistant-flow-business-actions/);
+  assert.match(renderSource, /assistantObjectFlowDependencyDiagnostics/);
+  assert.match(renderSource, /assistantFlowVisualOrderWarning/);
+  assert.doesNotMatch(renderSource, /assistant-flow-block-up/);
+  assert.doesNotMatch(renderSource, /assistant-flow-block-down/);
   assert.match(renderSource, /assistant-flow-generate/);
   assert.match(renderSource, /assistantFlowProposal/);
+  assert.match(renderSource, /assistantFlowCanApply/);
+  assert.match(renderSource, /assistantFlowSemanticPlan/);
+  assert.match(renderSource, /data-assistant-flow-semantic-plan/);
   assert.doesNotMatch(renderSource, /assistant-flow-generate-selection/);
   assert.doesNotMatch(renderSource, /assistant-flow-generate-match/);
   assert.doesNotMatch(renderSource, /renderObjectGroupSelection\(/);
   assert.doesNotMatch(renderSource, /renderObjectMatchingBlock\(/);
   assert.match(editorSource, /renderAssistantFlowEditor\(\)/);
-  assert.match(generateSource, /if \(state\.assistantFlowBusy\) return/);
+  assert.match(generateSource, /if \(state\.assistantFlowBusy \|\| !state\.assistantFlowSemanticPlan\) return/);
   assert.match(generateSource, /state\.assistantFlowProposal = null/);
+  assert.match(generateSource, /state\.assistantFlowCanApply = false/);
+  assert.match(generateSource, /result\.json\.canApply === true/);
   assert.match(generateSource, /\/assistant\/object-flow\/plan/);
+  assert.match(proxySource, /\/assistant\/object-flow\/semantic-plan/);
+  assert.match(proxySource, /function invalidateAssistantObjectFlowRequests\(\)/);
+  assert.match(proxySource, /function moveAssistantObjectFlowBlockTo\(from, to\)/);
+  assert.doesNotMatch(proxySource.slice(proxySource.indexOf('function updateAssistantObjectFlowIntent'), proxySource.indexOf('function addAssistantObjectFlowBlock')), /slice\(0, index\).*block\.uses/);
+  assert.match(proxySource, /function assistantTemplateRevisionMismatch\(snapshot\)/);
+  assert.match(proxySource, /function assistantTemplateRevisionError\(snapshot\)/);
+  assert.match(proxySource, /assistantResponseStaleTemplate/);
+  assert.match(proxySource, /assistantResponseStaleSpec/);
+  assert.match(proxySource, /assistantResponseStaleRequest/);
+  assert.match(generateSource, /state\.assistantFlowRequestGeneration = requestGeneration/);
+  assert.match(generateSource, /assistantTemplateRevisionSnapshot\(state\.selectedTemplate, requestSpec, requestGeneration\)/);
+  assert.match(generateSource, /mismatch === 'request'/);
+  assert.match(generateSource, /assistantTemplateRevisionError\(requestRevision\)/);
+  assert.match(generateSource, /state\.assistantFlowRequestGeneration \|\| 0\) === requestGeneration/);
+  assert.doesNotMatch(proxySource.slice(proxySource.indexOf('function assistantTemplateRevisionSnapshot'), proxySource.indexOf('function applyAssistantDraftToSpec')), /assistantObjectFlowPrompt|hasPrompt|specHash/);
+  assert.doesNotMatch(generateSource, /state\.selectedTemplate !== requestTemplate/);
   assert.match(generateSource, /state\.assistantFlowBusy = false/);
+});
+
+test('same-revision Designer reload preserves transient Assistant state', () => {
+  const hydrateStart = proxySource.indexOf('function hydrateDesignerStateFromTemplate(options)');
+  const noticeStart = proxySource.indexOf('function renderNotice(message)', hydrateStart);
+  const loadStart = proxySource.indexOf('function loadDesigner(options)');
+  const fetchVersionsStart = proxySource.indexOf('function fetchVersions(code)', loadStart);
+  const saveStart = proxySource.indexOf('function saveTemplate()');
+  const assistantStart = proxySource.indexOf('function openAssistantSection()', saveStart);
+  assert.ok(hydrateStart > -1);
+  assert.ok(noticeStart > hydrateStart);
+  assert.ok(loadStart > -1);
+  assert.ok(fetchVersionsStart > loadStart);
+  assert.ok(saveStart > -1);
+  assert.ok(assistantStart > saveStart);
+
+  const hydrateSource = proxySource.slice(hydrateStart, noticeStart);
+  const loadSource = proxySource.slice(loadStart, fetchVersionsStart);
+  const saveSource = proxySource.slice(saveStart, assistantStart);
+
+  assert.match(hydrateSource, /if \(!options\.preserveAssistantState\)/);
+  assert.match(loadSource, /var selectedBeforeReload = state\.selectedTemplate/);
+  assert.match(loadSource, /selectedBeforeReload\.specHash/);
+  assert.match(loadSource, /preserveAssistantState: preserveAssistantState/);
+  assert.match(saveSource, /loadDesigner\(\{ preserveAssistantState: true \}\)/);
 });
 
 test('assistant status is compact and flow capture uses proposal state without deterministic DOM fields', () => {
@@ -169,7 +292,7 @@ test('assistant status is compact and flow capture uses proposal state without d
   assert.match(captureSource, /state\.assistantFlowProposal/);
   assert.doesNotMatch(captureSource, /captureObjectGroupDraftFromDom/);
   assert.doesNotMatch(captureSource, /readRelationExpansionFields/);
-  assert.match(specWithPromptsSource, /objectFlowPrompt/);
+  assert.match(specWithPromptsSource, /assistantPromptDraft\(\)/);
   assert.match(specWithPromptsSource, /delete next\.assistantDraft\.flowPrompts/);
 });
 
@@ -195,7 +318,7 @@ test('designer blocks template-bound menu sections until a template is selected'
   const menuSource = proxySource.slice(menuStart, renderSectionStart);
   const renderSectionSource = proxySource.slice(renderSectionStart, titleStart);
   const clickSource = proxySource.slice(clickStart, actionStart);
-  const loadDesignerStart = proxySource.indexOf('function loadDesigner()');
+  const loadDesignerStart = proxySource.indexOf('function loadDesigner(options)');
   const fetchVersionsStart = proxySource.indexOf('function fetchVersions(code)');
   assert.ok(loadDesignerStart > -1);
   assert.ok(fetchVersionsStart > loadDesignerStart);
@@ -449,6 +572,10 @@ test('assistant owns D2 import while diagram owns deterministic mappings', () =>
   assert.match(proxySource, /function catalogRelationPathOptions\(className\)/);
   assert.match(proxySource, /Number\(state\.maxTraversalDepth\)/);
   assert.match(proxySource, /data-relation-path/);
+  assert.match(proxySource, /function renderRelationPathPlanner\(model, spec\)/);
+  assert.match(proxySource, /function appendRelationPath\(\)/);
+  assert.match(proxySource, /data-action="append-relation-path"/);
+  assert.match(proxySource, /catalogDomainRelationPathOptions/);
   assert.match(proxySource, /renderDiagramImportAttributeMultiSelect/);
   assert.match(proxySource, /diagramImportSelectedValues/);
   assert.match(proxySource, /renderDiagramImportLabelSuggestions/);
@@ -747,7 +874,8 @@ test('Relations Apply preserves explicit operation order and source-driven colum
   assert.match(buildSource, /var selectionSteps =/);
   assert.match(buildSource, /var operations = flowOperations\(model\)/);
   assert.match(buildSource, /var operationSteps = operations\.map/);
-  assert.match(buildSource, /var steps = selectionSteps\.concat\(operationSteps\)/);
+  assert.match(buildSource, /orderedRelationFlowStages\(selectionSteps, operationSteps\)/);
+  assert.match(buildSource, /var steps = orderedStages\.ordered\.map/);
   assert.doesNotMatch(buildSource, /deduplicateCards/);
   assert.doesNotMatch(buildSource, /includeSource/);
 });

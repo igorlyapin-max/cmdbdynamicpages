@@ -43,6 +43,19 @@ if (requireLiveUi && skipReason) {
   throw new Error(`Browser UI smoke is required but cannot run: ${skipReason}`);
 }
 
+async function addAssistantBusinessBlock(page, values = {}) {
+  if (await page.locator('[data-assistant-flow-block]').count() === 0) {
+    await page.locator('button[data-action="assistant-flow-block-add"]').click();
+  }
+  const block = page.locator('[data-assistant-flow-block]').last();
+  const index = (await page.locator('[data-assistant-flow-block]').count()) - 1;
+  await block.locator(`#assistant-flow-${index}-name`).fill(values.name || `Result ${index + 1}`);
+  await block.locator(`#assistant-flow-${index}-entities`).fill(values.entities || 'CMDBuild objects');
+  await block.locator(`#assistant-flow-${index}-algorithm`).fill(values.algorithm || 'Select the requested objects.');
+  await block.locator(`#assistant-flow-${index}-expected-result`).fill(values.expectedResult || 'A deterministic result table.');
+  return block;
+}
+
 test('Designer opens on the template list with fixed menu and action bar', { skip: skipReason }, async () => {
   await withPage(async (page) => {
     await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
@@ -64,6 +77,14 @@ test('Designer blocks template-bound menu sections until a template is selected'
     await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
     await page.waitForSelector('#cmdp-template-list', { timeout: 10_000 });
 
+    const menuGroups = await page.locator('#cmdp-designer-menu .menu-group').evaluateAll((groups) => groups.map((group) =>
+      Array.from(group.querySelectorAll('[data-designer-section]')).map((link) => link.getAttribute('data-designer-section'))
+    ));
+    const templateGroup = menuGroups.find((sections) => sections.includes('templates')) || [];
+    const constructorGroup = menuGroups.find((sections) => sections.includes('params')) || [];
+    assert.equal(templateGroup.includes('assistant'), false);
+    assert.deepEqual(constructorGroup.slice(0, 3), ['params', 'assistant', 'object-group']);
+
     assert.equal(await page.locator('#cmdp-cache-editor').count(), 0);
     assert.match(new URL(page.url()).pathname, /\/cmdbuild\/dynamicpages\/ui\/designer\/?$/);
     assert.match(await page.locator('.notice').first().innerText(), /Select or create a template|Выберите или создайте шаблон/);
@@ -76,6 +97,19 @@ test('Designer blocks template-bound menu sections until a template is selected'
 
     await page.locator('a[data-designer-section="schema"]').click();
     await page.waitForSelector('#cmdp-schema-manager', { timeout: 10_000 });
+  });
+});
+
+test('Runtime settings expose a configurable Assistant reference-path depth', { skip: skipReason }, async () => {
+  await withPage(async (page) => {
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer/settings`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-runtime-settings', { timeout: 10_000 });
+    await page.locator('#cmdp-language').selectOption('ru');
+
+    const field = page.locator('#cmdp-assistant-semantic-plan-max-reference-path-depth');
+    await field.waitFor({ timeout: 10_000 });
+    assert.equal(await field.isVisible(), true);
+    assert.match(await field.locator('xpath=..').innerText(), /Глубина reference-пути/);
   });
 });
 
@@ -99,15 +133,577 @@ test('Assistant keeps prompts separate from deterministic Designer controls', { 
     assert.equal(await page.locator('#cmdp-assistant-diagram-mapping-prompt').count(), 1);
     assert.equal(await page.locator('button[data-action="assistant-diagram-map"]').isDisabled(), true);
 
-    const flowPrompt = page.locator('#cmdp-assistant-object-flow-prompt');
+    await addAssistantBusinessBlock(page);
+    const flowPrompt = page.locator('#assistant-flow-0-algorithm');
     assert.equal(await flowPrompt.isVisible(), true);
     assert.equal(await page.locator('[data-assistant-flow-selection], [data-assistant-flow-match]').count(), 0);
     const promptWidth = await flowPrompt.evaluate((node) => {
       const rect = node.getBoundingClientRect();
-      const parentRect = node.parentElement.getBoundingClientRect();
+      const parentRect = node.closest('[data-assistant-flow-block]').getBoundingClientRect();
       return { width: rect.width, parentWidth: parentRect.width };
     });
-    assert.ok(promptWidth.width >= promptWidth.parentWidth - 1, JSON.stringify(promptWidth));
+    assert.ok(promptWidth.width >= promptWidth.parentWidth - 24, JSON.stringify(promptWidth));
+  });
+});
+
+test('Assistant autosaves all user prompts for a saved template without creating a version', { skip: skipReason, timeout: 90_000 }, async () => {
+  await withPage(async (page) => {
+    const code = `AssistantPromptAutosaveUiSmoke${Date.now()}`;
+    const prompts = {
+      objectFlow: {
+        name: 'IP ranges of information system',
+        entities: 'Информационная система по параметру isName и связанные IP-диапазоны.',
+        algorithm: 'Найти ИС по isName и получить связанные ipRange.',
+        expectedResult: 'Таблица IP-диапазонов выбранной ИС.'
+      },
+      interpret: 'Контейнеры являются визуальными группами, а узлы - экземплярами CMDB-классов.',
+      mapping: 'Сопоставить выборки с D2-ролями по семантике и доступным атрибутам.'
+    };
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.locator('button[data-action="new-template"]').click();
+    await page.waitForSelector('#cmdp-template-editor', { timeout: 10_000 });
+    await page.locator('#cmdp-code').fill(code);
+    await page.locator('#cmdp-description').fill('Assistant prompt autosave UI smoke');
+    const createResponsePromise = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/templates') && response.request().method() === 'POST');
+    await page.locator('button[data-action="save-template"]').click();
+    const createResponse = await createResponsePromise;
+    assert.equal(createResponse.status(), 201, await createResponse.text());
+
+    await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
+    await page.locator('a[data-designer-section="assistant"]').click();
+    await page.waitForSelector('#cmdp-assistant-editor', { timeout: 10_000 });
+    await addAssistantBusinessBlock(page, prompts.objectFlow);
+    await page.locator('[data-assistant-flow-candidate][value="block-1"]').check();
+    const autosaveResponsePromise = page.waitForResponse((response) => response.url().includes(`/cmdbuild/custom-api/templates/${code}/assistant-draft`) && response.request().method() === 'PUT');
+    await page.locator('#cmdp-assistant-diagram-interpret-prompt').fill(prompts.interpret);
+    await page.locator('#cmdp-assistant-diagram-mapping-prompt').fill(prompts.mapping);
+    const autosaveResponse = await autosaveResponsePromise;
+    assert.equal(autosaveResponse.status(), 200, await autosaveResponse.text());
+    const autosaveBody = JSON.parse(await autosaveResponse.text());
+    assert.deepEqual(autosaveBody.template.spec.assistantDraft, {
+      objectFlowIntent: {
+        context: '',
+        extractionCandidateBlockId: 'block-1',
+        extractionCandidateAlias: '',
+        blocks: [{ id: 'block-1', uses: [], ...prompts.objectFlow }]
+      },
+      diagramInterpretPrompt: prompts.interpret,
+      diagramMappingPrompt: prompts.mapping
+    });
+    assert.equal(autosaveBody.versionLog, undefined);
+    assert.equal(autosaveBody.cacheInvalidation, undefined);
+    await page.waitForFunction(() => document.querySelector('#cmdp-assistant-prompt-autosave-status')?.textContent?.includes('сохранены') || document.querySelector('#cmdp-assistant-prompt-autosave-status')?.textContent?.includes('saved'), null, { timeout: 10_000 });
+
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
+    await page.locator('a[data-designer-section="assistant"]').click();
+    await page.waitForSelector('#cmdp-assistant-editor', { timeout: 10_000 });
+    assert.equal(await page.locator('#assistant-flow-0-name').inputValue(), prompts.objectFlow.name);
+    assert.equal(await page.locator('#assistant-flow-0-entities').inputValue(), prompts.objectFlow.entities);
+    assert.equal(await page.locator('#assistant-flow-0-algorithm').inputValue(), prompts.objectFlow.algorithm);
+    assert.equal(await page.locator('#assistant-flow-0-expected-result').inputValue(), prompts.objectFlow.expectedResult);
+    assert.equal(await page.locator('[data-assistant-flow-candidate][value="block-1"]').isChecked(), true);
+    assert.equal(await page.locator('[data-assistant-flow-details] > summary .pill.ok').count(), 1);
+    assert.equal(await page.locator('#cmdp-assistant-diagram-interpret-prompt').inputValue(), prompts.interpret);
+    assert.equal(await page.locator('#cmdp-assistant-diagram-mapping-prompt').inputValue(), prompts.mapping);
+
+    await page.locator('a[data-designer-section="templates"]').click();
+    const deleteButton = page.locator(`[data-action="delete-template"][data-code="${code}"]`);
+    await deleteButton.waitFor({ timeout: 10_000 });
+    page.once('dialog', (dialog) => dialog.accept());
+    const deleteResponsePromise = page.waitForResponse((response) => response.url().includes(`/cmdbuild/custom-api/templates/${code}`) && response.request().method() === 'DELETE');
+    await deleteButton.click();
+    const deleteResponse = await deleteResponsePromise;
+    assert.equal(deleteResponse.status(), 200, await deleteResponse.text());
+  });
+});
+
+test('Assistant keeps an Object Flow response after updating a saved template variable and reloading it', { skip: skipReason, timeout: 90_000 }, async () => {
+  await withPage(async (page) => {
+    const code = `AssistantFlowRevisionUiSmoke${Date.now()}`;
+    const prompt = [
+      'Выборка 1',
+      'Для информационной системы (ИС) имя которой равно параметру отчета isName, выбираем все связанные объекты ipRange.'
+    ].join('\n');
+    const flow = {
+      version: 1,
+      selections: [{
+        id: 'selection:informationSystems',
+        name: 'Information systems',
+        alias: 'informationSystems',
+        className: 'IS',
+        from: '',
+        limit: 1,
+        columns: ['Name'],
+        rules: [{ action: 'include', path: 'Name', negate: false, op: 'equals', value: '', regex: '', valueParam: 'isName', valueColumn: '' }]
+      }],
+      operations: [{
+        id: 'relation:ipRanges',
+        type: 'relation',
+        from: 'informationSystems',
+        as: 'ipRanges',
+        domain: 'ISZabbixMonitoringDomain',
+        targetClass: 'ipRange',
+        direction: 'source',
+        columns: ['range'],
+        limit: 100,
+        distinct: true
+      }],
+      blocks: [],
+      setOperations: [],
+      publishedAlias: 'ipRanges'
+    };
+
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.locator('button[data-action="new-template"]').click();
+    await page.waitForSelector('#cmdp-template-editor', { timeout: 10_000 });
+    await page.locator('#cmdp-code').fill(code);
+    await page.locator('#cmdp-description').fill('Assistant revision guard UI smoke');
+    const createResponsePromise = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/templates') && response.request().method() === 'POST');
+    const createdTemplatesReloadPromise = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/templates?limit=1000') && response.request().method() === 'GET');
+    await page.locator('button[data-action="save-template"]').click();
+    const createResponse = await createResponsePromise;
+    assert.equal(createResponse.status(), 201, await createResponse.text());
+    await createdTemplatesReloadPromise;
+
+    await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
+    await page.locator('a[data-designer-section="params"]').click();
+    await page.waitForSelector('#cmdp-params-editor', { timeout: 10_000 });
+    const variableRow = page.locator('[data-param-row]').last();
+    await variableRow.locator('[data-param-field="name"]').fill('isName');
+    await variableRow.locator('[data-param-field="required"]').check();
+
+    const saveResponsePromise = page.waitForResponse((response) => response.url().includes(`/cmdbuild/custom-api/templates/${code}`) && response.request().method() === 'PUT');
+    const savedTemplatesReloadPromise = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/templates?limit=1000') && response.request().method() === 'GET');
+    await page.locator('button[data-action="save-template"]').click();
+    const saveResponse = await saveResponsePromise;
+    assert.equal(saveResponse.status(), 200, await saveResponse.text());
+    await savedTemplatesReloadPromise;
+    await page.locator('a[data-designer-section="assistant"]').click();
+    await page.waitForSelector('#cmdp-assistant-editor', { timeout: 10_000 });
+    await addAssistantBusinessBlock(page, {
+      name: 'IP ranges of selected IS',
+      entities: 'Информационная система и ipRange.',
+      algorithm: prompt,
+      expectedResult: 'Таблица связанных IP-диапазонов.'
+    });
+
+    await page.route('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*', async (route) => {
+      await route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          semanticPlan: { version: 1, blocks: [{ id: 'block-1', name: 'IP ranges of selected IS', summary: 'ИС -> ipRange', resolvedEntities: ['IS', 'ipRange'], relationPaths: ['IS --ISZabbixMonitoringDomain--> ipRange'], dependencies: [], expectedResult: 'Таблица связанных IP-диапазонов.', resultContract: { outputKind: 'relationPairs', outputClass: 'IS', relationPredicates: [] }, warnings: [] }], explanation: 'Semantic plan ready.', warnings: [] }
+        })
+      });
+    });
+
+    let releaseFlowResponse;
+    const flowResponseGate = new Promise((resolve) => { releaseFlowResponse = resolve; });
+    let flowRequestSeen;
+    const flowRequestSeenPromise = new Promise((resolve) => { flowRequestSeen = resolve; });
+    await page.route('**/cmdbuild/custom-api/assistant/object-flow/plan?*', async (route) => {
+      flowRequestSeen();
+      await flowResponseGate;
+      await route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({ success: true, action: 'assistant-object-flow-plan', flow, canApply: true, explanation: 'Flow ready.', warnings: [] })
+      });
+    });
+
+    const semanticResponsePromise = page.waitForResponse((response) => response.url().includes('/assistant/object-flow/semantic-plan'));
+    await page.locator('button[data-action="assistant-flow-prepare"]').click();
+    await semanticResponsePromise;
+    await page.locator('button[data-action="assistant-flow-generate"]').click();
+    await flowRequestSeenPromise;
+    await page.locator('#assistant-flow-0-algorithm').evaluate((node, value) => {
+      node.value = value;
+      node.dispatchEvent(new Event('input', { bubbles: true }));
+    }, `${prompt}\n`);
+    const refreshResponsePromise = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/templates?limit=1000') && response.request().method() === 'GET');
+    await page.locator('button[data-action="refresh"]').click();
+    await refreshResponsePromise;
+    await page.waitForFunction((value) => document.querySelector('#assistant-flow-0-algorithm')?.value === value, `${prompt}\n`, { timeout: 10_000 });
+
+    releaseFlowResponse();
+    await page.waitForFunction(() => {
+      const button = document.querySelector('button[data-action="assistant-flow-apply"]');
+      return Boolean(button && !button.disabled);
+    }, null, { timeout: 10_000 });
+    assert.match(await page.locator('#cmdp-assistant-editor').innerText(), /Flow ready\./);
+    assert.match(await page.locator('#cmdp-assistant-object-flow').innerText(), /ISZabbixMonitoringDomain/);
+    assert.doesNotMatch(await page.locator('.notice').first().innerText(), /предыдущей ревизии|older template revision/i);
+
+    await page.unroute('**/cmdbuild/custom-api/assistant/object-flow/plan?*');
+    await page.unroute('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*');
+    await page.locator('a[data-designer-section="templates"]').click();
+    const deleteButton = page.locator(`[data-action="delete-template"][data-code="${code}"]`);
+    await deleteButton.waitFor({ timeout: 10_000 });
+    page.once('dialog', (dialog) => dialog.accept());
+    const deleteResponsePromise = page.waitForResponse((response) => response.url().includes(`/cmdbuild/custom-api/templates/${code}`) && response.request().method() === 'DELETE');
+    await deleteButton.click();
+    const deleteResponse = await deleteResponsePromise;
+    assert.equal(deleteResponse.status(), 200, await deleteResponse.text());
+  });
+});
+
+test('Assistant shows a read-only Object Flow draft and disables Apply', { skip: skipReason }, async () => {
+  await withPage(async (page) => {
+    const flow = {
+      version: 1,
+      selections: [{
+        id: 'selection:assets',
+        name: 'Assets',
+        alias: 'assets',
+        className: 'ARM',
+        from: '',
+        limit: 100,
+        columns: ['Code'],
+        rules: []
+      }],
+      operations: [],
+      blocks: [],
+      setOperations: [],
+      publishedAlias: 'assets'
+    };
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.locator('button[data-action="new-template"]').click();
+    await page.waitForSelector('#cmdp-template-editor', { timeout: 10_000 });
+    await page.locator('#cmdp-code').fill(`AssistantReadOnlyUiSmoke${Date.now()}`);
+    await page.locator('#cmdp-description').fill('Assistant read-only proposal UI smoke');
+    await page.locator('a[data-designer-section="assistant"]').click();
+    await page.waitForSelector('#cmdp-assistant-editor', { timeout: 10_000 });
+    await addAssistantBusinessBlock(page, { name: 'Assets', entities: 'АРМ', algorithm: 'Выбрать все карточки АРМ.', expectedResult: 'Таблица АРМ.' });
+    const entitiesExample = page.locator('[data-assistant-flow-entities-example]').first();
+    assert.equal(await entitiesExample.count(), 1);
+    assert.equal(await entitiesExample.evaluate((element) => element.open), false);
+    await page.route('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*', async (route) => {
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ success: true, semanticPlan: { version: 1, blocks: [{ id: 'block-1', name: 'Assets', summary: 'АРМ', resolvedEntities: ['ARM'], relationPaths: [], dependencies: [], expectedResult: 'Таблица АРМ.', resultContract: { outputKind: 'sourceCards', outputClass: 'ARM', relationPredicates: [], attributePredicates: [{ sourceClass: 'ARM', comparisonBlockId: 'locations', comparisonClass: 'Location', sourceFields: ['Location'], comparisonField: 'Code', operator: 'equals' }] }, warnings: [] }], explanation: 'Semantic plan ready.', warnings: [] } }) });
+    });
+    await page.route('**/cmdbuild/custom-api/assistant/object-flow/plan?*', async (route) => {
+      await route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({ success: true, action: 'assistant-object-flow-plan', flow, canApply: false, explanation: 'Read-only flow ready.', warnings: [] })
+      });
+    });
+
+    await page.locator('button[data-action="assistant-flow-prepare"]').click();
+    await page.waitForSelector('[data-assistant-flow-semantic-plan]', { timeout: 10_000 });
+    const semanticPlanText = await page.locator('[data-assistant-flow-semantic-plan]').innerText();
+    assert.match(semanticPlanText, /ARM/);
+    assert.match(semanticPlanText, /Сравнение атрибутов|Attribute comparison/);
+    assert.match(semanticPlanText, /ARM\.Location equals Location\.Code/);
+    await page.locator('button[data-action="assistant-flow-generate"]').click();
+    const applyButton = page.locator('button[data-action="assistant-flow-apply"]');
+    await page.waitForFunction(() => Boolean(document.querySelector('#cmdp-assistant-object-flow')?.textContent?.includes('Read-only flow ready.')), null, { timeout: 10_000 });
+    assert.equal(await applyButton.isDisabled(), true);
+    assert.match(await page.locator('#cmdp-assistant-object-flow').innerText(), /Read-only flow ready\./);
+    await page.unroute('**/cmdbuild/custom-api/assistant/object-flow/plan?*');
+    await page.unroute('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*');
+  });
+});
+
+test('Assistant renders a direct dependency path in the Semantic Plan', { skip: skipReason }, async () => {
+  await withPage(async (page) => {
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.locator('button[data-action="new-template"]').click();
+    await page.waitForSelector('#cmdp-template-editor', { timeout: 10_000 });
+    await page.locator('#cmdp-code').fill(`AssistantDependencyPathUiSmoke${Date.now()}`);
+    await page.locator('#cmdp-description').fill('Assistant dependency path UI smoke');
+    await page.locator('a[data-designer-section="assistant"]').click();
+    await page.waitForSelector('#cmdp-assistant-editor', { timeout: 10_000 });
+    await addAssistantBusinessBlock(page, {
+      name: 'Результат 1', entities: 'IP-диапазоны.', algorithm: 'Выбрать IP-диапазоны исходной ИС.', expectedResult: 'Список ipRange.'
+    });
+    await page.locator('button[data-action="assistant-flow-block-add"]').click();
+    const secondBlock = page.locator('[data-assistant-flow-block]').last();
+    await secondBlock.locator('#assistant-flow-1-name').fill('Результат 2');
+    await secondBlock.locator('#assistant-flow-1-entities').fill('VLAN, связанные с первым результатом.');
+    await secondBlock.locator('#assistant-flow-1-algorithm').fill('Выбрать VLAN, связанные с ipRange из первого результата.');
+    await secondBlock.locator('#assistant-flow-1-expected-result').fill('Список VLAN.');
+    await secondBlock.locator('[data-assistant-flow-field="uses"]').selectOption('block-1');
+    await page.route('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*', async (route) => {
+      await route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          semanticPlan: {
+            version: 1,
+            blocks: [{
+              id: 'block-1', name: 'Результат 1', summary: 'IP-диапазоны.', resolvedEntities: ['ipRange'], relationPaths: [], dependencies: [], expectedResult: 'Список ipRange.',
+              resultContract: { outputKind: 'sourceCards', outputClass: 'ipRange', dependencyPaths: [], relationPredicates: [], attributePredicates: [] }, warnings: []
+            }, {
+              id: 'block-2', name: 'Результат 2', summary: 'VLAN первого результата.', resolvedEntities: ['ipRange', 'vlan'], relationPaths: ['ipRange --Vlan2super [destination]--> vlan'], dependencies: ['block-1'], expectedResult: 'Список VLAN.',
+              resultContract: {
+                outputKind: 'sourceCards', outputClass: 'vlan',
+                dependencyPaths: [{ comparisonBlockId: 'block-1', sourceClass: 'ipRange', domain: 'Vlan2super', direction: 'destination', targetClass: 'vlan' }],
+                relationPredicates: [], attributePredicates: []
+              }, warnings: []
+            }],
+            explanation: 'Semantic plan ready.', warnings: []
+          }
+        })
+      });
+    });
+
+    await page.locator('button[data-action="assistant-flow-prepare"]').click();
+    const semanticPlan = page.locator('[data-assistant-flow-semantic-plan]');
+    await semanticPlan.waitFor({ timeout: 10_000 });
+    assert.equal(await semanticPlan.isVisible(), true);
+    const box = await semanticPlan.boundingBox();
+    assert.ok(box && box.width > 0 && box.height > 0, JSON.stringify(box));
+    const text = await semanticPlan.innerText();
+    assert.match(text, /Прямой путь зависимости|Direct dependency path/);
+    assert.match(text, /ipRange --Vlan2super \[destination\]--> vlan/);
+    await page.unroute('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*');
+  });
+});
+
+test('Assistant explains a predicate erroneously added to an independent Semantic Plan block', { skip: skipReason }, async () => {
+  await withPage(async (page) => {
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.locator('button[data-action="new-template"]').click();
+    await page.waitForSelector('#cmdp-template-editor', { timeout: 10_000 });
+    await page.locator('#cmdp-code').fill(`AssistantSemanticDependencyUiSmoke${Date.now()}`);
+    await page.locator('#cmdp-description').fill('Assistant semantic dependency feedback UI smoke');
+    await page.locator('a[data-designer-section="assistant"]').click();
+    await page.waitForSelector('#cmdp-assistant-editor', { timeout: 10_000 });
+    await addAssistantBusinessBlock(page, {
+      name: 'Результат 1',
+      entities: 'Информационная система и IP-диапазоны.',
+      algorithm: 'Выбрать IP-диапазоны ИС.',
+      expectedResult: 'Список IP-диапазонов ИС.'
+    });
+    await page.route('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*', async (route) => {
+      await route.fulfill({
+        status: 422,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: false,
+          code: 'assistant_semantic_plan_invalid',
+          message: 'Semantic plan block Результат 1 has no selected dependencies and may not define relation predicates.',
+          errors: [{
+            kind: 'semanticPlanUnexpectedPredicateWithoutDependency',
+            blockId: 'block-1',
+            blockName: 'Результат 1',
+            predicateType: 'relation',
+            predicateIndex: 1,
+            comparisonBlockId: 'block-2',
+            sourceFields: ['range'],
+            comparisonField: 'ipaddress'
+          }],
+          feedback: {
+            summary: 'Семантический план не подготовлен: независимый «Результат 1» содержит переход по связи.',
+            action: 'Сформируйте семантический план повторно. У независимого блока не должно быть сравнений с другим результатом или переходов к нему; связь с входным параметром или CMDBuild domain опишите как путь выбора внутри этого блока.',
+            causes: [{ kind: 'semanticPlanUnexpectedPredicateWithoutDependency', message: 'Assistant добавил переход по связи с результатом «block-2» для полей range и ipaddress, хотя в «Использует результаты блоков» ничего не выбрано.' }],
+            affectedStages: [{ label: 'Результат 1', alias: 'block-1' }],
+            confirmedRelations: []
+          }
+        })
+      });
+    });
+
+    await page.locator('button[data-action="assistant-flow-prepare"]').click();
+    const rejected = page.locator('[data-assistant-flow-rejected]');
+    await rejected.waitFor({ timeout: 10_000 });
+    assert.equal(await rejected.isVisible(), true);
+    const box = await rejected.boundingBox();
+    assert.ok(box && box.width > 0 && box.height > 0, JSON.stringify(box));
+    const text = await rejected.innerText();
+    assert.match(text, /Семантический план отклонен|Semantic plan was rejected/);
+    assert.match(text, /Результат 1/);
+    assert.match(text, /независимый/);
+    assert.match(text, /сравнений с другим результатом/);
+    assert.doesNotMatch(text, /comparisonBlockId/);
+    const technicalDetails = rejected.locator('details').first();
+    assert.equal(await technicalDetails.evaluate((details) => details.open), false);
+    await technicalDetails.locator('summary').click();
+    assert.match(await technicalDetails.innerText(), /comparisonBlockId/);
+    assert.equal(await page.locator('button[data-action="assistant-flow-generate"]').isDisabled(), true);
+    assert.equal(await page.locator('button[data-action="assistant-flow-apply"]').isDisabled(), true);
+    await page.unroute('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*');
+  });
+});
+
+test('Assistant retries a timed-out semantic plan from the saved MCP stage', { skip: skipReason }, async () => {
+  await withPage(async (page) => {
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.locator('button[data-action="new-template"]').click();
+    await page.waitForSelector('#cmdp-template-editor', { timeout: 10_000 });
+    await page.locator('#cmdp-code').fill(`AssistantSemanticRetryUiSmoke${Date.now()}`);
+    await page.locator('#cmdp-description').fill('Assistant semantic retry UI smoke');
+    await page.locator('a[data-designer-section="assistant"]').click();
+    await page.waitForSelector('#cmdp-assistant-editor', { timeout: 10_000 });
+    await addAssistantBusinessBlock(page, {
+      name: 'Результат 1',
+      entities: 'Информационная система.',
+      algorithm: 'Выбрать ИС по параметру isName.',
+      expectedResult: 'Список ИС.'
+    });
+
+    const stages = [];
+    let planAttempts = 0;
+    await page.route('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*', async (route) => {
+      const body = route.request().postDataJSON();
+      stages.push(body.stage);
+      if (body.stage === 'context') {
+        await route.fulfill({
+          status: 202,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            success: true,
+            checkpoint: { resumeId: body.resumeId, stage: 'mcpContextReady', mcpContextReused: false, checkpointTtlSec: 900, expiresAt: '2030-01-01T00:00:00.000Z' },
+            diagnostics: { mcp: {} }
+          })
+        });
+        return;
+      }
+      planAttempts += 1;
+      if (planAttempts === 1) {
+        await route.fulfill({
+          status: 504,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            success: false,
+            code: 'assistant_timeout',
+            retryable: true,
+            resume: { resumeId: body.resumeId, stage: 'mcpContextReady', mcpContextReused: true, checkpointTtlSec: 900, expiresAt: '2030-01-01T00:00:00.000Z' },
+            message: 'LiteLLM request timed out.'
+          })
+        });
+        return;
+      }
+      await route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          semanticPlan: {
+            version: 1,
+            blocks: [{
+              id: 'block-1', name: 'Результат 1', summary: 'ИС по параметру.', resolvedEntities: ['IS'], relationPaths: [], dependencies: [], expectedResult: 'Список ИС.',
+              resultContract: { outputKind: 'sourceCards', outputClass: 'IS', dependencyPaths: [], relationPredicates: [], attributePredicates: [] }, warnings: []
+            }],
+            explanation: 'Семантический план готов.', warnings: []
+          }
+        })
+      });
+    });
+
+    await page.locator('button[data-action="assistant-flow-prepare"]').click();
+    const retry = page.locator('button[data-action="assistant-flow-prepare-retry"]');
+    await retry.waitFor({ timeout: 10_000 });
+    assert.equal(await retry.isVisible(), true);
+    assert.match(await page.locator('[data-assistant-flow-rejected]').innerText(), /Контекст CMDB сохранен|CMDB context was saved/);
+    await retry.click();
+    await page.locator('[data-assistant-flow-semantic-plan]').waitFor({ timeout: 10_000 });
+    assert.deepEqual(stages, ['context', 'plan', 'plan']);
+    assert.equal(planAttempts, 2);
+    await page.unroute('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*');
+  });
+});
+
+test('Assistant renders rejected Object Flow diagnostics without enabling Apply', { skip: skipReason }, async () => {
+  await withPage(async (page) => {
+    const rejectedFlow = {
+      version: 1,
+      selections: [{
+        id: 'selection:informationSystems', name: 'Information systems', alias: 'informationSystems', className: 'IS', from: '', limit: 1, columns: ['Name'],
+        rules: [{ action: 'include', path: 'Name', negate: false, op: 'equals', value: '', regex: '', valueParam: 'isName', valueColumn: '' }]
+      }],
+      operations: [{
+        id: 'relation:ipRanges', type: 'relation', from: 'informationSystems', as: 'ipRanges', domain: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source', columns: ['range'], limit: 100, distinct: true
+      }, {
+        id: 'relation:vlans', type: 'relation', from: 'ipRanges', as: 'vlans', domain: 'ipRangeVlanDomain', targetClass: 'vlan', direction: 'destination', columns: ['network'], limit: 100, distinct: true
+      }],
+      publishedAlias: 'vlans'
+    };
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.locator('button[data-action="new-template"]').click();
+    await page.waitForSelector('#cmdp-template-editor', { timeout: 10_000 });
+    await page.locator('#cmdp-code').fill(`AssistantRejectedFlowUiSmoke${Date.now()}`);
+    await page.locator('#cmdp-description').fill('Assistant rejected flow UI smoke');
+    await page.locator('a[data-designer-section="assistant"]').click();
+    await page.waitForSelector('#cmdp-assistant-editor', { timeout: 10_000 });
+    await addAssistantBusinessBlock(page, { name: 'VLANs', entities: 'ИС, ipRange и VLAN', algorithm: 'Для ИС получить IP-диапазоны и VLAN.', expectedResult: 'Таблица VLAN.' });
+    await page.route('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*', async (route) => {
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ success: true, semanticPlan: { version: 1, blocks: [{ id: 'block-1', name: 'VLANs', summary: 'ИС -> ipRange -> VLAN', resolvedEntities: ['IS', 'ipRange', 'vlan'], relationPaths: [], dependencies: [], expectedResult: 'Таблица VLAN.', resultContract: { outputKind: 'relationPairs', outputClass: 'IS', relationPredicates: [] }, warnings: [] }], explanation: 'Semantic plan ready.', warnings: [] } }) });
+    });
+    await page.route('**/cmdbuild/custom-api/assistant/object-flow/plan?*', async (route) => {
+      await route.fulfill({
+        status: 422,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: false,
+          code: 'assistant_object_flow_invalid',
+          message: 'Assistant response did not pass deterministic object-flow validation.',
+          feedback: {
+            summary: 'Assistant добавил неподтвержденный переход по связи ipRangeVlanDomain. Черновик не применен.',
+            action: 'Уточните алгоритм блока или оставьте сравнение атрибутов условием без перехода по связи.',
+            causes: [{ kind: 'unexpectedRelation', message: 'Неподтвержденный переход: ipRangeVlanDomain.' }],
+            affectedStages: [{ label: 'VLANs', alias: 'vlans' }],
+            confirmedRelations: ['IS --ISZabbixMonitoringDomain [source]--> ipRange']
+          },
+          rejectedFlow,
+          errors: [{
+            path: '$.flow.operations[1].domain',
+            message: 'CMDBuild domain ipRangeVlanDomain is not present in the available MCP relation context.',
+            candidates: [{ domain: 'Vlan2super', direction: 'destination', sourceClass: 'ipRange', targetClass: 'vlan', sourceEndpoint: ['ZabbixMonitoring', 'ipRange'], targetEndpoint: ['vlan'] }]
+          }, {
+            path: '$.operations[1].from',
+            message: 'Operation from must reference an alias declared earlier in the flow.',
+            availableAliases: [{ alias: 'informationSystems', classNames: ['IS'] }, { alias: 'ipRanges', classNames: ['ipRange'] }]
+          }],
+          diagnostics: {
+            objectFlow: {
+              aliases: [{ alias: 'informationSystems', classNames: ['IS'] }, { alias: 'ipRanges', classNames: ['ipRange'] }],
+              relationRequirements: {
+                kind: 'relationRequirements',
+                chains: [{ operations: [
+                  { sourceClass: 'IS', domain: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source' },
+                  { sourceClass: 'ipRange', domain: 'Vlan2super', targetClass: 'vlan', direction: 'destination' }
+                ] }]
+              }
+            }
+          }
+        })
+      });
+    });
+
+    const prompt = page.locator('#assistant-flow-0-algorithm');
+    await page.locator('button[data-action="assistant-flow-prepare"]').click();
+    await page.waitForSelector('[data-assistant-flow-semantic-plan]', { timeout: 10_000 });
+    await page.locator('button[data-action="assistant-flow-generate"]').click();
+    const rejected = page.locator('[data-assistant-flow-rejected]');
+    await rejected.waitFor({ timeout: 10_000 });
+    assert.equal(await rejected.isVisible(), true);
+    const box = await rejected.boundingBox();
+    assert.ok(box && box.width > 0 && box.height > 0, JSON.stringify(box));
+    const text = await rejected.innerText();
+    assert.match(text, /неподтвержденный переход/i);
+    assert.match(text, /Корневая причина|Root cause/);
+    assert.match(text, /Затронутые этапы|Affected stages/);
+    assert.match(text, /VLANs/);
+    assert.match(text, /Что нужно исправить|What to fix/);
+    const technicalDetails = rejected.locator('details').first();
+    assert.equal(await technicalDetails.evaluate((details) => details.open), false);
+    await technicalDetails.locator('summary').click();
+    assert.match(await technicalDetails.innerText(), /ipRangeVlanDomain/);
+    assert.match(await technicalDetails.innerText(), /declared earlier/);
+    assert.equal(await page.locator('button[data-action="assistant-flow-apply"]').isDisabled(), true);
+
+    await prompt.fill('Измененный промпт.');
+    await page.waitForFunction(() => !document.querySelector('[data-assistant-flow-rejected]'), null, { timeout: 10_000 });
+    assert.equal(await page.locator('button[data-action="assistant-flow-apply"]').isDisabled(), true);
+    await page.unroute('**/cmdbuild/custom-api/assistant/object-flow/plan?*');
+    await page.unroute('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*');
   });
 });
 
@@ -592,12 +1188,109 @@ test('Assistant generates an ARM by router Location object group and preview ren
     await page.locator('a[data-designer-section="assistant"]').click();
     await page.waitForSelector('#cmdp-assistant-editor', { timeout: 10_000 });
 
-    await page.locator('#cmdp-assistant-object-flow-prompt').fill([
-      'Выборка 1: найти экземпляр класса "маршрутизатор" с точным описанием "Маршрутизатор для Test City 300", вернуть Code, Description и Location.',
-      'Выборка 2: найти все карточки класса АРМ, вернуть Code, Description, Location, model и model2.',
-      'Соединяем: оставить только АРМ, у которых Location равен Location выбранного маршрутизатора.'
-    ].join('\n'));
+    await addAssistantBusinessBlock(page, {
+      name: 'Маршрутизатор Test City 300',
+      entities: 'Экземпляр класса маршрутизатор с Description "Маршрутизатор для Test City 300".',
+      algorithm: 'Найти один маршрутизатор и вернуть Code, Description и Location.',
+      expectedResult: 'Одна карточка маршрутизатора с Location.'
+    });
+    await page.locator('[data-assistant-flow-candidate][value="block-1"]').check();
+    await page.locator('button[data-action="assistant-flow-block-add"]').click();
+    await page.waitForFunction(() => document.querySelectorAll('[data-assistant-flow-block]').length === 2);
+    await addAssistantBusinessBlock(page, {
+      name: 'АРМ в местоположении маршрутизатора',
+      entities: 'Карточки класса АРМ и Location результата первого блока.',
+      algorithm: 'Найти АРМ, у которых Location равен Location выбранного маршрутизатора; вернуть Code, Description, Location, model и model2.',
+      expectedResult: 'Таблица всех АРМ в том же местоположении.'
+    });
+    await page.locator('[data-assistant-flow-block]').nth(1).locator('[data-assistant-flow-field="uses"]').selectOption('block-1');
+    const semanticPlan = {
+      version: 1,
+      blocks: [{
+        id: 'block-1',
+        name: 'Маршрутизатор Test City 300',
+        summary: 'Точная карточка routerG по Description.',
+        resolvedEntities: ['routerG'],
+        relationPaths: [],
+        dependencies: [],
+        expectedResult: 'Одна карточка маршрутизатора с Location.',
+        resultContract: { outputKind: 'sourceCards', outputClass: 'routerG', dependencyPaths: [], relationPredicates: [], attributePredicates: [] },
+        warnings: []
+      }, {
+        id: 'block-2',
+        name: 'АРМ в местоположении маршрутизатора',
+        summary: 'Карточки ARM, у которых Location совпадает с результатом первого блока.',
+        resolvedEntities: ['ARM', 'routerG'],
+        relationPaths: [],
+        dependencies: ['block-1'],
+        expectedResult: 'Таблица всех АРМ в том же местоположении.',
+        resultContract: {
+          outputKind: 'sourceCards',
+          outputClass: 'ARM',
+          dependencyPaths: [],
+          relationPredicates: [],
+          attributePredicates: [{
+            sourceClass: 'ARM',
+            comparisonBlockId: 'block-1',
+            comparisonClass: 'routerG',
+            sourceFields: ['Location'],
+            comparisonField: 'Location',
+            operator: 'equals'
+          }]
+        },
+        warnings: []
+      }],
+      explanation: 'Семантический план готов.',
+      warnings: []
+    };
+    const flow = {
+      version: 1,
+      selections: [{
+        id: 'selection:routerAnchor',
+        name: 'Маршрутизатор Test City 300',
+        alias: 'routerAnchor',
+        className: 'routerG',
+        from: '',
+        limit: 1,
+        columns: ['Code', 'Description', 'Location'],
+        rules: [{ action: 'include', path: 'Description', negate: false, op: 'equals', regex: '', value: 'Маршрутизатор для Test City 300', valueParam: '', valueColumn: '' }]
+      }, {
+        id: 'selection:arms',
+        name: 'АРМ в местоположении маршрутизатора',
+        alias: 'arms',
+        className: 'ARM',
+        from: 'routerAnchor',
+        limit: 100,
+        columns: ['Code', 'Description', 'Location', 'model', 'model2'],
+        rules: [{ action: 'include', path: 'Location', negate: false, op: 'equals', regex: '', value: '', valueParam: '', valueColumn: 'Location' }]
+      }],
+      operations: [],
+      blocks: [],
+      setOperations: [],
+      publishedAlias: 'arms'
+    };
+    // The browser test verifies the real deterministic apply/preview/extraction path.
+    // LLM responses are isolated so model variability cannot make this regression flaky.
+    await page.route('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*', async (route) => {
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ success: true, semanticPlan }) });
+    });
+    await page.route('**/cmdbuild/custom-api/assistant/object-flow/plan?*', async (route) => {
+      await route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          action: 'assistant-object-flow-plan',
+          flow,
+          canApply: true,
+          extractionCandidate: { blockId: 'block-1', alias: 'routerAnchor' },
+          explanation: 'Flow ready.',
+          warnings: []
+        })
+      });
+    });
     assert.equal(await page.locator('button[data-action="assistant-flow-apply"]').isDisabled(), true);
+    await page.locator('button[data-action="assistant-flow-prepare"]').click();
+    await page.locator('[data-assistant-flow-semantic-plan]').waitFor({ timeout: 60_000 });
     const flowResponsePromise = page.waitForResponse((response) => response.url().includes('/assistant/object-flow/plan'));
     await page.locator('button[data-action="assistant-flow-generate"]').click();
     const flowResponse = await flowResponsePromise;
@@ -606,7 +1299,28 @@ test('Assistant generates an ARM by router Location object group and preview ren
     assert.equal(flowBody.flow?.selections?.[0]?.className, 'routerG');
     assert.equal(flowBody.flow?.selections?.[1]?.className, 'ARM');
     assert.ok(flowBody.flow?.selections?.[0]?.rules?.some((rule) => rule.path === 'Description' && rule.op === 'equals' && rule.value === 'Маршрутизатор для Test City 300'), JSON.stringify(flowBody));
-    assert.deepEqual(flowBody.flow?.blocks?.[0]?.rules?.map((rule) => ({ left: rule.leftColumn, right: rule.rightColumn, operator: rule.operator })), [{ left: 'Location', right: 'Location', operator: 'equals' }]);
+    assert.equal(flowBody.flow?.selections?.[1]?.from, flowBody.flow?.selections?.[0]?.alias, JSON.stringify(flowBody));
+    assert.ok(flowBody.flow?.selections?.[1]?.rules?.some((rule) => rule.path === 'Location' && rule.op === 'equals' && rule.valueColumn === 'Location'), JSON.stringify(flowBody));
+    assert.equal(flowBody.flow?.operations?.some((operation) => operation.type === 'match'), false, JSON.stringify(flowBody));
+    assert.equal(await page.locator('[data-object-selection], [data-matching-block], [data-matching-rule-row]').count(), 0);
+    const assistantPreviewResponsePromise = page.waitForResponse((response) => response.url().includes('/assistant/object-flow/preview'));
+    await page.locator('button[data-action="assistant-flow-preview"]').click();
+    const assistantPreviewResponse = await assistantPreviewResponsePromise;
+    const assistantPreviewBody = await assistantPreviewResponse.json();
+    assert.equal(assistantPreviewResponse.status(), 200, JSON.stringify(assistantPreviewBody));
+    const previewStages = assistantPreviewBody.preview?.stages || [];
+    assert.deepEqual(previewStages.map((stage) => stage.as), [
+      flowBody.flow.selections[0].alias,
+      flowBody.flow.selections[1].alias
+    ]);
+    assert.equal(previewStages[0]?.rows?.length, 1, JSON.stringify(previewStages));
+    assert.ok(previewStages[1]?.rows?.length > 0, JSON.stringify(previewStages));
+    const assistantPreview = page.locator('[data-assistant-flow-preview]');
+    assert.equal(await assistantPreview.isVisible(), true);
+    const assistantPreviewBox = await assistantPreview.boundingBox();
+    assert.ok(assistantPreviewBox && assistantPreviewBox.width > 200 && assistantPreviewBox.height > 100, JSON.stringify(assistantPreviewBox));
+    assert.match(await assistantPreview.innerText(), /Маршрутизатор|router/i);
+    assert.match(await assistantPreview.innerText(), /АРМ|ARM/i);
     assert.equal(await page.locator('[data-object-selection], [data-matching-block], [data-matching-rule-row]').count(), 0);
     await page.locator('button[data-action="assistant-flow-apply"]').click();
     await page.waitForFunction(() => /цепочк|data flow/i.test(String(document.querySelector('.notice')?.textContent || '')), null, { timeout: 30_000 });
@@ -614,8 +1328,31 @@ test('Assistant generates an ARM by router Location object group and preview ren
     await page.locator('a[data-designer-section="extraction"]').click();
     await page.waitForSelector('#cmdp-extraction-editor', { timeout: 10_000 });
     const extractionOptions = await extractionResultOptions(page);
+    assert.deepEqual(
+      extractionOptions.map((item) => item.value),
+      [flowBody.flow.selections[0].alias, flowBody.flow.selections[1].alias],
+      `Extraction must list each Assistant business result once: ${JSON.stringify(extractionOptions)}`
+    );
+    assert.match(extractionOptions[0].text, /Маршрутизатор/i);
+    assert.match(extractionOptions[0].text, /extraction candidate|кандидат на извлечение/i);
+    assert.equal(
+      await page.locator('#cmdp-extraction-source').inputValue(),
+      flowBody.flow.selections[0].alias,
+      `Extraction must default to the Assistant candidate: ${JSON.stringify(extractionOptions)}`
+    );
     const finalExtractionSource = extractionOptions.find((item) => /^Final result/.test(item.text))?.value || '';
     assert.ok(finalExtractionSource, `Extraction source options do not include a final matching stage: ${JSON.stringify(extractionOptions)}`);
+    const candidateExtractionResponsePromise = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/draft/preview'));
+    await page.locator('button[data-action="extract-template"]').first().click();
+    const candidateExtractionResponse = await candidateExtractionResponsePromise;
+    const candidateExtractionBody = await candidateExtractionResponse.json();
+    assert.equal(candidateExtractionResponse.status(), 200, `Assistant candidate extraction failed: ${JSON.stringify(candidateExtractionBody)}`);
+    const candidateTable = (candidateExtractionBody?.result?.tables || []).find((table) => table.name === flowBody.flow.selections[0].alias);
+    assert.ok(candidateTable?.rows?.some((row) => /Маршрутизатор|router/i.test(JSON.stringify(row))), `Assistant candidate extraction did not use the selected router result: ${JSON.stringify(candidateExtractionBody?.result?.tables || [])}`);
+    await page.waitForSelector('#cmdp-extraction-editor tbody tr', { timeout: 10_000 });
+    assert.ok((await extractionPreviewRows(page)).some((row) => /Маршрутизатор|router/i.test(row)), 'Assistant candidate extraction did not render router rows.');
+
+    await page.locator('#cmdp-extraction-source').selectOption(finalExtractionSource);
     const extractionResponsePromise = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/draft/preview'));
     await page.locator('button[data-action="extract-template"]').first().click();
     const extractionResponse = await extractionResponsePromise;
@@ -641,16 +1378,11 @@ test('Assistant generates an ARM by router Location object group and preview ren
     assert.ok(routerSelection, `routerG object selection was not rendered: ${JSON.stringify(selections)}`);
     assert.ok(armSelection, `ARM object selection was not rendered: ${JSON.stringify(selections)}`);
     assert.ok(routerSelection.rules.some((rule) => rule.path === 'Description' && rule.op === 'equals' && rule.value === 'Маршрутизатор для Test City 300'), `routerG selection has no exact Description filter: ${JSON.stringify(routerSelection.rules)}`);
+    assert.equal(armSelection.from, routerSelection.alias, `ARM selection is not source-driven from the router anchor: ${JSON.stringify(armSelection)}`);
+    assert.ok(armSelection.rules.some((rule) => rule.path === 'Location' && rule.valueColumn === 'Location'), `ARM selection has no Location valueColumn filter: ${JSON.stringify(armSelection.rules)}`);
     await page.locator('a[data-designer-section="relations"]').click();
-    await page.waitForSelector('[data-matching-block]', { timeout: 10_000 });
-    const matchRule = await page.locator('[data-matching-rule-row]').first().evaluate((row) => ({
-      left: row.querySelector('[data-matching-rule-field="leftColumn"]')?.value || '',
-      right: row.querySelector('[data-matching-rule-field="rightColumn"]')?.value || '',
-      operator: row.querySelector('[data-matching-rule-field="operator"]')?.value || ''
-    }));
-    assert.equal(matchRule.left, 'Location');
-    assert.equal(matchRule.right, 'Location');
-    assert.equal(matchRule.operator, 'equals');
+    await page.waitForSelector('#cmdp-relation-expansion-editor', { timeout: 10_000 });
+    assert.equal(await page.locator('[data-matching-block]').count(), 0);
 
     await page.locator('a[data-designer-section="final-view"]').click();
     await page.waitForSelector('#cmdp-view-composer-editor', { timeout: 10_000 });
@@ -690,6 +1422,8 @@ test('Assistant generates an ARM by router Location object group and preview ren
     assert.ok(model2Index >= 0, `Assistant preview header cells do not include model2: ${JSON.stringify(headerCells)}`);
     assert.ok(tableRows.every((row) => row.length > modelIndex), `Assistant preview did not render model cells: ${JSON.stringify(tableRows.slice(0, 5))}`);
     assert.ok(tableRows.every((row) => row.length > model2Index), `Assistant preview did not render model2 cells: ${JSON.stringify(tableRows.slice(0, 5))}`);
+    await page.unroute('**/cmdbuild/custom-api/assistant/object-flow/plan?*');
+    await page.unroute('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*');
   });
 });
 
@@ -852,6 +1586,56 @@ test('Wiki page embeds runtime iframe in a browser context', { skip: playwright 
     const shellCount = await frameHandle.locator('.result-table-wrap, .notice').count();
     assert.ok(shellCount > 0, 'Runtime iframe did not render a result table or notice.');
   }, { cookieOrigin: originFromUrl(wikiIframeUrl) || nginxOrigin });
+});
+
+test('Assistant data blocks collapse, retain forward dependencies, and support mouse reordering', { skip: skipReason, timeout: 60_000 }, async () => {
+  await withPage(async (page) => {
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.locator('button[data-action="new-template"]').click();
+    await page.waitForSelector('#cmdp-template-editor', { timeout: 10_000 });
+    await page.locator('a[data-designer-section="assistant"]').click();
+    await page.waitForSelector('#cmdp-assistant-editor', { timeout: 10_000 });
+
+    await addAssistantBusinessBlock(page, {
+      name: 'Applications',
+      entities: 'Application cards.',
+      algorithm: 'Select applications.',
+      expectedResult: 'Application cards.'
+    });
+    await page.locator('[data-assistant-flow-details] > summary').first().click();
+    await page.locator('button[data-action="assistant-flow-block-add"]').click();
+    await page.waitForFunction(() => document.querySelectorAll('[data-assistant-flow-block]').length === 2);
+    await addAssistantBusinessBlock(page, {
+      name: 'Networks',
+      entities: 'ipRange cards.',
+      algorithm: 'Select networks.',
+      expectedResult: 'Network cards.'
+    });
+
+    const blocks = page.locator('[data-assistant-flow-block]');
+    assert.equal(await blocks.nth(0).locator('[data-assistant-flow-details]').evaluate((node) => node.open), false);
+    assert.equal(await blocks.nth(1).locator('[data-assistant-flow-details]').evaluate((node) => node.open), true);
+    assert.equal(await page.locator('[data-action="assistant-flow-block-up"], [data-action="assistant-flow-block-down"]').count(), 0);
+    assert.equal(await blocks.nth(0).locator('[data-action="assistant-flow-block-remove"]').isVisible(), false);
+    assert.equal(await blocks.nth(1).locator('[data-action="assistant-flow-block-remove"]').isVisible(), true);
+    const titleLayout = await blocks.nth(1).locator('[data-assistant-flow-details] > summary').evaluate((summary) => {
+      const label = summary.querySelector('.assistant-flow-business-summary strong').getBoundingClientRect();
+      const name = summary.querySelector('[data-assistant-flow-summary-name]').getBoundingClientRect();
+      return { labelLeft: label.left, labelTop: label.top, labelRight: label.right, nameLeft: name.left, nameTop: name.top };
+    });
+    assert.ok(titleLayout.nameLeft >= titleLayout.labelRight, JSON.stringify(titleLayout));
+    assert.ok(Math.abs(titleLayout.nameTop - titleLayout.labelTop) <= 2, JSON.stringify(titleLayout));
+    await blocks.nth(0).locator('[data-assistant-flow-details] > summary').click();
+    await blocks.nth(0).locator('[data-assistant-flow-field="uses"]').selectOption('block-2');
+    assert.equal(await page.locator('[data-assistant-flow-dependency-warning]').isVisible(), true);
+    assert.equal(await page.locator('button[data-action="assistant-flow-prepare"]').isDisabled(), false);
+
+    await blocks.nth(1).locator('[data-assistant-flow-drag-handle]').dragTo(blocks.nth(0));
+    await page.waitForFunction(() => document.querySelector('[data-assistant-flow-block]')?.getAttribute('data-assistant-flow-block') === 'block-2');
+    assert.equal(await page.locator('[data-assistant-flow-block]').nth(1).locator('[data-assistant-flow-field="uses"]').evaluate((select) => Array.from(select.selectedOptions).map((option) => option.value).includes('block-2')), true);
+    assert.equal(await page.locator('button[data-action="assistant-flow-prepare"]').isDisabled(), false);
+  });
 });
 
 async function withPage(fn, options = {}) {
