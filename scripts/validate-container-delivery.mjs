@@ -20,6 +20,8 @@ const requiredEnv = [
   'CMDBDYNAMIC_REDIS_REQUIRED',
   'CMDBDYNAMIC_HEALTH_REDIS_REQUIRED',
   'CMDBDYNAMICPAGES_CSRF_SECRET',
+  'CMDP_NGINX_CUSTOM_API_READ_TIMEOUT',
+  'CMDP_EXECUTION_MAX_SELECTION_SCAN_ROWS_ABSOLUTE',
   'CMDP_D2_RENDER_ENABLED',
   'CMDP_D2_BINARY',
   'CMDP_D2_TIMEOUT_MS',
@@ -60,6 +62,26 @@ function rejectPattern(file, regex, label) {
   if (regex.test(body)) failures.push(`${file}: contains forbidden ${label}`);
 }
 
+function requireCustomApiTimeouts() {
+  const file = 'nginx/cmdbdynamicpages-dev.conf';
+  const config = read(file);
+  const location = config.match(/location\s+\/cmdbuild\/custom-api\/\s*\{([\s\S]*?)\n\s*\}/);
+  if (!location) {
+    failures.push(`${file}: missing /cmdbuild/custom-api/ location`);
+    return;
+  }
+
+  const block = location[1];
+  [
+    'proxy_read_timeout ${CMDP_NGINX_CUSTOM_API_READ_TIMEOUT};',
+    'proxy_send_timeout ${CMDP_NGINX_CUSTOM_API_READ_TIMEOUT};'
+  ].forEach((directive) => {
+    if (!block.includes(directive)) {
+      failures.push(`${file}: /cmdbuild/custom-api/ missing ${directive}`);
+    }
+  });
+}
+
 requiredFiles.forEach((file) => {
   if (!fs.existsSync(file)) failures.push(`${file}: missing required delivery file`);
 });
@@ -78,9 +100,13 @@ requireText('docker-compose.runtime.yml', '/health/ready', 'container readiness 
 requireText('docker-compose.runtime.yml', 'LITELLM_API_KEY_FILE', 'LiteLLM assistant secret file wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_EXTERNAL_LOG_SINK', 'external log sink wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_LITELLM_ALLOWED_BASE_URLS', 'LiteLLM base URL allowlist wiring');
+requireText('docker-compose.runtime.yml', 'CMDP_EXECUTION_MAX_SELECTION_SCAN_ROWS_ABSOLUTE: ${CMDP_EXECUTION_MAX_SELECTION_SCAN_ROWS_ABSOLUTE:-50000}', 'absolute selection scan limit wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_D2_RENDER_ENABLED', 'D2 render wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_D2_MAX_DIAGRAMS', 'D2 max diagrams wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_D2_CONCURRENCY', 'D2 render concurrency wiring');
+requireText('docker-compose.nginx.yml', '/etc/nginx/templates/default.conf.template', 'nginx template mount');
+requireText('docker-compose.nginx.yml', 'CMDP_NGINX_CUSTOM_API_READ_TIMEOUT: "${CMDP_NGINX_CUSTOM_API_READ_TIMEOUT:-70s}"', 'custom API timeout default wiring');
+requireCustomApiTimeouts();
 requireText('Dockerfile', 'HEALTHCHECK', 'Docker HEALTHCHECK');
 requireText('Dockerfile', 'USER node', 'non-root runtime user');
 requireText('Dockerfile', 'd2-v${D2_VERSION}', 'pinned D2 binary download');
@@ -95,6 +121,8 @@ requireText('Dockerfile', 'sha256sum -c -', 'D2 checksum validation');
   '/health/ready',
   '/metrics',
   'CMDP_EXTERNAL_LOG_SINK',
+  'CMDP_NGINX_CUSTOM_API_READ_TIMEOUT',
+  'CMDP_EXECUTION_MAX_SELECTION_SCAN_ROWS_ABSOLUTE',
   'CMDP_LITELLM_ALLOWED_BASE_URLS',
   'CMDP_D2_RENDER_ENABLED',
   'CMDP_D2_MAX_DIAGRAMS',
@@ -108,6 +136,7 @@ requireText('.github/workflows/ci.yml', 'docker compose --env-file .env.example 
 requireText('.gitlab-ci.yml', 'docker build', 'Docker image build gate');
 requireText('.gitlab-ci.yml', 'docker push', 'Docker image push gate');
 requireText('.gitlab-ci.yml', 'docker compose --env-file .env.example -f docker-compose.runtime.yml config', 'runtime compose config gate');
+requireText('.gitlab-ci.yml', 'bash scripts/nginx-test.sh', 'nginx template syntax gate');
 
 if (/CMDBDYNAMICPAGES_CSRF_SECRET=(?!replace-me\b).+/m.test(envExample)) {
   failures.push('.env.example: CSRF secret must be a placeholder, not a real value');

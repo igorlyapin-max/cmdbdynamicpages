@@ -7,7 +7,6 @@ import {
   assistantClassMentionsFromText,
   assistantDiagramSelectionMappings,
   assistantDiagramSemanticDecisions,
-  assistantExtractionCandidateOutput,
   assistantLimitWarningsFromDiagnostics,
   assistantLiteLlmTimeoutMs,
   assistantMessages,
@@ -22,6 +21,7 @@ import {
   cmdbuildClassAttributesPath,
   d2RendererConfigSummary,
   d2CacheContext,
+  decorateD2MarkdownFrames,
   d2ImportConfigSummary,
   embedDiagramSvgMetadata,
   diagramImportAssistantSpec,
@@ -274,12 +274,46 @@ test('D2 renderer is enabled by default and SVG sanitizer strips unsafe content'
   assert.equal(config.concurrency, 2);
   assert.deepEqual(config.layoutAllowlist, ['dagre', 'elk']);
   assert.equal(d2CacheContext().d2.sourceBuilderVersion, 3);
+  assert.equal(d2CacheContext().d2.markdownFrameRevision, 1);
 
   const sanitized = sanitizeD2Svg('<?xml version="1.0"?><svg onclick="alert(1)"><script>alert(1)</script><foreignObject><body>Bad</body></foreignObject><style>@import url(http://evil)</style><animate attributeName="x"></animate><image href="https://evil.local/a.png"></image><a href="javascript:alert(1)"><text>Bad</text></a><a href="ftp://evil.local/a"><text>FTP</text></a><a href="/cmdbuild/ui/#classes/Server/cards/1" style="fill:#111"><text>Good</text></a><text style="background:url(https://evil.local/a.png)">Styled</text></svg>');
   assert.match(sanitized, /^<svg data-cmdp-d2-rendered="true"/);
   assert.doesNotMatch(sanitized, /<script|onclick|javascript:|ftp:\/\/evil|foreignObject|<style|<animate|<image|https:\/\/evil|url\(/i);
   assert.match(sanitized, /href="\/cmdbuild\/ui\/#classes\/Server\/cards\/1"/);
   assert.match(sanitized, /style="fill:#111"/);
+
+  const d2Markdown = sanitizeD2Svg('<svg data-d2-version="v0.7.1"><style type="text/css">.group_external { fill:#9FF6FF; stroke:#f503EB; } @font-face { src: url("data:application/font-woff;base64,QUJDRA=="); }</style><g class="group_external"><rect fill="#9FF6FF" stroke="#f503EB" /></g><foreignObject x="40" y="50" width="245" height="24"><div xmlns="http://www.w3.org/1999/xhtml" class="md" onclick="alert(1)"><p><strong>ИС LPS</strong> <code>192.168.5.0/24</code><img src="https://evil.local/a.png"></p></div></foreignObject></svg>');
+  assert.match(d2Markdown, /<style type="text\/css">/);
+  assert.match(d2Markdown, /#9FF6FF/);
+  assert.match(d2Markdown, /#f503EB/);
+  assert.match(d2Markdown, /<foreignObject x="40" y="50" width="245" height="24">/);
+  assert.match(d2Markdown, /ИС LPS/);
+  assert.match(d2Markdown, /192\.168\.5\.0\/24/);
+  assert.doesNotMatch(d2Markdown, /onclick|<img|evil\.local|@import/i);
+
+  const framedMarkdown = decorateD2MarkdownFrames(
+    '<svg data-d2-version="v0.7.1"><g class="ZXh0ZXJuYWxfc3lzdGVtcy5scHM= external_system"><g class="shape"></g><g><foreignObject x="20" y="30" width="180" height="64"><div>ИС LPS</div></foreignObject></g></g></svg>',
+    {
+      elements: {
+        nodes: [{
+          key: 'external_systems.lps',
+          kind: 'text',
+          styleHints: { shape: 'text', style: { fill: '#EFF6FF', stroke: '#1D4ED8', 'stroke-width': '2', 'stroke-dash': '7', 'border-radius': '8' } }
+        }]
+      }
+    }
+  );
+  assert.equal(framedMarkdown.decorated, 1);
+  assert.match(framedMarkdown.content, /data-cmdp-d2-markdown-frame="true"/);
+  assert.match(framedMarkdown.content, /fill="#EFF6FF" stroke="#1D4ED8" stroke-width="2" rx="8" stroke-dasharray="14,14" x="20" y="30" width="180" height="64"/);
+  assert.doesNotMatch(framedMarkdown.content, /<g class="shape"><\/g>/);
+
+  const unstyledMarkdown = decorateD2MarkdownFrames(
+    '<svg><g class="ZXh0ZXJuYWxfc3lzdGVtcy5scHM= external_system"><g class="shape"></g><g><foreignObject x="20" y="30" width="180" height="64"><div>ИС LPS</div></foreignObject></g></g></svg>',
+    { elements: { nodes: [{ key: 'external_systems.lps', kind: 'text', styleHints: { shape: 'text', style: { stroke: 'url(https://evil.local/a)' } } }] } }
+  );
+  assert.equal(unstyledMarkdown.decorated, 0);
+  assert.doesNotMatch(unstyledMarkdown.content, /data-cmdp-d2-markdown-frame|evil\.local/);
 
   const embedded = embedDiagramSvgMetadata('<svg><text>Safe</text></svg>', '<metadata id="cmdp-diagram-data">{}</metadata>');
   assert.equal(embedded.embedded, true);
@@ -418,7 +452,7 @@ test('D2 import maps reusable D2 classes instead of individual exemplar paths', 
   assert.equal(diagrams[0].nodes[0].data.fields[`${relatedId}.Code`].value, 'ROOM-1');
 });
 
-test('D2 class used by multiple containers requires an explicit exemplar', () => {
+test('D2 class used by structurally equivalent containers selects a safe exemplar', () => {
   const currentSpec = { version: 1, steps: [], result: { tables: [] } };
   const ir = normalizeDiagramImportIr({
     version: 3,
@@ -434,8 +468,9 @@ test('D2 class used by multiple containers requires an explicit exemplar', () =>
   const role = proposal.roles[0];
   assert.equal(role.key, 'network-zone');
   assert.equal(role.exemplarRequired, true);
-  assert.equal(role.exemplarKey, '');
-  assert.equal(proposal.unresolved.some((item) => item.id === role.id && item.fields.includes('exemplarKey')), true);
+  assert.equal(role.exemplarKey, 'dmz');
+  assert.equal(role.exemplarAutomatic, true);
+  assert.equal(proposal.unresolved.some((item) => item.id === role.id && item.fields.includes('exemplarKey')), false);
 });
 
 test('static D2 roles mapped to CMDBuild require a singleton filter', () => {
@@ -873,6 +908,38 @@ test('D2 import v3 compiles managed steps and never executes assistant-provided 
   assert.equal(applied.steps[0].as, 'switches');
   assert.notEqual(applied.steps[0].as, 'leftCards');
   assert.notEqual(applied.steps[0].as, 'rightCards');
+});
+
+test('one visual D2 role compiles distinct physical and virtual server mapping variants', () => {
+  const currentSpec = selectionFlowSpec([
+    { alias: 'physicalServers', className: 'phServer', columns: ['Code', 'Description'] },
+    { alias: 'virtualServers', className: 'vServer', columns: ['Code', 'Description'] }
+  ]);
+  const source = 'server: Server { class: server-role }';
+  const proposal = createDiagramImportProposal(currentSpec, normalizeDiagramImportIr({
+    version: 3,
+    elements: { nodes: [{ id: 'server', label: 'Server', classKeys: ['server-role'] }] },
+    classes: [{ key: 'server-role', usageCount: 1, sampleElementKeys: ['server'] }]
+  }, source), { sourceText: source });
+  const role = proposal.roles[0];
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [{
+    id: role.id,
+    selectedSemantic: 'object',
+    mapping: {
+      source: { stageId: 'selection:physicalServers', alias: 'physicalServers', kind: 'selection', className: 'phServer' },
+      primary: { className: 'phServer', idAttribute: '_id', labelTemplate: '${Description}', structuredFields: ['Code', 'Description'] },
+      variants: [{
+        id: 'virtual-server',
+        label: 'Виртуальный сервер',
+        source: { stageId: 'selection:virtualServers', alias: 'virtualServers', kind: 'selection', className: 'vServer' },
+        primary: { className: 'vServer', idAttribute: '_id', labelTemplate: '${Description}', structuredFields: ['Code', 'Description'] }
+      }]
+    }
+  }]);
+  assert.equal(applied.result.diagrams[0].nodeMappings.length, 2);
+  assert.deepEqual(applied.result.diagrams[0].nodeMappings.map((mapping) => mapping.from).sort(), ['physicalServers', 'virtualServers']);
+  assert.equal(applied.result.diagrams[0].authoring.d2Import.roleMappings[0].variants.length, 1);
+  assert.equal(applied.result.diagrams[0].authoring.d2Import.roleMappings[0].variants[0].primary.className, 'vServer');
 });
 
 test('diagram validation rejects duplicate stable mapping ids', () => {
@@ -1449,7 +1516,7 @@ test('object-flow planning messages keep the full-flow contract and configured p
   assert.match(parameterMessages[3].content, /"name":"isName"/);
 });
 
-test('object-flow intent keeps forward block dependencies and rejects only unknown or self references', () => {
+test('object-flow intent drops obsolete extraction-candidate fields and keeps forward block dependencies', () => {
   const intent = normalizeAssistantObjectFlowIntent({
     context: '',
     extractionCandidateBlockId: 'applications',
@@ -1460,8 +1527,8 @@ test('object-flow intent keeps forward block dependencies and rejects only unkno
     ]
   });
   assert.deepEqual(intent.blocks[0].uses, ['networks']);
-  assert.equal(intent.extractionCandidateBlockId, 'applications');
-  assert.equal(intent.extractionCandidateAlias, 'applicationsResult');
+  assert.equal(Object.hasOwn(intent, 'extractionCandidateBlockId'), false);
+  assert.equal(Object.hasOwn(intent, 'extractionCandidateAlias'), false);
   assert.throws(
     () => normalizeAssistantObjectFlowIntent({ context: '', blocks: [{ id: 'applications', name: 'Applications', entities: 'Application', algorithm: 'Select applications.', expectedResult: 'Applications.', uses: ['missing'] }] }),
     /another declared block/
@@ -1470,36 +1537,9 @@ test('object-flow intent keeps forward block dependencies and rejects only unkno
     () => normalizeAssistantObjectFlowIntent({ context: '', blocks: [{ id: 'applications', name: 'Applications', entities: 'Application', algorithm: 'Select applications.', expectedResult: 'Applications.', uses: ['applications'] }] }),
     /another declared block/
   );
-  assert.throws(
-    () => normalizeAssistantObjectFlowIntent({ context: '', extractionCandidateBlockId: 'missing', blocks: [{ id: 'applications', name: 'Applications', entities: 'Application', algorithm: 'Select applications.', expectedResult: 'Applications.', uses: [] }] }),
-    /extractionCandidateBlockId/
-  );
-});
-
-test('Assistant extraction candidate resolves its semantic block to a validated relation alias', () => {
-  const intent = normalizeAssistantObjectFlowIntent({
-    context: '',
-    extractionCandidateBlockId: 'ranges',
-    blocks: [
-      { id: 'systems', name: 'Information systems', entities: 'IS', algorithm: 'Select information systems.', expectedResult: 'IS cards.', uses: [] },
-      { id: 'ranges', name: 'IP ranges', entities: 'ipRange', algorithm: 'Select ranges related to the selected IS.', expectedResult: 'ipRange cards.', uses: ['systems'] }
-    ]
-  });
-  const semanticPlan = {
-    version: 1,
-    blocks: [
-      { id: 'systems', name: 'Information systems', resultContract: { outputKind: 'sourceCards', outputClass: 'IS', dependencyPaths: [], relationPredicates: [], attributePredicates: [], referencePathPredicates: [] } },
-      { id: 'ranges', name: 'IP ranges', resultContract: { outputKind: 'sourceCards', outputClass: 'ipRange', dependencyPaths: [{ comparisonBlockId: 'systems', sourceClass: 'IS', domain: 'ISZabbixMonitoringDomain', direction: 'source', targetClass: 'ipRange' }], relationPredicates: [], attributePredicates: [], referencePathPredicates: [] } }
-    ]
-  };
-  const output = assistantExtractionCandidateOutput({
-    version: 1,
-    selections: [{ id: 'selection:selectedSystems', name: 'Information systems', alias: 'selectedSystems', className: 'IS', from: '', limit: 100, columns: [], rules: [] }],
-    operations: [{ id: 'relation:selectedRanges', type: 'relation', from: 'selectedSystems', as: 'selectedRanges', domain: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source', columns: [], limit: 100, distinct: true }],
-    publishedAlias: 'selectedRanges'
-  }, semanticPlan, intent);
-
-  assert.deepEqual(output, { blockId: 'ranges', alias: 'selectedRanges', label: 'IP ranges' });
+  const obsolete = normalizeAssistantObjectFlowIntent({ context: '', extractionCandidateBlockId: 'missing', extractionCandidateAlias: 'legacyAlias', blocks: [{ id: 'applications', name: 'Applications', entities: 'Application', algorithm: 'Select applications.', expectedResult: 'Applications.', uses: [] }] });
+  assert.equal(Object.hasOwn(obsolete, 'extractionCandidateBlockId'), false);
+  assert.equal(Object.hasOwn(obsolete, 'extractionCandidateAlias'), false);
 });
 
 test('object-flow proposal adapter accepts equivalent LLM field names before strict validation', () => {

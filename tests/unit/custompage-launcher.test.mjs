@@ -60,8 +60,15 @@ function generatedDynamicPagesClientScript() {
 
 test('generated Dynamic Pages client script parses as browser JavaScript', () => {
   const clientScript = generatedDynamicPagesClientScript();
+  const stageSummaryStart = clientScript.indexOf('function assistantFlowStageSummaries(model, spec)');
+  const stageSummaryEnd = clientScript.indexOf('function refreshAssistantGenerationElapsed()', stageSummaryStart);
+  const stageSummarySource = clientScript.slice(stageSummaryStart, stageSummaryEnd);
 
   assert.match(clientScript, /function clearDiagramMappingRow\(button\)/);
+  assert.match(clientScript, /function diagramImportRoleMappingClient\(role, existing\)/);
+  assert.match(clientScript, /role\.mapping = diagramImportRoleMappingClient\(role, override\.mapping \|\| role\.mapping \|\| \{\}\);/);
+  assert.doesNotMatch(clientScript, /role\.mapping = diagramImportRoleMapping\(role,/);
+  assert.match(stageSummarySource, /flowOperations\(model\)\.forEach\(function \(operation, index\)/);
   assert.match(clientScript, /\[429, 502, 503, 504\]/);
   assert.match(clientScript, /var maxRetries = method === 'GET'/);
   assert.doesNotThrow(() => {
@@ -77,6 +84,14 @@ test('Assistant persists the configurable reference-path depth setting', () => {
   assert.match(proxySource, /assistantSemanticPlanMaxReferencePathDepthHelp/);
   assert.match(proxySource, /next\.assistant\.semanticPlan\.maxReferencePathDepth = readPositiveIntField/);
   assert.match(proxySource, /maxReferencePathDepth: maxReferencePathDepthConfig\.value/);
+});
+
+test('Assistant explains why deterministic flow generation is blocked by unresolved semantic blocks', () => {
+  assert.match(proxySource, /assistantSemanticPlanNeedsClarification/);
+  assert.match(proxySource, /assistantFlowBlockedByUnresolved/);
+  assert.match(proxySource, /data-assistant-flow-unresolved/);
+  assert.match(proxySource, /aria-describedby="cmdp-assistant-flow-unresolved"/);
+  assert.match(proxySource, /var flowGenerationBlocked = !semanticPlan \|\| state\.assistantFlowBusy \|\| unresolvedBlocks\.length > 0/);
 });
 
 test('CMDBuild custom page launcher redirects without relying only on afterrender', () => {
@@ -283,7 +298,9 @@ test('assistant status is compact and flow capture uses proposal state without d
   const captureSource = proxySource.slice(captureStart, specWithPromptsStart);
   const specWithPromptsSource = proxySource.slice(specWithPromptsStart, generateStart);
 
-  assert.match(proxySource, /menuAssistant: 'Ассистент'/);
+  assert.match(proxySource, /menuAssistantGroups: 'Ассистент групп и сопоставлений'/);
+  assert.match(proxySource, /menuDiagramAssistant: 'Ассистент диаграмм'/);
+  assert.match(proxySource, /menuCmdbBuildView: 'Отчет по модели данных CMDB'/);
   assert.match(proxySource, /assistantStatusTitle: 'Статус ассистента'/);
   assert.match(statusSource, /assistantStatusEnabled/);
   assert.match(statusSource, /assistantStatusApiKey/);
@@ -297,6 +314,21 @@ test('assistant status is compact and flow capture uses proposal state without d
   assert.doesNotMatch(captureSource, /readRelationExpansionFields/);
   assert.match(specWithPromptsSource, /assistantPromptDraft\(\)/);
   assert.match(specWithPromptsSource, /delete next\.assistantDraft\.flowPrompts/);
+});
+
+test('assistant D2 authoring state is safe to restore while preserving flow state', () => {
+  const hydrateStart = proxySource.indexOf('function hydrateDesignerStateFromTemplate(options)');
+  const loadDesignerStart = proxySource.indexOf('function loadDesigner(options)', hydrateStart);
+  assert.ok(hydrateStart > -1);
+  assert.ok(loadDesignerStart > hydrateStart);
+
+  const hydrateSource = proxySource.slice(hydrateStart, loadDesignerStart);
+  const draftStart = hydrateSource.indexOf("var assistantDraft = spec.assistantDraft");
+  const preserveStart = hydrateSource.indexOf('if (!options.preserveAssistantState)');
+  const d2AuthoringStart = hydrateSource.indexOf('var d2Authoring = assistantDraft.d2Authoring');
+  assert.ok(draftStart > -1);
+  assert.ok(preserveStart > draftStart);
+  assert.ok(d2AuthoringStart > preserveStart);
 });
 
 test('designer blocks template-bound menu sections until a template is selected', () => {
@@ -327,9 +359,21 @@ test('designer blocks template-bound menu sections until a template is selected'
   assert.ok(fetchVersionsStart > loadDesignerStart);
   const loadDesignerSource = proxySource.slice(loadDesignerStart, fetchVersionsStart);
 
+  const constructorStart = menuSource.indexOf("group(t('menuDesigner')");
+  const runStart = menuSource.indexOf("group(t('menuRun')");
+  const constructorSource = menuSource.slice(constructorStart, runStart);
+  const runSource = menuSource.slice(runStart);
+  assert.ok(constructorStart > -1);
+  assert.ok(runStart > constructorStart);
+  assert.ok(constructorSource.indexOf("{ section: 'extraction'") < constructorSource.indexOf("{ section: 'final-view'"));
+  assert.doesNotMatch(runSource, /section: 'extraction'/);
+
   assert.match(sectionNeedsSource, /'template'/);
   assert.match(sectionNeedsSource, /'assistant'/);
+  assert.match(sectionNeedsSource, /'diagram-assistant'/);
   assert.match(sectionNeedsSource, /'cache'/);
+  assert.ok(constructorSource.indexOf("{ section: 'assistant'") < constructorSource.indexOf("{ section: 'object-group'"));
+  assert.ok(constructorSource.indexOf("{ section: 'diagram-assistant'") < constructorSource.indexOf("{ section: 'diagram'"));
   assert.match(proxySource, /templateSelectionRequired/);
   assert.match(proxySource, /function redirectDesignerSectionToTemplates/);
   assert.match(menuSource, /aria-disabled="true"/);
@@ -341,7 +385,7 @@ test('designer blocks template-bound menu sections until a template is selected'
   assert.match(loadDesignerSource, /else if \(!redirectedToTemplates \|\| !state\.message\) state\.message = null/);
 });
 
-test('designer action bar exposes template save in Assistant and Templates', () => {
+test('designer action bar exposes template save in both assistants and Templates', () => {
   const actionBarStart = proxySource.indexOf('function renderDesignerActionBar(selected)');
   const actionBarEnd = proxySource.indexOf('function renderDesigner()', actionBarStart);
   assert.ok(actionBarStart > -1);
@@ -349,7 +393,7 @@ test('designer action bar exposes template save in Assistant and Templates', () 
 
   const actionBarSource = proxySource.slice(actionBarStart, actionBarEnd);
   const templatesStart = actionBarSource.indexOf("if (section === 'templates')");
-  const assistantStart = actionBarSource.indexOf("else if (section === 'assistant')");
+  const assistantStart = actionBarSource.indexOf("else if (section === 'assistant' || section === 'diagram-assistant')");
   const templateEditorStart = actionBarSource.indexOf("else if (section === 'template')");
   assert.ok(templatesStart > -1);
   assert.ok(assistantStart > templatesStart);
@@ -505,9 +549,12 @@ test('diagram editor renders repeatable mapping tables with source-dependent fie
 });
 
 test('assistant owns D2 import while diagram owns deterministic mappings', () => {
+  const flowEditorStart = proxySource.indexOf('function renderAssistantEditor(selected, config)');
+  const diagramAssistantEditorStart = proxySource.indexOf('function renderDiagramAssistantEditor(selected, config)', flowEditorStart);
+  const cacheEditorStart = proxySource.indexOf('function renderRuntimeCacheFields(', diagramAssistantEditorStart);
   const renderStart = proxySource.indexOf('function renderDiagramImportWorkbench(spec)');
   const renderEnd = proxySource.indexOf('function renderDiagramEditor(spec, outputMode, options)', renderStart);
-  const analyzeStart = proxySource.indexOf('function analyzeDiagramImport()');
+  const analyzeStart = proxySource.indexOf('function analyzeDiagramImport(options)');
   const legacyAssistantStart = proxySource.indexOf('function completeDiagramImportWithAssistant()', analyzeStart);
   const assistantStart = proxySource.indexOf('function assistantDiagramRequest(kind)', analyzeStart);
   const applyStart = proxySource.indexOf('function applyDiagramImport()', legacyAssistantStart);
@@ -515,6 +562,9 @@ test('assistant owns D2 import while diagram owns deterministic mappings', () =>
   const captureImportStart = proxySource.indexOf('function captureDiagramImportProposalFromDom(manualBindingId)');
   const importOverridesStart = proxySource.indexOf('function diagramImportBindingOverrides(proposal)', captureImportStart);
   assert.ok(renderStart > -1);
+  assert.ok(flowEditorStart > -1);
+  assert.ok(diagramAssistantEditorStart > flowEditorStart);
+  assert.ok(cacheEditorStart > diagramAssistantEditorStart);
   assert.ok(renderEnd > renderStart);
   assert.ok(analyzeStart > -1);
   assert.ok(assistantStart > -1);
@@ -524,6 +574,8 @@ test('assistant owns D2 import while diagram owns deterministic mappings', () =>
   assert.ok(importOverridesStart > captureImportStart);
 
   const renderSource = proxySource.slice(renderStart, renderEnd);
+  const flowEditorSource = proxySource.slice(flowEditorStart, diagramAssistantEditorStart);
+  const diagramAssistantEditorSource = proxySource.slice(diagramAssistantEditorStart, cacheEditorStart);
   const analyzeSource = proxySource.slice(analyzeStart, legacyAssistantStart);
   const assistantSource = proxySource.slice(assistantStart, proxySource.indexOf('function assistantFlowStageSummaries', assistantStart));
   const applySource = proxySource.slice(applyStart, refreshStart);
@@ -537,9 +589,22 @@ test('assistant owns D2 import while diagram owns deterministic mappings', () =>
   assert.doesNotMatch(renderSource, /renderDiagramImportV3Semantics\(/);
   assert.doesNotMatch(renderSource, /renderDiagramImportRoleMapping\(/);
   assert.doesNotMatch(renderSource, /data-action="diagram-import-apply"/);
+  assert.match(flowEditorSource, /menuAssistantGroups/);
+  assert.match(flowEditorSource, /renderAssistantStatus\(config\)/);
+  assert.match(flowEditorSource, /renderAssistantFlowEditor\(\)/);
+  assert.doesNotMatch(flowEditorSource, /renderDiagramImportWorkbench/);
+  assert.match(diagramAssistantEditorSource, /menuDiagramAssistant/);
+  assert.match(diagramAssistantEditorSource, /renderAssistantStatus\(config\)/);
+  assert.match(diagramAssistantEditorSource, /renderAssistantPromptAutosaveControl\(\)/);
+  assert.match(diagramAssistantEditorSource, /renderDiagramImportWorkbench\(spec\)/);
+  assert.doesNotMatch(diagramAssistantEditorSource, /renderAssistantFlowEditor/);
+  assert.match(proxySource, /if \(action === 'open-assistant-d2'\) setDesignerSection\('diagram-assistant'\)/);
   assert.match(analyzeSource, /\/draft\/diagram-import\/analyze/);
+  assert.match(analyzeSource, /diagramImportProposalMatchesCurrentRevision/);
   assert.match(assistantSource, /\/assistant\/diagram-import\//);
   assert.match(assistantSource, /map-selections/);
+  assert.match(assistantSource, /flushAssistantPromptAutosave/);
+  assert.match(assistantSource, /ensureDiagramImportProposalForCurrentRevision/);
   assert.match(applySource, /\/draft\/diagram-import\/apply/);
   assert.match(applySource, /state\.lastDraftPreviewOk = false/);
   assert.match(applySource, /state\.diagramImportAppliedPendingPreview = true/);
@@ -630,6 +695,27 @@ test('assistant owns D2 import while diagram owns deterministic mappings', () =>
   assert.match(readMappingsSource, /storedMappings\.find/);
   assert.match(readMappingsSource, /cloneJsonValue\(stored/);
   assert.match(readMappingsSource, /if \(!mapping\.importRole && importRoleKey\)/);
+});
+
+test('Assistant applies data flow by saving the selected template; Extraction remains the only execution view', () => {
+  const applyStart = proxySource.indexOf('function applyAssistantObjectFlow()');
+  const applyEnd = proxySource.indexOf('function assistantDiagramRequest(kind)', applyStart);
+  const applySource = proxySource.slice(applyStart, applyEnd);
+  const routeStart = proxySource.indexOf("if (requestUrl.pathname === `${BACKEND_PREFIX}/draft/object-flow/apply`)");
+  const routeEnd = proxySource.indexOf("if (requestUrl.pathname === `${BACKEND_PREFIX}/assistant/diagram-import/interpret`", routeStart);
+  const routeSource = proxySource.slice(routeStart, routeEnd);
+
+  assert.ok(applyStart > -1);
+  assert.ok(routeStart > -1);
+  assert.match(proxySource, /assistantApplyFlow: 'Применить цепочку'/);
+  assert.match(applySource, /flushAssistantPromptAutosave/);
+  assert.match(applySource, /result\.json\.template/);
+  assert.match(routeSource, /template_save_required/);
+  assert.match(routeSource, /writeTemplateVersion/);
+  assert.match(routeSource, /invalidateTemplateRuntimeCache/);
+  assert.match(routeSource, /invalidateTemplateStaticSnapshots/);
+  assert.doesNotMatch(proxySource, /assistant\/object-flow\/preview/);
+  assert.doesNotMatch(proxySource, /data-action="assistant-flow-preview"/);
 });
 
 test('D2 skill records structured vars.data.cmdp metadata rule', () => {
@@ -939,7 +1025,18 @@ test('Relations Apply preserves explicit operation order and source-driven colum
   assert.doesNotMatch(buildSource, /includeSource/);
 });
 
-test('operation aliases immediately become available to later operations and published output', () => {
+test('relation editor shows the persisted Assistant result label instead of a technical alias', () => {
+  const relationStart = proxySource.indexOf('function renderRelationOperation(operation, operationIndex, model, spec)');
+  const targetStart = proxySource.indexOf('function relatedTargetColumnOptions(className, selectedName)', relationStart);
+  assert.ok(relationStart > -1);
+  assert.ok(targetStart > relationStart);
+
+  const relationSource = proxySource.slice(relationStart, targetStart);
+  assert.match(relationSource, /aliasDisplayLabel\(operation\.as, spec\)/);
+  assert.match(proxySource, /renderRelationOperation\(operation, index, model, spec\)/);
+});
+
+test('operation aliases immediately become available to later operations without a publication selector', () => {
   const refreshStart = proxySource.indexOf('function refreshRelationOperationAliases()');
   const clearScopeStart = proxySource.indexOf('function clearObjectGroupScopeRuleRow(button)', refreshStart);
   const inputStart = proxySource.indexOf("document.addEventListener('input'", clearScopeStart);
@@ -951,10 +1048,26 @@ test('operation aliases immediately become available to later operations and pub
 
   const refreshSource = proxySource.slice(refreshStart, clearScopeStart);
   const inputSource = proxySource.slice(inputStart, changeStart);
-  assert.match(refreshSource, /data-result-set-field="publishedAlias"/);
-  assert.match(refreshSource, /renderMaterializedAliasOptions\(state\.relationDraft, selectedAlias\)/);
+  assert.doesNotMatch(refreshSource, /data-result-set-field="publishedAlias"/);
+  assert.match(proxySource, /data-action="apply-extraction-published"/);
+  assert.doesNotMatch(proxySource, /assistantFlowExtractionCandidate|assistantFlowCandidateOutput|extractionCandidateBlockId|extractionCandidateAlias/);
+  assert.match(proxySource, /roles: input\.modelRoles \|\| input\.roles/);
+  assert.match(proxySource, /Ignored static D2 role \$\{role\.displayName \|\| roleId\} returned by Assistant as unresolved mapping\./);
   assert.match(refreshSource, /renderPriorMaterializedAliasOptions\(state\.relationDraft, index, selected\)/);
   assert.match(refreshSource, /\['from', 'with'\]/);
   assert.match(inputSource, /\[data-set-operation-field="as"\], \[data-matching-block-field="as"\]/);
   assert.match(inputSource, /refreshRelationOperationAliases\(\)/);
+});
+
+test('runtime result UI renders execution-limit warnings returned by preview or run', () => {
+  const renderStart = proxySource.indexOf('function renderActionResult(result)');
+  const traceStart = proxySource.indexOf('function renderExecutionTrace(trace)', renderStart);
+  assert.ok(renderStart > -1);
+  assert.ok(traceStart > renderStart);
+
+  const renderSource = proxySource.slice(renderStart, traceStart);
+  assert.match(renderSource, /resultBody && Array\.isArray\(resultBody\.warnings\)/);
+  assert.match(renderSource, /renderNotice\(\{ type: 'warning', text: warning \}\)/);
+  assert.match(proxySource, /runtimeMaxSelectionScanRowsDefault/);
+  assert.match(proxySource, /runtimeMaxSelectionScanRowsMax/);
 });

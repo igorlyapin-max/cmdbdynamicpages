@@ -136,39 +136,15 @@ test('draft preview executes exact router anchor before selecting ARM cards by L
   assert.equal(backend.exitCode, null);
 });
 
-test('Assistant object-flow preview returns intermediate rows without applying the draft', async (t) => {
+test('Object-flow preview endpoint is removed; deterministic execution uses draft preview', async (t) => {
   const mock = await startMockCmdbuild(t);
   const backendPort = await freePort();
   const backend = await startBackend(t, backendPort, mock.origin);
   const backendOrigin = `http://127.0.0.1:${backendPort}`;
   const cookie = 'CMDBuild-Authorization=assistant-preview-token';
   const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
-  const flow = {
-    version: 1,
-    selections: [
-      {
-        id: 'selection:router', name: 'Маршрутизатор Test City 300', alias: 'router', className: 'routerG', from: '', limit: 1,
-        columns: ['Code', 'Description', 'Location'],
-        rules: [{ action: 'include', path: 'Description', negate: false, op: 'equals', value: 'Маршрутизатор для Test City 300', regex: '', valueParam: '', valueColumn: '' }]
-      },
-      {
-        id: 'selection:arms', name: 'АРМ в местоположении маршрутизатора', alias: 'arms', className: 'ARM', from: 'router', limit: 100,
-        columns: ['Code', 'Description', 'Location', 'model', 'model2'],
-        rules: [{ action: 'include', path: 'Location', negate: false, op: 'equals', value: '', regex: '', valueParam: '', valueColumn: 'Location' }]
-      }
-    ],
-    operations: [],
-    publishedAlias: 'arms'
-  };
-
   const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/preview`, {
     templateCode: 'AssistantObjectFlowPreview',
-    currentSpec: {
-      version: 1,
-      steps: [{ type: 'selectCards', className: 'ARM', as: 'targetARM', filters: [], limit: 100 }],
-      result: { tables: [{ name: 'targetARM', title: 'Manual ARM target' }] }
-    },
-    flow,
     params: {}
   }, {
     cookie,
@@ -176,24 +152,8 @@ test('Assistant object-flow preview returns intermediate rows without applying t
     'x-cmdbdynamicpages-csrf': csrf.json.token
   });
 
-  assert.equal(preview.statusCode, 200, preview.body);
-  assert.equal(preview.json.success, true);
-  assert.deepEqual(preview.json.preview.stages.map((stage) => [stage.as, stage.rows.length]), [
-    ['router', 1],
-    ['arms', 2]
-  ]);
-  assert.equal(preview.json.preview.stages[0].label, 'Маршрутизатор Test City 300');
-  assert.equal(preview.json.preview.stages[1].rows.every((row) => row.model && row.model2), true);
-  assert.deepEqual(preview.json.preview.trace.map((item) => [item.as, item.rows]), [
-    ['router', 1],
-    ['arms', 2]
-  ]);
-  assert.equal(
-    mock.requests.filter((item) => item.pathname.endsWith('/classes/ARM/cards')).length,
-    1,
-    'Preview must not execute unrelated targetARM from the current draft.'
-  );
-  assert.equal(mock.requests.some((item) => item.method === 'PUT' || item.method === 'POST'), false, preview.body);
+  assert.equal(preview.statusCode, 404, preview.body);
+  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/ARM/cards')), false);
   assert.equal(backend.exitCode, null);
 });
 
@@ -333,7 +293,9 @@ test('set operations keep documented case and duplicate semantics', async (t) =>
 });
 
 test('typed object-flow apply compiles deterministic stages and removed Assistant contracts return 410', async (t) => {
-  const mock = await startMockCmdbuild(t);
+  const initialSpec = { version: 1, steps: [], result: { tables: [] } };
+  const templateCode = 'ObjectFlowApply';
+  const mock = await startMockCmdbuild(t, { templates: [templateCard(templateCode, initialSpec)] });
   const backendPort = await freePort();
   const backend = await startBackend(t, backendPort, mock.origin);
   const backendOrigin = `http://127.0.0.1:${backendPort}`;
@@ -349,22 +311,24 @@ test('typed object-flow apply compiles deterministic stages and removed Assistan
     operations: [{ type: 'match', id: 'match:coLocated', from: 'routers', with: 'arms', as: 'coLocated', rightPrefix: 'Selection 2.', rules: [{ action: 'include', negate: false, operator: 'equals', leftColumn: 'Location', leftRegex: '', rightColumn: 'Location', rightRegex: '' }] }]
   };
   const applied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/object-flow/apply`, {
-    templateCode: '',
-    baseSpecHash: '',
-    currentSpec: { version: 1, steps: [], result: { tables: [] } },
+    templateCode,
+    baseSpecHash: hashJson(initialSpec),
+    currentSpec: initialSpec,
     flow
   }, headers);
   assert.equal(applied.statusCode, 200, applied.body);
-  assert.deepEqual(applied.json.spec.steps.map((step) => step.type), ['selectCards', 'selectCards', 'matchRows']);
-  assert.equal(applied.json.spec.steps[1].from, undefined);
-  assert.equal(applied.json.spec.steps[1].filters.some((filter) => filter.valueColumn), false);
-  assert.equal(applied.json.spec.steps[2].from, 'routers');
-  assert.equal(applied.json.spec.steps[2].with, 'arms');
-  assert.equal(applied.json.spec.visualModels.some((model) => model.mode === 'objectMatching'), true);
+  assert.deepEqual(applied.json.template.spec.steps.map((step) => step.type), ['selectCards', 'selectCards', 'matchRows']);
+  assert.equal(applied.json.template.spec.steps[1].from, undefined);
+  assert.equal(applied.json.template.spec.steps[1].filters.some((filter) => filter.valueColumn), false);
+  assert.equal(applied.json.template.spec.steps[2].from, 'routers');
+  assert.equal(applied.json.template.spec.steps[2].with, 'arms');
+  assert.equal(applied.json.template.spec.visualModels.some((model) => model.mode === 'objectMatching'), true);
   assert.deepEqual(
-    applied.json.spec.visualModels.find((model) => model.mode === 'objectMatching').outputs.map((output) => [output.alias, output.published]),
-    [['routers', false], ['arms', false], ['coLocated', false]]
+    applied.json.template.spec.visualModels.find((model) => model.mode === 'objectMatching').outputs.map((output) => [output.alias, output.published]),
+    [['routers', undefined], ['arms', undefined], ['coLocated', undefined]]
   );
+  assert.equal(typeof applied.json.cacheInvalidation.runtime, 'object');
+  assert.equal(typeof applied.json.cacheInvalidation.staticSnapshots, 'object');
 
   const removed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/template-draft`, { prompt: 'ignored' }, headers);
   assert.equal(removed.statusCode, 410, removed.body);
@@ -476,8 +440,9 @@ test('full object-flow planning returns a validated proposal without mutating th
     'x-cmdbdynamicpages-csrf': csrf.json.token
   });
   assert.equal(applied.statusCode, 200, applied.body);
-  const outputManifest = applied.json.spec.visualModels.find((model) => model.mode === 'objectMatching').outputs;
-  const ownershipManifest = applied.json.spec.visualModels.find((model) => model.mode === 'objectMatching').assistantOutputManifest;
+  const appliedSpec = applied.json.template.spec;
+  const outputManifest = appliedSpec.visualModels.find((model) => model.mode === 'objectMatching').outputs;
+  const ownershipManifest = appliedSpec.visualModels.find((model) => model.mode === 'objectMatching').assistantOutputManifest;
   assert.deepEqual(ownershipManifest, {
     version: 1,
     blocks: [{ id: 'block-1', name: 'Result', order: 1 }]
@@ -488,20 +453,10 @@ test('full object-flow planning returns a validated proposal without mutating th
     ['matchedObjects', 'Result: Сопоставление 1', 'block-1', ['block-1']],
     ['allAssets', 'Result', 'block-1', ['block-1']]
   ]);
-  assert.equal(applied.json.spec.result.tables.find((table) => table.name === 'routers').title, 'Result: Выборка 1');
-  assert.equal(applied.json.spec.result.tables.find((table) => table.name === 'arms').title, 'Result: Выборка 2');
-  assert.equal(applied.json.spec.result.tables.find((table) => table.name === 'allAssets').title, 'Result');
-  assert.equal(applied.json.spec.result.tables.find((table) => table.name === 'matchedObjects').title, 'Result: Сопоставление 1');
-  const saved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}`, {
-    code: templateCode,
-    spec: applied.json.spec,
-    expectedSpecHash: hashJson(initialSpec)
-  }, {
-    cookie,
-    origin: backendOrigin,
-    'x-cmdbdynamicpages-csrf': csrf.json.token
-  });
-  assert.equal(saved.statusCode, 200, saved.body);
+  assert.equal(appliedSpec.result.tables.find((table) => table.name === 'routers').title, 'Result: Выборка 1');
+  assert.equal(appliedSpec.result.tables.find((table) => table.name === 'arms').title, 'Result: Выборка 2');
+  assert.equal(appliedSpec.result.tables.find((table) => table.name === 'allAssets').title, 'Result');
+  assert.equal(appliedSpec.result.tables.find((table) => table.name === 'matchedObjects').title, 'Result: Сопоставление 1');
   const reloaded = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/templates?root=Cst_QueryTool`, undefined, { cookie });
   assert.equal(reloaded.statusCode, 200, reloaded.body);
   const reloadedSpec = reloaded.json.data.find((template) => template.code === templateCode)?.spec;
@@ -516,7 +471,7 @@ test('full object-flow planning returns a validated proposal without mutating th
   );
   assert.deepEqual(
     reloadedSpec.result.tables.map((table) => [table.name, table.title]),
-    applied.json.spec.result.tables.map((table) => [table.name, table.title])
+    appliedSpec.result.tables.map((table) => [table.name, table.title])
   );
   const duplicateNameIntent = {
     context: '',
@@ -532,8 +487,8 @@ test('full object-flow planning returns a validated proposal without mutating th
   };
   const duplicateName = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
     templateCode,
-    baseSpecHash: hashJson(initialSpec),
-    currentSpec: initialSpec,
+    baseSpecHash: applied.json.template.specHash,
+    currentSpec: appliedSpec,
     intent: duplicateNameIntent
   }, {
     cookie,
@@ -1124,14 +1079,14 @@ test('semantic planning rejects a substituted class when an exact MCP binding ex
   assert.equal(backend.exitCode, null);
 });
 
-test('semantic planning deterministically completes a cross-block IPv4 condition from confirmed fields', async (t) => {
+test('semantic planning defers a cross-block IPv4 condition to deterministic flow compilation', async (t) => {
   const intent = {
     context: '',
     blocks: [{
       id: 'ranges', name: 'Результат 1', entities: 'Карточки класса ipRange.', algorithm: 'Выбрать сети.', expectedResult: 'Список ipRange.', uses: []
     }, {
       id: 'acls', name: 'Результат 3', entities: 'Карточки класса ACL.',
-      algorithm: 'Выбрать ACL, у которых ipaddress входит в сеть range объектов ipRange из Результата 1.', expectedResult: 'Список ACL.', uses: ['ranges']
+      algorithm: 'Выбрать ACL, у которых ipaddress или dipaddress входит в сеть range объектов ipRange из Результата 1.', expectedResult: 'Список ACL.', uses: ['ranges']
     }]
   };
   const llm = await startLiteLlmStub(t, {
@@ -1154,7 +1109,7 @@ test('semantic planning deterministically completes a cross-block IPv4 condition
       { _id: 3, name: 'Cst_QueryToolConfig', description: 'Config', active: true },
       { _id: 4, name: 'Cst_QueryTemplate', description: 'Template', active: true }
     ],
-    attributesByClass: { ipRange: [{ name: 'range', type: 'string', active: true, _can_read: true }], ACL: [{ name: 'ipaddress', type: 'string', active: true, _can_read: true }] },
+    attributesByClass: { ipRange: [{ name: 'range', type: 'string', active: true, _can_read: true }], ACL: [{ name: 'ipaddress', type: 'string', active: true, _can_read: true }, { name: 'dipaddress', type: 'string', active: true, _can_read: true }] },
     configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } }) }]
   });
   const backendPort = await freePort();
@@ -1167,14 +1122,12 @@ test('semantic planning deterministically completes a cross-block IPv4 condition
   }, { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
 
   assert.equal(response.statusCode, 200, response.body);
-  assert.deepEqual(response.json.semanticPlan.blocks[1].resultContract.attributePredicates, [{
-    sourceClass: 'ACL', comparisonBlockId: 'ranges', comparisonClass: 'ipRange', sourceFields: ['ipaddress'], comparisonField: 'range', operator: 'ipv4InCidr'
-  }]);
-  assert.ok(response.json.warnings.some((warning) => /Deterministic semantic completion added IPv4 attribute comparison ACL\.ipaddress/i.test(warning)), response.body);
+  assert.deepEqual(response.json.semanticPlan.blocks[1].resultContract.attributePredicates, []);
+  assert.deepEqual(response.json.semanticPlan.blocks[1].resultContract.referencePathPredicates, []);
   assert.equal(backend.exitCode, null);
 });
 
-test('semantic planning removes a relation path duplicated by an IPv4 attribute comparison', async (t) => {
+test('semantic planning removes technical IPv4 paths and predicates from the business contract', async (t) => {
   const intent = {
     context: '',
     blocks: [{
@@ -1234,11 +1187,8 @@ test('semantic planning removes a relation path duplicated by an IPv4 attribute 
   assert.equal(response.statusCode, 200, response.body);
   const contract = response.json.semanticPlan.blocks[1].resultContract;
   assert.deepEqual(contract.dependencyPaths, []);
-  assert.deepEqual(contract.attributePredicates, [{
-    sourceClass: 'phServer', comparisonBlockId: 'ranges', comparisonClass: 'ipRange', sourceFields: ['ipaddress'], comparisonField: 'range', operator: 'ipv4InCidr'
-  }]);
-  assert.ok(response.json.semanticPlan.blocks[1].warnings.some((warning) => /duplicated 1 identical attribute predicate/i.test(warning)), response.body);
-  assert.ok(response.json.semanticPlan.blocks[1].warnings.some((warning) => /removed direct dependency path ipRange --super2super/i.test(warning)), response.body);
+  assert.deepEqual(contract.attributePredicates, []);
+  assert.deepEqual(contract.referencePathPredicates, []);
   assert.equal(backend.exitCode, null);
 });
 
@@ -1294,6 +1244,57 @@ test('semantic planning explains an incomplete relation predicate without empty 
   assert.match(response.json.feedback.summary, /Результат 2/);
   assert.match(response.json.feedback.summary, /неполное условие по связи/);
   assert.match(response.json.feedback.causes[0].message, /comparisonFields, relatedField, operator/);
+  assert.equal(backend.exitCode, null);
+});
+
+test('semantic planning explains an invalid comparison class without empty details', async (t) => {
+  const intent = {
+    context: '',
+    blocks: [{
+      id: 'ranges', name: 'Результат 1', entities: 'Карточки ipRange.', algorithm: 'Выбрать сети.', expectedResult: 'Список ipRange.', uses: []
+    }, {
+      id: 'applications', name: 'Результат 4', entities: 'Карточки ApplicG и сети первого результата.', algorithm: 'Выбрать ApplicG по IPv4 условию.', expectedResult: 'Список ApplicG.', uses: ['ranges']
+    }]
+  };
+  const llm = await startLiteLlmStub(t, {
+    responses: [{
+      version: 1,
+      blocks: [{
+        id: 'ranges', name: 'Результат 1', summary: 'Сети.', resolvedEntities: ['ipRange'], relationPaths: [], dependencies: [], expectedResult: 'Список ipRange.',
+        resultContract: { outputKind: 'sourceCards', outputClass: 'ipRange', relationPredicates: [] }, warnings: []
+      }, {
+        id: 'applications', name: 'Результат 4', summary: 'Приложения.', resolvedEntities: ['ApplicG', 'ipRange'], relationPaths: [], dependencies: ['ranges'], expectedResult: 'Список ApplicG.',
+        resultContract: {
+          outputKind: 'sourceCards', outputClass: 'ApplicG', relationPredicates: [],
+          attributePredicates: [{ sourceClass: 'Application', comparisonBlockId: 'ranges', comparisonClass: 'Application network', sourceFields: ['ipaddress'], comparisonField: 'range', operator: 'ipv4InCidr' }]
+        }, warnings: []
+      }],
+      explanation: 'Некорректный класс сравнения.', warnings: []
+    }]
+  });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{
+      _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true,
+      RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = testCmdbuildAuthorizationCookie('semantic-invalid-comparison-class-token');
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const response = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+    templateCode: '', baseSpecHash: '', currentSpec: { version: 1, params: {}, steps: [], result: { tables: [] } }, intent
+  }, { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
+
+  assert.equal(response.statusCode, 422, response.body);
+  assert.deepEqual(response.json.errors, [{
+    kind: 'semanticPlanPredicateClassInvalid', blockId: 'applications', blockName: 'Результат 4', predicateType: 'attribute', predicateIndex: 1,
+    outputClass: 'ApplicG', comparisonBlockId: 'ranges', invalidField: 'comparisonClass', value: 'Application network'
+  }]);
+  assert.match(response.json.feedback.summary, /Результат 4/);
+  assert.match(response.json.feedback.causes[0].message, /comparisonClass/);
+  assert.match(response.json.feedback.causes[0].message, /Application network/);
   assert.equal(backend.exitCode, null);
 });
 
@@ -1637,7 +1638,10 @@ test('Assistant prompt autosave updates only assistantDraft without versions or 
   }, headers);
   assert.equal(autosaved.statusCode, 200, autosaved.body);
   assert.equal(autosaved.json.action, 'assistant-draft-autosave');
-  assert.deepEqual(autosaved.json.template.spec.assistantDraft, assistantDraft);
+  assert.deepEqual(autosaved.json.template.spec.assistantDraft, {
+    ...assistantDraft,
+    objectFlowIntent: objectFlowIntentFromText('Выбрать АРМ.')
+  });
   assert.deepEqual(autosaved.json.template.spec.steps, savedSpec.steps);
   assert.equal(autosaved.json.versionLog, undefined);
   assert.equal(autosaved.json.cacheInvalidation, undefined);
@@ -1649,6 +1653,43 @@ test('Assistant prompt autosave updates only assistantDraft without versions or 
   }, headers);
   assert.equal(stale.statusCode, 409, stale.body);
   assert.equal(stale.json.reason, 'template_version_conflict');
+  assert.equal(backend.exitCode, null);
+});
+
+test('Assistant autosave retains D2 authoring source and reviewed overrides without persisting proposals', async (t) => {
+  const savedSpec = publishSpec();
+  const mock = await startMockCmdbuild(t, { templates: [templateCard('AssistantD2Authoring', savedSpec, { includeCanUpdate: false })] });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=assistant-d2-authoring-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const assistantDraft = {
+    objectFlowIntent: objectFlowIntentFromText('Выбрать АРМ.'),
+    diagramInterpretPrompt: 'Интерпретировать роли.',
+    diagramMappingPrompt: 'Сопоставить роли.',
+    d2Authoring: {
+      version: 1,
+      source: 'node: "Node" { class: server }',
+      overrides: {
+        roles: [{ id: 'class:server', selectedSemantic: 'object', exemplarKey: 'node', mapping: { primary: { className: 'Server', structuredFields: ['Code'] } } }],
+        relationRules: [],
+        placementRules: []
+      }
+    }
+  };
+  const autosaved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/AssistantD2Authoring/assistant-draft`, {
+    baseSpecHash: hashJson(savedSpec), assistantDraft
+  }, headers);
+  assert.equal(autosaved.statusCode, 200, autosaved.body);
+  const stored = autosaved.json.template.spec.assistantDraft.d2Authoring;
+  assert.equal(stored.source, assistantDraft.d2Authoring.source);
+  assert.equal(stored.overrides.roles[0].id, 'class:server');
+  assert.equal(stored.overrides.roles[0].mapping.primary.className, 'Server');
+  assert.equal(stored.proposal, undefined);
+  assert.equal(autosaved.json.versionLog, undefined);
+  assert.equal(autosaved.json.cacheInvalidation, undefined);
   assert.equal(backend.exitCode, null);
 });
 
@@ -1873,11 +1914,11 @@ test('assistant validates an inherited IS to ipRange to vlan relation chain and 
         _destinationType: 'ipRange', _destinationId: 201, _destinationCode: 'RANGE-001', _destinationDescription: 'Target range', _direction: 'direct'
       }],
       'ipRange:201': [{
-        _id: 402, domain: 'Vlan2super', _sourceType: 'vlan', _sourceId: 301, _sourceCode: 'VLAN-001', _sourceDescription: 'Target VLAN',
-        _destinationType: 'ipRange', _destinationId: 201, _destinationCode: 'RANGE-001', _destinationDescription: 'Target range', _direction: 'direct'
+        _id: 402, domain: 'Vlan2super', _sourceType: 'ipRange', _sourceId: 201, _sourceCode: 'RANGE-001', _sourceDescription: 'Target range',
+        _destinationType: 'vlan', _destinationId: 301, _destinationCode: 'VLAN-001', _destinationDescription: 'Target VLAN', _direction: 'inverse'
       }, {
-        _id: 403, domain: 'Vlan2super', _sourceType: 'routerG', _sourceId: 302, _sourceCode: 'ROUTER-001', _sourceDescription: 'Wrong endpoint class',
-        _destinationType: 'ipRange', _destinationId: 201, _destinationCode: 'RANGE-001', _destinationDescription: 'Target range', _direction: 'direct'
+        _id: 403, domain: 'Vlan2super', _sourceType: 'ipRange', _sourceId: 201, _sourceCode: 'RANGE-001', _sourceDescription: 'Target range',
+        _destinationType: 'routerG', _destinationId: 302, _destinationCode: 'ROUTER-001', _destinationDescription: 'Wrong endpoint class', _direction: 'inverse'
       }]
     },
     templates: [templateCard('IsIpRangeVlanRuntime', runtimeSpec)],
@@ -2044,8 +2085,8 @@ test('assistant keeps confirmed relation requirements and executes source-driven
         _destinationType: 'ipRange', _destinationId: 201, _destinationCode: 'RANGE-001', _destinationDescription: 'Target range', _direction: 'direct'
       }],
       'ipRange:201': [{
-        _id: 502, domain: 'Vlan2super', _sourceType: 'vlan', _sourceId: 301, _sourceCode: 'VLAN-001', _sourceDescription: 'Target VLAN',
-        _destinationType: 'ipRange', _destinationId: 201, _destinationCode: 'RANGE-001', _destinationDescription: 'Target range', _direction: 'direct'
+        _id: 502, domain: 'Vlan2super', _sourceType: 'ipRange', _sourceId: 201, _sourceCode: 'RANGE-001', _sourceDescription: 'Target range',
+        _destinationType: 'vlan', _destinationId: 301, _destinationCode: 'VLAN-001', _destinationDescription: 'Target VLAN', _direction: 'inverse'
       }]
     },
     configCards: [{
@@ -2468,6 +2509,12 @@ test('assistant preserves source cards for a direct cross-block IPv4 attribute p
   assert.equal(rebuilt.statusCode, 200, rebuilt.body);
   assert.deepEqual(rebuilt.json.diagnostics.objectFlow.fallback, { kind: 'semanticContractCompiler', used: true });
   assert.equal(rebuilt.json.flow.publishedAlias, rebuilt.json.flow.selections[1].alias);
+  assert.deepEqual(rebuilt.json.outputBindings, [
+    { blockId: 'ip-ranges', alias: rebuilt.json.flow.selections[0].alias },
+    { blockId: 'acls', alias: rebuilt.json.flow.selections[1].alias }
+  ]);
+  assert.equal(rebuilt.json.canApply, true);
+  assert.deepEqual(rebuilt.json.diagnostics.objectFlow.outputBindingErrors, []);
   assert.deepEqual(rebuilt.json.flow.selections.map((selection) => [selection.className, selection.from]), [
     ['ipRange', ''],
     ['ACL', rebuilt.json.flow.selections[0].alias]
@@ -2691,7 +2738,11 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
   assert.equal(analyzed.json.preview.layout, 'dagre');
   assert.match(analyzed.json.preview.content, /^<svg data-cmdp-d2-rendered="true"/);
   assert.match(analyzed.json.preview.content, /D2 import preview/);
-  assert.doesNotMatch(analyzed.json.preview.content, /<script|onclick|foreignObject/i);
+  assert.match(analyzed.json.preview.content, /<foreignObject x="40" y="50" width="245" height="24">/);
+  assert.match(analyzed.json.preview.content, /ИС LPS/);
+  assert.match(analyzed.json.preview.content, /#9FF6FF/);
+  assert.match(analyzed.json.preview.content, /#f503EB/);
+  assert.doesNotMatch(analyzed.json.preview.content, /<script|onclick|<img|evil\.local|@import/i);
   assert.equal(analyzed.json.preview.content.includes(source), false);
   assert.ok(analyzed.json.catalog.classes.some((item) => item.name === 'ARM'));
   assert.equal(analyzed.json.proposal.catalogHash.length > 0, true);
@@ -2766,6 +2817,31 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
   assert.equal(importsRejected.statusCode, 422, importsRejected.body);
   assert.match(importsRejected.json.message, /imports are not allowed/i);
   assert.equal(backend.exitCode, null);
+});
+
+test('D2 import preview adds frames for styled Markdown nodes', async (t) => {
+  const mock = await startMockCmdbuild(t);
+  const backendPort = await freePort();
+  await startBackend(t, backendPort, mock.origin, {
+    CMDP_D2_BINARY: `${process.cwd()}/tests/fixtures/d2-render-stub.mjs`
+  });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-markdown-frame-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([{ alias: 'assets', className: 'ARM', columns: ['Code'] }]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'MarkdownFrameImport',
+    baseSpecHash: hashJson(currentSpec),
+    currentSpec,
+    d2Source: 'markdown-frame: Preview'
+  }, headers);
+
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  assert.equal(analyzed.json.preview.rendered, true);
+  assert.match(analyzed.json.preview.content, /data-cmdp-d2-markdown-frame="true"/);
+  assert.match(analyzed.json.preview.content, /fill="#EFF6FF" stroke="#1D4ED8" stroke-width="2" rx="8" stroke-dasharray="14,14" x="20" y="30" width="180" height="64"/);
+  assert.match(analyzed.json.preview.content, /Markdown frame preview/);
 });
 
 test('D2 import analysis keeps the structural proposal when preview rendering is unavailable', async (t) => {
@@ -2867,6 +2943,216 @@ test('D2 import keeps untyped containers structural and places class-mapped obje
   assert.equal(previewDiagram.groups.length, 1);
   assert.equal(previewDiagram.nodes.every((node) => node.group === previewDiagram.groups[0].id), true);
   assert.doesNotMatch(previewDiagram.d2.source, /users\.operator|users\.administrator/);
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 interpretation retries an invalid container object semantic with allowed values', async (t) => {
+  const readRoles = ({ request }) => JSON.parse(request.messages.at(-1).content).roles;
+  const llm = await startLiteLlmStub(t, {
+    responses: [
+      ({ request }) => {
+        const role = readRoles({ request })[0];
+        return { decisions: [{ roleId: role.id, semantic: 'object', confidence: 'high', reason: 'Incorrect container decision.' }] };
+      },
+      ({ request }) => {
+        const role = readRoles({ request })[0];
+        return { decisions: [{ roleId: role.id, semantic: 'group', confidence: 'high', reason: 'Container groups Application cards.' }] };
+      }
+    ]
+  });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{
+      _id: 1,
+      Code: 'Cst_QueryTool',
+      RootCode: 'Cst_QueryTool',
+      Active: true,
+      RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, {
+    LITELLM_API_KEY: 'unit-test-key',
+    CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin
+  });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-semantic-retry-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([{ alias: 'applications', className: 'ARM', columns: ['Code', 'Description'] }]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'SemanticRetryImport',
+    currentSpec,
+    d2Source: 'container-class users: { operator: Operator; administrator: Administrator }'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const containerRole = analyzed.json.proposal.roles.find((role) => role.key === 'application_group');
+  assert.ok(containerRole, analyzed.body);
+  assert.deepEqual(containerRole.options, ['composite', 'group', 'static']);
+
+  const interpreted = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/interpret`, {
+    prompt: 'Interpret the supplied D2 roles.',
+    currentSpec,
+    proposal: analyzed.json.proposal,
+    roles: []
+  }, headers);
+
+  assert.equal(interpreted.statusCode, 200, interpreted.body);
+  assert.equal(interpreted.json.decisions[0].roleId, containerRole.id);
+  assert.equal(interpreted.json.decisions[0].semantic, 'group');
+  assert.equal(interpreted.json.diagnostics.attempts, 2);
+  assert.equal(llm.requests, 2);
+  const correction = JSON.parse(llm.lastRequest.messages.at(-1).content).correction;
+  assert.deepEqual(correction.invalidSemantics[0], {
+    roleId: containerRole.id,
+    displayName: 'application_group',
+    receivedSemantic: 'object',
+    allowedSemantics: ['composite', 'group', 'static']
+  });
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 interpretation reports a repeated invalid container semantic by visible role name', async (t) => {
+  const llm = await startLiteLlmStub(t, {
+    responses: [({ request }) => {
+      const role = JSON.parse(request.messages.at(-1).content).roles[0];
+      return { decisions: [{ roleId: role.id, semantic: 'object', reason: 'Invalid container decision.' }] };
+    }]
+  });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{
+      _id: 1,
+      Code: 'Cst_QueryTool',
+      RootCode: 'Cst_QueryTool',
+      Active: true,
+      RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, {
+    LITELLM_API_KEY: 'unit-test-key',
+    CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin
+  });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-semantic-diagnostic-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([{ alias: 'applications', className: 'ARM', columns: ['Code', 'Description'] }]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'SemanticDiagnosticImport',
+    currentSpec,
+    d2Source: 'container-class users: { operator: Operator; administrator: Administrator }'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+
+  const interpreted = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/interpret`, {
+    prompt: 'Interpret the supplied D2 roles.',
+    currentSpec,
+    proposal: analyzed.json.proposal,
+    roles: []
+  }, headers);
+
+  assert.equal(interpreted.statusCode, 422, interpreted.body);
+  assert.equal(interpreted.json.code, 'assistant_diagram_stage_invalid');
+  assert.equal(llm.requests, 2);
+  assert.deepEqual(interpreted.json.errors[0].allowedSemantics, ['composite', 'group', 'static']);
+  assert.equal(interpreted.json.errors[0].displayName, 'application_group');
+  assert.match(interpreted.json.errors[0].message, /application_group/);
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 mapping keeps valid partial mappings and reports every uncovered dynamic role', async (t) => {
+  const llm = await startLiteLlmStub(t, {
+    responses: [
+      ({ request }) => {
+        const payload = JSON.parse(request.messages.at(-1).content);
+        const role = payload.roles.find((item) => item.isContainer);
+        return { mappings: [{ roleId: role.id, stageId: payload.stages[0].id, reason: 'Group source.' }] };
+      },
+      ({ request }) => {
+        const payload = JSON.parse(request.messages.at(-1).content);
+        const role = payload.roles[0];
+        return { mappings: [], unresolved: [{ roleId: role.id, reason: 'noCompatibleStage', message: 'No dedicated source stage exists.' }] };
+      }
+    ]
+  });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } }) }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-partial-mapping-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([{ alias: 'applications', className: 'ARM', columns: ['Code', 'Description'] }]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'PartialMappingImport', currentSpec, d2Source: 'container-class users: { operator: Operator; administrator: Administrator }'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const roles = analyzed.json.proposal.roles.map((role) => ({
+    id: role.id,
+    selectedSemantic: role.key === 'application_group' ? 'group' : 'object',
+    mapping: role.mapping
+  }));
+  const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
+    prompt: 'Map every dynamic role or state why no source exists.', currentSpec, proposal: analyzed.json.proposal, roles
+  }, headers);
+
+  assert.equal(mapped.statusCode, 200, mapped.body);
+  assert.equal(mapped.json.mapping.status, 'partial');
+  assert.deepEqual([mapped.json.mapping.mappedRoles, mapped.json.mapping.requiredRoles], [1, 2]);
+  assert.equal(mapped.json.mappings.length, 1);
+  assert.equal(mapped.json.mapping.unresolved[0].code, 'noCompatibleStage');
+  assert.equal(mapped.json.mapping.unresolved[0].displayName, 'workstation');
+  assert.equal(mapped.json.diagnostics.attempts, 2);
+  assert.equal(llm.requests, 2);
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 mapping merges retry mappings and reports complete only after all dynamic roles are covered', async (t) => {
+  const llm = await startLiteLlmStub(t, {
+    responses: [
+      ({ request }) => {
+        const payload = JSON.parse(request.messages.at(-1).content);
+        const role = payload.roles.find((item) => item.isContainer);
+        return { mappings: [{ roleId: role.id, stageId: payload.stages[0].id, reason: 'Group source.' }] };
+      },
+      ({ request }) => {
+        const payload = JSON.parse(request.messages.at(-1).content);
+        return { mappings: [{ roleId: payload.roles[0].id, stageId: payload.stages[0].id, reason: 'Leaf source.' }] };
+      }
+    ]
+  });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } }) }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-complete-mapping-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([{ alias: 'applications', className: 'ARM', columns: ['Code', 'Description'] }]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'CompleteMappingImport', currentSpec, d2Source: 'container-class users: { operator: Operator; administrator: Administrator }'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const roles = analyzed.json.proposal.roles.map((role) => ({
+    id: role.id,
+    selectedSemantic: role.key === 'application_group' ? 'group' : 'object',
+    mapping: role.mapping
+  }));
+  const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
+    prompt: 'Map every dynamic role.', currentSpec, proposal: analyzed.json.proposal, roles
+  }, headers);
+
+  assert.equal(mapped.statusCode, 200, mapped.body);
+  assert.equal(mapped.json.mapping.status, 'complete');
+  assert.deepEqual([mapped.json.mapping.mappedRoles, mapped.json.mapping.requiredRoles], [2, 2]);
+  assert.deepEqual(mapped.json.mapping.unresolved, []);
+  assert.equal(mapped.json.mappings.length, 2);
+  assert.equal(mapped.json.diagnostics.attempts, 2);
+  assert.equal(llm.requests, 2);
   assert.equal(backend.exitCode, null);
 });
 
@@ -3407,17 +3693,6 @@ test('template deletion revokes all public static snapshots', async (t) => {
 });
 
 test('object-flow apply rejects Diagram mappings whose source aliases are removed', async (t) => {
-  const mock = await startMockCmdbuild(t);
-  const backendPort = await freePort();
-  const backend = await startBackend(t, backendPort, mock.origin);
-  const backendOrigin = `http://127.0.0.1:${backendPort}`;
-  const cookie = 'CMDBuild-Authorization' + '=' + 'diagram-source';
-  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
-  const headers = {
-    cookie,
-    origin: backendOrigin,
-    'x-cmdbdynamicpages-csrf': csrf.json.token
-  };
   const currentSpec = {
     version: 1,
     visualModels: [{
@@ -3443,9 +3718,22 @@ test('object-flow apply rejects Diagram mappings whose source aliases are remove
     operations: []
   };
 
+  const templateCode = 'DiagramSourceStale';
+  const mock = await startMockCmdbuild(t, { templates: [templateCard(templateCode, currentSpec)] });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization' + '=' + 'diagram-source';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token
+  };
+
   const response = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/object-flow/apply`, {
-    templateCode: '',
-    baseSpecHash: '',
+    templateCode,
+    baseSpecHash: hashJson(currentSpec),
     currentSpec,
     flow
   }, headers);
@@ -3456,13 +3744,6 @@ test('object-flow apply rejects Diagram mappings whose source aliases are remove
 });
 
 test('object-flow apply rejects retained Diagram sources when their class or required fields change', async (t) => {
-  const mock = await startMockCmdbuild(t);
-  const backendPort = await freePort();
-  const backend = await startBackend(t, backendPort, mock.origin);
-  const backendOrigin = `http://127.0.0.1:${backendPort}`;
-  const cookie = testCmdbuildAuthorizationCookie('diagram-source-schema');
-  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
-  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
   const currentSpec = {
     version: 1,
     visualModels: [{
@@ -3479,8 +3760,16 @@ test('object-flow apply rejects retained Diagram sources when their class or req
       diagrams: [{ name: 'network', type: 'd2', source: { nodes: 'assets' }, fields: { nodeId: 'Code', nodeLabel: 'model2' } }]
     }
   };
+  const templateCode = 'DiagramSourceSchema';
+  const mock = await startMockCmdbuild(t, { templates: [templateCard(templateCode, currentSpec)] });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = testCmdbuildAuthorizationCookie('diagram-source-schema');
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
   const fieldRemoved = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/object-flow/apply`, {
-    templateCode: '', baseSpecHash: '', currentSpec,
+    templateCode, baseSpecHash: hashJson(currentSpec), currentSpec,
     flow: {
       version: 1,
       selections: [{ alias: 'assets', className: 'ARM', columns: ['Code'], rules: [{ action: 'include', path: 'Code', op: 'exists' }] }],
@@ -3492,7 +3781,7 @@ test('object-flow apply rejects retained Diagram sources when their class or req
   assert.ok(fieldRemoved.json.errors.some((error) => /required fields: model2/.test(error.message)), fieldRemoved.body);
 
   const classChanged = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/object-flow/apply`, {
-    templateCode: '', baseSpecHash: '', currentSpec,
+    templateCode, baseSpecHash: hashJson(currentSpec), currentSpec,
     flow: {
       version: 1,
       selections: [{ alias: 'assets', className: 'routerG', columns: ['Code', 'model2'], rules: [{ action: 'include', path: 'Code', op: 'exists' }] }],
@@ -3647,38 +3936,24 @@ test('public snapshot D2 source requires explicit publication flag', async (t) =
   assert.equal(backend.exitCode, null);
 });
 
-test('semantic planning resolves a reference terminal attribute and deterministically returns the source class', async (t) => {
+test('semantic planning keeps an explicit reference field as a business requirement for deterministic compilation', async (t) => {
   const intent = {
     context: '',
-    blocks: [{
-      id: 'ranges', name: 'Результат 1', entities: 'Карточки ipRange.', algorithm: 'Выбрать сети.', expectedResult: 'Список ipRange.', uses: []
-    }, {
-      id: 'applications', name: 'Результат 4', entities: 'Карточки ApplicG и сети из Результата 1.',
-      algorithm: 'Выбрать ApplicG, у которых Provider email.IP address value входит в сеть range объектов ipRange из Результата 1.', expectedResult: 'Список ApplicG.', uses: ['ranges']
-    }]
+    blocks: [
+      { id: 'ranges', name: 'Результат 1', entities: 'Карточки ipRange.', algorithm: 'Выбрать сети.', expectedResult: 'Список ipRange.', uses: [] },
+      { id: 'applications', name: 'Результат 4', entities: 'Карточки ApplicG и сети из Результата 1.', algorithm: 'Выбрать ApplicG, у которых "ipaddress.IP address value" входит в сеть range объектов ipRange из Результата 1.', expectedResult: 'Список ApplicG.', uses: ['ranges'] }
+    ]
   };
   const llm = await startLiteLlmStub(t, {
     responses: [{
       version: 1,
-      blocks: [{
-        id: 'ranges', name: 'Результат 1', summary: 'Сети.', resolvedEntities: ['ipRange'], relationPaths: [], dependencies: [], expectedResult: 'Список ipRange.',
-        resultContract: { outputKind: 'sourceCards', outputClass: 'ipRange', relationPredicates: [], attributePredicates: [] }, warnings: []
-      }, {
-        id: 'applications', name: 'Результат 4', summary: 'Приложения с IP в диапазоне.', resolvedEntities: ['ApplicG', 'IpAddress', 'ipRange'], relationPaths: ['ApplicGIpaddressDomain'], dependencies: ['ranges'], expectedResult: 'Список ApplicG.',
-        resultContract: {
-          outputKind: 'sourceCards', outputClass: 'ApplicG', relationPredicates: [],
-          attributePredicates: [{ sourceClass: 'ApplicG', comparisonBlockId: 'ranges', comparisonClass: 'ipRange', sourceFields: ['Provider email.IP address value'], comparisonField: 'Network range', operator: 'ipv4InCidr' }]
-        }, warnings: []
-      }],
-      explanation: 'Проверен reference путь.', warnings: []
-    }, {
-      flow: { version: 1, selections: [], operations: [], publishedAlias: '' }, explanation: 'Incomplete flow.', warnings: []
+      blocks: [
+        { id: 'ranges', name: 'Результат 1', summary: 'Сети.', resolvedEntities: ['ipRange'], relationPaths: [], dependencies: [], expectedResult: 'Список ipRange.', resultContract: { outputKind: 'sourceCards', outputClass: 'ipRange', relationPredicates: [], attributePredicates: [] }, warnings: [] },
+        { id: 'applications', name: 'Результат 4', summary: 'Приложения.', resolvedEntities: ['ApplicG', 'IpAddress', 'ipRange'], relationPaths: [], dependencies: ['ranges'], expectedResult: 'Список ApplicG.', resultContract: { outputKind: 'sourceCards', outputClass: 'ApplicG', relationPredicates: [{ sourceClass: 'ApplicG', relatedClass: 'IpAddress', comparisonBlockId: 'ranges', comparisonClass: 'ipRange', domain: 'super2super', direction: 'source', comparisonFields: ['ipAddr'], relatedField: 'range', operator: 'ipv4InCidr' }] }, warnings: [] }
+      ],
+      explanation: 'Путь reference указан в алгоритме.', warnings: []
     }]
   });
-  const domain = {
-    _id: 'ApplicGIpaddressDomain', name: 'ApplicGIpaddressDomain', source: 'IpAddress', sources: ['IpAddress'], destination: 'ApplicG', destinations: ['ApplicG'],
-    disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: '1:N'
-  };
   const mock = await startMockCmdbuild(t, {
     classes: [
       { _id: 1, name: 'ipRange', description: 'IP range', parent: 'Class', active: true },
@@ -3692,7 +3967,81 @@ test('semantic planning resolves a reference terminal attribute and deterministi
       ApplicG: [{ name: 'ipaddress', description: 'Provider email', type: 'reference', targetClass: 'IpAddress', domain: 'ApplicGIpaddressDomain', active: true, _can_read: true }],
       IpAddress: [{ name: 'ipAddr', description: 'IP address value', type: 'ipAddress', active: true, _can_read: true }]
     },
-    domains: [domain],
+    domains: [
+      { _id: 'ApplicGIpaddressDomain', name: 'ApplicGIpaddressDomain', source: 'IpAddress', sources: ['IpAddress'], destination: 'ApplicG', destinations: ['ApplicG'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: '1:N' },
+      { _id: 'ApplicGMgmtDomain', name: 'ApplicGMgmtDomain', source: 'IpAddress', sources: ['IpAddress'], destination: 'ApplicG', destinations: ['ApplicG'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: '1:N' },
+      { _id: 'super2super', name: 'super2super', source: 'super', sources: ['ApplicG'], destination: 'super', destinations: ['IpAddress'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: 'N:N' }
+    ],
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' }, mcp: { maxClasses: 100, maxDomains: 100, maxRelationDomains: 100, maxContextBytes: 32768 } } }) }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = testCmdbuildAuthorizationCookie('semantic-relation-reference-token');
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const response = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+    templateCode: '', baseSpecHash: '', currentSpec: { version: 1, params: {}, steps: [], result: { tables: [] } }, intent
+  }, { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
+
+  assert.equal(response.statusCode, 200, response.body);
+  assert.deepEqual(response.json.semanticPlan.blocks[1].resultContract.relationPredicates, []);
+  assert.deepEqual(response.json.semanticPlan.blocks[1].resultContract.referencePathPredicates, []);
+  assert.equal(backend.exitCode, null);
+});
+
+test('semantic planning defers an explicit IPv4 reference path to deterministic flow compilation', async (t) => {
+  const intent = {
+    context: '',
+    blocks: [{
+      id: 'ranges', name: 'Результат 1', entities: 'Карточки ipRange.', algorithm: 'Выбрать сети.', expectedResult: 'Список ipRange.', uses: []
+    }, {
+      id: 'applications', name: 'Результат 4', entities: 'Карточки ApplicG и сети из Результата 1.',
+      algorithm: 'Выбрать ApplicG, у которых "ipaddress.IP address value" входит в сеть range объектов ipRange из Результата 1.', expectedResult: 'Список ApplicG.', uses: ['ranges']
+    }]
+  };
+  const llm = await startLiteLlmStub(t, {
+    responses: [{
+      version: 1,
+      blocks: [{
+        id: 'ranges', name: 'Результат 1', summary: 'Сети.', resolvedEntities: ['ipRange'], relationPaths: [], dependencies: [], expectedResult: 'Список ipRange.',
+        resultContract: { outputKind: 'sourceCards', outputClass: 'ipRange', relationPredicates: [], attributePredicates: [] }, warnings: []
+      }, {
+        id: 'applications', name: 'Результат 4', summary: 'Приложения с IP в диапазоне.', resolvedEntities: ['ApplicG', 'IpAddress', 'ipRange'], relationPaths: ['ApplicGIpaddressDomain'], dependencies: ['ranges'], expectedResult: 'Список ApplicG.',
+        resultContract: {
+          outputKind: 'sourceCards', outputClass: 'ApplicG', relationPredicates: [],
+          attributePredicates: [{ sourceClass: 'IpAddress', comparisonBlockId: 'ranges', comparisonClass: 'ipRange', sourceFields: ['ipAddr'], comparisonField: 'Network range', operator: 'ipv4InCidr' }]
+        }, warnings: []
+      }],
+      explanation: 'Проверен reference путь.', warnings: []
+    }, {
+      flow: { version: 1, selections: [], operations: [], publishedAlias: '' }, explanation: 'Incomplete flow.', warnings: []
+    }]
+  });
+  const domain = {
+    _id: 'ApplicGIpaddressDomain', name: 'ApplicGIpaddressDomain', source: 'IpAddress', sources: ['IpAddress'], destination: 'ApplicG', destinations: ['ApplicG'],
+    disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: '1:N'
+  };
+  const mgmtDomain = {
+    _id: 'ApplicGMgmtDomain', name: 'ApplicGMgmtDomain', source: 'IpAddress', sources: ['IpAddress'], destination: 'ApplicG', destinations: ['ApplicG'],
+    disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: '1:N'
+  };
+  const mock = await startMockCmdbuild(t, {
+    classes: [
+      { _id: 1, name: 'ipRange', description: 'IP range', parent: 'Class', active: true },
+      { _id: 2, name: 'ApplicG', description: 'Application', parent: 'Class', active: true },
+      { _id: 3, name: 'IpAddress', description: 'IP address', parent: 'Class', active: true },
+      { _id: 4, name: 'Cst_QueryToolConfig', description: 'Config', active: true },
+      { _id: 5, name: 'Cst_QueryTemplate', description: 'Template', active: true }
+    ],
+    attributesByClass: {
+      ipRange: [{ name: 'range', description: 'Network range', type: 'string', active: true, _can_read: true }],
+      ApplicG: [
+        { name: 'ipaddress', description: 'Provider email', type: 'reference', targetClass: 'IpAddress', domain: 'ApplicGIpaddressDomain', active: true, _can_read: true },
+        { name: 'mgmt', description: 'ipaddress', type: 'reference', targetClass: 'IpAddress', domain: 'ApplicGMgmtDomain', active: true, _can_read: true }
+      ],
+      IpAddress: [{ name: 'ipAddr', description: 'IP address value', type: 'ipAddress', active: true, _can_read: true }]
+    },
+    domains: [domain, mgmtDomain],
     cardsByClass: {
       ipRange: [{ _id: 101, Code: 'RANGE-001', Description: 'Target range', range: '10.44.0.0/24' }],
       IpAddress: [
@@ -3725,30 +4074,173 @@ test('semantic planning resolves a reference terminal attribute and deterministi
     templateCode: '', baseSpecHash: '', currentSpec, intent
   }, headers);
   assert.equal(semantic.statusCode, 200, semantic.body);
-  const predicate = semantic.json.semanticPlan.blocks[1].resultContract.referencePathPredicates[0];
-  assert.deepEqual(predicate, {
-    sourceClass: 'ApplicG', comparisonBlockId: 'ranges', comparisonClass: 'ipRange',
-    hops: [{ sourceClass: 'ApplicG', attribute: 'ipaddress', domain: 'ApplicGIpaddressDomain', direction: 'destination', targetClass: 'IpAddress' }],
-    terminalClass: 'IpAddress', terminalField: 'ipAddr', comparisonField: 'range', operator: 'ipv4InCidr'
-  });
-  assert.equal(semantic.json.semanticPlan.blocks[1].resultContract.attributePredicates.length, 0);
+  assert.equal(semantic.json.semanticPlan.blocks[1].resultContract.outputKind, 'sourceCards');
+  assert.equal(semantic.json.semanticPlan.blocks[1].resultContract.outputClass, 'ApplicG');
+  assert.deepEqual(semantic.json.semanticPlan.blocks[1].resultContract.referencePathPredicates, []);
+  assert.deepEqual(semantic.json.semanticPlan.blocks[1].resultContract.attributePredicates, []);
 
   const draft = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/plan`, {
     templateCode: '', baseSpecHash: '', currentSpec, intent, semanticPlan: semantic.json.semanticPlan
   }, headers);
   assert.equal(draft.statusCode, 200, draft.body);
   assert.equal(draft.json.success, true, draft.body);
+  assert.ok(draft.json.warnings.some((warning) => /resolved user reference path ipaddress\.ipAddr/i.test(warning)), draft.body);
   assert.equal(draft.json.flow.publishedAlias, 'applications');
   assert.ok(draft.json.flow.selections.some((selection) => selection.className === 'IpAddress' && selection.rules.some((rule) => rule.path === 'ipAddr' && rule.op === 'ipv4InCidr' && rule.valueColumn === 'range')));
   assert.ok(draft.json.flow.operations.some((operation) => operation.type === 'relation' && operation.domain === 'ApplicGIpaddressDomain' && operation.targetClass === 'ApplicG' && operation.direction === 'source'));
 
-  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/preview`, {
-    templateCode: '', currentSpec, flow: draft.json.flow, params: {}
+  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview`, {
+    template: { code: 'ReferencePathPreview', spec: compileObjectFlowToSpec(currentSpec, draft.json.flow) }, params: {}
   }, headers);
   assert.equal(preview.statusCode, 200, preview.body);
-  const finalStage = preview.json.preview.stages.find((stage) => stage.as === draft.json.flow.publishedAlias);
-  assert.ok(finalStage, preview.body);
-  assert.deepEqual(finalStage.rows.map((row) => row.Code), ['APP-IN']);
+  const finalTable = preview.json.result.tables.find((table) => table.name === draft.json.flow.publishedAlias);
+  assert.ok(finalTable, preview.body);
+  assert.deepEqual(finalTable.rows.map((row) => row.Code), ['APP-IN']);
+  assert.equal(backend.exitCode, null);
+});
+
+test('deterministic flow completes an unambiguous IPv4 reference predicate from confirmed MCP schema', async (t) => {
+  const intent = {
+    context: '',
+    blocks: [{
+      id: 'ranges', name: 'Результат 1', entities: 'Карточки ipRange.', algorithm: 'Выбрать сети.', expectedResult: 'Список ipRange.', uses: []
+    }, {
+      id: 'applications', name: 'Результат 4', entities: 'Карточки ApplicG и сети из Результата 1.',
+      algorithm: 'Выбрать ApplicG, у которых ipaddress входит в сеть range объектов ipRange из Результата 1.', expectedResult: 'Список ApplicG.', uses: ['ranges']
+    }]
+  };
+  const llm = await startLiteLlmStub(t, {
+    responses: [{
+      version: 1,
+      blocks: [{
+        id: 'ranges', name: 'Результат 1', summary: 'Сети.', resolvedEntities: ['ipRange'], relationPaths: [], dependencies: [], expectedResult: 'Список ipRange.',
+        resultContract: { outputKind: 'sourceCards', outputClass: 'ipRange', relationPredicates: [], attributePredicates: [] }, warnings: []
+      }, {
+        id: 'applications', name: 'Результат 4', summary: 'Приложения.', resolvedEntities: ['ApplicG', 'IpAddress', 'ipRange'], relationPaths: ['ApplicGIpaddressDomain'], dependencies: ['ranges'], expectedResult: 'Список ApplicG.',
+        resultContract: { outputKind: 'sourceCards', outputClass: 'ApplicG', relationPredicates: [], attributePredicates: [] }, warnings: []
+      }],
+      explanation: 'LLM omitted the predicate.', warnings: []
+    }, {
+      flow: { version: 1, selections: [], operations: [], publishedAlias: '' }, explanation: 'Incomplete flow.', warnings: []
+    }]
+  });
+  const domain = {
+    _id: 'ApplicGIpaddressDomain', name: 'ApplicGIpaddressDomain', source: 'IpAddress', sources: ['IpAddress'], destination: 'ApplicG', destinations: ['ApplicG'],
+    disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: '1:N'
+  };
+  const mock = await startMockCmdbuild(t, {
+    classes: [
+      { _id: 1, name: 'ipRange', description: 'IP range', parent: 'Class', active: true },
+      { _id: 2, name: 'ApplicG', description: 'Application', parent: 'Class', active: true },
+      { _id: 3, name: 'IpAddress', description: 'IP address', parent: 'Class', active: true },
+      { _id: 4, name: 'Cst_QueryToolConfig', description: 'Config', active: true },
+      { _id: 5, name: 'Cst_QueryTemplate', description: 'Template', active: true }
+    ],
+    attributesByClass: {
+      ipRange: [{ name: 'range', description: 'Network range', type: 'string', active: true, _can_read: true }],
+      ApplicG: [{ name: 'ipaddress', description: 'IP address', type: 'reference', targetClass: 'IpAddress', domain: 'ApplicGIpaddressDomain', active: true, _can_read: true }],
+      IpAddress: [{ name: 'ipAddr', description: 'IP address value', type: 'ipAddress', active: true, _can_read: true }]
+    },
+    domains: [domain],
+    cardsByClass: {
+      ipRange: [{ _id: 101, Code: 'RANGE-001', range: '10.44.0.0/24' }],
+      IpAddress: [{ _id: 201, Code: 'IP-IN', ipAddr: '10.44.0.10' }, { _id: 202, Code: 'IP-OUT', ipAddr: '10.99.0.10' }],
+      ApplicG: [{ _id: 301, Code: 'APP-IN', ipaddress: 201 }, { _id: 302, Code: 'APP-OUT', ipaddress: 202 }]
+    },
+    relationsByCard: {
+      'IpAddress:201': [{ _id: 401, domain: 'ApplicGIpaddressDomain', _sourceType: 'IpAddress', _sourceId: 201, _destinationType: 'ApplicG', _destinationId: 301, _direction: 'direct' }],
+      'IpAddress:202': [{ _id: 402, domain: 'ApplicGIpaddressDomain', _sourceType: 'IpAddress', _sourceId: 202, _destinationType: 'ApplicG', _destinationId: 302, _direction: 'direct' }]
+    },
+    configCards: [{
+      _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true,
+      RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' }, semanticPlan: { maxReferencePathDepth: 3 }, mcp: { maxClasses: 100, maxDomains: 100, maxRelationDomains: 100, maxContextBytes: 32768 } } })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = testCmdbuildAuthorizationCookie('semantic-omitted-reference-predicate-token');
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = { version: 1, params: {}, steps: [], result: { tables: [] } };
+
+  const semantic = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+    templateCode: '', baseSpecHash: '', currentSpec, intent
+  }, headers);
+  assert.equal(semantic.statusCode, 200, semantic.body);
+  assert.deepEqual(semantic.json.semanticPlan.blocks[1].resultContract.referencePathPredicates, []);
+
+  const draft = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/plan`, {
+    templateCode: '', baseSpecHash: '', currentSpec, intent, semanticPlan: semantic.json.semanticPlan
+  }, headers);
+  assert.equal(draft.statusCode, 200, draft.body);
+  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview`, {
+    template: { code: 'ReferencePredicatePreview', spec: compileObjectFlowToSpec(currentSpec, draft.json.flow) }, params: {}
+  }, headers);
+  assert.equal(preview.statusCode, 200, preview.body);
+  const finalTable = preview.json.result.tables.find((table) => table.name === draft.json.flow.publishedAlias);
+  assert.deepEqual(finalTable.rows.map((row) => row.Code), ['APP-IN']);
+  assert.equal(backend.exitCode, null);
+});
+
+test('semantic planning accepts an ambiguous IPv4 reference and deterministic flow reports the ambiguity', async (t) => {
+  const intent = {
+    context: '',
+    blocks: [{ id: 'ranges', name: 'Результат 1', entities: 'Карточки ipRange.', algorithm: 'Выбрать сети.', expectedResult: 'Список ipRange.', uses: [] }, {
+      id: 'applications', name: 'Результат 4', entities: 'Карточки ApplicG и сети из Результата 1.',
+      algorithm: 'Выбрать ApplicG, у которых ipaddress входит в сеть range объектов ipRange из Результата 1.', expectedResult: 'Список ApplicG.', uses: ['ranges']
+    }]
+  };
+  const llm = await startLiteLlmStub(t, {
+    responses: [{
+      version: 1,
+      blocks: [
+        { id: 'ranges', name: 'Результат 1', summary: 'Сети.', resolvedEntities: ['ipRange'], relationPaths: [], dependencies: [], expectedResult: 'Список ipRange.', resultContract: { outputKind: 'sourceCards', outputClass: 'ipRange', relationPredicates: [], attributePredicates: [] }, warnings: [] },
+        { id: 'applications', name: 'Результат 4', summary: 'Приложения.', resolvedEntities: ['ApplicG', 'IpAddressA', 'IpAddressB', 'ipRange'], relationPaths: [], dependencies: ['ranges'], expectedResult: 'Список ApplicG.', resultContract: { outputKind: 'sourceCards', outputClass: 'ApplicG', relationPredicates: [], attributePredicates: [] }, warnings: [] }
+      ], explanation: 'Missing predicate.', warnings: []
+    }]
+  });
+  const mock = await startMockCmdbuild(t, {
+    classes: [
+      { _id: 1, name: 'ipRange', description: 'IP range', parent: 'Class', active: true }, { _id: 2, name: 'ApplicG', description: 'Application', parent: 'Class', active: true },
+      { _id: 3, name: 'IpAddressA', description: 'Primary IP address', parent: 'Class', active: true }, { _id: 4, name: 'IpAddressB', description: 'Secondary IP address', parent: 'Class', active: true },
+      { _id: 5, name: 'Cst_QueryToolConfig', description: 'Config', active: true }, { _id: 6, name: 'Cst_QueryTemplate', description: 'Template', active: true }
+    ],
+    attributesByClass: {
+      ipRange: [{ name: 'range', description: 'Network range', type: 'string', active: true, _can_read: true }],
+      ApplicG: [
+        { name: 'primaryIp', description: 'Primary ipaddress', type: 'reference', targetClass: 'IpAddressA', domain: 'ApplicGPrimaryIpDomain', active: true, _can_read: true },
+        { name: 'secondaryIp', description: 'Secondary ipaddress', type: 'reference', targetClass: 'IpAddressB', domain: 'ApplicGSecondaryIpDomain', active: true, _can_read: true }
+      ],
+      IpAddressA: [{ name: 'ipAddr', description: 'IP address value', type: 'ipAddress', active: true, _can_read: true }],
+      IpAddressB: [{ name: 'ipAddr', description: 'IP address value', type: 'ipAddress', active: true, _can_read: true }]
+    },
+    domains: [
+      { _id: 'ApplicGPrimaryIpDomain', name: 'ApplicGPrimaryIpDomain', source: 'IpAddressA', sources: ['IpAddressA'], destination: 'ApplicG', destinations: ['ApplicG'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: '1:N' },
+      { _id: 'ApplicGSecondaryIpDomain', name: 'ApplicGSecondaryIpDomain', source: 'IpAddressB', sources: ['IpAddressB'], destination: 'ApplicG', destinations: ['ApplicG'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: '1:N' }
+    ],
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' }, semanticPlan: { maxReferencePathDepth: 3 }, mcp: { maxClasses: 100, maxDomains: 100, maxRelationDomains: 100, maxContextBytes: 32768 } } }) }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = testCmdbuildAuthorizationCookie('semantic-ambiguous-reference-predicate-token');
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const response = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+    templateCode: '', baseSpecHash: '', currentSpec: { version: 1, params: {}, steps: [], result: { tables: [] } }, intent
+  }, { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
+
+  assert.equal(response.statusCode, 200, response.body);
+  const contract = response.json.semanticPlan.blocks[1].resultContract;
+  assert.equal(contract.outputKind, 'sourceCards');
+  assert.deepEqual(contract.referencePathPredicates, []);
+  const draft = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/plan`, {
+    templateCode: '', baseSpecHash: '', currentSpec: { version: 1, params: {}, steps: [], result: { tables: [] } }, intent, semanticPlan: response.json.semanticPlan
+  }, { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
+  assert.equal(draft.statusCode, 422, draft.body);
+  assert.equal(draft.json.code, 'assistant_semantic_plan_invalid');
+  assert.match(draft.json.message, /cannot resolve/i);
+  assert.deepEqual(draft.json.errors[0].candidates, ['primaryIp.ipAddr', 'secondaryIp.ipAddr']);
   assert.equal(backend.exitCode, null);
 });
 
@@ -3852,11 +4344,11 @@ test('reference-path repair restores phServer without rebuilding unrelated Assis
   assert.ok(draft.json.warnings.some((warning) => /rebuilt the confirmed reference path for Результат 5/i.test(warning)), draft.body);
   assert.ok(draft.json.flow.operations.some((operation) => operation.as === 'phServers' && operation.domain === 'ip_addressph' && operation.targetClass === 'phServer' && operation.direction === 'source'));
 
-  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/preview`, { templateCode: '', currentSpec, flow: draft.json.flow, params: {} }, headers);
+  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview`, { template: { code: 'ReferenceRepairPreview', spec: compileObjectFlowToSpec(currentSpec, draft.json.flow) }, params: {} }, headers);
   assert.equal(preview.statusCode, 200, preview.body);
-  const repairedStage = preview.json.preview.stages.find((stage) => stage.as === 'phServers');
-  assert.ok(repairedStage, preview.body);
-  assert.deepEqual(repairedStage.rows.map((row) => row.Code), ['PHS-IN']);
+  const repairedTable = preview.json.result.tables.find((table) => table.name === 'phServers');
+  assert.ok(repairedTable, preview.body);
+  assert.deepEqual(repairedTable.rows.map((row) => row.Code), ['PHS-IN']);
   assert.equal(backend.exitCode, null);
 });
 
@@ -3916,6 +4408,7 @@ test('semantic planning rejects a reference path that exceeds the configured dep
   assert.equal(response.json.errors[0].kind, 'semanticPlanReferencePathUnresolved');
   assert.match(response.json.errors[0].reason, /maxReferencePathDepth=1/);
   assert.match(response.json.feedback.action, /Глубина reference-пути/);
+  assert.match(response.json.feedback.action, /Проверьте reference attribute/);
   assert.equal(backend.exitCode, null);
 });
 
@@ -4206,9 +4699,12 @@ async function startLiteLlmStub(t, proposal) {
     if (delayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
-    const response = Array.isArray(proposal.responses)
+    const configuredResponse = Array.isArray(proposal.responses)
       ? proposal.responses[Math.min(requests - 1, proposal.responses.length - 1)]
       : { flow: proposal.flow, explanation: 'Validated test proposal.', warnings: [] };
+    const response = typeof configuredResponse === 'function'
+      ? await configuredResponse({ request: lastRequest, requests })
+      : configuredResponse;
     sendJson(res, 200, {
       choices: [{ message: { content: JSON.stringify(response) } }]
     });
@@ -4307,6 +4803,104 @@ function stableJsonStringify(value) {
 function hashJson(value) {
   return crypto.createHash('sha256').update(stableJsonStringify(value)).digest('hex');
 }
+
+test('filtered selections scan beyond the result row limit and report an explicit scan warning when capped', async (t) => {
+  const cards = Array.from({ length: 2101 }, (_, index) => ({
+    _id: index + 1,
+    Code: index === 2100 ? 'MATCH-AFTER-2000' : `ITEM-${String(index + 1).padStart(4, '0')}`,
+    Description: `Item ${index + 1}`
+  }));
+  const mock = await startMockCmdbuild(t, {
+    classes: [
+      { _id: 1, name: 'TestItem', description: 'Test item', parent: 'Class', active: true },
+      { _id: 2, name: 'Cst_QueryToolConfig', description: 'Config', active: true },
+      { _id: 3, name: 'Cst_QueryTemplate', description: 'Template', active: true }
+    ],
+    attributesByClass: { TestItem: [{ name: 'Code', type: 'string', active: true, _can_read: true }] },
+    cardsByClass: { TestItem: cards },
+    configCards: [{
+      _id: 1,
+      Code: 'Cst_QueryTool',
+      RootCode: 'Cst_QueryTool',
+      Active: true,
+      RuntimeConfigJson: JSON.stringify({ executionLimits: { maxRowsMax: 2000, maxSelectionScanRowsDefault: 3000, maxSelectionScanRowsMax: 3000 } })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=selection-scan-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const spec = {
+    version: 1,
+    params: {},
+    steps: [{
+      type: 'selectCards', as: 'items', className: 'TestItem', limit: 10, columns: ['Code'],
+      filters: [{ path: 'Code', op: 'equals', value: 'MATCH-AFTER-2000' }]
+    }],
+    result: { tables: [{ name: 'items', title: 'Items', columns: ['Code'] }] }
+  };
+  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=10&maxClasses=20&maxRestCalls=20`, {
+    template: { code: 'SelectionScanPreview', spec }, params: {}
+  }, headers);
+  assert.equal(preview.statusCode, 200, preview.body);
+  assert.deepEqual(preview.json.result.tables[0].rows.map((row) => row.Code), ['MATCH-AFTER-2000']);
+  assert.equal(preview.json.result.trace[0].selectionScan, null);
+
+  const cappedPreview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=10&maxClasses=20&maxRestCalls=20`, {
+    template: { code: 'SelectionScanCappedPreview', spec: { ...spec, steps: [{ ...spec.steps[0], scanLimit: 2000 }] } }, params: {}
+  }, headers);
+  assert.equal(cappedPreview.statusCode, 200, cappedPreview.body);
+  assert.deepEqual(cappedPreview.json.result.tables[0].rows, []);
+  assert.equal(cappedPreview.json.result.trace[0].selectionScan.scanLimit, 2000);
+  assert.match(cappedPreview.json.result.warnings[0], /Results may be incomplete/i);
+  assert.equal(backend.exitCode, null);
+});
+
+test('filtered selections report both row and scan limits when both bounds are reached', async (t) => {
+  const cards = Array.from({ length: 3000 }, (_, index) => ({
+    _id: index + 1,
+    Code: `ITEM-${String(index + 1).padStart(4, '0')}`,
+    Description: `Item ${index + 1}`
+  }));
+  const mock = await startMockCmdbuild(t, {
+    classes: [
+      { _id: 1, name: 'TestItem', description: 'Test item', parent: 'Class', active: true },
+      { _id: 2, name: 'Cst_QueryToolConfig', description: 'Config', active: true },
+      { _id: 3, name: 'Cst_QueryTemplate', description: 'Template', active: true }
+    ],
+    attributesByClass: { TestItem: [{ name: 'Code', type: 'string', active: true, _can_read: true }] },
+    cardsByClass: { TestItem: cards }
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = testCmdbuildAuthorizationCookie('selection-scan-and-row-limit');
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const spec = {
+    version: 1,
+    params: {},
+    steps: [{
+      type: 'selectCards', as: 'items', className: 'TestItem', limit: 10, scanLimit: 2000, columns: ['Code'],
+      filters: [{ path: 'Code', op: 'matches', regex: '^ITEM-' }]
+    }],
+    result: { tables: [{ name: 'items', title: 'Items', columns: ['Code'] }] }
+  };
+  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=10&maxClasses=20&maxRestCalls=20`, {
+    template: { code: 'SelectionScanAndRowLimitPreview', spec }, params: {}
+  }, headers);
+
+  assert.equal(preview.statusCode, 200, preview.body);
+  assert.equal(preview.json.result.tables[0].rows.length, 10);
+  assert.equal(preview.json.result.trace[0].rowLimitReached, true);
+  assert.equal(preview.json.result.trace[0].selectionScan.scanLimit, 2000);
+  assert.deepEqual(preview.json.result.limitDiagnostics.map((item) => item.limitName), ['maxRows', 'maxSelectionScanRows']);
+  assert.equal(preview.json.result.warnings.length, 2);
+  assert.ok(preview.json.result.warnings.every((warning) => /Results may be incomplete/i.test(warning)));
+  assert.equal(backend.exitCode, null);
+});
 
 function paginate(requestUrl, rows) {
   const limit = Number(requestUrl.searchParams.get('limit') || rows.length);

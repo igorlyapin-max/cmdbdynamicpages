@@ -114,7 +114,6 @@
  * @property {string} alias
  * @property {string} label
  * @property {'selection' | 'match' | 'set' | 'relation' | 'existsRelated'} kind
- * @property {boolean} published
  * @property {boolean=} assistantManaged
  * @property {string=} assistantBlockId
  * @property {string[]=} assistantBlockIds
@@ -128,7 +127,6 @@
  * @typedef {object} AssistantOutputManifest
  * @property {number} version
  * @property {Array<{id: string, name: string, order: number}>} blocks
- * @property {{blockId: string, alias: string}=} extractionCandidate
  */
 
 /**
@@ -1169,22 +1167,15 @@ function normalizeAssistantOutputManifest(value, outputs) {
   if (outputs.some((output) => !output.assistantManaged || !output.assistantBlockIds?.length || output.assistantBlockIds.some((id) => !knownBlockIds.has(id)))) {
     throw contractError('Assistant ownership manifest must own every materialized Assistant result.', 'assistant_output_manifest_invalid', 422);
   }
-  const rawCandidate = isRecord(value.extractionCandidate) ? value.extractionCandidate : null;
-  const blockId = text(rawCandidate?.blockId);
-  const alias = text(rawCandidate?.alias);
-  if (Boolean(blockId) !== Boolean(alias) || (blockId && (!knownBlockIds.has(blockId) || !outputs.some((output) => output.alias === alias)))) {
-    throw contractError('Assistant ownership manifest extraction candidate must reference a known block and result.', 'assistant_output_manifest_invalid', 422);
-  }
   return {
     version: 1,
-    blocks,
-    ...(blockId ? { extractionCandidate: { blockId, alias } } : {})
+    blocks
   };
 }
 
 function objectFlowVisualModels(flow, outputs, assistantOutputManifest = null) {
   const groupSelections = flow.selections.map(visualSelection);
-  const publishedOutput = outputs.find((output) => output.published);
+  const terminalOutput = outputs.find((output) => output.alias === flow.publishedAlias);
   return {
     objectGroup: {
       version: 1,
@@ -1202,7 +1193,7 @@ function objectFlowVisualModels(flow, outputs, assistantOutputManifest = null) {
       ...(assistantOutputManifest ? { assistantOutputManifest: cloneJsonValue(assistantOutputManifest) } : {}),
       output: {
         alias: flow.publishedAlias,
-        title: publishedOutput?.label || 'Final result'
+        title: terminalOutput?.label || 'Final result'
       }
     }
   };
@@ -1262,10 +1253,6 @@ function generatedResultTables(flow, existingByName, outputs) {
       ...(stage.kind === 'match' ? { columnLabels: resultColumnLabels(stage.columns) } : {})
     });
   }
-  tables.forEach((table) => {
-    delete table.published;
-    if (flow.publishedAlias && text(table.name) === flow.publishedAlias) table.published = true;
-  });
   return tables;
 }
 
@@ -1339,7 +1326,6 @@ export function objectFlowResultOutputs(flow, outputMetadata = []) {
       alias,
       label: metadata?.label || label,
       kind: stage.kind === 'selection' ? 'selection' : stage.item.type === 'relation' ? 'relation' : stage.item.type === 'existsRelated' ? 'existsRelated' : stage.item.type === 'match' ? 'match' : 'set',
-      published: Boolean(normalized.publishedAlias && normalized.publishedAlias === alias),
       ...(metadata ? {
         assistantManaged: true,
         ...(metadata.assistantBlockId ? { assistantBlockId: metadata.assistantBlockId } : {}),
@@ -1518,15 +1504,15 @@ export function compileObjectFlowToSpec(currentSpec, flow, options = {}) {
   const relatedTableNames = new Set(oldManagedAliases);
   for (const table of generatedTables) relatedTableNames.add(text(table.name));
   result.tables = replaceObjectFlowTables(currentTables, relatedTableNames, generatedTables);
-  if (normalized.publishedAlias) {
-    result.tables = result.tables.map((table) => {
-      if (!isRecord(table)) return table;
-      const next = { ...table };
-      if (text(next.name) === normalized.publishedAlias) next.published = true;
-      else delete next.published;
-      return next;
-    });
-  }
+  const generatedAliases = new Set(generatedTables.map((table) => text(table && table.name)).filter(Boolean));
+  const previouslyManagedAliases = new Set(oldManagedAliases);
+  result.tables = result.tables.map((table) => {
+    const name = isRecord(table) ? text(table.name) : '';
+    if (!isRecord(table) || generatedAliases.has(name) || !previouslyManagedAliases.has(name)) return table;
+    const next = { ...table };
+    delete next.published;
+    return next;
+  });
   spec.result = result;
 
   return spec;

@@ -121,6 +121,7 @@ const D2_MAX_DIAGRAMS = Math.max(1, Math.min(100, Number(process.env.CMDP_D2_MAX
 const D2_CONCURRENCY = Math.max(1, Math.min(10, Number(process.env.CMDP_D2_CONCURRENCY || 2) || 2));
 const D2_LAYOUT = String(process.env.CMDP_D2_LAYOUT || 'dagre').trim() || 'dagre';
 const D2_LAYOUT_ALLOWLIST = parseNameSet(process.env.CMDP_D2_LAYOUT_ALLOWLIST || 'dagre,elk');
+const D2_MARKDOWN_FRAME_REVISION = 1;
 const D2_RENDERER_UNAVAILABLE_TEXT = 'D2 renderer is unavailable; showing fallback diagram. D2 source is still available for download.';
 const D2_IMPORT_BINARY = String(process.env.CMDP_D2_IMPORT_BINARY || '/usr/local/bin/cmdp-d2-import').trim() || '/usr/local/bin/cmdp-d2-import';
 const D2_IMPORT_TIMEOUT_MS = Math.max(500, Number(process.env.CMDP_D2_IMPORT_TIMEOUT_MS || 5000) || 5000);
@@ -160,29 +161,30 @@ const DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT = [
 const DEFAULT_ASSISTANT_OBJECT_FLOW_SEMANTIC_PROMPT = [
   'Ты строишь проверяемый семантический план CMDBuild из пользовательских бизнес-блоков. Не создавай Object Flow, DSL, alias, Spec JSON, D2 source или результат выполнения.',
   'Для каждого блока сохрани его id и название, кратко опиши предполагаемую выборку, перечисли подтвержденные классы, атрибуты и пути связей только из permission-filtered MCP context. Укажи зависимости только между переданными блоками.',
-  'Для каждого блока зафиксируй контракт результата. outputKind sourceCards означает только карточки outputClass; relationPairs означает пары основного и связанного объекта. Если ожидаемый результат говорит «Список <класса>», другой блок не становится отдельным output. Прямой переход от результата dependency к outputClass через CMDBuild domain описывай dependencyPaths: comparisonBlockId, sourceClass, domain, direction и targetClass. relationPredicate используй только когда нужно сохранить outputClass, пройти к relatedClass и сравнить поля связанной карточки с другим результатом: он всегда обязан содержать comparisonBlockId, comparisonClass, domain, direction, comparisonFields, relatedField и operator. Для прямого сравнения атрибутов outputClass с атрибутами другого блока используй attributePredicate с comparisonBlockId, comparisonClass, sourceFields, comparisonField и оператором; у него нет domain и direction. Для поля reference используй referencePathPredicates: comparisonBlockId, comparisonClass, sourcePath и comparisonField с оператором. sourcePath — массив сегментов от outputClass до читаемого terminal field; каждый сегмент может быть Code, Name или Description, но backend подтвердит и сохранит только CMDBuild identifiers. Не передавай reference path как строку sourceFields с точкой. Если пользователь пишет «Provider email», сначала проверь точное прямое поле outputClass, затем единственный доступный reference target field; при неоднозначности верни unresolved. Если пользователь явно указал domain, который не соединяет классы, используй единственный подтвержденный MCP path и добавь warning; при нескольких кандидатах верни unresolved. Если пользователь явно просит связанные строки или их поля, выбери relationPairs. Не создавай внутренние aliases в контракте.',
+  'Для каждого блока зафиксируй контракт результата. outputKind sourceCards означает только карточки outputClass; relationPairs означает пары основного и связанного объекта. Если ожидаемый результат говорит «Список <класса>», другой блок не становится отдельным output. Прямой переход от результата dependency к outputClass через CMDBuild domain описывай dependencyPaths: comparisonBlockId, sourceClass, domain, direction и targetClass. relationPredicate используй только когда нужно сохранить outputClass, пройти к relatedClass и сравнить поля связанной карточки с другим результатом: он всегда обязан содержать comparisonBlockId, comparisonClass, domain, direction, comparisonFields, relatedField и operator. Для прямого сравнения атрибутов outputClass с атрибутами другого блока используй attributePredicate с comparisonBlockId, comparisonClass, sourceFields, comparisonField и оператором; у него нет domain и direction. Для поля reference используй referencePathPredicates: comparisonBlockId, comparisonClass, sourcePath и comparisonField с оператором. sourcePath — массив сегментов от outputClass до читаемого terminal field; каждый сегмент может быть Code, Name или Description, но backend подтвердит и сохранит только CMDBuild identifiers. Не передавай reference path как строку sourceFields с точкой и не помещай terminal field reference-цели в attributePredicate: верни полный referencePathPredicate либо unresolved. Если пользователь пишет «Provider email», сначала проверь точное прямое поле outputClass, затем единственный доступный reference target field; при неоднозначности верни unresolved. Если пользователь явно указал domain, который не соединяет классы, используй единственный подтвержденный MCP path и добавь warning; при нескольких кандидатах верни unresolved. Если пользователь явно просит связанные строки или их поля, выбери relationPairs. Не создавай внутренние aliases в контракте.',
   'Ожидаемый результат определяет outputClass: при «Список <класса A>» outputClass обязан быть A. Класс B, нужный только чтобы пройти связь или взять поле для проверки, не становится output. Когда требуется сохранить A, перейти к B и сравнить B с результатом C, используй relationPredicate с outputClass=A, relatedClass=B и comparisonClass=C; это не dependencyPath C -> B.',
   'Проверка IPv4 «адрес входит в сеть/range» является сравнением атрибутов, а не переходом по CMDBuild domain. Если IP-поля карточек outputClass сравниваются с network/range полем результата dependency, используй attributePredicate. Если для сохранения outputClass сначала нужно пройти к связанной карточке с network/range, используй relationPredicate. Не описывай такую проверку как dependencyPath и не делай superclass сети outputClass.',
   'Если класс, атрибут, связь или гранулярность результата неоднозначны либо context ограничен, не выбирай их молча: верни outputKind unresolved и warning к соответствующему блоку. Ожидаемый результат обязателен и определяет гранулярность итогового набора.',
   'Семантический план является предложением для проверки человеком. Он не применяет draft, не сохраняет шаблон и не меняет диаграмму.'
 ].join('\n\n');
 const DEFAULT_ASSISTANT_DIAGRAM_INTERPRETATION_PROMPT = [
-  'Ты интерпретируешь только семантику структурных D2 roles. D2 class является переиспользуемым визуальным типом и не является CMDBuild class. D2 nesting является layout hint и не доказывает CMDB hierarchy или relation.',
-  'Выбирай только один semantic для каждой supplied role: object означает один динамический CMDB object на строку источника; composite означает один динамический объект, разворачиваемый в согласованную вложенную структуру; group означает динамический контейнер по положительному правилу включения; static означает layout-only контейнер, декоративный объект или неизвлекаемый элемент.',
-  'OS, hardware, сетевые параметры, lookup labels и подобные details по умолчанию являются attribute projection родительского объекта, а не самостоятельными CMDB nodes. Не превращай их в role без явного отдельного источника объектов.',
-  'Контейнер без положительного критерия membership остаётся static. Не интерпретируй «не относится к текущей ИС» как dynamic group без явного ограниченного CMDB признака или relation path.',
-  'Не выбирай CMDB classes, attributes, aliases, object-flow stages, relation paths или mapping. Не добавляй и не удаляй D2 elements. Верни только typed semantic decisions для supplied exact role ids.'
+  'Ты интерпретируешь только смысл визуальных ролей диаграммы. D2 class и визуальный тип не являются CMDBuild class, а вложенность на схеме не доказывает CMDB hierarchy или relation.',
+  'Для каждой переданной роли выбери ровно один смысл: object — отдельная карточка CMDB на строку результата; composite — карточка со своей согласованной вложенной структурой; group — динамический контейнер с положительным правилом включения; static — постоянный контекст, легенда или декоративный элемент.',
+  'Пример: «DMZ для VLAN с isNAT=true» может быть group только при подтвержденном положительном признаке; «Приложения и среды» без самостоятельного критерия обычно static; «VLAN» и «сервер» обычно object или composite. Физический и виртуальный сервер — разные логические источники одной визуальной роли, а не разные экземпляры схемы.',
+  'OS, hardware, сетевые параметры, lookup labels и подобные details по умолчанию являются атрибутами родительской карточки, а не самостоятельными объектами. Контейнер «не относится к текущей ИС» остаётся static без явного ограниченного CMDB-критерия.',
+  'Не выбирай CMDB classes, attributes, aliases, object-flow stages, relation paths или mapping. Не добавляй и не удаляй элементы диаграммы. Верни только typed semantic decisions для supplied exact role ids.'
 ].join('\n\n');
 const DEFAULT_ASSISTANT_DIAGRAM_MAPPING_PROMPT = [
-  'Ты сопоставляешь только уже подтверждённые динамические D2 roles с supplied deterministic object-flow stages. CMDB source — это selection или intermediate match result; D2 role — это визуальная роль, а не instance path и не CMDB class name.',
-  'Сопоставляй role только со stage, который действительно возвращает подходящие CMDB objects. Используй exact supplied role ids и stage ids. Не выдумывай classes, attributes, aliases, stages, domains, relations или D2 paths.',
-  'Для object/composite выбирай source с объектами нужного типа. Для group выбирай source только при наличии положительного membership rule. Static role не сопоставляй с выборкой.',
-  'Label template и structured data должны использовать только колонки выбранного stage. Attribute projection остаётся данными родительского объекта, пока не существует отдельный подтверждённый source.',
-  'Не меняй D2 source, семантику roles, flow, Spec JSON, save, publish или runtime execution. Верни только typed mapping proposals для supplied exact ids.'
+  'Ты сопоставляешь уже подтвержденные динамические визуальные роли с результатами детерминированного Object Flow. Источник — выборка или промежуточный результат; роль — смысловой тип на диаграмме, а не путь экземпляра и не CMDBuild class name.',
+  'Сопоставляй роль только с результатом, который действительно содержит нужные карточки. Используй exact supplied role ids и stage ids. Не выдумывай classes, attributes, aliases, stages, domains, relations или элементы диаграммы.',
+  'Одна визуальная роль может иметь несколько вариантов только для реально разных CMDB классов. Например, визуальная роль «Сервер» может получить два варианта: результат phServer и результат vServer. Дай вариантам ясные названия «Физический сервер» и «Виртуальный сервер». Не создавай варианты для дублей одного класса.',
+  'Для object/composite выбирай источник с объектами нужного типа. Для group выбирай источник только при положительном критерии membership. Static роль не сопоставляй с выборкой. Дочерняя визуальная деталь, которая является атрибутом или частью composite, не требует собственного источника.',
+  'Label template и structured data должны использовать только колонки выбранного результата. Не меняй D2 source, семантику roles, flow, Spec JSON, save, publish или runtime execution. Верни только typed mapping proposals для supplied exact ids.'
 ].join('\n\n');
 const STARTED_AT = new Date();
 const ABSOLUTE_EXECUTION_LIMITS = {
   maxRows: 2000,
+  maxSelectionScanRows: Math.max(1, Number(process.env.CMDP_EXECUTION_MAX_SELECTION_SCAN_ROWS_ABSOLUTE || 50000) || 50000),
   maxClasses: 500,
   maxDomains: 500,
   maxRestCalls: 1000,
@@ -893,7 +895,8 @@ function d2CacheContext() {
       maxDiagrams: config.maxDiagrams,
       concurrency: config.concurrency,
       layout: config.layout,
-      layoutAllowlist: config.layoutAllowlist
+      layoutAllowlist: config.layoutAllowlist,
+      markdownFrameRevision: D2_MARKDOWN_FRAME_REVISION
     }
   };
 }
@@ -1611,13 +1614,13 @@ function createDiagramImportProposalV2Legacy(currentSpec, ir, options = {}) {
   };
 }
 
-function diagramImportRoleMapping(role, existing = {}) {
-  const source = existing && typeof existing === 'object' && !Array.isArray(existing) ? existing : {};
-  const stageSource = source.source && typeof source.source === 'object' && !Array.isArray(source.source) ? source.source : {};
-  const primary = source.primary && typeof source.primary === 'object' && !Array.isArray(source.primary) ? source.primary : {};
+function diagramImportRoleMappingVariant(role, source = {}, index = 0) {
+  const candidate = source && typeof source === 'object' && !Array.isArray(source) ? source : {};
+  const stageSource = candidate.source && typeof candidate.source === 'object' && !Array.isArray(candidate.source) ? candidate.source : {};
+  const primary = candidate.primary && typeof candidate.primary === 'object' && !Array.isArray(candidate.primary) ? candidate.primary : {};
   return {
-    id: String(source.id || diagramImportStableId('role_mapping', role.id)).trim(),
-    roleId: role.id,
+    id: String(candidate.id || diagramImportStableId('role_mapping_variant', `${role.id}:${index}`)).trim(),
+    label: truncateText(String(candidate.label || candidate.name || '').trim(), 160),
     source: {
       stageId: String(stageSource.stageId || '').trim(),
       alias: String(stageSource.alias || '').trim(),
@@ -1631,8 +1634,8 @@ function diagramImportRoleMapping(role, existing = {}) {
       structuredFields: uniqueStrings(primary.structuredFields || ['Code', 'Description']),
       filters: Array.isArray(primary.filters) ? cloneJsonValueServer(primary.filters, []) : []
     },
-    related: (Array.isArray(source.related) ? source.related : []).map((item, index) => ({
-      id: String(item && item.id || diagramImportStableId('related', `${role.id}:${index}`)),
+    related: (Array.isArray(candidate.related) ? candidate.related : []).map((item, relatedIndex) => ({
+      id: String(item && item.id || diagramImportStableId('related', `${role.id}:${index}:${relatedIndex}`)),
       className: String(item && item.className || '').trim(),
       path: (Array.isArray(item && item.path) ? item.path : []).map((hop) => ({
         kind: String(hop && hop.kind || 'domain').trim(),
@@ -1644,6 +1647,43 @@ function diagramImportRoleMapping(role, existing = {}) {
       structuredFields: uniqueStrings(item && item.structuredFields || ['Code', 'Description'])
     })).filter((item) => item.className || item.path.length || item.structuredFields.length)
   };
+}
+
+function diagramImportRoleMapping(role, existing = {}) {
+  const source = existing && typeof existing === 'object' && !Array.isArray(existing) ? existing : {};
+  const mapping = {
+    id: String(source.id || diagramImportStableId('role_mapping', role.id)).trim(),
+    roleId: role.id,
+    ...diagramImportRoleMappingVariant(role, source)
+  };
+  const variants = Array.isArray(source.variants) ? source.variants.map((item, index) => diagramImportRoleMappingVariant(role, item, index + 1)) : [];
+  if (variants.length) mapping.variants = variants;
+  return mapping;
+}
+
+function diagramImportRoleMappingVariants(role) {
+  const mapping = role && role.mapping || {};
+  const variants = [mapping].concat(Array.isArray(mapping.variants) ? mapping.variants : []);
+  return variants.map((item, index) => diagramImportRoleMappingVariant(role, item, index));
+}
+
+function diagramImportContainerSignature(structure, key) {
+  const elements = structure && typeof structure === 'object' ? structure : {};
+  const all = (Array.isArray(elements.nodes) ? elements.nodes : []).concat(Array.isArray(elements.groups) ? elements.groups : []);
+  return all.filter((item) => String(item && item.parentKey || '') === String(key || '')).map((item) => ({
+    kind: Array.isArray(elements.groups) && elements.groups.some((group) => group && group.key === item.key) ? 'group' : 'node',
+    classes: uniqueStrings(item && item.classKeys || []).sort()
+  })).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+}
+
+function diagramImportRoleExemplar(role, structure) {
+  if (!role.exemplarRequired) return { key: role.exemplarKey || '', automatic: false };
+  const candidates = Array.isArray(role.containerKeys) ? role.containerKeys.filter(Boolean) : [];
+  if (!candidates.length) return { key: '', automatic: false };
+  const signatures = candidates.map((key) => JSON.stringify(diagramImportContainerSignature(structure, key)));
+  return signatures.every((signature) => signature === signatures[0])
+    ? { key: candidates[0], automatic: true }
+    : { key: '', automatic: false };
 }
 
 function diagramImportClassRoleDefinitions(ir) {
@@ -1706,16 +1746,19 @@ function diagramImportV3Unresolved(roles, relationRules = [], placementRules = [
     const semantic = normalizeDiagramImportSemantic(role.selectedSemantic);
     if (!semantic) unresolved.push({ id: role.id, family: 'roles', fields: ['semantic'] });
     if (role.exemplarRequired && !role.exemplarKey) unresolved.push({ id: role.id, family: 'roles', fields: ['exemplarKey'] });
-    const primary = role.mapping && role.mapping.primary || {};
-    const source = role.mapping && role.mapping.source || {};
-    if (semantic && semantic !== 'static' && !String(source.stageId || '').trim()) {
+    const mappings = diagramImportRoleMappingVariants(role);
+    if (semantic && semantic !== 'static' && !mappings.some((mapping) => String(mapping.source && mapping.source.stageId || '').trim())) {
       unresolved.push({ id: role.id, family: 'roles', fields: ['source.stageId'] });
     }
-    if (semantic === 'static' && primary.className && !source.stageId && !(Array.isArray(primary.filters) && primary.filters.length)) {
-      unresolved.push({ id: role.id, family: 'roles', fields: ['primary.filters'] });
-    }
-    for (const related of role.mapping && Array.isArray(role.mapping.related) ? role.mapping.related : []) {
-      if (!related.className || !related.path.length) unresolved.push({ id: related.id, family: 'related', fields: ['className', 'path'] });
+    for (const mapping of mappings) {
+      const primary = mapping.primary || {};
+      const source = mapping.source || {};
+      if (semantic === 'static' && primary.className && !source.stageId && !(Array.isArray(primary.filters) && primary.filters.length)) {
+        unresolved.push({ id: role.id, family: 'roles', fields: ['primary.filters'] });
+      }
+      for (const related of Array.isArray(mapping.related) ? mapping.related : []) {
+        if (!related.className || !related.path.length) unresolved.push({ id: related.id, family: 'related', fields: ['className', 'path'] });
+      }
     }
   }
   for (const rule of Array.isArray(relationRules) ? relationRules : []) {
@@ -1748,14 +1791,16 @@ function createDiagramImportProposal(currentSpec, ir, options = {}) {
   const previousMappings = new Map((Array.isArray(previousImport.roleMappings) ? previousImport.roleMappings : []).map((mapping) => [String(mapping.roleId || ''), mapping]));
   const roles = diagramImportClassRoleDefinitions(ir).map((role) => {
     const previousRole = previousRoles.get(role.id) || {};
+    const automaticExemplar = diagramImportRoleExemplar(role, ir.elements);
     const selectedSemantic = normalizeDiagramImportSemantic(previousRole.selectedSemantic) || (role.suggestedSemantic === 'object' || role.suggestedSemantic === 'static' ? role.suggestedSemantic : '');
     const exemplarKey = role.exemplarRequired
-      ? String(previousRole.exemplarKey || '').trim()
+      ? String(previousRole.exemplarKey || automaticExemplar.key || '').trim()
       : role.exemplarKey;
     return {
       ...role,
       selectedSemantic,
       exemplarKey,
+      exemplarAutomatic: automaticExemplar.automatic && !previousRole.exemplarKey,
       mapping: diagramImportRoleMapping(role, previousMappings.get(role.id))
     };
   });
@@ -2179,13 +2224,12 @@ function diagramImportCompileTraversal(options) {
   return { alias: from, steps, rootIdField, targetIdField, targetClass: currentClass };
 }
 
-function diagramImportCompileRole(role) {
+function diagramImportCompileRoleVariant(role, mapping, variantIndex = 0) {
   const semantic = normalizeDiagramImportSemantic(role.selectedSemantic);
-  const mapping = role.mapping || {};
   const source = mapping.source || {};
   const primary = mapping.primary || {};
   const steps = [];
-  const primaryAlias = String(source.alias || '').trim() || (primary.className ? diagramImportManagedAlias('d2_primary', role.id) : '');
+  const primaryAlias = String(source.alias || '').trim() || (primary.className ? diagramImportManagedAlias('d2_primary', `${role.id}:${variantIndex}`) : '');
   const relatedBindings = [];
   if (primaryAlias && !source.alias) {
     const columns = uniqueStrings(['Class', '_id', 'Code', 'Description', primary.idAttribute]
@@ -2230,7 +2274,7 @@ function diagramImportCompileRole(role) {
     styleHints: cloneJsonValueServer(role.styleHints, {})
   };
   const runtimeMapping = {
-    id: mapping.id,
+    id: variantIndex ? diagramImportStableId('mapping', `${mapping.id}:${variantIndex}`) : mapping.id,
     from: primaryAlias,
     fields: { id: primary.idAttribute || '_id', label: 'Description' },
     labelTemplate: primary.labelTemplate || '${Description}',
@@ -2280,6 +2324,17 @@ function diagramImportCompileRole(role) {
     runtimeMappings = [{ family, mapping: runtimeMapping }];
   }
   return { semantic, steps, primaryAlias, primaryStep: steps.find((step) => step.type === 'selectCards' && step.as === primaryAlias), runtimeMapping, runtimeMappings };
+}
+
+function diagramImportCompileRole(role) {
+  const variants = diagramImportRoleMappingVariants(role);
+  const compiled = variants.map((mapping, index) => diagramImportCompileRoleVariant(role, mapping, index));
+  const first = compiled[0] || { semantic: normalizeDiagramImportSemantic(role.selectedSemantic), steps: [], primaryAlias: '', primaryStep: null, runtimeMapping: {}, runtimeMappings: [] };
+  return {
+    ...first,
+    steps: compiled.flatMap((item) => item.steps),
+    runtimeMappings: compiled.flatMap((item) => item.runtimeMappings || [])
+  };
 }
 
 function diagramImportCompileRelationRule(rule, roleById, compiledByRoleId) {
@@ -2456,38 +2511,40 @@ function validateDiagramImportV3Catalog(proposal, catalog, currentSpec = {}) {
     return currentClass;
   };
   for (const [roleIndex, role] of (proposal.roles || []).entries()) {
-    const primary = role.mapping && role.mapping.primary || {};
-    const source = role.mapping && role.mapping.source || {};
-    const basePath = `$.roles[${roleIndex}].mapping`;
     const semantic = normalizeDiagramImportSemantic(role.selectedSemantic);
-    if (semantic && semantic !== 'static') {
-      const stage = stageById.get(String(source.stageId || ''));
-      if (!stage) {
-        errors.push({ path: `${basePath}.source.stageId`, message: `Object-flow stage ${source.stageId || '(empty)'} is not available in the current deterministic spec.` });
-      } else {
-        if (source.alias && String(source.alias) !== String(stage.alias)) errors.push({ path: `${basePath}.source.alias`, message: `Object-flow alias is derived from stage ${stage.id} and must be ${stage.alias}.` });
-        const available = new Set((stage.columns || []).map(String));
-        const fields = uniqueStrings([primary.idAttribute].concat(primary.structuredFields || []).concat(diagramTemplateFieldNames(primary.labelTemplate || '')))
-          .map((field) => String(field).replace(/^primary\./, ''));
-        for (const field of fields) {
-          if (field && !available.has(field)) errors.push({ path: `${basePath}.primary`, message: `Field ${field} is not materialized by object-flow stage ${stage.id}.` });
+    for (const [variantIndex, mapping] of diagramImportRoleMappingVariants(role).entries()) {
+      const primary = mapping.primary || {};
+      const source = mapping.source || {};
+      const basePath = `$.roles[${roleIndex}].mapping${variantIndex ? `.variants[${variantIndex - 1}]` : ''}`;
+      if (semantic && semantic !== 'static') {
+        const stage = stageById.get(String(source.stageId || ''));
+        if (!stage) {
+          errors.push({ path: `${basePath}.source.stageId`, message: `Object-flow stage ${source.stageId || '(empty)'} is not available in the current deterministic spec.` });
+        } else {
+          if (source.alias && String(source.alias) !== String(stage.alias)) errors.push({ path: `${basePath}.source.alias`, message: `Object-flow alias is derived from stage ${stage.id} and must be ${stage.alias}.` });
+          const available = new Set((stage.columns || []).map(String));
+          const fields = uniqueStrings([primary.idAttribute].concat(primary.structuredFields || []).concat(diagramTemplateFieldNames(primary.labelTemplate || '')))
+            .map((field) => String(field).replace(/^primary\./, ''));
+          for (const field of fields) {
+            if (field && !available.has(field)) errors.push({ path: `${basePath}.primary`, message: `Field ${field} is not materialized by object-flow stage ${stage.id}.` });
+          }
         }
       }
-    }
-    validateClass(primary.className, `${basePath}.primary.className`);
-    if (primary.className) {
-      for (const field of uniqueStrings([primary.idAttribute].concat(primary.structuredFields || []).concat(diagramTemplateFieldNames(primary.labelTemplate || '')))) {
-        const plain = String(field || '').replace(/^primary\./, '');
-        if (plain && !['_id', 'Code', 'Description', 'Class'].includes(plain) && !classAttribute(primary.className, plain)) {
-          errors.push({ path: `${basePath}.primary`, message: `Attribute ${primary.className}.${plain} is not readable.` });
+      validateClass(primary.className, `${basePath}.primary.className`);
+      if (primary.className) {
+        for (const field of uniqueStrings([primary.idAttribute].concat(primary.structuredFields || []).concat(diagramTemplateFieldNames(primary.labelTemplate || '')))) {
+          const plain = String(field || '').replace(/^primary\./, '');
+          if (plain && !['_id', 'Code', 'Description', 'Class'].includes(plain) && !classAttribute(primary.className, plain)) {
+            errors.push({ path: `${basePath}.primary`, message: `Attribute ${primary.className}.${plain} is not readable.` });
+          }
         }
       }
-    }
-    for (const [relatedIndex, related] of (role.mapping && role.mapping.related || []).entries()) {
-      validateClass(related.className, `${basePath}.related[${relatedIndex}].className`);
-      const resolved = validatePath(primary.className, related.path, `${basePath}.related[${relatedIndex}].path`);
-      if (related.className && resolved && resolved !== related.className) {
-        errors.push({ path: `${basePath}.related[${relatedIndex}].className`, message: `Relation path resolves to ${resolved}, not ${related.className}.` });
+      for (const [relatedIndex, related] of (mapping.related || []).entries()) {
+        validateClass(related.className, `${basePath}.related[${relatedIndex}].className`);
+        const resolved = validatePath(primary.className, related.path, `${basePath}.related[${relatedIndex}].path`);
+        if (related.className && resolved && resolved !== related.className) {
+          errors.push({ path: `${basePath}.related[${relatedIndex}].className`, message: `Relation path resolves to ${resolved}, not ${related.className}.` });
+        }
       }
     }
   }
@@ -2792,17 +2849,170 @@ async function analyzeD2ImportSource(source, currentSpec, options = {}) {
   };
 }
 
+async function d2ImportIrForRender(source) {
+  const result = await runD2ImportProcess(source);
+  if (!result.ok) return { ok: false, reason: result.reason || 'failed', error: result.error || 'D2 import failed.' };
+  let parsed;
+  try {
+    parsed = JSON.parse(result.stdout);
+  } catch {
+    return { ok: false, reason: 'invalid_output', error: 'D2 import helper returned invalid JSON.' };
+  }
+  const sourceErrors = parsed && parsed.source && Array.isArray(parsed.source.errors) ? parsed.source.errors : [];
+  if (sourceErrors.length) {
+    const first = sourceErrors[0] || {};
+    return { ok: false, reason: first.code || 'source_error', error: first.message || 'D2 import source is invalid.' };
+  }
+  try {
+    return { ok: true, ir: normalizeDiagramImportIr(parsed, source) };
+  } catch (error) {
+    return { ok: false, reason: error && error.code || 'normalize_error', error: error && error.message ? error.message : String(error) };
+  }
+}
+
+function d2MarkdownFrameColor(value) {
+  const color = String(value || '').trim();
+  return /^(?:#[0-9a-f]{3,8}|[a-z]{1,32}|(?:rgb|rgba|hsl|hsla)\([0-9.%\s,]+\))$/i.test(color) ? color : '';
+}
+
+function d2MarkdownFrameNumber(value, max = 10_000) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 && number <= max ? String(number) : '';
+}
+
+function d2MarkdownFrameAttributes(style) {
+  const source = style && typeof style === 'object' && !Array.isArray(style) ? style : {};
+  const fill = d2MarkdownFrameColor(source.fill);
+  const stroke = d2MarkdownFrameColor(source.stroke);
+  if (!fill && !stroke) return '';
+  const attributes = ['data-cmdp-d2-markdown-frame="true"'];
+  attributes.push(`fill="${fill || 'none'}"`);
+  attributes.push(`stroke="${stroke || 'none'}"`);
+  const strokeWidth = d2MarkdownFrameNumber(source['stroke-width'], 100);
+  if (strokeWidth) attributes.push(`stroke-width="${strokeWidth}"`);
+  const radius = d2MarkdownFrameNumber(source['border-radius']);
+  if (radius) attributes.push(`rx="${radius}"`);
+  const dash = d2MarkdownFrameNumber(source['stroke-dash']);
+  if (dash && stroke) {
+    const dashLength = Number(dash) * 2;
+    attributes.push(`stroke-dasharray="${dashLength},${dashLength}"`);
+  }
+  return attributes.join(' ');
+}
+
+function d2SvgNumericAttributes(rawAttributes) {
+  const source = String(rawAttributes || '');
+  const values = {};
+  for (const name of ['x', 'y', 'width', 'height']) {
+    const match = source.match(new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i'));
+    const value = String(match && (match[1] || match[2] || match[3]) || '');
+    if (!/^-?\d+(?:\.\d+)?$/.test(value)) return null;
+    values[name] = value;
+  }
+  return Number(values.width) > 0 && Number(values.height) > 0 ? values : null;
+}
+
+function escapeD2SvgRegex(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function decorateD2MarkdownFrames(svg, importIr) {
+  const nodes = importIr && importIr.elements && Array.isArray(importIr.elements.nodes) ? importIr.elements.nodes : [];
+  let output = String(svg || '');
+  let decorated = 0;
+  for (const node of nodes) {
+    const shape = String(node && node.styleHints && node.styleHints.shape || node && node.kind || '').toLowerCase();
+    const frameAttributes = d2MarkdownFrameAttributes(node && node.styleHints && node.styleHints.style);
+    if (shape !== 'text' || !frameAttributes || !node || !node.key) continue;
+    const encodedKey = Buffer.from(String(node.key), 'utf8').toString('base64');
+    const token = escapeD2SvgRegex(encodedKey);
+    const pattern = new RegExp(
+      `(<g\\b(?=[^>]*\\bclass\\s*=\\s*(?:"[^"]*${token}[^"]*"|'[^']*${token}[^']*'))[^>]*>\\s*<g\\b(?=[^>]*\\bclass\\s*=\\s*(?:"[^"]*\\bshape\\b[^"]*"|'[^']*\\bshape\\b[^']*'))[^>]*>)\\s*</g>(\\s*<g>\\s*<foreignObject\\b([^>]*)>[\\s\\S]*?</foreignObject>\\s*</g>\\s*</g>)`,
+      'i'
+    );
+    output = output.replace(pattern, (match, shapeOpen, tail, foreignObjectAttributes) => {
+      if (match.includes('data-cmdp-d2-markdown-frame=')) return match;
+      const bounds = d2SvgNumericAttributes(foreignObjectAttributes);
+      if (!bounds) return match;
+      decorated += 1;
+      return `${shapeOpen}<rect ${frameAttributes} x="${bounds.x}" y="${bounds.y}" width="${bounds.width}" height="${bounds.height}" /></g>${tail}`;
+    });
+  }
+  return { content: output, decorated };
+}
+
+function d2SvgStyleIsSafe(value) {
+  const css = String(value || '');
+  if (!css || /<\/?(?:style|script|iframe|object|embed)\b|@import|expression\s*\(|behavior\s*:|javascript\s*:|vbscript\s*:/i.test(css)) {
+    return false;
+  }
+  const urls = css.matchAll(/url\(\s*(['"]?)(.*?)\1\s*\)/gi);
+  for (const match of urls) {
+    const reference = String(match[2] || '').trim();
+    if (!reference.startsWith('#') && !/^data:application\/font-woff(?:2)?;base64,[a-z0-9+/=]+$/i.test(reference)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function sanitizeD2SvgStyles(svg, allowD2Content) {
+  return String(svg || '').replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gi, (_match, content) => (
+    allowD2Content && d2SvgStyleIsSafe(content) ? `<style type="text/css">${content}</style>` : ''
+  ));
+}
+
+function d2MarkdownAttributes(tag, rawAttributes) {
+  const attributes = String(rawAttributes || '');
+  const result = [];
+  const classMatch = attributes.match(/\bclass\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i);
+  const className = String(classMatch?.[1] || classMatch?.[2] || classMatch?.[3] || '').trim();
+  if (className && /^[A-Za-z0-9_ -]{1,512}$/.test(className)) result.push(`class="${className}"`);
+  if (tag === 'div' && /\bxmlns\s*=\s*(?:"http:\/\/www\.w3\.org\/1999\/xhtml"|'http:\/\/www\.w3\.org\/1999\/xhtml')/i.test(attributes)) {
+    result.push('xmlns="http://www.w3.org/1999/xhtml"');
+  }
+  return result.length ? ` ${result.join(' ')}` : '';
+}
+
+function sanitizeD2MarkdownHtml(value) {
+  const allowedTags = new Set(['a', 'b', 'br', 'code', 'div', 'em', 'i', 'kbd', 'li', 'ol', 'p', 'pre', 's', 'span', 'strong', 'ul']);
+  return String(value || '')
+    .replace(/<(script|style|iframe|object|embed|svg|math)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '')
+    .replace(/<\/?([A-Za-z][A-Za-z0-9:-]*)\b([^>]*)>/g, (match, rawTag, rawAttributes) => {
+      const tag = String(rawTag || '').toLowerCase();
+      if (!allowedTags.has(tag)) return '';
+      if (match.startsWith('</')) return `</${tag}>`;
+      return `<${tag}${d2MarkdownAttributes(tag, rawAttributes)}>`;
+    });
+}
+
+function sanitizeD2ForeignObjects(svg, allowD2Content) {
+  return String(svg || '').replace(/<foreignObject\b([^>]*)>([\s\S]*?)<\/foreignObject>/gi, (_match, rawAttributes, content) => {
+    if (!allowD2Content) return '';
+    const attributes = String(rawAttributes || '');
+    const values = [];
+    for (const name of ['x', 'y', 'width', 'height']) {
+      const attribute = attributes.match(new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i'));
+      const value = String(attribute?.[1] || attribute?.[2] || attribute?.[3] || '');
+      if (value && /^-?\d+(?:\.\d+)?$/.test(value)) values.push(`${name}="${value}"`);
+    }
+    if (values.length !== 4) return '';
+    return `<foreignObject ${values.join(' ')}>${sanitizeD2MarkdownHtml(content)}</foreignObject>`;
+  });
+}
+
 function sanitizeD2Svg(svg) {
   const text = String(svg || '');
   const start = text.search(/<svg[\s>]/i);
   const end = text.toLowerCase().lastIndexOf('</svg>');
   if (start < 0 || end < start) return '';
   let sanitized = text.slice(start, end + '</svg>'.length);
+  const allowD2Content = /^<svg\b[^>]*\bdata-d2-version\s*=\s*(?:"[^"]+"|'[^']+'|[^\s>]+)/i.test(sanitized);
   sanitized = sanitized.replace(/<\?xml[\s\S]*?\?>/gi, '');
   sanitized = sanitized.replace(/<!doctype[\s\S]*?>/gi, '');
   sanitized = sanitized.replace(/<script\b[\s\S]*?<\/script>/gi, '');
-  sanitized = sanitized.replace(/<(iframe|object|embed|foreignObject|style|animate|animateMotion|animateTransform|set|image|use|feImage)\b[\s\S]*?<\/\1>/gi, '');
-  sanitized = sanitized.replace(/<(iframe|object|embed|foreignObject|style|animate|animateMotion|animateTransform|set|image|use|feImage)\b[^>]*\/?>/gi, '');
+  sanitized = sanitized.replace(/<(iframe|object|embed|animate|animateMotion|animateTransform|set|image|use|feImage)\b[\s\S]*?<\/\1>/gi, '');
+  sanitized = sanitized.replace(/<(iframe|object|embed|animate|animateMotion|animateTransform|set|image|use|feImage)\b[^>]*\/?>/gi, '');
   sanitized = sanitized.replace(/\s+on[a-z]+\s*=\s*"[^"]*"/gi, '');
   sanitized = sanitized.replace(/\s+on[a-z]+\s*=\s*'[^']*'/gi, '');
   sanitized = sanitized.replace(/\s+on[a-z]+\s*=\s*[^\s>]+/gi, '');
@@ -2812,6 +3022,9 @@ function sanitizeD2Svg(svg) {
   sanitized = sanitized.replace(/\s+style\s*=\s*"[^"]*(?:url\s*\(|expression\s*\(|@import)[^"]*"/gi, '');
   sanitized = sanitized.replace(/\s+style\s*=\s*'[^']*(?:url\s*\(|expression\s*\(|@import)[^']*'/gi, '');
   sanitized = sanitized.replace(/\s+style\s*=\s*[^\s>]*(?:url\s*\(|expression\s*\(|@import)[^\s>]*/gi, '');
+  sanitized = sanitizeD2SvgStyles(sanitized, allowD2Content);
+  sanitized = sanitizeD2ForeignObjects(sanitized, allowD2Content);
+  sanitized = sanitized.replace(/<(?:foreignObject|style)\b[^>]*\/\s*>/gi, '');
   if (!/data-cmdp-d2-rendered=/.test(sanitized)) {
     sanitized = sanitized.replace(/<svg\b/i, '<svg data-cmdp-d2-rendered="true"');
   }
@@ -2858,7 +3071,26 @@ async function renderD2SourceToSvg(source, diagram = {}) {
     });
   }
 
-  const content = sanitizeD2Svg(result.stdout);
+  let renderedSvg = result.stdout;
+  if (/<foreignObject\b/i.test(renderedSvg)) {
+    const imported = await d2ImportIrForRender(d2Source);
+    if (!imported.ok) {
+      incMetric('cmdp_d2_render_errors_total', { reason: 'markdown_frame_import' });
+      logWarn('d2.markdown_frame_import_failed', {
+        requestId: currentRequestId(),
+        reason: imported.reason,
+        elapsedMs: result.elapsedMs,
+        inputBytes
+      });
+      return d2RenderError('markdown_frame_import', `D2 Markdown frame preparation failed: ${imported.error}`, {
+        layout,
+        inputBytes
+      });
+    }
+    renderedSvg = decorateD2MarkdownFrames(renderedSvg, imported.ir).content;
+  }
+
+  const content = sanitizeD2Svg(renderedSvg);
   if (!content) {
     incMetric('cmdp_d2_render_errors_total', { reason: 'invalid_svg' });
     return d2RenderError('invalid_svg', 'D2 renderer did not return a valid SVG document.', {
@@ -3956,7 +4188,7 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     .visual-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.visual-grid label{min-width:0}.visual-grid input,.visual-grid select{width:100%}.diagram-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.diagram-grid label{min-width:0}.diagram-grid input,.diagram-grid select{width:100%;min-width:0}.diagram-editor-sections{display:grid;gap:12px}.diagram-editor-block{display:grid;gap:8px;border-top:1px solid var(--line);padding-top:10px}.diagram-editor-block:first-child{border-top:0;padding-top:0}.diagram-editor-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.diagram-editor-block h4{margin:0;color:#334e68;font-size:12px}.diagram-mapping-table{table-layout:fixed}.diagram-mapping-table th,.diagram-mapping-table td{overflow-wrap:break-word}.diagram-mapping-table select,.diagram-mapping-table input{width:100%;min-width:0}.diagram-mapping-table select[multiple]{min-height:70px}.diagram-mapping-table .diagram-action-cell{width:44px;text-align:right}.diagram-mapping-detail-cell{background:#fbfdff}.diagram-mapping-detail{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;align-items:end}.diagram-mapping-detail label{min-width:0}.diagram-template-field{grid-column:span 2}.diagram-template-suggestions,.diagram-derived-fields{display:grid;gap:4px;align-self:start}.diagram-token-list{display:flex;gap:4px;flex-wrap:wrap}.diagram-token-button,.diagram-token-pill{display:inline-flex;align-items:center;max-width:180px;border:1px solid var(--line);border-radius:999px;padding:2px 7px;background:#fff;color:#334e68;font-size:12px;line-height:1.35;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.diagram-token-button{cursor:pointer}.diagram-token-button:hover{border-color:#9fb3c8;background:#f8fafc}.diagram-add-button{min-width:32px;padding:4px 8px;font-weight:700}.segmented-control{display:inline-flex;align-items:center;gap:0;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}.segmented-control label{margin:0;display:inline-flex;align-items:center;min-height:32px;padding:0 10px;border-right:1px solid var(--line);font-size:13px;cursor:pointer}.segmented-control label:last-child{border-right:0}.segmented-control input{position:absolute;opacity:0;pointer-events:none}.segmented-control label:has(input:checked){background:#e6f4f1;color:#07575b;font-weight:700}.assistant-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr);gap:12px}.assistant-status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.assistant-draft-preview pre{max-height:360px;overflow:auto}.assistant-busy{display:grid;gap:6px;border:1px solid #b7d8d4;background:#f2faf8;padding:8px 10px;margin:0 0 10px}.assistant-busy-head{display:flex;align-items:center;gap:8px;justify-content:space-between;flex-wrap:wrap}.assistant-busy-title{display:inline-flex;align-items:center;gap:8px;font-weight:700;color:#07575b}.assistant-busy-spinner{width:14px;height:14px;border:2px solid #b7d8d4;border-top-color:#236c91;border-radius:50%;animation:cmdp-spin .8s linear infinite}.assistant-busy-elapsed{font-variant-numeric:tabular-nums;color:#334e68;font-size:12px}.assistant-draft-preview[aria-busy="true"]{position:relative}button[disabled]{opacity:.58;cursor:not-allowed}@media(max-width:1100px){.assistant-grid{grid-template-columns:1fr}}.visualization-table{table-layout:fixed}.visualization-table th,.visualization-table td{overflow-wrap:anywhere}.visualization-table th:nth-child(1){width:30%}.visualization-table th:nth-child(2){width:14%}.visualization-table th:nth-child(3){width:15%}.visualization-table th:nth-child(4){width:26%}.visualization-table th:nth-child(5){width:15%}.visualization-table input,.visualization-table select{width:100%;min-width:0}.visualization-link-table{table-layout:fixed}.visualization-link-table th,.visualization-link-table td{overflow-wrap:anywhere}.visualization-link-table input,.visualization-link-table select{width:100%;min-width:0}.visual-row-groups{margin-top:10px;display:grid;gap:6px}.visual-row-group{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.visual-row-group label{flex:1 1 240px;min-width:0}.visual-row-group select{width:100%;min-width:0}.result-table-wrap{margin-top:8px}.result-table-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:6px;min-height:30px;margin:0 0 2px}.result-table-header{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 4px;min-height:30px;flex-wrap:wrap}.result-table-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex:0 0 auto;flex-wrap:wrap;min-width:30px}.cmdp-d2-svg{overflow:auto;background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:6px}.cmdp-d2-svg svg{max-width:100%;height:auto;display:block}.result-table-filter{width:240px;max-width:min(52vw,320px);height:30px;padding:4px 7px}.runtime-cache-control{position:relative;display:inline-flex;align-items:center}.runtime-cache-button{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;font-size:18px;line-height:1}.runtime-cache-button[data-disabled="true"]{opacity:.55;cursor:default}.runtime-cache-button.refreshing{animation:cmdp-spin 1s linear infinite}.runtime-cache-tooltip{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:50;min-width:250px;max-width:min(86vw,420px);padding:8px 10px;border:1px solid var(--line);background:#1f2933;color:#fff;box-shadow:0 8px 22px rgba(15,23,42,.18);font-size:12px;line-height:1.35;text-align:left}.runtime-cache-tooltip span{display:block;white-space:nowrap}.runtime-cache-control:hover .runtime-cache-tooltip,.runtime-cache-control:focus-within .runtime-cache-tooltip{display:block}.runtime-notice-shell{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin:0 0 8px}.runtime-notice-shell .notice{flex:1 1 auto;min-width:160px;overflow-wrap:normal;word-break:normal}.runtime-notice-actions{display:flex;justify-content:flex-end;flex:0 0 auto}.result-table-title{display:flex;align-items:center;gap:8px;flex:1 1 16rem;flex-wrap:wrap;min-width:160px;margin:0}.result-table-title h3{margin:0;font-size:13px;overflow-wrap:normal;word-break:normal;white-space:normal}.result-subtitle{font-size:12px;color:var(--muted);margin:10px 0 4px}.table-sort{border:0;background:transparent;padding:0;color:inherit;font:inherit;text-align:left}.table-sort:after{content:" ↕";font-size:10px;color:var(--muted)}.cmdp-density-compact th,.cmdp-density-compact td{padding:4px 6px}.cmdp-font-small{font-size:12px}.cmdp-font-normal{font-size:13px}.cmdp-font-large{font-size:15px}.cmdp-zebra tbody tr:nth-child(even) td{background:#fbfdff}.cmdp-row-group-cell{background:#f8fafc;font-weight:600;vertical-align:top}@media(max-width:700px){.diagram-template-field{grid-column:span 1}}@media(max-width:420px){.result-table-title{flex-basis:100%;min-width:0}.runtime-notice-shell .notice{min-width:0}}@keyframes cmdp-spin{to{transform:rotate(360deg)}}
     .diagram-import-shell{display:grid;gap:8px;border:1px solid var(--line);padding:10px;background:#fbfdff}.diagram-import-source{width:100%;min-height:140px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.diagram-import-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.diagram-import-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:6px}.diagram-import-shell>.table-wrap{max-width:100%;overflow-x:auto}.diagram-import-binding-table{table-layout:fixed;min-width:900px}.diagram-import-binding-table th,.diagram-import-binding-table td{overflow-wrap:normal;word-break:normal}.diagram-import-binding-table select,.diagram-import-binding-table input{width:100%;min-width:0}.diagram-import-status{font-size:12px;font-weight:700}.diagram-import-status.ready{color:var(--ok)}.diagram-import-status.unresolved,.diagram-import-status.ambiguous{color:var(--warn)}.diagram-import-status.inactive{color:var(--muted)}.diagram-import-preview{min-width:0}.diagram-import-preview-canvas{display:grid;place-items:center;min-height:240px;border:1px solid var(--line);background:#fff;padding:8px;overflow:auto}.diagram-import-preview-canvas>.cmdp-d2-svg{width:100%;min-height:220px;margin:0}.diagram-import-preview[data-diagram-import-preview-state="stale"] .diagram-import-preview-canvas{background:#fffdf5;border-color:#e5c36e}.diagram-import-preview[data-diagram-import-preview-state="loading"] .diagram-import-preview-canvas{background:#f2faf8}.diagram-import-preview[data-diagram-import-preview-state="error"] .diagram-import-preview-canvas{background:#fff7f5;border-color:#f0b8b0}
     .cmdp-diagram-viewport{display:grid;gap:6px;min-width:0}.cmdp-diagram-viewport-controls{display:flex;align-items:center;justify-content:flex-end;gap:4px;min-height:30px}.cmdp-diagram-viewport-button{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;font-size:16px;line-height:1}.cmdp-diagram-viewport-reset{min-width:52px;width:auto;padding:0 7px;font-size:12px;font-variant-numeric:tabular-nums}.cmdp-diagram-viewport-scale{min-width:42px;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums;text-align:right}.cmdp-diagram-viewport-canvas{min-width:0;min-height:220px;max-height:70vh;overflow:auto;touch-action:none;cursor:grab;background:#fff;border:1px solid #e5e7eb;border-radius:8px}.cmdp-diagram-viewport-canvas.is-panning{cursor:grabbing;user-select:none}.cmdp-diagram-viewport-stage{position:relative;min-width:1px;min-height:1px}.cmdp-diagram-viewport-content{display:inline-block;transform-origin:0 0}.cmdp-diagram-viewport-content .cmdp-d2-svg{overflow:visible;margin:0}.cmdp-diagram-viewport-content .cmdp-d2-svg svg{max-width:none!important;height:auto;display:block}.diagram-import-preview-canvas>.cmdp-diagram-viewport{width:100%;min-height:220px}.diagram-import-preview-canvas .cmdp-diagram-viewport-canvas{min-height:220px}
-    .assistant-flow-stage,.assistant-d2-prompt,#cmdp-assistant-object-flow{display:grid;gap:8px}.assistant-flow-stage textarea,.assistant-d2-prompt textarea,#cmdp-assistant-object-flow textarea{width:100%;min-height:112px}.assistant-flow-business-block{border:1px solid var(--line);background:#fff;padding:8px}.assistant-flow-drag-handle{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;cursor:grab;font-size:16px;line-height:1}.assistant-flow-business-block.is-dragging{opacity:.55}.assistant-flow-business-block.is-drop-target{border-color:#236c91;background:#f2faf8}.assistant-flow-business-details{min-width:0}.assistant-flow-business-details>summary{display:flex;align-items:center;gap:8px;min-height:30px;cursor:pointer;list-style:none}.assistant-flow-business-details>summary::-webkit-details-marker{display:none}.assistant-flow-disclosure{flex:0 0 12px;color:var(--muted);font-weight:700;text-align:center}.assistant-flow-disclosure:before{content:'>'}.assistant-flow-business-details[open] .assistant-flow-disclosure:before{content:'v'}.assistant-flow-business-summary{display:flex;align-items:baseline;gap:8px;min-width:0;flex:1 1 auto}.assistant-flow-business-summary strong{font-size:12px;color:#334e68;white-space:nowrap}.assistant-flow-business-summary-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}.assistant-flow-business-fields{display:grid;gap:8px;padding:10px 0 2px}.assistant-flow-business-actions{display:flex;justify-content:flex-end;padding-top:2px}.assistant-flow-business-block select[multiple]{min-height:72px}.assistant-flow-candidate-control{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.assistant-flow-candidate-control input{width:auto;margin:0}.notice.warning{border-color:#e5c36e;background:#fffdf5}.assistant-flow-preview-params{display:grid;gap:8px;border-top:1px solid var(--line);padding-top:10px}.assistant-flow-preview-params h4{margin:0}.assistant-flow-preview-stage{display:grid;gap:8px;border-top:1px solid var(--line);padding:8px 0}.assistant-flow-preview-stage:first-of-type{border-top:0}.assistant-flow-preview-stage summary{cursor:pointer;display:flex;justify-content:space-between;gap:8px;align-items:baseline;flex-wrap:wrap}.assistant-flow-preview-stage .table-wrap{max-width:100%;overflow:auto}
+    .assistant-flow-stage,.assistant-d2-prompt,#cmdp-assistant-object-flow{display:grid;gap:8px}.assistant-flow-stage textarea,.assistant-d2-prompt textarea,#cmdp-assistant-object-flow textarea{width:100%;min-height:112px}.assistant-flow-business-block{border:1px solid var(--line);background:#fff;padding:8px}.assistant-flow-drag-handle{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;cursor:grab;font-size:16px;line-height:1}.assistant-flow-business-block.is-dragging{opacity:.55}.assistant-flow-business-block.is-drop-target{border-color:#236c91;background:#f2faf8}.assistant-flow-business-details{min-width:0}.assistant-flow-business-details>summary{display:flex;align-items:center;gap:8px;min-height:30px;cursor:pointer;list-style:none}.assistant-flow-business-details>summary::-webkit-details-marker{display:none}.assistant-flow-disclosure{flex:0 0 12px;color:var(--muted);font-weight:700;text-align:center}.assistant-flow-disclosure:before{content:'>'}.assistant-flow-business-details[open] .assistant-flow-disclosure:before{content:'v'}.assistant-flow-business-summary{display:flex;align-items:baseline;gap:8px;min-width:0;flex:1 1 auto}.assistant-flow-business-summary strong{font-size:12px;color:#334e68;white-space:nowrap}.assistant-flow-business-summary-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}.assistant-flow-business-fields{display:grid;gap:8px;padding:10px 0 2px}.assistant-flow-business-actions{display:flex;justify-content:flex-end;padding-top:2px}.assistant-flow-business-block select[multiple]{min-height:72px}.assistant-flow-candidate-control{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.assistant-flow-candidate-control input{width:auto;margin:0}.notice.warning{border-color:#e5c36e;background:#fffdf5}
     .cmdp-html-result{display:block}.cmdp-build-view{display:grid;gap:10px}.cmdp-build-toolbar{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border-bottom:1px solid var(--line);padding-bottom:6px}.cmdp-build-toolbar-main{display:grid;gap:5px;min-width:0}.cmdp-build-summary,.cmdp-build-nav{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.cmdp-build-nav a{color:var(--accent);text-decoration:none;font-size:12px}.cmdp-build-search{flex:0 0 260px;max-width:min(42vw,320px)}.cmdp-build-section{display:grid;gap:8px}.cmdp-build-section h2{font-size:15px;margin:8px 0 0}.cmdp-build-panel{border:1px solid var(--line);background:#fff;margin:0 0 8px}.cmdp-build-panel>summary{cursor:pointer;display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 10px;background:#fbfdff}.cmdp-build-title{font-weight:700}.cmdp-build-panel .table-wrap{border:0;border-top:1px solid var(--line)}.cmdp-build-table{width:100%;table-layout:auto}.cmdp-build-table th,.cmdp-build-table td{vertical-align:top}.cmdp-build-related,.cmdp-build-links{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:8px 10px}.cmdp-build-related a,.cmdp-build-links a{color:var(--accent);text-decoration:none}
     .settings-block{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}.settings-block:first-of-type{border-top:0;margin-top:0;padding-top:0}.settings-block h3{margin:0 0 8px}.settings-block h4{margin:0 0 7px;font-size:12px;color:#334e68}.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}.settings-grid label{display:grid;gap:4px;color:var(--muted);font-size:12px;min-width:0}.settings-grid input,.settings-grid select{width:100%;min-width:0}.checkbox-list{display:grid;gap:8px}.checkbox-stacked{align-items:flex-start!important}.checkbox-stacked>span{display:grid;gap:2px}.checkbox-stacked strong{font-size:12px;color:var(--text)}.visual-table-list{display:grid;gap:12px}.visual-table-panel{border:1px solid var(--line);background:#fbfdff;padding:10px}.visual-table-heading{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px}.visual-table-heading h3{margin:0}.visual-table-subblock{border-top:1px solid #e4e9f0;padding-top:9px;margin-top:9px}.run-param-list{display:grid;gap:8px}.run-param-row{display:grid;grid-template-columns:minmax(180px,1fr) minmax(220px,1.4fr);gap:10px;align-items:start;border:1px solid var(--line);background:#fbfdff;padding:8px}.run-param-main{display:grid;gap:3px;min-width:0}.run-param-main strong{font-size:13px}.run-param-meta{font-size:12px;color:var(--muted)}.run-param-value label{display:grid;gap:4px;color:var(--muted);font-size:12px}.run-param-value input,.run-param-value select{width:100%}.run-action-grid{display:grid;grid-template-columns:minmax(220px,max-content) minmax(280px,1fr);gap:10px;align-items:start}.run-action-buttons{display:flex;gap:8px;flex-wrap:wrap}
     @media(max-width:1100px){.designer-menu{position:static;width:auto;overflow:visible;margin-bottom:12px}.designer-main{margin-left:0}.menu-groups{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}.menu-links{display:flex;flex-wrap:wrap}}
@@ -4058,6 +4290,8 @@ function dynamicPagesClientScript() {
       menuObjectGroup: 'Object group',
       menuRelations: 'Object matching',
       menuFinalView: 'Final data',
+      menuAssistantGroups: 'Group and matching assistant',
+      menuDiagramAssistant: 'Diagram assistant',
       menuDiagram: 'Diagram editor',
       menuPublication: 'Publication',
       menuSchema: 'Schema',
@@ -4085,6 +4319,11 @@ function dynamicPagesClientScript() {
       runtimeMaxRowsPreviewDefaultHelp: 'Default row limit for draft preview and test runs.',
       runtimeMaxRowsMax: 'Maximum rows',
       runtimeMaxRowsMaxHelp: 'Upper cap for rows returned by one execution.',
+      runtimeMaxSelectionScanRowsDefault: 'Default selection scan rows',
+      runtimeMaxSelectionScanRowsDefaultHelp: 'Maximum cards inspected for a filtered selection before the result is marked incomplete.',
+      runtimeMaxSelectionScanRowsMax: 'Maximum selection scan rows',
+      runtimeMaxSelectionScanRowsMaxHelp: 'Upper cap for cards inspected by one filtered selection.',
+      selectionScanLimitReached: 'Selection {alias} inspected {scannedRows} of {availableTotal} {className} cards (scan limit {scanLimit}). Results may be incomplete.',
       runtimeMaxClassesDefault: 'Default classes',
       runtimeMaxClassesDefaultHelp: 'Default number of CMDBuild classes read by model-scanning operations.',
       runtimeMaxClassesMax: 'Maximum classes',
@@ -4111,7 +4350,7 @@ function dynamicPagesClientScript() {
       templateKindDsl: 'Dynamic data template',
       templateKindCmdbBuildView: 'CMDBuild model view',
       templateKindHelp: 'CMDBuild model view uses a built-in renderer and does not use the ordinary selection/matching DSL.',
-      menuCmdbBuildView: 'CMDBuild model view',
+      menuCmdbBuildView: 'Отчет по модели данных CMDB',
       cmdbBuildViewEditor: 'CMDBuild model view',
       cmdbBuildViewHelp: 'Special template that renders CMDBuild classes, attributes, domains, and lookups with the current user rights or as a published snapshot.',
       cmdbBuildViewLanguage: 'Language',
@@ -4199,16 +4438,17 @@ function dynamicPagesClientScript() {
       assistantFlowDependencies: 'Uses results of blocks',
       assistantFlowAlgorithm: 'Algorithm',
       assistantFlowExpectedResult: 'Expected result',
-      assistantFlowExtractionCandidate: 'Extraction candidate',
-      assistantFlowExtractionCandidateHelp: 'Uses this result as the default source in Extraction. It does not publish the table.',
-      assistantFlowExtractionCandidateOption: '{label} (extraction candidate)',
-      assistantFlowExtractionCandidateUnresolved: 'The extraction candidate has no resolved deterministic result yet. Generate and apply the data flow first.',
       assistantFlowOutputManifestInvalid: 'Assistant result labels are incomplete. Generate and apply the data flow again before using Extraction.',
       assistantFlowOwnershipIncomplete: 'The data flow cannot be applied because Assistant result ownership is incomplete.',
       assistantFlowOwnershipIncompleteAction: 'Regenerate the flow so every named data block resolves to one deterministic result.',
+      assistantFlowOwnershipMissing: 'Block "{name}" has no unique deterministic result. Available results: {aliases}.',
+      assistantFlowOwnershipDuplicate: 'Block "{name}" resolves to "{alias}", which is already assigned to another block.',
+      assistantFlowOwnershipFinal: 'The final block "{name}" must use the published result "{alias}".',
+      assistantFlowOwnershipUnowned: 'Intermediate result "{alias}" is not assigned to a named data block.',
+      assistantFlowOwnershipActionSpecific: 'Correct the named data block shown above and form the flow again.',
+      assistantFlowOwnershipNoAlias: 'none',
       assistantFlowDuplicateBlockName: 'Data block name "{name}" must be unique.',
       assistantFlowDuplicateBlockNameAction: 'Rename duplicate data blocks before preparing the semantic plan.',
-      assistantFlowExtractionCandidateNone: 'No extraction candidate',
       assistantFlowRemoveBlock: 'Remove data block',
       assistantFlowAddBlock: 'Add data block',
       assistantPrepareSemanticPlan: 'Prepare semantic plan',
@@ -4221,6 +4461,8 @@ function dynamicPagesClientScript() {
       assistantFlowPlanRetryReady: 'CMDB context and the semantic plan were saved. Retry will generate only the deterministic flow draft.',
       assistantFlowPlanRetryGateway: 'The reverse proxy ended the request before the backend diagnostic response. CMDB context and the semantic plan were saved; retry will generate only the flow draft.',
       assistantSemanticPlanReady: 'Semantic plan is ready for review.',
+      assistantSemanticPlanNeedsClarification: 'Semantic plan needs clarification before flow generation.',
+      assistantFlowBlockedByUnresolved: 'Data flow cannot be generated until these blocks are clarified:',
       assistantSemanticPlanRejected: 'Semantic plan was rejected.',
       assistantFlowDragBlock: 'Drag to reorder',
       assistantFlowVisualOrderWarning: 'The visual order does not match selected block dependencies. The Assistant will plan execution from dependencies.',
@@ -4244,12 +4486,6 @@ function dynamicPagesClientScript() {
       assistantFlowAffectedStages: 'Affected stages',
       assistantFlowWhatToFix: 'What to fix',
       assistantFlowTechnicalDetails: 'Technical details',
-      assistantFlowPreview: 'Check data',
-      assistantFlowPreviewTitle: 'Data check',
-      assistantFlowPreviewParams: 'Check parameters',
-      assistantFlowPreviewReady: 'Data check completed. The draft was not changed.',
-      assistantFlowPreviewHelp: 'The generated flow is executed read-only with the current parameters. Intermediate rows are limited by the configured preview limit.',
-      assistantFlowPreviewTruncated: 'The configured preview row limit was reached. Results may be incomplete.',
       assistantFlowValidationErrors: 'Validation errors',
       assistantFlowAvailableAliases: 'Available earlier aliases',
       assistantFlowValidRelationPaths: 'Confirmed CMDBuild relation paths',
@@ -4265,8 +4501,8 @@ function dynamicPagesClientScript() {
       assistantGenerateMatching: 'Suggest matching rule',
       assistantAddStage: 'Add matching rule and selection',
       assistantRemoveStage: 'Remove stage',
-      assistantApplyFlow: 'Apply data flow to draft',
-      assistantFlowApplied: 'Deterministic data flow was applied to the current draft.',
+      assistantApplyFlow: 'Apply data flow',
+      assistantFlowApplied: 'Deterministic data flow was applied and saved.',
       assistantIntermediateStage: 'Intermediate result',
       existsRelatedOperation: 'Related-object matching {number}',
       addExistsRelatedOperation: 'Add relation matching',
@@ -4284,6 +4520,7 @@ function dynamicPagesClientScript() {
       assistantDiagramMap: 'Suggest mapping',
       assistantDiagramAnalysisRequired: 'Analyze D2 deterministically first.',
       assistantProposalOnly: 'Assistant output is a proposal. Review it and apply explicitly.',
+      assistantSaveDraft: 'Save Assistant draft',
       diagramImportedStatus: 'Imported D2 status',
       diagramEditInAssistant: 'Edit D2 import in Assistant',
       assistantStatusTitle: 'Assistant status',
@@ -4402,6 +4639,8 @@ function dynamicPagesClientScript() {
       extractionApplied: 'Extraction step applied to Spec JSON.',
       extractionPreviewReady: 'Extraction preview is ready.',
       extractionCompleted: 'Template extraction completed.',
+      extractionPublishSelected: 'Publish selected table',
+      extractionPublishedSelected: 'Published table selection applied to the draft.',
       extractionSelectedSourceEmpty: 'Selected extraction source {selected} returned 0 rows; {source} has {rows} rows.',
       extractionNeedsSource: 'Extraction source parameter is required.',
       extractionNeedsRegex: 'Extraction regular expression is required.',
@@ -4455,6 +4694,7 @@ function dynamicPagesClientScript() {
       diagramImportAnalyze: 'Analyze D2',
       diagramImportAssistant: 'Complete with Assistant',
       diagramImportApply: 'Apply reviewed mapping',
+      openDiagramEditor: 'Open diagram editor',
       diagramImportAnalyzing: 'D2 analysis is running.',
       diagramImportPreviewTitle: 'D2 preview',
       diagramViewportControls: 'Diagram controls for {title}',
@@ -5005,6 +5245,8 @@ function dynamicPagesClientScript() {
       menuObjectGroup: 'Группа объектов',
       menuRelations: 'Сопоставление с объектами',
       menuFinalView: 'Итоговые данные',
+      menuAssistantGroups: 'Ассистент групп и сопоставлений',
+      menuDiagramAssistant: 'Ассистент диаграмм',
       menuDiagram: 'Редактор диаграмм',
       menuPublication: 'Публикация',
       menuSchema: 'Схема',
@@ -5032,6 +5274,11 @@ function dynamicPagesClientScript() {
       runtimeMaxRowsPreviewDefaultHelp: 'Лимит строк для предпросмотра черновика и тестового прогона.',
       runtimeMaxRowsMax: 'Максимум строк',
       runtimeMaxRowsMaxHelp: 'Верхний предел строк, которые может вернуть одно выполнение.',
+      runtimeMaxSelectionScanRowsDefault: 'Сканирование выборки по умолчанию',
+      runtimeMaxSelectionScanRowsDefaultHelp: 'Сколько карточек проверяется для выборки с фильтрами, прежде чем результат будет помечен как неполный.',
+      runtimeMaxSelectionScanRowsMax: 'Максимум сканирования выборки',
+      runtimeMaxSelectionScanRowsMaxHelp: 'Верхний предел карточек, которые одна выборка с фильтрами может проверить.',
+      selectionScanLimitReached: 'Выборка {alias} проверила {scannedRows} из {availableTotal} карточек класса {className} (лимит сканирования {scanLimit}). Результат может быть неполным.',
       runtimeMaxClassesDefault: 'Классов по умолчанию',
       runtimeMaxClassesDefaultHelp: 'Сколько классов CMDBuild читают операции сканирования модели по умолчанию.',
       runtimeMaxClassesMax: 'Максимум классов',
@@ -5146,16 +5393,17 @@ function dynamicPagesClientScript() {
       assistantFlowDependencies: 'Использует результаты блоков',
       assistantFlowAlgorithm: 'Алгоритм',
       assistantFlowExpectedResult: 'Ожидаемый результат',
-      assistantFlowExtractionCandidate: 'Кандидат на извлечение',
-      assistantFlowExtractionCandidateHelp: 'Использует этот результат как источник по умолчанию в «Извлечении». Таблица при этом не публикуется.',
-      assistantFlowExtractionCandidateOption: '{label} (кандидат на извлечение)',
-      assistantFlowExtractionCandidateUnresolved: 'У кандидата на извлечение пока нет определенного детерминированного результата. Сформируйте и примените поток данных.',
       assistantFlowOutputManifestInvalid: 'Подписи результатов Assistant неполны. Сформируйте и примените поток данных повторно перед использованием «Извлечения».',
       assistantFlowOwnershipIncomplete: 'Поток данных нельзя применить: не определена принадлежность результатов Assistant.',
       assistantFlowOwnershipIncompleteAction: 'Сформируйте поток повторно так, чтобы каждый именованный блок данных имел один детерминированный результат.',
+      assistantFlowOwnershipMissing: 'Для блока «{name}» не определен единственный детерминированный результат. Доступные результаты: {aliases}.',
+      assistantFlowOwnershipDuplicate: 'Блок «{name}» сопоставлен с «{alias}», уже назначенным другому блоку.',
+      assistantFlowOwnershipFinal: 'Последний блок «{name}» должен использовать опубликованный результат «{alias}».',
+      assistantFlowOwnershipUnowned: 'Промежуточный результат «{alias}» не отнесен к именованному блоку данных.',
+      assistantFlowOwnershipActionSpecific: 'Исправьте указанный блок данных и сформируйте поток повторно.',
+      assistantFlowOwnershipNoAlias: 'нет',
       assistantFlowDuplicateBlockName: 'Название блока данных «{name}» должно быть уникальным.',
       assistantFlowDuplicateBlockNameAction: 'Переименуйте повторяющиеся блоки данных перед подготовкой семантического плана.',
-      assistantFlowExtractionCandidateNone: 'Не выбирать кандидата на извлечение',
       assistantFlowRemoveBlock: 'Удалить блок данных',
       assistantFlowAddBlock: 'Добавить блок данных',
       assistantPrepareSemanticPlan: 'Подготовить семантический план',
@@ -5168,6 +5416,8 @@ function dynamicPagesClientScript() {
       assistantFlowPlanRetryReady: 'Контекст CMDB и семантический план сохранены. Повтор сформирует только детерминированный черновик потока.',
       assistantFlowPlanRetryGateway: 'Reverse proxy завершил запрос до диагностического ответа backend. Контекст CMDB и семантический план сохранены; повтор сформирует только черновик потока.',
       assistantSemanticPlanReady: 'Семантический план готов к проверке.',
+      assistantSemanticPlanNeedsClarification: 'Семантический план требует уточнения перед формированием потока.',
+      assistantFlowBlockedByUnresolved: 'Поток данных нельзя сформировать, пока не уточнены блоки:',
       assistantSemanticPlanRejected: 'Семантический план отклонен.',
       assistantFlowDragBlock: 'Перетащить для изменения порядка',
       assistantFlowVisualOrderWarning: 'Визуальный порядок не соответствует выбранным зависимостям блоков. Assistant построит порядок выполнения по зависимостям.',
@@ -5191,12 +5441,6 @@ function dynamicPagesClientScript() {
       assistantFlowAffectedStages: 'Затронутые этапы',
       assistantFlowWhatToFix: 'Что нужно исправить',
       assistantFlowTechnicalDetails: 'Технические детали',
-      assistantFlowPreview: 'Проверить данные',
-      assistantFlowPreviewTitle: 'Проверка данных',
-      assistantFlowPreviewParams: 'Параметры проверки',
-      assistantFlowPreviewReady: 'Проверка данных выполнена. Draft не изменен.',
-      assistantFlowPreviewHelp: 'Сформированный поток выполняется только для проверки с текущими параметрами. Число строк каждого этапа ограничено настроенным лимитом preview.',
-      assistantFlowPreviewTruncated: 'Достигнут настроенный лимит строк preview. Результаты могут быть неполными.',
       assistantFlowValidationErrors: 'Ошибки валидации',
       assistantFlowAvailableAliases: 'Доступные ранее aliases',
       assistantFlowValidRelationPaths: 'Подтвержденные пути связей CMDBuild',
@@ -5212,8 +5456,8 @@ function dynamicPagesClientScript() {
       assistantGenerateMatching: 'Предложить правило совмещения',
       assistantAddStage: 'Добавить правило совмещения и выборку',
       assistantRemoveStage: 'Удалить этап',
-      assistantApplyFlow: 'Применить цепочку к draft',
-      assistantFlowApplied: 'Детерминированная цепочка данных применена к текущему draft.',
+      assistantApplyFlow: 'Применить цепочку',
+      assistantFlowApplied: 'Детерминированная цепочка данных применена и сохранена.',
       assistantIntermediateStage: 'Промежуточный результат',
       existsRelatedOperation: 'Сопоставление по связанным объектам {number}',
       addExistsRelatedOperation: 'Добавить сопоставление по связям',
@@ -5231,6 +5475,7 @@ function dynamicPagesClientScript() {
       assistantDiagramMap: 'Предложить mapping',
       assistantDiagramAnalysisRequired: 'Сначала выполните детерминированный анализ D2.',
       assistantProposalOnly: 'Результат Assistant является предложением. Проверьте его и примените явно.',
+      assistantSaveDraft: 'Сохранить черновик Assistant',
       diagramImportedStatus: 'Статус импортированного D2',
       diagramEditInAssistant: 'Редактировать D2 import в Assistant',
       assistantStatusTitle: 'Статус ассистента',
@@ -5349,6 +5594,8 @@ function dynamicPagesClientScript() {
       extractionApplied: 'Шаг извлечения применен к Spec JSON.',
       extractionPreviewReady: 'Предпросмотр извлечения готов.',
       extractionCompleted: 'Извлечение по шаблону выполнено.',
+      extractionPublishSelected: 'Назначить публикуемой таблицей',
+      extractionPublishedSelected: 'Выбор публикуемой таблицы применен к draft.',
       extractionSelectedSourceEmpty: 'Выбранный источник извлечения {selected} вернул 0 строк; {source} содержит {rows} строк.',
       extractionNeedsSource: 'Параметр-источник обязателен.',
       extractionNeedsRegex: 'Регулярное выражение извлечения обязательно.',
@@ -5402,6 +5649,7 @@ function dynamicPagesClientScript() {
       diagramImportAnalyze: 'Анализировать D2',
       diagramImportAssistant: 'Дозаполнить Assistant',
       diagramImportApply: 'Применить проверенный mapping',
+      openDiagramEditor: 'Открыть редактор диаграмм',
       diagramImportAnalyzing: 'Выполняется анализ D2.',
       diagramImportPreviewTitle: 'Предпросмотр D2',
       diagramViewportControls: 'Управление диаграммой {title}',
@@ -5950,17 +6198,16 @@ function dynamicPagesClientScript() {
       assistantFlowFeedback: null,
       assistantFlowErrorStage: '',
       assistantFlowResume: null,
-      assistantFlowPreview: null,
       assistantFlowCanApply: false,
       assistantFlowExplanation: '',
     assistantFlowWarnings: [],
-    assistantFlowCandidateOutput: null,
     assistantFlowOutputBindings: [],
     assistantFlowBusy: false,
     assistantFlowRequestGeneration: 0,
     assistantFlowExpandedBlockIds: {},
     assistantFlowDragSourceId: '',
     assistantPromptAutosaveTimer: null,
+    assistantPromptAutosavePromise: null,
     assistantPromptAutosaveGeneration: 0,
     assistantPromptAutosaveStatus: 'idle',
     assistantPromptAutosaveError: '',
@@ -5971,8 +6218,11 @@ function dynamicPagesClientScript() {
     assistantDiagramInterpretResult: null,
     assistantDiagramMappingResult: null,
     diagramImportSource: '',
+    diagramImportAuthoringOverrides: { roles: [], relationRules: [], placementRules: [] },
+    diagramImportRestorePending: false,
       diagramImportProposal: null,
       diagramImportSignedProposal: null,
+      diagramImportEditorSpecSnapshot: '',
       diagramImportIr: null,
       diagramImportPreview: null,
       diagramImportPreviewSource: '',
@@ -5999,6 +6249,7 @@ function dynamicPagesClientScript() {
       'template',
       'versions',
       'assistant',
+      'diagram-assistant',
       'object-group',
       'relations',
       'final-view',
@@ -6038,6 +6289,7 @@ function dynamicPagesClientScript() {
       'template',
       'versions',
       'assistant',
+      'diagram-assistant',
       'object-group',
       'relations',
       'final-view',
@@ -6087,6 +6339,10 @@ function dynamicPagesClientScript() {
       else window.history.pushState({ designerSection: normalized }, '', url);
     }
     renderDesigner();
+    if (normalized === 'diagram-assistant' && state.diagramImportRestorePending && String(state.diagramImportSource || '').trim()) {
+      state.diagramImportRestorePending = false;
+      window.setTimeout(function () { analyzeDiagramImport(); }, 0);
+    }
   }
 
   function normalizeLanguage(value) {
@@ -6765,13 +7021,9 @@ function dynamicPagesClientScript() {
           uses: Array.isArray(item.uses) ? item.uses.map(String).filter(function (dependency) { return dependency && dependency !== id; }) : []
         };
       });
-    var extractionCandidateBlockId = String(source.extractionCandidateBlockId || '').trim();
-    var candidateExists = blocks.some(function (block) { return block.id === extractionCandidateBlockId; });
     return {
       context: String(source.context || ''),
-      blocks: blocks,
-      extractionCandidateBlockId: candidateExists ? extractionCandidateBlockId : '',
-      extractionCandidateAlias: candidateExists ? String(source.extractionCandidateAlias || '').trim() : ''
+      blocks: blocks
     };
   }
 
@@ -6828,13 +7080,8 @@ function dynamicPagesClientScript() {
   function readAssistantObjectFlowIntentFromDom() {
     var context = readValue('cmdp-assistant-object-flow-context');
     var rows = Array.prototype.slice.call(document.querySelectorAll('[data-assistant-flow-block]'));
-    var candidate = document.querySelector('[data-assistant-flow-candidate]:checked');
-    var extractionCandidateBlockId = candidate ? String(candidate.value || '') : '';
-    var current = normalizeAssistantObjectFlowIntentClient(state.assistantObjectFlowIntent);
     return normalizeAssistantObjectFlowIntentClient({
       context: context,
-      extractionCandidateBlockId: extractionCandidateBlockId,
-      extractionCandidateAlias: current.extractionCandidateBlockId === extractionCandidateBlockId ? current.extractionCandidateAlias : '',
       blocks: rows.map(function (row, index) {
         var uses = Array.prototype.slice.call(row.querySelectorAll('[data-assistant-flow-field="uses"] option:checked')).map(function (option) { return option.value; });
         return {
@@ -6860,11 +7107,9 @@ function dynamicPagesClientScript() {
     state.assistantFlowFeedback = null;
     state.assistantFlowErrorStage = '';
     if (!options.preserveResume) state.assistantFlowResume = null;
-    state.assistantFlowPreview = null;
     state.assistantFlowCanApply = false;
     state.assistantFlowExplanation = '';
     state.assistantFlowWarnings = [];
-    state.assistantFlowCandidateOutput = null;
     state.assistantFlowOutputBindings = [];
   }
 
@@ -6878,11 +7123,32 @@ function dynamicPagesClientScript() {
   }
 
   function assistantPromptDraft() {
+    captureDiagramImportProposalFromDom();
     return {
       objectFlowIntent: cloneJsonValue(state.assistantObjectFlowIntent, { context: '', blocks: [] }),
       diagramInterpretPrompt: String(state.assistantDiagramInterpretPrompt || ''),
-      diagramMappingPrompt: String(state.assistantDiagramMappingPrompt || '')
+      diagramMappingPrompt: String(state.assistantDiagramMappingPrompt || ''),
+      d2Authoring: {
+        version: 1,
+        source: String(state.diagramImportSource || ''),
+        overrides: cloneJsonValue(state.diagramImportAuthoringOverrides || { roles: [], relationRules: [], placementRules: [] }, { roles: [], relationRules: [], placementRules: [] })
+      }
     };
+  }
+
+  function saveAssistantDraft() {
+    captureAssistantPromptsFromDom();
+    captureDiagramImportProposalFromDom();
+    var save = state.assistantPromptAutosavePromise
+      ? state.assistantPromptAutosavePromise.catch(function () {}).then(function () { return autosaveAssistantPrompts(); })
+      : autosaveAssistantPrompts();
+    save.then(function () {
+      state.message = { type: 'ok', text: t('assistantPromptAutosaveSaved') };
+      renderDesigner();
+    }).catch(function (error) {
+      state.message = { type: 'error', text: String(error && error.message || error || t('requestFailed')) };
+      renderDesigner();
+    });
   }
 
   function assistantPromptAutosaveText() {
@@ -6893,6 +7159,11 @@ function dynamicPagesClientScript() {
     if (state.assistantPromptAutosaveStatus === 'conflict') return t('assistantPromptAutosaveConflict');
     if (state.assistantPromptAutosaveStatus === 'failed') return t('assistantPromptAutosaveFailed', { message: state.assistantPromptAutosaveError || t('requestFailed') });
     return '';
+  }
+
+  function renderAssistantPromptAutosaveControl() {
+    var text = assistantPromptAutosaveText();
+    return '<div class="toolbar"><button type="button" data-action="assistant-draft-save">' + escapeHtml(t('assistantSaveDraft')) + '</button><span id="cmdp-assistant-prompt-autosave-status" class="muted" role="status" aria-live="polite"' + (text ? '' : ' hidden') + '>' + escapeHtml(text) + '</span></div>';
   }
 
   function syncAssistantPromptAutosaveStatus() {
@@ -6910,6 +7181,7 @@ function dynamicPagesClientScript() {
     if (state.assistantPromptAutosaveTimer) window.clearTimeout(state.assistantPromptAutosaveTimer);
     state.assistantPromptAutosaveTimer = null;
     state.assistantPromptAutosaveGeneration = Number(state.assistantPromptAutosaveGeneration || 0) + 1;
+    state.assistantPromptAutosavePromise = null;
     state.assistantPromptAutosaveStatus = 'idle';
     state.assistantPromptAutosaveError = '';
   }
@@ -6929,7 +7201,7 @@ function dynamicPagesClientScript() {
     if (!selected || !selected.id || !selected.code || !selected.specHash) {
       state.assistantPromptAutosaveStatus = 'requires-template-save';
       syncAssistantPromptAutosaveStatus();
-      return;
+      return Promise.resolve(null);
     }
     var generation = Number(state.assistantPromptAutosaveGeneration || 0) + 1;
     var templateCode = String(selected.code || '');
@@ -6939,25 +7211,43 @@ function dynamicPagesClientScript() {
     state.assistantPromptAutosaveStatus = 'saving';
     state.assistantPromptAutosaveError = '';
     syncAssistantPromptAutosaveStatus();
-    request(apiPrefix + '/templates/' + encodeURIComponent(templateCode) + '/assistant-draft', {
+    var autosave = request(apiPrefix + '/templates/' + encodeURIComponent(templateCode) + '/assistant-draft', {
       method: 'PUT',
       body: { baseSpecHash: baseSpecHash, assistantDraft: draft }
     }).then(function (result) {
-      if (Number(state.assistantPromptAutosaveGeneration || 0) !== generation) return;
+      if (Number(state.assistantPromptAutosaveGeneration || 0) !== generation) return null;
       if (!result.ok || !result.json || !result.json.template) {
         state.assistantPromptAutosaveStatus = result && result.status === 409 ? 'conflict' : 'failed';
         state.assistantPromptAutosaveError = errorText(result);
-        return;
+        throw new Error(state.assistantPromptAutosaveError);
       }
       mergeAssistantPromptAutosaveTemplate(result.json.template);
       state.assistantPromptAutosaveStatus = 'saved';
+      return result.json.template;
     }).catch(function (error) {
-      if (Number(state.assistantPromptAutosaveGeneration || 0) !== generation) return;
-      state.assistantPromptAutosaveStatus = 'failed';
+      if (Number(state.assistantPromptAutosaveGeneration || 0) !== generation) return null;
+      state.assistantPromptAutosaveStatus = state.assistantPromptAutosaveStatus === 'conflict' ? 'conflict' : 'failed';
       state.assistantPromptAutosaveError = String(error && error.message || error || t('requestFailed'));
+      throw error;
     }).finally(function () {
-      if (Number(state.assistantPromptAutosaveGeneration || 0) === generation) syncAssistantPromptAutosaveStatus();
+      if (Number(state.assistantPromptAutosaveGeneration || 0) === generation) {
+        state.assistantPromptAutosavePromise = null;
+        syncAssistantPromptAutosaveStatus();
+      }
     });
+    state.assistantPromptAutosavePromise = autosave;
+    return autosave;
+  }
+
+  function flushAssistantPromptAutosave() {
+    captureAssistantPromptsFromDom();
+    if (state.assistantPromptAutosaveTimer) {
+      window.clearTimeout(state.assistantPromptAutosaveTimer);
+      state.assistantPromptAutosaveTimer = null;
+      return autosaveAssistantPrompts();
+    }
+    if (state.assistantPromptAutosavePromise) return state.assistantPromptAutosavePromise;
+    return Promise.resolve(null);
   }
 
   function scheduleAssistantPromptAutosave() {
@@ -6967,7 +7257,7 @@ function dynamicPagesClientScript() {
     syncAssistantPromptAutosaveStatus();
     state.assistantPromptAutosaveTimer = window.setTimeout(function () {
       state.assistantPromptAutosaveTimer = null;
-      autosaveAssistantPrompts();
+      autosaveAssistantPrompts().catch(function () {});
     }, 1200);
   }
 
@@ -7328,6 +7618,7 @@ function dynamicPagesClientScript() {
     options = options || {};
     var selected = state.selectedTemplate;
     var spec = selected && selected.spec ? selected.spec : defaultSpec();
+    var assistantDraft = spec.assistantDraft && typeof spec.assistantDraft === 'object' && !Array.isArray(spec.assistantDraft) ? spec.assistantDraft : {};
     var builder = inferBuilderStateFromSpec(spec);
     var relation = getRelationExpansionStep(spec);
     var selection = getDataSelectionStep(spec);
@@ -7339,7 +7630,6 @@ function dynamicPagesClientScript() {
     if (!options.preserveAssistantState) {
       invalidateAssistantObjectFlowRequests();
       invalidateAssistantPromptAutosave();
-      var assistantDraft = spec.assistantDraft && typeof spec.assistantDraft === 'object' && !Array.isArray(spec.assistantDraft) ? spec.assistantDraft : {};
       state.assistantDraftIntent = String(assistantDraft.intent || '');
       state.assistantTaskMode = normalizeOutputMode(assistantDraft.taskMode || state.assistantTaskMode || 'both');
       state.assistantObjectFlowIntent = normalizeAssistantObjectFlowIntentClient(assistantDraft.objectFlowIntent);
@@ -7351,11 +7641,9 @@ function dynamicPagesClientScript() {
       state.assistantFlowDiagnostics = {};
       state.assistantFlowFeedback = null;
       state.assistantFlowErrorStage = '';
-      state.assistantFlowPreview = null;
       state.assistantFlowCanApply = false;
       state.assistantFlowExplanation = '';
       state.assistantFlowWarnings = [];
-      state.assistantFlowCandidateOutput = null;
       state.assistantDiagramInterpretPrompt = String(assistantDraft.diagramInterpretPrompt || '');
       state.assistantDiagramMappingPrompt = String(assistantDraft.diagramMappingPrompt || '');
       state.assistantFlowBusy = false;
@@ -7366,9 +7654,13 @@ function dynamicPagesClientScript() {
     }
     var diagram = firstDiagramSpec(spec);
     var d2Import = diagram.authoring && diagram.authoring.d2Import && typeof diagram.authoring.d2Import === 'object' ? diagram.authoring.d2Import : {};
-    state.diagramImportSource = String(d2Import.source || '');
+    var d2Authoring = assistantDraft.d2Authoring && typeof assistantDraft.d2Authoring === 'object' && !Array.isArray(assistantDraft.d2Authoring) ? assistantDraft.d2Authoring : {};
+    state.diagramImportSource = String(d2Authoring.source || d2Import.source || '');
+    state.diagramImportAuthoringOverrides = cloneJsonValue(d2Authoring.overrides || { roles: [], relationRules: [], placementRules: [] }, { roles: [], relationRules: [], placementRules: [] });
+    state.diagramImportRestorePending = Boolean(state.diagramImportSource.trim() && d2Authoring.source);
     state.diagramImportProposal = null;
     state.diagramImportSignedProposal = null;
+    state.diagramImportEditorSpecSnapshot = '';
     state.diagramImportIr = null;
     state.diagramImportPreview = null;
     state.diagramImportPreviewSource = '';
@@ -9136,7 +9428,7 @@ function dynamicPagesClientScript() {
 
   function operationLabel(operation, index, matchIndex, setIndex) {
     if (operation && operation.type === 'match') return t('matchingBlock', { number: matchIndex + 1 });
-    if (operation && operation.type === 'relation') return t('relationOperation', { number: index + 1 });
+    if (operation && operation.type === 'relation') return String(operation.label || operation.name || operation.as || '').trim() || t('relationOperation', { number: index + 1 });
     if (operation && operation.type === 'existsRelated') return t('existsRelatedOperation', { number: index + 1 });
     return t('setOperation', { number: setIndex + 1 });
   }
@@ -9297,11 +9589,12 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
-  function renderRelationOperation(operation, operationIndex, model) {
+  function renderRelationOperation(operation, operationIndex, model, spec) {
     operation = normalizeRelationOperation(operation, operationIndex, model.selections, flowOperations(model).slice(0, operationIndex));
+    var label = aliasDisplayLabel(operation.as, spec) || t('relationOperation', { number: operationIndex + 1 });
     return [
       '<div class="matching-block" data-flow-operation="relation" data-flow-operation-index="' + operationIndex + '" data-relation-operation data-relation-operation-id="' + escapeHtml(operation.id) + '">',
-      '<div class="section-title-row"><h3>' + t('relationOperation', { number: operationIndex + 1 }) + '</h3><button data-action="clear-relation-operation" type="button" aria-label="' + escapeHtml(t('clear') + ': ' + (operation.as || String(operationIndex + 1))) + '">' + t('clear') + '</button></div>',
+      '<div class="section-title-row"><h3>' + escapeHtml(label) + '</h3><button data-action="clear-relation-operation" type="button" aria-label="' + escapeHtml(t('clear') + ': ' + (operation.as || String(operationIndex + 1))) + '">' + t('clear') + '</button></div>',
       '<div class="settings-grid">',
       '<label>' + t('relationOperationFrom') + '<select data-relation-operation-field="from">' + renderPriorMaterializedAliasOptions(model, operationIndex, operation.from) + '</select></label>',
       '<label>' + t('relationDomain') + '<select data-relation-operation-field="domain">' + renderDomainOptions(operation.domain) + '</select></label>',
@@ -9353,15 +9646,6 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
-  function renderPublishedTableControl(model) {
-    return [
-      '<div class="settings-block" data-result-set-output>',
-      '<h3>' + t('publishedTable') + '</h3>',
-      '<label>' + t('publishedTable') + '<select data-result-set-field="publishedAlias">' + renderMaterializedAliasOptions(model, model.output && model.output.alias || '') + '</select><span class="muted">' + escapeHtml(t('publishedTableHelp')) + '</span></label>',
-      '</div>'
-    ].join('');
-  }
-
   function renderRelationExpansionEditor(selected) {
     var spec = (selected && selected.spec) || defaultSpec();
     var model = inferRelationExpansionModel(spec);
@@ -9385,13 +9669,12 @@ function dynamicPagesClientScript() {
         return operation.type === 'match'
           ? renderObjectMatchingBlock(operation, index, matchIndex, model, spec)
           : operation.type === 'relation'
-            ? renderRelationOperation(operation, index, model)
+            ? renderRelationOperation(operation, index, model, spec)
             : operation.type === 'existsRelated'
               ? renderExistsRelatedOperation(operation, index, model, spec)
             : renderSetOperation(operation, index, setIndex, model, spec);
       }).join(''),
       '</div>',
-      renderPublishedTableControl(model),
       '</section>'
     ].join('');
   }
@@ -9419,15 +9702,16 @@ function dynamicPagesClientScript() {
       ]),
       group(t('menuDesigner'), [
         { section: 'params', label: t('menuParams') },
-        { section: 'assistant', label: t('menuAssistant') },
+        { section: 'assistant', label: t('menuAssistantGroups') },
         { section: 'object-group', label: t('menuObjectGroup') },
         { section: 'relations', label: t('menuRelations') },
+        { section: 'extraction', label: t('menuExtraction') },
         { section: 'final-view', label: t('menuFinalView') },
+        { section: 'diagram-assistant', label: t('menuDiagramAssistant') },
         { section: 'diagram', label: t('menuDiagram') },
         { section: 'cmdb-build-view', label: t('menuCmdbBuildView') }
       ]),
       group(t('menuRun'), [
-        { section: 'extraction', label: t('menuExtraction') },
         { section: 'visualization', label: t('visualizationEditor') },
         { section: 'cache', label: t('cacheEditor') },
         { section: 'publication', label: t('menuPublication') },
@@ -9539,48 +9823,14 @@ function dynamicPagesClientScript() {
     return '<div class="assistant-draft-preview" aria-busy="' + (state.assistantGenerating ? 'true' : 'false') + '">' + (html || '<pre>' + escapeHtml(pretty(json)) + '</pre>') + '</div>';
   }
 
-  function renderAssistantObjectFlowPreview() {
-    var result = state.assistantFlowPreview;
-    if (!result) return '';
-    if (!result.ok) return '<div class="notice error">' + escapeHtml(errorText(result)) + '</div>';
-    var preview = result.json && result.json.preview || {};
-    var warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
-    var stages = Array.isArray(preview.stages) ? preview.stages : [];
-    var stagesHtml = stages.map(function (stage) {
-      var details = [stage.kind, stage.className, stage.as].filter(Boolean).join(' / ');
-      var status = String(stage.rows && stage.rows.length || 0) + ' ' + t('traceRows') + (stage.truncated ? ' - ' + t('assistantFlowPreviewTruncated') : '');
-      return '<details class="assistant-flow-preview-stage" open><summary><strong>' + escapeHtml(stage.label || stage.as || '') + '</strong><span class="muted">' + escapeHtml(status) + '</span></summary>'
-        + (details ? '<p class="muted">' + escapeHtml(details) + '</p>' : '')
-        + renderPlainDataTable({ columns: stage.columns || [], rows: stage.rows || [], emptyText: t('noRows') })
-        + '</details>';
-    }).join('');
-    var trace = Array.isArray(preview.trace) && preview.trace.length ? '<details class="help-details"><summary>' + escapeHtml(t('executionTrace')) + '</summary>' + renderExecutionTrace(preview.trace) + '</details>' : '';
-    return '<div class="assistant-draft-preview" data-assistant-flow-preview><h4>' + escapeHtml(t('assistantFlowPreviewTitle')) + '</h4>'
-      + '<p class="muted">' + escapeHtml(t('assistantFlowPreviewHelp')) + '</p>'
-      + (warnings.length ? '<div class="notice warning"><ul class="steps">' + warnings.map(function (warning) { return '<li>' + escapeHtml(warning) + '</li>'; }).join('') + '</ul></div>' : '')
-      + (stagesHtml || '<div class="notice">' + escapeHtml(t('noRows')) + '</div>')
-      + trace + '</div>';
-  }
-
   function renderAssistantFlowEditor() {
     var intent = normalizeAssistantObjectFlowIntentClient(state.assistantObjectFlowIntent);
     state.assistantObjectFlowIntent = intent;
     var proposal = state.assistantFlowProposal;
     var semanticPlan = state.assistantFlowSemanticPlan;
     var applyDisabled = !proposal || state.assistantFlowBusy || !state.assistantFlowCanApply;
-    var candidateRows = intent.blocks.map(function (block) {
-      var selected = intent.extractionCandidateBlockId === block.id;
-      return '<label class="assistant-flow-candidate-control"><input type="radio" name="cmdp-assistant-flow-candidate" data-assistant-flow-candidate value="' + escapeHtml(block.id) + '"' + (selected ? ' checked' : '') + (state.assistantFlowBusy ? ' disabled' : '') + '><span>' + escapeHtml(block.name || block.id) + '</span></label>';
-    }).join('');
-    var candidateControl = '<fieldset class="assistant-flow-candidate-control"' + (state.assistantFlowBusy ? ' disabled' : '') + '><legend>' + escapeHtml(t('assistantFlowExtractionCandidate')) + '</legend>'
-      + '<label class="assistant-flow-candidate-control"><input type="radio" name="cmdp-assistant-flow-candidate" data-assistant-flow-candidate value=""' + (!intent.extractionCandidateBlockId ? ' checked' : '') + '><span>' + escapeHtml(t('assistantFlowExtractionCandidateNone')) + '</span></label>'
-      + candidateRows
-      + '<span class="muted">' + escapeHtml(t('assistantFlowExtractionCandidateHelp')) + '</span>'
-      + (intent.extractionCandidateBlockId && !intent.extractionCandidateAlias ? '<p class="muted">' + escapeHtml(t('assistantFlowExtractionCandidateUnresolved')) + '</p>' : '')
-      + '</fieldset>';
     var dependencyDiagnostics = assistantObjectFlowDependencyDiagnostics(intent.blocks);
     var blockRows = intent.blocks.map(function (block, index) {
-      var isExtractionCandidate = intent.extractionCandidateBlockId === block.id;
       var available = intent.blocks.filter(function (candidate) { return candidate.id !== block.id; });
       var options = available.map(function (candidate) {
         return '<option value="' + escapeHtml(candidate.id) + '"' + (block.uses.indexOf(candidate.id) >= 0 ? ' selected' : '') + '>' + escapeHtml(candidate.name) + '</option>';
@@ -9598,7 +9848,6 @@ function dynamicPagesClientScript() {
         + '<span class="assistant-flow-disclosure" aria-hidden="true"></span>'
         + '<button type="button" class="assistant-flow-drag-handle" data-action="assistant-flow-drag-handle" data-assistant-flow-drag-handle data-assistant-flow-block-id="' + escapeHtml(block.id) + '"' + (state.assistantFlowBusy ? ' disabled' : ' draggable="true"') + ' title="' + escapeHtml(t('assistantFlowDragBlock')) + '" aria-label="' + escapeHtml(t('assistantFlowDragBlock')) + '">↕</button>'
         + '<span class="assistant-flow-business-summary"><strong>' + escapeHtml(t('assistantFlowBlock', { number: index + 1 })) + '</strong><span class="assistant-flow-business-summary-name" data-assistant-flow-summary-name>' + escapeHtml(block.name) + '</span></span>'
-        + (isExtractionCandidate ? '<span class="pill ok">' + escapeHtml(t('assistantFlowExtractionCandidate')) + '</span>' : '')
         + '</summary>'
         + '<div class="assistant-flow-business-fields">'
         + '<label>' + escapeHtml(t('assistantFlowBlockName')) + '<input data-assistant-flow-field="name" id="assistant-flow-' + index + '-name" value="' + escapeHtml(block.name) + '"' + (state.assistantFlowBusy ? ' disabled' : '') + '></label>'
@@ -9615,7 +9864,16 @@ function dynamicPagesClientScript() {
     var dependencyNotice = dependencyDiagnostics.hasForward || dependencyDiagnostics.hasCycle
       ? '<div class="notice warning" data-assistant-flow-dependency-warning><p>' + escapeHtml(t('assistantFlowVisualOrderWarning')) + '</p>' + (dependencyDiagnostics.hasCycle ? '<p>' + escapeHtml(t('assistantFlowDependencyCycleWarning')) + '</p>' : '') + '</div>'
       : '';
-    var semanticPreview = semanticPlan ? '<div class="assistant-draft-preview" data-assistant-flow-semantic-plan><h4>' + escapeHtml(t('assistantSemanticPlanReady')) + '</h4><p>' + escapeHtml(semanticPlan.explanation || '') + '</p><ul class="steps">'
+    var unresolvedBlocks = semanticPlan && Array.isArray(semanticPlan.blocks) ? semanticPlan.blocks.filter(function (block) {
+      return !block || !block.resultContract || block.resultContract.outputKind === 'unresolved';
+    }) : [];
+    var flowGenerationBlocked = !semanticPlan || state.assistantFlowBusy || unresolvedBlocks.length > 0;
+    var unresolvedNotice = unresolvedBlocks.length ? '<div class="notice warning" id="cmdp-assistant-flow-unresolved" data-assistant-flow-unresolved><p>' + escapeHtml(t('assistantFlowBlockedByUnresolved')) + '</p><ul class="steps">'
+      + unresolvedBlocks.map(function (block) {
+        var warnings = block && Array.isArray(block.warnings) ? block.warnings.filter(Boolean).join(' ') : '';
+        return '<li><strong>' + escapeHtml(block && block.name || t('assistantFlowOutputUnresolved')) + '</strong>' + (warnings ? ': ' + escapeHtml(warnings) : '') + '</li>';
+      }).join('') + '</ul></div>' : '';
+    var semanticPreview = semanticPlan ? '<div class="assistant-draft-preview" data-assistant-flow-semantic-plan><h4>' + escapeHtml(unresolvedBlocks.length ? t('assistantSemanticPlanNeedsClarification') : t('assistantSemanticPlanReady')) + '</h4><p>' + escapeHtml(semanticPlan.explanation || '') + '</p><ul class="steps">'
       + semanticPlan.blocks.map(function (block) {
         var contract = block && block.resultContract && typeof block.resultContract === 'object' ? block.resultContract : {};
         var kindKey = contract.outputKind === 'sourceCards' ? 'assistantFlowOutputSourceCards' : contract.outputKind === 'relationPairs' ? 'assistantFlowOutputRelationPairs' : contract.outputKind === 'unresolved' ? 'assistantFlowOutputUnresolved' : '';
@@ -9660,23 +9918,19 @@ function dynamicPagesClientScript() {
       + (feedback && Array.isArray(feedback.confirmedRelations) && feedback.confirmedRelations.length ? '<p class="muted">' + escapeHtml(t('assistantFlowRelationRequirements')) + ': ' + escapeHtml(feedback.confirmedRelations.join('; ')) + '</p>' : '')
       + technical + '</div>' : '';
     var paramsRows = getParamRows((state.selectedTemplate && state.selectedTemplate.spec) || defaultSpec()).filter(function (row) { return row.name; });
-    var previewParams = proposal ? '<div class="assistant-flow-preview-params"><h4>' + escapeHtml(t('assistantFlowPreviewParams')) + '</h4>'
-      + (paramsRows.length ? '<div class="run-param-list">' + paramsRows.map(renderRunParamRow).join('') + '</div>' : '<p class="muted">' + escapeHtml(t('noInputVariables')) + '</p>')
-      + '</div>' : '';
     return [
       '<div class="diagram-editor-block" id="cmdp-assistant-object-flow" aria-busy="' + (state.assistantFlowBusy ? 'true' : 'false') + '">',
       '<div class="diagram-editor-heading"><h3>' + t('assistantDataFlowTitle') + '</h3></div>',
       '<p class="muted">' + t('assistantDataFlowHelp') + '</p>',
       '<label>' + escapeHtml(t('assistantFlowContext')) + '<textarea id="cmdp-assistant-object-flow-context" rows="3"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(intent.context) + '</textarea><span class="muted">' + escapeHtml(t('assistantFlowContextHelp')) + '</span></label>',
       dependencyNotice,
-      '<div id="cmdp-assistant-object-flow-intent" aria-busy="' + (state.assistantFlowBusy ? 'true' : 'false') + '">' + candidateControl + blockRows + '</div>',
+      '<div id="cmdp-assistant-object-flow-intent" aria-busy="' + (state.assistantFlowBusy ? 'true' : 'false') + '">' + blockRows + '</div>',
       '<div class="toolbar"><button type="button" data-action="assistant-flow-block-add"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantFlowAddBlock')) + '</button></div>',
-      '<p id="cmdp-assistant-prompt-autosave-status" class="muted" role="status" aria-live="polite"' + (assistantPromptAutosaveText() ? '' : ' hidden') + '>' + escapeHtml(assistantPromptAutosaveText()) + '</p>',
-      '<div class="toolbar"><button type="button" data-action="assistant-flow-prepare"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(state.assistantFlowBusy ? t('assistantGenerateBusy') : t('assistantPrepareSemanticPlan')) + '</button>' + (semanticPlanRetryAvailable ? '<button type="button" data-action="assistant-flow-prepare-retry"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantRetrySemanticPlan')) + '</button>' : '') + '<button type="button" data-action="assistant-flow-generate"' + (!semanticPlan || state.assistantFlowBusy || (semanticPlan.blocks || []).some(function (block) { return !block || !block.resultContract || block.resultContract.outputKind === 'unresolved'; }) ? ' disabled' : '') + '>' + escapeHtml(t('assistantGenerateFlow')) + '</button>' + (flowPlanRetryAvailable ? '<button type="button" data-action="assistant-flow-generate-retry"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantRetryFlowPlan')) + '</button>' : '') + '<button type="button" data-action="assistant-flow-preview"' + (!proposal || state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantFlowPreview')) + '</button><button type="button" class="primary" data-action="assistant-flow-apply"' + (applyDisabled ? ' disabled' : '') + '>' + escapeHtml(t('assistantApplyFlow')) + '</button></div>',
+      renderAssistantPromptAutosaveControl(),
+      unresolvedNotice,
+      '<div class="toolbar"><button type="button" data-action="assistant-flow-prepare"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(state.assistantFlowBusy ? t('assistantGenerateBusy') : t('assistantPrepareSemanticPlan')) + '</button>' + (semanticPlanRetryAvailable ? '<button type="button" data-action="assistant-flow-prepare-retry"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantRetrySemanticPlan')) + '</button>' : '') + '<button type="button" data-action="assistant-flow-generate"' + (flowGenerationBlocked ? ' disabled' + (unresolvedBlocks.length ? ' aria-describedby="cmdp-assistant-flow-unresolved"' : '') : '') + '>' + escapeHtml(t('assistantGenerateFlow')) + '</button>' + (flowPlanRetryAvailable ? '<button type="button" data-action="assistant-flow-generate-retry"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantRetryFlowPlan')) + '</button>' : '') + '<button type="button" class="primary" data-action="assistant-flow-apply"' + (applyDisabled ? ' disabled' : '') + '>' + escapeHtml(t('assistantApplyFlow')) + '</button></div>',
       semanticPreview,
       flowPreview,
-      previewParams,
-      renderAssistantObjectFlowPreview(),
       errors,
       '<p class="muted">' + t('assistantProposalOnly') + '</p>',
       '</div>'
@@ -9684,12 +9938,22 @@ function dynamicPagesClientScript() {
   }
 
   function renderAssistantEditor(selected, config) {
-    var spec = selected && selected.spec ? selected.spec : defaultSpec();
     return [
-      '<section class="section" id="cmdp-assistant-editor"><h2>' + t('assistantEditor') + '</h2>',
+      '<section class="section" id="cmdp-assistant-editor"><h2>' + t('menuAssistantGroups') + '</h2>',
       '<p class="muted">' + t('assistantProposalOnly') + '</p>',
       renderAssistantStatus(config),
       renderAssistantFlowEditor(),
+      '</section>'
+    ].join('');
+  }
+
+  function renderDiagramAssistantEditor(selected, config) {
+    var spec = selected && selected.spec ? selected.spec : defaultSpec();
+    return [
+      '<section class="section" id="cmdp-diagram-assistant-editor"><h2>' + t('menuDiagramAssistant') + '</h2>',
+      '<p class="muted">' + t('assistantProposalOnly') + '</p>',
+      renderAssistantStatus(config),
+      renderAssistantPromptAutosaveControl(),
       renderDiagramImportWorkbench(spec),
       '</section>'
     ].join('');
@@ -9709,6 +9973,8 @@ function dynamicPagesClientScript() {
       renderNumberSetting('cmdp-runtime-max-rows-default', 'runtimeMaxRowsDefault', 'runtimeMaxRowsDefaultHelp', executionLimits.maxRowsDefault, { max: 2000 }),
       renderNumberSetting('cmdp-runtime-max-rows-preview-default', 'runtimeMaxRowsPreviewDefault', 'runtimeMaxRowsPreviewDefaultHelp', executionLimits.maxRowsPreviewDefault, { max: 2000 }),
       renderNumberSetting('cmdp-runtime-max-rows-max', 'runtimeMaxRowsMax', 'runtimeMaxRowsMaxHelp', executionLimits.maxRowsMax, { max: 2000 }),
+      renderNumberSetting('cmdp-runtime-max-selection-scan-rows-default', 'runtimeMaxSelectionScanRowsDefault', 'runtimeMaxSelectionScanRowsDefaultHelp', executionLimits.maxSelectionScanRowsDefault, { max: executionLimits.maxSelectionScanRowsMax }),
+      renderNumberSetting('cmdp-runtime-max-selection-scan-rows-max', 'runtimeMaxSelectionScanRowsMax', 'runtimeMaxSelectionScanRowsMaxHelp', executionLimits.maxSelectionScanRowsMax, { max: 50000 }),
       renderNumberSetting('cmdp-runtime-max-classes-default', 'runtimeMaxClassesDefault', 'runtimeMaxClassesDefaultHelp', executionLimits.maxClassesDefault, { max: 500 }),
       renderNumberSetting('cmdp-runtime-max-classes-max', 'runtimeMaxClassesMax', 'runtimeMaxClassesMaxHelp', executionLimits.maxClassesMax, { max: 500 }),
       renderNumberSetting('cmdp-runtime-max-domains-default', 'runtimeMaxDomainsDefault', 'runtimeMaxDomainsDefaultHelp', executionLimits.maxDomainsDefault, { max: 500 }),
@@ -10296,6 +10562,7 @@ function dynamicPagesClientScript() {
     if (section === 'schema') return renderSchemaManager();
     if (section === 'versions') return renderVersions();
     if (section === 'assistant') return renderAssistantEditor(selected, config);
+    if (section === 'diagram-assistant') return renderDiagramAssistantEditor(selected, config);
     if (section === 'object-group') return renderObjectGroupEditor(selected);
     if (section === 'relations') return renderRelationExpansionEditor(selected);
     if (section === 'final-view') return renderViewComposerEditor(selected);
@@ -10323,7 +10590,8 @@ function dynamicPagesClientScript() {
     if (section === 'template') return t('creatingTemplate');
     if (section === 'schema') return t('menuSchema');
     if (section === 'versions') return t('menuVersions');
-    if (section === 'assistant') return t('menuAssistant');
+    if (section === 'assistant') return t('menuAssistantGroups');
+    if (section === 'diagram-assistant') return t('menuDiagramAssistant');
     if (section === 'params') return t('menuParams');
     if (section === 'object-group') return t('menuObjectGroup');
     if (section === 'relations') return t('menuRelations');
@@ -10402,7 +10670,7 @@ function dynamicPagesClientScript() {
       actions.push(renderActionButton('new-template', t('newTemplate'), { primary: true }));
       actions.push(renderActionButton('new-cmdb-build-view', t('templateKindCmdbBuildView')));
       actions.push(renderActionButton('save-template', t('save'), { disabled: saveDisabled, title: saveTitle }));
-    } else if (section === 'assistant') {
+    } else if (section === 'assistant' || section === 'diagram-assistant') {
       actions.push(renderActionButton('save-template', t('save'), { primary: true, disabled: saveDisabled, title: saveTitle }));
       actions.push(renderActionButton('draft-validate', t('validate')));
       actions.push(renderActionButton('draft-preview', t('preview')));
@@ -10788,19 +11056,6 @@ function dynamicPagesClientScript() {
     return visual && visual.output && visual.output.alias || '';
   }
 
-  function assistantExtractionCandidate(spec) {
-    var manifest = assistantObjectFlowOutputManifest(spec);
-    var candidate = manifest && manifest.extractionCandidate;
-    if (!manifest.assistantManaged || manifest.error || !candidate) return null;
-    var block = manifest.blocks.find(function (item) { return item.id === candidate.blockId; });
-    return block ? { blockId: candidate.blockId, alias: candidate.alias, label: block.name || candidate.alias } : null;
-  }
-
-  function assistantExtractionCandidateLabel(alias, label, candidate) {
-    if (!candidate || candidate.alias !== alias) return label;
-    return t('assistantFlowExtractionCandidateOption', { label: label || candidate.label || alias });
-  }
-
   function assistantObjectFlowOutputManifest(spec) {
     var objectMatching = getStoredVisualModel(spec || {}, 'objectMatching');
     var outputs = objectMatching && Array.isArray(objectMatching.outputs) ? objectMatching.outputs : [];
@@ -10859,17 +11114,13 @@ function dynamicPagesClientScript() {
       return {
         alias: alias,
         label: String(output && output.label || alias).trim() || alias,
-        published: output && output.published === true,
         assistantManaged: true,
         assistantBlockId: ownerIds[0],
         assistantBlockIds: ownerIds
       };
     }).filter(Boolean);
     if (Object.keys(expectedAliases).some(function (alias) { return !seen[alias]; })) invalid = true;
-    var rawCandidate = persisted.extractionCandidate && typeof persisted.extractionCandidate === 'object' ? persisted.extractionCandidate : null;
-    var candidate = rawCandidate ? { blockId: String(rawCandidate.blockId || '').trim(), alias: String(rawCandidate.alias || '').trim() } : null;
-    if (candidate && (!candidate.blockId || !candidate.alias || !knownBlockIds[candidate.blockId] || !seen[candidate.alias])) invalid = true;
-    return { assistantManaged: true, error: invalid ? 'invalid manifest' : '', outputs: invalid ? [] : manifest, blocks: invalid ? [] : blocks, extractionCandidate: invalid ? null : candidate };
+    return { assistantManaged: true, error: invalid ? 'invalid manifest' : '', outputs: invalid ? [] : manifest, blocks: invalid ? [] : blocks };
   }
 
   function objectFlowOutputManifest(spec) {
@@ -10881,13 +11132,11 @@ function dynamicPagesClientScript() {
     var assistantManifest = assistantObjectFlowOutputManifest(spec);
     if (assistantManifest.assistantManaged) {
       if (assistantManifest.error) return [];
-      var managedPublished = assistantManifest.outputs.filter(function (output) { return output.published; }).map(function (output) { return output.alias; });
-      return managedPublished.length ? managedPublished : [assistantManifest.outputs[assistantManifest.outputs.length - 1].alias];
+      return assistantManifest.outputs.length ? [assistantManifest.outputs[assistantManifest.outputs.length - 1].alias] : [];
     }
     var objectFlowOutputs = objectFlowOutputManifest(spec);
     if (objectFlowOutputs.length) {
-      var published = objectFlowOutputs.filter(function (output) { return output.published; }).map(function (output) { return output.alias; });
-      return published.length ? published : [objectFlowOutputs[objectFlowOutputs.length - 1].alias];
+      return [objectFlowOutputs[objectFlowOutputs.length - 1].alias];
     }
     var aliases = [];
     function add(alias) {
@@ -11176,13 +11425,12 @@ function dynamicPagesClientScript() {
   function extractionResultOptions(spec, tables) {
     var result = [];
     var seen = {};
-    var candidate = assistantExtractionCandidate(spec);
     function add(name, label) {
       var text = String(name || '').trim();
       if (!text || seen[text]) return;
       seen[text] = true;
       var baseLabel = label || aliasDisplayLabel(text, spec) || text;
-      result.push({ name: text, label: assistantExtractionCandidateLabel(text, baseLabel, candidate) });
+      result.push({ name: text, label: baseLabel });
     }
     var assistantManifest = assistantObjectFlowOutputManifest(spec);
     if (assistantManifest.assistantManaged) {
@@ -11230,8 +11478,6 @@ function dynamicPagesClientScript() {
     var resultOptions = options || extractionResultOptions(spec, tables);
     var selected = String(selectedName || '').trim();
     if (selected && resultOptions.some(function (item) { return item.name === selected; })) return selected;
-    var candidate = assistantExtractionCandidate(spec);
-    if (candidate && resultOptions.some(function (item) { return item.name === candidate.alias; })) return candidate.alias;
     var finalAliases = finalExtractionAliases(spec);
     for (var index = 0; index < finalAliases.length; index += 1) {
       var alias = finalAliases[index];
@@ -11289,12 +11535,15 @@ function dynamicPagesClientScript() {
     var optionTables = previewTables.length ? previewTables : specTables;
     var assistantManifest = assistantObjectFlowOutputManifest(spec);
     var options = renderExtractionResultOptions(state.extractionSource, spec, optionTables);
+    var selectedName = preferredExtractionResultName(spec, optionTables, state.extractionSource);
     return [
       '<section class="section" id="cmdp-extraction-editor"><h2>' + t('extractionEditor') + '</h2>',
       assistantManifest.assistantManaged && assistantManifest.error ? '<div class="notice error" role="alert">' + escapeHtml(t('assistantFlowOutputManifestInvalid')) + '</div>' : '',
       '<div class="row">',
       options ? '<label>' + t('extractionResultSource') + '<select id="cmdp-extraction-source">' + options + '</select></label>' : '',
       '</div>',
+      options ? '<div class="toolbar"><button type="button" class="primary" data-action="apply-extraction-published">' + escapeHtml(t('extractionPublishSelected')) + '</button></div>' : '',
+      selectedName ? '<p class="muted">' + escapeHtml(t('publishedTable') + ': ' + selectedName) + '</p>' : '',
       assistantManifest.assistantManaged && assistantManifest.error ? '' : renderExtractionPreview(spec),
       '</section>'
     ].join('');
@@ -11987,7 +12236,7 @@ function dynamicPagesClientScript() {
       var exemplar = role.exemplarRequired
         ? '<select data-diagram-import-exemplar="' + escapeHtml(role.id || '') + '"><option value=""></option>' + exemplarKeys.map(function (key) {
           return '<option value="' + escapeHtml(key) + '"' + (String(role.exemplarKey || '') === String(key) ? ' selected' : '') + '>' + escapeHtml(key) + '</option>';
-        }).join('') + '</select>'
+        }).join('') + '</select>' + (role.exemplarAutomatic ? '<div class="muted">Автоматически выбран структурно эквивалентный пример.</div>' : '')
         : '<span class="muted">' + escapeHtml(role.exemplarKey || '-') + '</span>';
       return '<tr data-diagram-import-role-row="' + escapeHtml(role.id || '') + '">' +
         '<td><strong>' + escapeHtml(role.label || role.key) + '</strong><div class="muted">' + escapeHtml(role.key || '') + '</div></td>' +
@@ -12022,6 +12271,7 @@ function dynamicPagesClientScript() {
     var stage = diagramImportStageById(spec || defaultSpec(), source.stageId) || {};
     var filter = Array.isArray(primary.filters) && primary.filters[0] || {};
     var related = Array.isArray(mapping.related) ? mapping.related : [];
+    var variants = Array.isArray(mapping.variants) ? mapping.variants : [];
     var expanded = role.selectedSemantic !== 'static';
     return '<details class="diagram-editor-block" data-diagram-import-role-mapping="' + escapeHtml(role.id || '') + '"' + (expanded ? ' open' : '') + '><summary><strong>' + escapeHtml(role.label || role.key) + '</strong> <span class="muted">' + escapeHtml(role.key || '') + '</span></summary>' +
       '<div class="diagram-grid">' +
@@ -12034,7 +12284,12 @@ function dynamicPagesClientScript() {
       '<label>' + t('objectGroupAttribute') + '<select data-diagram-import-role-field="primary.filter.path">' + renderAttributeOptions(primary.className || '', filter.path || '') + '</select></label>' +
       '<label>' + t('objectGroupOperator') + '<select data-diagram-import-role-field="primary.filter.op"><option value="equals"' + (filter.op === 'equals' ? ' selected' : '') + '>equals</option><option value="contains"' + (filter.op === 'contains' ? ' selected' : '') + '>contains</option></select></label>' +
       '<label>' + t('objectGroupValue') + '<input data-diagram-import-role-field="primary.filter.value" value="' + escapeHtml(filter.value || '') + '"></label>' +
-      '</div><div class="diagram-editor-heading"><h5>' + t('diagramImportRelatedClasses') + '</h5><button type="button" class="diagram-add-button" data-action="diagram-import-add-related" title="' + escapeHtml(t('diagramImportAddRelated')) + '">+</button></div>' +
+      '</div>' + (variants.length ? '<div class="notice"><strong>Варианты источника</strong><ul class="steps">' + variants.map(function (variant, index) {
+        var variantSource = variant && variant.source || {};
+        var variantPrimary = variant && variant.primary || {};
+        var stage = diagramImportStageById(spec || defaultSpec(), variantSource.stageId) || {};
+        return '<li><strong>' + escapeHtml(variant.label || ('Вариант ' + String(index + 2))) + '</strong>: ' + escapeHtml(stage.label || stage.alias || variantSource.stageId || '-') + ' [' + escapeHtml(variantPrimary.className || stage.className || '-') + ']</li>';
+      }).join('') + '</ul></div>' : '') + '<div class="diagram-editor-heading"><h5>' + t('diagramImportRelatedClasses') + '</h5><button type="button" class="diagram-add-button" data-action="diagram-import-add-related" title="' + escapeHtml(t('diagramImportAddRelated')) + '">+</button></div>' +
       '<div class="table-wrap"><table class="compact"><thead><tr><th>' + t('diagramImportRelatedClass') + '</th><th>' + t('diagramImportRelationPath') + '</th><th>' + t('diagramImportDirection') + '</th><th>' + t('diagramImportStructuredFields') + '</th><th>' + t('diagramImportActions') + '</th></tr></thead><tbody data-diagram-import-related-body>' +
       related.map(function (item, index) { return renderDiagramImportRelatedRow(role, item, index); }).join('') + '</tbody></table></div></details>';
   }
@@ -12091,20 +12346,58 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
+  function renderDiagramImportUnresolvedDetails(proposal) {
+    var unresolved = Array.isArray(proposal && proposal.unresolved) ? proposal.unresolved : [];
+    if (!unresolved.length) return '';
+    var roles = Array.isArray(proposal && proposal.roles) ? proposal.roles : [];
+    var fieldLabels = {
+      semantic: 'семантика',
+      exemplarKey: 'экземпляр D2',
+      'source.stageId': 'источник данных',
+      'primary.filters': 'singleton-фильтр',
+      className: 'класс CMDBuild',
+      path: 'путь связи',
+      parentRoleId: 'родительская роль',
+      childRoleId: 'дочерняя роль'
+    };
+    var rows = unresolved.map(function (item) {
+      var role = roles.find(function (candidate) { return String(candidate && candidate.id || '') === String(item && item.id || ''); });
+      if (!role && item && item.family === 'related') {
+        roles.some(function (candidate) {
+          role = (candidate.mapping && candidate.mapping.related || []).find(function (related) { return String(related && related.id || '') === String(item.id || ''); });
+          return Boolean(role);
+        });
+      }
+      var name = role && (role.label || role.key || role.id) || String(item && item.id || '');
+      var fields = (item && item.fields || []).map(function (field) { return fieldLabels[field] || field; }).join(', ');
+      return '<li><strong>' + escapeHtml(name) + '</strong>: ' + escapeHtml(fields) + '. <a href="' + escapeHtml(designerSectionUrl('diagram')) + '">' + escapeHtml(t('openDiagramEditor')) + '</a></li>';
+    }).join('');
+    return '<details class="help-details" open><summary>' + escapeHtml(t('diagramImportUnresolved')) + ': ' + escapeHtml(String(unresolved.length)) + '</summary><p class="muted">Заполните указанные поля в детерминированном редакторе; Assistant ничего не применяет автоматически.</p><ul class="steps">' + rows + '</ul></details>';
+  }
+
   function renderDiagramImportAssistantProposal(spec) {
     var proposal = state.diagramImportProposal;
     if (!proposal) return '';
     refreshDiagramImportSemanticState(proposal);
     var counts = state.diagramImportIr && state.diagramImportIr.elements || {};
     var warnings = Array.isArray(proposal.warnings) ? proposal.warnings.filter(Boolean) : [];
+    var mappingResult = state.assistantDiagramMappingResult || {};
+    var mapping = mappingResult && mappingResult.mapping || null;
+    var mappingStatus = mapping ? '<div class="notice" data-assistant-diagram-mapping-status><strong>' + (mapping.status === 'complete' ? 'Сопоставление завершено' : 'Частично сопоставлено') + '</strong>: ' + escapeHtml(String(mapping.mappedRoles || 0)) + '/' + escapeHtml(String(mapping.requiredRoles || 0)) + (Array.isArray(mapping.unresolved) && mapping.unresolved.length ? '<ul class="steps">' + mapping.unresolved.map(function (item) {
+      var name = String(item && item.displayName || item && item.roleId || '');
+      var message = String(item && item.message || item && item.code || '');
+      return '<li><strong>' + escapeHtml(name) + '</strong>: ' + escapeHtml(message) + ' <a href="' + escapeHtml(designerSectionUrl('diagram')) + '">' + escapeHtml(t('openDiagramEditor')) + '</a></li>';
+    }).join('') + '</ul>' : '') + '</div>' : '';
     return [
       warnings.map(function (warning) { return '<div class="notice" data-diagram-import-warning>' + escapeHtml(warning) + '</div>'; }).join(''),
+      mappingStatus,
       '<div class="diagram-import-summary">',
       renderKpi(t('diagramImportNodes'), String((counts.nodes || []).length)),
       renderKpi(t('diagramImportEdges'), String((counts.edges || []).length)),
       renderKpi(t('diagramImportGroups'), String((counts.groups || []).length)),
       renderKpi(t('diagramImportUnresolved'), String((proposal.unresolved || []).length)),
       '</div>',
+      renderDiagramImportUnresolvedDetails(proposal),
       '<p class="muted">' + escapeHtml(t('assistantProposalOnly')) + '</p>'
     ].join('');
   }
@@ -12139,6 +12432,8 @@ function dynamicPagesClientScript() {
   function renderDiagramImportWorkbench(spec) {
     var busy = state.diagramImportBusy || state.diagramImportAssistantBusy || state.assistantDiagramInterpretBusy || state.assistantDiagramMappingBusy;
     var proposal = state.diagramImportProposal;
+    var hasSource = Boolean(String(state.diagramImportSource || '').trim());
+    var hasAppliedFlowStages = diagramImportStageRows(spec || defaultSpec()).length > 0;
     var semanticBlocked = Boolean(proposal) && (proposal.unresolved || []).some(function (item) {
       return item && (item.family === 'containerRoles' || item.family === 'roles' && (item.fields || []).some(function (field) { return field === 'semantic' || field === 'exemplarKey' || field === 'boundaryEdge'; }));
     });
@@ -12155,8 +12450,8 @@ function dynamicPagesClientScript() {
       '</div>',
       '<div data-diagram-import-stale class="diagram-import-status unresolved" role="status" aria-live="polite"' + (state.diagramImportStale ? '' : ' hidden') + '>' + escapeHtml(t('diagramImportStale')) + '</div>',
       renderDiagramImportPreview(),
-      '<div class="assistant-d2-prompt"><h4>' + t('assistantDiagramStructureTitle') + '</h4><p class="muted">' + t('assistantDiagramStructureHelp') + '</p><label>' + t('assistantDiagramInterpretPrompt') + '<textarea id="cmdp-assistant-diagram-interpret-prompt" rows="4">' + escapeHtml(state.assistantDiagramInterpretPrompt || '') + '</textarea></label><div class="toolbar"><button type="button" data-action="assistant-diagram-interpret"' + (busy || !proposal || state.diagramImportStale ? ' disabled' : '') + '>' + t('assistantDiagramInterpret') + '</button></div></div>',
-      '<div class="assistant-d2-prompt"><h4>' + t('assistantDiagramMappingTitle') + '</h4><p class="muted">' + t('assistantDiagramMappingHelp') + '</p><label>' + t('assistantDiagramMappingPrompt') + '<textarea id="cmdp-assistant-diagram-mapping-prompt" rows="4">' + escapeHtml(state.assistantDiagramMappingPrompt || '') + '</textarea></label><div class="toolbar"><button type="button" data-action="assistant-diagram-map"' + (busy || !proposal || state.diagramImportStale || semanticBlocked ? ' disabled' : '') + '>' + t('assistantDiagramMap') + '</button></div>' + (!proposal ? '<p class="muted">' + escapeHtml(t('assistantDiagramAnalysisRequired')) + '</p>' : '') + '</div>',
+      '<div class="assistant-d2-prompt"><h4>' + t('assistantDiagramStructureTitle') + '</h4><p class="muted">' + t('assistantDiagramStructureHelp') + '</p><label>' + t('assistantDiagramInterpretPrompt') + '<textarea id="cmdp-assistant-diagram-interpret-prompt" rows="4">' + escapeHtml(state.assistantDiagramInterpretPrompt || '') + '</textarea></label><div class="toolbar"><button type="button" data-action="assistant-diagram-interpret"' + (busy || !hasSource ? ' disabled' : '') + '>' + t('assistantDiagramInterpret') + '</button></div></div>',
+      '<div class="assistant-d2-prompt"><h4>' + t('assistantDiagramMappingTitle') + '</h4><p class="muted">' + t('assistantDiagramMappingHelp') + '</p><label>' + t('assistantDiagramMappingPrompt') + '<textarea id="cmdp-assistant-diagram-mapping-prompt" rows="4">' + escapeHtml(state.assistantDiagramMappingPrompt || '') + '</textarea></label><div class="toolbar"><button type="button" data-action="assistant-diagram-map"' + (busy || !hasSource || !hasAppliedFlowStages || semanticBlocked && Boolean(proposal) && !state.diagramImportStale ? ' disabled' : '') + '>' + t('assistantDiagramMap') + '</button></div>' + (!proposal ? '<p class="muted">' + escapeHtml(t('assistantDiagramAnalysisRequired')) + '</p>' : '') + (proposal && !hasAppliedFlowStages ? '<p class="muted">Сначала примените поток данных к draft: только примененные детерминированные результаты доступны для сопоставления.</p>' : '') + '</div>',
       renderDiagramImportAssistantProposal(spec),
       '</div>',
       '</div>'
@@ -12747,12 +13042,14 @@ function dynamicPagesClientScript() {
     var tables = outputMode === 'diagrams' ? [] : visibleResultTables(resultBody ? (resultBody.tables || []) : []);
     var diagrams = outputMode === 'tables' ? [] : visibleResultDiagrams(resultBody ? (resultBody.diagrams || []) : []);
     var trace = result.json && result.json.result ? (result.json.result.trace || []) : [];
+    var warnings = resultBody && Array.isArray(resultBody.warnings) ? resultBody.warnings : [];
     if (!result.ok) {
       var errorHtml = '<section class="section" id="cmdp-result-section">' + renderNotice({ type: 'error', text: errorText(result) });
       if (trace.length) errorHtml += renderExecutionTrace(trace);
       return errorHtml + '</section>';
     }
     var html = '<section class="section" id="cmdp-result-section"><h2>' + t('result') + '</h2>';
+    if (warnings.length) html += warnings.map(function (warning) { return renderNotice({ type: 'warning', text: warning }); }).join('');
     if (diagrams.length || tables.length) {
       if (diagrams.length) html += diagrams.map(function (diagram, diagramIndex) {
         return renderResultDiagram(diagram, renderDraftD2DownloadAction(diagram, diagramIndex), '');
@@ -13159,6 +13456,7 @@ function dynamicPagesClientScript() {
   }
 
   function renderExecutionTrace(trace) {
+    var warnings = trace.filter(function (item) { return item && item.warning; }).map(function (item) { return item.warning; });
     var rows = trace.map(function (item) {
       return '<tr><td>' + escapeHtml(item.index == null ? '' : String(item.index + 1)) + '</td>' +
         '<td>' + escapeHtml(item.type || '') + '</td>' +
@@ -13168,7 +13466,8 @@ function dynamicPagesClientScript() {
         '<td>' + escapeHtml(item.elapsedMs == null ? '' : String(item.elapsedMs)) + '</td>' +
         '<td>' + escapeHtml(item.restCalls == null ? '' : String(item.restCalls)) + '</td></tr>';
     }).join('');
-    return '<h3>' + t('executionTrace') + '</h3><table class="compact"><thead><tr><th>' + t('traceStep') + '</th><th>' +
+    return (warnings.length ? warnings.map(function (warning) { return renderNotice({ type: 'warning', text: warning }); }).join('') : '') +
+      '<h3>' + t('executionTrace') + '</h3><table class="compact"><thead><tr><th>' + t('traceStep') + '</th><th>' +
       t('type') + '</th><th>' + t('traceAlias') + '</th><th>' + t('traceStatus') + '</th><th>' +
       t('traceRows') + '</th><th>' + t('traceMs') + '</th><th>' + t('traceRest') + '</th></tr></thead><tbody>' +
       rows + '</tbody></table>';
@@ -14670,10 +14969,8 @@ function dynamicPagesClientScript() {
         distinct: Boolean(distinctField && distinctField.checked)
       }, index, selections, operations));
     });
-    var outputField = document.querySelector('[data-result-set-field="publishedAlias"]');
     var model = normalizeObjectMatchingModel({
-      operations: operations,
-      output: { alias: String(outputField && outputField.value || '').trim() }
+      operations: operations
     }, previousSpec);
     validateRelationOperationTopology(model);
     return model;
@@ -14714,7 +15011,7 @@ function dynamicPagesClientScript() {
       if (alias) selectionAliases.push(alias);
     });
     var availableAliases = selectionAliases.slice();
-    flowOperations(model).forEach(function (operation) {
+    flowOperations(model).forEach(function (operation, index) {
       var from = String(operation && operation.from || '').trim();
       var withAlias = String(operation && operation.with || '').trim();
       var alias = String(operation && operation.as || '').trim();
@@ -14875,13 +15172,15 @@ function dynamicPagesClientScript() {
         columns: flowColumnOptionRows(model, specForLabels, finalAlias, operations.length).map(function (item) { return item.value; })
       });
     }
-    if (finalAlias) {
-      resultTables.forEach(function (table) {
-        if (!table) return;
-        if (table.name === finalAlias) table.published = true;
-        else delete table.published;
-      });
-    }
+    var preservedPublishedTable = previousSpec && previousSpec.result && Array.isArray(previousSpec.result.tables)
+      ? previousSpec.result.tables.find(function (table) { return table && table.published === true && resultTables.some(function (candidate) { return candidate && candidate.name === table.name; }); })
+      : null;
+    var preservedPublishedAlias = String(preservedPublishedTable && preservedPublishedTable.name || '').trim();
+    resultTables.forEach(function (table) {
+      if (!table) return;
+      if (table.name === preservedPublishedAlias) table.published = true;
+      else delete table.published;
+    });
     var spec = {
       version: 1,
       params: objectSpec.params || {},
@@ -15140,6 +15439,28 @@ function dynamicPagesClientScript() {
       renderDesigner();
     } catch (error) {
       state.message = { type: 'error', text: error.message };
+      renderDesigner();
+    }
+  }
+
+  function applyExtractionPublishedTable() {
+    try {
+      var specData = readSpecWithParamEditor();
+      var selectedName = String(readValue('cmdp-extraction-source') || state.extractionSource || '').trim();
+      if (!selectedName) throw new Error(t('viewComposerNeedsSource'));
+      specData.spec = ensureExtractionPreviewTable(specData.spec, selectedName);
+      specData.spec.result.tables.forEach(function (table) {
+        if (!table) return;
+        if (table.name === selectedName) table.published = true;
+        else delete table.published;
+      });
+      state.extractionSource = selectedName;
+      updateSelectedFromEditor(specData.spec);
+      state.runParams = Object.assign({}, specData.examples, state.runParams || {});
+      state.message = { type: 'ok', text: t('extractionPublishedSelected') };
+      renderDesigner();
+    } catch (error) {
+      state.message = { type: 'error', text: error.message || String(error) };
       renderDesigner();
     }
   }
@@ -15578,12 +15899,8 @@ function dynamicPagesClientScript() {
   }
 
   function refreshRelationOperationAliases() {
-    var outputField = document.querySelector('[data-result-set-field="publishedAlias"]');
-    if (!outputField) return;
     var draft = captureRelationDraftFromDom();
     state.relationDraft = normalizeObjectMatchingModel(draft, readCurrentSpec());
-    var selectedAlias = String(outputField.value || '').trim();
-    outputField.innerHTML = renderMaterializedAliasOptions(state.relationDraft, selectedAlias);
     document.querySelectorAll('[data-flow-operation]').forEach(function (node) {
       var index = Number(node.getAttribute('data-flow-operation-index') || -1);
       var isMatch = node.getAttribute('data-flow-operation') === 'match';
@@ -15858,6 +16175,7 @@ function dynamicPagesClientScript() {
       }).filter(function (rule) { return rule.parentRoleId || rule.childRoleId; });
       refreshDiagramImportSemanticState(proposal);
       state.diagramImportProposal = proposal;
+      state.diagramImportAuthoringOverrides = diagramImportAuthoringOverrides(proposal);
       var sourceV3 = document.getElementById('cmdp-diagram-import-source');
       if (sourceV3) state.diagramImportSource = sourceV3.value;
       return proposal;
@@ -15906,6 +16224,7 @@ function dynamicPagesClientScript() {
     });
     refreshDiagramImportSemanticState(proposal);
     state.diagramImportProposal = proposal;
+    state.diagramImportAuthoringOverrides = diagramImportAuthoringOverrides(proposal);
     var source = document.getElementById('cmdp-diagram-import-source');
     if (source) state.diagramImportSource = source.value;
     return proposal;
@@ -15930,6 +16249,107 @@ function dynamicPagesClientScript() {
         confidence: binding.confidence === 'manual' ? 'manual' : binding.confidence
       };
     });
+  }
+
+  function diagramImportAuthoringOverrides(proposal) {
+    if (!proposal || proposal.version !== 3) return { roles: [], relationRules: [], placementRules: [] };
+    return {
+      roles: diagramImportBindingOverrides(proposal),
+      relationRules: cloneJsonValue(proposal.relationRules || [], []),
+      placementRules: cloneJsonValue(proposal.placementRules || [], [])
+    };
+  }
+
+  // The browser restores locally saved authoring overrides before the proposal
+  // is sent back to the server. Keep this normalizer self-contained: server
+  // helpers are not emitted into the generated client script.
+  function diagramImportRoleMappingVariantClient(role, source, index) {
+    var candidate = source && typeof source === 'object' && !Array.isArray(source) ? source : {};
+    var stageSource = candidate.source && typeof candidate.source === 'object' && !Array.isArray(candidate.source) ? candidate.source : {};
+    var primary = candidate.primary && typeof candidate.primary === 'object' && !Array.isArray(candidate.primary) ? candidate.primary : {};
+    var roleId = String(role && role.id || 'role');
+    var dedupe = function (values, fallback) {
+      var result = [];
+      (Array.isArray(values) ? values : fallback).forEach(function (value) {
+        var text = String(value || '').trim();
+        if (text && result.indexOf(text) === -1) result.push(text);
+      });
+      return result;
+    };
+    return {
+      id: String(candidate.id || ('role_mapping_variant_' + roleId + '_' + String(index))).trim(),
+      label: String(candidate.label || candidate.name || '').trim().slice(0, 160),
+      source: {
+        stageId: String(stageSource.stageId || '').trim(),
+        alias: String(stageSource.alias || '').trim(),
+        kind: String(stageSource.kind || '').trim(),
+        className: String(stageSource.className || '').trim()
+      },
+      primary: {
+        className: String(primary.className || '').trim(),
+        idAttribute: String(primary.idAttribute || '_id').trim() || '_id',
+        labelTemplate: String(primary.labelTemplate || '\${Description}'),
+        structuredFields: dedupe(primary.structuredFields, ['Code', 'Description']),
+        filters: Array.isArray(primary.filters) ? cloneJsonValue(primary.filters, []) : []
+      },
+      related: (Array.isArray(candidate.related) ? candidate.related : []).map(function (item, relatedIndex) {
+        var related = item && typeof item === 'object' ? item : {};
+        return {
+          id: String(related.id || ('related_' + roleId + '_' + String(index) + '_' + String(relatedIndex))),
+          className: String(related.className || '').trim(),
+          path: (Array.isArray(related.path) ? related.path : []).map(function (hop) {
+            var pathHop = hop && typeof hop === 'object' ? hop : {};
+            return {
+              kind: String(pathHop.kind || 'domain').trim(),
+              name: String(pathHop.name || pathHop.domain || pathHop.reference || '').trim(),
+              domain: String(pathHop.domain || '').trim(),
+              targetClass: String(pathHop.targetClass || '').trim(),
+              direction: String(pathHop.direction || 'both').trim() || 'both'
+            };
+          }).filter(function (hop) { return hop.name; }),
+          structuredFields: dedupe(related.structuredFields, ['Code', 'Description'])
+        };
+      }).filter(function (item) { return item.className || item.path.length || item.structuredFields.length; })
+    };
+  }
+
+  function diagramImportRoleMappingClient(role, existing) {
+    var source = existing && typeof existing === 'object' && !Array.isArray(existing) ? existing : {};
+    var mapping = diagramImportRoleMappingVariantClient(role, source, 0);
+    mapping.id = String(source.id || ('role_mapping_' + String(role && role.id || 'role'))).trim();
+    mapping.roleId = String(role && role.id || '');
+    var variants = Array.isArray(source.variants) ? source.variants.map(function (item, index) {
+      return diagramImportRoleMappingVariantClient(role, item, index + 1);
+    }) : [];
+    if (variants.length) mapping.variants = variants;
+    return mapping;
+  }
+
+  function applyDiagramImportAuthoringOverrides(proposal) {
+    if (!proposal || proposal.version !== 3) return proposal;
+    var overrides = state.diagramImportAuthoringOverrides || {};
+    var byRoleId = {};
+    (Array.isArray(overrides.roles) ? overrides.roles : []).forEach(function (item) {
+      if (item && item.id) byRoleId[String(item.id)] = item;
+    });
+    var unmatched = Object.keys(byRoleId);
+    (proposal.roles || []).forEach(function (role) {
+      var override = byRoleId[String(role.id || '')];
+      if (!override) return;
+      role.selectedSemantic = String(override.selectedSemantic || role.selectedSemantic || '');
+      role.exemplarKey = String(override.exemplarKey || role.exemplarKey || '');
+      role.mapping = diagramImportRoleMappingClient(role, override.mapping || role.mapping || {});
+      unmatched = unmatched.filter(function (id) { return id !== String(role.id || ''); });
+    });
+    if (Array.isArray(overrides.relationRules)) proposal.relationRules = cloneJsonValue(overrides.relationRules, []);
+    if (Array.isArray(overrides.placementRules)) proposal.placementRules = cloneJsonValue(overrides.placementRules, []);
+    if (unmatched.length) {
+      proposal.warnings = Array.isArray(proposal.warnings) ? proposal.warnings : [];
+      proposal.warnings.push('Для ' + unmatched.length + ' сохраненных D2-ролей не найдено соответствие в новом исходнике. Проверьте сопоставления в редакторе диаграмм.');
+    }
+    refreshDiagramImportSemanticState(proposal);
+    state.diagramImportAuthoringOverrides = diagramImportAuthoringOverrides(proposal);
+    return proposal;
   }
 
   function diagramImportSemanticOverrides(proposal) {
@@ -15981,6 +16401,8 @@ function dynamicPagesClientScript() {
       if (Number.isInteger(placementIndex)) proposal.placementRules.splice(placementIndex, 1);
     }
     refreshDiagramImportSemanticState(proposal);
+    state.diagramImportAuthoringOverrides = diagramImportAuthoringOverrides(proposal);
+    scheduleAssistantPromptAutosave();
     renderDesigner();
   }
 
@@ -15996,7 +16418,9 @@ function dynamicPagesClientScript() {
   function persistedDiagramImportSource() {
     var diagram = firstDiagramSpec(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
     var d2Import = diagram && diagram.authoring && diagram.authoring.d2Import;
-    return String(d2Import && d2Import.source || '');
+    var assistantDraft = state.selectedTemplate && state.selectedTemplate.spec && state.selectedTemplate.spec.assistantDraft || {};
+    var d2Authoring = assistantDraft && assistantDraft.d2Authoring;
+    return String(d2Authoring && d2Authoring.source || d2Import && d2Import.source || '');
   }
 
   function markImportedDiagramChanged() {
@@ -16017,15 +16441,21 @@ function dynamicPagesClientScript() {
     });
   }
 
-  function analyzeDiagramImport() {
-    if (state.diagramImportBusy || state.diagramImportAssistantBusy) return;
-    if (!captureVisibleDesignerState()) return;
+  function analyzeDiagramImport(options) {
+    options = options || {};
+    function rejectedAnalysis(error) {
+      var rejected = Promise.reject(error);
+      if (!options.propagateErrors) rejected.catch(function () {});
+      return rejected;
+    }
+    if (state.diagramImportBusy || state.diagramImportAssistantBusy) return rejectedAnalysis(new Error(t('diagramImportAnalyzing')));
+    if (!captureVisibleDesignerState()) return rejectedAnalysis(new Error(t('requestFailed')));
     var source = document.getElementById('cmdp-diagram-import-source');
     state.diagramImportSource = String(source && source.value || state.diagramImportSource || '');
     if (!state.diagramImportSource.trim()) {
       state.message = { type: 'error', text: t('fieldRequired', { label: t('diagramImportSource') }) };
       renderDesigner();
-      return;
+      return rejectedAnalysis(new Error(t('fieldRequired', { label: t('diagramImportSource') })));
     }
     state.diagramImportBusy = true;
     state.diagramImportProposal = null;
@@ -16034,10 +16464,11 @@ function dynamicPagesClientScript() {
     state.diagramImportPreviewError = '';
     state.diagramImportStale = false;
     var requestTemplate = state.selectedTemplate;
+    var requestEditorSpecSnapshot = JSON.stringify(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
     state.message = { type: 'ok', text: t('diagramImportAnalyzing') };
     renderDesigner();
     var requestSource = state.diagramImportSource;
-    request(apiPrefix + '/draft/diagram-import/analyze', {
+    var analysis = request(apiPrefix + '/draft/diagram-import/analyze', {
       method: 'POST',
       timeoutMs: 30000,
       body: {
@@ -16052,6 +16483,8 @@ function dynamicPagesClientScript() {
       if (!result.ok || !result.json || !result.json.proposal) throw new Error(errorText(result));
       state.diagramImportSignedProposal = cloneJsonValue(result.json.proposal, null);
       state.diagramImportProposal = cloneJsonValue(result.json.proposal, null);
+      applyDiagramImportAuthoringOverrides(state.diagramImportProposal);
+      state.diagramImportEditorSpecSnapshot = requestEditorSpecSnapshot;
       state.diagramImportIr = result.json.ir || null;
       if (state.diagramImportSource === requestSource) {
         state.diagramImportPreview = cloneJsonValue(result.json.preview, null);
@@ -16064,14 +16497,40 @@ function dynamicPagesClientScript() {
         writeCatalogCache(result.json.catalog);
       }
       state.diagramImportStale = state.diagramImportSource !== requestSource;
+      state.diagramImportRestorePending = false;
       state.message = { type: state.diagramImportStale ? 'error' : 'ok', text: state.diagramImportStale ? t('diagramImportStale') : t('diagramImportReady') };
+      if (state.diagramImportStale) throw new Error(t('diagramImportStale'));
+      return state.diagramImportSignedProposal;
     }).catch(function (error) {
       var message = String(error && error.message || error || t('requestFailed')).slice(0, 500);
       state.diagramImportPreviewError = message;
       state.message = { type: 'error', text: message };
+      if (options.propagateErrors) throw error;
     }).finally(function () {
       state.diagramImportBusy = false;
       renderDesigner();
+    });
+    if (!options.propagateErrors) analysis.catch(function () {});
+    return analysis;
+  }
+
+  function diagramImportProposalMatchesCurrentRevision() {
+    var selected = state.selectedTemplate;
+    var proposal = state.diagramImportSignedProposal;
+    return Boolean(
+      selected && proposal &&
+      String(proposal.templateCode || '') === String(selected.code || '') &&
+      String(proposal.baseSpecHash || '') === String(selected.specHash || '') &&
+      state.diagramImportEditorSpecSnapshot === JSON.stringify(selected.spec || defaultSpec()) &&
+      !state.diagramImportStale
+    );
+  }
+
+  function ensureDiagramImportProposalForCurrentRevision() {
+    if (diagramImportProposalMatchesCurrentRevision()) return Promise.resolve(state.diagramImportSignedProposal);
+    return analyzeDiagramImport({ propagateErrors: true }).then(function (proposal) {
+      if (!proposal || !diagramImportProposalMatchesCurrentRevision()) throw new Error(t('assistantResponseStale'));
+      return proposal;
     });
   }
 
@@ -16262,6 +16721,8 @@ function dynamicPagesClientScript() {
       renderDesigner();
       return;
     }
+    captureAssistantPromptsFromDom();
+    invalidateAssistantPromptAutosave();
     var payload;
     try { payload = readEditorPayload(); } catch (error) {
       state.message = { type: 'error', text: error.message };
@@ -16346,10 +16807,6 @@ function dynamicPagesClientScript() {
       var removed = intent.blocks.splice(Number(index), 1)[0];
       if (!removed) return;
       delete state.assistantFlowExpandedBlockIds[removed.id];
-      if (intent.extractionCandidateBlockId === removed.id) {
-        intent.extractionCandidateBlockId = '';
-        intent.extractionCandidateAlias = '';
-      }
       intent.blocks.forEach(function (block) {
         block.uses = block.uses.filter(function (dependency) { return dependency !== removed.id; });
       });
@@ -16399,6 +16856,34 @@ function dynamicPagesClientScript() {
     };
     state.assistantFlowErrorStage = 'flowDraft';
     state.message = { type: 'error', text: state.assistantFlowFeedback.action };
+  }
+
+  function assistantFlowOwnershipFeedback(errors) {
+    var issues = Array.isArray(errors) ? errors : [];
+    var causes = issues.map(function (issue) {
+      var item = issue && typeof issue === 'object' ? issue : {};
+      var name = String(item.blockName || item.blockId || t('assistantFlowBlockDefault', { number: '?' }));
+      var alias = String(item.alias || item.expectedAlias || '');
+      if (item.code === 'assistant_output_binding_missing') {
+        var aliases = Array.isArray(item.availableAliases) && item.availableAliases.length ? item.availableAliases.join(', ') : t('assistantFlowOwnershipNoAlias');
+        return { kind: item.code, message: t('assistantFlowOwnershipMissing', { name: name, aliases: aliases }) };
+      }
+      if (item.code === 'assistant_output_binding_duplicate_alias') {
+        return { kind: item.code, message: t('assistantFlowOwnershipDuplicate', { name: name, alias: alias || t('assistantFlowOwnershipNoAlias') }) };
+      }
+      if (item.code === 'assistant_output_binding_final') {
+        return { kind: item.code, message: t('assistantFlowOwnershipFinal', { name: name, alias: alias || t('assistantFlowOwnershipNoAlias') }) };
+      }
+      if (item.code === 'assistant_output_stage_unowned') {
+        return { kind: item.code, message: t('assistantFlowOwnershipUnowned', { alias: alias || t('assistantFlowOwnershipNoAlias') }) };
+      }
+      return { kind: String(item.code || ''), message: String(item.message || '') };
+    }).filter(function (cause) { return cause.message; });
+    return {
+      summary: t('assistantFlowOwnershipIncomplete'),
+      causes: causes,
+      action: causes.length ? t('assistantFlowOwnershipActionSpecific') : t('assistantFlowOwnershipIncompleteAction')
+    };
   }
 
   function prepareAssistantObjectFlowSemanticPlan(retry) {
@@ -16516,9 +17001,7 @@ function dynamicPagesClientScript() {
     state.assistantFlowDiagnostics = {};
     state.assistantFlowFeedback = null;
     state.assistantFlowErrorStage = '';
-    state.assistantFlowPreview = null;
     state.assistantFlowCanApply = false;
-    state.assistantFlowCandidateOutput = null;
     state.assistantFlowOutputBindings = [];
     state.message = { type: 'ok', text: t('assistantGeneratingTitle') };
     renderDesigner();
@@ -16559,9 +17042,6 @@ function dynamicPagesClientScript() {
       state.assistantFlowCanApply = result.json.canApply === true;
       state.assistantFlowExplanation = String(result.json.explanation || '');
       state.assistantFlowWarnings = Array.isArray(result.json.warnings) ? result.json.warnings.map(String).filter(Boolean) : [];
-      state.assistantFlowCandidateOutput = result.json.extractionCandidate && typeof result.json.extractionCandidate === 'object'
-        ? { blockId: String(result.json.extractionCandidate.blockId || ''), alias: String(result.json.extractionCandidate.alias || '') }
-        : null;
       state.assistantFlowOutputBindings = Array.isArray(result.json.outputBindings)
         ? result.json.outputBindings.map(function (binding) {
           return { blockId: String(binding && binding.blockId || ''), alias: String(binding && binding.alias || '') };
@@ -16569,7 +17049,7 @@ function dynamicPagesClientScript() {
         : [];
       state.assistantFlowErrors = Array.isArray(result.json.ownershipErrors) ? result.json.ownershipErrors : [];
       state.assistantFlowFeedback = state.assistantFlowErrors.length
-        ? { summary: t('assistantFlowOwnershipIncomplete'), action: t('assistantFlowOwnershipIncompleteAction') }
+        ? assistantFlowOwnershipFeedback(state.assistantFlowErrors)
         : null;
       state.assistantFlowErrorStage = state.assistantFlowErrors.length ? 'ownership' : '';
       state.assistantFlowResume = Object.assign({}, resume, { retryable: false, retryStage: '' });
@@ -16588,60 +17068,14 @@ function dynamicPagesClientScript() {
     });
   }
 
-  function previewAssistantObjectFlow() {
-    if (state.assistantFlowBusy || !state.assistantFlowProposal) return;
-    var requestSpec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
-    var params;
-    try {
-      params = readRunParams();
-    } catch (error) {
-      state.message = { type: 'error', text: error.message || String(error) };
-      renderDesigner();
-      return;
-    }
-    var requestGeneration = Number(state.assistantFlowRequestGeneration || 0) + 1;
-    state.assistantFlowRequestGeneration = requestGeneration;
-    var requestRevision = assistantTemplateRevisionSnapshot(state.selectedTemplate, requestSpec, requestGeneration);
-    state.assistantFlowBusy = true;
-    state.assistantFlowPreview = null;
-    state.runParams = Object.assign({}, state.runParams || {}, params);
-    state.message = { type: 'ok', text: t('assistantGeneratingTitle') };
-    renderDesigner();
-    request(apiPrefix + '/assistant/object-flow/preview?root=' + encodeURIComponent(state.root || 'Cst_QueryTool'), {
-      method: 'POST', timeoutMs: 60000,
-      body: {
-        flow: state.assistantFlowProposal,
-        assistantOutputBindings: state.assistantFlowOutputBindings,
-        assistantObjectFlowIntent: state.assistantObjectFlowIntent,
-        currentSpec: requestSpec,
-        params: params,
-        templateCode: state.selectedTemplate && state.selectedTemplate.code || '',
-        baseSpecHash: state.selectedTemplate && state.selectedTemplate.specHash || ''
-      }
-    }).then(function (result) {
-      var mismatch = assistantTemplateRevisionMismatch(requestRevision);
-      if (mismatch === 'request') throw assistantTemplateRevisionError(requestRevision);
-      if (!result.ok) {
-        state.assistantFlowPreview = result;
-        state.message = { type: 'error', text: errorText(result) };
-        return;
-      }
-      var staleError = assistantTemplateRevisionError(requestRevision);
-      if (staleError) throw staleError;
-      state.assistantFlowPreview = result;
-      state.message = { type: 'ok', text: t('assistantFlowPreviewReady') };
-    }).catch(function (error) {
-      state.assistantFlowPreview = null;
-      state.message = { type: 'error', text: error.message || String(error) };
-    }).finally(function () {
-      if (Number(state.assistantFlowRequestGeneration || 0) === requestGeneration) state.assistantFlowBusy = false;
-      renderDesigner();
-    });
-  }
-
   function applyAssistantObjectFlow() {
     if (state.assistantFlowBusy || !state.assistantFlowCanApply) {
       state.message = { type: 'error', text: t('assistantFlowApplyUnavailable') };
+      renderDesigner();
+      return;
+    }
+    if (!state.selectedTemplate || !state.selectedTemplate.id || !state.selectedTemplate.code) {
+      state.message = { type: 'error', text: t('templateSelectionRequired') };
       renderDesigner();
       return;
     }
@@ -16651,21 +17085,22 @@ function dynamicPagesClientScript() {
       renderDesigner();
       return;
     }
-    var requestSpec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
     var requestGeneration = Number(state.assistantFlowRequestGeneration || 0) + 1;
     state.assistantFlowRequestGeneration = requestGeneration;
-    var requestRevision = assistantTemplateRevisionSnapshot(
-      state.selectedTemplate,
-      requestSpec,
-      requestGeneration
-    );
     var requestFlowFingerprint = stableClientJsonStringify(flow);
-    var requestIntentFingerprint = stableClientJsonStringify(state.assistantObjectFlowIntent);
-    var requestOutputBindingsFingerprint = stableClientJsonStringify(state.assistantFlowOutputBindings);
     state.assistantFlowBusy = true;
     state.message = { type: 'ok', text: t('assistantGeneratingTitle') };
     renderDesigner();
-    request(apiPrefix + '/draft/object-flow/apply', {
+    flushAssistantPromptAutosave().then(function () {
+      var requestSpec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
+      var requestRevision = assistantTemplateRevisionSnapshot(
+        state.selectedTemplate,
+        requestSpec,
+        requestGeneration
+      );
+      var requestIntentFingerprint = stableClientJsonStringify(state.assistantObjectFlowIntent);
+      var requestOutputBindingsFingerprint = stableClientJsonStringify(state.assistantFlowOutputBindings);
+      return request(apiPrefix + '/draft/object-flow/apply', {
       method: 'POST', timeoutMs: 30000,
       body: {
         root: state.root,
@@ -16676,7 +17111,7 @@ function dynamicPagesClientScript() {
         templateCode: state.selectedTemplate && state.selectedTemplate.code || '',
         baseSpecHash: state.selectedTemplate && state.selectedTemplate.specHash || ''
       }
-    }).then(function (result) {
+      }).then(function (result) {
       var mismatch = assistantTemplateRevisionMismatch(requestRevision);
       if (mismatch === 'request') throw assistantTemplateRevisionError(requestRevision);
       if (stableClientJsonStringify(state.assistantFlowProposal) !== requestFlowFingerprint
@@ -16684,16 +17119,10 @@ function dynamicPagesClientScript() {
         || stableClientJsonStringify(state.assistantFlowOutputBindings) !== requestOutputBindingsFingerprint) {
         throw assistantTemplateRevisionError(Object.assign({}, requestRevision, { requestGeneration: -1 }));
       }
-      if (!result.ok || !result.json || !result.json.spec) throw new Error(errorText(result));
+      if (!result.ok || !result.json || !result.json.template) throw new Error(errorText(result));
       var staleError = assistantTemplateRevisionError(requestRevision);
       if (staleError) throw staleError;
-      var candidateOutput = state.assistantFlowCandidateOutput;
-      if (candidateOutput && candidateOutput.blockId === state.assistantObjectFlowIntent.extractionCandidateBlockId && candidateOutput.alias) {
-        state.assistantObjectFlowIntent.extractionCandidateAlias = candidateOutput.alias;
-      } else {
-        state.assistantObjectFlowIntent.extractionCandidateAlias = '';
-      }
-      updateSelectedFromEditor(assistantSpecWithPrompts(result.json.spec));
+      state.selectedTemplate = result.json.template;
       state.objectGroupDraft = null;
       state.relationDraft = null;
       state.assistantFlowProposal = null;
@@ -16703,15 +17132,14 @@ function dynamicPagesClientScript() {
       state.assistantFlowDiagnostics = {};
       state.assistantFlowFeedback = null;
       state.assistantFlowErrorStage = '';
-      state.assistantFlowPreview = null;
       state.assistantFlowCanApply = false;
       state.assistantFlowExplanation = '';
       state.assistantFlowWarnings = [];
-      state.assistantFlowCandidateOutput = null;
       state.assistantFlowOutputBindings = [];
       if (state.diagramImportProposal) state.diagramImportStale = true;
       clearDraftExecutionState({ clearExtractionSource: true });
       state.message = { type: 'ok', text: t('assistantFlowApplied') };
+      });
     }).catch(function (error) {
       state.message = { type: 'error', text: error.message || String(error) };
     }).finally(function () {
@@ -16721,9 +17149,8 @@ function dynamicPagesClientScript() {
   }
 
   function assistantDiagramRequest(kind) {
-    if (state.assistantDiagramInterpretBusy || state.assistantDiagramMappingBusy || !state.diagramImportSignedProposal) return;
+    if (state.assistantDiagramInterpretBusy || state.assistantDiagramMappingBusy) return;
     if (!captureVisibleDesignerState()) return;
-    var proposal = state.diagramImportProposal;
     var prompt = kind === 'interpret' ? state.assistantDiagramInterpretPrompt.trim() : state.assistantDiagramMappingPrompt.trim();
     if (!prompt) {
       state.message = { type: 'error', text: t('fieldRequired', { label: kind === 'interpret' ? t('assistantDiagramInterpretPrompt') : t('assistantDiagramMappingPrompt') }) };
@@ -16732,20 +17159,25 @@ function dynamicPagesClientScript() {
     }
     if (kind === 'interpret') state.assistantDiagramInterpretBusy = true;
     else state.assistantDiagramMappingBusy = true;
-    var requestTemplate = state.selectedTemplate;
-    var requestProposal = state.diagramImportProposal;
     state.message = { type: 'ok', text: t('assistantGeneratingTitle') };
     renderDesigner();
-    var body = {
-      prompt: prompt,
-      currentSpec: state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(),
-      proposal: state.diagramImportSignedProposal,
-      roles: diagramImportBindingOverrides(proposal),
-      relationRules: cloneJsonValue(proposal.relationRules || [], []),
-      placementRules: cloneJsonValue(proposal.placementRules || [], [])
-    };
-    if (kind === 'map') body.stages = assistantFlowStageSummaries(assistantFlowModel(body.currentSpec), body.currentSpec);
-    request(apiPrefix + '/assistant/diagram-import/' + (kind === 'interpret' ? 'interpret' : 'map-selections') + '?root=' + encodeURIComponent(state.root || 'Cst_QueryTool'), { method: 'POST', timeoutMs: assistantRequestTimeoutMs(), body: body }).then(function (result) {
+    flushAssistantPromptAutosave().then(function () {
+      return ensureDiagramImportProposalForCurrentRevision();
+    }).then(function () {
+      var proposal = state.diagramImportProposal;
+      var requestTemplate = state.selectedTemplate;
+      var requestProposal = state.diagramImportProposal;
+      if (!proposal || !diagramImportProposalMatchesCurrentRevision()) throw new Error(t('assistantResponseStale'));
+      var body = {
+        prompt: prompt,
+        currentSpec: state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(),
+        proposal: state.diagramImportSignedProposal,
+        roles: diagramImportBindingOverrides(proposal),
+        relationRules: cloneJsonValue(proposal.relationRules || [], []),
+        placementRules: cloneJsonValue(proposal.placementRules || [], [])
+      };
+      if (kind === 'map') body.stages = assistantFlowStageSummaries(assistantFlowModel(body.currentSpec), body.currentSpec);
+      return request(apiPrefix + '/assistant/diagram-import/' + (kind === 'interpret' ? 'interpret' : 'map-selections') + '?root=' + encodeURIComponent(state.root || 'Cst_QueryTool'), { method: 'POST', timeoutMs: assistantRequestTimeoutMs(), body: body }).then(function (result) {
       if (state.selectedTemplate !== requestTemplate || state.diagramImportProposal !== requestProposal) throw new Error(t('assistantResponseStale'));
       if (!result.ok || !result.json) throw new Error(errorText(result));
       if (kind === 'interpret') {
@@ -16753,6 +17185,7 @@ function dynamicPagesClientScript() {
         (result.json.decisions || []).forEach(function (decision) {
           var role = (proposal.roles || []).find(function (item) { return item.id === decision.roleId; });
           if (role && decision.semantic) role.selectedSemantic = decision.semantic;
+          if (role && decision.exemplarKey) role.exemplarKey = decision.exemplarKey;
           if (role && decision.reason) role.semanticReason = decision.reason;
         });
       } else {
@@ -16760,12 +17193,28 @@ function dynamicPagesClientScript() {
         (result.json.mappings || []).forEach(function (candidate) {
           var role = (proposal.roles || []).find(function (item) { return item.id === candidate.roleId; });
           if (!role) return;
-          role.mapping = Object.assign({}, role.mapping || {}, candidate.mapping || {}, { source: candidate.source || candidate.mapping && candidate.mapping.source || {} });
+          var nextMapping = candidate.mapping || {};
+          var source = candidate.source || nextMapping.source || {};
+          var current = role.mapping || {};
+          if (!String(current.source && current.source.stageId || '').trim()) {
+            role.mapping = Object.assign({}, current, nextMapping, { source: source });
+            return;
+          }
+          var variants = Array.isArray(current.variants) ? current.variants.slice() : [];
+          var allSources = [current].concat(variants).map(function (item) { return String(item && item.source && item.source.stageId || ''); });
+          if (allSources.indexOf(String(source.stageId || '')) === -1) {
+            variants.push(Object.assign({}, nextMapping, { source: source }));
+            role.mapping = Object.assign({}, current, { variants: variants });
+          }
         });
       }
       refreshDiagramImportSemanticState(proposal);
       state.diagramImportProposal = proposal;
-      state.message = { type: 'ok', text: assistantCompletionText(result.json, t('assistantDraftGenerated')) };
+      var mappingPartial = kind === 'map' && result.json.mapping && result.json.mapping.status === 'partial';
+      state.message = { type: mappingPartial ? 'error' : 'ok', text: mappingPartial
+        ? 'Сопоставление выполнено частично: ' + String(result.json.mapping.mappedRoles || 0) + '/' + String(result.json.mapping.requiredRoles || 0) + '. Заполните незавершенные роли перед применением.'
+        : assistantCompletionText(result.json, t('assistantDraftGenerated')) };
+      });
     }).catch(function (error) {
       state.message = { type: 'error', text: error.message || String(error) };
     }).finally(function () {
@@ -16789,7 +17238,7 @@ function dynamicPagesClientScript() {
     });
     var matchIndex = 0;
     var setIndex = 0;
-    flowOperations(model).forEach(function (operation) {
+    flowOperations(model).forEach(function (operation, index) {
       var leftColumns = columnsByAlias[operation.from] || [];
       var rightColumns = columnsByAlias[operation.with] || [];
       var columns;
@@ -17021,6 +17470,8 @@ function dynamicPagesClientScript() {
       ['cmdp-runtime-max-rows-default', 'runtimeMaxRowsDefault', 'maxRowsDefault'],
       ['cmdp-runtime-max-rows-preview-default', 'runtimeMaxRowsPreviewDefault', 'maxRowsPreviewDefault'],
       ['cmdp-runtime-max-rows-max', 'runtimeMaxRowsMax', 'maxRowsMax'],
+      ['cmdp-runtime-max-selection-scan-rows-default', 'runtimeMaxSelectionScanRowsDefault', 'maxSelectionScanRowsDefault'],
+      ['cmdp-runtime-max-selection-scan-rows-max', 'runtimeMaxSelectionScanRowsMax', 'maxSelectionScanRowsMax'],
       ['cmdp-runtime-max-classes-default', 'runtimeMaxClassesDefault', 'maxClassesDefault'],
       ['cmdp-runtime-max-classes-max', 'runtimeMaxClassesMax', 'maxClassesMax'],
       ['cmdp-runtime-max-domains-default', 'runtimeMaxDomainsDefault', 'maxDomainsDefault'],
@@ -17813,6 +18264,7 @@ function dynamicPagesClientScript() {
     if (action === 'new-template') newTemplate();
     if (action === 'new-cmdb-build-view') newCmdbBuildViewTemplate();
     if (action === 'save-template') saveTemplate();
+    if (action === 'assistant-draft-save') saveAssistantDraft();
     if (action === 'validate-template') runDraftAction('validate');
     if (action === 'preview-template') runDraftAction('preview');
     if (action === 'assistant-draft') openAssistantSection();
@@ -17822,13 +18274,12 @@ function dynamicPagesClientScript() {
     if (action === 'assistant-flow-prepare-retry') prepareAssistantObjectFlowSemanticPlan(true);
     if (action === 'assistant-flow-generate') generateAssistantObjectFlow();
     if (action === 'assistant-flow-generate-retry') generateAssistantObjectFlow(true);
-    if (action === 'assistant-flow-preview') previewAssistantObjectFlow();
     if (action === 'assistant-flow-apply') applyAssistantObjectFlow();
     if (action === 'assistant-flow-block-add') addAssistantObjectFlowBlock();
     if (action === 'assistant-flow-block-remove') removeAssistantObjectFlowBlock(target.getAttribute('data-block-index'));
     if (action === 'assistant-diagram-interpret') assistantDiagramRequest('interpret');
     if (action === 'assistant-diagram-map') assistantDiagramRequest('map');
-    if (action === 'open-assistant-d2') setDesignerSection('assistant');
+    if (action === 'open-assistant-d2') setDesignerSection('diagram-assistant');
     if (action === 'open-diagram-editor') setDesignerSection('diagram');
     if (action === 'visualize-editor') visualizeInEditor();
     if (action === 'force-refresh-editor') forceRefreshInEditor();
@@ -17861,6 +18312,7 @@ function dynamicPagesClientScript() {
     if (action === 'clear-param-row') clearParamRow(target);
     if (action === 'extract-template') extractByTemplate();
     if (action === 'apply-extraction') applyExtractionEditor();
+    if (action === 'apply-extraction-published') applyExtractionPublishedTable();
     if (action === 'preview-extraction') previewExtraction();
     if (action === 'add-selection-filter-row') addSelectionFilterRow();
     if (action === 'clear-selection-filter-row') clearSelectionFilterRow(target);
@@ -17958,11 +18410,6 @@ function dynamicPagesClientScript() {
     if (event.target && ((event.target.closest && event.target.closest('#cmdp-assistant-object-flow-intent')) || event.target.id === 'cmdp-assistant-object-flow-context')) {
       state.assistantObjectFlowIntent = readAssistantObjectFlowIntentFromDom();
       var editedFlowBlock = event.target.closest && event.target.closest('[data-assistant-flow-block]');
-      if (event.target.id === 'cmdp-assistant-object-flow-context' || (editedFlowBlock
-        && event.target.getAttribute && event.target.getAttribute('data-assistant-flow-field') !== 'name'
-        && state.assistantObjectFlowIntent.extractionCandidateBlockId === editedFlowBlock.getAttribute('data-assistant-flow-block'))) {
-        state.assistantObjectFlowIntent.extractionCandidateAlias = '';
-      }
       if (event.target.getAttribute && event.target.getAttribute('data-assistant-flow-field') === 'name') {
         var block = event.target.closest('[data-assistant-flow-block]');
         var summaryName = block && block.querySelector('[data-assistant-flow-summary-name]');
@@ -17992,9 +18439,6 @@ function dynamicPagesClientScript() {
     if (event.target && event.target.matches && event.target.matches('[data-run-param-field]')) {
       refreshTemplateLaunchUrl();
       if (event.target.closest && event.target.closest('#cmdp-assistant-object-flow')) {
-        state.assistantFlowPreview = null;
-        var assistantPreview = document.querySelector('[data-assistant-flow-preview]');
-        if (assistantPreview) assistantPreview.remove();
       }
     }
     if (event.target && event.target.matches && event.target.matches('[data-object-path-filter-field]')) {
@@ -18012,6 +18456,7 @@ function dynamicPagesClientScript() {
     }
     if (event.target && event.target.id === 'cmdp-diagram-import-source') {
       state.diagramImportSource = String(event.target.value || '');
+      scheduleAssistantPromptAutosave();
       var analyzedSource = state.diagramImportProposal ? String(state.diagramImportProposal.sourceText || '') : persistedDiagramImportSource();
       state.diagramImportStale = state.diagramImportSource !== analyzedSource;
       state.diagramImportPreviewError = '';
@@ -18029,22 +18474,8 @@ function dynamicPagesClientScript() {
   });
 
   document.addEventListener('change', function (event) {
-    if (event.target && event.target.matches && event.target.matches('[data-assistant-flow-candidate]')) {
-      var candidateIntent = readAssistantObjectFlowIntentFromDom();
-      candidateIntent.extractionCandidateBlockId = String(event.target.value || '');
-      candidateIntent.extractionCandidateAlias = '';
-      state.assistantObjectFlowIntent = normalizeAssistantObjectFlowIntentClient(candidateIntent);
-      resetAssistantObjectFlowProposal();
-      scheduleAssistantPromptAutosave();
-      renderDesigner();
-      return;
-    }
     if (event.target && event.target.matches && event.target.matches('[data-assistant-flow-field="uses"]')) {
       state.assistantObjectFlowIntent = readAssistantObjectFlowIntentFromDom();
-      var dependencyBlock = event.target.closest('[data-assistant-flow-block]');
-      if (dependencyBlock && state.assistantObjectFlowIntent.extractionCandidateBlockId === dependencyBlock.getAttribute('data-assistant-flow-block')) {
-        state.assistantObjectFlowIntent.extractionCandidateAlias = '';
-      }
       resetAssistantObjectFlowProposal();
       scheduleAssistantPromptAutosave();
       renderDesigner();
@@ -18101,11 +18532,14 @@ function dynamicPagesClientScript() {
         else role.selectedRole = String(target.value || '');
       }
       refreshDiagramImportSemanticState(proposal);
+      state.diagramImportAuthoringOverrides = diagramImportAuthoringOverrides(proposal);
+      scheduleAssistantPromptAutosave();
       renderDesigner();
       return;
     }
     if (target.matches && target.matches('[data-diagram-import-role-field], [data-diagram-import-related-field], [data-diagram-import-rule-field], [data-diagram-import-placement-field]')) {
       captureDiagramImportProposalFromDom();
+      scheduleAssistantPromptAutosave();
       renderDesigner();
       return;
     }
@@ -18120,6 +18554,7 @@ function dynamicPagesClientScript() {
       var reader = new FileReader();
       reader.onload = function () {
         state.diagramImportSource = String(reader.result || '');
+        scheduleAssistantPromptAutosave();
         state.diagramImportProposal = null;
         state.diagramImportSignedProposal = null;
         state.diagramImportIr = null;
@@ -19975,43 +20410,9 @@ function normalizeAssistantObjectFlowIntent(value, options = {}) {
     normalized.uses = uniqueStrings(uses);
     return normalized;
   });
-  if (source.extractionCandidateBlockId !== undefined && typeof source.extractionCandidateBlockId !== 'string') {
-    const error = new Error('assistantDraft.objectFlowIntent.extractionCandidateBlockId must be a string.');
-    error.statusCode = 400;
-    error.code = 'assistant_object_flow_intent_invalid';
-    throw error;
-  }
-  if (source.extractionCandidateAlias !== undefined && typeof source.extractionCandidateAlias !== 'string') {
-    const error = new Error('assistantDraft.objectFlowIntent.extractionCandidateAlias must be a string.');
-    error.statusCode = 400;
-    error.code = 'assistant_object_flow_intent_invalid';
-    throw error;
-  }
-  const extractionCandidateBlockId = String(source.extractionCandidateBlockId || '').trim();
-  const extractionCandidateAlias = String(source.extractionCandidateAlias || '').trim();
-  if (extractionCandidateBlockId && !known.has(extractionCandidateBlockId)) {
-    const error = new Error('assistantDraft.objectFlowIntent.extractionCandidateBlockId must reference a declared block.');
-    error.statusCode = 400;
-    error.code = 'assistant_object_flow_intent_invalid';
-    throw error;
-  }
-  if (extractionCandidateAlias && !/^[A-Za-z][A-Za-z0-9_]*$/.test(extractionCandidateAlias)) {
-    const error = new Error('assistantDraft.objectFlowIntent.extractionCandidateAlias must be a CMDBuild result alias.');
-    error.statusCode = 400;
-    error.code = 'assistant_object_flow_intent_invalid';
-    throw error;
-  }
-  if (extractionCandidateAlias && !extractionCandidateBlockId) {
-    const error = new Error('assistantDraft.objectFlowIntent.extractionCandidateAlias requires extractionCandidateBlockId.');
-    error.statusCode = 400;
-    error.code = 'assistant_object_flow_intent_invalid';
-    throw error;
-  }
   const normalized = {
     context: typeof source.context === 'string' ? truncateText(source.context, 6000) : '',
-    blocks,
-    extractionCandidateBlockId,
-    extractionCandidateAlias
+    blocks
   };
   if (options.requireComplete) {
     if (!blocks.length) {
@@ -20056,7 +20457,52 @@ function normalizeAssistantPromptDraft(body) {
     }
     normalized[field] = draft[field];
   }
+  if (draft.d2Authoring !== undefined) normalized.d2Authoring = normalizeAssistantD2AuthoringDraft(draft.d2Authoring);
   return normalized;
+}
+
+function normalizeAssistantD2AuthoringDraft(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('assistantDraft.d2Authoring must be an object.');
+  for (const forbidden of ['proposal', 'signedProposal', 'ir', 'mcpContext', 'llmOutput', 'assistantOutput']) {
+    if (Object.prototype.hasOwnProperty.call(value, forbidden)) throw new Error(`assistantDraft.d2Authoring.${forbidden} is not persisted. Save only D2 source and reviewed overrides.`);
+  }
+  const source = String(value.source || '');
+  if (Buffer.byteLength(source, 'utf8') > D2_IMPORT_MAX_INPUT_BYTES) {
+    throw new Error(`assistantDraft.d2Authoring.source exceeded configured maxInputBytes=${D2_IMPORT_MAX_INPUT_BYTES}.`);
+  }
+  const rawOverrides = value.overrides && typeof value.overrides === 'object' && !Array.isArray(value.overrides) ? value.overrides : {};
+  const normalizePath = (path) => (Array.isArray(path) ? path : []).slice(0, D2_IMPORT_MAX_ELEMENTS).map((hop) => ({
+    kind: String(hop && hop.kind || 'domain').trim(),
+    name: String(hop && hop.name || '').trim(),
+    domain: String(hop && hop.domain || '').trim(),
+    targetClass: String(hop && hop.targetClass || '').trim(),
+    direction: String(hop && hop.direction || 'both').trim() || 'both'
+  })).filter((hop) => hop.name || hop.domain);
+  const roles = (Array.isArray(rawOverrides.roles) ? rawOverrides.roles : []).slice(0, D2_IMPORT_MAX_ELEMENTS).map((item) => {
+    const id = String(item && item.id || '').trim();
+    if (!id) throw new Error('assistantDraft.d2Authoring.overrides.roles[].id is required.');
+    const selectedSemantic = String(item && item.selectedSemantic || '').trim();
+    if (selectedSemantic && !['object', 'composite', 'group', 'static'].includes(selectedSemantic)) throw new Error(`assistantDraft.d2Authoring role ${id} has unsupported semantic.`);
+    return {
+      id,
+      selectedSemantic,
+      exemplarKey: String(item && item.exemplarKey || '').trim(),
+      mapping: diagramImportRoleMapping({ id }, item && item.mapping || {})
+    };
+  });
+  const relationRules = (Array.isArray(rawOverrides.relationRules) ? rawOverrides.relationRules : []).slice(0, D2_IMPORT_MAX_ELEMENTS).map((item, index) => ({
+    id: String(item && item.id || `relation_rule_${index + 1}`).trim(),
+    kind: ['connection', 'group', 'hierarchy'].includes(String(item && item.kind || 'connection')) ? String(item && item.kind || 'connection') : 'connection',
+    parentRoleId: String(item && item.parentRoleId || '').trim(),
+    childRoleId: String(item && item.childRoleId || '').trim(),
+    path: normalizePath(item && item.path)
+  }));
+  const placementRules = (Array.isArray(rawOverrides.placementRules) ? rawOverrides.placementRules : []).slice(0, D2_IMPORT_MAX_ELEMENTS).map((item, index) => ({
+    id: String(item && item.id || `placement_rule_${index + 1}`).trim(),
+    parentRoleId: String(item && item.parentRoleId || '').trim(),
+    childRoleId: String(item && item.childRoleId || '').trim()
+  }));
+  return { version: 1, source, overrides: { roles, relationRules, placementRules } };
 }
 
 function templatePayloadWithAssistantPromptDraft(card, draft) {
@@ -20219,6 +20665,8 @@ function defaultRuntimeConfig() {
       maxRowsDefault: 500,
       maxRowsPreviewDefault: 25,
       maxRowsMax: 2000,
+      maxSelectionScanRowsDefault: 10000,
+      maxSelectionScanRowsMax: 50000,
       maxClassesDefault: 100,
       maxClassesMax: 500,
       maxDomainsDefault: 100,
@@ -20302,6 +20750,7 @@ function normalizeExecutionLimitConfig(runtimeConfig) {
   const defaults = defaultRuntimeConfig().executionLimits;
   const source = runtimeConfig && runtimeConfig.executionLimits ? runtimeConfig.executionLimits : {};
   const maxRowsMax = toPositiveInt(source.maxRowsMax, defaults.maxRowsMax, ABSOLUTE_EXECUTION_LIMITS.maxRows);
+  const maxSelectionScanRowsMax = toPositiveInt(source.maxSelectionScanRowsMax, defaults.maxSelectionScanRowsMax, ABSOLUTE_EXECUTION_LIMITS.maxSelectionScanRows);
   const maxClassesMax = toPositiveInt(source.maxClassesMax, defaults.maxClassesMax, ABSOLUTE_EXECUTION_LIMITS.maxClasses);
   const maxDomainsMax = toPositiveInt(source.maxDomainsMax, defaults.maxDomainsMax, ABSOLUTE_EXECUTION_LIMITS.maxDomains);
   const maxRestCallsMax = toPositiveInt(source.maxRestCallsMax, defaults.maxRestCallsMax, ABSOLUTE_EXECUTION_LIMITS.maxRestCalls);
@@ -20311,6 +20760,8 @@ function normalizeExecutionLimitConfig(runtimeConfig) {
     maxRowsDefault: toPositiveInt(source.maxRowsDefault, defaults.maxRowsDefault, maxRowsMax),
     maxRowsPreviewDefault: toPositiveInt(source.maxRowsPreviewDefault, defaults.maxRowsPreviewDefault, maxRowsMax),
     maxRowsMax,
+    maxSelectionScanRowsDefault: toPositiveInt(source.maxSelectionScanRowsDefault, defaults.maxSelectionScanRowsDefault, maxSelectionScanRowsMax),
+    maxSelectionScanRowsMax,
     maxClassesDefault: toPositiveInt(source.maxClassesDefault, defaults.maxClassesDefault, maxClassesMax),
     maxClassesMax,
     maxDomainsDefault: toPositiveInt(source.maxDomainsDefault, defaults.maxDomainsDefault, maxDomainsMax),
@@ -21540,6 +21991,7 @@ function runtimeJsonResponsePayload(payload, options = {}) {
       d2DownloadAllowed: options.d2DownloadAllowed !== false
     }),
     emptyText: result.emptyText || DEFAULT_EMPTY_RESULT_TEXT,
+    warnings: Array.isArray(result.warnings) ? result.warnings.map((item) => String(item || '')).filter(Boolean) : [],
     cache: payload.cache || null,
     html: result.kind === 'html' && result.htmlTrusted ? result.html : undefined
   };
@@ -24378,14 +24830,14 @@ function assistantObjectFlowIntentPlanningText(intent) {
   ].filter(Boolean).join('\n\n');
 }
 
-function assistantObjectFlowSemanticMessages(intent, currentSpec, mcpContext, runtimeConfig, classBindings = []) {
+function assistantObjectFlowSemanticMessages(intent, currentSpec, mcpContext, runtimeConfig, classBindings = [], referencePathContracts = []) {
   const assistantConfig = normalizeAssistantRuntimeConfig(runtimeConfig || defaultRuntimeConfig());
   const system = [
     'Return exactly one JSON object: {"version":1,"blocks":[{"id":"...","name":"...","summary":"...","resolvedEntities":["..."],"relationPaths":["..."],"dependencies":["..."],"expectedResult":"...","resultContract":{"outputKind":"sourceCards|relationPairs|unresolved","outputClass":"...","dependencyPaths":[{"comparisonBlockId":"...","sourceClass":"...","domain":"...","direction":"source|destination","targetClass":"..."}],"relationPredicates":[{"sourceClass":"...","relatedClass":"...","comparisonBlockId":"...","comparisonClass":"...","domain":"...","direction":"source|destination","comparisonFields":["..."],"relatedField":"...","operator":"..."}],"attributePredicates":[{"sourceClass":"...","comparisonBlockId":"...","comparisonClass":"...","sourceFields":["..."],"comparisonField":"...","operator":"..."}],"referencePathPredicates":[{"sourceClass":"...","comparisonBlockId":"...","comparisonClass":"...","sourcePath":["referenceAttribute","terminalAttribute"],"comparisonField":"...","operator":"..."}]},"warnings":[]}],"explanation":"...","warnings":[]}.',
     'Return no markdown, Object Flow, DSL, aliases, Spec JSON, D2 source, save, publish, or execution action.',
     'Return every supplied block exactly once with the same id, name, dependency ids, and expected result. The order of blocks in the editor is visual only: a dependency may point to a block displayed later. Preserve all dependency ids and derive execution order from the dependency graph, not the visual order. resolvedEntities and relationPaths must contain only identifiers or paths confirmed by supplied MCP context. outputKind sourceCards means the expected result contains only outputClass cards; relationPairs means both sides of the relation are output. For sourceCards, dependencyPaths is the only representation of a direct CMDBuild traversal from a dependency result to outputClass: its comparisonBlockId must be a dependency, sourceClass is the class produced by that dependency, and targetClass equals outputClass. Do not use relationPredicates for such a traversal. Create a relationPredicates item only when retaining outputClass requires traversing a confirmed CMDBuild domain to relatedClass and comparing that related card with a different block result; every relationPredicate must contain non-empty comparisonFields, relatedField, and operator. Create an attributePredicates item when outputClass cards are compared directly with attributes of a different block result; attributePredicates never has domain or direction. Every predicate comparisonBlockId must exactly equal one of that block dependencies. If dependencies is empty, dependencyPaths, relationPredicates and attributePredicates must all be exactly []; a CMDBuild path from an input parameter or an anchor card belongs to the block selection and relationPaths, never to a contract predicate. A block with no dependencies must return sourceCards with all three arrays empty, relationPairs when both relation sides are expected, or unresolved with a warning. If a user-written domain does not connect the source and target classes, use the unique matching MCP path and add a warning; if no unique path exists, return unresolved. If the expected result granularity is ambiguous, use outputKind unresolved, leave outputClass and contract arrays empty, and add a warning. Use warnings instead of inventing identifiers.',
     'The expected result controls outputClass. When the expected result asks for class A cards, outputClass must be A; a helper class B used only for a relation hop or field comparison must not replace it. When retaining A requires traversing to B and comparing B with dependency result C, use relationPredicate with outputClass A, relatedClass B, and comparisonClass C. Do not encode that as dependencyPath C to B.',
-    'An IPv4 condition that an address belongs to a network, CIDR, or range is always an attribute comparison. Use attributePredicates when outputClass IP fields are compared directly with a dependency network/range field. Use referencePathPredicates when the IP field is reached through one or more CMDBuild reference attributes: sourcePath lists reference attributes followed by the terminal IP attribute, and never uses dotted sourceFields. Use relationPredicates when retaining outputClass first requires a CMDBuild domain hop to a related network/range card. Every explicit cross-block IPv4 condition requires at least one of those predicates; if its fields cannot be confirmed, return unresolved with a warning. Never convert an IPv4 comparison into dependencyPaths or make a network superclass the outputClass.'
+    'An IPv4 condition that an address belongs to a network, CIDR, or range is compiled only by the deterministic Object Flow layer. In this semantic response keep the business dependency, output class and expected result, but do not validate IPv4 fields, reference paths, operators or predicates and do not return unresolved because of an IPv4 condition. A user-supplied dotted reference path is resolved later from MCP schema by the deterministic compiler. Never convert an IPv4 comparison into dependencyPaths or make a network superclass the outputClass.'
   ].join('\n');
   return [
     { role: 'system', content: assistantConfig.prompt.system },
@@ -24395,10 +24847,15 @@ function assistantObjectFlowSemanticMessages(intent, currentSpec, mcpContext, ru
       role: 'system',
       content: `Confirmed class bindings are mandatory. A binding maps a user class term to exactly one CMDBuild Code. For a binding marked expectedOutput, resultContract.outputClass must equal className exactly; do not substitute a parent, superclass, or nearest class. ${JSON.stringify(classBindings)}`
     }] : []),
+    ...(referencePathContracts.length ? [{
+      role: 'system',
+      content: `Confirmed user reference paths are mandatory for their blocks. Use each canonical sourcePath exactly in referencePathPredicates; do not replace it with a terminal field, another reference attribute, or a generic CMDB relation. ${JSON.stringify(referencePathContracts)}`
+    }] : []),
     { role: 'user', content: JSON.stringify({
       intent,
       availableParameters: assistantObjectFlowInputParameters(currentSpec),
       confirmedClassBindings: classBindings,
+      confirmedReferencePathContracts: referencePathContracts,
       mcpContext: mcpContext && mcpContext.enabled ? {
         tools: mcpContext.tools,
         truncated: Boolean(mcpContext.truncated),
@@ -24476,7 +24933,7 @@ function assistantSemanticDependencyPathError(block, index, path, candidates) {
   );
 }
 
-function assistantSemanticRelationPredicatePathError(block, index, predicate, candidates) {
+function assistantSemanticRelationPredicatePathError(block, index, predicate, candidates, referenceCandidates = []) {
   return assistantSemanticPlanError(
     `Semantic plan block ${block.name} relation predicate ${index + 1} must use a confirmed CMDBuild domain transition.`,
     {
@@ -24488,21 +24945,65 @@ function assistantSemanticRelationPredicatePathError(block, index, predicate, ca
       sourceClass: String(predicate && predicate.sourceClass || '').trim(),
       relatedClass: String(predicate && predicate.relatedClass || '').trim(),
       expectedResult: String(block && block.expectedResult || '').trim(),
-      candidates
+      candidates,
+      referenceCandidates
     }
   );
 }
 
+function assistantReferenceSemanticDependencyPathCandidates(mcpContext, sourceClass, targetClass, block) {
+  const fieldsByClass = assistantMcpFieldsByClass(mcpContext);
+  const hints = assistantReferencePathHintsFromBlock(block);
+  const referencedFields = (fieldsByClass.get(sourceClass) || []).filter((field) => (
+    String(field && field.type || '').toLowerCase() === 'reference'
+    && assistantReferenceTargetClass(field) === targetClass
+    && hints.some((hint) => hint.length > 1
+      && assistantMcpPreferredFieldMatches([field], hint[0], { requireReference: true })
+        .some((match) => String(match.name || '') === String(field.name || '')))
+  ));
+  if (!referencedFields.length) return [];
+  const paths = assistantSemanticDependencyPathCandidates(mcpContext, sourceClass, targetClass);
+  const seen = new Set();
+  return referencedFields.flatMap((field) => {
+    const declaredDomain = String(field && (field.domain || field.referenceDomainName) || '').trim();
+    return paths.filter((path) => path.domain === declaredDomain).map((path) => ({
+      ...path,
+      attribute: String(field.name || ''),
+      attributeDescription: String(field.description || '')
+    }));
+  }).filter((path) => {
+    const key = [path.attribute, path.domain, path.direction].join('\u0000');
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function normalizeAssistantSemanticRelationPredicatePath(block, predicate, index, options = {}) {
   const candidates = assistantSemanticDependencyPathCandidates(options.mcpContext, predicate.sourceClass, predicate.relatedClass);
+  const referenceCandidates = assistantReferenceSemanticDependencyPathCandidates(
+    options.mcpContext,
+    predicate.sourceClass,
+    predicate.relatedClass,
+    block
+  );
+  if (referenceCandidates.length === 1) {
+    const normalized = referenceCandidates[0];
+    const alreadySelected = normalized.domain === predicate.domain && normalized.direction === predicate.direction;
+    if (!alreadySelected && Array.isArray(options.warnings)) {
+      const supplied = predicate.domain ? `${predicate.domain}${predicate.direction ? ` [${predicate.direction}]` : ''}` : '';
+      options.warnings.push(`Assistant normalized relation predicate ${predicate.sourceClass} -> ${predicate.relatedClass}${supplied ? ` from ${supplied}` : ''} to reference ${predicate.sourceClass}.${normalized.attribute} and confirmed MCP path ${normalized.sourceClass} --${normalized.domain} [${normalized.direction}]--> ${normalized.targetClass}.`);
+    }
+    return { ...predicate, domain: normalized.domain, direction: normalized.direction };
+  }
   const exact = candidates.find((candidate) => candidate.domain === predicate.domain && candidate.direction === predicate.direction);
   const preferredCandidates = assistantPreferredSemanticDependencyPathCandidates(candidates);
   const hasMcpRelationContext = Array.isArray(options.mcpContext && options.mcpContext.diagnostics && options.mcpContext.diagnostics.relationPaths);
   if (!exact && candidates.length && preferredCandidates.length !== 1) {
-    throw assistantSemanticRelationPredicatePathError(block, index, predicate, candidates);
+    throw assistantSemanticRelationPredicatePathError(block, index, predicate, candidates, referenceCandidates);
   }
   if (!exact && hasMcpRelationContext && !candidates.length) {
-    throw assistantSemanticRelationPredicatePathError(block, index, predicate, candidates);
+    throw assistantSemanticRelationPredicatePathError(block, index, predicate, candidates, referenceCandidates);
   }
   const normalized = exact || preferredCandidates[0];
   if (!normalized) return predicate;
@@ -24609,6 +25110,41 @@ function assistantSemanticPlanCatalogErrors(semanticPlan, mcpContext) {
   return errors;
 }
 
+function assistantCanonicalPredicateSourceClass(predicate, outputClass, block, index, predicateType, warnings) {
+  const supplied = String(predicate && predicate.sourceClass || '').trim();
+  if (supplied && supplied !== outputClass && Array.isArray(warnings)) {
+    warnings.push(`Assistant normalized ${predicateType} predicate ${index + 1} sourceClass ${supplied} to outputClass ${outputClass} for block ${block.name}.`);
+    logWarn('assistant.semantic_plan.predicate_source_normalized', {
+      requestId: currentRequestId(),
+      blockId: String(block.id || ''),
+      predicateType,
+      predicateIndex: index + 1,
+      suppliedSourceClass: supplied,
+      outputClass
+    });
+  }
+  return outputClass;
+}
+
+function assistantSemanticPredicateClassError(block, index, predicateType, fields = {}) {
+  const invalidField = String(fields.invalidField || 'class').trim();
+  const value = String(fields.value || '').trim();
+  return assistantSemanticPlanError(
+    `Semantic plan block ${block.name} ${predicateType} predicate ${index + 1} must use confirmed CMDBuild class identifiers.`,
+    {
+      kind: 'semanticPlanPredicateClassInvalid',
+      blockId: block.id,
+      blockName: block.name,
+      predicateType,
+      predicateIndex: index + 1,
+      outputClass: String(fields.outputClass || ''),
+      comparisonBlockId: String(fields.comparisonBlockId || ''),
+      invalidField,
+      value
+    }
+  );
+}
+
 function assistantSemanticPlanValidationFeedback(error) {
   const details = Array.isArray(error && error.details) ? error.details : [];
   const classBindingIssue = details.find((item) => item && ['semanticPlanClassUnavailable', 'semanticPlanClassAmbiguous', 'semanticPlanOutputClassMismatch'].includes(item.kind));
@@ -24620,7 +25156,8 @@ function assistantSemanticPlanValidationFeedback(error) {
   const referencePathIssue = details.find((item) => item && item.kind === 'semanticPlanReferencePathUnresolved');
   const dependencyPathIssue = details.find((item) => item && item.kind === 'semanticPlanDependencyPathUnconfirmed');
   const relationPredicatePathIssue = details.find((item) => item && item.kind === 'semanticPlanRelationPredicateUnconfirmed');
-  if (!classBindingIssue && !missingIpv4PredicateIssue && !unexpectedPredicateIssue && !issue && !directAttributeIssue && !incompleteRelationIssue && !referencePathIssue && !dependencyPathIssue && !relationPredicatePathIssue) return null;
+  const predicateClassIssue = details.find((item) => item && item.kind === 'semanticPlanPredicateClassInvalid');
+  if (!classBindingIssue && !missingIpv4PredicateIssue && !unexpectedPredicateIssue && !issue && !directAttributeIssue && !incompleteRelationIssue && !referencePathIssue && !dependencyPathIssue && !relationPredicatePathIssue && !predicateClassIssue) return null;
   if (classBindingIssue) {
     const blockName = String(classBindingIssue.blockName || 'блок данных');
     const className = String(classBindingIssue.className || classBindingIssue.mention || '');
@@ -24733,11 +25270,29 @@ function assistantSemanticPlanValidationFeedback(error) {
       return source && domain && target ? `${source} --${domain} [${direction}]--> ${target}` : '';
     }).filter(Boolean);
     const reason = String(referencePathIssue.reason || 'reference path is not confirmed');
+    const contextBytesLimit = /maxContextBytes=(\d+)/.exec(reason);
     const depthLimit = /maxReferencePathDepth=(\d+)/.exec(reason);
+    const missingReference = /terminal field ([^\s]+) has no confirmed reference attribute from ([^\s]+)/.exec(reason);
+    const missingNamedReference = /reference attribute ([^\s]+) or its terminal field is not present/.exec(reason);
+    if (missingReference || missingNamedReference) {
+      const reference = missingNamedReference ? missingNamedReference[1] : `${missingReference[2]}.${missingReference[1]}`;
+      return {
+        summary: `Семантический план не подготовлен: в «${blockName}» не подтвержден reference-атрибут для «${path || reference}».`,
+        action: `Проверьте читаемость и target class атрибута «${reference}». Для IPv4-пути должны быть указаны reference и terminal attribute, например «ipaddress.ipAddr».`,
+        causes: [{
+          kind: 'semanticPlanReferencePathUnresolved',
+          message: `Terminal attribute «${path || 'не указан'}» не связан с подтвержденным reference-путем от класса «${String(referencePathIssue.sourceClass || 'результата')}». ${reason}`
+        }],
+        affectedStages: [{ label: blockName, alias: String(referencePathIssue.blockId || '') }],
+        confirmedRelations: candidates
+      };
+    }
     return {
       summary: `Семантический план не подготовлен: reference-путь «${path || 'не указан'}» в «${blockName}» не подтвержден.`,
-      action: depthLimit
-        ? `Увеличьте настройку «Глубина reference-пути» выше ${depthLimit[1]} либо укажите более короткий подтвержденный путь. Draft не изменен.`
+      action: contextBytesLimit
+        ? `MCP context был обрезан при настроенном «Макс. размер MCP context» = ${contextBytesLimit[1]}. Проверьте reference attribute и его target class; увеличьте размер context, если нужная схема не попала в контекст. «Глубина reference-пути» не устранит эту причину. Draft не изменен.`
+        : depthLimit
+        ? `MCP достиг настроенной «Глубина reference-пути» = ${depthLimit[1]}. Проверьте reference attribute, target class и увеличьте глубину, если путь читаем и требует следующего hop. Draft не изменен.`
         : 'Укажите reference и terminal attribute явно через точку. Assistant разрешает Code, Name или Description, но применяет только единственный путь, подтвержденный MCP schema.',
       causes: [{
         kind: 'semanticPlanReferencePathUnresolved',
@@ -24771,12 +25326,22 @@ function assistantSemanticPlanValidationFeedback(error) {
   if (relationPredicatePathIssue) {
     const blockName = String(relationPredicatePathIssue.blockName || 'блок данных');
     const candidates = Array.isArray(relationPredicatePathIssue.candidates) ? relationPredicatePathIssue.candidates : [];
+    const referenceCandidates = Array.isArray(relationPredicatePathIssue.referenceCandidates) ? relationPredicatePathIssue.referenceCandidates : [];
+    const referenceText = referenceCandidates.map((candidate) => {
+      const attribute = String(candidate && candidate.attribute || 'reference');
+      const domain = String(candidate && candidate.domain || '');
+      return domain ? `${String(relationPredicatePathIssue.sourceClass || '')}.${attribute} -> ${String(relationPredicatePathIssue.relatedClass || '')} через ${domain}` : '';
+    }).filter(Boolean);
     return {
       summary: `Семантический план не подготовлен: для «${blockName}» не подтверждена связь условия между классами.`,
-      action: 'Уточните классы, между которыми проходит условие. Если MCP показывает единственный предметный путь, Assistant подставит его с предупреждением; несколько равноценных путей требуют явного выбора.',
+      action: referenceText.length
+        ? `Укажите reference-атрибут и terminal field через точку. Доступные reference-пути: ${referenceText.join('; ')}.`
+        : 'Уточните классы, между которыми проходит условие. Если MCP показывает единственный предметный путь, Assistant подставит его с предупреждением; несколько равноценных путей требуют явного выбора.',
       causes: [{
         kind: 'semanticPlanRelationPredicateUnconfirmed',
-        message: `Не удалось однозначно подтвердить переход ${String(relationPredicatePathIssue.sourceClass || 'исходный класс')} -> ${String(relationPredicatePathIssue.relatedClass || 'связанный класс')}.${relationPredicatePathIssue.expectedResult ? ` Ожидаемый результат блока: «${relationPredicatePathIssue.expectedResult}».` : ''}`
+        message: referenceText.length
+          ? `Указанный reference-путь не выбран однозначно: ${referenceText.join('; ')}.`
+          : `Не удалось однозначно подтвердить переход ${String(relationPredicatePathIssue.sourceClass || 'исходный класс')} -> ${String(relationPredicatePathIssue.relatedClass || 'связанный класс')}.${relationPredicatePathIssue.expectedResult ? ` Ожидаемый результат блока: «${relationPredicatePathIssue.expectedResult}».` : ''}`
       }],
       affectedStages: [{ label: blockName, alias: String(relationPredicatePathIssue.blockId || '') }],
       confirmedRelations: candidates.map((candidate) => {
@@ -24786,6 +25351,21 @@ function assistantSemanticPlanValidationFeedback(error) {
         const direction = String(candidate && candidate.direction || '');
         return source && domain && target ? `${source} --${domain} [${direction}]--> ${target}` : '';
       }).filter(Boolean)
+    };
+  }
+  if (predicateClassIssue) {
+    const blockName = String(predicateClassIssue.blockName || 'блок данных');
+    const field = String(predicateClassIssue.invalidField || 'class');
+    const value = String(predicateClassIssue.value || 'не указан');
+    return {
+      summary: `Семантический план не подготовлен: в «${blockName}» не подтвержден CMDBuild класс для условия.`,
+      action: 'Сформируйте семантический план повторно. Assistant должен выбрать класс и поле только из MCP context; draft не изменен.',
+      causes: [{
+        kind: 'semanticPlanPredicateClassInvalid',
+        message: `В ${String(predicateClassIssue.predicateType || 'условии')} ${String(predicateClassIssue.predicateIndex || '')} поле ${field} имеет значение «${value}». Ожидается CMDBuild identifier; класс результата блока: «${String(predicateClassIssue.outputClass || 'не определен')}».`
+      }],
+      affectedStages: [{ label: blockName, alias: String(predicateClassIssue.blockId || '') }],
+      confirmedRelations: []
     };
   }
   const blockName = String(issue.blockName || 'блок данных');
@@ -24981,8 +25561,23 @@ function assistantMcpFieldMatches(fields, value, options = {}) {
   });
 }
 
+function assistantMcpPreferredFieldMatches(fields, value, options = {}) {
+  const normalized = normalizedAssistantLookupText(value);
+  if (!normalized) return [];
+  const requireReference = options.requireReference;
+  const candidates = (fields || []).filter((field) => (
+    field && field.name
+    && (requireReference === undefined || (String(field.type || '').toLowerCase() === 'reference') === requireReference)
+  ));
+  for (const key of ['name', 'description', 'code']) {
+    const matches = candidates.filter((field) => normalizedAssistantLookupText(field[key]) === normalized);
+    if (matches.length) return matches;
+  }
+  return [];
+}
+
 function assistantMcpFieldIdentifier(fields, value, options = {}) {
-  const matches = assistantMcpFieldMatches(fields, value, options);
+  const matches = assistantMcpPreferredFieldMatches(fields, value, options);
   return matches.length === 1 ? String(matches[0].name || '') : '';
 }
 
@@ -25005,6 +25600,119 @@ function assistantReferencePathIssue(block, index, predicate, reason, candidates
       candidates
     }
   );
+}
+
+function assistantMcpReferenceDepthLimit(mcpContext) {
+  const limits = Array.isArray(mcpContext && mcpContext.diagnostics && mcpContext.diagnostics.limits)
+    ? mcpContext.diagnostics.limits
+    : [];
+  const limit = limits.find((item) => item
+    && item.tool === 'cmdbuild_class_fields'
+    && item.limitName === 'maxReferencePathDepth'
+    && item.limitHit);
+  return limit ? Number(limit.effectiveLimit || limit.limit || 0) : 0;
+}
+
+function assistantMcpContextBytesLimit(mcpContext) {
+  const limits = Array.isArray(mcpContext && mcpContext.diagnostics && mcpContext.diagnostics.limits)
+    ? mcpContext.diagnostics.limits
+    : [];
+  const limit = limits.find((item) => item
+    && item.tool === 'buildAssistantMcpContext'
+    && item.limitName === 'maxContextBytes'
+    && (item.truncated || item.limitHit));
+  return limit ? Number(limit.effectiveLimit || limit.configuredLimit || limit.limit || 0) : 0;
+}
+
+function assistantReferencePathHintsFromBlock(block, sourcePath = []) {
+  const hints = [sourcePath];
+  const text = [block && block.entities, block && block.algorithm, block && block.expectedResult].filter(Boolean).join('\n');
+  const quoted = /["'«“]([^"'«“»”\n]*\.[^"'«“»”\n]*)["'»”]/g;
+  for (const match of text.matchAll(quoted)) {
+    const segments = assistantReferencePathSegments(match[1]);
+    if (segments.length >= 2) hints.push(segments);
+  }
+  const unquoted = /\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b/g;
+  for (const match of text.matchAll(unquoted)) {
+    const segments = assistantReferencePathSegments(match[0]);
+    if (segments.length >= 2) hints.push(segments);
+  }
+  return Array.from(new Map(hints.map((hint) => [hint.join('\u0000'), hint]).filter(([key]) => key)).values());
+}
+
+function assistantReferencePathHintMatchesCandidate(hint, candidate, sourceClass, fieldsByClass) {
+  if (!Array.isArray(hint) || !hint.length) return false;
+  if (hint.length === 1) {
+    return assistantMcpPreferredFieldMatches(fieldsByClass.get(candidate.terminalClass), hint[0], { requireReference: false })
+      .some((field) => String(field.name || '') === candidate.terminalField);
+  }
+  if (hint.length !== candidate.sourcePath.length) return false;
+  let currentClass = sourceClass;
+  for (let index = 0; index < candidate.hops.length; index += 1) {
+    const hop = candidate.hops[index];
+    const matches = assistantMcpPreferredFieldMatches(fieldsByClass.get(currentClass), hint[index], { requireReference: true });
+    if (!matches.some((field) => String(field.name || '') === hop.attribute)) return false;
+    currentClass = hop.targetClass;
+  }
+  return assistantMcpPreferredFieldMatches(fieldsByClass.get(candidate.terminalClass), hint.at(-1), { requireReference: false })
+    .some((field) => String(field.name || '') === candidate.terminalField);
+}
+
+function assistantRecoverIncompleteReferencePath(block, predicate, sourceClass, sourcePath, options = {}) {
+  const fieldsByClass = assistantMcpFieldsByClass(options.mcpContext);
+  const hints = assistantReferencePathHintsFromBlock(block, sourcePath);
+  const candidates = assistantIpv4ReferencePathCandidates(
+    options.mcpContext,
+    sourceClass,
+    [block && block.entities, block && block.algorithm, block && block.expectedResult].filter(Boolean).join('\n'),
+    options.maxReferencePathDepth
+  );
+  const qualifiedHints = hints.filter((hint) => hint.length > 1);
+  const qualifiedCandidates = candidates.filter((candidate) => qualifiedHints.some((hint) => assistantReferencePathHintMatchesCandidate(hint, candidate, sourceClass, fieldsByClass)));
+  const matchingCandidates = qualifiedHints.length
+    ? qualifiedCandidates
+    : candidates.filter((candidate) => hints.some((hint) => assistantReferencePathHintMatchesCandidate(hint, candidate, sourceClass, fieldsByClass)));
+  if (matchingCandidates.length === 1) return { candidate: matchingCandidates[0], candidates: matchingCandidates };
+  const candidatePaths = (matchingCandidates.length ? matchingCandidates : candidates)
+    .map((candidate) => candidate.sourcePath.join('.'));
+  const expectedReference = hints.find((hint) => hint.length > 1)?.[0] || '';
+  const contextBytesLimit = assistantMcpContextBytesLimit(options.mcpContext);
+  const depthLimit = assistantMcpReferenceDepthLimit(options.mcpContext);
+  if (!matchingCandidates.length && contextBytesLimit) {
+    return {
+      candidate: null,
+      candidates: candidatePaths,
+      reason: `MCP context was truncated at configured maxContextBytes=${contextBytesLimit} while resolving ${sourceClass}${expectedReference ? `.${expectedReference}` : ''}; the required reference schema may be absent from the available context. Check the reference attribute and increase «Макс. размер MCP context» if it is readable.`
+    };
+  }
+  if (!matchingCandidates.length && depthLimit) {
+    return {
+      candidate: null,
+      candidates: candidatePaths,
+      reason: `MCP context reached configured maxReferencePathDepth=${depthLimit} while resolving ${sourceClass}${expectedReference ? `.${expectedReference}` : ''}; the required path depth is at least ${depthLimit + 1}. Check the reference attribute and increase «Глубина reference-пути» if it is readable.`
+    };
+  }
+  if (matchingCandidates.length > 1) {
+    return {
+      candidate: null,
+      candidates: candidatePaths,
+      reason: `reference terminal field is ambiguous; confirmed paths: ${candidatePaths.join(', ')}`
+    };
+  }
+  if (qualifiedHints.length) {
+    return {
+      candidate: null,
+      candidates: [],
+      reason: `explicit reference path ${qualifiedHints.map((hint) => hint.join('.')).join(' / ')} is not present in the available MCP reference schema`
+    };
+  }
+  return {
+    candidate: null,
+    candidates: candidatePaths,
+    reason: expectedReference
+      ? `reference attribute ${sourceClass}.${expectedReference} or its terminal field is not present in the available MCP field context`
+      : `terminal field ${sourcePath.join('.')} has no confirmed reference attribute from ${sourceClass}`
+  };
 }
 
 function assistantReferencePathHop(mcpContext, sourceClass, attribute, block, index, predicate) {
@@ -25032,12 +25740,20 @@ function assistantReferencePathHop(mcpContext, sourceClass, attribute, block, in
 
 function assistantNormalizeReferencePathPredicate(rawPredicate, block, outputClass, index, options = {}) {
   const predicate = rawPredicate && typeof rawPredicate === 'object' && !Array.isArray(rawPredicate) ? rawPredicate : {};
-  const sourceClass = String(predicate.sourceClass || outputClass || '').trim();
+  const sourceClass = assistantCanonicalPredicateSourceClass(predicate, outputClass, block, index, 'reference path', options.warnings);
   const comparisonBlockId = String(predicate.comparisonBlockId || '').trim();
   const dependencyOutputClasses = options.dependencyOutputClasses instanceof Map ? options.dependencyOutputClasses : new Map();
   const comparisonClass = String(predicate.comparisonClass || dependencyOutputClasses.get(comparisonBlockId) || '').trim();
   const storedHopAttributes = Array.isArray(predicate.hops) ? predicate.hops.map((hop) => String(hop && hop.attribute || '').trim()).filter(Boolean) : [];
-  const sourcePath = assistantReferencePathSegments(predicate.sourcePath || predicate.sourceField || predicate.path || (storedHopAttributes.length ? storedHopAttributes.concat(String(predicate.terminalField || '')).filter(Boolean) : []));
+  let sourcePath = assistantReferencePathSegments(predicate.sourcePath || predicate.sourceField || predicate.path || (storedHopAttributes.length ? storedHopAttributes.concat(String(predicate.terminalField || '')).filter(Boolean) : []));
+  const explicitReferenceContract = assistantReferencePathContractForBlock(block, sourceClass, options.referencePathContracts);
+  if (explicitReferenceContract) {
+    const canonicalPath = explicitReferenceContract.sourcePath.slice();
+    if (sourcePath.join('.') !== canonicalPath.join('.') && Array.isArray(options.warnings)) {
+      options.warnings.push(`Assistant normalized reference path ${sourcePath.join('.') || '(empty)'} to user-confirmed MCP path ${canonicalPath.join('.')}.`);
+    }
+    sourcePath = canonicalPath;
+  }
   const fieldsByClass = assistantMcpFieldsByClass(options.mcpContext);
   if (!block.uses.length) {
     throw assistantSemanticPlanError(`Semantic plan block ${block.name} has no selected dependencies and may not define reference path predicates.`, {
@@ -25045,8 +25761,13 @@ function assistantNormalizeReferencePathPredicate(rawPredicate, block, outputCla
       predicateType: 'reference path', predicateIndex: index + 1, comparisonBlockId, sourceFields: sourcePath, comparisonField: String(predicate.comparisonField || '')
     });
   }
-  if (sourceClass !== outputClass || !ASSISTANT_CMDBUILD_CLASS_IDENTIFIER_PATTERN.test(comparisonClass)) {
-    throw assistantReferencePathIssue(block, index, { ...predicate, sourceClass, comparisonBlockId, sourcePath }, 'source or comparison class is invalid');
+  if (!ASSISTANT_CMDBUILD_CLASS_IDENTIFIER_PATTERN.test(comparisonClass)) {
+    throw assistantSemanticPredicateClassError(block, index, 'reference path', {
+      outputClass,
+      comparisonBlockId,
+      invalidField: 'comparisonClass',
+      value: comparisonClass
+    });
   }
   if (!block.uses.includes(comparisonBlockId)) {
     throw assistantSemanticPlanError(`Semantic plan block ${block.name} reference path predicate ${index + 1} must reference a selected block result in comparisonBlockId.`, {
@@ -25054,7 +25775,26 @@ function assistantNormalizeReferencePathPredicate(rawPredicate, block, outputCla
       comparisonBlockId, availableDependencyIds: block.uses.slice()
     });
   }
-  if (sourcePath.length < 2) throw assistantReferencePathIssue(block, index, { ...predicate, sourceClass, comparisonBlockId, sourcePath }, 'reference path must contain a reference attribute and a terminal field');
+  if (sourcePath.length < 2) {
+    const recovered = assistantRecoverIncompleteReferencePath(block, predicate, sourceClass, sourcePath, {
+      ...options,
+      maxReferencePathDepth: options.maxReferencePathDepth
+    });
+    if (!recovered.candidate) {
+      throw assistantReferencePathIssue(block, index, { ...predicate, sourceClass, comparisonBlockId, sourcePath }, recovered.reason, recovered.candidates);
+    }
+    sourcePath = recovered.candidate.sourcePath;
+    if (Array.isArray(options.warnings)) {
+      options.warnings.push(`Assistant completed incomplete reference path ${String(predicate.sourcePath || sourcePath.at(-1) || '')} to ${sourcePath.join('.')} from confirmed MCP schema.`);
+    }
+    logWarn('assistant.semantic_plan.reference_path_completed', {
+      requestId: currentRequestId(),
+      blockId: String(block.id || ''),
+      predicateIndex: index + 1,
+      sourceClass,
+      sourcePath: sourcePath.join('.')
+    });
+  }
   const maxDepth = Number(options.maxReferencePathDepth || 0);
   if (maxDepth > 0 && sourcePath.length - 1 > maxDepth) {
     throw assistantReferencePathIssue(block, index, { ...predicate, sourceClass, comparisonBlockId, sourcePath }, `reference path depth ${sourcePath.length - 1} exceeds configured maxReferencePathDepth=${maxDepth}`);
@@ -25067,7 +25807,7 @@ function assistantNormalizeReferencePathPredicate(rawPredicate, block, outputCla
   let currentClass = sourceClass;
   for (let segmentIndex = 0; segmentIndex < sourcePath.length - 1; segmentIndex += 1) {
     const fields = fieldsByClass.get(currentClass) || [];
-    const matches = assistantMcpFieldMatches(fields, sourcePath[segmentIndex], { requireReference: true });
+    const matches = assistantMcpPreferredFieldMatches(fields, sourcePath[segmentIndex], { requireReference: true });
     if (matches.length !== 1) {
       throw assistantReferencePathIssue(block, index, { ...predicate, sourceClass, comparisonBlockId, sourcePath }, matches.length ? 'reference attribute is ambiguous' : 'reference attribute is not present in MCP field context', matches.map((field) => String(field.name || '')));
     }
@@ -25075,7 +25815,7 @@ function assistantNormalizeReferencePathPredicate(rawPredicate, block, outputCla
     hops.push(hop);
     currentClass = hop.targetClass;
   }
-  const terminalMatches = assistantMcpFieldMatches(fieldsByClass.get(currentClass), sourcePath.at(-1), { requireReference: false });
+  const terminalMatches = assistantMcpPreferredFieldMatches(fieldsByClass.get(currentClass), sourcePath.at(-1), { requireReference: false });
   if (terminalMatches.length !== 1) {
     throw assistantReferencePathIssue(block, index, { ...predicate, sourceClass, comparisonBlockId, sourcePath }, terminalMatches.length ? 'terminal field is ambiguous' : 'terminal field is not present in MCP field context', terminalMatches.map((field) => String(field.name || '')));
   }
@@ -25094,22 +25834,6 @@ function assistantNormalizeReferencePathPredicate(rawPredicate, block, outputCla
     comparisonField,
     operator
   };
-}
-
-function assistantImplicitReferencePathPredicate(rawPredicate, block, outputClass, index, options = {}) {
-  const predicate = rawPredicate && typeof rawPredicate === 'object' && !Array.isArray(rawPredicate) ? rawPredicate : {};
-  const sourceClass = String(predicate.sourceClass || outputClass || '').trim();
-  const sourceFields = Array.isArray(predicate.sourceFields) ? predicate.sourceFields : [];
-  if (sourceFields.length !== 1 || !sourceClass) return null;
-  const fieldsByClass = assistantMcpFieldsByClass(options.mcpContext);
-  const candidates = [];
-  (fieldsByClass.get(sourceClass) || []).filter((field) => String(field && field.type || '').toLowerCase() === 'reference').forEach((field) => {
-    const targetClass = assistantReferenceTargetClass(field);
-    const terminalMatches = assistantMcpFieldMatches(fieldsByClass.get(targetClass), sourceFields[0], { requireReference: false });
-    terminalMatches.forEach((terminal) => candidates.push([String(field.name || ''), String(terminal.name || '')]));
-  });
-  if (candidates.length !== 1) return null;
-  return assistantNormalizeReferencePathPredicate({ ...predicate, sourceClass, sourcePath: candidates[0] }, block, outputClass, index, options);
 }
 
 function normalizeAssistantObjectFlowResultContract(value, block, options = {}) {
@@ -25135,15 +25859,14 @@ function normalizeAssistantObjectFlowResultContract(value, block, options = {}) 
   }
   const ipv4OnlyComparison = !assistantSemanticRequestsDirectRelation(block)
     && assistantSemanticHasExplicitIpv4Comparison(block);
+  // IPv4 path resolution belongs to deterministic Object Flow compilation.
+  // Semantic planning keeps the business dependency but must not validate or
+  // reject LLM-provided predicate details at this stage.
   const dependencyPathInputs = ipv4OnlyComparison ? [] : rawDependencyPaths;
-  if (ipv4OnlyComparison && rawDependencyPaths.length) {
-    rawDependencyPaths.forEach((path) => {
-      const sourceClass = String(path && path.sourceClass || '').trim();
-      const domain = String(path && path.domain || '').trim();
-      const direction = String(path && path.direction || '').trim();
-      options.warnings && options.warnings.push(`Assistant removed direct dependency path ${sourceClass}${domain ? ` --${domain}` : ''}${direction ? ` [${direction}]` : ''}--> ${outputClass}: the block requests an IPv4 attribute comparison and does not request a relation traversal.`);
-    });
-  }
+  const deferIpv4ReferenceResolution = ipv4OnlyComparison;
+  const semanticRelationPredicates = deferIpv4ReferenceResolution ? [] : rawPredicates;
+  const semanticAttributePredicates = deferIpv4ReferenceResolution ? [] : rawAttributePredicates;
+  const semanticReferencePathPredicates = deferIpv4ReferenceResolution ? [] : rawReferencePathPredicates;
   let dependencyPaths = dependencyPathInputs.map((path, index) => normalizeAssistantDependencyPath(path, block, outputClass, index, options));
   const directAttributePredicatesFromPaths = dependencyPaths.map((path) => assistantInferExplicitDirectAttributePredicate(block, outputClass, {
     sourceClass: outputClass,
@@ -25161,9 +25884,9 @@ function normalizeAssistantObjectFlowResultContract(value, block, options = {}) 
     });
   }
   const relationPredicates = [];
-  rawPredicates.forEach((rawPredicate, index) => {
+  semanticRelationPredicates.forEach((rawPredicate, index) => {
     const predicate = rawPredicate && typeof rawPredicate === 'object' && !Array.isArray(rawPredicate) ? rawPredicate : {};
-    const sourceClass = String(predicate.sourceClass || '').trim();
+    const sourceClass = assistantCanonicalPredicateSourceClass(predicate, outputClass, block, index, 'relation', warnings);
     const relatedClass = String(predicate.relatedClass || '').trim();
     const comparisonBlockId = String(predicate.comparisonBlockId || '').trim();
     const comparisonClass = String(predicate.comparisonClass || '').trim();
@@ -25213,8 +25936,13 @@ function normalizeAssistantObjectFlowResultContract(value, block, options = {}) 
         }
       );
     }
-    if (sourceClass !== outputClass || !ASSISTANT_CMDBUILD_CLASS_IDENTIFIER_PATTERN.test(relatedClass) || !ASSISTANT_CMDBUILD_CLASS_IDENTIFIER_PATTERN.test(comparisonClass)) {
-      throw assistantSemanticPlanError(`Semantic plan block ${block.name} relation predicate ${index + 1} must use outputClass as sourceClass and CMDBuild class identifiers.`);
+    if (!ASSISTANT_CMDBUILD_CLASS_IDENTIFIER_PATTERN.test(relatedClass) || !ASSISTANT_CMDBUILD_CLASS_IDENTIFIER_PATTERN.test(comparisonClass)) {
+      throw assistantSemanticPredicateClassError(block, index, 'relation', {
+        outputClass,
+        comparisonBlockId,
+        invalidField: !ASSISTANT_CMDBUILD_CLASS_IDENTIFIER_PATTERN.test(relatedClass) ? 'relatedClass' : 'comparisonClass',
+        value: !ASSISTANT_CMDBUILD_CLASS_IDENTIFIER_PATTERN.test(relatedClass) ? relatedClass : comparisonClass
+      });
     }
     if (!block.uses.includes(comparisonBlockId)) {
       throw assistantSemanticPlanError(
@@ -25322,13 +26050,13 @@ function normalizeAssistantObjectFlowResultContract(value, block, options = {}) 
     }
     relationPredicates.push({ sourceClass, relatedClass, comparisonBlockId, comparisonClass, domain: confirmedDomain, direction: confirmedDirection, comparisonFields, relatedField, operator: confirmedOperator });
   });
-  const referencePathPredicates = rawReferencePathPredicates.map((predicate, index) => assistantNormalizeReferencePathPredicate(predicate, block, outputClass, index, {
+  const referencePathPredicates = semanticReferencePathPredicates.map((predicate, index) => assistantNormalizeReferencePathPredicate(predicate, block, outputClass, index, {
     ...options,
     maxReferencePathDepth: options.maxReferencePathDepth
   }));
-  const attributePredicates = directAttributePredicatesFromPaths.concat(rawAttributePredicates.map((rawPredicate, index) => {
+  const attributePredicates = directAttributePredicatesFromPaths.concat(semanticAttributePredicates.map((rawPredicate, index) => {
     const predicate = rawPredicate && typeof rawPredicate === 'object' && !Array.isArray(rawPredicate) ? rawPredicate : {};
-    let sourceClass = String(predicate.sourceClass || outputClass || '').trim();
+    let sourceClass = assistantCanonicalPredicateSourceClass(predicate, outputClass, block, index, 'attribute', warnings);
     const comparisonBlockId = String(predicate.comparisonBlockId || '').trim();
     let comparisonClass = String(predicate.comparisonClass || (options.dependencyOutputClasses instanceof Map ? options.dependencyOutputClasses.get(comparisonBlockId) : '') || '').trim();
     const rawSourceFields = uniqueStrings((Array.isArray(predicate.sourceFields) ? predicate.sourceFields : []).map((field) => String(field || '').trim()).filter(Boolean));
@@ -25350,8 +26078,13 @@ function normalizeAssistantObjectFlowResultContract(value, block, options = {}) 
         }
       );
     }
-    if (sourceClass !== outputClass || !ASSISTANT_CMDBUILD_CLASS_IDENTIFIER_PATTERN.test(comparisonClass)) {
-      throw assistantSemanticPlanError(`Semantic plan block ${block.name} attribute predicate ${index + 1} must use outputClass as sourceClass and a CMDBuild class identifier.`);
+    if (!ASSISTANT_CMDBUILD_CLASS_IDENTIFIER_PATTERN.test(comparisonClass)) {
+      throw assistantSemanticPredicateClassError(block, index, 'attribute', {
+        outputClass,
+        comparisonBlockId,
+        invalidField: 'comparisonClass',
+        value: comparisonClass
+      });
     }
     if (!block.uses.includes(comparisonBlockId)) {
       throw assistantSemanticPlanError(
@@ -25370,11 +26103,28 @@ function normalizeAssistantObjectFlowResultContract(value, block, options = {}) 
     const dottedPath = rawSourceFields.find((field) => assistantReferencePathSegments(field).length > 1);
     const directSourceMatches = rawSourceFields.map((field) => assistantMcpFieldMatches(fieldsByClass.get(sourceClass), field));
     const unresolvedHumanReference = !dottedPath && rawSourceFields.length === 1 && directSourceMatches[0] && directSourceMatches[0].length === 0;
-    const implicitReference = unresolvedHumanReference
-      ? assistantImplicitReferencePathPredicate({ ...predicate, sourceClass, comparisonBlockId, comparisonClass, sourceFields: rawSourceFields }, block, outputClass, index, options)
+    const recoveredReference = unresolvedHumanReference
+      ? assistantRecoverIncompleteReferencePath(block, predicate, sourceClass, rawSourceFields, options)
+      : null;
+    const implicitReference = recoveredReference && recoveredReference.candidate
+      ? assistantNormalizeReferencePathPredicate({
+        ...predicate,
+        sourceClass,
+        comparisonBlockId,
+        comparisonClass,
+        sourcePath: recoveredReference.candidate.sourcePath
+      }, block, outputClass, index, options)
       : null;
     if (unresolvedHumanReference && !implicitReference) {
-      throw assistantReferencePathIssue(block, index, { ...predicate, sourceClass, comparisonBlockId, sourcePath: rawSourceFields }, 'attribute or reference terminal field is not uniquely present in MCP field context');
+      throw assistantReferencePathIssue(
+        block,
+        index,
+        { ...predicate, sourceClass, comparisonBlockId, sourcePath: rawSourceFields },
+        recoveredReference && recoveredReference.reason
+          ? recoveredReference.reason
+          : 'attribute or reference terminal field is not uniquely present in MCP field context',
+        recoveredReference && recoveredReference.candidates || []
+      );
     }
     if (dottedPath || implicitReference) {
       const referencePredicate = implicitReference || assistantNormalizeReferencePathPredicate({
@@ -25640,6 +26390,7 @@ async function prepareAssistantObjectFlowSemanticPlanContext(input, options = {}
     planningText,
     checkpoint,
     classBindingResult,
+    referencePathContracts: [],
     checkpointOptions,
     cacheBackend,
     mcpContextReused,
@@ -25681,16 +26432,11 @@ async function createAssistantObjectFlowSemanticPlan(input, options = {}) {
     if (bindingErrors.length) {
       throw assistantSemanticPlanError('Semantic plan selected a class different from the confirmed class binding.', bindingErrors);
     }
-    const ipv4CompletionWarnings = assistantCompleteExplicitIpv4Predicates(semanticPlan, prepared.intent, prepared.checkpoint.mcpContext);
-    const requiredPredicateErrors = assistantSemanticPlanRequiredPredicateErrors(semanticPlan, prepared.intent);
-    if (requiredPredicateErrors.length) {
-      throw assistantSemanticPlanError('Semantic plan omitted a required cross-block IPv4 predicate.', requiredPredicateErrors);
-    }
     const catalogErrors = assistantSemanticPlanCatalogErrors(semanticPlan, prepared.checkpoint.mcpContext);
     if (catalogErrors.length) {
       throw assistantSemanticPlanError('Semantic plan uses CMDBuild classes that are not present in the available MCP model context.', catalogErrors);
     }
-    const warnings = uniqueStrings([...(prepared.checkpoint.mcpContext.warnings || []), ...(semanticPlan.warnings || []), ...ipv4CompletionWarnings, ...semanticPlan.blocks.flatMap((block) => block.warnings || [])]);
+    const warnings = uniqueStrings([...(prepared.checkpoint.mcpContext.warnings || []), ...(semanticPlan.warnings || []), ...semanticPlan.blocks.flatMap((block) => block.warnings || [])]);
     if (prepared.checkpointOptions) {
       prepared.checkpoint.semanticPlan = semanticPlan;
       prepared.checkpoint.explanation = semanticPlan.explanation || '';
@@ -26491,7 +27237,7 @@ function assistantRepairReferencePathPredicates(flow, semanticPlan, intent) {
       const terminalAlias = uniqueAlias(`${contract.blockId}_reference`, usedAliases);
       const terminalSelection = {
         id: `selection:${terminalAlias}`,
-        name: `${contract.blockName} (reference)`,
+        name: `${contract.blockName} (reference ${predicate.terminalClass})`,
         alias: terminalAlias,
         className: predicate.terminalClass,
         from: comparisonAlias,
@@ -26835,25 +27581,31 @@ function assistantObjectFlowBlockOutput(flow, semanticPlan, intent, blockId) {
   return alias && candidateBlock ? { blockId: candidateBlockId, alias, label: candidateBlock.name } : null;
 }
 
-export function assistantExtractionCandidateOutput(flow, semanticPlan, intent) {
-  const normalizedIntent = normalizeAssistantObjectFlowIntent(intent);
-  return assistantObjectFlowBlockOutput(flow, semanticPlan, normalizedIntent, normalizedIntent.extractionCandidateBlockId);
-}
-
-function assistantObjectFlowOutputBindings(flow, semanticPlan, intent) {
+function assistantObjectFlowOutputBindings(flow, semanticPlan, intent, explicitBindings = null) {
   const normalizedIntent = normalizeAssistantObjectFlowIntent(intent, { requireComplete: true });
   const aliases = new Set(objectFlowResultOutputs(flow).map((output) => output.alias));
   const bindings = [];
   const errors = [];
   const usedAliases = new Set();
+  const explicitByBlockId = explicitBindings instanceof Map
+    ? explicitBindings
+    : new Map((Array.isArray(explicitBindings) ? explicitBindings : []).map((binding) => [
+      String(binding && binding.blockId || ''),
+      String(binding && binding.alias || '')
+    ]).filter(([blockId, alias]) => blockId && alias));
   normalizedIntent.blocks.forEach((block) => {
-    const output = assistantObjectFlowBlockOutput(flow, semanticPlan, normalizedIntent, block.id);
+    const explicitAlias = explicitByBlockId.get(block.id) || '';
+    const output = explicitAlias
+      ? { blockId: block.id, alias: explicitAlias, label: block.name }
+      : assistantObjectFlowBlockOutput(flow, semanticPlan, normalizedIntent, block.id);
     if (!output || !aliases.has(output.alias)) {
       errors.push({
         code: 'assistant_output_binding_missing',
         path: '$.flow',
         blockId: block.id,
         blockName: block.name,
+        expectedClass: String((assistantResultContractRequirements(semanticPlan, normalizedIntent).find((contract) => contract.blockId === block.id) || {}).outputClass || ''),
+        availableAliases: Array.from(aliases),
         message: `Assistant block ${block.name} does not have one unique materialized result alias.`
       });
       return;
@@ -27023,16 +27775,6 @@ function assistantOutputManifestForRequest(flow, bindings, requestedIntent) {
   }
   const intent = normalizeAssistantObjectFlowIntent(requestedIntent, { requireComplete: true });
   const resolved = assistantOutputBindingMetadata(flow, intent, bindings);
-  const candidateBinding = intent.extractionCandidateBlockId
-    ? bindings.find((binding) => String(binding && binding.blockId || '') === intent.extractionCandidateBlockId)
-    : null;
-  if (intent.extractionCandidateBlockId && (!candidateBinding || !String(candidateBinding.alias || '').trim())) {
-    resolved.errors.push({
-      code: 'assistant_output_manifest_invalid',
-      path: '$.assistantObjectFlowIntent.extractionCandidateBlockId',
-      message: 'Assistant extraction candidate must resolve to a bound deterministic result alias.'
-    });
-  }
   if (resolved.errors.length) {
     const error = new Error(resolved.errors[0].message);
     error.statusCode = 422;
@@ -27044,13 +27786,7 @@ function assistantOutputManifestForRequest(flow, bindings, requestedIntent) {
     outputMetadata: resolved.metadata,
     assistantOutputManifest: {
       version: 1,
-      blocks: intent.blocks.map((block, index) => ({ id: block.id, name: block.name, order: index + 1 })),
-      ...(candidateBinding ? {
-        extractionCandidate: {
-          blockId: intent.extractionCandidateBlockId,
-          alias: String(candidateBinding.alias).trim()
-        }
-      } : {})
+      blocks: intent.blocks.map((block, index) => ({ id: block.id, name: block.name, order: index + 1 }))
     }
   };
 }
@@ -28123,16 +28859,262 @@ function assistantIpv4PredicateFieldCandidates(attributes, blockText, role) {
   return uniqueStrings(candidates.map((attribute) => String(attribute.name || '').trim()).filter(Boolean));
 }
 
-function assistantCompleteExplicitIpv4Predicates(semanticPlan, intent, mcpContext) {
+function assistantIpv4ReferencePathCandidates(mcpContext, sourceClass, blockText, maxReferencePathDepth) {
+  const fieldsByClass = assistantMcpFieldsByClass(mcpContext);
+  const candidates = [];
+  const maxDepth = Math.max(1, Number(maxReferencePathDepth) || 1);
+  const visit = (currentClass, hops, visitedClasses) => {
+    const fields = fieldsByClass.get(currentClass) || [];
+    if (hops.length) {
+      const terminalFields = assistantIpv4PredicateFieldCandidates(fields, blockText, 'source');
+      terminalFields.forEach((terminalField) => candidates.push({
+        sourcePath: hops.map((hop) => hop.attribute).concat(terminalField),
+        hops: hops.map((hop) => ({ ...hop })),
+        terminalClass: currentClass,
+        terminalField
+      }));
+    }
+    if (hops.length >= maxDepth) return;
+    fields.filter((field) => String(field && field.type || '').toLowerCase() === 'reference').forEach((field) => {
+      const targetClass = assistantReferenceTargetClass(field);
+      const declaredDomain = String(field && (field.domain || field.referenceDomainName) || '').trim();
+      if (!targetClass || !declaredDomain || visitedClasses.has(targetClass)) return;
+      const relationCandidates = assistantSemanticDependencyPathCandidates(mcpContext, currentClass, targetClass)
+        .filter((candidate) => candidate.domain === declaredDomain && candidate.sourceClass === currentClass && candidate.targetClass === targetClass);
+      if (relationCandidates.length !== 1) return;
+      visit(targetClass, hops.concat({
+        sourceClass: currentClass,
+        attribute: String(field.name || ''),
+        domain: relationCandidates[0].domain,
+        direction: relationCandidates[0].direction,
+        targetClass
+      }), new Set([...visitedClasses, targetClass]));
+    });
+  };
+  visit(sourceClass, [], new Set([sourceClass]));
+  return Array.from(new Map(candidates.map((candidate) => [
+    `${candidate.sourcePath.join('.')}\u0000${candidate.terminalClass}`,
+    candidate
+  ])).values());
+}
+
+function assistantExplicitReferencePathContracts(intent, mcpContext, classBindings, maxReferencePathDepth) {
+  const expectedOutputByBlock = new Map((classBindings || [])
+    .filter((binding) => binding && binding.expectedOutput)
+    .map((binding) => [String(binding.blockId || ''), String(binding.className || '')])
+    .filter(([blockId, className]) => blockId && ASSISTANT_CMDBUILD_CLASS_IDENTIFIER_PATTERN.test(className)));
+  const fieldsByClass = assistantMcpFieldsByClass(mcpContext);
+  const contracts = [];
+  const errors = [];
+  (intent && Array.isArray(intent.blocks) ? intent.blocks : []).forEach((block) => {
+    const blockId = String(block && block.id || '');
+    const sourceClass = expectedOutputByBlock.get(blockId) || '';
+    if (!sourceClass || !assistantSemanticHasExplicitIpv4Comparison(block)) return;
+    const hints = assistantReferencePathHintsFromBlock(block).filter((hint) => hint.length > 1);
+    if (!hints.length) return;
+    const text = [block.entities, block.algorithm, block.expectedResult].filter(Boolean).join('\n');
+    const candidates = assistantIpv4ReferencePathCandidates(mcpContext, sourceClass, text, maxReferencePathDepth);
+    const matchingCandidates = candidates.filter((candidate) => hints.some((hint) => (
+      assistantReferencePathHintMatchesCandidate(hint, candidate, sourceClass, fieldsByClass)
+    )));
+    if (matchingCandidates.length === 1) {
+      const candidate = matchingCandidates[0];
+      contracts.push({
+        blockId,
+        sourceClass,
+        sourcePath: candidate.sourcePath.slice(),
+        hops: candidate.hops.map((hop) => ({ ...hop })),
+        terminalClass: candidate.terminalClass,
+        terminalField: candidate.terminalField
+      });
+      return;
+    }
+    const requestedPaths = hints.map((hint) => hint.join('.'));
+    errors.push({
+      kind: 'semanticPlanReferencePathUnresolved',
+      blockId,
+      blockName: String(block && block.name || ''),
+      predicateIndex: 1,
+      sourceClass,
+      comparisonBlockId: String((block && block.uses || [])[0] || ''),
+      sourcePath: requestedPaths,
+      reason: matchingCandidates.length
+        ? `explicit reference path is ambiguous; confirmed paths: ${matchingCandidates.map((candidate) => candidate.sourcePath.join('.')).join(', ')}`
+        : `explicit reference path ${requestedPaths.join(' / ')} is not present in the available MCP reference schema within configured maxReferencePathDepth=${maxReferencePathDepth}`,
+      candidates: matchingCandidates.length
+        ? matchingCandidates.map((candidate) => candidate.sourcePath.join('.'))
+        : candidates.map((candidate) => candidate.sourcePath.join('.'))
+    });
+  });
+  return { contracts, errors };
+}
+
+function assistantReferencePathContractForBlock(block, sourceClass, contracts) {
+  const values = Array.isArray(contracts) ? contracts : [];
+  const match = values.find((contract) => (
+    String(contract && contract.blockId || '') === String(block && block.id || '')
+    && String(contract && contract.sourceClass || '') === String(sourceClass || '')
+  ));
+  return match || null;
+}
+
+function assistantExecutableSemanticPlanForFlow(semanticPlan, intent, mcpContext, options = {}) {
+  const executable = cloneJsonValueServer(semanticPlan, {});
+  const intentById = new Map((intent && Array.isArray(intent.blocks) ? intent.blocks : []).map((block) => [String(block && block.id || ''), block]));
+  const blocksById = new Map((executable && Array.isArray(executable.blocks) ? executable.blocks : []).map((block) => [String(block && block.id || ''), block]));
+  const fieldsByClass = assistantMcpFieldsByClass(mcpContext);
+  const maxReferencePathDepth = Math.max(1, Number(options.maxReferencePathDepth) || 1);
+  const warnings = [];
+  blocksById.forEach((semanticBlock, blockId) => {
+    const intentBlock = intentById.get(blockId);
+    const resultContract = semanticBlock && semanticBlock.resultContract && typeof semanticBlock.resultContract === 'object'
+      ? semanticBlock.resultContract
+      : null;
+    if (!intentBlock || !resultContract || resultContract.outputKind !== 'sourceCards' || !assistantSemanticHasExplicitIpv4Comparison(intentBlock)) return;
+    if (intentBlock.uses.length !== 1) {
+      throw assistantSemanticPlanError(`Deterministic flow for ${semanticBlock.name} requires exactly one comparison result for the explicit IPv4 reference path.`, {
+        kind: 'deterministicFlowReferencePathDependency', blockId, blockName: semanticBlock.name, dependencies: intentBlock.uses.slice()
+      });
+    }
+    const comparisonBlock = blocksById.get(String(intentBlock.uses[0] || ''));
+    const sourceClass = String(resultContract.outputClass || '').trim();
+    const comparisonClass = String(comparisonBlock && comparisonBlock.resultContract && comparisonBlock.resultContract.outputClass || '').trim();
+    const text = [intentBlock.entities, intentBlock.algorithm, intentBlock.expectedResult].filter(Boolean).join('\n');
+    const directSourceFields = assistantIpv4PredicateFieldCandidates(fieldsByClass.get(sourceClass), text, 'source');
+    const comparisonFields = assistantIpv4PredicateFieldCandidates(fieldsByClass.get(comparisonClass), text, 'comparison');
+    const directOperator = assistantSemanticIpv4Operator(intentBlock, directSourceFields, comparisonFields[0]);
+    if (directSourceFields.length && comparisonFields.length === 1 && ASSISTANT_ATTRIBUTE_PREDICATE_OPERATORS.has(directOperator)) {
+      resultContract.dependencyPaths = [];
+      resultContract.relationPredicates = [];
+      resultContract.referencePathPredicates = [];
+      resultContract.attributePredicates = [{
+        sourceClass,
+        comparisonBlockId: String(intentBlock.uses[0] || ''),
+        comparisonClass,
+        sourceFields: directSourceFields,
+        comparisonField: comparisonFields[0],
+        operator: directOperator
+      }];
+      const warning = `Deterministic flow resolved IPv4 comparison ${sourceClass}.${directSourceFields.join(' / ')} ${directOperator} ${comparisonClass}.${comparisonFields[0]}.`;
+      semanticBlock.warnings = uniqueStrings([...(semanticBlock.warnings || []), warning]);
+      warnings.push(warning);
+      return;
+    }
+    const relationCandidates = uniqueStrings((mcpContext && mcpContext.diagnostics && Array.isArray(mcpContext.diagnostics.relationPaths)
+      ? mcpContext.diagnostics.relationPaths
+      : []).filter((candidate) => String(candidate && candidate.sourceClass || '') === sourceClass)
+      .map((candidate) => JSON.stringify(candidate)))
+      .map((candidate) => JSON.parse(candidate))
+      .filter((candidate) => assistantIpv4PredicateFieldCandidates(fieldsByClass.get(String(candidate && candidate.targetClass || '')), text, 'comparison').length === 1);
+    const relatedSourceFields = assistantIpv4PredicateFieldCandidates(fieldsByClass.get(comparisonClass), text, 'source');
+    if (relationCandidates.length === 1 && relatedSourceFields.length) {
+      const relation = relationCandidates[0];
+      const relatedClass = String(relation.targetClass || '');
+      const relatedFields = assistantIpv4PredicateFieldCandidates(fieldsByClass.get(relatedClass), text, 'comparison');
+      const relationOperator = assistantSemanticIpv4Operator(intentBlock, relatedSourceFields, relatedFields[0]);
+      if (relatedFields.length === 1 && ASSISTANT_ATTRIBUTE_PREDICATE_OPERATORS.has(relationOperator)) {
+        resultContract.dependencyPaths = [];
+        resultContract.attributePredicates = [];
+        resultContract.referencePathPredicates = [];
+        resultContract.relationPredicates = [{
+          sourceClass,
+          relatedClass,
+          comparisonBlockId: String(intentBlock.uses[0] || ''),
+          comparisonClass,
+          domain: String(relation.domain || ''),
+          direction: String(relation.direction || ''),
+          comparisonFields: relatedSourceFields,
+          relatedField: relatedFields[0],
+          operator: relationOperator
+        }];
+        const warning = `Deterministic flow resolved IPv4 comparison through ${sourceClass} --${relation.domain} [${relation.direction}]--> ${relatedClass}.`;
+        semanticBlock.warnings = uniqueStrings([...(semanticBlock.warnings || []), warning]);
+        warnings.push(warning);
+        return;
+      }
+    }
+    if (comparisonFields.length !== 1) {
+      throw assistantSemanticPlanError(`Deterministic flow cannot resolve one IPv4 network field for ${semanticBlock.name}.`, {
+        kind: 'deterministicFlowIpv4ComparisonFieldUnresolved',
+        blockId,
+        blockName: semanticBlock.name,
+        comparisonClass,
+        candidates: comparisonFields,
+        reason: comparisonFields.length ? 'multiple readable network fields match the algorithm' : 'no readable network field matches the algorithm'
+      });
+    }
+    const hints = assistantReferencePathHintsFromBlock(intentBlock).filter((hint) => hint.length > 1);
+    const candidates = assistantIpv4ReferencePathCandidates(mcpContext, sourceClass, text, maxReferencePathDepth);
+    const matchingCandidates = hints.length
+      ? candidates.filter((candidate) => hints.some((hint) => (
+        assistantReferencePathHintMatchesCandidate(hint, candidate, sourceClass, fieldsByClass)
+      )))
+      : candidates;
+    if (matchingCandidates.length !== 1) {
+      const requested = hints.length ? hints.map((hint) => hint.join('.')).join(' / ') : 'неуточненный reference-путь';
+      const available = (matchingCandidates.length ? matchingCandidates : candidates).map((candidate) => candidate.sourcePath.join('.'));
+      throw assistantSemanticPlanError(`Deterministic flow cannot resolve the explicit reference path for ${semanticBlock.name}.`, {
+        kind: 'deterministicFlowReferencePathUnresolved',
+        blockId,
+        blockName: semanticBlock.name,
+        sourceClass,
+        comparisonBlockId: String(intentBlock.uses[0] || ''),
+        sourcePath: requested,
+        candidates: available,
+        reason: matchingCandidates.length
+          ? `${hints.length ? 'explicit reference path' : 'reference path'} is ambiguous; confirmed paths: ${available.join(', ')}`
+          : `${hints.length ? `explicit reference path ${requested}` : 'no IPv4 reference path'} is present in the available MCP schema within configured maxReferencePathDepth=${maxReferencePathDepth}`
+      });
+    }
+    const candidate = matchingCandidates[0];
+    const operator = assistantSemanticIpv4Operator(intentBlock, [candidate.terminalField], comparisonFields[0]);
+    if (!ASSISTANT_ATTRIBUTE_PREDICATE_OPERATORS.has(operator)) {
+      throw assistantSemanticPlanError(`Deterministic flow cannot determine an IPv4 operator for ${semanticBlock.name}.`, {
+        kind: 'deterministicFlowIpv4OperatorUnresolved', blockId, blockName: semanticBlock.name, sourcePath: candidate.sourcePath.join('.'), comparisonField: comparisonFields[0]
+      });
+    }
+    resultContract.dependencyPaths = [];
+    resultContract.relationPredicates = [];
+    resultContract.attributePredicates = [];
+    resultContract.referencePathPredicates = [{
+      sourceClass,
+      comparisonBlockId: String(intentBlock.uses[0] || ''),
+      comparisonClass,
+      hops: candidate.hops.map((hop) => ({ ...hop })),
+      terminalClass: candidate.terminalClass,
+      terminalField: candidate.terminalField,
+      comparisonField: comparisonFields[0],
+      operator
+    }];
+    const warning = `Deterministic flow resolved user reference path ${candidate.sourcePath.join('.')} and IPv4 comparison ${candidate.terminalClass}.${candidate.terminalField} ${operator} ${comparisonClass}.${comparisonFields[0]}.`;
+    semanticBlock.warnings = uniqueStrings([...(semanticBlock.warnings || []), warning]);
+    warnings.push(warning);
+  });
+  return { semanticPlan: executable, warnings };
+}
+
+function assistantMarkIpv4PredicateUnresolved(semanticBlock, contract, reason) {
+  contract.outputKind = 'unresolved';
+  contract.outputClass = '';
+  contract.dependencyPaths = [];
+  contract.relationPredicates = [];
+  contract.attributePredicates = [];
+  contract.referencePathPredicates = [];
+  semanticBlock.warnings = uniqueStrings([...(semanticBlock.warnings || []), reason]);
+  return reason;
+}
+
+function assistantCompleteExplicitIpv4Predicates(semanticPlan, intent, mcpContext, options = {}) {
   const intentBlocks = new Map((intent && Array.isArray(intent.blocks) ? intent.blocks : []).map((block) => [String(block && block.id || ''), block]));
   const semanticBlocks = new Map((semanticPlan && Array.isArray(semanticPlan.blocks) ? semanticPlan.blocks : []).map((block) => [String(block && block.id || ''), block]));
   const fieldsByClass = assistantMcpFieldsByClass(mcpContext);
+  const maxReferencePathDepth = Math.max(1, Number(options.maxReferencePathDepth) || 1);
   const warnings = [];
   semanticBlocks.forEach((semanticBlock, blockId) => {
     const intentBlock = intentBlocks.get(blockId);
     const contract = semanticBlock && semanticBlock.resultContract && typeof semanticBlock.resultContract === 'object' ? semanticBlock.resultContract : null;
     if (!intentBlock || !contract || contract.outputKind !== 'sourceCards' || !assistantSemanticHasExplicitIpv4Comparison(intentBlock)) return;
-    if ((contract.attributePredicates || []).length || (contract.relationPredicates || []).length || intentBlock.uses.length !== 1) return;
+    if ((contract.attributePredicates || []).length || (contract.relationPredicates || []).length || (contract.referencePathPredicates || []).length || intentBlock.uses.length !== 1) return;
     const comparisonBlock = semanticBlocks.get(String(intentBlock.uses[0] || ''));
     const comparisonClass = String(comparisonBlock && comparisonBlock.resultContract && comparisonBlock.resultContract.outputClass || '').trim();
     const sourceClass = String(contract.outputClass || '').trim();
@@ -28142,18 +29124,60 @@ function assistantCompleteExplicitIpv4Predicates(semanticPlan, intent, mcpContex
     const comparisonFields = assistantIpv4PredicateFieldCandidates(fieldsByClass.get(comparisonClass), blockText, 'comparison');
     const comparisonField = comparisonFields.length === 1 ? comparisonFields[0] : '';
     const operator = assistantSemanticIpv4Operator(intentBlock, sourceFields, comparisonField);
-    if (!sourceFields.length || !comparisonField || !operator) return;
-    contract.attributePredicates = [{
-      sourceClass,
-      comparisonBlockId: String(intentBlock.uses[0]),
-      comparisonClass,
-      sourceFields,
-      comparisonField,
-      operator
-    }];
-    const warning = `Deterministic semantic completion added IPv4 attribute comparison ${sourceClass}.${sourceFields.join(' / ')} ${operator} ${comparisonClass}.${comparisonField} from the explicit block algorithm and confirmed MCP fields.`;
-    semanticBlock.warnings = uniqueStrings([...(semanticBlock.warnings || []), warning]);
-    warnings.push(warning);
+    if (comparisonFields.length !== 1 || !operator) {
+      const candidates = comparisonFields.length ? comparisonFields.join(', ') : 'нет подтвержденного network/range поля';
+      warnings.push(assistantMarkIpv4PredicateUnresolved(
+        semanticBlock,
+        contract,
+        `Deterministic semantic completion could not choose one comparison field for explicit IPv4 condition in ${semanticBlock.name}: ${comparisonClass}.${candidates}.`
+      ));
+      return;
+    }
+    if (sourceFields.length) {
+      contract.attributePredicates = [{
+        sourceClass,
+        comparisonBlockId: String(intentBlock.uses[0]),
+        comparisonClass,
+        sourceFields,
+        comparisonField,
+        operator
+      }];
+      const warning = `Deterministic semantic completion added IPv4 attribute comparison ${sourceClass}.${sourceFields.join(' / ')} ${operator} ${comparisonClass}.${comparisonField} from the explicit block algorithm and confirmed MCP fields.`;
+      semanticBlock.warnings = uniqueStrings([...(semanticBlock.warnings || []), warning]);
+      warnings.push(warning);
+      return;
+    }
+    const explicitReferenceContract = assistantReferencePathContractForBlock(intentBlock, sourceClass, options.referencePathContracts);
+    const referenceCandidates = explicitReferenceContract
+      ? [{
+        sourcePath: explicitReferenceContract.sourcePath.slice(),
+        hops: explicitReferenceContract.hops.map((hop) => ({ ...hop })),
+        terminalClass: explicitReferenceContract.terminalClass,
+        terminalField: explicitReferenceContract.terminalField
+      }]
+      : assistantIpv4ReferencePathCandidates(mcpContext, sourceClass, blockText, maxReferencePathDepth);
+    if (referenceCandidates.length === 1) {
+      const candidate = referenceCandidates[0];
+      contract.referencePathPredicates = [{
+        sourceClass,
+        comparisonBlockId: String(intentBlock.uses[0]),
+        comparisonClass,
+        hops: candidate.hops,
+        terminalClass: candidate.terminalClass,
+        terminalField: candidate.terminalField,
+        comparisonField,
+        operator
+      }];
+      const warning = `Deterministic semantic completion added IPv4 reference path ${sourceClass}.${candidate.sourcePath.join('.')} ${operator} ${comparisonClass}.${comparisonField} from the explicit block algorithm and confirmed MCP schema.`;
+      semanticBlock.warnings = uniqueStrings([...(semanticBlock.warnings || []), warning]);
+      warnings.push(warning);
+      return;
+    }
+    const sourceCandidates = sourceFields.length ? sourceFields.map((field) => `${sourceClass}.${field}`) : referenceCandidates.map((candidate) => `${sourceClass}.${candidate.sourcePath.join('.')}`);
+    const reason = sourceCandidates.length
+      ? `Deterministic semantic completion could not choose one IPv4 source path for ${semanticBlock.name}: ${sourceCandidates.join(', ')}.`
+      : `Deterministic semantic completion found no confirmed IPv4 source field or reference path for ${semanticBlock.name} within maxReferencePathDepth=${maxReferencePathDepth}.`;
+    warnings.push(assistantMarkIpv4PredicateUnresolved(semanticBlock, contract, reason));
   });
   return warnings;
 }
@@ -28401,7 +29425,7 @@ function assistantDeterministicSemanticFlow(intent, semanticPlan, mcpContext, cu
       let currentAlias = addSelection(block, predicate.terminalClass, comparisonAlias, [{
         action: 'include', path: predicate.terminalField, negate: false, op: predicate.operator,
         regex: '', value: '', valueParam: '', valueColumn: predicate.comparisonField
-      }], 'reference');
+      }], `reference ${predicate.terminalClass}`);
       reverseHops.forEach((hop, hopIndex) => {
         const alias = hopIndex === reverseHops.length - 1 ? aliasFor(block.id) : aliasFor(`${block.id}_reference_${hopIndex + 1}`);
         operations.push({
@@ -28448,7 +29472,15 @@ function assistantDeterministicSemanticFlow(intent, semanticPlan, mcpContext, cu
   }
   const lastBlock = (intent.blocks || []).at(-1);
   const publishedAlias = lastBlock && aliases.get(lastBlock.id);
-  return publishedAlias ? normalizeObjectFlow({ version: 1, selections, operations, publishedAlias }) : null;
+  if (!publishedAlias) return null;
+  const flow = normalizeObjectFlow({ version: 1, selections, operations, publishedAlias });
+  const bindings = (intent.blocks || []).map((block) => ({
+    blockId: String(block && block.id || ''),
+    alias: String(aliases.get(String(block && block.id || '')) || '')
+  }));
+  if (bindings.some((binding) => !binding.blockId || !binding.alias)
+    || new Set(bindings.map((binding) => binding.alias)).size !== bindings.length) return null;
+  return { flow, bindings };
 }
 
 function assistantRelationRequirementsFromFlow(flow) {
@@ -28489,10 +29521,17 @@ async function createAssistantObjectFlowDraft(input, options = {}) {
       assistantContextClassNames: semanticContext.classNames,
       assistantContextDomainNames: semanticContext.domainNames
     }, runtimeConfig);
-  const semanticPlan = normalizeAssistantObjectFlowSemanticPlan(input.semanticPlan, intent, {
+  const normalizedSemanticPlan = normalizeAssistantObjectFlowSemanticPlan(input.semanticPlan, intent, {
     mcpContext,
     maxReferencePathDepth: normalizeAssistantRuntimeConfig(runtimeConfig).semanticPlan.maxReferencePathDepth
   });
+  const executableSemantic = assistantExecutableSemanticPlanForFlow(
+    normalizedSemanticPlan,
+    intent,
+    mcpContext,
+    { maxReferencePathDepth: normalizeAssistantRuntimeConfig(runtimeConfig).semanticPlan.maxReferencePathDepth }
+  );
+  const semanticPlan = executableSemantic.semanticPlan;
   const unresolved = semanticPlan.blocks.find((block) => block && block.resultContract && block.resultContract.outputKind === 'unresolved');
   if (unresolved) {
     const error = new Error(`Semantic plan block ${unresolved.name} has unresolved result granularity. Clarify the expected result before generating the deterministic flow.`);
@@ -28517,6 +29556,7 @@ async function createAssistantObjectFlowDraft(input, options = {}) {
   const classRecovery = assistantRestoreObjectFlowSelectionClasses(candidate.flow, semanticPlan, mcpContext, relationRequirements);
   const warnings = uniqueStrings([
     ...(mcpContext.warnings || []),
+    ...executableSemantic.warnings,
     ...candidate.warnings,
     ...classRecovery.warnings,
     ...(Array.isArray(parsedObject.warnings) ? parsedObject.warnings.map((item) => String(item || '')).filter(Boolean) : [])
@@ -28556,10 +29596,12 @@ async function createAssistantObjectFlowDraft(input, options = {}) {
     .concat(assistantObjectFlowCatalogErrors(flow, mcpContext))
     .concat(assistantUnexpectedRelationErrors(flow, relationRequirements, sourceCardPredicates))
     .concat(assistantMatchRequirementsErrors(flow, matchRequirements));
+  let deterministicBindings = null;
   if (errors.length) {
-    const deterministicFlow = assistantDeterministicSemanticFlow(intent, semanticPlan, mcpContext, input.currentSpec || {});
-    if (deterministicFlow) {
-      flow = deterministicFlow;
+    const deterministicCompilation = assistantDeterministicSemanticFlow(intent, semanticPlan, mcpContext, input.currentSpec || {});
+    if (deterministicCompilation) {
+      flow = deterministicCompilation.flow;
+      deterministicBindings = deterministicCompilation.bindings;
       relationRequirements = assistantRelationRequirementsFromFlow(flow);
       warnings.push('Assistant flow was incomplete; rebuilt it deterministically from the confirmed semantic contract and MCP context.');
       errors = assistantResultContractErrors(flow, semanticPlan, intent)
@@ -28570,22 +29612,37 @@ async function createAssistantObjectFlowDraft(input, options = {}) {
         .concat(assistantMatchRequirementsErrors(flow, matchRequirements));
     }
   }
-  const outputBindingResult = errors.length ? { bindings: [], errors: [] } : assistantObjectFlowOutputBindings(flow, semanticPlan, intent);
+  let outputBindingResult = errors.length ? { bindings: [], errors: [] } : assistantObjectFlowOutputBindings(flow, semanticPlan, intent, deterministicBindings);
+  if (!errors.length && outputBindingResult.errors.length && !deterministicBindings) {
+    const deterministicCompilation = assistantDeterministicSemanticFlow(intent, semanticPlan, mcpContext, input.currentSpec || {});
+    if (deterministicCompilation) {
+      const deterministicFlow = deterministicCompilation.flow;
+      const deterministicRelationRequirements = assistantRelationRequirementsFromFlow(deterministicFlow);
+      const deterministicErrors = assistantResultContractErrors(deterministicFlow, semanticPlan, intent)
+        .concat(assistantObjectFlowIncompleteFieldErrors(deterministicFlow))
+        .concat(validateObjectFlow(deterministicFlow))
+        .concat(assistantObjectFlowCatalogErrors(deterministicFlow, mcpContext))
+        .concat(assistantUnexpectedRelationErrors(deterministicFlow, deterministicRelationRequirements, sourceCardPredicates))
+        .concat(assistantMatchRequirementsErrors(deterministicFlow, matchRequirements));
+      if (!deterministicErrors.length) {
+        flow = deterministicFlow;
+        deterministicBindings = deterministicCompilation.bindings;
+        relationRequirements = deterministicRelationRequirements;
+        outputBindingResult = assistantObjectFlowOutputBindings(flow, semanticPlan, intent, deterministicBindings);
+        warnings.push('Assistant flow ownership was incomplete; rebuilt it deterministically from the confirmed semantic contract and MCP context.');
+      }
+    }
+  }
   if (!errors.length && outputBindingResult.errors.length) {
-    warnings.push('Не удалось однозначно связать подписи Assistant со всеми именованными блоками данных. Детерминированный поток доступен с текущими подписями результатов.');
+    warnings.push('Не удалось однозначно связать подписи Assistant со всеми именованными блоками данных. Применение заблокировано до устранения указанного блока.');
   }
   const objectFlowDiagnostics = assistantObjectFlowValidationDiagnostics(flow, errors);
-  const extractionCandidate = errors.length ? null : assistantExtractionCandidateOutput(flow, semanticPlan, intent);
-  if (!errors.length && intent.extractionCandidateBlockId && !extractionCandidate) {
-    warnings.push(`Assistant extraction candidate ${intent.extractionCandidateBlockId} has no unique deterministic result alias in the validated flow.`);
-  }
   return {
     success: errors.length === 0,
     flow: errors.length ? null : flow,
     rejectedFlow: errors.length ? flow : null,
     explanation: errors.length ? String(parsedObject.explanation || '') : (warnings.some((warning) => /rebuilt it deterministically/i.test(warning)) ? 'Детерминированный поток собран из подтвержденного семантического контракта.' : String(parsedObject.explanation || '')),
     warnings,
-    extractionCandidate,
     outputBindings: errors.length || outputBindingResult.errors.length ? [] : outputBindingResult.bindings,
     errors: objectFlowDiagnostics.errors,
     diagnostics: {
@@ -28609,7 +29666,7 @@ async function createAssistantObjectFlowDraft(input, options = {}) {
           repaired: referencePathRepair.repaired,
           skipped: referencePathRepair.skipped
         },
-        fallback: warnings.some((warning) => /rebuilt it deterministically/i.test(warning))
+        fallback: warnings.some((warning) => /rebuilt it deterministically|ownership was incomplete/i.test(warning))
           ? { kind: 'semanticContractCompiler', used: true }
           : referencePathRepair.repaired.length
             ? { kind: 'semanticReferencePathRepair', used: true, blockIds: referencePathRepair.repaired.map((repair) => repair.blockId) }
@@ -28681,12 +29738,14 @@ function assistantDiagramSemanticDecisions(spec, proposal) {
     const role = allowedRoles.get(String(candidate && candidate.id || ''));
     const semantic = normalizeDiagramImportSemantic(candidate && (candidate.selectedSemantic || candidate.semantic));
     if (!role || !semantic || !Array.isArray(role.options) || !role.options.includes(semantic)) return null;
-    return {
+    const decision = {
       roleId: role.id,
       semantic,
       confidence: ['high', 'medium', 'low'].includes(candidate.confidence) ? candidate.confidence : 'medium',
       reason: truncateText(String(candidate.reason || candidate.semanticReason || ''), 1000)
     };
+    if (role.exemplarRequired && Array.isArray(role.containerKeys) && role.containerKeys.includes(String(candidate.exemplarKey || ''))) decision.exemplarKey = String(candidate.exemplarKey);
+    return decision;
   }).filter(Boolean);
 }
 
@@ -28694,7 +29753,7 @@ function assistantDiagramSelectionMappings(spec, proposal, stages) {
   const imported = assistantDiagramImportPayload(spec);
   const roleIds = new Set((proposal.roles || []).map((role) => String(role.id || '')));
   const stageById = new Map((Array.isArray(stages) ? stages : []).map((stage) => [String(stage.id || ''), stage]));
-  return (Array.isArray(imported.roleMappings) ? imported.roleMappings : []).map((candidate) => {
+  return (Array.isArray(imported.roleMappings) ? imported.roleMappings : []).map((candidate, index) => {
     const roleId = String(candidate && candidate.roleId || '');
     const source = candidate && candidate.source && typeof candidate.source === 'object' ? candidate.source : {};
     const stage = stageById.get(String(source.stageId || candidate.stageId || ''));
@@ -28709,7 +29768,8 @@ function assistantDiagramSelectionMappings(spec, proposal, stages) {
       roleId,
       source: { stageId: stage.id, alias: stage.alias, kind: stage.kind, className: stage.className || '' },
       mapping: {
-        id: String(candidate.id || diagramImportStableId('role_mapping', roleId)),
+        id: String(candidate.id || diagramImportStableId('role_mapping_variant', `${roleId}:${index}`)),
+        label: truncateText(String(candidate.label || candidate.variantLabel || ''), 160),
         roleId,
         source: { stageId: stage.id, alias: stage.alias, kind: stage.kind, className: stage.className || '' },
         primary,
@@ -28724,8 +29784,25 @@ function assistantDiagramStageMessages(input, runtimeConfig) {
   const mapTask = input.kind === 'mapping';
   const assistantConfig = normalizeAssistantRuntimeConfig(runtimeConfig || defaultRuntimeConfig());
   const taskPrompt = String(assistantConfig.prompt[mapTask ? 'diagramMapping' : 'diagramInterpretation'] || '').trim();
+  const semanticCorrection = !mapTask && input.correction && Array.isArray(input.correction.invalidSemantics)
+    ? { invalidSemantics: input.correction.invalidSemantics.map((item) => ({
+      roleId: String(item.roleId || ''),
+      displayName: String(item.displayName || ''),
+      receivedSemantic: String(item.receivedSemantic || ''),
+      allowedSemantics: Array.isArray(item.allowedSemantics) ? item.allowedSemantics.map(String) : []
+    })) }
+    : null;
+  const mappingCorrection = mapTask && input.correction && Array.isArray(input.correction.missingMappings)
+    ? { missingMappings: input.correction.missingMappings.map((item) => ({
+      roleId: String(item.roleId || ''),
+      displayName: String(item.displayName || ''),
+      semantic: String(item.semantic || ''),
+      allowedStages: Array.isArray(item.allowedStages) ? item.allowedStages.map((stage) => ({ id: String(stage && stage.id || ''), label: String(stage && stage.label || ''), className: String(stage && stage.className || '') })) : []
+    })) }
+    : null;
+  const correction = semanticCorrection || mappingCorrection;
   const contract = mapTask
-    ? '{"mappings":[{"roleId":"<exact role id>","stageId":"<exact stage id>","confidence":"high|medium|low","reason":"..."}],"explanation":"...","warnings":[]}'
+    ? '{"mappings":[{"roleId":"<exact role id>","stageId":"<exact stage id>","variantLabel":"...","confidence":"high|medium|low","reason":"..."}],"unresolved":[{"roleId":"<exact role id>","reason":"noCompatibleStage|ambiguousStage|needsStaticDecision","message":"..."}],"explanation":"...","warnings":[]}'
     : '{"decisions":[{"roleId":"<exact role id>","semantic":"object|composite|group|static","confidence":"high|medium|low","reason":"..."}],"explanation":"...","warnings":[]}';
   const system = [
     'You are a D2 diagram authoring assistant.',
@@ -28733,13 +29810,19 @@ function assistantDiagramStageMessages(input, runtimeConfig) {
     'Return no markdown, comments, prose, runtime Spec, D2 source, or fields outside that contract.',
     'Use only exact role ids and stage ids supplied in the user payload.',
     mapTask
-      ? 'Map dynamic D2 roles to existing deterministic object-flow stages. Do not invent stages, classes, fields, or aliases.'
-      : 'Interpret D2 roles only. Do not choose CMDBuild classes, attributes, aliases, or object-flow stages.',
+      ? 'Map every supplied dynamic D2 role to one or more existing deterministic object-flow stages, or return it once in unresolved with a supported reason. Do not map static roles. A visual role can have more than one mapping only when the supplied stages represent distinct CMDB classes; use one item per variant and give each a short human-readable variantLabel. Do not invent stages, classes, fields, aliases, or an unresolved reason outside the contract.'
+      : 'Interpret D2 roles only. For every decision, semantic must be exactly one value from that role\'s allowedSemantics array. object is only for a leaf CMDB card; a container role can be composite, group, or static and must never be object unless object is explicitly allowed. Do not choose CMDBuild classes, attributes, aliases, or object-flow stages.',
+    semanticCorrection
+      ? 'The previous response used invalid semantics. Return a complete replacement decisions array and correct every listed role using only its allowedSemantics. Do not repeat the invalid values.'
+      : mappingCorrection
+        ? 'The previous response omitted required dynamic roles. Return mappings or unresolved entries only for the listed missing roles; do not repeat already accepted mappings.'
+      : '',
     'Do not save, publish, execute, or mutate the template.'
-  ].join('\n');
+  ].filter(Boolean).join('\n');
   const user = JSON.stringify({
     prompt: truncateText(input.prompt, 4000),
-    roles: input.roles,
+    roles: input.modelRoles || input.roles,
+    ...(correction ? { correction } : {}),
     ...(mapTask ? { stages: input.stages } : {})
   });
   return [
@@ -28750,22 +29833,20 @@ function assistantDiagramStageMessages(input, runtimeConfig) {
   ];
 }
 
-async function createAssistantDiagramStageDraft(input, runtimeConfig) {
-  ensureAssistantRequestIntent({ prompt: input.prompt });
-  ensureAssistantReady(runtimeConfig);
-  const content = await callLiteLLM(assistantDiagramStageMessages(input, runtimeConfig), runtimeConfig);
-  const parsed = parseAssistantJson(content);
-  const parsedObject = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
-  const warnings = Array.isArray(parsedObject.warnings)
-    ? parsedObject.warnings.map((item) => String(item || '')).filter(Boolean)
+function assistantDiagramStageDraftFromResponse(input, parsedObject) {
+  const response = parsedObject && typeof parsedObject === 'object' && !Array.isArray(parsedObject) ? parsedObject : {};
+  const warnings = Array.isArray(response.warnings)
+    ? response.warnings.map((item) => String(item || '')).filter(Boolean)
     : [];
   const roleById = new Map((input.roles || []).map((role) => [String(role.id || ''), role]));
   const stageById = new Map((input.stages || []).map((stage) => [String(stage.id || ''), stage]));
   const errors = [];
   const seenRoles = new Set();
+  const unresolved = [];
+  const seenUnresolvedRoles = new Set();
   let items = [];
   if (input.kind === 'interpretation') {
-    const candidates = Array.isArray(parsedObject.decisions) ? parsedObject.decisions : [];
+    const candidates = Array.isArray(response.decisions) ? response.decisions : [];
     items = candidates.map((candidate, index) => {
       const roleId = String(candidate && candidate.roleId || '');
       const role = roleById.get(roleId);
@@ -28780,18 +29861,28 @@ async function createAssistantDiagramStageDraft(input, runtimeConfig) {
       }
       seenRoles.add(roleId);
       if (!semantic || !Array.isArray(role.options) || !role.options.includes(semantic)) {
-        errors.push({ path: `$.decisions[${index}].semantic`, message: `Semantic ${semantic || '(empty)'} is not allowed for D2 role ${roleId}.` });
+        errors.push({
+          path: `$.decisions[${index}].semantic`,
+          code: 'diagram_semantic_not_allowed',
+          roleId,
+          displayName: String(role.displayName || role.key || roleId),
+          receivedSemantic: semantic || '(empty)',
+          allowedSemantics: Array.isArray(role.options) ? role.options.map(String) : [],
+          message: `Роль D2 «${String(role.displayName || role.key || roleId)}» не допускает семантику «${semantic || '(empty)'}». Разрешены: ${(Array.isArray(role.options) ? role.options : []).join(', ') || '(none)'}.`
+        });
         return null;
       }
-      return {
+      const decision = {
         roleId,
         semantic,
         confidence: ['high', 'medium', 'low'].includes(candidate.confidence) ? candidate.confidence : 'medium',
         reason: truncateText(String(candidate.reason || ''), 1000)
       };
+      if (role.exemplarRequired && Array.isArray(role.containerKeys) && role.containerKeys.includes(String(candidate.exemplarKey || ''))) decision.exemplarKey = String(candidate.exemplarKey);
+      return decision;
     }).filter(Boolean);
   } else {
-    const candidates = Array.isArray(parsedObject.mappings) ? parsedObject.mappings : [];
+    const candidates = Array.isArray(response.mappings) ? response.mappings : [];
     items = candidates.map((candidate, index) => {
       const roleId = String(candidate && candidate.roleId || '');
       const stageId = String(candidate && (candidate.stageId || candidate.source && candidate.source.stageId) || '');
@@ -28801,11 +29892,10 @@ async function createAssistantDiagramStageDraft(input, runtimeConfig) {
         errors.push({ path: `$.mappings[${index}].roleId`, message: `Unknown D2 role id ${roleId || '(empty)'}.` });
         return null;
       }
-      if (seenRoles.has(roleId)) {
-        errors.push({ path: `$.mappings[${index}].roleId`, message: `D2 role ${roleId} was returned more than once.` });
+      if (normalizeDiagramImportSemantic(role.selectedSemantic) === 'static') {
+        errors.push({ path: `$.mappings[${index}].roleId`, message: `Static D2 role ${role.displayName || roleId} must not be mapped to an object-flow stage.` });
         return null;
       }
-      seenRoles.add(roleId);
       if (!stage) {
         errors.push({ path: `$.mappings[${index}].stageId`, message: `Unknown object-flow stage id ${stageId || '(empty)'}.` });
         return null;
@@ -28823,7 +29913,8 @@ async function createAssistantDiagramStageDraft(input, runtimeConfig) {
         roleId,
         source,
         mapping: {
-          id: diagramImportStableId('role_mapping', roleId),
+          id: diagramImportStableId('role_mapping_variant', `${roleId}:${index}`),
+          label: truncateText(String(candidate.variantLabel || candidate.label || ''), 160),
           roleId,
           source,
           primary,
@@ -28833,18 +29924,162 @@ async function createAssistantDiagramStageDraft(input, runtimeConfig) {
         reason: truncateText(String(candidate.reason || ''), 1000)
       };
     }).filter(Boolean);
+    if (response.unresolved !== undefined && !Array.isArray(response.unresolved)) {
+      errors.push({ path: '$.unresolved', message: 'Assistant response unresolved must be an array when present.' });
+    }
+    (Array.isArray(response.unresolved) ? response.unresolved : []).forEach((candidate, index) => {
+      const roleId = String(candidate && candidate.roleId || '');
+      const role = roleById.get(roleId);
+      const reason = String(candidate && candidate.reason || '').trim();
+      if (!role) {
+        errors.push({ path: `$.unresolved[${index}].roleId`, message: `Unknown D2 role id ${roleId || '(empty)'}.` });
+        return;
+      }
+      if (normalizeDiagramImportSemantic(role.selectedSemantic) === 'static') {
+        warnings.push(`Ignored static D2 role ${role.displayName || roleId} returned by Assistant as unresolved mapping.`);
+        return;
+      }
+      if (seenUnresolvedRoles.has(roleId)) {
+        errors.push({ path: `$.unresolved[${index}].roleId`, message: `D2 role ${roleId} was returned as unresolved more than once.` });
+        return;
+      }
+      if (!['noCompatibleStage', 'ambiguousStage', 'needsStaticDecision'].includes(reason)) {
+        errors.push({ path: `$.unresolved[${index}].reason`, message: `Unsupported D2 mapping unresolved reason ${reason || '(empty)'}.` });
+        return;
+      }
+      seenUnresolvedRoles.add(roleId);
+      unresolved.push({
+        roleId,
+        displayName: String(role.displayName || role.key || roleId),
+        code: reason,
+        message: truncateText(String(candidate && candidate.message || candidate && candidate.reason || ''), 1000)
+      });
+    });
   }
   const key = input.kind === 'interpretation' ? 'decisions' : 'mappings';
-  if (!Array.isArray(parsedObject[key])) errors.push({ path: `$.${key}`, message: `Assistant response must contain a ${key} array.` });
-  if (!items.length && !errors.length) errors.push({ path: `$.${key}`, message: `Assistant returned no valid ${key}.` });
+  if (!Array.isArray(response[key])) errors.push({ path: `$.${key}`, message: `Assistant response must contain a ${key} array.` });
+  if (!items.length && !unresolved.length && !errors.length) errors.push({ path: `$.${key}`, message: `Assistant returned no valid ${key}.` });
   return {
-    success: errors.length === 0 && items.length > 0,
+    success: errors.length === 0 && (items.length > 0 || unresolved.length > 0),
     items,
-    explanation: String(parsedObject.explanation || ''),
+    unresolved,
+    explanation: String(response.explanation || ''),
     warnings: uniqueStrings(warnings),
     errors,
-    diagnostics: { contract: 'typed-d2-stage-v1' }
+    diagnostics: { contract: 'typed-d2-stage-v1', attempts: 1 }
   };
+}
+
+function assistantDiagramRequiredMappingRoles(roles) {
+  return (Array.isArray(roles) ? roles : []).filter((role) => {
+    const semantic = normalizeDiagramImportSemantic(role && role.selectedSemantic);
+    return Boolean(semantic && semantic !== 'static');
+  });
+}
+
+function assistantDiagramMappingCoverage(input, items, unresolved) {
+  const requiredRoles = assistantDiagramRequiredMappingRoles(input.roles);
+  const mappedRoleIds = new Set((Array.isArray(items) ? items : []).map((item) => String(item && item.roleId || '')).filter(Boolean));
+  const explicit = new Map((Array.isArray(unresolved) ? unresolved : []).map((item) => [String(item && item.roleId || ''), item]));
+  const allowedStages = (Array.isArray(input.stages) ? input.stages : []).map((stage) => ({ id: String(stage && stage.id || ''), label: String(stage && stage.label || ''), className: String(stage && stage.className || '') }));
+  const missing = requiredRoles.filter((role) => !mappedRoleIds.has(String(role.id || '')) && !explicit.has(String(role.id || '')));
+  const completedUnresolved = requiredRoles
+    .filter((role) => !mappedRoleIds.has(String(role.id || '')))
+    .map((role) => explicit.get(String(role.id || '')) || {
+      roleId: String(role.id || ''),
+      displayName: String(role.displayName || role.key || role.id || ''),
+      code: 'assistantOmittedRole',
+      message: 'Assistant did not return a mapping or unresolved reason for this dynamic D2 role.'
+    });
+  return {
+    status: completedUnresolved.length ? 'partial' : 'complete',
+    requiredRoles: requiredRoles.length,
+    mappedRoles: requiredRoles.filter((role) => mappedRoleIds.has(String(role.id || ''))).length,
+    unresolved: completedUnresolved,
+    missingMappings: missing.map((role) => ({
+      roleId: String(role.id || ''),
+      displayName: String(role.displayName || role.key || role.id || ''),
+      semantic: String(role.selectedSemantic || ''),
+      allowedStages
+    }))
+  };
+}
+
+function mergeAssistantDiagramMappings(firstItems, retryItems) {
+  const merged = [];
+  const seen = new Set();
+  for (const item of (Array.isArray(firstItems) ? firstItems : []).concat(Array.isArray(retryItems) ? retryItems : [])) {
+    const key = `${String(item && item.roleId || '')}:${String(item && item.source && item.source.stageId || '')}`;
+    if (!item || seen.has(key)) continue;
+    seen.add(key);
+    merged.push(item);
+  }
+  return merged;
+}
+
+function assistantDiagramSemanticCorrection(errors) {
+  const invalidSemantics = (Array.isArray(errors) ? errors : [])
+    .filter((error) => error && error.code === 'diagram_semantic_not_allowed')
+    .map((error) => ({
+      roleId: String(error.roleId || ''),
+      displayName: String(error.displayName || error.roleId || ''),
+      receivedSemantic: String(error.receivedSemantic || ''),
+      allowedSemantics: Array.isArray(error.allowedSemantics) ? error.allowedSemantics.map(String) : []
+    }));
+  return invalidSemantics.length && invalidSemantics.length === (Array.isArray(errors) ? errors.length : 0)
+    ? { invalidSemantics }
+    : null;
+}
+
+async function createAssistantDiagramStageDraft(input, runtimeConfig) {
+  ensureAssistantRequestIntent({ prompt: input.prompt });
+  ensureAssistantReady(runtimeConfig);
+  const firstContent = await callLiteLLM(assistantDiagramStageMessages(input, runtimeConfig), runtimeConfig);
+  const firstDraft = assistantDiagramStageDraftFromResponse(input, parseAssistantJson(firstContent));
+  if (input.kind === 'mapping') {
+    if (!firstDraft.success) return firstDraft;
+    const firstCoverage = assistantDiagramMappingCoverage(input, firstDraft.items, firstDraft.unresolved);
+    if (!firstCoverage.missingMappings.length) {
+      firstDraft.mapping = firstCoverage;
+      firstDraft.diagnostics = { ...firstDraft.diagnostics, mappingStatus: firstCoverage.status };
+      return firstDraft;
+    }
+    const retryRoles = assistantDiagramRequiredMappingRoles(input.roles).filter((role) => firstCoverage.missingMappings.some((item) => item.roleId === String(role.id || '')));
+    const retryInput = {
+      ...input,
+      roles: retryRoles,
+      modelRoles: retryRoles,
+      correction: { missingMappings: firstCoverage.missingMappings }
+    };
+    const retryContent = await callLiteLLM(assistantDiagramStageMessages(retryInput, runtimeConfig), runtimeConfig);
+    const retryDraft = assistantDiagramStageDraftFromResponse(retryInput, parseAssistantJson(retryContent));
+    if (!retryDraft.success) return retryDraft;
+    const items = mergeAssistantDiagramMappings(firstDraft.items, retryDraft.items);
+    const firstUnresolved = firstDraft.unresolved.filter((item) => !items.some((mapping) => mapping.roleId === item.roleId));
+    const retryUnresolved = retryDraft.unresolved.filter((item) => !items.some((mapping) => mapping.roleId === item.roleId));
+    const coverage = assistantDiagramMappingCoverage(input, items, firstUnresolved.concat(retryUnresolved));
+    return {
+      success: true,
+      items,
+      unresolved: coverage.unresolved,
+      mapping: coverage,
+      explanation: retryDraft.explanation || firstDraft.explanation,
+      warnings: uniqueStrings([...firstDraft.warnings, ...retryDraft.warnings, 'Assistant retried omitted D2 role mappings after deterministic coverage validation.']),
+      errors: [],
+      diagnostics: { contract: 'typed-d2-stage-v1', attempts: 2, retriedMissingMappings: firstCoverage.missingMappings.length, mappingStatus: coverage.status }
+    };
+  }
+  const correction = input.kind === 'interpretation' ? assistantDiagramSemanticCorrection(firstDraft.errors) : null;
+  if (!correction) return firstDraft;
+
+  const retryContent = await callLiteLLM(assistantDiagramStageMessages({ ...input, correction }, runtimeConfig), runtimeConfig);
+  const retryDraft = assistantDiagramStageDraftFromResponse(input, parseAssistantJson(retryContent));
+  retryDraft.warnings = uniqueStrings([
+    ...retryDraft.warnings,
+    'Assistant corrected invalid D2 container semantics after deterministic validation.'
+  ]);
+  retryDraft.diagnostics = { ...retryDraft.diagnostics, attempts: 2, correctedInvalidSemantics: correction.invalidSemantics.length };
+  return retryDraft;
 }
 
 async function sendPublicSnapshotRun(res, requestUrl, templateCode) {
@@ -31515,10 +32750,12 @@ async function requestCardsForSelection(cmdbuildExecRequest, className, limit, f
 }
 
 function selectionScanLimit(step, filters, limits, resultLimit) {
-  const maxScan = Math.max(resultLimit, limits.maxRowsMax || limits.maxRows || resultLimit);
+  const maxScan = Math.max(resultLimit, limits.maxSelectionScanRowsMax || limits.maxSelectionScanRows || resultLimit);
   const explicit = toPositiveInt(step.scanLimit || step.searchLimit || step.fetchLimit, 0, maxScan);
   if (explicit) return Math.max(resultLimit, explicit);
-  return Array.isArray(filters) && filters.length ? maxScan : resultLimit;
+  return Array.isArray(filters) && filters.length
+    ? Math.max(resultLimit, Math.min(limits.maxSelectionScanRows || maxScan, maxScan))
+    : resultLimit;
 }
 
 async function requestCardsForSelectionScan(cmdbuildExecRequest, className, scanLimit, fields) {
@@ -31542,7 +32779,8 @@ async function requestCardsForSelectionScan(cmdbuildExecRequest, className, scan
     ok: true,
     statusCode: 200,
     json: { data: rows },
-    truncated: rows.length >= limit && (knownTotal === null || rows.length < knownTotal)
+    truncated: rows.length >= limit && (knownTotal === null || rows.length < knownTotal),
+    total: knownTotal
   };
 }
 
@@ -31575,6 +32813,13 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
   const resolvedClassCache = new Map();
   const pathCache = { attributes: new Map(), cards: new Map(), relations: new Map() };
 
+  const selectionScan = () => scanTruncated ? {
+    scanLimit,
+    scannedRows: Array.from(cardsByClass.values()).reduce((total, item) => total + (item.rows || []).length, 0),
+    availableTotal: Array.from(cardsByClass.values()).reduce((total, item) => total + (Number.isFinite(item.availableTotal) ? item.availableTotal : 0), 0) || null,
+    classes: Array.from(cardsByClass.entries()).filter(([, item]) => item.truncated).map(([className]) => className)
+  } : null;
+
   for (const driverRow of driverRows) {
     const requestedClassName = resolveSelectionClassName(step, params, driverRow);
     if (!requestedClassName) {
@@ -31593,7 +32838,9 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
         }
         cardsByClass.set(className, {
           rows: Array.isArray(cards.json && cards.json.data) ? cards.json.data : [],
-          truncated: Boolean(cards.truncated)
+          truncated: Boolean(cards.truncated),
+          availableTotal: Number.isFinite(Number(cards.total)) ? Number(cards.total) : null,
+          scanLimit
         });
       }
 
@@ -31615,7 +32862,10 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
           return {
             columns,
             rows,
-            truncated: true
+            truncated: true,
+            rowLimitReached: true,
+            rowLimit: maxRows,
+            selectionScan: selectionScan()
           };
         }
       }
@@ -31625,7 +32875,10 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
   return {
     columns,
     rows,
-    truncated: scanTruncated
+    truncated: scanTruncated,
+    rowLimitReached: false,
+    rowLimit: maxRows,
+    selectionScan: selectionScan()
   };
 }
 
@@ -31724,8 +32977,17 @@ function relationMatchesDirection(relation, sourceEndpointMatches, destinationEn
     if (direction === 'direct') return relation && relation._is_direct === true;
     return relation && relation._is_direct === false;
   }
-  if (direction === 'source') return sourceEndpointMatches;
-  if (direction === 'destination') return destinationEndpointMatches;
+  if (direction === 'source' || direction === 'destination') {
+    // CMDBuild returns card-scoped relation endpoints, while _direction keeps
+    // the domain orientation. Prefer the latter when it is available: a card
+    // read through the inverse endpoint is the domain destination, even when
+    // CMDBuild places that card in _sourceType in the scoped response.
+    const actual = relationDirection(relation).toLowerCase();
+    if (actual === 'direct' || actual === 'inverse') {
+      return direction === 'source' ? actual === 'direct' : actual === 'inverse';
+    }
+    return direction === 'source' ? sourceEndpointMatches : destinationEndpointMatches;
+  }
   return false;
 }
 
@@ -32991,6 +34253,7 @@ async function executeCompareClassAttributes(cmdbuildExecRequest, step, params, 
 async function executeTemplateSpec(authToken, spec, params, options = {}) {
   const effectiveParams = applyTemplateParamDefaults(spec, params);
   const maxRowsMax = Math.min(options.maxRowsMax || ABSOLUTE_EXECUTION_LIMITS.maxRows, ABSOLUTE_EXECUTION_LIMITS.maxRows);
+  const maxSelectionScanRowsMax = Math.min(options.maxSelectionScanRowsMax || ABSOLUTE_EXECUTION_LIMITS.maxSelectionScanRows, ABSOLUTE_EXECUTION_LIMITS.maxSelectionScanRows);
   const maxClassesMax = Math.min(options.maxClassesMax || ABSOLUTE_EXECUTION_LIMITS.maxClasses, ABSOLUTE_EXECUTION_LIMITS.maxClasses);
   const maxDomainsMax = Math.min(options.maxDomainsMax || ABSOLUTE_EXECUTION_LIMITS.maxDomains, ABSOLUTE_EXECUTION_LIMITS.maxDomains);
   const maxRestCallsMax = Math.min(options.maxRestCallsMax || ABSOLUTE_EXECUTION_LIMITS.maxRestCalls, ABSOLUTE_EXECUTION_LIMITS.maxRestCalls);
@@ -33001,6 +34264,8 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
     maxDomains: Math.min(options.maxDomains || 100, maxDomainsMax),
     maxRows: Math.min(options.maxRows || 500, maxRowsMax),
     maxRowsMax,
+    maxSelectionScanRows: Math.min(options.maxSelectionScanRows || 10000, maxSelectionScanRowsMax),
+    maxSelectionScanRowsMax,
     maxRestCalls: Math.min(options.maxRestCalls || 250, maxRestCallsMax),
     maxTraversalDepth: Math.min(options.maxTraversalDepth || maxTraversalDepthMax, maxTraversalDepthMax),
     traversalDepthDefault: Math.min(options.traversalDepthDefault || 1, maxTraversalDepthMax)
@@ -33054,6 +34319,33 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
         throw new Error(`Unsupported step type: ${step.type}`);
       }
       const output = context[step.as] || {};
+      const selectionScan = output.selectionScan && typeof output.selectionScan === 'object' ? output.selectionScan : null;
+      const rowLimitReached = output.rowLimitReached === true || (Boolean(output.truncated) && !selectionScan);
+      const limitDiagnostics = [];
+      if (rowLimitReached) {
+        limitDiagnostics.push({
+          source: 'template-execution',
+          limitHit: true,
+          limitName: 'maxRows',
+          configuredLimit: Number(output.rowLimit || step.limit || limits.maxRows),
+          returned: Array.isArray(output.rows) ? output.rows.length : 0,
+          truncated: true,
+          reason: 'result-row-limit'
+        });
+      }
+      if (selectionScan) {
+        limitDiagnostics.push({
+          source: 'template-execution',
+          limitHit: true,
+          limitName: 'maxSelectionScanRows',
+          configuredLimit: selectionScan.scanLimit,
+          returned: selectionScan.scannedRows,
+          total: selectionScan.availableTotal,
+          truncated: true,
+          reason: 'selection-scan-limit'
+        });
+      }
+      const limitWarnings = assistantLimitWarningsFromDiagnostics(limitDiagnostics);
       trace.push({
         index,
         type: step.type,
@@ -33062,6 +34354,10 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
         rows: Array.isArray(output.rows) ? output.rows.length : 0,
         columns: Array.isArray(output.columns) ? output.columns.length : 0,
         truncated: Boolean(output.truncated),
+        rowLimitReached,
+        selectionScan,
+        limitDiagnostics,
+        warning: limitWarnings.join(' '),
         elapsedMs: Date.now() - startedAt,
         restCalls: cmdbuildExecRequest.getRestCalls() - restBefore
       });
@@ -33153,6 +34449,10 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
     tables,
     diagrams,
     trace,
+    limitDiagnostics: trace.flatMap((item) => Array.isArray(item.limitDiagnostics) ? item.limitDiagnostics : []),
+    warnings: trace.flatMap((item) => Array.isArray(item.limitDiagnostics)
+      ? assistantLimitWarningsFromDiagnostics(item.limitDiagnostics)
+      : (item.warning ? [item.warning] : [])),
     ...(options.includeStageResults ? { stageResults } : {})
   };
 }
@@ -33933,7 +35233,6 @@ async function handleBackend(req, res, requestUrl) {
         canApply: planContext.canApply && ownershipErrors.length === 0,
         explanation: draft.explanation || '',
         warnings: draft.warnings || [],
-        extractionCandidate: draft.extractionCandidate || null,
         outputBindings: draft.outputBindings || [],
         ownershipErrors,
         diagnostics: {
@@ -33946,6 +35245,7 @@ async function handleBackend(req, res, requestUrl) {
       const retryable = assistantSemanticPlanRetryable(error) && Boolean(checkpoint && checkpoint.resume);
       const resume = retryable ? checkpoint.resume : null;
       const stage = checkpoint ? 'flowDraft' : 'checkpoint';
+      const semanticErrors = Array.isArray(error && error.details) ? error.details : [];
       logWarn('assistant.object_flow.plan.rejected', {
         requestId: req.cmdpRequestId || '',
         authSource: backendLogUser,
@@ -33963,6 +35263,10 @@ async function handleBackend(req, res, requestUrl) {
         action: 'assistant-object-flow-plan',
         code: error.code || 'assistant_error',
         message: error.message || String(error),
+        errors: semanticErrors,
+        feedback: error && error.code === 'assistant_semantic_plan_invalid'
+          ? assistantSemanticPlanValidationFeedback(semanticErrors)
+          : null,
         retryable,
         resume,
         diagnostics: {
@@ -33977,132 +35281,6 @@ async function handleBackend(req, res, requestUrl) {
     return;
   }
 
-  if (requestUrl.pathname === `${BACKEND_PREFIX}/assistant/object-flow/preview`) {
-    if (!methodAllowed(req, res, 'POST')) return;
-    if (!requireStateChangingRequest(req, res, authToken)) return;
-    if (!requireJsonContentType(req, res)) return;
-    const body = await readJsonObjectBody(req, res, 512 * 1024);
-    if (!body) return;
-    const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
-    const slot = acquireExecutionSlot(req, res, {
-      action: 'assistant-object-flow-preview',
-      templateCode: body.templateCode
-    });
-    if (!slot) return;
-    try {
-      const flow = normalizeObjectFlow(body.flow || {});
-      const flowErrors = validateObjectFlow(flow);
-      if (flowErrors.length) {
-        const error = new Error('Object-flow proposal failed deterministic validation.');
-        error.statusCode = 422;
-        error.code = 'object_flow_invalid';
-        error.details = flowErrors;
-        throw error;
-      }
-      const diagramSourceErrors = staleObjectFlowDiagramSourceErrors(body.currentSpec || {}, flow);
-      if (diagramSourceErrors.length) {
-        const error = new Error('Object-flow would leave Diagram mappings with removed source aliases.');
-        error.statusCode = 422;
-        error.code = 'object_flow_diagram_source_stale';
-        error.details = diagramSourceErrors;
-        throw error;
-      }
-      const assistantOutput = assistantOutputManifestForRequest(flow, body.assistantOutputBindings, body.assistantObjectFlowIntent);
-      const outputMetadata = assistantOutput ? assistantOutput.outputMetadata : [];
-      const spec = compileObjectFlowToSpec(body.currentSpec || {}, flow, {
-        outputMetadata,
-        ...(assistantOutput ? { assistantOutputManifest: assistantOutput.assistantOutputManifest } : {})
-      });
-      const outputs = new Map(objectFlowResultOutputs(flow, outputMetadata).map((output) => [output.alias, output]));
-      const previewSpec = {
-        ...spec,
-        steps: (spec.steps || []).filter((step) => step && outputs.has(step.as)),
-        result: {
-          ...(spec.result || {}),
-          tables: ((spec.result && spec.result.tables) || []).filter((table) => table && outputs.has(table.name))
-        }
-      };
-      const specErrors = validateTemplateSpec(previewSpec);
-      if (specErrors.length) {
-        const error = new Error('Object-flow compiler produced an invalid template spec.');
-        error.statusCode = 422;
-        error.code = 'object_flow_spec_invalid';
-        error.details = specErrors;
-        throw error;
-      }
-      const runtimeConfig = await getRuntimeConfig(authToken, root);
-      const executionLimits = normalizeExecutionLimitConfig(runtimeConfig);
-      const result = await executeTemplateSpec(authToken, previewSpec, body.params && typeof body.params === 'object' ? body.params : {}, {
-        maxRows: executionLimits.maxRowsPreviewDefault,
-        maxRowsMax: executionLimits.maxRowsMax,
-        maxClasses: executionLimits.maxClassesDefault,
-        maxClassesMax: executionLimits.maxClassesMax,
-        maxDomains: executionLimits.maxDomainsDefault,
-        maxDomainsMax: executionLimits.maxDomainsMax,
-        maxRestCalls: executionLimits.maxRestCallsDefault,
-        maxRestCallsMax: executionLimits.maxRestCallsMax,
-        maxTraversalDepth: executionLimits.maxTraversalDepthDefault,
-        traversalDepthDefault: executionLimits.maxTraversalDepthDefault,
-        maxTraversalDepthMax: executionLimits.maxTraversalDepthMax,
-        skipD2Render: true,
-        includeStageResults: true
-      });
-      const summaries = new Map(objectFlowStageSummaries(flow).map((stage) => [stage.alias, stage]));
-      const stages = (result.stageResults || []).filter((stage) => outputs.has(stage.as)).map((stage) => {
-        const summary = summaries.get(stage.as);
-        const output = outputs.get(stage.as);
-        return {
-          ...stage,
-          label: output && output.label || stage.as,
-          published: Boolean(output && output.published),
-          kind: summary && summary.kind || '',
-          className: summary && summary.className || ''
-        };
-      });
-      const trace = (result.trace || []).filter((item) => outputs.has(item && item.as));
-      const truncated = stages.filter((stage) => stage.truncated).map((stage) => stage.as);
-      logInfo('assistant.object_flow.preview.completed', {
-        requestId: req.cmdpRequestId || '',
-        authSource: backendLogUser,
-        root,
-        stages: stages.length,
-        truncatedStages: truncated.length,
-        maxRows: executionLimits.maxRowsPreviewDefault,
-        maxRestCalls: executionLimits.maxRestCallsDefault
-      });
-      sendJson(res, 200, {
-        success: true,
-        action: 'assistant-object-flow-preview',
-        params: body.params && typeof body.params === 'object' ? body.params : {},
-        preview: {
-          stages,
-          trace,
-          limits: result.limits || {},
-          warnings: truncated.length
-            ? [`Preview returned the configured maximum number of rows for: ${truncated.join(', ')}. Results may be incomplete.`]
-            : []
-        }
-      });
-    } catch (error) {
-      const permissionDenied = errorLooksPermissionDenied(error);
-      incMetric('cmdp_template_run_errors_total', {
-        action: 'assistant-object-flow-preview',
-        reason: templateExecutionErrorReason(error)
-      });
-      sendJson(res, permissionDenied ? 403 : (error.statusCode || 400), {
-        success: false,
-        action: 'assistant-object-flow-preview',
-        code: error.code || 'assistant_object_flow_preview_failed',
-        message: error && error.message ? error.message : String(error),
-        errors: error.details || [],
-        result: { trace: error && Array.isArray(error.executionTrace) ? error.executionTrace : [] }
-      });
-    } finally {
-      slot.release();
-    }
-    return;
-  }
-
   if (requestUrl.pathname === `${BACKEND_PREFIX}/draft/object-flow/apply`) {
     if (!methodAllowed(req, res, 'POST')) return;
     if (!requireStateChangingRequest(req, res, authToken)) return;
@@ -34110,7 +35288,27 @@ async function handleBackend(req, res, requestUrl) {
     const body = await readJsonObjectBody(req, res, 512 * 1024);
     if (!body) return;
     const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
-    if (!await requireDiagramAuthoringContext(authToken, res, root, body.templateCode, body.baseSpecHash)) return;
+    const authoring = await requireDiagramAuthoringContext(authToken, res, root, body.templateCode, body.baseSpecHash);
+    if (!authoring) return;
+    if (!authoring.template) {
+      sendJson(res, 409, {
+        success: false,
+        reason: 'template_save_required',
+        message: 'Save the template before applying an Assistant data flow.'
+      });
+      return;
+    }
+    if (hashJson(body.currentSpec || {}) !== authoring.template.specHash) {
+      sendJson(res, 409, {
+        success: false,
+        reason: 'template_version_conflict',
+        message: `Template ${authoring.template.code} changed before the data flow was applied. Reload it and retry.`,
+        expectedSpecHash: String(body.baseSpecHash || ''),
+        currentSpecHash: authoring.template.specHash,
+        template: authoring.template
+      });
+      return;
+    }
     try {
       const flow = normalizeObjectFlow(body.flow || {});
       const errors = validateObjectFlow(flow);
@@ -34121,7 +35319,7 @@ async function handleBackend(req, res, requestUrl) {
         error.details = errors;
         throw error;
       }
-      const diagramSourceErrors = staleObjectFlowDiagramSourceErrors(body.currentSpec || {}, flow);
+      const diagramSourceErrors = staleObjectFlowDiagramSourceErrors(authoring.template.spec || {}, flow);
       if (diagramSourceErrors.length) {
         const error = new Error('Object-flow would leave Diagram mappings with removed source aliases.');
         error.statusCode = 422;
@@ -34130,7 +35328,7 @@ async function handleBackend(req, res, requestUrl) {
         throw error;
       }
       const assistantOutput = assistantOutputManifestForRequest(flow, body.assistantOutputBindings, body.assistantObjectFlowIntent);
-      const spec = compileObjectFlowToSpec(body.currentSpec || {}, flow, {
+      const spec = compileObjectFlowToSpec(authoring.template.spec || {}, flow, {
         outputMetadata: assistantOutput ? assistantOutput.outputMetadata : [],
         ...(assistantOutput ? { assistantOutputManifest: assistantOutput.assistantOutputManifest } : {})
       });
@@ -34142,15 +35340,72 @@ async function handleBackend(req, res, requestUrl) {
         error.details = specErrors;
         throw error;
       }
+      const found = await findTemplateCard(authToken, root, authoring.template.code);
+      if (!found.response.ok || !found.card) {
+        const error = new Error(`Template ${authoring.template.code} is no longer available for saving.`);
+        error.statusCode = found.response.ok ? 404 : 502;
+        error.code = 'template_save_failed';
+        throw error;
+      }
+      const persistedTemplate = sanitizeTemplateCard(found.card);
+      if (!persistedTemplate || persistedTemplate.specHash !== authoring.template.specHash) {
+        const error = new Error(`Template ${authoring.template.code} changed before the data flow was saved. Reload it and retry.`);
+        error.statusCode = 409;
+        error.code = 'template_version_conflict';
+        error.details = [{
+          path: '$.baseSpecHash',
+          message: 'Template revision changed during Assistant data-flow application.',
+          expectedSpecHash: authoring.template.specHash,
+          currentSpecHash: persistedTemplate && persistedTemplate.specHash || ''
+        }];
+        throw error;
+      }
+      const payload = normalizeTemplatePayload({
+        code: authoring.template.code,
+        description: authoring.template.description,
+        active: authoring.template.active,
+        spec,
+        paramsSchema: authoring.template.paramsSchema,
+        resultSchema: authoring.template.resultSchema,
+        owner: authoring.template.owner
+      }, authoring.template.code, authoring.session.data && authoring.session.data.username);
+      const updated = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(found.schema.classNames.template)}/cards/${encodeURIComponent(found.card._id)}`, authToken, {
+        method: 'PUT',
+        body: payload
+      });
+      if (!updated.ok) {
+        const error = new Error(`Template ${authoring.template.code} could not be saved after applying the data flow.`);
+        error.statusCode = updated.statusCode === 401 || updated.statusCode === 403 ? 403 : 502;
+        error.code = 'template_save_failed';
+        throw error;
+      }
+      const versionLog = await writeTemplateVersion(authToken, found.schema.root, payload.Code, safeJsonValue(payload.SpecJson, null), authoring.session.data && authoring.session.data.username, 'assistant-object-flow-apply');
+      const cacheInvalidation = await Promise.all([
+        invalidateTemplateRuntimeCache(found.schema.root, payload.Code),
+        invalidateTemplateStaticSnapshots(found.schema.root, payload.Code)
+      ]);
       logInfo('assistant.object_flow.applied', {
         requestId: req.cmdpRequestId || '',
         authSource: backendLogUser,
         selections: flow.selections.length,
         matches: flow.blocks.length,
         setOperations: flow.setOperations.length,
-        publishedAlias: flow.publishedAlias
+        publishedAlias: flow.publishedAlias,
+        templateCode: payload.Code,
+        versionLogged: Boolean(versionLog),
+        runtimeCacheInvalidated: cacheInvalidation[0].invalidated || 0,
+        staticSnapshotsInvalidated: cacheInvalidation[1].invalidated || 0
       });
-      sendJson(res, 200, { success: true, action: 'object-flow-apply', spec, specHash: hashJson(spec) });
+      sendJson(res, 200, {
+        success: true,
+        action: 'object-flow-apply',
+        template: sanitizeTemplateCard(updated.json && updated.json.data),
+        versionLog,
+        cacheInvalidation: {
+          runtime: cacheInvalidation[0],
+          staticSnapshots: cacheInvalidation[1]
+        }
+      });
     } catch (error) {
       sendJson(res, error.statusCode || 422, { success: false, code: error.code || 'object_flow_invalid', message: error.message || String(error), errors: error.details || [] });
     }
@@ -34193,16 +35448,28 @@ async function handleBackend(req, res, requestUrl) {
       }
       const roles = reviewProposal.roles.map((role) => ({
         id: role.id,
-        d2Key: role.key,
+        displayName: role.label || role.key,
+        visualType: role.key,
         kind: role.kind,
         selectedSemantic: role.selectedSemantic,
-        options: role.options
+        options: role.options,
+        allowedSemantics: role.options,
+        isContainer: Array.isArray(role.containerKeys) && role.containerKeys.length > 0,
+        exemplarRequired: Boolean(role.exemplarRequired && !role.exemplarKey),
+        guidance: role.kind === 'untypedContainer'
+          ? 'Structural container. Use static unless a confirmed positive CMDB membership rule exists.'
+          : role.exemplarRequired
+            ? 'Reusable visual container. A structurally equivalent exemplar is selected automatically when safe; otherwise user confirmation is required in Diagram editor.'
+            : Array.isArray(role.containerKeys) && role.containerKeys.length
+              ? 'Visual container. It may group zero, one, or many child CMDB objects; object is not allowed for this container role.'
+              : 'Reusable visual role. It may map to one or more confirmed object-flow stages when they represent distinct CMDB classes.'
       }));
       const runtimeConfig = await getRuntimeConfig(authToken, root);
       const draft = await createAssistantDiagramStageDraft({
         kind: mapTask ? 'mapping' : 'interpretation',
         prompt: String(body.prompt || '').trim(),
         roles,
+        ...(mapTask ? { modelRoles: assistantDiagramRequiredMappingRoles(roles) } : {}),
         stages
       }, runtimeConfig);
       if (!draft.success) {
@@ -34218,13 +35485,27 @@ async function handleBackend(req, res, requestUrl) {
         return;
       }
       const resultItems = draft.items;
-      sendJson(res, resultItems.length ? 200 : 422, {
-        success: resultItems.length > 0,
+      const mapping = mapTask ? (draft.mapping || assistantDiagramMappingCoverage({ roles, stages }, resultItems, draft.unresolved)) : null;
+      if (mapTask) {
+        logInfo('assistant.diagram_mapping.completed', {
+          requestId: req.cmdpRequestId || '',
+          authSource: backendLogUser,
+          templateCode: proposalInput && proposalInput.templateCode || '',
+          requiredRoles: mapping.requiredRoles,
+          mappedRoles: mapping.mappedRoles,
+          unresolvedRoles: mapping.unresolved.length,
+          status: mapping.status,
+          attempts: Number(draft.diagnostics && draft.diagnostics.attempts || 1)
+        });
+      }
+      sendJson(res, 200, {
+        success: true,
         action: mapTask ? 'assistant-diagram-import-map-selections' : 'assistant-diagram-import-interpret',
         ...(mapTask ? { mappings: resultItems } : { decisions: resultItems }),
+        ...(mapTask ? { mapping } : {}),
         explanation: draft.explanation || '',
         warnings: draft.warnings || [],
-        errors: resultItems.length ? [] : [{ path: '$', message: mapTask ? 'Assistant returned no valid selection mappings.' : 'Assistant returned no valid semantic decisions.' }],
+        errors: [],
         diagnostics: draft.diagnostics || {}
       });
     } catch (error) {
@@ -34304,6 +35585,8 @@ async function handleBackend(req, res, requestUrl) {
       const result = await executeTemplateSpec(authToken, draft.spec, draft.params, {
         maxRows: getPositiveInt(requestUrl.searchParams, 'maxRows', executionLimits.maxRowsPreviewDefault, executionLimits.maxRowsMax),
         maxRowsMax: executionLimits.maxRowsMax,
+        maxSelectionScanRows: executionLimits.maxSelectionScanRowsDefault,
+        maxSelectionScanRowsMax: executionLimits.maxSelectionScanRowsMax,
         maxClasses: getPositiveInt(requestUrl.searchParams, 'maxClasses', executionLimits.maxClassesDefault, executionLimits.maxClassesMax),
         maxClassesMax: executionLimits.maxClassesMax,
         maxDomains: getPositiveInt(requestUrl.searchParams, 'maxDomains', executionLimits.maxDomainsDefault, executionLimits.maxDomainsMax),
@@ -34314,6 +35597,12 @@ async function handleBackend(req, res, requestUrl) {
         traversalDepthDefault: executionLimits.maxTraversalDepthDefault,
         maxTraversalDepthMax: executionLimits.maxTraversalDepthMax
       });
+      logLimitDiagnostics('template.execution_limit_reached', {
+        requestId: req.cmdpRequestId || '',
+        action: 'draft-preview',
+        templateCode: template.code,
+        username: backendLogUser
+      }, result.limitDiagnostics);
       sendJson(res, 200, {
         success: true,
         action: draftAction,
@@ -34671,6 +35960,8 @@ async function handleBackend(req, res, requestUrl) {
       const executionOptions = {
         maxRows,
         maxRowsMax: executionLimits.maxRowsMax,
+        maxSelectionScanRows: executionLimits.maxSelectionScanRowsDefault,
+        maxSelectionScanRowsMax: executionLimits.maxSelectionScanRowsMax,
         maxClasses: getPositiveInt(requestUrl.searchParams, 'maxClasses', executionLimits.maxClassesDefault, executionLimits.maxClassesMax),
         maxClassesMax: executionLimits.maxClassesMax,
         maxDomains: getPositiveInt(requestUrl.searchParams, 'maxDomains', executionLimits.maxDomainsDefault, executionLimits.maxDomainsMax),
@@ -34873,6 +36164,12 @@ async function handleBackend(req, res, requestUrl) {
         executionSlot.release();
       }
       if (templateAction === 'run' || templateAction === 'preview') {
+        logLimitDiagnostics('template.execution_limit_reached', {
+          requestId: req.cmdpRequestId || '',
+          action: templateAction,
+          templateCode: template.code,
+          username
+        }, result.limitDiagnostics);
         logInfo('template.executed', {
           requestId: req.cmdpRequestId || '',
           action: templateAction,
@@ -35458,6 +36755,7 @@ export {
   dependencyMapWithHash,
   d2RendererConfigSummary,
   d2CacheContext,
+  decorateD2MarkdownFrames,
   d2ImportConfigSummary,
   d2ImporterHealth,
   d2RendererHealth,

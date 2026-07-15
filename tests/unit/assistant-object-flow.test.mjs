@@ -220,7 +220,7 @@ test('object flow compiles a typed domain relation without inventing a match att
     distinct: true,
     as: 'ipRanges'
   });
-  assert.equal(compiled.result.tables.find((table) => table.name === 'ipRanges').published, true);
+  assert.equal(compiled.result.tables.find((table) => table.name === 'ipRanges').published, undefined);
   assert.equal(compiled.result.tables.find((table) => table.name === 'ipRanges').columns.includes('range'), true);
   assert.equal(compiled.steps.some((step) => step.type === 'matchRows'), false);
 });
@@ -503,7 +503,7 @@ test('compileObjectFlowToSpec supports a single selection without match steps', 
   assert.deepEqual(validateTemplateSpec(compiled), []);
 });
 
-test('object flow compiles typed set operations and an explicit published table', () => {
+test('object flow compiles typed set operations without selecting a published table', () => {
   const compiled = compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, {
     version: 1,
     selections: [
@@ -529,8 +529,8 @@ test('object flow compiles typed set operations and an explicit published table'
   ]);
   const setStep = compiled.steps.find((step) => step.as === 'activeAssets');
   assert.deepEqual(setStep.on, [{ left: 'Class', right: 'Class' }, { left: '_id', right: '_id' }]);
-  assert.equal(compiled.result.tables.find((table) => table.name === 'activeAssets').published, true);
-  assert.equal(compiled.result.tables.filter((table) => table.published).length, 1);
+  assert.equal(compiled.result.tables.find((table) => table.name === 'activeAssets').published, undefined);
+  assert.equal(compiled.result.tables.filter((table) => table.published).length, 0);
   assert.ok(compiled.result.tables.find((table) => table.name === 'matchedAssets').columns.includes('Red.Code'));
   assert.deepEqual(validateObjectFlow({
     version: 1,
@@ -577,7 +577,7 @@ test('operations run only in declared order and can use an earlier set alias', (
   ]);
   assert.equal(compiled.steps[4].from, 'allSites');
   assert.equal(compiled.steps[4].with, 'vlans');
-  assert.equal(compiled.result.tables.find((table) => table.name === 'siteVlans').published, true);
+  assert.equal(compiled.result.tables.find((table) => table.name === 'siteVlans').published, undefined);
 });
 
 test('operations reject forward references and retain migrated saved operation order', () => {
@@ -684,17 +684,17 @@ test('Object Flow persists an ordered output manifest without claiming unrelated
     result: { tables: [{ name: 'targetARM', title: 'Manual ARM target', published: true }] }
   }, flow);
 
-  assert.deepEqual(outputs.map((output) => [output.alias, output.label, output.kind, output.published]), [
-    ['routers', 'Routers', 'selection', false],
-    ['rooms', 'Rooms', 'selection', false],
-    ['vlans', 'VLANs', 'selection', false],
-    ['routerRooms', 'Сопоставление 1', 'match', false],
-    ['routerRoomVlans', 'Сопоставление 2', 'match', true]
+  assert.deepEqual(outputs.map((output) => [output.alias, output.label, output.kind]), [
+    ['routers', 'Routers', 'selection'],
+    ['rooms', 'Rooms', 'selection'],
+    ['vlans', 'VLANs', 'selection'],
+    ['routerRooms', 'Сопоставление 1', 'match'],
+    ['routerRoomVlans', 'Сопоставление 2', 'match']
   ]);
   const manifest = compiled.visualModels.find((model) => model.mode === 'objectMatching').outputs;
   assert.deepEqual(manifest, outputs);
-  assert.equal(compiled.result.tables.find((table) => table.name === 'targetARM').published, undefined);
-  assert.equal(compiled.result.tables.find((table) => table.name === 'routerRoomVlans').published, true);
+  assert.equal(compiled.result.tables.find((table) => table.name === 'targetARM').published, true);
+  assert.equal(compiled.result.tables.find((table) => table.name === 'routerRoomVlans').published, undefined);
 });
 
 test('Assistant output metadata gives named blocks ownership of visible tables without changing aliases', () => {
@@ -1124,7 +1124,7 @@ test('object flow migrates only Object Group aliases recorded in stored visual m
   );
 });
 
-test('object flow clears inherited published flags when no published alias is selected', () => {
+test('object flow preserves a table publication selected in Extraction', () => {
   const compiled = compileObjectFlowToSpec({
     version: 1,
     steps: [],
@@ -1136,7 +1136,7 @@ test('object flow clears inherited published flags when no published alias is se
     publishedAlias: ''
   });
 
-  assert.equal(Object.hasOwn(compiled.result.tables.find((table) => table.name === 'assets'), 'published'), false);
+  assert.equal(compiled.result.tables.find((table) => table.name === 'assets').published, true);
 });
 
 test('object flow does not publish the final operation when no alias is selected', () => {
@@ -1145,6 +1145,6 @@ test('object flow does not publish the final operation when no alias is selected
   const objectMatching = compiled.visualModels.find((model) => model.mode === 'objectMatching');
 
   assert.equal(objectMatching.output.alias, '');
-  assert.ok(objectMatching.outputs.every((output) => output.published === false));
+  assert.ok(objectMatching.outputs.every((output) => output.published === undefined));
   assert.equal(compiled.result.tables.some((table) => table.published), false);
 });

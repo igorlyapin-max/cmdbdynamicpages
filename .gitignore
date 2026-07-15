@@ -4,5 +4,6 @@ node_modules/
 npm-debug.log*
 dist/*.zip
 .env
+secrets/
 .env.*
 !.env.example

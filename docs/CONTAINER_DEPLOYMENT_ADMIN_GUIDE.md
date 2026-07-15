@@ -40,6 +40,8 @@ cp .env.example .env
 - `CMDBDYNAMIC_REDIS_URL` - Redis endpoint без plaintext password в URL, если пароль передается файлом;
 - `CMDBDYNAMIC_REDIS_PASSWORD_FILE_HOST` - host path к secret file от PAM/platform;
 - `CMDBDYNAMICPAGES_CSRF_SECRET` - stable external secret из approved secret source;
+- `CMDP_NGINX_CUSTOM_API_READ_TIMEOUT` - timeout для `proxy_read_timeout` и `proxy_send_timeout` только в nginx location `/cmdbuild/custom-api/`; default `70s`. Использовать nginx duration, например `90s`, если подтверждено, что upstream operation требует больше времени;
+- `CMDP_EXECUTION_MAX_SELECTION_SCAN_ROWS_ABSOLUTE` - абсолютный server-side cap количества карточек, которые один детерминированный selection может просканировать; default `50000`. Он ограничивает настроечные значения Designer и не увеличивает число строк в опубликованной таблице. Поднимать только после оценки нагрузки CMDBuild; при достижении cap UI сообщает, что результат может быть неполным;
 - `CMDP_ASSISTANT_ENABLED` - deprecated/no-op compatibility variable; фактическое включение Designer draft assistant хранится в `Cst_QueryToolConfig.RuntimeConfigJson.assistant.llm.enabled`;
 - `LITELLM_BASE_URL`, `LITELLM_MODEL`, `LITELLM_API_KEY_FILE_HOST` - optional LiteLLM assistant endpoint/model/API-key secret file;
 - `CMDP_LITELLM_ALLOWED_BASE_URLS` - server-side allowlist для LiteLLM-compatible endpoints; RuntimeConfig baseUrl не должен выводить API key за этот список;
@@ -61,10 +63,13 @@ docker compose --env-file .env.example -f docker-compose.runtime.yml config
 docker compose -f docker-compose.nginx.yml config
 ```
 
+Bundled nginx использует штатную template processing entrypoint image `nginx:1.27-alpine`: конфигурация монтируется в `/etc/nginx/templates/default.conf.template`, а Compose передает `CMDP_NGINX_CUSTOM_API_READ_TIMEOUT` со значением `70s` по умолчанию. Не монтировать этот файл напрямую в `/etc/nginx/conf.d/default.conf`, иначе template variable не будет подставлена.
+
 Перед production start проверить уже реальный `.env`:
 
 ```bash
 docker compose --env-file .env -f docker-compose.runtime.yml config
+docker compose --env-file .env -f docker-compose.nginx.yml config
 ```
 
 Compose template не содержит `build:` и использует только prebuilt `image:`.
@@ -157,6 +162,7 @@ CI для release должен:
 - строить Docker image;
 - проверять `docker compose --env-file .env.example -f docker-compose.runtime.yml config`;
 - проверять `docker compose -f docker-compose.nginx.yml config`;
+- запускать `bash scripts/nginx-test.sh` для проверки рендеринга nginx template;
 - публиковать image в approved registry для branch/tag release;
 - прикладывать `dist/cmdbdynamicpages-custompage.zip` как release artifact.
 
