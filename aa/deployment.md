@@ -9,7 +9,6 @@ flowchart TB
   subgraph Host["Developer/Test host"]
     Browser[Browser]
     Nginx[Nginx container<br/>listen 8088]
-    Wiki[Wiki container<br/>listen 3000]
     Backend[Node.js cmdbdynamicpages<br/>listen 127.0.0.1:8093]
     Redis[Redis container<br/>listen 127.0.0.1:6379<br/>RDB snapshot]
     CMDBuild[CMDBuild app<br/>listen 127.0.0.1:8090]
@@ -18,7 +17,6 @@ flowchart TB
   end
 
   Browser -->|HTTP 8088| Nginx
-  Nginx -->|HTTP 3000| Wiki
   Nginx -->|HTTP 8093| Backend
   Browser -->|HTTP direct dev 8093| Backend
   Backend -->|HTTP REST 8090| CMDBuild
@@ -70,6 +68,6 @@ Production deployment requirements:
 
 | Контур | Статус схемы | Отличия |
 | --- | --- | --- |
-| Тест ИТ | Описан | Локальные порты `8093`, `8090`, `6379`, `8088`, `3000` |
+| Тест ИТ | Описан | Локальные порты `8093`, `8090`, `6379`, `8088` |
 | Бизнес Тест | Логически совпадает с production | Адреса/сертификаты задаются платформой |
 | Продуктив | Описан | Redis password обязателен; health/readiness используются LB/monitoring |

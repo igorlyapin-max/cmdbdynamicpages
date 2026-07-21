@@ -12,5 +12,6 @@ docker run -d \
   --name "${NAME}" \
   --restart unless-stopped \
   --network host \
-  -v "${ROOT_DIR}/nginx/cmdbdynamicpages-dev.conf:/etc/nginx/conf.d/default.conf:ro" \
+  -v "${ROOT_DIR}/nginx/cmdbdynamicpages.conf:/etc/nginx/templates/default.conf.template:ro" \
+  -e CMDP_NGINX_CUSTOM_API_READ_TIMEOUT=70s \
   nginx:1.27-alpine

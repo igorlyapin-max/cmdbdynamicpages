@@ -59,6 +59,20 @@ test('state-changing custom API call without CSRF/session is rejected', { skip: 
   assert.ok([401, 403].includes(result.statusCode), `unexpected HTTP ${result.statusCode}`);
 });
 
+test('state-changing custom API rejects a cross-origin request before CSRF validation', { skip: skipWhenUnavailable }, async () => {
+  const cookie = 'CMDBuild-Authorization=fake-cross-origin-token';
+  const result = await request('POST', `${proxyOrigin}/cmdbuild/custom-api/draft/validate`, {
+    template: { code: 'CrossOrigin', spec: { version: 1, steps: [], result: { tables: [] } } },
+    params: {}
+  }, {
+    cookie,
+    origin: 'https://cross-origin.example'
+  });
+
+  assert.equal(result.statusCode, 403);
+  assert.equal(JSON.parse(result.body).message, 'State-changing custom API calls require a same-origin Origin or Referer header.');
+});
+
 test('state-changing custom API rejects non-JSON content type', { skip: skipWhenUnavailable }, async () => {
   const cookie = 'CMDBuild-Authorization=fake-content-type-token';
   const csrfResult = await request('GET', `${proxyOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });

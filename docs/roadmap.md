@@ -48,7 +48,7 @@ Done:
 - `npm run test:unit` covers runtime cache keys, cache metadata, parameter defaults, IPv4 matching, dependency maps, and log redaction.
 - `npm run test:api` provides a skip-safe API contract smoke against a running proxy.
 - `npm run test:ui` provides a skip-safe Playwright smoke for Designer and Runtime shell behavior.
-- `npm run test:nginx` validates nginx config and same-origin wiki/dynamicpages routes through `localhost:8088`.
+- `npm run test:nginx` validates the project-only nginx config and `cmdbdynamicpages` routes through `localhost:8088`.
 - `npm run e2e` verifies session, logging diagnostics, schema readiness, CSRF rejection, draft preview without runtime cache, Runtime shell loading, saved-template run, cache hit, POST `forceRefresh`, and that GET runtime cannot force refresh.
 - `npm run e2e:write` creates or updates a stable smoke template and verifies save/version/runtime flow.
 - `npm run e2e:write` verifies `expectedSpecHash` conflict handling for stale template updates.
@@ -82,9 +82,7 @@ Not done:
 - No remaining core implementation items in the current plan.
 - Example templates are tracked separately from the implementation plan.
 - Deeper Playwright Runtime table checks are implemented as skip-safe tests and depend on available live template fixtures for full coverage.
-- Browser-level iframe rendering inside a real wiki page is implemented as an optional smoke through `CMDBDYNAMIC_WIKI_IFRAME_URL`.
 - Browser smoke for customer-approved topology diagrams will be added after the target diagram layouts stabilize.
-- A stable local wiki page still needs to be maintained so the optional iframe smoke can run regularly.
 
 ## 1. CMDBuild Roles/Groups Check
 

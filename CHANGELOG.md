@@ -26,7 +26,7 @@
 - Added `CMDP_DIAGNOSTIC_MODE=off|Basic|Verbose` with safe structured diagnostic events and sanitized verbose diagnostics.
 - Added production startup validation for `CMDBDYNAMICPAGES_CSRF_SECRET`.
 - Added dependency-free `secret:scan`, `ci`, and ZIP build gates.
-- Added skip-safe Runtime table UI checks, optional browser-level wiki iframe smoke, write-mode `expectedSpecHash` conflict coverage, and production runbooks.
+- Added skip-safe Runtime table UI checks, optional browser-level external embedding smoke, write-mode `expectedSpecHash` conflict coverage, and production runbooks.
 
 ### Changed
 

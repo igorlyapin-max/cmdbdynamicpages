@@ -38,7 +38,8 @@ function objectFlowIntentFromText(algorithm, options = {}) {
   return { context: options.context || '', blocks };
 }
 
-function semanticPlanForIntent(intent) {
+function semanticPlanForIntent(intent, options = {}) {
+  const outputClass = String(options.outputClass || 'ARM');
   return {
     version: 1,
     blocks: intent.blocks.map((block) => ({
@@ -49,7 +50,7 @@ function semanticPlanForIntent(intent) {
       relationPaths: [],
       dependencies: block.uses || [],
       expectedResult: block.expectedResult,
-      resultContract: { outputKind: 'relationPairs', outputClass: 'CMDBCard', relationPredicates: [] },
+      resultContract: { outputKind: 'sourceCards', outputClass, relationPredicates: [] },
       warnings: []
     })),
     explanation: 'Semantic plan confirmed.',
@@ -59,7 +60,29 @@ function semanticPlanForIntent(intent) {
 
 function objectFlowPlanRequest(algorithm, options = {}) {
   const intent = objectFlowIntentFromText(algorithm, options);
-  return { intent, semanticPlan: semanticPlanForIntent(intent) };
+  return { intent, semanticPlan: semanticPlanForIntent(intent, options) };
+}
+
+function d2RoleOverride(role, mapping = role.mapping, model = {}) {
+  return {
+    id: role.id,
+    visualKind: model.visualKind ?? role.visualKind,
+    labelTemplate: model.labelTemplate ?? role.labelTemplate,
+    mapping
+  };
+}
+
+function d2StructureTreeWithSources(proposal, roles) {
+  const sourceByRoleId = new Map((Array.isArray(roles) ? roles : []).map((role) => [
+    String(role && role.id || ''),
+    String(role && role.mapping && role.mapping.source && role.mapping.source.stageId || '')
+  ]));
+  const tree = structuredClone(proposal && proposal.structureTree || { version: 1, items: [] });
+  tree.items = (Array.isArray(tree.items) ? tree.items : []).map((item) => ({
+    ...item,
+    sourceStageId: sourceByRoleId.get(String(item && item.roleId || '')) || String(item && item.sourceStageId || '')
+  }));
+  return tree;
 }
 
 test('draft preview executes exact router anchor before selecting ARM cards by Location', async (t) => {
@@ -367,7 +390,7 @@ test('full object-flow planning returns a validated proposal without mutating th
         id: 'set:allAssets', type: 'union', from: 'routers', with: 'arms', as: 'allAssets',
         on: [{ left: 'Class', right: 'Class' }, { left: '_id', right: '_id' }], distinct: true, caseSensitive: false
       }],
-      publishedAlias: 'allAssets'
+      publishedAlias: 'arms'
     }
   });
   const mock = await startMockCmdbuild(t, {
@@ -388,7 +411,7 @@ test('full object-flow planning returns a validated proposal without mutating th
   const backendOrigin = `http://127.0.0.1:${backendPort}`;
   const cookie = 'CMDBuild-Authorization=object-flow-plan-token';
   const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
-  const planRequest = objectFlowPlanRequest('маршрутизатор с описанием Маршрутизатор для Test City 300. АРМ в том же Location.');
+  const planRequest = objectFlowPlanRequest('маршрутизатор с описанием Маршрутизатор для Test City 300. АРМ в том же Location.', { outputClass: 'ARM' });
   const response = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/plan`, {
     templateCode,
     baseSpecHash: hashJson(initialSpec),
@@ -410,8 +433,8 @@ test('full object-flow planning returns a validated proposal without mutating th
     id: 'set:allAssets', type: 'union', from: 'routers', with: 'arms', as: 'allAssets',
     on: [{ left: 'Class', right: 'Class' }, { left: '_id', right: '_id' }], distinct: true, caseSensitive: false
   });
-  assert.equal(response.json.flow.publishedAlias, 'allAssets');
-  assert.deepEqual(response.json.outputBindings, [{ blockId: 'block-1', alias: 'allAssets' }]);
+  assert.equal(response.json.flow.publishedAlias, 'arms');
+  assert.deepEqual(response.json.outputBindings, [{ blockId: 'block-1', alias: 'arms' }]);
   assert.deepEqual(response.json.diagnostics.objectFlow.outputBindingErrors, []);
   const rejectedApply = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/object-flow/apply`, {
     templateCode,
@@ -449,13 +472,13 @@ test('full object-flow planning returns a validated proposal without mutating th
   });
   assert.deepEqual(outputManifest.map((output) => [output.alias, output.label, output.assistantBlockId, output.assistantBlockIds]), [
     ['routers', 'Result: Выборка 1', 'block-1', ['block-1']],
-    ['arms', 'Result: Выборка 2', 'block-1', ['block-1']],
+    ['arms', 'Result', 'block-1', ['block-1']],
     ['matchedObjects', 'Result: Сопоставление 1', 'block-1', ['block-1']],
-    ['allAssets', 'Result', 'block-1', ['block-1']]
+    ['allAssets', 'Result: Операция множеств 1', 'block-1', ['block-1']]
   ]);
   assert.equal(appliedSpec.result.tables.find((table) => table.name === 'routers').title, 'Result: Выборка 1');
-  assert.equal(appliedSpec.result.tables.find((table) => table.name === 'arms').title, 'Result: Выборка 2');
-  assert.equal(appliedSpec.result.tables.find((table) => table.name === 'allAssets').title, 'Result');
+  assert.equal(appliedSpec.result.tables.find((table) => table.name === 'arms').title, 'Result');
+  assert.equal(appliedSpec.result.tables.find((table) => table.name === 'allAssets').title, 'Result: Операция множеств 1');
   assert.equal(appliedSpec.result.tables.find((table) => table.name === 'matchedObjects').title, 'Result: Сопоставление 1');
   const reloaded = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/templates?root=Cst_QueryTool`, undefined, { cookie });
   assert.equal(reloaded.statusCode, 200, reloaded.body);
@@ -771,11 +794,13 @@ test('object-flow retry reuses the completed semantic-plan checkpoint after a Li
   assert.equal(retriedDraft.json.resume.resumeId, resumeId);
   assert.equal(retriedDraft.json.diagnostics.objectFlow.mcpContextReused, true);
   assert.equal(mock.requests.filter((item) => item.pathname === '/cmdbuild/services/rest/v3/classes').length, modelReadsAfterSemantic, 'flow retry must not read the MCP catalog again');
+  // The timed-out flow request reached LiteLLM before the client deadline;
+  // retrying the completed semantic checkpoint therefore produces request 3.
   assert.equal(llm.requests, 3);
   assert.equal(backend.exitCode, null);
 });
 
-test('semantic planning resolves the submitted business blocks before Object Flow generation', async (t) => {
+test('semantic planning rejects relationPairs without two selected endpoint blocks', async (t) => {
   const intent = objectFlowIntentFromText('Найти ИС по параметру isName и получить связанные ipRange.', {
     name: 'IP ranges of IS',
     entities: 'Информационная система и IP-диапазоны.',
@@ -814,11 +839,140 @@ test('semantic planning resolves the submitted business blocks before Object Flo
     templateCode: '', baseSpecHash: '', currentSpec: { version: 1, params: { isName: { type: 'string' } }, steps: [], result: { tables: [] } }, intent
   }, { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
 
-  assert.equal(response.statusCode, 200, response.body);
-  assert.equal(response.json.semanticPlan.blocks[0].id, 'block-1');
-  assert.deepEqual(response.json.semanticPlan.blocks[0].resolvedEntities, ['IS', 'ipRange']);
-  assert.deepEqual(response.json.semanticPlan.blocks[0].resultContract, { outputKind: 'relationPairs', outputClass: 'IS', dependencyPaths: [], relationPredicates: [], attributePredicates: [], referencePathPredicates: [] });
+  assert.equal(response.statusCode, 422, response.body);
+  assert.equal(response.json.errors[0].kind, 'semanticPlanRelationPairMissingEndpoint');
+  assert.match(response.json.feedback.summary, /не выбраны оба набора объектов связи/i);
+  assert.match(response.json.feedback.action, /Использует результаты блоков/i);
   assert.equal(llm.requests, 1);
+  assert.equal(backend.exitCode, null);
+});
+
+test('relationPairs compiles a confirmed domain between two selected results and excludes unselected endpoints', async (t) => {
+  const intent = objectFlowIntentFromText('', {
+    blocks: [{
+      id: 'ranges', name: 'Result 1', entities: 'Карточки класса ipRange.',
+      algorithm: 'Для IS с Name равным параметру isName получить связанные ipRange через ISZabbixMonitoringDomain.', expectedResult: 'Список ipRange.', uses: []
+    }, {
+      id: 'applications', name: 'Applications', entities: 'Карточки класса Application.',
+      algorithm: 'Выбрать Application, у которых ipaddress.ipAddr входит в range из Result 1.', expectedResult: 'Список Application.', uses: ['ranges']
+    }, {
+      id: 'servers', name: 'Result 5', entities: 'Карточки класса phServer.',
+      algorithm: 'Выбрать phServer, у которых ipaddress.ipAddr входит в range из Result 1.', expectedResult: 'Список phServer.', uses: ['ranges']
+    }, {
+      id: 'application-servers', name: 'Applications phServers', entities: 'Связи Application и phServer.',
+      algorithm: 'Взять Application из Applications и phServer из Result 5, получить связи domain phS.',
+      expectedResult: 'Таблица связей между Application и phServer.', uses: ['applications', 'servers']
+    }]
+  });
+  const llm = await startLiteLlmStub(t, {
+    responses: [{
+      version: 1,
+      blocks: [{
+        id: 'ranges', name: 'Result 1', summary: 'Сети целевой ИС.', resolvedEntities: ['IS', 'ipRange'], relationPaths: ['ISZabbixMonitoringDomain'], dependencies: [], expectedResult: 'Список ipRange.',
+        resultContract: { outputKind: 'sourceCards', outputClass: 'ipRange' }, warnings: []
+      }, {
+        id: 'applications', name: 'Applications', summary: 'Приложения.', resolvedEntities: ['ApplicG', 'IpAddress', 'ipRange'], relationPaths: ['ApplicGIpaddressDomain'], dependencies: ['ranges'], expectedResult: 'Список Application.',
+        resultContract: { outputKind: 'sourceCards', outputClass: 'ApplicG', referencePathPredicates: [{ sourceClass: 'ApplicG', comparisonBlockId: 'ranges', comparisonClass: 'ipRange', sourcePath: ['ipaddress', 'ipAddr'], comparisonField: 'range', operator: 'ipv4InCidr' }] }, warnings: []
+      }, {
+        id: 'servers', name: 'Result 5', summary: 'Выбранные серверы.', resolvedEntities: ['phServer', 'IpAddress', 'ipRange'], relationPaths: ['ip_addressph'], dependencies: ['ranges'], expectedResult: 'Список phServer.',
+        resultContract: { outputKind: 'sourceCards', outputClass: 'phServer', referencePathPredicates: [{ sourceClass: 'phServer', comparisonBlockId: 'ranges', comparisonClass: 'ipRange', sourcePath: ['ipaddress', 'ipAddr'], comparisonField: 'range', operator: 'ipv4InCidr' }] }, warnings: []
+      }, {
+        id: 'application-servers', name: 'Applications phServers', summary: 'Пары приложений и серверов.', resolvedEntities: ['ApplicG', 'phServer'], relationPaths: ['phs'], dependencies: ['applications', 'servers'], expectedResult: 'Таблица связей между Application и phServer.',
+        resultContract: {
+          outputKind: 'relationPairs',
+          pair: { mode: 'domain', fromBlockId: 'applications', fromClass: 'ApplicG', withBlockId: 'servers', withClass: 'phServer', domain: 'phS', direction: 'source', rules: [] }
+        }, warnings: []
+      }],
+      explanation: 'Связь подтверждена.', warnings: []
+    }, {
+      flow: { version: 1, selections: [], operations: [], publishedAlias: '' },
+      explanation: 'Assistant flow incomplete.', warnings: []
+    }]
+  });
+  const mock = await startMockCmdbuild(t, {
+    classes: [
+      { _id: 1, name: 'IS', description: 'Information system', parent: 'Class', active: true },
+      { _id: 2, name: 'ipRange', description: 'IP range', parent: 'Class', active: true },
+      { _id: 3, name: 'IpAddress', description: 'IP address', parent: 'Class', active: true },
+      { _id: 4, name: 'ApplicG', description: 'Application', parent: 'Class', active: true },
+      { _id: 5, name: 'phServer', description: 'Physical server', parent: 'Class', active: true },
+      { _id: 6, name: 'Cst_QueryToolConfig', description: 'Config', active: true },
+      { _id: 7, name: 'Cst_QueryTemplate', description: 'Template', active: true }
+    ],
+    attributesByClass: {
+      IS: [{ name: 'Name', description: 'Name', type: 'string', active: true, _can_read: true }],
+      ipRange: [{ name: 'range', description: 'Network range', type: 'string', active: true, _can_read: true }],
+      IpAddress: [{ name: 'ipAddr', description: 'IP address value', type: 'ipAddress', active: true, _can_read: true }],
+      ApplicG: [{ name: 'ipaddress', description: 'IP address', type: 'reference', targetClass: 'IpAddress', domain: 'ApplicGIpaddressDomain', active: true, _can_read: true }],
+      phServer: [{ name: 'ipaddress', description: 'IP address', type: 'reference', targetClass: 'IpAddress', domain: 'ip_addressph', active: true, _can_read: true }]
+    },
+    domains: [
+      { _id: 'ISZabbixMonitoringDomain', name: 'ISZabbixMonitoringDomain', source: 'IS', sources: ['IS'], destination: 'ipRange', destinations: ['ipRange'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: 'N:N' },
+      { _id: 'ApplicGIpaddressDomain', name: 'ApplicGIpaddressDomain', source: 'IpAddress', sources: ['IpAddress'], destination: 'ApplicG', destinations: ['ApplicG'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: '1:N' },
+      { _id: 'ip_addressph', name: 'ip_addressph', source: 'IpAddress', sources: ['IpAddress'], destination: 'phServer', destinations: ['phServer'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: '1:N' },
+      { _id: 'phs', name: 'phs', description: 'Applications on physical servers', source: 'ApplicG', sources: ['ApplicG'], destination: 'phServer', destinations: ['phServer'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: 'N:1' }
+    ],
+    cardsByClass: {
+      IS: [{ _id: 51, Code: 'IS-TARGET', Description: 'Target system', Name: 'Target system' }],
+      ipRange: [{ _id: 101, Code: 'RANGE-SELECTED', Description: 'Selected range', range: '10.44.0.0/24' }],
+      IpAddress: [{ _id: 201, Code: 'IP-SELECTED', Description: 'Selected IP', ipAddr: '10.44.0.10' }, { _id: 202, Code: 'IP-OTHER', Description: 'Other IP', ipAddr: '10.99.0.10' }],
+      ApplicG: [{ _id: 301, Code: 'APP-SELECTED', Description: 'Selected app', ipaddress: 201 }],
+      phServer: [{ _id: 401, Code: 'PHS-SELECTED', Description: 'Selected server', ipaddress: 201 }, { _id: 402, Code: 'PHS-OTHER', Description: 'Other server', ipaddress: 202 }]
+    },
+    relationsByCard: {
+      'IS:51': [{ _id: 500, domain: 'ISZabbixMonitoringDomain', _sourceType: 'IS', _sourceId: 51, _sourceCode: 'IS-TARGET', _sourceDescription: 'Target system', _destinationType: 'ipRange', _destinationId: 101, _destinationCode: 'RANGE-SELECTED', _destinationDescription: 'Selected range', _direction: 'direct' }],
+      'IpAddress:201': [
+        { _id: 501, domain: 'ApplicGIpaddressDomain', _sourceType: 'IpAddress', _sourceId: 201, _sourceCode: 'IP-SELECTED', _sourceDescription: 'Selected IP', _destinationType: 'ApplicG', _destinationId: 301, _destinationCode: 'APP-SELECTED', _destinationDescription: 'Selected app', _direction: 'direct' },
+        { _id: 502, domain: 'ip_addressph', _sourceType: 'IpAddress', _sourceId: 201, _sourceCode: 'IP-SELECTED', _sourceDescription: 'Selected IP', _destinationType: 'phServer', _destinationId: 401, _destinationCode: 'PHS-SELECTED', _destinationDescription: 'Selected server', _direction: 'direct' }
+      ],
+      'IpAddress:202': [{ _id: 503, domain: 'ip_addressph', _sourceType: 'IpAddress', _sourceId: 202, _sourceCode: 'IP-OTHER', _sourceDescription: 'Other IP', _destinationType: 'phServer', _destinationId: 402, _destinationCode: 'PHS-OTHER', _destinationDescription: 'Other server', _direction: 'direct' }],
+      'ApplicG:301': [
+        { _id: 504, domain: 'phs', _sourceType: 'ApplicG', _sourceId: 301, _sourceCode: 'APP-SELECTED', _sourceDescription: 'Selected app', _destinationType: 'phServer', _destinationId: 401, _destinationCode: 'PHS-SELECTED', _destinationDescription: 'Selected server', _direction: 'direct' },
+        { _id: 505, domain: 'phs', _sourceType: 'ApplicG', _sourceId: 301, _sourceCode: 'APP-SELECTED', _sourceDescription: 'Selected app', _destinationType: 'phServer', _destinationId: 402, _destinationCode: 'PHS-OTHER', _destinationDescription: 'Other server', _direction: 'direct' }
+      ]
+    },
+    configCards: [{
+      _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true,
+      RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' }, mcp: { maxClasses: 100, maxDomains: 100, maxRelationDomains: 100, maxContextBytes: 65536 } } })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = testCmdbuildAuthorizationCookie('relation-pair-token');
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = { version: 1, params: { isName: { type: 'string', required: true } }, steps: [], result: { tables: [] } };
+
+  const semantic = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+    templateCode: '', baseSpecHash: '', currentSpec, intent
+  }, headers);
+  assert.equal(semantic.statusCode, 200, semantic.body);
+  const pair = semantic.json.semanticPlan.blocks[3].resultContract.pair;
+  assert.equal(pair.domain, 'phs');
+  assert.equal(pair.fromBlockId, 'applications');
+  assert.equal(pair.withBlockId, 'servers');
+
+  const draft = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/plan`, {
+    templateCode: '', baseSpecHash: '', currentSpec, intent, semanticPlan: semantic.json.semanticPlan
+  }, headers);
+  assert.equal(draft.statusCode, 200, draft.body);
+  assert.equal(draft.json.success, true, draft.body);
+  const relation = draft.json.flow.operations.find((operation) => operation.type === 'relation' && operation.domain === 'phs');
+  const pairMatch = draft.json.flow.operations.find((operation) => operation.type === 'match' && operation.as === draft.json.flow.publishedAlias);
+  assert.ok(relation, draft.body);
+  assert.equal(pairMatch.from, relation.as);
+  assert.equal(pairMatch.connection.mode, 'domain');
+  assert.equal(pairMatch.connection.sourceField, 'SourceId');
+  assert.equal(pairMatch.connection.targetField, 'RelatedId');
+
+  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview`, {
+    template: { code: 'RelationPairPreview', spec: compileObjectFlowToSpec(currentSpec, draft.json.flow) }, params: { isName: 'Target system' }
+  }, headers);
+  assert.equal(preview.statusCode, 200, preview.body);
+  const table = preview.json.result.tables.find((item) => item.name === draft.json.flow.publishedAlias);
+  assert.ok(table, preview.body);
+  assert.deepEqual(table.rows.map((row) => [row.SourceId, row.RelatedId]), [['301', '401']]);
   assert.equal(backend.exitCode, null);
 });
 
@@ -947,7 +1101,7 @@ test('semantic planning normalizes a direct dependency traversal to the unique M
 
   assert.equal(response.statusCode, 200, response.body);
   assert.deepEqual(response.json.semanticPlan.blocks[1].resultContract, {
-    outputKind: 'sourceCards', outputClass: 'vlan',
+    outputKind: 'sourceCards', outputClass: 'vlan', candidateFilter: null,
     dependencyPaths: [{ comparisonBlockId: 'ip-ranges', sourceClass: 'ipRange', domain: 'Vlan2super', direction: 'destination', targetClass: 'vlan' }],
     relationPredicates: [], attributePredicates: [], referencePathPredicates: []
   });
@@ -1530,7 +1684,7 @@ test('object-flow planning is read-only while Apply requires an explicitly denie
     templateCode: 'NoUpdateObjectFlow',
     baseSpecHash: '',
     currentSpec: savedSpec,
-    ...objectFlowPlanRequest('Выбрать все карточки АРМ.')
+    ...objectFlowPlanRequest('Выбрать все карточки АРМ.', { outputClass: 'ARM' })
   }, headers);
   assert.equal(planned.statusCode, 200, planned.body);
   assert.equal(planned.json.success, true);
@@ -1594,7 +1748,7 @@ test('object-flow planning falls back to the template class update grant when a 
     templateCode: 'ClassGrantObjectFlow',
     baseSpecHash: hashJson(savedSpec),
     currentSpec: savedSpec,
-    ...objectFlowPlanRequest('Выбрать все карточки АРМ.')
+    ...objectFlowPlanRequest('Выбрать все карточки АРМ.', { outputClass: 'ARM' })
   }, headers);
   assert.equal(planned.statusCode, 200, planned.body);
   assert.equal(planned.json.canApply, true);
@@ -1656,7 +1810,7 @@ test('Assistant prompt autosave updates only assistantDraft without versions or 
   assert.equal(backend.exitCode, null);
 });
 
-test('Assistant autosave retains D2 authoring source and reviewed overrides without persisting proposals', async (t) => {
+test('Assistant autosave keeps D2 source but discards old role-model overrides without persisting proposals', async (t) => {
   const savedSpec = publishSpec();
   const mock = await startMockCmdbuild(t, { templates: [templateCard('AssistantD2Authoring', savedSpec, { includeCanUpdate: false })] });
   const backendPort = await freePort();
@@ -1675,7 +1829,9 @@ test('Assistant autosave retains D2 authoring source and reviewed overrides with
       overrides: {
         roles: [{ id: 'class:server', selectedSemantic: 'object', exemplarKey: 'node', mapping: { primary: { className: 'Server', structuredFields: ['Code'] } } }],
         relationRules: [],
-        placementRules: []
+        elementBindings: [{ id: 'binding:node', elementKey: 'node', elementKind: 'node', stageId: 'selection:servers', mode: 'result', fields: { labelField: 'Description' } }],
+        navigatorGroups: [{ id: 'navigator:servers', label: 'Servers', memberElementKeys: ['node'] }],
+        navigatorHierarchies: [{ id: 'hierarchy:server-node', parentElementKey: 'server', childElementKey: 'node', label: 'contains' }]
       }
     }
   };
@@ -1685,11 +1841,107 @@ test('Assistant autosave retains D2 authoring source and reviewed overrides with
   assert.equal(autosaved.statusCode, 200, autosaved.body);
   const stored = autosaved.json.template.spec.assistantDraft.d2Authoring;
   assert.equal(stored.source, assistantDraft.d2Authoring.source);
-  assert.equal(stored.overrides.roles[0].id, 'class:server');
-  assert.equal(stored.overrides.roles[0].mapping.primary.className, 'Server');
+  assert.equal(stored.sourceHash, crypto.createHash('sha256').update(assistantDraft.d2Authoring.source).digest('hex'));
+  assert.equal(stored.semanticModelRevision, 0);
+  assert.equal(stored.structureHash, '');
+  assert.deepEqual(stored.overrides.roles, []);
+  assert.equal(stored.overrides.elementBindings, undefined);
+  assert.equal(stored.overrides.navigatorGroups, undefined);
+  assert.equal(stored.overrides.navigatorHierarchies, undefined);
+  assert.deepEqual(stored.overrides.structureTree, { version: 1, items: [] });
   assert.equal(stored.proposal, undefined);
   assert.equal(autosaved.json.versionLog, undefined);
   assert.equal(autosaved.json.cacheInvalidation, undefined);
+  assert.equal(backend.exitCode, null);
+});
+
+test('Assistant autosave keeps the applied D2 mapping isolated when the authoring source changes', async (t) => {
+  const sourceA = 'app: "Application"';
+  const sourceB = 'app: "Changed application"';
+  const sourceHashA = crypto.createHash('sha256').update(sourceA).digest('hex');
+  const savedSpec = publishSpec({
+    assistantDraft: {
+      objectFlowIntent: objectFlowIntentFromText('Выбрать АРМ.'),
+      diagramInterpretPrompt: 'Интерпретировать роли.',
+      diagramMappingPrompt: 'Сопоставить роли.',
+      d2Authoring: {
+        version: 1,
+        semanticModelRevision: 4,
+        diagramId: 'd2_saved',
+        sourceHash: sourceHashA,
+        structureHash: 'structure_saved',
+        source: sourceA,
+        overrides: {
+          semanticModelRevision: 4,
+          diagramId: 'd2_saved',
+          sourceHash: sourceHashA,
+          structureHash: 'structure_saved',
+          roles: [],
+          relationRules: [],
+          structureTree: { version: 1, items: [] }
+        }
+      }
+    },
+    result: {
+      tables: [{ name: 'arms', columns: ['Code', 'Description', 'Location'] }],
+      diagrams: [{
+        name: 'topology',
+        source: { nodes: 'arms' },
+        templateGrammar: { version: 3, elements: [], roles: [], edges: [], fingerprint: 'saved' },
+        authoring: {
+          d2Import: {
+            version: 3,
+            semanticModelRevision: 4,
+            diagramId: 'd2_saved',
+            sourceHash: sourceHashA,
+            structureHash: 'structure_saved',
+            source: sourceA,
+            roles: []
+          }
+        }
+      }]
+    }
+  });
+  const mock = await startMockCmdbuild(t, { templates: [templateCard('AssistantD2SourceChange', savedSpec, { includeCanUpdate: false })] });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = testCmdbuildAuthorizationCookie('assistant-d2-source-change');
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const assistantDraft = {
+    objectFlowIntent: objectFlowIntentFromText('Выбрать АРМ.'),
+    diagramInterpretPrompt: 'Интерпретировать роли.',
+    diagramMappingPrompt: 'Сопоставить роли.',
+    d2Authoring: {
+      version: 1,
+      source: sourceB,
+      overrides: {
+        semanticModelRevision: 4,
+        diagramId: 'd2_saved',
+        sourceHash: sourceHashA,
+        structureHash: 'structure_saved',
+        roles: [],
+        relationRules: [],
+        structureTree: { version: 1, items: [] }
+      }
+    }
+  };
+  const autosaved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/AssistantD2SourceChange/assistant-draft`, {
+    baseSpecHash: hashJson(savedSpec), assistantDraft
+  }, headers);
+  assert.equal(autosaved.statusCode, 200, autosaved.body);
+  const storedSpec = autosaved.json.template.spec;
+  const stored = storedSpec.assistantDraft.d2Authoring;
+  assert.equal(stored.source, sourceB);
+  assert.equal(stored.sourceHash, crypto.createHash('sha256').update(sourceB).digest('hex'));
+  assert.equal(stored.semanticModelRevision, 0);
+  assert.equal(stored.diagramId, '');
+  assert.equal(stored.structureHash, '');
+  assert.equal(stored.overrides.sourceHash, '');
+  assert.deepEqual(stored.overrides.structureTree, { version: 1, items: [] });
+  assert.equal(storedSpec.result.diagrams[0].authoring.d2Import.source, sourceA);
+  assert.equal(storedSpec.result.diagrams[0].authoring.d2Import.sourceHash, sourceHashA);
   assert.equal(backend.exitCode, null);
 });
 
@@ -1797,7 +2049,7 @@ test('assistant plans an inherited domain relation from IS to ipRange and previe
     templateCode: '',
     baseSpecHash: '',
     currentSpec: { version: 1, params: { isName: { type: 'string', required: true } }, steps: [], result: { tables: [] } },
-    ...objectFlowPlanRequest(prompt)
+    ...objectFlowPlanRequest(prompt, { outputClass: 'ipRange' })
   }, headers);
 
   assert.equal(planned.statusCode, 200, planned.body);
@@ -2032,7 +2284,7 @@ test('assistant keeps confirmed relation requirements and executes source-driven
     }, {
       id: 'relation:vlans', type: 'relation', from: 'ipRanges', as: 'vlans', domain: 'Vlan2super', targetClass: 'vlan', direction: 'destination', columns: ['network'], limit: 100, distinct: true
     }],
-    publishedAlias: ''
+    publishedAlias: 'acls'
   };
   const llm = await startLiteLlmStub(t, { flow });
   const isDomain = {
@@ -2118,20 +2370,52 @@ test('assistant keeps confirmed relation requirements and executes source-driven
     '',
     'Проверьте сформированный поток в Группе объектов и Связях перед применением draft.'
   ].join('\n');
+  const intent = objectFlowIntentFromText(prompt, {
+    blocks: [{
+      id: 'information-systems', name: 'Выборка 1', entities: 'Карточки класса IS.',
+      algorithm: 'Выбрать IS по Name из параметра isName.', expectedResult: 'Список IS.', uses: []
+    }, {
+      id: 'ip-ranges', name: 'Связь 1.1', entities: 'Карточки класса ipRange.',
+      algorithm: 'Из Выборки 1 получить связанные ipRange.', expectedResult: 'Список ipRange.', uses: ['information-systems']
+    }, {
+      id: 'vlans', name: 'Связь 2.1', entities: 'Карточки класса vlan.',
+      algorithm: 'Из Связи 1.1 получить связанные VLAN.', expectedResult: 'Список VLAN.', uses: ['ip-ranges']
+    }, {
+      id: 'acls', name: 'Выборка 3', entities: 'Карточки класса ACL.',
+      algorithm: 'Оставить ACL, у которых Destination ipaddress или Source ipaddress входят в range Связи 1.1.', expectedResult: 'Список ACL.', uses: ['ip-ranges']
+    }]
+  });
+  const semanticPlan = {
+    version: 1,
+    blocks: [{
+      id: 'information-systems', name: 'Выборка 1', summary: 'Целевая ИС.', resolvedEntities: ['IS'], relationPaths: [], dependencies: [], expectedResult: 'Список IS.',
+      resultContract: { outputKind: 'sourceCards', outputClass: 'IS' }, warnings: []
+    }, {
+      id: 'ip-ranges', name: 'Связь 1.1', summary: 'Связанные сети.', resolvedEntities: ['IS', 'ipRange'], relationPaths: ['ISZabbixMonitoringDomain'], dependencies: ['information-systems'], expectedResult: 'Список ipRange.',
+      resultContract: { outputKind: 'sourceCards', outputClass: 'ipRange', dependencyPaths: [{ comparisonBlockId: 'information-systems', sourceClass: 'IS', domain: 'ISZabbixMonitoringDomain', direction: 'source', targetClass: 'ipRange' }] }, warnings: []
+    }, {
+      id: 'vlans', name: 'Связь 2.1', summary: 'Связанные VLAN.', resolvedEntities: ['ipRange', 'vlan'], relationPaths: ['Vlan2super'], dependencies: ['ip-ranges'], expectedResult: 'Список VLAN.',
+      resultContract: { outputKind: 'sourceCards', outputClass: 'vlan', dependencyPaths: [{ comparisonBlockId: 'ip-ranges', sourceClass: 'ipRange', domain: 'Vlan2super', direction: 'destination', targetClass: 'vlan' }] }, warnings: []
+    }, {
+      id: 'acls', name: 'Выборка 3', summary: 'ACL с адресом в выбранных сетях.', resolvedEntities: ['ACL', 'ipRange'], relationPaths: [], dependencies: ['ip-ranges'], expectedResult: 'Список ACL.',
+      resultContract: { outputKind: 'sourceCards', outputClass: 'ACL', attributePredicates: [{ sourceClass: 'ACL', comparisonBlockId: 'ip-ranges', comparisonClass: 'ipRange', sourceFields: ['ipaddress', 'dipaddress'], comparisonField: 'range', operator: 'ipv4InCidr' }] }, warnings: []
+    }],
+    explanation: 'Подтвержденная цепочка и IPv4-сопоставление.', warnings: []
+  };
   const planned = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/plan`, {
-    templateCode: '', baseSpecHash: '', currentSpec: { version: 1, params: { isName: { type: 'string', required: true } }, steps: [], result: { tables: [] } }, ...objectFlowPlanRequest(prompt)
+    templateCode: '', baseSpecHash: '', currentSpec: { version: 1, params: { isName: { type: 'string', required: true } }, steps: [], result: { tables: [] } }, intent, semanticPlan
   }, headers);
 
   assert.equal(planned.statusCode, 200, planned.body);
   assert.equal(planned.json.success, true);
-  assert.equal(planned.json.flow.publishedAlias, '');
+  assert.equal(planned.json.flow.publishedAlias, 'acls');
   assert.equal(planned.json.diagnostics.objectFlow.fallback, null);
   assert.deepEqual(planned.json.diagnostics.objectFlow.relationRequirements, {
     kind: 'relationRequirements',
-    chains: [{ operations: [
-      { sourceClass: 'IS', domain: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source' },
-      { sourceClass: 'ipRange', domain: 'Vlan2super', targetClass: 'vlan', direction: 'destination' }
-    ] }]
+    chains: [
+      { operations: [{ sourceClass: 'IS', domain: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source' }] },
+      { operations: [{ sourceClass: 'ipRange', domain: 'Vlan2super', targetClass: 'vlan', direction: 'destination' }] }
+    ]
   });
   const plannedAcls = planned.json.flow.selections.find((selection) => selection.alias === 'acls');
   assert.equal(plannedAcls.from, 'ipRanges');
@@ -2356,11 +2640,15 @@ test('assistant keeps an IS list when related ipRange is only an ACL IPv4 predic
       ipRange: [{ name: 'range', type: 'string', active: true, _can_read: true }],
       ACL: [{ name: 'ipaddress', type: 'string', active: true, _can_read: true }, { name: 'dipaddress', type: 'string', active: true, _can_read: true }]
     },
-    domains: [{ _id: 'ISIpRange', name: 'ISIpRange', source: 'IS', sources: ['IS'], destination: 'ipRange', destinations: ['ipRange'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: 'N:N' }],
+    domains: [
+      { _id: 'ISIpRange', name: 'ISIpRange', source: 'IS', sources: ['IS'], destination: 'ipRange', destinations: ['ipRange'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: 'N:N' },
+      { _id: 'AlternativeISIpRange', name: 'AlternativeISIpRange', source: 'IS', sources: ['IS'], destination: 'ipRange', destinations: ['ipRange'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: 'N:N' }
+    ],
     cardsByClass: {
       IS: [
         { _id: 101, Code: 'IS-001', Description: 'External matching', Name: 'External matching', isExt: false },
-        { _id: 102, Code: 'IS-002', Description: 'External other', Name: 'External other', isExt: false }
+        { _id: 102, Code: 'IS-002', Description: 'External other', Name: 'External other', isExt: false },
+        { _id: 103, Code: 'IS-003', Description: 'External true', Name: 'External true', isExt: true }
       ],
       ipRange: [
         { _id: 201, Code: 'RANGE-001', Description: 'Matching range', range: '10.44.0.0/24' },
@@ -2370,7 +2658,8 @@ test('assistant keeps an IS list when related ipRange is only an ACL IPv4 predic
     },
     relationsByCard: {
       'IS:101': [{ _id: 401, domain: 'ISIpRange', _sourceType: 'IS', _sourceId: 101, _sourceCode: 'IS-001', _sourceDescription: 'External matching', _destinationType: 'ipRange', _destinationId: 201, _destinationCode: 'RANGE-001', _destinationDescription: 'Matching range', _direction: 'direct' }],
-      'IS:102': [{ _id: 402, domain: 'ISIpRange', _sourceType: 'IS', _sourceId: 102, _sourceCode: 'IS-002', _sourceDescription: 'External other', _destinationType: 'ipRange', _destinationId: 202, _destinationCode: 'RANGE-002', _destinationDescription: 'Other range', _direction: 'direct' }]
+      'IS:102': [{ _id: 402, domain: 'ISIpRange', _sourceType: 'IS', _sourceId: 102, _sourceCode: 'IS-002', _sourceDescription: 'External other', _destinationType: 'ipRange', _destinationId: 202, _destinationCode: 'RANGE-002', _destinationDescription: 'Other range', _direction: 'direct' }],
+      'IS:103': [{ _id: 403, domain: 'ISIpRange', _sourceType: 'IS', _sourceId: 103, _sourceCode: 'IS-003', _sourceDescription: 'External true', _destinationType: 'ipRange', _destinationId: 201, _destinationCode: 'RANGE-001', _destinationDescription: 'Matching range', _direction: 'direct' }]
     },
     configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } }) }]
   });
@@ -2400,6 +2689,11 @@ test('assistant keeps an IS list when related ipRange is only an ACL IPv4 predic
     ['isExt', 'equals', 'false', '']
   ]);
   const spec = compileObjectFlowToSpec({ version: 1, params: { isName: { type: 'string', required: true } }, steps: [], result: { tables: [] } }, planned.json.flow);
+  delete spec.steps.find((step) => step.as === 'externalIs').filterJoin;
+  spec.visualModels.find((model) => model.mode === 'objectMatching').assistantOutputManifest = {
+    version: 1,
+    blocks: [{ id: 'external-systems', name: 'Внутренние ИС', order: 1 }]
+  };
   const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=20&maxClasses=20&maxRestCalls=50`, {
     template: { code: 'SourceCardsContractPreview', spec }, params: { isName: 'Source IS' }
   }, headers);
@@ -2535,7 +2829,7 @@ test('assistant preserves source cards for a direct cross-block IPv4 attribute p
   assert.equal(backend.exitCode, null);
 });
 
-test('assistant rejects invented domain and forward aliases with confirmed relation candidates', async (t) => {
+test('assistant replaces invented domains and forward aliases with the confirmed deterministic relation chain', async (t) => {
   const invalidFlow = {
     version: 1,
     selections: [{
@@ -2574,32 +2868,49 @@ test('assistant rejects invented domain and forward aliases with confirmed relat
   const backendOrigin = `http://127.0.0.1:${backendPort}`;
   const cookie = 'CMDBuild-Authorization=invalid-relation-flow-token';
   const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const intent = objectFlowIntentFromText('', { blocks: [{
+    id: 'information-systems', name: 'Information systems', entities: 'Карточки IS.', algorithm: 'Выбрать IS по Name.', expectedResult: 'Список IS.', uses: []
+  }, {
+    id: 'ip-ranges', name: 'IP ranges', entities: 'Карточки ipRange.', algorithm: 'Получить связанные ipRange.', expectedResult: 'Список ipRange.', uses: ['information-systems']
+  }, {
+    id: 'vlans', name: 'VLANs', entities: 'Карточки vlan.', algorithm: 'Получить связанные VLAN.', expectedResult: 'Список VLAN.', uses: ['ip-ranges']
+  }] });
+  const semanticPlan = {
+    version: 1,
+    blocks: [{
+      id: 'information-systems', name: 'Information systems', summary: 'Целевая ИС.', resolvedEntities: ['IS'], relationPaths: [], dependencies: [], expectedResult: 'Список IS.', resultContract: { outputKind: 'sourceCards', outputClass: 'IS' }, warnings: []
+    }, {
+      id: 'ip-ranges', name: 'IP ranges', summary: 'Связанные сети.', resolvedEntities: ['IS', 'ipRange'], relationPaths: ['ISZabbixMonitoringDomain'], dependencies: ['information-systems'], expectedResult: 'Список ipRange.', resultContract: { outputKind: 'sourceCards', outputClass: 'ipRange', dependencyPaths: [{ comparisonBlockId: 'information-systems', sourceClass: 'IS', domain: 'ISZabbixMonitoringDomain', direction: 'source', targetClass: 'ipRange' }] }, warnings: []
+    }, {
+      id: 'vlans', name: 'VLANs', summary: 'Связанные VLAN.', resolvedEntities: ['ipRange', 'vlan'], relationPaths: ['Vlan2super'], dependencies: ['ip-ranges'], expectedResult: 'Список VLAN.', resultContract: { outputKind: 'sourceCards', outputClass: 'vlan', dependencyPaths: [{ comparisonBlockId: 'ip-ranges', sourceClass: 'ipRange', domain: 'Vlan2super', direction: 'destination', targetClass: 'vlan' }] }, warnings: []
+    }],
+    explanation: 'Подтвержденная цепочка.', warnings: []
+  };
   const response = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/plan`, {
     templateCode: '', baseSpecHash: '', currentSpec: { version: 1, params: { isName: { type: 'string', required: true } }, steps: [], result: { tables: [] } },
-    ...objectFlowPlanRequest('Для информационной системы (ИС) с Name равным isName получить связанные ipRange, затем связанные VLAN.')
+    intent, semanticPlan
   }, { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
 
-  assert.equal(response.statusCode, 422, response.body);
-  assert.equal(response.json.code, 'assistant_object_flow_invalid');
-  assert.equal(response.json.flow, undefined);
-  assert.deepEqual(response.json.rejectedFlow.operations, invalidFlow.operations);
-  assert.equal(response.json.rejectedFlow.selections[0].alias, 'informationSystems');
-  assert.ok(response.json.errors.some((item) => item.path === '$.operations[1].from' && item.availableAliases.some((alias) => alias.alias === 'ipRanges')), response.body);
-  const domainError = response.json.errors.find((item) => item.path === '$.flow.operations[2].domain');
-  assert.ok(domainError, response.body);
-  assert.ok(domainError.candidates.some((item) => item.domain === 'Vlan2super' && item.direction === 'destination' && item.sourceClass === 'ipRange' && item.targetClass === 'vlan'), response.body);
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json.success, true);
+  assert.deepEqual(response.json.flow.operations.map((operation) => [operation.type, operation.domain, operation.direction]), [
+    ['relation', 'ISZabbixMonitoringDomain', 'source'],
+    ['relation', 'Vlan2super', 'destination']
+  ]);
+  assert.equal(response.json.flow.operations.some((operation) => operation.as === 'invalidAliases' || operation.domain === 'ipRangeVlanDomain'), false);
+  assert.equal(response.json.diagnostics.objectFlow.fallback.kind, 'semanticContractCompiler');
   assert.deepEqual(response.json.diagnostics.objectFlow.relationRequirements, {
     kind: 'relationRequirements',
-    chains: [{ operations: [
-      { sourceClass: 'IS', domain: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source' },
-      { sourceClass: 'ipRange', domain: 'Vlan2super', targetClass: 'vlan', direction: 'destination' }
-    ] }]
+    chains: [
+      { operations: [{ sourceClass: 'IS', domain: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source' }] },
+      { operations: [{ sourceClass: 'ipRange', domain: 'Vlan2super', targetClass: 'vlan', direction: 'destination' }] }
+    ]
   });
   assert.equal(llm.requests, 1);
   assert.equal(backend.exitCode, null);
 });
 
-test('assistant reports the primary missing field when LiteLLM omits Object Flow identifiers', async (t) => {
+test('assistant repairs missing Object Flow identifiers from the confirmed semantic contract', async (t) => {
   const incompleteFlow = {
     version: 1,
     selections: [
@@ -2641,20 +2952,22 @@ test('assistant reports the primary missing field when LiteLLM omits Object Flow
   const backendOrigin = `http://127.0.0.1:${backendPort}`;
   const cookie = 'CMDBuild-Authorization=incomplete-object-flow-token';
   const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
-  const planRequest = objectFlowPlanRequest('Для информационной системы (ИС) с Name равным isName получить связанные ipRange, затем оставить ipRange, у которых есть связанный ACL с ipaddress в range.');
+  const planRequest = objectFlowPlanRequest('Для информационной системы (ИС) с Name равным isName получить связанные ipRange, затем оставить ipRange, у которых есть связанный ACL с ipaddress в range.', { outputClass: 'ipRange' });
   planRequest.semanticPlan.blocks[0].resolvedEntities = ['IS', 'ipRange', 'ACL'];
   const response = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/plan`, {
     templateCode: '', baseSpecHash: '', currentSpec: { version: 1, params: { isName: { type: 'string', required: true } }, steps: [], result: { tables: [] } },
     ...planRequest
   }, { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
 
-  assert.equal(response.statusCode, 422, response.body);
-  assert.equal(response.json.code, 'assistant_object_flow_invalid');
-  assert.equal(response.json.feedback.causes[0].kind, 'missingOperationField', response.body);
-  assert.match(response.json.feedback.summary, /отсутствует «with»/);
-  assert.ok(response.json.errors.some((item) => item.path === '$.operations[0].with' && item.code === 'assistant_missing_operation_field'), response.body);
-  assert.deepEqual(response.json.rejectedFlow.selections.map((selection) => selection.className), ['IS', 'ipRange']);
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json.success, true);
+  assert.equal(response.json.flow.publishedAlias, 'block_1');
+  assert.deepEqual(response.json.flow.operations.map((operation) => [operation.type, operation.domain, operation.targetClass]), [
+    ['relation', 'ISZabbixMonitoringDomain', 'ipRange']
+  ]);
   assert.equal(response.json.diagnostics.objectFlow.normalizations.length, 2);
+  assert.equal(response.json.diagnostics.objectFlow.fallback.kind, 'semanticContractCompiler');
+  assert.ok(response.json.warnings.some((warning) => /rebuilt it deterministically/i.test(warning)), response.body);
   assert.equal(llm.requests, 1);
   assert.equal(backend.exitCode, null);
 });
@@ -2696,7 +3009,12 @@ test('typed object-flow apply denies unsaved drafts without template create perm
 });
 
 test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild mappings', async (t) => {
-  const mock = await startMockCmdbuild(t);
+  const mock = await startMockCmdbuild(t, {
+    domains: [{
+      _id: 'AssetReference', name: 'AssetReference', source: 'routerG', sources: ['routerG'],
+      destination: 'ARM', destinations: ['ARM'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: 'N:N'
+    }]
+  });
   const backendPort = await freePort();
   const backend = await startBackend(t, backendPort, mock.origin, {
     CMDP_D2_BINARY: `${process.cwd()}/tests/fixtures/d2-render-stub.mjs`
@@ -2720,7 +3038,7 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
     rightPrefix: 'Selection 2.',
     rules: [{ action: 'include', negate: false, operator: 'equals', leftColumn: 'Code', leftRegex: '', rightColumn: 'Code', rightRegex: '' }]
   }]);
-  const source = 'router: Router\nswitch: Switch\nrouter -> switch: uplink';
+  const source = 'router: Router\nswitch: Switch';
   const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
     templateCode: 'NetworkImport',
     baseSpecHash: hashJson(currentSpec),
@@ -2747,11 +3065,22 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
   assert.ok(analyzed.json.catalog.classes.some((item) => item.name === 'ARM'));
   assert.equal(analyzed.json.proposal.catalogHash.length > 0, true);
   assert.deepEqual(analyzed.json.proposal.roles.map((role) => role.key).sort(), ['router', 'switch']);
-  assert.equal(analyzed.json.proposal.unresolved.length, 2);
+  assert.equal(analyzed.json.proposal.unresolved.length, 3);
+  assert.deepEqual(analyzed.json.proposal.relationRules.map((rule) => ({
+    d2ElementKey: rule.d2ElementKey,
+    d2ClassKey: rule.d2ClassKey,
+    d2Label: rule.d2Label,
+    mode: rule.mode
+  })), [{ d2ElementKey: 'router_switch', d2ClassKey: 'network_link', d2Label: 'network_link', mode: 'direct' }]);
+  assert.deepEqual(analyzed.json.proposal.relationRules[0].d2ElementKeys, ['router_switch']);
+  assert.match(analyzed.json.proposal.relationRules[0].d2Notes, /dedicated deterministic connection result/);
+  assert.equal(analyzed.json.proposal.templateGrammar.edges[0].classKey, 'network_link');
+  assert.match(analyzed.json.proposal.templateGrammar.edges[0].classNotes, /dedicated deterministic connection result/);
   const tamperedProposal = structuredClone(analyzed.json.proposal);
   tamperedProposal.sourceText += '\nchanged: true';
   const tampered = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
     currentSpec,
+    d2Source: source,
     proposal: tamperedProposal,
     roles: []
   }, headers);
@@ -2761,11 +3090,36 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
   tamperedTemplateProposal.template.title = 'Tampered title';
   const tamperedTemplate = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
     currentSpec,
+    d2Source: source,
     proposal: tamperedTemplateProposal,
     roles: []
   }, headers);
   assert.equal(tamperedTemplate.statusCode, 409, tamperedTemplate.body);
   assert.equal(tamperedTemplate.json.code, 'diagram_import_proposal_invalid');
+
+  const sourceRequired = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
+    currentSpec,
+    proposal: analyzed.json.proposal,
+    roles: []
+  }, headers);
+  assert.equal(sourceRequired.statusCode, 400, sourceRequired.body);
+  assert.equal(sourceRequired.json.code, 'diagram_import_source_required');
+
+  const incomplete = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
+    currentSpec,
+    d2Source: source,
+    proposal: analyzed.json.proposal,
+    roles: []
+  }, headers);
+  assert.equal(incomplete.statusCode, 422, incomplete.body);
+  assert.equal(incomplete.json.code, 'diagram_import_topology_unresolved');
+  assert.equal(incomplete.json.errors.length, 3);
+  assert.deepEqual(incomplete.json.errors.map((item) => item.displayName).sort(), ['network_link', 'router', 'switch']);
+  assert.deepEqual(incomplete.json.errors.map((item) => item.fields), [
+    ['D2 node router requires one Object Flow result.'],
+    ['D2 node switch requires one Object Flow result.'],
+    ['directionPolicy']
+  ]);
 
   const assistantConflict = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/interpret`, {
     prompt: 'Interpret roles',
@@ -2775,14 +3129,12 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
   }, headers);
   assert.equal(assistantConflict.statusCode, 409, assistantConflict.body);
   assert.equal(assistantConflict.json.code, 'diagram_import_editor_conflict');
+  const topologyContract = analyzed.json.proposal.relationRules[0];
   const roles = analyzed.json.proposal.roles.map((role) => {
     const sourceStage = role.key === 'router'
       ? { stageId: 'selection:routers', alias: 'routers', kind: 'selection', className: 'routerG' }
       : { stageId: 'selection:switches', alias: 'switches', kind: 'selection', className: 'ARM' };
-    return {
-    id: role.id,
-    selectedSemantic: 'object',
-    mapping: {
+    return d2RoleOverride(role, {
       source: sourceStage,
       primary: {
         className: role.key === 'router' ? 'routerG' : 'ARM',
@@ -2792,22 +3144,159 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
         filters: []
       },
       related: []
-    }
-  }; });
+    });
+  });
+  const structureTree = d2StructureTreeWithSources(analyzed.json.proposal, roles);
   const applied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
     currentSpec,
+    d2Source: source,
     proposal: analyzed.json.proposal,
-    roles
+    roles,
+    structureTree,
+    relationRules: [{
+      ...topologyContract,
+      id: 'router_switch_relation',
+      kind: 'connection',
+      directionPolicy: 'template',
+      parentRoleId: roles.find((role) => role.mapping.primary.className === 'routerG').id,
+      childRoleId: roles.find((role) => role.mapping.primary.className === 'ARM').id,
+      path: [{ kind: 'domain', name: 'AssetReference', domain: 'AssetReference', targetClass: 'ARM', direction: 'both' }]
+    }]
   }, headers);
 
   assert.equal(applied.statusCode, 200, applied.body);
   assert.equal(applied.json.success, true);
+  assert.equal(applied.json.d2Workflow.state, 'applied');
   assert.equal(applied.json.spec.result.diagrams[0].nodeMappings.length, 2);
-  assert.equal(applied.json.spec.result.diagrams[0].edgeMappings.length, 0);
+  assert.equal(applied.json.spec.result.diagrams[0].edgeMappings.length, 1);
+  assert.match(applied.json.spec.result.diagrams[0].edgeMappings[0].importRole.edgeClassNotes, /dedicated deterministic connection result/);
   assert.equal(applied.json.spec.result.diagrams[0].authoring.d2Import.source, source);
+  assert.match(applied.json.spec.result.diagrams[0].authoring.d2Import.structureHash, /^[0-9a-f]{64}$/);
   assert.equal(applied.json.spec.steps[0].as, 'routers');
-  assert.equal(applied.json.spec.steps.filter((step) => step.managedBy === 'd2ImportV3').length, 0);
+  assert.equal(applied.json.spec.steps.filter((step) => step.managedBy === 'd2ImportV3').length, 1);
   assert.equal(applied.json.spec.result.diagrams[0].authoring.d2Import.roleMappings.length, 2);
+  assert.equal(applied.json.spec.assistantDraft.d2Authoring.source, source);
+  assert.equal(applied.json.spec.assistantDraft.d2Authoring.sourceHash, applied.json.spec.result.diagrams[0].authoring.d2Import.sourceHash);
+  assert.equal(applied.json.spec.assistantDraft.d2Authoring.structureHash, applied.json.spec.result.diagrams[0].authoring.d2Import.structureHash);
+  assert.equal(applied.json.spec.assistantDraft.d2Authoring.overrides.roles.length, 2);
+
+  const relationCardApplied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
+    currentSpec,
+    d2Source: source,
+    proposal: analyzed.json.proposal,
+    roles,
+    structureTree,
+    relationRules: [{
+      ...topologyContract,
+      id: 'router_switch_acl',
+      kind: 'connection',
+      mode: 'relationCard',
+      directionPolicy: 'template',
+      parentRoleId: roles.find((role) => role.mapping.primary.className === 'routerG').id,
+      childRoleId: roles.find((role) => role.mapping.primary.className === 'ARM').id,
+      sourceStageId: 'selection:routers',
+      sourceField: 'Code',
+      targetField: 'Description',
+      labelField: 'Code'
+    }]
+  }, headers);
+  assert.equal(relationCardApplied.statusCode, 200, relationCardApplied.body);
+  assert.equal(relationCardApplied.json.spec.result.diagrams[0].edgeMappings[0].type, 'relationObject');
+  assert.equal(relationCardApplied.json.spec.result.diagrams[0].edgeMappings[0].from, 'routers');
+
+  const deterministicEndpointsApplied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
+    currentSpec,
+    d2Source: source,
+    proposal: analyzed.json.proposal,
+    roles,
+    structureTree,
+    relationRules: [{
+      ...topologyContract,
+      id: 'router_switch_deterministic',
+      kind: 'connection',
+      mode: 'deterministicEndpoints',
+      directionPolicy: 'dataFields',
+      parentRoleId: roles.find((role) => role.mapping.primary.className === 'routerG').id,
+      childRoleId: roles.find((role) => role.mapping.primary.className === 'ARM').id,
+      sourceStageId: 'match:matchedNetwork',
+      sourceField: 'Code',
+      targetField: 'Selection 2.Code',
+      labelField: ''
+    }]
+  }, headers);
+  assert.equal(deterministicEndpointsApplied.statusCode, 200, deterministicEndpointsApplied.body);
+  assert.equal(deterministicEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].type, 'computed');
+  assert.equal(deterministicEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].from, 'matchedNetwork');
+
+  const networkEndpointsApplied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
+    currentSpec,
+    d2Source: source,
+    proposal: analyzed.json.proposal,
+    roles,
+    structureTree,
+    relationRules: [{
+      ...topologyContract,
+      id: 'router_switch_network',
+      kind: 'connection',
+      mode: 'networkEndpoints',
+      directionPolicy: 'dataFields',
+      parentRoleId: roles.find((role) => role.mapping.primary.className === 'routerG').id,
+      childRoleId: roles.find((role) => role.mapping.primary.className === 'ARM').id,
+      sourceStageId: 'selection:routers',
+      sourceField: 'Code',
+      targetField: 'Description',
+      labelField: 'Code'
+    }]
+  }, headers);
+  assert.equal(networkEndpointsApplied.statusCode, 200, networkEndpointsApplied.body);
+  assert.equal(networkEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].type, 'networkEndpoints');
+  assert.equal(networkEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].endpointResolution.strategy, 'ipv4ObjectThenRange');
+
+  const missingDirectionPolicy = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
+    currentSpec,
+    d2Source: source,
+    proposal: analyzed.json.proposal,
+    roles,
+    structureTree,
+    relationRules: [{
+      ...topologyContract,
+      id: 'router_switch_network_missing_direction',
+      kind: 'connection',
+      mode: 'networkEndpoints',
+      directionPolicy: '',
+      directionPolicySuggestion: 'dataFields',
+      parentRoleId: roles.find((role) => role.mapping.primary.className === 'routerG').id,
+      childRoleId: roles.find((role) => role.mapping.primary.className === 'ARM').id,
+      sourceStageId: 'selection:routers',
+      sourceField: 'Code',
+      targetField: 'Description',
+      labelField: 'Code'
+    }]
+  }, headers);
+  assert.equal(missingDirectionPolicy.statusCode, 422, missingDirectionPolicy.body);
+  assert.equal(missingDirectionPolicy.json.code, 'diagram_import_topology_unresolved');
+  const directionError = missingDirectionPolicy.json.errors.find((item) => Array.isArray(item.fields) && item.fields.includes('directionPolicy'));
+  assert.ok(directionError, missingDirectionPolicy.body);
+  assert.equal(directionError.directionPolicySuggestion, topologyContract.directionPolicySuggestion);
+
+  const formattingRefresh = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/refresh`, {
+    templateCode: 'NetworkImport',
+    baseSpecHash: hashJson(currentSpec),
+    currentSpec: applied.json.spec,
+    d2Source: `${source}\n\n# presentation-only comment`
+  }, headers);
+  assert.equal(formattingRefresh.statusCode, 200, formattingRefresh.body);
+  assert.equal(formattingRefresh.json.d2Workflow.state, 'applied');
+  assert.equal(formattingRefresh.json.spec.result.diagrams[0].authoring.d2Import.source.endsWith('# presentation-only comment'), true);
+
+  const structuralRefresh = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/refresh`, {
+    templateCode: 'NetworkImport',
+    baseSpecHash: hashJson(currentSpec),
+    currentSpec: applied.json.spec,
+    d2Source: `${source}\nswitch -> router: reverse`
+  }, headers);
+  assert.equal(structuralRefresh.statusCode, 409, structuralRefresh.body);
+  assert.equal(structuralRefresh.json.code, 'diagram_import_source_changed');
 
   const importsRejected = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
     templateCode: 'NetworkImport',
@@ -2816,6 +3305,217 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
   }, headers);
   assert.equal(importsRejected.statusCode, 422, importsRejected.body);
   assert.match(importsRejected.json.message, /imports are not allowed/i);
+  assert.equal(backend.exitCode, null);
+});
+
+test('network endpoint edges prefer exact IP objects, then ranges, and retain unresolved endpoints', async (t) => {
+  const mock = await startMockCmdbuild(t);
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=network-endpoint-test-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=20`, {
+    template: {
+      code: 'NetworkEndpoints',
+      spec: {
+        version: 1,
+        steps: [{ type: 'selectCards', as: 'dummy', className: 'ARM', filters: [], columns: ['Code'], limit: 1 }],
+        result: {
+          tables: [{ name: 'dummy', columns: ['Code'] }],
+          diagrams: [{
+            id: 'network-endpoints', name: 'networkEndpoints', type: 'topology',
+            nodeMappings: [
+              { id: 'host', staticRows: [{ _id: 'host-1', Description: 'Host 10.0.0.8', ip: '10.0.0.8' }], fields: { id: '_id', label: 'Description' }, endpointFields: ['ip'], importRole: { key: 'host' } },
+              { id: 'range', staticRows: [{ _id: 'range-1', Description: 'Network 10.0.0.0/24', range: '10.0.0.0/24' }], fields: { id: '_id', label: 'Description' }, endpointFields: ['range'], importRole: { key: 'range' } }
+            ],
+            edgeMappings: [{
+              id: 'acl-edge', type: 'networkEndpoints', staticRows: [
+                { sourceIp: '10.0.0.8', targetIp: '10.0.0.77', label: 'ACL allow' },
+                { sourceIp: '10.0.0.8', targetIp: '203.0.113.5', label: 'ACL outside' },
+                { sourceIp: '10.0.0.77', targetIp: '10.0.0.8', label: 'ACL reverse roles' }
+              ],
+              fields: { source: 'sourceIp', target: 'targetIp', label: 'label' },
+              endpointResolution: { strategy: 'ipv4ObjectThenRange', directionPolicy: 'dataFields' },
+              importRole: { key: 'acl-edge', sourceKey: 'host', targetKey: 'range' }
+            }]
+          }]
+        }
+      }
+    },
+    params: {}
+  }, headers);
+  assert.equal(preview.statusCode, 200, preview.body);
+  const diagram = preview.json.result.diagrams[0];
+  assert.equal(diagram.edges.length, 3);
+  const resolved = diagram.edges.find((edge) => edge.label === 'ACL allow');
+  assert.equal(diagram.nodes.find((node) => node.id === resolved.source).businessId, 'host-1');
+  assert.equal(diagram.nodes.find((node) => node.id === resolved.target).businessId, 'range-1');
+  const outside = diagram.edges.find((edge) => edge.label === 'ACL outside');
+  assert.equal(outside.targetMissing, true);
+  assert.ok(diagram.nodes.some((node) => node.fakeEndpoint && node.label === 'Заглушка'));
+  assert.equal(diagram.nodes.some((node) => String(node.label || '').includes('203.0.113.5')), false);
+  assert.ok(diagram.warnings.some((warning) => warning.includes('203.0.113.5')));
+  const reversed = diagram.edges.find((edge) => edge.label === 'ACL reverse roles');
+  assert.equal(diagram.nodes.find((node) => node.id === reversed.source).businessId, 'range-1');
+  assert.equal(diagram.nodes.find((node) => node.id === reversed.target).businessId, 'host-1');
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 preview keeps role-aware IPv4 edges and persisted structure-tree placement deterministic', async (t) => {
+  const mock = await startMockCmdbuild(t);
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-role-placement-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=20`, {
+    template: {
+      code: 'RoleAwarePlacement',
+      spec: {
+        version: 1,
+        steps: [{ type: 'selectCards', as: 'dummy', className: 'ARM', filters: [], columns: ['Code'], limit: 1 }],
+        result: {
+          tables: [{ name: 'dummy', columns: ['Code'] }],
+          diagrams: [{
+            id: 'role-aware-placement', name: 'roleAwarePlacement', type: 'topology',
+            groupMappings: [
+              { id: 'external-group', staticRows: [{ _id: 'external-container', Description: 'External systems' }], fields: { id: '_id', label: 'Description' }, importRole: { key: 'external-group', structureItemId: 'external' } },
+              { id: 'dmz-group', staticRows: [{ _id: 'dmz-container', Description: 'DMZ' }], fields: { id: '_id', label: 'Description' }, importRole: { key: 'dmz-group', structureItemId: 'dmz' } },
+              { id: 'target-group', staticRows: [{ _id: 'target-container', Description: 'Target zone' }], fields: { id: '_id', label: 'Description' }, importRole: { key: 'target-group', structureItemId: 'target' } }
+            ],
+            nodeMappings: [
+              { id: 'external', staticRows: [{ _id: 'external-1', Description: 'External system', ip: '10.10.0.8', Class: 'IS' }], fields: { id: '_id', label: 'Description' }, endpointFields: ['ip'], importRole: { key: 'external-system', structureItemId: 'external-node', parentStructureItemId: 'external' } },
+              { id: 'internal', staticRows: [{ _id: 'internal-1', Description: 'Internal system', ip: '10.10.0.8', Class: 'IS' }], fields: { id: '_id', label: 'Description' }, endpointFields: ['ip'], importRole: { key: 'internal-system', structureItemId: 'internal-node' } },
+              { id: 'vlans-dmz', staticRows: [{ _id: 'vlan-dmz', Description: 'DMZ VLAN', isNAT: true, Class: 'vlan' }], fields: { id: '_id', label: 'Description' }, importRole: { key: 'vlan', structureItemId: 'vlan-dmz', parentStructureItemId: 'dmz' } },
+              { id: 'vlans-target', staticRows: [{ _id: 'vlan-target', Description: 'Target VLAN', isNAT: false, Class: 'vlan' }], fields: { id: '_id', label: 'Description' }, importRole: { key: 'vlan', structureItemId: 'vlan-target', parentStructureItemId: 'target' } }
+            ],
+            edgeMappings: [{
+              id: 'role-aware-edge', type: 'networkEndpoints', staticRows: [{ sourceIp: '10.10.0.8', targetIp: '10.10.0.8', label: 'ACL' }],
+              fields: { source: 'sourceIp', target: 'targetIp', label: 'label' }, endpointResolution: { strategy: 'ipv4ObjectThenRange', directionPolicy: 'template' },
+              importRole: { key: 'acl', sourceKey: 'external-system', targetKey: 'internal-system' }
+            }],
+            structureTree: {
+              version: 1,
+              items: [
+                { id: 'external', roleId: 'external-group', templateElementKey: 'external-group', parentId: '', sourceStageId: '' },
+                { id: 'external-node', roleId: 'external-system', templateElementKey: 'external-system', parentId: 'external', sourceStageId: 'static' },
+                { id: 'dmz', roleId: 'dmz-group', templateElementKey: 'dmz-group', parentId: '', sourceStageId: '' },
+                { id: 'target', roleId: 'target-group', templateElementKey: 'target-group', parentId: '', sourceStageId: '' },
+                { id: 'vlan-dmz', roleId: 'vlan', templateElementKey: 'vlan', parentId: 'dmz', sourceStageId: 'static' },
+                { id: 'vlan-target', roleId: 'vlan', templateElementKey: 'vlan', parentId: 'target', sourceStageId: 'static' }
+              ]
+            }
+          }]
+        }
+      }
+    },
+    params: {}
+  }, headers);
+  assert.equal(preview.statusCode, 200, preview.body);
+  const diagram = preview.json.result.diagrams[0];
+  const nodeByBusinessId = new Map(diagram.nodes.map((node) => [node.businessId, node]));
+  assert.equal(nodeByBusinessId.get('vlan-dmz').group, diagram.groups.find((group) => group.businessId === 'dmz-container').id);
+  assert.equal(nodeByBusinessId.get('vlan-target').group, diagram.groups.find((group) => group.businessId === 'target-container').id);
+  const edge = diagram.edges.find((item) => item.label === 'ACL');
+  assert.equal(nodeByBusinessId.get('external-1').id, edge.source);
+  assert.equal(nodeByBusinessId.get('internal-1').id, edge.target);
+  assert.equal(backend.exitCode, null);
+});
+
+test('Extraction preview skips diagram building and D2 rendering', async (t) => {
+  const mock = await startMockCmdbuild(t);
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=table-extraction-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=20&includeDiagrams=false`, {
+    template: {
+      code: 'TableExtractionOnly',
+      spec: {
+        version: 1,
+        steps: [{ type: 'selectCards', as: 'arms', className: 'ARM', filters: [], columns: ['Code'], limit: 20 }],
+        result: {
+          tables: [{ name: 'arms', columns: ['Code'] }],
+          diagrams: [{
+            id: 'must-not-build',
+            name: 'mustNotBuild',
+            type: 'topology',
+            nodeMappings: [{
+              id: 'static-node',
+              staticRows: [{ _id: 'node-1', Description: 'Diagram node' }],
+              fields: { id: '_id', label: 'Description' },
+              importRole: { key: 'static-node' }
+            }],
+            edgeMappings: [{
+              id: 'invalid-network-endpoint-policy',
+              type: 'networkEndpoints',
+              staticRows: [{ sourceIp: '10.0.0.1', targetIp: '10.0.0.2' }],
+              fields: { source: 'sourceIp', target: 'targetIp' },
+              endpointResolution: { strategy: 'ipv4ObjectThenRange' }
+            }]
+          }]
+        }
+      }
+    },
+    params: {}
+  }, headers);
+  assert.equal(preview.statusCode, 200, preview.body);
+  assert.equal(preview.json.success, true);
+  assert.deepEqual(preview.json.result.diagrams, []);
+  assert.ok(preview.json.result.tables.find((table) => table.name === 'arms')?.rows.length > 0);
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 preview executes only diagram mapping dependencies', async (t) => {
+  const mock = await startMockCmdbuild(t);
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-scope-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=20&executionScope=diagrams`, {
+    template: {
+      code: 'DiagramScopeOnly',
+      spec: {
+        version: 1,
+        steps: [
+          { type: 'selectCards', as: 'unrelatedRouter', className: 'routerG', filters: [], columns: ['Code'], limit: 20 },
+          { type: 'selectCards', as: 'diagramArms', className: 'ARM', filters: [], columns: ['Code', 'Description'], limit: 20 }
+        ],
+        result: {
+          tables: [{ name: 'diagramArms', columns: ['Code', 'Description'] }],
+          diagrams: [{
+            id: 'scope-diagram',
+            name: 'scopeDiagram',
+            type: 'topology',
+            nodeMappings: [{
+              id: 'scope-nodes',
+              from: 'diagramArms',
+              fields: { id: '_id', label: 'Description' },
+              importRole: { key: 'arm' }
+            }]
+          }]
+        }
+      }
+    },
+    params: {}
+  }, headers);
+  assert.equal(preview.statusCode, 200, preview.body);
+  assert.deepEqual(preview.json.result.trace.map((item) => item.as), ['diagramArms']);
+  assert.deepEqual(preview.json.result.executionScope, {
+    kind: 'diagrams',
+    includedAliases: ['diagramArms'],
+    skippedAliases: ['unrelatedRouter']
+  });
+  assert.equal(preview.json.result.diagrams[0].nodes.length, 3);
+  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/routerG/cards')), false);
+  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/ARM/cards')), true);
   assert.equal(backend.exitCode, null);
 });
 
@@ -2870,7 +3570,7 @@ test('D2 import analysis keeps the structural proposal when preview rendering is
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 import keeps untyped containers structural and places class-mapped objects inside them', async (t) => {
+test('D2 import keeps untyped containers as source-free frames and places mapped nodes inside them', async (t) => {
   const mock = await startMockCmdbuild(t);
   const backendPort = await freePort();
   const backend = await startBackend(t, backendPort, mock.origin);
@@ -2891,13 +3591,11 @@ test('D2 import keeps untyped containers structural and places class-mapped obje
   assert.ok(workstation);
   assert.ok(users);
   assert.equal(users.kind, 'untypedContainer');
-  assert.equal(users.selectedSemantic, 'static');
+  assert.equal(users.visualKind, 'container');
+  assert.equal(analyzed.json.proposal.structureTree.items.some((item) => item.roleId === users.id && item.sourceStageId === ''), true);
   assert.equal(analyzed.json.proposal.roles.some((role) => role.key === 'users.operator'), false);
-  assert.equal(analyzed.json.proposal.unresolved.length, 1);
-  const roles = [{
-    id: workstation.id,
-    selectedSemantic: 'object',
-    mapping: {
+  assert.equal(analyzed.json.proposal.unresolved.length, 2);
+  const roles = [d2RoleOverride(workstation, {
       source: { stageId: 'selection:workstations', alias: 'workstations', kind: 'selection', className: 'ARM' },
       primary: {
         className: 'ARM',
@@ -2907,28 +3605,26 @@ test('D2 import keeps untyped containers structural and places class-mapped obje
         filters: []
       },
       related: []
-    }
-  }, {
-    id: users.id,
-    selectedSemantic: 'static',
-    mapping: users.mapping
-  }];
+    }), d2RoleOverride(users)];
+  const structureTree = d2StructureTreeWithSources(analyzed.json.proposal, roles);
 
   const applied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
     currentSpec,
+    d2Source: source,
     proposal: analyzed.json.proposal,
     roles,
-    placementRules: [{ id: 'users_workstations', parentRoleId: users.id, childRoleId: workstation.id }]
+    structureTree
   }, headers);
   assert.equal(applied.statusCode, 200, applied.body);
   const diagram = applied.json.spec.result.diagrams[0];
-  assert.equal(diagram.nodeMappings.length, 1);
-  assert.equal(diagram.nodeMappings[0].importRole.key, 'workstation');
+  assert.equal(diagram.nodeMappings.length, 2);
+  assert.equal(diagram.nodeMappings.every((mapping) => mapping.importRole.key === 'workstation'), true);
   assert.equal(diagram.groupMappings.length, 1);
   assert.equal(diagram.groupMappings[0].importRole.key, 'users');
   assert.deepEqual(diagram.hierarchyMappings, []);
   assert.equal(diagram.authoring.d2Import.version, 3);
-  assert.equal(diagram.placementRules[0].parentRoleKey, 'users');
+  assert.equal(diagram.placementRules, undefined);
+  assert.deepEqual(diagram.authoring.d2Import.structureTree, structureTree);
 
   const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=10`, {
     template: {
@@ -2941,22 +3637,36 @@ test('D2 import keeps untyped containers structural and places class-mapped obje
   const previewDiagram = preview.json.result.diagrams[0];
   assert.ok(previewDiagram.nodes.length > 0);
   assert.equal(previewDiagram.groups.length, 1);
-  assert.equal(previewDiagram.nodes.every((node) => node.group === previewDiagram.groups[0].id), true);
+  assert.equal(previewDiagram.nodes.every((node) => node.group === previewDiagram.groups[0].id), true, JSON.stringify(previewDiagram));
   assert.doesNotMatch(previewDiagram.d2.source, /users\.operator|users\.administrator/);
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 interpretation retries an invalid container object semantic with allowed values', async (t) => {
+test('D2 interpretation retries an invalid container visual kind with the node/container contract', async (t) => {
   const readRoles = ({ request }) => JSON.parse(request.messages.at(-1).content).roles;
   const llm = await startLiteLlmStub(t, {
     responses: [
       ({ request }) => {
-        const role = readRoles({ request })[0];
-        return { decisions: [{ roleId: role.id, semantic: 'object', confidence: 'high', reason: 'Incorrect container decision.' }] };
+        return {
+          decisions: readRoles({ request }).map((role) => ({
+            roleId: role.id,
+            visualKind: 'node',
+            confidence: 'high',
+            reason: role.isContainer ? 'Incorrect container decision.' : 'Node decision.'
+          }))
+        };
       },
       ({ request }) => {
-        const role = readRoles({ request })[0];
-        return { decisions: [{ roleId: role.id, semantic: 'group', confidence: 'high', reason: 'Container groups Application cards.' }] };
+        return {
+          decisions: readRoles({ request }).map((role) => role.isContainer
+            ? {
+                roleId: role.id,
+                visualKind: 'container',
+                confidence: 'high',
+                reason: 'Container remains a structural D2 container.'
+              }
+            : { roleId: role.id, visualKind: 'node', confidence: 'high', reason: 'Node decision.' })
+        };
       }
     ]
   });
@@ -2987,7 +3697,9 @@ test('D2 interpretation retries an invalid container object semantic with allowe
   assert.equal(analyzed.statusCode, 200, analyzed.body);
   const containerRole = analyzed.json.proposal.roles.find((role) => role.key === 'application_group');
   assert.ok(containerRole, analyzed.body);
-  assert.deepEqual(containerRole.options, ['composite', 'group', 'static']);
+  assert.equal(containerRole.visualKind, 'container');
+  assert.equal(containerRole.repeatModeOptions, undefined);
+  assert.deepEqual(containerRole.allowedOwnerRoleIds, []);
 
   const interpreted = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/interpret`, {
     prompt: 'Interpret the supplied D2 roles.',
@@ -2997,26 +3709,90 @@ test('D2 interpretation retries an invalid container object semantic with allowe
   }, headers);
 
   assert.equal(interpreted.statusCode, 200, interpreted.body);
-  assert.equal(interpreted.json.decisions[0].roleId, containerRole.id);
-  assert.equal(interpreted.json.decisions[0].semantic, 'group');
+  const decision = interpreted.json.decisions.find((item) => item.roleId === containerRole.id);
+  assert.equal(decision.visualKind, 'container');
+  assert.equal(decision.repeatMode, undefined);
+  assert.equal(decision.ownerRoleId, undefined);
   assert.equal(interpreted.json.diagnostics.attempts, 2);
   assert.equal(llm.requests, 2);
-  const correction = JSON.parse(llm.lastRequest.messages.at(-1).content).correction;
-  assert.deepEqual(correction.invalidSemantics[0], {
-    roleId: containerRole.id,
-    displayName: 'application_group',
-    receivedSemantic: 'object',
-    allowedSemantics: ['composite', 'group', 'static']
-  });
+  const correctionMessage = llm.lastRequest.messages.find((message) => (
+    message.role === 'system' && String(message.content || '').includes('previous response was rejected')
+  ));
+  assert.ok(correctionMessage, llm.lastRequest.messages);
+  assert.match(correctionMessage.content, new RegExp(containerRole.id));
+  assert.match(correctionMessage.content, /allowed visual kind/);
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 interpretation reports a repeated invalid container semantic by visible role name', async (t) => {
+test('D2 interpretation accepts a container without role-level repeat or owner settings', async (t) => {
+  const readRoles = ({ request }) => JSON.parse(request.messages.at(-1).content).roles;
   const llm = await startLiteLlmStub(t, {
-    responses: [({ request }) => {
-      const role = JSON.parse(request.messages.at(-1).content).roles[0];
-      return { decisions: [{ roleId: role.id, semantic: 'object', reason: 'Invalid container decision.' }] };
+    responses: [({ request }) => ({
+      decisions: readRoles({ request }).map((role) => role.isContainer
+        ? { roleId: role.id, visualKind: 'container', confidence: 'medium', reason: 'Structural visual frame.' }
+        : { roleId: role.id, visualKind: 'node', confidence: 'medium', reason: 'Node decision.' })
+    })]
+  });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{
+      _id: 1,
+      Code: 'Cst_QueryTool',
+      RootCode: 'Cst_QueryTool',
+      Active: true,
+      RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } })
     }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, {
+    LITELLM_API_KEY: 'unit-test-key',
+    CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin
+  });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-repeat-fallback-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([{ alias: 'applications', className: 'ARM', columns: ['Code', 'Description'] }]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'RepeatFallbackImport',
+    currentSpec,
+    d2Source: 'container-class users: { operator: Operator; administrator: Administrator }'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const containerRole = analyzed.json.proposal.roles.find((role) => role.key === 'application_group');
+  assert.ok(containerRole, analyzed.body);
+
+  const interpreted = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/interpret`, {
+    prompt: 'Interpret the supplied D2 roles.',
+    currentSpec,
+    proposal: analyzed.json.proposal,
+    roles: []
+  }, headers);
+
+  assert.equal(interpreted.statusCode, 200, interpreted.body);
+  assert.equal(interpreted.json.decisions.find((item) => item.roleId === containerRole.id).visualKind, 'container');
+  assert.equal(interpreted.json.diagnostics.attempts, 1);
+  assert.equal(llm.requests, 1);
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 interpretation reports an invalid container visual kind by visible role name', async (t) => {
+  const llm = await startLiteLlmStub(t, {
+    responses: [
+      ({ request }) => ({
+        decisions: JSON.parse(request.messages.at(-1).content).roles.map((role) => ({
+          roleId: role.id,
+          visualKind: 'node',
+          reason: role.isContainer ? 'Invalid container decision.' : 'Node decision.'
+        }))
+      }),
+      ({ request }) => ({
+        decisions: JSON.parse(request.messages.at(-1).content).roles.map((role) => ({
+          roleId: role.id,
+          visualKind: 'node',
+          reason: role.isContainer ? 'Invalid container decision again.' : 'Node decision.'
+        }))
+      })
+    ]
   });
   const mock = await startMockCmdbuild(t, {
     configCards: [{
@@ -3054,26 +3830,278 @@ test('D2 interpretation reports a repeated invalid container semantic by visible
   assert.equal(interpreted.statusCode, 422, interpreted.body);
   assert.equal(interpreted.json.code, 'assistant_diagram_stage_invalid');
   assert.equal(llm.requests, 2);
-  assert.deepEqual(interpreted.json.errors[0].allowedSemantics, ['composite', 'group', 'static']);
+  assert.deepEqual(interpreted.json.errors[0].allowedVisualKinds, ['container']);
   assert.equal(interpreted.json.errors[0].displayName, 'application_group');
   assert.match(interpreted.json.errors[0].message, /application_group/);
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 mapping keeps valid partial mappings and reports every uncovered dynamic role', async (t) => {
+test('D2 mapping accepts only catalog-offered direct path ids and materializes the selected path', async (t) => {
   const llm = await startLiteLlmStub(t, {
     responses: [
       ({ request }) => {
         const payload = JSON.parse(request.messages.at(-1).content);
-        const role = payload.roles.find((item) => item.isContainer);
-        return { mappings: [{ roleId: role.id, stageId: payload.stages[0].id, reason: 'Group source.' }] };
+        return {
+          mappings: payload.roles.map((role, index) => ({ roleId: role.id, stageId: payload.stages[index].id, reason: 'Mapped to the corresponding deterministic stage.' }))
+        };
       },
       ({ request }) => {
         const payload = JSON.parse(request.messages.at(-1).content);
-        const role = payload.roles[0];
-        return { mappings: [], unresolved: [{ roleId: role.id, reason: 'noCompatibleStage', message: 'No dedicated source stage exists.' }] };
+        return { relationRules: [{ d2ElementKey: payload.topology[0].d2ElementKey, mode: 'direct', pathId: 'not-offered' }] };
+      },
+      ({ request }) => {
+        const payload = JSON.parse(request.messages.at(-1).content);
+        const connection = payload.topology[0];
+        assert.ok(connection.directPaths.length >= 1);
+        assert.deepEqual(connection.directPaths.map((item) => [item.sourceClass, item.targetClass]), [['routerG', 'ARM']]);
+        return { relationRules: [{ d2ElementKey: connection.d2ElementKey, mode: 'direct', pathId: 'not-offered' }] };
+      },
+      ({ request }) => {
+        const payload = JSON.parse(request.messages.at(-1).content);
+        return {
+          mappings: payload.roles.map((role, index) => ({ roleId: role.id, stageId: payload.stages[index].id, reason: 'Mapped to the corresponding deterministic stage.' }))
+        };
+      },
+      ({ request }) => {
+        const payload = JSON.parse(request.messages.at(-1).content);
+        const connection = payload.topology[0];
+        const path = connection.directPaths.find((item) => item.sourceClass === 'routerG' && item.targetClass === 'ARM');
+        return {
+          relationRules: [{ d2ElementKey: connection.d2ElementKey, mode: 'direct', pathId: path.id }]
+        };
       }
     ]
+  });
+  const mock = await startMockCmdbuild(t, {
+    domains: [{
+      _id: 'AssetReference', name: 'AssetReference', source: 'routerG', sources: ['routerG'],
+      destination: 'ARM', destinations: ['ARM'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: 'N:N'
+    }, {
+      _id: 'AclRouter', name: 'AclRouter', source: 'ACL', sources: ['ACL'],
+      destination: 'routerG', destinations: ['routerG'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: 'N:N'
+    }],
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } }) }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-catalog-path-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([
+    { alias: 'routers', className: 'routerG', columns: ['Code', 'Description'] },
+    { alias: 'workstations', className: 'ARM', columns: ['Code', 'Description'] },
+    { alias: 'acls', className: 'ACL', columns: ['Code', 'Description'] }
+  ]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'CatalogPathImport', currentSpec, d2Source: 'router: Router\nworkstation: Workstation\nrouter -> workstation: link'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
+  const invalid = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
+    prompt: 'Map the roles and connection.', currentSpec, proposal: analyzed.json.proposal, roles, traversalDepth: 1
+  }, headers);
+  assert.equal(invalid.statusCode, 422, invalid.body);
+  assert.equal(invalid.json.errors[0].code, 'diagram_direct_path_not_offered');
+
+  const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
+    prompt: 'Map the roles and connection.', currentSpec, proposal: analyzed.json.proposal, roles, traversalDepth: 1
+  }, headers);
+  assert.equal(mapped.statusCode, 200, mapped.body);
+  assert.equal(mapped.json.relationRules.length, 1);
+  assert.deepEqual(mapped.json.relationRules[0].path, [{ kind: 'domain', name: 'AssetReference', targetClass: 'ARM', direction: 'direct' }]);
+  assert.equal(mapped.json.relationRules[0].pathId, undefined);
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 mapping aggregates same-role arrows by D2 relation class and preserves class Notes', async (t) => {
+  const llm = await startLiteLlmStub(t, {
+    responses: [
+      ({ request }) => {
+        const payload = JSON.parse(request.messages.at(-1).content);
+        return {
+          mappings: payload.roles.map((role) => ({
+            roleId: role.id,
+            stageId: payload.stages.find((stage) => stage.id === 'selection:applications').id,
+            reason: 'Applications are materialized by the selected result.'
+          }))
+        };
+      },
+      ({ request }) => {
+        const payload = JSON.parse(request.messages.at(-1).content);
+        const connection = payload.topology[0];
+        const candidate = connection.networkEndpointStages.find((item) => item.sourceStageId === 'selection:aclIntrasystem');
+        assert.equal(connection.d2ClassKey, 'acl_intrasystem');
+        assert.deepEqual(connection.d2ElementKeys.sort(), ['application_a_b_1', 'application_a_b_2']);
+        assert.match(connection.notes, /Dedicated ACL result/);
+        assert.equal(connection.sourceRoleId, connection.targetRoleId);
+        assert.equal(connection.dedicatedResultRequired, true);
+        assert.deepEqual(connection.d2ClassKeys, ['acl_intrasystem']);
+        assert.deepEqual(connection.exampleLabels.sort(), ['TCP 443', 'UDP 443']);
+        return {
+          relationRules: [{
+            d2ElementKey: connection.d2ElementKey,
+            mode: 'networkEndpoints',
+            candidateId: candidate.candidateId,
+            sourceStageId: candidate.sourceStageId,
+            sourceField: candidate.sourceField,
+            targetField: candidate.targetField,
+            labelField: candidate.labelField
+          }]
+        };
+      }
+    ]
+  });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } }) }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-same-role-connection-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([
+    { alias: 'applications', className: 'ApplicG', columns: ['_id', 'Code', 'Description'] },
+    { alias: 'aclIntrasystem', className: 'ACL', columns: ['_id', 'ipaddress', 'dipaddress', 'Description'] }
+  ]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'SameRoleConnections', currentSpec, d2Source: 'same-role-edges'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  assert.equal(analyzed.json.proposal.relationRules.length, 1);
+  assert.equal(analyzed.json.proposal.relationRules[0].d2ClassKey, 'acl_intrasystem');
+  assert.equal(analyzed.json.proposal.relationRules[0].parentRoleId, analyzed.json.proposal.relationRules[0].childRoleId);
+  assert.deepEqual(analyzed.json.proposal.relationRules[0].d2ElementKeys.sort(), ['application_a_b_1', 'application_a_b_2']);
+  assert.match(analyzed.json.proposal.relationRules[0].d2Notes, /Dedicated ACL result/);
+
+  const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
+  const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
+    prompt: 'Map applications and one dedicated ACL relation result.', currentSpec, proposal: analyzed.json.proposal, roles
+  }, headers);
+  assert.equal(mapped.statusCode, 200, mapped.body);
+  assert.equal(mapped.json.mapping.status, 'complete');
+  assert.deepEqual([mapped.json.mapping.requiredConnections, mapped.json.mapping.mappedConnections], [1, 1]);
+  assert.equal(mapped.json.relationRules.length, 1);
+  assert.deepEqual(mapped.json.relationRules[0].d2ElementKeys.sort(), ['application_a_b_1', 'application_a_b_2']);
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 mapping reports a missing dedicated result for a same-role relation class', async (t) => {
+  const llm = await startLiteLlmStub(t, {
+    responses: [
+      ({ request }) => {
+        const payload = JSON.parse(request.messages.at(-1).content);
+        return { mappings: payload.roles.map((role) => ({ roleId: role.id, stageId: 'selection:applications', reason: 'Application result.' })) };
+      },
+      () => ({ relationRules: [] })
+    ]
+  });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } }) }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-missing-connection-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([
+    { alias: 'applications', className: 'ApplicG', columns: ['_id', 'Code', 'Description'] },
+    { alias: 'aclIntrasystem', className: 'ACL', columns: ['_id', 'ipaddress', 'dipaddress', 'Description'] }
+  ]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'MissingDedicatedConnection', currentSpec, d2Source: 'same-role-edges'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
+  const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
+    prompt: 'Map only confirmed D2 relation results.', currentSpec, proposal: analyzed.json.proposal, roles
+  }, headers);
+
+  assert.equal(mapped.statusCode, 200, mapped.body);
+  assert.equal(mapped.json.mapping.status, 'partial');
+  assert.deepEqual(mapped.json.mapping.objectCoverage, { mapped: 1, required: 1 });
+  assert.deepEqual(mapped.json.mapping.connectionCoverage, { mapped: 0, required: 1 });
+  assert.equal(mapped.json.relationRules.length, 0);
+  assert.equal(mapped.json.connectionUnresolved.length, 1);
+  assert.equal(mapped.json.connectionUnresolved[0].code, 'missingDedicatedConnectionResult');
+  assert.equal(mapped.json.connectionUnresolved[0].d2ClassKey, 'acl_intrasystem');
+  assert.equal(mapped.json.mapping.unresolved[0].family, 'connections');
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 mapping requires separate named Object Flow results for different D2 relation classes', async (t) => {
+  const llm = await startLiteLlmStub(t, {
+    responses: [
+      ({ request }) => {
+        const payload = JSON.parse(request.messages.at(-1).content);
+        return {
+          mappings: payload.roles.map((role) => ({
+            roleId: role.id,
+            stageId: 'selection:applications',
+            reason: 'Application result.'
+          }))
+        };
+      },
+      ({ request }) => {
+        const payload = JSON.parse(request.messages.at(-1).content);
+        const shared = payload.topology[0].networkEndpointStages.find((item) => item.sourceStageId === 'selection:aclHttp');
+        return {
+          relationRules: payload.topology.map((connection) => ({
+            d2ElementKey: connection.d2ElementKey,
+            mode: 'networkEndpoints',
+            candidateId: shared.candidateId,
+            sourceStageId: shared.sourceStageId,
+            sourceField: shared.sourceField,
+            targetField: shared.targetField,
+            labelField: shared.labelField
+          }))
+        };
+      }
+    ]
+  });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } }) }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-dedicated-connection-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([
+    { alias: 'applications', className: 'ApplicG', columns: ['_id', 'Code', 'Description'] },
+    { alias: 'aclHttp', className: 'ACL', columns: ['_id', 'ipaddress', 'dipaddress', 'Description'] },
+    { alias: 'applicationDependencies', className: 'ACL', columns: ['_id', 'ipaddress', 'dipaddress', 'Description'] }
+  ]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'DedicatedConnections', currentSpec, d2Source: 'multiple-relation-classes'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  assert.deepEqual(analyzed.json.proposal.relationRules.map((rule) => rule.d2ClassKey).sort(), ['acl_intrasystem', 'application_dependency']);
+
+  const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
+  const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
+    prompt: 'Map each D2 relation class to a dedicated result.', currentSpec, proposal: analyzed.json.proposal, roles
+  }, headers);
+  assert.equal(mapped.statusCode, 200, mapped.body);
+  assert.equal(mapped.json.mapping.status, 'partial');
+  assert.deepEqual([mapped.json.mapping.requiredConnections, mapped.json.mapping.mappedConnections], [2, 0]);
+  assert.equal(mapped.json.relationRules.length, 0);
+  assert.equal(mapped.json.connectionUnresolved.length, 2);
+  assert.ok(mapped.json.connectionUnresolved.every((item) => item.code === 'sharedConnectionResult'), mapped.body);
+  assert.match(mapped.json.connectionUnresolved[0].message, /separate named result/);
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 mapping reports an uncovered node role without inventing a container stage', async (t) => {
+  const llm = await startLiteLlmStub(t, {
+    responses: [({ request }) => {
+      const payload = JSON.parse(request.messages.at(-1).content);
+      const role = payload.roles.find((item) => !item.isContainer);
+      return { mappings: [], unresolved: [{ roleId: role.id, reason: 'noCompatibleStage', message: 'No dedicated source stage exists.' }] };
+    }]
   });
   const mock = await startMockCmdbuild(t, {
     configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } }) }]
@@ -3089,39 +4117,31 @@ test('D2 mapping keeps valid partial mappings and reports every uncovered dynami
     templateCode: 'PartialMappingImport', currentSpec, d2Source: 'container-class users: { operator: Operator; administrator: Administrator }'
   }, headers);
   assert.equal(analyzed.statusCode, 200, analyzed.body);
-  const roles = analyzed.json.proposal.roles.map((role) => ({
-    id: role.id,
-    selectedSemantic: role.key === 'application_group' ? 'group' : 'object',
-    mapping: role.mapping
-  }));
+  const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
   const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
     prompt: 'Map every dynamic role or state why no source exists.', currentSpec, proposal: analyzed.json.proposal, roles
   }, headers);
 
   assert.equal(mapped.statusCode, 200, mapped.body);
   assert.equal(mapped.json.mapping.status, 'partial');
-  assert.deepEqual([mapped.json.mapping.mappedRoles, mapped.json.mapping.requiredRoles], [1, 2]);
-  assert.equal(mapped.json.mappings.length, 1);
+  assert.deepEqual([mapped.json.mapping.mappedRoles, mapped.json.mapping.requiredRoles], [0, 1]);
+  assert.equal(mapped.json.mappings.length, 0);
   assert.equal(mapped.json.mapping.unresolved[0].code, 'noCompatibleStage');
   assert.equal(mapped.json.mapping.unresolved[0].displayName, 'workstation');
-  assert.equal(mapped.json.diagnostics.attempts, 2);
-  assert.equal(llm.requests, 2);
+  assert.equal(mapped.json.mapping.requiredContainers, 0);
+  assert.equal(mapped.json.mapping.mappedContainers, 0);
+  assert.equal(mapped.json.diagnostics.attempts, 1);
+  assert.equal(llm.requests, 1);
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 mapping merges retry mappings and reports complete only after all dynamic roles are covered', async (t) => {
+test('D2 mapping reports complete when every node role is covered by an Object Flow result', async (t) => {
   const llm = await startLiteLlmStub(t, {
-    responses: [
-      ({ request }) => {
-        const payload = JSON.parse(request.messages.at(-1).content);
-        const role = payload.roles.find((item) => item.isContainer);
-        return { mappings: [{ roleId: role.id, stageId: payload.stages[0].id, reason: 'Group source.' }] };
-      },
-      ({ request }) => {
-        const payload = JSON.parse(request.messages.at(-1).content);
-        return { mappings: [{ roleId: payload.roles[0].id, stageId: payload.stages[0].id, reason: 'Leaf source.' }] };
-      }
-    ]
+    responses: [({ request }) => {
+      const payload = JSON.parse(request.messages.at(-1).content);
+      const role = payload.roles.find((item) => !item.isContainer);
+      return { mappings: [{ roleId: role.id, stageId: payload.stages[0].id, reason: 'Node source.' }] };
+    }]
   });
   const mock = await startMockCmdbuild(t, {
     configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } }) }]
@@ -3137,22 +4157,19 @@ test('D2 mapping merges retry mappings and reports complete only after all dynam
     templateCode: 'CompleteMappingImport', currentSpec, d2Source: 'container-class users: { operator: Operator; administrator: Administrator }'
   }, headers);
   assert.equal(analyzed.statusCode, 200, analyzed.body);
-  const roles = analyzed.json.proposal.roles.map((role) => ({
-    id: role.id,
-    selectedSemantic: role.key === 'application_group' ? 'group' : 'object',
-    mapping: role.mapping
-  }));
+  const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
   const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
     prompt: 'Map every dynamic role.', currentSpec, proposal: analyzed.json.proposal, roles
   }, headers);
 
   assert.equal(mapped.statusCode, 200, mapped.body);
   assert.equal(mapped.json.mapping.status, 'complete');
-  assert.deepEqual([mapped.json.mapping.mappedRoles, mapped.json.mapping.requiredRoles], [2, 2]);
+  assert.deepEqual([mapped.json.mapping.mappedRoles, mapped.json.mapping.requiredRoles], [1, 1]);
+  assert.deepEqual([mapped.json.mapping.mappedContainers, mapped.json.mapping.requiredContainers], [0, 0]);
   assert.deepEqual(mapped.json.mapping.unresolved, []);
-  assert.equal(mapped.json.mappings.length, 2);
-  assert.equal(mapped.json.diagnostics.attempts, 2);
-  assert.equal(llm.requests, 2);
+  assert.equal(mapped.json.mappings.length, 1);
+  assert.equal(mapped.json.diagnostics.attempts, 1);
+  assert.equal(llm.requests, 1);
   assert.equal(backend.exitCode, null);
 });
 
@@ -3182,6 +4199,7 @@ test('D2 import analysis is read-only while Apply checks the saved template vers
 
   const applied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
     currentSpec,
+    d2Source: response.json.proposal.sourceText,
     proposal: response.json.proposal,
     roles: []
   }, {
@@ -3191,6 +4209,179 @@ test('D2 import analysis is read-only while Apply checks the saved template vers
   });
   assert.equal(applied.statusCode, 409, applied.body);
   assert.equal(applied.json.reason, 'template_version_conflict');
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 import Apply persists the reviewed mapping with the current template revision', async (t) => {
+  const currentSpec = apiObjectFlowSpec([
+    { alias: 'routers', className: 'routerG', columns: ['Code', 'Description'] },
+    { alias: 'switches', className: 'ARM', columns: ['Code', 'Description'] }
+  ]);
+  const mock = await startMockCmdbuild(t, {
+    domains: [{
+      _id: 'AssetReference', name: 'AssetReference', source: 'routerG', sources: ['routerG'],
+      destination: 'ARM', destinations: ['ARM'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: 'N:N'
+    }],
+    templates: [templateCard('PersistedImport', currentSpec, { canUpdate: true })]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-persist-test-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const source = 'router: Router';
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'PersistedImport',
+    baseSpecHash: hashJson(currentSpec),
+    currentSpec,
+    d2Source: source
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const roles = analyzed.json.proposal.roles.map((role) => {
+    const isRouter = role.key === 'router';
+    return d2RoleOverride(role, {
+        source: isRouter
+          ? { stageId: 'selection:routers', alias: 'routers', kind: 'selection', className: 'routerG' }
+          : { stageId: 'selection:switches', alias: 'switches', kind: 'selection', className: 'ARM' },
+        primary: {
+          className: isRouter ? 'routerG' : 'ARM',
+          idAttribute: '_id', labelTemplate: '${Code}', structuredFields: ['Code'], filters: []
+        },
+        related: []
+      });
+  });
+  const structureTree = d2StructureTreeWithSources(analyzed.json.proposal, roles);
+  const applied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
+    currentSpec,
+    d2Source: source,
+    proposal: analyzed.json.proposal,
+    persist: true,
+    roles,
+    structureTree,
+    relationRules: [{
+      ...analyzed.json.proposal.relationRules[0],
+      id: 'router_switch_persisted',
+      kind: 'connection',
+      directionPolicy: 'template',
+      parentRoleId: roles.find((role) => role.mapping.primary.className === 'routerG').id,
+      childRoleId: roles.find((role) => role.mapping.primary.className === 'ARM').id,
+      path: [{ kind: 'domain', name: 'AssetReference', domain: 'AssetReference', targetClass: 'ARM', direction: 'both' }]
+    }]
+  }, headers);
+  assert.equal(applied.statusCode, 200, applied.body);
+  assert.equal(applied.json.success, true);
+  assert.equal(applied.json.template.code, 'PersistedImport');
+  assert.equal(applied.json.template.spec.result.diagrams[0].authoring.d2Import.source, source);
+  assert.ok(applied.json.versionLog);
+  assert.ok(applied.json.cacheInvalidation);
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 applied mapping can be edited without a new D2 analysis or template persistence', async (t) => {
+  const currentSpec = apiObjectFlowSpec([
+    { alias: 'routers', className: 'routerG', columns: ['Code', 'Description'] },
+    { alias: 'switches', className: 'ARM', columns: ['Code', 'Description'] }
+  ]);
+  const mock = await startMockCmdbuild(t, {
+    domains: [{
+      _id: 'AssetReference', name: 'AssetReference', source: 'routerG', sources: ['routerG'],
+      destination: 'ARM', destinations: ['ARM'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: 'N:N'
+    }],
+    templates: [templateCard('AppliedMappingEditor', currentSpec, { canUpdate: true })]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-applied-editor-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const source = 'router: Router';
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'AppliedMappingEditor', baseSpecHash: hashJson(currentSpec), currentSpec, d2Source: source
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const roles = analyzed.json.proposal.roles.map((role) => {
+    const isRouter = role.key === 'router';
+    return d2RoleOverride(role, {
+      source: isRouter
+        ? { stageId: 'selection:routers', alias: 'routers', kind: 'selection', className: 'routerG' }
+        : { stageId: 'selection:switches', alias: 'switches', kind: 'selection', className: 'ARM' },
+      primary: { className: isRouter ? 'routerG' : 'ARM', idAttribute: '_id', labelTemplate: '${Code}', structuredFields: ['Code'], filters: [] },
+      related: []
+    }, { labelTemplate: '${Code}' });
+  });
+  const structureTree = d2StructureTreeWithSources(analyzed.json.proposal, roles);
+  const applied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
+    currentSpec,
+    d2Source: source,
+    proposal: analyzed.json.proposal,
+    persist: true,
+    roles,
+    structureTree,
+    relationRules: [{
+      ...analyzed.json.proposal.relationRules[0],
+      id: 'router_switch_applied_editor',
+      kind: 'connection',
+      directionPolicy: 'template',
+      parentRoleId: roles.find((role) => role.mapping.primary.className === 'routerG').id,
+      childRoleId: roles.find((role) => role.mapping.primary.className === 'ARM').id,
+      path: [{ kind: 'domain', name: 'AssetReference', domain: 'AssetReference', targetClass: 'ARM', direction: 'both' }]
+    }]
+  }, headers);
+  assert.equal(applied.statusCode, 200, applied.body);
+  const appliedSpec = applied.json.template.spec;
+  const imported = appliedSpec.result.diagrams[0].authoring.d2Import;
+  const mappingsByRoleId = new Map(imported.roleMappings.map((mapping) => [mapping.roleId, mapping]));
+  const updatedRoles = imported.roles.map((role) => {
+    const mapping = JSON.parse(JSON.stringify(mappingsByRoleId.get(role.id)));
+    mapping.primary.labelTemplate = '${Description}';
+    return d2RoleOverride(role, mapping, { labelTemplate: '${Description}' });
+  });
+  const templateWritesBefore = mock.requests.filter((request) => request.method === 'PUT' && request.pathname.includes('/classes/Cst_QueryTemplate/cards/')).length;
+  const updated = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/update-applied`, {
+    templateCode: 'AppliedMappingEditor',
+    baseSpecHash: hashJson(appliedSpec),
+    currentSpec: appliedSpec,
+    roles: updatedRoles,
+    relationRules: imported.relationRules,
+    structureTree: imported.structureTree
+  }, headers);
+  assert.equal(updated.statusCode, 200, updated.body);
+  assert.equal(updated.json.action, 'diagram-import-update-applied');
+  assert.equal(updated.json.d2Workflow?.state, 'applied');
+  const updatedImport = updated.json.spec.result.diagrams[0].authoring.d2Import;
+  assert.equal(updatedImport.source, source);
+  assert.equal(updatedImport.sourceHash, imported.sourceHash);
+  assert.equal(updatedImport.structureHash, imported.structureHash);
+  assert.equal(updatedImport.roleMappings.every((mapping) => mapping.primary.labelTemplate === '${Description}'), true);
+  const templateWritesAfter = mock.requests.filter((request) => request.method === 'PUT' && request.pathname.includes('/classes/Cst_QueryTemplate/cards/')).length;
+  assert.equal(templateWritesAfter, templateWritesBefore, 'Applied mapping update must remain a draft operation until the normal template save.');
+
+  const missing = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/update-applied`, {
+    templateCode: 'AppliedMappingEditor', baseSpecHash: hashJson(appliedSpec), currentSpec, roles: []
+  }, headers);
+  assert.equal(missing.statusCode, 409, missing.body);
+  assert.equal(missing.json.code, 'diagram_import_mapping_missing');
+  assert.equal(backend.exitCode, null);
+});
+
+test('Diagram editor 2 sandbox API is unavailable', async (t) => {
+  const currentSpec = apiObjectFlowSpec([{ alias: 'routers', className: 'routerG', columns: ['Code'] }]);
+  const mock = await startMockCmdbuild(t, {
+    templates: [templateCard('MainDiagramOnly', currentSpec, { canUpdate: true })]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=main-diagram-only-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+
+  const response = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/MainDiagramOnly/diagram-sandbox/reset`, {
+    baseSpecHash: hashJson(currentSpec)
+  }, headers);
+  assert.equal(response.statusCode, 404, response.body);
   assert.equal(backend.exitCode, null);
 });
 
@@ -3221,6 +4412,7 @@ test('D2 analysis is allowed read-only while Apply requires an explicitly denied
 
   const forbiddenApply = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
     currentSpec: savedSpec,
+    d2Source: analyzedReadOnly.json.proposal.sourceText,
     proposal: analyzedReadOnly.json.proposal,
     roles: []
   }, headers);
@@ -3301,6 +4493,7 @@ test('D2 analysis permits unsaved drafts while Apply requires template create pe
 
   const applied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
     currentSpec: { version: 1, steps: [], result: { tables: [] } },
+    d2Source: analyzed.json.proposal.sourceText,
     proposal: analyzed.json.proposal,
     roles: []
   }, {
@@ -3411,6 +4604,38 @@ test('template publish rejects unsaved static snapshot settings with actionable 
   assert.equal(publish.json.reason, 'publication_settings_not_saved');
   assert.match(publish.json.message, /Publication settings were not saved/);
   assert.equal(publish.json.publish.mode, 'dynamicUser');
+  assert.equal(backend.exitCode, null);
+});
+
+test('template publish blocks diagram output while a saved D2 source has no applied deterministic mapping', async (t) => {
+  const spec = publishSpec({
+    assistantDraft: { d2Authoring: { version: 1, source: 'app: "Application"' } },
+    result: {
+      presentation: { outputMode: 'both' },
+      tables: [{ name: 'arms', columns: ['Code', 'Description', 'Location'], published: true }],
+      diagrams: [{
+        name: 'topology',
+        source: { nodes: 'arms', edges: 'arms' },
+        nodeMappings: [{ from: 'arms', fields: { id: 'Code', label: 'Description' } }]
+      }]
+    }
+  });
+  const mock = await startMockCmdbuild(t, { templates: [templateCard('PendingD2PublishTemplate', spec)] });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=pending-d2-publish-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+
+  const publish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/PendingD2PublishTemplate/publish`, {
+    params: {}, savedSpecHash: hashJson(spec)
+  }, { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
+
+  assert.equal(publish.statusCode, 422, publish.body);
+  assert.equal(publish.json.reason, 'publication_d2_mapping_pending');
+  assert.equal(publish.json.d2Workflow.state, 'pending');
+  assert.match(publish.json.message, /D2 source is saved/i);
+  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/routerG/cards')), false);
   assert.equal(backend.exitCode, null);
 });
 
@@ -4349,6 +5574,176 @@ test('reference-path repair restores phServer without rebuilding unrelated Assis
   const repairedTable = preview.json.result.tables.find((table) => table.name === 'phServers');
   assert.ok(repairedTable, preview.body);
   assert.deepEqual(repairedTable.rows.map((row) => row.Code), ['PHS-IN']);
+  assert.equal(backend.exitCode, null);
+});
+
+test('candidate filter retains named ACL candidates through a parameterized IS to ipRange path', async (t) => {
+  const intent = {
+    context: 'Проверка ACL для выбранной информационной системы.',
+    blocks: [
+      {
+        id: 'ranges', name: 'Результат 1', entities: 'Карточки ipRange.',
+        algorithm: 'Выбрать все объекты класса ipRange.', expectedResult: 'Список ipRange.', uses: []
+      },
+      {
+        id: 'all-acl', name: 'Все ACL', entities: 'Карточки ACL и сети из Результата 1.',
+        algorithm: 'Выбрать ACL, у которых Destination ipaddress или Source ipaddress входит в network range объектов из Результата 1.',
+        expectedResult: 'Список ACL.', uses: ['ranges']
+      },
+      {
+        id: 'target-acl', name: 'ACL внутри target системы', entities: 'Карточки ACL из Все ACL, IS и ipRange.',
+        algorithm: 'Из Все ACL оставить карточки, у которых network range связанных объектов ipRange для IS, у которой Description равно параметру isName, включает Destination ipaddress или Source ipaddress.',
+        expectedResult: 'Список ACL.', uses: ['all-acl']
+      },
+      {
+        id: 'external-systems', name: 'Внешние ИС', entities: 'Карточки IS.',
+        algorithm: 'Выбрать IS, у которых isExt равно true и range связанных через ISZabbixMonitoringDomain объектов ipRange включает Destination ipaddress или Source ipaddress из Все ACL.',
+        expectedResult: 'Список внешних ИС.', uses: ['all-acl']
+      },
+      {
+        id: 'external-acl', name: 'ACL внешних ИС', entities: 'Все ACL, Внешние ИС, ipRange, domain ISZabbixMonitoringDomain.',
+        algorithm: 'Из Все ACL оставить карточки, у которых range связанных с Внешние ИС объектов ipRange включает Destination ipaddress или Source ipaddress.',
+        expectedResult: 'Список ACL внешних ИС.', uses: ['all-acl', 'external-systems']
+      }
+    ]
+  };
+  const llm = await startLiteLlmStub(t, {
+    responses: [{
+      version: 1,
+      blocks: [
+        {
+          id: 'ranges', name: 'Результат 1', summary: 'Сети.', resolvedEntities: ['ipRange'], relationPaths: [], dependencies: [], expectedResult: 'Список ipRange.',
+          resultContract: { outputKind: 'sourceCards', outputClass: 'ipRange', dependencyPaths: [], relationPredicates: [], attributePredicates: [], referencePathPredicates: [] }, warnings: []
+        },
+        {
+          id: 'all-acl', name: 'Все ACL', summary: 'Все ACL в известных сетях.', resolvedEntities: ['ACL', 'ipRange'], relationPaths: [], dependencies: ['ranges'], expectedResult: 'Список ACL.',
+          resultContract: { outputKind: 'sourceCards', outputClass: 'ACL', dependencyPaths: [], relationPredicates: [], attributePredicates: [], referencePathPredicates: [] }, warnings: []
+        },
+        {
+          id: 'target-acl', name: 'ACL внутри target системы', summary: 'ACL выбранной ИС.', resolvedEntities: ['ACL', 'IS', 'ipRange'], relationPaths: ['aclLine', 'ISZabbixMonitoringDomain'], dependencies: ['all-acl'], expectedResult: 'Список ACL.',
+          resultContract: {
+            outputKind: 'sourceCards', outputClass: 'ACL', dependencyPaths: [], attributePredicates: [], referencePathPredicates: [],
+            relationPredicates: [{
+              sourceClass: 'ACL', relatedClass: 'ipRange', comparisonBlockId: 'all-acl', comparisonClass: 'IS',
+              domain: 'aclLine', direction: 'destination', comparisonFields: ['dipaddress', 'ipaddress'], relatedField: 'range', operator: 'ipv4InCidr'
+            }]
+          }, warnings: []
+        },
+        {
+          id: 'external-systems', name: 'Внешние ИС', summary: 'Внешние ИС, сети которых содержат адреса ACL.', resolvedEntities: ['IS', 'ipRange', 'ACL'], relationPaths: ['ISZabbixMonitoringDomain'], dependencies: ['all-acl'], expectedResult: 'Список внешних ИС.',
+          resultContract: { outputKind: 'sourceCards', outputClass: 'IS', dependencyPaths: [], relationPredicates: [], attributePredicates: [], referencePathPredicates: [] }, warnings: []
+        },
+        {
+          id: 'external-acl', name: 'ACL внешних ИС', summary: 'ACL внешних ИС.', resolvedEntities: ['ACL', 'IS', 'ipRange'], relationPaths: [], dependencies: ['all-acl', 'external-systems'], expectedResult: 'Список ACL внешних ИС.',
+          resultContract: { outputKind: 'sourceCards', outputClass: 'ACL', dependencyPaths: [], relationPredicates: [], attributePredicates: [], referencePathPredicates: [] }, warnings: []
+        }
+      ],
+      explanation: 'LLM supplied a stale relation predicate for the final ACL block.', warnings: []
+    }, {
+      flow: { version: 1, selections: [], operations: [], publishedAlias: '' },
+      explanation: 'Incomplete LLM flow forces deterministic compilation.', warnings: []
+    }]
+  });
+  const mock = await startMockCmdbuild(t, {
+    classes: [
+      { _id: 1, name: 'IS', description: 'Информационная система', parent: 'Class', active: true },
+      { _id: 2, name: 'ipRange', description: 'IP range', parent: 'Class', active: true },
+      { _id: 3, name: 'ACL', description: 'ACL', parent: 'Class', active: true },
+      { _id: 4, name: 'Cst_QueryToolConfig', description: 'Config', active: true },
+      { _id: 5, name: 'Cst_QueryTemplate', description: 'Template', active: true }
+    ],
+    attributesByClass: {
+      IS: [
+        { name: 'Description', description: 'Description', type: 'string', active: true, _can_read: true },
+        { name: 'isExt', description: 'External system', type: 'boolean', active: true, _can_read: true }
+      ],
+      ipRange: [{ name: 'range', description: 'Network range', type: 'string', active: true, _can_read: true }],
+      ACL: [
+        { name: 'ipaddress', description: 'Source ipaddress', type: 'string', active: true, _can_read: true },
+        { name: 'dipaddress', description: 'Destination ipaddress', type: 'string', active: true, _can_read: true }
+      ]
+    },
+    domains: [{
+      _id: 'ISZabbixMonitoringDomain', name: 'ISZabbixMonitoringDomain', source: 'IS', sources: ['IS'], destination: 'ipRange', destinations: ['ipRange'],
+      disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: '1:N'
+    }, {
+      _id: 'AlternativeISRangeDomain', name: 'AlternativeISRangeDomain', source: 'IS', sources: ['IS'], destination: 'ipRange', destinations: ['ipRange'],
+      disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: 'N:N'
+    }],
+    cardsByClass: {
+      IS: [
+        { _id: 11, Code: 'TARGET', Description: 'Target system', isExt: false },
+        { _id: 12, Code: 'OTHER', Description: 'Other system', isExt: true }
+      ],
+      ipRange: [
+        { _id: 21, Code: 'TARGET-RANGE', Description: 'Target range', range: '10.44.0.0/24' },
+        { _id: 22, Code: 'OTHER-RANGE', Description: 'Other range', range: '10.55.0.0/24' }
+      ],
+      ACL: [
+        { _id: 31, Code: 'ACL-TARGET', Description: 'Target ACL', ipaddress: '10.44.0.10', dipaddress: '192.0.2.10' },
+        { _id: 32, Code: 'ACL-OTHER', Description: 'Other ACL', ipaddress: '10.55.0.10', dipaddress: '192.0.2.20' },
+        { _id: 33, Code: 'ACL-OUTSIDE', Description: 'Outside ACL', ipaddress: '10.66.0.10', dipaddress: '192.0.2.30' }
+      ]
+    },
+    relationsByCard: {
+      'IS:11': [{ _id: 101, domain: 'ISZabbixMonitoringDomain', _sourceType: 'IS', _sourceId: 11, _sourceCode: 'TARGET', _sourceDescription: 'Target system', _destinationType: 'ipRange', _destinationId: 21, _destinationCode: 'TARGET-RANGE', _destinationDescription: 'Target range', _direction: 'direct' }],
+      'IS:12': [{ _id: 102, domain: 'ISZabbixMonitoringDomain', _sourceType: 'IS', _sourceId: 12, _sourceCode: 'OTHER', _sourceDescription: 'Other system', _destinationType: 'ipRange', _destinationId: 22, _destinationCode: 'OTHER-RANGE', _destinationDescription: 'Other range', _direction: 'direct' }]
+    },
+    configCards: [{
+      _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true,
+      RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' }, semanticPlan: { maxReferencePathDepth: 3 }, mcp: { maxClasses: 100, maxDomains: 100, maxRelationDomains: 100, maxContextBytes: 65536 } } })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = testCmdbuildAuthorizationCookie('candidate-filter-token');
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = { version: 1, params: { isName: { name: 'isName', type: 'string', required: true } }, steps: [], result: { tables: [] } };
+
+  const semantic = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+    templateCode: '', baseSpecHash: '', currentSpec, intent
+  }, headers);
+  assert.equal(semantic.statusCode, 200, semantic.body);
+  const finalContract = semantic.json.semanticPlan.blocks.find((block) => block.id === 'target-acl').resultContract;
+  assert.equal(finalContract.candidateFilter.candidateBlockId, 'all-acl');
+  assert.equal(finalContract.candidateFilter.comparisonSource.kind, 'selection');
+  assert.equal(finalContract.candidateFilter.comparisonSource.className, 'IS');
+  assert.deepEqual(finalContract.candidateFilter.comparisonPath.map((hop) => [hop.sourceClass, hop.domain, hop.direction, hop.targetClass]), [
+    ['IS', 'ISZabbixMonitoringDomain', 'source', 'ipRange']
+  ]);
+  assert.equal(finalContract.candidateFilter.ruleJoin, 'any');
+  assert.deepEqual(finalContract.relationPredicates, []);
+  const externalContract = semantic.json.semanticPlan.blocks.find((block) => block.id === 'external-acl').resultContract;
+  assert.equal(externalContract.candidateFilter.candidateBlockId, 'all-acl');
+  assert.deepEqual(externalContract.candidateFilter.comparisonSource, {
+    kind: 'block', blockId: 'external-systems', className: 'IS', rules: []
+  });
+  assert.deepEqual(externalContract.candidateFilter.comparisonPath.map((hop) => [hop.sourceClass, hop.domain, hop.direction, hop.targetClass]), [
+    ['IS', 'ISZabbixMonitoringDomain', 'source', 'ipRange']
+  ]);
+
+  const draft = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/plan`, {
+    templateCode: '', baseSpecHash: '', currentSpec, intent, semanticPlan: semantic.json.semanticPlan
+  }, headers);
+  assert.equal(draft.statusCode, 200, draft.body);
+  assert.equal(draft.json.success, true, draft.body);
+  assert.ok(draft.json.flow.operations.some((operation) => operation.type === 'semiJoin' && operation.ruleJoin === 'any'), draft.body);
+  assert.ok(draft.json.flow.operations.some((operation) => operation.type === 'relation' && operation.domain === 'ISZabbixMonitoringDomain'), draft.body);
+  assert.equal(draft.json.flow.operations.some((operation) => operation.domain === 'aclLine'), false, draft.body);
+
+  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview`, {
+    template: { code: 'CandidateFilterPreview', spec: compileObjectFlowToSpec(currentSpec, draft.json.flow) },
+    params: { isName: 'Target system' }
+  }, headers);
+  assert.equal(preview.statusCode, 200, preview.body);
+  const allAclBinding = draft.json.outputBindings.find((binding) => binding.blockId === 'all-acl');
+  const targetBinding = draft.json.outputBindings.find((binding) => binding.blockId === 'target-acl');
+  const externalBinding = draft.json.outputBindings.find((binding) => binding.blockId === 'external-acl');
+  assert.deepEqual(preview.json.result.tables.find((table) => table.name === allAclBinding.alias).rows.map((row) => row.Code).sort(), ['ACL-OTHER', 'ACL-TARGET']);
+  assert.deepEqual(preview.json.result.tables.find((table) => table.name === targetBinding.alias).rows.map((row) => row.Code), ['ACL-TARGET']);
+  assert.deepEqual(preview.json.result.tables.find((table) => table.name === externalBinding.alias).rows.map((row) => row.Code), ['ACL-OTHER']);
   assert.equal(backend.exitCode, null);
 });
 

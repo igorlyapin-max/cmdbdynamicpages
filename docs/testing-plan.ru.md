@@ -11,12 +11,11 @@
 - `npm run test:static`: проверяет обязательные OpenAPI paths, локальные component references и ссылки архитектурных артефактов.
 - `npm run test:unit`: покрывает настройки кэша, scope ключей кэша, refresh metadata, параметры static snapshot URL, defaults параметров, IPv4-сопоставление, topology diagram payloads, runtime JSON output-mode filtering, assistant MCP allowlist/defaults, dependency map, маскирование логов, diagnostic mode, assistant-disabled config и runtime config validation.
 - `npm run test:api`: skip-safe API smoke для `/health/*`, `/metrics`, защищенного logging status и отказа state-changing вызовов без CSRF/session на запущенном proxy.
-- `npm run test:ui`: skip-safe Playwright smoke для списка шаблонов Designer, fixed menu/action bar, контекстных кнопок Run, компактной Runtime shell, runtime table search/sort, отключения grouped-table controls, split-subtable local sorting и опционального real wiki iframe rendering через `CMDBDYNAMIC_WIKI_IFRAME_URL`.
-- `npm run test:nginx`: проверяет nginx config и same-origin wiki/dynamicpages маршруты через `localhost:8088`.
+- `npm run test:ui`: skip-safe Playwright smoke для списка шаблонов Designer, fixed menu/action bar, контекстных кнопок Run, компактной Runtime shell, runtime table search/sort, отключения grouped-table controls и split-subtable local sorting.
+- `npm run test:nginx`: проверяет project-only nginx config и маршруты `cmdbdynamicpages` через `localhost:8088`.
 - `npm run e2e`: проверяет logging diagnostics, draft preview без runtime cache, runtime cache hit, POST `forceRefresh`, что GET runtime не делает forced refresh, и write-mode `expectedSpecHash` conflict handling.
 
 ## Осталось
 
 - Для live e2e нужен свежий CMDBuild session cookie или явные `CMDBUILD_USERNAME`/`CMDBUILD_PASSWORD`.
-- Поддерживать стабильную local wiki page для `CMDBDYNAMIC_WIKI_IFRAME_URL`, чтобы optional browser-level iframe smoke запускался регулярно.
 - Добавить browser smoke для rendered topology SVG diagrams и Assistant section controls после подтверждения целевых видов диаграмм заказчиком и доступа к LiteLLM стенду для UI automation.

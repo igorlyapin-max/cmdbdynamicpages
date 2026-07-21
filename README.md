@@ -20,6 +20,8 @@ The current implementation keeps CMDBuild custom page code intentionally small:
 - the backend receives the CMDBuild `HttpOnly` cookie on same-origin routes;
 - the backend forwards the cookie value to CMDBuild REST as a server-side `CMDBuild-Authorization` header.
 
+In production, `CMDP_PUBLIC_ORIGIN` is the single public browser origin while `CMDBUILD_ORIGIN` remains an internal backend upstream. They may differ behind a TLS-terminated reverse proxy, but the internal URL must not appear in browser traffic.
+
 The CMDBuild/Tomcat deployment owns the user session lifetime; `cmdbdynamicpages` does not extend it. On the current test stand the server-side idle timeout is 30 minutes. The relevant Tomcat `web.xml` block is approximately:
 
 ```xml
@@ -101,7 +103,7 @@ Optional API contract smoke tests can run against a started proxy:
 npm run test:api
 ```
 
-Run same-origin nginx/wiki iframe checks after starting nginx:
+Run project nginx route checks after starting nginx:
 
 ```bash
 npm run test:nginx
@@ -179,7 +181,7 @@ The visible Designer does not expose standalone relation-chain, search-by-values
 
 The `Final view` block is the focused runtime layout composer. It chooses the visible result alias, table title, display mode, empty-state text, visible columns, and column labels, then writes ordinary `result.tables` metadata. It can replace the runtime output with one final table while keeping the full DSL steps available for preview/debug.
 
-Visualization can render a final-data column as a link. URL and text templates support `${mysource.value}`, `${mysource.source}`, `${mysource.sourceClass}`, `${mysource.sourceId}`, `${mysource.attribute}`, `${mysource.domainPath}`, `${row.<column>}`, and `${param.<name>}`. Internal links to cards that participated in the result can use ready-made variables such as `${mysource.sourceURLВыборка1}`, `${mysource.sourceURLВыборка2}`, `${mysource.sourceURLSelection1}`, and so on. Examples: `${mysource.sourceURLВыборка2}`, `/cmdbuild/ui/#classes/${mysource.sourceClass}/cards/${mysource.sourceId}` or `/wiki/${param.city}/${mysource.value}`. Unsafe `javascript:`, `data:`, and `vbscript:` URLs are blocked and fall back to plain text.
+Visualization can render a final-data column as a link. URL and text templates support `${mysource.value}`, `${mysource.source}`, `${mysource.sourceClass}`, `${mysource.sourceId}`, `${mysource.attribute}`, `${mysource.domainPath}`, `${row.<column>}`, and `${param.<name>}`. Internal links to cards that participated in the result can use ready-made variables such as `${mysource.sourceURLВыборка1}`, `${mysource.sourceURLВыборка2}`, `${mysource.sourceURLSelection1}`, and so on. Examples: `${mysource.sourceURLВыборка2}`, `/cmdbuild/ui/#classes/${mysource.sourceClass}/cards/${mysource.sourceId}` or `https://portal.example.local/${param.city}/${mysource.value}`. Unsafe `javascript:`, `data:`, and `vbscript:` URLs are blocked and fall back to plain text.
 
 Minimal relation expansion draft:
 
@@ -235,6 +237,7 @@ http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/run/ProbeClassesByAttributeType?a
 
 The direct runtime page renders only the final result tables, without Designer chrome or diagnostic parameters.
 Use the same URL as a normal link or as an iframe source. Dynamic templates require a valid CMDBuild session cookie through the proxy. Published static snapshots can be served without that cookie because the runtime reads only Redis snapshot data and does not execute CMDBuild business-data requests.
+Saving a `dynamicUser` template does not publish data: its launch URL remains an authenticated runtime request. Snapshot publication is available only after `staticSnapshot` has been selected and saved.
 Add the reserved system parameter `json=true` to the same runtime URL to receive the final tables as `application/json` instead of HTML:
 
 ```text
@@ -289,33 +292,21 @@ CMDBDYNAMIC_REDIS_PASSWORD_FILE=/run/secrets/cmdbdynamicpages_redis_password
 
 `CMDBDYNAMIC_REDIS_PASSWORD` and URL form `redis://:password@host:6379/0` are also supported for non-production/dev use, but the file-based secret is preferred. Health/status responses mask Redis credentials before returning the URL.
 
-### Local same-origin nginx for wiki iframes
+### Local project nginx front
 
-The wiki can stay on `http://localhost:3000/`, CMDBuild/DynamicPages can stay on `http://127.0.0.1:8093/`, and nginx provides one browser-facing origin:
+CMDBuild/DynamicPages stays on `http://127.0.0.1:8093/`; nginx exposes only the browser-facing routes owned by this project:
 
 ```bash
 npm run nginx:dev
 ```
 
-Open the wiki through nginx:
-
-```text
-http://localhost:8088/
-```
-
-Log in to CMDBuild through the same nginx origin:
+Open CMDBuild through nginx:
 
 ```text
 http://localhost:8088/cmdbuild/ui/
 ```
 
-Use a relative iframe URL in wiki content:
-
-```html
-<iframe src="/cmdbuild/dynamicpages/ui/run/testtemplate?city=city49&routername=router047"></iframe>
-```
-
-The old wiki URL `http://localhost:3000/` still works as a direct wiki entry point, but iframe authentication is only reliable when the wiki page and `/cmdbuild/...` runtime are opened through the same browser-facing origin. A relative `/cmdbuild/...` iframe on the old `3000` URL resolves to `http://localhost:3000/cmdbuild/...` and will not hit nginx.
+The root path `http://localhost:8088/` intentionally returns `404`. Wiki, WikiAI, and other portal services are outside this project's runtime and delivery contract. An external portal may embed the runtime by its own independently configured route; this repository neither starts nor proxies that portal.
 
 Runtime route example, through the custom page launcher:
 
@@ -382,7 +373,7 @@ Because these UI and backend routes are also under `/cmdbuild`, the browser send
 
 The legacy PoC routes `/cmdbuild/custom-api/session-probe` and `/cmdbuild/custom-api/classes-probe` are still available for compatibility, but new work should use the stable routes above.
 
-State-changing custom API routes require a same-origin `Origin` or `Referer` header and `X-CMDBDynamicPages-CSRF`. The backend-served UI obtains the token from `/cmdbuild/custom-api/csrf` and attaches it automatically. Schema bootstrap also requires the current CMDBuild role to have `admin_classes_modify`.
+State-changing custom API routes compare `Origin` or `Referer` with configured `CMDP_PUBLIC_ORIGIN` and require `X-CMDBDynamicPages-CSRF`. The backend-served UI obtains the token from `/cmdbuild/custom-api/csrf` and attaches it automatically. Schema bootstrap also requires the current CMDBuild role to have `admin_classes_modify`.
 
 `GET /cmdbuild/custom-api/auth/permission-scope` probes what permission-scope metadata is visible to the current CMDBuild session. It returns session role data, endpoint statuses for roles/users/groups/classes/domains, sampled readable classes/attributes, and a visible-model hash. That hash is diagnostic only; runtime result sharing is controlled explicitly by each template's `spec.cache.scopeMode`.
 
@@ -429,28 +420,28 @@ CMDP_TEMPLATE_REQUEST_MAX_BYTES=5767168
 
 ## Logging
 
-The backend writes structured operational logs. Docker deployments should keep the default `stdout` target and let Docker, Filebeat, Fluent Bit or Logstash forward the stream to ELK. The application does not write directly to Elasticsearch.
+The backend writes structured operational logs. Local development can use `stdout` only. The production Docker Compose contract is `stdout,syslog` with an approved syslog collector; the application does not write directly to Elasticsearch.
 
 ```text
 CMDP_LOG_LEVEL=info
 CMDP_LOG_FORMAT=json
-CMDP_LOG_TARGET=stdout
+CMDP_LOG_TARGET=stdout,syslog
+CMDP_SYSLOG_HOST=syslog.example.local
+CMDP_SYSLOG_PORT=514
+CMDP_SYSLOG_PROTOCOL=udp
+CMDP_SYSLOG_FACILITY=local0
 CMDP_DIAGNOSTIC_MODE=off
 CMDP_LOG_REDACT_HEADERS=cookie,authorization,cmdbuild-authorization,x-csrf-token,x-cmdbdynamicpages-csrf,set-cookie
 CMDP_LOG_REDACT_QUERY=password,passwd,pwd,token,secret,authorization,auth,csrf,x-cmdbdynamicpages-csrf
 ```
 
-Syslog output is optional for VM/bare-metal deployments or SIEM integration:
+For local development without a collector, use stdout only:
 
 ```text
-CMDP_LOG_TARGET=syslog
-CMDP_SYSLOG_HOST=127.0.0.1
-CMDP_SYSLOG_PORT=514
-CMDP_SYSLOG_PROTOCOL=udp
-CMDP_SYSLOG_FACILITY=local0
+CMDP_LOG_TARGET=stdout
 ```
 
-`stdout` remains enabled even when `CMDP_LOG_TARGET=syslog` is configured. `CMDP_LOG_TARGET=stdout,syslog` can be used when both outputs are required explicitly. Logged events include request completion, CSRF/same-origin rejection, Redis availability changes, CMDBuild upstream errors, runtime cache status, static snapshot publish/hit/miss, and template create/update/delete. Cookies, authorization headers, CSRF tokens and configured secret-like query parameters are redacted; runtime result rows and CMDBuild card payloads are not logged. `/metrics` exposes only aggregate counters/gauges and does not include cookies, tokens, user names, runtime rows or raw CMDBuild payloads.
+`stdout` always remains enabled. Production must use `CMDP_LOG_TARGET=stdout,syslog` and replace the example collector with an approved syslog endpoint. Logged events include request completion, CSRF/same-origin rejection, Redis availability changes, CMDBuild upstream errors, runtime cache status, static snapshot publish/hit/miss, and template create/update/delete. Cookies, authorization headers, CSRF tokens and configured secret-like query parameters are redacted; runtime result rows and CMDBuild card payloads are not logged. `/metrics` exposes only aggregate counters/gauges and does not include cookies, tokens, user names, runtime rows or raw CMDBuild payloads.
 
 Diagnostic mode is off by default and can be enabled without code changes:
 

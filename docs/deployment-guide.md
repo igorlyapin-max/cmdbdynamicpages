@@ -7,7 +7,7 @@ English branch. Russian branch: [deployment-guide.ru.md](deployment-guide.ru.md)
 - CMDBuild is reachable, locally `http://127.0.0.1:8090/cmdbuild`.
 - `cmdbdynamicpages` backend/proxy runs on `http://127.0.0.1:8093`.
 - Redis is reachable at `redis://127.0.0.1:6379/0`; production Redis must require a password.
-- Wiki/iframe scenarios use the same-origin nginx front `http://localhost:8088`.
+- The project-only nginx front is available at `http://localhost:8088`; it exposes only `/cmdbuild/*` and `/health/*`.
 - First technical schema creation requires a CMDBuild role with `admin_classes_modify` and access to the metadata/classes API.
 - Designer access is access to the project's technical schema: a user who can edit technical classes can create and change runtime endpoint templates.
 
@@ -26,19 +26,24 @@ Minimum production env:
 ```text
 PROXY_HOST=127.0.0.1
 PROXY_PORT=8093
+CMDP_PUBLIC_ORIGIN=https://cmdb.example.local
 CMDBUILD_ORIGIN=http://127.0.0.1:8090
 CMDBDYNAMIC_REDIS_URL=redis://127.0.0.1:6379/0
 CMDBDYNAMIC_REDIS_PASSWORD_FILE=/run/secrets/cmdbdynamicpages_redis_password
 CMDBDYNAMIC_REDIS_REQUIRED=true
 CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=true
 CMDBDYNAMICPAGES_CSRF_SECRET=<stable external secret>
-CMDP_LOG_TARGET=stdout
+CMDP_LOG_TARGET=stdout,syslog
 CMDP_LOG_FORMAT=json
+CMDP_SYSLOG_HOST=syslog.example.local
+CMDP_SYSLOG_PORT=514
+CMDP_SYSLOG_PROTOCOL=udp
+CMDP_SYSLOG_FACILITY=local0
 CMDP_DIAGNOSTIC_MODE=off
 ```
 
-The repository includes a backend `Dockerfile` for container deployment. The image runs as the `node` user, listens on `8093`, and uses `/health/live` as the container healthcheck.
-Production startup fails closed when `CMDBDYNAMICPAGES_CSRF_SECRET` is missing. `CMDP_DIAGNOSTIC_MODE=Verbose` should be enabled only temporarily during incident diagnostics.
+The repository includes a backend `Dockerfile` for container deployment. The image runs as the `node` user, listens on `8093`, and uses `/health/live` only as the container liveness healthcheck. Configure `CMDP_SYSLOG_HOST`, `CMDP_SYSLOG_PORT`, `CMDP_SYSLOG_PROTOCOL`, and `CMDP_SYSLOG_FACILITY` for the approved production collector; `CMDP_LOG_TARGET=stdout,syslog` keeps stdout/stderr as the local operational output.
+Production startup fails closed when `CMDBDYNAMICPAGES_CSRF_SECRET` or `CMDP_PUBLIC_ORIGIN` is missing. `CMDP_PUBLIC_ORIGIN` is the public browser origin; `CMDBUILD_ORIGIN` is the internal backend upstream and they may differ. Enable `CMDP_DIAGNOSTIC_MODE=Verbose` only temporarily during incident diagnostics.
 Admin-facing container handoff is documented in [CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md](CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md).
 
 If the platform can pass the Redis secret only as a string, these variants are supported:
@@ -145,10 +150,12 @@ Key routes:
 ```text
 http://localhost:8088/cmdbuild/ -> http://127.0.0.1:8093/cmdbuild/
 http://localhost:8088/health/  -> http://127.0.0.1:8093/health/
-http://localhost:8088/         -> http://127.0.0.1:3000/
+http://localhost:8088/         -> 404
 ```
 
-This puts the wiki and runtime iframe on one origin, `localhost:8088`.
+This nginx instance exposes only routes owned by `cmdbdynamicpages`. External portals are deployed and proxied independently.
+
+With an external TLS reverse proxy, the browser must open CMDBuild UI, the custom page, and `/cmdbuild/custom-api/*` through one `CMDP_PUBLIC_ORIGIN`, for example `https://custom.example.local`. The external proxy forwards public `Host`, `X-Forwarded-Host`, and `X-Forwarded-Proto=https`; an internal `CMDBUILD_ORIGIN`, for example `https://vr2.internal.example`, is never user-facing. Confirm that `/cmdbuild/ui/config.js`, redirects, and the CMDBuild session cookie use the public hostname rather than the internal upstream.
 
 ## 8. Post-deployment checks
 
@@ -175,7 +182,7 @@ http://127.0.0.1:8093/health/redis
 http://127.0.0.1:8093/metrics
 ```
 
-In production, `/health/ready` must see Redis and CMDBuild upstream. `/metrics` returns aggregate Prometheus counters/gauges and must not be used as a readiness gate.
+`/health/live` is liveness only: it proves that the Node process answers HTTP and is used by the Docker healthcheck. `/health/ready` is readiness: in production it must see Redis and the CMDBuild upstream before rollout or traffic routing. `/metrics` returns aggregate Prometheus counters/gauges and must not be used as a readiness gate.
 
 ## 9. Production notes
 

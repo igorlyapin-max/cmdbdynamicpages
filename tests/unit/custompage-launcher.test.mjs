@@ -16,15 +16,16 @@ test('Assistant browser deadline follows the configured MCP timeout with backend
   assert.match(helperSource, /boot\.assistantMcpCaps/);
   assert.match(helperSource, /boot\.assistantTimeoutGraceMs/);
   assert.match(helperSource, /backendTimeout \* phases \+ grace/);
-  [
-    '/assistant/diagram-import/complete',
-    '/assistant/diagram-import/',
-    '/assistant/template-draft'
-  ].forEach((route) => {
-    const routeStart = proxySource.indexOf(route);
-    assert.ok(routeStart >= 0, `Assistant route ${route} is missing.`);
-    assert.match(proxySource.slice(routeStart, routeStart + 420), /timeoutMs: assistantRequestTimeoutMs\(\)/);
-  });
+  const diagramAssistantStart = proxySource.indexOf('function assistantDiagramRequest(kind)');
+  const diagramAssistantEnd = proxySource.indexOf('function assistantFlowStageSummaries', diagramAssistantStart);
+  const diagramAssistantSource = proxySource.slice(diagramAssistantStart, diagramAssistantEnd);
+  assert.ok(diagramAssistantStart >= 0, 'Diagram Assistant request helper is missing.');
+  assert.ok(diagramAssistantEnd > diagramAssistantStart, 'Diagram Assistant request helper boundary is missing.');
+  assert.match(diagramAssistantSource, /\/assistant\/diagram-import\//);
+  assert.match(diagramAssistantSource, /map-selections/);
+  assert.match(diagramAssistantSource, /timeoutMs: assistantRequestTimeoutMs\(\)/);
+  assert.ok(proxySource.includes('/assistant/diagram-import/interpret'), 'Diagram interpretation endpoint is missing.');
+  assert.ok(proxySource.includes('/assistant/diagram-import/map-selections'), 'Diagram mapping endpoint is missing.');
   const semanticRouteStart = proxySource.indexOf('/assistant/object-flow/semantic-plan');
   assert.match(proxySource.slice(semanticRouteStart, semanticRouteStart + 600), /timeoutMs: assistantRequestTimeoutMs\(1\)/);
   const flowRouteStart = proxySource.indexOf('/assistant/object-flow/plan');
@@ -49,13 +50,14 @@ function generatedDynamicPagesClientScript() {
     'DEFAULT_EMPTY_RESULT_TEXT',
     'DEFAULT_PERMISSION_DENIED_TEXT',
     'DEFAULT_TEMPLATE_CACHE_TTL_SEC',
+    'D2_IMPORT_SEMANTIC_MODEL_REVISION',
     'DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT',
     'DEFAULT_ASSISTANT_OBJECT_FLOW_SEMANTIC_PROMPT',
     'DEFAULT_ASSISTANT_DIAGRAM_INTERPRETATION_PROMPT',
     'DEFAULT_ASSISTANT_DIAGRAM_MAPPING_PROMPT',
     factorySource
   );
-  return factory('empty result', 'permission denied', 3600, 'object flow prompt', 'semantic plan prompt', 'diagram interpretation prompt', 'diagram mapping prompt')();
+  return factory('empty result', 'permission denied', 3600, 6, 'object flow prompt', 'semantic plan prompt', 'diagram interpretation prompt', 'diagram mapping prompt')();
 }
 
 test('generated Dynamic Pages client script parses as browser JavaScript', () => {
@@ -66,7 +68,33 @@ test('generated Dynamic Pages client script parses as browser JavaScript', () =>
 
   assert.match(clientScript, /function clearDiagramMappingRow\(button\)/);
   assert.match(clientScript, /function diagramImportRoleMappingClient\(role, existing\)/);
-  assert.match(clientScript, /role\.mapping = diagramImportRoleMappingClient\(role, override\.mapping \|\| role\.mapping \|\| \{\}\);/);
+  assert.match(clientScript, /function diagramImportDirectionPolicyGroups\(unresolved\)/);
+  assert.match(clientScript, /function diagramImportDirectionPolicyMetadataSnippet\(groups\)/);
+  assert.match(clientScript, /function normalizeDiagramDirectionPolicyClient\(value\)/);
+  assert.match(clientScript, /function diagramImportLabelTemplateCandidates\(role, spec, mapping\)/);
+  assert.match(clientScript, /function diagramImportLabelTemplateHasUnterminatedPlaceholder\(template\)/);
+  assert.match(clientScript, /function diagramImportCanonicalLabelTemplate\(template, candidates\)/);
+  assert.match(clientScript, /function diagramImportEnsureRelatedTemplateFields\(mapping, template, candidates\)/);
+  assert.match(clientScript, /function diagramImportIsUserVisibleLabelField\(value\)/);
+  assert.match(clientScript, /function renderDiagramImportLabelAutocomplete\(input\)/);
+  assert.match(clientScript, /data-action="diagram-import-label-token-select"/);
+  assert.match(clientScript, /data-diagram-import-label-template/);
+  assert.doesNotMatch(clientScript, /renderDiagramImportLabelSuggestions/);
+  assert.match(clientScript, /var sourceDirectionPolicy = normalizeDiagramDirectionPolicyClient\(candidate\.directionPolicy\)/);
+  assert.match(clientScript, /function diagramImportStructureTreeClient\(proposal\)/);
+  assert.match(clientScript, /function renderDiagramImportStructureTree\(proposal, spec\)/);
+  assert.match(clientScript, /data-diagram-structure-tree/);
+  assert.match(clientScript, /data-diagram-structure-field="sourceStageId"/);
+  assert.match(clientScript, /data-diagram-structure-field="parentId"/);
+  assert.match(clientScript, /data-diagram-structure-tree-drag/);
+  assert.match(clientScript, /aria-keyshortcuts="Control\+ArrowUp Control\+ArrowDown"/);
+  assert.match(clientScript, /aria-controls="cmdp-diagram-import-panel-/);
+  assert.match(clientScript, /function focusDiagramImportEditorTab\(tab\)/);
+  assert.match(clientScript, /function focusDiagramImportStructureHandle\(itemId\)/);
+  assert.match(clientScript, /canvas\.addEventListener\('keydown'/);
+  assert.match(clientScript, /if \(!identity\.hasIdentity \|\| !identity\.matches\)/);
+  assert.match(clientScript, /не имеют identity исходника и не были наложены/);
+  assert.doesNotMatch(clientScript, /diagramImportMergeLegacyRoleMappingClient/);
   assert.doesNotMatch(clientScript, /role\.mapping = diagramImportRoleMapping\(role,/);
   assert.match(stageSummarySource, /flowOperations\(model\)\.forEach\(function \(operation, index\)/);
   assert.match(clientScript, /\[429, 502, 503, 504\]/);
@@ -74,6 +102,105 @@ test('generated Dynamic Pages client script parses as browser JavaScript', () =>
   assert.doesNotThrow(() => {
     new vm.Script(clientScript, { filename: 'dynamic-pages-client.js' });
   });
+});
+
+test('D2 label template keeps related binding identifiers internal', () => {
+  const clientScript = generatedDynamicPagesClientScript();
+  const helperStart = clientScript.indexOf('function diagramImportLabelTokenIdentifier(value, fallback)');
+  const helperEnd = clientScript.indexOf('function diagramImportStageRows(spec)', helperStart);
+  assert.ok(helperStart >= 0, 'D2 label-template helpers are missing.');
+  assert.ok(helperEnd > helperStart, 'D2 label-template helper boundary is missing.');
+  const helpers = new Function(
+    'state',
+    'uniqueList',
+    'catalogAttributeOptions',
+    'diagramImportStageById',
+    'diagramImportFieldDisplayLabel',
+    'diagramImportClassDisplayLabel',
+    'catalogDomains',
+    'diagramImportCatalogDisplayLabel',
+    't',
+    `${clientScript.slice(helperStart, helperEnd)}\nreturn { diagramImportLabelTemplateCandidates, diagramImportLabelTemplateHasUnterminatedPlaceholder, diagramImportDisplayLabelTemplate, diagramImportCanonicalLabelTemplate, diagramImportEnsureRelatedTemplateFields };`
+  )(
+    { diagramImportLabelTemplateDrafts: {}, diagramImportLabelTemplateErrors: {} },
+    (values) => [...new Set((values || []).filter(Boolean))],
+    (className) => className === 'IpAddress'
+      ? [{ name: 'ipAddr' }, { name: 'Id' }, { name: '_id' }]
+      : [{ name: 'Code' }, { name: 'Description' }, { name: 'Id' }, { name: '_id' }, { name: 'Class' }],
+    () => ({ columns: ['Code', 'Description', 'Id', '_id', 'Class'] }),
+    (_className, field) => field,
+    (className) => className,
+    () => [],
+    (name) => name,
+    (key, values = {}) => `${values.className || ''} ${values.path || ''} ${values.field || ''}`.trim() || key
+  );
+  const mapping = {
+    source: { stageId: 'selection:arm' },
+    primary: { className: 'ARM', structuredFields: [] },
+    related: [{
+      id: 'related_comparison_abc123',
+      className: 'IpAddress',
+      path: [{ kind: 'reference', name: 'ipaddress', targetClass: 'IpAddress' }],
+      structuredFields: []
+    }]
+  };
+  const role = { id: 'workstation', labelTemplate: '${related_comparison_abc123.ipAddr}' };
+  const candidates = helpers.diagramImportLabelTemplateCandidates(role, {}, mapping);
+  const related = candidates.find((candidate) => candidate.kind === 'related' && candidate.relatedField === 'ipAddr');
+
+  assert.equal(related.displayToken, 'related.ipaddress.ipAddr');
+  assert.equal(related.canonicalToken, 'related_comparison_abc123.ipAddr');
+  assert.equal(candidates.some((candidate) => ['_id', 'Id', 'Class'].includes(candidate.displayToken)), false);
+  assert.equal(helpers.diagramImportDisplayLabelTemplate('${related_comparison_abc123.ipAddr}', candidates).value, '${related.ipaddress.ipAddr}');
+  const canonical = helpers.diagramImportCanonicalLabelTemplate('${related.ipaddress.ipAddr}', candidates);
+  assert.deepEqual(canonical.errors, []);
+  assert.equal(canonical.value, '${related_comparison_abc123.ipAddr}');
+  assert.equal(helpers.diagramImportLabelTemplateHasUnterminatedPlaceholder('${Code'), true);
+  assert.deepEqual(helpers.diagramImportDisplayLabelTemplate('${Code', candidates).errors, ['diagramImportLabelTemplateInvalid']);
+  assert.deepEqual(helpers.diagramImportCanonicalLabelTemplate('${Code', candidates).errors, ['diagramImportLabelTemplateInvalid']);
+  helpers.diagramImportEnsureRelatedTemplateFields(mapping, canonical.value, candidates);
+  assert.deepEqual(mapping.related[0].structuredFields, ['ipAddr']);
+});
+
+test('client-side D2 diagnostics validate the persisted structure tree', () => {
+  const clientScript = generatedDynamicPagesClientScript();
+  const helpersStart = clientScript.indexOf('function diagramImportStructureTreeClient(proposal)');
+  const helpersEnd = clientScript.indexOf('\n  function renderDiagramImportStructureTreeRoleOptions', helpersStart);
+  assert.ok(helpersStart >= 0, 'D2 structure-tree helper is missing.');
+  assert.ok(helpersEnd > helpersStart, 'D2 structure-tree helper boundary is missing.');
+
+  const helpers = new Function(
+    'diagramImportRoleVisualKindClient',
+    `${clientScript.slice(helpersStart, helpersEnd)}\nreturn { diagramImportStructureTreeClient, diagramImportStructureTreeIssuesClient };`
+  )((role) => String(role && role.visualKind || 'node'));
+  const proposal = {
+    version: 3,
+    roles: [
+      { id: 'role:group', visualKind: 'container', elementKeys: ['root'] },
+      { id: 'role:node', visualKind: 'node', elementKeys: ['root.node'] }
+    ],
+    structureTree: {
+      version: 1,
+      items: [
+        { id: 'group', roleId: 'role:group', templateElementKey: 'root', parentId: '', sourceStageId: '' },
+        { id: 'node', roleId: 'role:node', templateElementKey: 'root.node', parentId: 'group', sourceStageId: '' }
+      ]
+    }
+  };
+
+  assert.deepEqual(helpers.diagramImportStructureTreeIssuesClient(proposal, {}), { node: 'Выберите результат Object Flow.' });
+  proposal.structureTree.items[1].sourceStageId = 'selection:nodes';
+  assert.deepEqual(helpers.diagramImportStructureTreeIssuesClient(proposal, {}), {});
+
+  proposal.structureTree.items[0].parentId = 'node';
+  assert.equal(helpers.diagramImportStructureTreeIssuesClient(proposal, {}).group, 'Узел D2 не может содержать дочерние элементы.');
+  proposal.structureTree.items[0].parentId = '';
+  proposal.structureTree.items[1].roleId = 'role:group';
+  proposal.structureTree.items[1].templateElementKey = 'root';
+  proposal.structureTree.items[0].parentId = 'node';
+  assert.equal(helpers.diagramImportStructureTreeIssuesClient(proposal, {}).group, 'Обнаружен цикл вложенности.');
+  assert.match(clientScript, /function renderDiagramImportRelationRules\(proposal, spec\)/);
+  assert.match(clientScript, /data-diagram-import-rule-row/);
 });
 
 test('Assistant persists the configurable reference-path depth setting', () => {
@@ -545,47 +672,64 @@ test('diagram editor renders repeatable mapping tables with source-dependent fie
   assert.match(proxySource, /if \(action === 'clear-diagram-mapping-row'\) clearDiagramMappingRow\(target\)/);
   assert.match(proxySource, /if \(action === 'insert-diagram-template-token'\) insertDiagramTemplateToken\(target\)/);
   assert.match(proxySource, /\[data-diagram-mapping-field="from"\]/);
-  assert.match(proxySource, /binding\.unresolved = diagramMappingSourceValue\(mapping\) \? \[\] : \['from'\]/);
+  assert.match(proxySource, /function diagramImportStructureTreeIssuesClient\(proposal, spec\)/);
+  assert.match(proxySource, /data-diagram-structure-field="sourceStageId"/);
+  assert.doesNotMatch(generatedDynamicPagesClientScript(), /binding\.unresolved/);
 });
 
-test('assistant owns D2 import while diagram owns deterministic mappings', () => {
+test('Assistant owns D2 import while Diagram persists structureTree and direct relation rules', () => {
   const flowEditorStart = proxySource.indexOf('function renderAssistantEditor(selected, config)');
   const diagramAssistantEditorStart = proxySource.indexOf('function renderDiagramAssistantEditor(selected, config)', flowEditorStart);
   const cacheEditorStart = proxySource.indexOf('function renderRuntimeCacheFields(', diagramAssistantEditorStart);
   const renderStart = proxySource.indexOf('function renderDiagramImportWorkbench(spec)');
   const renderEnd = proxySource.indexOf('function renderDiagramEditor(spec, outputMode, options)', renderStart);
   const analyzeStart = proxySource.indexOf('function analyzeDiagramImport(options)');
-  const legacyAssistantStart = proxySource.indexOf('function completeDiagramImportWithAssistant()', analyzeStart);
-  const assistantStart = proxySource.indexOf('function assistantDiagramRequest(kind)', analyzeStart);
-  const applyStart = proxySource.indexOf('function applyDiagramImport()', legacyAssistantStart);
+  const analyzeEnd = proxySource.indexOf('function diagramImportProposalMatchesCurrentRevision()', analyzeStart);
+  const applyStart = proxySource.indexOf('function applyDiagramImport()', analyzeStart);
   const refreshStart = proxySource.indexOf('function refreshDiagramMappingEditorAfterSourceChange()', applyStart);
+  const assistantStart = proxySource.indexOf('function assistantDiagramRequest(kind)', refreshStart);
   const captureImportStart = proxySource.indexOf('function captureDiagramImportProposalFromDom(manualBindingId)');
   const importOverridesStart = proxySource.indexOf('function diagramImportBindingOverrides(proposal)', captureImportStart);
+  const appliedEditorStart = proxySource.indexOf('function diagramImportAppliedEditorFromSpec(spec)');
+  const appliedEditorEnd = proxySource.indexOf('function activeDiagramImportEditorModel(spec)', appliedEditorStart);
+  const updateAppliedStart = proxySource.indexOf('function applyAppliedDiagramImportChanges()');
+  const updateAppliedEnd = proxySource.indexOf('function refreshAppliedDiagramImportSource()', updateAppliedStart);
   assert.ok(renderStart > -1);
   assert.ok(flowEditorStart > -1);
   assert.ok(diagramAssistantEditorStart > flowEditorStart);
   assert.ok(cacheEditorStart > diagramAssistantEditorStart);
   assert.ok(renderEnd > renderStart);
   assert.ok(analyzeStart > -1);
-  assert.ok(assistantStart > -1);
+  assert.ok(analyzeEnd > analyzeStart);
   assert.ok(applyStart > analyzeStart);
   assert.ok(refreshStart > applyStart);
+  assert.ok(assistantStart > refreshStart);
   assert.ok(captureImportStart > -1);
   assert.ok(importOverridesStart > captureImportStart);
+  assert.ok(appliedEditorStart > -1);
+  assert.ok(appliedEditorEnd > appliedEditorStart);
+  assert.ok(updateAppliedStart > -1);
+  assert.ok(updateAppliedEnd > updateAppliedStart);
 
   const renderSource = proxySource.slice(renderStart, renderEnd);
   const flowEditorSource = proxySource.slice(flowEditorStart, diagramAssistantEditorStart);
   const diagramAssistantEditorSource = proxySource.slice(diagramAssistantEditorStart, cacheEditorStart);
-  const analyzeSource = proxySource.slice(analyzeStart, legacyAssistantStart);
+  const analyzeSource = proxySource.slice(analyzeStart, analyzeEnd);
   const assistantSource = proxySource.slice(assistantStart, proxySource.indexOf('function assistantFlowStageSummaries', assistantStart));
   const applySource = proxySource.slice(applyStart, refreshStart);
   const captureImportSource = proxySource.slice(captureImportStart, importOverridesStart);
+  const appliedEditorSource = proxySource.slice(appliedEditorStart, appliedEditorEnd);
+  const updateAppliedSource = proxySource.slice(updateAppliedStart, updateAppliedEnd);
   assert.match(renderSource, /cmdp-diagram-import-source/);
   assert.match(renderSource, /cmdp-diagram-import-file/);
   assert.match(renderSource, /diagram-import-analyze/);
   assert.match(renderSource, /assistant-diagram-interpret/);
   assert.match(renderSource, /assistant-diagram-map/);
   assert.match(renderSource, /assistantDiagramAnalysisRequired/);
+  assert.match(renderSource, /renderDiagramImportPreview\(\)[\s\S]*renderDiagramImportRuntimePreview\(\)/);
+  assert.match(renderSource, /function renderDiagramImportRuntimePreview\(\)/);
+  assert.match(renderSource, /diagramImportRuntimePreviewTitle/);
+  assert.match(renderSource, /diagramImportAppliedAssistantHelp/);
   assert.doesNotMatch(renderSource, /renderDiagramImportV3Semantics\(/);
   assert.doesNotMatch(renderSource, /renderDiagramImportRoleMapping\(/);
   assert.doesNotMatch(renderSource, /data-action="diagram-import-apply"/);
@@ -600,14 +744,48 @@ test('assistant owns D2 import while diagram owns deterministic mappings', () =>
   assert.doesNotMatch(diagramAssistantEditorSource, /renderAssistantFlowEditor/);
   assert.match(proxySource, /if \(action === 'open-assistant-d2'\) setDesignerSection\('diagram-assistant'\)/);
   assert.match(analyzeSource, /\/draft\/diagram-import\/analyze/);
-  assert.match(analyzeSource, /diagramImportProposalMatchesCurrentRevision/);
+  assert.match(proxySource, /function renderDiagramImportSafely\(\)/);
+  assert.match(analyzeSource, /var busyRenderError = renderDiagramImportSafely\(\)/);
+  assert.match(analyzeSource, /var resultRenderError = renderDiagramImportSafely\(\)/);
+  assert.match(proxySource, /function diagramImportProposalMatchesCurrentRevision\(\)/);
   assert.match(assistantSource, /\/assistant\/diagram-import\//);
   assert.match(assistantSource, /map-selections/);
   assert.match(assistantSource, /flushAssistantPromptAutosave/);
   assert.match(assistantSource, /ensureDiagramImportProposalForCurrentRevision/);
   assert.match(applySource, /\/draft\/diagram-import\/apply/);
   assert.match(applySource, /state\.lastDraftPreviewOk = false/);
-  assert.match(applySource, /state\.diagramImportAppliedPendingPreview = true/);
+  assert.match(applySource, /diagramImportPreviewBackground/);
+  assert.match(applySource, /previewAppliedDiagramImport\(\)/);
+  assert.match(applySource, /updateSelectedFromEditor\(result\.json\.spec\)/);
+  assert.doesNotMatch(proxySource, /assistantSpecWithPrompts\(result\.json\.spec\)/);
+  assert.doesNotMatch(applySource, /state\.diagramImportAppliedPendingPreview = true/);
+  assert.match(applySource, /state\.diagramImportRuntimePreview = null/);
+  assert.doesNotMatch(applySource, /state\.diagramImportPreview = null/);
+  assert.match(appliedEditorSource, /authoring\.d2Import/);
+  assert.match(appliedEditorSource, /editorMode: 'applied'/);
+  assert.match(updateAppliedSource, /\/draft\/diagram-import\/update-applied/);
+  assert.match(updateAppliedSource, /templateCode: String\(selected\.code \|\| ''\)/);
+  assert.match(updateAppliedSource, /currentSpec: cloneSpecForEdit\(selected\.spec \|\| defaultSpec\(\)\)/);
+  assert.doesNotMatch(updateAppliedSource, /d2Source:/);
+  assert.doesNotMatch(updateAppliedSource, /proposal:/);
+  assert.doesNotMatch(updateAppliedSource, /\/draft\/diagram-import\/analyze/);
+  const appliedPreviewStart = proxySource.indexOf('function previewAppliedDiagramImport()');
+  const appliedPreviewEnd = proxySource.indexOf('function applyDiagramImport()', appliedPreviewStart);
+  const appliedPreviewSource = proxySource.slice(appliedPreviewStart, appliedPreviewEnd);
+  assert.match(appliedPreviewSource, /state\.diagramImportRuntimePreview = result/);
+  assert.match(appliedPreviewSource, /diagramImportRuntimePreviewDetails\(result\)/);
+  assert.match(proxySource, /function diagramImportRuntimePreviewWorkflowMessage\(workflow\)/);
+  assert.match(proxySource, /diagramImportRuntimePreviewSourceRefreshRequired/);
+  assert.match(proxySource, /diagramImportRuntimePreviewHashes/);
+  assert.match(appliedPreviewSource, /state\.lastDraftPreviewOk = result\.ok && details\.ready/);
+  assert.match(appliedPreviewSource, /state\.diagramImportRuntimePreviewBusy = true/);
+  assert.match(appliedPreviewSource, /timeoutMs: 30000/);
+  assert.match(appliedPreviewSource, /draft\/preview\?maxRows=25&executionScope=diagrams/);
+  assert.match(appliedPreviewSource, /previewTemplateCode/);
+  assert.doesNotMatch(appliedPreviewSource, /previewSpecHash/);
+  assert.match(proxySource, /data-action="diagram-import-preview-retry"/);
+  assert.match(proxySource, /function diagramImportRuntimePreviewTiming\(preview\)/);
+  assert.doesNotMatch(appliedPreviewSource, /state\.result = result/);
   assert.doesNotMatch(analyzeSource, /saveTemplate\(/);
   assert.doesNotMatch(assistantSource, /saveTemplate\(/);
   assert.doesNotMatch(applySource, /saveTemplate\(/);
@@ -620,24 +798,40 @@ test('assistant owns D2 import while diagram owns deterministic mappings', () =>
   const deterministicStart = proxySource.indexOf('function renderDiagramImportDeterministicMappings(spec)');
   const deterministicEnd = proxySource.indexOf('function renderImportedD2Status(diagram)', deterministicStart);
   const deterministicSource = proxySource.slice(deterministicStart, deterministicEnd);
-  assert.match(deterministicSource, /renderDiagramImportV3Semantics\(proposal\)/);
-  assert.match(deterministicSource, /renderDiagramImportRoleMapping\(role, spec\)/);
+  assert.match(deterministicSource, /activeDiagramImportEditorModel\(spec\)/);
+  assert.match(deterministicSource, /data-diagram-import-editor-mode/);
+  assert.match(deterministicSource, /diagram-import-update-applied/);
+  assert.match(deterministicSource, /diagramImportProposalHasReviewBlocker\(proposal\)/);
+  assert.match(deterministicSource, /renderDiagramImportEditorTabs\(editorTab\)/);
+  assert.match(deterministicSource, /renderDiagramImportNodeMappings\(proposal, spec\)/);
+  assert.match(deterministicSource, /renderDiagramImportStructureEditor\(proposal, spec\)/);
+  assert.match(deterministicSource, /renderDiagramImportRelationRules\(proposal, spec\)/);
   assert.match(deterministicSource, /diagram-import-apply/);
   assert.match(captureImportSource, /roleMappingVisible/);
-  assert.match(captureImportSource, /if \(relationRuleRows\.length\) proposal\.relationRules/);
-  assert.match(captureImportSource, /if \(placementRuleRows\.length\) proposal\.placementRules/);
+  assert.match(captureImportSource, /activeDiagramImportEditorModel\(state\.selectedTemplate/);
+  assert.match(captureImportSource, /proposal\.structureTree = structureTree/);
+  assert.match(captureImportSource, /proposal\.relationRules/);
+  assert.match(proxySource, /Сохраненное дерево определяет фактическую вложенность/);
+  assert.match(proxySource, /data-diagram-structure-tree/);
+  assert.match(proxySource, /data-diagram-import-rule-row/);
+  assert.match(proxySource, /directionPolicy/);
   assert.match(proxySource, /data-diagram-mapping-id/);
   assert.match(proxySource, /data-import-role-key/);
   assert.match(proxySource, /state\.diagramImportStale/);
   assert.match(proxySource, /diagramImportProposalHasReviewBlocker/);
   assert.match(proxySource, /'diagram',[\s\S]*?'visualization'/);
   assert.match(proxySource, /diagramImportAppliedPendingPreview && !state\.lastDraftPreviewOk/);
-  assert.match(proxySource, /Boolean\(state\.diagramImportProposal\).*diagramImportAppliedPendingPreview/);
+  assert.match(proxySource, /var blocked = Boolean\(state\.diagramImportProposal\);/);
   assert.match(proxySource, /function saveTemplate\(\)[\s\S]*?if \(state\.diagramImportProposal\)/);
+  assert.match(proxySource, /if \(state\.diagramImportAppliedEditorDirty\)/);
+  assert.match(proxySource, /appliedDiagramImportSpecWithSavedMapping/);
+  assert.match(proxySource, /mappingValidation = \{ version: 1, status: 'needsValidation' \}/);
   assert.match(proxySource, /diagramImportSignedProposal/);
   assert.match(proxySource, /markImportedDiagramChanged/);
   assert.match(proxySource, /assistantResponseStale/);
   assert.match(proxySource, /state\.selectedTemplate !== requestTemplate/);
+  assert.match(proxySource, /if \(action === 'diagram-import-update-applied'\) applyAppliedDiagramImportChanges\(\)/);
+  assert.match(proxySource, /if \(requestUrl\.pathname === `\$\{BACKEND_PREFIX\}\/draft\/diagram-import\/update-applied`\)/);
   const objectFlowRouteStart = proxySource.indexOf("if (requestUrl.pathname === `${BACKEND_PREFIX}/assistant/object-flow/plan`");
   const objectFlowRouteEnd = proxySource.indexOf("if (requestUrl.pathname === `${BACKEND_PREFIX}/draft/object-flow/apply`", objectFlowRouteStart);
   const objectFlowRouteSource = proxySource.slice(objectFlowRouteStart, objectFlowRouteEnd);
@@ -650,14 +844,25 @@ test('assistant owns D2 import while diagram owns deterministic mappings', () =>
   const diagramAssistantRouteSource = proxySource.slice(diagramAssistantRouteStart, diagramAssistantRouteEnd);
   assert.match(diagramAssistantRouteSource, /createAssistantDiagramStageDraft/);
   assert.doesNotMatch(diagramAssistantRouteSource, /createAssistantTemplateDraft/);
-  assert.match(proxySource, /data-diagram-import-semantic/);
-  assert.match(proxySource, /data-diagram-import-role-row/);
+  assert.doesNotMatch(proxySource, /data-diagram-import-role-row/);
+  assert.match(proxySource, /data-diagram-structure-tree-row/);
+  assert.match(proxySource, /data-action="diagram-structure-add-root"/);
+  assert.match(proxySource, /data-action="diagram-structure-add-child"/);
   assert.match(proxySource, /data-diagram-import-role-mapping/);
-  assert.match(proxySource, /data-diagram-import-exemplar/);
   assert.match(proxySource, /data-diagram-import-role-field="primary\.className"/);
+  const roleMappingStart = proxySource.indexOf('function renderDiagramImportRoleMapping(role, spec, roles)');
+  const roleMappingEnd = proxySource.indexOf('function renderDiagramImportRelationRules(proposal, spec)', roleMappingStart);
+  const roleMappingSource = proxySource.slice(roleMappingStart, roleMappingEnd);
+  assert.ok(roleMappingStart > -1);
+  assert.ok(roleMappingEnd > roleMappingStart);
+  assert.match(roleMappingSource, /diagram-import-readonly-value/);
+  assert.match(roleMappingSource, /renderDiagramImportNodeDataFields\(/);
+  assert.match(proxySource, /data-diagram-import-node-data/);
+  assert.doesNotMatch(roleMappingSource, /data-diagram-import-role-field="primary\.idAttribute"/);
+  assert.match(proxySource, /function diagramImportPrimaryIdAttribute\(role, primary/);
+  assert.match(proxySource, /primary\.idAttribute = '_id'/);
   assert.match(proxySource, /diagram-import-add-related/);
   assert.match(proxySource, /diagram-import-add-rule/);
-  assert.match(proxySource, /diagram-import-add-placement/);
   assert.match(proxySource, /state\.diagramImportProposal && state\.diagramImportProposal\.version === 3/);
   assert.match(proxySource, /function catalogRelationPathOptions\(className\)/);
   assert.match(proxySource, /Number\(state\.maxTraversalDepth\)/);
@@ -668,17 +873,19 @@ test('assistant owns D2 import while diagram owns deterministic mappings', () =>
   assert.match(proxySource, /catalogDomainRelationPathOptions/);
   assert.match(proxySource, /renderDiagramImportAttributeMultiSelect/);
   assert.match(proxySource, /diagramImportSelectedValues/);
-  assert.match(proxySource, /renderDiagramImportLabelSuggestions/);
+  assert.match(roleMappingSource, /diagramImportLabelTemplateEditorValue\(role, spec \|\| defaultSpec\(\), mapping\)/);
+  assert.match(roleMappingSource, /data-diagram-import-label-template/);
+  assert.match(roleMappingSource, /<div class="diagram-import-label-template"/);
+  assert.match(roleMappingSource, /data-diagram-import-label-autocomplete/);
+  assert.match(proxySource, /function selectDiagramImportLabelAutocompleteTarget\(target\)/);
+  assert.match(proxySource, /addEventListener\('pointerdown'/);
+  assert.doesNotMatch(roleMappingSource, /diagram-template-suggestions/);
+  assert.doesNotMatch(roleMappingSource, /related_comparison_/);
+  assert.match(proxySource, /function diagramImportEnsureRelatedTemplateFields\(mapping, template, candidates\)/);
+  assert.match(proxySource, /diagramImportEnsureRelatedTemplateFields\(role\.mapping, primary\.labelTemplate/);
+  assert.match(proxySource, /\['_id', 'Id', 'Class', 'SourceId', 'RelatedId'\]/);
   assert.match(proxySource, /configuredModelCatalogRequestUrl/);
   assert.doesNotMatch(proxySource, /model\/catalog\?maxClasses=500&maxDomains=500/);
-  assert.match(proxySource, /diagramImportSemanticComposite/);
-  const v3SemanticsStart = proxySource.indexOf('function renderDiagramImportV3Semantics(proposal)');
-  const v3SemanticsEnd = proxySource.indexOf('function renderDiagramImportRelatedRow', v3SemanticsStart);
-  const v3SemanticsSource = proxySource.slice(v3SemanticsStart, v3SemanticsEnd);
-  assert.match(v3SemanticsSource, /renderDiagramImportSemanticsHelp/);
-  assert.match(v3SemanticsSource, /diagramImportTypeOrContainer/);
-  assert.match(v3SemanticsSource, /diagramImportBasis/);
-  assert.doesNotMatch(v3SemanticsSource, /<th><\/th>/);
   const v3ProposalStart = proxySource.indexOf('function renderDiagramImportProposal(spec)');
   const v3ProposalEnd = proxySource.indexOf('function renderDiagramImportWorkbench', v3ProposalStart);
   const v3ProposalSource = proxySource.slice(v3ProposalStart, v3ProposalEnd);
@@ -695,6 +902,21 @@ test('assistant owns D2 import while diagram owns deterministic mappings', () =>
   assert.match(readMappingsSource, /storedMappings\.find/);
   assert.match(readMappingsSource, /cloneJsonValue\(stored/);
   assert.match(readMappingsSource, /if \(!mapping\.importRole && importRoleKey\)/);
+});
+
+test('only the main Diagram editor remains; Diagram editor 2 sandbox UI and API are removed', () => {
+  assert.doesNotMatch(proxySource, /data-designer-section="diagram-2"/);
+  assert.doesNotMatch(proxySource, /menuDiagramSandbox/);
+  assert.doesNotMatch(proxySource, /diagram-sandbox/);
+  assert.doesNotMatch(proxySource, /diagramSandboxProposal/);
+  const menuStart = proxySource.indexOf('function renderDesignerMenu()');
+  const menuEnd = proxySource.indexOf('function renderNumberSetting', menuStart);
+  const menuSource = proxySource.slice(menuStart, menuEnd);
+  assert.match(menuSource, /section: 'diagram'/);
+  assert.match(proxySource, /data-action="diagram-import-editor-tab"/);
+  assert.match(proxySource, /diagramImportEditorTab/);
+  assert.match(proxySource, /diagramImportStructureTitle/);
+  assert.match(proxySource, /function renderDiagramImportStructureTree\(proposal, spec\)/);
 });
 
 test('Assistant applies data flow by saving the selected template; Extraction remains the only execution view', () => {
@@ -743,7 +965,7 @@ test('D2 import helper handles stdin errors without crashing the backend', () =>
   const end = proxySource.indexOf('function normalizeDiagramImportElement', start);
   assert.ok(start > -1 && end > start);
   assert.match(proxySource.slice(start, end), /child\.stdin\.on\('error'/);
-  assert.match(proxySource, /parsed\.version === 3/);
+  assert.match(proxySource, /parsed\.version >= 4/);
 });
 
 test('runtime diagram view exposes D2 rendered SVG and source download affordances', () => {
@@ -820,6 +1042,12 @@ test('snapshot publication saves static settings before publish and uses saved t
   assert.match(publishSource, /savedSpecHash: savedTemplate\.specHash/);
   assert.doesNotMatch(publishSource, /savedTemplate\.specHash \|\| ''/);
   assert.doesNotMatch(publishSource, /encodeURIComponent\(payload\.code\) \+ '\/publish'/);
+});
+
+test('dynamic runtime explains that snapshot publication is unavailable', () => {
+  assert.match(proxySource, /publicationDynamicHint/);
+  assert.match(proxySource, /snapshotPublicationEnabled/);
+  assert.match(proxySource, /disabled: !snapshotPublicationEnabled/);
 });
 
 test('final view attribute lazy-load retries after transient class attribute errors', () => {
@@ -1052,7 +1280,6 @@ test('operation aliases immediately become available to later operations without
   assert.match(proxySource, /data-action="apply-extraction-published"/);
   assert.doesNotMatch(proxySource, /assistantFlowExtractionCandidate|assistantFlowCandidateOutput|extractionCandidateBlockId|extractionCandidateAlias/);
   assert.match(proxySource, /roles: input\.modelRoles \|\| input\.roles/);
-  assert.match(proxySource, /Ignored static D2 role \$\{role\.displayName \|\| roleId\} returned by Assistant as unresolved mapping\./);
   assert.match(refreshSource, /renderPriorMaterializedAliasOptions\(state\.relationDraft, index, selected\)/);
   assert.match(refreshSource, /\['from', 'with'\]/);
   assert.match(inputSource, /\[data-set-operation-field="as"\], \[data-matching-block-field="as"\]/);

@@ -25,9 +25,8 @@ flowchart TB
 
 | Режим | Настройка | Назначение | Примечание ИБ |
 | --- | --- | --- | --- |
-| Docker stdout | `CMDP_LOG_TARGET=stdout` | Базовый режим для контейнеров | Collector отвечает за доставку в ELK |
-| Syslog | `CMDP_LOG_TARGET=syslog` | VM/bare-metal, SIEM, существующий rsyslog/syslog-ng контур | `stdout` остается включенным; UDP может терять сообщения, TCP предпочтительнее при строгих требованиях |
-| Дублирование | `CMDP_LOG_TARGET=stdout,syslog` | Параллельная отправка в два контура | Следить за дублями в SIEM/ELK |
+| Local stdout | `CMDP_LOG_TARGET=stdout` | Локальная разработка без syslog collector | Не использовать как production delivery contract |
+| Production delivery | `CMDP_LOG_TARGET=stdout,syslog` | Docker/VM production, SIEM или существующий rsyslog/syslog-ng контур | `CMDP_SYSLOG_HOST` обязателен; UDP может терять сообщения, TCP предпочтительнее при строгих требованиях |
 
 ## Состав событий
 

@@ -33,7 +33,7 @@
 
   <rect class="bg" width="1400" height="820"/>
   <text x="60" y="52" class="zone-title">CMDB Dynamic Pages: высокоуровневая архитектура окружения</text>
-  <text x="60" y="80" class="small">Локальный стенд: единый origin для wiki/iframe, backend-owned UI, CMDBuild REST под правами пользователя, Redis для кэша и снимков.</text>
+  <text x="60" y="80" class="small">Локальный стенд: project-only nginx, backend-owned UI, CMDBuild REST под правами пользователя, Redis для кэша и снимков.</text>
 
   <rect x="40" y="115" width="1320" height="650" rx="18" class="zone"/>
   <text x="70" y="154" class="zone-title">Developer / Test host</text>
@@ -41,19 +41,14 @@
   <rect x="85" y="210" width="210" height="118" rx="12" class="box browser"/>
   <text x="110" y="248" class="box-title">Browser</text>
   <text x="110" y="276" class="box-text">CMDBuild user</text>
-  <text x="110" y="300" class="box-text">Wiki iframe / direct URL</text>
+  <text x="110" y="300" class="box-text">Direct project URL</text>
 
   <rect x="380" y="178" width="250" height="170" rx="12" class="box front"/>
   <text x="410" y="216" class="box-title">Nginx same-origin</text>
   <text x="410" y="246" class="port">localhost:8088</text>
-  <text x="410" y="276" class="box-text">/ -> wiki</text>
+  <text x="410" y="276" class="box-text">/ -> 404</text>
   <text x="410" y="300" class="box-text">/cmdbuild/* -> app chain</text>
   <text x="410" y="324" class="box-text">/health/* -> app health</text>
-
-  <rect x="380" y="425" width="250" height="120" rx="12" class="box front"/>
-  <text x="410" y="464" class="box-title">Wiki / Portal</text>
-  <text x="410" y="494" class="port">localhost:3000</text>
-  <text x="410" y="522" class="box-text">Pages with runtime iframe</text>
 
   <rect x="735" y="170" width="290" height="210" rx="12" class="box app"/>
   <text x="765" y="208" class="box-title">cmdbdynamicpages</text>
@@ -87,10 +82,6 @@
   <path class="flow" d="M295 250 C330 250 342 250 380 250"/>
   <rect x="310" y="224" width="60" height="24" rx="6" class="label-bg"/>
   <text x="322" y="241" class="label">8088</text>
-
-  <path class="flow" d="M505 348 C505 378 505 395 505 425"/>
-  <rect x="520" y="376" width="80" height="24" rx="6" class="label-bg"/>
-  <text x="532" y="393" class="label">wiki UI</text>
 
   <path class="flow" d="M630 263 C675 263 690 263 735 263"/>
   <rect x="650" y="237" width="67" height="24" rx="6" class="label-bg"/>

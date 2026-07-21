@@ -11,7 +11,8 @@ MediaWiki остается источником модерируемого ст�
 
 ## Reverse Proxy
 
-Все пользовательские маршруты должны быть доступны через один origin:
+Все пользовательские маршруты должны быть доступны через один public origin
+`CMDP_PUBLIC_ORIGIN`:
 
 ```text
 /wiki/* или обычные wiki routes    -> MediaWiki
@@ -20,14 +21,22 @@ MediaWiki остается источником модерируемого ст�
 /cmdbuild/custom-api/*             -> cmdbdynamicpages
 ```
 
-Proxy должен пробрасывать `Cookie`, `Authorization`, `X-Forwarded-*` и request
-id/correlation id. Browser-код использует относительные URL и не обращается к
-внутренним портам напрямую.
+Browser-код MediaWiki и WikiAI использует относительные URL этого origin. Он
+никогда не обращается к backend напрямую по `:8093` (включая `localhost` и IP
+host). `:8093` остается loopback-only портом backend для локального health
+check; public routes обслуживает TLS reverse proxy.
+
+Proxy передает public `Host`, `X-Forwarded-*`, обычную CMDBuild session и
+request id/correlation id согласно своему контракту. Он не должен создавать
+или передавать как доверенную identity заголовки `X-User-Name`, `X-Groups` или
+их аналоги: `cmdbdynamicpages` их не использует для авторизации.
 
 ## Auth Model
 
 `cmdbdynamicpages` не читает cookie из JavaScript. Backend получает
-`CMDBuild-Authorization` на same-origin route и валидирует его через CMDBuild.
+`CMDBuild-Authorization` только на public same-origin route и валидирует его
+через CMDBuild. MediaWiki/WikiAI не подменяют эту сессию username/groups
+headers.
 
 WikiAI Gateway валидирует пользователя отдельно через MediaWiki cookie или OIDC
 Bearer. Нельзя передавать username/groups из frontend как доверенный источник

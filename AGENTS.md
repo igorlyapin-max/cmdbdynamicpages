@@ -32,6 +32,11 @@ Keep these surfaces aligned when editing init/runtime docs:
 - Read only the selected `SKILL.md`, then only directly referenced `references/*.md` needed for the task.
 - Keep required project rules in this `AGENTS.md`; keep long API, architecture, runbook, and payload details in skill references.
 
+## Runtime Ownership
+
+- Project delivery owns only `cmdbdynamicpages` backend, its optional nginx front, and their documented interfaces.
+- Do not add, document, proxy, test, restart, or review ports and services of other projects. Existing shared host nginx configuration is unmanaged unless the user explicitly requests work on it.
+
 ## Core Operating Rules
 
 1. Read this file before planning or editing.

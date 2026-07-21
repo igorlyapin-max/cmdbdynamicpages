@@ -17,15 +17,16 @@ Runtime host не должен выполнять `npm install`, `npm run build`
 - Если registry использует внутренний CA, установить CA/cert в trust store Docker host до pull image.
 - DNS/proxy/firewall должны разрешать:
   - pull image из private registry;
+  - browser access только к public `CMDP_PUBLIC_ORIGIN` через TLS reverse proxy;
   - доступ backend к `CMDBUILD_ORIGIN`;
   - доступ backend к Redis;
   - optional доступ backend к LiteLLM endpoint, если включен Designer assistant;
-  - входящий доступ к `PROXY_PORT`, по умолчанию `8093`;
-  - optional same-origin nginx front `8088`, если используется bundled nginx.
+  - доступ backend к approved syslog collector.
+- Backend по умолчанию слушает только `127.0.0.1:8093`. Не открывать `PROXY_PORT` во внешнем firewall и не использовать его как public URL: browser входит через `CMDP_PUBLIC_ORIGIN`.
 - Redis должен быть production-grade и password-protected, если static snapshot или runtime cache входят в service contract.
 - Kafka для этого сервиса не требуется.
 - Секреты должны приходить из PAM, platform injection, Docker secrets, mounted secret file или другого approved secret source.
-- Логи должны уходить через Docker logging driver, Filebeat, Fluent Bit, Logstash, syslog или другой collector. Приложение всегда пишет structured logs в `stdout`.
+- Production logging использует `CMDP_LOG_TARGET=stdout,syslog`: приложение пишет structured logs в `stdout`/`stderr` и отправляет их в approved syslog collector. Docker logging driver не является заменой этого delivery contract.
 
 ## Подготовка env
 
@@ -36,6 +37,8 @@ cp .env.example .env
 Заменить placeholders:
 
 - `CMDBDYNAMIC_IMAGE` - approved registry image, например `registry.example.local/gkm/cmdbdynamicpages:v0.1.0-static-baseline`;
+- `PROXY_HOST` - bind address backend; production default `127.0.0.1`, а внешний TLS reverse proxy публикует только `CMDP_PUBLIC_ORIGIN`;
+- `CMDP_PUBLIC_ORIGIN` - canonical public `http(s)` origin для browser, CMDBuild UI, custom page и custom API; не содержит path, query, fragment или credentials;
 - `CMDBUILD_ORIGIN` - URL CMDBuild upstream, доступный с backend host;
 - `CMDBDYNAMIC_REDIS_URL` - Redis endpoint без plaintext password в URL, если пароль передается файлом;
 - `CMDBDYNAMIC_REDIS_PASSWORD_FILE_HOST` - host path к secret file от PAM/platform;
@@ -48,11 +51,12 @@ cp .env.example .env
 - `Cst_QueryToolConfig.RuntimeConfigJson.assistant.mcp` - runtime-настройки read-only MCP tools для Designer Assistant; secrets здесь не хранить;
 - `CMDP_D2_RENDER_ENABLED`, `CMDP_D2_BINARY`, `CMDP_D2_TIMEOUT_MS`, `CMDP_D2_MAX_INPUT_BYTES`, `CMDP_D2_MAX_OUTPUT_BYTES`, `CMDP_D2_MAX_DIAGRAMS`, `CMDP_D2_CONCURRENCY`, `CMDP_D2_LAYOUT`, `CMDP_D2_LAYOUT_ALLOWLIST` - обязательный по умолчанию server-side D2 SVG render. В штатном image binary уже лежит в `/usr/local/bin/d2`; при `CMDP_D2_RENDER_ENABLED=true` `/health/ready` требует рабочий binary;
 - `CMDP_D2_IMPORT_BINARY`, `CMDP_D2_IMPORT_TIMEOUT_MS`, `CMDP_D2_IMPORT_MAX_INPUT_BYTES`, `CMDP_D2_IMPORT_MAX_OUTPUT_BYTES`, `CMDP_D2_IMPORT_MAX_ELEMENTS`, `CMDP_D2_IMPORT_PROPOSAL_TTL_MS`, `CMDP_D2_IMPORT_ASSISTANT_MAX_SPEC_BYTES`, `CMDP_TEMPLATE_REQUEST_MAX_BYTES` - bounded import self-contained `.d2` в Designer. Штатный image содержит `/usr/local/bin/cmdp-d2-import`; readiness проверяет parser helper отдельно. Proposal подписан, привязан к CMDBuild session/template version и по умолчанию действует 30 минут. Перед LiteLLM raw D2 source/structural IR и composite template удаляются, размер sanitized spec ограничен. Общий body limit Preview/Create/Update должен вмещать разрешённые source и normalized IR. Raw D2 source и CMDBuild payload не должны попадать в operational logs;
-- `CMDP_LOG_TARGET` - `stdout` или `stdout,syslog`, если контур использует syslog sink;
-- `CMDP_EXTERNAL_LOG_SINK` - имя внешней доставки логов (`docker logging driver`, collector/sidecar, ELK/OpenSearch/syslog route), если `CMDP_LOG_TARGET` остается `stdout`;
-- `CMDP_SYSLOG_*` - только если включен syslog.
+- `CMDP_LOG_TARGET` - production contract `stdout,syslog`: structured logs остаются в stdout/stderr и дублируются в syslog;
+- `CMDP_SYSLOG_HOST`, `CMDP_SYSLOG_PORT`, `CMDP_SYSLOG_PROTOCOL`, `CMDP_SYSLOG_FACILITY` - обязательные параметры approved syslog collector.
 
 `replace-me`, `registry.example.local`, `cmdbuild.example.local`, `redis.example.local`, `litellm.example.local` и `syslog.example.local` не являются рабочими значениями. Real `.env` файлы не коммитить.
+
+`CMDP_PUBLIC_ORIGIN` и `CMDBUILD_ORIGIN` имеют разные роли. Например, browser работает с `https://custom.example.local`, а backend обращается к internal CMDBuild `https://vr2.internal.example`. Internal upstream не должен быть доступен пользователям, попадать в browser URLs, redirect `Location`, `Origin`, `Referer` или CMDBuild cookie domain. Внешний TLS reverse proxy обязан передать public `Host`, `X-Forwarded-Host` и `X-Forwarded-Proto=https`.
 
 Для опубликованных static snapshots raw `.d2` source не отдается публичному endpoint по умолчанию. Если заказчик разрешает скачивание `.d2`, включайте `publish.publicD2Source=true` в шаблоне осознанно: source может содержать structured diagram metadata и бизнес-данные, уже зафиксированные в snapshot.
 
@@ -108,11 +112,11 @@ docker logs --tail=100 cmdbdynamicpages-backend
 
 Ожидания:
 
-- `/health/live` возвращает `200`, если Node process отвечает;
-- `/health/ready` возвращает `200`, только если Redis, CMDBuild upstream и обязательный D2 renderer доступны;
+- `/health/live` - liveness: возвращает `200`, если Node process отвечает; не доказывает готовность зависимостей;
+- `/health/ready` - readiness: возвращает `200`, только если Redis, CMDBuild upstream и обязательный D2 renderer доступны;
 - `/health/redis` возвращает `200` при доступном Redis;
 - `/metrics` возвращает Prometheus text без cookies, tokens, user names, runtime rows и raw CMDBuild payload;
-- Docker healthcheck использует `/health/live`.
+- Docker healthcheck использует только `/health/live`; rollout и traffic routing должны использовать `/health/ready`.
 
 ## Diagnostic и logging baseline
 
@@ -120,8 +124,12 @@ Production default:
 
 ```text
 CMDP_DIAGNOSTIC_MODE=off
-CMDP_LOG_TARGET=stdout
+CMDP_LOG_TARGET=stdout,syslog
 CMDP_LOG_FORMAT=json
+CMDP_SYSLOG_HOST=syslog.example.local
+CMDP_SYSLOG_PORT=514
+CMDP_SYSLOG_PROTOCOL=udp
+CMDP_SYSLOG_FACILITY=local0
 ```
 
 Для диагностики можно временно включить:
@@ -131,7 +139,7 @@ CMDP_DIAGNOSTIC_MODE=Basic
 CMDP_DIAGNOSTIC_MODE=Verbose
 ```
 
-`Verbose` включать только на время incident. Cookie, authorization headers, CSRF token, Redis password, raw runtime rows и raw CMDBuild payload не должны попадать в логи. Если нужен внешний sink, использовать `CMDP_LOG_TARGET=stdout,syslog` и настроить `CMDP_SYSLOG_*` либо собрать stdout платформенным collector-ом.
+`Verbose` включать только на время incident. Cookie, authorization headers, CSRF token, Redis password, raw runtime rows и raw CMDBuild payload не должны попадать в логи. `CMDP_SYSLOG_HOST`, `CMDP_SYSLOG_PORT`, `CMDP_SYSLOG_PROTOCOL` и `CMDP_SYSLOG_FACILITY` должны указывать на approved syslog collector; `stdout`/stderr остаются обязательным локальным output.
 
 ## CMDBuild schema и custom page
 

@@ -7,7 +7,7 @@
 - CMDBuild доступен, локально по умолчанию `http://127.0.0.1:8090/cmdbuild`.
 - `cmdbdynamicpages` backend/proxy запускается на `http://127.0.0.1:8093`.
 - Redis доступен на `redis://127.0.0.1:6379/0`; в production пароль обязателен.
-- Для iframe/wiki используется same-origin nginx front `http://localhost:8088`.
+- Project-only nginx front доступен по `http://localhost:8088` и обслуживает только `/cmdbuild/*` и `/health/*`.
 - Для первого создания схемы нужен CMDBuild role с `admin_classes_modify` и доступом к metadata/classes API.
 - Доступ к Designer равен доступу к технической схеме проекта: пользователь с правом редактировать технические классы может создавать и менять шаблоны runtime endpoints.
 
@@ -26,19 +26,24 @@ Production env минимум:
 ```text
 PROXY_HOST=127.0.0.1
 PROXY_PORT=8093
+CMDP_PUBLIC_ORIGIN=https://cmdb.example.local
 CMDBUILD_ORIGIN=http://127.0.0.1:8090
 CMDBDYNAMIC_REDIS_URL=redis://127.0.0.1:6379/0
 CMDBDYNAMIC_REDIS_PASSWORD_FILE=/run/secrets/cmdbdynamicpages_redis_password
 CMDBDYNAMIC_REDIS_REQUIRED=true
 CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=true
 CMDBDYNAMICPAGES_CSRF_SECRET=<stable external secret>
-CMDP_LOG_TARGET=stdout
+CMDP_LOG_TARGET=stdout,syslog
 CMDP_LOG_FORMAT=json
+CMDP_SYSLOG_HOST=syslog.example.local
+CMDP_SYSLOG_PORT=514
+CMDP_SYSLOG_PROTOCOL=udp
+CMDP_SYSLOG_FACILITY=local0
 CMDP_DIAGNOSTIC_MODE=off
 ```
 
-В репозитории есть backend `Dockerfile` для container deployment. Образ запускается от пользователя `node`, слушает `8093` и использует `/health/live` как container healthcheck.
-Production startup fail-closed, если не задан `CMDBDYNAMICPAGES_CSRF_SECRET`. `CMDP_DIAGNOSTIC_MODE=Verbose` включать только временно для incident diagnostics.
+В репозитории есть backend `Dockerfile` для container deployment. Образ запускается от пользователя `node`, слушает `8093` и использует `/health/live` только как liveness container healthcheck. Для approved production collector задать `CMDP_SYSLOG_HOST`, `CMDP_SYSLOG_PORT`, `CMDP_SYSLOG_PROTOCOL` и `CMDP_SYSLOG_FACILITY`; `CMDP_LOG_TARGET=stdout,syslog` оставляет stdout/stderr локальным operational output.
+Production startup fail-closed, если не задан `CMDBDYNAMICPAGES_CSRF_SECRET` или `CMDP_PUBLIC_ORIGIN`. `CMDP_PUBLIC_ORIGIN` - публичный browser origin; `CMDBUILD_ORIGIN` - внутренний backend upstream и они могут различаться. `CMDP_DIAGNOSTIC_MODE=Verbose` включать только временно для incident diagnostics.
 Admin-facing container handoff описан отдельно: [CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md](CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md).
 
 Если платформа передает Redis secret только строкой, поддерживаются варианты:
@@ -145,10 +150,12 @@ npm run nginx:dev
 ```text
 http://localhost:8088/cmdbuild/ -> http://127.0.0.1:8093/cmdbuild/
 http://localhost:8088/health/  -> http://127.0.0.1:8093/health/
-http://localhost:8088/         -> http://127.0.0.1:3000/
+http://localhost:8088/         -> 404
 ```
 
-Так wiki и runtime iframe оказываются на одном origin `localhost:8088`.
+Этот nginx обслуживает только маршруты `cmdbdynamicpages`. Внешние порталы разворачиваются и проксируются отдельно.
+
+В production с external TLS reverse proxy browser всегда открывает CMDBuild UI, custom page и `/cmdbuild/custom-api/*` через один `CMDP_PUBLIC_ORIGIN`, например `https://custom.example.local`. Внешний proxy передает public `Host`, `X-Forwarded-Host` и `X-Forwarded-Proto=https`; internal `CMDBUILD_ORIGIN`, например `https://vr2.internal.example`, не публикуется пользователям. Проверить, что `/cmdbuild/ui/config.js`, redirects и CMDBuild session cookie используют public hostname, а не internal upstream.
 
 Если контур разворачивается совместно с WikiAI, используйте дополнительные
 договоренности из [wikiai-integration.ru.md](wikiai-integration.ru.md):
@@ -180,7 +187,7 @@ http://127.0.0.1:8093/health/redis
 http://127.0.0.1:8093/metrics
 ```
 
-`/health/ready` в production должен видеть Redis и CMDBuild upstream. `/metrics` отдает агрегированные Prometheus counters/gauges и не должен использоваться как readiness gate.
+`/health/live` - только liveness: он подтверждает, что Node process отвечает на HTTP, и используется Docker healthcheck. `/health/ready` - readiness: в production он должен видеть Redis и CMDBuild upstream до rollout или traffic routing. `/metrics` отдает агрегированные Prometheus counters/gauges и не должен использоваться как readiness gate.
 
 ## 9. Production notes
 

@@ -52,9 +52,7 @@
 - Нет оставшихся core implementation задач.
 - Примеры шаблонов ведутся отдельно от roadmap.
 - Глубокие Playwright Runtime table проверки реализованы как skip-safe tests и зависят от доступных live template fixtures для полного покрытия.
-- Browser-level проверка iframe внутри реальной wiki page реализована как optional smoke через `CMDBDYNAMIC_WIKI_IFRAME_URL`.
 - Browser smoke для согласованных заказчиком topology diagrams будет добавлен после стабилизации целевых layout.
-- Стабильную local wiki page ещё нужно поддерживать, чтобы optional iframe smoke запускался регулярно.
 
 ## 1. Проверка ролей и групп CMDBuild
 

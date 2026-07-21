@@ -9,7 +9,7 @@
 
 Пошаговая инструкция развертывания: [docs/deployment-guide.ru.md](docs/deployment-guide.ru.md).
 Контейнерная поставка для администраторов: [docs/CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md](docs/CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md).
-Интеграция с MediaWiki/WikiAI описана отдельно:
+Отдельная интеграция с MediaWiki/WikiAI описана как внешний контракт:
 [docs/wikiai-integration.ru.md](docs/wikiai-integration.ru.md).
 
 ## Текущая архитектура
@@ -23,6 +23,8 @@ CMDBuild custom page оставлен тонким launcher-компоненто
 ```
 
 Все маршруты находятся под `/cmdbuild`, поэтому браузер автоматически отправляет `HttpOnly` cookie CMDBuild. JavaScript не читает и не пересылает `CMDBuild-Authorization`; backend получает cookie на same-origin маршруте и сам вызывает CMDBuild REST с серверным заголовком `CMDBuild-Authorization`.
+
+В production `CMDP_PUBLIC_ORIGIN` задает единственный public browser origin, а `CMDBUILD_ORIGIN` остается internal backend upstream. Они могут различаться при TLS-terminated reverse proxy, но internal URL не должен попадать в browser traffic.
 
 Срок жизни пользовательской сессии задает CMDBuild/Tomcat, а не `cmdbdynamicpages`. На текущем стенде server-side idle timeout составляет 30 минут неактивности. Ориентировочный блок настройки находится в Tomcat `web.xml`:
 
@@ -39,7 +41,6 @@ CMDBuild custom page оставлен тонким launcher-компоненто
 ```text
 CMDBuild UI/REST          http://127.0.0.1:8090
 cmdbdynamicpages proxy    http://127.0.0.1:8093
-wiki                      http://localhost:3000
 nginx same-origin front   http://localhost:8088
 Redis                     redis://127.0.0.1:6379/0
 ```
@@ -110,7 +111,7 @@ npm run e2e:limited
 npm run nginx:test
 ```
 
-`npm test` выполняет syntax check, статическую проверку OpenAPI/ссылок `aa/` и unit-тесты. `test:unit` покрывает ключи runtime cache, cooldown refresh, defaults параметров, IPv4-сравнения, dependency map и маскирование логов. `test:api` является smoke-контрактом для уже запущенного proxy на `8093`; если proxy недоступен, тесты помечаются как skipped. `test:ui` запускает skip-safe Playwright smoke, только если Playwright установлен и есть валидная CMDBuild cookie. `test:nginx` проверяет nginx config и same-origin wiki/iframe маршруты через `localhost:8088`.
+`npm test` выполняет syntax check, статическую проверку OpenAPI/ссылок `aa/` и unit-тесты. `test:unit` покрывает ключи runtime cache, cooldown refresh, defaults параметров, IPv4-сравнения, dependency map и маскирование логов. `test:api` является smoke-контрактом для уже запущенного proxy на `8093`; если proxy недоступен, тесты помечаются как skipped. `test:ui` запускает skip-safe Playwright smoke, только если Playwright установлен и есть валидная CMDBuild cookie. `test:nginx` проверяет project-only nginx config и маршруты `cmdbdynamicpages` через `localhost:8088`.
 
 ## Redis и секреты
 
@@ -168,28 +169,28 @@ CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=true
 
 ## Логирование
 
-Backend пишет структурированные операционные логи. Для Docker-установок основной режим - `stdout`: дальше поток забирает Docker logging driver, Filebeat, Fluent Bit или Logstash и передает в ELK. Прямой output в Elasticsearch из приложения не используется.
+Backend пишет структурированные операционные логи. Для локальной разработки допустим только `stdout`. Production Docker Compose использует `stdout,syslog` с approved syslog collector; прямой output в Elasticsearch из приложения не используется.
 
 ```text
 CMDP_LOG_LEVEL=info
 CMDP_LOG_FORMAT=json
-CMDP_LOG_TARGET=stdout
+CMDP_LOG_TARGET=stdout,syslog
+CMDP_SYSLOG_HOST=syslog.example.local
+CMDP_SYSLOG_PORT=514
+CMDP_SYSLOG_PROTOCOL=udp
+CMDP_SYSLOG_FACILITY=local0
 CMDP_DIAGNOSTIC_MODE=off
 CMDP_LOG_REDACT_HEADERS=cookie,authorization,cmdbuild-authorization,x-csrf-token,x-cmdbdynamicpages-csrf,set-cookie
 CMDP_LOG_REDACT_QUERY=password,passwd,pwd,token,secret,authorization,auth,csrf,x-cmdbdynamicpages-csrf
 ```
 
-Syslog включается отдельно для VM/bare-metal или SIEM:
+Для локальной разработки без collector используйте только stdout:
 
 ```text
-CMDP_LOG_TARGET=syslog
-CMDP_SYSLOG_HOST=127.0.0.1
-CMDP_SYSLOG_PORT=514
-CMDP_SYSLOG_PROTOCOL=udp
-CMDP_SYSLOG_FACILITY=local0
+CMDP_LOG_TARGET=stdout
 ```
 
-`stdout` остается включенным даже при `CMDP_LOG_TARGET=syslog`. Если нужны оба канала явно, можно указать `CMDP_LOG_TARGET=stdout,syslog`. В логи попадают завершение HTTP-запросов, CSRF/same-origin отказы, изменение доступности Redis, ошибки CMDBuild upstream, runtime cache hit/miss/refresh, static snapshot publish/hit/miss и create/update/delete шаблонов. Cookie, authorization headers, CSRF token и secret-like query параметры маскируются. Runtime-строки результата и payload карточек CMDBuild в операционные логи не пишутся.
+`stdout` остается включенным всегда. Для production обязателен `CMDP_LOG_TARGET=stdout,syslog`; example collector нужно заменить на approved syslog endpoint. В логи попадают завершение HTTP-запросов, CSRF/same-origin отказы, изменение доступности Redis, ошибки CMDBuild upstream, runtime cache hit/miss/refresh, static snapshot publish/hit/miss и create/update/delete шаблонов. Cookie, authorization headers, CSRF token и secret-like query параметры маскируются. Runtime-строки результата и payload карточек CMDBuild в операционные логи не пишутся.
 
 Diagnostic mode выключен по умолчанию и включается без изменения кода:
 
@@ -244,7 +245,7 @@ Designer умеет:
 
 В `Группе объектов` список атрибутов/путей можно фильтровать по домену, кардинальности и направлению связи. Это помогает явно выбрать, через какой `reference`/`domain` пришел атрибут, если одинаковые имена полей доступны через разные связи. В разделе есть свернутая подсказка с примерами.
 
-В `Визуализации` колонку итоговых данных можно превратить в ссылку. Шаблон URL и текста поддерживает `${mysource.value}`, `${mysource.source}`, `${mysource.sourceClass}`, `${mysource.sourceId}`, `${mysource.attribute}`, `${mysource.domainPath}`, `${row.<column>}` и `${param.<name>}`. Для внутренних ссылок на карточки, участвовавшие в результате, есть готовые переменные `${mysource.sourceURLВыборка1}`, `${mysource.sourceURLВыборка2}`, `${mysource.sourceURLSelection1}` и так далее. Например: `${mysource.sourceURLВыборка2}`, `/cmdbuild/ui/#classes/${mysource.sourceClass}/cards/${mysource.sourceId}` или `/wiki/${param.city}/${mysource.value}`.
+В `Визуализации` колонку итоговых данных можно превратить в ссылку. Шаблон URL и текста поддерживает `${mysource.value}`, `${mysource.source}`, `${mysource.sourceClass}`, `${mysource.sourceId}`, `${mysource.attribute}`, `${mysource.domainPath}`, `${row.<column>}` и `${param.<name>}`. Для внутренних ссылок на карточки, участвовавшие в результате, есть готовые переменные `${mysource.sourceURLВыборка1}`, `${mysource.sourceURLВыборка2}`, `${mysource.sourceURLSelection1}` и так далее. Например: `${mysource.sourceURLВыборка2}`, `/cmdbuild/ui/#classes/${mysource.sourceClass}/cards/${mysource.sourceId}` или `https://portal.example.local/${param.city}/${mysource.value}`.
 
 ## Шаблоны
 
@@ -292,6 +293,8 @@ GET /cmdbuild/custom-api/templates/<templateCode>/run?param=value
 ```
 
 Для dynamic шаблонов выполнение идет под правами текущего пользователя CMDBuild. Для static snapshot шаблонов Runtime читает опубликованный результат из Redis; права зрителя на исходные CMDBuild-объекты не проверяются, поэтому Designer требует явного подтверждения режима публикации.
+
+Сохранение шаблона в режиме `dynamicUser` не публикует данные: URL запуска остается авторизованным runtime и требует сессию с правами на используемые классы и атрибуты. Кнопка публикации снимка доступна только после выбора и сохранения `staticSnapshot`.
 
 Чтобы получить те же итоговые таблицы как `application/json`, добавьте системный параметр `json=true`:
 
@@ -363,7 +366,7 @@ Root относится только к техническим классам п
 ## Ограничения безопасности
 
 - Нет generic REST proxy к CMDBuild.
-- State-changing API требует same-origin `Origin`/`Referer` и `X-CMDBDynamicPages-CSRF`.
+- State-changing API сравнивает `Origin`/`Referer` с configured `CMDP_PUBLIC_ORIGIN` и требует `X-CMDBDynamicPages-CSRF`.
 - Runtime iframe использует read-only `GET run`, поэтому CSRF token ему не нужен.
 - Cookie и CMDBuild token не логируются.
 - Redis password хранится только как deployment secret.

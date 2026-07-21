@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import dgram from 'node:dgram';
+import { spawn, spawnSync } from 'node:child_process';
 
 import {
   cmdbuildRequestCanRetry,
@@ -16,6 +17,7 @@ import {
   normalizeLogFormat,
   normalizeLogLevel,
   normalizeLogTargets,
+  parsePublicOriginConfiguration,
   parseNameSet,
   redactByName,
   redisRequiredError,
@@ -26,6 +28,7 @@ import {
   sanitizeUrlForLog,
   setMetricGauge,
   securityHeaders,
+  sameOriginMutationDecision,
   shouldRetryCmdbuildResult,
   validateRuntimeConfig,
   validateRegexPattern
@@ -49,6 +52,61 @@ test('diagnostic mode normalizers expose Basic and Verbose levels', () => {
   assert.equal(diagnosticModeAllows('Verbose', 'Basic'), false);
   assert.equal(diagnosticModeAllows('Verbose', 'Verbose'), true);
   assert.equal(diagnosticModeAllows('Basic', 'off'), false);
+});
+
+test('public origin configuration accepts only a bare HTTP(S) origin', () => {
+  assert.deepEqual(parsePublicOriginConfiguration('https://custom.example/'), {
+    configured: true,
+    valid: true,
+    origin: 'https://custom.example',
+    reason: ''
+  });
+  assert.equal(parsePublicOriginConfiguration('https://custom.example/cmdbuild').valid, false);
+  assert.equal(parsePublicOriginConfiguration('https://user:password@custom.example').valid, false);
+  assert.equal(parsePublicOriginConfiguration('ftp://custom.example').valid, false);
+  assert.deepEqual(parsePublicOriginConfiguration(''), {
+    configured: false,
+    valid: true,
+    origin: '',
+    reason: ''
+  });
+});
+
+test('same-origin mutation checks use the configured public origin, not the upstream host', () => {
+  const request = { headers: { host: 'vr2.internal.example', origin: 'https://custom.example' } };
+  const accepted = sameOriginMutationDecision(request, 'https://custom.example');
+
+  assert.deepEqual(accepted, {
+    allowed: true,
+    expectedOrigin: 'https://custom.example',
+    source: 'origin',
+    reason: 'matched'
+  });
+
+  const rejected = sameOriginMutationDecision({ headers: { host: 'custom.example', origin: 'https://vr2.internal.example' } }, 'https://custom.example');
+  assert.equal(rejected.allowed, false);
+  assert.equal(rejected.source, 'origin');
+  assert.equal(rejected.reason, 'origin_mismatch');
+
+  const schemeMismatch = sameOriginMutationDecision({ headers: { host: 'custom.example', origin: 'http://custom.example' } }, 'https://custom.example');
+  assert.equal(schemeMismatch.allowed, false);
+  assert.equal(schemeMismatch.reason, 'origin_mismatch');
+
+  const originTakesPrecedence = sameOriginMutationDecision({
+    headers: {
+      origin: 'https://vr2.internal.example',
+      referer: 'https://custom.example/cmdbuild/dynamicpages/ui/designer'
+    }
+  }, 'https://custom.example');
+  assert.equal(originTakesPrecedence.allowed, false);
+  assert.equal(originTakesPrecedence.source, 'origin');
+
+  const refererFallback = sameOriginMutationDecision({ headers: { referer: 'https://custom.example/cmdbuild/dynamicpages/ui/designer' } }, 'https://custom.example');
+  assert.equal(refererFallback.allowed, true);
+  assert.equal(refererFallback.source, 'referer');
+
+  const missing = sameOriginMutationDecision({ headers: {} }, 'https://custom.example');
+  assert.equal(missing.reason, 'headers_missing');
 });
 
 test('redaction helpers mask configured header and query names', () => {
@@ -93,10 +151,12 @@ test('logging status is diagnostic and does not expose secret values', () => {
   assert.ok(Array.isArray(status.redactQuery));
   assert.equal(typeof status.diagnostic.mode, 'string');
   assert.deepEqual(status.diagnostic.levels, ['Basic', 'Verbose']);
+  assert.equal(typeof status.publicOrigin.configured, 'boolean');
+  assert.equal(typeof status.publicOrigin.mode, 'string');
   assert.equal(status.assistant.enabled, false);
   assert.equal(status.assistant.provider, 'litellm');
   assert.equal(status.assistant.apiKeyConfigured, false);
-  assert.ok(status.externalSink === null || typeof status.externalSink === 'string');
+  assert.ok(status.syslog === null || typeof status.syslog === 'object');
   assert.equal(status.elk.directOutput, false);
   assert.match(status.elk.recommendedPipeline, /stdout\/syslog/);
 });
@@ -106,38 +166,59 @@ test('runtime config validation fails closed for production CSRF secret', () => 
     nodeEnv: 'production',
     csrfSecret: '',
     logTargets: ['stdout'],
+    publicOrigin: 'https://custom.example',
     diagnosticMode: 'off'
   });
 
   assert.equal(invalid.ok, false);
-  assert.deepEqual(invalid.errors.map((item) => item.code), ['csrf_secret_required', 'external_log_sink_required']);
+  assert.deepEqual(invalid.errors.map((item) => item.code), ['csrf_secret_required', 'syslog_log_target_required']);
 
   const placeholder = validateRuntimeConfig({
     nodeEnv: 'production',
     csrfSecret: 'replace-me',
-    logTargets: ['stdout'],
-    externalLogSink: 'docker-logging-driver',
+    logTargets: ['stdout', 'syslog'],
+    syslogHost: 'collector.internal.example',
+    syslogPort: 514,
+    publicOrigin: 'https://custom.example',
     diagnosticMode: 'off'
   });
 
   assert.equal(placeholder.ok, false);
   assert.deepEqual(placeholder.errors.map((item) => item.code), ['csrf_secret_placeholder']);
 
-  const fakeSink = validateRuntimeConfig({
+  const missingSyslog = validateRuntimeConfig({
     nodeEnv: 'production',
     csrfSecret: 'externally-managed-secret',
-    logTargets: ['stdout'],
-    externalLogSink: 'docker-logging-driver-or-collector',
+    logTargets: ['stdout', 'syslog'],
+    syslogHost: 'syslog.example.local',
+    syslogPort: 514,
+    publicOrigin: 'https://custom.example',
     diagnosticMode: 'off'
   });
 
-  assert.equal(fakeSink.ok, false);
-  assert.deepEqual(fakeSink.errors.map((item) => item.code), ['external_log_sink_placeholder']);
+  assert.equal(missingSyslog.ok, false);
+  assert.deepEqual(missingSyslog.errors.map((item) => item.code), ['syslog_configuration_required']);
+
+  const invalidSyslogPort = validateRuntimeConfig({
+    nodeEnv: 'production',
+    csrfSecret: 'externally-managed-secret',
+    logTargets: ['stdout', 'syslog'],
+    syslogHost: 'collector.internal.example',
+    syslogPort: 0,
+    publicOrigin: 'https://custom.example',
+    diagnosticMode: 'off'
+  });
+
+  assert.equal(invalidSyslogPort.ok, false);
+  assert.deepEqual(invalidSyslogPort.errors.map((item) => item.code), ['syslog_configuration_required']);
 
   const valid = validateRuntimeConfig({
     nodeEnv: 'production',
     csrfSecret: 'externally-managed-secret',
     logTargets: ['stdout', 'syslog'],
+    syslogHost: 'collector.internal.example',
+    syslogPort: 514,
+    publicOrigin: 'https://custom.example',
     diagnosticMode: 'Verbose'
   });
 
@@ -145,6 +226,86 @@ test('runtime config validation fails closed for production CSRF secret', () => 
   assert.deepEqual(valid.warnings.map((item) => item.code), ['verbose_diagnostic_in_production']);
   assert.equal(valid.assistant.enabled, false);
   assert.equal(valid.assistant.apiKeyConfigured, false);
+
+  const missingPublicOrigin = validateRuntimeConfig({
+    nodeEnv: 'production',
+    csrfSecret: 'externally-managed-secret',
+    logTargets: ['stdout', 'syslog'],
+    syslogHost: 'collector.internal.example',
+    syslogPort: 514,
+    publicOrigin: '',
+    diagnosticMode: 'off'
+  });
+  assert.deepEqual(missingPublicOrigin.errors.map((item) => item.code), ['public_origin_required']);
+
+  const invalidPublicOrigin = validateRuntimeConfig({
+    nodeEnv: 'production',
+    csrfSecret: 'externally-managed-secret',
+    logTargets: ['stdout', 'syslog'],
+    syslogHost: 'collector.internal.example',
+    syslogPort: 514,
+    publicOrigin: 'https://custom.example/cmdbuild',
+    diagnosticMode: 'off'
+  });
+  assert.deepEqual(invalidPublicOrigin.errors.map((item) => item.code), ['public_origin_invalid']);
+});
+
+test('production startup delivers structured app.started to the configured UDP syslog collector', async (t) => {
+  const collector = dgram.createSocket('udp4');
+  try {
+    await new Promise((resolve, reject) => {
+      collector.once('error', reject);
+      collector.bind(0, '127.0.0.1', resolve);
+    });
+  } catch (error) {
+    collector.close();
+    if (error && error.code === 'EPERM') {
+      t.skip('UDP sockets are not permitted by this execution sandbox.');
+      return;
+    }
+    throw error;
+  }
+  const address = collector.address();
+  let backend = null;
+  t.after(async () => {
+    collector.close();
+    if (!backend || backend.exitCode !== null) return;
+    backend.kill('SIGTERM');
+    await new Promise((resolve) => backend.once('exit', resolve));
+  });
+
+  const message = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Timed out waiting for the syslog startup event.')), 5000);
+    collector.once('message', (packet) => {
+      clearTimeout(timer);
+      resolve(packet.toString('utf8'));
+    });
+  });
+  // Start after registering the collector listener so the first structured
+  // startup event is part of the delivery contract, not a timing accident.
+  backend = spawn(process.execPath, ['scripts/dev-proxy-server.mjs'], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      NODE_ENV: 'production',
+      PROXY_HOST: '127.0.0.1',
+      PROXY_PORT: '0',
+      CMDBUILD_ORIGIN: 'http://127.0.0.1:8090',
+      CMDBDYNAMICPAGES_CSRF_SECRET: 'production-test-secret',
+      CMDP_PUBLIC_ORIGIN: 'https://custom.example',
+      CMDP_LOG_TARGET: 'stdout,syslog',
+      CMDP_LOG_LEVEL: 'info',
+      CMDP_SYSLOG_HOST: '127.0.0.1',
+      CMDP_SYSLOG_PORT: String(address.port),
+      CMDP_SYSLOG_PROTOCOL: 'udp',
+      CMDP_D2_RENDER_ENABLED: 'false'
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  const packet = await message;
+  assert.match(packet, /app\.started/);
+  assert.match(packet, /"service":"cmdbdynamicpages"/);
 });
 
 test('URL log sanitizer redacts sensitive query parameters', () => {

@@ -9,8 +9,9 @@ services:
       - /tmp
     environment:
       NODE_ENV: ${NODE_ENV:-production}
-      PROXY_HOST: ${PROXY_HOST:-0.0.0.0}
+      PROXY_HOST: ${PROXY_HOST:-127.0.0.1}
       PROXY_PORT: ${PROXY_PORT:-8093}
+      CMDP_PUBLIC_ORIGIN: ${CMDP_PUBLIC_ORIGIN}
       CMDBUILD_ORIGIN: ${CMDBUILD_ORIGIN}
       CMDBUILD_REQUEST_TIMEOUT_MS: ${CMDBUILD_REQUEST_TIMEOUT_MS:-10000}
       CMDBDYNAMIC_REDIS_URL: ${CMDBDYNAMIC_REDIS_URL}
@@ -46,8 +47,7 @@ services:
       CMDBDYNAMIC_EXECUTION_THROTTLE_RETRY_AFTER_SEC: ${CMDBDYNAMIC_EXECUTION_THROTTLE_RETRY_AFTER_SEC:-5}
       CMDP_LOG_LEVEL: ${CMDP_LOG_LEVEL:-info}
       CMDP_LOG_FORMAT: ${CMDP_LOG_FORMAT:-json}
-      CMDP_LOG_TARGET: ${CMDP_LOG_TARGET:-stdout}
-      CMDP_EXTERNAL_LOG_SINK: ${CMDP_EXTERNAL_LOG_SINK:-}
+      CMDP_LOG_TARGET: ${CMDP_LOG_TARGET:-stdout,syslog}
       CMDP_DIAGNOSTIC_MODE: ${CMDP_DIAGNOSTIC_MODE:-off}
       CMDP_LOG_REDACT_HEADERS: ${CMDP_LOG_REDACT_HEADERS:-cookie,authorization,cmdbuild-authorization,x-csrf-token,x-cmdbdynamicpages-csrf,set-cookie}
       CMDP_LOG_REDACT_QUERY: ${CMDP_LOG_REDACT_QUERY:-password,passwd,pwd,token,secret,authorization,auth,csrf,x-cmdbdynamicpages-csrf}
@@ -56,7 +56,7 @@ services:
       CMDP_LITELLM_ALLOWED_BASE_URLS: ${CMDP_LITELLM_ALLOWED_BASE_URLS:-}
       LITELLM_MODEL: ${LITELLM_MODEL:-corp-openai-gpt-4.1-mini}
       LITELLM_API_KEY_FILE: ${LITELLM_API_KEY_FILE:-/run/secrets/cmdbdynamicpages_litellm_api_key}
-      CMDP_SYSLOG_HOST: ${CMDP_SYSLOG_HOST:-127.0.0.1}
+      CMDP_SYSLOG_HOST: ${CMDP_SYSLOG_HOST:?CMDP_SYSLOG_HOST must be set}
       CMDP_SYSLOG_PORT: ${CMDP_SYSLOG_PORT:-514}
       CMDP_SYSLOG_PROTOCOL: ${CMDP_SYSLOG_PROTOCOL:-udp}
       CMDP_SYSLOG_FACILITY: ${CMDP_SYSLOG_FACILITY:-local0}
@@ -70,7 +70,7 @@ services:
         target: /run/secrets/cmdbdynamicpages_litellm_api_key
         read_only: true
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:${PROXY_PORT:-8093}/health/ready || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:${PROXY_PORT:-8093}/health/live || exit 1"]
       interval: 30s
       timeout: 3s
       retries: 3

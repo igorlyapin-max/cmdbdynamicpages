@@ -30,7 +30,6 @@ Backend -> Redis
 ```text
 CMDBuild            127.0.0.1:8090
 cmdbdynamicpages    127.0.0.1:8093
-Wiki                localhost:3000
 Nginx same-origin   localhost:8088
 Redis               127.0.0.1:6379
 ```
@@ -53,12 +52,12 @@ Backend API:
 
 Обычные `/cmdbuild/*` запросы проксируются в CMDBuild на `8090`. Маршруты dynamicpages обслуживаются проектным backend на `8093`.
 
-Для wiki iframe используется nginx same-origin front на `8088`:
+Project-only nginx front на `8088` обслуживает только маршруты этого проекта:
 
 ```text
-http://localhost:8088/                 -> wiki localhost:3000
 http://localhost:8088/cmdbuild/*       -> dynamicpages/CMDBuild chain on 8093
 http://localhost:8088/health/*         -> dynamicpages health on 8093
+http://localhost:8088/                 -> 404
 ```
 
 ## Безопасность сессии CMDBuild

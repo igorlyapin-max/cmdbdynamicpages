@@ -41,6 +41,17 @@
  * @property {string} as
  * @property {string} rightPrefix
  * @property {ObjectFlowMatchRule[]} rules
+ * @property {{mode: 'domain' | 'match', fromClass: string, withClass: string, sourceField: string, targetField: string, domain: string, direction: string}=} connection
+ */
+/**
+ * @typedef {object} ObjectFlowSemiJoinOperation
+ * @property {string} id
+ * @property {'semiJoin'} type
+ * @property {string} from
+ * @property {string} with
+ * @property {string} as
+ * @property {'any' | 'all'} ruleJoin
+ * @property {ObjectFlowMatchRule[]} rules
  */
 /**
  * @typedef {object} ObjectFlowSetOperation
@@ -85,7 +96,7 @@
  * @property {ObjectFlowMatchRule[]} rules
  */
 /**
- * @typedef {(ObjectFlowMatchBlock & {type: 'match'}) | ObjectFlowSetOperation | ObjectFlowRelationOperation | ObjectFlowExistsRelatedOperation} ObjectFlowOperation
+ * @typedef {(ObjectFlowMatchBlock & {type: 'match'}) | ObjectFlowSemiJoinOperation | ObjectFlowSetOperation | ObjectFlowRelationOperation | ObjectFlowExistsRelatedOperation} ObjectFlowOperation
  */
 /**
  * @typedef {object} ObjectFlow
@@ -104,7 +115,7 @@
 /**
  * @typedef {object} ObjectFlowStageSummary
  * @property {string} id
- * @property {'selection' | 'match' | 'set' | 'relation' | 'existsRelated'} kind
+ * @property {'selection' | 'match' | 'semiJoin' | 'set' | 'relation' | 'existsRelated'} kind
  * @property {string} alias
  * @property {string=} className
  * @property {string[]} columns
@@ -113,7 +124,7 @@
  * @typedef {object} ObjectFlowResultOutput
  * @property {string} alias
  * @property {string} label
- * @property {'selection' | 'match' | 'set' | 'relation' | 'existsRelated'} kind
+ * @property {'selection' | 'match' | 'semiJoin' | 'set' | 'relation' | 'existsRelated'} kind
  * @property {boolean=} assistantManaged
  * @property {string=} assistantBlockId
  * @property {string[]=} assistantBlockIds
@@ -170,10 +181,12 @@ const MATCH_OPERATORS = [
 const VALUELESS_SELECTION_OPERATORS = new Set(['exists', 'notExists', 'isIpv4', 'isIpv4Network']);
 const REGEX_SELECTION_OPERATORS = new Set(['matches', 'notMatches']);
 const MANAGED_PURPOSES = new Set(['objectGroup', 'objectMatching']);
+const FILTER_JOINS = new Set(['all', 'any']);
 const IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CLASS_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_]*$/;
 const SELECTION_ID_PATTERN = /^selection:[A-Za-z_][A-Za-z0-9_]*$/;
 const MATCH_ID_PATTERN = /^match:[A-Za-z_][A-Za-z0-9_]*$/;
+const SEMI_JOIN_ID_PATTERN = /^semiJoin:[A-Za-z_][A-Za-z0-9_]*$/;
 const SET_OPERATION_ID_PATTERN = /^set:[A-Za-z_][A-Za-z0-9_]*$/;
 const RELATION_OPERATION_ID_PATTERN = /^relation:[A-Za-z_][A-Za-z0-9_]*$/;
 const EXISTS_RELATED_OPERATION_ID_PATTERN = /^existsRelated:[A-Za-z_][A-Za-z0-9_]*$/;
@@ -268,6 +281,14 @@ function normalizeSelectionRule(value) {
   };
 }
 
+function inferredSelectionFilterJoin(rules) {
+  const includeRules = rules.filter((rule) => rule.action === 'include');
+  const valueColumns = new Set(includeRules.map((rule) => rule.valueColumn).filter(Boolean));
+  const operators = new Set(includeRules.map((rule) => rule.op).filter(Boolean));
+  const paths = new Set(includeRules.map((rule) => rule.path).filter(Boolean));
+  return includeRules.length > 1 && valueColumns.size === 1 && operators.size === 1 && paths.size > 1 ? 'any' : 'all';
+}
+
 /**
  * @param {unknown} value
  * @param {number} index
@@ -280,6 +301,7 @@ function normalizeSelection(value, index) {
     ? 100
     : Number(selection.limit);
   const rules = Array.isArray(selection.rules) ? selection.rules.map(normalizeSelectionRule) : [];
+  const requestedFilterJoin = text(selection.filterJoin);
   return {
     id: text(selection.id) || `selection:${alias}`,
     name: text(selection.name) || `Selection ${index + 1}`,
@@ -288,6 +310,7 @@ function normalizeSelection(value, index) {
     from: text(selection.from),
     limit: requestedLimit,
     columns: normalizeColumns(selection.columns),
+    filterJoin: requestedFilterJoin || inferredSelectionFilterJoin(rules),
     rules
   };
 }
@@ -317,13 +340,47 @@ function normalizeMatchBlock(value) {
   const block = isRecord(value) ? value : {};
   const outputAlias = text(block.as);
   const rightAlias = text(block.with);
+  const rawConnection = isRecord(block.connection) ? block.connection : null;
+  const connectionMode = text(rawConnection && rawConnection.mode);
+  const connection = rawConnection && ['domain', 'match'].includes(connectionMode)
+    ? {
+        mode: /** @type {'domain' | 'match'} */ (connectionMode),
+        fromClass: text(rawConnection.fromClass),
+        withClass: text(rawConnection.withClass),
+        sourceField: text(rawConnection.sourceField),
+        targetField: text(rawConnection.targetField),
+        domain: text(rawConnection.domain),
+        direction: text(rawConnection.direction)
+      }
+    : null;
   return {
     id: text(block.id) || `match:${outputAlias}`,
     from: text(block.from),
     with: rightAlias,
     as: outputAlias,
     rightPrefix: text(block.rightPrefix) || `${rightAlias}_`,
-    rules: Array.isArray(block.rules) ? block.rules.map(normalizeMatchRule) : []
+    rules: Array.isArray(block.rules) ? block.rules.map(normalizeMatchRule) : [],
+    ...(connection && connection.fromClass && connection.withClass && connection.sourceField && connection.targetField
+      ? { connection }
+      : {})
+  };
+}
+
+/**
+ * @param {unknown} value
+ * @returns {ObjectFlowSemiJoinOperation}
+ */
+function normalizeSemiJoinOperation(value) {
+  const operation = isRecord(value) ? value : {};
+  const as = text(operation.as);
+  return {
+    id: text(operation.id) || `semiJoin:${as}`,
+    type: 'semiJoin',
+    from: text(operation.from),
+    with: text(operation.with),
+    as,
+    ruleJoin: /** @type {ObjectFlowSemiJoinOperation['ruleJoin']} */ (text(operation.ruleJoin) || 'all'),
+    rules: Array.isArray(operation.rules) ? operation.rules.map(normalizeMatchRule) : []
   };
 }
 
@@ -428,6 +485,7 @@ function normalizeExistsRelatedOperation(value) {
 function normalizeOperation(value) {
   const operation = isRecord(value) ? value : {};
   const type = text(operation.type || operation.operation).toLowerCase();
+  if (type === 'semijoin') return normalizeSemiJoinOperation(operation);
   if (type === 'match' || (!type && (Array.isArray(operation.rules) || operation.rightPrefix !== undefined))) {
     return { ...normalizeMatchBlock(operation), type: 'match' };
   }
@@ -543,7 +601,7 @@ function operationOutputColumns(operation, materializedColumns) {
   if (operation.type === 'match') {
     return uniqueStrings(leftColumns.concat(rightColumns.map((column) => `${operation.rightPrefix}${column}`)));
   }
-  if (operation.type === 'existsRelated') return leftColumns.slice();
+  if (operation.type === 'semiJoin' || operation.type === 'existsRelated') return leftColumns.slice();
   return operation.type === 'union' ? uniqueStrings(leftColumns.concat(rightColumns)) : leftColumns.slice();
 }
 
@@ -624,6 +682,9 @@ export function validateObjectFlow(flow) {
     if (!Number.isInteger(selection.limit) || selection.limit <= 0) {
       addError(errors, `${path}.limit`, 'Selection limit must be a positive integer.');
     }
+    if (!FILTER_JOINS.has(selection.filterJoin)) {
+      addError(errors, `${path}.filterJoin`, 'Selection filterJoin must be all or any.');
+    }
     if (!selection.rules.length) {
       addError(errors, `${path}.rules`, 'Selection requires a non-empty rules array.');
     }
@@ -644,12 +705,15 @@ export function validateObjectFlow(flow) {
   normalized.operations.forEach((operation, index) => {
     const path = `$.operations[${index}]`;
     const isMatch = operation.type === 'match';
+    const isSemiJoin = operation.type === 'semiJoin';
     const isRelation = operation.type === 'relation';
     const isExistsRelated = operation.type === 'existsRelated';
-    const idPattern = isMatch ? MATCH_ID_PATTERN : isRelation ? RELATION_OPERATION_ID_PATTERN : isExistsRelated ? EXISTS_RELATED_OPERATION_ID_PATTERN : SET_OPERATION_ID_PATTERN;
+    const idPattern = isMatch ? MATCH_ID_PATTERN : isSemiJoin ? SEMI_JOIN_ID_PATTERN : isRelation ? RELATION_OPERATION_ID_PATTERN : isExistsRelated ? EXISTS_RELATED_OPERATION_ID_PATTERN : SET_OPERATION_ID_PATTERN;
     if (!idPattern.test(operation.id)) {
       addError(errors, `${path}.id`, isMatch
         ? 'Match id must be a stable match:<identifier> value.'
+        : isSemiJoin
+          ? 'Semi-join id must be a stable semiJoin:<identifier> value.'
         : isRelation
           ? 'Relation id must be a stable relation:<identifier> value.'
           : isExistsRelated
@@ -662,7 +726,7 @@ export function validateObjectFlow(flow) {
       ids.set(operation.id, `${path}.id`);
     }
     if (!operation.as || !IDENTIFIER_PATTERN.test(operation.as)) {
-      addError(errors, `${path}.as`, `${isMatch ? 'Match' : isRelation ? 'Relation' : isExistsRelated ? 'Related-existence' : 'Set operation'} output alias must be a non-empty identifier.`);
+      addError(errors, `${path}.as`, `${isMatch ? 'Match' : isSemiJoin ? 'Semi-join' : isRelation ? 'Relation' : isExistsRelated ? 'Related-existence' : 'Set operation'} output alias must be a non-empty identifier.`);
     } else if (aliases.has(operation.as)) {
       addError(errors, `${path}.as`, `Object flow alias must be unique; already used at ${aliases.get(operation.as)}.`);
     }
@@ -691,9 +755,13 @@ export function validateObjectFlow(flow) {
       if (!Number.isInteger(operation.limit) || operation.limit <= 0) {
         addError(errors, `${path}.limit`, 'Relation operation limit must be a positive integer.');
       }
-    } else if (isMatch || isExistsRelated) {
+    } else if (isMatch || isSemiJoin || isExistsRelated) {
       if (!operation.rules.length) {
-        addError(errors, `${path}.rules`, isExistsRelated ? 'Related-existence operation requires a non-empty rules array.' : 'Match block requires a non-empty rules array.');
+        addError(errors, `${path}.rules`, isExistsRelated
+          ? 'Related-existence operation requires a non-empty rules array.'
+          : isSemiJoin
+            ? 'Semi-join operation requires a non-empty rules array.'
+            : 'Match block requires a non-empty rules array.');
       }
       operation.rules.forEach((rule, ruleIndex) => {
         const rulePath = `${path}.rules[${ruleIndex}]`;
@@ -702,7 +770,9 @@ export function validateObjectFlow(flow) {
         if (!rule.leftColumn) addError(errors, `${rulePath}.leftColumn`, 'Match rule requires leftColumn.');
         if (!rule.rightColumn) addError(errors, `${rulePath}.rightColumn`, 'Match rule requires rightColumn.');
       });
-      if (isExistsRelated) {
+      if (isSemiJoin && !FILTER_JOINS.has(operation.ruleJoin)) {
+        addError(errors, `${path}.ruleJoin`, 'Semi-join ruleJoin must be all or any.');
+      } else if (isExistsRelated) {
         if (!operation.domain || !CLASS_NAME_PATTERN.test(operation.domain)) {
           addError(errors, `${path}.domain`, 'Related-existence operation domain must be a CMDBuild identifier.');
         }
@@ -755,11 +825,12 @@ export function validateObjectFlow(flow) {
 
     const operation = /** @type {ObjectFlowOperation} */ (stage.item);
     const isMatch = operation.type === 'match';
+    const isSemiJoin = operation.type === 'semiJoin';
     const isExistsRelated = operation.type === 'existsRelated';
     const leftColumns = materializedColumns.get(operation.from);
     const rightColumns = materializedColumns.get(operation.with);
     const path = stage.path;
-    if (isMatch || isExistsRelated) {
+    if (isMatch || isSemiJoin || isExistsRelated) {
       operation.rules.forEach((rule, ruleIndex) => {
         const rulePath = `${path}.rules[${ruleIndex}]`;
         const ruleLeftColumns = isExistsRelated ? rightColumns : leftColumns;
@@ -767,10 +838,10 @@ export function validateObjectFlow(flow) {
           ? uniqueStrings(BASE_RESULT_COLUMNS.concat(operation.columns))
           : rightColumns;
         if (rule.leftColumn && ruleLeftColumns && !ruleLeftColumns.includes(rule.leftColumn)) {
-          addError(errors, `${rulePath}.leftColumn`, `${isExistsRelated ? 'Related-existence' : 'Match'} rule column ${rule.leftColumn} is not materialized by source ${isExistsRelated ? operation.with : operation.from}.`);
+          addError(errors, `${rulePath}.leftColumn`, `${isExistsRelated ? 'Related-existence' : isSemiJoin ? 'Semi-join' : 'Match'} rule column ${rule.leftColumn} is not materialized by source ${isExistsRelated ? operation.with : operation.from}.`);
         }
         if (rule.rightColumn && ruleRightColumns && !ruleRightColumns.includes(rule.rightColumn)) {
-          addError(errors, `${rulePath}.rightColumn`, `${isExistsRelated ? 'Related-existence' : 'Match'} rule column ${rule.rightColumn} is not materialized by ${isExistsRelated ? 'related class' : `source ${operation.with}`}.`);
+          addError(errors, `${rulePath}.rightColumn`, `${isExistsRelated ? 'Related-existence' : isSemiJoin ? 'Semi-join' : 'Match'} rule column ${rule.rightColumn} is not materialized by ${isExistsRelated ? 'related class' : `source ${operation.with}`}.`);
         }
       });
     } else if (operation.type !== 'relation') {
@@ -889,7 +960,7 @@ function collectMatchingSelectionColumns(flow) {
   };
 
   for (const operation of flow.operations) {
-    if (operation.type !== 'match' && operation.type !== 'existsRelated') continue;
+    if (operation.type !== 'match' && operation.type !== 'semiJoin' && operation.type !== 'existsRelated') continue;
     for (const rule of operation.rules) {
       // Only direct selection sources can have their projection amended here.
       // Columns from an earlier match/set result are already explicit output
@@ -943,6 +1014,7 @@ function compileObjectFlowSteps(flow) {
       purpose: 'objectGroup',
       className: selection.className,
       filters,
+      filterJoin: selection.filterJoin,
       limit: selection.limit,
       as: selection.alias
     };
@@ -971,6 +1043,24 @@ function compileObjectFlowSteps(flow) {
         })),
         caseSensitive: false,
         rightPrefix: operation.rightPrefix,
+        as: operation.as
+      };
+    }
+    if (operation.type === 'semiJoin') {
+      return {
+        type: 'semiJoinRows',
+        purpose: 'objectMatching',
+        from: operation.from,
+        with: operation.with,
+        rules: operation.rules.map((rule) => ({
+          action: rule.action,
+          negate: rule.negate,
+          operator: rule.operator,
+          left: { column: rule.leftColumn, regex: rule.leftRegex },
+          right: { column: rule.rightColumn, regex: rule.rightRegex }
+        })),
+        ruleJoin: operation.ruleJoin,
+        caseSensitive: false,
         as: operation.as
       };
     }
@@ -1116,6 +1206,7 @@ function visualSelection(selection) {
     from: selection.from,
     limit: selection.limit,
     columns: selection.columns.slice(),
+    filterJoin: selection.filterJoin,
     sourceType: 'cmdb',
     scopeRules: cloneJsonValue(selection.rules),
     source: {
@@ -1250,7 +1341,7 @@ function generatedResultTables(flow, existingByName, outputs) {
         ? outputByAlias.get(stage.alias)?.label
         : text(existing.title) || outputByAlias.get(stage.alias)?.label || stage.alias,
       columns: stage.columns,
-      ...(stage.kind === 'match' ? { columnLabels: resultColumnLabels(stage.columns) } : {})
+      ...(stage.kind === 'match' || stage.kind === 'semiJoin' ? { columnLabels: resultColumnLabels(stage.columns) } : {})
     });
   }
   return tables;
@@ -1299,6 +1390,7 @@ export function objectFlowResultOutputs(flow, outputMetadata = []) {
   }
   const outputs = [];
   let matchIndex = 0;
+  let semiJoinIndex = 0;
   let relationIndex = 0;
   let existsRelatedIndex = 0;
   let setIndex = 0;
@@ -1311,6 +1403,9 @@ export function objectFlowResultOutputs(flow, outputMetadata = []) {
     } else if (stage.item.type === 'match') {
       matchIndex += 1;
       label = `Сопоставление ${matchIndex}`;
+    } else if (stage.item.type === 'semiJoin') {
+      semiJoinIndex += 1;
+      label = `Полусоединение ${semiJoinIndex}`;
     } else if (stage.item.type === 'relation') {
       relationIndex += 1;
       label = stage.item.domain ? `Связь ${relationIndex}: ${stage.item.domain}` : `Связь ${relationIndex}`;
@@ -1325,7 +1420,7 @@ export function objectFlowResultOutputs(flow, outputMetadata = []) {
     outputs.push({
       alias,
       label: metadata?.label || label,
-      kind: stage.kind === 'selection' ? 'selection' : stage.item.type === 'relation' ? 'relation' : stage.item.type === 'existsRelated' ? 'existsRelated' : stage.item.type === 'match' ? 'match' : 'set',
+      kind: stage.kind === 'selection' ? 'selection' : stage.item.type === 'relation' ? 'relation' : stage.item.type === 'existsRelated' ? 'existsRelated' : stage.item.type === 'match' ? 'match' : stage.item.type === 'semiJoin' ? 'semiJoin' : 'set',
       ...(metadata ? {
         assistantManaged: true,
         ...(metadata.assistantBlockId ? { assistantBlockId: metadata.assistantBlockId } : {}),
@@ -1537,7 +1632,18 @@ export function objectFlowStageSummaries(flow) {
         id: selection.id,
         kind: /** @type {'selection'} */ ('selection'),
         alias: selection.alias,
+        label: selection.name,
         className: selection.className,
+        from: selection.from,
+        rules: selection.rules.map((rule) => ({
+          path: rule.path,
+          op: rule.op,
+          value: rule.value,
+          valueParam: rule.valueParam,
+          valueColumn: rule.valueColumn,
+          action: rule.action,
+          negate: rule.negate
+        })),
         columns: uniqueStrings(BASE_RESULT_COLUMNS.concat(selection.columns))
       };
       summaries.push(summary);
@@ -1568,6 +1674,9 @@ export function objectFlowStageSummaries(flow) {
         const rightColumn = `${operation.rightPrefix}${rule.rightColumn}`;
         if (rule.rightColumn && !columns.includes(rightColumn)) columns.push(rightColumn);
       }
+    } else if (operation.type === 'semiJoin') {
+      kind = 'semiJoin';
+      columns = leftColumns.slice();
     } else if (operation.type === 'existsRelated') {
       kind = 'existsRelated';
       columns = leftColumns.slice();
@@ -1581,8 +1690,106 @@ export function objectFlowStageSummaries(flow) {
       alias: operation.as,
       columns
     };
+    if (operation.type === 'relation') {
+      summary.className = operation.targetClass;
+      summary.from = operation.from;
+      summary.domain = operation.domain;
+      summary.direction = operation.direction;
+    } else if (operation.type === 'existsRelated') {
+      // The stage returns the left rows, but retains the relation needed to
+      // materialize structured fields from the matching related cards later.
+      summary.from = operation.from;
+      summary.with = operation.with;
+      summary.domain = operation.domain;
+      summary.targetClass = operation.targetClass;
+      summary.direction = operation.direction;
+      summary.relatedColumns = uniqueStrings(operation.columns.concat(operation.rules.map((rule) => rule.rightColumn)));
+      summary.rules = operation.rules.map((rule) => ({
+        leftColumn: rule.leftColumn,
+        rightColumn: rule.rightColumn,
+        operator: rule.operator,
+        action: rule.action,
+        negate: rule.negate
+      }));
+    } else if (operation.type === 'match' || operation.type === 'semiJoin') {
+      summary.from = operation.from;
+      summary.with = operation.with;
+      if (operation.type === 'semiJoin') summary.ruleJoin = operation.ruleJoin;
+      if (operation.connection) summary.connection = cloneJsonValue(operation.connection);
+      summary.rules = operation.rules.map((rule) => ({
+        leftColumn: rule.leftColumn,
+        rightColumn: rule.rightColumn,
+        operator: rule.operator,
+        action: rule.action,
+        negate: rule.negate
+      }));
+    }
     summaries.push(summary);
     columnsByAlias.set(operation.as, columns);
+  }
+  const byAlias = new Map(summaries.map((summary) => [String(summary.alias || ''), summary]));
+  const classNameFor = (summary) => String(summary && (summary.className || summary.targetClass) || '').trim();
+  const bindings = [];
+  const addBinding = (owner, source, comparison, operator, evidence, relation = null) => {
+    if (!owner || !source.alias || !source.className || !source.field || !comparison.alias || !comparison.className || !comparison.field || !operator) return;
+    const binding = {
+      id: `comparison:${owner.id}:${bindings.length + 1}`,
+      source,
+      comparison,
+      operator,
+      evidence
+    };
+    if (relation && relation.domain && relation.targetClass) binding.relation = relation;
+    bindings.push({ owner, binding });
+  };
+  for (const summary of summaries) {
+    if (summary.kind === 'selection') {
+      const comparisonStage = byAlias.get(String(summary.from || ''));
+      for (const rule of Array.isArray(summary.rules) ? summary.rules : []) {
+        if (!rule.valueColumn || !comparisonStage) continue;
+        addBinding(summary,
+          { alias: summary.alias, className: classNameFor(summary), field: String(rule.path || '') },
+          { alias: comparisonStage.alias, className: classNameFor(comparisonStage), field: String(rule.valueColumn) },
+          String(rule.op || ''),
+          'selectionValueColumn',
+          comparisonStage.kind === 'relation' ? {
+            alias: comparisonStage.alias,
+            fromAlias: String(comparisonStage.from || ''),
+            domain: String(comparisonStage.domain || ''),
+            targetClass: classNameFor(comparisonStage),
+            direction: String(comparisonStage.direction || 'both')
+          } : null);
+      }
+    } else if (summary.kind === 'match' || summary.kind === 'semiJoin') {
+      const left = byAlias.get(String(summary.from || ''));
+      const right = byAlias.get(String(summary.with || ''));
+      for (const rule of Array.isArray(summary.rules) ? summary.rules : []) {
+        addBinding(summary,
+          { alias: left && left.alias, className: classNameFor(left), field: String(rule.leftColumn || '') },
+          { alias: right && right.alias, className: classNameFor(right), field: String(rule.rightColumn || '') },
+          String(rule.operator || ''),
+          summary.kind === 'semiJoin' ? 'semiJoinRows' : 'matchRows');
+      }
+    } else if (summary.kind === 'existsRelated') {
+      const comparison = byAlias.get(String(summary.with || ''));
+      for (const rule of Array.isArray(summary.rules) ? summary.rules : []) {
+        addBinding(summary,
+          { alias: comparison && comparison.alias, className: classNameFor(comparison), field: String(rule.leftColumn || '') },
+          { alias: summary.alias, className: String(summary.targetClass || ''), field: String(rule.rightColumn || '') },
+          String(rule.operator || ''),
+          'existsRelatedRows', {
+            alias: summary.alias,
+            fromAlias: String(summary.from || ''),
+            domain: String(summary.domain || ''),
+            targetClass: String(summary.targetClass || ''),
+            direction: String(summary.direction || 'both')
+          });
+      }
+    }
+  }
+  for (const { owner, binding } of bindings) {
+    if (!Array.isArray(owner.comparisonBindings)) owner.comparisonBindings = [];
+    owner.comparisonBindings.push(binding);
   }
   return summaries;
 }

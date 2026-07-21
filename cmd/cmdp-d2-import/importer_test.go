@@ -26,7 +26,7 @@ cluster.alpha -> cluster.beta: connects
 	if len(result.Source.Errors) != 0 {
 		t.Fatalf("unexpected source errors: %#v", result.Source.Errors)
 	}
-	if result.Version != 3 || result.Source.Format != "d2" || result.Source.SHA256 == "" {
+	if result.Version != 4 || result.Source.Format != "d2" || result.Source.SHA256 == "" {
 		t.Fatalf("unexpected source contract: %#v", result.Source)
 	}
 	if got := len(result.Elements.Nodes); got != 2 {
@@ -73,10 +73,10 @@ func TestImportD2ExtractsUsedClassesAndKeepsStructuralGroupsUntyped(t *testing.T
       border-radius: 12
     }
   }
-  unused: {
-    shape: cloud
-  }
-}
+	  unused: {
+	    shape: cloud
+	  }
+	}
 dmz: "DMZ" {
   vlan1540: "VLAN-1540\n192.168.10.152/29" {
     class: vlan
@@ -89,8 +89,8 @@ dmz: "DMZ" {
 	if len(result.Source.Errors) != 0 {
 		t.Fatalf("unexpected source errors: %#v", result.Source.Errors)
 	}
-	if result.Version != 3 {
-		t.Fatalf("version = %d, want 3", result.Version)
+	if result.Version != 4 {
+		t.Fatalf("version = %d, want 4", result.Version)
 	}
 	if len(result.Classes) != 1 {
 		t.Fatalf("classes = %#v, want only the used vlan definition", result.Classes)
@@ -111,10 +111,16 @@ dmz: "DMZ" {
 	}
 
 	dmz := findGroupByID(t, result.Elements.Groups, "dmz")
+	if len(dmz.Path) != 1 || dmz.Path[0] != "dmz" {
+		t.Fatalf("dmz path segments = %#v", dmz.Path)
+	}
 	if len(dmz.ClassKeys) != 0 {
 		t.Fatalf("structural dmz class keys = %#v, want empty", dmz.ClassKeys)
 	}
 	vlan := findGroupByID(t, result.Elements.Groups, "dmz.vlan1540")
+	if len(vlan.Path) != 2 || vlan.Path[0] != "dmz" || vlan.Path[1] != "vlan1540" {
+		t.Fatalf("vlan path segments = %#v", vlan.Path)
+	}
 	if len(vlan.ClassKeys) != 1 || vlan.ClassKeys[0] != "vlan" {
 		t.Fatalf("typed vlan class keys = %#v, want [vlan]", vlan.ClassKeys)
 	}
@@ -128,6 +134,177 @@ dmz: "DMZ" {
 	}
 	if !bytes.Contains(encoded, []byte(`"classKeys":[]`)) {
 		t.Fatalf("untyped group must expose an empty classKeys array: %s", encoded)
+	}
+}
+
+func TestImportD2ExtractsClassNotesAsRoleGuidance(t *testing.T) {
+	input := []byte(`classes: {
+  application: {
+    Notes: |md
+      CMDB application object. It is a connection endpoint.
+    |
+  }
+  unused: { shape: cloud }
+}
+app: Application { class: application }
+`)
+
+	result := importD2(input, 20)
+	if len(result.Source.Errors) != 0 {
+		t.Fatalf("unexpected source errors: %#v", result.Source.Errors)
+	}
+	if len(result.Classes) != 1 || result.Classes[0].Key != "application" {
+		t.Fatalf("unexpected classes: %#v", result.Classes)
+	}
+	if got := result.Classes[0].Notes; got != "CMDB application object. It is a connection endpoint." {
+		t.Fatalf("notes = %q", got)
+	}
+}
+
+func TestStripClassNotesIgnoresBracesInQuotedLiterals(t *testing.T) {
+	input := []byte(`classes: {
+  application: {
+    tooltip: "A quoted closing brace } is not D2 structure"
+    Notes: |md
+      CMDB application object.
+    |
+  }
+}
+`)
+
+	stripped, notes := stripClassNotes(input)
+
+	assertStrippedClassNotes(t, input, stripped, notes, "application", "CMDB application object.")
+}
+
+func TestStripClassNotesIgnoresBracesInComments(t *testing.T) {
+	input := []byte(`classes: {
+  application: {
+    # A comment containing } must not close the class.
+    Notes: |md
+      CMDB application object.
+    |
+  }
+}
+`)
+
+	stripped, notes := stripClassNotes(input)
+
+	assertStrippedClassNotes(t, input, stripped, notes, "application", "CMDB application object.")
+}
+
+func TestStripClassNotesIgnoresBracesInMarkdownPayload(t *testing.T) {
+	input := []byte(`classes: {
+  application: {
+    description: |md
+      This Markdown payload contains a closing brace }.
+    |
+    Notes: |md
+      CMDB application object.
+      # This is Markdown content, not a D2 comment.
+    |
+  }
+}
+`)
+
+	stripped, notes := stripClassNotes(input)
+
+	assertStrippedClassNotes(t, input, stripped, notes, "application", "CMDB application object.\n# This is Markdown content, not a D2 comment.")
+	if !bytes.Contains(stripped, []byte("This Markdown payload contains a closing brace }.")) {
+		t.Fatalf("non-Notes Markdown payload was unexpectedly removed: %q", stripped)
+	}
+}
+
+func assertStrippedClassNotes(t *testing.T, input, stripped []byte, notes map[string]string, classKey, wantNote string) {
+	t.Helper()
+	if got := notes[classKey]; got != wantNote {
+		t.Fatalf("notes[%q] = %q, want %q", classKey, got, wantNote)
+	}
+	if bytes.Contains(stripped, []byte("Notes:")) {
+		t.Fatalf("Notes field was not stripped: %q", stripped)
+	}
+	if got, want := bytes.Count(stripped, []byte("\n")), bytes.Count(input, []byte("\n")); got != want {
+		t.Fatalf("newline count = %d, want %d", got, want)
+	}
+}
+
+func TestImportD2AggregatesClassNotesAndUsageAcrossTypedEdges(t *testing.T) {
+	input := []byte(`classes: {
+  network_link: {
+    style.stroke: "#2563EB"
+    Notes: |md
+      CMDB network connection generated from ACL data.
+    |
+  }
+}
+source: Source
+target_a: "Target A"
+target_b: "Target B"
+source -> target_a: "TCP 443" {class: network_link}
+source -> target_b: "UDP 53" {class: network_link}
+`)
+
+	result := importD2(input, 20)
+	if len(result.Source.Errors) != 0 {
+		t.Fatalf("unexpected source errors: %#v", result.Source.Errors)
+	}
+	if len(result.Classes) != 1 {
+		t.Fatalf("classes = %#v, want only network_link", result.Classes)
+	}
+	class := result.Classes[0]
+	if class.Key != "network_link" || class.Notes != "CMDB network connection generated from ACL data." {
+		t.Fatalf("unexpected edge class metadata: %#v", class)
+	}
+	if class.UsageCount != 2 || len(class.SampleElementKeys) != 2 {
+		t.Fatalf("unexpected edge class usage: %#v", class)
+	}
+	if len(result.Elements.Edges) != 2 {
+		t.Fatalf("edges = %#v, want two typed edges", result.Elements.Edges)
+	}
+
+	sampledEdges := make(map[string]bool, len(class.SampleElementKeys))
+	for _, key := range class.SampleElementKeys {
+		sampledEdges[key] = true
+	}
+	for _, edge := range result.Elements.Edges {
+		if len(edge.ClassKeys) != 1 || edge.ClassKeys[0] != "network_link" {
+			t.Fatalf("edge class keys = %#v, want [network_link]", edge.ClassKeys)
+		}
+		if !sampledEdges[edge.ID] {
+			t.Fatalf("edge %q missing from class samples: %#v", edge.ID, class.SampleElementKeys)
+		}
+	}
+}
+
+func TestImportD2ReadsExplicitConnectionDirectionPolicy(t *testing.T) {
+	input := []byte(`vars: {
+  data: {
+    cmdp: {
+      import: {
+        connections: {
+          acl_external: { directionPolicy: dataFields }
+        }
+      }
+    }
+  }
+}
+classes: {
+  acl_external: { style.stroke: "#2563EB" }
+}
+source: Source
+target: Target
+source -> target: Traffic { class: acl_external }
+`)
+
+	result := importD2(input, 20)
+	if len(result.Source.Errors) != 0 {
+		t.Fatalf("unexpected source errors: %#v", result.Source.Errors)
+	}
+	if len(result.Classes) != 1 || result.Classes[0].Key != "acl_external" {
+		t.Fatalf("unexpected classes: %#v", result.Classes)
+	}
+	if result.Classes[0].DirectionPolicy != "dataFields" {
+		t.Fatalf("direction policy = %q, want dataFields", result.Classes[0].DirectionPolicy)
 	}
 }
 

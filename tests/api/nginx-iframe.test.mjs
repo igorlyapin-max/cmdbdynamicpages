@@ -13,8 +13,8 @@ const cookieHeader = process.env.CMDBUILD_COOKIE_HEADER || readCookieJar(cookieJ
 const nginxAvailable = await canReach(`${nginxOrigin}/health/live`);
 const skipWhenUnavailable = nginxAvailable ? false : `nginx same-origin front did not return healthy /health/live at ${nginxOrigin}`;
 
-test('nginx config keeps wiki and dynamicpages on the same origin', () => {
-  const config = fs.readFileSync('nginx/cmdbdynamicpages-dev.conf', 'utf8');
+test('nginx config exposes only cmdbdynamicpages routes on the same origin', () => {
+  const config = fs.readFileSync('nginx/cmdbdynamicpages.conf', 'utf8');
 
   assert.match(config, /listen\s+8088;/);
   assert.match(config, /limit_req_zone\s+\$binary_remote_addr\s+zone=cmdp_api:/);
@@ -29,7 +29,8 @@ test('nginx config keeps wiki and dynamicpages on the same origin', () => {
   assert.match(config, /location\s+\/health\/\s*\{/);
   assert.match(config, /proxy_pass\s+http:\/\/127\.0\.0\.1:8093\/health\/;/);
   assert.match(config, /location\s+\/\s*\{/);
-  assert.match(config, /proxy_pass\s+http:\/\/127\.0\.0\.1:3000;/);
+  assert.match(config, /return\s+404;/);
+  assert.doesNotMatch(config, /3000|13000|13001|18080/);
 });
 
 test('nginx health route reaches cmdbdynamicpages backend', { skip: skipWhenUnavailable }, async () => {
@@ -55,10 +56,9 @@ test('dynamicpages runtime route is iframe-compatible through nginx origin', { s
   assert.doesNotMatch(String(result.headers['content-security-policy'] || ''), /frame-ancestors\s+'none'/i);
 });
 
-test('wiki root is still served by nginx root proxy', { skip: skipWhenUnavailable }, async () => {
+test('nginx root does not proxy an external portal', { skip: skipWhenUnavailable }, async () => {
   const result = await request('GET', `${nginxOrigin}/`);
-
-  assert.ok(result.statusCode < 500, `wiki/root proxy returned HTTP ${result.statusCode}`);
+  assert.equal(result.statusCode, 404);
 });
 
 async function canReach(url) {

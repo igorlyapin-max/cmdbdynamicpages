@@ -10,6 +10,7 @@ import {
 } from '../../scripts/assistant-object-flow.mjs';
 import {
   assistantObjectFlowMessages,
+  assistantDiagramAttachRelatedNetworkStages,
   assistantObjectFlowCandidate,
   assistantIpv4MatchRequirements,
   assistantMatchRequirementsErrors,
@@ -19,8 +20,67 @@ import {
   assistantResultContractErrors,
   assistantRestoreObjectFlowSelectionClasses,
   assistantObjectFlowValidationFeedback,
+  assistantSemanticPlanValidationFeedback,
   validateTemplateSpec
 } from '../../scripts/dev-proxy-server.mjs';
+
+test('result contract validation uses deterministic bindings across relation predicates and candidate filters', () => {
+  const intent = {
+    context: '',
+    blocks: [
+      { id: 'all-acl', name: 'Все ACL', entities: 'ACL', algorithm: 'Выбрать ACL.', expectedResult: 'Список ACL.', uses: [] },
+      { id: 'external-systems', name: 'Внешние ИС', entities: 'IS, ipRange, ACL', algorithm: 'Оставить IS, чьи связанные ipRange содержат адреса Все ACL.', expectedResult: 'Список IS.', uses: ['all-acl'] },
+      { id: 'external-acl', name: 'ACL внешних ИС', entities: 'Все ACL, Внешние ИС', algorithm: 'Из Все ACL оставить адреса в сетях Внешние ИС.', expectedResult: 'Список ACL.', uses: ['all-acl', 'external-systems'] }
+    ]
+  };
+  const relationPredicate = {
+    sourceClass: 'IS', relatedClass: 'ipRange', comparisonBlockId: 'all-acl', comparisonClass: 'ACL',
+    domain: 'ISZabbixMonitoringDomain', direction: 'source', comparisonFields: ['dipaddress', 'ipaddress'], relatedField: 'range', operator: 'ipv4InCidr'
+  };
+  const candidateFilter = {
+    candidateBlockId: 'all-acl', candidateClass: 'ACL',
+    comparisonSource: { kind: 'block', blockId: 'external-systems', className: 'IS', rules: [] },
+    comparisonPath: [{ sourceClass: 'IS', domain: 'ISZabbixMonitoringDomain', direction: 'source', targetClass: 'ipRange' }],
+    comparisonTerminalClass: 'ipRange', ruleJoin: 'any',
+    rules: [
+      { candidateField: 'dipaddress', comparisonField: 'range', operator: 'ipv4InCidr' },
+      { candidateField: 'ipaddress', comparisonField: 'range', operator: 'ipv4InCidr' }
+    ]
+  };
+  const semanticPlan = {
+    version: 1,
+    blocks: [
+      { id: 'all-acl', name: 'Все ACL', expectedResult: 'Список ACL.', resultContract: { outputKind: 'sourceCards', outputClass: 'ACL', candidateFilter: null, dependencyPaths: [], relationPredicates: [], attributePredicates: [], referencePathPredicates: [] } },
+      { id: 'external-systems', name: 'Внешние ИС', expectedResult: 'Список IS.', resultContract: { outputKind: 'sourceCards', outputClass: 'IS', candidateFilter: null, dependencyPaths: [], relationPredicates: [relationPredicate], attributePredicates: [], referencePathPredicates: [] } },
+      { id: 'external-acl', name: 'ACL внешних ИС', expectedResult: 'Список ACL.', resultContract: { outputKind: 'sourceCards', outputClass: 'ACL', candidateFilter, dependencyPaths: [], relationPredicates: [], attributePredicates: [], referencePathPredicates: [] } }
+    ]
+  };
+  const flow = normalizeObjectFlow({
+    version: 1,
+    selections: [
+      { id: 'selection:allAcl', name: 'Все ACL', alias: 'allAcl', className: 'ACL', columns: ['ipaddress', 'dipaddress'], rules: [{ action: 'include', path: 'Code', op: 'matches', regex: '.*' }] },
+      { id: 'selection:externalIsSource', name: 'Внешние ИС (source)', alias: 'externalIsSource', className: 'IS', rules: [{ action: 'include', path: 'isExt', op: 'equals', value: 'true' }] }
+    ],
+    operations: [
+      { id: 'existsRelated:externalSystems', type: 'existsRelated', from: 'externalIsSource', with: 'allAcl', as: 'externalSystems', domain: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source', columns: ['range'], rules: [
+        { action: 'include', operator: 'ipv4InCidr', leftColumn: 'dipaddress', rightColumn: 'range' },
+        { action: 'include', operator: 'ipv4InCidr', leftColumn: 'ipaddress', rightColumn: 'range' }
+      ] },
+      { id: 'relation:externalRanges', type: 'relation', from: 'externalSystems', as: 'externalRanges', domain: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source', columns: ['range'] },
+      { id: 'semiJoin:externalAcl', type: 'semiJoin', from: 'allAcl', with: 'externalRanges', as: 'externalAcl', ruleJoin: 'any', rules: [
+        { action: 'include', operator: 'ipv4InCidr', leftColumn: 'dipaddress', rightColumn: 'range' },
+        { action: 'include', operator: 'ipv4InCidr', leftColumn: 'ipaddress', rightColumn: 'range' }
+      ] }
+    ],
+    publishedAlias: 'externalAcl'
+  });
+
+  assert.deepEqual(assistantResultContractErrors(flow, semanticPlan, intent, [
+    { blockId: 'all-acl', alias: 'allAcl' },
+    { blockId: 'external-systems', alias: 'externalSystems' },
+    { blockId: 'external-acl', alias: 'externalAcl' }
+  ]), []);
+});
 
 function validFlow() {
   return {
@@ -88,6 +148,37 @@ function validFlow() {
         ]
       }
     ]
+  };
+}
+
+function semiJoinFlow(ruleJoin) {
+  return {
+    version: 1,
+    selections: [{
+      alias: 'assets',
+      name: 'Assets',
+      className: 'Asset',
+      columns: ['Location', 'Owner'],
+      rules: [{ action: 'include', path: 'Code', op: 'exists' }]
+    }, {
+      alias: 'policies',
+      name: 'Policies',
+      className: 'Policy',
+      columns: ['Site', 'Scope'],
+      rules: [{ action: 'include', path: 'Code', op: 'exists' }]
+    }],
+    operations: [{
+      type: 'semiJoin',
+      from: 'assets',
+      with: 'policies',
+      as: 'eligibleAssets',
+      ruleJoin,
+      rules: [
+        { action: 'include', operator: 'equals', leftColumn: 'Location', rightColumn: 'Site' },
+        { action: 'include', operator: 'contains', leftColumn: 'Owner', rightColumn: 'Scope' }
+      ]
+    }],
+    publishedAlias: 'eligibleAssets'
   };
 }
 
@@ -169,6 +260,94 @@ test('validateObjectFlow reports ids, aliases, operation references, actions, an
   assert.ok(paths.includes('$.operations[0].rules'));
   assert.ok(paths.includes('$.operations[1].from'));
   assert.ok(paths.includes('$.operations[1].rules[0].operator'));
+});
+
+test('semiJoin normalization preserves canonical operations for any and all rule joins', () => {
+  for (const ruleJoin of ['any', 'all']) {
+    const normalized = normalizeObjectFlow(semiJoinFlow(ruleJoin));
+    const operation = normalized.operations[0];
+
+    assert.equal(operation.id, 'semiJoin:eligibleAssets');
+    assert.equal(operation.type, 'semiJoin');
+    assert.equal(operation.ruleJoin, ruleJoin);
+    assert.equal(operation.rules.length, 2);
+    assert.deepEqual(normalized.blocks, []);
+    assert.deepEqual(normalized.setOperations, []);
+    assert.deepEqual(validateObjectFlow(normalized), []);
+  }
+});
+
+test('validateObjectFlow enforces the semiJoin id, aliases, rule join, rules, operators, and columns', () => {
+  const invalid = semiJoinFlow('some');
+  invalid.operations[0].id = 'match:eligibleAssets';
+  invalid.operations[0].from = 'missingLeft';
+  invalid.operations[0].with = 'missingRight';
+  invalid.operations[0].as = 'assets';
+  invalid.operations[0].rules = [];
+
+  const invalidPaths = validateObjectFlow(invalid).map((error) => error.path);
+  assert.ok(invalidPaths.includes('$.operations[0].id'));
+  assert.ok(invalidPaths.includes('$.operations[0].from'));
+  assert.ok(invalidPaths.includes('$.operations[0].with'));
+  assert.ok(invalidPaths.includes('$.operations[0].as'));
+  assert.ok(invalidPaths.includes('$.operations[0].ruleJoin'));
+  assert.ok(invalidPaths.includes('$.operations[0].rules'));
+
+  const invalidRule = validFlow();
+  invalidRule.operations.push({
+    id: 'semiJoin:invalidColumns',
+    type: 'semiJoin',
+    from: 'routerRooms',
+    with: 'routerRoomVlans',
+    as: 'invalidColumns',
+    ruleJoin: 'all',
+    rules: [{ action: 'include', operator: 'unsupported', leftColumn: 'MissingLeft', rightColumn: 'MissingRight' }]
+  });
+  const invalidRulePaths = validateObjectFlow(invalidRule).map((error) => error.path);
+  assert.ok(invalidRulePaths.includes('$.operations[2].rules[0].operator'));
+  assert.ok(invalidRulePaths.includes('$.operations[2].rules[0].leftColumn'));
+  assert.ok(invalidRulePaths.includes('$.operations[2].rules[0].rightColumn'));
+});
+
+test('semiJoin compiles any and all rule joins while preserving exactly the left columns', () => {
+  for (const ruleJoin of ['any', 'all']) {
+    const flow = semiJoinFlow(ruleJoin);
+    const normalized = normalizeObjectFlow(flow);
+    const compiled = compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, flow);
+    const step = compiled.steps.find((item) => item.as === 'eligibleAssets');
+    const leftColumns = objectFlowStageSummaries(normalized).find((item) => item.alias === 'assets').columns;
+    const summary = objectFlowStageSummaries(normalized).find((item) => item.alias === 'eligibleAssets');
+    const table = compiled.result.tables.find((item) => item.name === 'eligibleAssets');
+    const visualOperation = compiled.visualModels
+      .find((model) => model.mode === 'objectMatching')
+      .operations.find((operation) => operation.as === 'eligibleAssets');
+
+    assert.deepEqual(step, {
+      type: 'semiJoinRows',
+      purpose: 'objectMatching',
+      from: 'assets',
+      with: 'policies',
+      rules: [{
+        action: 'include', negate: false, operator: 'equals',
+        left: { column: 'Location', regex: '' }, right: { column: 'Site', regex: '' }
+      }, {
+        action: 'include', negate: false, operator: 'contains',
+        left: { column: 'Owner', regex: '' }, right: { column: 'Scope', regex: '' }
+      }],
+      ruleJoin,
+      caseSensitive: false,
+      as: 'eligibleAssets'
+    });
+    assert.deepEqual(summary.columns, leftColumns);
+    assert.equal(summary.kind, 'semiJoin');
+    assert.equal(summary.ruleJoin, ruleJoin);
+    assert.deepEqual(table.columns, leftColumns);
+    assert.equal(table.columns.includes('Site'), false);
+    assert.equal(table.columns.includes('Scope'), false);
+    assert.equal(visualOperation.type, 'semiJoin');
+    assert.equal(visualOperation.ruleJoin, ruleJoin);
+    assert.equal(objectFlowResultOutputs(normalized).at(-1).kind, 'semiJoin');
+  }
 });
 
 test('validateObjectFlow accepts independent selections without a match operation', () => {
@@ -255,10 +434,30 @@ test('object flow schedules a source-driven IPv4 selection after its relation ou
   ]);
   const acls = compiled.steps.at(-1);
   assert.equal(acls.from, 'ipRanges');
+  assert.equal(acls.filterJoin, 'any');
   assert.deepEqual(acls.filters.map((filter) => [filter.scope, filter.path, filter.op, filter.valueColumn]), [
     ['include', 'ipaddress', 'ipv4InCidr', 'range'],
     ['include', 'dipaddress', 'ipv4InCidr', 'range']
   ]);
+});
+
+test('object flow compiles ordinary selection predicates with all semantics', () => {
+  const flow = {
+    version: 1,
+    selections: [{
+      id: 'selection:internalSystems', name: 'Internal systems', alias: 'internalSystems', className: 'IS', limit: 100,
+      columns: ['Name', 'isExt'],
+      rules: [
+        { action: 'include', path: 'isExt', op: 'equals', value: 'false' },
+        { action: 'include', path: 'Name', op: 'notEquals', valueParam: 'isName' }
+      ]
+    }],
+    operations: [],
+    publishedAlias: 'internalSystems'
+  };
+
+  const compiled = compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, flow);
+  assert.equal(compiled.steps[0].filterJoin, 'all');
 });
 
 test('object flow compiles a relation-aware existence match without changing the retained source schema', () => {
@@ -302,7 +501,22 @@ test('object flow compiles a relation-aware existence match without changing the
   });
   assert.deepEqual(objectFlowStageSummaries(flow).at(-1), {
     id: 'existsRelated:externalSystemsWithAcl', kind: 'existsRelated', alias: 'externalSystemsWithAcl',
-    columns: ['Class', '_id', 'Code', 'Description', 'isExt']
+    columns: ['Class', '_id', 'Code', 'Description', 'isExt'],
+    from: 'externalSystems',
+    with: 'acls',
+    domain: 'ISIpRange',
+    targetClass: 'ipRange',
+    direction: 'source',
+    relatedColumns: ['range'],
+    rules: [{ action: 'include', negate: false, operator: 'ipv4InCidr', leftColumn: 'ipaddress', rightColumn: 'range' }],
+    comparisonBindings: [{
+      id: 'comparison:existsRelated:externalSystemsWithAcl:1',
+      source: { alias: 'acls', className: 'ACL', field: 'ipaddress' },
+      comparison: { alias: 'externalSystemsWithAcl', className: 'ipRange', field: 'range' },
+      operator: 'ipv4InCidr',
+      evidence: 'existsRelatedRows',
+      relation: { alias: 'externalSystemsWithAcl', fromAlias: 'externalSystems', domain: 'ISIpRange', targetClass: 'ipRange', direction: 'source' }
+    }]
   });
 });
 
@@ -620,21 +834,30 @@ test('objectFlowStageSummaries returns deterministic cumulative columns', () => 
       id: 'selection:routers',
       kind: 'selection',
       alias: 'routers',
+      label: 'Routers',
       className: 'Router',
+      from: '',
+      rules: [{ path: 'Status', op: 'equals', value: 'active', valueParam: '', valueColumn: '', action: 'include', negate: false }],
       columns: ['Class', '_id', 'Code', 'Description', 'Location']
     },
     {
       id: 'selection:rooms',
       kind: 'selection',
       alias: 'rooms',
+      label: 'Rooms',
       className: 'Room',
+      from: '',
+      rules: [{ path: 'Code', op: 'matches', value: '', valueParam: '', valueColumn: '', action: 'include', negate: false }],
       columns: ['Class', '_id', 'Code', 'Description']
     },
     {
       id: 'selection:vlans',
       kind: 'selection',
       alias: 'vlans',
+      label: 'VLANs',
       className: 'Vlan',
+      from: '',
+      rules: [{ path: 'Status', op: 'equals', value: 'retired', valueParam: '', valueColumn: '', action: 'exclude', negate: false }],
       columns: ['Class', '_id', 'Code', 'Description']
     }
   ]);
@@ -646,7 +869,17 @@ test('objectFlowStageSummaries returns deterministic cumulative columns', () => 
       'Class', '_id', 'Code', 'Description',
       'Location',
       'Rooms.Class', 'Rooms._id', 'Rooms.Code', 'Rooms.Description'
-    ]
+    ],
+    from: 'routers',
+    with: 'rooms',
+    rules: [{ action: 'include', negate: false, operator: 'equals', leftColumn: 'Location', rightColumn: 'Code' }],
+    comparisonBindings: [{
+      id: 'comparison:match:routerRooms:1',
+      source: { alias: 'routers', className: 'Router', field: 'Location' },
+      comparison: { alias: 'rooms', className: 'Room', field: 'Code' },
+      operator: 'equals',
+      evidence: 'matchRows'
+    }]
   });
   assert.ok(summaries[4].columns.includes('Rooms.Code'));
   assert.ok(summaries[4].columns.includes('Vlans.Location'));
@@ -672,6 +905,107 @@ test('objectFlowStageSummaries exposes typed set-operation aliases for diagram m
     alias: 'allInfrastructure',
     columns: ['Class', '_id', 'Code', 'Description', 'Location']
   });
+});
+
+test('objectFlowStageSummaries retains relation provenance for diagram related bindings', () => {
+  const flow = validFlow();
+  flow.operations.push({
+    id: 'relation:routerNetworks',
+    type: 'relation',
+    from: 'routers',
+    as: 'routerNetworks',
+    domain: 'RouterNetwork',
+    targetClass: 'ipRange',
+    direction: 'source',
+    columns: ['range'],
+    limit: 100,
+    distinct: true
+  });
+  const stage = objectFlowStageSummaries(flow).find((item) => item.id === 'relation:routerNetworks');
+  assert.equal(stage.className, 'ipRange');
+  assert.equal(stage.from, 'routers');
+  assert.equal(stage.domain, 'RouterNetwork');
+  assert.equal(stage.direction, 'source');
+  assert.ok(stage.columns.includes('range'));
+});
+
+test('objectFlowStageSummaries preserves typed relation-pair endpoints for D2 mapping', () => {
+  const flow = {
+    version: 1,
+    selections: [{
+      id: 'selection:applications', name: 'Applications', alias: 'applications', className: 'ApplicG', limit: 100,
+      columns: ['Code'], rules: [{ action: 'include', path: 'Code', op: 'matches', regex: '.*' }]
+    }, {
+      id: 'selection:servers', name: 'Servers', alias: 'servers', className: 'phServer', limit: 100,
+      columns: ['Code'], rules: [{ action: 'include', path: 'Code', op: 'matches', regex: '.*' }]
+    }],
+    operations: [{
+      id: 'relation:applicationServersRaw', type: 'relation', from: 'applications', as: 'applicationServersRaw', domain: 'phs',
+      targetClass: 'phServer', direction: 'source', columns: ['Code'], limit: 100, distinct: true
+    }, {
+      id: 'match:applicationServers', type: 'match', from: 'applicationServersRaw', with: 'servers', as: 'applicationServers', rightPrefix: 'Endpoint_',
+      rules: [{ action: 'include', operator: 'equals', leftColumn: 'RelatedId', rightColumn: '_id' }],
+      connection: { mode: 'domain', fromClass: 'ApplicG', withClass: 'phServer', sourceField: 'SourceId', targetField: 'RelatedId', domain: 'phs', direction: 'source' }
+    }],
+    publishedAlias: 'applicationServers'
+  };
+
+  const normalized = normalizeObjectFlow(flow);
+  const stage = objectFlowStageSummaries(normalized).find((item) => item.id === 'match:applicationServers');
+  assert.deepEqual(stage.connection, {
+    mode: 'domain', fromClass: 'ApplicG', withClass: 'phServer', sourceField: 'SourceId', targetField: 'RelatedId', domain: 'phs', direction: 'source'
+  });
+  assert.ok(stage.columns.includes('SourceId'));
+  assert.ok(stage.columns.includes('RelatedId'));
+  const compiled = compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, normalized);
+  const stored = compiled.visualModels.find((model) => model.mode === 'objectMatching').operations.find((operation) => operation.as === 'applicationServers');
+  assert.deepEqual(stored.connection, stage.connection);
+  assert.equal(compiled.steps.find((step) => step.as === 'applicationServers').connection, undefined);
+});
+
+test('diagram role mapping keeps a comparison-proven related field from any CMDBuild class', () => {
+  const roles = [{ id: 'role:site', selectedSemantic: 'object' }];
+  const stages = [
+    { id: 'selection:site', kind: 'selection', alias: 'site', className: 'Site', from: '', columns: [] },
+    {
+      id: 'relation:siteNetwork',
+      kind: 'relation',
+      alias: 'siteNetwork',
+      className: 'AddressPool',
+      from: 'site',
+      domain: 'SiteAddressPool',
+      direction: 'source',
+      columns: ['cidr']
+    },
+    {
+      id: 'selection:device',
+      kind: 'selection',
+      alias: 'device',
+      className: 'Device',
+      from: 'siteNetwork',
+      columns: ['address'],
+      comparisonBindings: [{
+        id: 'comparison:device:1',
+        source: { alias: 'device', className: 'Device', field: 'address' },
+        comparison: { alias: 'siteNetwork', className: 'AddressPool', field: 'cidr' },
+        operator: 'ipv4InCidr',
+        evidence: 'selectionValueColumn',
+        relation: { alias: 'siteNetwork', fromAlias: 'site', domain: 'SiteAddressPool', targetClass: 'AddressPool', direction: 'source' }
+      }]
+    }
+  ];
+  const mapped = assistantDiagramAttachRelatedNetworkStages([{
+    roleId: 'role:site',
+    source: { alias: 'site', stageId: 'selection:site', kind: 'selection', className: 'Site' },
+    mapping: { id: 'mapping:site', roleId: 'role:site', source: { alias: 'site' }, primary: {}, related: [] }
+  }], roles, stages);
+
+  assert.deepEqual(mapped[0].mapping.related, [{
+    id: mapped[0].mapping.related[0].id,
+    className: 'AddressPool',
+    path: [{ kind: 'domain', name: 'SiteAddressPool', targetClass: 'AddressPool', direction: 'source' }],
+    structuredFields: ['cidr']
+  }]);
 });
 
 test('Object Flow persists an ordered output manifest without claiming unrelated tables', () => {
@@ -1147,4 +1481,26 @@ test('object flow does not publish the final operation when no alias is selected
   assert.equal(objectMatching.output.alias, '');
   assert.ok(objectMatching.outputs.every((output) => output.published === undefined));
   assert.equal(compiled.result.tables.some((table) => table.published), false);
+});
+
+test('candidate-filter feedback names the exact user result and explains an ambiguous field join', () => {
+  const error = Object.assign(new Error('candidate filter unresolved'), {
+    details: [{
+      kind: 'deterministicCandidateRulesUnresolved',
+      blockId: 'target-acl',
+      blockName: 'ACL внутри target системы',
+      candidateBlockId: 'all-acl',
+      outputClass: 'ACL',
+      candidateFields: ['ipaddress', 'dipaddress'],
+      reason: 'между полями не указано явное И/ИЛИ'
+    }]
+  });
+
+  const feedback = assistantSemanticPlanValidationFeedback(error);
+
+  assert.match(feedback.summary, /ACL внутри target системы/);
+  assert.match(feedback.summary, /фильтр кандидатов/);
+  assert.match(feedback.action, /«или»/);
+  assert.match(feedback.causes[0].message, /all-acl/);
+  assert.deepEqual(feedback.affectedStages, [{ label: 'ACL внутри target системы', alias: 'target-acl' }]);
 });

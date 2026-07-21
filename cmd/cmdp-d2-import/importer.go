@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 
 	"oss.terrastruct.com/d2/d2ast"
 	"oss.terrastruct.com/d2/d2compiler"
@@ -75,6 +76,7 @@ type nodeElement struct {
 	Href      string            `json:"href,omitempty"`
 	Tooltip   string            `json:"tooltip,omitempty"`
 	Board     string            `json:"board,omitempty"`
+	Path      []string          `json:"pathSegments"`
 	Range     *sourceRange      `json:"range,omitempty"`
 }
 
@@ -92,6 +94,8 @@ type edgeElement struct {
 	Href        string            `json:"href,omitempty"`
 	Tooltip     string            `json:"tooltip,omitempty"`
 	Board       string            `json:"board,omitempty"`
+	SourcePath  []string          `json:"sourcePathSegments"`
+	TargetPath  []string          `json:"targetPathSegments"`
 	Range       *sourceRange      `json:"range,omitempty"`
 }
 
@@ -109,21 +113,26 @@ type groupElement struct {
 	Href           string            `json:"href,omitempty"`
 	Tooltip        string            `json:"tooltip,omitempty"`
 	Board          string            `json:"board,omitempty"`
+	Path           []string          `json:"pathSegments"`
 	Range          *sourceRange      `json:"range,omitempty"`
 }
 
 type hierarchyElement struct {
-	ID     string       `json:"id"`
-	Parent string       `json:"parent"`
-	Child  string       `json:"child"`
-	Label  string       `json:"label"`
-	Board  string       `json:"board,omitempty"`
-	Range  *sourceRange `json:"range,omitempty"`
+	ID         string       `json:"id"`
+	Parent     string       `json:"parent"`
+	Child      string       `json:"child"`
+	Label      string       `json:"label"`
+	Board      string       `json:"board,omitempty"`
+	ParentPath []string     `json:"parentPathSegments"`
+	ChildPath  []string     `json:"childPathSegments"`
+	Range      *sourceRange `json:"range,omitempty"`
 }
 
 // classDefinition is a reusable D2 visual/template role, never a CMDBuild class identity.
 type classDefinition struct {
 	Key               string         `json:"key"`
+	Notes             string         `json:"notes,omitempty"`
+	DirectionPolicy   string         `json:"directionPolicy,omitempty"`
 	Definition        map[string]any `json:"definition"`
 	UsageCount        int            `json:"usageCount"`
 	SampleElementKeys []string       `json:"sampleElementKeys"`
@@ -156,6 +165,13 @@ type semanticRoleEntry struct {
 
 type semanticRoleIndex map[string]semanticRoleEntry
 
+type connectionPolicyEntry struct {
+	Policy string
+	Range  *sourceRange
+}
+
+type connectionPolicyIndex map[string]connectionPolicyEntry
+
 type classUsage struct {
 	count   int
 	samples []string
@@ -164,7 +180,7 @@ type classUsage struct {
 
 func newImportResult(input []byte) importResult {
 	result := importResult{
-		Version: 3,
+		Version: 4,
 		Source: sourceInfo{
 			Format: "d2",
 			Parser: "d2-v0.7.1",
@@ -196,8 +212,9 @@ func newImportResult(input []byte) importResult {
 
 func importD2(input []byte, maxElements int) importResult {
 	result := newImportResult(input)
+	compilerInput, notesByClass := stripClassNotes(input)
 
-	ast, err := d2parser.Parse(sourcePath, bytes.NewReader(input), nil)
+	ast, err := d2parser.Parse(sourcePath, bytes.NewReader(compilerInput), nil)
 	if err != nil {
 		result.Source.Errors = append(result.Source.Errors, errorsFromD2(err, "parse_error")...)
 		return result
@@ -226,8 +243,13 @@ func importD2(input []byte, maxElements int) importResult {
 		result.Source.Errors = append(result.Source.Errors, semanticErrors...)
 		return result
 	}
+	connectionPolicies, policyErrors := extractConnectionPolicyIndex(ir)
+	if len(policyErrors) != 0 {
+		result.Source.Errors = append(result.Source.Errors, policyErrors...)
+		return result
+	}
 
-	graph, _, err := d2compiler.Compile(sourcePath, bytes.NewReader(input), &d2compiler.CompileOptions{FS: nil})
+	graph, _, err := d2compiler.Compile(sourcePath, bytes.NewReader(compilerInput), &d2compiler.CompileOptions{FS: nil})
 	if err != nil {
 		result.Source.Errors = append(result.Source.Errors, errorsFromD2(err, "compile_error")...)
 		return result
@@ -248,9 +270,166 @@ func importD2(input []byte, maxElements int) importResult {
 	}
 
 	result.Elements = normalizeElements(visits, semanticRoles)
-	result.Classes = extractUsedClassDefinitions(ir, result.Elements)
+	if policyErrors = validateConnectionPolicyTargets(result.Elements, connectionPolicies); len(policyErrors) != 0 {
+		result.Source.Errors = append(result.Source.Errors, policyErrors...)
+		return result
+	}
+	result.Classes = extractUsedClassDefinitions(ir, result.Elements, notesByClass, connectionPolicies)
 	result.Template = templateForElements(result.Elements)
 	return result
+}
+
+// stripClassNotes supports Notes as authoring-only guidance inside classes.<role>.
+// D2 v0.7.1 rejects arbitrary class fields, so the compiler receives a source
+// with exactly the same line count while the importer retains the annotation.
+func stripClassNotes(input []byte) ([]byte, map[string]string) {
+	lines := strings.SplitAfter(string(input), "\n")
+	notesByClass := make(map[string]string)
+	output := make([]string, 0, len(lines))
+	depth, classesDepth, classDepth := 0, -1, -1
+	classKey := ""
+	scanner := d2SourceScanner{}
+	noteClass := ""
+	noteLines := make([]string, 0)
+	for _, line := range lines {
+		if noteClass != "" {
+			output = append(output, newlineOnly(line))
+			if isD2MarkdownEnd(line) {
+				notesByClass[noteClass] = strings.TrimSpace(strings.Join(noteLines, "\n"))
+				noteClass = ""
+				noteLines = noteLines[:0]
+			} else {
+				noteLines = append(noteLines, strings.TrimSpace(line))
+			}
+			continue
+		}
+		if scanner.markdown {
+			output = append(output, line)
+			if isD2MarkdownEnd(line) {
+				scanner.markdown = false
+			}
+			continue
+		}
+
+		code := scanner.codeLine(line)
+		fieldName, fieldValue, hasField := d2Field(code)
+		if classesDepth < 0 && hasField && fieldName == "classes" && d2MapValue(fieldValue) {
+			classesDepth = depth + 1
+		}
+		if classesDepth >= 0 && depth == classesDepth && hasField && d2MapValue(fieldValue) {
+			classKey = fieldName
+			classDepth = depth + 1
+		}
+		if classKey != "" && depth == classDepth && hasField && strings.EqualFold(fieldName, "notes") && d2MarkdownValue(fieldValue) {
+			noteClass = classKey
+			noteLines = noteLines[:0]
+			output = append(output, newlineOnly(line))
+			continue
+		}
+		output = append(output, line)
+		if hasField && d2MarkdownValue(fieldValue) {
+			scanner.markdown = true
+		}
+		depth += d2BraceDelta(code)
+		if classKey != "" && depth < classDepth {
+			classKey, classDepth = "", -1
+		}
+		if classesDepth >= 0 && depth < classesDepth {
+			classesDepth = -1
+		}
+	}
+	if noteClass != "" {
+		notesByClass[noteClass] = strings.TrimSpace(strings.Join(noteLines, "\n"))
+	}
+	return []byte(strings.Join(output, "")), notesByClass
+}
+
+// d2SourceScanner keeps only structural D2 syntax in codeLine. Braces in
+// quoted values, # comments, and multiline Markdown do not affect map depth.
+type d2SourceScanner struct {
+	escaped  bool
+	markdown bool
+	quoted   bool
+}
+
+func (scanner *d2SourceScanner) codeLine(line string) string {
+	var code strings.Builder
+	code.Grow(len(line))
+	for index := 0; index < len(line); index++ {
+		character := line[index]
+		if scanner.quoted {
+			code.WriteByte(' ')
+			if scanner.escaped {
+				scanner.escaped = false
+				continue
+			}
+			switch character {
+			case '\\':
+				scanner.escaped = true
+			case '"':
+				scanner.quoted = false
+			}
+			continue
+		}
+		if character == '#' {
+			break
+		}
+		if character == '"' {
+			scanner.quoted = true
+			scanner.escaped = false
+			code.WriteByte(' ')
+			continue
+		}
+		code.WriteByte(character)
+	}
+	return code.String()
+}
+
+func d2Field(code string) (string, string, bool) {
+	separator := strings.IndexByte(code, ':')
+	if separator <= 0 {
+		return "", "", false
+	}
+	name := strings.TrimSpace(code[:separator])
+	if name == "" || strings.ContainsAny(name, "{};") {
+		return "", "", false
+	}
+	return name, strings.TrimSpace(code[separator+1:]), true
+}
+
+func d2MapValue(value string) bool {
+	return strings.HasPrefix(value, "{")
+}
+
+func d2MarkdownValue(value string) bool {
+	return strings.HasPrefix(value, "|")
+}
+
+func isD2MarkdownEnd(line string) bool {
+	return strings.TrimSpace(line) == "|"
+}
+
+func d2BraceDelta(code string) int {
+	depth := 0
+	for index := 0; index < len(code); index++ {
+		switch code[index] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+		}
+	}
+	return depth
+}
+
+func newlineOnly(line string) string {
+	if strings.HasSuffix(line, "\r\n") {
+		return "\r\n"
+	}
+	if strings.HasSuffix(line, "\n") {
+		return "\n"
+	}
+	return ""
 }
 
 func extractSemanticRoleIndex(ir *d2ir.Map) (semanticRoleIndex, []sourceError) {
@@ -297,7 +476,66 @@ func extractSemanticRoleIndex(ir *d2ir.Map) (semanticRoleIndex, []sourceError) {
 	return result, errors
 }
 
-func extractUsedClassDefinitions(ir *d2ir.Map, normalized elements) []classDefinition {
+func extractConnectionPolicyIndex(ir *d2ir.Map) (connectionPolicyIndex, []sourceError) {
+	result := make(connectionPolicyIndex)
+	current := ir
+	var connectionsField *d2ir.Field
+	for _, name := range []string{"vars", "data", "cmdp", "import", "connections"} {
+		connectionsField = current.GetField(d2ast.FlatUnquotedString(name))
+		if connectionsField == nil {
+			return result, nil
+		}
+		if connectionsField.Map() == nil {
+			return result, []sourceError{{Code: "invalid_connection_policies", Message: fmt.Sprintf("vars.data.cmdp.import.connections path component %q must be a map", name), Range: rangeFromD2(connectionsField.AST().GetRange())}}
+		}
+		current = connectionsField.Map()
+	}
+	errors := make([]sourceError, 0)
+	for _, connectionField := range current.Fields {
+		key := connectionField.Name.ScalarString()
+		connectionMap := connectionField.Map()
+		if connectionMap == nil {
+			errors = append(errors, sourceError{Code: "invalid_connection_policy", Message: fmt.Sprintf("connection policy %q must be a map", key), Range: rangeFromD2(connectionField.AST().GetRange())})
+			continue
+		}
+		var directionPolicyField *d2ir.Field
+		for _, field := range connectionMap.Fields {
+			if field.Name.ScalarString() == "directionPolicy" {
+				directionPolicyField = field
+				break
+			}
+		}
+		if directionPolicyField == nil || directionPolicyField.Primary() == nil {
+			errors = append(errors, sourceError{Code: "invalid_connection_policy", Message: fmt.Sprintf("connection policy %q must define a scalar directionPolicy", key), Range: rangeFromD2(connectionField.AST().GetRange())})
+			continue
+		}
+		policy := directionPolicyField.Primary().Value.ScalarString()
+		if !validDirectionPolicy(policy) {
+			errors = append(errors, sourceError{Code: "invalid_connection_policy", Message: fmt.Sprintf("connection policy %q must use dataFields, template, or undirected", key), Range: rangeFromD2(directionPolicyField.AST().GetRange())})
+			continue
+		}
+		result[key] = connectionPolicyEntry{Policy: policy, Range: rangeFromD2(directionPolicyField.AST().GetRange())}
+	}
+	return result, errors
+}
+
+func validateConnectionPolicyTargets(value elements, policies connectionPolicyIndex) []sourceError {
+	edgeClasses := make(map[string]struct{})
+	for _, edge := range value.Edges {
+		for _, key := range edge.ClassKeys {
+			edgeClasses[key] = struct{}{}
+		}
+	}
+	errors := make([]sourceError, 0)
+	for key, entry := range policies {
+		if _, ok := edgeClasses[key]; !ok {
+			errors = append(errors, sourceError{Code: "unknown_connection_policy_target", Message: fmt.Sprintf("connection policy target %q is not a used D2 edge class", key), Range: entry.Range})
+		}
+	}
+	return errors
+}
+
+func extractUsedClassDefinitions(ir *d2ir.Map, normalized elements, notesByClass map[string]string, connectionPolicies connectionPolicyIndex) []classDefinition {
 	result := make([]classDefinition, 0)
 	classesField := ir.GetField(d2ast.FlatUnquotedString("classes"))
 	if classesField == nil || classesField.Map() == nil {
@@ -312,6 +550,8 @@ func extractUsedClassDefinitions(ir *d2ir.Map, normalized elements) []classDefin
 		}
 		result = append(result, classDefinition{
 			Key:               field.Name.ScalarString(),
+			Notes:             strings.TrimSpace(notesByClass[field.Name.ScalarString()]),
+			DirectionPolicy:   connectionPolicies[field.Name.ScalarString()].Policy,
 			Definition:        classMapDefinition(field.Map()),
 			UsageCount:        entry.count,
 			SampleElementKeys: append([]string(nil), entry.samples...),
@@ -423,6 +663,10 @@ func validContainerRole(value string) bool {
 	return value == "composite" || value == "group" || value == "decorative"
 }
 
+func validDirectionPolicy(value string) bool {
+	return value == "dataFields" || value == "template" || value == "undirected"
+}
+
 func encodeResult(w io.Writer, result importResult) error {
 	encoder := json.NewEncoder(w)
 	encoder.SetEscapeHTML(false)
@@ -527,12 +771,14 @@ func normalizeElements(visits []graphVisit, semanticRoles semanticRoleIndex) ele
 				parentID := elementID(visit.board, object.Parent.AbsID())
 				childID := elementID(visit.board, object.AbsID())
 				result.Hierarchies = append(result.Hierarchies, hierarchyElement{
-					ID:     hierarchyID(visit.board, parentID, childID),
-					Parent: parentID,
-					Child:  childID,
-					Label:  "contains",
-					Board:  visit.board,
-					Range:  objectRange(object),
+					ID:         hierarchyID(visit.board, parentID, childID),
+					Parent:     parentID,
+					Child:      childID,
+					Label:      "contains",
+					Board:      visit.board,
+					ParentPath: objectPathSegments(object.Parent),
+					ChildPath:  objectPathSegments(object),
+					Range:      objectRange(object),
 				})
 			}
 		}
@@ -556,6 +802,7 @@ func normalizeNode(visit graphVisit, object *d2graph.Object) nodeElement {
 		Href:      scalarValue(object.Link),
 		Tooltip:   scalarValue(object.Tooltip),
 		Board:     visit.board,
+		Path:      objectPathSegments(object),
 		Range:     objectRange(object),
 	}
 }
@@ -584,6 +831,7 @@ func normalizeGroup(visit graphVisit, object *d2graph.Object, semanticRoles sema
 		Href:           scalarValue(object.Link),
 		Tooltip:        scalarValue(object.Tooltip),
 		Board:          visit.board,
+		Path:           objectPathSegments(object),
 		Range:          objectRange(object),
 	}
 }
@@ -603,6 +851,8 @@ func normalizeEdge(visit graphVisit, edge *d2graph.Edge) edgeElement {
 		Href:        scalarValue(edge.Link),
 		Tooltip:     scalarValue(edge.Tooltip),
 		Board:       visit.board,
+		SourcePath:  objectPathSegments(edge.Src),
+		TargetPath:  objectPathSegments(edge.Dst),
 		Range:       edgeRange(edge),
 	}
 }
@@ -742,6 +992,20 @@ func hasSemanticRole(visit graphVisit, object *d2graph.Object, roles semanticRol
 
 func hasElementParent(object *d2graph.Object) bool {
 	return object.Parent != nil && object.Parent != object.Graph.Root
+}
+
+func objectPathSegments(object *d2graph.Object) []string {
+	if object == nil {
+		return []string{}
+	}
+	result := make([]string, 0, 4)
+	for current := object; current != nil && current != current.Graph.Root; current = current.Parent {
+		result = append(result, current.IDVal)
+	}
+	for left, right := 0, len(result)-1; left < right; left, right = left+1, right-1 {
+		result[left], result[right] = result[right], result[left]
+	}
+	return result
 }
 
 func elementParentID(visit graphVisit, object *d2graph.Object) string {
