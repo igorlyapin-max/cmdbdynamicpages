@@ -45,8 +45,9 @@ cp .env.example .env
 - `CMDBDYNAMICPAGES_CSRF_SECRET` - stable external secret из approved secret source;
 - `CMDP_NGINX_CUSTOM_API_READ_TIMEOUT` - timeout для `proxy_read_timeout` и `proxy_send_timeout` только в nginx location `/cmdbuild/custom-api/`; default `70s`. Использовать nginx duration, например `90s`, если подтверждено, что upstream operation требует больше времени;
 - `CMDP_EXECUTION_MAX_SELECTION_SCAN_ROWS_ABSOLUTE` - абсолютный server-side cap количества карточек, которые один детерминированный selection может просканировать; default `50000`. Он ограничивает настроечные значения Designer и не увеличивает число строк в опубликованной таблице. Поднимать только после оценки нагрузки CMDBuild; при достижении cap UI сообщает, что результат может быть неполным;
+- `CMDP_DRAFT_PREVIEW_TIMEOUT_MS` - общий deadline draft preview в Designer; default `60000` ms, допустимый диапазон `1000-300000` ms. Он включает CSRF/browser request и весь server-side deterministic execution. При поздней ошибке diagram-only preview возвращает безопасный partial preview успешно завершившихся этапов и trace, но не считается успешным preview;
 - `CMDP_ASSISTANT_ENABLED` - deprecated/no-op compatibility variable; фактическое включение Designer draft assistant хранится в `Cst_QueryToolConfig.RuntimeConfigJson.assistant.llm.enabled`;
-- `LITELLM_BASE_URL`, `LITELLM_MODEL`, `LITELLM_API_KEY_FILE_HOST` - optional LiteLLM assistant endpoint/model/API-key secret file;
+- `LITELLM_BASE_URL`, `LITELLM_MODEL`, `LITELLM_API_KEY_FILE_HOST` - optional LiteLLM assistant endpoint/model/API-key secret file. Leave `LITELLM_API_KEY_FILE_HOST` empty when Assistant is unused: compose mounts `/dev/null`. When Assistant is enabled, the host path must already be a readable regular file; do not create a directory at the secret path;
 - `CMDP_LITELLM_ALLOWED_BASE_URLS` - server-side allowlist для LiteLLM-compatible endpoints; RuntimeConfig baseUrl не должен выводить API key за этот список;
 - `Cst_QueryToolConfig.RuntimeConfigJson.assistant.mcp` - runtime-настройки read-only MCP tools для Designer Assistant; secrets здесь не хранить;
 - `CMDP_D2_RENDER_ENABLED`, `CMDP_D2_BINARY`, `CMDP_D2_TIMEOUT_MS`, `CMDP_D2_MAX_INPUT_BYTES`, `CMDP_D2_MAX_OUTPUT_BYTES`, `CMDP_D2_MAX_DIAGRAMS`, `CMDP_D2_CONCURRENCY`, `CMDP_D2_LAYOUT`, `CMDP_D2_LAYOUT_ALLOWLIST` - обязательный по умолчанию server-side D2 SVG render. В штатном image binary уже лежит в `/usr/local/bin/d2`; при `CMDP_D2_RENDER_ENABLED=true` `/health/ready` требует рабочий binary;
@@ -55,6 +56,13 @@ cp .env.example .env
 - `CMDP_SYSLOG_HOST`, `CMDP_SYSLOG_PORT`, `CMDP_SYSLOG_PROTOCOL`, `CMDP_SYSLOG_FACILITY` - обязательные параметры approved syslog collector.
 
 `replace-me`, `registry.example.local`, `cmdbuild.example.local`, `redis.example.local`, `litellm.example.local` и `syslog.example.local` не являются рабочими значениями. Real `.env` файлы не коммитить.
+
+Перед запуском с включенным Assistant проверить secret mount без вывода ключа:
+
+```bash
+test -f "$LITELLM_API_KEY_FILE_HOST" && test -r "$LITELLM_API_KEY_FILE_HOST"
+docker compose -f docker-compose.runtime.yml exec cmdbdynamicpages sh -c 'test -f /run/secrets/cmdbdynamicpages_litellm_api_key && test -r /run/secrets/cmdbdynamicpages_litellm_api_key'
+```
 
 `CMDP_PUBLIC_ORIGIN` и `CMDBUILD_ORIGIN` имеют разные роли. Например, browser работает с `https://custom.example.local`, а backend обращается к internal CMDBuild `https://vr2.internal.example`. Internal upstream не должен быть доступен пользователям, попадать в browser URLs, redirect `Location`, `Origin`, `Referer` или CMDBuild cookie domain. Внешний TLS reverse proxy обязан передать public `Host`, `X-Forwarded-Host` и `X-Forwarded-Proto=https`.
 

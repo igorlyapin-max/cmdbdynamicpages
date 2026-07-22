@@ -86,6 +86,7 @@ requiredEnv.forEach((name) => {
 });
 requireEnvValue('PROXY_HOST', '127.0.0.1');
 requireEnvValue('CMDP_LOG_TARGET', 'stdout,syslog');
+requireEnvValue('LITELLM_API_KEY_FILE_HOST', '');
 
 rejectPattern('docker-compose.runtime.yml', /^\s*build\s*:/m, 'build directive');
 rejectPattern('docker-compose.nginx.yml', /^\s*build\s*:/m, 'build directive');
@@ -95,6 +96,7 @@ requireText('docker-compose.runtime.yml', 'image: ${CMDBDYNAMIC_IMAGE}', 'prebui
 requireText('docker-compose.runtime.yml', 'PROXY_HOST: ${PROXY_HOST:-127.0.0.1}', 'loopback proxy host default');
 requireText('docker-compose.runtime.yml', '/health/live', 'container liveness healthcheck');
 requireText('docker-compose.runtime.yml', 'LITELLM_API_KEY_FILE', 'LiteLLM assistant secret file wiring');
+requireText('docker-compose.runtime.yml', 'source: ${LITELLM_API_KEY_FILE_HOST:-/dev/null}', 'LiteLLM empty-secret fallback');
 requireText('docker-compose.runtime.yml', 'CMDP_LOG_TARGET: ${CMDP_LOG_TARGET:-stdout,syslog}', 'production stdout and syslog target default');
 requireText('docker-compose.runtime.yml', 'CMDP_SYSLOG_HOST: ${CMDP_SYSLOG_HOST:?CMDP_SYSLOG_HOST must be set}', 'required syslog host wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_SYSLOG_PORT', 'syslog port wiring');

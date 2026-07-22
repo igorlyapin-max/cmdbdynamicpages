@@ -73,16 +73,36 @@ function d2RoleOverride(role, mapping = role.mapping, model = {}) {
 }
 
 function d2StructureTreeWithSources(proposal, roles) {
-  const sourceByRoleId = new Map((Array.isArray(roles) ? roles : []).map((role) => [
+  const tree = structuredClone(proposal && proposal.structureTree || { version: 4, items: [] });
+  const mappingsByRoleId = new Map((Array.isArray(roles) ? roles : []).map((role) => [
     String(role && role.id || ''),
-    String(role && role.mapping && role.mapping.source && role.mapping.source.stageId || '')
+    role && role.mapping && typeof role.mapping === 'object' ? role.mapping : null
   ]));
-  const tree = structuredClone(proposal && proposal.structureTree || { version: 1, items: [] });
-  tree.items = (Array.isArray(tree.items) ? tree.items : []).map((item) => ({
-    ...item,
-    sourceStageId: sourceByRoleId.get(String(item && item.roleId || '')) || String(item && item.sourceStageId || '')
-  }));
+  tree.version = 4;
+  tree.items = (Array.isArray(tree.items) ? tree.items : []).map((item) => {
+    const mapping = mappingsByRoleId.get(String(item && item.roleId || ''));
+    if (!mapping) return item;
+    return {
+      ...item,
+      mapping: {
+        ...structuredClone(mapping),
+        id: `mapping:${item.id}`,
+        roleId: String(item.roleId || '')
+      }
+    };
+  });
   return tree;
+}
+
+function d2StaticPlacementMapping(itemId, roleId) {
+  return {
+    id: `mapping-${itemId}`,
+    roleId,
+    source: { stageId: '', alias: '', kind: '', className: '' },
+    primary: { className: '', idAttribute: '_id', labelTemplate: '${Description}', structuredFields: [], filters: [] },
+    conditions: { ruleJoin: 'any', rules: [] },
+    related: []
+  };
 }
 
 test('draft preview executes exact router anchor before selecting ARM cards by Location', async (t) => {
@@ -156,6 +176,48 @@ test('draft preview executes exact router anchor before selecting ARM cards by L
   assert.ok(requestedAttributes.split(',').includes('model'));
   assert.ok(requestedAttributes.split(',').includes('model2'));
   assert.equal(mock.requests.some((item) => item.pathname.includes('/relations')), false);
+  assert.equal(backend.exitCode, null);
+});
+
+test('draft preview returns a bounded 504 with the caller Request ID when CMDBuild exceeds its deadline', async (t) => {
+  const mock = await startMockCmdbuild(t, {
+    delayByPath: {
+      '/cmdbuild/services/rest/v3/classes/ARM/cards': 1600
+    }
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, {
+    CMDP_DRAFT_PREVIEW_TIMEOUT_MS: '1000',
+    CMDBUILD_REQUEST_TIMEOUT_MS: '5000'
+  });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = testCmdbuildAuthorizationCookie('draft-preview-timeout');
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const requestId = 'draft-preview-timeout-regression';
+  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=100&includeDiagrams=false`, {
+    template: {
+      code: 'DraftPreviewTimeout',
+      spec: {
+        version: 1,
+        params: {},
+        steps: [{ type: 'selectCards', as: 'arms', className: 'ARM', columns: ['Code'], limit: 100 }],
+        result: { tables: [{ name: 'arms', columns: ['Code'] }] }
+      }
+    },
+    params: {}
+  }, {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token,
+    'x-request-id': requestId
+  }, 5000);
+
+  assert.equal(preview.statusCode, 504, preview.body);
+  assert.equal(preview.headers['x-request-id'], requestId);
+  assert.equal(preview.json.success, false, preview.body);
+  assert.match(preview.json.message, /Draft preview timed out after 1000ms\./);
+  assert.ok(Array.isArray(preview.json.result?.trace), preview.body);
+  assert.equal(preview.json.result.trace.at(-1)?.status, 'error', preview.body);
   assert.equal(backend.exitCode, null);
 });
 
@@ -1848,7 +1910,7 @@ test('Assistant autosave keeps D2 source but discards old role-model overrides w
   assert.equal(stored.overrides.elementBindings, undefined);
   assert.equal(stored.overrides.navigatorGroups, undefined);
   assert.equal(stored.overrides.navigatorHierarchies, undefined);
-  assert.deepEqual(stored.overrides.structureTree, { version: 1, items: [] });
+  assert.deepEqual(stored.overrides.structureTree, { version: 4, items: [] });
   assert.equal(stored.proposal, undefined);
   assert.equal(autosaved.json.versionLog, undefined);
   assert.equal(autosaved.json.cacheInvalidation, undefined);
@@ -1859,6 +1921,7 @@ test('Assistant autosave keeps the applied D2 mapping isolated when the authorin
   const sourceA = 'app: "Application"';
   const sourceB = 'app: "Changed application"';
   const sourceHashA = crypto.createHash('sha256').update(sourceA).digest('hex');
+  const sourceHashB = crypto.createHash('sha256').update(sourceB).digest('hex');
   const savedSpec = publishSpec({
     assistantDraft: {
       objectFlowIntent: objectFlowIntentFromText('Выбрать АРМ.'),
@@ -1878,7 +1941,7 @@ test('Assistant autosave keeps the applied D2 mapping isolated when the authorin
           structureHash: 'structure_saved',
           roles: [],
           relationRules: [],
-          structureTree: { version: 1, items: [] }
+          structureTree: { version: 4, items: [] }
         }
       }
     },
@@ -1887,7 +1950,7 @@ test('Assistant autosave keeps the applied D2 mapping isolated when the authorin
       diagrams: [{
         name: 'topology',
         source: { nodes: 'arms' },
-        templateGrammar: { version: 3, elements: [], roles: [], edges: [], fingerprint: 'saved' },
+        templateGrammar: { version: 3, elements: [], roles: [], contexts: [], edges: [], fingerprint: 'saved' },
         authoring: {
           d2Import: {
             version: 3,
@@ -1915,15 +1978,21 @@ test('Assistant autosave keeps the applied D2 mapping isolated when the authorin
     diagramMappingPrompt: 'Сопоставить роли.',
     d2Authoring: {
       version: 1,
+      semanticModelRevision: 9,
+      diagramId: 'forged_current_identity',
+      sourceHash: sourceHashB,
+      structureHash: 'forged_structure',
+      mappingContractHash: 'forged_contract',
       source: sourceB,
       overrides: {
-        semanticModelRevision: 4,
-        diagramId: 'd2_saved',
-        sourceHash: sourceHashA,
-        structureHash: 'structure_saved',
+        semanticModelRevision: 9,
+        diagramId: 'forged_current_identity',
+        sourceHash: sourceHashB,
+        structureHash: 'forged_structure',
+        mappingContractHash: 'forged_contract',
         roles: [],
         relationRules: [],
-        structureTree: { version: 1, items: [] }
+        structureTree: { version: 4, items: [] }
       }
     }
   };
@@ -1938,8 +2007,10 @@ test('Assistant autosave keeps the applied D2 mapping isolated when the authorin
   assert.equal(stored.semanticModelRevision, 0);
   assert.equal(stored.diagramId, '');
   assert.equal(stored.structureHash, '');
+  assert.equal(stored.mappingContractHash, '');
   assert.equal(stored.overrides.sourceHash, '');
-  assert.deepEqual(stored.overrides.structureTree, { version: 1, items: [] });
+  assert.equal(stored.overrides.mappingContractHash, '');
+  assert.deepEqual(stored.overrides.structureTree, { version: 4, items: [] });
   assert.equal(storedSpec.result.diagrams[0].authoring.d2Import.source, sourceA);
   assert.equal(storedSpec.result.diagrams[0].authoring.d2Import.sourceHash, sourceHashA);
   assert.equal(backend.exitCode, null);
@@ -3114,11 +3185,10 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
   assert.equal(incomplete.statusCode, 422, incomplete.body);
   assert.equal(incomplete.json.code, 'diagram_import_topology_unresolved');
   assert.equal(incomplete.json.errors.length, 3);
-  assert.deepEqual(incomplete.json.errors.map((item) => item.displayName).sort(), ['network_link', 'router', 'switch']);
-  assert.deepEqual(incomplete.json.errors.map((item) => item.fields), [
-    ['D2 node router requires one Object Flow result.'],
-    ['D2 node switch requires one Object Flow result.'],
-    ['directionPolicy']
+  assert.deepEqual(incomplete.json.errors.map((item) => [item.displayName, item.fields]).sort(([left], [right]) => left.localeCompare(right)), [
+    ['network_link', ['directionPolicy']],
+    ['router', ['D2 node placement router requires a materialized Object Flow result.']],
+    ['switch', ['D2 node placement switch requires a materialized Object Flow result.']]
   ]);
 
   const assistantConflict = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/interpret`, {
@@ -3174,11 +3244,47 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
   assert.match(applied.json.spec.result.diagrams[0].authoring.d2Import.structureHash, /^[0-9a-f]{64}$/);
   assert.equal(applied.json.spec.steps[0].as, 'routers');
   assert.equal(applied.json.spec.steps.filter((step) => step.managedBy === 'd2ImportV3').length, 1);
-  assert.equal(applied.json.spec.result.diagrams[0].authoring.d2Import.roleMappings.length, 2);
+  assert.equal(applied.json.spec.result.diagrams[0].authoring.d2Import.roleMappings, undefined);
+  assert.equal(applied.json.spec.result.diagrams[0].authoring.d2Import.structureTree.items
+    .filter((item) => item.mapping.source.stageId).length, 2);
   assert.equal(applied.json.spec.assistantDraft.d2Authoring.source, source);
   assert.equal(applied.json.spec.assistantDraft.d2Authoring.sourceHash, applied.json.spec.result.diagrams[0].authoring.d2Import.sourceHash);
   assert.equal(applied.json.spec.assistantDraft.d2Authoring.structureHash, applied.json.spec.result.diagrams[0].authoring.d2Import.structureHash);
   assert.equal(applied.json.spec.assistantDraft.d2Authoring.overrides.roles.length, 2);
+
+  const lateFailureSpec = structuredClone(applied.json.spec);
+  lateFailureSpec.steps.push({
+    type: 'selectCards',
+    as: 'lateFailure',
+    className: 'MissingPreviewClass',
+    filters: [],
+    columns: ['Code', 'Description'],
+    limit: 20
+  });
+  lateFailureSpec.result.diagrams[0].nodeMappings.push({
+    id: 'late-failure-node',
+    from: 'lateFailure',
+    fields: { id: '_id', label: 'Description' }
+  });
+  const partialPreview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=20&executionScope=diagrams`, {
+    template: { code: 'NetworkImport', spec: lateFailureSpec },
+    params: {}
+  }, headers);
+  assert.notEqual(partialPreview.statusCode, 200, partialPreview.body);
+  assert.equal(partialPreview.json.success, false);
+  const partialTrace = partialPreview.json.result.trace;
+  assert.equal(partialTrace[0].as, 'routers');
+  assert.equal(partialTrace[1].as, 'switches');
+  assert.equal(partialTrace.at(-1).as, 'lateFailure');
+  assert.equal(partialTrace.at(-1).status, 'error');
+  assert.ok(partialTrace.slice(0, -1).every((item) => item.status === 'ok'));
+  assert.equal(partialPreview.json.result.diagnosticPreview.state, 'partial');
+  assert.equal(partialPreview.json.result.diagnosticPreview.incomplete, true);
+  assert.deepEqual(partialPreview.json.result.diagnosticPreview.availableStages, partialTrace.slice(0, -1).map((item) => item.as));
+  assert.equal(partialPreview.json.result.diagnosticPreview.failedStages[0].as, 'lateFailure');
+  assert.ok(partialPreview.json.result.diagnosticPreview.diagrams[0].nodes.length > 0);
+  assert.equal(partialPreview.json.result.diagnosticPreview.diagrams[0].nodes.some((node) => Object.hasOwn(node, 'data')), false);
+  assert.match(partialPreview.json.result.diagnosticPreview.diagrams[0].svg.content, /^<svg data-cmdp-d2-rendered="true"/);
 
   const relationCardApplied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
     currentSpec,
@@ -3398,14 +3504,14 @@ test('D2 preview keeps role-aware IPv4 edges and persisted structure-tree placem
               importRole: { key: 'acl', sourceKey: 'external-system', targetKey: 'internal-system' }
             }],
             structureTree: {
-              version: 1,
+              version: 4,
               items: [
-                { id: 'external', roleId: 'external-group', templateElementKey: 'external-group', parentId: '', sourceStageId: '' },
-                { id: 'external-node', roleId: 'external-system', templateElementKey: 'external-system', parentId: 'external', sourceStageId: 'static' },
-                { id: 'dmz', roleId: 'dmz-group', templateElementKey: 'dmz-group', parentId: '', sourceStageId: '' },
-                { id: 'target', roleId: 'target-group', templateElementKey: 'target-group', parentId: '', sourceStageId: '' },
-                { id: 'vlan-dmz', roleId: 'vlan', templateElementKey: 'vlan', parentId: 'dmz', sourceStageId: 'static' },
-                { id: 'vlan-target', roleId: 'vlan', templateElementKey: 'vlan', parentId: 'target', sourceStageId: 'static' }
+                { id: 'external', roleId: 'external-group', templateContextKey: 'external', templateElementKey: 'external-group', templateElementKeys: ['external-group'], parentId: '', mapping: d2StaticPlacementMapping('external', 'external-group') },
+                { id: 'external-node', roleId: 'external-system', templateContextKey: 'external-node', templateElementKey: 'external-system', templateElementKeys: ['external-system'], parentId: 'external', mapping: d2StaticPlacementMapping('external-node', 'external-system') },
+                { id: 'dmz', roleId: 'dmz-group', templateContextKey: 'dmz', templateElementKey: 'dmz-group', templateElementKeys: ['dmz-group'], parentId: '', mapping: d2StaticPlacementMapping('dmz', 'dmz-group') },
+                { id: 'target', roleId: 'target-group', templateContextKey: 'target', templateElementKey: 'target-group', templateElementKeys: ['target-group'], parentId: '', mapping: d2StaticPlacementMapping('target', 'target-group') },
+                { id: 'vlan-dmz', roleId: 'vlan', templateContextKey: 'vlan-dmz', templateElementKey: 'vlan', templateElementKeys: ['vlan'], parentId: 'dmz', mapping: d2StaticPlacementMapping('vlan-dmz', 'vlan') },
+                { id: 'vlan-target', roleId: 'vlan', templateContextKey: 'vlan-target', templateElementKey: 'vlan', templateElementKeys: ['vlan'], parentId: 'target', mapping: d2StaticPlacementMapping('vlan-target', 'vlan') }
               ]
             }
           }]
@@ -3592,9 +3698,12 @@ test('D2 import keeps untyped containers as source-free frames and places mapped
   assert.ok(users);
   assert.equal(users.kind, 'untypedContainer');
   assert.equal(users.visualKind, 'container');
-  assert.equal(analyzed.json.proposal.structureTree.items.some((item) => item.roleId === users.id && item.sourceStageId === ''), true);
+  assert.equal(analyzed.json.proposal.structureTree.items.some((item) => item.roleId === users.id && item.mapping.source.stageId === ''), true);
   assert.equal(analyzed.json.proposal.roles.some((role) => role.key === 'users.operator'), false);
-  assert.equal(analyzed.json.proposal.unresolved.length, 2);
+  const workstationItems = analyzed.json.proposal.structureTree.items.filter((item) => item.roleId === workstation.id);
+  assert.equal(workstationItems.length, 1);
+  assert.deepEqual(workstationItems[0].templateElementKeys, ['users.administrator', 'users.operator']);
+  assert.equal(analyzed.json.proposal.unresolved.length, 1);
   const roles = [d2RoleOverride(workstation, {
       source: { stageId: 'selection:workstations', alias: 'workstations', kind: 'selection', className: 'ARM' },
       primary: {
@@ -3617,14 +3726,19 @@ test('D2 import keeps untyped containers as source-free frames and places mapped
   }, headers);
   assert.equal(applied.statusCode, 200, applied.body);
   const diagram = applied.json.spec.result.diagrams[0];
-  assert.equal(diagram.nodeMappings.length, 2);
+  assert.equal(diagram.nodeMappings.length, 1);
   assert.equal(diagram.nodeMappings.every((mapping) => mapping.importRole.key === 'workstation'), true);
   assert.equal(diagram.groupMappings.length, 1);
   assert.equal(diagram.groupMappings[0].importRole.key, 'users');
   assert.deepEqual(diagram.hierarchyMappings, []);
   assert.equal(diagram.authoring.d2Import.version, 3);
   assert.equal(diagram.placementRules, undefined);
-  assert.deepEqual(diagram.authoring.d2Import.structureTree, structureTree);
+  assert.equal(diagram.authoring.d2Import.structureTree.version, 4);
+  assert.deepEqual(
+    diagram.authoring.d2Import.structureTree.items.map((item) => [item.id, item.roleId, item.parentId, item.mapping.source.stageId, item.mapping.primary.labelTemplate]),
+    structureTree.items.map((item) => [item.id, item.roleId, item.parentId, item.mapping.source.stageId, item.mapping.primary.labelTemplate])
+  );
+  assert.equal(diagram.authoring.d2Import.structureTree.items.every((item) => item.mapping.conditions && Array.isArray(item.mapping.conditions.rules)), true);
 
   const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=10`, {
     template: {
@@ -3638,6 +3752,10 @@ test('D2 import keeps untyped containers as source-free frames and places mapped
   assert.ok(previewDiagram.nodes.length > 0);
   assert.equal(previewDiagram.groups.length, 1);
   assert.equal(previewDiagram.nodes.every((node) => node.group === previewDiagram.groups[0].id), true, JSON.stringify(previewDiagram));
+  assert.doesNotMatch(previewDiagram.nodes.map((node) => node.label).join('\n'), /model2-a/);
+  assert.match(previewDiagram.d2.source, /vars:\s+\{/);
+  assert.match(previewDiagram.d2.source, /model2/);
+  assert.match(previewDiagram.d2.source, /model2-a/);
   assert.doesNotMatch(previewDiagram.d2.source, /users\.operator|users\.administrator/);
   assert.equal(backend.exitCode, null);
 });
@@ -4212,7 +4330,7 @@ test('D2 import analysis is read-only while Apply checks the saved template vers
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 import Apply persists the reviewed mapping with the current template revision', async (t) => {
+test('D2 import Apply persists the reviewed mapping and Assistant autosave retains its current identity', async (t) => {
   const currentSpec = apiObjectFlowSpec([
     { alias: 'routers', className: 'routerG', columns: ['Code', 'Description'] },
     { alias: 'switches', className: 'ARM', columns: ['Code', 'Description'] }
@@ -4275,10 +4393,36 @@ test('D2 import Apply persists the reviewed mapping with the current template re
   assert.equal(applied.json.template.spec.result.diagrams[0].authoring.d2Import.source, source);
   assert.ok(applied.json.versionLog);
   assert.ok(applied.json.cacheInvalidation);
+
+  const autosaved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/PersistedImport/assistant-draft`, {
+    baseSpecHash: applied.json.template.specHash,
+    assistantDraft: {
+      objectFlowIntent: objectFlowIntentFromText('Выбрать маршрутизаторы.'),
+      diagramInterpretPrompt: 'Проверить контейнеры.',
+      diagramMappingPrompt: 'Сопоставить этапы с ролями.',
+      // This reproduces an older client autosave payload: it has the current
+      // source but no trusted applied D2 identity or reviewed overrides.
+      d2Authoring: { version: 1, source }
+    }
+  }, headers);
+  assert.equal(autosaved.statusCode, 200, autosaved.body);
+  const storedSpec = autosaved.json.template.spec;
+  const storedImport = storedSpec.result.diagrams[0].authoring.d2Import;
+  const storedAuthoring = storedSpec.assistantDraft.d2Authoring;
+  assert.equal(storedAuthoring.source, source);
+  assert.equal(storedAuthoring.semanticModelRevision, storedImport.semanticModelRevision);
+  assert.equal(storedAuthoring.diagramId, storedImport.diagramId);
+  assert.equal(storedAuthoring.sourceHash, storedImport.sourceHash);
+  assert.equal(storedAuthoring.structureHash, storedImport.structureHash);
+  assert.equal(storedAuthoring.mappingContractHash, storedImport.mappingContractHash);
+  assert.deepEqual(storedAuthoring.overrides.structureTree, storedImport.structureTree);
+  assert.equal(storedAuthoring.overrides.relationRules.length, storedImport.relationRules.length);
+  assert.equal(autosaved.json.versionLog, undefined);
+  assert.equal(autosaved.json.cacheInvalidation, undefined);
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 applied mapping can be edited without a new D2 analysis or template persistence', async (t) => {
+test('D2 applied mapping update persists the validated template without a new D2 analysis', async (t) => {
   const currentSpec = apiObjectFlowSpec([
     { alias: 'routers', className: 'routerG', columns: ['Code', 'Description'] },
     { alias: 'switches', className: 'ARM', columns: ['Code', 'Description'] }
@@ -4332,34 +4476,45 @@ test('D2 applied mapping can be edited without a new D2 analysis or template per
   assert.equal(applied.statusCode, 200, applied.body);
   const appliedSpec = applied.json.template.spec;
   const imported = appliedSpec.result.diagrams[0].authoring.d2Import;
-  const mappingsByRoleId = new Map(imported.roleMappings.map((mapping) => [mapping.roleId, mapping]));
-  const updatedRoles = imported.roles.map((role) => {
-    const mapping = JSON.parse(JSON.stringify(mappingsByRoleId.get(role.id)));
-    mapping.primary.labelTemplate = '${Description}';
-    return d2RoleOverride(role, mapping, { labelTemplate: '${Description}' });
-  });
+  assert.equal(imported.diagramId, appliedSpec.result.diagrams[0].id);
+  assert.equal(appliedSpec.assistantDraft?.d2Authoring?.diagramId, appliedSpec.result.diagrams[0].id);
+  const updatedStructureTree = structuredClone(imported.structureTree);
+  const mappedItemIds = new Set();
+  for (const item of updatedStructureTree.items) {
+    if (!item.mapping || !item.mapping.source || !item.mapping.source.stageId) continue;
+    item.mapping.primary.labelTemplate = '${Description}';
+    mappedItemIds.add(item.id);
+  }
+  assert.ok(mappedItemIds.size > 0);
   const templateWritesBefore = mock.requests.filter((request) => request.method === 'PUT' && request.pathname.includes('/classes/Cst_QueryTemplate/cards/')).length;
   const updated = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/update-applied`, {
     templateCode: 'AppliedMappingEditor',
     baseSpecHash: hashJson(appliedSpec),
     currentSpec: appliedSpec,
-    roles: updatedRoles,
+    persist: true,
+    roles: imported.roles,
     relationRules: imported.relationRules,
-    structureTree: imported.structureTree
+    structureTree: updatedStructureTree
   }, headers);
   assert.equal(updated.statusCode, 200, updated.body);
   assert.equal(updated.json.action, 'diagram-import-update-applied');
   assert.equal(updated.json.d2Workflow?.state, 'applied');
+  assert.ok(updated.json.template, updated.body);
+  assert.equal(updated.json.template.specHash, updated.json.specHash);
+  assert.ok(updated.json.versionLog, updated.body);
+  assert.ok(updated.json.cacheInvalidation, updated.body);
   const updatedImport = updated.json.spec.result.diagrams[0].authoring.d2Import;
   assert.equal(updatedImport.source, source);
   assert.equal(updatedImport.sourceHash, imported.sourceHash);
   assert.equal(updatedImport.structureHash, imported.structureHash);
-  assert.equal(updatedImport.roleMappings.every((mapping) => mapping.primary.labelTemplate === '${Description}'), true);
+  assert.equal(updatedImport.structureTree.items
+    .filter((item) => mappedItemIds.has(item.id))
+    .every((item) => item.mapping.primary.labelTemplate === '${Description}'), true);
   const templateWritesAfter = mock.requests.filter((request) => request.method === 'PUT' && request.pathname.includes('/classes/Cst_QueryTemplate/cards/')).length;
-  assert.equal(templateWritesAfter, templateWritesBefore, 'Applied mapping update must remain a draft operation until the normal template save.');
+  assert.equal(templateWritesAfter, templateWritesBefore + 1, 'Validated applied mapping updates must persist atomically.');
 
   const missing = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/update-applied`, {
-    templateCode: 'AppliedMappingEditor', baseSpecHash: hashJson(appliedSpec), currentSpec, roles: []
+    templateCode: 'AppliedMappingEditor', baseSpecHash: updated.json.template.specHash, currentSpec, roles: []
   }, headers);
   assert.equal(missing.statusCode, 409, missing.body);
   assert.equal(missing.json.code, 'diagram_import_mapping_missing');

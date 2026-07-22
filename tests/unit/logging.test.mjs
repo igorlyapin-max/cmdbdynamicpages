@@ -1,13 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import dgram from 'node:dgram';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   cmdbuildRequestCanRetry,
   cmdbuildRetryDelayMs,
   diagnosticModeAllows,
   executionThrottleScopeKey,
+  ensureAssistantStatusReady,
   expectedSpecHashFromBody,
   incMetric,
   isCmdbuildProxyPathAllowed,
@@ -20,6 +24,7 @@ import {
   parsePublicOriginConfiguration,
   parseNameSet,
   redactByName,
+  readOptionalSecretValue,
   redisRequiredError,
   renderPrometheusMetrics,
   sanitizeTemplateCard,
@@ -156,6 +161,8 @@ test('logging status is diagnostic and does not expose secret values', () => {
   assert.equal(status.assistant.enabled, false);
   assert.equal(status.assistant.provider, 'litellm');
   assert.equal(status.assistant.apiKeyConfigured, false);
+  assert.equal(status.assistant.apiKeyState, 'missing');
+  assert.equal(status.assistant.apiKeyErrorCode, '');
   assert.ok(status.syslog === null || typeof status.syslog === 'object');
   assert.equal(status.elk.directOutput, false);
   assert.match(status.elk.recommendedPipeline, /stdout\/syslog/);
@@ -317,24 +324,33 @@ test('URL log sanitizer redacts sensitive query parameters', () => {
   assert.doesNotMatch(redacted, /fragment/);
 });
 
-test('missing optional LiteLLM secret file does not fail module import', () => {
-  const result = spawnSync(process.execPath, ['--input-type=module', '-e', "import('./scripts/dev-proxy-server.mjs').then(() => process.exit(0)).catch((error) => { console.error(error && error.stack || error); process.exit(1); });"], {
-    cwd: process.cwd(),
-    env: {
-      ...process.env,
-      NODE_ENV: 'test',
-      LITELLM_API_KEY: '',
-      CMDP_LITELLM_API_KEY: '',
-      LITELLM_API_KEY_FILE: '/tmp/cmdbdynamicpages-missing-litellm-key',
-      CMDP_LITELLM_API_KEY_FILE: '',
-      CMDBDYNAMIC_REDIS_PASSWORD_FILE: '',
-      REDIS_PASSWORD_FILE: '',
-      CMDP_LOG_LEVEL: 'silent'
-    },
-    encoding: 'utf8'
-  });
+test('optional LiteLLM secret reader distinguishes missing, invalid, and direct values', () => {
+  const secretDirectory = mkdtempSync(join(tmpdir(), 'cmdbdynamicpages-litellm-secret-dir-'));
+  try {
+    assert.deepEqual(readOptionalSecretValue('', '/tmp/cmdbdynamicpages-missing-litellm-key'), {
+      value: '', state: 'missing', errorCode: ''
+    });
+    assert.deepEqual(readOptionalSecretValue('', secretDirectory), {
+      value: '', state: 'invalid_file', errorCode: 'EISDIR'
+    });
+    assert.deepEqual(readOptionalSecretValue('test-direct-value', secretDirectory), {
+      value: 'test-direct-value', state: 'configured', errorCode: ''
+    });
+  } finally {
+    rmSync(secretDirectory, { recursive: true, force: true });
+  }
+});
 
-  assert.equal(result.status, 0, result.stderr);
+test('invalid optional LiteLLM secret produces a controlled Assistant error', () => {
+  assert.throws(
+    () => ensureAssistantStatusReady({ enabled: true, baseUrlAllowed: true, apiKeyState: 'invalid_file' }),
+    (error) => {
+      assert.equal(error.code, 'assistant_secret_file_invalid');
+      assert.equal(error.statusCode, 503);
+      assert.equal(error.message, 'LiteLLM API key secret file is invalid.');
+      return true;
+    }
+  );
 });
 
 test('security headers are iframe-safe by default', () => {

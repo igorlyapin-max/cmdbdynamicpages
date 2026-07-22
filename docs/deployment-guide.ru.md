@@ -65,6 +65,13 @@ docker compose -f docker-compose.nginx.yml up -d redis
 
 Production Redis должен быть защищен паролем. Предпочтительно передавать пароль через `CMDBDYNAMIC_REDIS_PASSWORD_FILE`; если используется строковая передача секрета, задавать `CMDBDYNAMIC_REDIS_PASSWORD` или password в `CMDBDYNAMIC_REDIS_URL` только через secret/env платформы. Не хранить секрет в git или compose-файле репозитория.
 
+LiteLLM Assistant опционален. Оставляйте `LITELLM_API_KEY_FILE_HOST` пустым, если Assistant не используется: compose смонтирует `/dev/null`. При включенном Assistant путь обязан существовать до `docker compose up` и быть читаемым обычным файлом, иначе Docker может создать каталог вместо secret file. Проверка без вывода ключа:
+
+```bash
+test -f "$LITELLM_API_KEY_FILE_HOST" && test -r "$LITELLM_API_KEY_FILE_HOST"
+docker compose -f docker-compose.runtime.yml exec cmdbdynamicpages sh -c 'test -f /run/secrets/cmdbdynamicpages_litellm_api_key && test -r /run/secrets/cmdbdynamicpages_litellm_api_key'
+```
+
 ## 4. Регистрация custom page
 
 Собрать zip:

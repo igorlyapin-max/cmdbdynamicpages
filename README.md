@@ -257,7 +257,7 @@ Runtime results can include deterministic static diagrams in `result.diagrams`. 
 
 Designer has a `Visualization` output switch: `Tables`, `Diagrams`, or `Both`. The table editor stays unchanged for table-only templates; the diagram editor appears only for diagram-capable output and stores its config in `result.diagrams[]`.
 
-The D2 importer contract uses class-aware IR v3. Every used D2 `class` is one reusable visual role; exemplar object paths are not separate mappings. The author explicitly maps that role to a primary CMDBuild class and optional related classes through catalog-backed reference/domain paths. Untyped D2 containers remain structural roles. Grouping, hierarchy, connections, and static placement are explicit role rules; backend-managed DSL aliases are not exposed in this UI. Legacy D2 import proposals and mappings before IR v3 are unsupported, are not migrated automatically, and are not planned as compatibility modes.
+The D2 importer contract uses class-aware IR v3. Every used D2 `class` is one reusable visual role; exemplar object paths are not separate mappings or authoring controls. A selected Object Flow result determines the primary CMDBuild class; the author configures the composite label, optional structured data, and catalog-backed related classes. Additional fields are emitted in per-object structured data and affect the visible label only when referenced by `${...}`. Untyped D2 containers remain structural roles. Grouping, hierarchy, connections, and static placement are explicit role rules; backend-managed DSL aliases and template-element bindings are not exposed in this UI. Legacy D2 import proposals and mappings before IR v3 are unsupported, are not migrated automatically, and are not planned as compatibility modes.
 
 The approved authoring split is explicit: `Assistant` owns D2 import, semantic interpretation, object-flow selection/match proposals, and selection-to-role proposals. `Diagram` owns the accepted deterministic settings in `result.diagrams[]`, including applied node, edge, group, and hierarchy mappings. Object-flow LLM calls receive a sanitized stage-only flow context and return one typed `selection` or `block`, never a complete runtime Spec. Assistant responses never mutate the editor draft; the author reviews them and invokes a deterministic apply action. Every selection stage and every intermediate match stage is eligible as a Diagram mapping source.
 
@@ -464,7 +464,7 @@ maxRestCalls
 maxTraversalDepth
 ```
 
-Each CMDBuild REST request also uses `CMDBUILD_REQUEST_TIMEOUT_MS`, default `10000`.
+Each CMDBuild REST request also uses `CMDBUILD_REQUEST_TIMEOUT_MS`, default `10000`. `CMDP_DRAFT_PREVIEW_TIMEOUT_MS` bounds the complete Designer draft-preview execution, including all selected deterministic stages; it defaults to `60000` ms and is clamped to `1000-300000` ms. When a diagram-only preview fails after one or more stages complete, the response contains a sanitized partial diagram preview and execution trace; the browser also keeps the analyzed source-template preview visible for correction.
 
 Regex-based extraction and matching are bounded by:
 

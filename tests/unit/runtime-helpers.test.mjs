@@ -128,7 +128,36 @@ function structureTreeWithStage(tree, roleId, stageId) {
   return {
     ...structuredClone(tree),
     items: tree.items.map((item) => String(item.roleId) === String(roleId)
-      ? { ...item, sourceStageId: stageId }
+      ? {
+          ...item,
+          mapping: {
+            ...(item.mapping || {}),
+            source: {
+              ...((item.mapping && item.mapping.source) || {}),
+              stageId
+            }
+          }
+        }
+      : { ...item })
+  };
+}
+
+function structureTreeItemWithSource(tree, itemId, stageId, mapping = {}) {
+  return {
+    ...structuredClone(tree),
+    items: tree.items.map((item) => String(item.id) === String(itemId)
+      ? {
+          ...item,
+          mapping: {
+            ...(item.mapping || {}),
+            ...mapping,
+            source: {
+              ...((item.mapping && item.mapping.source) || {}),
+              ...((mapping && mapping.source) || {}),
+              stageId
+            }
+          }
+        }
       : { ...item })
   };
 }
@@ -169,15 +198,26 @@ test('semiJoin keeps a left row when inclusion and exclusion match different rig
 test('D2 structure tree reports an explicit unavailable template element instead of coercing it', () => {
   const roles = [{ id: 'role:server', key: 'server', label: 'Server', visualKind: 'node', elementKeys: ['root.server'] }];
   const tree = diagramImportStructureTree({
-    version: 1,
-    items: [{ id: 'server', roleId: 'role:server', templateElementKey: 'root.other', parentId: '', sourceStageId: 'selection:servers' }]
+    version: 4,
+    items: [{
+      id: 'server',
+      roleId: 'role:server',
+      templateContextKey: '',
+      templateElementKey: 'root.other',
+      templateElementKeys: ['root.other'],
+      parentId: '',
+      mapping: { source: { stageId: 'selection:servers' } }
+    }]
   }, null, roles);
 
   assert.equal(tree.items[0].templateElementKey, 'root.other');
-  assert.match(diagramImportStructureTreeErrors(tree, roles, {
+  const errors = diagramImportStructureTreeErrors(tree, roles, {
     version: 1,
     steps: [{ type: 'selectCards', as: 'servers', className: 'Server', columns: ['Code'] }]
-  })[0].message, /must use a D2 element/);
+  }, {
+    nodes: [{ key: 'root.server', classKeys: ['server'] }]
+  });
+  assert.ok(errors.some((error) => /must use a D2 element/.test(error.message)));
 });
 
 test('D2 authoring removes the obsolete Diagram editor 2 sandbox on template save', () => {
@@ -205,7 +245,7 @@ test('D2 authoring removes the obsolete Diagram editor 2 sandbox on template sav
 test('D2 workflow is pending until the saved source hash matches the applied deterministic mapping', async () => {
   const source = 'app: "Application"';
   const sourceHash = crypto.createHash('sha256').update(source).digest('hex');
-  const semanticModelRevision = 6;
+  const semanticModelRevision = 9;
   const diagramId = 'd2_test';
   const structureHash = 'structure_test';
   const mappingContractHash = 'mapping_contract_test';
@@ -257,7 +297,7 @@ test('D2 workflow is pending until the saved source hash matches the applied det
       structureHash,
       mappingContractHash,
       roles: [{ id: 'role:application' }],
-      structureTree: { version: 1, items: [] }
+      structureTree: { version: 4, items: [] }
     }
   };
   assert.deepEqual(await d2WorkflowStatusForSpec(spec), {
@@ -266,7 +306,7 @@ test('D2 workflow is pending until the saved source hash matches the applied det
     sourceHash,
     appliedSourceHash: sourceHash
   });
-  spec.result.diagrams[0].templateGrammar = { version: 3, elements: [], roles: [], edges: [], fingerprint: 'test' };
+  spec.result.diagrams[0].templateGrammar = { version: 3, elements: [], roles: [], contexts: [], edges: [], fingerprint: 'test' };
   assert.deepEqual(await d2WorkflowStatusForSpec(spec), {
     state: 'applied',
     sourceHash,
@@ -678,39 +718,125 @@ test('D2 renderer masks class Notes without treating braces in values as structu
   assert.match(compilerSource, /app: Application \{ class: application \}/);
 });
 
-test('D2 structure tree seeds separate instances for the same container role', () => {
+test('D2 structure tree keeps placements from distinct ancestor contexts independent and normalizes node conditions', () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   const tree = diagramImportStructureTree(proposal.structureTree, proposal.structure, proposal.roles);
-  const scopeItems = tree.items.filter((item) => item.roleId === roles['scope-vlan'].id);
+  const vlanItems = tree.items.filter((item) => item.roleId === roles.vlan.id);
   const byId = new Map(tree.items.map((item) => [item.id, item]));
 
-  assert.equal(tree.version, 1);
-  assert.equal(scopeItems.length, 2);
-  assert.notEqual(scopeItems[0].id, scopeItems[1].id);
-  assert.deepEqual(scopeItems.map((item) => byId.get(item.parentId).templateElementKey).sort(), [
-    'target',
-    'target.dmz'
+  assert.equal(tree.version, 4);
+  assert.equal(vlanItems.length, 2);
+  assert.notEqual(vlanItems[0].id, vlanItems[1].id);
+  assert.notEqual(vlanItems[0].templateContextKey, vlanItems[1].templateContextKey);
+  assert.notEqual(vlanItems[0].mapping.id, vlanItems[1].mapping.id);
+  assert.deepEqual(vlanItems.map((item) => byId.get(item.parentId).templateElementKey).sort(), [
+    'target.dmz.vlan_scope',
+    'target.vlan_scope'
   ]);
 
-  const staged = structureTreeWithStage(tree, roles.vlan.id, 'selection:systemsA');
-  assert.deepEqual(diagramImportStructureTreeErrors(staged, proposal.roles, currentSpec), []);
+  let staged = structureTreeItemWithSource(tree, vlanItems[0].id, 'selection:systemsA', {
+    conditions: {
+      ruleJoin: 'all',
+      rules: [{
+        action: 'include',
+        op: 'equals',
+        leftColumn: 'Description',
+        rightStageId: 'selection:systemsB',
+        rightColumn: 'Description'
+      }]
+    }
+  });
+  staged = structureTreeItemWithSource(staged, vlanItems[1].id, 'selection:systemsB');
+  const normalized = diagramImportStructureTree(staged, proposal.structure, proposal.roles);
+  const normalizedFirst = normalized.items.find((item) => item.id === vlanItems[0].id);
+  assert.equal(normalizedFirst.mapping.source.stageId, 'selection:systemsA');
+  assert.deepEqual(normalizedFirst.mapping.conditions, {
+    ruleJoin: 'all',
+    rules: [{
+      id: normalizedFirst.mapping.conditions.rules[0].id,
+      action: 'include',
+      negate: false,
+      operator: 'equals',
+      caseSensitive: false,
+      left: { column: 'Description', regex: '' },
+      right: { kind: 'stage', value: '', name: '', stageId: 'selection:systemsB', column: 'Description', regex: '' }
+    }]
+  });
+  assert.deepEqual(diagramImportStructureTreeErrors(staged, proposal.roles, currentSpec, proposal.structure), []);
+
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], staged);
+  assert.equal(applied.result.diagrams[0].nodeMappings.length, 2);
+  const conditionStep = applied.steps.find((step) => step.type === 'semiJoinRows' && step.managedBy === 'd2ImportV3');
+  assert.ok(conditionStep);
+  assert.deepEqual(executeSemiJoinRows(conditionStep, {}, {
+    systemsA: { columns: ['Description'], rows: [{ Description: 'match' }, { Description: 'skip' }] },
+    systemsB: { columns: ['Description'], rows: [{ Description: 'match' }] }
+  }, { maxRows: 10 }).rows, [{ Description: 'match' }]);
+});
+
+test('D2 structure tree collapses sibling exemplars with the same role-path context', () => {
+  const source = 'systems: { first: System second: System }';
+  const proposal = createDiagramImportProposal(selectionFlowSpec([{ alias: 'systems', className: 'IS' }]), normalizeDiagramImportIr({
+    version: 4,
+    elements: {
+      groups: [{ id: 'systems', label: 'Systems', pathSegments: ['systems'] }],
+      nodes: [
+        { id: 'systems.first', label: 'First', parentKey: 'systems', classKeys: ['system'], pathSegments: ['systems', 'first'] },
+        { id: 'systems.second', label: 'Second', parentKey: 'systems', classKeys: ['system'], pathSegments: ['systems', 'second'] }
+      ]
+    },
+    classes: [{ key: 'system', usageKeys: ['systems.first', 'systems.second'] }]
+  }, source), { sourceText: source });
+  const role = proposal.roles.find((item) => item.key === 'system');
+  const placements = proposal.structureTree.items.filter((item) => item.roleId === role.id);
+
+  assert.deepEqual(role.elementKeys.sort(), ['systems.first', 'systems.second']);
+  assert.equal(placements.length, 1);
+  assert.equal(placements[0].templateElementKey, 'systems.first');
+  assert.deepEqual(placements[0].templateElementKeys, ['systems.first', 'systems.second']);
+});
+
+test('D2 structure tree permits an explicit duplicate only in the same template context', () => {
+  const source = 'systems: { first: System second: System }';
+  const currentSpec = selectionFlowSpec([{ alias: 'systems', className: 'IS' }]);
+  const proposal = createDiagramImportProposal(currentSpec, normalizeDiagramImportIr({
+    version: 4,
+    elements: {
+      groups: [{ id: 'systems', label: 'Systems', pathSegments: ['systems'] }],
+      nodes: [
+        { id: 'systems.first', label: 'First', parentKey: 'systems', classKeys: ['system'], pathSegments: ['systems', 'first'] },
+        { id: 'systems.second', label: 'Second', parentKey: 'systems', classKeys: ['system'], pathSegments: ['systems', 'second'] }
+      ]
+    },
+    classes: [{ key: 'system', usageKeys: ['systems.first', 'systems.second'] }]
+  }, source), { sourceText: source });
+  const role = proposal.roles.find((item) => item.key === 'system');
+  const tree = structureTreeWithStage(proposal.structureTree, role.id, 'selection:systems');
+  const original = tree.items.find((item) => item.roleId === role.id);
+  tree.items.push({
+    ...structuredClone(original),
+    id: 'structure:system-copy',
+    mapping: { ...structuredClone(original.mapping), id: 'structure_mapping:system-copy' }
+  });
+
+  assert.deepEqual(diagramImportStructureTreeErrors(tree, proposal.roles, currentSpec, proposal.structure), []);
 });
 
 test('D2 structure tree accepts blank static containers and rejects node parents or cycles', () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   const valid = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
-  assert.deepEqual(diagramImportStructureTreeErrors(valid, proposal.roles, currentSpec), []);
+  assert.deepEqual(diagramImportStructureTreeErrors(valid, proposal.roles, currentSpec, proposal.structure), []);
 
   const invalid = structuredClone(valid);
   const target = invalid.items.find((item) => item.templateElementKey === 'target');
   const vlan = invalid.items.find((item) => item.templateElementKey === 'target.dmz.vlan_scope.vlan');
   target.parentId = vlan.id;
-  const errors = diagramImportStructureTreeErrors(invalid, proposal.roles, currentSpec);
+  const errors = diagramImportStructureTreeErrors(invalid, proposal.roles, currentSpec, proposal.structure);
   assert.ok(errors.some((item) => item.message.includes('cannot contain children')));
   assert.ok(errors.some((item) => item.message.includes('containment cycle')));
 });
 
-test('D2 structure tree is preserved only for the exact source revision and old mappings fail closed', () => {
+test('D2 structure tree is preserved only for the exact source revision and legacy mappings fail closed', () => {
   const { currentSpec, source, ir, proposal, roles } = d2StructureTreeFixture();
   const tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
   const imported = {
@@ -720,7 +846,6 @@ test('D2 structure tree is preserved only for the exact source revision and old 
     structureHash: ir.source.structureHash,
     mappingContractHash: ir.source.mappingContractHash,
     roles: proposal.roles,
-    roleMappings: proposal.roles.map((role) => ({ ...role.mapping, roleId: role.id })),
     relationRules: [],
     structureTree: tree
   };
@@ -730,12 +855,14 @@ test('D2 structure tree is preserved only for the exact source revision and old 
   };
 
   const restored = createDiagramImportProposal(saved, ir, { sourceText: source });
-  assert.deepEqual(restored.structureTree, tree);
+  const restoredVlanItems = restored.structureTree.items.filter((item) => item.roleId === roles.vlan.id);
+  assert.equal(restoredVlanItems.length, 2);
+  assert.ok(restoredVlanItems.every((item) => item.mapping.source.stageId === 'selection:systemsA'));
 
   const changed = normalizeDiagramImportIr(ir, `${source}\n# revised`);
   const reanalyzed = createDiagramImportProposal(saved, changed, { sourceText: `${source}\n# revised` });
   assert.ok(reanalyzed.warnings.some((warning) => warning.includes('saved structure tree was not reused')));
-  assert.ok(reanalyzed.structureTree.items.filter((item) => item.roleId === roles.vlan.id).every((item) => !item.sourceStageId));
+  assert.ok(reanalyzed.structureTree.items.filter((item) => item.roleId === roles.vlan.id).every((item) => !item.mapping.source.stageId));
 
   const legacy = structuredClone(saved);
   delete legacy.result.diagrams[0].authoring.d2Import.structureTree;
@@ -817,29 +944,115 @@ test('D2 mapping source catalog retains intermediate Assistant results', () => {
   assert.equal(stages.find((stage) => stage.alias === 'ipRanges').className, 'ipRange');
 });
 
-test('D2 structure items compile their own Object Flow stage', async () => {
+test('D2 placements compile their own related traversal without sharing a role mapping', () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
-  const tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
-  const applied = applyDiagramImportProposal(currentSpec, proposal, [{
-    id: roles.vlan.id,
-    mapping: {
-      primary: {
-        className: 'IS',
-        idAttribute: '_id',
-        labelTemplate: '${Description}',
-        structuredFields: ['Code', 'Description'],
-        filters: []
-      }
-    }
-  }], [], tree);
+  const vlanItems = proposal.structureTree.items.filter((item) => item.roleId === roles.vlan.id);
+  let tree = structureTreeItemWithSource(proposal.structureTree, vlanItems[0].id, 'selection:systemsA', {
+    related: [{
+      id: 'related_network',
+      className: 'ipRange',
+      path: [{ kind: 'domain', name: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source' }],
+      structuredFields: ['range']
+    }]
+  });
+  tree = structureTreeItemWithSource(tree, vlanItems[1].id, 'selection:systemsA', {
+    related: [{
+      id: 'related_network',
+      className: 'ipRange',
+      path: [{ kind: 'domain', name: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source' }],
+      structuredFields: ['range']
+    }]
+  });
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
   const diagram = applied.result.diagrams[0];
 
   assert.equal(diagram.nodeMappings.length, 2);
   assert.ok(diagram.nodeMappings.every((mapping) => mapping.from === 'systemsA'));
   assert.ok(diagram.nodeMappings.every((mapping) => mapping.importRole.structureItemId));
-  assert.deepEqual(diagram.structureTree, tree);
+  assert.notEqual(diagram.nodeMappings[0].id, diagram.nodeMappings[1].id);
+  assert.equal(applied.steps.filter((step) => step.managedBy === 'd2ImportV3' && step.type === 'expandRelations').length, 2);
   assert.equal(diagram.authoring.d2Import.mappingValidation.status, 'valid');
-  assert.equal((await d2WorkflowStatusForSpec(applied)).state, 'applied');
+});
+
+test('D2 container labels use exactly one direct child value and materialize related child fields', () => {
+  const { currentSpec, proposal, roles } = d2StructureTreeFixture();
+  let tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
+  const scopeItems = tree.items.filter((item) => item.roleId === roles['scope-vlan'].id);
+  scopeItems.forEach((scope) => {
+    const child = tree.items.find((item) => item.parentId === scope.id && item.roleId === roles.vlan.id);
+    assert.ok(child);
+    const primaryToken = 'child:' + child.id + ':primary:Code';
+    scope.mapping.primary.labelTemplate = 'VLAN ' + '$' + '{' + primaryToken + '}';
+  });
+
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
+  const exact = buildResultDiagrams(applied, {
+    systemsA: { rows: [{ _id: 101, Code: 'VLAN-A', Description: 'VLAN A' }] }
+  }, {}, { maxRows: 100 })[0];
+  const scopeLabels = exact.groups
+    .filter((group) => group.importRole && group.importRole.key === 'scope-vlan')
+    .map((group) => group.label);
+  assert.deepEqual(scopeLabels, ['VLAN VLAN-A', 'VLAN VLAN-A']);
+  assert.equal(exact.warnings.some((warning) => /expected exactly one direct child card/.test(warning)), false);
+  const malformedTree = structuredClone(tree);
+  malformedTree.items.find((item) => item.roleId === roles['scope-vlan'].id).mapping.primary.labelTemplate = 'VLAN ' + '$' + '{Code';
+  assert.ok(diagramImportStructureTreeErrors(malformedTree, proposal.roles, currentSpec, proposal.structure).some((error) => /unterminated placeholder/.test(error.message)));
+
+  const multiple = buildResultDiagrams(applied, {
+    systemsA: { rows: [
+      { _id: 101, Code: 'VLAN-A', Description: 'VLAN A' },
+      { _id: 102, Code: 'VLAN-B', Description: 'VLAN B' }
+    ] }
+  }, {}, { maxRows: 100 })[0];
+  assert.deepEqual(
+    multiple.groups.filter((group) => group.importRole && group.importRole.key === 'scope-vlan').map((group) => group.label),
+    ['VLAN', 'VLAN']
+  );
+  assert.ok(multiple.warnings.some((warning) => /expected exactly one direct child card, received 2/.test(warning)));
+
+  tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
+  const relationPath = [{ kind: 'domain', name: 'ISZabbixMonitoringDomain', targetClass: 'ipRange', direction: 'source' }];
+  tree.items.filter((item) => item.roleId === roles.vlan.id).forEach((child) => {
+    child.mapping.related = [{
+      id: 'related_network',
+      className: 'ipRange',
+      path: relationPath,
+      structuredFields: ['range']
+    }];
+  });
+  scopeItems.forEach((originalScope) => {
+    const scope = tree.items.find((item) => item.id === originalScope.id);
+    const child = tree.items.find((item) => item.parentId === scope.id && item.roleId === roles.vlan.id);
+    const relatedToken = 'child:' + child.id + ':related:' + encodeURIComponent('domain:ISZabbixMonitoringDomain:ipRange:source') + ':range';
+    scope.mapping.primary.labelTemplate = 'Network ' + '$' + '{' + relatedToken + '}';
+  });
+  const relatedApplied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
+  const relatedContext = {
+    systemsA: { rows: [{ _id: 101, Code: 'VLAN-A', Description: 'VLAN A' }] }
+  };
+  relatedApplied.result.diagrams[0].nodeMappings.forEach((mapping) => {
+    const binding = mapping.relatedBindings[0];
+    relatedContext[binding.alias] = { rows: [{ SourceId: 101, range: '10.10.0.0/24' }] };
+  });
+  const relatedExact = buildResultDiagrams(relatedApplied, relatedContext, {}, { maxRows: 100 })[0];
+  assert.deepEqual(
+    relatedExact.groups.filter((group) => group.importRole && group.importRole.key === 'scope-vlan').map((group) => group.label),
+    ['Network 10.10.0.0/24', 'Network 10.10.0.0/24']
+  );
+
+  relatedApplied.result.diagrams[0].nodeMappings.forEach((mapping) => {
+    const binding = mapping.relatedBindings[0];
+    relatedContext[binding.alias] = { rows: [
+      { SourceId: 101, range: '10.10.0.0/24' },
+      { SourceId: 101, range: '10.20.0.0/24' }
+    ] };
+  });
+  const relatedMultiple = buildResultDiagrams(relatedApplied, relatedContext, {}, { maxRows: 100 })[0];
+  assert.deepEqual(
+    relatedMultiple.groups.filter((group) => group.importRole && group.importRole.key === 'scope-vlan').map((group) => group.label),
+    ['Network', 'Network']
+  );
+  assert.ok(relatedMultiple.warnings.some((warning) => /expected exactly one value, received 2/.test(warning)));
 });
 
 test('D2 import rejects legacy proposal versions and requires re-analysis', () => {
@@ -849,16 +1062,16 @@ test('D2 import rejects legacy proposal versions and requires re-analysis', () =
   );
 });
 
-test('D2 import reports unresolved data at the structure-tree item that needs a stage', () => {
+test('D2 import reports every unresolved node placement independently', () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   const unresolved = proposal.unresolved.filter((item) => item.family === 'structureTree');
 
   assert.equal(unresolved.length, 2);
-  assert.ok(unresolved.every((item) => item.fields[0].includes('requires one Object Flow result')));
-  assert.ok(unresolved.every((item) => item.id.includes('sourceStageId')));
+  assert.ok(unresolved.every((item) => item.fields[0].includes('requires a materialized Object Flow result')));
+  assert.ok(unresolved.every((item) => item.id.includes('mapping.source.stageId')));
 
   const staged = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
-  assert.deepEqual(diagramImportStructureTreeErrors(staged, proposal.roles, currentSpec), []);
+  assert.deepEqual(diagramImportStructureTreeErrors(staged, proposal.roles, currentSpec, proposal.structure), []);
 });
 
 test('D2 direct connections stay separate from the structure tree', () => {
@@ -887,25 +1100,13 @@ test('D2 direct connections stay separate from the structure tree', () => {
   assert.equal(proposal.structureTree.items.some((item) => item.templateElementKey === 'source-target'), false);
 });
 
-test('D2 structure tree lets identical role instances use different deterministic stages', () => {
+test('D2 structure placement override changes only its own branch', () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
-  const tree = structuredClone(proposal.structureTree);
-  const vlanItems = tree.items.filter((item) => item.roleId === roles.vlan.id);
-  vlanItems[0].sourceStageId = 'selection:systemsA';
-  vlanItems[1].sourceStageId = 'selection:systemsB';
+  const vlanItems = proposal.structureTree.items.filter((item) => item.roleId === roles.vlan.id);
+  let tree = structureTreeItemWithSource(proposal.structureTree, vlanItems[0].id, 'selection:systemsA');
+  tree = structureTreeItemWithSource(tree, vlanItems[1].id, 'selection:systemsB');
 
-  const applied = applyDiagramImportProposal(currentSpec, proposal, [{
-    id: roles.vlan.id,
-    mapping: {
-      primary: {
-        className: 'IS',
-        idAttribute: '_id',
-        labelTemplate: '${Description}',
-        structuredFields: ['Code', 'Description'],
-        filters: []
-      }
-    }
-  }], [], tree);
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
 
   assert.deepEqual(applied.result.diagrams[0].nodeMappings.map((mapping) => mapping.from).sort(), ['systemsA', 'systemsB']);
   assert.equal(new Set(applied.result.diagrams[0].nodeMappings.map((mapping) => mapping.importRole.structureItemId)).size, 2);
@@ -916,17 +1117,7 @@ test('D2 structure tree keeps blank containers static and allows a dynamic conta
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   let tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
   tree = structureTreeWithStage(tree, roles['scope-vlan'].id, 'selection:systemsB');
-  const primary = {
-    className: 'IS',
-    idAttribute: '_id',
-    labelTemplate: '${Description}',
-    structuredFields: ['Code', 'Description'],
-    filters: []
-  };
-  const applied = applyDiagramImportProposal(currentSpec, proposal, [
-    { id: roles.vlan.id, mapping: { primary } },
-    { id: roles['scope-vlan'].id, mapping: { primary } }
-  ], [], tree);
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
   const mappings = applied.result.diagrams[0].groupMappings;
 
   assert.equal(mappings.filter((mapping) => mapping.importRole.semantic === 'structural').length, 2);
@@ -1202,7 +1393,7 @@ test('D2 assistant interpretation changes role semantics but not the persisted s
   const role = { id: 'role-workstation', visualKind: 'node', visualKindOptions: ['node', 'container'] };
   const roleModel = assistantDiagramStageDraftFromResponse({
     kind: 'interpretation',
-    roleModelRevision: 6,
+    roleModelRevision: 9,
     roles: [role]
   }, {
     decisions: [{ roleId: role.id, visualKind: 'node', confidence: 'high', reason: 'Leaf card.' }]
@@ -1223,7 +1414,7 @@ test('D2 assistant interpretation changes role semantics but not the persisted s
   assert.equal(interpretedTree.items.filter((item) => item.roleId === roles.vlan.id).length, 2);
 });
 
-test('D2 role mapping keeps exact Object Flow stage metadata while tree items select the source', () => {
+test('D2 role mapping keeps exact Object Flow stage metadata at the role level', () => {
   const role = { id: 'role-workstation', visualKind: 'node', visualKindOptions: ['node'] };
   const mappingSpec = {
     result: { diagrams: [{ authoring: { d2Import: { roleMappings: [{
@@ -1245,92 +1436,54 @@ test('D2 role mapping keeps exact Object Flow stage metadata while tree items se
   assert.deepEqual(mappings[0].mapping.primary.structuredFields, ['Description', 'Code', 'model']);
 });
 
-test('D2 import compiles only saved deterministic stages selected by tree items', () => {
+test('D2 import compiles only saved deterministic placement sources', () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   proposal.dslSteps = [{ type: 'selectCards', as: 'assistant_alias', className: 'Other' }];
   const tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
-  const applied = applyDiagramImportProposal(currentSpec, proposal, [{
-    id: roles.vlan.id,
-    mapping: {
-      primary: {
-        className: 'IS',
-        idAttribute: '_id',
-        labelTemplate: '${Description}',
-        structuredFields: ['Code', 'Description'],
-        filters: []
-      }
-    }
-  }], [], tree);
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
 
   assert.equal(applied.steps.some((step) => step.as === 'assistant_alias'), false);
   assert.ok(applied.result.diagrams[0].nodeMappings.every((mapping) => mapping.from === 'systemsA'));
 });
 
-test('D2 structure tree preserves a valid manual reparenting independently of source nesting', () => {
+test('D2 structure tree rejects manual reparenting outside the declared template context', () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   const tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
   const vlanItems = tree.items.filter((item) => item.roleId === roles.vlan.id);
-  const scopeItems = tree.items.filter((item) => item.roleId === roles['scope-vlan'].id);
 
-  vlanItems[0].parentId = scopeItems[1].id;
-  assert.deepEqual(diagramImportStructureTreeErrors(tree, proposal.roles, currentSpec), []);
-
-  const applied = applyDiagramImportProposal(currentSpec, proposal, [{
-    id: roles.vlan.id,
-    mapping: {
-      primary: {
-        className: 'IS',
-        idAttribute: '_id',
-        labelTemplate: '${Description}',
-        structuredFields: ['Code', 'Description'],
-        filters: []
-      }
-    }
-  }], [], tree);
-  const diagram = applied.result.diagrams[0];
-
-  assert.deepEqual(diagram.structureTree, tree);
-  assert.ok(diagram.nodeMappings.some((mapping) => mapping.importRole.structureItemId === vlanItems[0].id));
+  const firstParentId = vlanItems[0].parentId;
+  vlanItems[0].parentId = vlanItems[1].parentId;
+  vlanItems[1].parentId = firstParentId;
+  const errors = diagramImportStructureTreeErrors(tree, proposal.roles, currentSpec, proposal.structure);
+  assert.ok(errors.some((error) => /requires its declared parent container/.test(error.message)));
 });
 
-test('D2 structure tree repeats a blank container for each independent parent branch', () => {
+test('D2 structure tree permits an explicit duplicate static container in its declared context', () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   const tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
   const scopeItems = tree.items.filter((item) => item.roleId === roles['scope-vlan'].id);
-  const vlanItems = tree.items.filter((item) => item.roleId === roles.vlan.id);
   const staticContainer = tree.items.find((item) => item.roleId === roles['group-dmz'].id);
+  const target = tree.items.find((item) => item.roleId === roles['group-target'].id);
 
-  scopeItems.forEach((item) => { item.parentId = tree.items.find((candidate) => candidate.roleId === roles['group-target'].id).id; item.sourceStageId = 'selection:systemsB'; });
-  staticContainer.parentId = scopeItems[0].id;
   const copiedStaticContainer = {
     ...structuredClone(staticContainer),
-    id: 'structure:dmz-copy',
-    parentId: scopeItems[1].id,
-    sourceStageId: ''
+    id: 'structure:dmz-copy-a',
+    parentId: target.id,
+    mapping: { ...structuredClone(staticContainer.mapping), id: 'structure_mapping:dmz-copy-a' }
   };
   tree.items.push(copiedStaticContainer);
-  vlanItems[0].parentId = staticContainer.id;
-  vlanItems[1].parentId = copiedStaticContainer.id;
+  const dmzScope = scopeItems.find((item) => item.parentId === staticContainer.id);
+  dmzScope.parentId = copiedStaticContainer.id;
 
-  assert.deepEqual(diagramImportStructureTreeErrors(tree, proposal.roles, currentSpec), []);
+  assert.deepEqual(diagramImportStructureTreeErrors(tree, proposal.roles, currentSpec, proposal.structure), []);
 
-  const primary = {
-    className: 'IS',
-    idAttribute: '_id',
-    labelTemplate: '${Description}',
-    structuredFields: ['Code', 'Description'],
-    filters: []
-  };
-  const applied = applyDiagramImportProposal(currentSpec, proposal, [
-    { id: roles.vlan.id, mapping: { primary } },
-    { id: roles['scope-vlan'].id, mapping: { primary } }
-  ], [], tree);
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
   const groupMappings = applied.result.diagrams[0].groupMappings;
   const staticMappings = groupMappings.filter((mapping) => [staticContainer.id, copiedStaticContainer.id].includes(mapping.importRole.structureItemId));
 
   assert.equal(staticMappings.length, 2);
   assert.ok(staticMappings.every((mapping) => mapping.importRole.semantic === 'structural'));
-  assert.deepEqual(new Set(staticMappings.map((mapping) => mapping.importRole.parentStructureItemId)), new Set(scopeItems.map((item) => item.id)));
+  assert.deepEqual(new Set(staticMappings.map((mapping) => mapping.importRole.parentStructureItemId)), new Set([target.id]));
 });
 
 test('D2 relation-class Notes drive a data-fields direction suggestion without selecting it', () => {
@@ -1460,7 +1613,7 @@ test('D2 Assistant repairs only an unambiguous object-flow stage kind prefix', (
   assert.equal(assistantDiagramResolveStageId('match:block_5', stages.concat({ id: 'selection:block_5' })), '');
 });
 
-test('D2 mapping drops legacy role variants and keeps one source per structure-tree item', () => {
+test('D2 mapping persists a source only on its owning structure item', () => {
   const currentSpec = selectionFlowSpec([
     { alias: 'physicalServers', className: 'Server', columns: ['Code', 'Description'] },
     { alias: 'virtualServers', className: 'Server', columns: ['Code', 'Description'] }
@@ -1472,29 +1625,16 @@ test('D2 mapping drops legacy role variants and keeps one source per structure-t
     classes: [{ key: 'server-role', usageCount: 1, sampleElementKeys: ['server'] }]
   }, source), { sourceText: source });
   const role = proposal.roles[0];
-  const tree = structuredClone(proposal.structureTree);
-  tree.items[0].sourceStageId = 'selection:physicalServers';
-  const applied = applyDiagramImportProposal(currentSpec, proposal, [{
-    id: role.id,
-    visualKind: 'node',
-    mapping: {
-      source: { stageId: 'selection:physicalServers', alias: 'physicalServers', kind: 'selection', className: 'Server' },
-      primary: { className: 'Server', idAttribute: '_id', labelTemplate: '${Description}', structuredFields: ['Code', 'Description'] },
-      variants: [{
-        id: 'virtual-server',
-        label: 'Виртуальный сервер',
-        source: { stageId: 'selection:virtualServers', alias: 'virtualServers', kind: 'selection', className: 'Server' },
-        primary: { className: 'Server', idAttribute: '_id', labelTemplate: '${Description}', structuredFields: ['Code', 'Description'] }
-      }]
-    }
-  }], [], tree);
+  const tree = structureTreeItemWithSource(proposal.structureTree, proposal.structureTree.items[0].id, 'selection:physicalServers');
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
   const [mapping] = applied.result.diagrams[0].nodeMappings;
 
   assert.equal(applied.result.diagrams[0].nodeMappings.length, 1);
   assert.equal(mapping.from, 'physicalServers');
   assert.equal(mapping.importRole.structureItemId, tree.items[0].id);
-  assert.equal(Object.hasOwn(applied.result.diagrams[0].authoring.d2Import.roleMappings[0], 'variants'), false);
-  assert.equal(Object.hasOwn(applied.result.diagrams[0].authoring.d2Import.roleMappings[0], 'repeatMode'), false);
+  assert.equal(Object.hasOwn(applied.result.diagrams[0].authoring.d2Import, 'roleMappings'), false);
+  assert.equal(applied.result.diagrams[0].structureTree.items[0].mapping.source.stageId, 'selection:physicalServers');
+  assert.equal(role.id, applied.result.diagrams[0].structureTree.items[0].mapping.roleId);
 });
 
 test('diagram validation rejects duplicate stable mapping ids', () => {
@@ -1829,6 +1969,10 @@ test('strict D2 grammar renders only declared roles and keeps fake endpoints ins
       { roleId: 'root', roleKey: 'root-role', label: 'Root', semantic: 'structural', mode: 'static', rootAllowed: true, parentRoleKeys: [], childRoleKeys: ['child-role'], elementKeys: ['root-template'], nodeElementKeys: [], groupElementKeys: ['root-template'], exemplarKey: 'root-template' },
       { roleId: 'child', roleKey: 'child-role', label: 'Child', semantic: 'object', mode: 'static', rootAllowed: false, parentRoleKeys: ['root-role'], childRoleKeys: [], elementKeys: ['root-template.child-template'], nodeElementKeys: ['root-template.child-template'], groupElementKeys: [], exemplarKey: 'root-template.child-template' }
     ],
+    contexts: [
+      { key: 'context:root', roleId: 'root', parentContextKey: '', elementKeys: ['root-template'] },
+      { key: 'context:child', roleId: 'child', parentContextKey: 'context:root', elementKeys: ['root-template.child-template'] }
+    ],
     edges: [{ key: '(root-template.child-template -> root-template.child-template)[0]', sourceKey: 'root-template.child-template', targetKey: 'root-template.child-template', sourceRoleKey: 'child-role', targetRoleKey: 'child-role', direction: '->' }]
   };
   const spec = (groupValue) => ({
@@ -1836,10 +1980,10 @@ test('strict D2 grammar renders only declared roles and keeps fake endpoints ins
       name: 'strict-template',
       templateGrammar: grammar,
       structureTree: {
-        version: 1,
+        version: 4,
         items: [
-          { id: 'root-tree-item', roleId: 'root', templateElementKey: 'root-template', parentId: '', sourceStageId: '' },
-          { id: 'child-tree-item', roleId: 'child', templateElementKey: 'root-template.child-template', parentId: 'root-tree-item', sourceStageId: '' }
+          { id: 'root-tree-item', roleId: 'root', templateContextKey: 'context:root', templateElementKey: 'root-template', templateElementKeys: ['root-template'], parentId: '', mapping: {} },
+          { id: 'child-tree-item', roleId: 'child', templateContextKey: 'context:child', templateElementKey: 'root-template.child-template', templateElementKeys: ['root-template.child-template'], parentId: 'root-tree-item', mapping: {} }
         ]
       },
       groupMappings: [{ id: 'root', staticRows: [{ _id: 'root-template', Description: 'Root' }], fields: { id: '_id', label: 'Description' }, importRole: { roleId: 'root', key: 'root-role', semantic: 'structural', elementKey: 'root-template', structureItemId: 'root-tree-item' } }],
