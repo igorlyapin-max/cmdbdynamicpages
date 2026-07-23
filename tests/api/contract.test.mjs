@@ -5,8 +5,18 @@ import https from 'node:https';
 import { URL } from 'node:url';
 
 const proxyOrigin = process.env.CMDBDYNAMIC_PROXY || 'http://127.0.0.1:8093';
+const cmdbuildOrigin = process.env.CMDBUILD_LOGIN_ORIGIN || process.env.CMDBUILD_ORIGIN || 'http://127.0.0.1:8090';
+const loginUsername = process.env.CMDBUILD_USERNAME || '';
+const loginPassword = process.env.CMDBUILD_PASSWORD || '';
+const loginRole = process.env.CMDBUILD_ROLE || '';
+const loginScope = process.env.CMDBUILD_SCOPE || 'ui';
+const configuredCookieHeader = String(process.env.CMDBUILD_COOKIE_HEADER || '').trim();
 const proxyAvailable = await canReach(`${proxyOrigin}/health/live`);
 const skipWhenUnavailable = proxyAvailable ? false : `proxy is not reachable at ${proxyOrigin}`;
+const authenticatedSession = proxyAvailable ? await resolveAuthenticatedSession() : {
+  cookie: '',
+  skip: skipWhenUnavailable
+};
 
 test('health live endpoint is public and reports process liveness', { skip: skipWhenUnavailable }, async () => {
   const result = await request('GET', `${proxyOrigin}/health/live`);
@@ -24,8 +34,11 @@ test('health ready endpoint returns a production readiness payload', { skip: ski
   const json = JSON.parse(result.body);
   assert.equal(json.service, 'cmdbdynamicpages');
   assert.equal(typeof json.ready, 'boolean');
-  assert.ok(json.redis);
-  assert.ok(json.cmdbuild);
+  assert.ok(json.checks && typeof json.checks === 'object');
+  assert.ok(json.checks.redis);
+  assert.ok(json.checks.cmdbuild);
+  assert.ok(json.checks.d2);
+  assert.ok(json.checks.d2Import);
 });
 
 test('metrics endpoint exposes aggregate Prometheus text only', { skip: skipWhenUnavailable }, async () => {
@@ -73,8 +86,19 @@ test('state-changing custom API rejects a cross-origin request before CSRF valid
   assert.equal(JSON.parse(result.body).message, 'State-changing custom API calls require a same-origin Origin or Referer header.');
 });
 
-test('state-changing custom API rejects non-JSON content type', { skip: skipWhenUnavailable }, async () => {
-  const cookie = 'CMDBuild-Authorization=fake-content-type-token';
+test('CSRF endpoint rejects an invalid CMDBuild session', { skip: skipWhenUnavailable }, async () => {
+  const result = await request('GET', `${proxyOrigin}/cmdbuild/custom-api/csrf`, undefined, {
+    cookie: 'CMDBuild-Authorization=invalid-contract-test-token'
+  });
+
+  assert.equal(result.statusCode, 401);
+  assert.equal(JSON.parse(result.body).reason, 'cmdbuild_session_invalid');
+});
+
+test('state-changing custom API rejects non-JSON content type after valid session and CSRF validation', {
+  skip: authenticatedSession.skip
+}, async () => {
+  const cookie = authenticatedSession.cookie;
   const csrfResult = await request('GET', `${proxyOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
   assert.equal(csrfResult.statusCode, 200);
   const csrfToken = JSON.parse(csrfResult.body).token;
@@ -97,6 +121,44 @@ test('CMDBuild proxy fallback rejects paths outside the allowlist', { skip: skip
 
   assert.equal(result.statusCode, 403);
 });
+
+async function resolveAuthenticatedSession() {
+  if (configuredCookieHeader) return { cookie: configuredCookieHeader, skip: false };
+  if (!loginUsername || !loginPassword) {
+    return {
+      cookie: '',
+      skip: 'set CMDBUILD_COOKIE_HEADER or CMDBUILD_USERNAME/CMDBUILD_PASSWORD to run authenticated API contract checks'
+    };
+  }
+  try {
+    const payload = { username: loginUsername, password: loginPassword, scope: loginScope };
+    if (loginRole) payload.role = loginRole;
+    const result = await request('POST', `${cmdbuildOrigin.replace(/\/+$/, '')}/cmdbuild/services/rest/v3/sessions/?ext=true`, payload, {
+      origin: cmdbuildOrigin
+    }, 10_000);
+    if (result.statusCode < 200 || result.statusCode >= 300) {
+      return { cookie: '', skip: `CMDBuild login returned HTTP ${result.statusCode}` };
+    }
+    const cookie = cmdbuildAuthorizationCookie(result.headers['set-cookie']);
+    return cookie
+      ? { cookie, skip: false }
+      : { cookie: '', skip: 'CMDBuild login did not return CMDBuild-Authorization cookie' };
+  } catch (error) {
+    return {
+      cookie: '',
+      skip: `CMDBuild login failed: ${error && error.message ? error.message : String(error)}`
+    };
+  }
+}
+
+function cmdbuildAuthorizationCookie(setCookie) {
+  const cookies = Array.isArray(setCookie) ? setCookie : (setCookie ? [setCookie] : []);
+  for (const cookie of cookies) {
+    const token = String(cookie || '').split(';')[0] || '';
+    if (token.startsWith('CMDBuild-Authorization=')) return token;
+  }
+  return '';
+}
 
 async function canReach(url) {
   try {

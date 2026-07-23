@@ -220,7 +220,8 @@ test('Diagram editor keeps every placement mapping and matching condition in Str
       await nodeRow.locator('button[data-action="diagram-structure-select"]').click();
       const placementMapping = structurePanel.locator('[data-diagram-import-placement-mapping]');
       await placementMapping.waitFor({ state: 'visible', timeout: 10_000 });
-      assert.equal(await placementMapping.locator('[data-diagram-import-placement-field="source.stageId"]').count(), 1);
+      assert.equal(await placementMapping.locator('[data-diagram-import-placement-field="materialization.kind"]').count(), 1);
+      assert.equal(await placementMapping.locator('[data-diagram-import-placement-field="materialization.stageId"]').count(), 1);
       assert.equal(await placementMapping.locator('[data-diagram-import-placement-field="primary.labelTemplate"]').count(), 1);
       assert.equal(await placementMapping.locator('[data-diagram-import-placement-field="primary.structuredFields"]').count(), 1);
       assert.equal(await placementMapping.locator('[data-diagram-import-placement-field="conditions.ruleJoin"]').count(), 1);
@@ -286,6 +287,106 @@ test('Diagram editor keeps every placement mapping and matching condition in Str
         await deleteButton.click();
         const deleteResponse = await deleteResponsePromise;
         assert.equal(deleteResponse.status(), 200, await deleteResponse.text());
+      }
+    }
+  });
+});
+
+test('Diagram editor saves incomplete structure edits as template state', { skip: skipReason, timeout: 90_000 }, async () => {
+  await withPage(async (page) => {
+    const code = `DiagramIncompleteSaveUiSmoke${Date.now()}`;
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.locator('button[data-action="new-template"]').click();
+    await page.waitForSelector('#cmdp-template-editor', { timeout: 10_000 });
+    await page.locator('#cmdp-code').fill(code);
+    await page.locator('#cmdp-description').fill('Incomplete D2 editor persistence smoke');
+    const createResponsePromise = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/templates') && response.request().method() === 'POST');
+    await page.locator('button[data-action="save-template"]').click();
+    assert.equal((await createResponsePromise).status(), 201);
+
+    try {
+      await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
+      await page.locator('a[data-designer-section="diagram-assistant"]').click();
+      await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 10_000 });
+      await page.locator('#cmdp-diagram-import-source').fill([
+        'classes: { server: { shape: rectangle } }',
+        'servers: "Servers" {',
+        '  first: "Server A" { class: server }',
+        '  second: "Server B" { class: server }',
+        '}'
+      ].join('\n'));
+      const analyzeResponsePromise = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/draft/diagram-import/analyze'));
+      await page.locator('button[data-action="diagram-import-analyze"]').click();
+      assert.equal((await analyzeResponsePromise).status(), 200);
+
+      await page.locator('a[data-designer-section="diagram"]').click();
+      const structurePanel = page.locator('[data-diagram-import-editor-panel="structure"]');
+      await structurePanel.waitFor({ state: 'visible', timeout: 10_000 });
+      const containerRow = structurePanel.locator('[data-diagram-structure-tree-row][data-diagram-structure-tree-kind="container"]').first();
+      await containerRow.locator('button[data-action="diagram-structure-select"]').click();
+      const placement = structurePanel.locator('[data-diagram-import-placement-mapping]');
+      const labelTemplate = placement.locator('[data-diagram-import-placement-field="primary.labelTemplate"]');
+      await labelTemplate.fill('Сохраненная группа');
+      await labelTemplate.blur();
+      assert.equal(await page.locator('button[data-action="save-template"]').isDisabled(), false);
+
+      await page.locator('button[data-action="open-visualization"]').click();
+      const visualization = page.locator('#cmdp-visualization-editor');
+      await visualization.waitFor({ state: 'visible', timeout: 10_000 });
+      assert.equal(await visualization.locator('[data-diagram-editor-section="d2-mappings"]').count(), 0, 'Visualization must not duplicate the D2 mapping editor.');
+      const intermediatePreview = visualization.locator('button[data-action="diagram-import-preview-current"]');
+      assert.equal(await intermediatePreview.isEnabled(), true);
+      const previewRequestPromise = page.waitForRequest((request) => request.url().includes('/cmdbuild/custom-api/draft/preview') && request.method() === 'POST');
+      await intermediatePreview.click();
+      const previewRequest = await previewRequestPromise;
+      const previewPayload = previewRequest.postDataJSON();
+      assert.equal(previewPayload.template.spec.authoring?.d2?.source.includes('servers: "Servers"'), true);
+      assert.equal(previewPayload.template.spec.result?.diagrams?.[0]?.authoring?.d2Import?.mappingValidation?.status, 'needsValidation');
+      assert.equal(previewPayload.template.spec.result?.diagrams?.[0]?.authoring?.d2Import?.structureTree?.items.some((item) => item.mapping?.primary?.labelTemplate === 'Сохраненная группа'), true, 'Intermediate preview must use the current unsaved structure fields.');
+      const previewBlock = visualization.locator('[data-diagram-import-runtime-preview]');
+      await previewBlock.waitFor({ state: 'visible', timeout: 30_000 });
+      await previewBlock.locator('[data-d2-rendered-svg]').first().waitFor({ state: 'visible', timeout: 30_000 });
+
+      await page.locator('a[data-designer-section="diagram"]').click();
+      await structurePanel.waitFor({ state: 'visible', timeout: 10_000 });
+      assert.equal(await structurePanel.locator('[data-diagram-import-placement-mapping] [data-diagram-import-placement-field="primary.labelTemplate"]').inputValue(), 'Сохраненная группа');
+
+      const saveResponsePromise = page.waitForResponse((response) => response.url().includes(`/cmdbuild/custom-api/templates/${code}`) && response.request().method() === 'PUT');
+      await page.locator('button[data-action="save-template"]').click();
+      assert.equal((await saveResponsePromise).status(), 200);
+
+      await page.locator('a[data-designer-section="templates"]').click();
+      await page.waitForSelector('#cmdp-template-list', { timeout: 10_000 });
+      await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
+      await page.locator('a[data-designer-section="diagram"]').click();
+      const reloadedStructurePanel = page.locator('[data-diagram-import-editor-panel="structure"]');
+      await reloadedStructurePanel.waitFor({ state: 'visible', timeout: 10_000 });
+      const reloadedContainerRow = reloadedStructurePanel.locator('[data-diagram-structure-tree-row][data-diagram-structure-tree-kind="container"]').first();
+      await reloadedContainerRow.locator('button[data-action="diagram-structure-select"]').click();
+      const reloadedLabelTemplate = reloadedStructurePanel.locator('[data-diagram-import-placement-mapping] [data-diagram-import-placement-field="primary.labelTemplate"]');
+      await reloadedLabelTemplate.waitFor({ state: 'visible', timeout: 10_000 });
+      const reloadedLabelBox = await reloadedLabelTemplate.boundingBox();
+      assert.ok(reloadedLabelBox && reloadedLabelBox.width > 0 && reloadedLabelBox.height > 0, 'The restored label editor must remain visibly usable.');
+      assert.equal(await reloadedLabelTemplate.inputValue(), 'Сохраненная группа');
+      assert.equal(await page.locator('button[data-action="save-template"]').isDisabled(), false, 'An incomplete mapping must not block normal template Save after reopening Diagram.');
+
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+      await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
+      await page.locator('a[data-designer-section="diagram"]').click();
+      const restoredStructurePanel = page.locator('[data-diagram-import-editor-panel="structure"]');
+      await restoredStructurePanel.waitFor({ state: 'visible', timeout: 10_000 });
+      await restoredStructurePanel.locator('[data-diagram-structure-tree-row][data-diagram-structure-tree-kind="container"]').first().locator('button[data-action="diagram-structure-select"]').click();
+      assert.equal(await restoredStructurePanel.locator('[data-diagram-import-placement-mapping] [data-diagram-import-placement-field="primary.labelTemplate"]').inputValue(), 'Сохраненная группа');
+    } finally {
+      await page.locator('a[data-designer-section="templates"]').click();
+      const deleteButton = page.locator(`[data-action="delete-template"][data-code="${code}"]`);
+      if (await deleteButton.count()) {
+        page.once('dialog', (dialog) => dialog.accept());
+        const deleteResponsePromise = page.waitForResponse((response) => response.url().includes(`/cmdbuild/custom-api/templates/${code}`) && response.request().method() === 'DELETE');
+        await deleteButton.click();
+        assert.equal((await deleteResponsePromise).status(), 200);
       }
     }
   });
@@ -1613,6 +1714,8 @@ test('Designer analyzes and applies a reviewed D2 structure template', { skip: s
     assert.ok(directApplyBody.spec, JSON.stringify(directApplyBody));
     assert.equal(directApplyBody.template, undefined);
     assert.equal(directApplyBody.versionLog, undefined);
+    await page.locator('#cmdp-visualization-editor').waitFor({ state: 'visible', timeout: 10_000 });
+    assert.equal(await page.locator('[data-diagram-editor-section="d2-mappings"]').count(), 0, 'Applied preview must open the dedicated visualization workspace.');
     await page.locator('[data-diagram-import-runtime-preview] [data-diagram-import-runtime-preview-elapsed]').waitFor({ timeout: 10_000 });
     assert.equal(await page.locator('button[data-action="save-template"]').isDisabled(), false, 'Save must remain available while background D2 preview runs.');
     const directPreviewResponse = await directPreviewResponsePromise;
@@ -1621,10 +1724,10 @@ test('Designer analyzes and applies a reviewed D2 structure template', { skip: s
     assert.equal(directPreviewResponse.status(), 200, `Assistant direct D2 preview failed: ${JSON.stringify(directPreviewBody)}`);
     assert.ok(directPreviewBody.result?.diagrams?.length, `Assistant direct D2 preview returned no diagram: ${JSON.stringify(directPreviewBody.result)}`);
     await page.locator('[data-diagram-import-runtime-preview] [data-d2-rendered-svg]').waitFor({ timeout: 30_000 });
-    assert.equal(await page.locator('[data-diagram-import-preview] [data-d2-rendered-svg]').count(), 1);
+    assert.equal(await page.locator('#cmdp-diagram-assistant-editor').count(), 0);
     assert.equal(await page.locator('[data-diagram-import-runtime-preview] [data-d2-rendered-svg]').count(), 1);
     assert.equal(await page.locator('button[data-action="save-template"]').isDisabled(), false);
-    assert.doesNotMatch(await page.locator('#cmdp-diagram-assistant-editor').innerText(), /Сначала выполните детерминированный анализ D2/);
+    assert.doesNotMatch(await page.locator('#cmdp-visualization-editor').innerText(), /Сначала выполните детерминированный анализ D2/);
 
     let appliedEditorAnalyzeRequests = 0;
     const countAppliedEditorAnalysis = (request) => {
@@ -1675,7 +1778,8 @@ test('Designer analyzes and applies a reviewed D2 structure template', { skip: s
     await appliedWorkstationTreeRow.locator('button[data-action="diagram-structure-select"]').click();
     const appliedWorkstationMapping = structurePanel.locator('[data-diagram-import-placement-mapping]');
     await appliedWorkstationMapping.waitFor({ state: 'visible', timeout: 10_000 });
-    assert.equal(await appliedWorkstationMapping.locator('[data-diagram-import-placement-field="source.stageId"]').inputValue(), 'selection:workstations');
+    assert.equal(await appliedWorkstationMapping.locator('[data-diagram-import-placement-field="materialization.kind"]').inputValue(), 'stage');
+    assert.equal(await appliedWorkstationMapping.locator('[data-diagram-import-placement-field="materialization.stageId"]').inputValue(), 'selection:workstations');
     assert.equal(await appliedWorkstationMapping.locator('[data-diagram-import-placement-field="primary.className"]').inputValue(), 'ARM');
     const appliedLabelTemplate = appliedWorkstationMapping.locator('[data-diagram-import-placement-field="primary.labelTemplate"]');
     await appliedLabelTemplate.fill('${Code');
@@ -1723,9 +1827,19 @@ test('Designer analyzes and applies a reviewed D2 structure template', { skip: s
     assert.equal(updateAppliedBody.versionLog, undefined);
     assert.equal(appliedEditorAnalyzeRequests, 0, 'Opening or editing the applied mapping must not trigger a new D2 analysis.');
     await updatedPreviewResponsePromise;
-    assert.equal(await reloadedWorkstationMapping.locator('[data-diagram-import-placement-field="primary.labelTemplate"]').inputValue(), '${Code} ${Description}');
+    await page.locator('#cmdp-visualization-editor').waitFor({ state: 'visible', timeout: 10_000 });
+    await page.locator('[data-diagram-import-runtime-preview] [data-d2-rendered-svg]').waitFor({ state: 'visible', timeout: 30_000 });
     assert.equal(await page.locator('button[data-action="save-template"]').isDisabled(), false);
     page.off('request', countAppliedEditorAnalysis);
+    await page.locator('a[data-designer-section="diagram"]').click();
+    await page.waitForSelector('#cmdp-diagram-editor', { timeout: 10_000 });
+    const updatedStructurePanel = page.locator('[data-diagram-import-editor-panel="structure"]');
+    await updatedStructurePanel.waitFor({ state: 'visible', timeout: 10_000 });
+    const updatedWorkstationTreeRow = updatedStructurePanel.locator('[data-diagram-structure-tree-row]').filter({ hasText: /workstation/i }).first();
+    await updatedWorkstationTreeRow.locator('button[data-action="diagram-structure-select"]').click();
+    const updatedWorkstationMapping = updatedStructurePanel.locator('[data-diagram-import-placement-mapping]');
+    await updatedWorkstationMapping.waitFor({ state: 'visible', timeout: 10_000 });
+    assert.equal(await updatedWorkstationMapping.locator('[data-diagram-import-placement-field="primary.labelTemplate"]').inputValue(), '${Code} ${Description}');
     await page.locator('a[data-designer-section="diagram-assistant"]').click();
     await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 10_000 });
 
@@ -1759,7 +1873,7 @@ test('Designer analyzes and applies a reviewed D2 structure template', { skip: s
     for (let index = 0; index < await refreshedWorkstationTreeRows.count(); index += 1) {
       const refreshedWorkstationTreeRow = refreshedWorkstationTreeRows.nth(index);
       await refreshedWorkstationTreeRow.locator('button[data-action="diagram-structure-select"]').click();
-      const sourceStage = refreshedStructurePanel.locator('[data-diagram-import-placement-mapping] [data-diagram-import-placement-field="source.stageId"]');
+      const sourceStage = refreshedStructurePanel.locator('[data-diagram-import-placement-mapping] [data-diagram-import-placement-field="materialization.stageId"]');
       const sourceOptions = await sourceStage.locator('option').evaluateAll((options) => options.map((option) => option.value).filter(Boolean));
       assert.ok(sourceOptions.includes('selection:workstations'), `Workstation selection is absent from D2 tree sources: ${JSON.stringify(sourceOptions)}`);
       await sourceStage.selectOption('selection:workstations');
@@ -1832,6 +1946,7 @@ test('Designer analyzes and applies a reviewed D2 structure template', { skip: s
     const requestedDiagrams = previewRequestBody?.template?.spec?.result?.diagrams || [];
     assert.equal(requestedDiagrams.length, 1, `Draft preview lost imported diagram: ${JSON.stringify(requestedDiagrams)}`);
     assert.equal(requestedDiagrams[0].authoring?.d2Import?.version, 3);
+    assert.equal(requestedDiagrams[0].authoring?.d2Import?.mappingValidation?.status, 'valid', 'Applied preview must not downgrade its mapping to intermediate needsValidation state.');
     assert.equal(requestedDiagrams[0].nodeMappings?.[0]?.importRole?.key, 'workstation');
     assert.equal(requestedDiagrams[0].groupMappings?.[0]?.importRole?.key, 'users');
     assert.deepEqual(requestedDiagrams[0].authoring?.d2Import?.roles?.map((role) => role.key).sort(), ['users', 'workstation']);

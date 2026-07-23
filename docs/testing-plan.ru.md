@@ -10,12 +10,15 @@
 - `npm run ci`: запускает `secret:scan`, `npm test` и `build:zip`.
 - `npm run test:static`: проверяет обязательные OpenAPI paths, локальные component references и ссылки архитектурных артефактов.
 - `npm run test:unit`: покрывает настройки кэша, scope ключей кэша, refresh metadata, параметры static snapshot URL, defaults параметров, IPv4-сопоставление, topology diagram payloads, runtime JSON output-mode filtering, assistant MCP allowlist/defaults, dependency map, маскирование логов, diagnostic mode, assistant-disabled config и runtime config validation.
-- `npm run test:api`: skip-safe API smoke для `/health/*`, `/metrics`, защищенного logging status и отказа state-changing вызовов без CSRF/session на запущенном proxy.
+- `npm run test:api`: API contract smoke для `/health/*`, `/metrics`, защищенного logging status, same-origin/CSRF отказов и JSON content-type проверки. Readiness проверяется по `checks.redis`, `checks.cmdbuild`, `checks.d2`, `checks.d2Import`.
 - `npm run test:ui`: skip-safe Playwright smoke для списка шаблонов Designer, fixed menu/action bar, контекстных кнопок Run, компактной Runtime shell, runtime table search/sort, отключения grouped-table controls и split-subtable local sorting.
 - `npm run test:nginx`: проверяет project-only nginx config и маршруты `cmdbdynamicpages` через `localhost:8088`.
-- `npm run e2e`: проверяет logging diagnostics, draft preview без runtime cache, runtime cache hit, POST `forceRefresh`, что GET runtime не делает forced refresh, и write-mode `expectedSpecHash` conflict handling.
+- `npm run e2e`: проверяет logging diagnostics, draft preview без runtime cache, runtime cache hit, POST `forceRefresh`, что GET runtime не делает forced refresh, technical schema bootstrap и write-mode `expectedSpecHash` conflict handling.
+
+При валидной non-readonly CMDBuild admin session обычный `npm run e2e` вызывает `POST /schema/bootstrap`. Он создает только отсутствующие technical CMDBuild classes и attributes, поэтому изменяет состояние. `CMDBDYNAMIC_EXPECT_READONLY=1` предназначен для ограниченной CMDBuild-учетной записи: bootstrap не вызывается, а e2e проверяет запрет создания шаблона. Это не admin check-only режим.
 
 ## Осталось
 
 - Для live e2e нужен свежий CMDBuild session cookie или явные `CMDBUILD_USERNAME`/`CMDBUILD_PASSWORD`.
+- Для authenticated ветки `npm run test:api` задайте `CMDBUILD_COOKIE_HEADER` либо `CMDBUILD_USERNAME`/`CMDBUILD_PASSWORD` (опционально `CMDBUILD_LOGIN_ORIGIN`, `CMDBUILD_ROLE`, `CMDBUILD_SCOPE`). Без этих значений публичные и reject-сценарии выполняются, а проверка content-type после валидной session явно пропускается.
 - Добавить browser smoke для rendered topology SVG diagrams и Assistant section controls после подтверждения целевых видов диаграмм заказчиком и доступа к LiteLLM стенду для UI automation.

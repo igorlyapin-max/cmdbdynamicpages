@@ -95,7 +95,7 @@ Run the backend smoke/e2e check against the local proxy:
 npm run e2e
 ```
 
-The e2e check verifies session, logging diagnostics, technical schema readiness, CSRF rejection, draft validate/preview without runtime cache, relation expansion, multi-hop relation chains, value search, group comparison, Runtime shell loading, saved-template `run`, cache hit, POST `forceRefresh`, and that read-only GET runtime cannot force refresh. Runtime execution events are written only through the standard backend logging paths; no runtime execution cards are stored in CMDBuild.
+The e2e check verifies session, logging diagnostics, non-destructive technical schema bootstrap and readiness, CSRF rejection, draft validate/preview without runtime cache, relation expansion, multi-hop relation chains, value search, group comparison, Runtime shell loading, saved-template `run`, cache hit, POST `forceRefresh`, and that read-only GET runtime cannot force refresh. Runtime execution events are written only through the standard backend logging paths; no runtime execution cards are stored in CMDBuild. `CMDBDYNAMIC_EXPECT_READONLY=1` skips bootstrap and retains the read-only schema check.
 
 Optional API contract smoke tests can run against a started proxy:
 

@@ -7,6 +7,8 @@ const proxyOrigin = process.env.CMDBDYNAMIC_PROXY || 'http://127.0.0.1:8093';
 const cmdbuildOrigin = process.env.CMDBUILD_ORIGIN || 'http://127.0.0.1:8090';
 const cookieJar = process.env.CMDBUILD_COOKIE_JAR || '/tmp/cmdbuild-ui-cookie.txt';
 const root = process.env.CMDBDYNAMIC_ROOT || 'Cst_QueryTool';
+const schemaParent = process.env.CMDBDYNAMIC_SCHEMA_PARENT || 'Class';
+const schemaDescription = process.env.CMDBDYNAMIC_SCHEMA_DESCRIPTION || '';
 const runtimeTemplate = process.env.CMDBDYNAMIC_E2E_TEMPLATE || 'ProbeClassesByAttributeType';
 const writeTemplate = process.env.CMDBDYNAMIC_E2E_WRITE_TEMPLATE || 'CmdpE2eSmoke';
 const runtimeAttrType = process.env.CMDBDYNAMIC_E2E_ATTR_TYPE || 'reference';
@@ -434,6 +436,7 @@ console.log(`proxy: ${proxyOrigin}`);
 console.log(`cmdbuild: ${cmdbuildOrigin}`);
 console.log(`cookie: ${cookieSource} (${cookieHeader ? 'loaded' : 'empty'})`);
 console.log(`root: ${root}`);
+console.log(`schema parent: ${schemaParent}`);
 console.log(`runtime template: ${runtimeTemplate}`);
 console.log(`relation fixture: ${relationSourceClass}/${relationSourceCode} -> ${relationTargetClass}`);
 console.log(`write mode: ${writeMode ? `yes (${writeTemplate})` : 'no'}`);
@@ -482,8 +485,28 @@ await test('model catalog', async () => {
   return `classes=${json.catalog.counts.classes} attributes=${json.catalog.counts.attributes} domains=${json.catalog.counts.domains}`;
 });
 
-await test('technical schema ready', async () => {
-  const result = await request('GET', `${proxyOrigin}/cmdbuild/custom-api/schema?root=${encodeURIComponent(root)}`);
+if (!expectReadonly) {
+  await test('technical schema bootstrap', async () => {
+    const result = await request('POST', `${proxyOrigin}/cmdbuild/custom-api/schema/bootstrap`, {
+      root,
+      parent: schemaParent,
+      description: schemaDescription,
+      confirm: true
+    }, withCsrf(csrf));
+    assertStatus(result, 200);
+    const json = getJson(result);
+    assert(json.success === true, 'Technical schema bootstrap returned success=false.');
+    assert(json.schema && json.schema.ready === true, 'Technical schema bootstrap did not make the schema ready.');
+    assert(!json.rootCause, 'Technical schema bootstrap unexpectedly returned a root cause.');
+    const actions = Array.isArray(json.schema.actions) ? json.schema.actions : [];
+    return `status=${json.schema.status} actions=${actions.length}`;
+  });
+}
+
+await test('technical schema ready after bootstrap', async () => {
+  const query = new URLSearchParams({ root, parent: schemaParent });
+  if (schemaDescription) query.set('description', schemaDescription);
+  const result = await request('GET', `${proxyOrigin}/cmdbuild/custom-api/schema?${query.toString()}`);
   assertStatus(result, 200);
   const json = getJson(result);
   assert(json.schema && json.schema.ready === true, 'Technical schema is not ready.');

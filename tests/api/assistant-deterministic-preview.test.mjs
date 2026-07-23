@@ -72,13 +72,13 @@ function d2RoleOverride(role, mapping = role.mapping, model = {}) {
   };
 }
 
-function d2StructureTreeWithSources(proposal, roles) {
-  const tree = structuredClone(proposal && proposal.structureTree || { version: 4, items: [] });
+function d2StructureTreeWithMaterialization(proposal, roles) {
+  const tree = structuredClone(proposal && proposal.structureTree || { version: 5, items: [] });
   const mappingsByRoleId = new Map((Array.isArray(roles) ? roles : []).map((role) => [
     String(role && role.id || ''),
     role && role.mapping && typeof role.mapping === 'object' ? role.mapping : null
   ]));
-  tree.version = 4;
+  tree.version = 5;
   tree.items = (Array.isArray(tree.items) ? tree.items : []).map((item) => {
     const mapping = mappingsByRoleId.get(String(item && item.roleId || ''));
     if (!mapping) return item;
@@ -98,7 +98,7 @@ function d2StaticPlacementMapping(itemId, roleId) {
   return {
     id: `mapping-${itemId}`,
     roleId,
-    source: { stageId: '', alias: '', kind: '', className: '' },
+    materialization: { kind: 'structural', stageId: '' },
     primary: { className: '', idAttribute: '_id', labelTemplate: '${Description}', structuredFields: [], filters: [] },
     conditions: { ruleJoin: 'any', rules: [] },
     related: []
@@ -3096,7 +3096,7 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
       ? { stageId: 'selection:routers', alias: 'routers', kind: 'selection', className: 'routerG' }
       : { stageId: 'selection:switches', alias: 'switches', kind: 'selection', className: 'ARM' };
     return d2RoleOverride(role, {
-      source: sourceStage,
+      materialization: { kind: 'stage', stageId: sourceStage.stageId },
       primary: {
         className: role.key === 'router' ? 'routerG' : 'ARM',
         idAttribute: '_id',
@@ -3107,7 +3107,7 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
       related: []
     });
   });
-  const structureTree = d2StructureTreeWithSources(analyzed.json.proposal, roles);
+  const structureTree = d2StructureTreeWithMaterialization(analyzed.json.proposal, roles);
   const applied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
     currentSpec,
     d2Source: source,
@@ -3137,7 +3137,7 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
   assert.equal(applied.json.spec.steps.filter((step) => step.managedBy === 'd2ImportV3').length, 1);
   assert.equal(applied.json.spec.result.diagrams[0].authoring.d2Import.roleMappings, undefined);
   assert.equal(applied.json.spec.result.diagrams[0].authoring.d2Import.structureTree.items
-    .filter((item) => item.mapping.source.stageId).length, 2);
+    .filter((item) => item.mapping.materialization && item.mapping.materialization.kind === 'stage' && item.mapping.materialization.stageId).length, 2);
   assert.equal(applied.json.spec.assistantDraft, undefined);
   assert.equal(applied.json.spec.authoring.d2.source, source);
   assert.equal(applied.json.spec.authoring.d2.sourceHash, applied.json.spec.result.diagrams[0].authoring.d2Import.sourceHash);
@@ -3394,7 +3394,7 @@ test('D2 preview keeps role-aware IPv4 edges and persisted structure-tree placem
               importRole: { key: 'acl', sourceKey: 'external-system', targetKey: 'internal-system' }
             }],
             structureTree: {
-              version: 4,
+              version: 5,
               items: [
                 { id: 'external', roleId: 'external-group', templateContextKey: 'external', templateElementKey: 'external-group', templateElementKeys: ['external-group'], parentId: '', mapping: d2StaticPlacementMapping('external', 'external-group') },
                 { id: 'external-node', roleId: 'external-system', templateContextKey: 'external-node', templateElementKey: 'external-system', templateElementKeys: ['external-system'], parentId: 'external', mapping: d2StaticPlacementMapping('external-node', 'external-system') },
@@ -3654,14 +3654,14 @@ test('D2 import keeps untyped containers as source-free frames and places mapped
   assert.ok(users);
   assert.equal(users.kind, 'untypedContainer');
   assert.equal(users.visualKind, 'container');
-  assert.equal(analyzed.json.proposal.structureTree.items.some((item) => item.roleId === users.id && item.mapping.source.stageId === ''), true);
+  assert.equal(analyzed.json.proposal.structureTree.items.some((item) => item.roleId === users.id && item.mapping.materialization.kind === 'structural'), true);
   assert.equal(analyzed.json.proposal.roles.some((role) => role.key === 'users.operator'), false);
   const workstationItems = analyzed.json.proposal.structureTree.items.filter((item) => item.roleId === workstation.id);
   assert.equal(workstationItems.length, 1);
   assert.deepEqual(workstationItems[0].templateElementKeys, ['users.administrator', 'users.operator']);
   assert.equal(analyzed.json.proposal.unresolved.length, 1);
   const roles = [d2RoleOverride(workstation, {
-      source: { stageId: 'selection:workstations', alias: 'workstations', kind: 'selection', className: 'ARM' },
+      materialization: { kind: 'stage', stageId: 'selection:workstations' },
       primary: {
         className: 'ARM',
         idAttribute: '_id',
@@ -3671,7 +3671,7 @@ test('D2 import keeps untyped containers as source-free frames and places mapped
       },
       related: []
     }), d2RoleOverride(users)];
-  const structureTree = d2StructureTreeWithSources(analyzed.json.proposal, roles);
+  const structureTree = d2StructureTreeWithMaterialization(analyzed.json.proposal, roles);
 
   const applied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
     currentSpec,
@@ -3689,10 +3689,10 @@ test('D2 import keeps untyped containers as source-free frames and places mapped
   assert.deepEqual(diagram.hierarchyMappings, []);
   assert.equal(diagram.authoring.d2Import.version, 3);
   assert.equal(diagram.placementRules, undefined);
-  assert.equal(diagram.authoring.d2Import.structureTree.version, 4);
+  assert.equal(diagram.authoring.d2Import.structureTree.version, 5);
   assert.deepEqual(
-    diagram.authoring.d2Import.structureTree.items.map((item) => [item.id, item.roleId, item.parentId, item.mapping.source.stageId, item.mapping.primary.labelTemplate]),
-    structureTree.items.map((item) => [item.id, item.roleId, item.parentId, item.mapping.source.stageId, item.mapping.primary.labelTemplate])
+    diagram.authoring.d2Import.structureTree.items.map((item) => [item.id, item.roleId, item.parentId, item.mapping.materialization.kind, item.mapping.materialization.stageId, item.mapping.primary.labelTemplate]),
+    structureTree.items.map((item) => [item.id, item.roleId, item.parentId, item.mapping.materialization.kind, item.mapping.materialization.stageId, item.mapping.primary.labelTemplate])
   );
   assert.equal(diagram.authoring.d2Import.structureTree.items.every((item) => item.mapping.conditions && Array.isArray(item.mapping.conditions.rules)), true);
 
@@ -4330,9 +4330,7 @@ test('D2 import Apply stays local until the normal template Save persists the ma
   const roles = analyzed.json.proposal.roles.map((role) => {
     const isRouter = role.key === 'router';
     return d2RoleOverride(role, {
-        source: isRouter
-          ? { stageId: 'selection:routers', alias: 'routers', kind: 'selection', className: 'routerG' }
-          : { stageId: 'selection:switches', alias: 'switches', kind: 'selection', className: 'ARM' },
+        materialization: { kind: 'stage', stageId: isRouter ? 'selection:routers' : 'selection:switches' },
         primary: {
           className: isRouter ? 'routerG' : 'ARM',
           idAttribute: '_id', labelTemplate: '${Code}', structuredFields: ['Code'], filters: []
@@ -4340,7 +4338,7 @@ test('D2 import Apply stays local until the normal template Save persists the ma
         related: []
       });
   });
-  const structureTree = d2StructureTreeWithSources(analyzed.json.proposal, roles);
+  const structureTree = d2StructureTreeWithMaterialization(analyzed.json.proposal, roles);
   const applied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
     templateCode: 'PersistedImport',
     baseSpecHash: hashJson(currentSpec),
@@ -4407,14 +4405,12 @@ test('D2 applied mapping update stays local until normal template Save', async (
   const roles = analyzed.json.proposal.roles.map((role) => {
     const isRouter = role.key === 'router';
     return d2RoleOverride(role, {
-      source: isRouter
-        ? { stageId: 'selection:routers', alias: 'routers', kind: 'selection', className: 'routerG' }
-        : { stageId: 'selection:switches', alias: 'switches', kind: 'selection', className: 'ARM' },
+      materialization: { kind: 'stage', stageId: isRouter ? 'selection:routers' : 'selection:switches' },
       primary: { className: isRouter ? 'routerG' : 'ARM', idAttribute: '_id', labelTemplate: '${Code}', structuredFields: ['Code'], filters: [] },
       related: []
     }, { labelTemplate: '${Code}' });
   });
-  const structureTree = d2StructureTreeWithSources(analyzed.json.proposal, roles);
+  const structureTree = d2StructureTreeWithMaterialization(analyzed.json.proposal, roles);
   const applied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
     templateCode: 'AppliedMappingEditor',
     baseSpecHash: hashJson(currentSpec),
@@ -4443,7 +4439,7 @@ test('D2 applied mapping update stays local until normal template Save', async (
   const updatedStructureTree = structuredClone(imported.structureTree);
   const mappedItemIds = new Set();
   for (const item of updatedStructureTree.items) {
-    if (!item.mapping || !item.mapping.source || !item.mapping.source.stageId) continue;
+    if (!item.mapping || !item.mapping.materialization || item.mapping.materialization.kind !== 'stage' || !item.mapping.materialization.stageId) continue;
     item.mapping.primary.labelTemplate = '${Description}';
     mappedItemIds.add(item.id);
   }
@@ -4535,7 +4531,7 @@ test('D2 analysis and local Apply do not require an update grant', async (t) => 
   const role = analyzedReadOnly.json.proposal.roles.find((item) => item.key === 'router');
   assert.ok(role, analyzedReadOnly.body);
   const roles = [d2RoleOverride(role, {
-    source: { stageId: 'selection:routers', alias: 'routers', kind: 'selection', className: 'routerG' },
+    materialization: { kind: 'stage', stageId: 'selection:routers' },
     primary: { className: 'routerG', idAttribute: '_id', labelTemplate: '${Code}', structuredFields: ['Code'], filters: [] },
     related: []
   })];
@@ -4546,7 +4542,7 @@ test('D2 analysis and local Apply do not require an update grant', async (t) => 
     d2Source: analyzedReadOnly.json.proposal.sourceText,
     proposal: analyzedReadOnly.json.proposal,
     roles,
-    structureTree: d2StructureTreeWithSources(analyzedReadOnly.json.proposal, roles)
+    structureTree: d2StructureTreeWithMaterialization(analyzedReadOnly.json.proposal, roles)
   }, headers);
   assert.equal(localApply.statusCode, 422, localApply.body);
   assert.notEqual(localApply.json.reason, 'template_update_forbidden');
@@ -4600,6 +4596,20 @@ test('CSRF token is not issued when CMDBuild rejects the session', async (t) => 
   const backend = await startBackend(t, backendPort, mock.origin);
   const response = await requestJson('GET', `http://127.0.0.1:${backendPort}/cmdbuild/custom-api/csrf`, undefined, {
     cookie: 'CMDBuild-Authorization=invalid-token'
+  });
+
+  assert.equal(response.statusCode, 401, response.body);
+  assert.equal(response.json.reason, 'cmdbuild_session_invalid');
+  assert.equal(response.json.token, undefined);
+  assert.equal(backend.exitCode, null);
+});
+
+test('CSRF token treats a malformed CMDBuild session as unauthorized', async (t) => {
+  const mock = await startMockCmdbuild(t, { sessionStatus: 400 });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const response = await requestJson('GET', `http://127.0.0.1:${backendPort}/cmdbuild/custom-api/csrf`, undefined, {
+    cookie: 'CMDBuild-Authorization=malformed-token'
   });
 
   assert.equal(response.statusCode, 401, response.body);
@@ -6053,13 +6063,16 @@ async function startMockCmdbuild(t, options = {}) {
       model2: 'model2-b'
     }
   ];
-  const classFixtures = Array.isArray(options.classes) ? options.classes : [
+  const classFixtures = (Array.isArray(options.classes) ? options.classes : [
     { _id: 1, name: 'routerG', description: 'Маршрутизатор', active: true },
     { _id: 2, name: 'ARM', description: 'АРМ', active: true },
     { _id: 3, name: 'Cst_QueryToolConfig', description: 'Config', active: true },
     { _id: 4, name: 'Cst_QueryTemplate', description: 'Template', active: true }
-  ];
-  const attributesByClass = options.attributesByClass || {};
+  ]).map((item) => ({ ...item }));
+  const attributesByClass = Object.fromEntries(Object.entries(options.attributesByClass || {}).map(([className, attributes]) => [
+    className,
+    Array.isArray(attributes) ? attributes.map((attribute) => ({ ...attribute })) : []
+  ]));
   const domains = Array.isArray(options.domains) ? options.domains : [];
   const cardsByClass = options.cardsByClass || {};
   const relationsByCard = options.relationsByCard || {};
@@ -6079,7 +6092,13 @@ async function startMockCmdbuild(t, options = {}) {
 
     if (requestUrl.pathname === '/cmdbuild/services/rest/v3/sessions/current') {
       const status = Number(options.sessionStatus || 200);
-      sendJson(res, status, status === 200 ? { data: { username: 'preview-user', role: 'Admin' } } : { message: 'session rejected' });
+      sendJson(res, status, status === 200 ? {
+        data: {
+          username: 'preview-user',
+          role: 'Admin',
+          rolePrivileges: options.rolePrivileges === undefined ? { admin_classes_modify: true } : options.rolePrivileges
+        }
+      } : { message: 'session rejected' });
       return;
     }
     if (requestUrl.pathname === '/cmdbuild/services/rest/v3/classes/Cst_QueryTemplate') {
@@ -6099,7 +6118,29 @@ async function startMockCmdbuild(t, options = {}) {
       });
       return;
     }
-    if (requestUrl.pathname.match(/^\/cmdbuild\/services\/rest\/v3\/classes\/[^/]+\/attributes$/)) {
+    if (requestUrl.pathname === '/cmdbuild/services/rest/v3/classes/' && req.method === 'POST') {
+      const payload = await readRequestJson(req);
+      const failure = typeof options.schemaMutationFailure === 'function'
+        ? options.schemaMutationFailure({ type: 'class', name: payload.name, payload })
+        : null;
+      if (failure) {
+        sendJson(res, Number(failure.statusCode || 500), { message: failure.message || 'schema class create failed' });
+        return;
+      }
+      const created = { _id: classFixtures.length + 100, active: true, ...payload };
+      classFixtures.push(created);
+      sendJson(res, 200, { data: created });
+      return;
+    }
+    const classDetailMatch = requestUrl.pathname.match(/^\/cmdbuild\/services\/rest\/v3\/classes\/([^/]+)$/);
+    if (classDetailMatch) {
+      const className = decodeURIComponent(classDetailMatch[1]);
+      const classDefinition = classFixtures.find((item) => String(item && item.name || '') === className);
+      if (classDefinition) sendJson(res, 200, { data: classDefinition });
+      else sendJson(res, 404, { message: `Class not found: ${className}` });
+      return;
+    }
+    if (req.method === 'GET' && requestUrl.pathname.match(/^\/cmdbuild\/services\/rest\/v3\/classes\/[^/]+\/attributes$/)) {
       if (requestUrl.searchParams.get('scope') !== 'service' || requestUrl.searchParams.get('limit') !== '1000') {
         sendJson(res, 404, { message: `missing service-scope attributes query: ${requestUrl.pathname}${requestUrl.search}` });
         return;
@@ -6126,6 +6167,32 @@ async function startMockCmdbuild(t, options = {}) {
         Cst_QueryTemplate: []
       }, attributesByClass);
       sendJson(res, 200, { data: fixtures[className] || [] });
+      return;
+    }
+    const attributeDetailMatch = requestUrl.pathname.match(/^\/cmdbuild\/services\/rest\/v3\/classes\/([^/]+)\/attributes\/([^/]+)$/);
+    if (attributeDetailMatch) {
+      const className = decodeURIComponent(attributeDetailMatch[1]);
+      const attributeName = decodeURIComponent(attributeDetailMatch[2]);
+      const attribute = (attributesByClass[className] || []).find((item) => String(item && item.name || '') === attributeName);
+      if (attribute) sendJson(res, 200, { data: attribute });
+      else sendJson(res, 404, { message: `Attribute not found: ${className}.${attributeName}` });
+      return;
+    }
+    const attributeCreateMatch = requestUrl.pathname.match(/^\/cmdbuild\/services\/rest\/v3\/classes\/([^/]+)\/attributes$/);
+    if (attributeCreateMatch && req.method === 'POST') {
+      const className = decodeURIComponent(attributeCreateMatch[1]);
+      const payload = await readRequestJson(req);
+      const failure = typeof options.schemaMutationFailure === 'function'
+        ? options.schemaMutationFailure({ type: 'attribute', className, name: payload.name, payload })
+        : null;
+      if (failure) {
+        sendJson(res, Number(failure.statusCode || 500), { message: failure.message || 'schema attribute create failed' });
+        return;
+      }
+      attributesByClass[className] = attributesByClass[className] || [];
+      const created = { active: true, ...payload };
+      attributesByClass[className].push(created);
+      sendJson(res, 200, { data: created });
       return;
     }
     if (requestUrl.pathname === '/cmdbuild/services/rest/v3/domains') {
@@ -6436,6 +6503,71 @@ test('filtered selections report both row and scan limits when both bounds are r
   assert.deepEqual(preview.json.result.limitDiagnostics.map((item) => item.limitName), ['maxRows', 'maxSelectionScanRows']);
   assert.equal(preview.json.result.warnings.length, 2);
   assert.ok(preview.json.result.warnings.every((warning) => /Results may be incomplete/i.test(warning)));
+  assert.equal(backend.exitCode, null);
+});
+
+async function bootstrapSchemaRequest(t, mockOptions = {}, body = { root: 'Acme_QueryTool', parent: 'Class' }) {
+  const mock = await startMockCmdbuild(t, mockOptions);
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = testCmdbuildAuthorizationCookie('schema-bootstrap');
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const response = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/schema/bootstrap`, body, headers);
+  return { mock, backend, backendOrigin, cookie, headers, response };
+}
+
+test('schema bootstrap creates only missing technical classes and is idempotent', async (t) => {
+  const initialClasses = [];
+  const { mock, backendOrigin, headers, response, backend } = await bootstrapSchemaRequest(t, { classes: initialClasses });
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json.success, true);
+  const firstMutationCount = mock.requests.filter((request) => request.method === 'POST' && /\/classes\/?(?:$|\/)/.test(request.pathname)).length;
+  assert.ok(firstMutationCount > 0);
+
+  const repeat = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/schema/bootstrap`, { root: 'Acme_QueryTool', parent: 'Class' }, headers);
+  assert.equal(repeat.statusCode, 200, repeat.body);
+  assert.equal(repeat.json.success, true);
+  assert.equal(mock.requests.filter((request) => request.method === 'POST' && /\/classes\/?(?:$|\/)/.test(request.pathname)).length, firstMutationCount);
+  assert.equal(backend.exitCode, null);
+});
+
+test('schema bootstrap rejects missing admin privilege before CMDBuild schema mutations', async (t) => {
+  const { mock, response, backend } = await bootstrapSchemaRequest(t, { classes: [], rolePrivileges: {} });
+  assert.equal(response.statusCode, 403, response.body);
+  assert.equal(mock.requests.some((request) => request.method === 'POST' && request.pathname.includes('/classes')), false);
+  assert.equal(backend.exitCode, null);
+});
+
+test('schema bootstrap returns conflict without attempting mutations', async (t) => {
+  const { mock, response, backend } = await bootstrapSchemaRequest(t, {
+    classes: [{ _id: 1, name: 'Acme_QueryTool', description: 'Acme', parent: 'WrongParent', prototype: true, active: true }]
+  });
+  assert.equal(response.statusCode, 409, response.body);
+  assert.equal(response.json.schema.status, 'conflict');
+  assert.equal(mock.requests.some((request) => request.method === 'POST' && request.pathname.includes('/classes')), false);
+  assert.equal(backend.exitCode, null);
+});
+
+test('schema bootstrap reports CMDBuild mutation failure and stops subsequent writes', async (t) => {
+  const { mock, response, backend } = await bootstrapSchemaRequest(t, {
+    classes: [],
+    schemaMutationFailure: ({ type }) => type === 'class' ? { statusCode: 500, message: 'class create unavailable' } : null
+  });
+  assert.equal(response.statusCode, 502, response.body);
+  assert.equal(response.json.success, false);
+  assert.equal(response.json.schema.rootCause.kind, 'operation_failed');
+  assert.equal(mock.requests.filter((request) => request.method === 'POST' && request.pathname === '/cmdbuild/services/rest/v3/classes/').length, 1);
+  assert.equal(backend.exitCode, null);
+});
+
+test('schema bootstrap rejects invalid local input before CMDBuild schema mutations', async (t) => {
+  const { mock, response, backend } = await bootstrapSchemaRequest(t, { classes: [] }, { root: 'bad-root' });
+  assert.equal(response.statusCode, 400, response.body);
+  assert.equal(response.json.reason, 'technical_schema_bootstrap_invalid_input');
+  assert.equal(response.json.rootCause.kind, 'invalid_input');
+  assert.equal(mock.requests.some((request) => request.method === 'POST' && request.pathname.includes('/classes')), false);
   assert.equal(backend.exitCode, null);
 });
 

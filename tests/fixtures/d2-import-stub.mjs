@@ -10,6 +10,7 @@ process.stdin.on('end', () => {
     return;
   }
   const composite = source.includes('users:');
+  const serverGroup = source.includes('servers:');
   const containerClass = source.includes('container-class');
   const markdownFrame = source.includes('markdown-frame');
   const reverseEdge = source.includes('switch -> router: reverse');
@@ -25,6 +26,9 @@ process.stdin.on('end', () => {
       ] : composite ? [
         { key: 'users.operator', pathSegments: ['users', 'operator'], label: 'Operator', parentKey: 'users', classKeys: ['workstation'], styleHints: { classes: ['workstation'] } },
         { key: 'users.administrator', pathSegments: ['users', 'administrator'], label: 'Administrator', parentKey: 'users', classKeys: ['workstation'], styleHints: { classes: ['workstation'] } }
+      ] : serverGroup ? [
+        { key: 'servers.first', pathSegments: ['servers', 'first'], label: 'Server A', parentKey: 'servers', classKeys: ['server'], styleHints: { classes: ['server'] } },
+        { key: 'servers.second', pathSegments: ['servers', 'second'], label: 'Server B', parentKey: 'servers', classKeys: ['server'], styleHints: { classes: ['server'] } }
       ] : sameRoleEdges || multipleRelationClasses ? [
         { key: 'application_a', pathSegments: ['application_a'], label: 'Application A', kind: 'application', classKeys: ['application'] },
         { key: 'application_b', pathSegments: ['application_b'], label: 'Application B', kind: 'application', classKeys: ['application'] }
@@ -32,7 +36,7 @@ process.stdin.on('end', () => {
         { key: 'router', pathSegments: ['router'], label: 'Router', kind: 'router', classKeys: ['router'] },
         { key: 'switch', pathSegments: ['switch'], label: 'Switch', kind: 'switch', classKeys: ['switch'] }
       ],
-      edges: composite || markdownFrame ? [] : multipleRelationClasses ? [
+      edges: composite || serverGroup || markdownFrame ? [] : multipleRelationClasses ? [
         { key: 'application_a_b_acl', sourceKey: 'application_a', targetKey: 'application_b', sourcePathSegments: ['application_a'], targetPathSegments: ['application_b'], label: 'TCP 443', direction: 'forward', classKeys: ['acl_intrasystem'] },
         { key: 'application_a_b_dependency', sourceKey: 'application_a', targetKey: 'application_b', sourcePathSegments: ['application_a'], targetPathSegments: ['application_b'], label: 'depends on', direction: 'forward', classKeys: ['application_dependency'] }
       ] : sameRoleEdges ? [
@@ -51,10 +55,22 @@ process.stdin.on('end', () => {
         suggestedRole: 'composite',
         semanticReason: 'leaf shapes',
         styleHints: { style: { fill: '#FAFAFA', 'stroke-dash': '4' } }
+      }] : serverGroup ? [{
+        key: 'servers',
+        pathSegments: ['servers'],
+        label: 'Servers',
+        childrenKeys: ['servers.first', 'servers.second'],
+        classKeys: [],
+        suggestedRole: 'composite',
+        semanticReason: 'leaf shapes',
+        styleHints: { style: { fill: '#FAFAFA', 'stroke-dash': '4' } }
       }] : [],
       hierarchies: composite ? [
         { key: 'contains_operator', parentKey: 'users', childKey: 'users.operator', parentPathSegments: ['users'], childPathSegments: ['users', 'operator'], label: 'contains' },
         { key: 'contains_administrator', parentKey: 'users', childKey: 'users.administrator', parentPathSegments: ['users'], childPathSegments: ['users', 'administrator'], label: 'contains' }
+      ] : serverGroup ? [
+        { key: 'contains_first', parentKey: 'servers', childKey: 'servers.first', parentPathSegments: ['servers'], childPathSegments: ['servers', 'first'], label: 'contains' },
+        { key: 'contains_second', parentKey: 'servers', childKey: 'servers.second', parentPathSegments: ['servers'], childPathSegments: ['servers', 'second'], label: 'contains' }
       ] : []
     },
     classes: markdownFrame ? [
@@ -64,7 +80,9 @@ process.stdin.on('end', () => {
       { key: 'workstation', definition: { style: { fill: '#FFFFFF' } }, usageCount: 2, sampleElementKeys: ['users.operator', 'users.administrator'] }
     ] : [
       { key: 'workstation', definition: { style: { fill: '#FFFFFF' } }, usageCount: 2, sampleElementKeys: ['users.operator', 'users.administrator'] }
-    ]) : multipleRelationClasses ? [
+    ]) : serverGroup ? [
+      { key: 'server', definition: { style: { fill: '#FFFFFF' } }, usageCount: 2, sampleElementKeys: ['servers.first', 'servers.second'] }
+    ] : multipleRelationClasses ? [
       { key: 'application', notes: 'Dynamic Application objects.', definition: {}, usageCount: 2, sampleElementKeys: ['application_a', 'application_b'] },
       { key: 'acl_intrasystem', notes: 'Dedicated ACL result for connections inside the target system.', definition: { style: { stroke: '#D97706' } }, usageCount: 1, sampleElementKeys: ['application_a_b_acl'] },
       { key: 'application_dependency', notes: 'Dedicated dependency result for application links.', definition: { style: { stroke: '#2563EB' } }, usageCount: 1, sampleElementKeys: ['application_a_b_dependency'] }

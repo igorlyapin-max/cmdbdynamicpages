@@ -21,6 +21,7 @@ import {
   assertDiagramImportProposal,
   buildResultCellMeta,
   buildResultDiagrams,
+  cmdbuildSessionFailureHttpStatus,
   createDiagramImportProposal,
   callLiteLLM,
   cmdbuildClassAttributesPath,
@@ -69,6 +70,14 @@ import {
   validateTemplateSpec
 } from '../../scripts/dev-proxy-server.mjs';
 import { compileObjectFlowToSpec } from '../../scripts/assistant-object-flow.mjs';
+
+test('CMDBuild session failures distinguish invalid authorization from upstream unavailability', () => {
+  assert.equal(cmdbuildSessionFailureHttpStatus(400), 401);
+  assert.equal(cmdbuildSessionFailureHttpStatus(401), 401);
+  assert.equal(cmdbuildSessionFailureHttpStatus(403), 401);
+  assert.equal(cmdbuildSessionFailureHttpStatus(0), 502);
+  assert.equal(cmdbuildSessionFailureHttpStatus(500), 502);
+});
 
 function selectionFlowSpec(selections, blocks = []) {
   return compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, {
@@ -137,10 +146,7 @@ function structureTreeWithStage(tree, roleId, stageId) {
           ...item,
           mapping: {
             ...(item.mapping || {}),
-            source: {
-              ...((item.mapping && item.mapping.source) || {}),
-              stageId
-            }
+            materialization: { kind: 'stage', stageId }
           }
         }
       : { ...item })
@@ -156,11 +162,7 @@ function structureTreeItemWithSource(tree, itemId, stageId, mapping = {}) {
           mapping: {
             ...(item.mapping || {}),
             ...mapping,
-            source: {
-              ...((item.mapping && item.mapping.source) || {}),
-              ...((mapping && mapping.source) || {}),
-              stageId
-            }
+            materialization: { kind: 'stage', stageId }
           }
         }
       : { ...item })
@@ -260,7 +262,7 @@ test('template Save migrates retired assistantDraft into canonical authoring and
 test('D2 workflow accepts only canonical authoring source and matching deterministic mapping', async () => {
   const source = 'app: "Application"';
   const sourceHash = crypto.createHash('sha256').update(source).digest('hex');
-  const semanticModelRevision = 9;
+  const semanticModelRevision = 10;
   const diagramId = 'd2_test';
   const structureHash = 'structure_test';
   const mappingContractHash = 'mapping_contract_test';
@@ -309,7 +311,7 @@ test('D2 workflow accepts only canonical authoring source and matching determini
       structureHash,
       mappingContractHash,
       roles: [{ id: 'role:application' }],
-      structureTree: { version: 4, items: [] }
+      structureTree: { version: 5, items: [] }
     }
   };
   assert.deepEqual(await d2WorkflowStatusForSpec(spec), {
@@ -703,7 +705,7 @@ test('D2 structure tree keeps placements from distinct ancestor contexts indepen
   const vlanItems = tree.items.filter((item) => item.roleId === roles.vlan.id);
   const byId = new Map(tree.items.map((item) => [item.id, item]));
 
-  assert.equal(tree.version, 4);
+  assert.equal(tree.version, 5);
   assert.equal(vlanItems.length, 2);
   assert.notEqual(vlanItems[0].id, vlanItems[1].id);
   assert.notEqual(vlanItems[0].templateContextKey, vlanItems[1].templateContextKey);
@@ -728,7 +730,7 @@ test('D2 structure tree keeps placements from distinct ancestor contexts indepen
   staged = structureTreeItemWithSource(staged, vlanItems[1].id, 'selection:systemsB');
   const normalized = diagramImportStructureTree(staged, proposal.structure, proposal.roles);
   const normalizedFirst = normalized.items.find((item) => item.id === vlanItems[0].id);
-  assert.equal(normalizedFirst.mapping.source.stageId, 'selection:systemsA');
+  assert.equal(normalizedFirst.mapping.materialization.stageId, 'selection:systemsA');
   assert.deepEqual(normalizedFirst.mapping.conditions, {
     ruleJoin: 'all',
     rules: [{
@@ -799,6 +801,11 @@ test('D2 structure tree permits an explicit duplicate only in the same template 
   });
 
   assert.deepEqual(diagramImportStructureTreeErrors(tree, proposal.roles, currentSpec, proposal.structure), []);
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
+  const systemMappings = applied.result.diagrams[0].nodeMappings.filter((mapping) => mapping.importRole.key === 'system');
+  assert.equal(systemMappings.length, 2);
+  assert.equal(new Set(systemMappings.map((mapping) => mapping.id)).size, 2);
+  assert.ok(systemMappings.every((mapping) => mapping.from === 'systems'));
 });
 
 test('D2 structure tree accepts blank static containers and rejects node parents or cycles', () => {
@@ -836,12 +843,12 @@ test('D2 structure tree is preserved only for the exact source revision and lega
   const restored = createDiagramImportProposal(saved, ir, { sourceText: source });
   const restoredVlanItems = restored.structureTree.items.filter((item) => item.roleId === roles.vlan.id);
   assert.equal(restoredVlanItems.length, 2);
-  assert.ok(restoredVlanItems.every((item) => item.mapping.source.stageId === 'selection:systemsA'));
+  assert.ok(restoredVlanItems.every((item) => item.mapping.materialization.stageId === 'selection:systemsA'));
 
   const changed = normalizeDiagramImportIr(ir, `${source}\n# revised`);
   const reanalyzed = createDiagramImportProposal(saved, changed, { sourceText: `${source}\n# revised` });
   assert.ok(reanalyzed.warnings.some((warning) => warning.includes('saved structure tree was not reused')));
-  assert.ok(reanalyzed.structureTree.items.filter((item) => item.roleId === roles.vlan.id).every((item) => !item.mapping.source.stageId));
+  assert.ok(reanalyzed.structureTree.items.filter((item) => item.roleId === roles.vlan.id).every((item) => !item.mapping.materialization.stageId));
 
   const legacy = structuredClone(saved);
   delete legacy.result.diagrams[0].authoring.d2Import.structureTree;
@@ -981,7 +988,7 @@ test('D2 mapping keeps its signed inputs on reload and requires explicit review 
   assert.equal((await d2WorkflowStatusForSpec(reviewed)).reason, 'mapping_input_review_required');
 });
 
-test('normal Save recovers only an exact signed D2 mapping version and migrates placement revision 8/3', async () => {
+test('normal Save keeps retired D2 mapping revisions pending re-analysis', async () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   const tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
   const signedVersion = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
@@ -1032,13 +1039,11 @@ test('normal Save recovers only an exact signed D2 mapping version and migrates 
     d2SourceIdentities: [identity]
   });
   const recoveredImport = recovered.result.diagrams[0].authoring.d2Import;
-  assert.equal(recoveredImport.semanticModelRevision, 9);
-  assert.equal(recoveredImport.structureTree.version, 4);
-  assert.equal(recoveredImport.mappingValidation.status, 'valid');
-  assert.equal(diagramImportMappingValidationIsCurrent(recoveredImport), true);
-  assert.equal(diagramImportMappingInputRevision(recovered, recoveredImport).sourceHash, recoveredImport.mappingInputRevision.sourceHash);
-  assert.equal((await d2WorkflowStatusForSpec(recovered)).state, 'applied');
-  assert.equal(recovered.result.diagrams[0].nodeMappings.every((mapping) => !String(mapping.importRole && mapping.importRole.structureItemId || '').startsWith('legacy_item_')), true);
+  assert.equal(recoveredImport.semanticModelRevision, 8);
+  assert.equal(recoveredImport.structureTree.version, 3);
+  assert.equal(recoveredImport.mappingValidation.status, 'needsReview');
+  assert.equal(diagramImportMappingValidationIsCurrent(recoveredImport), false);
+  assert.equal((await d2WorkflowStatusForSpec(recovered)).state, 'pending');
 
   const changedPrompt = structuredClone(lostMarker);
   changedPrompt.authoring.assistant.diagramInterpretPrompt = 'Новый prompt без повторного mapping';
@@ -1049,7 +1054,7 @@ test('normal Save recovers only an exact signed D2 mapping version and migrates 
   assert.equal(notRecovered.result.diagrams[0].authoring.d2Import.mappingValidation.status, 'needsReview');
 });
 
-test('normal Save uses an exact 8/3 historical attestation only to recompile after signing-secret rotation', () => {
+test('normal Save does not recompile a retired D2 mapping after signing-secret rotation', () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA'));
   const historicalVersion = structuredClone(applied);
@@ -1082,10 +1087,11 @@ test('normal Save uses an exact 8/3 historical attestation only to recompile aft
     recoveryVersions: [{ version: 53, spec: historicalVersion }],
     d2SourceIdentities: [identity]
   });
-  assert.equal(recovered.result.diagrams[0].authoring.d2Import.semanticModelRevision, 9);
-  assert.equal(recovered.result.diagrams[0].authoring.d2Import.structureTree.version, 4);
-  assert.equal(recovered.result.diagrams[0].authoring.d2Import.diagramId, recovered.result.diagrams[0].id);
-  assert.equal(diagramImportMappingValidationIsCurrent(recovered.result.diagrams[0].authoring.d2Import), true);
+  assert.equal(recovered.result.diagrams[0].authoring.d2Import.semanticModelRevision, 8);
+  assert.equal(recovered.result.diagrams[0].authoring.d2Import.structureTree.version, 3);
+  assert.equal(recovered.result.diagrams[0].authoring.d2Import.diagramId, '');
+  assert.equal(diagramImportMappingValidationIsCurrent(recovered.result.diagrams[0].authoring.d2Import), false);
+  assert.equal(recovered.result.diagrams[0].authoring.d2Import.mappingValidation.status, 'needsReview');
 
   const unsupportedVersion = structuredClone(historicalVersion);
   unsupportedVersion.result.diagrams[0].authoring.d2Import.semanticModelRevision = 7;
@@ -1097,7 +1103,7 @@ test('normal Save uses an exact 8/3 historical attestation only to recompile aft
   assert.equal(currentImport.mappingValidation.status, 'needsReview');
 });
 
-test('normal Save merges only identical legacy placements when the current tree collapses sibling exemplars', () => {
+test('normal Save does not collapse retired placements into a current structure tree', () => {
   const currentSpec = selectionFlowSpec([{ alias: 'systems', className: 'IS', columns: ['Code', 'Description'] }]);
   const source = 'target: { left: Left; right: Right }';
   const ir = normalizeDiagramImportIr({
@@ -1161,9 +1167,9 @@ test('normal Save merges only identical legacy placements when the current tree 
     }]
   });
   const recoveredImport = recovered.result.diagrams[0].authoring.d2Import;
-  assert.equal(recoveredImport.structureTree.items.filter((item) => item.roleId === systemRole.id).length, 1);
-  assert.deepEqual(recoveredImport.structureTree.items.find((item) => item.roleId === systemRole.id).templateElementKeys, ['target.left', 'target.right']);
-  assert.equal(diagramImportMappingValidationIsCurrent(recoveredImport), true);
+  assert.equal(recoveredImport.structureTree.items.filter((item) => item.roleId === systemRole.id).length, 2);
+  assert.equal(recoveredImport.mappingValidation.status, 'needsReview');
+  assert.equal(diagramImportMappingValidationIsCurrent(recoveredImport), false);
 });
 
 test('D2 container labels use exactly one direct child value and materialize related child fields', () => {
@@ -1284,7 +1290,7 @@ test('D2 import reports every unresolved node placement independently', () => {
 
   assert.equal(unresolved.length, 2);
   assert.ok(unresolved.every((item) => item.fields[0].includes('requires a materialized Object Flow result')));
-  assert.ok(unresolved.every((item) => item.id.includes('mapping.source.stageId')));
+  assert.ok(unresolved.every((item) => item.id.includes('mapping.materialization.stageId')));
 
   const staged = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
   assert.deepEqual(diagramImportStructureTreeErrors(staged, proposal.roles, currentSpec, proposal.structure), []);
@@ -1333,6 +1339,9 @@ test('D2 structure tree keeps blank containers static and allows a dynamic conta
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   let tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
   tree = structureTreeWithStage(tree, roles['scope-vlan'].id, 'selection:systemsB');
+  tree.items = tree.items.map((item) => String(item.roleId) === String(roles.vlan.id)
+    ? { ...item, mapping: { ...(item.mapping || {}), materialization: { kind: 'parentCard', stageId: '' } } }
+    : item);
   const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
   const mappings = applied.result.diagrams[0].groupMappings;
 
@@ -1340,6 +1349,116 @@ test('D2 structure tree keeps blank containers static and allows a dynamic conta
   assert.equal(mappings.filter((mapping) => mapping.importRole.key === 'scope-vlan').length, 2);
   assert.ok(mappings.filter((mapping) => mapping.importRole.key === 'scope-vlan').every((mapping) => mapping.from === 'systemsB'));
   assert.equal(new Set(mappings.map((mapping) => mapping.id)).size, mappings.length);
+});
+
+test('D2 parentCard materialization reuses its dynamic container card without a second source', () => {
+  const { currentSpec, proposal, roles } = d2StructureTreeFixture();
+  let tree = structureTreeWithStage(proposal.structureTree, roles['scope-vlan'].id, 'selection:systemsA');
+  tree.items = tree.items.map((item) => String(item.roleId) === String(roles.vlan.id)
+    ? { ...item, mapping: { ...(item.mapping || {}), materialization: { kind: 'parentCard', stageId: '' } } }
+    : item);
+
+  assert.deepEqual(diagramImportStructureTreeErrors(tree, proposal.roles, currentSpec, proposal.structure), []);
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
+  const groupMappings = applied.result.diagrams[0].groupMappings.filter((mapping) => mapping.importRole.key === 'scope-vlan');
+  const nodeMappings = applied.result.diagrams[0].nodeMappings.filter((mapping) => mapping.importRole.key === 'vlan');
+
+  assert.equal(groupMappings.length, 2);
+  assert.equal(nodeMappings.length, 2);
+  assert.ok(groupMappings.every((mapping) => mapping.from === 'systemsA'));
+  assert.ok(nodeMappings.every((mapping) => mapping.from === 'systemsA'));
+  assert.equal(applied.steps.filter((step) => step.managedBy === 'd2ImportV3' && step.type === 'selectCards').length, 0);
+});
+
+test('D2 nested independent stage requires an explicit comparison to the materialized parent', () => {
+  const { currentSpec, proposal, roles } = d2StructureTreeFixture();
+  let tree = structureTreeWithStage(proposal.structureTree, roles['scope-vlan'].id, 'selection:systemsA');
+  tree = structureTreeWithStage(tree, roles.vlan.id, 'selection:systemsB');
+
+  const missingCondition = diagramImportStructureTreeErrors(tree, proposal.roles, currentSpec, proposal.structure);
+  assert.ok(missingCondition.some((error) => error.message.includes('explicitly match the parent result')));
+
+  tree.items = tree.items.map((item) => String(item.roleId) === String(roles.vlan.id)
+    ? {
+        ...item,
+        mapping: {
+          ...(item.mapping || {}),
+          conditions: {
+            ruleJoin: 'all',
+            rules: [{
+              action: 'include',
+              negate: false,
+              operator: 'equals',
+              left: { column: 'Code', regex: '' },
+              right: { kind: 'stage', stageId: 'selection:systemsA', column: 'Code', value: '', name: '', regex: '' }
+            }]
+          }
+        }
+      }
+    : item);
+
+  assert.deepEqual(diagramImportStructureTreeErrors(tree, proposal.roles, currentSpec, proposal.structure), []);
+});
+
+test('D2 nested independent stages place each child under its matched parent card', () => {
+  const spec = {
+    version: 1,
+    steps: [],
+    result: {
+      diagrams: [{
+        name: 'nested-stage-correlation',
+        groupMappings: [{
+          id: 'parents-mapping',
+          from: 'parents',
+          fields: { id: '_id', label: 'Description' },
+          importRole: { key: 'parent', structureItemId: 'parent' }
+        }],
+        nodeMappings: [{
+          id: 'children-mapping',
+          from: 'children',
+          fields: { id: '_id', label: 'Description' },
+          importRole: {
+            key: 'child',
+            structureItemId: 'child',
+            parentStructureItemId: 'parent',
+            parentCorrelations: [{
+              parentStructureItemId: 'parent',
+              childColumn: 'ParentCode',
+              childRegex: '',
+              parentColumn: 'Code',
+              parentRegex: '',
+              operator: 'equals',
+              caseSensitive: false
+            }]
+          }
+        }],
+        structureTree: {
+          version: 5,
+          items: [
+            { id: 'parent', roleId: 'parent', parentId: '', mapping: {} },
+            { id: 'child', roleId: 'child', parentId: 'parent', mapping: {} }
+          ]
+        }
+      }]
+    }
+  };
+  const diagrams = buildResultDiagrams(spec, {
+    parents: { rows: [
+      { _id: 'parent-a', Code: 'A', Description: 'Parent A' },
+      { _id: 'parent-b', Code: 'B', Description: 'Parent B' }
+    ] },
+    children: { rows: [
+      { _id: 'child-a', ParentCode: 'A', Description: 'Child A' },
+      { _id: 'child-b', ParentCode: 'B', Description: 'Child B' }
+    ] }
+  }, {}, { maxRows: 100 });
+  const diagram = diagrams[0];
+  const groupByBusinessId = new Map(diagram.groups.map((group) => [group.businessId, group]));
+  const nodeByBusinessId = new Map(diagram.nodes.map((node) => [node.businessId, node]));
+
+  assert.equal(nodeByBusinessId.get('child-a').group, groupByBusinessId.get('parent-a').id);
+  assert.equal(nodeByBusinessId.get('child-b').group, groupByBusinessId.get('parent-b').id);
+  assert.deepEqual(diagram.unplaced, []);
 });
 
 test('composite runtime scopes duplicate business ids by mapping and enforces expanded shape limits', () => {
@@ -1609,7 +1728,7 @@ test('D2 assistant interpretation changes role semantics but not the persisted s
   const role = { id: 'role-workstation', visualKind: 'node', visualKindOptions: ['node', 'container'] };
   const roleModel = assistantDiagramStageDraftFromResponse({
     kind: 'interpretation',
-    roleModelRevision: 9,
+    roleModelRevision: 10,
     roles: [role]
   }, {
     decisions: [{ roleId: role.id, visualKind: 'node', confidence: 'high', reason: 'Leaf card.' }]
@@ -1849,7 +1968,7 @@ test('D2 mapping persists a source only on its owning structure item', () => {
   assert.equal(mapping.from, 'physicalServers');
   assert.equal(mapping.importRole.structureItemId, tree.items[0].id);
   assert.equal(Object.hasOwn(applied.result.diagrams[0].authoring.d2Import, 'roleMappings'), false);
-  assert.equal(applied.result.diagrams[0].structureTree.items[0].mapping.source.stageId, 'selection:physicalServers');
+  assert.equal(applied.result.diagrams[0].structureTree.items[0].mapping.materialization.stageId, 'selection:physicalServers');
   assert.equal(role.id, applied.result.diagrams[0].structureTree.items[0].mapping.roleId);
 });
 
@@ -2196,7 +2315,7 @@ test('strict D2 grammar renders only declared roles and keeps fake endpoints ins
       name: 'strict-template',
       templateGrammar: grammar,
       structureTree: {
-        version: 4,
+        version: 5,
         items: [
           { id: 'root-tree-item', roleId: 'root', templateContextKey: 'context:root', templateElementKey: 'root-template', templateElementKeys: ['root-template'], parentId: '', mapping: {} },
           { id: 'child-tree-item', roleId: 'child', templateContextKey: 'context:child', templateElementKey: 'root-template.child-template', templateElementKeys: ['root-template.child-template'], parentId: 'root-tree-item', mapping: {} }
@@ -2215,12 +2334,54 @@ test('strict D2 grammar renders only declared roles and keeps fake endpoints ins
   assert.equal(fake.importRole.key, 'child-role');
   assert.equal(fake.group, root.id);
   assert.equal(diagram.nodes.every((node) => node.importRole.key === 'child-role'), true);
-  const invalid = spec('');
-  invalid.result.diagrams[0].nodeMappings[0].importRole.key = 'role-not-declared-by-template';
-  assert.throws(
-    () => buildResultDiagrams(invalid, {}, {}, { maxRows: 20 }),
-    (error) => error.code === 'diagram_template_contract_violation' && error.details.some((item) => item.code === 'undeclaredRole')
-  );
+});
+
+test('strict D2 grammar ignores stale generic mappings instead of emitting undeclared runtime elements', () => {
+  const grammar = {
+    version: 3,
+    fingerprint: 'strict-stale-mapping-grammar',
+    elements: [
+      { key: 'root-template', kind: 'group', roleKey: 'root-role', parentKey: '', parentRoleKey: '' },
+      { key: 'root-template.child-template', kind: 'node', roleKey: 'child-role', parentKey: 'root-template', parentRoleKey: 'root-role' }
+    ],
+    roles: [
+      { roleId: 'root', roleKey: 'root-role', label: 'Root', visualKind: 'container', rootAllowed: true, parentRoleKeys: [], childRoleKeys: ['child-role'], elementKeys: ['root-template'], nodeElementKeys: [], groupElementKeys: ['root-template'] },
+      { roleId: 'child', roleKey: 'child-role', label: 'Child', visualKind: 'node', rootAllowed: false, parentRoleKeys: ['root-role'], childRoleKeys: [], elementKeys: ['root-template.child-template'], nodeElementKeys: ['root-template.child-template'], groupElementKeys: [] }
+    ],
+    contexts: [
+      { key: 'context:root', roleId: 'root', parentContextKey: '', elementKeys: ['root-template'] },
+      { key: 'context:child', roleId: 'child', parentContextKey: 'context:root', elementKeys: ['root-template.child-template'] }
+    ],
+    edges: [{ key: '(root-template.child-template -> root-template.child-template)[0]', sourceKey: 'root-template.child-template', targetKey: 'root-template.child-template', sourceRoleKey: 'child-role', targetRoleKey: 'child-role', direction: '->' }]
+  };
+  const diagram = buildResultDiagrams({
+    result: { diagrams: [{
+      name: 'strict-stale-mappings',
+      templateGrammar: grammar,
+      structureTree: {
+        version: 5,
+        items: [
+          { id: 'root-tree-item', roleId: 'root', templateContextKey: 'context:root', templateElementKey: 'root-template', templateElementKeys: ['root-template'], parentId: '', mapping: {} },
+          { id: 'child-tree-item', roleId: 'child', templateContextKey: 'context:child', templateElementKey: 'root-template.child-template', templateElementKeys: ['root-template.child-template'], parentId: 'root-tree-item', mapping: {} }
+        ]
+      },
+      groupMappings: [{ id: 'root', staticRows: [{ _id: 'root', Description: 'Root' }], fields: { id: '_id', label: 'Description' }, importRole: { roleId: 'root', key: 'root-role', elementKey: 'root-template', structureItemId: 'root-tree-item' } }],
+      nodeMappings: [
+        { id: 'child', staticRows: [{ _id: 'known', Description: 'Known' }], fields: { id: '_id', label: 'Description' }, importRole: { roleId: 'child', key: 'child-role', elementKey: 'root-template.child-template', structureItemId: 'child-tree-item' } },
+        { id: 'legacy-node', staticRows: [{ _id: 'legacy', Description: 'Legacy' }], fields: { id: '_id', label: 'Description' } }
+      ],
+      edgeMappings: [
+        { id: 'declared-edge', staticRows: [{ Source: 'known', Target: 'missing', Label: 'uses' }], fields: { source: 'Source', target: 'Target', label: 'Label' }, importRole: { key: 'edge-role', elementKey: '(root-template.child-template -> root-template.child-template)[0]', sourceKey: 'child-role', targetKey: 'child-role' } },
+        { id: 'legacy-edge', staticRows: [{ Source: 'legacy', Target: 'missing', Label: 'legacy' }], fields: { source: 'Source', target: 'Target', label: 'Label' } }
+      ]
+    }] }
+  }, {}, {}, { maxRows: 20 })[0];
+
+  assert.equal(diagram.nodes.some((node) => node.businessId === 'legacy'), false);
+  assert.equal(diagram.edges.some((edge) => edge.label === 'legacy'), false);
+  assert.equal(diagram.nodes.filter((node) => node.fakeEndpoint).length, 1);
+  assert.match(diagram.warnings.join('\n'), /Ignored D2 runtime mapping outside the current template contract: legacy-node: missing declared D2 role/);
+  assert.match(diagram.warnings.join('\n'), /Ignored D2 runtime mapping outside the current template contract: legacy-edge: missing declared D2 edge blueprint/);
 });
 
 test('result diagrams build graph mappings for groups hierarchy and object relation edges', () => {

@@ -120,6 +120,25 @@ Bootstrap creates only missing classes and attributes. It does not delete, move,
 
 The bootstrap administrator must be allowed to modify the CMDBuild class model: create classes under the selected parent superclass, create attributes, read metadata classes/attributes, and inspect the existing schema. After bootstrap, normal template editors do not need this administrative role.
 
+## 5.1 Verify schema deployment
+
+`npm run e2e` is a state-changing deployment gate for the configured technical schema. With an administrative CMDBuild session it calls `POST /cmdbuild/custom-api/schema/bootstrap`, then verifies the same schema with `GET /cmdbuild/custom-api/schema`.
+
+Set the deployment schema explicitly when it does not use the default root and parent:
+
+```bash
+CMDBDYNAMIC_ROOT=Acme_QueryTool \
+CMDBDYNAMIC_SCHEMA_PARENT=Acme_TechnicalRoot \
+CMDBDYNAMIC_SCHEMA_DESCRIPTION='ACME dynamic pages' \
+CMDBUILD_USERNAME='<admin-user>' \
+CMDBUILD_PASSWORD='<admin-password>' \
+npm run e2e
+```
+
+The check is non-destructive: it creates only missing classes and attributes. A failed bootstrap reports the first failed CMDBuild operation in the API response and structured backend log `schema.bootstrap_failed`.
+
+For a deliberately read-only role use `CMDBDYNAMIC_EXPECT_READONLY=1`; this mode does not call bootstrap and checks the schema without modifying it.
+
 ## 6. CMDBuild permissions
 
 Template editors need read/create/update on the technical classes:
