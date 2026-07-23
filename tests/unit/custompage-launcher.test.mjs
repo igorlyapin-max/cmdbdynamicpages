@@ -325,70 +325,58 @@ test('assistant draft generation auto-applies only successful drafts to editor s
   assert.doesNotMatch(generateSource, /runtimeRunPath/);
 });
 
-test('assistant prompt and task mode persist in template spec metadata', () => {
+test('Assistant authoring is persisted only through canonical authoring on normal Save', () => {
   const hydrateStart = proxySource.indexOf('function hydrateDesignerStateFromTemplate(options)');
   const noticeStart = proxySource.indexOf('function renderNotice(message)');
-  const applyDraftStart = proxySource.indexOf('function applyAssistantDraftToSpec(spec, intent, taskMode)');
-  const readBlocksStart = proxySource.indexOf('function readSpecWithEditorBlocks()');
-  const captureStart = proxySource.indexOf('function captureVisibleDesignerState()');
+  const authoringStart = proxySource.indexOf('function templateAuthoringClient(spec)');
+  const authoringEnd = proxySource.indexOf('function assistantAuthoringFromState(spec)', authoringStart);
+  const specWithPromptsStart = proxySource.indexOf('function assistantSpecWithPrompts(spec)');
+  const specWithPromptsEnd = proxySource.indexOf('function markAssistantAuthoringChanged()', specWithPromptsStart);
+  const saveStart = proxySource.indexOf('function saveTemplate()');
+  const saveEnd = proxySource.indexOf('function openAssistantSection()', saveStart);
   const defaultSpecStart = proxySource.indexOf('function defaultSpec()');
-  const generateStart = proxySource.indexOf('function generateAssistantDraft()');
-  const applyStart = proxySource.indexOf('function applyAssistantDraft()');
-  const runDraftStart = proxySource.indexOf('function runDraftAction(action)');
   assert.ok(hydrateStart > -1);
   assert.ok(noticeStart > hydrateStart);
-  assert.ok(applyDraftStart > noticeStart);
-  assert.ok(readBlocksStart > applyDraftStart);
-  assert.ok(captureStart > -1);
-  assert.ok(defaultSpecStart > captureStart);
-  assert.ok(generateStart > readBlocksStart);
-  assert.ok(applyStart > generateStart);
-  assert.ok(runDraftStart > applyStart);
+  assert.ok(authoringStart > -1);
+  assert.ok(authoringEnd > authoringStart);
+  assert.ok(specWithPromptsStart > authoringEnd);
+  assert.ok(specWithPromptsEnd > specWithPromptsStart);
+  assert.ok(defaultSpecStart > specWithPromptsEnd);
+  assert.ok(saveStart > -1);
+  assert.ok(saveEnd > saveStart);
 
   const hydrateSource = proxySource.slice(hydrateStart, noticeStart);
-  const applyDraftSource = proxySource.slice(applyDraftStart, readBlocksStart);
-  const readBlocksSource = proxySource.slice(readBlocksStart, proxySource.indexOf('function clearDraftExecutionState'));
-  const captureSource = proxySource.slice(captureStart, defaultSpecStart);
-  const generateSource = proxySource.slice(generateStart, applyStart);
-  const applySource = proxySource.slice(applyStart, runDraftStart);
+  const authoringSource = proxySource.slice(authoringStart, authoringEnd);
+  const specWithPromptsSource = proxySource.slice(specWithPromptsStart, specWithPromptsEnd);
+  const saveSource = proxySource.slice(saveStart, saveEnd);
 
-  assert.match(hydrateSource, /spec\.assistantDraft/);
-  assert.match(hydrateSource, /state\.assistantDraftIntent = String\(assistantDraft\.intent/);
-  assert.match(hydrateSource, /state\.assistantTaskMode = normalizeOutputMode\(assistantDraft\.taskMode/);
-  assert.match(applyDraftSource, /next\.assistantDraft = \{/);
-  assert.match(applyDraftSource, /intent: prompt/);
-  assert.match(applyDraftSource, /taskMode: mode/);
-  assert.match(applyDraftSource, /delete next\.assistantDraft/);
-  assert.match(readBlocksSource, /specData\.spec = applyAssistantDraftFromDomToSpec\(specData\.spec\)/);
-  assert.match(captureSource, /updateSelectedFromEditor\(applyAssistantDraftFromDomToSpec\(state\.selectedTemplate\.spec \|\| defaultSpec\(\)\)\)/);
-  assert.match(generateSource, /applyAssistantDraftToSpec\(result\.json\.spec, state\.assistantDraftIntent, state\.assistantTaskMode\)/);
-  assert.match(applySource, /applyAssistantDraftToSpec\(result\.json\.spec, state\.assistantDraftIntent, state\.assistantTaskMode\)/);
+  assert.match(hydrateSource, /var authoring = templateAuthoringClient\(spec\)/);
+  assert.match(authoringSource, /source\.authoring/);
+  assert.doesNotMatch(authoringSource, /legacyAssistantAuthoringClient/);
+  assert.match(specWithPromptsSource, /next\.authoring = assistantAuthoringFromState\(next\)/);
+  assert.match(specWithPromptsSource, /delete next\.assistantDraft/);
+  assert.match(specWithPromptsSource, /state\.assistantAuthoringDirty/);
+  assert.match(saveSource, /assistantSpecWithPrompts\(state\.selectedTemplate && state\.selectedTemplate\.spec \|\| defaultSpec\(\)\)/);
+  assert.match(saveSource, /request\(path, \{ method: exists \? 'PUT' : 'POST'/);
 });
 
-test('Assistant prompt-only autosave uses an isolated template endpoint and ignores prompt metadata in flow staleness checks', () => {
-  const autosaveStart = proxySource.indexOf('function autosaveAssistantPrompts()');
-  const scheduleStart = proxySource.indexOf('function scheduleAssistantPromptAutosave()');
+test('Assistant authoring has no autosave write endpoint and is excluded from flow staleness checks', () => {
   const flowSnapshotStart = proxySource.indexOf('function assistantTemplateRevisionSnapshot(template, spec, requestGeneration)');
   const applyDraftStart = proxySource.indexOf('function applyAssistantDraftToSpec(spec, intent, taskMode)');
   const serverDraftStart = proxySource.indexOf("if (templateAction === 'assistant-draft')");
   const serverVersionsStart = proxySource.indexOf("if (templateAction === 'versions')");
-  assert.ok(autosaveStart > -1);
-  assert.ok(scheduleStart > autosaveStart);
   assert.ok(flowSnapshotStart > -1);
   assert.ok(applyDraftStart > flowSnapshotStart);
   assert.ok(serverDraftStart > -1);
   assert.ok(serverVersionsStart > serverDraftStart);
 
-  const autosaveSource = proxySource.slice(autosaveStart, scheduleStart);
   const flowSnapshotSource = proxySource.slice(flowSnapshotStart, applyDraftStart);
   const serverDraftSource = proxySource.slice(serverDraftStart, serverVersionsStart);
-  assert.match(autosaveSource, /\/templates\/.*\/assistant-draft/);
-  assert.match(autosaveSource, /baseSpecHash/);
-  assert.match(autosaveSource, /assistantDraft: draft/);
   assert.match(flowSnapshotSource, /assistantSpecWithoutPromptDraft/);
-  assert.match(serverDraftSource, /methodAllowed\(req, res, 'PUT'\)/);
-  assert.match(serverDraftSource, /normalizeAssistantPromptDraft/);
-  assert.match(serverDraftSource, /templatePayloadWithAssistantPromptDraft/);
+  assert.match(serverDraftSource, /assistant_authoring_route_removed/);
+  assert.match(serverDraftSource, /statusCode: 410|sendJson\(res, 410/);
+  assert.doesNotMatch(proxySource, /function autosaveAssistantPrompts\(/);
+  assert.doesNotMatch(proxySource, /function scheduleAssistantPromptAutosave\(/);
   assert.doesNotMatch(serverDraftSource, /writeTemplateVersion/);
   assert.doesNotMatch(serverDraftSource, /invalidateTemplateRuntimeCache/);
   assert.doesNotMatch(serverDraftSource, /invalidateTemplateStaticSnapshots/);
@@ -454,7 +442,7 @@ test('typed assistant flow renders one in-progress proposal before deterministic
   assert.match(generateSource, /state\.assistantFlowBusy = false/);
 });
 
-test('same-revision Designer reload preserves transient Assistant state', () => {
+test('normal Save reloads canonical authoring without automatic D2 analysis', () => {
   const hydrateStart = proxySource.indexOf('function hydrateDesignerStateFromTemplate(options)');
   const noticeStart = proxySource.indexOf('function renderNotice(message)', hydrateStart);
   const loadStart = proxySource.indexOf('function loadDesigner(options)');
@@ -476,22 +464,24 @@ test('same-revision Designer reload preserves transient Assistant state', () => 
   assert.match(loadSource, /var selectedBeforeReload = state\.selectedTemplate/);
   assert.match(loadSource, /selectedBeforeReload\.specHash/);
   assert.match(loadSource, /preserveAssistantState: preserveAssistantState/);
-  assert.match(saveSource, /loadDesigner\(\{ preserveAssistantState: true \}\)/);
+  assert.match(saveSource, /loadDesigner\(\{ preserveAssistantState: false \}\)/);
+  assert.doesNotMatch(hydrateSource, /analyzeDiagramImport\(/);
 });
 
 test('assistant status is compact and flow capture uses proposal state without deterministic DOM fields', () => {
   const statusStart = proxySource.indexOf('function renderAssistantStatus(config)');
   const taskModeStart = proxySource.indexOf('function renderAssistantTaskMode(value)', statusStart);
   const captureStart = proxySource.indexOf('function captureAssistantObjectFlow()');
-  const specWithPromptsStart = proxySource.indexOf('function assistantSpecWithPrompts(spec)', captureStart);
-  const generateStart = proxySource.indexOf('function generateAssistantObjectFlow()', specWithPromptsStart);
+  const specWithPromptsStart = proxySource.indexOf('function assistantSpecWithPrompts(spec)');
+  const specWithPromptsEnd = proxySource.indexOf('function markAssistantAuthoringChanged()', specWithPromptsStart);
   assert.ok(statusStart > -1);
   assert.ok(taskModeStart > statusStart);
   assert.ok(captureStart > -1);
-  assert.ok(specWithPromptsStart > captureStart);
+  assert.ok(specWithPromptsStart > -1);
+  assert.ok(specWithPromptsEnd > specWithPromptsStart);
   const statusSource = proxySource.slice(statusStart, taskModeStart);
-  const captureSource = proxySource.slice(captureStart, specWithPromptsStart);
-  const specWithPromptsSource = proxySource.slice(specWithPromptsStart, generateStart);
+  const captureSource = proxySource.slice(captureStart, proxySource.indexOf('function updateAssistantObjectFlowIntent', captureStart));
+  const specWithPromptsSource = proxySource.slice(specWithPromptsStart, specWithPromptsEnd);
 
   assert.match(proxySource, /menuAssistantGroups: 'Ассистент групп и сопоставлений'/);
   assert.match(proxySource, /menuDiagramAssistant: 'Ассистент диаграмм'/);
@@ -510,23 +500,24 @@ test('assistant status is compact and flow capture uses proposal state without d
   assert.match(captureSource, /state\.assistantFlowProposal/);
   assert.doesNotMatch(captureSource, /captureObjectGroupDraftFromDom/);
   assert.doesNotMatch(captureSource, /readRelationExpansionFields/);
-  assert.match(specWithPromptsSource, /assistantPromptDraft\(\)/);
-  assert.match(specWithPromptsSource, /delete next\.assistantDraft\.flowPrompts/);
+  assert.match(specWithPromptsSource, /next\.authoring = assistantAuthoringFromState\(next\)/);
+  assert.match(specWithPromptsSource, /delete next\.assistantDraft/);
 });
 
-test('assistant D2 authoring state is safe to restore while preserving flow state', () => {
+test('Assistant D2 authoring restores only canonical authoring and does not analyze on reload', () => {
   const hydrateStart = proxySource.indexOf('function hydrateDesignerStateFromTemplate(options)');
   const loadDesignerStart = proxySource.indexOf('function loadDesigner(options)', hydrateStart);
   assert.ok(hydrateStart > -1);
   assert.ok(loadDesignerStart > hydrateStart);
 
   const hydrateSource = proxySource.slice(hydrateStart, loadDesignerStart);
-  const draftStart = hydrateSource.indexOf("var assistantDraft = spec.assistantDraft");
+  const authoringStart = hydrateSource.indexOf('var authoring = templateAuthoringClient(spec)');
   const preserveStart = hydrateSource.indexOf('if (!options.preserveAssistantState)');
-  const d2AuthoringStart = hydrateSource.indexOf('var d2Authoring = assistantDraft.d2Authoring');
-  assert.ok(draftStart > -1);
-  assert.ok(preserveStart > draftStart);
-  assert.ok(d2AuthoringStart > preserveStart);
+  assert.ok(authoringStart > -1);
+  assert.ok(preserveStart > authoringStart);
+  assert.match(hydrateSource, /state\.diagramImportSource = String\(authoring\.d2\.source/);
+  assert.doesNotMatch(hydrateSource, /spec\.assistantDraft/);
+  assert.doesNotMatch(hydrateSource, /analyzeDiagramImport\(/);
 });
 
 test('designer blocks template-bound menu sections until a template is selected', () => {
@@ -563,8 +554,10 @@ test('designer blocks template-bound menu sections until a template is selected'
   const runSource = menuSource.slice(runStart);
   assert.ok(constructorStart > -1);
   assert.ok(runStart > constructorStart);
-  assert.ok(constructorSource.indexOf("{ section: 'extraction'") < constructorSource.indexOf("{ section: 'final-view'"));
-  assert.doesNotMatch(runSource, /section: 'extraction'/);
+  assert.doesNotMatch(constructorSource, /section: 'extraction'/);
+  assert.doesNotMatch(constructorSource, /section: 'final-view'/);
+  assert.ok(runSource.indexOf("{ section: 'extraction'") < runSource.indexOf("{ section: 'final-view'"));
+  assert.ok(runSource.indexOf("{ section: 'final-view'") < runSource.indexOf("{ section: 'visualization'"));
 
   assert.match(sectionNeedsSource, /'template'/);
   assert.match(sectionNeedsSource, /'assistant'/);
@@ -583,26 +576,30 @@ test('designer blocks template-bound menu sections until a template is selected'
   assert.match(loadDesignerSource, /else if \(!redirectedToTemplates \|\| !state\.message\) state\.message = null/);
 });
 
-test('designer action bar exposes template save in both assistants and Templates', () => {
+test('designer action bar exposes the global template Save in every selected-template section', () => {
   const actionBarStart = proxySource.indexOf('function renderDesignerActionBar(selected)');
   const actionBarEnd = proxySource.indexOf('function renderDesigner()', actionBarStart);
   assert.ok(actionBarStart > -1);
   assert.ok(actionBarEnd > actionBarStart);
 
   const actionBarSource = proxySource.slice(actionBarStart, actionBarEnd);
+  const globalSaveStart = actionBarSource.indexOf("if (section !== 'templates')");
   const templatesStart = actionBarSource.indexOf("if (section === 'templates')");
   const assistantStart = actionBarSource.indexOf("else if (section === 'assistant' || section === 'diagram-assistant')");
-  const templateEditorStart = actionBarSource.indexOf("else if (section === 'template')");
+  const diagramStart = actionBarSource.indexOf("else if (section === 'diagram')");
+  assert.ok(globalSaveStart > -1);
   assert.ok(templatesStart > -1);
+  assert.ok(templatesStart > globalSaveStart);
   assert.ok(assistantStart > templatesStart);
-  assert.ok(templateEditorStart > assistantStart);
+  assert.ok(diagramStart > assistantStart);
 
   const templatesSource = actionBarSource.slice(templatesStart, assistantStart);
-  const assistantSource = actionBarSource.slice(assistantStart, templateEditorStart);
+  const globalSaveSource = actionBarSource.slice(globalSaveStart, templatesStart);
   assert.match(actionBarSource, /var templateSelected = Boolean\(state\.selectedTemplate\)/);
   assert.match(actionBarSource, /templateSelectionRequired/);
   assert.match(templatesSource, /renderActionButton\('save-template', t\('save'\)/);
-  assert.match(assistantSource, /renderActionButton\('save-template', t\('save'\), \{ primary: true/);
+  assert.match(globalSaveSource, /renderActionButton\('save-template', t\('save'\), \{/);
+  assert.match(globalSaveSource, /disabled: saveDisabled/);
 });
 
 test('diagram editor renders repeatable mapping tables with source-dependent field selects', () => {
@@ -823,22 +820,22 @@ test('Assistant owns D2 import while Diagram persists structureTree and direct r
   assert.match(proxySource, /function diagramImportProposalMatchesCurrentRevision\(\)/);
   assert.match(assistantSource, /\/assistant\/diagram-import\//);
   assert.match(assistantSource, /map-selections/);
-  assert.match(assistantSource, /flushAssistantPromptAutosave/);
+  assert.match(assistantSource, /captureAssistantPromptsFromDom\(\)/);
+  assert.match(assistantSource, /assistantSpecWithPrompts\(/);
   assert.match(assistantSource, /ensureDiagramImportProposalForCurrentRevision/);
   assert.match(applySource, /\/draft\/diagram-import\/apply/);
   assert.match(applySource, /state\.lastDraftPreviewOk = false/);
-  assert.match(applySource, /diagramImportPreviewBackground/);
-  assert.match(applySource, /previewAppliedDiagramImport\(\)/);
   assert.match(applySource, /updateSelectedFromEditor\(result\.json\.spec\)/);
   assert.doesNotMatch(proxySource, /assistantSpecWithPrompts\(result\.json\.spec\)/);
-  assert.doesNotMatch(applySource, /state\.diagramImportAppliedPendingPreview = true/);
+  assert.match(applySource, /state\.diagramImportAppliedPendingPreview = true/);
+  assert.match(applySource, /changesReadyToSave/);
   assert.match(applySource, /state\.diagramImportRuntimePreview = null/);
   assert.doesNotMatch(applySource, /state\.diagramImportPreview = null/);
   assert.match(appliedEditorSource, /authoring\.d2Import/);
   assert.match(appliedEditorSource, /editorMode: 'applied'/);
   assert.match(updateAppliedSource, /\/draft\/diagram-import\/update-applied/);
   assert.match(updateAppliedSource, /templateCode: String\(selected\.code \|\| ''\)/);
-  assert.match(updateAppliedSource, /currentSpec: cloneSpecForEdit\(selected\.spec \|\| defaultSpec\(\)\)/);
+  assert.match(updateAppliedSource, /currentSpec: assistantSpecWithPrompts\(selected\.spec \|\| defaultSpec\(\)\)/);
   assert.doesNotMatch(updateAppliedSource, /d2Source:/);
   assert.doesNotMatch(updateAppliedSource, /proposal:/);
   assert.doesNotMatch(updateAppliedSource, /\/draft\/diagram-import\/analyze/);
@@ -860,8 +857,12 @@ test('Assistant owns D2 import while Diagram persists structureTree and direct r
   assert.match(proxySource, /function draftPreviewRequestTimeoutMs\(\)/);
   assert.match(proxySource, /function renderDiagramImportRuntimeSourceFallback\(\)/);
   assert.match(proxySource, /diagramImportRuntimePreviewPartial/);
+  assert.match(proxySource, /diagramImportRuntimePreviewMappingPartial/);
+  assert.match(proxySource, /diagramImportRuntimePreviewOmitted/);
+  assert.match(proxySource, /resultBody\.diagramPreview/);
+  assert.match(proxySource, /mappingOmissions/);
   assert.match(proxySource, /diagnosticPreview/);
-  assert.match(proxySource, /function diagramImportRuntimePreviewTiming\(preview\)/);
+  assert.match(proxySource, /function diagramImportRuntimePreviewTiming\(preview, spec\)/);
   assert.doesNotMatch(appliedPreviewSource, /state\.result = result/);
   assert.doesNotMatch(analyzeSource, /saveTemplate\(/);
   assert.doesNotMatch(assistantSource, /saveTemplate\(/);
@@ -893,9 +894,11 @@ test('Assistant owns D2 import while Diagram persists structureTree and direct r
   assert.match(captureImportSource, /activeDiagramImportEditorModel\(spec\)/);
   assert.match(captureImportSource, /proposal\.structureTree = structureTree/);
   assert.match(captureImportSource, /proposal\.relationRules/);
-  assert.match(proxySource, /function assistantD2AuthoringDraft\(\)/);
-  assert.match(proxySource, /function assistantDraftWithAppliedD2Identity\(spec, draft\)/);
-  assert.match(proxySource, /function resetAssistantD2AuthoringIdentity\(authoring\)/);
+  assert.match(proxySource, /function templateAuthoringClient\(spec\)/);
+  assert.match(proxySource, /function assistantSpecWithPrompts\(spec\)/);
+  assert.doesNotMatch(proxySource, /function assistantD2AuthoringDraft\(\)/);
+  assert.doesNotMatch(proxySource, /function assistantDraftWithAppliedD2Identity\(spec, draft\)/);
+  assert.doesNotMatch(proxySource, /function resetAssistantD2AuthoringIdentity\(authoring\)/);
   assert.match(proxySource, /Дерево определяет фактическую вложенность, а каждый элемент дерева хранит собственный источник/);
   assert.match(proxySource, /data-diagram-structure-tree/);
   assert.match(proxySource, /data-diagram-import-rule-row/);
@@ -906,8 +909,12 @@ test('Assistant owns D2 import while Diagram persists structureTree and direct r
   assert.match(proxySource, /diagramImportProposalHasReviewBlocker/);
   assert.match(proxySource, /'diagram',[\s\S]*?'visualization'/);
   assert.match(proxySource, /diagramImportAppliedPendingPreview && !state\.lastDraftPreviewOk/);
-  assert.match(proxySource, /var pendingDiagramImport = Boolean\(state\.diagramImportProposal && !canSaveAppliedDiagramImportWhileProposalPending\(\)\);/);
-  assert.match(proxySource, /function saveTemplate\(\)[\s\S]*?if \(state\.diagramImportProposal\)/);
+  const saveFunctionStart = proxySource.indexOf('function saveTemplate()');
+  const saveFunctionEnd = proxySource.indexOf('function openAssistantSection()', saveFunctionStart);
+  const saveFunctionSource = proxySource.slice(saveFunctionStart, saveFunctionEnd);
+  assert.ok(saveFunctionStart > -1);
+  assert.ok(saveFunctionEnd > saveFunctionStart);
+  assert.doesNotMatch(saveFunctionSource, /state\.diagramImportProposal/);
   assert.match(proxySource, /if \(state\.diagramImportAppliedEditorDirty\)/);
   assert.match(proxySource, /appliedDiagramImportSpecWithSavedMapping/);
   assert.match(proxySource, /mappingValidation = \{ version: 1, status: 'needsValidation' \}/);
@@ -1009,7 +1016,7 @@ test('only the main Diagram editor remains; Diagram editor 2 sandbox UI and API 
   assert.match(proxySource, /function renderDiagramImportStructureTree\(proposal, spec\)/);
 });
 
-test('Assistant applies data flow by saving the selected template; Extraction remains the only execution view', () => {
+test('Assistant applies data flow locally; normal Save remains the only persistence path', () => {
   const applyStart = proxySource.indexOf('function applyAssistantObjectFlow()');
   const applyEnd = proxySource.indexOf('function assistantDiagramRequest(kind)', applyStart);
   const applySource = proxySource.slice(applyStart, applyEnd);
@@ -1020,12 +1027,14 @@ test('Assistant applies data flow by saving the selected template; Extraction re
   assert.ok(applyStart > -1);
   assert.ok(routeStart > -1);
   assert.match(proxySource, /assistantApplyFlow: 'Применить цепочку'/);
-  assert.match(applySource, /flushAssistantPromptAutosave/);
-  assert.match(applySource, /result\.json\.template/);
+  assert.match(applySource, /captureAssistantPromptsFromDom\(\)/);
+  assert.match(applySource, /result\.json\.spec/);
+  assert.match(applySource, /changesReadyToSave/);
   assert.match(routeSource, /template_save_required/);
-  assert.match(routeSource, /writeTemplateVersion/);
-  assert.match(routeSource, /invalidateTemplateRuntimeCache/);
-  assert.match(routeSource, /invalidateTemplateStaticSnapshots/);
+  assert.match(routeSource, /persisted: false/);
+  assert.doesNotMatch(routeSource, /writeTemplateVersion/);
+  assert.doesNotMatch(routeSource, /invalidateTemplateRuntimeCache/);
+  assert.doesNotMatch(routeSource, /invalidateTemplateStaticSnapshots/);
   assert.doesNotMatch(proxySource, /assistant\/object-flow\/preview/);
   assert.doesNotMatch(proxySource, /data-action="assistant-flow-preview"/);
 });
@@ -1167,7 +1176,7 @@ test('object group editor preserves assistant source-row selection fields', () =
   const normalizeRuleStart = proxySource.indexOf('function normalizeObjectSelectionRule(rule)');
   const normalizeStart = proxySource.indexOf('function normalizeObjectSelection(selection, index)');
   const inferStart = proxySource.indexOf('function inferObjectGroupModel(spec)');
-  const renderStart = proxySource.indexOf('function renderObjectGroupSelection(selection, index)');
+  const renderStart = proxySource.indexOf('function renderObjectGroupSelection(selection, index, spec)');
   const buildStart = proxySource.indexOf('function buildObjectGroupSpec(model, previousSpec)');
   const captureStart = proxySource.indexOf('function captureObjectGroupDraftFromDom()');
   const matchingStart = proxySource.indexOf('function readRelationExpansionFields()');
@@ -1219,7 +1228,7 @@ test('object group path hint filters are conditional and UI-only', () => {
   const optionsStart = proxySource.indexOf('function objectGroupPathHintOptions(className)');
   const renderStart = proxySource.indexOf('function renderObjectGroupPathHintFilters(className)');
   const regexExamplesStart = proxySource.indexOf('function objectGroupRegexExamples()');
-  const selectionStart = proxySource.indexOf('function renderObjectGroupSelection(selection, index)');
+  const selectionStart = proxySource.indexOf('function renderObjectGroupSelection(selection, index, spec)');
   const editorStart = proxySource.indexOf('function renderObjectGroupEditor(selected)');
   const readStart = proxySource.indexOf('function readObjectGroupFields()');
   const buildStart = proxySource.indexOf('function buildObjectGroupSpec(model, previousSpec)');
@@ -1257,11 +1266,13 @@ test('object group final alias drives extraction defaults and diagnostics', () =
   const aliasStart = proxySource.indexOf('function getObjectGroupOutputAlias(spec)');
   const finalAliasesStart = proxySource.indexOf('function finalExtractionAliases(spec)');
   const finalBaseStart = proxySource.indexOf('function finalBaseResultAlias(spec)');
-  const warningStart = proxySource.indexOf('function extractionSelectedSourceEmptyWarning(result, selectedName)');
+  const resultLabelStart = proxySource.indexOf('function userFacingResultLabel(alias, spec)');
+  const warningStart = proxySource.indexOf('function extractionSelectedSourceEmptyWarning(result, selectedName, spec)');
   const renderOptionsStart = proxySource.indexOf('function renderExtractionResultOptions(selectedName, spec, tables)');
   const extractStart = proxySource.indexOf('function extractByTemplate()');
   const applyStart = proxySource.indexOf('function applyDataSelectionEditor()');
   assert.ok(aliasStart > -1);
+  assert.ok(resultLabelStart > -1);
   assert.ok(finalAliasesStart > aliasStart);
   assert.ok(finalBaseStart > finalAliasesStart);
   assert.ok(warningStart > finalBaseStart);
@@ -1270,6 +1281,7 @@ test('object group final alias drives extraction defaults and diagnostics', () =
   assert.ok(applyStart > extractStart);
 
   const aliasSource = proxySource.slice(aliasStart, finalAliasesStart);
+  const resultLabelSource = proxySource.slice(resultLabelStart, finalAliasesStart);
   const finalAliasesSource = proxySource.slice(finalAliasesStart, finalBaseStart);
   const finalBaseSource = proxySource.slice(finalBaseStart, warningStart);
   const warningSource = proxySource.slice(warningStart, renderOptionsStart);
@@ -1277,13 +1289,17 @@ test('object group final alias drives extraction defaults and diagnostics', () =
 
   assert.match(aliasSource, /objectSelectionsFromModel\(visual\)/);
   assert.match(aliasSource, /objectGroupFinalAliasFromSelections\(selections\)/);
+  assert.match(resultLabelSource, /assistantManifest\.assistantManaged/);
+  assert.match(resultLabelSource, /assistantFlowOutputManifestInvalid/);
+  assert.match(resultLabelSource, /output && output\.label/);
   assert.match(finalAliasesSource, /add\(getObjectGroupOutputAlias\(spec\)\)/);
   assert.match(finalBaseSource, /var objectGroupAlias = getObjectGroupOutputAlias\(spec\)/);
   assert.match(finalBaseSource, /if \(objectGroupAlias\) return objectGroupAlias/);
   assert.match(warningSource, /selectedTable\.rows/);
   assert.match(warningSource, /populatedTable\.rows\.length/);
-  assert.match(warningSource, /extractionSelectedSourceEmpty/);
-  assert.match(extractSource, /var sourceWarning = extractionSelectedSourceEmptyWarning\(result, state\.extractionSource\)/);
+  assert.match(warningSource, /userFacingResultLabel\(selected, spec\)/);
+  assert.match(warningSource, /userFacingResultLabel\(populatedTable\.name, spec\)/);
+  assert.match(extractSource, /var sourceWarning = extractionSelectedSourceEmptyWarning\(result, state\.extractionSource, spec\)/);
   assert.match(extractSource, /type: result\.ok \? \(sourceWarning \? 'warning' : 'ok'\) : 'error'/);
   assert.match(extractSource, /sourceWarning \|\| t\('extractionCompleted'\)/);
 });
@@ -1319,7 +1335,42 @@ test('Assistant extraction uses the persisted user-label manifest and never fall
   assert.match(finalAliasesSource, /if \(assistantManifest\.error\) return \[\]/);
   assert.match(optionsSource, /if \(assistantManifest\.error\) return result/);
   assert.match(renderSource, /assistantFlowOutputManifestInvalid/);
+  assert.match(renderSource, /userFacingResultLabel\(selectedName, spec\)/);
   assert.match(extractionSource, /assistantManifest\.assistantManaged && assistantManifest\.error/);
+});
+
+test('Assistant-managed Object Flow aliases stay internal across deterministic and Diagram editors', () => {
+  const resultLabelStart = proxySource.indexOf('function userFacingResultLabel(alias, spec)');
+  const aliasFieldStart = proxySource.indexOf('function renderResultAliasField(attribute, alias, spec)');
+  const priorOptionsStart = proxySource.indexOf('function renderPriorMaterializedAliasOptions(model, operationIndex, selectedName, spec)');
+  const diagramStagesStart = proxySource.indexOf('function renderDiagramImportStageOptions(spec, selectedId)');
+  const traceStart = proxySource.indexOf('function renderExecutionTrace(trace, spec)');
+  const diagnosticsStart = proxySource.indexOf('function userFacingAssistantDiagnostics(value, spec, fieldName)');
+
+  assert.ok(resultLabelStart > -1);
+  assert.ok(aliasFieldStart > resultLabelStart);
+  assert.ok(priorOptionsStart > -1);
+  assert.ok(diagramStagesStart > priorOptionsStart);
+  assert.ok(traceStart > diagramStagesStart);
+  assert.ok(diagnosticsStart > aliasFieldStart);
+
+  const aliasFieldSource = proxySource.slice(aliasFieldStart, proxySource.indexOf('function displayTitleForResult', aliasFieldStart));
+  const priorOptionsSource = proxySource.slice(priorOptionsStart, proxySource.indexOf('function flowColumnOptionRows', priorOptionsStart));
+  const diagramStagesSource = proxySource.slice(diagramStagesStart, proxySource.indexOf('function diagramImportStageById', diagramStagesStart));
+  const traceSource = proxySource.slice(traceStart, proxySource.indexOf('function renderKeyValueTable', traceStart));
+  const diagnosticsSource = proxySource.slice(diagnosticsStart, proxySource.indexOf('function displayTitleForResult', diagnosticsStart));
+
+  assert.match(aliasFieldSource, /type="hidden"/);
+  assert.match(aliasFieldSource, /result-display-name/);
+  assert.match(aliasFieldSource, /userFacingResultLabel/);
+  assert.match(priorOptionsSource, /escapeHtml\(row\.label\)/);
+  assert.doesNotMatch(priorOptionsSource, /row\.label \+ ' \[' \+ row\.alias/);
+  assert.match(diagramStagesSource, /userFacingResultLabel\(stage\.alias/);
+  assert.doesNotMatch(diagramStagesSource, /label \+ ' \[' \+ stage\.alias/);
+  assert.match(traceSource, /userFacingResultLabel\(item\.as/);
+  assert.match(traceSource, /assistantFlowBlockName/);
+  assert.match(diagnosticsSource, /aliasFields/);
+  assert.match(diagnosticsSource, /userFacingResultLabel/);
 });
 
 test('Relations Apply preserves explicit operation order and source-driven columns', () => {
@@ -1352,7 +1403,7 @@ test('relation editor shows the persisted Assistant result label instead of a te
   assert.ok(targetStart > relationStart);
 
   const relationSource = proxySource.slice(relationStart, targetStart);
-  assert.match(relationSource, /aliasDisplayLabel\(operation\.as, spec\)/);
+  assert.match(relationSource, /userFacingResultLabel\(operation\.as, spec\)/);
   assert.match(proxySource, /renderRelationOperation\(operation, index, model, spec\)/);
 });
 
@@ -1372,7 +1423,7 @@ test('operation aliases immediately become available to later operations without
   assert.match(proxySource, /data-action="apply-extraction-published"/);
   assert.doesNotMatch(proxySource, /assistantFlowExtractionCandidate|assistantFlowCandidateOutput|extractionCandidateBlockId|extractionCandidateAlias/);
   assert.match(proxySource, /roles: input\.modelRoles \|\| input\.roles/);
-  assert.match(refreshSource, /renderPriorMaterializedAliasOptions\(state\.relationDraft, index, selected\)/);
+  assert.match(refreshSource, /renderPriorMaterializedAliasOptions\(state\.relationDraft, index, selected, readCurrentSpec\(\)\)/);
   assert.match(refreshSource, /\['from', 'with'\]/);
   assert.match(inputSource, /\[data-set-operation-field="as"\], \[data-matching-block-field="as"\]/);
   assert.match(inputSource, /refreshRelationOperationAliases\(\)/);
@@ -1380,7 +1431,7 @@ test('operation aliases immediately become available to later operations without
 
 test('runtime result UI renders execution-limit warnings returned by preview or run', () => {
   const renderStart = proxySource.indexOf('function renderActionResult(result)');
-  const traceStart = proxySource.indexOf('function renderExecutionTrace(trace)', renderStart);
+  const traceStart = proxySource.indexOf('function renderExecutionTrace(trace, spec)', renderStart);
   assert.ok(renderStart > -1);
   assert.ok(traceStart > renderStart);
 

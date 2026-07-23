@@ -136,10 +136,12 @@ const D2_IMPORT_ASSISTANT_MAX_SPEC_BYTES = Math.max(1024, Number(process.env.CMD
 // Revision 9 normalizes structural placements by their D2 role path. Repeated
 // demonstration nodes in one template branch share one deterministic binding;
 // distinct container paths and explicitly added items remain independent.
-// Older mappings are deliberately not migrated: re-analysis is required
-// instead of guessing a collapsed branch's source, labels, or conditions.
+// Version 8/3 mappings may be promoted only when their complete persisted
+// structure tree maps one-to-one to the current D2 blueprint. All other
+// legacy mappings remain unsupported and require explicit re-analysis.
 const D2_IMPORT_SEMANTIC_MODEL_REVISION = 9;
 const D2_IMPORT_STRUCTURE_TREE_VERSION = 4;
+const D2_IMPORT_MAPPING_INPUT_REVISION = 1;
 const TEMPLATE_REQUEST_MAX_BYTES = Math.max(64 * 1024, Number(process.env.CMDP_TEMPLATE_REQUEST_MAX_BYTES || D2_IMPORT_MAX_INPUT_BYTES + D2_IMPORT_MAX_OUTPUT_BYTES + 512 * 1024) || D2_IMPORT_MAX_INPUT_BYTES + D2_IMPORT_MAX_OUTPUT_BYTES + 512 * 1024);
 const LITELLM_BASE_URL = process.env.LITELLM_BASE_URL || process.env.CMDP_LITELLM_BASE_URL || 'http://127.0.0.1:4000/v1';
 const LITELLM_MODEL = process.env.LITELLM_MODEL || process.env.CMDP_LITELLM_MODEL || 'corp-openai-gpt-4.1-mini';
@@ -981,6 +983,98 @@ function hashJson(value) {
   return sha256Hex(stableJsonStringify(value));
 }
 
+function legacyAssistantDraftAuthoring(value) {
+  const draft = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const d2Draft = draft.d2Authoring && typeof draft.d2Authoring === 'object' && !Array.isArray(draft.d2Authoring)
+    ? draft.d2Authoring
+    : {};
+  return {
+    version: 1,
+    assistant: {
+      objectFlowIntent: cloneJsonValueServer(draft.objectFlowIntent, { context: '', blocks: [] }),
+      diagramInterpretPrompt: String(draft.diagramInterpretPrompt || ''),
+      diagramMappingPrompt: String(draft.diagramMappingPrompt || '')
+    },
+    d2: { source: String(d2Draft.source || '') }
+  };
+}
+
+function normalizeTemplateAuthoring(value, legacyDraft = null) {
+  const source = value && typeof value === 'object' && !Array.isArray(value)
+    ? value
+    : legacyDraft && typeof legacyDraft === 'object' && !Array.isArray(legacyDraft)
+      ? legacyAssistantDraftAuthoring(legacyDraft)
+      : null;
+  if (!source) return null;
+  const assistant = source.assistant && typeof source.assistant === 'object' && !Array.isArray(source.assistant)
+    ? source.assistant
+    : {};
+  const d2 = source.d2 && typeof source.d2 === 'object' && !Array.isArray(source.d2)
+    ? source.d2
+    : {};
+  const d2Source = String(d2.source || '');
+  if (Buffer.byteLength(d2Source, 'utf8') > D2_IMPORT_MAX_INPUT_BYTES) {
+    throw new Error(`authoring.d2.source exceeded configured maxInputBytes=${D2_IMPORT_MAX_INPUT_BYTES}.`);
+  }
+  return {
+    version: 1,
+    assistant: {
+      objectFlowIntent: cloneJsonValueServer(assistant.objectFlowIntent, { context: '', blocks: [] }),
+      diagramInterpretPrompt: truncateText(String(assistant.diagramInterpretPrompt || ''), 6000),
+      diagramMappingPrompt: truncateText(String(assistant.diagramMappingPrompt || ''), 6000)
+    },
+    d2: {
+      source: d2Source,
+      sourceHash: d2Source ? sha256Hex(d2Source) : ''
+    }
+  };
+}
+
+function templateAuthoring(spec, options = {}) {
+  const source = spec && typeof spec === 'object' && !Array.isArray(spec) ? spec : {};
+  const authoring = normalizeTemplateAuthoring(source.authoring);
+  if (authoring || options.allowLegacy !== true) return authoring;
+  // Retired assistantDraft is accepted only by the ordinary template-save
+  // migration path. Runtime and authoring actions never treat it as state.
+  return normalizeTemplateAuthoring(null, source.assistantDraft);
+}
+
+function templateAuthoringD2(spec, options = {}) {
+  const authoring = templateAuthoring(spec, options);
+  return authoring && authoring.d2 && typeof authoring.d2 === 'object' && !Array.isArray(authoring.d2)
+    ? authoring.d2
+    : {};
+}
+
+function executionTemplateSpec(spec) {
+  const next = cloneJsonValueServer(spec && typeof spec === 'object' && !Array.isArray(spec) ? spec : {}, {});
+  // Authoring prompts and raw D2 source do not change deterministic execution.
+  // D2 mapping state remains in result.diagrams and is therefore part of this hash.
+  // Validation signatures and input fingerprints only govern authoring review;
+  // they must not invalidate a published/static result by themselves.
+  delete next.authoring;
+  delete next.assistantDraft;
+  for (const diagram of next.result && Array.isArray(next.result.diagrams) ? next.result.diagrams : []) {
+    const imported = diagram && diagram.authoring && diagram.authoring.d2Import;
+    if (!imported || typeof imported !== 'object' || Array.isArray(imported)) continue;
+    delete imported.mappingValidation;
+    delete imported.mappingInputRevision;
+  }
+  return next;
+}
+
+function executionSpecHash(spec) {
+  return hashJson(executionTemplateSpec(spec));
+}
+
+function diagramImportDeterministicSpec(spec) {
+  return executionTemplateSpec(spec);
+}
+
+function diagramImportDeterministicSpecHash(spec) {
+  return hashJson(diagramImportDeterministicSpec(spec));
+}
+
 const d2SourceStructureCache = new Map();
 const D2_SOURCE_STRUCTURE_CACHE_MAX = 100;
 
@@ -1047,12 +1141,7 @@ async function d2SourceStructureIdentity(source) {
 }
 
 async function d2WorkflowStatusForSpec(spec) {
-  const assistantDraft = spec && spec.assistantDraft && typeof spec.assistantDraft === 'object' && !Array.isArray(spec.assistantDraft)
-    ? spec.assistantDraft
-    : {};
-  const d2Authoring = assistantDraft.d2Authoring && typeof assistantDraft.d2Authoring === 'object' && !Array.isArray(assistantDraft.d2Authoring)
-    ? assistantDraft.d2Authoring
-    : {};
+  const d2Authoring = templateAuthoringD2(spec, { allowLegacy: false });
   const diagrams = spec && spec.result && Array.isArray(spec.result.diagrams) ? spec.result.diagrams : [];
   const importedDiagram = diagrams.find((diagram) => {
     const item = diagram && diagram.authoring && diagram.authoring.d2Import;
@@ -1072,15 +1161,6 @@ async function d2WorkflowStatusForSpec(spec) {
     return { state: 'none', reason: 'source_missing' };
   }
   const sourceHash = sha256Hex(source);
-  const authoringSourceHash = String(d2Authoring.sourceHash || '').trim().toLowerCase();
-  if (authoringSourceHash !== sourceHash) {
-    return {
-      state: 'pending',
-      reason: 'authoring_identity_missing',
-      sourceHash,
-      appliedSourceHash: String(imported && imported.sourceHash || '')
-    };
-  }
   if (!imported) {
     return { state: 'pending', reason: 'mapping_missing', sourceHash, appliedSourceHash: '' };
   }
@@ -1098,63 +1178,39 @@ async function d2WorkflowStatusForSpec(spec) {
       appliedSourceHash: String(imported.sourceHash || '')
     };
   }
-  const appliedMappingContractHash = String(imported.mappingContractHash || '').trim();
-  if (!appliedMappingContractHash) {
+  if (!String(imported.mappingContractHash || '').trim()) {
     return { state: 'pending', reason: 'mapping_contract_missing', sourceHash, appliedSourceHash: String(imported.sourceHash || '') };
   }
-  if (String(imported.sourceHash) === sourceHash) {
-    const authoringMatchesAppliedMapping = Number(d2Authoring.semanticModelRevision || 0) === Number(imported.semanticModelRevision || 0) &&
-      String(d2Authoring.diagramId || '') === String(imported.diagramId || '') &&
-      String(d2Authoring.structureHash || '') === String(imported.structureHash || '') &&
-      String(d2Authoring.mappingContractHash || '') === appliedMappingContractHash;
-    if (!authoringMatchesAppliedMapping) {
-      return {
-        state: 'pending',
-        reason: 'authoring_mapping_unconfirmed',
-        sourceHash,
-        appliedSourceHash: String(imported.sourceHash || '')
-      };
-    }
-    if (imported.mappingValidation && !diagramImportMappingValidationIsCurrent(imported)) {
-      return {
-        state: 'pending',
-        reason: 'mapping_validation_required',
-        sourceHash,
-        appliedSourceHash: String(imported.sourceHash || '')
-      };
-    }
-    return {
-      state: 'applied',
-      sourceHash,
-      diagramId: String(imported.diagramId || ''),
-      roles: Array.isArray(imported.roles) ? imported.roles.length : 0
-    };
-  }
-  const appliedStructureHash = String(imported.structureHash || '').trim();
-  if (!appliedStructureHash) {
+  if (String(imported.sourceHash || '') !== sourceHash) {
     return { state: 'pending', reason: 'source_changed', sourceHash, appliedSourceHash: String(imported.sourceHash || '') };
   }
-  const identity = await d2SourceStructureIdentity(source);
-  if (!identity.ok) {
-    return { state: 'pending', reason: 'source_invalid', sourceHash, appliedSourceHash: String(imported.sourceHash || '') };
-  }
-  if (identity.structureHash === appliedStructureHash && identity.mappingContractHash === appliedMappingContractHash) {
+  if (imported.mappingValidation && imported.mappingValidation.status === 'needsReview') {
     return {
       state: 'pending',
-      reason: 'source_refresh_required',
+      reason: 'mapping_input_review_required',
+      inputReasons: Array.isArray(imported.mappingValidation.reasons) ? imported.mappingValidation.reasons : [],
       sourceHash,
-      appliedSourceHash: String(imported.sourceHash || ''),
-      structureHash: identity.structureHash,
-      mappingContractHash: identity.mappingContractHash
+      appliedSourceHash: String(imported.sourceHash || '')
+    };
+  }
+  if (!imported.mappingValidation || imported.mappingValidation.status !== 'valid' || !diagramImportMappingValidationIsCurrent(imported)) {
+    return { state: 'pending', reason: 'mapping_validation_required', sourceHash, appliedSourceHash: String(imported.sourceHash || '') };
+  }
+  const inputRevision = diagramImportMappingInputRevisionStatus(spec, imported);
+  if (!inputRevision.current) {
+    return {
+      state: 'pending',
+      reason: inputRevision.reasons.includes('source') ? 'source_changed' : 'mapping_input_review_required',
+      inputReasons: inputRevision.reasons,
+      sourceHash,
+      appliedSourceHash: String(imported.sourceHash || '')
     };
   }
   return {
-    state: 'pending',
-    reason: identity.structureHash === appliedStructureHash ? 'mapping_contract_changed' : 'source_changed',
+    state: 'applied',
     sourceHash,
-    appliedSourceHash: String(imported.sourceHash || ''),
-    structureHash: identity.structureHash,
-    mappingContractHash: identity.mappingContractHash
+    diagramId: String(imported.diagramId || ''),
+    roles: Array.isArray(imported.roles) ? imported.roles.length : 0
   };
 }
 
@@ -2230,6 +2286,225 @@ function diagramImportStructureTreeErrors(tree, roles, currentSpec = {}, structu
   return errors;
 }
 
+function diagramImportStructureItemElementKeys(item) {
+  return uniqueStrings(Array.isArray(item && item.templateElementKeys)
+    ? item.templateElementKeys
+    : [String(item && item.templateElementKey || '')]).sort();
+}
+
+function diagramImportStructureItemBlueprintKey(item) {
+  const keys = diagramImportStructureItemElementKeys(item);
+  if (!String(item && item.roleId || '').trim() || !keys.length) return '';
+  return `${String(item.roleId)}\u0000${JSON.stringify(keys)}`;
+}
+
+function diagramImportMigrationMappingFingerprint(mapping) {
+  const value = cloneJsonValueServer(mapping, {});
+  delete value.id;
+  delete value.roleId;
+  for (const related of Array.isArray(value.related) ? value.related : []) {
+    if (related && typeof related === 'object') delete related.id;
+  }
+  return stableJsonStringify(value);
+}
+
+function diagramImportMigrationRoles(imported, structure, classes) {
+  const canonicalStructure = structure && typeof structure === 'object' && !Array.isArray(structure)
+    ? structure
+    : null;
+  const canonicalClasses = Array.isArray(classes) ? classes : [];
+  const storedRoles = Array.isArray(imported && imported.roles) ? imported.roles : [];
+  if (!canonicalStructure || !canonicalClasses.length || !storedRoles.length) return null;
+  const canonical = diagramImportClassRoleDefinitions({ elements: canonicalStructure, classes: canonicalClasses });
+  const storedById = new Map(storedRoles.map((role) => [String(role && role.id || ''), role]).filter(([id]) => id));
+  if (!canonical.length || canonical.length !== storedById.size || canonical.some((role) => !storedById.has(String(role.id)))) return null;
+  return canonical.map((role) => {
+    const stored = storedById.get(String(role.id)) || {};
+    return {
+      ...role,
+      label: String(stored.label || role.label || role.key || ''),
+      notes: String(stored.notes !== undefined ? stored.notes : role.notes || ''),
+      visualKind: diagramImportRoleVisualKind({ ...role, visualKind: stored.visualKind || role.visualKind }),
+      labelTemplate: String(stored.labelTemplate || role.labelTemplate || ''),
+      semanticModelRevision: D2_IMPORT_SEMANTIC_MODEL_REVISION
+    };
+  });
+}
+
+// A migration is intentionally narrower than a compatibility layer. It only
+// promotes an old persisted tree when every old placement maps one-to-one to
+// the current source blueprint by role and complete D2 element set. No source,
+// label, filter, relation, or containment decision is invented.
+function rejectDiagramImportMigration(options, reason) {
+  if (options && Array.isArray(options.diagnostics) && reason) options.diagnostics.push(reason);
+  return null;
+}
+
+function diagramImportMigrationOwnerIsUnambiguous(spec, ownerId) {
+  const diagrams = spec && spec.result && Array.isArray(spec.result.diagrams) ? spec.result.diagrams : [];
+  return diagrams.filter((diagram) => diagram && diagram.authoring && diagram.authoring.d2Import &&
+    (!ownerId || String(diagram.id || '') === String(ownerId))).length === 1;
+}
+
+function migrateDiagramImportToCurrentRevision(spec, value, options = {}) {
+  const imported = value && typeof value === 'object' && !Array.isArray(value)
+    ? cloneJsonValueServer(value, {})
+    : null;
+  if (!imported) return rejectDiagramImportMigration(options, 'mappingMissing');
+  const revision = Number(imported.semanticModelRevision || 0);
+  const treeVersion = Number(imported.structureTree && imported.structureTree.version || 0);
+  if (revision === D2_IMPORT_SEMANTIC_MODEL_REVISION && treeVersion === D2_IMPORT_STRUCTURE_TREE_VERSION) return imported;
+  if (revision !== 8 || treeVersion !== 3 || !Array.isArray(imported.structureTree && imported.structureTree.items)) return rejectDiagramImportMigration(options, 'unsupportedPlacementRevision');
+  const source = String(templateAuthoringD2(spec || {}, { allowLegacy: false }).source || '');
+  if (!source || source !== String(imported.source || '') || sha256Hex(source) !== String(imported.sourceHash || '')) return rejectDiagramImportMigration(options, 'sourceMismatch');
+  if (!String(imported.structureHash || '').trim() || !String(imported.mappingContractHash || '').trim()) return rejectDiagramImportMigration(options, 'identityMetadataMissing');
+  const ownerId = String(options.diagramId || '').trim();
+  const importedDiagramId = String(imported.diagramId || '').trim();
+  if (ownerId && importedDiagramId && importedDiagramId !== ownerId) return rejectDiagramImportMigration(options, 'diagramOwnerMismatch');
+  if (ownerId && !importedDiagramId && !diagramImportMigrationOwnerIsUnambiguous(spec, ownerId)) return rejectDiagramImportMigration(options, 'diagramOwnerAmbiguous');
+  const identity = options.identity && typeof options.identity === 'object' ? options.identity : null;
+  const ir = identity && identity.ok && identity.ir && typeof identity.ir === 'object' ? identity.ir : null;
+  if (!ir ||
+    String(identity.sourceHash || '') !== String(imported.sourceHash || '') ||
+    String(identity.structureHash || '') !== String(imported.structureHash || '') ||
+    String(identity.mappingContractHash || '') !== String(imported.mappingContractHash || '')) return rejectDiagramImportMigration(options, 'sourceIdentityMismatch');
+  const canonicalStructure = ir.elements && typeof ir.elements === 'object' && !Array.isArray(ir.elements) ? ir.elements : null;
+  const canonicalClasses = Array.isArray(ir.classes) ? ir.classes : [];
+  const canonicalTemplate = ir.template && typeof ir.template === 'object' && !Array.isArray(ir.template) ? ir.template : {};
+  if (!canonicalStructure || !canonicalClasses.length) return rejectDiagramImportMigration(options, 'canonicalStructureMissing');
+
+  const roles = diagramImportMigrationRoles(imported, canonicalStructure, canonicalClasses);
+  if (!roles) return rejectDiagramImportMigration(options, 'roleSetMismatch');
+  const sourceItems = imported.structureTree.items;
+  const sourceByRoleElement = new Map();
+  const sourceItemKeys = new Map();
+  for (const item of sourceItems) {
+    const itemId = String(item && item.id || '');
+    const roleId = String(item && item.roleId || '');
+    const keys = diagramImportStructureItemElementKeys(item);
+    if (!itemId || !roleId || !keys.length) return rejectDiagramImportMigration(options, 'legacyBlueprintAmbiguous');
+    sourceItemKeys.set(itemId, keys);
+    for (const key of keys) {
+      const roleElementKey = `${roleId}\u0000${key}`;
+      if (sourceByRoleElement.has(roleElementKey)) return rejectDiagramImportMigration(options, 'legacyBlueprintAmbiguous');
+      sourceByRoleElement.set(roleElementKey, item);
+    }
+  }
+  const target = diagramImportStructureTree(null, canonicalStructure, roles);
+  if (!target.items.length) return rejectDiagramImportMigration(options, 'placementCountMismatch');
+  const sourcesByTargetId = new Map();
+  const sourceTargetIds = new Map();
+  const itemIdMap = new Map();
+  for (const targetItem of target.items) {
+    const targetId = String(targetItem && targetItem.id || '');
+    const roleId = String(targetItem && targetItem.roleId || '');
+    const targetKeys = diagramImportStructureItemElementKeys(targetItem);
+    if (!targetId || !roleId || !targetKeys.length) return rejectDiagramImportMigration(options, 'placementBlueprintMismatch');
+    const sourceItemsForTarget = [];
+    const seenSourceIds = new Set();
+    for (const key of targetKeys) {
+      const sourceItem = sourceByRoleElement.get(`${roleId}\u0000${key}`);
+      if (!sourceItem) return rejectDiagramImportMigration(options, 'placementBlueprintMismatch');
+      const sourceItemId = String(sourceItem.id || '');
+      if (!seenSourceIds.has(sourceItemId)) {
+        seenSourceIds.add(sourceItemId);
+        sourceItemsForTarget.push(sourceItem);
+      }
+    }
+    for (const sourceItem of sourceItemsForTarget) {
+      const sourceItemId = String(sourceItem.id || '');
+      const sourceKeys = sourceItemKeys.get(sourceItemId) || [];
+      if (!sourceKeys.every((key) => targetKeys.includes(key))) return rejectDiagramImportMigration(options, 'legacyBlueprintSplit');
+      const priorTargetId = sourceTargetIds.get(sourceItemId);
+      if (priorTargetId && priorTargetId !== targetId) return rejectDiagramImportMigration(options, 'legacyBlueprintSplit');
+      sourceTargetIds.set(sourceItemId, targetId);
+      itemIdMap.set(sourceItemId, targetId);
+    }
+    sourcesByTargetId.set(targetId, sourceItemsForTarget);
+  }
+  if (sourceTargetIds.size !== sourceItems.length) return rejectDiagramImportMigration(options, 'placementBlueprintMismatch');
+  const migratedItems = [];
+  for (const item of target.items) {
+    const sourceItemsForTarget = sourcesByTargetId.get(String(item.id || '')) || [];
+    if (!sourceItemsForTarget.length) return rejectDiagramImportMigration(options, 'placementBlueprintMismatch');
+    const role = roles.find((candidate) => String(candidate && candidate.id || '') === String(item.roleId || '')) || {};
+    const candidateMappings = [];
+    for (const sourceItem of sourceItemsForTarget) {
+      const existing = cloneJsonValueServer(sourceItem && sourceItem.mapping, {});
+      delete existing.id;
+      const mapping = diagramImportStructureItemMapping(role, existing, item.id);
+      mapping.id = diagramImportStableId('structure_mapping', `${role && role.id || 'role'}:${item.id || 'item'}`);
+      mapping.roleId = String(role && role.id || '');
+      const labelTemplate = String(mapping.primary && mapping.primary.labelTemplate || '');
+      for (const entry of diagramImportChildTemplateTokens(labelTemplate)) {
+        if (!entry.descriptor || !itemIdMap.has(String(entry.descriptor.itemId || ''))) return rejectDiagramImportMigration(options, 'childTokenOrBlueprintMismatch');
+        const oldTokenPrefix = `child:${String(entry.descriptor.itemId)}:`;
+        const newTokenPrefix = `child:${itemIdMap.get(String(entry.descriptor.itemId))}:`;
+        mapping.primary.labelTemplate = String(mapping.primary.labelTemplate || '').split(oldTokenPrefix).join(newTokenPrefix);
+      }
+      candidateMappings.push(mapping);
+    }
+    if (new Set(candidateMappings.map(diagramImportMigrationMappingFingerprint)).size !== 1) {
+      return rejectDiagramImportMigration(options, 'collapsedPlacementMappingConflict');
+    }
+    migratedItems.push({
+      ...item,
+      mapping: candidateMappings[0]
+    });
+  }
+  const migrationTree = { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: migratedItems };
+  const treeErrors = diagramImportStructureTreeErrors(migrationTree, roles, spec || {}, canonicalStructure)
+    .filter((error) => !/Object Flow result|materialized field|materialized CMDBuild class|returns .* but D2 role/.test(String(error && error.message || '')));
+  if (treeErrors.length) return rejectDiagramImportMigration(options, 'migratedStructureInvalid');
+
+  return {
+    ...imported,
+    version: 3,
+    semanticModelRevision: D2_IMPORT_SEMANTIC_MODEL_REVISION,
+    diagramId: ownerId || importedDiagramId,
+    sourceHash: String(identity.sourceHash || ''),
+    structureHash: String(identity.structureHash || ''),
+    mappingContractHash: String(identity.mappingContractHash || ''),
+    parser: String(ir.source && ir.source.parser || imported.parser || ''),
+    source,
+    template: cloneJsonValueServer(canonicalTemplate, {}),
+    structure: cloneJsonValueServer(canonicalStructure, {}),
+    classes: cloneJsonValueServer(canonicalClasses, []),
+    roles,
+    relationRules: diagramImportTopologyRules(roles, canonicalStructure, imported.relationRules || [], canonicalClasses),
+    structureTree: migrationTree,
+    templateGrammar: diagramImportTemplateGrammar(roles, canonicalStructure, canonicalClasses)
+  };
+}
+
+function diagramImportMigrationProposal(spec, imported) {
+  const source = String(templateAuthoringD2(spec || {}, { allowLegacy: false }).source || '');
+  return {
+    version: 3,
+    semanticModelRevision: D2_IMPORT_SEMANTIC_MODEL_REVISION,
+    proposalId: String(imported && imported.proposalId || diagramImportStableId('migration', String(imported && imported.diagramId || ''))),
+    createdAt: Date.now(),
+    deterministicSpecHash: diagramImportDeterministicSpecHash(spec || {}),
+    source: {
+      hash: String(imported && imported.sourceHash || ''),
+      structureHash: String(imported && imported.structureHash || ''),
+      mappingContractHash: String(imported && imported.mappingContractHash || ''),
+      parser: String(imported && imported.parser || '')
+    },
+    sourceText: source,
+    template: cloneJsonValueServer(imported && imported.template, {}),
+    structure: cloneJsonValueServer(imported && imported.structure, {}),
+    classes: cloneJsonValueServer(imported && imported.classes, []),
+    roles: cloneJsonValueServer(imported && imported.roles, []),
+    relationRules: cloneJsonValueServer(imported && imported.relationRules, []),
+    structureTree: cloneJsonValueServer(imported && imported.structureTree, { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] }),
+    templateGrammar: cloneJsonValueServer(imported && imported.templateGrammar, {}),
+    diagramId: String(imported && imported.diagramId || ''),
+    warnings: [],
+    unresolved: []
+  };
+}
+
 function diagramImportV3Unresolved(roles, relationRules = [], structureTree, currentSpec = {}, structure = null) {
   const unresolved = [];
   const normalizedTreeCandidate = diagramImportStructureTree(structureTree, structure, roles);
@@ -2547,7 +2822,7 @@ function createDiagramImportProposal(currentSpec, ir, options = {}) {
     createdAt: Date.now(),
     templateCode: String(options.templateCode || '').trim(),
     baseSpecHash: String(options.baseSpecHash || '').trim(),
-    editorSpecHash: hashJson(sourceSpec),
+    deterministicSpecHash: diagramImportDeterministicSpecHash(sourceSpec),
     source: ir.source,
     sourceText: String(options.sourceText || ''),
     template: ir.template,
@@ -2602,6 +2877,158 @@ function diagramImportMappingValidationIsCurrent(imported) {
   return timingSafeEqualString(validation.signature, signDiagramImportMappingValidation(imported));
 }
 
+function diagramImportMappingInputStageIds(imported) {
+  const stageIds = [];
+  const push = (value) => {
+    const stageId = String(value || '').trim();
+    if (stageId) stageIds.push(stageId);
+  };
+  const structureTree = imported && imported.structureTree && typeof imported.structureTree === 'object' && !Array.isArray(imported.structureTree)
+    ? imported.structureTree
+    : {};
+  for (const item of Array.isArray(structureTree.items) ? structureTree.items : []) {
+    const mapping = item && item.mapping && typeof item.mapping === 'object' && !Array.isArray(item.mapping) ? item.mapping : {};
+    push(mapping.source && mapping.source.stageId);
+    const conditions = mapping.conditions && typeof mapping.conditions === 'object' && !Array.isArray(mapping.conditions)
+      ? mapping.conditions
+      : {};
+    for (const rule of Array.isArray(conditions.rules) ? conditions.rules : []) {
+      const right = rule && rule.right && typeof rule.right === 'object' && !Array.isArray(rule.right) ? rule.right : {};
+      if (String(right.kind || '').trim() === 'stage') push(right.stageId);
+    }
+  }
+  for (const rule of Array.isArray(imported && imported.relationRules) ? imported.relationRules : []) {
+    push(rule && rule.sourceStageId);
+  }
+  return uniqueStrings(stageIds).sort();
+}
+
+function diagramImportMappingInputStageContracts(spec, imported) {
+  let stages = [];
+  try {
+    stages = assistantObjectFlowDiagramStages(spec || {}, objectFlowFromSpecServer(spec || {}));
+  } catch {
+    stages = [];
+  }
+  const byId = new Map(stages.map((stage) => [String(stage && stage.id || ''), stage]));
+  return diagramImportMappingInputStageIds(imported).map((stageId) => {
+    const stage = byId.get(stageId);
+    if (!stage) return { id: stageId, missing: true };
+    return {
+      id: stageId,
+      alias: String(stage.alias || ''),
+      kind: String(stage.kind || ''),
+      className: String(stage.className || ''),
+      columns: uniqueStrings(Array.isArray(stage.columns) ? stage.columns.map(String) : []).sort()
+    };
+  });
+}
+
+function diagramImportMappingInputRevision(spec, imported) {
+  const authoring = templateAuthoring(spec || {}, { allowLegacy: true }) || {
+    assistant: { diagramInterpretPrompt: '', diagramMappingPrompt: '' },
+    d2: { source: '' }
+  };
+  const assistant = authoring.assistant && typeof authoring.assistant === 'object' && !Array.isArray(authoring.assistant)
+    ? authoring.assistant
+    : {};
+  const d2 = authoring.d2 && typeof authoring.d2 === 'object' && !Array.isArray(authoring.d2)
+    ? authoring.d2
+    : {};
+  const source = String(d2.source || '');
+  return {
+    version: D2_IMPORT_MAPPING_INPUT_REVISION,
+    sourceHash: source ? sha256Hex(source) : '',
+    interpretPromptHash: sha256Hex(String(assistant.diagramInterpretPrompt || '')),
+    mappingPromptHash: sha256Hex(String(assistant.diagramMappingPrompt || '')),
+    stageContracts: diagramImportMappingInputStageContracts(spec || {}, imported)
+  };
+}
+
+function diagramImportMappingInputRevisionStatus(spec, imported) {
+  const stored = imported && imported.mappingInputRevision && typeof imported.mappingInputRevision === 'object' && !Array.isArray(imported.mappingInputRevision)
+    ? imported.mappingInputRevision
+    : null;
+  if (!stored || Number(stored.version || 0) !== D2_IMPORT_MAPPING_INPUT_REVISION) {
+    return { current: false, missing: true, reasons: ['inputRevision'] };
+  }
+  const current = diagramImportMappingInputRevision(spec, imported);
+  const reasons = [];
+  if (String(stored.sourceHash || '') !== current.sourceHash) reasons.push('source');
+  if (String(stored.interpretPromptHash || '') !== current.interpretPromptHash) reasons.push('interpretPrompt');
+  if (String(stored.mappingPromptHash || '') !== current.mappingPromptHash) reasons.push('mappingPrompt');
+  if (stableJsonStringify(Array.isArray(stored.stageContracts) ? stored.stageContracts : []) !== stableJsonStringify(current.stageContracts)) reasons.push('stages');
+  return { current: reasons.length === 0, missing: false, reasons, value: current };
+}
+
+function withDiagramImportMappingInputRevision(spec, imported) {
+  return {
+    ...imported,
+    mappingInputRevision: diagramImportMappingInputRevision(spec, imported)
+  };
+}
+
+function diagramImportRecoveryPayloadHash(imported) {
+  const payload = cloneJsonValueServer(imported, {});
+  delete payload.mappingValidation;
+  delete payload.mappingInputRevision;
+  return hashJson(payload);
+}
+
+function diagramImportLegacyHistoricalAttestation(imported) {
+  const validation = imported && imported.mappingValidation && typeof imported.mappingValidation === 'object' && !Array.isArray(imported.mappingValidation)
+    ? imported.mappingValidation
+    : {};
+  return Number(imported && imported.semanticModelRevision || 0) === 8 &&
+    Number(imported && imported.structureTree && imported.structureTree.version || 0) === 3 &&
+    !imported.mappingInputRevision &&
+    validation.status === 'valid' &&
+    /^[a-f0-9]{64}$/i.test(String(validation.signature || ''));
+}
+
+function diagramImportForSpec(spec, diagramId = '') {
+  const diagrams = spec && spec.result && Array.isArray(spec.result.diagrams) ? spec.result.diagrams : [];
+  const diagram = diagrams.find((item) => item && item.authoring && item.authoring.d2Import &&
+    (!diagramId || String(item.id || '') === diagramId)) ||
+    diagrams.find((item) => item && item.authoring && item.authoring.d2Import) || null;
+  const imported = diagram && diagram.authoring && diagram.authoring.d2Import;
+  return imported && typeof imported === 'object' && !Array.isArray(imported) ? { diagram, imported } : null;
+}
+
+function diagramImportRecoveryCandidate(spec, imported, recoveryVersions = []) {
+  const currentAuthoring = templateAuthoring(spec, { allowLegacy: true });
+  const currentSource = String(currentAuthoring && currentAuthoring.d2 && currentAuthoring.d2.source || '');
+  if (!currentSource || String(imported && imported.sourceHash || '') !== sha256Hex(currentSource)) return null;
+  const currentPayloadHash = diagramImportRecoveryPayloadHash(imported);
+  const currentInput = diagramImportMappingInputRevision(spec, imported);
+  for (const version of Array.isArray(recoveryVersions) ? recoveryVersions : []) {
+    const versionSpec = safeJsonValue(version && (version.spec !== undefined ? version.spec : version.SpecJson), null);
+    if (!versionSpec || typeof versionSpec !== 'object' || Array.isArray(versionSpec)) continue;
+    const candidate = diagramImportForSpec(versionSpec, String(imported && imported.diagramId || ''));
+    if (!candidate) continue;
+    const verified = diagramImportMappingValidationIsCurrent(candidate.imported);
+    // CSRF signing secrets can legitimately rotate between the historical
+    // version and this normal Save. A legacy signature is never accepted at
+    // runtime: it is only an attestation source for the narrow 8/3 -> 9/4
+    // write-time migration below, which re-parses, recompiles, validates, and
+    // signs the result with the current secret.
+    const legacyHistoricalAttestation = !verified && diagramImportLegacyHistoricalAttestation(candidate.imported);
+    if (!verified && !legacyHistoricalAttestation) continue;
+    const candidateAuthoring = templateAuthoring(versionSpec, { allowLegacy: true });
+    const candidateSource = String(candidateAuthoring && candidateAuthoring.d2 && candidateAuthoring.d2.source || '');
+    if (candidateSource !== currentSource || String(candidate.imported.sourceHash || '') !== sha256Hex(candidateSource)) continue;
+    if (diagramImportRecoveryPayloadHash(candidate.imported) !== currentPayloadHash) continue;
+    const candidateInput = diagramImportMappingInputRevision(versionSpec, candidate.imported);
+    if (stableJsonStringify(candidateInput) !== stableJsonStringify(currentInput)) continue;
+    return {
+      imported: cloneJsonValueServer(candidate.imported, {}),
+      version: Number(version && version.version || version && version.Version || 0) || null,
+      verification: verified ? 'currentSignature' : 'legacyHistoricalAttestation'
+    };
+  }
+  return null;
+}
+
 function assertDiagramImportProposal(proposal, authToken) {
   if (!proposal || typeof proposal !== 'object' || Array.isArray(proposal)) {
     const error = new Error('Diagram import proposal is required.');
@@ -2612,6 +3039,12 @@ function assertDiagramImportProposal(proposal, authToken) {
   if (proposal.version !== 3) {
     const error = new Error('D2 import proposal version is no longer supported. Analyze the D2 source again.');
     error.code = 'diagram_import_proposal_version';
+    error.statusCode = 409;
+    throw error;
+  }
+  if (!isSpecHash(String(proposal.deterministicSpecHash || ''))) {
+    const error = new Error('D2 import proposal has no deterministic template revision. Analyze the D2 source again.');
+    error.code = 'diagram_import_deterministic_revision_missing';
     error.statusCode = 409;
     throw error;
   }
@@ -2636,6 +3069,23 @@ function assertDiagramImportProposal(proposal, authToken) {
     throw error;
   }
   return proposal;
+}
+
+function assertDiagramImportProposalDeterministicSpec(proposal, spec, action = 'using Assistant') {
+  if (diagramImportDeterministicSpecHash(spec) === String(proposal && proposal.deterministicSpecHash || '')) return;
+  const error = new Error(`Deterministic template configuration changed after D2 analysis. Analyze the D2 source again before ${action}.`);
+  error.code = 'diagram_import_deterministic_conflict';
+  error.statusCode = 409;
+  throw error;
+}
+
+function assertDiagramImportStoredSource(proposal, spec, action = 'applying its mapping') {
+  const storedSource = String(templateAuthoringD2(spec, { allowLegacy: false }).source || '');
+  if (!storedSource || sha256Hex(storedSource) === String(proposal && proposal.source && proposal.source.hash || '')) return;
+  const error = new Error(`D2 source changed after analysis. Analyze the current source again before ${action}.`);
+  error.code = 'diagram_import_source_conflict';
+  error.statusCode = 409;
+  throw error;
 }
 
 function diagramImportAssistantSpec(currentSpec, proposal = null) {
@@ -3778,12 +4228,7 @@ function applyDiagramImportProposal(currentSpec, proposal, roleOverrides = [], r
     error.statusCode = 409;
     throw error;
   }
-  if (proposal.editorSpecHash && hashJson(sourceSpec) !== proposal.editorSpecHash) {
-    const error = new Error('Template draft changed after D2 analysis. Analyze the D2 source again before applying it.');
-    error.code = 'diagram_import_editor_conflict';
-    error.statusCode = 409;
-    throw error;
-  }
+  assertDiagramImportProposalDeterministicSpec(proposal, sourceSpec, 'applying it');
   const reviewed = diagramImportV3WithOverrides(proposal, roleOverrides, relationRules, structureTree, sourceSpec);
   const appliedFlow = objectFlowFromSpecServer(sourceSpec);
   const stageById = new Map(assistantObjectFlowDiagramStages(sourceSpec, appliedFlow).map((stage) => [String(stage.id || ''), stage]));
@@ -3938,16 +4383,17 @@ function applyDiagramImportProposal(currentSpec, proposal, roleOverrides = [], r
       }
     }
   };
+  if (diagramIndex >= 0) diagrams[diagramIndex] = diagram;
+  else diagrams.push(diagram);
+  sourceSpec.result.diagrams = diagrams;
+  synchronizeD2Authoring(sourceSpec, diagram.authoring.d2Import);
+  diagram.authoring.d2Import = withDiagramImportMappingInputRevision(sourceSpec, diagram.authoring.d2Import);
   diagram.authoring.d2Import.mappingValidation = {
     version: 1,
     status: 'valid',
     signature: signDiagramImportMappingValidation(diagram.authoring.d2Import)
   };
-  if (diagramIndex >= 0) diagrams[diagramIndex] = diagram;
-  else diagrams.push(diagram);
-  sourceSpec.result.diagrams = diagrams;
-  synchronizeD2AuthoringDraft(sourceSpec, diagram.authoring.d2Import);
-  const errors = validateTemplateSpec(sourceSpec);
+  const errors = validateTemplateSpecForStorage(sourceSpec);
   if (errors.length) {
     const error = new Error('D2 class mapping produced an invalid deterministic template spec.');
     error.code = 'diagram_import_invalid_spec';
@@ -3958,90 +4404,22 @@ function applyDiagramImportProposal(currentSpec, proposal, roleOverrides = [], r
   return sourceSpec;
 }
 
-function d2AuthoringDraftFromAppliedImport(imported) {
-  const appliedRevision = Number(imported && imported.semanticModelRevision || 0);
-  const identity = {
-    semanticModelRevision: appliedRevision === D2_IMPORT_SEMANTIC_MODEL_REVISION ? appliedRevision : 0,
-    diagramId: String(imported && imported.diagramId || ''),
-    sourceHash: String(imported && imported.sourceHash || ''),
-    structureHash: String(imported && imported.structureHash || ''),
-    mappingContractHash: String(imported && imported.mappingContractHash || '')
-  };
-  const roles = (Array.isArray(imported && imported.roles) ? imported.roles : []).map((role) => ({
-    id: String(role && role.id || ''),
-    visualKind: diagramImportRoleVisualKind(role),
-    labelTemplate: String(role && role.labelTemplate || '')
-  })).filter((role) => role.id);
-  return {
-    version: 1,
-    ...identity,
-    source: String(imported && imported.source || ''),
-    overrides: {
-      ...identity,
-      roles,
-      relationRules: cloneJsonValueServer(imported && imported.relationRules || [], []),
-      structureTree: cloneJsonValueServer(imported && imported.structureTree || {}, {})
-    }
-  };
-}
-
-function resetAssistantD2AuthoringIdentity(authoring) {
-  const source = String(authoring && authoring.source || '');
-  return {
-    version: 1,
-    semanticModelRevision: 0,
-    diagramId: '',
-    sourceHash: String(authoring && authoring.sourceHash || ''),
-    structureHash: '',
-    mappingContractHash: '',
-    source,
-    overrides: {
-      semanticModelRevision: 0,
-      diagramId: '',
-      sourceHash: '',
-      structureHash: '',
-      mappingContractHash: '',
-      roles: [],
-      relationRules: [],
-      structureTree: { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] }
-    }
-  };
-}
-
-function assistantDraftWithAppliedD2Identity(spec, draft) {
-  if (!draft || !draft.d2Authoring || typeof draft.d2Authoring !== 'object' || Array.isArray(draft.d2Authoring)) return draft;
-  const diagrams = Array.isArray(spec && spec.result && spec.result.diagrams) ? spec.result.diagrams : [];
-  const diagram = diagrams.find((item) => item && typeof item === 'object' && !Array.isArray(item) && item.authoring && item.authoring.d2Import);
-  const imported = diagram && diagram.authoring && diagram.authoring.d2Import;
-  const source = String(draft.d2Authoring.source || '');
-  const hasCurrentAppliedIdentity = Boolean(
-    imported && Number(imported.version || 0) === 3 &&
-    Number(imported.semanticModelRevision || 0) === D2_IMPORT_SEMANTIC_MODEL_REVISION &&
-    source && String(imported.source || '') === source &&
-    String(imported.sourceHash || '') === sha256Hex(source) &&
-    String(imported.diagramId || diagram.id || '').trim() &&
-    String(imported.structureHash || '').trim() &&
-    String(imported.mappingContractHash || '').trim() &&
-    imported.structureTree && Number(imported.structureTree.version || 0) === D2_IMPORT_STRUCTURE_TREE_VERSION &&
-    Array.isArray(imported.structureTree.items)
-  );
-  return {
-    ...draft,
-    d2Authoring: hasCurrentAppliedIdentity
-      ? d2AuthoringDraftFromAppliedImport(imported)
-      : resetAssistantD2AuthoringIdentity(draft.d2Authoring)
-  };
-}
-
-function synchronizeD2AuthoringDraft(spec, imported) {
+function synchronizeD2Authoring(spec, imported) {
   if (!spec || typeof spec !== 'object' || Array.isArray(spec) || !imported || typeof imported !== 'object') return;
-  const draft = spec.assistantDraft && typeof spec.assistantDraft === 'object' && !Array.isArray(spec.assistantDraft)
-    ? spec.assistantDraft
-    : {};
-  spec.assistantDraft = {
-    ...draft,
-    d2Authoring: d2AuthoringDraftFromAppliedImport(imported)
+  const authoring = normalizeTemplateAuthoring(spec.authoring) || {
+    version: 1,
+    assistant: { objectFlowIntent: { context: '', blocks: [] }, diagramInterpretPrompt: '', diagramMappingPrompt: '' },
+    d2: { source: '', sourceHash: '' }
   };
+  const source = String(imported.source || '');
+  spec.authoring = {
+    ...authoring,
+    d2: {
+      source,
+      sourceHash: source ? sha256Hex(source) : ''
+    }
+  };
+  delete spec.assistantDraft;
 }
 
 function appliedDiagramImportProposalError(message, code, details = []) {
@@ -4120,7 +4498,7 @@ async function appliedDiagramImportProposalFromSpec(currentSpec) {
     semanticModelRevision: Number(imported.semanticModelRevision || D2_IMPORT_SEMANTIC_MODEL_REVISION),
     proposalId: String(imported.proposalId || ''),
     createdAt: Date.now(),
-    editorSpecHash: hashJson(sourceSpec),
+    deterministicSpecHash: diagramImportDeterministicSpecHash(sourceSpec),
     source: cloneJsonValueServer(identity.ir.source, {}),
     sourceText,
     template: cloneJsonValueServer(identity.ir.template, {}),
@@ -4218,7 +4596,11 @@ async function refreshDiagramImportSource(currentSpec, source) {
     error.statusCode = 409;
     throw error;
   }
-  const mappingWasValidated = !imported.mappingValidation || diagramImportMappingValidationIsCurrent(imported);
+  // Refreshing presentation-only D2 source is an explicit source action, but
+  // it must not silently accept a changed Assistant prompt or Object Flow
+  // contract. Those inputs need a normal mapping reapply.
+  const mappingWasValidated = diagramImportMappingValidationIsCurrent(imported) &&
+    diagramImportMappingInputRevisionStatus(next, imported).current;
   diagram.authoring.d2Import = {
     ...imported,
     sourceHash: identity.sourceHash,
@@ -4231,15 +4613,18 @@ async function refreshDiagramImportSource(currentSpec, source) {
     classes: cloneJsonValueServer(identity.ir.classes, []),
     sourceUpdatedAt: new Date().toISOString()
   };
-  diagram.authoring.d2Import.mappingValidation = mappingWasValidated
-    ? {
+  synchronizeD2Authoring(next, diagram.authoring.d2Import);
+  if (mappingWasValidated) {
+    diagram.authoring.d2Import = withDiagramImportMappingInputRevision(next, diagram.authoring.d2Import);
+    diagram.authoring.d2Import.mappingValidation = {
       version: 1,
       status: 'valid',
       signature: signDiagramImportMappingValidation(diagram.authoring.d2Import)
-    }
-    : { version: 1, status: 'needsValidation' };
-  synchronizeD2AuthoringDraft(next, diagram.authoring.d2Import);
-  const errors = validateTemplateSpec(next);
+    };
+  } else {
+    diagram.authoring.d2Import.mappingValidation = { version: 1, status: 'needsValidation' };
+  }
+  const errors = validateTemplateSpecForStorage(next);
   if (errors.length) {
     const error = new Error('Updated D2 source produced an invalid deterministic template spec.');
     error.code = 'diagram_import_invalid_spec';
@@ -6085,12 +6470,10 @@ function dynamicPagesClientScript() {
       assistantFlowDependencyLaterWarning: 'Uses "{name}", shown later in the editor. This is allowed; planning follows the dependency.',
       assistantFlowDependencyCycleWarning: 'Circular dependencies were found. The Assistant can prepare a plan, but a deterministic draft cannot execute a cycle.',
       remove: 'Remove',
-      assistantPromptAutosavePending: 'Assistant prompts will be saved shortly.',
-      assistantPromptAutosaveSaving: 'Saving Assistant prompts...',
-      assistantPromptAutosaveSaved: 'Assistant prompts saved.',
-      assistantPromptAutosaveRequiresTemplateSave: 'Save the new template first; Assistant prompts are kept in this draft until then.',
-      assistantPromptAutosaveConflict: 'Assistant prompts were not saved because the template changed. Reload the template before retrying.',
-      assistantPromptAutosaveFailed: 'Assistant prompts were not saved: {message}',
+      assistantPromptGlobalSaveHint: 'Assistant settings are saved with the template by the common Save action.',
+      savingTemplate: 'Saving template...',
+      changesReadyToSave: 'Changes are ready. Save the template to persist them.',
+      savedNotExecutable: 'Template was saved, but execution remains unavailable until the deterministic configuration is complete.',
       assistantGenerateFlow: 'Plan data flow',
       assistantAcceptRefinedPrompt: 'Replace with suggested description',
       assistantPromptRefinementTitle: 'The description must be refined before planning the flow',
@@ -6337,6 +6720,7 @@ function dynamicPagesClientScript() {
       d2WorkflowPendingTitle: 'D2 mapping must be applied',
       d2WorkflowPendingHelp: 'The D2 source is saved, but it has not yet become a deterministic diagram mapping. Analyze it, complete the mapping in Diagram Editor, apply it, then save the template.',
       d2WorkflowChangedHelp: 'The D2 source changed after the last mapping. Analyze and apply the new mapping before previewing or publishing a diagram.',
+      d2WorkflowPromptChangedHelp: 'A D2 Assistant prompt changed after the last mapping. Assistant was not run automatically. Explicitly reapply the mapping or adjust the existing mapping in Diagram Editor before previewing or publishing.',
       d2WorkflowSemanticModelRevisionRequiredHelp: 'This D2 mapping uses a retired semantic model. Analyze the current D2 source and apply the new mapping before previewing or publishing a diagram.',
       d2WorkflowValidationRequiredHelp: 'D2 mapping changes are saved, but they have not passed deterministic validation. Complete the fields in Diagram Editor and run Check and apply D2 mapping before previewing or publishing a diagram.',
       d2WorkflowAppliedTitle: 'D2 mapping is applied',
@@ -6354,6 +6738,8 @@ function dynamicPagesClientScript() {
       diagramImportRuntimePreviewTitle: 'Diagram preview from data',
       diagramImportRuntimePreviewEmpty: 'Apply a D2 mapping to build the diagram from data.',
       diagramImportRuntimePreviewPartial: 'The preview is incomplete: it shows only data from stages that completed before the error.',
+      diagramImportRuntimePreviewMappingPartial: 'The preview contains only independently validated mappings. Unconfirmed roles and connections are omitted.',
+      diagramImportRuntimePreviewOmitted: 'Omitted mapping items: {count}.',
       diagramImportRuntimePreviewSourceFallback: 'Source D2 template structure',
       diagramImportRuntimePreviewSourceFallbackHelp: 'Data preview could not be built completely. The current source template is shown so that the preserved visual structure remains visible.',
       diagramImportRuntimePreviewMissing: 'D2 mapping was applied, but the draft preview returned no diagram.',
@@ -6384,7 +6770,7 @@ function dynamicPagesClientScript() {
       diagramImportPendingProposalPriority: 'The current reviewed D2 proposal is shown here. Applying it replaces the saved mapping; the saved mapping is not an editable fallback.',
       diagramImportReadinessProposalMissing: 'No current reviewed D2 proposal is available.',
       diagramImportReadinessSemanticRevision: 'The D2 proposal uses an unsupported semantic model revision. Analyze the current source again.',
-      diagramImportReadinessRevisionChanged: 'The reviewed D2 proposal no longer matches the current template revision. Analyze the current source again.',
+      diagramImportReadinessRevisionChanged: 'The reviewed D2 proposal no longer matches the deterministic template configuration. Assistant prompt changes do not require another analysis.',
       diagramImportReadinessUnresolved: 'Complete the unresolved D2 mapping fields.',
       diagramImportReadinessLabelTemplates: 'Fix the highlighted composite label templates.',
       diagramImportRenderFailed: 'Designer could not display the D2 analysis result. Refresh Designer and analyze the source again.',
@@ -7140,12 +7526,10 @@ function dynamicPagesClientScript() {
       assistantFlowDependencyLaterWarning: 'Использует «{name}», который расположен ниже в редакторе. Это разрешено: планирование учитывает зависимость.',
       assistantFlowDependencyCycleWarning: 'Обнаружена циклическая зависимость. Assistant может подготовить план, но детерминированный draft не сможет исполнить цикл.',
       remove: 'Удалить',
-      assistantPromptAutosavePending: 'Промпты Assistant будут сохранены через несколько секунд.',
-      assistantPromptAutosaveSaving: 'Сохранение промптов Assistant...',
-      assistantPromptAutosaveSaved: 'Промпты Assistant сохранены.',
-      assistantPromptAutosaveRequiresTemplateSave: 'Сначала сохраните новый шаблон; до этого промпты Assistant хранятся только в текущем draft.',
-      assistantPromptAutosaveConflict: 'Промпты Assistant не сохранены: шаблон был изменен. Перезагрузите шаблон перед повторной попыткой.',
-      assistantPromptAutosaveFailed: 'Промпты Assistant не сохранены: {message}',
+      assistantPromptGlobalSaveHint: 'Настройки Assistant сохраняются вместе с шаблоном общей кнопкой «Сохранить».',
+      savingTemplate: 'Шаблон сохраняется...',
+      changesReadyToSave: 'Изменения готовы. Нажмите «Сохранить», чтобы записать их в шаблон.',
+      savedNotExecutable: 'Шаблон сохранен, но выполнение недоступно, пока детерминированная конфигурация не завершена.',
       assistantGenerateFlow: 'Сформировать поток данных',
       assistantAcceptRefinedPrompt: 'Заменить описание предложенным',
       assistantPromptRefinementTitle: 'Описание нужно уточнить перед построением потока',
@@ -7392,6 +7776,7 @@ function dynamicPagesClientScript() {
       d2WorkflowPendingTitle: 'Нужно применить D2 mapping',
       d2WorkflowPendingHelp: 'D2 source сохранен, но еще не стал детерминированным mapping диаграммы. Проанализируйте его, заполните mapping в «Редакторе диаграмм», примените и сохраните шаблон.',
       d2WorkflowChangedHelp: 'D2 source изменен после предыдущего mapping. Перед предпросмотром или публикацией диаграммы повторно проанализируйте и примените mapping.',
+      d2WorkflowPromptChangedHelp: 'После предыдущего mapping изменен prompt Ассистента диаграмм. Assistant не запускался автоматически. Явно повторно примените mapping или скорректируйте существующий mapping в «Редакторе диаграмм» перед preview или публикацией.',
       d2WorkflowSemanticModelRevisionRequiredHelp: 'Этот D2 mapping использует устаревшую семантическую модель. Перед предпросмотром или публикацией повторно проанализируйте текущий D2 source и примените новый mapping.',
       d2WorkflowValidationRequiredHelp: 'Изменения D2 mapping сохранены, но не прошли детерминированную проверку. Заполните поля в «Редакторе диаграмм» и выполните «Проверить и применить D2 mapping» перед preview или публикацией диаграммы.',
       d2WorkflowAppliedTitle: 'D2 mapping применен',
@@ -7409,6 +7794,8 @@ function dynamicPagesClientScript() {
       diagramImportRuntimePreviewTitle: 'Предпросмотр диаграммы по данным',
       diagramImportRuntimePreviewEmpty: 'Примените D2 mapping, чтобы построить диаграмму по данным.',
       diagramImportRuntimePreviewPartial: 'Предпросмотр неполный: показаны данные только успешно завершившихся этапов до ошибки.',
+      diagramImportRuntimePreviewMappingPartial: 'В preview включены только независимо проверенные mapping. Неподтвержденные роли и связи исключены.',
+      diagramImportRuntimePreviewOmitted: 'Исключено элементов mapping: {count}.',
       diagramImportRuntimePreviewSourceFallback: 'Структура исходного D2 template',
       diagramImportRuntimePreviewSourceFallbackHelp: 'Предпросмотр по данным не удалось построить полностью. Показана текущая структура исходного template, чтобы оставалась видна сохраненная визуальная схема.',
       diagramImportRuntimePreviewMissing: 'D2 mapping применен, но draft preview не вернул диаграмму.',
@@ -7439,7 +7826,7 @@ function dynamicPagesClientScript() {
       diagramImportPendingProposalPriority: 'Здесь показан текущий проверенный D2 proposal. Его применение заменит сохраненный mapping; сохраненный mapping не является редактируемым запасным вариантом.',
       diagramImportReadinessProposalMissing: 'Нет актуального проверенного D2 proposal.',
       diagramImportReadinessSemanticRevision: 'D2 proposal использует неподдерживаемую ревизию семантической модели. Повторно проанализируйте текущий source.',
-      diagramImportReadinessRevisionChanged: 'Проверенный D2 proposal больше не соответствует текущей ревизии шаблона. Повторно проанализируйте текущий source.',
+      diagramImportReadinessRevisionChanged: 'Проверенный D2 proposal больше не соответствует детерминированной схеме шаблона. Изменения prompts Assistant не требуют нового анализа.',
       diagramImportReadinessUnresolved: 'Заполните незавершенные поля D2 mapping.',
       diagramImportReadinessLabelTemplates: 'Исправьте выделенные составные label template.',
       diagramImportRenderFailed: 'Дизайнер не смог отобразить результат анализа D2. Обновите Дизайнер и повторите анализ source.',
@@ -8022,11 +8409,8 @@ function dynamicPagesClientScript() {
     assistantFlowRequestGeneration: 0,
     assistantFlowExpandedBlockIds: {},
     assistantFlowDragSourceId: '',
-    assistantPromptAutosaveTimer: null,
-    assistantPromptAutosavePromise: null,
-    assistantPromptAutosaveGeneration: 0,
-    assistantPromptAutosaveStatus: 'idle',
-    assistantPromptAutosaveError: '',
+    assistantAuthoringDirty: false,
+    savingTemplate: false,
     assistantDiagramInterpretPrompt: '',
     assistantDiagramMappingPrompt: '',
     assistantDiagramInterpretBusy: false,
@@ -8063,6 +8447,7 @@ function dynamicPagesClientScript() {
       diagramImportBusy: false,
     diagramImportAssistantBusy: false,
     diagramImportStale: false,
+    diagramImportPromptStale: '',
     diagramImportAppliedPendingPreview: false,
     lastDraftPreviewOk: false,
     builderKind: 'classes',
@@ -8172,10 +8557,9 @@ function dynamicPagesClientScript() {
       else window.history.pushState({ designerSection: normalized }, '', url);
     }
     renderDesigner();
-    if (normalized === 'diagram-assistant' && state.diagramImportRestorePending && String(state.diagramImportSource || '').trim()) {
-      state.diagramImportRestorePending = false;
-      window.setTimeout(function () { analyzeDiagramImport(); }, 0);
-    }
+    // A saved D2 source is rendered as saved authoring state. Analysis is an
+    // explicit user action so opening the Assistant never changes a draft.
+    state.diagramImportRestorePending = false;
   }
 
   function normalizeLanguage(value) {
@@ -9054,206 +9438,72 @@ function dynamicPagesClientScript() {
     if (mapping) state.assistantDiagramMappingPrompt = String(mapping.value || '');
   }
 
-  function assistantD2AuthoringDraft() {
-    var source = String(state.diagramImportSource || '');
-    var diagram = firstDiagramSpec(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
-    var imported = diagram && diagram.authoring && diagram.authoring.d2Import;
-    var currentImported = imported && Number(imported.version || 0) === 3 &&
-      Number(imported.semanticModelRevision || 0) === D2_IMPORT_SEMANTIC_MODEL_REVISION &&
-      String(imported.source || '') === source &&
-      String(imported.sourceHash || '').trim() &&
-      String(imported.structureHash || '').trim() &&
-      String(imported.mappingContractHash || '').trim() &&
-      imported.structureTree && Number(imported.structureTree.version || 0) === D2_IMPORT_STRUCTURE_TREE_VERSION &&
-      Array.isArray(imported.structureTree.items);
-    if (!currentImported) {
-      return {
-        version: 1,
-        semanticModelRevision: 0,
-        diagramId: '',
-        sourceHash: '',
-        structureHash: '',
-        mappingContractHash: '',
-        source: source,
-        overrides: {
-          semanticModelRevision: 0,
-          diagramId: '',
-          sourceHash: '',
-          structureHash: '',
-          mappingContractHash: '',
-          roles: [],
-          relationRules: [],
-          structureTree: { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] }
-        }
-      };
-    }
-    var identity = {
-      semanticModelRevision: D2_IMPORT_SEMANTIC_MODEL_REVISION,
-      diagramId: String(imported.diagramId || diagram.id || ''),
-      sourceHash: String(imported.sourceHash || ''),
-      structureHash: String(imported.structureHash || ''),
-      mappingContractHash: String(imported.mappingContractHash || '')
-    };
+  function templateAuthoringClient(spec) {
+    var source = spec && typeof spec === 'object' && !Array.isArray(spec) ? spec : {};
+    var stored = source.authoring && typeof source.authoring === 'object' && !Array.isArray(source.authoring)
+      ? source.authoring
+      : {};
+    var assistant = stored.assistant && typeof stored.assistant === 'object' && !Array.isArray(stored.assistant) ? stored.assistant : {};
+    var d2 = stored.d2 && typeof stored.d2 === 'object' && !Array.isArray(stored.d2) ? stored.d2 : {};
     return {
       version: 1,
-      semanticModelRevision: identity.semanticModelRevision,
-      diagramId: identity.diagramId,
-      sourceHash: identity.sourceHash,
-      structureHash: identity.structureHash,
-      mappingContractHash: identity.mappingContractHash,
-      source: source,
-      overrides: {
-        semanticModelRevision: identity.semanticModelRevision,
-        diagramId: identity.diagramId,
-        sourceHash: identity.sourceHash,
-        structureHash: identity.structureHash,
-        mappingContractHash: identity.mappingContractHash,
-        roles: (Array.isArray(imported.roles) ? imported.roles : []).map(function (role) {
-          return {
-            id: String(role && role.id || ''),
-            visualKind: diagramImportRoleVisualKindClient(role),
-            labelTemplate: String(role && role.labelTemplate || '')
-          };
-        }).filter(function (role) { return role.id; }),
-        relationRules: cloneJsonValue(imported.relationRules || [], []),
-        structureTree: cloneJsonValue(imported.structureTree || {}, { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] })
-      }
+      assistant: {
+        objectFlowIntent: normalizeAssistantObjectFlowIntentClient(assistant.objectFlowIntent),
+        diagramInterpretPrompt: String(assistant.diagramInterpretPrompt || ''),
+        diagramMappingPrompt: String(assistant.diagramMappingPrompt || '')
+      },
+      d2: { source: String(d2.source || '') }
     };
   }
 
-  function assistantPromptDraft() {
-    captureDiagramImportProposalFromDom();
+  function assistantAuthoringFromState(spec) {
+    var current = templateAuthoringClient(spec);
+    var sourceInput = document.getElementById('cmdp-diagram-import-source');
+    if (sourceInput) state.diagramImportSource = String(sourceInput.value || '');
     return {
-      objectFlowIntent: cloneJsonValue(state.assistantObjectFlowIntent, { context: '', blocks: [] }),
-      diagramInterpretPrompt: String(state.assistantDiagramInterpretPrompt || ''),
-      diagramMappingPrompt: String(state.assistantDiagramMappingPrompt || ''),
-      d2Authoring: assistantD2AuthoringDraft()
+      version: 1,
+      assistant: {
+        objectFlowIntent: cloneJsonValue(state.assistantObjectFlowIntent, current.assistant.objectFlowIntent),
+        diagramInterpretPrompt: String(state.assistantDiagramInterpretPrompt || ''),
+        diagramMappingPrompt: String(state.assistantDiagramMappingPrompt || '')
+      },
+      d2: { source: String(state.diagramImportSource || current.d2.source || '') }
     };
   }
 
-  function saveAssistantDraft() {
-    captureAssistantPromptsFromDom();
-    captureDiagramImportProposalFromDom();
-    var save = state.assistantPromptAutosavePromise
-      ? state.assistantPromptAutosavePromise.catch(function () {}).then(function () { return autosaveAssistantPrompts(); })
-      : autosaveAssistantPrompts();
-    save.then(function () {
-      state.message = { type: 'ok', text: t('assistantPromptAutosaveSaved') };
-      renderDesigner();
-    }).catch(function (error) {
-      state.message = { type: 'error', text: String(error && error.message || error || t('requestFailed')) };
-      renderDesigner();
-    });
+  function assistantSpecWithPrompts(spec) {
+    var next = cloneSpecForEdit(spec || defaultSpec());
+    var hasCanonicalAuthoring = next.authoring && typeof next.authoring === 'object' && !Array.isArray(next.authoring);
+    if (!hasCanonicalAuthoring && Object.prototype.hasOwnProperty.call(next, 'assistantDraft') && !state.assistantAuthoringDirty) {
+      // Preserve the opaque retired payload only until the normal Save request,
+      // where the server performs its one-time canonical migration.
+      return next;
+    }
+    next.authoring = assistantAuthoringFromState(next);
+    delete next.assistantDraft;
+    return next;
   }
 
-  function assistantPromptAutosaveText() {
-    if (state.assistantPromptAutosaveStatus === 'pending') return t('assistantPromptAutosavePending');
-    if (state.assistantPromptAutosaveStatus === 'saving') return t('assistantPromptAutosaveSaving');
-    if (state.assistantPromptAutosaveStatus === 'saved') return t('assistantPromptAutosaveSaved');
-    if (state.assistantPromptAutosaveStatus === 'requires-template-save') return t('assistantPromptAutosaveRequiresTemplateSave');
-    if (state.assistantPromptAutosaveStatus === 'conflict') return t('assistantPromptAutosaveConflict');
-    if (state.assistantPromptAutosaveStatus === 'failed') return t('assistantPromptAutosaveFailed', { message: state.assistantPromptAutosaveError || t('requestFailed') });
-    return '';
+  function markAssistantAuthoringChanged() {
+    state.assistantAuthoringDirty = true;
+  }
+
+  function markDiagramImportPromptChanged(kind) {
+    var imported = firstDiagramSpec(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec()).authoring;
+    if (!imported || !imported.d2Import) return;
+    state.diagramImportPromptStale = String(kind || 'prompt');
+    state.lastDraftPreviewOk = false;
+    state.diagramImportAppliedPendingPreview = false;
+    state.diagramImportRuntimePreview = null;
+    state.diagramImportRuntimePreviewError = '';
   }
 
   function renderAssistantPromptAutosaveControl() {
-    var text = assistantPromptAutosaveText();
-    return '<div class="toolbar"><button type="button" data-action="assistant-draft-save">' + escapeHtml(t('assistantSaveDraft')) + '</button><span id="cmdp-assistant-prompt-autosave-status" class="muted" role="status" aria-live="polite"' + (text ? '' : ' hidden') + '>' + escapeHtml(text) + '</span></div>';
+    return '<p class="muted">' + escapeHtml(t('assistantPromptGlobalSaveHint')) + '</p>';
   }
 
-  function syncAssistantPromptAutosaveStatus() {
-    var node = document.getElementById('cmdp-assistant-prompt-autosave-status');
-    if (!node) return;
-    var text = assistantPromptAutosaveText();
-    node.textContent = text;
-    node.hidden = !text;
-    node.className = state.assistantPromptAutosaveStatus === 'failed' || state.assistantPromptAutosaveStatus === 'conflict'
-      ? 'notice error'
-      : 'muted';
-  }
-
-  function invalidateAssistantPromptAutosave() {
-    if (state.assistantPromptAutosaveTimer) window.clearTimeout(state.assistantPromptAutosaveTimer);
-    state.assistantPromptAutosaveTimer = null;
-    state.assistantPromptAutosaveGeneration = Number(state.assistantPromptAutosaveGeneration || 0) + 1;
-    state.assistantPromptAutosavePromise = null;
-    state.assistantPromptAutosaveStatus = 'idle';
-    state.assistantPromptAutosaveError = '';
-  }
-
-  function mergeAssistantPromptAutosaveTemplate(template) {
-    var selected = state.selectedTemplate;
-    if (!selected || !template || String(selected.code || '') !== String(template.code || '')) return;
-    var localSpec = cloneSpecForEdit(selected.spec || defaultSpec());
-    localSpec.assistantDraft = cloneJsonValue(template.spec && template.spec.assistantDraft, {});
-    selected.spec = localSpec;
-    selected.specHash = template.specHash || selected.specHash;
-    selected.updatedAt = template.updatedAt || selected.updatedAt;
-  }
-
-  function autosaveAssistantPrompts() {
-    var selected = state.selectedTemplate;
-    if (!selected || !selected.id || !selected.code || !selected.specHash) {
-      state.assistantPromptAutosaveStatus = 'requires-template-save';
-      syncAssistantPromptAutosaveStatus();
-      return Promise.resolve(null);
-    }
-    var generation = Number(state.assistantPromptAutosaveGeneration || 0) + 1;
-    var templateCode = String(selected.code || '');
-    var baseSpecHash = String(selected.specHash || '');
-    var draft = assistantPromptDraft();
-    state.assistantPromptAutosaveGeneration = generation;
-    state.assistantPromptAutosaveStatus = 'saving';
-    state.assistantPromptAutosaveError = '';
-    syncAssistantPromptAutosaveStatus();
-    var autosave = request(apiPrefix + '/templates/' + encodeURIComponent(templateCode) + '/assistant-draft', {
-      method: 'PUT',
-      body: { baseSpecHash: baseSpecHash, assistantDraft: draft }
-    }).then(function (result) {
-      if (Number(state.assistantPromptAutosaveGeneration || 0) !== generation) return null;
-      if (!result.ok || !result.json || !result.json.template) {
-        state.assistantPromptAutosaveStatus = result && result.status === 409 ? 'conflict' : 'failed';
-        state.assistantPromptAutosaveError = errorText(result);
-        throw new Error(state.assistantPromptAutosaveError);
-      }
-      mergeAssistantPromptAutosaveTemplate(result.json.template);
-      state.assistantPromptAutosaveStatus = 'saved';
-      return result.json.template;
-    }).catch(function (error) {
-      if (Number(state.assistantPromptAutosaveGeneration || 0) !== generation) return null;
-      state.assistantPromptAutosaveStatus = state.assistantPromptAutosaveStatus === 'conflict' ? 'conflict' : 'failed';
-      state.assistantPromptAutosaveError = String(error && error.message || error || t('requestFailed'));
-      throw error;
-    }).finally(function () {
-      if (Number(state.assistantPromptAutosaveGeneration || 0) === generation) {
-        state.assistantPromptAutosavePromise = null;
-        syncAssistantPromptAutosaveStatus();
-      }
-    });
-    state.assistantPromptAutosavePromise = autosave;
-    return autosave;
-  }
-
-  function flushAssistantPromptAutosave() {
-    captureAssistantPromptsFromDom();
-    if (state.assistantPromptAutosaveTimer) {
-      window.clearTimeout(state.assistantPromptAutosaveTimer);
-      state.assistantPromptAutosaveTimer = null;
-      return autosaveAssistantPrompts();
-    }
-    if (state.assistantPromptAutosavePromise) return state.assistantPromptAutosavePromise;
-    return Promise.resolve(null);
-  }
-
-  function scheduleAssistantPromptAutosave() {
-    if (state.assistantPromptAutosaveTimer) window.clearTimeout(state.assistantPromptAutosaveTimer);
-    state.assistantPromptAutosaveStatus = 'pending';
-    state.assistantPromptAutosaveError = '';
-    syncAssistantPromptAutosaveStatus();
-    state.assistantPromptAutosaveTimer = window.setTimeout(function () {
-      state.assistantPromptAutosaveTimer = null;
-      autosaveAssistantPrompts().catch(function () {});
-    }, 1200);
+  function resetAssistantAuthoringDirty() {
+    state.assistantAuthoringDirty = false;
   }
 
   function defaultSpec() {
@@ -9613,7 +9863,7 @@ function dynamicPagesClientScript() {
     options = options || {};
     var selected = state.selectedTemplate;
     var spec = selected && selected.spec ? selected.spec : defaultSpec();
-    var assistantDraft = spec.assistantDraft && typeof spec.assistantDraft === 'object' && !Array.isArray(spec.assistantDraft) ? spec.assistantDraft : {};
+    var authoring = templateAuthoringClient(spec);
     var builder = inferBuilderStateFromSpec(spec);
     var relation = getRelationExpansionStep(spec);
     var selection = getDataSelectionStep(spec);
@@ -9624,10 +9874,10 @@ function dynamicPagesClientScript() {
     }
     if (!options.preserveAssistantState) {
       invalidateAssistantObjectFlowRequests();
-      invalidateAssistantPromptAutosave();
-      state.assistantDraftIntent = String(assistantDraft.intent || '');
-      state.assistantTaskMode = normalizeOutputMode(assistantDraft.taskMode || state.assistantTaskMode || 'both');
-      state.assistantObjectFlowIntent = normalizeAssistantObjectFlowIntentClient(assistantDraft.objectFlowIntent);
+      resetAssistantAuthoringDirty();
+      state.assistantDraftIntent = '';
+      state.assistantTaskMode = normalizeOutputMode(state.assistantTaskMode || 'both');
+      state.assistantObjectFlowIntent = normalizeAssistantObjectFlowIntentClient(authoring.assistant.objectFlowIntent);
       state.assistantFlowProposal = null;
       state.assistantFlowSemanticPlan = null;
       state.assistantFlowRefinement = null;
@@ -9639,8 +9889,8 @@ function dynamicPagesClientScript() {
       state.assistantFlowCanApply = false;
       state.assistantFlowExplanation = '';
       state.assistantFlowWarnings = [];
-      state.assistantDiagramInterpretPrompt = String(assistantDraft.diagramInterpretPrompt || '');
-      state.assistantDiagramMappingPrompt = String(assistantDraft.diagramMappingPrompt || '');
+      state.assistantDiagramInterpretPrompt = String(authoring.assistant.diagramInterpretPrompt || '');
+      state.assistantDiagramMappingPrompt = String(authoring.assistant.diagramMappingPrompt || '');
       state.assistantFlowBusy = false;
       state.assistantDiagramInterpretBusy = false;
       state.assistantDiagramMappingBusy = false;
@@ -9649,14 +9899,21 @@ function dynamicPagesClientScript() {
     }
     var diagram = firstDiagramSpec(spec);
     var d2Import = diagram.authoring && diagram.authoring.d2Import && typeof diagram.authoring.d2Import === 'object' ? diagram.authoring.d2Import : {};
-    var d2Authoring = assistantDraft.d2Authoring && typeof assistantDraft.d2Authoring === 'object' && !Array.isArray(assistantDraft.d2Authoring) ? assistantDraft.d2Authoring : {};
-    var d2AuthoringOverrides = cloneJsonValue(d2Authoring.overrides || { roles: [], relationRules: [], structureTree: { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] } }, { roles: [], relationRules: [], structureTree: { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] } });
-    ['semanticModelRevision', 'diagramId', 'sourceHash', 'structureHash', 'mappingContractHash'].forEach(function (field) {
-      if ((d2AuthoringOverrides[field] === undefined || d2AuthoringOverrides[field] === '') && d2Authoring[field] !== undefined) d2AuthoringOverrides[field] = d2Authoring[field];
-    });
-    state.diagramImportSource = String(d2Authoring.source || d2Import.source || '');
+    var d2AuthoringOverrides = {
+      semanticModelRevision: Number(d2Import.semanticModelRevision || 0),
+      diagramId: String(d2Import.diagramId || diagram.id || ''),
+      sourceHash: String(d2Import.sourceHash || ''),
+      structureHash: String(d2Import.structureHash || ''),
+      mappingContractHash: String(d2Import.mappingContractHash || ''),
+      roles: (Array.isArray(d2Import.roles) ? d2Import.roles : []).map(function (role) {
+        return { id: String(role && role.id || ''), visualKind: diagramImportRoleVisualKindClient(role), labelTemplate: String(role && role.labelTemplate || '') };
+      }).filter(function (role) { return role.id; }),
+      relationRules: cloneJsonValue(d2Import.relationRules || [], []),
+      structureTree: cloneJsonValue(d2Import.structureTree || {}, { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] })
+    };
+    state.diagramImportSource = String(authoring.d2.source || d2Import.source || '');
     state.diagramImportAuthoringOverrides = d2AuthoringOverrides;
-    state.diagramImportRestorePending = Boolean(state.diagramImportSource.trim() && d2Authoring.source);
+    state.diagramImportRestorePending = false;
     state.diagramImportProposal = null;
     state.diagramImportSignedProposal = null;
     state.diagramImportAppliedEditor = null;
@@ -9684,6 +9941,7 @@ function dynamicPagesClientScript() {
     state.diagramImportBusy = false;
     state.diagramImportAssistantBusy = false;
     state.diagramImportStale = false;
+    state.diagramImportPromptStale = '';
     state.diagramImportAppliedPendingPreview = false;
     state.extractionPreview = null;
     state.lastDraftPreviewOk = false;
@@ -10323,7 +10581,7 @@ function dynamicPagesClientScript() {
   }
 
   function relationPathDefaultSourceAlias(model, spec) {
-    var candidates = materializedAliasRows(model).map(function (row) { return row.alias; });
+    var candidates = materializedAliasRows(model, spec).map(function (row) { return row.alias; });
     var selected = String(state.relationPathSource || '').trim();
     if (selected && candidates.indexOf(selected) !== -1) return selected;
     return candidates.find(function (alias) { return relationPathSourceClass(model, spec, alias); }) || '';
@@ -10337,7 +10595,7 @@ function dynamicPagesClientScript() {
       '<div class="settings-block" data-relation-path-planner>',
       '<div class="section-title-row"><h3>' + t('relationPathPlanner') + '</h3></div>',
       '<div class="settings-grid">',
-      '<label>' + t('relationPathSource') + '<select data-relation-path-source>' + renderMaterializedAliasOptions(model, sourceAlias) + '</select></label>',
+      '<label>' + t('relationPathSource') + '<select data-relation-path-source>' + renderMaterializedAliasOptions(model, sourceAlias, spec) + '</select></label>',
       '<label>' + t('relationPath') + '<select data-relation-path>' + renderRelationPathOptions(sourceClass) + '</select></label>',
       '</div>',
       '<p class="muted">' + escapeHtml(t('relationPathHelp')) + '</p>',
@@ -11174,8 +11432,10 @@ function dynamicPagesClientScript() {
     return result;
   }
 
-  function objectSelectionLabel(selection, index) {
-    return objectSelectionDisplayName(index || 0);
+  function objectSelectionLabel(selection, index, spec) {
+    var alias = String(selection && (selection.alias || selection.as || selection.output && selection.output.alias) || objectSelectionAlias(index)).trim();
+    if (assistantManagedObjectFlow(spec)) return userFacingResultLabel(alias, spec);
+    return String(selection && (selection.name || selection.title || selection.output && selection.output.title) || '').trim() || objectSelectionDisplayName(index || 0);
   }
 
   function selectionOptionRows(spec, selectedName) {
@@ -11187,7 +11447,7 @@ function dynamicPagesClientScript() {
       var alias = selection.alias || objectSelectionAlias(index);
       return {
         alias: alias,
-        label: objectSelectionLabel(selection, index),
+        label: objectSelectionLabel(selection, index, spec),
         className: selection.className || sourceClassForAlias(spec || {}, alias)
       };
     });
@@ -11417,7 +11677,7 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
-  function renderObjectGroupSelection(selection, index) {
+  function renderObjectGroupSelection(selection, index, spec) {
     selection = normalizeObjectSelection(selection, index);
     var rules = selection.rules && selection.rules.length ? selection.rules : [{ action: 'include', path: 'Code', regex: '.*' }];
     var ruleRows = rules.map(function (rule) {
@@ -11429,9 +11689,11 @@ function dynamicPagesClientScript() {
       '<div class="object-selection" data-object-selection data-object-selection-index="' + index + '" data-object-selection-id="' + escapeHtml(selection.id || ('selection:' + selection.alias)) + '" data-object-filter-join="' + escapeHtml(selection.filterJoin) + '">',
       '<div class="settings-grid">',
       '<label>' + t('objectSelectionTitle') + '<input data-object-selection-field="name" value="' + escapeHtml(selection.name || defaultObjectSelectionName(index)) + '"></label>',
-      '<label>' + t('objectSelectionAlias') + '<input data-object-selection-field="alias" value="' + escapeHtml(selection.alias || objectSelectionAlias(index)) + '"></label>',
+      renderResultAliasField('data-object-selection-field="alias"', selection.alias || objectSelectionAlias(index), spec),
       '<label>' + t('objectGroupSourceClass') + '<select' + classId + ' data-object-selection-field="className">' + renderObjectGroupSourceClassOptions(selection.className) + '</select></label>',
-      '<label>' + t('objectSelectionFrom') + '<input data-object-selection-field="from" value="' + escapeHtml(selection.from || '') + '"></label>',
+      assistantManagedObjectFlow(spec)
+        ? '<label>' + t('objectSelectionFrom') + '<input type="hidden" data-object-selection-field="from" value="' + escapeHtml(selection.from || '') + '"><output class="result-display-name">' + escapeHtml(selection.from ? userFacingResultLabel(selection.from, spec) : '') + '</output></label>'
+        : '<label>' + t('objectSelectionFrom') + '<input data-object-selection-field="from" value="' + escapeHtml(selection.from || '') + '"></label>',
       '<label>' + t('objectSelectionLimit') + '<input data-object-selection-field="limit" value="' + escapeHtml(selection.limit == null ? '' : String(selection.limit)) + '"></label>',
       '<label>' + t('objectSelectionColumns') + '<input data-object-selection-field="columns" value="' + escapeHtml(objectSelectionColumnsText(selection)) + '"></label>',
       '</div>',
@@ -11455,7 +11717,7 @@ function dynamicPagesClientScript() {
     return [
       '<section class="section" id="cmdp-object-group-editor"><h2>' + t('objectGroupEditor') + '</h2>',
       '<p class="muted">' + t('objectGroupHelp') + '</p>',
-      selections.map(renderObjectGroupSelection).join(''),
+      selections.map(function (selection, index) { return renderObjectGroupSelection(selection, index, spec); }).join(''),
       renderObjectGroupRegexExamples(),
       '</section>'
     ].join('');
@@ -11525,7 +11787,8 @@ function dynamicPagesClientScript() {
     return model && Array.isArray(model.operations) ? model.operations : [];
   }
 
-  function operationLabel(operation, index, matchIndex, setIndex) {
+  function operationLabel(operation, index, matchIndex, setIndex, spec) {
+    if (assistantManagedObjectFlow(spec)) return userFacingResultLabel(operation && operation.as, spec);
     if (operation && operation.type === 'match') return t('matchingBlock', { number: matchIndex + 1 });
     if (operation && operation.type === 'semiJoin') return t('semiJoinOperation', { number: index + 1 });
     if (operation && operation.type === 'relation') return String(operation.label || operation.name || operation.as || '').trim() || t('relationOperation', { number: index + 1 });
@@ -11533,26 +11796,26 @@ function dynamicPagesClientScript() {
     return t('setOperation', { number: setIndex + 1 });
   }
 
-  function priorMaterializedAliasRows(model, operationIndex) {
+  function priorMaterializedAliasRows(model, operationIndex, spec) {
     var rows = [];
     (model.selections || []).forEach(function (selection, index) {
-      rows.push({ alias: selection.alias || objectSelectionAlias(index), label: objectSelectionLabel(selection, index) });
+      rows.push({ alias: selection.alias || objectSelectionAlias(index), label: objectSelectionLabel(selection, index, spec) });
     });
     flowOperations(model).slice(0, operationIndex).forEach(function (operation, index) {
       var earlier = flowOperations(model).slice(0, index);
       var matchIndex = earlier.filter(function (item) { return item.type === 'match'; }).length;
       var setIndex = earlier.length - matchIndex;
-      rows.push({ alias: operation.as, label: operationLabel(operation, index, matchIndex, setIndex) });
+      rows.push({ alias: operation.as, label: operationLabel(operation, index, matchIndex, setIndex, spec) });
     });
     return rows.filter(function (row, index) {
       return row.alias && rows.findIndex(function (candidate) { return candidate.alias === row.alias; }) === index;
     });
   }
 
-  function renderPriorMaterializedAliasOptions(model, operationIndex, selectedName) {
-    var rows = priorMaterializedAliasRows(model, operationIndex);
+  function renderPriorMaterializedAliasOptions(model, operationIndex, selectedName, spec) {
+    var rows = priorMaterializedAliasRows(model, operationIndex, spec);
     return '<option value=""></option>' + rows.map(function (row) {
-      return '<option value="' + escapeHtml(row.alias) + '"' + (row.alias === selectedName ? ' selected' : '') + '>' + escapeHtml(row.label + ' [' + row.alias + ']') + '</option>';
+      return '<option value="' + escapeHtml(row.alias) + '"' + (row.alias === selectedName ? ' selected' : '') + '>' + escapeHtml(row.label) + '</option>';
     }).join('');
   }
 
@@ -11600,12 +11863,12 @@ function dynamicPagesClientScript() {
     }).join('');
     return [
       '<div class="matching-block" data-flow-operation="' + (isSemiJoin ? 'semiJoin' : 'match') + '" data-flow-operation-index="' + operationIndex + '" data-matching-block data-matching-block-id="' + escapeHtml(block.id || ((isSemiJoin ? 'semiJoin:' : 'match:') + block.as)) + '">',
-      '<div class="section-title-row"><h3>' + (isSemiJoin ? t('semiJoinOperation', { number: operationIndex + 1 }) : t('matchingBlock', { number: matchIndex + 1 })) + '</h3>',
-      '<div><button data-action="add-matching-rule-row">' + t('addMatchingRule') + '</button><button data-action="clear-matching-block" type="button" aria-label="' + escapeHtml(t('clearMatchingBlock') + ': ' + (block.as || String(matchIndex + 1))) + '">' + t('clearMatchingBlock') + '</button></div></div>',
+      '<div class="section-title-row"><h3>' + escapeHtml(assistantManagedObjectFlow(spec) ? userFacingResultLabel(block.as, spec) : (isSemiJoin ? t('semiJoinOperation', { number: operationIndex + 1 }) : t('matchingBlock', { number: matchIndex + 1 }))) + '</h3>',
+      '<div><button data-action="add-matching-rule-row">' + t('addMatchingRule') + '</button><button data-action="clear-matching-block" type="button" aria-label="' + escapeHtml(t('clearMatchingBlock') + ': ' + (assistantManagedObjectFlow(spec) ? userFacingResultLabel(block.as, spec) : (block.as || String(matchIndex + 1)))) + '">' + t('clearMatchingBlock') + '</button></div></div>',
       '<div class="row">',
-      '<label>' + t('matchingLeftSelection') + '<select data-matching-block-field="from">' + renderPriorMaterializedAliasOptions(model, operationIndex, block.from) + '</select></label>',
-      '<label>' + t('matchingRightSelection') + '<select data-matching-block-field="with">' + renderPriorMaterializedAliasOptions(model, operationIndex, block.with) + '</select></label>',
-      '<label>' + t('setOperationAlias') + '<input data-matching-block-field="as" value="' + escapeHtml(block.as || ('matchedObjects' + String(matchIndex + 1))) + '"></label>',
+      '<label>' + t('matchingLeftSelection') + '<select data-matching-block-field="from">' + renderPriorMaterializedAliasOptions(model, operationIndex, block.from, spec) + '</select></label>',
+      '<label>' + t('matchingRightSelection') + '<select data-matching-block-field="with">' + renderPriorMaterializedAliasOptions(model, operationIndex, block.with, spec) + '</select></label>',
+      renderResultAliasField('data-matching-block-field="as"', block.as || ('matchedObjects' + String(matchIndex + 1)), spec),
       isSemiJoin ? '<label>' + t('semiJoinRuleJoin') + '<select data-matching-block-field="ruleJoin"><option value="any"' + (block.ruleJoin !== 'all' ? ' selected' : '') + '>' + t('semiJoinAny') + '</option><option value="all"' + (block.ruleJoin === 'all' ? ' selected' : '') + '>' + t('semiJoinAll') + '</option></select></label>' : '',
       '</div>',
       '<div class="matching-rule-list" data-matching-rule-list>',
@@ -11618,27 +11881,27 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
-  function materializedAliasRows(model) {
+  function materializedAliasRows(model, spec) {
     var rows = [];
     (model.selections || []).forEach(function (selection, index) {
-      rows.push({ alias: selection.alias || objectSelectionAlias(index), label: objectSelectionLabel(selection, index) });
+      rows.push({ alias: selection.alias || objectSelectionAlias(index), label: objectSelectionLabel(selection, index, spec) });
     });
     flowOperations(model).forEach(function (operation, index) {
       var earlier = flowOperations(model).slice(0, index);
       var matchIndex = earlier.filter(function (item) { return item.type === 'match'; }).length;
       var setIndex = earlier.length - matchIndex;
-      rows.push({ alias: operation.as, label: operationLabel(operation, index, matchIndex, setIndex) });
+      rows.push({ alias: operation.as, label: operationLabel(operation, index, matchIndex, setIndex, spec) });
     });
     return rows.filter(function (row, index) {
       return row.alias && rows.findIndex(function (candidate) { return candidate.alias === row.alias; }) === index;
     });
   }
 
-  function renderMaterializedAliasOptions(model, selectedName) {
-    var rows = materializedAliasRows(model);
-    if (selectedName && !rows.some(function (row) { return row.alias === selectedName; })) rows.unshift({ alias: selectedName, label: selectedName });
+  function renderMaterializedAliasOptions(model, selectedName, spec) {
+    var rows = materializedAliasRows(model, spec);
+    if (selectedName && !rows.some(function (row) { return row.alias === selectedName; })) rows.unshift({ alias: selectedName, label: userFacingResultLabel(selectedName, spec) });
     return '<option value=""></option>' + rows.map(function (row) {
-      return '<option value="' + escapeHtml(row.alias) + '"' + (row.alias === selectedName ? ' selected' : '') + '>' + escapeHtml(row.label + ' [' + row.alias + ']') + '</option>';
+      return '<option value="' + escapeHtml(row.alias) + '"' + (row.alias === selectedName ? ' selected' : '') + '>' + escapeHtml(row.label) + '</option>';
     }).join('');
   }
 
@@ -11677,12 +11940,12 @@ function dynamicPagesClientScript() {
     var keys = operation.on && operation.on.length ? operation.on : [{ left: 'Class', right: 'Class' }, { left: '_id', right: '_id' }];
     return [
       '<div class="matching-block" data-flow-operation="' + escapeHtml(operation.type) + '" data-flow-operation-index="' + operationIndex + '" data-set-operation data-set-operation-id="' + escapeHtml(operation.id) + '">',
-      '<div class="section-title-row"><h3>' + t('setOperation', { number: setIndex + 1 }) + '</h3><button data-action="clear-set-operation" type="button" aria-label="' + escapeHtml(t('clear') + ': ' + (operation.as || String(setIndex + 1))) + '">' + t('clear') + '</button></div>',
+      '<div class="section-title-row"><h3>' + escapeHtml(assistantManagedObjectFlow(spec) ? userFacingResultLabel(operation.as, spec) : t('setOperation', { number: setIndex + 1 })) + '</h3><button data-action="clear-set-operation" type="button" aria-label="' + escapeHtml(t('clear') + ': ' + (assistantManagedObjectFlow(spec) ? userFacingResultLabel(operation.as, spec) : (operation.as || String(setIndex + 1)))) + '">' + t('clear') + '</button></div>',
       '<div class="settings-grid">',
       '<label>' + t('setOperationType') + '<select data-set-operation-field="type">' + renderSetOperationTypeOptions(operation.type) + '</select></label>',
-      '<label>' + t('setOperationFrom') + '<select data-set-operation-field="from">' + renderPriorMaterializedAliasOptions(model, operationIndex, operation.from) + '</select></label>',
-      '<label>' + t('setOperationWith') + '<select data-set-operation-field="with">' + renderPriorMaterializedAliasOptions(model, operationIndex, operation.with) + '</select></label>',
-      '<label>' + t('setOperationAlias') + '<input data-set-operation-field="as" value="' + escapeHtml(operation.as) + '"></label>',
+      '<label>' + t('setOperationFrom') + '<select data-set-operation-field="from">' + renderPriorMaterializedAliasOptions(model, operationIndex, operation.from, spec) + '</select></label>',
+      '<label>' + t('setOperationWith') + '<select data-set-operation-field="with">' + renderPriorMaterializedAliasOptions(model, operationIndex, operation.with, spec) + '</select></label>',
+      renderResultAliasField('data-set-operation-field="as"', operation.as, spec),
       '<label class="checkbox checkbox-stacked"><input data-set-operation-field="distinct" type="checkbox"' + (operation.distinct !== false ? ' checked' : '') + '> <span><strong>' + t('setOperationDistinct') + '</strong></span></label>',
       '</div>',
       '<div class="section-title-row"><h4>' + t('setOperationKeys') + '</h4><button data-action="add-set-operation-key" type="button">' + t('addSetOperationKey') + '</button></div>',
@@ -11695,18 +11958,18 @@ function dynamicPagesClientScript() {
 
   function renderRelationOperation(operation, operationIndex, model, spec) {
     operation = normalizeRelationOperation(operation, operationIndex, model.selections, flowOperations(model).slice(0, operationIndex));
-    var label = aliasDisplayLabel(operation.as, spec) || t('relationOperation', { number: operationIndex + 1 });
+    var label = userFacingResultLabel(operation.as, spec) || t('relationOperation', { number: operationIndex + 1 });
     return [
       '<div class="matching-block" data-flow-operation="relation" data-flow-operation-index="' + operationIndex + '" data-relation-operation data-relation-operation-id="' + escapeHtml(operation.id) + '">',
-      '<div class="section-title-row"><h3>' + escapeHtml(label) + '</h3><button data-action="clear-relation-operation" type="button" aria-label="' + escapeHtml(t('clear') + ': ' + (operation.as || String(operationIndex + 1))) + '">' + t('clear') + '</button></div>',
+      '<div class="section-title-row"><h3>' + escapeHtml(label) + '</h3><button data-action="clear-relation-operation" type="button" aria-label="' + escapeHtml(t('clear') + ': ' + label) + '">' + t('clear') + '</button></div>',
       '<div class="settings-grid">',
-      '<label>' + t('relationOperationFrom') + '<select data-relation-operation-field="from">' + renderPriorMaterializedAliasOptions(model, operationIndex, operation.from) + '</select></label>',
+      '<label>' + t('relationOperationFrom') + '<select data-relation-operation-field="from">' + renderPriorMaterializedAliasOptions(model, operationIndex, operation.from, spec) + '</select></label>',
       '<label>' + t('relationDomain') + '<select data-relation-operation-field="domain">' + renderDomainOptions(operation.domain) + '</select></label>',
       '<label>' + t('relationTargetClass') + '<select data-relation-operation-field="targetClass">' + renderClassOptions(operation.targetClass) + '</select></label>',
       '<label>' + t('relationDirection') + '<select data-relation-operation-field="direction">' + renderRelationDirectionOptions(operation.direction) + '</select></label>',
       '<label>' + t('relationOperationColumns') + '<input data-relation-operation-field="columns" value="' + escapeHtml(operation.columns.join(', ')) + '"></label>',
       '<label>' + t('relationLimit') + '<input data-relation-operation-field="limit" type="number" min="1" value="' + escapeHtml(String(operation.limit)) + '"></label>',
-      '<label>' + t('setOperationAlias') + '<input data-relation-operation-field="as" value="' + escapeHtml(operation.as) + '"></label>',
+      renderResultAliasField('data-relation-operation-field="as"', operation.as, spec),
       '</div>',
       '<p class="muted">' + t('relationOperationHelp') + '</p>',
       '</div>'
@@ -11732,17 +11995,17 @@ function dynamicPagesClientScript() {
     }).join('');
     return [
       '<div class="matching-block" data-flow-operation="existsRelated" data-flow-operation-index="' + operationIndex + '" data-exists-related-operation data-exists-related-operation-id="' + escapeHtml(operation.id) + '">',
-      '<div class="section-title-row"><h3>' + t('existsRelatedOperation', { number: operationIndex + 1 }) + '</h3><div><button data-action="add-exists-related-rule-row" type="button">' + t('addMatchingRule') + '</button><button data-action="clear-exists-related-operation" type="button" aria-label="' + escapeHtml(t('clear') + ': ' + (operation.as || String(operationIndex + 1))) + '">' + t('clear') + '</button></div></div>',
+      '<div class="section-title-row"><h3>' + escapeHtml(assistantManagedObjectFlow(spec) ? userFacingResultLabel(operation.as, spec) : t('existsRelatedOperation', { number: operationIndex + 1 })) + '</h3><div><button data-action="add-exists-related-rule-row" type="button">' + t('addMatchingRule') + '</button><button data-action="clear-exists-related-operation" type="button" aria-label="' + escapeHtml(t('clear') + ': ' + (assistantManagedObjectFlow(spec) ? userFacingResultLabel(operation.as, spec) : (operation.as || String(operationIndex + 1)))) + '">' + t('clear') + '</button></div></div>',
       '<p class="muted">' + escapeHtml(t('existsRelatedOperationHelp')) + '</p>',
       '<div class="settings-grid">',
-      '<label>' + t('existsRelatedFrom') + '<select data-exists-related-field="from">' + renderPriorMaterializedAliasOptions(model, operationIndex, operation.from) + '</select></label>',
-      '<label>' + t('existsRelatedWith') + '<select data-exists-related-field="with">' + renderPriorMaterializedAliasOptions(model, operationIndex, operation.with) + '</select></label>',
+      '<label>' + t('existsRelatedFrom') + '<select data-exists-related-field="from">' + renderPriorMaterializedAliasOptions(model, operationIndex, operation.from, spec) + '</select></label>',
+      '<label>' + t('existsRelatedWith') + '<select data-exists-related-field="with">' + renderPriorMaterializedAliasOptions(model, operationIndex, operation.with, spec) + '</select></label>',
       '<label>' + t('relationDomain') + '<select data-exists-related-field="domain">' + renderDomainOptions(operation.domain) + '</select></label>',
       '<label>' + t('relationTargetClass') + '<select data-exists-related-field="targetClass">' + renderClassOptions(operation.targetClass) + '</select></label>',
       '<label>' + t('relationDirection') + '<select data-exists-related-field="direction">' + renderRelationDirectionOptions(operation.direction) + '</select></label>',
       '<label>' + t('relationOperationColumns') + '<input data-exists-related-field="columns" value="' + escapeHtml(operation.columns.join(', ')) + '"></label>',
       '<label>' + t('relationLimit') + '<input data-exists-related-field="limit" type="number" min="1" value="' + escapeHtml(String(operation.limit)) + '"></label>',
-      '<label>' + t('setOperationAlias') + '<input data-exists-related-field="as" value="' + escapeHtml(operation.as) + '"></label>',
+      renderResultAliasField('data-exists-related-field="as"', operation.as, spec),
       '</div>',
       '<div class="matching-rule-list" data-matching-rule-list>', rows, '</div>',
       '<p class="muted">' + escapeHtml(t('existsRelatedRuleHelp')) + '</p>',
@@ -11809,13 +12072,13 @@ function dynamicPagesClientScript() {
         { section: 'assistant', label: t('menuAssistantGroups') },
         { section: 'object-group', label: t('menuObjectGroup') },
         { section: 'relations', label: t('menuRelations') },
-        { section: 'extraction', label: t('menuExtraction') },
-        { section: 'final-view', label: t('menuFinalView') },
         { section: 'diagram-assistant', label: t('menuDiagramAssistant') },
         { section: 'diagram', label: t('menuDiagram') },
         { section: 'cmdb-build-view', label: t('menuCmdbBuildView') }
       ]),
       group(t('menuRun'), [
+        { section: 'extraction', label: t('menuExtraction') },
+        { section: 'final-view', label: t('menuFinalView') },
         { section: 'visualization', label: t('visualizationEditor') },
         { section: 'cache', label: t('cacheEditor') },
         { section: 'publication', label: t('menuPublication') },
@@ -11916,20 +12179,21 @@ function dynamicPagesClientScript() {
     var busy = renderAssistantBusyNotice();
     if (!result) return '<div class="assistant-draft-preview" aria-busy="' + (state.assistantGenerating ? 'true' : 'false') + '">' + busy + '<div class="notice">' + escapeHtml(t('assistantNoDraft')) + '</div></div>';
     var json = result.json || {};
+    var displaySpec = json.spec && typeof json.spec === 'object' ? json.spec : ((state.selectedTemplate && state.selectedTemplate.spec) || defaultSpec());
     var html = busy;
     if (!result.ok) html += renderNotice({ type: 'error', text: errorText(result) });
     if (Array.isArray(json.warnings) && json.warnings.length) {
-      html += '<h3>' + t('assistantWarnings') + '</h3><ul class="steps">' + json.warnings.map(function (item) { return '<li>' + escapeHtml(item) + '</li>'; }).join('') + '</ul>';
+      html += '<h3>' + t('assistantWarnings') + '</h3><ul class="steps">' + json.warnings.map(function (item) { return '<li>' + escapeHtml(userFacingResultText(item, displaySpec)) + '</li>'; }).join('') + '</ul>';
     }
     if (json.explanation) html += '<p>' + escapeHtml(json.explanation) + '</p>';
     if (Array.isArray(json.errors) && json.errors.length) {
-      html += '<h3>' + t('assistantErrors') + '</h3><ul class="steps">' + json.errors.map(function (item) { return '<li>' + escapeHtml((item.path ? item.path + ': ' : '') + item.message) + '</li>'; }).join('') + '</ul>';
+      html += '<h3>' + t('assistantErrors') + '</h3><ul class="steps">' + json.errors.map(function (item) { return '<li>' + escapeHtml(userFacingResultText((item.path ? item.path + ': ' : '') + item.message, displaySpec)) + '</li>'; }).join('') + '</ul>';
     }
     if (json.diagnostics) {
-      html += '<details class="help-details"><summary>' + t('assistantDiagnostics') + '</summary><pre>' + escapeHtml(pretty(json.diagnostics)) + '</pre></details>';
+      html += '<details class="help-details"><summary>' + t('assistantDiagnostics') + '</summary><pre>' + escapeHtml(pretty(userFacingAssistantDiagnostics(json.diagnostics, displaySpec))) + '</pre></details>';
     }
-    if (json.spec) html += '<h3>' + t('assistantDraftSpec') + '</h3><pre>' + escapeHtml(pretty(json.spec)) + '</pre>';
-    return '<div class="assistant-draft-preview" aria-busy="' + (state.assistantGenerating ? 'true' : 'false') + '">' + (html || '<pre>' + escapeHtml(pretty(json)) + '</pre>') + '</div>';
+    if (json.spec) html += '<h3>' + t('assistantDraftSpec') + '</h3><pre>' + escapeHtml(pretty(userFacingAssistantDiagnostics(json.spec, displaySpec))) + '</pre>';
+    return '<div class="assistant-draft-preview" aria-busy="' + (state.assistantGenerating ? 'true' : 'false') + '">' + (html || '<pre>' + escapeHtml(pretty(userFacingAssistantDiagnostics(json, displaySpec))) + '</pre>') + '</div>';
   }
 
   function renderAssistantFlowEditor() {
@@ -12038,12 +12302,12 @@ function dynamicPagesClientScript() {
     var semanticPlanRetryAvailable = Boolean(state.assistantFlowResume && state.assistantFlowResume.retryable && state.assistantFlowResume.retryStage !== 'flowDraft');
     var flowPlanRetryAvailable = Boolean(state.assistantFlowResume && state.assistantFlowResume.retryable && state.assistantFlowResume.retryStage === 'flowDraft');
     var retryAvailable = semanticPlanRetryAvailable || flowPlanRetryAvailable;
-    var technical = state.assistantFlowErrors.length ? '<details class="help-details"><summary>' + escapeHtml(t('assistantFlowTechnicalDetails')) + '</summary><pre>' + escapeHtml(pretty({ errors: state.assistantFlowErrors, diagnostics: state.assistantFlowDiagnostics, rejectedFlow: state.assistantFlowRejected })) + '</pre></details>' : '';
+    var technical = state.assistantFlowErrors.length ? '<details class="help-details"><summary>' + escapeHtml(t('assistantFlowTechnicalDetails')) + '</summary><pre>' + escapeHtml(pretty(userFacingAssistantDiagnostics({ errors: state.assistantFlowErrors, diagnostics: state.assistantFlowDiagnostics, rejectedFlow: state.assistantFlowRejected }, (state.selectedTemplate && state.selectedTemplate.spec) || defaultSpec()))) + '</pre></details>' : '';
     var errorHeading = flowPlanRetryAvailable ? t('assistantFlowPlanPaused') : retryAvailable ? t('assistantSemanticPlanPaused') : state.assistantFlowErrorStage === 'semanticPlan' ? t('assistantSemanticPlanRejected') : t('assistantFlowRejected');
     var errors = state.assistantFlowErrors.length || feedback ? '<div class="assistant-draft-preview notice warning" data-assistant-flow-rejected><h4>' + escapeHtml(errorHeading) + '</h4>'
       + (feedback && feedback.summary ? '<p>' + escapeHtml(feedback.summary) + '</p>' : '')
-      + (feedback && Array.isArray(feedback.causes) && feedback.causes.length ? '<h5>' + escapeHtml(t('assistantFlowRootCause')) + '</h5><ul class="steps">' + feedback.causes.map(function (cause) { return '<li>' + escapeHtml(String(cause && cause.message || '')) + '</li>'; }).join('') + '</ul>' : '')
-      + (feedback && Array.isArray(feedback.affectedStages) && feedback.affectedStages.length ? '<h5>' + escapeHtml(t('assistantFlowAffectedStages')) + '</h5><ul class="steps">' + feedback.affectedStages.map(function (stage) { return '<li>' + escapeHtml(String(stage && stage.label || stage || '')) + '</li>'; }).join('') + '</ul>' : '')
+      + (feedback && Array.isArray(feedback.causes) && feedback.causes.length ? '<h5>' + escapeHtml(t('assistantFlowRootCause')) + '</h5><ul class="steps">' + feedback.causes.map(function (cause) { return '<li>' + escapeHtml(userFacingResultText(String(cause && cause.message || ''), (state.selectedTemplate && state.selectedTemplate.spec) || defaultSpec())) + '</li>'; }).join('') + '</ul>' : '')
+      + (feedback && Array.isArray(feedback.affectedStages) && feedback.affectedStages.length ? '<h5>' + escapeHtml(t('assistantFlowAffectedStages')) + '</h5><ul class="steps">' + feedback.affectedStages.map(function (stage) { return '<li>' + escapeHtml(userFacingResultText(String(stage && stage.label || stage || ''), (state.selectedTemplate && state.selectedTemplate.spec) || defaultSpec())) + '</li>'; }).join('') + '</ul>' : '')
       + (feedback && feedback.action ? '<h5>' + escapeHtml(t('assistantFlowWhatToFix')) + '</h5><p>' + escapeHtml(feedback.action) + '</p>' : '')
       + (feedback && Array.isArray(feedback.confirmedRelations) && feedback.confirmedRelations.length ? '<p class="muted">' + escapeHtml(t('assistantFlowRelationRequirements')) + ': ' + escapeHtml(feedback.confirmedRelations.join('; ')) + '</p>' : '')
       + technical + '</div>' : '';
@@ -12790,16 +13054,22 @@ function dynamicPagesClientScript() {
       renderActionButton('refresh', t('refresh'))
     ];
     var context = '';
-    var pendingDiagramImport = Boolean(state.diagramImportProposal && !canSaveAppliedDiagramImportWhileProposalPending());
     var templateSelected = Boolean(state.selectedTemplate);
-    var saveDisabled = pendingDiagramImport || !templateSelected;
-    var saveTitle = pendingDiagramImport
-      ? t('diagramImportPendingSave')
-      : !templateSelected
+    var saveDisabled = !templateSelected || state.savingTemplate;
+    var saveTitle = !templateSelected
         ? t('templateSelectionRequired')
-        : '';
-    if (sectionPersistsTemplate(section) || section === 'run') {
-      actions.push(renderActionButton('assistant-draft', t('assistantDraft')));
+        : state.savingTemplate
+          ? t('savingTemplate')
+          : '';
+
+    // This is the single persistence action for every template-bound section.
+    // Local Apply actions validate and update only the in-browser draft.
+    if (section !== 'templates') {
+      actions.push(renderActionButton('save-template', t('save'), {
+        primary: true,
+        disabled: saveDisabled,
+        title: saveTitle
+      }));
     }
 
     if (section === 'templates') {
@@ -12807,11 +13077,8 @@ function dynamicPagesClientScript() {
       actions.push(renderActionButton('new-cmdb-build-view', t('templateKindCmdbBuildView')));
       actions.push(renderActionButton('save-template', t('save'), { disabled: saveDisabled, title: saveTitle }));
     } else if (section === 'assistant' || section === 'diagram-assistant') {
-      actions.push(renderActionButton('save-template', t('save'), { primary: true, disabled: saveDisabled, title: saveTitle }));
       actions.push(renderActionButton('draft-validate', t('validate')));
       actions.push(renderActionButton('draft-preview', t('preview')));
-    } else if (section === 'template') {
-      actions.push(renderActionButton('save-template', t('save'), { primary: true, disabled: saveDisabled, title: saveTitle }));
     } else if (section === 'params') {
       actions.push(renderActionButton('add-param-row', t('addParam')));
       actions.push(renderActionButton('apply-params', t('applyParams'), { primary: true }));
@@ -12876,9 +13143,16 @@ function dynamicPagesClientScript() {
     }
 
     if (sectionPersistsTemplate(section) && section !== 'template') {
-      actions.push(renderActionButton('save-template', t('save'), { disabled: saveDisabled, title: saveTitle }));
-      actions.push(renderActionButton('validate-template', t('validate')));
-      actions.push(renderActionButton('preview-template', t('preview')));
+      var draftPreviewBusy = Boolean(state.diagramImportRuntimePreviewBusy);
+      var draftPreviewBusyTitle = draftPreviewBusy ? t('diagramImportPreviewing') : '';
+      actions.push(renderActionButton('validate-template', t('validate'), {
+        disabled: draftPreviewBusy,
+        title: draftPreviewBusyTitle
+      }));
+      actions.push(renderActionButton('preview-template', t('preview'), {
+        disabled: draftPreviewBusy,
+        title: draftPreviewBusyTitle
+      }));
     }
 
     return [
@@ -13123,24 +13397,102 @@ function dynamicPagesClientScript() {
       return defaultObjectSelectionName(Number.isFinite(number) && number > 0 ? number - 1 : 0);
     }
     var outputAlias = visual && visual.output && visual.output.alias;
-    if (outputAlias && outputAlias === name) return t('viewComposerObjectsAlias') + ' (' + name + ')';
+    if (outputAlias && outputAlias === name) return t('viewComposerObjectsAlias');
     var objectMatching = getStoredVisualModel(spec || {}, 'objectMatching');
     if (objectMatching && objectMatching.output && objectMatching.output.alias === name) {
-      return t('extractionFinalResult') + ' (' + name + ')';
+      return t('extractionFinalResult');
     }
     var matchingFinalStep = getObjectMatchingFinalStep(spec || {});
     if (matchingFinalStep && matchingFinalStep.as === name) {
-      return t('extractionFinalResult') + ' (' + name + ')';
+      return t('extractionFinalResult');
     }
     var relationVisual = getStoredVisualModel(spec || {}, 'relationExpansion');
     if (relationVisual && relationVisual.output && relationVisual.output.alias === name) {
-      return t('extractionFinalResult') + ' (' + name + ')';
+      return t('extractionFinalResult');
     }
     var relationStep = getRelationExpansionStep(spec || {});
     if (relationStep && relationStep.as === name) {
-      return t('extractionFinalResult') + ' (' + name + ')';
+      return t('extractionFinalResult');
     }
+    var table = findResultTableByName(spec || {}, name);
+    if (table && (table.title || table.label)) return String(table.title || table.label);
     return name;
+  }
+
+  function assistantDraftResultLabel(alias) {
+    var name = String(alias || '').trim();
+    if (!name) return '';
+    var bindings = Array.isArray(state.assistantFlowOutputBindings) ? state.assistantFlowOutputBindings : [];
+    var binding = bindings.find(function (item) { return item && String(item.alias || '') === name; });
+    if (!binding) return '';
+    var intent = normalizeAssistantObjectFlowIntentClient(state.assistantObjectFlowIntent);
+    var block = intent.blocks.find(function (item) { return item && String(item.id || '') === String(binding.blockId || ''); });
+    return String(block && block.name || '').trim();
+  }
+
+  function userFacingResultLabel(alias, spec) {
+    var name = String(alias || '').trim();
+    if (!name) return '';
+    var assistantManifest = assistantObjectFlowOutputManifest(spec || {});
+    if (assistantManifest.assistantManaged) {
+      if (assistantManifest.error) return t('assistantFlowOutputManifestInvalid');
+      var output = assistantManifest.outputs.find(function (item) { return item.alias === name; });
+      return output && output.label ? output.label : t('assistantFlowOutputManifestInvalid');
+    }
+    var draftLabel = assistantDraftResultLabel(name);
+    if (draftLabel) return draftLabel;
+    return aliasDisplayLabel(name, spec) || name;
+  }
+
+  function assistantManagedObjectFlow(spec) {
+    return assistantObjectFlowOutputManifest(spec || {}).assistantManaged;
+  }
+
+  function renderResultAliasField(attribute, alias, spec) {
+    var name = String(alias || '').trim();
+    if (!assistantManagedObjectFlow(spec)) {
+      return '<label>' + t('setOperationAlias') + '<input ' + attribute + ' value="' + escapeHtml(name) + '"></label>';
+    }
+    return '<label>' + t('assistantFlowBlockName') +
+      '<input type="hidden" ' + attribute + ' value="' + escapeHtml(name) + '">' +
+      '<output class="result-display-name">' + escapeHtml(userFacingResultLabel(name, spec)) + '</output></label>';
+  }
+
+  function escapeRegExpText(text) {
+    return String(text == null ? '' : text).replace(/[.*+?^\x24{}()|[\]\\]/g, '\\$&');
+  }
+
+  function userFacingResultText(text, spec) {
+    var value = String(text == null ? '' : text);
+    var manifest = assistantObjectFlowOutputManifest(spec || {});
+    if (!manifest.assistantManaged || manifest.error) return value;
+    manifest.outputs.forEach(function (output) {
+      var alias = String(output && output.alias || '').trim();
+      var label = String(output && output.label || '').trim();
+      if (!alias || !label) return;
+      value = value.replace(new RegExp('\\b' + escapeRegExpText(alias) + '\\b', 'g'), label);
+    });
+    return value;
+  }
+
+  function userFacingAssistantDiagnostics(value, spec, fieldName) {
+    if (Array.isArray(value)) return value.map(function (item) { return userFacingAssistantDiagnostics(item, spec, fieldName); });
+    if (!value || typeof value !== 'object') {
+      return typeof value === 'string' ? userFacingResultText(value, spec) : value;
+    }
+    var aliasFields = ['alias', 'as', 'from', 'with', 'expectedAlias', 'publishedAlias', 'sourceAlias', 'targetAlias', 'comparisonAlias'];
+    var aliasesFields = ['aliases', 'availableAliases'];
+    return Object.keys(value).reduce(function (result, key) {
+      var item = value[key];
+      if (aliasFields.indexOf(key) >= 0 && typeof item === 'string') {
+        result[key] = userFacingResultLabel(item, spec);
+      } else if (aliasesFields.indexOf(key) >= 0 && Array.isArray(item)) {
+        result[key] = item.map(function (alias) { return userFacingResultLabel(alias, spec); });
+      } else {
+        result[key] = userFacingAssistantDiagnostics(item, spec, key);
+      }
+      return result;
+    }, {});
   }
 
   function displayTitleForResult(name, title) {
@@ -13203,10 +13555,7 @@ function dynamicPagesClientScript() {
     var persisted = objectMatching && objectMatching.assistantOutputManifest && typeof objectMatching.assistantOutputManifest === 'object'
       ? objectMatching.assistantOutputManifest
       : null;
-    var assistantDraft = spec && spec.assistantDraft && typeof spec.assistantDraft === 'object' && !Array.isArray(spec.assistantDraft)
-      ? spec.assistantDraft
-      : {};
-    var intent = normalizeAssistantObjectFlowIntentClient(assistantDraft.objectFlowIntent);
+    var intent = templateAuthoringClient(spec).assistant.objectFlowIntent;
     var hasCompiledFlow = Boolean(objectMatching && (
       (Array.isArray(objectMatching.selections) && objectMatching.selections.length)
       || (Array.isArray(objectMatching.operations) && objectMatching.operations.length)
@@ -13513,7 +13862,7 @@ function dynamicPagesClientScript() {
     var aliases = steps.map(function (step) { return step && !isDataSelectionStep(step) ? step.as : ''; }).filter(Boolean);
     if (selectedName && aliases.indexOf(selectedName) === -1) aliases.unshift(selectedName);
     return '<option value="">' + t('dataSelectionNoSource') + '</option>' + aliases.map(function (name) {
-      return '<option value="' + escapeHtml(name) + '"' + (name === selectedName ? ' selected' : '') + '>' + escapeHtml(name) + '</option>';
+      return '<option value="' + escapeHtml(name) + '"' + (name === selectedName ? ' selected' : '') + '>' + escapeHtml(userFacingResultLabel(name, spec)) + '</option>';
     }).join('');
   }
 
@@ -13532,7 +13881,7 @@ function dynamicPagesClientScript() {
     });
     if (selectedName && aliases.indexOf(selectedName) === -1) aliases.unshift(selectedName);
     return '<option value=""></option>' + aliases.map(function (name) {
-      return '<option value="' + escapeHtml(name) + '"' + (name === selectedName ? ' selected' : '') + '>' + escapeHtml(aliasDisplayLabel(name, spec)) + '</option>';
+      return '<option value="' + escapeHtml(name) + '"' + (name === selectedName ? ' selected' : '') + '>' + escapeHtml(userFacingResultLabel(name, spec)) + '</option>';
     }).join('');
   }
 
@@ -13570,7 +13919,7 @@ function dynamicPagesClientScript() {
       var text = String(name || '').trim();
       if (!text || seen[text]) return;
       seen[text] = true;
-      var baseLabel = label || aliasDisplayLabel(text, spec) || text;
+      var baseLabel = label || userFacingResultLabel(text, spec) || text;
       result.push({ name: text, label: baseLabel });
     }
     var assistantManifest = assistantObjectFlowOutputManifest(spec);
@@ -13586,25 +13935,25 @@ function dynamicPagesClientScript() {
     var objectMatching = getStoredVisualModel(spec || {}, 'objectMatching');
     var matchingFinalStep = getObjectMatchingFinalStep(spec || {});
     finalExtractionAliases(spec).forEach(function (alias) {
-      add(alias, t('extractionFinalResult') + ' (' + alias + ')');
+      add(alias, userFacingResultLabel(alias, spec));
     });
     (Array.isArray(tables) ? tables : []).forEach(function (table) {
       if (!table || !table.name) return;
       var isFinalRelation = relation && relation.output && relation.output.alias === table.name || relationStep && relationStep.as === table.name;
       var isFinalMatching = objectMatching && objectMatching.output && objectMatching.output.alias === table.name || matchingFinalStep && matchingFinalStep.as === table.name;
-      add(table.name, isFinalRelation || isFinalMatching ? t('extractionFinalResult') + ' (' + table.name + ')' : (table.title || table.label || aliasDisplayLabel(table.name, spec)));
+      add(table.name, isFinalRelation || isFinalMatching ? userFacingResultLabel(table.name, spec) : (table.title || table.label || userFacingResultLabel(table.name, spec)));
     });
     if (objectMatching && objectMatching.output && objectMatching.output.alias) {
-      add(objectMatching.output.alias, t('extractionFinalResult') + ' (' + objectMatching.output.alias + ')');
+      add(objectMatching.output.alias, userFacingResultLabel(objectMatching.output.alias, spec));
     }
     if (matchingFinalStep && matchingFinalStep.as) {
-      add(matchingFinalStep.as, t('extractionFinalResult') + ' (' + matchingFinalStep.as + ')');
+      add(matchingFinalStep.as, userFacingResultLabel(matchingFinalStep.as, spec));
     }
     if (relation && relation.output && relation.output.alias) {
-      add(relation.output.alias, t('extractionFinalResult') + ' (' + relation.output.alias + ')');
+      add(relation.output.alias, userFacingResultLabel(relation.output.alias, spec));
     }
     if (relationStep && relationStep.as) {
-      add(relationStep.as, t('extractionFinalResult') + ' (' + relationStep.as + ')');
+      add(relationStep.as, userFacingResultLabel(relationStep.as, spec));
     }
     var objectVisual = getStoredVisualModel(spec || {}, 'objectGroup');
     var selections = objectVisual && Array.isArray(objectVisual.selections) ? objectVisual.selections : [];
@@ -13627,7 +13976,7 @@ function dynamicPagesClientScript() {
     return resultOptions.length ? resultOptions[0].name : '';
   }
 
-  function extractionSelectedSourceEmptyWarning(result, selectedName) {
+  function extractionSelectedSourceEmptyWarning(result, selectedName, spec) {
     var selected = String(selectedName || '').trim();
     var tables = result && result.ok && result.json && result.json.result && Array.isArray(result.json.result.tables)
       ? result.json.result.tables
@@ -13640,8 +13989,8 @@ function dynamicPagesClientScript() {
     });
     if (!populatedTable) return '';
     return t('extractionSelectedSourceEmpty', {
-      selected: selected,
-      source: populatedTable.name,
+      selected: userFacingResultLabel(selected, spec),
+      source: userFacingResultLabel(populatedTable.name, spec),
       rows: populatedTable.rows.length
     });
   }
@@ -13684,7 +14033,7 @@ function dynamicPagesClientScript() {
       options ? '<label>' + t('extractionResultSource') + '<select id="cmdp-extraction-source">' + options + '</select></label>' : '',
       '</div>',
       options ? '<div class="toolbar"><button type="button" class="primary" data-action="apply-extraction-published">' + escapeHtml(t('extractionPublishSelected')) + '</button></div>' : '',
-      selectedName ? '<p class="muted">' + escapeHtml(t('publishedTable') + ': ' + selectedName) + '</p>' : '',
+      selectedName ? '<p class="muted">' + escapeHtml(t('publishedTable') + ': ' + userFacingResultLabel(selectedName, spec)) + '</p>' : '',
       assistantManifest.assistantManaged && assistantManifest.error ? '' : renderExtractionPreview(spec),
       '</section>'
     ].join('');
@@ -13893,13 +14242,12 @@ function dynamicPagesClientScript() {
     if (state.diagramImportProposal && state.diagramImportProposal.version === 3) {
       return { state: 'proposal', readiness: diagramImportProposalReadiness(state.diagramImportProposal) };
     }
-    var draft = spec && spec.assistantDraft && typeof spec.assistantDraft === 'object' ? spec.assistantDraft : {};
-    var authoring = draft.d2Authoring && typeof draft.d2Authoring === 'object' ? draft.d2Authoring : {};
-    var source = String(authoring.source || state.diagramImportSource || '');
+    var authoring = templateAuthoringClient(spec);
+    var source = String(authoring.d2.source || state.diagramImportSource || '');
     if (!source.trim()) return { state: 'none' };
     var imported = firstDiagramSpec(spec).authoring && firstDiagramSpec(spec).authoring.d2Import;
     if (state.diagramImportStale) return { state: 'pending', reason: 'changed' };
-    if (!String(authoring.sourceHash || '').trim() || !String(authoring.mappingContractHash || '').trim()) return { state: 'pending', reason: 'identity' };
+    if (state.diagramImportPromptStale) return { state: 'pending', reason: 'prompt_changed', imported: imported || {} };
     if (imported && imported.version === 3 && String(imported.sourceHash || '').trim()) {
       if (!imported.structureTree || Number(imported.structureTree.version || 0) !== D2_IMPORT_STRUCTURE_TREE_VERSION || !Array.isArray(imported.structureTree.items)) {
         return { state: 'pending', reason: 'structure_tree_missing', imported: imported };
@@ -13909,14 +14257,10 @@ function dynamicPagesClientScript() {
       }
       if (!String(imported.mappingContractHash || '').trim()) return { state: 'pending', reason: 'identity', imported: imported };
       if (String(imported.source || '') && String(imported.source || '') !== source) return { state: 'pending', reason: 'changed', imported: imported };
-      if (String(authoring.sourceHash || '') !== String(imported.sourceHash || '') ||
-        Number(authoring.semanticModelRevision || 0) !== Number(imported.semanticModelRevision || 0) ||
-        String(authoring.diagramId || '') !== String(imported.diagramId || '') ||
-        String(authoring.structureHash || '') !== String(imported.structureHash || '') ||
-        String(authoring.mappingContractHash || '') !== String(imported.mappingContractHash || '')) {
-        return { state: 'pending', reason: 'identity', imported: imported };
+      if (imported.mappingValidation && imported.mappingValidation.status === 'needsReview') {
+        return { state: 'pending', reason: 'mapping_input_review_required', imported: imported };
       }
-      if (imported.mappingValidation && (imported.mappingValidation.status !== 'valid' || !String(imported.mappingValidation.signature || '').trim())) {
+      if (!imported.mappingValidation || imported.mappingValidation.status !== 'valid' || !String(imported.mappingValidation.signature || '').trim()) {
         return { state: 'pending', reason: 'mapping_validation_required', imported: imported };
       }
       return { state: 'applied', imported: imported };
@@ -14029,7 +14373,7 @@ function dynamicPagesClientScript() {
     storeDiagramImportEditorModel(proposal);
     state.diagramImportAuthoringOverrides = diagramImportAuthoringOverrides(proposal);
     if (diagramImportEditorIsApplied(proposal)) markAppliedDiagramImportEditorDirty(proposal);
-    else scheduleAssistantPromptAutosave();
+    else markAssistantAuthoringChanged();
     return proposal;
   }
 
@@ -15035,12 +15379,8 @@ function dynamicPagesClientScript() {
 
   function renderDiagramImportStageOptions(spec, selectedId) {
     return '<option value=""></option>' + diagramImportStageRows(spec).map(function (stage) {
-      var label = stage.kind === 'match'
-        ? t('matchingBlock', { number: stage.index + 1 })
-        : stage.kind === 'set'
-          ? t('setOperation', { number: stage.index + 1 })
-          : stage.label || stage.alias;
-      return '<option value="' + escapeHtml(stage.id || '') + '"' + (String(stage.id || '') === String(selectedId || '') ? ' selected' : '') + '>' + escapeHtml(label + ' [' + stage.alias + ']') + '</option>';
+      var label = stage.label || userFacingResultLabel(stage.alias, spec || defaultSpec());
+      return '<option value="' + escapeHtml(stage.id || '') + '"' + (String(stage.id || '') === String(selectedId || '') ? ' selected' : '') + '>' + escapeHtml(label) + '</option>';
     }).join('');
   }
 
@@ -15245,7 +15585,7 @@ function dynamicPagesClientScript() {
         var issue = String(issues[String(item.id)] || '');
         var status = issue ? 'pending' : 'complete';
         var stageLabel = stageId
-          ? String(stage.label || stage.alias || stageId)
+          ? String(stage.label || userFacingResultLabel(stage.alias || stageId, spec || defaultSpec()))
           : isContainer ? 'Статический контейнер' : 'Не выбран источник элемента';
         var row = '<div class="diagram-element-tree-row ' + (isContainer ? 'group ' : '') + status + (selectedId === String(item.id) ? ' selected' : '') + '" data-diagram-structure-tree-row="' + escapeHtml(item.id) + '" data-diagram-structure-tree-drop-target="' + escapeHtml(item.id) + '" data-diagram-structure-tree-kind="' + (isContainer ? 'container' : 'node') + '">' +
           '<button type="button" class="diagram-element-drag-handle" draggable="true" data-diagram-structure-tree-drag="' + escapeHtml(item.id) + '" title="' + escapeHtml(t('diagramImportKeyboardMove')) + '" aria-label="' + escapeHtml(t('diagramImportKeyboardMove')) + '" aria-keyshortcuts="Control+ArrowUp Control+ArrowDown">↕</button>' +
@@ -15600,6 +15940,8 @@ function dynamicPagesClientScript() {
     if (status.state === 'pending') {
       var help = status.reason === 'changed'
         ? t('d2WorkflowChangedHelp')
+        : status.reason === 'prompt_changed' || status.reason === 'mapping_input_review_required'
+          ? t('d2WorkflowPromptChangedHelp')
         : status.reason === 'semantic_model_revision_required'
           ? t('d2WorkflowSemanticModelRevisionRequiredHelp')
         : status.reason === 'mapping_validation_required'
@@ -15763,6 +16105,9 @@ function dynamicPagesClientScript() {
     var diagnostic = resultBody && resultBody.diagnosticPreview && typeof resultBody.diagnosticPreview === 'object'
       ? resultBody.diagnosticPreview
       : null;
+    var mappingPreview = resultBody && resultBody.diagramPreview && typeof resultBody.diagramPreview === 'object'
+      ? resultBody.diagramPreview
+      : null;
     var diagrams = visibleResultDiagrams(diagnostic && Array.isArray(diagnostic.diagrams)
       ? diagnostic.diagrams
       : resultBody && Array.isArray(resultBody.diagrams) ? resultBody.diagrams : []);
@@ -15772,10 +16117,11 @@ function dynamicPagesClientScript() {
     if (diagrams.length) {
       return {
         ready: Boolean(preview && preview.ok && !diagnostic),
-        partial: Boolean(diagnostic),
+        partial: Boolean(diagnostic || mappingPreview && mappingPreview.partial),
         diagrams: diagrams,
         workflow: workflow,
-        message: diagnostic && diagnostic.message ? String(diagnostic.message) : ''
+        message: diagnostic && diagnostic.message ? String(diagnostic.message) : '',
+        mappingOmissions: mappingPreview && Array.isArray(mappingPreview.omissions) ? mappingPreview.omissions : []
       };
     }
     if (diagnostic) {
@@ -15784,15 +16130,17 @@ function dynamicPagesClientScript() {
         partial: true,
         diagrams: [],
         workflow: workflow,
-        message: String(diagnostic.message || draftPreviewResultErrorText(preview))
+        message: String(diagnostic.message || draftPreviewResultErrorText(preview)),
+        mappingOmissions: Array.isArray(diagnostic.omissions) ? diagnostic.omissions : []
       };
     }
-    if (!preview || !preview.ok) return { ready: false, diagrams: [], workflow: workflow, message: preview ? draftPreviewResultErrorText(preview) : '' };
+    if (!preview || !preview.ok) return { ready: false, diagrams: [], workflow: workflow, message: preview ? draftPreviewResultErrorText(preview) : '', mappingOmissions: [] };
     return {
       ready: false,
       diagrams: [],
       workflow: workflow,
-      message: diagramImportRuntimePreviewWorkflowMessage(workflow)
+      message: diagramImportRuntimePreviewWorkflowMessage(workflow),
+      mappingOmissions: []
     };
   }
 
@@ -15857,20 +16205,25 @@ function dynamicPagesClientScript() {
       body = '<div class="assistant-busy-title" role="status" aria-live="polite"><span class="assistant-busy-spinner" aria-hidden="true"></span>' + escapeHtml(t('diagramImportPreviewing')) + ' <span data-diagram-import-runtime-preview-elapsed>' + escapeHtml(t('diagramImportPreviewElapsed', { seconds: state.diagramImportRuntimePreviewElapsedSeconds })) + '</span></div>';
     } else if (preview) {
       var details = diagramImportRuntimePreviewDetails(preview);
-      var timing = diagramImportRuntimePreviewTiming(preview);
+      var timing = diagramImportRuntimePreviewTiming(preview, (state.selectedTemplate && state.selectedTemplate.spec) || defaultSpec());
       var trace = diagramImportRuntimePreviewTrace(preview);
       var timingText = '<p class="muted">' + escapeHtml(t('diagramImportPreviewDuration', { seconds: timing.elapsedSeconds })) + (timing.slowSteps ? ' ' + escapeHtml(t('diagramImportPreviewSlowSteps', { steps: timing.slowSteps })) : '') + '</p>';
+      var mappingOmissionText = details.mappingOmissions && details.mappingOmissions.length
+        ? ' ' + escapeHtml(t('diagramImportRuntimePreviewOmitted', { count: details.mappingOmissions.length }))
+        : '';
       if (details.diagrams.length) {
         body = (details.partial
-          ? renderNotice({ type: 'warning', text: t('diagramImportRuntimePreviewPartial') + ' ' + (details.message || '') })
+          ? renderNotice({ type: 'warning', text: (details.mappingOmissions && details.mappingOmissions.length
+            ? t('diagramImportRuntimePreviewMappingPartial')
+            : t('diagramImportRuntimePreviewPartial')) + mappingOmissionText + ' ' + (details.message || '') })
           : timingText) +
           details.diagrams.map(function (diagram, index) { return renderResultDiagram(diagram, renderDraftD2DownloadAction(diagram, index), ''); }).join('') +
-          (details.partial && trace.length ? renderExecutionTrace(trace) : '') +
+          (details.partial && trace.length ? renderExecutionTrace(trace, (state.selectedTemplate && state.selectedTemplate.spec) || defaultSpec()) : '') +
           (details.partial ? '<div class="toolbar"><button type="button" data-action="diagram-import-preview-retry">' + escapeHtml(t('diagramImportPreviewRetry')) + '</button></div>' : '');
       } else {
         body = renderNotice({ type: 'error', text: details.message || previewError || errorText(preview) }) +
           renderDiagramImportRuntimeSourceFallback() +
-          (trace.length ? renderExecutionTrace(trace) : '') +
+          (trace.length ? renderExecutionTrace(trace, (state.selectedTemplate && state.selectedTemplate.spec) || defaultSpec()) : '') +
           '<div class="toolbar"><button type="button" data-action="diagram-import-preview-retry">' + escapeHtml(t('diagramImportPreviewRetry')) + '</button></div>';
       }
     } else if (previewError) {
@@ -15881,14 +16234,14 @@ function dynamicPagesClientScript() {
     return '<div class="diagram-editor-block diagram-import-runtime-preview" data-diagram-import-runtime-preview><div class="diagram-editor-heading"><h4>' + escapeHtml(title) + '</h4></div>' + body + '</div>';
   }
 
-  function diagramImportRuntimePreviewTiming(preview) {
+  function diagramImportRuntimePreviewTiming(preview, spec) {
     var trace = preview && preview.json && preview.json.result && Array.isArray(preview.json.result.trace) ? preview.json.result.trace : [];
     var elapsedMs = Math.max(0, Date.now() - Number(state.diagramImportRuntimePreviewStartedAt || 0));
     var slowSteps = trace
       .filter(function (item) { return item && Number.isFinite(Number(item.elapsedMs)); })
       .sort(function (left, right) { return Number(right.elapsedMs) - Number(left.elapsedMs); })
       .slice(0, 3)
-      .map(function (item) { return String(item.as || item.type || 'step') + ' (' + (Number(item.elapsedMs) / 1000).toFixed(1) + ' s)'; })
+      .map(function (item) { return userFacingResultLabel(item.as || '', spec || defaultSpec()) + ' (' + (Number(item.elapsedMs) / 1000).toFixed(1) + ' s)'; })
       .join(', ');
     return {
       elapsedSeconds: (elapsedMs / 1000).toFixed(1),
@@ -16017,6 +16370,7 @@ function dynamicPagesClientScript() {
       pendingD2Import ? '' : '</div>',
       pendingD2Import ? '' : '</div>',
       renderDiagramImportDeterministicMappings(spec),
+      renderDiagramImportRuntimePreview(),
       classBasedD2Import ? '' : renderDiagramMappingTable('nodes', 'diagramNodes', [t('visualizationDiagramNodesSource'), t('visualizationDiagramNodeId'), t('visualizationDiagramNodeLabel'), t('visualizationDiagramNodeGroup'), t('visualizationDiagramNodeParent'), t('visualizationDiagramNodeType'), t('visualizationDiagramNodeHref')], nodeRows, spec),
       classBasedD2Import ? '' : renderDiagramMappingTable('edges', 'diagramEdges', [t('visualizationDiagramEdgesSource'), t('visualizationDiagramEdgeMappingType'), t('visualizationDiagramEdgeSource'), t('visualizationDiagramEdgeTarget'), t('visualizationDiagramEdgeLabel'), t('visualizationDiagramEdgeKind'), t('visualizationDiagramEdgeDirection')], edgeRows, spec),
       classBasedD2Import ? '' : renderDiagramMappingTable('groups', 'diagramGroups', [t('visualizationDiagramGroupsSource'), t('visualizationDiagramGroupId'), t('visualizationDiagramGroupLabel'), t('visualizationDiagramGroupParent')], groupRows, spec),
@@ -16942,12 +17296,13 @@ function dynamicPagesClientScript() {
     return renderRuntimeNotice(resultBody && resultBody.emptyText || DEFAULT_EMPTY_RESULT_TEXT, cacheHtml);
   }
 
-  function renderExecutionTrace(trace) {
-    var warnings = trace.filter(function (item) { return item && item.warning; }).map(function (item) { return item.warning; });
+  function renderExecutionTrace(trace, spec) {
+    var currentSpec = spec || state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
+    var warnings = trace.filter(function (item) { return item && item.warning; }).map(function (item) { return userFacingResultText(item.warning, currentSpec); });
     var rows = trace.map(function (item) {
       return '<tr><td>' + escapeHtml(item.index == null ? '' : String(item.index + 1)) + '</td>' +
         '<td>' + escapeHtml(item.type || '') + '</td>' +
-        '<td>' + escapeHtml(item.as || '') + '</td>' +
+        '<td>' + escapeHtml(userFacingResultLabel(item.as || '', currentSpec)) + '</td>' +
         '<td>' + escapeHtml(item.status || '') + '</td>' +
         '<td>' + escapeHtml(item.rows == null ? '' : String(item.rows)) + '</td>' +
         '<td>' + escapeHtml(item.elapsedMs == null ? '' : String(item.elapsedMs)) + '</td>' +
@@ -16955,7 +17310,7 @@ function dynamicPagesClientScript() {
     }).join('');
     return (warnings.length ? warnings.map(function (warning) { return renderNotice({ type: 'warning', text: warning }); }).join('') : '') +
       '<h3>' + t('executionTrace') + '</h3><table class="compact"><thead><tr><th>' + t('traceStep') + '</th><th>' +
-      t('type') + '</th><th>' + t('traceAlias') + '</th><th>' + t('traceStatus') + '</th><th>' +
+      t('type') + '</th><th>' + t('assistantFlowBlockName') + '</th><th>' + t('traceStatus') + '</th><th>' +
       t('traceRows') + '</th><th>' + t('traceMs') + '</th><th>' + t('traceRest') + '</th></tr></thead><tbody>' +
       rows + '</tbody></table>';
   }
@@ -18676,7 +19031,9 @@ function dynamicPagesClientScript() {
       var columnRows = flowColumnOptionRows(model, specForLabels, operation.as, operations.length);
       resultTables.push({
         name: operation.as,
-        title: operation.as === finalAlias ? t('extractionFinalResult') : operation.type === 'match' ? t('matchingBlock', { number: index + 1 }) : operation.type === 'semiJoin' ? t('semiJoinOperation', { number: index + 1 }) : operation.type === 'relation' ? t('relationOperation', { number: index + 1 }) : operation.type === 'existsRelated' ? t('existsRelatedOperation', { number: index + 1 }) : operation.as,
+        title: assistantManagedObjectFlow(specForLabels)
+          ? userFacingResultLabel(operation.as, specForLabels)
+          : (operation.as === finalAlias ? t('extractionFinalResult') : operation.type === 'match' ? t('matchingBlock', { number: index + 1 }) : operation.type === 'semiJoin' ? t('semiJoinOperation', { number: index + 1 }) : operation.type === 'relation' ? t('relationOperation', { number: index + 1 }) : operation.type === 'existsRelated' ? t('existsRelatedOperation', { number: index + 1 }) : operation.as),
         columns: columnRows.map(function (item) { return item.value; }),
         columnLabels: columnRows.reduce(function (labels, item) { labels[item.value] = item.label; return labels; }, {})
       });
@@ -18684,7 +19041,7 @@ function dynamicPagesClientScript() {
     if (finalAlias && !resultTables.some(function (table) { return table && table.name === finalAlias; })) {
       resultTables.push({
         name: finalAlias,
-        title: t('extractionFinalResult'),
+        title: assistantManagedObjectFlow(specForLabels) ? userFacingResultLabel(finalAlias, specForLabels) : t('extractionFinalResult'),
         columns: flowColumnOptionRows(model, specForLabels, finalAlias, operations.length).map(function (item) { return item.value; })
       });
     }
@@ -18785,7 +19142,12 @@ function dynamicPagesClientScript() {
   function assistantSpecWithoutPromptDraft(spec) {
     var next = cloneSpecForEdit(spec || defaultSpec());
     delete next.assistantDraft;
+    delete next.authoring;
     return next;
+  }
+
+  function diagramImportDeterministicSpecSnapshot(spec) {
+    return stableClientJsonStringify(assistantSpecWithoutPromptDraft(spec));
   }
 
   function assistantTemplateRevisionMismatch(snapshot) {
@@ -18811,16 +19173,7 @@ function dynamicPagesClientScript() {
 
   function applyAssistantDraftToSpec(spec, intent, taskMode) {
     var next = cloneSpecForEdit(spec || defaultSpec());
-    var prompt = String(intent === undefined || intent === null ? '' : intent);
-    var mode = normalizeOutputMode(taskMode || 'both');
-    if (prompt || mode !== 'both') {
-      next.assistantDraft = {
-        intent: prompt,
-        taskMode: mode
-      };
-    } else {
-      delete next.assistantDraft;
-    }
+    delete next.assistantDraft;
     return next;
   }
 
@@ -18862,7 +19215,7 @@ function dynamicPagesClientScript() {
     var selected = state.selectedTemplate || {};
     var code = readTemplateCode(selected);
     var normalizedSpec = normalizeTemplateProtection(spec);
-    if (state.diagramImportProposal && JSON.stringify(selected.spec || {}) !== JSON.stringify(normalizedSpec)) {
+    if (state.diagramImportProposal && diagramImportDeterministicSpecSnapshot(selected.spec || defaultSpec()) !== diagramImportDeterministicSpecSnapshot(normalizedSpec)) {
       state.diagramImportStale = true;
     }
     state.selectedTemplate = Object.assign({}, selected, {
@@ -19018,7 +19371,7 @@ function dynamicPagesClientScript() {
     state.extractionPreview = null;
     requestDraftPreview(apiPrefix + '/draft/preview?maxRows=100&includeDiagrams=false', payload, params).then(function (result) {
       state.extractionPreview = result;
-      var sourceWarning = extractionSelectedSourceEmptyWarning(result, state.extractionSource);
+      var sourceWarning = extractionSelectedSourceEmptyWarning(result, state.extractionSource, spec);
       state.message = {
         type: result.ok ? (sourceWarning ? 'warning' : 'ok') : 'error',
         text: result.ok ? (sourceWarning || t('extractionCompleted')) : draftPreviewResultErrorText(result)
@@ -19399,13 +19752,17 @@ function dynamicPagesClientScript() {
       return operation && (operation.from === alias || operation.with === alias);
     }).map(function (operation) { return String(operation.as || '').trim(); }).filter(Boolean);
     if (alias && dependents.length) {
-      state.message = { type: 'error', text: t('relationOperationRemoveBlocked', { alias: alias, operations: dependents.join(', ') }) };
+      var spec = readCurrentSpec();
+      state.message = { type: 'error', text: t('relationOperationRemoveBlocked', {
+        alias: userFacingResultLabel(alias, spec),
+        operations: dependents.map(function (item) { return userFacingResultLabel(item, spec); }).join(', ')
+      }) };
       renderDesigner();
       return;
     }
     updateRelationDraft(function (nextDraft) {
       nextDraft.operations.splice(index, 1);
-      if (nextDraft.output && nextDraft.output.alias && !materializedAliasRows(nextDraft).some(function (row) { return row.alias === nextDraft.output.alias; })) {
+      if (nextDraft.output && nextDraft.output.alias && !materializedAliasRows(nextDraft, readCurrentSpec()).some(function (row) { return row.alias === nextDraft.output.alias; })) {
         nextDraft.output.alias = '';
       }
     });
@@ -19429,7 +19786,7 @@ function dynamicPagesClientScript() {
             : '[data-set-operation-field="' + fieldName + '"]');
         if (!field) return;
         var selected = String(field.value || '').trim();
-        field.innerHTML = renderPriorMaterializedAliasOptions(state.relationDraft, index, selected);
+        field.innerHTML = renderPriorMaterializedAliasOptions(state.relationDraft, index, selected, readCurrentSpec());
       });
     });
   }
@@ -19859,17 +20216,9 @@ function dynamicPagesClientScript() {
     diagram.authoring.d2Import = imported;
     diagrams[diagramIndex] = diagram;
     next.result.diagrams = diagrams;
-    next.assistantDraft = next.assistantDraft && typeof next.assistantDraft === 'object' && !Array.isArray(next.assistantDraft) ? next.assistantDraft : {};
-    next.assistantDraft.d2Authoring = {
-      version: 1,
-      semanticModelRevision: Number(imported.semanticModelRevision || proposal.semanticModelRevision || 0),
-      diagramId: String(imported.diagramId || proposal.diagramId || diagram.id || ''),
-      sourceHash: String(imported.sourceHash || proposal.source && proposal.source.hash || ''),
-      structureHash: String(imported.structureHash || proposal.source && proposal.source.structureHash || ''),
-      mappingContractHash: String(imported.mappingContractHash || proposal.source && proposal.source.mappingContractHash || ''),
-      source: String(imported.source || state.diagramImportSource || ''),
-      overrides: overrides
-    };
+    next.authoring = templateAuthoringClient(next);
+    next.authoring.d2.source = String(imported.source || state.diagramImportSource || '');
+    delete next.assistantDraft;
     return next;
   }
 
@@ -20230,9 +20579,8 @@ function dynamicPagesClientScript() {
   function persistedDiagramImportSource() {
     var diagram = firstDiagramSpec(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
     var d2Import = diagram && diagram.authoring && diagram.authoring.d2Import;
-    var assistantDraft = state.selectedTemplate && state.selectedTemplate.spec && state.selectedTemplate.spec.assistantDraft || {};
-    var d2Authoring = assistantDraft && assistantDraft.d2Authoring;
-    return String(d2Authoring && d2Authoring.source || d2Import && d2Import.source || '');
+    var authoring = templateAuthoringClient(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
+    return String(authoring.d2.source || d2Import && d2Import.source || '');
   }
 
   function markImportedDiagramChanged() {
@@ -20254,11 +20602,11 @@ function dynamicPagesClientScript() {
   }
 
   function syncImportedDiagramSaveGate() {
-    var blocked = Boolean(state.diagramImportProposal && !canSaveAppliedDiagramImportWhileProposalPending());
+    var blocked = !state.selectedTemplate || state.savingTemplate;
     Array.prototype.slice.call(document.querySelectorAll('[data-action="save-template"]')).forEach(function (button) {
       button.disabled = blocked;
       button.setAttribute('aria-disabled', blocked ? 'true' : 'false');
-      button.title = blocked ? t('diagramImportPendingSave') : '';
+      button.title = blocked && state.savingTemplate ? t('savingTemplate') : '';
     });
   }
 
@@ -20316,7 +20664,7 @@ function dynamicPagesClientScript() {
     state.diagramImportRuntimePreviewError = '';
     state.diagramImportStale = false;
     var requestTemplate = state.selectedTemplate;
-    var requestEditorSpecSnapshot = JSON.stringify(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
+    var requestEditorSpecSnapshot = diagramImportDeterministicSpecSnapshot(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
     state.message = { type: 'ok', text: t('diagramImportAnalyzing') };
     var busyRenderError = renderDiagramImportSafely();
     if (busyRenderError) return rejectedAnalysis(busyRenderError);
@@ -20374,8 +20722,8 @@ function dynamicPagesClientScript() {
     return Boolean(
       selected && proposal &&
       String(proposal.templateCode || '') === String(selected.code || '') &&
-      String(proposal.baseSpecHash || '') === String(selected.specHash || '') &&
-      state.diagramImportEditorSpecSnapshot === JSON.stringify(selected.spec || defaultSpec()) &&
+      String(proposal.deterministicSpecHash || '').trim() &&
+      state.diagramImportEditorSpecSnapshot === diagramImportDeterministicSpecSnapshot(selected.spec || defaultSpec()) &&
       !state.diagramImportStale
     );
   }
@@ -20473,10 +20821,11 @@ function dynamicPagesClientScript() {
       timeoutMs: 30000,
       body: {
         root: state.root,
-        currentSpec: state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(),
+        templateCode: state.selectedTemplate && state.selectedTemplate.code || '',
+        baseSpecHash: state.selectedTemplate && state.selectedTemplate.specHash || '',
+        currentSpec: assistantSpecWithPrompts(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec()),
         d2Source: state.diagramImportSource,
         proposal: state.diagramImportSignedProposal,
-        persist: true,
         roles: diagramImportBindingOverrides(proposal),
         relationRules: cloneJsonValue(proposal.relationRules || [], []),
         structureTree: cloneJsonValue(diagramImportStructureTreeClient(proposal), { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] })
@@ -20491,17 +20840,15 @@ function dynamicPagesClientScript() {
       state.diagramImportIr = null;
       state.diagramImportRuntimePreview = null;
       state.diagramImportRuntimePreviewError = '';
-      // The applied spec already contains a synchronized D2 authoring identity.
-      // Rebuilding it from prompt controls would turn that mapping back into pending.
-      if (result.json.template && result.json.template.spec) state.selectedTemplate = result.json.template;
-      else updateSelectedFromEditor(result.json.spec);
+      updateSelectedFromEditor(result.json.spec);
       state.lastDraftPreviewOk = false;
-      state.diagramImportAppliedPendingPreview = false;
+      state.diagramImportAppliedPendingPreview = true;
       state.diagramImportStale = false;
-      state.message = { type: 'ok', text: t('diagramImportPreviewBackground') };
+      state.diagramImportPromptStale = '';
+      state.message = { type: 'ok', text: t('changesReadyToSave') };
       state.diagramImportBusy = false;
       renderDesigner();
-      previewAppliedDiagramImport();
+      return previewAppliedDiagramImport();
     }).catch(function (error) {
       state.message = { type: 'error', text: error.message || String(error) };
     }).finally(function () {
@@ -20536,8 +20883,7 @@ function dynamicPagesClientScript() {
         root: state.root,
         templateCode: String(selected.code || ''),
         baseSpecHash: String(selected.specHash || ''),
-        currentSpec: cloneSpecForEdit(selected.spec || defaultSpec()),
-        persist: true,
+        currentSpec: assistantSpecWithPrompts(selected.spec || defaultSpec()),
         roles: diagramImportBindingOverrides(proposal),
         relationRules: cloneJsonValue(proposal.relationRules || [], []),
         structureTree: cloneJsonValue(diagramImportStructureTreeClient(proposal), { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] })
@@ -20549,15 +20895,15 @@ function dynamicPagesClientScript() {
       state.diagramImportAppliedEditorDirty = false;
       state.diagramImportRuntimePreview = null;
       state.diagramImportRuntimePreviewError = '';
-      if (result.json.template && result.json.template.spec) state.selectedTemplate = result.json.template;
-      else updateSelectedFromEditor(result.json.spec);
+      updateSelectedFromEditor(result.json.spec);
       state.lastDraftPreviewOk = false;
-      state.diagramImportAppliedPendingPreview = false;
+      state.diagramImportAppliedPendingPreview = true;
       state.diagramImportStale = false;
-      state.message = { type: 'ok', text: t('diagramImportUpdated') };
+      state.diagramImportPromptStale = '';
+      state.message = { type: 'ok', text: t('changesReadyToSave') };
       state.diagramImportBusy = false;
       renderDesigner();
-      previewAppliedDiagramImport();
+      return previewAppliedDiagramImport();
     }).catch(function (error) {
       state.message = { type: 'error', text: error.message || String(error) };
     }).finally(function () {
@@ -20586,7 +20932,7 @@ function dynamicPagesClientScript() {
         root: state.root,
         templateCode: String(selected.code || ''),
         baseSpecHash: String(selected.specHash || ''),
-        currentSpec: selected.spec || defaultSpec(),
+        currentSpec: assistantSpecWithPrompts(selected.spec || defaultSpec()),
         d2Source: source
       }
     }).then(function (result) {
@@ -20599,8 +20945,8 @@ function dynamicPagesClientScript() {
       state.lastDraftPreviewOk = false;
       state.diagramImportRuntimePreview = null;
       state.diagramImportRuntimePreviewError = '';
-      state.message = { type: 'ok', text: t('diagramImportPreviewBackground') };
-      previewAppliedDiagramImport();
+      state.diagramImportAppliedPendingPreview = true;
+      state.message = { type: 'ok', text: t('changesReadyToSave') };
     }).catch(function (error) {
       state.message = { type: 'error', text: error.message || String(error) };
     }).finally(function () {
@@ -20687,12 +21033,7 @@ function dynamicPagesClientScript() {
   }
 
   function saveTemplate() {
-    var pendingDiagramProposalCanBeDiscarded = Boolean(state.diagramImportProposal && canSaveAppliedDiagramImportWhileProposalPending());
-    if (state.diagramImportProposal && !pendingDiagramProposalCanBeDiscarded) {
-      state.message = { type: 'error', text: t(state.diagramImportStale ? 'diagramImportStale' : 'diagramImportPendingSave') };
-      renderDesigner();
-      return;
-    }
+    if (state.savingTemplate) return;
     if (!captureVisibleDesignerState()) return;
     var savedAppliedMapping = false;
     if (state.diagramImportAppliedEditorDirty) {
@@ -20704,7 +21045,7 @@ function dynamicPagesClientScript() {
       }
     }
     captureAssistantPromptsFromDom();
-    invalidateAssistantPromptAutosave();
+    updateSelectedFromEditor(assistantSpecWithPrompts(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec()));
     var payload;
     try { payload = readEditorPayload(); } catch (error) {
       state.message = { type: 'error', text: error.message };
@@ -20714,33 +21055,38 @@ function dynamicPagesClientScript() {
     var exists = Boolean(state.selectedTemplate && state.selectedTemplate.id);
     var path = exists ? apiPrefix + '/templates/' + encodeURIComponent(state.selectedTemplate.code) : apiPrefix + '/templates';
     var wasCreating = state.designerSection === 'template';
+    state.savingTemplate = true;
+    state.message = { type: 'ok', text: t('savingTemplate') };
+    renderDesigner();
     request(path, { method: exists ? 'PUT' : 'POST', body: payload }).then(function (result) {
       if (!result.ok) throw new Error(errorText(result));
       state.selectedTemplate = result.json.template;
+      var executionValidation = result.json.executionValidation || {};
       var saveMessage = result.json.cacheInvalidation && result.json.cacheInvalidation.complete === false
         ? { type: 'error', text: t('diagramImportCacheInvalidationPartial') }
-        : { type: 'ok', text: savedAppliedMapping ? t('diagramImportSavedNeedsValidation') : t('saved') };
+        : !executionValidation.executable
+          ? { type: 'ok', text: t('savedNotExecutable') }
+          : { type: 'ok', text: savedAppliedMapping ? t('diagramImportSavedNeedsValidation') : t('saved') };
       state.message = saveMessage;
       state.paramRowsDraft = null;
       state.diagramImportAppliedEditorDirty = false;
-      if (pendingDiagramProposalCanBeDiscarded) {
-        state.diagramImportProposal = null;
-        state.diagramImportSignedProposal = null;
-        state.assistantDiagramMappingResult = null;
-      }
+      state.assistantAuthoringDirty = false;
       state.lastDraftPreviewOk = false;
       state.diagramImportAppliedPendingPreview = savedAppliedMapping;
       if (wasCreating) {
         state.designerSection = 'templates';
         if (window.history && window.history.pushState) window.history.pushState({ designerSection: 'templates' }, '', designerSectionUrl('templates'));
       }
-      return loadDesigner({ preserveAssistantState: true }).then(function () {
+      return loadDesigner({ preserveAssistantState: false }).then(function () {
         state.message = saveMessage;
         renderDesigner();
       });
     }).catch(function (error) {
       state.message = { type: 'error', text: error.message };
       renderDesigner();
+    }).finally(function () {
+      state.savingTemplate = false;
+      syncImportedDiagramSaveGate();
     });
   }
 
@@ -20761,16 +21107,6 @@ function dynamicPagesClientScript() {
     return cloneJsonValue(state.assistantFlowProposal, { version: 1, selections: [], blocks: [] });
   }
 
-  function assistantSpecWithPrompts(spec) {
-    var next = cloneSpecForEdit(spec || defaultSpec());
-    next.assistantDraft = Object.assign({}, next.assistantDraft || {}, assistantPromptDraft());
-    delete next.assistantDraft.objectFlowPrompt;
-    delete next.assistantDraft.flowPrompts;
-    delete next.assistantDraft.intent;
-    delete next.assistantDraft.taskMode;
-    return next;
-  }
-
   function updateAssistantObjectFlowIntent(mutator) {
     if (state.assistantFlowBusy) return;
     captureAssistantPromptsFromDom();
@@ -20778,7 +21114,7 @@ function dynamicPagesClientScript() {
     mutator(next);
     state.assistantObjectFlowIntent = next;
     resetAssistantObjectFlowProposal();
-    scheduleAssistantPromptAutosave();
+    markAssistantAuthoringChanged();
     renderDesigner();
   }
 
@@ -20848,12 +21184,15 @@ function dynamicPagesClientScript() {
 
   function assistantFlowOwnershipFeedback(errors) {
     var issues = Array.isArray(errors) ? errors : [];
+    var spec = (state.selectedTemplate && state.selectedTemplate.spec) || defaultSpec();
     var causes = issues.map(function (issue) {
       var item = issue && typeof issue === 'object' ? issue : {};
       var name = String(item.blockName || item.blockId || t('assistantFlowBlockDefault', { number: '?' }));
-      var alias = String(item.alias || item.expectedAlias || '');
+      var alias = userFacingResultLabel(String(item.alias || item.expectedAlias || ''), spec);
       if (item.code === 'assistant_output_binding_missing') {
-        var aliases = Array.isArray(item.availableAliases) && item.availableAliases.length ? item.availableAliases.join(', ') : t('assistantFlowOwnershipNoAlias');
+        var aliases = Array.isArray(item.availableAliases) && item.availableAliases.length
+          ? item.availableAliases.map(function (value) { return userFacingResultLabel(value, spec); }).join(', ')
+          : t('assistantFlowOwnershipNoAlias');
         return { kind: item.code, message: t('assistantFlowOwnershipMissing', { name: name, aliases: aliases }) };
       }
       if (item.code === 'assistant_output_binding_duplicate_alias') {
@@ -20882,7 +21221,7 @@ function dynamicPagesClientScript() {
     var duplicateName = assistantObjectFlowDuplicateNameError(intent.blocks);
     if (duplicateName) {
       state.assistantFlowFeedback = { summary: t('assistantFlowDuplicateBlockName'), action: t('assistantFlowDuplicateBlockNameAction') };
-      state.assistantFlowErrors = [{ path: '$.assistantDraft.objectFlowIntent.blocks', message: t('assistantFlowDuplicateBlockName', { name: duplicateName }) }];
+      state.assistantFlowErrors = [{ path: '$.authoring.assistant.objectFlowIntent.blocks', message: t('assistantFlowDuplicateBlockName', { name: duplicateName }) }];
       state.assistantFlowErrorStage = 'semanticPlan';
       state.message = { type: 'error', text: t('assistantFlowDuplicateBlockName', { name: duplicateName }) };
       renderDesigner();
@@ -21079,7 +21418,9 @@ function dynamicPagesClientScript() {
     state.assistantFlowBusy = true;
     state.message = { type: 'ok', text: t('assistantGeneratingTitle') };
     renderDesigner();
-    flushAssistantPromptAutosave().then(function () {
+    Promise.resolve().then(function () {
+      captureAssistantPromptsFromDom();
+      updateSelectedFromEditor(assistantSpecWithPrompts(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec()));
       var requestSpec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
       var requestRevision = assistantTemplateRevisionSnapshot(
         state.selectedTemplate,
@@ -21107,10 +21448,10 @@ function dynamicPagesClientScript() {
         || stableClientJsonStringify(state.assistantFlowOutputBindings) !== requestOutputBindingsFingerprint) {
         throw assistantTemplateRevisionError(Object.assign({}, requestRevision, { requestGeneration: -1 }));
       }
-      if (!result.ok || !result.json || !result.json.template) throw new Error(errorText(result));
+      if (!result.ok || !result.json || !result.json.spec) throw new Error(errorText(result));
       var staleError = assistantTemplateRevisionError(requestRevision);
       if (staleError) throw staleError;
-      state.selectedTemplate = result.json.template;
+      updateSelectedFromEditor(result.json.spec);
       state.objectGroupDraft = null;
       state.relationDraft = null;
       state.assistantFlowProposal = null;
@@ -21126,7 +21467,7 @@ function dynamicPagesClientScript() {
       state.assistantFlowOutputBindings = [];
       if (state.diagramImportProposal) state.diagramImportStale = true;
       clearDraftExecutionState({ clearExtractionSource: true });
-      state.message = { type: 'ok', text: t('assistantFlowApplied') };
+      state.message = { type: 'ok', text: t('changesReadyToSave') };
       });
     }).catch(function (error) {
       state.message = { type: 'error', text: error.message || String(error) };
@@ -21149,7 +21490,9 @@ function dynamicPagesClientScript() {
     else state.assistantDiagramMappingBusy = true;
     state.message = { type: 'ok', text: t('assistantGeneratingTitle') };
     renderDesigner();
-    flushAssistantPromptAutosave().then(function () {
+    Promise.resolve().then(function () {
+      captureAssistantPromptsFromDom();
+      updateSelectedFromEditor(assistantSpecWithPrompts(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec()));
       return ensureDiagramImportProposalForCurrentRevision();
     }).then(function () {
       var proposal = state.diagramImportProposal;
@@ -21158,7 +21501,9 @@ function dynamicPagesClientScript() {
       if (!proposal || !diagramImportProposalMatchesCurrentRevision()) throw new Error(t('assistantResponseStale'));
       var body = {
         prompt: prompt,
-        currentSpec: state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(),
+        templateCode: state.selectedTemplate && state.selectedTemplate.code || '',
+        baseSpecHash: state.selectedTemplate && state.selectedTemplate.specHash || '',
+        currentSpec: assistantSpecWithPrompts(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec()),
         proposal: state.diagramImportSignedProposal,
         roles: diagramImportBindingOverrides(proposal),
         relationRules: cloneJsonValue(proposal.relationRules || [], []),
@@ -21270,7 +21615,7 @@ function dynamicPagesClientScript() {
     var columnsByAlias = {};
     (model.selections || []).forEach(function (selection, index) {
       var columns = uniqueList(['Class', '_id', 'Code', 'Description'].concat(selection.columns || []));
-      summaries.push({ id: selection.id, kind: 'selection', index: index, label: selection.name || defaultObjectSelectionName(index), alias: selection.alias, className: selection.className, columns: columns });
+      summaries.push({ id: selection.id, kind: 'selection', index: index, label: userFacingResultLabel(selection.alias, spec) || selection.name || defaultObjectSelectionName(index), alias: selection.alias, className: selection.className, columns: columns });
       columnsByAlias[selection.alias] = columns;
     });
     var matchIndex = 0;
@@ -21289,20 +21634,20 @@ function dynamicPagesClientScript() {
           if (rule.leftColumn && columns.indexOf(rule.leftColumn) === -1) columns.push(rule.leftColumn);
           if (rule.rightColumn && columns.indexOf(prefix + rule.rightColumn) === -1) columns.push(prefix + rule.rightColumn);
         });
-        summaries.push({ id: operation.id, kind: 'match', index: matchIndex, label: t('matchingBlock', { number: matchIndex + 1 }), alias: operation.as, columns: columns });
+        summaries.push({ id: operation.id, kind: 'match', index: matchIndex, label: userFacingResultLabel(operation.as, spec) || t('matchingBlock', { number: matchIndex + 1 }), alias: operation.as, columns: columns });
         matchIndex += 1;
       } else if (operation.type === 'relation') {
         columns = uniqueList(['SourceClass', 'SourceId', 'SourceCode', 'SourceDescription', 'Domain', 'RelationId', 'RelationDirection', 'RelationSourceSide', 'RelatedClass', 'RelatedId', 'Class', '_id', 'Code', 'Description'].concat(operation.columns || []));
-        summaries.push({ id: operation.id, kind: 'relation', index: index, label: t('relationOperation', { number: index + 1 }), alias: operation.as, className: operation.targetClass || '', columns: columns });
+        summaries.push({ id: operation.id, kind: 'relation', index: index, label: userFacingResultLabel(operation.as, spec) || t('relationOperation', { number: index + 1 }), alias: operation.as, className: operation.targetClass || '', columns: columns });
       } else if (operation.type === 'existsRelated') {
         columns = leftColumns.slice();
-        summaries.push({ id: operation.id, kind: 'existsRelated', index: index, label: t('existsRelatedOperation', { number: index + 1 }), alias: operation.as, className: sourceClassForAlias(spec || defaultSpec(), operation.as), columns: columns });
+        summaries.push({ id: operation.id, kind: 'existsRelated', index: index, label: userFacingResultLabel(operation.as, spec) || t('existsRelatedOperation', { number: index + 1 }), alias: operation.as, className: sourceClassForAlias(spec || defaultSpec(), operation.as), columns: columns });
       } else if (operation.type === 'semiJoin') {
         columns = leftColumns.slice();
-        summaries.push({ id: operation.id, kind: 'semiJoin', index: index, label: t('semiJoinOperation', { number: index + 1 }), alias: operation.as, className: sourceClassForAlias(spec || defaultSpec(), operation.as), columns: columns });
+        summaries.push({ id: operation.id, kind: 'semiJoin', index: index, label: userFacingResultLabel(operation.as, spec) || t('semiJoinOperation', { number: index + 1 }), alias: operation.as, className: sourceClassForAlias(spec || defaultSpec(), operation.as), columns: columns });
       } else {
         columns = operation.type === 'union' ? uniqueList(leftColumns.concat(rightColumns)) : leftColumns.slice();
-        summaries.push({ id: operation.id, kind: 'set', index: setIndex, label: t('setOperation', { number: setIndex + 1 }), alias: operation.as, className: sourceClassForAlias(spec || defaultSpec(), operation.as), columns: columns });
+        summaries.push({ id: operation.id, kind: 'set', index: setIndex, label: userFacingResultLabel(operation.as, spec) || t('setOperation', { number: setIndex + 1 }), alias: operation.as, className: sourceClassForAlias(spec || defaultSpec(), operation.as), columns: columns });
         setIndex += 1;
       }
       columnsByAlias[operation.as] = columns;
@@ -21845,7 +22190,7 @@ function dynamicPagesClientScript() {
       rightType: readValue('cmdp-builder-right-type') || 'string'
     });
     invalidateAssistantObjectFlowRequests();
-    invalidateAssistantPromptAutosave();
+    resetAssistantAuthoringDirty();
     state.selectedTemplate = {
       code: readTemplateCode() || built.code,
       description: built.description,
@@ -21918,7 +22263,7 @@ function dynamicPagesClientScript() {
 
   function newTemplate() {
     invalidateAssistantObjectFlowRequests();
-    invalidateAssistantPromptAutosave();
+    resetAssistantAuthoringDirty();
     state.selectedTemplate = { code: '', description: '', active: true, spec: defaultSpec(), paramsSchema: {}, resultSchema: {} };
     state.templateVersions = [];
     state.runParams = {};
@@ -21941,7 +22286,7 @@ function dynamicPagesClientScript() {
 
   function newCmdbBuildViewTemplate() {
     invalidateAssistantObjectFlowRequests();
-    invalidateAssistantPromptAutosave();
+    resetAssistantAuthoringDirty();
     state.selectedTemplate = {
       code: DEFAULT_CMDB_BUILD_VIEW_CODE,
       description: 'CMDBuild model view',
@@ -22321,10 +22666,8 @@ function dynamicPagesClientScript() {
     if (action === 'new-template') newTemplate();
     if (action === 'new-cmdb-build-view') newCmdbBuildViewTemplate();
     if (action === 'save-template') saveTemplate();
-    if (action === 'assistant-draft-save') saveAssistantDraft();
     if (action === 'validate-template') runDraftAction('validate');
     if (action === 'preview-template') runDraftAction('preview');
-    if (action === 'assistant-draft') openAssistantSection();
     if (action === 'assistant-generate') generateAssistantDraft();
     if (action === 'assistant-apply-draft') applyAssistantDraft();
     if (action === 'assistant-flow-prepare') prepareAssistantObjectFlowSemanticPlan();
@@ -22667,15 +23010,17 @@ function dynamicPagesClientScript() {
       if (flowApplyButton) flowApplyButton.disabled = true;
       var rejectedFlowPreview = document.querySelector('[data-assistant-flow-rejected]');
       if (rejectedFlowPreview) rejectedFlowPreview.remove();
-      scheduleAssistantPromptAutosave();
+      markAssistantAuthoringChanged();
     }
     if (event.target && event.target.id === 'cmdp-assistant-diagram-interpret-prompt') {
       state.assistantDiagramInterpretPrompt = String(event.target.value || '');
-      scheduleAssistantPromptAutosave();
+      markAssistantAuthoringChanged();
+      markDiagramImportPromptChanged('interpretPrompt');
     }
     if (event.target && event.target.id === 'cmdp-assistant-diagram-mapping-prompt') {
       state.assistantDiagramMappingPrompt = String(event.target.value || '');
-      scheduleAssistantPromptAutosave();
+      markAssistantAuthoringChanged();
+      markDiagramImportPromptChanged('mappingPrompt');
     }
     if (event.target && event.target.closest && event.target.closest('#cmdp-diagram-editor') && event.target.id !== 'cmdp-diagram-import-source' && event.target.id !== 'cmdp-diagram-import-file' && !(event.target.matches && event.target.matches('[data-diagram-import-field]'))) {
       markImportedDiagramChanged();
@@ -22709,7 +23054,7 @@ function dynamicPagesClientScript() {
       state.diagramImportSource = String(event.target.value || '');
       state.diagramImportSelectedElementKey = '';
       state.diagramImportSelectedStructureItemId = '';
-      scheduleAssistantPromptAutosave();
+      markAssistantAuthoringChanged();
       var analyzedSource = state.diagramImportProposal ? String(state.diagramImportProposal.sourceText || '') : persistedDiagramImportSource();
       state.diagramImportStale = state.diagramImportSource !== analyzedSource;
       state.diagramImportPreview = null;
@@ -22735,7 +23080,7 @@ function dynamicPagesClientScript() {
     if (event.target && event.target.matches && event.target.matches('[data-assistant-flow-field="uses"]')) {
       state.assistantObjectFlowIntent = readAssistantObjectFlowIntentFromDom();
       resetAssistantObjectFlowProposal();
-      scheduleAssistantPromptAutosave();
+      markAssistantAuthoringChanged();
       renderDesigner();
     }
     if (event.target && event.target.closest && event.target.closest('#cmdp-diagram-editor') && event.target.id !== 'cmdp-diagram-import-source' && event.target.id !== 'cmdp-diagram-import-file' && !(event.target.matches && event.target.matches('[data-diagram-import-field]'))) {
@@ -22813,7 +23158,7 @@ function dynamicPagesClientScript() {
       var reader = new FileReader();
       reader.onload = function () {
         state.diagramImportSource = String(reader.result || '');
-        scheduleAssistantPromptAutosave();
+        markAssistantAuthoringChanged();
         state.diagramImportProposal = null;
         state.diagramImportSignedProposal = null;
         state.diagramImportSelectedElementKey = '';
@@ -24446,7 +24791,6 @@ async function requireDiagramAuthoringContext(authToken, res, root, templateCode
     if (!await requireTemplateClassPermission(authToken, res, found.schema, '_can_create')) return null;
     return { session, template: null };
   }
-  if (!await requireTemplateUpdatePermission(authToken, res, found.schema, found.card, code)) return null;
   const template = found.card ? sanitizeTemplateCard(found.card) : null;
   const expected = String(expectedSpecHash || '').trim();
   if (!expected) {
@@ -24478,6 +24822,9 @@ async function requireDiagramAuthoringContext(authToken, res, root, templateCode
     });
     return null;
   }
+  // Assistant and deterministic Apply endpoints compile only an in-browser
+  // draft. They need a readable current card for CAS, not update permission.
+  // The normal template Save endpoint remains the only CMDBuild write boundary.
   return { session, template };
 }
 
@@ -24506,16 +24853,11 @@ async function resolveAssistantObjectFlowPlanContext(authToken, res, root, templ
     sendJson(res, 400, { success: false, reason: 'invalid_template_code', message: error.message || String(error) });
     return null;
   }
+  // Object-flow planning and Apply only compile an in-browser draft. For a
+  // saved template, a readable current card is sufficient; write permission
+  // is checked only by the normal template Save endpoint.
   if (!found.response.ok) return { session, canApply: false };
-  if (found.card) {
-    const permission = await resolveTemplateUpdatePermission(authToken, found.schema, found.card);
-    return { session, canApply: permission.verified && permission.allowed };
-  }
-  const classAccess = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(found.schema.classNames.template)}`, authToken);
-  return {
-    session,
-    canApply: Boolean(classAccess.ok && classAccess.json && classAccess.json.data && classAccess.json.data._can_create === true)
-  };
+  return { session, canApply: Boolean(found.card) };
 }
 
 async function requireAdminClassesModify(authToken, res) {
@@ -24551,7 +24893,111 @@ function cmdbuildJsonAttribute(value, fallback = {}) {
   return typeof value === 'string' ? value : JSON.stringify(value);
 }
 
-function normalizeTemplateSpecForStorage(spec, code = '') {
+function recordD2MappingStorageOutcome(options, outcome) {
+  if (!options || !Array.isArray(options.d2MappingOutcomes) || !outcome) return;
+  options.d2MappingOutcomes.push(outcome);
+}
+
+function diagramImportNeedsRecovery(value) {
+  const parsed = safeJsonValue(value, null);
+  const imported = diagramImportForSpec(parsed || {});
+  const validation = imported && imported.imported && imported.imported.mappingValidation && typeof imported.imported.mappingValidation === 'object'
+    ? imported.imported.mappingValidation
+    : {};
+  const status = String(validation.status || '').trim();
+  const legacyPlacement = imported && Number(imported.imported.semanticModelRevision || 0) === 8 &&
+    Number(imported.imported.structureTree && imported.imported.structureTree.version || 0) === 3;
+  return Boolean(imported && !imported.imported.mappingInputRevision &&
+    (['valid', 'needsValidation', 'incomplete'].includes(status) || legacyPlacement));
+}
+
+function diagramImportStorageIdentity(options, imported) {
+  const identities = Array.isArray(options && options.d2SourceIdentities) ? options.d2SourceIdentities : [];
+  const sourceHash = String(imported && imported.sourceHash || '');
+  return identities.find((identity) => identity && identity.ok && String(identity.sourceHash || '') === sourceHash) || null;
+}
+
+function normalizeStoredDiagramImport(spec, diagram, options = {}) {
+  const authoring = diagram && diagram.authoring && typeof diagram.authoring === 'object' && !Array.isArray(diagram.authoring)
+    ? { ...diagram.authoring }
+    : null;
+  const original = authoring && authoring.d2Import && typeof authoring.d2Import === 'object' && !Array.isArray(authoring.d2Import)
+    ? cloneJsonValueServer(authoring.d2Import, {})
+    : null;
+  if (!original) return diagram;
+
+  const d2 = templateAuthoringD2(spec, { allowLegacy: false });
+  const source = String(d2.source || '');
+  const sourceHash = source ? sha256Hex(source) : '';
+  const sourceMatches = Boolean(sourceHash && String(original.sourceHash || '') === sourceHash);
+  const validation = original.mappingValidation && typeof original.mappingValidation === 'object' && !Array.isArray(original.mappingValidation)
+    ? original.mappingValidation
+    : {};
+  const inputStatus = diagramImportMappingInputRevisionStatus(spec, original);
+  const currentSignedMapping = sourceMatches && diagramImportMappingValidationIsCurrent(original) && inputStatus.current;
+  const legacyPlacement = Number(original.semanticModelRevision || 0) === 8 &&
+    Number(original.structureTree && original.structureTree.version || 0) === 3;
+  const recoveryEligible = sourceMatches && !original.mappingInputRevision &&
+    (['valid', 'needsValidation', 'incomplete'].includes(String(validation.status || '')) || legacyPlacement);
+  const recovered = !currentSignedMapping && recoveryEligible
+    ? diagramImportRecoveryCandidate(spec, original, options.recoveryVersions)
+    : null;
+  const trusted = currentSignedMapping ? original : recovered && recovered.imported;
+
+  if (trusted) {
+    const migrationIdentity = diagramImportStorageIdentity(options, trusted);
+    const migrationDiagnostics = [];
+    const migrated = migrateDiagramImportToCurrentRevision(spec, trusted, {
+      diagramId: String(diagram && diagram.id || ''),
+      identity: migrationIdentity,
+      diagnostics: migrationDiagnostics
+    });
+    if (migrated) {
+      const prepared = withDiagramImportMappingInputRevision(spec, migrated);
+      prepared.mappingValidation = {
+        version: 1,
+        status: 'valid',
+        signature: signDiagramImportMappingValidation(prepared)
+      };
+      recordD2MappingStorageOutcome(options, {
+        status: recovered ? 'recovered' : Number(original.semanticModelRevision || 0) !== D2_IMPORT_SEMANTIC_MODEL_REVISION ? 'migrated' : 'retained',
+        recoveredFromVersion: recovered && recovered.version || null,
+        verification: recovered && recovered.verification || ''
+      });
+      return { ...diagram, authoring: { ...authoring, d2Import: prepared } };
+    }
+    const requiresIdentity = Number(trusted.semanticModelRevision || 0) !== D2_IMPORT_SEMANTIC_MODEL_REVISION ||
+      Number(trusted.structureTree && trusted.structureTree.version || 0) !== D2_IMPORT_STRUCTURE_TREE_VERSION;
+    const reasons = uniqueStrings(migrationDiagnostics.length
+      ? migrationDiagnostics
+      : requiresIdentity && !migrationIdentity ? ['migrationIdentity'] : ['migrationRebuild']);
+    recordD2MappingStorageOutcome(options, { status: 'migration_required', reasons });
+    const imported = {
+      ...original,
+      mappingValidation: { version: 1, status: 'needsReview', reasons }
+    };
+    return { ...diagram, authoring: { ...authoring, d2Import: imported } };
+  }
+
+  const inputReasons = sourceMatches
+    ? inputStatus.missing
+      ? ['inputRevision']
+      : inputStatus.reasons
+    : ['source'];
+  const status = sourceMatches ? 'needsReview' : 'needsAnalysis';
+  const imported = {
+    ...original,
+    mappingValidation: {
+      version: 1,
+      status,
+      reasons: inputReasons.length ? inputReasons : ['mappingValidation']
+    }
+  };
+  recordD2MappingStorageOutcome(options, { status, reasons: imported.mappingValidation.reasons });
+  return { ...diagram, authoring: { ...authoring, d2Import: imported } };
+}
+
+function normalizeTemplateSpecForStorage(spec, code = '', options = {}) {
   const parsed = safeJsonValue(spec, spec);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return spec;
 
@@ -24568,31 +25014,42 @@ function normalizeTemplateSpecForStorage(spec, code = '') {
     if (Object.keys(system).length) next.system = system;
     else delete next.system;
   }
-  if (next.assistantDraft && typeof next.assistantDraft === 'object' && !Array.isArray(next.assistantDraft)) {
-    const assistantDraft = { ...next.assistantDraft };
-    // Diagram editor 2 was removed; never retain its obsolete sandbox state.
-    delete assistantDraft.diagramSandbox;
-    if (assistantDraft.d2Authoring !== undefined) assistantDraft.d2Authoring = normalizeAssistantD2AuthoringDraft(assistantDraft.d2Authoring);
-    next.assistantDraft = assistantDraft;
-  }
+  // One-time migration on the next ordinary template save. The persisted
+  // contract after this point contains only canonical authoring, never the
+  // retired assistantDraft side channel.
+  const authoring = normalizeTemplateAuthoring(next.authoring, next.assistantDraft);
+  if (authoring) next.authoring = authoring;
+  else delete next.authoring;
+  delete next.assistantDraft;
   if (next.result && typeof next.result === 'object' && !Array.isArray(next.result) && Array.isArray(next.result.diagrams)) {
-    next.result.diagrams = next.result.diagrams.map((diagram) => {
-      if (!diagram || typeof diagram !== 'object' || Array.isArray(diagram)) return diagram;
-      const authoring = diagram.authoring && typeof diagram.authoring === 'object' && !Array.isArray(diagram.authoring)
-        ? { ...diagram.authoring }
-        : null;
-      const imported = authoring && authoring.d2Import && typeof authoring.d2Import === 'object' && !Array.isArray(authoring.d2Import)
-        ? { ...authoring.d2Import }
-        : null;
-      if (!imported || imported.mappingValidation === undefined) return diagram;
-      const validation = imported.mappingValidation && typeof imported.mappingValidation === 'object' && !Array.isArray(imported.mappingValidation)
-        ? imported.mappingValidation
-        : {};
-      imported.mappingValidation = validation.status === 'valid' && diagramImportMappingValidationIsCurrent(imported)
-        ? { version: 1, status: 'valid', signature: String(validation.signature || '') }
-        : { version: 1, status: 'needsValidation' };
-      return { ...diagram, authoring: { ...authoring, d2Import: imported } };
+    const before = next.result.diagrams.map((diagram) => cloneJsonValueServer(diagram, diagram));
+    next.result.diagrams = next.result.diagrams.map((diagram) => normalizeStoredDiagramImport(next, diagram, options));
+    const migrations = next.result.diagrams.map((diagram, index) => ({ diagram, previous: before[index] })).filter(({ diagram, previous }) => {
+      const previousImport = previous && previous.authoring && previous.authoring.d2Import;
+      const imported = diagram && diagram.authoring && diagram.authoring.d2Import;
+      return previousImport && imported &&
+        (Number(previousImport.semanticModelRevision || 0) !== D2_IMPORT_SEMANTIC_MODEL_REVISION ||
+          Number(previousImport.structureTree && previousImport.structureTree.version || 0) !== D2_IMPORT_STRUCTURE_TREE_VERSION) &&
+        imported.mappingValidation && imported.mappingValidation.status === 'valid';
     });
+    for (const { diagram } of migrations) {
+      const imported = diagram && diagram.authoring && diagram.authoring.d2Import;
+      try {
+        const proposal = diagramImportMigrationProposal(next, imported);
+        next = applyDiagramImportProposal(next, proposal, [], proposal.relationRules, proposal.structureTree);
+        recordD2MappingStorageOutcome(options, { status: 'recompiled' });
+      } catch (error) {
+        const failed = diagramImportForSpec(next, String(imported && imported.diagramId || ''));
+        if (failed && failed.imported) {
+          failed.imported.mappingValidation = {
+            version: 1,
+            status: 'needsReview',
+            reasons: ['migrationRebuild']
+          };
+        }
+        recordD2MappingStorageOutcome(options, { status: 'migration_rebuild_failed' });
+      }
+    }
   }
   return next;
 }
@@ -24619,11 +25076,6 @@ function sanitizeTemplateCard(card) {
 function expectedSpecHashFromBody(body) {
   const source = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
   return String(source.expectedSpecHash || source.ExpectedSpecHash || '').trim();
-}
-
-function baseSpecHashFromBody(body) {
-  const source = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
-  return String(source.baseSpecHash || source.BaseSpecHash || '').trim();
 }
 
 function isSpecHash(value) {
@@ -24667,13 +25119,13 @@ function sanitizeTemplateVersionCard(card) {
   };
 }
 
-function normalizeTemplatePayload(body, fallbackCode, username) {
+function normalizeTemplatePayload(body, fallbackCode, username, options = {}) {
   const code = validateCmdbuildIdentifier(body.code || body.Code || fallbackCode, 'template code');
   const spec = body.spec !== undefined ? body.spec : body.SpecJson;
   if (spec === undefined || spec === null) {
     throw new Error('Template spec is required.');
   }
-  const normalizedSpec = normalizeTemplateSpecForStorage(spec, code);
+  const normalizedSpec = normalizeTemplateSpecForStorage(spec, code, options);
 
   return {
     Code: code,
@@ -24690,14 +25142,14 @@ function normalizeTemplatePayload(body, fallbackCode, username) {
 function normalizeAssistantObjectFlowIntent(value, options = {}) {
   const source = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
   if (!source) {
-    const error = new Error('assistantDraft.objectFlowIntent must be an object.');
+    const error = new Error('assistantObjectFlowIntent must be an object.');
     error.statusCode = 400;
     error.code = 'assistant_object_flow_intent_invalid';
     throw error;
   }
   const rawBlocks = Array.isArray(source.blocks) ? source.blocks : [];
   if (rawBlocks.length > 32) {
-    const error = new Error('assistantDraft.objectFlowIntent.blocks must contain no more than 32 blocks.');
+    const error = new Error('assistantObjectFlowIntent.blocks must contain no more than 32 blocks.');
     error.statusCode = 400;
     error.code = 'assistant_object_flow_intent_invalid';
     throw error;
@@ -24707,7 +25159,7 @@ function normalizeAssistantObjectFlowIntent(value, options = {}) {
     const item = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
     const id = String(item.id || '').trim();
     if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(id) || known.has(id)) {
-      const error = new Error(`assistantDraft.objectFlowIntent.blocks[${index}].id must be a unique identifier.`);
+      const error = new Error(`assistantObjectFlowIntent.blocks[${index}].id must be a unique identifier.`);
       error.statusCode = 400;
       error.code = 'assistant_object_flow_intent_invalid';
       throw error;
@@ -24722,7 +25174,7 @@ function normalizeAssistantObjectFlowIntent(value, options = {}) {
     const normalized = { id };
     strings.forEach((field) => {
       if (typeof item[field] !== 'string') {
-        const error = new Error(`assistantDraft.objectFlowIntent.blocks[${index}].${field} must be a string.`);
+        const error = new Error(`assistantObjectFlowIntent.blocks[${index}].${field} must be a string.`);
         error.statusCode = 400;
         error.code = 'assistant_object_flow_intent_invalid';
         throw error;
@@ -24732,7 +25184,7 @@ function normalizeAssistantObjectFlowIntent(value, options = {}) {
     const uses = Array.isArray(item.uses) ? item.uses.map((dependency) => String(dependency || '').trim()).filter(Boolean) : [];
     const invalidDependency = uses.find((dependency) => !known.has(dependency));
     if (invalidDependency || uses.includes(id)) {
-      const error = new Error(`assistantDraft.objectFlowIntent.blocks[${index}].uses must reference another declared block.`);
+      const error = new Error(`assistantObjectFlowIntent.blocks[${index}].uses must reference another declared block.`);
       error.statusCode = 400;
       error.code = 'assistant_object_flow_intent_invalid';
       throw error;
@@ -24755,7 +25207,7 @@ function normalizeAssistantObjectFlowIntent(value, options = {}) {
     blocks.forEach((block, index) => {
       const normalizedName = block.name.trim().replace(/\s+/g, ' ').toLocaleLowerCase('ru-RU');
       if (!normalizedName || knownNames.has(normalizedName)) {
-        const error = new Error(`assistantDraft.objectFlowIntent.blocks[${index}].name must be a unique non-empty user-facing result name.`);
+        const error = new Error(`assistantObjectFlowIntent.blocks[${index}].name must be a unique non-empty user-facing result name.`);
         error.statusCode = 400;
         error.code = 'assistant_object_flow_intent_invalid';
         throw error;
@@ -24764,7 +25216,7 @@ function normalizeAssistantObjectFlowIntent(value, options = {}) {
       block.name = block.name.trim();
       ['name', 'entities', 'algorithm', 'expectedResult'].forEach((field) => {
         if (block[field].trim()) return;
-        const error = new Error(`assistantDraft.objectFlowIntent.blocks[${index}].${field} is required.`);
+        const error = new Error(`assistantObjectFlowIntent.blocks[${index}].${field} is required.`);
         error.statusCode = 400;
         error.code = 'assistant_object_flow_intent_incomplete';
         throw error;
@@ -24772,156 +25224,6 @@ function normalizeAssistantObjectFlowIntent(value, options = {}) {
     });
   }
   return normalized;
-}
-
-function normalizeAssistantPromptDraft(body) {
-  const source = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
-  const draft = source.assistantDraft;
-  if (!draft || typeof draft !== 'object' || Array.isArray(draft)) {
-    throw new Error('assistantDraft must be an object with the structured Object Flow intent and Assistant prompt fields.');
-  }
-  const normalized = { objectFlowIntent: normalizeAssistantObjectFlowIntent(draft.objectFlowIntent) };
-  for (const field of ['diagramInterpretPrompt', 'diagramMappingPrompt']) {
-    if (typeof draft[field] !== 'string') {
-      throw new Error(`assistantDraft.${field} must be a string.`);
-    }
-    normalized[field] = draft[field];
-  }
-  if (draft.d2Authoring !== undefined) normalized.d2Authoring = normalizeAssistantD2AuthoringDraft(draft.d2Authoring);
-  return normalized;
-}
-
-function normalizeAssistantD2AuthoringDraft(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('assistantDraft.d2Authoring must be an object.');
-  for (const forbidden of ['proposal', 'signedProposal', 'ir', 'mcpContext', 'llmOutput', 'assistantOutput']) {
-    if (Object.prototype.hasOwnProperty.call(value, forbidden)) throw new Error(`assistantDraft.d2Authoring.${forbidden} is not persisted. Save only D2 source and reviewed overrides.`);
-  }
-  const source = String(value.source || '');
-  if (Buffer.byteLength(source, 'utf8') > D2_IMPORT_MAX_INPUT_BYTES) {
-    throw new Error(`assistantDraft.d2Authoring.source exceeded configured maxInputBytes=${D2_IMPORT_MAX_INPUT_BYTES}.`);
-  }
-  const rawOverrides = value.overrides && typeof value.overrides === 'object' && !Array.isArray(value.overrides) ? value.overrides : {};
-  // Old side-channel fields are intentionally ignored. They never recreate a
-  // structure tree and therefore cannot act as a legacy runtime fallback.
-  const normalizedRevision = (candidate) => {
-    const revision = Number(candidate || 0);
-    return revision === D2_IMPORT_SEMANTIC_MODEL_REVISION ? revision : 0;
-  };
-  const sourceHash = source ? sha256Hex(source) : '';
-  const suppliedSourceHash = String(value.sourceHash || '').trim().toLowerCase();
-  const sourceIdentityMatches = Boolean(sourceHash && suppliedSourceHash === sourceHash);
-  const identity = {
-    semanticModelRevision: sourceIdentityMatches ? normalizedRevision(value.semanticModelRevision) : 0,
-    diagramId: sourceIdentityMatches ? truncateText(String(value.diagramId || ''), 256) : '',
-    sourceHash,
-    structureHash: sourceIdentityMatches ? truncateText(String(value.structureHash || ''), 128) : '',
-    mappingContractHash: sourceIdentityMatches ? truncateText(String(value.mappingContractHash || ''), 128) : ''
-  };
-  // Keep override identity separate. It may intentionally describe the previous source,
-  // so analysis can reject it instead of applying it to a changed source.
-  const overridesAreCurrent = normalizedRevision(rawOverrides.semanticModelRevision) === D2_IMPORT_SEMANTIC_MODEL_REVISION;
-  const overrideIdentity = {
-    semanticModelRevision: overridesAreCurrent ? D2_IMPORT_SEMANTIC_MODEL_REVISION : 0,
-    diagramId: overridesAreCurrent ? truncateText(String(rawOverrides.diagramId || ''), 256) : '',
-    sourceHash: overridesAreCurrent ? truncateText(String(rawOverrides.sourceHash || ''), 128) : '',
-    structureHash: overridesAreCurrent ? truncateText(String(rawOverrides.structureHash || ''), 128) : '',
-    mappingContractHash: overridesAreCurrent ? truncateText(String(rawOverrides.mappingContractHash || ''), 128) : ''
-  };
-  const normalizePath = (path) => (Array.isArray(path) ? path : []).slice(0, D2_IMPORT_MAX_ELEMENTS).map((hop) => ({
-    kind: String(hop && hop.kind || 'domain').trim(),
-    name: String(hop && hop.name || '').trim(),
-    domain: String(hop && hop.domain || '').trim(),
-    targetClass: String(hop && hop.targetClass || '').trim(),
-    direction: String(hop && hop.direction || 'both').trim() || 'both'
-  })).filter((hop) => hop.name || hop.domain);
-  const roles = (overridesAreCurrent && Array.isArray(rawOverrides.roles) ? rawOverrides.roles : []).slice(0, D2_IMPORT_MAX_ELEMENTS).map((item) => {
-    const id = String(item && item.id || '').trim();
-    if (!id) throw new Error('assistantDraft.d2Authoring.overrides.roles[].id is required.');
-    const visualKind = normalizeDiagramImportVisualKind(item && item.visualKind);
-    if (!visualKind) throw new Error(`assistantDraft.d2Authoring role ${id} must define visualKind node or container.`);
-    return {
-      id,
-      visualKind,
-      labelTemplate: truncateText(String(item && item.labelTemplate || ''), 1000)
-    };
-  });
-  const relationRules = (overridesAreCurrent && Array.isArray(rawOverrides.relationRules) ? rawOverrides.relationRules : []).slice(0, D2_IMPORT_MAX_ELEMENTS).map((item, index) => ({
-    id: String(item && item.id || `relation_rule_${index + 1}`).trim(),
-    kind: ['connection', 'group', 'hierarchy'].includes(String(item && item.kind || 'connection')) ? String(item && item.kind || 'connection') : 'connection',
-    mode: ['direct', 'relationCard', 'networkEndpoints', 'deterministicEndpoints'].includes(String(item && item.mode || 'direct')) ? String(item && item.mode || 'direct') : 'direct',
-    d2ClassKey: String(item && item.d2ClassKey || '').trim(),
-    d2ClassKeys: uniqueStrings(Array.isArray(item && item.d2ClassKeys) ? item.d2ClassKeys : []),
-    d2Notes: truncateText(String(item && item.d2Notes || ''), 8000),
-    d2ElementKey: String(item && item.d2ElementKey || '').trim(),
-    d2ElementKeys: uniqueStrings(Array.isArray(item && item.d2ElementKeys) ? item.d2ElementKeys : []),
-    d2ExampleLabels: uniqueStrings(Array.isArray(item && item.d2ExampleLabels) ? item.d2ExampleLabels : []),
-    d2Label: String(item && item.d2Label || '').trim(),
-    parentRoleId: String(item && item.parentRoleId || '').trim(),
-    childRoleId: String(item && item.childRoleId || '').trim(),
-    direction: String(item && item.direction || '').trim(),
-    directionPolicy: normalizeDiagramDirectionPolicy(item && item.directionPolicy),
-    directionPolicySuggestion: normalizeDiagramDirectionPolicy(item && item.directionPolicySuggestion) || diagramImportDirectionPolicySuggestion(item),
-    path: normalizePath(item && item.path),
-    candidateId: String(item && item.candidateId || '').trim(),
-    sourceStageId: String(item && item.sourceStageId || '').trim(),
-    sourceField: String(item && item.sourceField || '').trim(),
-    targetField: String(item && item.targetField || '').trim(),
-    labelField: String(item && item.labelField || '').trim()
-  }));
-  const roleById = new Map(roles.map((role) => [role.id, role]));
-  const structureTree = overridesAreCurrent && rawOverrides.structureTree && typeof rawOverrides.structureTree === 'object' && !Array.isArray(rawOverrides.structureTree)
-    ? {
-      version: Number(rawOverrides.structureTree.version || 0),
-      items: (Array.isArray(rawOverrides.structureTree.items) ? rawOverrides.structureTree.items : []).slice(0, D2_IMPORT_MAX_ELEMENTS).map((item, index) => ({
-        id: truncateText(String(item && item.id || `structure_item_${index + 1}`), 256),
-        roleId: truncateText(String(item && item.roleId || ''), 256),
-        templateContextKey: truncateText(String(item && item.templateContextKey || ''), 256),
-        templateElementKey: truncateText(String(item && item.templateElementKey || ''), 1024),
-        templateElementKeys: uniqueStrings(Array.isArray(item && item.templateElementKeys) ? item.templateElementKeys : []),
-        parentId: truncateText(String(item && item.parentId || ''), 256),
-        mapping: diagramImportStructureItemMapping(
-          roleById.get(String(item && item.roleId || '')) || { id: String(item && item.roleId || '') },
-          item && item.mapping || {},
-          String(item && item.id || `structure_item_${index + 1}`)
-        )
-      }))
-    }
-    : { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] };
-  if (structureTree.version !== D2_IMPORT_STRUCTURE_TREE_VERSION) throw new Error(`assistantDraft.d2Authoring.overrides.structureTree must be version ${D2_IMPORT_STRUCTURE_TREE_VERSION}.`);
-  return {
-    version: 1,
-    ...identity,
-    source,
-    overrides: { ...overrideIdentity, roles, relationRules, structureTree }
-  };
-}
-
-function templatePayloadWithAssistantPromptDraft(card, draft) {
-  const currentSpec = safeJsonValue(card && card.SpecJson, null);
-  if (!currentSpec || typeof currentSpec !== 'object' || Array.isArray(currentSpec)) {
-    throw new Error('Template spec must be an object.');
-  }
-  const spec = cloneJsonValueServer(currentSpec, currentSpec);
-  const currentDraft = spec.assistantDraft && typeof spec.assistantDraft === 'object' && !Array.isArray(spec.assistantDraft)
-    ? spec.assistantDraft
-    : {};
-  const normalizedDraft = assistantDraftWithAppliedD2Identity(spec, draft);
-  spec.assistantDraft = { ...currentDraft, ...normalizedDraft };
-  delete spec.assistantDraft.objectFlowPrompt;
-  delete spec.assistantDraft.flowPrompts;
-  delete spec.assistantDraft.intent;
-  delete spec.assistantDraft.taskMode;
-
-  return {
-    Code: card.Code || '',
-    Description: card.Description || card.Code || '',
-    Active: card.Active !== false,
-    SpecJson: cmdbuildJsonAttribute(normalizeTemplateSpecForStorage(spec, card.Code || '')),
-    ParamsSchemaJson: card.ParamsSchemaJson,
-    ResultSchemaJson: card.ResultSchemaJson,
-    Owner: card.Owner || '',
-    UpdatedAt: new Date().toISOString()
-  };
 }
 
 function normalizeDraftTemplateBody(body) {
@@ -25014,58 +25316,6 @@ async function writeTemplateVersion(authToken, root, templateCode, spec, usernam
     cmdbuildStatus: created.statusCode,
     className: fetched.schema.classNames.version,
     version: created.ok ? sanitizeTemplateVersionCard(created.json && created.json.data) : null
-  };
-}
-
-async function persistDiagramImportTemplate({ authToken, root, authoring, templateCode, expectedSpecHash, spec, changeComment }) {
-  const code = validateCmdbuildIdentifier(templateCode, 'template code');
-  const found = await findTemplateCard(authToken, root, code);
-  const currentTemplate = found.card ? sanitizeTemplateCard(found.card) : null;
-  if (!found.response.ok || !found.card || !currentTemplate || currentTemplate.specHash !== String(expectedSpecHash || '')) {
-    const conflict = new Error(`Template ${code} was changed by another editor. Reload it before applying the D2 mapping.`);
-    conflict.code = 'template_version_conflict';
-    conflict.statusCode = 409;
-    throw conflict;
-  }
-  const payload = normalizeTemplatePayload({
-    code: currentTemplate.code,
-    description: currentTemplate.description,
-    active: currentTemplate.active !== false,
-    spec,
-    paramsSchema: currentTemplate.paramsSchema,
-    resultSchema: currentTemplate.resultSchema,
-    owner: currentTemplate.owner
-  }, code, authoring.session.data && authoring.session.data.username);
-  const updated = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(found.schema.classNames.template)}/cards/${encodeURIComponent(found.card._id)}`, authToken, {
-    method: 'PUT',
-    body: payload
-  });
-  if (!updated.ok) {
-    const persistenceError = new Error('D2 mapping was validated but could not be saved to the template.');
-    persistenceError.code = 'diagram_import_persist_failed';
-    persistenceError.statusCode = updated.statusCode === 401 || updated.statusCode === 403 ? 403 : 502;
-    throw persistenceError;
-  }
-  const template = sanitizeTemplateCard(updated.json && updated.json.data);
-  const versionLog = await writeTemplateVersion(
-    authToken,
-    found.schema.root,
-    payload.Code,
-    safeJsonValue(payload.SpecJson, null),
-    authoring.session.data && authoring.session.data.username,
-    changeComment
-  );
-  const cacheInvalidation = await Promise.all([
-    invalidateTemplateRuntimeCache(found.schema.root, payload.Code),
-    invalidateTemplateStaticSnapshots(found.schema.root, payload.Code)
-  ]);
-  return {
-    template,
-    versionLog,
-    cacheInvalidation: {
-      runtime: cacheInvalidation[0],
-      staticSnapshots: cacheInvalidation[1]
-    }
   };
 }
 
@@ -37197,6 +37447,81 @@ function validateTemplateSpec(spec) {
   return errors;
 }
 
+function validateTemplateSpecForStorage(spec) {
+  const errors = [];
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
+    return [{ path: '$', message: 'Template spec must be an object.' }];
+  }
+  if (Buffer.byteLength(stableJsonStringify(spec), 'utf8') > TEMPLATE_REQUEST_MAX_BYTES) {
+    errors.push({ path: '$', message: `Template spec exceeds configured maxBytes=${TEMPLATE_REQUEST_MAX_BYTES}.` });
+  }
+  if (spec.authoring !== undefined) {
+    if (!spec.authoring || typeof spec.authoring !== 'object' || Array.isArray(spec.authoring)) {
+      errors.push({ path: '$.authoring', message: 'Template authoring must be an object.' });
+    } else {
+      try {
+        normalizeTemplateAuthoring(spec.authoring);
+      } catch (error) {
+        errors.push({ path: '$.authoring', message: error && error.message ? error.message : String(error) });
+      }
+    }
+  }
+  const diagrams = spec.result && typeof spec.result === 'object' && !Array.isArray(spec.result) && Array.isArray(spec.result.diagrams)
+    ? spec.result.diagrams
+    : [];
+  if (diagrams.length > D2_MAX_DIAGRAMS) {
+    errors.push({ path: '$.result.diagrams', message: `Template may contain no more than ${D2_MAX_DIAGRAMS} diagrams.` });
+  }
+  diagrams.forEach((diagram, index) => {
+    const imported = diagram && diagram.authoring && diagram.authoring.d2Import;
+    if (!imported || typeof imported !== 'object' || Array.isArray(imported)) return;
+    const source = String(imported.source || '');
+    if (Buffer.byteLength(source, 'utf8') > D2_IMPORT_MAX_INPUT_BYTES) {
+      errors.push({ path: `$.result.diagrams[${index}].authoring.d2Import.source`, message: `D2 source exceeds configured maxInputBytes=${D2_IMPORT_MAX_INPUT_BYTES}.` });
+    }
+    for (const field of ['roles', 'relationRules']) {
+      if (Array.isArray(imported[field]) && imported[field].length > D2_IMPORT_MAX_ELEMENTS) {
+        errors.push({ path: `$.result.diagrams[${index}].authoring.d2Import.${field}`, message: `D2 ${field} exceeds configured maxElements=${D2_IMPORT_MAX_ELEMENTS}.` });
+      }
+    }
+    const treeItems = imported.structureTree && Array.isArray(imported.structureTree.items) ? imported.structureTree.items : [];
+    if (treeItems.length > D2_IMPORT_MAX_ELEMENTS) {
+      errors.push({ path: `$.result.diagrams[${index}].authoring.d2Import.structureTree.items`, message: `D2 structure tree exceeds configured maxElements=${D2_IMPORT_MAX_ELEMENTS}.` });
+    }
+  });
+  return errors;
+}
+
+function validateD2ExecutionState(spec) {
+  const errors = [];
+  const authoring = templateAuthoring(spec, { allowLegacy: false });
+  const source = String(authoring && authoring.d2 && authoring.d2.source || '');
+  const diagrams = spec && spec.result && Array.isArray(spec.result.diagrams) ? spec.result.diagrams : [];
+  const importedDiagram = diagrams.find((diagram) => diagram && diagram.authoring && diagram.authoring.d2Import);
+  const imported = importedDiagram && importedDiagram.authoring && importedDiagram.authoring.d2Import;
+  if (!source && !imported) return errors;
+  if (!source) {
+    errors.push({ path: '$.authoring.d2.source', message: 'D2 mapping requires the canonical authoring D2 source. Save the current template source before execution.' });
+    return errors;
+  }
+  if (!imported) {
+    errors.push({ path: '$.result.diagrams', message: 'D2 source has not been analyzed and mapped. Diagram execution is unavailable.' });
+    return errors;
+  }
+  const sourceHash = sha256Hex(source);
+  if (String(imported.sourceHash || '') !== sourceHash) {
+    errors.push({ path: '$.result.diagrams[0].authoring.d2Import.mappingValidation', message: 'D2 source changed after mapping. Analyze and apply the current source before execution.' });
+    return errors;
+  }
+  const validation = imported.mappingValidation && typeof imported.mappingValidation === 'object' && !Array.isArray(imported.mappingValidation)
+    ? imported.mappingValidation
+    : {};
+  if (validation.status !== 'valid' || !diagramImportMappingValidationIsCurrent(imported)) {
+    errors.push({ path: '$.result.diagrams[0].authoring.d2Import.mappingValidation', message: 'D2 mapping is saved but not executable. Analyze and apply the deterministic mapping before execution.' });
+  }
+  return errors;
+}
+
 function templateSpecWithoutDiagrams(spec) {
   const tableOnlySpec = cloneJsonValueServer(spec, {});
   if (tableOnlySpec && tableOnlySpec.result && typeof tableOnlySpec.result === 'object' && !Array.isArray(tableOnlySpec.result)) {
@@ -37205,8 +37530,69 @@ function templateSpecWithoutDiagrams(spec) {
   return tableOnlySpec;
 }
 
+function tableExecutionScope(spec) {
+  const steps = Array.isArray(spec && spec.steps) ? spec.steps : [];
+  const byAlias = new Map(steps.map((step, index) => [String(step && step.as || '').trim(), { step, index }]).filter(([alias]) => alias));
+  const requested = new Set((Array.isArray(spec && spec.result && spec.result.tables) ? spec.result.tables : [])
+    .map((table) => String(table && table.name || '').trim())
+    .filter(Boolean));
+  const included = new Set();
+  const visit = (alias) => {
+    const name = String(alias || '').trim();
+    if (!name || included.has(name)) return;
+    const entry = byAlias.get(name);
+    if (!entry) return;
+    included.add(name);
+    visit(entry.step && entry.step.from);
+    visit(entry.step && entry.step.with);
+  };
+  requested.forEach(visit);
+  const selected = steps
+    .map((step, index) => ({ step, index }))
+    .filter(({ step }) => included.has(String(step && step.as || '').trim()));
+  return {
+    steps: selected,
+    includedAliases: selected.map(({ step }) => String(step && step.as || '').trim()),
+    skippedAliases: steps.map((step) => String(step && step.as || '').trim()).filter((alias) => alias && !included.has(alias))
+  };
+}
+
+function templateSpecForTableExecution(spec) {
+  const tableSpec = templateSpecWithoutDiagrams(spec);
+  const scope = tableExecutionScope(tableSpec);
+  tableSpec.steps = scope.steps.map(({ step }) => cloneJsonValueServer(step, {}));
+  return tableSpec;
+}
+
+function templateSpecForDraftDiagramPreview(spec) {
+  const previewSpec = templateSpecWithoutDiagrams(spec);
+  previewSpec.steps = (Array.isArray(previewSpec.steps) ? previewSpec.steps : [])
+    .filter((step) => step && step.managedBy !== 'd2ImportV3');
+  return previewSpec;
+}
+
 function validateTemplateSpecForExecution(spec, options = {}) {
-  return validateTemplateSpec(options.includeDiagrams === false ? templateSpecWithoutDiagrams(spec) : spec);
+  const d2Mode = options.d2Mode === 'tables' || options.d2Mode === 'draft-preview'
+    ? options.d2Mode
+    : options.includeDiagrams === false ? 'tables' : 'strict';
+  const executionSpec = d2Mode === 'tables'
+    ? templateSpecForTableExecution(spec)
+    : d2Mode === 'draft-preview'
+      ? templateSpecForDraftDiagramPreview(spec)
+      : spec;
+  const errors = validateTemplateSpec(executionSpec);
+  // A saved D2 source is an executable contract only for runtime/publication.
+  // Table extraction and authoring preview deliberately operate on their own
+  // bounded surfaces and must not inherit an incomplete diagram mapping.
+  return d2Mode === 'strict' ? errors.concat(validateD2ExecutionState(spec)) : errors;
+}
+
+function executionValidationForSpec(spec) {
+  const errors = validateTemplateSpecForExecution(spec);
+  return {
+    executable: errors.length === 0,
+    errors
+  };
 }
 
 function projectRows(rows, columns) {
@@ -38740,6 +39126,181 @@ function buildTopologyDiagram(diagram, context, params, limits) {
 function buildResultDiagrams(spec, context, params, limits) {
   const diagrams = Array.isArray(spec && spec.result && spec.result.diagrams) ? spec.result.diagrams : [];
   return diagrams.map((diagram) => buildTopologyDiagram(diagram || {}, context, params, limits));
+}
+
+function draftDiagramPreviewMappingPlan(spec) {
+  const previewSpec = cloneJsonValueServer(spec, {});
+  previewSpec.steps = (Array.isArray(previewSpec.steps) ? previewSpec.steps : [])
+    .filter((step) => step && step.managedBy !== 'd2ImportV3');
+  const flow = objectFlowFromSpecServer(previewSpec);
+  const flowErrors = validateObjectFlow(flow);
+  const stages = flowErrors.length ? [] : assistantObjectFlowDiagramStages(previewSpec, flow);
+  const stageById = new Map(stages.map((stage) => [String(stage && stage.id || ''), stage]));
+  const omissions = [];
+  const diagrams = Array.isArray(previewSpec.result && previewSpec.result.diagrams) ? previewSpec.result.diagrams : [];
+
+  previewSpec.result = previewSpec.result && typeof previewSpec.result === 'object' && !Array.isArray(previewSpec.result)
+    ? previewSpec.result
+    : {};
+  previewSpec.result.diagrams = diagrams.map((diagram, diagramIndex) => {
+    const imported = diagram && diagram.authoring && diagram.authoring.d2Import;
+    const roles = Array.isArray(imported && imported.roles) ? imported.roles : [];
+    const sourceTree = imported && imported.structureTree;
+    const structure = imported && imported.structure;
+    if (!imported || !roles.length || !sourceTree) {
+      omissions.push({
+        diagramIndex,
+        kind: 'mapping',
+        message: 'D2 mapping has no current structured import state; only the source template can be shown.'
+      });
+      return {
+        ...cloneJsonValueServer(diagram, {}),
+        nodeMappings: [],
+        groupMappings: [],
+        edgeMappings: [],
+        hierarchyMappings: [],
+        classRelationRules: []
+      };
+    }
+
+    const normalizedTree = diagramImportStructureTree(sourceTree, structure, roles);
+    const validationErrors = diagramImportStructureTreeErrors(normalizedTree, roles, previewSpec, structure);
+    const invalidIndexes = new Set();
+    const globalErrors = [];
+    for (const error of validationErrors) {
+      const match = /^\$\.structureTree\.items\[(\d+)\]/.exec(String(error && error.path || ''));
+      if (match) invalidIndexes.add(Number(match[1]));
+      else globalErrors.push(error);
+    }
+    if (globalErrors.length) {
+      omissions.push({
+        diagramIndex,
+        kind: 'mapping',
+        message: 'D2 structure has global validation errors; only the source template can be shown.'
+      });
+      return {
+        ...cloneJsonValueServer(diagram, {}),
+        nodeMappings: [],
+        groupMappings: [],
+        edgeMappings: [],
+        hierarchyMappings: [],
+        classRelationRules: []
+      };
+    }
+
+    const roleById = new Map(roles.map((role) => [String(role && role.id || ''), role]));
+    const safeItems = [];
+    const validRoleIds = new Set();
+    normalizedTree.items.forEach((item, index) => {
+      const role = roleById.get(String(item && item.roleId || '')) || {};
+      const visualKind = diagramImportRoleVisualKind(role);
+      if (!invalidIndexes.has(index)) {
+        safeItems.push(cloneJsonValueServer(item, {}));
+        validRoleIds.add(String(role.id || ''));
+        return;
+      }
+      omissions.push({
+        diagramIndex,
+        kind: visualKind === 'container' ? 'container-data' : 'node-data',
+        roleId: String(role.id || ''),
+        label: String(role.label || role.key || item.id || ''),
+        message: 'Binding did not pass deterministic preview validation and was omitted.'
+      });
+      if (visualKind !== 'container') return;
+      const mapping = diagramImportStructureItemMapping(role, item && item.mapping || {}, String(item && item.id || ''));
+      safeItems.push({
+        ...cloneJsonValueServer(item, {}),
+        mapping: {
+          ...mapping,
+          source: { stageId: '', alias: '', kind: '', className: '' },
+          primary: {
+            ...mapping.primary,
+            className: '',
+            structuredFields: []
+          },
+          conditions: { ruleJoin: 'any', rules: [] },
+          related: []
+        }
+      });
+    });
+
+    const compiledTree = diagramImportCompileStructureTree({
+      version: D2_IMPORT_STRUCTURE_TREE_VERSION,
+      items: safeItems
+    }, roles, stageById);
+    previewSpec.steps.push(...compiledTree.steps);
+    const nodeMappings = [];
+    const groupMappings = [];
+    for (const runtime of compiledTree.runtimeMappings) {
+      if (runtime.family === 'groupMappings') groupMappings.push(runtime.mapping);
+      else nodeMappings.push(runtime.mapping);
+    }
+    const connectionRules = Array.isArray(imported.relationRules) ? imported.relationRules : [];
+    if (connectionRules.length) {
+      for (const rule of connectionRules) {
+        const sourceRoleId = String(rule && rule.parentRoleId || '');
+        const targetRoleId = String(rule && rule.childRoleId || '');
+        if (validRoleIds.has(sourceRoleId) && validRoleIds.has(targetRoleId)) continue;
+        omissions.push({
+          diagramIndex,
+          kind: 'connection',
+          label: String(rule && (rule.d2Label || rule.d2ClassKey || rule.d2ElementKey || rule.id) || ''),
+          message: 'Connection was omitted because one or both endpoint roles are not confirmed.'
+        });
+      }
+    }
+    // Relation rules are retained only after full Apply. A pending mapping has
+    // no signed per-rule contract, so preview must not invent or reuse edges.
+    return {
+      ...cloneJsonValueServer(diagram, {}),
+      nodeMappings,
+      groupMappings,
+      edgeMappings: [],
+      hierarchyMappings: [],
+      classRelationRules: [],
+      structureTree: compiledTree.tree
+    };
+  });
+
+  return { spec: previewSpec, omissions };
+}
+
+async function buildDraftDiagramTemplateFallback(spec, workflow, omissions = []) {
+  const authoring = templateAuthoringD2(spec, { allowLegacy: false });
+  const source = String(authoring && authoring.source || '');
+  const preview = await renderD2ImportPreview(source);
+  const message = 'D2 mapping is incomplete. The source template is shown without unconfirmed CMDBuild data.';
+  return {
+    state: preview.rendered ? 'template-only' : 'unavailable',
+    incomplete: true,
+    reason: String(workflow && workflow.reason || 'mapping_validation_required'),
+    message,
+    d2Workflow: workflow,
+    omissions,
+    diagrams: preview.rendered ? [{
+      name: 'd2-template-preview',
+      title: 'D2 template',
+      type: 'topology',
+      nodes: [],
+      edges: [],
+      groups: [],
+      warnings: [message],
+      d2: {
+        source,
+        sourceHash: sha256Hex(source),
+        metadataEmbedded: false
+      },
+      svg: {
+        content: preview.content,
+        rendered: true,
+        renderError: '',
+        renderReason: 'template-only',
+        renderer: 'd2',
+        layout: preview.layout,
+        metadataEmbedded: false
+      }
+    }] : []
+  };
 }
 
 async function buildDraftDiagramDiagnosticPreview(spec, error) {
@@ -41303,14 +41864,16 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
   const trace = [];
   const stageResults = [];
   const diagramScope = options.executionScope === 'diagrams' ? diagramExecutionScope(spec) : null;
-  const executableSteps = diagramScope ? diagramScope.steps : (Array.isArray(spec.steps) ? spec.steps.map((step, index) => ({ step, index })) : []);
+  const tableScope = options.executionScope === 'tables' ? tableExecutionScope(spec) : null;
+  const executionScope = diagramScope || tableScope;
+  const executableSteps = executionScope ? executionScope.steps : (Array.isArray(spec.steps) ? spec.steps.map((step, index) => ({ step, index })) : []);
   const attachExecutionSnapshot = (error) => {
     error.executionTrace = Array.isArray(error.executionTrace) ? error.executionTrace : trace;
     error.executionSnapshot = error.executionSnapshot || {
       context,
       effectiveParams,
       limits,
-      diagramScope
+      diagramScope: executionScope
     };
     return error;
   };
@@ -41475,7 +42038,8 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
   });
   const includeDiagrams = options.includeDiagrams !== false;
   const d2Workflow = includeDiagrams ? await d2WorkflowStatusForSpec(spec) : { state: 'not-requested' };
-  const diagrams = includeDiagrams && d2Workflow.state !== 'pending'
+  const partialDiagramPreview = includeDiagrams && options.allowPartialDiagramPreview === true && d2Workflow.state === 'pending';
+  const diagrams = includeDiagrams && (d2Workflow.state !== 'pending' || partialDiagramPreview)
     ? buildResultDiagrams(spec, context, effectiveParams, limits)
     : [];
   if (includeDiagrams && !options.skipD2Render && diagrams.length) {
@@ -41508,15 +42072,23 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
       ? assistantLimitWarningsFromDiagnostics(item.limitDiagnostics)
       : (item.warning ? [item.warning] : [])),
       ...(includeDiagrams && d2Workflow.state === 'pending'
-        ? ['D2 source was changed or imported but its deterministic mapping has not been applied. Diagram output is withheld until the D2 mapping is applied; table output remains available.']
+        ? [partialDiagramPreview
+          ? 'D2 mapping is incomplete. Preview contains only independently executable deterministic bindings; omitted roles and connections require mapping correction.'
+          : 'D2 source was changed or imported but its deterministic mapping has not been applied. Diagram output is withheld until the D2 mapping is applied; table output remains available.']
         : [])
     ],
     d2Workflow,
-    ...(diagramScope ? {
+    ...(partialDiagramPreview ? {
+      diagramPreview: {
+        partial: true,
+        omissions: Array.isArray(options.partialDiagramOmissions) ? options.partialDiagramOmissions : []
+      }
+    } : {}),
+    ...(executionScope ? {
       executionScope: {
-        kind: 'diagrams',
-        includedAliases: diagramScope.includedAliases,
-        skippedAliases: diagramScope.skippedAliases
+        kind: diagramScope ? 'diagrams' : 'tables',
+        includedAliases: executionScope.includedAliases,
+        skippedAliases: executionScope.skippedAliases
       }
     } : {}),
     ...(options.includeStageResults ? { stageResults } : {})
@@ -42046,12 +42618,25 @@ async function handleBackend(req, res, requestUrl) {
     const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
     const proposal = body.proposal;
     const d2Source = String(body.d2Source || '');
-    const authoring = await requireDiagramAuthoringContext(authToken, res, root, proposal && proposal.templateCode, proposal && proposal.baseSpecHash);
+    const templateCode = String(body.templateCode || proposal && proposal.templateCode || '').trim();
+    const requestedSpecHash = templateCode
+      ? String(body.baseSpecHash || hashJson(body.currentSpec || {})).trim()
+      : '';
+    const authoring = await requireDiagramAuthoringContext(authToken, res, root, templateCode, requestedSpecHash);
     if (!authoring) return;
-    const slot = acquireExecutionSlot(req, res, { action: 'd2-import-apply', templateCode: proposal && proposal.templateCode });
+    const slot = acquireExecutionSlot(req, res, { action: 'd2-import-apply', templateCode });
     if (!slot) return;
     try {
       assertDiagramImportProposal(proposal, authToken);
+      if (String(proposal.templateCode || '') !== templateCode) {
+        const templateError = new Error('D2 import proposal belongs to a different template. Analyze the current D2 source again.');
+        templateError.code = 'diagram_import_template_conflict';
+        templateError.statusCode = 409;
+        throw templateError;
+      }
+      const sourceSpec = cloneJsonValueServer(body.currentSpec || authoring.template && authoring.template.spec || {}, {});
+      assertDiagramImportProposalDeterministicSpec(proposal, sourceSpec, 'applying it');
+      assertDiagramImportStoredSource(proposal, sourceSpec, 'applying its mapping');
       if (!d2Source.trim()) {
         const sourceError = new Error('Current D2 source is required before applying mapping.');
         sourceError.code = 'diagram_import_source_required';
@@ -42059,8 +42644,8 @@ async function handleBackend(req, res, requestUrl) {
         throw sourceError;
       }
       const sourceProposal = await proposalWithCompatibleD2Source(proposal, d2Source);
-      const reviewedProposal = diagramImportV3WithOverrides(sourceProposal, body.roles, body.relationRules, body.structureTree, body.currentSpec || {});
-      reviewedProposal.unresolved = diagramImportV3Unresolved(reviewedProposal.roles, reviewedProposal.relationRules, reviewedProposal.structureTree, body.currentSpec || {}, reviewedProposal.structure);
+      const reviewedProposal = diagramImportV3WithOverrides(sourceProposal, body.roles, body.relationRules, body.structureTree, sourceSpec);
+      reviewedProposal.unresolved = diagramImportV3Unresolved(reviewedProposal.roles, reviewedProposal.relationRules, reviewedProposal.structureTree, sourceSpec, reviewedProposal.structure);
       if (reviewedProposal.unresolved.length) {
         const topology = reviewedProposal.unresolved.filter((item) => item && item.family === 'topology');
         const unresolvedError = new Error(topology.length
@@ -42079,7 +42664,7 @@ async function handleBackend(req, res, requestUrl) {
         catalogError.statusCode = 502;
         throw catalogError;
       }
-      const catalogErrors = validateDiagramImportV3Catalog(reviewedProposal, catalogResult.catalog, body.currentSpec);
+      const catalogErrors = validateDiagramImportV3Catalog(reviewedProposal, catalogResult.catalog, sourceSpec);
       if (catalogErrors.length) {
         const catalogError = new Error('D2 class mapping does not match the readable CMDBuild catalog.');
         catalogError.code = 'diagram_import_catalog_validation';
@@ -42087,20 +42672,7 @@ async function handleBackend(req, res, requestUrl) {
         catalogError.details = diagramImportCatalogValidationDiagnostics(catalogErrors, reviewedProposal);
         throw catalogError;
       }
-      const spec = applyDiagramImportProposal(body.currentSpec, sourceProposal, body.roles, body.relationRules, body.structureTree);
-      let persistence = null;
-      if (body.persist === true) {
-        persistence = await persistDiagramImportTemplate({
-          authToken,
-          root,
-          authoring,
-          templateCode: String(proposal && proposal.templateCode || ''),
-          expectedSpecHash: String(proposal && proposal.baseSpecHash || ''),
-          spec,
-          changeComment: 'd2-import-apply'
-        });
-      }
-      const savedSpec = persistence && persistence.template && persistence.template.spec || spec;
+      const spec = applyDiagramImportProposal(sourceSpec, sourceProposal, body.roles, body.relationRules, body.structureTree);
       const roleModelCounts = (Array.isArray(body.roles) ? body.roles : []).reduce((counts, item) => {
         const visualKind = diagramImportRoleVisualKind(item);
         counts[visualKind] = (counts[visualKind] || 0) + 1;
@@ -42108,7 +42680,7 @@ async function handleBackend(req, res, requestUrl) {
       }, {});
       logInfo('d2.import.applied', {
         requestId: req.cmdpRequestId || '',
-        templateCode: truncateText(String(proposal && proposal.templateCode || ''), 120),
+        templateCode: truncateText(templateCode, 120),
         nodeRoles: roleModelCounts.node || 0,
         containerRoles: roleModelCounts.container || 0,
         structureItems: Array.isArray(reviewedProposal.structureTree && reviewedProposal.structureTree.items) ? reviewedProposal.structureTree.items.length : 0
@@ -42116,12 +42688,10 @@ async function handleBackend(req, res, requestUrl) {
       sendJson(res, 200, {
         success: true,
         action: 'diagram-import-apply',
-        spec: savedSpec,
-        specHash: hashJson(savedSpec),
-        d2Workflow: await d2WorkflowStatusForSpec(savedSpec),
-        template: persistence && persistence.template,
-        versionLog: persistence && persistence.versionLog,
-        cacheInvalidation: persistence && persistence.cacheInvalidation,
+        spec,
+        specHash: hashJson(spec),
+        executionSpecHash: executionSpecHash(spec),
+        d2Workflow: await d2WorkflowStatusForSpec(spec),
         warnings: proposal && proposal.warnings || []
       });
     } catch (error) {
@@ -42151,15 +42721,16 @@ async function handleBackend(req, res, requestUrl) {
     const slot = acquireExecutionSlot(req, res, { action: 'd2-import-update-applied', templateCode });
     if (!slot) return;
     try {
-      const proposal = await appliedDiagramImportProposalFromSpec(body.currentSpec || {});
+      const localSpec = cloneJsonValueServer(body.currentSpec || authoring.template && authoring.template.spec || {}, {});
+      const proposal = await appliedDiagramImportProposalFromSpec(localSpec);
       const reviewedProposal = diagramImportV3WithOverrides(
         proposal,
         body.roles,
         body.relationRules,
         body.structureTree,
-        body.currentSpec || {}
+        localSpec
       );
-      reviewedProposal.unresolved = diagramImportV3Unresolved(reviewedProposal.roles, reviewedProposal.relationRules, reviewedProposal.structureTree, body.currentSpec || {}, reviewedProposal.structure);
+      reviewedProposal.unresolved = diagramImportV3Unresolved(reviewedProposal.roles, reviewedProposal.relationRules, reviewedProposal.structureTree, localSpec, reviewedProposal.structure);
       if (reviewedProposal.unresolved.length) {
         const topology = reviewedProposal.unresolved.filter((item) => item && item.family === 'topology');
         const unresolvedError = new Error(topology.length
@@ -42178,7 +42749,7 @@ async function handleBackend(req, res, requestUrl) {
         catalogError.statusCode = 502;
         throw catalogError;
       }
-      const catalogErrors = validateDiagramImportV3Catalog(reviewedProposal, catalogResult.catalog, body.currentSpec || {});
+      const catalogErrors = validateDiagramImportV3Catalog(reviewedProposal, catalogResult.catalog, localSpec);
       if (catalogErrors.length) {
         const catalogError = new Error('D2 class mapping does not match the readable CMDBuild catalog.');
         catalogError.code = 'diagram_import_catalog_validation';
@@ -42187,24 +42758,12 @@ async function handleBackend(req, res, requestUrl) {
         throw catalogError;
       }
       const spec = applyDiagramImportProposal(
-        body.currentSpec || {},
+        localSpec,
         proposal,
         body.roles,
         body.relationRules,
         body.structureTree
       );
-      const persistence = body.persist === true
-        ? await persistDiagramImportTemplate({
-          authToken,
-          root,
-          authoring,
-          templateCode,
-          expectedSpecHash: String(body.baseSpecHash || ''),
-          spec,
-          changeComment: 'd2-import-update-applied'
-        })
-        : null;
-      const savedSpec = persistence && persistence.template && persistence.template.spec || spec;
       logInfo('d2.import.applied_mapping_updated', {
         requestId: req.cmdpRequestId || '',
         templateCode: truncateText(templateCode, 120),
@@ -42215,12 +42774,10 @@ async function handleBackend(req, res, requestUrl) {
       sendJson(res, 200, {
         success: true,
         action: 'diagram-import-update-applied',
-        spec: savedSpec,
-        specHash: hashJson(savedSpec),
-        d2Workflow: await d2WorkflowStatusForSpec(savedSpec),
-        template: persistence && persistence.template,
-        versionLog: persistence && persistence.versionLog,
-        cacheInvalidation: persistence && persistence.cacheInvalidation,
+        spec,
+        specHash: hashJson(spec),
+        executionSpecHash: executionSpecHash(spec),
+        d2Workflow: await d2WorkflowStatusForSpec(spec),
         warnings: reviewedProposal.warnings || []
       });
     } catch (error) {
@@ -42543,18 +43100,8 @@ async function handleBackend(req, res, requestUrl) {
       });
       return;
     }
-    if (hashJson(body.currentSpec || {}) !== authoring.template.specHash) {
-      sendJson(res, 409, {
-        success: false,
-        reason: 'template_version_conflict',
-        message: `Template ${authoring.template.code} changed before the data flow was applied. Reload it and retry.`,
-        expectedSpecHash: String(body.baseSpecHash || ''),
-        currentSpecHash: authoring.template.specHash,
-        template: authoring.template
-      });
-      return;
-    }
     try {
+      const localSpec = cloneJsonValueServer(body.currentSpec || authoring.template.spec || {}, {});
       const flow = normalizeObjectFlow(body.flow || {});
       const errors = validateObjectFlow(flow);
       if (errors.length) {
@@ -42564,7 +43111,7 @@ async function handleBackend(req, res, requestUrl) {
         error.details = errors;
         throw error;
       }
-      const diagramSourceErrors = staleObjectFlowDiagramSourceErrors(authoring.template.spec || {}, flow);
+      const diagramSourceErrors = staleObjectFlowDiagramSourceErrors(localSpec, flow);
       if (diagramSourceErrors.length) {
         const error = new Error('Object-flow would leave Diagram mappings with removed source aliases.');
         error.statusCode = 422;
@@ -42573,11 +43120,11 @@ async function handleBackend(req, res, requestUrl) {
         throw error;
       }
       const assistantOutput = assistantOutputManifestForRequest(flow, body.assistantOutputBindings, body.assistantObjectFlowIntent);
-      const spec = compileObjectFlowToSpec(authoring.template.spec || {}, flow, {
+      const spec = compileObjectFlowToSpec(localSpec, flow, {
         outputMetadata: assistantOutput ? assistantOutput.outputMetadata : [],
         ...(assistantOutput ? { assistantOutputManifest: assistantOutput.assistantOutputManifest } : {})
       });
-      const specErrors = validateTemplateSpec(spec);
+      const specErrors = validateTemplateSpecForStorage(spec);
       if (specErrors.length) {
         const error = new Error('Object-flow compiler produced an invalid template spec.');
         error.statusCode = 422;
@@ -42585,50 +43132,6 @@ async function handleBackend(req, res, requestUrl) {
         error.details = specErrors;
         throw error;
       }
-      const found = await findTemplateCard(authToken, root, authoring.template.code);
-      if (!found.response.ok || !found.card) {
-        const error = new Error(`Template ${authoring.template.code} is no longer available for saving.`);
-        error.statusCode = found.response.ok ? 404 : 502;
-        error.code = 'template_save_failed';
-        throw error;
-      }
-      const persistedTemplate = sanitizeTemplateCard(found.card);
-      if (!persistedTemplate || persistedTemplate.specHash !== authoring.template.specHash) {
-        const error = new Error(`Template ${authoring.template.code} changed before the data flow was saved. Reload it and retry.`);
-        error.statusCode = 409;
-        error.code = 'template_version_conflict';
-        error.details = [{
-          path: '$.baseSpecHash',
-          message: 'Template revision changed during Assistant data-flow application.',
-          expectedSpecHash: authoring.template.specHash,
-          currentSpecHash: persistedTemplate && persistedTemplate.specHash || ''
-        }];
-        throw error;
-      }
-      const payload = normalizeTemplatePayload({
-        code: authoring.template.code,
-        description: authoring.template.description,
-        active: authoring.template.active,
-        spec,
-        paramsSchema: authoring.template.paramsSchema,
-        resultSchema: authoring.template.resultSchema,
-        owner: authoring.template.owner
-      }, authoring.template.code, authoring.session.data && authoring.session.data.username);
-      const updated = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(found.schema.classNames.template)}/cards/${encodeURIComponent(found.card._id)}`, authToken, {
-        method: 'PUT',
-        body: payload
-      });
-      if (!updated.ok) {
-        const error = new Error(`Template ${authoring.template.code} could not be saved after applying the data flow.`);
-        error.statusCode = updated.statusCode === 401 || updated.statusCode === 403 ? 403 : 502;
-        error.code = 'template_save_failed';
-        throw error;
-      }
-      const versionLog = await writeTemplateVersion(authToken, found.schema.root, payload.Code, safeJsonValue(payload.SpecJson, null), authoring.session.data && authoring.session.data.username, 'assistant-object-flow-apply');
-      const cacheInvalidation = await Promise.all([
-        invalidateTemplateRuntimeCache(found.schema.root, payload.Code),
-        invalidateTemplateStaticSnapshots(found.schema.root, payload.Code)
-      ]);
       logInfo('assistant.object_flow.applied', {
         requestId: req.cmdpRequestId || '',
         authSource: backendLogUser,
@@ -42636,20 +43139,15 @@ async function handleBackend(req, res, requestUrl) {
         matches: flow.blocks.length,
         setOperations: flow.setOperations.length,
         publishedAlias: flow.publishedAlias,
-        templateCode: payload.Code,
-        versionLogged: Boolean(versionLog),
-        runtimeCacheInvalidated: cacheInvalidation[0].invalidated || 0,
-        staticSnapshotsInvalidated: cacheInvalidation[1].invalidated || 0
+        templateCode: authoring.template.code,
+        persisted: false
       });
       sendJson(res, 200, {
         success: true,
         action: 'object-flow-apply',
-        template: sanitizeTemplateCard(updated.json && updated.json.data),
-        versionLog,
-        cacheInvalidation: {
-          runtime: cacheInvalidation[0],
-          staticSnapshots: cacheInvalidation[1]
-        }
+        spec,
+        specHash: hashJson(spec),
+        executionSpecHash: executionSpecHash(spec)
       });
     } catch (error) {
       sendJson(res, error.statusCode || 422, { success: false, code: error.code || 'object_flow_invalid', message: error.message || String(error), errors: error.details || [] });
@@ -42665,23 +43163,31 @@ async function handleBackend(req, res, requestUrl) {
     if (!body) return;
     const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
     const proposalInput = body.proposal;
-    if (!await requireDiagramAuthoringContext(authToken, res, root, proposalInput && proposalInput.templateCode, proposalInput && proposalInput.baseSpecHash)) return;
+    const templateCode = String(body.templateCode || proposalInput && proposalInput.templateCode || '').trim();
+    const requestedSpecHash = templateCode
+      ? String(body.baseSpecHash || hashJson(body.currentSpec || {})).trim()
+      : '';
+    const authoring = await requireDiagramAuthoringContext(authToken, res, root, templateCode, requestedSpecHash);
+    if (!authoring) return;
     const mapTask = requestUrl.pathname.endsWith('/map-selections');
-    const slot = acquireExecutionSlot(req, res, { action: mapTask ? 'd2-map-selections' : 'd2-interpret', templateCode: proposalInput && proposalInput.templateCode });
+    const slot = acquireExecutionSlot(req, res, { action: mapTask ? 'd2-map-selections' : 'd2-interpret', templateCode });
     if (!slot) return;
     try {
       assertDiagramImportProposal(proposalInput, authToken);
-      if (!proposalInput.editorSpecHash || hashJson(body.currentSpec) !== proposalInput.editorSpecHash) {
-        const error = new Error('Template draft changed after D2 analysis. Analyze the D2 source again before using Assistant.');
-        error.code = 'diagram_import_editor_conflict';
-        error.statusCode = 409;
-        throw error;
+      if (String(proposalInput.templateCode || '') !== templateCode) {
+        const templateError = new Error('D2 import proposal belongs to a different template. Analyze the current D2 source again.');
+        templateError.code = 'diagram_import_template_conflict';
+        templateError.statusCode = 409;
+        throw templateError;
       }
-      const reviewProposal = diagramImportV3WithOverrides(proposalInput, body.roles, body.relationRules, body.structureTree, body.currentSpec || {});
+      const sourceSpec = cloneJsonValueServer(body.currentSpec || authoring.template && authoring.template.spec || {}, {});
+      assertDiagramImportProposalDeterministicSpec(proposalInput, sourceSpec, 'using Assistant');
+      assertDiagramImportStoredSource(proposalInput, sourceSpec, 'using Assistant');
+      const reviewProposal = diagramImportV3WithOverrides(proposalInput, body.roles, body.relationRules, body.structureTree, sourceSpec);
       let stages = [];
       let mappingCatalog = null;
       if (mapTask) {
-        const flow = objectFlowFromSpecServer(body.currentSpec);
+        const flow = objectFlowFromSpecServer(sourceSpec);
         const flowErrors = validateObjectFlow(flow);
         if (flowErrors.length) {
           const error = new Error('Selection flow must be applied before diagram mapping.');
@@ -42690,7 +43196,7 @@ async function handleBackend(req, res, requestUrl) {
           error.details = flowErrors;
           throw error;
         }
-        stages = assistantObjectFlowDiagramStages(body.currentSpec, flow);
+        stages = assistantObjectFlowDiagramStages(sourceSpec, flow);
         const catalogRequestUrl = await configuredModelCatalogRequestUrl(authToken, root, new URL('http://127.0.0.1/model/catalog?includeAttributes=true'));
         const catalogResult = await buildModelCatalog(authToken, catalogRequestUrl);
         if (!catalogResult.success) {
@@ -42751,7 +43257,7 @@ async function handleBackend(req, res, requestUrl) {
         logInfo('assistant.diagram_mapping.completed', {
           requestId: req.cmdpRequestId || '',
           authSource: backendLogUser,
-          templateCode: proposalInput && proposalInput.templateCode || '',
+          templateCode,
           requiredRoles: mapping.requiredRoles,
           mappedRoles: mapping.mappedRoles,
           unresolvedRoles: mapping.unresolved.length,
@@ -42821,11 +43327,19 @@ async function handleBackend(req, res, requestUrl) {
       description: draft.description,
       active: draft.active
     };
-    const draftExecutionScope = requestUrl.searchParams.get('executionScope') === 'diagrams' ? 'diagrams' : '';
+    const requestedDiagramScope = requestUrl.searchParams.get('executionScope') === 'diagrams';
+    const requestedTableScope = !requestedDiagramScope && requestUrl.searchParams.get('includeDiagrams') === 'false';
+    const draftExecutionScope = requestedDiagramScope ? 'diagrams' : requestedTableScope ? 'tables' : '';
     const includeDraftDiagrams = draftAction !== 'preview' || draftExecutionScope === 'diagrams' || requestUrl.searchParams.get('includeDiagrams') !== 'false';
-    const errors = draftAction === 'preview'
-      ? validateTemplateSpecForExecution(draft.spec, { includeDiagrams: includeDraftDiagrams })
-      : validateTemplateSpec(draft.spec);
+    const d2ValidationMode = draftAction === 'preview' && draftExecutionScope === 'diagrams'
+      ? 'draft-preview'
+      : draftAction === 'preview' && draftExecutionScope === 'tables'
+        ? 'tables'
+        : 'strict';
+    const errors = validateTemplateSpecForExecution(draft.spec, {
+      includeDiagrams: includeDraftDiagrams,
+      d2Mode: d2ValidationMode
+    });
 
     if (draftAction === 'validate') {
       sendJson(res, errors.length ? 400 : 200, {
@@ -42900,6 +43414,11 @@ async function handleBackend(req, res, requestUrl) {
       return;
     }
     const executionLimits = normalizeExecutionLimitConfig(runtimeConfig);
+    const draftD2Workflow = includeDraftDiagrams ? await d2WorkflowStatusForSpec(draft.spec) : { state: 'not-requested' };
+    const partialDiagramPlan = draftExecutionScope === 'diagrams' && draftD2Workflow.state === 'pending'
+      ? draftDiagramPreviewMappingPlan(draft.spec)
+      : null;
+    const executionSpec = partialDiagramPlan ? partialDiagramPlan.spec : draft.spec;
     const previewExecutionOptions = {
       maxRows: getPositiveInt(requestUrl.searchParams, 'maxRows', executionLimits.maxRowsPreviewDefault, executionLimits.maxRowsMax),
       maxRowsMax: executionLimits.maxRowsMax,
@@ -42916,6 +43435,8 @@ async function handleBackend(req, res, requestUrl) {
       maxTraversalDepthMax: executionLimits.maxTraversalDepthMax,
       includeDiagrams: includeDraftDiagrams,
       executionScope: draftExecutionScope,
+      allowPartialDiagramPreview: Boolean(partialDiagramPlan),
+      partialDiagramOmissions: partialDiagramPlan ? partialDiagramPlan.omissions : [],
       executionDeadlineAt: draftPreviewDeadlineAt,
       executionDeadlineTimeoutMs: DRAFT_PREVIEW_TIMEOUT_MS
     };
@@ -42931,7 +43452,13 @@ async function handleBackend(req, res, requestUrl) {
     });
     if (!executionSlot) return;
     try {
-      const result = await executeTemplateSpec(authToken, draft.spec, draft.params, previewExecutionOptions);
+      const result = await executeTemplateSpec(authToken, executionSpec, draft.params, previewExecutionOptions);
+      const partialPreviewHasMaterializedData = Array.isArray(result.diagrams) && result.diagrams.some((diagram) =>
+        (Array.isArray(diagram && diagram.nodes) && diagram.nodes.length) ||
+        (Array.isArray(diagram && diagram.edges) && diagram.edges.length));
+      if (partialDiagramPlan && !partialPreviewHasMaterializedData) {
+        result.diagnosticPreview = await buildDraftDiagramTemplateFallback(draft.spec, draftD2Workflow, partialDiagramPlan.omissions);
+      }
       logLimitDiagnostics('template.execution_limit_reached', {
         requestId: req.cmdpRequestId || '',
         action: 'draft-preview',
@@ -43048,7 +43575,8 @@ async function handleBackend(req, res, requestUrl) {
       const body = await readJsonBody(req, TEMPLATE_REQUEST_MAX_BYTES);
       const session = await getSessionData(authToken);
       const payload = normalizeTemplatePayload(body, null, session.data && session.data.username);
-      const specErrors = validateTemplateSpec(safeJsonValue(payload.SpecJson, null));
+      const storedSpec = safeJsonValue(payload.SpecJson, null);
+      const specErrors = validateTemplateSpecForStorage(storedSpec);
       if (specErrors.length) {
         sendJson(res, 400, {
           success: false,
@@ -43076,8 +43604,9 @@ async function handleBackend(req, res, requestUrl) {
         body: payload
       });
       const versionLog = created.ok
-        ? await writeTemplateVersion(authToken, existing.schema.root, payload.Code, safeJsonValue(payload.SpecJson, null), session.data && session.data.username, body.changeComment || 'create')
+        ? await writeTemplateVersion(authToken, existing.schema.root, payload.Code, storedSpec, session.data && session.data.username, body.changeComment || 'create')
         : null;
+      const executionValidation = executionValidationForSpec(storedSpec);
       logInfo(created.ok ? 'template.created' : 'template.create_failed', {
         requestId: req.cmdpRequestId || '',
         templateCode: payload.Code,
@@ -43091,7 +43620,8 @@ async function handleBackend(req, res, requestUrl) {
         root: existing.schema.root,
         className: existing.schema.classNames.template,
         template: sanitizeTemplateCard(created.json && created.json.data),
-        versionLog
+        versionLog,
+        executionValidation
       });
       return;
     }
@@ -43122,105 +43652,10 @@ async function handleBackend(req, res, requestUrl) {
         return;
       }
       if (templateAction === 'assistant-draft') {
-        if (!methodAllowed(req, res, 'PUT')) return;
-        if (!requireStateChangingRequest(req, res, authToken)) return;
-        if (!requireJsonContentType(req, res)) return;
-        const body = await readJsonObjectBody(req, res, TEMPLATE_REQUEST_MAX_BYTES);
-        if (!body) return;
-        const baseSpecHash = baseSpecHashFromBody(body);
-        if (!baseSpecHash) {
-          sendJson(res, 409, {
-            success: false,
-            reason: 'template_version_required',
-            message: `Template ${templateCode} requires baseSpecHash before Assistant prompts can be saved.`
-          });
-          return;
-        }
-        if (!isSpecHash(baseSpecHash)) {
-          sendJson(res, 400, {
-            success: false,
-            reason: 'template_version_invalid',
-            message: 'baseSpecHash must be a SHA-256 hex value.'
-          });
-          return;
-        }
-        let draft;
-        try {
-          draft = normalizeAssistantPromptDraft(body);
-        } catch (error) {
-          sendJson(res, 400, {
-            success: false,
-            reason: 'assistant_draft_invalid',
-            message: error && error.message ? error.message : String(error)
-          });
-          return;
-        }
-        const found = await findTemplateCard(authToken, root, templateCode);
-        if (!found.response.ok) {
-          if (sendTechnicalSchemaAccessDeniedIfNeeded(res, {
-            cmdbuildStatus: found.response.statusCode,
-            root: found.schema.root,
-            className: found.schema.classNames.template
-          })) return;
-          sendJson(res, 502, {
-            success: false,
-            cmdbuildStatus: found.response.statusCode,
-            root: found.schema.root,
-            className: found.schema.classNames.template
-          });
-          return;
-        }
-        if (!found.card) {
-          sendJson(res, 404, {
-            success: false,
-            message: `Template not found: ${templateCode}`
-          });
-          return;
-        }
-        if (!await requireTemplateUpdatePermission(authToken, res, found.schema, found.card, templateCode)) return;
-        const currentTemplate = sanitizeTemplateCard(found.card);
-        if (currentTemplate.specHash !== baseSpecHash) {
-          sendJson(res, 409, {
-            success: false,
-            reason: 'template_version_conflict',
-            message: `Template ${templateCode} was changed by another editor. Reload it before saving Assistant prompts.`,
-            expectedSpecHash: baseSpecHash,
-            currentSpecHash: currentTemplate.specHash,
-            template: currentTemplate
-          });
-          return;
-        }
-        let payload;
-        try {
-          payload = templatePayloadWithAssistantPromptDraft(found.card, draft);
-        } catch (error) {
-          sendJson(res, 400, {
-            success: false,
-            reason: 'assistant_draft_invalid',
-            message: error && error.message ? error.message : String(error)
-          });
-          return;
-        }
-        const updated = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(found.schema.classNames.template)}/cards/${encodeURIComponent(found.card._id)}`, authToken, {
-          method: 'PUT',
-          body: payload
-        });
-        const updateFailedForPermission = updated.statusCode === 401 || updated.statusCode === 403;
-        logInfo(updated.ok ? 'assistant.prompts_autosaved' : 'assistant.prompts_autosave_failed', {
-          requestId: req.cmdpRequestId || '',
-          templateCode,
-          cmdbuildStatus: updated.statusCode,
-          promptFields: Object.keys(draft).length,
-          permissionDenied: updateFailedForPermission
-        });
-        sendJson(res, updated.ok ? 200 : (updateFailedForPermission ? 403 : 502), {
-          success: updated.ok,
-          action: 'assistant-draft-autosave',
-          reason: updateFailedForPermission ? 'template_update_forbidden' : undefined,
-          cmdbuildStatus: updated.statusCode,
-          root: found.schema.root,
-          className: found.schema.classNames.template,
-          template: sanitizeTemplateCard(updated.json && updated.json.data)
+        sendJson(res, 410, {
+          success: false,
+          code: 'assistant_authoring_route_removed',
+          message: 'Assistant authoring is saved only with the template.'
         });
         return;
       }
@@ -43283,7 +43718,7 @@ async function handleBackend(req, res, requestUrl) {
       if (templateAction === 'publish' && !await requireTemplateUpdatePermission(authToken, res, found.schema, found.card, templateCode)) return;
 
       const template = sanitizeTemplateCard(found.card);
-      const errors = validateTemplateSpec(template.spec);
+      const errors = validateTemplateSpecForExecution(template.spec);
       if (templateAction === 'validate') {
         sendJson(res, errors.length ? 400 : 200, {
           success: errors.length === 0,
@@ -43750,8 +44185,46 @@ async function handleBackend(req, res, requestUrl) {
         return;
       }
       const session = await getSessionData(authToken);
-      const payload = normalizeTemplatePayload(body, templateCode, session.data && session.data.username);
-      const specErrors = validateTemplateSpec(safeJsonValue(payload.SpecJson, null));
+      const storageOptions = { d2MappingOutcomes: [] };
+      const rawSpec = body.spec !== undefined ? body.spec : body.SpecJson;
+      if (diagramImportNeedsRecovery(rawSpec)) {
+        const rawAuthoringSource = String(templateAuthoringD2(safeJsonValue(rawSpec, {}), { allowLegacy: true }).source || '');
+        if (rawAuthoringSource.trim()) {
+          const identity = await d2SourceStructureIdentity(rawAuthoringSource);
+          if (identity.ok) {
+            storageOptions.d2SourceIdentities = [identity];
+          } else {
+            logWarn('template.d2_mapping_recovery_source_invalid', {
+              requestId: req.cmdpRequestId || '',
+              templateCode,
+              reason: String(identity.reason || 'invalid_source')
+            });
+          }
+        }
+        try {
+          const versions = await fetchTemplateVersionCards(authToken, found.schema.root);
+          if (versions.response.ok) {
+            storageOptions.recoveryVersions = versions.cards
+              .filter((card) => String(card && card.TemplateCode || '') === templateCode)
+              .map(sanitizeTemplateVersionCard);
+          } else {
+            logWarn('template.d2_mapping_recovery_history_unavailable', {
+              requestId: req.cmdpRequestId || '',
+              templateCode,
+              cmdbuildStatus: versions.response.statusCode
+            });
+          }
+        } catch (error) {
+          logWarn('template.d2_mapping_recovery_history_failed', {
+            requestId: req.cmdpRequestId || '',
+            templateCode,
+            error: error && error.message ? error.message : String(error)
+          });
+        }
+      }
+      const payload = normalizeTemplatePayload(body, templateCode, session.data && session.data.username, storageOptions);
+      const storedSpec = safeJsonValue(payload.SpecJson, null);
+      const specErrors = validateTemplateSpecForStorage(storedSpec);
       if (specErrors.length) {
         sendJson(res, 400, {
           success: false,
@@ -43760,28 +44233,47 @@ async function handleBackend(req, res, requestUrl) {
         });
         return;
       }
+      const executionChanged = executionSpecHash(currentTemplate.spec || {}) !== executionSpecHash(storedSpec);
       const updated = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(found.schema.classNames.template)}/cards/${encodeURIComponent(found.card._id)}`, authToken, {
         method: 'PUT',
         body: payload
       });
       const versionLog = updated.ok
-        ? await writeTemplateVersion(authToken, found.schema.root, payload.Code, safeJsonValue(payload.SpecJson, null), session.data && session.data.username, body.changeComment || 'update')
+        ? await writeTemplateVersion(authToken, found.schema.root, payload.Code, storedSpec, session.data && session.data.username, body.changeComment || 'update')
         : null;
       const cacheInvalidation = updated.ok
-        ? await Promise.all([
-          invalidateTemplateRuntimeCache(found.schema.root, payload.Code),
-          invalidateTemplateStaticSnapshots(found.schema.root, payload.Code)
-        ])
+        ? executionChanged
+          ? await Promise.all([
+            invalidateTemplateRuntimeCache(found.schema.root, payload.Code),
+            invalidateTemplateStaticSnapshots(found.schema.root, payload.Code)
+          ])
+          : [
+            { invalidated: 0, complete: true, skipped: true, reason: 'authoring_only' },
+            { invalidated: 0, complete: true, skipped: true, reason: 'authoring_only' }
+          ]
         : null;
+      const executionValidation = executionValidationForSpec(storedSpec);
+      const legacyHistoricalRecovery = storageOptions.d2MappingOutcomes.find((item) => item && item.verification === 'legacyHistoricalAttestation');
+      if (updated.ok && legacyHistoricalRecovery) {
+        logWarn('template.d2_mapping_legacy_historical_recovered', {
+          requestId: req.cmdpRequestId || '',
+          templateCode: payload.Code,
+          recoveredFromVersion: legacyHistoricalRecovery.recoveredFromVersion || null,
+          action: 'recompiled_and_resigned'
+        });
+      }
       logInfo(updated.ok ? 'template.updated' : 'template.update_failed', {
         requestId: req.cmdpRequestId || '',
         templateCode: payload.Code,
         username: session.data && session.data.username || '',
         cmdbuildStatus: updated.statusCode,
         versionLogged: Boolean(versionLog),
+        executionChanged,
         runtimeCacheInvalidated: cacheInvalidation && cacheInvalidation[0].invalidated || 0,
         staticSnapshotsInvalidated: cacheInvalidation && cacheInvalidation[1].invalidated || 0,
-        cacheInvalidationComplete: cacheInvalidation ? cacheInvalidation.every((item) => item.complete) : false
+        cacheInvalidationComplete: cacheInvalidation ? cacheInvalidation.every((item) => item.complete) : false,
+        d2MappingOutcomes: storageOptions.d2MappingOutcomes.map((item) => String(item && item.status || '')).filter(Boolean),
+        d2MappingReasons: uniqueStrings(storageOptions.d2MappingOutcomes.flatMap((item) => Array.isArray(item && item.reasons) ? item.reasons.map(String) : []))
       });
       sendJson(res, updated.ok ? 200 : 502, {
         success: updated.ok,
@@ -43790,6 +44282,13 @@ async function handleBackend(req, res, requestUrl) {
         className: found.schema.classNames.template,
         template: sanitizeTemplateCard(updated.json && updated.json.data),
         versionLog,
+        executionValidation,
+        authoringRecovery: storageOptions.d2MappingOutcomes.map((item) => ({
+          status: String(item && item.status || ''),
+          recoveredFromVersion: item && item.recoveredFromVersion || null,
+          verification: String(item && item.verification || ''),
+          reasons: Array.isArray(item && item.reasons) ? item.reasons.map(String) : []
+        })),
         cacheInvalidation: cacheInvalidation && {
           runtime: cacheInvalidation[0],
           staticSnapshots: cacheInvalidation[1]
@@ -44173,6 +44672,12 @@ export {
   d2WorkflowStatusForSpec,
   decorateD2MarkdownFrames,
   d2ImportConfigSummary,
+  diagramImportDeterministicSpecHash,
+  diagramImportMappingInputRevision,
+  diagramImportMappingInputRevisionStatus,
+  diagramImportMappingValidationIsCurrent,
+  migrateDiagramImportToCurrentRevision,
+  signDiagramImportMappingValidation,
   diagramImportStructureTree,
   diagramImportStructureTreeErrors,
   d2ImporterHealth,

@@ -5,6 +5,8 @@ info:
   description: >
     Backend-owned UI/API for CMDBuild dynamic pages. Dynamic endpoints run with
     the current CMDBuild session cookie. Health endpoints are unauthenticated.
+    Каноническое Assistant/D2 authoring хранится в `spec.authoring`; версию
+    шаблона записывает только обычный template POST/PUT.
 servers:
   - url: http://127.0.0.1:8093
     description: Local dynamicpages backend
@@ -20,10 +22,12 @@ tags:
   - name: runtime
   - name: assistant
     description: >
-      Authoring-only proposal APIs. Assistant owns object-flow proposals, D2
-      import interpretation, and selection-to-role proposals; responses never
-      mutate an editor draft. The legacy `/assistant/template-draft` and
-      `/assistant/diagram-import/complete` routes are unsupported and unplanned.
+      API authoring-предложений. Assistant формирует object-flow, D2
+      interpretation и selection-to-role предложения; ответы не сохраняют
+      шаблон. Legacy `/assistant/template-draft`,
+      `/assistant/diagram-import/complete` и
+      `/templates/{code}/assistant-draft` не поддержаны и не запланированы;
+      последний route возвращает 410.
   - name: mcp
   - name: config
 security:
@@ -298,9 +302,10 @@ paths:
       tags: [assistant]
       summary: Propose a complete deterministic object flow
       description: >
-        Authoring-only LLM proposal for the complete Selection -> Match ->
-        Selection flow. The response never changes the current spec and must
-        be explicitly applied through `/draft/object-flow/apply`.
+        LLM authoring-предложение полного потока Selection -> Match ->
+        Selection. Ответ не меняет текущий spec и применяется явно через
+        `/draft/object-flow/apply`. Нужны читаемый сохранённый шаблон и
+        compare-and-swap base hash, но не update permission.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -320,7 +325,7 @@ paths:
         "401":
           description: CMDBuild session is invalid or expired
         "403":
-          description: CSRF or template authoring permission check failed
+          description: Не пройдена CSRF-проверка или шаблон недоступен для чтения
         "409":
           description: Saved template changed before proposal generation
         "422":
@@ -338,10 +343,12 @@ paths:
       tags: [templates]
       summary: Apply a reviewed object flow to the editor draft
       description: >
-        Deterministically validates and compiles reviewed selection and match
-        stages into a new editor spec. This endpoint does not call LLM and does
-        not save or publish the template. Every selection and every intermediate
-        match stage is returned as an eligible Diagram mapping source.
+        Детерминированно валидирует и компилирует проверенные selection/match
+        stages в новый editor spec. Endpoint не вызывает LLM, не сохраняет и не
+        публикует шаблон, не создаёт версию CMDB и не инвалидирует runtime/static
+        cache. Нужны читаемый шаблон и совпадающий CAS base hash, но не update
+        permission. Каждая selection и intermediate match stage возвращается как
+        допустимый источник Diagram mapping.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -361,7 +368,7 @@ paths:
         "401":
           description: CMDBuild session is invalid or expired
         "403":
-          description: CSRF or template authoring permission check failed
+          description: Не пройдена CSRF-проверка или шаблон недоступен для чтения
         "409":
           description: Editor draft or saved template changed before apply
         "422":
@@ -437,6 +444,10 @@ paths:
     post:
       tags: [templates]
       summary: Create query template
+      description: >
+        Обычное глобальное `Сохранить` для нового шаблона. Требует create
+        permission, сохраняет canonical `spec.authoring` вместе с executable
+        Spec и записывает версию CMDB. Хранилище принимает неполное authoring.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -467,6 +478,12 @@ paths:
     put:
       tags: [templates]
       summary: Update one template
+      description: >
+        Обычное глобальное `Сохранить` для существующего шаблона. Требует update
+        permission и является единственной update-операцией, записывающей версию
+        CMDB template. Хранилище принимает неполный `spec.authoring`; runtime и
+        preview проходят строгую execution-валидацию. Runtime cache и static
+        snapshots инвалидируются только при изменении executable Spec hash.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -483,6 +500,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TemplateResponse"
+        "403":
+          description: Нет Template update permission или не пройдена CSRF-проверка
         "409":
           description: Template changed since the caller loaded it
           content:
@@ -637,12 +656,11 @@ paths:
       tags: [assistant]
       summary: Analyze a self-contained D2 structure template
       description: >
-        Read-only deterministic parser stage in the Assistant-owned D2 import
-        workflow. It requires a valid CMDBuild session and CSRF protection,
-        returns structural IR, rendered preview, and a signed review proposal,
-        and never changes or saves the template. Template write permission and
-        saved-template version are checked only by the explicit apply, save,
-        or publish operation.
+        Read-only deterministic parser stage Assistant-owned D2 import workflow.
+        Требует валидную CMDBuild session и CSRF protection, возвращает structural
+        IR, rendered preview и signed review proposal, но не меняет и не
+        сохраняет шаблон. Обычное Save или publication проверяет write permission;
+        сам analysis его не требует.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -670,9 +688,12 @@ paths:
       tags: [templates]
       summary: Apply reviewed D2 class-role mappings to an editor draft
       description: >
-        Diagram-owned deterministic apply stage. It accepts only explicitly
-        reviewed role settings and selection mappings, returns a new validated
-        Spec JSON, and does not call LLM, save, or publish the template.
+        Diagram-owned deterministic apply stage. Принимает только явно
+        проверенные role settings и selection mappings, возвращает новый
+        валидный local draft Spec JSON и не вызывает LLM, не сохраняет и не
+        публикует шаблон, не создаёт версию CMDB и не инвалидирует runtime/static
+        cache. D2 Update использует тот же local contract. Нужны читаемый
+        шаблон и совпадающая CAS revision из proposal, но не update permission.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -688,7 +709,7 @@ paths:
         "401":
           description: CMDBuild session is invalid or expired
         "403":
-          description: Template update permission is missing
+          description: Не пройдена CSRF-проверка или шаблон недоступен для чтения
         "409":
           description: Editor draft, saved template, source, or signed proposal changed after D2 analysis
         "429":
@@ -723,7 +744,7 @@ paths:
         "401":
           description: CMDBuild session is invalid or expired
         "403":
-          description: Template create or update permission is missing
+          description: Не пройдена CSRF-проверка или шаблон недоступен для чтения
         "409":
           description: Saved template, source, or signed proposal changed after D2 analysis
         "429":
@@ -764,7 +785,7 @@ paths:
         "401":
           description: CMDBuild session is invalid or expired
         "403":
-          description: Template create or update permission is missing
+          description: Не пройдена CSRF-проверка или шаблон недоступен для чтения
         "409":
           description: Editor flow, saved template, source, or signed proposal changed
         "429":
@@ -990,10 +1011,10 @@ components:
           type: string
         templateCode:
           type: string
-          description: Existing template code; empty means a create-permission check.
+          description: Code существующего читаемого шаблона для local authoring CAS.
         baseSpecHash:
           type: string
-          description: Saved template hash used for optimistic authoring conflict detection.
+          description: Hash сохранённого шаблона для optimistic authoring conflict detection; не означает update permission.
         currentSpec:
           type: object
           additionalProperties: true
@@ -1070,6 +1091,9 @@ components:
           additionalProperties: true
         specHash:
           type: string
+        executionSpecHash:
+          type: string
+          description: Hash executable-части возвращённого draft; authoring-only изменения его не меняют.
     ObjectFlowProposal:
       type: object
       additionalProperties: false
@@ -1526,7 +1550,14 @@ components:
           type: boolean
         spec:
           type: object
-          description: Template Spec JSON. Normal dynamic templates use the DSL steps/result model; special CMDBuild model view templates set `kind=cmdbBuildView` and store renderer settings under `cmdbBuildView`.
+          description: >
+            Template Spec JSON. Normal dynamic templates используют DSL
+            steps/result model; special CMDBuild model view templates задают
+            `kind=cmdbBuildView` и хранят renderer settings в `cmdbBuildView`.
+            Canonical Assistant и D2 authoring находится в `spec.authoring`:
+            version, assistant prompts, D2 source и source hash. Хранилище
+            принимает неполный authoring section; execution paths валидируют его
+            строго.
           additionalProperties: true
         expectedSpecHash:
           type: string
@@ -1588,6 +1619,10 @@ components:
             versionLog:
               nullable: true
               type: object
+              additionalProperties: true
+            executionValidation:
+              type: object
+              description: Статус строгой execution-валидации сохранённого Spec. Успешное Save может вернуть неполный неисполняемый authoring draft.
               additionalProperties: true
     TemplateListResponse:
       allOf:

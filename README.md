@@ -259,7 +259,7 @@ Designer has a `Visualization` output switch: `Tables`, `Diagrams`, or `Both`. T
 
 The D2 importer contract uses class-aware IR v3. Every used D2 `class` is one reusable visual role; exemplar object paths are not separate mappings or authoring controls. A selected Object Flow result determines the primary CMDBuild class; the author configures the composite label, optional structured data, and catalog-backed related classes. Additional fields are emitted in per-object structured data and affect the visible label only when referenced by `${...}`. Untyped D2 containers remain structural roles. Grouping, hierarchy, connections, and static placement are explicit role rules; backend-managed DSL aliases and template-element bindings are not exposed in this UI. Legacy D2 import proposals and mappings before IR v3 are unsupported, are not migrated automatically, and are not planned as compatibility modes.
 
-The approved authoring split is explicit: `Assistant` owns D2 import, semantic interpretation, object-flow selection/match proposals, and selection-to-role proposals. `Diagram` owns the accepted deterministic settings in `result.diagrams[]`, including applied node, edge, group, and hierarchy mappings. Object-flow LLM calls receive a sanitized stage-only flow context and return one typed `selection` or `block`, never a complete runtime Spec. Assistant responses never mutate the editor draft; the author reviews them and invokes a deterministic apply action. Every selection stage and every intermediate match stage is eligible as a Diagram mapping source.
+The approved authoring split is explicit: `Assistant` owns D2 import, semantic interpretation, object-flow selection/match proposals, and selection-to-role proposals. `Diagram` owns the accepted deterministic settings in `result.diagrams[]`, including applied node, edge, group, and hierarchy mappings. Object-flow LLM calls receive a sanitized stage-only flow context and return one typed `selection` or `block`, never a complete runtime Spec. Assistant responses never mutate the editor draft before an explicit deterministic apply action. Every selection stage and every intermediate match stage is eligible as a Diagram mapping source.
 
 For an exact non-negated `include equals` match, the deterministic object-flow compiler also drives the right `selectCards` from the left stage and adds a mandatory `valueColumn` filter before the class scan. Correlated right cards are materialized once by CMDBuild class/card id, so repeated left keys do not multiply the later `matchRows` cross-product. The explicit `matchRows` stage remains in the pipeline and remains available as a Diagram source. This prevents a class result limit from discarding the matching cards before the join is evaluated. While a reviewed D2 proposal is pending, Diagram shows its mapping controls only; general deterministic diagram settings become editable after Apply so proposal review cannot silently change the analyzed spec hash.
 
@@ -267,11 +267,32 @@ Typed authoring endpoints under `/cmdbuild/custom-api` are:
 
 - `POST /assistant/object-flow/selection` - propose one selection stage;
 - `POST /assistant/object-flow/match` - propose one intermediate match stage;
-- `POST /draft/object-flow/apply` - deterministically validate and apply the reviewed object flow to the draft;
+- `POST /draft/object-flow/apply` - deterministically validate and compile the reviewed object flow into a local draft;
 - `POST /assistant/diagram-import/interpret` - propose semantics for imported D2 roles;
-- `POST /assistant/diagram-import/map-selections` - propose mappings from selection or intermediate match stages to confirmed D2 roles.
+- `POST /assistant/diagram-import/map-selections` - propose mappings from selection or intermediate match stages to confirmed D2 roles;
+- `POST /draft/diagram-import/apply` - deterministically compile reviewed D2 mapping into a local draft. The UI D2 Update action follows the same local contract.
 
-The deterministic D2 parser/analyzer remains separate from LLM interpretation, and reviewed D2 settings are applied only through the Diagram-owned draft path. The generic `POST /assistant/template-draft` route and mixed `POST /assistant/diagram-import/complete` route are removed from the public contract; legacy aliases are unsupported and unplanned.
+Каноническое authoring-состояние сохраняется в `SpecJson.authoring`, а не в отдельном draft endpoint:
+
+```json
+{
+  "authoring": {
+    "version": 1,
+    "assistant": {
+      "objectFlowIntent": "...",
+      "diagramInterpretPrompt": "...",
+      "diagramMappingPrompt": "..."
+    },
+    "d2": { "source": "...", "sourceHash": "..." }
+  }
+}
+```
+
+`Применить цепочку`, D2 Apply и D2 Update возвращают только новый локальный draft `spec`: они не выполняют template `PUT`, не создают версию CMDBuild и не инвалидируют runtime cache/static snapshot. Единственная операция записи — глобальный `Сохранить`, выполняющий обычный template `POST`/`PUT`: он сохраняет одновременно executable Spec и `spec.authoring`, создаёт версию шаблона, а cache/static snapshot инвалидирует только при изменении executable-части Spec. Для локальных действий нужны читаемый шаблон и compare-and-swap `baseSpecHash`, но не update grant; обычный template `PUT` требует update grant.
+
+Хранилище допускает незавершённый D2 source/mapping и другие authoring-поля. Runtime, draft preview, extraction и publication выполняют строгую execution-валидацию и блокируются до готового D2 source/mapping. Legacy `assistantDraft` мигрируется только при обычном `Сохранить`; `/templates/<code>/assistant-draft` удалён и возвращает `410`. Generic `POST /assistant/template-draft` и mixed `POST /assistant/diagram-import/complete` удалены из публичного контракта; legacy aliases не поддержаны и не запланированы.
+
+Applied D2 mapping has a signed `mappingInputRevision`: canonical D2 `sourceHash`, hashes of both D2 prompts (`diagramInterpretPrompt` and `diagramMappingPrompt`), and the contract of only the Object Flow stages and fields referenced by that mapping. When all of those inputs and the signature match, the mapping remains usable after reload without Analyze, Interpret, Map, Apply, or an automatic LLM call. A change to the D2 source, either D2 prompt, or a referenced Object Flow stage contract preserves the mapping for inspection/editing but marks it `needsReview`; execution, preview, extraction, runtime, and publication fail closed until the author explicitly reviews and applies a replacement or corrects it in Diagram. Unrelated template changes and unreferenced Object Flow stages must not mark the mapping stale. Exact version-history recovery never restores a different mapping: it accepts the same source, prompts, referenced stage contract and mapping only. A historical `semanticModelRevision=8` / tree `3` valid marker from before a signing-secret rotation is only a migration attestation during normal Save; the backend re-parses, revalidates, recompiles and signs the current mapping before it becomes runtime-valid. It is not a runtime fallback or legacy compatibility. The full saved `specHash` remains the compare-and-swap guard for concurrent template updates.
 
 Assistant authoring calls use the configured LiteLLM-compatible `/v1/chat/completions` endpoint and may include bounded read-only CMDBuild model context through `POST /cmdbuild/custom-api/mcp` tools controlled by `Cst_QueryToolConfig.RuntimeConfigJson.assistant.mcp`. `assistant.mcp.timeoutMs` bounds the complete MCP-context collection phase and each subsequent LiteLLM request; its effective range is 1000-60000 ms. A context deadline returns partial context with an explicit warning instead of silently starting more MCP reads. The browser waits an additional five seconds for each backend phase. The authoring-only `Cst_QueryToolConfig.RuntimeConfigJson.assistant.prompt.system` setting may add deployment-specific naming and relation semantics without hardcoding customer classes in the default contract. Runtime page rendering, runtime cache construction, static snapshot serving, and publication never call LLM or MCP. The assistant is disabled by default and is enabled by `Cst_QueryToolConfig.RuntimeConfigJson.assistant.llm.enabled`; the LiteLLM API key is supplied only through env or a secret file. `CMDP_ASSISTANT_ENABLED` is kept as a deprecated no-op for older deployment templates. `CMDP_ASSISTANT_TIMEOUT_MS` is unsupported. This section defines the approved API contract and does not claim runtime implementation verification.
 
@@ -512,7 +533,7 @@ ParamsSchemaJson  optional metadata for template parameters
 ResultSchemaJson  optional metadata for result rendering
 ```
 
-`SpecJson` has three main parts:
+`SpecJson` has three executable parts plus optional canonical authoring metadata in `authoring`:
 
 ```json
 {
@@ -529,6 +550,8 @@ ResultSchemaJson  optional metadata for result rendering
   }
 }
 ```
+
+`authoring` не исполняется runtime как DSL. Оно хранит промпты Assistant и D2 source, может быть неполным при обычном `Сохранить` и не заменяет строгую execution-валидацию перед preview, extraction, runtime или publication.
 
 The first constructor block is `Input variables`. It declares the variables expected at template input and writes them into `spec.params`. Each row defines:
 

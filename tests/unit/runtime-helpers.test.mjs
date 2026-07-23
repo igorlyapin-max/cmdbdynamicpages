@@ -30,6 +30,11 @@ import {
   d2WorkflowStatusForSpec,
   decorateD2MarkdownFrames,
   d2ImportConfigSummary,
+  diagramImportDeterministicSpecHash,
+  diagramImportMappingInputRevision,
+  diagramImportMappingValidationIsCurrent,
+  migrateDiagramImportToCurrentRevision,
+  signDiagramImportMappingValidation,
   diagramImportStructureTree,
   diagramImportStructureTreeErrors,
   embedDiagramSvgMetadata,
@@ -220,7 +225,7 @@ test('D2 structure tree reports an explicit unavailable template element instead
   assert.ok(errors.some((error) => /must use a D2 element/.test(error.message)));
 });
 
-test('D2 authoring removes the obsolete Diagram editor 2 sandbox on template save', () => {
+test('template Save migrates retired assistantDraft into canonical authoring and removes the sandbox', () => {
   const before = {
     version: 1,
     steps: [{ type: 'selectCards', as: 'assets', className: 'ARM', columns: ['Code'] }],
@@ -237,12 +242,22 @@ test('D2 authoring removes the obsolete Diagram editor 2 sandbox on template sav
     }
   };
   const stored = normalizeTemplateSpecForStorage(before);
-  assert.equal(Object.hasOwn(stored.assistantDraft, 'diagramSandbox'), false);
-  assert.deepEqual(stored.assistantDraft.d2Authoring.overrides.roles, []);
-  assert.equal(stored.assistantDraft.d2Authoring.overrides.semanticModelRevision, 0);
+  assert.equal(Object.hasOwn(stored, 'assistantDraft'), false);
+  assert.deepEqual(stored.authoring, {
+    version: 1,
+    assistant: {
+      objectFlowIntent: { context: '', blocks: [] },
+      diagramInterpretPrompt: '',
+      diagramMappingPrompt: ''
+    },
+    d2: {
+      source: 'server: Server',
+      sourceHash: crypto.createHash('sha256').update('server: Server').digest('hex')
+    }
+  });
 });
 
-test('D2 workflow is pending until the saved source hash matches the applied deterministic mapping', async () => {
+test('D2 workflow accepts only canonical authoring source and matching deterministic mapping', async () => {
   const source = 'app: "Application"';
   const sourceHash = crypto.createHash('sha256').update(source).digest('hex');
   const semanticModelRevision = 9;
@@ -251,26 +266,23 @@ test('D2 workflow is pending until the saved source hash matches the applied det
   const mappingContractHash = 'mapping_contract_test';
   const missingIdentity = {
     version: 1,
-    assistantDraft: { d2Authoring: { version: 1, source } },
+    authoring: { version: 1, assistant: {}, d2: { source } },
     result: { diagrams: [] }
   };
   assert.deepEqual(await d2WorkflowStatusForSpec(missingIdentity), {
     state: 'pending',
-    reason: 'authoring_identity_missing',
+    reason: 'mapping_missing',
     sourceHash,
     appliedSourceHash: ''
   });
   const spec = {
     version: 1,
-    assistantDraft: {
-      d2Authoring: {
-        version: 1,
+    authoring: {
+      version: 1,
+      assistant: { objectFlowIntent: { context: '', blocks: [] } },
+      d2: {
         source,
-        sourceHash,
-        semanticModelRevision,
-        diagramId,
-        structureHash,
-        mappingContractHash
+        sourceHash
       }
     },
     result: {
@@ -308,56 +320,26 @@ test('D2 workflow is pending until the saved source hash matches the applied det
   });
   spec.result.diagrams[0].templateGrammar = { version: 3, elements: [], roles: [], contexts: [], edges: [], fingerprint: 'test' };
   assert.deepEqual(await d2WorkflowStatusForSpec(spec), {
-    state: 'applied',
-    sourceHash,
-    diagramId,
-    roles: 1
-  });
-
-  spec.result.diagrams[0].authoring.d2Import.mappingValidation = { version: 1, status: 'needsValidation' };
-  assert.deepEqual(await d2WorkflowStatusForSpec(spec), {
     state: 'pending',
     reason: 'mapping_validation_required',
     sourceHash,
     appliedSourceHash: sourceHash
   });
-  delete spec.result.diagrams[0].authoring.d2Import.mappingValidation;
 
-  spec.result.diagrams[0].authoring.d2Import.semanticModelRevision = semanticModelRevision - 1;
-  assert.deepEqual(await d2WorkflowStatusForSpec(spec), {
-    state: 'pending',
-    reason: 'semantic_model_revision_required',
-    sourceHash,
-    appliedSourceHash: sourceHash
-  });
-  spec.result.diagrams[0].authoring.d2Import.semanticModelRevision = semanticModelRevision;
-
-  spec.assistantDraft.d2Authoring.mappingContractHash = 'changed_mapping_contract';
-  assert.equal((await d2WorkflowStatusForSpec(spec)).reason, 'authoring_mapping_unconfirmed');
-  spec.assistantDraft.d2Authoring.mappingContractHash = mappingContractHash;
-
-  spec.assistantDraft.d2Authoring.source = `${source}\n`;
-  spec.assistantDraft.d2Authoring.sourceHash = crypto.createHash('sha256').update(`${source}\n`).digest('hex');
-  spec.result.diagrams[0].authoring.d2Import.sourceHash = spec.assistantDraft.d2Authoring.sourceHash;
-  spec.result.diagrams[0].authoring.d2Import.source = `${source}\n`;
-  assert.equal((await d2WorkflowStatusForSpec(spec)).state, 'applied');
-
-  spec.assistantDraft.d2Authoring.source = 'app: "Changed application"';
-  spec.assistantDraft.d2Authoring.sourceHash = crypto.createHash('sha256').update(spec.assistantDraft.d2Authoring.source).digest('hex');
-  spec.result.diagrams[0].authoring.d2Import.structureHash = '';
+  spec.authoring.d2.source = 'app: "Changed application"';
   assert.equal((await d2WorkflowStatusForSpec(spec)).state, 'pending');
   assert.equal((await d2WorkflowStatusForSpec(spec)).reason, 'source_changed');
 
-  delete spec.assistantDraft;
+  delete spec.authoring;
   assert.deepEqual(await d2WorkflowStatusForSpec(spec), {
     state: 'pending',
     reason: 'authoring_source_missing',
     sourceHash: '',
-    appliedSourceHash: crypto.createHash('sha256').update(`${source}\n`).digest('hex')
+    appliedSourceHash: sourceHash
   });
 });
 
-test('template storage derives current D2 source identity and discards old role-model overrides', () => {
+test('template storage migrates old D2 source into canonical authoring and discards retired overrides', () => {
   const source = 'app: "Application"';
   const normalized = normalizeTemplateSpecForStorage({
     version: 1,
@@ -380,16 +362,13 @@ test('template storage derives current D2 source identity and discards old role-
       }
     }
   });
-  const authoring = normalized.assistantDraft.d2Authoring;
-  assert.equal(authoring.sourceHash, crypto.createHash('sha256').update(source).digest('hex'));
-  assert.equal(authoring.semanticModelRevision, 0);
-  assert.equal(authoring.diagramId, '');
-  assert.equal(authoring.structureHash, '');
-  assert.equal(authoring.mappingContractHash, '');
-  assert.equal(authoring.overrides.semanticModelRevision, 0);
-  assert.equal(authoring.overrides.sourceHash, '');
-  assert.equal(authoring.overrides.diagramId, '');
-  assert.equal(authoring.overrides.mappingContractHash, '');
+  assert.equal(Object.hasOwn(normalized, 'assistantDraft'), false);
+  const authoring = normalized.authoring;
+  assert.equal(authoring.d2.sourceHash, crypto.createHash('sha256').update(source).digest('hex'));
+  assert.equal(authoring.d2.source, source);
+  assert.deepEqual(authoring.assistant.objectFlowIntent, { context: '', blocks: [] });
+  assert.equal(authoring.assistant.diagramInterpretPrompt, '');
+  assert.equal(authoring.assistant.diagramMappingPrompt, '');
 });
 
 test('non-special templates drop stale protected flags and legacy BAA fields before storage', () => {
@@ -974,6 +953,219 @@ test('D2 placements compile their own related traversal without sharing a role m
   assert.equal(diagram.authoring.d2Import.mappingValidation.status, 'valid');
 });
 
+test('D2 mapping keeps its signed inputs on reload and requires explicit review after a prompt change', async () => {
+  const { currentSpec, proposal, roles } = d2StructureTreeFixture();
+  const tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
+  const appliedImport = applied.result.diagrams[0].authoring.d2Import;
+
+  assert.equal(appliedImport.mappingInputRevision.version, 1);
+  assert.equal(diagramImportMappingValidationIsCurrent(appliedImport), true);
+  assert.deepEqual(await d2WorkflowStatusForSpec(applied), {
+    state: 'applied',
+    sourceHash: appliedImport.sourceHash,
+    diagramId: appliedImport.diagramId,
+    roles: appliedImport.roles.length
+  });
+
+  const reloaded = normalizeTemplateSpecForStorage(applied);
+  assert.equal(reloaded.result.diagrams[0].authoring.d2Import.mappingValidation.status, 'valid');
+  assert.equal(diagramImportMappingValidationIsCurrent(reloaded.result.diagrams[0].authoring.d2Import), true);
+
+  const promptChanged = structuredClone(applied);
+  promptChanged.authoring.assistant.diagramMappingPrompt = 'Измененный mapping prompt';
+  const reviewed = normalizeTemplateSpecForStorage(promptChanged);
+  const reviewedImport = reviewed.result.diagrams[0].authoring.d2Import;
+  assert.equal(reviewedImport.mappingValidation.status, 'needsReview');
+  assert.deepEqual(reviewedImport.mappingValidation.reasons, ['mappingPrompt']);
+  assert.equal((await d2WorkflowStatusForSpec(reviewed)).reason, 'mapping_input_review_required');
+});
+
+test('normal Save recovers only an exact signed D2 mapping version and migrates placement revision 8/3', async () => {
+  const { currentSpec, proposal, roles } = d2StructureTreeFixture();
+  const tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
+  const signedVersion = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
+  const historicVersion = structuredClone(signedVersion);
+  const versionImport = historicVersion.result.diagrams[0].authoring.d2Import;
+
+  // Simulate the immediately previous persisted revision: it had a verified
+  // mapping but predated the current placement representation and input stamp.
+  // Its placement IDs are deliberately different from the current source tree.
+  const legacyIds = new Map(versionImport.structureTree.items.map((item, index) => [item.id, `legacy_item_${index + 1}`]));
+  versionImport.structureTree.items = versionImport.structureTree.items.map((item) => ({
+    ...item,
+    id: legacyIds.get(item.id),
+    parentId: item.parentId ? legacyIds.get(item.parentId) : ''
+  }));
+  versionImport.semanticModelRevision = 8;
+  versionImport.structureTree.version = 3;
+  delete versionImport.mappingInputRevision;
+  versionImport.mappingValidation = {
+    version: 1,
+    status: 'valid',
+    signature: signDiagramImportMappingValidation(versionImport)
+  };
+  assert.equal(diagramImportMappingValidationIsCurrent(versionImport), true);
+
+  const lostMarker = structuredClone(historicVersion);
+  const lostImport = lostMarker.result.diagrams[0].authoring.d2Import;
+  lostImport.mappingValidation = { version: 1, status: 'needsValidation' };
+  const identity = {
+    ok: true,
+    sourceHash: signedVersion.result.diagrams[0].authoring.d2Import.sourceHash,
+    structureHash: signedVersion.result.diagrams[0].authoring.d2Import.structureHash,
+    mappingContractHash: signedVersion.result.diagrams[0].authoring.d2Import.mappingContractHash,
+    ir: {
+      source: { parser: signedVersion.result.diagrams[0].authoring.d2Import.parser },
+      template: signedVersion.result.diagrams[0].authoring.d2Import.template,
+      elements: signedVersion.result.diagrams[0].authoring.d2Import.structure,
+      classes: signedVersion.result.diagrams[0].authoring.d2Import.classes
+    }
+  };
+
+  assert.equal(migrateDiagramImportToCurrentRevision(lostMarker, versionImport, {
+    diagramId: versionImport.diagramId
+  }), null, 'A retained legacy tree must never be promoted without a fresh D2 identity.');
+
+  const recovered = normalizeTemplateSpecForStorage(lostMarker, '', {
+    recoveryVersions: [{ version: 53, spec: historicVersion }],
+    d2SourceIdentities: [identity]
+  });
+  const recoveredImport = recovered.result.diagrams[0].authoring.d2Import;
+  assert.equal(recoveredImport.semanticModelRevision, 9);
+  assert.equal(recoveredImport.structureTree.version, 4);
+  assert.equal(recoveredImport.mappingValidation.status, 'valid');
+  assert.equal(diagramImportMappingValidationIsCurrent(recoveredImport), true);
+  assert.equal(diagramImportMappingInputRevision(recovered, recoveredImport).sourceHash, recoveredImport.mappingInputRevision.sourceHash);
+  assert.equal((await d2WorkflowStatusForSpec(recovered)).state, 'applied');
+  assert.equal(recovered.result.diagrams[0].nodeMappings.every((mapping) => !String(mapping.importRole && mapping.importRole.structureItemId || '').startsWith('legacy_item_')), true);
+
+  const changedPrompt = structuredClone(lostMarker);
+  changedPrompt.authoring.assistant.diagramInterpretPrompt = 'Новый prompt без повторного mapping';
+  const notRecovered = normalizeTemplateSpecForStorage(changedPrompt, '', {
+    recoveryVersions: [{ version: 53, spec: historicVersion }],
+    d2SourceIdentities: [identity]
+  });
+  assert.equal(notRecovered.result.diagrams[0].authoring.d2Import.mappingValidation.status, 'needsReview');
+});
+
+test('normal Save uses an exact 8/3 historical attestation only to recompile after signing-secret rotation', () => {
+  const { currentSpec, proposal, roles } = d2StructureTreeFixture();
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA'));
+  const historicalVersion = structuredClone(applied);
+  const historicImport = historicalVersion.result.diagrams[0].authoring.d2Import;
+  historicImport.semanticModelRevision = 8;
+  historicImport.structureTree.version = 3;
+  historicImport.diagramId = '';
+  delete historicImport.mappingInputRevision;
+  // This shape represents a mapping saved before the server's signing secret
+  // was rotated. It is never accepted as runtime validation by itself.
+  historicImport.mappingValidation = { version: 1, status: 'valid', signature: 'a'.repeat(64) };
+
+  const current = structuredClone(historicalVersion);
+  current.result.diagrams[0].authoring.d2Import.mappingValidation = { version: 1, status: 'needsReview', reasons: ['inputRevision'] };
+  const currentImport = current.result.diagrams[0].authoring.d2Import;
+  const identity = {
+    ok: true,
+    sourceHash: applied.result.diagrams[0].authoring.d2Import.sourceHash,
+    structureHash: applied.result.diagrams[0].authoring.d2Import.structureHash,
+    mappingContractHash: applied.result.diagrams[0].authoring.d2Import.mappingContractHash,
+    ir: {
+      source: { parser: applied.result.diagrams[0].authoring.d2Import.parser },
+      template: applied.result.diagrams[0].authoring.d2Import.template,
+      elements: applied.result.diagrams[0].authoring.d2Import.structure,
+      classes: applied.result.diagrams[0].authoring.d2Import.classes
+    }
+  };
+
+  const recovered = normalizeTemplateSpecForStorage(current, '', {
+    recoveryVersions: [{ version: 53, spec: historicalVersion }],
+    d2SourceIdentities: [identity]
+  });
+  assert.equal(recovered.result.diagrams[0].authoring.d2Import.semanticModelRevision, 9);
+  assert.equal(recovered.result.diagrams[0].authoring.d2Import.structureTree.version, 4);
+  assert.equal(recovered.result.diagrams[0].authoring.d2Import.diagramId, recovered.result.diagrams[0].id);
+  assert.equal(diagramImportMappingValidationIsCurrent(recovered.result.diagrams[0].authoring.d2Import), true);
+
+  const unsupportedVersion = structuredClone(historicalVersion);
+  unsupportedVersion.result.diagrams[0].authoring.d2Import.semanticModelRevision = 7;
+  const blocked = normalizeTemplateSpecForStorage(current, '', {
+    recoveryVersions: [{ version: 52, spec: unsupportedVersion }],
+    d2SourceIdentities: [identity]
+  });
+  assert.equal(blocked.result.diagrams[0].authoring.d2Import.mappingValidation.status, 'needsReview');
+  assert.equal(currentImport.mappingValidation.status, 'needsReview');
+});
+
+test('normal Save merges only identical legacy placements when the current tree collapses sibling exemplars', () => {
+  const currentSpec = selectionFlowSpec([{ alias: 'systems', className: 'IS', columns: ['Code', 'Description'] }]);
+  const source = 'target: { left: Left; right: Right }';
+  const ir = normalizeDiagramImportIr({
+    version: 4,
+    elements: {
+      groups: [{ id: 'target', label: 'Target', classKeys: ['scope'], pathSegments: ['target'] }],
+      nodes: [
+        { id: 'target.left', label: 'Left', parentKey: 'target', classKeys: ['system'], pathSegments: ['target', 'left'] },
+        { id: 'target.right', label: 'Right', parentKey: 'target', classKeys: ['system'], pathSegments: ['target', 'right'] }
+      ]
+    },
+    classes: [
+      { key: 'scope', usageKeys: ['target'] },
+      { key: 'system', usageKeys: ['target.left', 'target.right'] }
+    ]
+  }, source);
+  const proposal = createDiagramImportProposal(currentSpec, ir, { sourceText: source });
+  const systemRole = proposal.roles.find((role) => role.key === 'system');
+  const mergedItem = proposal.structureTree.items.find((item) => item.roleId === systemRole.id);
+  assert.deepEqual(mergedItem.templateElementKeys, ['target.left', 'target.right']);
+  const tree = structureTreeWithStage(proposal.structureTree, systemRole.id, 'selection:systems');
+  const applied = applyDiagramImportProposal({
+    ...currentSpec,
+    authoring: {
+      version: 1,
+      assistant: { objectFlowIntent: { context: '', blocks: [] }, diagramInterpretPrompt: '', diagramMappingPrompt: '' },
+      d2: { source }
+    }
+  }, proposal, [], [], tree);
+  const historicalVersion = structuredClone(applied);
+  const historicImport = historicalVersion.result.diagrams[0].authoring.d2Import;
+  const historicMergedItem = historicImport.structureTree.items.find((item) => item.roleId === systemRole.id);
+  historicImport.structureTree.items = historicImport.structureTree.items.flatMap((item) => {
+    if (item.id !== historicMergedItem.id) return [item];
+    return item.templateElementKeys.map((templateElementKey, index) => {
+      const split = structuredClone(item);
+      split.id = `legacy_system_${index + 1}`;
+      split.templateElementKey = templateElementKey;
+      delete split.templateElementKeys;
+      return split;
+    });
+  });
+  historicImport.semanticModelRevision = 8;
+  historicImport.structureTree.version = 3;
+  delete historicImport.mappingInputRevision;
+  historicImport.mappingValidation = {
+    version: 1,
+    status: 'valid',
+    signature: signDiagramImportMappingValidation(historicImport)
+  };
+  const current = structuredClone(historicalVersion);
+  current.result.diagrams[0].authoring.d2Import.mappingValidation = { version: 1, status: 'needsValidation' };
+  const recovered = normalizeTemplateSpecForStorage(current, '', {
+    recoveryVersions: [{ version: 53, spec: historicalVersion }],
+    d2SourceIdentities: [{
+      ok: true,
+      sourceHash: applied.result.diagrams[0].authoring.d2Import.sourceHash,
+      structureHash: applied.result.diagrams[0].authoring.d2Import.structureHash,
+      mappingContractHash: applied.result.diagrams[0].authoring.d2Import.mappingContractHash,
+      ir
+    }]
+  });
+  const recoveredImport = recovered.result.diagrams[0].authoring.d2Import;
+  assert.equal(recoveredImport.structureTree.items.filter((item) => item.roleId === systemRole.id).length, 1);
+  assert.deepEqual(recoveredImport.structureTree.items.find((item) => item.roleId === systemRole.id).templateElementKeys, ['target.left', 'target.right']);
+  assert.equal(diagramImportMappingValidationIsCurrent(recoveredImport), true);
+});
+
 test('D2 container labels use exactly one direct child value and materialize related child fields', () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   let tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
@@ -1055,10 +1247,34 @@ test('D2 container labels use exactly one direct child value and materialize rel
   assert.ok(relatedMultiple.warnings.some((warning) => /expected exactly one value, received 2/.test(warning)));
 });
 
-test('D2 import rejects legacy proposal versions and requires re-analysis', () => {
+test('D2 import deterministic revision ignores Assistant prompts but not template schema', () => {
+  const { currentSpec, proposal } = d2StructureTreeFixture();
+  const promptOnly = structuredClone(currentSpec);
+  promptOnly.authoring = {
+    version: 1,
+    assistant: {
+      objectFlowIntent: { context: 'Prompt context', blocks: [] },
+      diagramInterpretPrompt: 'Interpret the D2 template.',
+      diagramMappingPrompt: 'Map deterministic stages.'
+    },
+    d2: { source: 'target: Target' }
+  };
+  const changedSchema = structuredClone(currentSpec);
+  changedSchema.steps[0].columns = ['Code', 'Description', 'Location'];
+
+  assert.equal(proposal.deterministicSpecHash, diagramImportDeterministicSpecHash(currentSpec));
+  assert.equal(diagramImportDeterministicSpecHash(promptOnly), diagramImportDeterministicSpecHash(currentSpec));
+  assert.notEqual(diagramImportDeterministicSpecHash(changedSchema), diagramImportDeterministicSpecHash(currentSpec));
+});
+
+test('D2 import rejects legacy proposal revisions and requires re-analysis', () => {
   assert.throws(
     () => assertDiagramImportProposal({ version: 1 }, 'token'),
     (error) => error.code === 'diagram_import_proposal_version' && error.statusCode === 409
+  );
+  assert.throws(
+    () => assertDiagramImportProposal({ version: 3 }, 'token'),
+    (error) => error.code === 'diagram_import_deterministic_revision_missing' && error.statusCode === 409
   );
 });
 

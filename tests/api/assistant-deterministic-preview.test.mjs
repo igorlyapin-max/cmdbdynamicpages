@@ -402,18 +402,21 @@ test('typed object-flow apply compiles deterministic stages and removed Assistan
     flow
   }, headers);
   assert.equal(applied.statusCode, 200, applied.body);
-  assert.deepEqual(applied.json.template.spec.steps.map((step) => step.type), ['selectCards', 'selectCards', 'matchRows']);
-  assert.equal(applied.json.template.spec.steps[1].from, undefined);
-  assert.equal(applied.json.template.spec.steps[1].filters.some((filter) => filter.valueColumn), false);
-  assert.equal(applied.json.template.spec.steps[2].from, 'routers');
-  assert.equal(applied.json.template.spec.steps[2].with, 'arms');
-  assert.equal(applied.json.template.spec.visualModels.some((model) => model.mode === 'objectMatching'), true);
+  assert.deepEqual(applied.json.spec.steps.map((step) => step.type), ['selectCards', 'selectCards', 'matchRows']);
+  assert.equal(applied.json.spec.steps[1].from, undefined);
+  assert.equal(applied.json.spec.steps[1].filters.some((filter) => filter.valueColumn), false);
+  assert.equal(applied.json.spec.steps[2].from, 'routers');
+  assert.equal(applied.json.spec.steps[2].with, 'arms');
+  assert.equal(applied.json.spec.visualModels.some((model) => model.mode === 'objectMatching'), true);
   assert.deepEqual(
-    applied.json.template.spec.visualModels.find((model) => model.mode === 'objectMatching').outputs.map((output) => [output.alias, output.published]),
+    applied.json.spec.visualModels.find((model) => model.mode === 'objectMatching').outputs.map((output) => [output.alias, output.published]),
     [['routers', undefined], ['arms', undefined], ['coLocated', undefined]]
   );
-  assert.equal(typeof applied.json.cacheInvalidation.runtime, 'object');
-  assert.equal(typeof applied.json.cacheInvalidation.staticSnapshots, 'object');
+  assert.equal(applied.json.template, undefined);
+  assert.equal(applied.json.versionLog, undefined);
+  assert.equal(applied.json.cacheInvalidation, undefined);
+  assert.equal(mock.requests.some((item) => item.method === 'PUT' && item.pathname.includes('/classes/Cst_QueryTemplate/cards/')), false);
+  assert.equal(mock.requests.some((item) => item.pathname.includes('/classes/Cst_QueryTemplateVersion/cards')), false);
 
   const removed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/template-draft`, { prompt: 'ignored' }, headers);
   assert.equal(removed.statusCode, 410, removed.body);
@@ -525,7 +528,7 @@ test('full object-flow planning returns a validated proposal without mutating th
     'x-cmdbdynamicpages-csrf': csrf.json.token
   });
   assert.equal(applied.statusCode, 200, applied.body);
-  const appliedSpec = applied.json.template.spec;
+  const appliedSpec = applied.json.spec;
   const outputManifest = appliedSpec.visualModels.find((model) => model.mode === 'objectMatching').outputs;
   const ownershipManifest = appliedSpec.visualModels.find((model) => model.mode === 'objectMatching').assistantOutputManifest;
   assert.deepEqual(ownershipManifest, {
@@ -546,18 +549,8 @@ test('full object-flow planning returns a validated proposal without mutating th
   assert.equal(reloaded.statusCode, 200, reloaded.body);
   const reloadedSpec = reloaded.json.data.find((template) => template.code === templateCode)?.spec;
   assert.ok(reloadedSpec, reloaded.body);
-  assert.deepEqual(
-    reloadedSpec.visualModels.find((model) => model.mode === 'objectMatching').outputs.map((output) => [output.alias, output.label]),
-    outputManifest.map((output) => [output.alias, output.label])
-  );
-  assert.deepEqual(
-    reloadedSpec.visualModels.find((model) => model.mode === 'objectMatching').assistantOutputManifest,
-    ownershipManifest
-  );
-  assert.deepEqual(
-    reloadedSpec.result.tables.map((table) => [table.name, table.title]),
-    appliedSpec.result.tables.map((table) => [table.name, table.title])
-  );
+  assert.deepEqual(reloadedSpec, initialSpec);
+  assert.equal(mock.requests.some((item) => item.method === 'PUT' && item.pathname.includes('/classes/Cst_QueryTemplate/cards/')), false);
   const duplicateNameIntent = {
     context: '',
     blocks: [
@@ -572,7 +565,7 @@ test('full object-flow planning returns a validated proposal without mutating th
   };
   const duplicateName = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
     templateCode,
-    baseSpecHash: applied.json.template.specHash,
+    baseSpecHash: hashJson(initialSpec),
     currentSpec: appliedSpec,
     intent: duplicateNameIntent
   }, {
@@ -1702,7 +1695,7 @@ test('object-flow planning restores exact Description and an explicit business a
   assert.equal(backend.exitCode, null);
 });
 
-test('object-flow planning is read-only while Apply requires an explicitly denied update grant', async (t) => {
+test('object-flow planning and local Apply do not require an update grant', async (t) => {
   const flow = {
     version: 1,
     selections: [{
@@ -1750,7 +1743,7 @@ test('object-flow planning is read-only while Apply requires an explicitly denie
   }, headers);
   assert.equal(planned.statusCode, 200, planned.body);
   assert.equal(planned.json.success, true);
-  assert.equal(planned.json.canApply, false);
+  assert.equal(planned.json.canApply, true);
   assert.equal(planned.json.flow.publishedAlias, flow.publishedAlias);
   assert.equal(planned.json.flow.selections[0].className, flow.selections[0].className);
   assert.equal(llm.requests, 1);
@@ -1761,12 +1754,19 @@ test('object-flow planning is read-only while Apply requires an explicitly denie
     currentSpec: savedSpec,
     flow
   }, headers);
-  assert.equal(applied.statusCode, 403, applied.body);
-  assert.equal(applied.json.reason, 'template_update_forbidden');
+  assert.equal(applied.statusCode, 200, applied.body);
+  assert.ok(applied.json.spec, applied.body);
+  assert.equal(mock.requests.some((item) => item.method === 'PUT' && item.pathname.includes('/classes/Cst_QueryTemplate/cards/')), false);
+
+  const save = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/NoUpdateObjectFlow`, {
+    code: 'NoUpdateObjectFlow', expectedSpecHash: hashJson(savedSpec), spec: applied.json.spec
+  }, headers);
+  assert.equal(save.statusCode, 403, save.body);
+  assert.equal(save.json.reason, 'template_update_forbidden');
   assert.equal(backend.exitCode, null);
 });
 
-test('object-flow planning falls back to the template class update grant when a card omits _can_update', async (t) => {
+test('object-flow planning remains locally applicable when a card omits _can_update', async (t) => {
   const flow = {
     version: 1,
     selections: [{
@@ -1823,196 +1823,87 @@ test('object-flow planning falls back to the template class update grant when a 
   }, headers);
   assert.equal(applied.statusCode, 200, applied.body);
   assert.equal(applied.json.success, true);
-  assert.equal(mock.requests.some((item) => item.pathname === '/cmdbuild/services/rest/v3/classes/Cst_QueryTemplate'), true);
+  assert.equal(mock.requests.some((item) => item.method === 'PUT' && item.pathname.includes('/classes/Cst_QueryTemplate/cards/')), false);
   assert.equal(backend.exitCode, null);
 });
 
-test('Assistant prompt autosave updates only assistantDraft without versions or cache invalidation', async (t) => {
+test('normal template Save migrates legacy Assistant authoring and retires the side route', async (t) => {
   const savedSpec = publishSpec();
-  const mock = await startMockCmdbuild(t, {
-    templates: [templateCard('AssistantAutosave', savedSpec, { includeCanUpdate: false })]
-  });
-  const backendPort = await freePort();
-  const backend = await startBackend(t, backendPort, mock.origin);
-  const backendOrigin = `http://127.0.0.1:${backendPort}`;
-  const cookie = 'CMDBuild-Authorization=assistant-autosave-token';
-  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
-  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
-  const assistantDraft = {
-    objectFlowIntent: {
-      ...objectFlowIntentFromText('Выбрать АРМ.'),
-      extractionCandidateBlockId: 'block-1',
-      extractionCandidateAlias: 'arms'
-    },
-    diagramInterpretPrompt: 'Интерпретировать контейнеры.',
-    diagramMappingPrompt: 'Сопоставить выборки с узлами.'
-  };
-
-  const autosaved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/AssistantAutosave/assistant-draft`, {
-    baseSpecHash: hashJson(savedSpec),
-    assistantDraft
-  }, headers);
-  assert.equal(autosaved.statusCode, 200, autosaved.body);
-  assert.equal(autosaved.json.action, 'assistant-draft-autosave');
-  assert.deepEqual(autosaved.json.template.spec.assistantDraft, {
-    ...assistantDraft,
-    objectFlowIntent: objectFlowIntentFromText('Выбрать АРМ.')
-  });
-  assert.deepEqual(autosaved.json.template.spec.steps, savedSpec.steps);
-  assert.equal(autosaved.json.versionLog, undefined);
-  assert.equal(autosaved.json.cacheInvalidation, undefined);
-  assert.equal(mock.requests.some((item) => item.pathname === '/cmdbuild/services/rest/v3/classes/Cst_QueryTemplateVersion/cards'), false);
-
-  const stale = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/AssistantAutosave/assistant-draft`, {
-    baseSpecHash: hashJson(savedSpec),
-    assistantDraft
-  }, headers);
-  assert.equal(stale.statusCode, 409, stale.body);
-  assert.equal(stale.json.reason, 'template_version_conflict');
-  assert.equal(backend.exitCode, null);
-});
-
-test('Assistant autosave keeps D2 source but discards old role-model overrides without persisting proposals', async (t) => {
-  const savedSpec = publishSpec();
-  const mock = await startMockCmdbuild(t, { templates: [templateCard('AssistantD2Authoring', savedSpec, { includeCanUpdate: false })] });
-  const backendPort = await freePort();
-  const backend = await startBackend(t, backendPort, mock.origin);
-  const backendOrigin = `http://127.0.0.1:${backendPort}`;
-  const cookie = 'CMDBuild-Authorization=assistant-d2-authoring-token';
-  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
-  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
-  const assistantDraft = {
-    objectFlowIntent: objectFlowIntentFromText('Выбрать АРМ.'),
-    diagramInterpretPrompt: 'Интерпретировать роли.',
-    diagramMappingPrompt: 'Сопоставить роли.',
-    d2Authoring: {
-      version: 1,
-      source: 'node: "Node" { class: server }',
-      overrides: {
-        roles: [{ id: 'class:server', selectedSemantic: 'object', exemplarKey: 'node', mapping: { primary: { className: 'Server', structuredFields: ['Code'] } } }],
-        relationRules: [],
-        elementBindings: [{ id: 'binding:node', elementKey: 'node', elementKind: 'node', stageId: 'selection:servers', mode: 'result', fields: { labelField: 'Description' } }],
-        navigatorGroups: [{ id: 'navigator:servers', label: 'Servers', memberElementKeys: ['node'] }],
-        navigatorHierarchies: [{ id: 'hierarchy:server-node', parentElementKey: 'server', childElementKey: 'node', label: 'contains' }]
-      }
-    }
-  };
-  const autosaved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/AssistantD2Authoring/assistant-draft`, {
-    baseSpecHash: hashJson(savedSpec), assistantDraft
-  }, headers);
-  assert.equal(autosaved.statusCode, 200, autosaved.body);
-  const stored = autosaved.json.template.spec.assistantDraft.d2Authoring;
-  assert.equal(stored.source, assistantDraft.d2Authoring.source);
-  assert.equal(stored.sourceHash, crypto.createHash('sha256').update(assistantDraft.d2Authoring.source).digest('hex'));
-  assert.equal(stored.semanticModelRevision, 0);
-  assert.equal(stored.structureHash, '');
-  assert.deepEqual(stored.overrides.roles, []);
-  assert.equal(stored.overrides.elementBindings, undefined);
-  assert.equal(stored.overrides.navigatorGroups, undefined);
-  assert.equal(stored.overrides.navigatorHierarchies, undefined);
-  assert.deepEqual(stored.overrides.structureTree, { version: 4, items: [] });
-  assert.equal(stored.proposal, undefined);
-  assert.equal(autosaved.json.versionLog, undefined);
-  assert.equal(autosaved.json.cacheInvalidation, undefined);
-  assert.equal(backend.exitCode, null);
-});
-
-test('Assistant autosave keeps the applied D2 mapping isolated when the authoring source changes', async (t) => {
-  const sourceA = 'app: "Application"';
-  const sourceB = 'app: "Changed application"';
-  const sourceHashA = crypto.createHash('sha256').update(sourceA).digest('hex');
-  const sourceHashB = crypto.createHash('sha256').update(sourceB).digest('hex');
-  const savedSpec = publishSpec({
+  const legacySpec = {
+    ...savedSpec,
     assistantDraft: {
       objectFlowIntent: objectFlowIntentFromText('Выбрать АРМ.'),
-      diagramInterpretPrompt: 'Интерпретировать роли.',
-      diagramMappingPrompt: 'Сопоставить роли.',
-      d2Authoring: {
-        version: 1,
-        semanticModelRevision: 4,
-        diagramId: 'd2_saved',
-        sourceHash: sourceHashA,
-        structureHash: 'structure_saved',
-        source: sourceA,
-        overrides: {
-          semanticModelRevision: 4,
-          diagramId: 'd2_saved',
-          sourceHash: sourceHashA,
-          structureHash: 'structure_saved',
-          roles: [],
-          relationRules: [],
-          structureTree: { version: 4, items: [] }
-        }
-      }
-    },
-    result: {
-      tables: [{ name: 'arms', columns: ['Code', 'Description', 'Location'] }],
-      diagrams: [{
-        name: 'topology',
-        source: { nodes: 'arms' },
-        templateGrammar: { version: 3, elements: [], roles: [], contexts: [], edges: [], fingerprint: 'saved' },
-        authoring: {
-          d2Import: {
-            version: 3,
-            semanticModelRevision: 4,
-            diagramId: 'd2_saved',
-            sourceHash: sourceHashA,
-            structureHash: 'structure_saved',
-            source: sourceA,
-            roles: []
-          }
-        }
-      }]
+      diagramInterpretPrompt: 'Интерпретировать контейнеры.',
+      diagramMappingPrompt: 'Сопоставить выборки с узлами.',
+      d2Authoring: { version: 1, source: 'node: "Node" { class: server }' }
     }
-  });
-  const mock = await startMockCmdbuild(t, { templates: [templateCard('AssistantD2SourceChange', savedSpec, { includeCanUpdate: false })] });
+  };
+  const mock = await startMockCmdbuild(t, { templates: [templateCard('AssistantAuthoringSave', savedSpec)] });
   const backendPort = await freePort();
   const backend = await startBackend(t, backendPort, mock.origin);
   const backendOrigin = `http://127.0.0.1:${backendPort}`;
-  const cookie = testCmdbuildAuthorizationCookie('assistant-d2-source-change');
+  const cookie = 'CMDBuild-Authorization=assistant-authoring-save-token';
   const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
   const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
-  const assistantDraft = {
-    objectFlowIntent: objectFlowIntentFromText('Выбрать АРМ.'),
-    diagramInterpretPrompt: 'Интерпретировать роли.',
-    diagramMappingPrompt: 'Сопоставить роли.',
-    d2Authoring: {
+
+  const retired = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/AssistantAuthoringSave/assistant-draft`, {
+    baseSpecHash: hashJson(savedSpec), assistantDraft: legacySpec.assistantDraft
+  }, headers);
+  assert.equal(retired.statusCode, 410, retired.body);
+  assert.equal(retired.json.code, 'assistant_authoring_route_removed');
+
+  const saved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/AssistantAuthoringSave`, {
+    code: 'AssistantAuthoringSave', expectedSpecHash: hashJson(savedSpec), spec: legacySpec
+  }, headers);
+  assert.equal(saved.statusCode, 200, saved.body);
+  const stored = saved.json.template.spec;
+  assert.equal(stored.assistantDraft, undefined);
+  assert.equal(stored.authoring.version, 1);
+  assert.equal(stored.authoring.assistant.diagramInterpretPrompt, 'Интерпретировать контейнеры.');
+  assert.equal(stored.authoring.assistant.diagramMappingPrompt, 'Сопоставить выборки с узлами.');
+  assert.equal(stored.authoring.d2.source, 'node: "Node" { class: server }');
+  assert.equal(stored.authoring.d2.sourceHash, crypto.createHash('sha256').update(stored.authoring.d2.source).digest('hex'));
+  assert.ok(saved.json.versionLog, saved.body);
+  assert.equal(saved.json.cacheInvalidation.runtime.reason, 'authoring_only');
+  assert.equal(saved.json.cacheInvalidation.staticSnapshots.reason, 'authoring_only');
+  assert.equal(saved.json.executionValidation.executable, false);
+  assert.equal(mock.requests.some((item) => item.pathname.includes('/classes/Cst_QueryTemplateVersion/cards')), true);
+  assert.equal(backend.exitCode, null);
+});
+
+test('normal template Save preserves incomplete canonical D2 authoring without executing it', async (t) => {
+  const savedSpec = publishSpec();
+  const source = 'application: "Application"';
+  const draft = {
+    ...savedSpec,
+    authoring: {
       version: 1,
-      semanticModelRevision: 9,
-      diagramId: 'forged_current_identity',
-      sourceHash: sourceHashB,
-      structureHash: 'forged_structure',
-      mappingContractHash: 'forged_contract',
-      source: sourceB,
-      overrides: {
-        semanticModelRevision: 9,
-        diagramId: 'forged_current_identity',
-        sourceHash: sourceHashB,
-        structureHash: 'forged_structure',
-        mappingContractHash: 'forged_contract',
-        roles: [],
-        relationRules: [],
-        structureTree: { version: 4, items: [] }
-      }
+      assistant: {
+        objectFlowIntent: objectFlowIntentFromText('Выбрать АРМ.'),
+        diagramInterpretPrompt: 'Интерпретировать роли.',
+        diagramMappingPrompt: 'Сопоставить роли.'
+      },
+      d2: { source }
     }
   };
-  const autosaved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/AssistantD2SourceChange/assistant-draft`, {
-    baseSpecHash: hashJson(savedSpec), assistantDraft
+  const mock = await startMockCmdbuild(t, { templates: [templateCard('IncompleteD2Authoring', savedSpec)] });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=incomplete-d2-authoring-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+
+  const saved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/IncompleteD2Authoring`, {
+    code: 'IncompleteD2Authoring', expectedSpecHash: hashJson(savedSpec), spec: draft
   }, headers);
-  assert.equal(autosaved.statusCode, 200, autosaved.body);
-  const storedSpec = autosaved.json.template.spec;
-  const stored = storedSpec.assistantDraft.d2Authoring;
-  assert.equal(stored.source, sourceB);
-  assert.equal(stored.sourceHash, crypto.createHash('sha256').update(sourceB).digest('hex'));
-  assert.equal(stored.semanticModelRevision, 0);
-  assert.equal(stored.diagramId, '');
-  assert.equal(stored.structureHash, '');
-  assert.equal(stored.mappingContractHash, '');
-  assert.equal(stored.overrides.sourceHash, '');
-  assert.equal(stored.overrides.mappingContractHash, '');
-  assert.deepEqual(stored.overrides.structureTree, { version: 4, items: [] });
-  assert.equal(storedSpec.result.diagrams[0].authoring.d2Import.source, sourceA);
-  assert.equal(storedSpec.result.diagrams[0].authoring.d2Import.sourceHash, sourceHashA);
+  assert.equal(saved.statusCode, 200, saved.body);
+  assert.equal(saved.json.template.spec.authoring.d2.source, source);
+  assert.equal(saved.json.template.spec.assistantDraft, undefined);
+  assert.equal(saved.json.executionValidation.executable, false);
+  assert.equal(saved.json.executionValidation.errors.some((item) => item.path === '$.result.diagrams'), true);
+  assert.ok(saved.json.versionLog, saved.body);
+  assert.equal(saved.json.cacheInvalidation.runtime.reason, 'authoring_only');
   assert.equal(backend.exitCode, null);
 });
 
@@ -3198,7 +3089,7 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
     roles: []
   }, headers);
   assert.equal(assistantConflict.statusCode, 409, assistantConflict.body);
-  assert.equal(assistantConflict.json.code, 'diagram_import_editor_conflict');
+  assert.equal(assistantConflict.json.code, 'diagram_import_deterministic_conflict');
   const topologyContract = analyzed.json.proposal.relationRules[0];
   const roles = analyzed.json.proposal.roles.map((role) => {
     const sourceStage = role.key === 'router'
@@ -3247,10 +3138,9 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
   assert.equal(applied.json.spec.result.diagrams[0].authoring.d2Import.roleMappings, undefined);
   assert.equal(applied.json.spec.result.diagrams[0].authoring.d2Import.structureTree.items
     .filter((item) => item.mapping.source.stageId).length, 2);
-  assert.equal(applied.json.spec.assistantDraft.d2Authoring.source, source);
-  assert.equal(applied.json.spec.assistantDraft.d2Authoring.sourceHash, applied.json.spec.result.diagrams[0].authoring.d2Import.sourceHash);
-  assert.equal(applied.json.spec.assistantDraft.d2Authoring.structureHash, applied.json.spec.result.diagrams[0].authoring.d2Import.structureHash);
-  assert.equal(applied.json.spec.assistantDraft.d2Authoring.overrides.roles.length, 2);
+  assert.equal(applied.json.spec.assistantDraft, undefined);
+  assert.equal(applied.json.spec.authoring.d2.source, source);
+  assert.equal(applied.json.spec.authoring.d2.sourceHash, applied.json.spec.result.diagrams[0].authoring.d2Import.sourceHash);
 
   const lateFailureSpec = structuredClone(applied.json.spec);
   lateFailureSpec.steps.push({
@@ -3577,6 +3467,72 @@ test('Extraction preview skips diagram building and D2 rendering', async (t) => 
   assert.equal(backend.exitCode, null);
 });
 
+test('table extraction ignores incomplete D2 mapping and diagram preview returns a safe template fallback', async (t) => {
+  const mock = await startMockCmdbuild(t);
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, {
+    CMDP_D2_BINARY: `${process.cwd()}/tests/fixtures/d2-render-stub.mjs`
+  });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=pending-d2-preview-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const source = 'router: Router';
+  const spec = {
+    version: 1,
+    authoring: { version: 1, d2: { source, sourceHash: crypto.createHash('sha256').update(source).digest('hex') } },
+    steps: [
+      { type: 'selectCards', as: 'arms', className: 'ARM', filters: [], columns: ['Code', 'Description'], limit: 20 },
+      { type: 'selectCards', as: 'staleDiagramStep', className: 'MissingPreviewClass', filters: [], columns: ['Code'], limit: 20, managedBy: 'd2ImportV3' }
+    ],
+    result: {
+      tables: [{ name: 'arms', columns: ['Code', 'Description'] }],
+      diagrams: [{
+        id: 'pending-d2',
+        name: 'pendingD2',
+        type: 'topology',
+        authoring: {
+          d2Import: {
+            version: 3,
+            source,
+            sourceHash: crypto.createHash('sha256').update(source).digest('hex'),
+            mappingValidation: { version: 1, status: 'needsValidation' }
+          }
+        }
+      }]
+    }
+  };
+
+  const extraction = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=20&includeDiagrams=false`, {
+    template: { code: 'PendingD2Extraction', spec },
+    params: {}
+  }, headers);
+  assert.equal(extraction.statusCode, 200, extraction.body);
+  assert.equal(extraction.json.success, true);
+  assert.deepEqual(extraction.json.result.trace.map((item) => item.as), ['arms']);
+  assert.equal(extraction.json.result.tables[0].rows.length, 3);
+  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/MissingPreviewClass/cards')), false);
+
+  const diagramPreview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=20&executionScope=diagrams`, {
+    template: { code: 'PendingD2Preview', spec },
+    params: {}
+  }, headers);
+  assert.equal(diagramPreview.statusCode, 200, diagramPreview.body);
+  assert.equal(diagramPreview.json.success, true);
+  assert.equal(diagramPreview.json.result.d2Workflow.state, 'pending');
+  assert.equal(diagramPreview.json.result.diagnosticPreview.state, 'template-only');
+  assert.match(diagramPreview.json.result.diagnosticPreview.diagrams[0].svg.content, /^<svg data-cmdp-d2-rendered="true"/);
+
+  const strictValidation = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/validate`, {
+    template: { code: 'PendingD2Validation', spec },
+    params: {}
+  }, headers);
+  assert.equal(strictValidation.statusCode, 400, strictValidation.body);
+  assert.equal(strictValidation.json.success, false);
+  assert.ok(strictValidation.json.errors.some((item) => String(item.path || '').includes('mappingValidation')));
+  assert.equal(backend.exitCode, null);
+});
+
 test('D2 preview executes only diagram mapping dependencies', async (t) => {
   const mock = await startMockCmdbuild(t);
   const backendPort = await freePort();
@@ -3743,7 +3699,10 @@ test('D2 import keeps untyped containers as source-free frames and places mapped
   const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=10`, {
     template: {
       code: 'CompositeImport',
-      spec: { ...applied.json.spec, authoring: { bodyLimitProbe: 'x'.repeat(70 * 1024) } }
+      spec: {
+        ...applied.json.spec,
+        authoring: { ...applied.json.spec.authoring, bodyLimitProbe: 'x'.repeat(70 * 1024) }
+      }
     },
     params: {}
   }, headers);
@@ -4330,7 +4289,7 @@ test('D2 import analysis is read-only while Apply checks the saved template vers
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 import Apply persists the reviewed mapping and Assistant autosave retains its current identity', async (t) => {
+test('D2 import Apply stays local until the normal template Save persists the mapping', async (t) => {
   const currentSpec = apiObjectFlowSpec([
     { alias: 'routers', className: 'routerG', columns: ['Code', 'Description'] },
     { alias: 'switches', className: 'ARM', columns: ['Code', 'Description'] }
@@ -4356,6 +4315,18 @@ test('D2 import Apply persists the reviewed mapping and Assistant autosave retai
     d2Source: source
   }, headers);
   assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const currentSpecWithAuthoring = {
+    ...currentSpec,
+    authoring: {
+      version: 1,
+      assistant: {
+        objectFlowIntent: objectFlowIntentFromText('Выбрать маршрутизаторы.'),
+        diagramInterpretPrompt: 'Проверить контейнеры.',
+        diagramMappingPrompt: 'Сопоставить этапы с ролями.'
+      },
+      d2: { source }
+    }
+  };
   const roles = analyzed.json.proposal.roles.map((role) => {
     const isRouter = role.key === 'router';
     return d2RoleOverride(role, {
@@ -4371,7 +4342,9 @@ test('D2 import Apply persists the reviewed mapping and Assistant autosave retai
   });
   const structureTree = d2StructureTreeWithSources(analyzed.json.proposal, roles);
   const applied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
-    currentSpec,
+    templateCode: 'PersistedImport',
+    baseSpecHash: hashJson(currentSpec),
+    currentSpec: currentSpecWithAuthoring,
     d2Source: source,
     proposal: analyzed.json.proposal,
     persist: true,
@@ -4389,40 +4362,26 @@ test('D2 import Apply persists the reviewed mapping and Assistant autosave retai
   }, headers);
   assert.equal(applied.statusCode, 200, applied.body);
   assert.equal(applied.json.success, true);
-  assert.equal(applied.json.template.code, 'PersistedImport');
-  assert.equal(applied.json.template.spec.result.diagrams[0].authoring.d2Import.source, source);
-  assert.ok(applied.json.versionLog);
-  assert.ok(applied.json.cacheInvalidation);
+  assert.equal(applied.json.template, undefined);
+  assert.equal(applied.json.versionLog, undefined);
+  assert.equal(applied.json.cacheInvalidation, undefined);
+  assert.equal(applied.json.spec.authoring.assistant.diagramInterpretPrompt, 'Проверить контейнеры.');
+  assert.equal(applied.json.spec.authoring.assistant.diagramMappingPrompt, 'Сопоставить этапы с ролями.');
+  assert.equal(applied.json.spec.result.diagrams[0].authoring.d2Import.source, source);
+  assert.equal(mock.requests.some((item) => item.method === 'PUT' && item.pathname.includes('/classes/Cst_QueryTemplate/cards/')), false);
 
-  const autosaved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/PersistedImport/assistant-draft`, {
-    baseSpecHash: applied.json.template.specHash,
-    assistantDraft: {
-      objectFlowIntent: objectFlowIntentFromText('Выбрать маршрутизаторы.'),
-      diagramInterpretPrompt: 'Проверить контейнеры.',
-      diagramMappingPrompt: 'Сопоставить этапы с ролями.',
-      // This reproduces an older client autosave payload: it has the current
-      // source but no trusted applied D2 identity or reviewed overrides.
-      d2Authoring: { version: 1, source }
-    }
+  const saved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/PersistedImport`, {
+    code: 'PersistedImport', expectedSpecHash: hashJson(currentSpec), spec: applied.json.spec
   }, headers);
-  assert.equal(autosaved.statusCode, 200, autosaved.body);
-  const storedSpec = autosaved.json.template.spec;
-  const storedImport = storedSpec.result.diagrams[0].authoring.d2Import;
-  const storedAuthoring = storedSpec.assistantDraft.d2Authoring;
-  assert.equal(storedAuthoring.source, source);
-  assert.equal(storedAuthoring.semanticModelRevision, storedImport.semanticModelRevision);
-  assert.equal(storedAuthoring.diagramId, storedImport.diagramId);
-  assert.equal(storedAuthoring.sourceHash, storedImport.sourceHash);
-  assert.equal(storedAuthoring.structureHash, storedImport.structureHash);
-  assert.equal(storedAuthoring.mappingContractHash, storedImport.mappingContractHash);
-  assert.deepEqual(storedAuthoring.overrides.structureTree, storedImport.structureTree);
-  assert.equal(storedAuthoring.overrides.relationRules.length, storedImport.relationRules.length);
-  assert.equal(autosaved.json.versionLog, undefined);
-  assert.equal(autosaved.json.cacheInvalidation, undefined);
+  assert.equal(saved.statusCode, 200, saved.body);
+  assert.equal(saved.json.template.spec.authoring.d2.source, source);
+  assert.equal(saved.json.template.spec.assistantDraft, undefined);
+  assert.ok(saved.json.versionLog, saved.body);
+  assert.ok(saved.json.cacheInvalidation, saved.body);
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 applied mapping update persists the validated template without a new D2 analysis', async (t) => {
+test('D2 applied mapping update stays local until normal template Save', async (t) => {
   const currentSpec = apiObjectFlowSpec([
     { alias: 'routers', className: 'routerG', columns: ['Code', 'Description'] },
     { alias: 'switches', className: 'ARM', columns: ['Code', 'Description'] }
@@ -4457,6 +4416,8 @@ test('D2 applied mapping update persists the validated template without a new D2
   });
   const structureTree = d2StructureTreeWithSources(analyzed.json.proposal, roles);
   const applied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
+    templateCode: 'AppliedMappingEditor',
+    baseSpecHash: hashJson(currentSpec),
     currentSpec,
     d2Source: source,
     proposal: analyzed.json.proposal,
@@ -4474,10 +4435,11 @@ test('D2 applied mapping update persists the validated template without a new D2
     }]
   }, headers);
   assert.equal(applied.statusCode, 200, applied.body);
-  const appliedSpec = applied.json.template.spec;
+  const appliedSpec = applied.json.spec;
   const imported = appliedSpec.result.diagrams[0].authoring.d2Import;
   assert.equal(imported.diagramId, appliedSpec.result.diagrams[0].id);
-  assert.equal(appliedSpec.assistantDraft?.d2Authoring?.diagramId, appliedSpec.result.diagrams[0].id);
+  assert.equal(appliedSpec.authoring.d2.source, source);
+  assert.equal(appliedSpec.assistantDraft, undefined);
   const updatedStructureTree = structuredClone(imported.structureTree);
   const mappedItemIds = new Set();
   for (const item of updatedStructureTree.items) {
@@ -4489,9 +4451,8 @@ test('D2 applied mapping update persists the validated template without a new D2
   const templateWritesBefore = mock.requests.filter((request) => request.method === 'PUT' && request.pathname.includes('/classes/Cst_QueryTemplate/cards/')).length;
   const updated = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/update-applied`, {
     templateCode: 'AppliedMappingEditor',
-    baseSpecHash: hashJson(appliedSpec),
+    baseSpecHash: hashJson(currentSpec),
     currentSpec: appliedSpec,
-    persist: true,
     roles: imported.roles,
     relationRules: imported.relationRules,
     structureTree: updatedStructureTree
@@ -4499,10 +4460,9 @@ test('D2 applied mapping update persists the validated template without a new D2
   assert.equal(updated.statusCode, 200, updated.body);
   assert.equal(updated.json.action, 'diagram-import-update-applied');
   assert.equal(updated.json.d2Workflow?.state, 'applied');
-  assert.ok(updated.json.template, updated.body);
-  assert.equal(updated.json.template.specHash, updated.json.specHash);
-  assert.ok(updated.json.versionLog, updated.body);
-  assert.ok(updated.json.cacheInvalidation, updated.body);
+  assert.equal(updated.json.template, undefined);
+  assert.equal(updated.json.versionLog, undefined);
+  assert.equal(updated.json.cacheInvalidation, undefined);
   const updatedImport = updated.json.spec.result.diagrams[0].authoring.d2Import;
   assert.equal(updatedImport.source, source);
   assert.equal(updatedImport.sourceHash, imported.sourceHash);
@@ -4511,10 +4471,17 @@ test('D2 applied mapping update persists the validated template without a new D2
     .filter((item) => mappedItemIds.has(item.id))
     .every((item) => item.mapping.primary.labelTemplate === '${Description}'), true);
   const templateWritesAfter = mock.requests.filter((request) => request.method === 'PUT' && request.pathname.includes('/classes/Cst_QueryTemplate/cards/')).length;
-  assert.equal(templateWritesAfter, templateWritesBefore + 1, 'Validated applied mapping updates must persist atomically.');
+  assert.equal(templateWritesAfter, templateWritesBefore, 'Local D2 mapping updates must not persist implicitly.');
+
+  const saved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/AppliedMappingEditor`, {
+    code: 'AppliedMappingEditor', expectedSpecHash: hashJson(currentSpec), spec: updated.json.spec
+  }, headers);
+  assert.equal(saved.statusCode, 200, saved.body);
+  assert.ok(saved.json.versionLog, saved.body);
+  assert.equal(mock.requests.filter((request) => request.method === 'PUT' && request.pathname.includes('/classes/Cst_QueryTemplate/cards/')).length, templateWritesBefore + 1);
 
   const missing = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/update-applied`, {
-    templateCode: 'AppliedMappingEditor', baseSpecHash: updated.json.template.specHash, currentSpec, roles: []
+    templateCode: 'AppliedMappingEditor', baseSpecHash: saved.json.template.specHash, currentSpec, roles: []
   }, headers);
   assert.equal(missing.statusCode, 409, missing.body);
   assert.equal(missing.json.code, 'diagram_import_mapping_missing');
@@ -4540,8 +4507,8 @@ test('Diagram editor 2 sandbox API is unavailable', async (t) => {
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 analysis is allowed read-only while Apply requires an explicitly denied update grant', async (t) => {
-  const savedSpec = { version: 1, steps: [], result: { tables: [{ name: 'saved' }] } };
+test('D2 analysis and local Apply do not require an update grant', async (t) => {
+  const savedSpec = apiObjectFlowSpec([{ alias: 'routers', className: 'routerG', columns: ['Code', 'Description'] }]);
   const mock = await startMockCmdbuild(t, {
     templates: [
       templateCard('NoUpdateGrant', savedSpec, { canUpdate: false }),
@@ -4565,14 +4532,31 @@ test('D2 analysis is allowed read-only while Apply requires an explicitly denied
   assert.equal(analyzedReadOnly.json.success, true);
   assert.ok(analyzedReadOnly.json.proposal);
 
-  const forbiddenApply = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
+  const role = analyzedReadOnly.json.proposal.roles.find((item) => item.key === 'router');
+  assert.ok(role, analyzedReadOnly.body);
+  const roles = [d2RoleOverride(role, {
+    source: { stageId: 'selection:routers', alias: 'routers', kind: 'selection', className: 'routerG' },
+    primary: { className: 'routerG', idAttribute: '_id', labelTemplate: '${Code}', structuredFields: ['Code'], filters: [] },
+    related: []
+  })];
+  const localApply = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
+    templateCode: 'NoUpdateGrant',
+    baseSpecHash: hashJson(savedSpec),
     currentSpec: savedSpec,
     d2Source: analyzedReadOnly.json.proposal.sourceText,
     proposal: analyzedReadOnly.json.proposal,
-    roles: []
+    roles,
+    structureTree: d2StructureTreeWithSources(analyzedReadOnly.json.proposal, roles)
   }, headers);
-  assert.equal(forbiddenApply.statusCode, 403, forbiddenApply.body);
-  assert.equal(forbiddenApply.json.reason, 'template_update_forbidden');
+  assert.equal(localApply.statusCode, 422, localApply.body);
+  assert.notEqual(localApply.json.reason, 'template_update_forbidden');
+  assert.equal(localApply.json.code, 'diagram_import_topology_unresolved');
+
+  const forbiddenSave = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/NoUpdateGrant`, {
+    code: 'NoUpdateGrant', expectedSpecHash: hashJson(savedSpec), spec: savedSpec
+  }, headers);
+  assert.equal(forbiddenSave.statusCode, 403, forbiddenSave.body);
+  assert.equal(forbiddenSave.json.reason, 'template_update_forbidden');
 
   const missingBaseHash = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
     templateCode: 'MissingBaseHash',
@@ -4764,7 +4748,11 @@ test('template publish rejects unsaved static snapshot settings with actionable 
 
 test('template publish blocks diagram output while a saved D2 source has no applied deterministic mapping', async (t) => {
   const spec = publishSpec({
-    assistantDraft: { d2Authoring: { version: 1, source: 'app: "Application"' } },
+    authoring: {
+      version: 1,
+      assistant: { objectFlowIntent: { context: '', blocks: [] }, diagramInterpretPrompt: '', diagramMappingPrompt: '' },
+      d2: { source: 'app: "Application"' }
+    },
     result: {
       presentation: { outputMode: 'both' },
       tables: [{ name: 'arms', columns: ['Code', 'Description', 'Location'], published: true }],
@@ -4786,10 +4774,8 @@ test('template publish blocks diagram output while a saved D2 source has no appl
     params: {}, savedSpecHash: hashJson(spec)
   }, { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
 
-  assert.equal(publish.statusCode, 422, publish.body);
-  assert.equal(publish.json.reason, 'publication_d2_mapping_pending');
-  assert.equal(publish.json.d2Workflow.state, 'pending');
-  assert.match(publish.json.message, /D2 source is saved/i);
+  assert.equal(publish.statusCode, 400, publish.body);
+  assert.equal(publish.json.errors.some((item) => item.path === '$.result.diagrams'), true);
   assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/routerG/cards')), false);
   assert.equal(backend.exitCode, null);
 });
@@ -5049,11 +5035,12 @@ test('template deletion revokes all public static snapshots', async (t) => {
     spec
   }, headers);
   assert.equal(updated.statusCode, 200, updated.body);
-  assert.equal(updated.json.cacheInvalidation.staticSnapshots.invalidated, 1);
+  assert.equal(updated.json.cacheInvalidation.staticSnapshots.invalidated, 0);
+  assert.equal(updated.json.cacheInvalidation.staticSnapshots.reason, 'authoring_only');
 
   const afterUpdate = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/public-snapshots/StaticSnapshotRevoke/run?json=true`);
   assert.equal(afterUpdate.statusCode, 200, afterUpdate.body);
-  assert.equal(afterUpdate.json.snapshotFound, false);
+  assert.equal(afterUpdate.json.snapshotFound, true);
 
   const republished = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/StaticSnapshotRevoke/publish`, {
     params: {},
