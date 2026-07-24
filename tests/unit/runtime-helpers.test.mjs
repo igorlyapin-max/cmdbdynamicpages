@@ -30,6 +30,7 @@ import {
   d2SourceForCompiler,
   d2WorkflowStatusForSpec,
   decorateD2MarkdownFrames,
+  diagramSvgExecutionContract,
   d2ImportConfigSummary,
   diagramImportDeterministicSpecHash,
   diagramImportMappingInputRevision,
@@ -42,6 +43,7 @@ import {
   diagramImportAssistantSpec,
   defaultRuntimeConfig,
   dependencyMapWithHash,
+  executeFilterRows,
   executeSemiJoinRows,
   extractAssistantDraftSpec,
   ipv4ValueMatches,
@@ -64,9 +66,11 @@ import {
   runtimeJsonOutputRequested,
   runtimeJsonResponsePayload,
   sanitizeD2Svg,
+  svgContainsD2ElementKey,
   stripSensitiveDiagramArtifacts,
   sanitizeVisibleClassAttributes,
   templateIsProtected,
+  validateDiagramImportV3Catalog,
   validateTemplateSpec
 } from '../../scripts/dev-proxy-server.mjs';
 import { compileObjectFlowToSpec } from '../../scripts/assistant-object-flow.mjs';
@@ -463,6 +467,65 @@ test('runtime title templates support param placeholders', () => {
     renderRuntimeParamTemplate('Routers for ${params.city}', { city: 'city49' }),
     'Routers for city49'
   );
+  const warnings = [];
+  assert.equal(
+    renderRuntimeParamTemplate('Routers for ${param.city}', {}, warnings, 'diagram topology title'),
+    'Routers for '
+  );
+  assert.deepEqual(warnings, ['Diagram template diagram topology title references unavailable parameter city.']);
+});
+
+test('diagram mapping templates resolve report parameters and keep missing values visible as warnings', () => {
+  const diagram = buildResultDiagrams({
+    version: 1,
+    steps: [],
+    result: {
+      diagrams: [{
+        name: 'parameterized',
+        title: 'Topology for ${param.system}',
+        nodeMappings: [{
+          id: 'parameterized_node',
+          from: 'nodes',
+          fields: { id: 'Code', label: 'Description' },
+          labelTemplate: '${Description} (${param.system})'
+        }],
+        edgeMappings: [{
+          id: 'parameterized_edge',
+          from: 'edges',
+          fields: { source: 'Source', target: 'Target', label: 'Label' },
+          labelTemplate: '${param.system}: ${Label}'
+        }]
+      }]
+    }
+  }, {
+    nodes: { rows: [{ Code: 'srv-1', Description: 'Server 1' }, { Code: 'srv-2', Description: 'Server 2' }] },
+    edges: { rows: [{ Source: 'srv-1', Target: 'srv-2', Label: 'HTTPS' }] }
+  }, { system: 'billing' }, { maxRows: 100 })[0];
+
+  assert.equal(diagram.title, 'Topology for billing');
+  assert.equal(diagram.nodes[0].label, 'Server 1 (billing)');
+  assert.equal(diagram.edges[0].label, 'billing: HTTPS');
+  assert.deepEqual(diagram.warnings, []);
+
+  const missing = buildResultDiagrams({
+    version: 1,
+    steps: [],
+    result: {
+      diagrams: [{
+        name: 'missing-parameter',
+        title: 'Topology ${param.system}',
+        nodeMappings: [{
+          id: 'missing_parameter_node',
+          from: 'nodes',
+          fields: { id: 'Code', label: 'Description' },
+          labelTemplate: '${Description} ${param.system}'
+        }]
+      }]
+    }
+  }, { nodes: { rows: [{ Code: 'srv-1', Description: 'Server 1' }] } }, {}, { maxRows: 100 })[0];
+  assert.equal(missing.title, 'Topology ');
+  assert.equal(missing.nodes[0].label, 'Server 1');
+  assert.match(missing.warnings.join('\n'), /unavailable parameter system/);
 });
 
 test('runtime cell link templates support current cell, row and params', () => {
@@ -1054,6 +1117,147 @@ test('normal Save keeps retired D2 mapping revisions pending re-analysis', async
   assert.equal(notRecovered.result.diagrams[0].authoring.d2Import.mappingValidation.status, 'needsReview');
 });
 
+test('owned v3 D2 mappings merge equivalent exemplars into one current template context', () => {
+  const source = 'users: { dns: DNS { class: system }; ad: AD { class: system } }';
+  const currentSpec = selectionFlowSpec([{ alias: 'internalSystems', className: 'IS', columns: ['_id', 'Description'] }]);
+  currentSpec.authoring = { d2: { source } };
+  const ir = normalizeDiagramImportIr({
+    version: 3,
+    elements: {
+      groups: [{ id: 'users', label: 'Users', pathSegments: ['users'] }],
+      nodes: [
+        { id: 'users.dns', label: 'DNS', parentKey: 'users', classKeys: ['system'], pathSegments: ['users', 'dns'] },
+        { id: 'users.ad', label: 'AD', parentKey: 'users', classKeys: ['system'], pathSegments: ['users', 'ad'] }
+      ]
+    },
+    classes: [{ key: 'system', usageKeys: ['users.dns', 'users.ad'] }]
+  }, source);
+  const proposal = createDiagramImportProposal(currentSpec, ir, { sourceText: source });
+  const groupRole = proposal.roles.find((role) => role.key === 'users');
+  const systemRole = proposal.roles.find((role) => role.key === 'system');
+  assert.ok(groupRole);
+  assert.ok(systemRole);
+  const groupItem = proposal.structureTree.items.find((item) => item.roleId === groupRole.id);
+  const systemItem = proposal.structureTree.items.find((item) => item.roleId === systemRole.id);
+  const legacyMapping = structuredClone(systemItem.mapping);
+  delete legacyMapping.materialization;
+  legacyMapping.source = { stageId: 'selection:internalSystems', alias: 'internalSystems', kind: 'selection', className: 'IS' };
+  const legacy = {
+    ...structuredClone(proposal),
+    source,
+    sourceHash: proposal.source.hash,
+    structureHash: proposal.source.structureHash,
+    mappingContractHash: proposal.source.mappingContractHash,
+    parser: proposal.source.parser,
+    semanticModelRevision: 8,
+    structureTree: {
+      version: 3,
+      items: [
+        { id: 'legacy-users', roleId: groupRole.id, templateElementKey: groupItem.templateElementKey, parentId: '', mapping: { ...structuredClone(groupItem.mapping), materialization: undefined, source: { stageId: '', alias: '', kind: '', className: '' } } },
+        { id: 'legacy-dns', roleId: systemRole.id, templateElementKey: 'users.dns', parentId: 'legacy-users', mapping: structuredClone(legacyMapping) },
+        { id: 'legacy-ad', roleId: systemRole.id, templateElementKey: 'users.ad', parentId: 'legacy-users', mapping: structuredClone(legacyMapping) }
+      ]
+    }
+  };
+  const identity = {
+    ok: true,
+    sourceHash: proposal.source.hash,
+    structureHash: proposal.source.structureHash,
+    mappingContractHash: proposal.source.mappingContractHash,
+    ir
+  };
+  const migrationDiagnostics = [];
+  const migrated = migrateDiagramImportToCurrentRevision(currentSpec, legacy, { diagramId: proposal.diagramId, identity, diagnostics: migrationDiagnostics });
+  assert.ok(migrated, migrationDiagnostics.join(', '));
+  assert.equal(migrated.semanticModelRevision, 10);
+  assert.equal(migrated.structureTree.version, 5);
+  const migratedSystems = migrated.structureTree.items.filter((item) => item.roleId === systemRole.id);
+  assert.equal(migratedSystems.length, 1);
+  assert.deepEqual(migratedSystems[0].templateElementKeys, ['users.ad', 'users.dns']);
+  assert.deepEqual(migratedSystems[0].mapping.materialization, { kind: 'stage', stageId: 'selection:internalSystems' });
+
+  legacy.structureTree.items[2].mapping.primary.labelTemplate = '${Code}';
+  assert.equal(migrateDiagramImportToCurrentRevision(currentSpec, legacy, { diagramId: proposal.diagramId, identity }), null);
+});
+
+test('normal Save migrates verified v4 D2 source bindings to materialization', async () => {
+  const { currentSpec, proposal, roles } = d2StructureTreeFixture();
+  const currentTree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], currentTree);
+  const retired = structuredClone(applied);
+  const retiredImport = retired.result.diagrams[0].authoring.d2Import;
+  retiredImport.semanticModelRevision = 9;
+  retiredImport.structureTree = {
+    version: 4,
+    items: retiredImport.structureTree.items.map((item) => {
+      const mapping = structuredClone(item.mapping || {});
+      const materialization = mapping.materialization || {};
+      mapping.source = {
+        stageId: String(materialization.stageId || ''),
+        alias: String(materialization.stageId || '').replace(/^selection:/, ''),
+        kind: materialization.stageId ? 'selection' : '',
+        className: materialization.stageId ? 'IS' : ''
+      };
+      delete mapping.materialization;
+      return { ...item, mapping };
+    })
+  };
+  retiredImport.mappingValidation = { version: 1, status: 'needsReview' };
+  const identity = {
+    ok: true,
+    sourceHash: retiredImport.sourceHash,
+    structureHash: retiredImport.structureHash,
+    mappingContractHash: retiredImport.mappingContractHash,
+    ir: {
+      source: { parser: retiredImport.parser },
+      template: retiredImport.template,
+      elements: retiredImport.structure,
+      classes: retiredImport.classes
+    }
+  };
+
+  const migrated = normalizeTemplateSpecForStorage(retired, '', { d2SourceIdentities: [identity] });
+  const migratedImport = migrated.result.diagrams[0].authoring.d2Import;
+  const migratedVlanItems = migratedImport.structureTree.items.filter((item) => item.roleId === roles.vlan.id);
+
+  assert.equal(migratedImport.semanticModelRevision, 10);
+  assert.equal(migratedImport.structureTree.version, 5);
+  assert.equal(migratedImport.mappingValidation.status, 'valid');
+  assert.equal(diagramImportMappingValidationIsCurrent(migratedImport), true);
+  assert.ok(migratedVlanItems.every((item) => item.mapping.materialization.kind === 'stage'));
+  assert.ok(migratedVlanItems.every((item) => item.mapping.materialization.stageId === 'selection:systemsA'));
+  assert.equal((await d2WorkflowStatusForSpec(migrated)).state, 'applied');
+});
+
+test('normal Save reattests a current D2 mapping after signing-secret rotation', async () => {
+  const { currentSpec, proposal, roles } = d2StructureTreeFixture();
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA'));
+  const stale = structuredClone(applied);
+  const staleImport = stale.result.diagrams[0].authoring.d2Import;
+  staleImport.mappingValidation.signature = 'stale-signature';
+  const identity = {
+    ok: true,
+    sourceHash: staleImport.sourceHash,
+    structureHash: staleImport.structureHash,
+    mappingContractHash: staleImport.mappingContractHash,
+    ir: {
+      source: { parser: staleImport.parser },
+      template: staleImport.template,
+      elements: staleImport.structure,
+      classes: staleImport.classes
+    }
+  };
+
+  const reattested = normalizeTemplateSpecForStorage(stale, '', { d2SourceIdentities: [identity] });
+  const reattestedImport = reattested.result.diagrams[0].authoring.d2Import;
+
+  assert.equal(reattestedImport.semanticModelRevision, 10);
+  assert.equal(reattestedImport.structureTree.version, 5);
+  assert.equal(reattestedImport.mappingValidation.status, 'valid');
+  assert.equal(diagramImportMappingValidationIsCurrent(reattestedImport), true);
+  assert.equal((await d2WorkflowStatusForSpec(reattested)).state, 'applied');
+});
+
 test('normal Save does not recompile a retired D2 mapping after signing-secret rotation', () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA'));
@@ -1351,6 +1555,20 @@ test('D2 structure tree keeps blank containers static and allows a dynamic conta
   assert.equal(new Set(mappings.map((mapping) => mapping.id)).size, mappings.length);
 });
 
+test('D2 structural root container keeps its declared D2 label and never inherits a child VLAN stage', () => {
+  const { currentSpec, proposal, roles } = d2StructureTreeFixture();
+  const tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
+  const target = applied.result.diagrams[0].groupMappings.find((mapping) => mapping.importRole.key === 'group-target');
+
+  assert.ok(target);
+  assert.equal(target.from, '');
+  assert.ok(!target.importRole.sourceStageId);
+  assert.equal(target.staticRows.length, 1);
+  assert.equal(target.staticRows[0].Description, 'Target');
+  assert.equal(target.staticRows[0].Code, 'target');
+});
+
 test('D2 parentCard materialization reuses its dynamic container card without a second source', () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   let tree = structureTreeWithStage(proposal.structureTree, roles['scope-vlan'].id, 'selection:systemsA');
@@ -1368,6 +1586,170 @@ test('D2 parentCard materialization reuses its dynamic container card without a 
   assert.ok(groupMappings.every((mapping) => mapping.from === 'systemsA'));
   assert.ok(nodeMappings.every((mapping) => mapping.from === 'systemsA'));
   assert.equal(applied.steps.filter((step) => step.managedBy === 'd2ImportV3' && step.type === 'selectCards').length, 0);
+});
+
+test('D2 placement filters apply independently to dynamic containers and inherited nodes', () => {
+  const { currentSpec, proposal, roles } = d2StructureTreeFixture();
+  let tree = structureTreeWithStage(proposal.structureTree, roles['scope-vlan'].id, 'selection:systemsA');
+  tree.items = tree.items.map((item) => {
+    if (String(item.roleId) === String(roles['scope-vlan'].id)) {
+      return {
+        ...item,
+        mapping: {
+          ...(item.mapping || {}),
+          conditions: {
+            ruleJoin: 'all',
+            rules: [{
+              action: 'include',
+              negate: false,
+              operator: 'equals',
+              left: { column: 'Code', regex: '' },
+              right: { kind: 'literal', value: 'dmz', name: '', stageId: '', column: '', regex: '' }
+            }]
+          }
+        }
+      };
+    }
+    if (String(item.roleId) === String(roles.vlan.id)) {
+      return {
+        ...item,
+        mapping: {
+          ...(item.mapping || {}),
+          materialization: { kind: 'parentCard', stageId: '' },
+          conditions: {
+            ruleJoin: 'all',
+            rules: [{
+              action: 'include',
+              negate: false,
+              operator: 'contains',
+              left: { column: 'Description', regex: '' },
+              right: { kind: 'literal', value: 'VLAN', name: '', stageId: '', column: '', regex: '' }
+            }]
+          }
+        }
+      };
+    }
+    return item;
+  });
+
+  assert.deepEqual(diagramImportStructureTreeErrors(tree, proposal.roles, currentSpec, proposal.structure), []);
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
+  const filterSteps = applied.steps.filter((step) => step.managedBy === 'd2ImportV3' && step.type === 'filterRows');
+  assert.equal(filterSteps.length, 4);
+  const containerFilterSteps = filterSteps.filter((step) => step.from === 'systemsA');
+  assert.equal(containerFilterSteps.length, 2);
+  assert.ok(containerFilterSteps.every((step) => step.filters[0].column === 'Code'));
+
+  const containerAliases = new Set(containerFilterSteps.map((step) => step.as));
+  const nodeFilterSteps = filterSteps.filter((step) => containerAliases.has(step.from));
+  assert.equal(nodeFilterSteps.length, 2);
+  assert.ok(nodeFilterSteps.every((step) => step.filters[0].column === 'Description'));
+  const nodeAliases = new Set(nodeFilterSteps.map((step) => step.as));
+  const groups = applied.result.diagrams[0].groupMappings.filter((mapping) => mapping.importRole.key === 'scope-vlan');
+  const nodes = applied.result.diagrams[0].nodeMappings.filter((mapping) => mapping.importRole.key === 'vlan');
+  assert.ok(groups.every((mapping) => containerAliases.has(mapping.from)));
+  assert.ok(nodes.every((mapping) => nodeAliases.has(mapping.from)));
+  assert.equal(applied.steps.filter((step) => step.managedBy === 'd2ImportV3' && step.type === 'selectCards').length, 0);
+
+  const rows = executeFilterRows(containerFilterSteps[0], {}, {
+    systemsA: { columns: ['Code', 'Description'], rows: [{ Code: 'dmz', Description: 'DMZ VLAN' }, { Code: 'internal', Description: 'Internal VLAN' }] }
+  }, { maxRows: 10 }).rows;
+  assert.deepEqual(rows, [{ Code: 'dmz', Description: 'DMZ VLAN' }]);
+});
+
+test('D2 placement filters enrich catalog fields that Object Flow does not materialize', () => {
+  const fixture = d2StructureTreeFixture();
+  const currentSpec = selectionFlowSpec([
+    { alias: 'vlans', className: 'vlan', columns: ['Code', 'Description'] },
+    { alias: 'networks', className: 'ipRange', columns: ['Code', 'Description'] }
+  ]);
+  const proposal = createDiagramImportProposal(currentSpec, fixture.ir, { sourceText: fixture.source });
+  const roles = Object.fromEntries(proposal.roles.map((role) => [role.key, role]));
+  let tree = structureTreeWithStage(proposal.structureTree, roles['scope-vlan'].id, 'selection:vlans');
+  tree.items = tree.items.map((item) => {
+    if (String(item.roleId) === String(roles.vlan.id)) {
+      return {
+        ...item,
+        mapping: {
+          ...(item.mapping || {}),
+          materialization: { kind: 'parentCard', stageId: '' }
+        }
+      };
+    }
+    if (String(item.roleId) !== String(roles['scope-vlan'].id)) return item;
+    return {
+      ...item,
+      mapping: {
+        ...(item.mapping || {}),
+        conditions: {
+          ruleJoin: 'all',
+          rules: [
+            {
+              action: 'include', negate: false, operator: 'equals',
+              left: { column: 'isNAT', regex: '' },
+              right: { kind: 'literal', value: 'true', name: '', stageId: '', column: '', regex: '' }
+            },
+            {
+              action: 'include', negate: false, operator: 'equals',
+              left: { column: 'ipaddress.ipAddr', regex: '' },
+              right: { kind: 'stage', value: '', name: '', stageId: 'selection:networks', column: 'range', regex: '' }
+            }
+          ]
+        }
+      }
+    };
+  });
+
+  const catalog = {
+    classes: [
+      {
+        name: 'vlan',
+        attributes: [
+          { name: 'isNAT', type: 'boolean' },
+          { name: 'ipaddress', type: 'reference', targetClass: 'IpAddress' }
+        ]
+      },
+      { name: 'IpAddress', attributes: [{ name: 'ipAddr', type: 'string' }] },
+      { name: 'ipRange', attributes: [{ name: 'range', type: 'string' }] }
+    ],
+    domains: []
+  };
+  const reviewedProposal = { ...proposal, structureTree: tree };
+
+  assert.deepEqual(validateDiagramImportV3Catalog(reviewedProposal, catalog, currentSpec), []);
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
+  const enrichments = applied.steps.filter((step) => step.type === 'enrichRows' && step.purpose === 'd2PlacementFilter');
+  const vlanEnrichments = enrichments.filter((step) => step.from === 'vlans');
+  const networkEnrichments = enrichments.filter((step) => step.from === 'networks');
+
+  assert.equal(vlanEnrichments.length, 2);
+  assert.ok(vlanEnrichments.every((step) => step.columns.includes('isNAT') && step.columns.includes('ipaddress.ipAddr')));
+  assert.equal(networkEnrichments.length, 2);
+  assert.ok(networkEnrichments.every((step) => step.columns.includes('range')));
+  const joins = applied.steps.filter((step) => step.type === 'semiJoinRows' && step.managedBy === 'd2ImportV3');
+  assert.equal(joins.length, 2);
+  assert.ok(joins.every((step) => vlanEnrichments.some((enrichment) => enrichment.as === step.from)));
+  assert.ok(joins.every((step) => networkEnrichments.some((enrichment) => enrichment.as === step.with)));
+});
+
+test('D2 structural containers reject placement filters', () => {
+  const { currentSpec, proposal, roles } = d2StructureTreeFixture();
+  const tree = structuredClone(proposal.structureTree);
+  const target = tree.items.find((item) => String(item.roleId) === String(roles['group-target'].id));
+  target.mapping = {
+    ...(target.mapping || {}),
+    conditions: {
+      ruleJoin: 'all',
+      rules: [{
+        action: 'include', negate: false, operator: 'equals',
+        left: { column: 'Code', regex: '' },
+        right: { kind: 'literal', value: 'target', name: '', stageId: '', column: '', regex: '' }
+      }]
+    }
+  };
+
+  const errors = diagramImportStructureTreeErrors(tree, proposal.roles, currentSpec, proposal.structure);
+  assert.ok(errors.some((error) => error.message.includes('structural D2 container has no Object Flow source')));
 });
 
 test('D2 nested independent stage requires an explicit comparison to the materialized parent', () => {
@@ -2173,6 +2555,81 @@ test('result diagrams build deterministic topology payloads and runtime json exp
   assert.equal(displayPayload.result.diagrams[0].nodes[0].data, undefined);
 });
 
+test('D2 execution contract accounts for every row of the explicitly selected Object Flow result', () => {
+  const diagram = buildResultDiagrams({
+    result: {
+      diagrams: [{
+        name: 'internal-systems',
+        nodeMappings: [{
+          id: 'mapping_internal_systems',
+          from: 'internalSystems',
+          fields: { id: '_id', label: 'Description' },
+          importRole: { key: 'internal_system', label: 'Внутренние ИС', sourceLabel: 'Внутренние ИС' }
+        }]
+      }]
+    }
+  }, {
+    internalSystems: {
+      rows: [
+        { _id: 'dns', Description: 'DNS' },
+        { _id: 'ad', Description: 'AD' }
+      ]
+    }
+  }, {}, { maxRows: 100 })[0];
+
+  assert.deepEqual(diagram.nodes.map((node) => node.label).sort(), ['AD', 'DNS']);
+  assert.deepEqual(diagram.execution.bindings, [{
+    family: 'node',
+    role: { key: 'internal_system', label: 'Внутренние ИС' },
+    source: { stageLabel: 'Внутренние ИС', alias: 'internalSystems', materialization: '' },
+    inputRows: 2,
+    materialized: 2,
+    duplicates: 0,
+    omitted: { missingId: 0, limit: 0, invalid: 0 },
+    templateResolution: { explicit: 0, businessKey: 0, exemplar: 0, roleDefault: 0, unavailable: 2 },
+    placementResolution: { parentCorrelation: 0, sourceKey: 0, structuralSingleParent: 0, unresolved: 0 }
+  }]);
+  assert.deepEqual(diagram.execution.items.map((item) => ({
+    role: item.role.label,
+    source: item.source.stageLabel,
+    label: item.label,
+    status: item.status,
+    placement: item.placement
+  })), [
+    { role: 'Внутренние ИС', source: 'Внутренние ИС', label: 'DNS', status: 'materialized', placement: 'resolved' },
+    { role: 'Внутренние ИС', source: 'Внутренние ИС', label: 'AD', status: 'materialized', placement: 'resolved' }
+  ]);
+  assert.ok(diagram.execution.items.every((item) => item.d2Path));
+  assert.equal(diagram.execution.svgContract.status, 'pending');
+});
+
+test('D2 SVG execution contract reports the materialized item that is absent from SVG', () => {
+  const d2Path = 'internal_system_ad';
+  const token = Buffer.from(d2Path, 'utf8').toString('base64');
+  const diagram = {
+    execution: {
+      items: [
+        { family: 'node', role: { key: 'internal_system', label: 'Внутренние ИС' }, label: 'DNS', status: 'materialized', d2Path: 'internal_system_dns' },
+        { family: 'node', role: { key: 'internal_system', label: 'Внутренние ИС' }, label: 'AD', status: 'materialized', d2Path }
+      ]
+    }
+  };
+  const svg = '<svg><g class="shape ' + token + '"></g></svg>';
+
+  assert.equal(svgContainsD2ElementKey(svg, d2Path), true);
+  assert.deepEqual(diagramSvgExecutionContract(diagram, svg), {
+    status: 'failed',
+    expected: 2,
+    verified: 1,
+    missing: [{
+      family: 'node',
+      role: { key: 'internal_system', label: 'Внутренние ИС' },
+      label: 'DNS',
+      d2Path: 'internal_system_dns'
+    }]
+  });
+});
+
 test('result diagrams retain unresolved connections as fake endpoint objects', () => {
   const diagram = buildResultDiagrams({
     result: { diagrams: [{
@@ -2322,7 +2779,7 @@ test('strict D2 grammar renders only declared roles and keeps fake endpoints ins
         ]
       },
       groupMappings: [{ id: 'root', staticRows: [{ _id: 'root-template', Description: 'Root' }], fields: { id: '_id', label: 'Description' }, importRole: { roleId: 'root', key: 'root-role', semantic: 'structural', elementKey: 'root-template', structureItemId: 'root-tree-item' } }],
-      nodeMappings: [{ id: 'child', staticRows: [{ _id: 'known', Description: 'Known', Group: groupValue }], fields: { id: '_id', label: 'Description', group: 'Group' }, importRole: { roleId: 'child', key: 'child-role', semantic: 'object', elementKey: 'root-template.child-template', structureItemId: 'child-tree-item', parentStructureItemId: 'root-tree-item' } }],
+      nodeMappings: [{ id: 'child', staticRows: [{ _id: 'known', Description: 'Known', Group: groupValue }], fields: { id: '_id', label: 'Description', group: 'Group' }, labelTemplate: '${Description}', importRole: { roleId: 'child', key: 'child-role', semantic: 'object', elementKey: 'root-template.child-template', structureItemId: 'child-tree-item', parentStructureItemId: 'root-tree-item' } }],
       edgeMappings: [{ id: 'edge', staticRows: [{ Source: 'known', Target: 'missing', Label: 'uses' }], fields: { source: 'Source', target: 'Target', label: 'Label' }, importRole: { key: 'edge-role', semantic: 'connection', elementKey: '(root-template.child-template -> root-template.child-template)[0]', sourceKey: 'child-role', targetKey: 'child-role' } }]
     }] }
   });
@@ -2334,6 +2791,8 @@ test('strict D2 grammar renders only declared roles and keeps fake endpoints ins
   assert.equal(fake.importRole.key, 'child-role');
   assert.equal(fake.group, root.id);
   assert.equal(diagram.nodes.every((node) => node.importRole.key === 'child-role'), true);
+  assert.equal(diagram.nodes.find((node) => !node.fakeEndpoint).label, 'Known');
+  assert.equal(diagram.nodes.some((node) => node.label === 'Child'), false);
 });
 
 test('strict D2 grammar ignores stale generic mappings instead of emitting undeclared runtime elements', () => {
@@ -2627,6 +3086,32 @@ test('assistant MCP limits fall back to runtime execution limits and surface war
   assert.deepEqual(warnings, [
     'CMDBuild class context limit reached: returned 42 of configured maxClasses=42. Results may be incomplete.'
   ]);
+});
+
+test('template row limits are not reported as MCP context truncation', () => {
+  const warnings = assistantLimitWarningsFromDiagnostics([
+    {
+      source: 'template-execution',
+      limitName: 'maxRows',
+      configuredLimit: 25,
+      returned: 25,
+      truncated: true,
+      limitHit: true
+    },
+    {
+      source: 'mcp',
+      tool: 'buildAssistantMcpContext',
+      limitName: 'maxContextBytes',
+      configuredLimit: 64000,
+      returned: 80000,
+      truncated: true,
+      limitHit: true
+    }
+  ]);
+
+  assert.match(warnings[0], /Template execution row limit reached: returned 25 of configured maxRows=25/);
+  assert.doesNotMatch(warnings[0], /MCP context/i);
+  assert.match(warnings[1], /buildAssistantMcpContext context limit reached/);
 });
 
 test('assistant explicit MCP limits are not silently clamped by runtime execution limits', () => {

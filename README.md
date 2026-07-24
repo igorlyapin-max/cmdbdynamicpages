@@ -89,6 +89,40 @@ npm run test:ui
 
 `test:static` validates required OpenAPI paths, local component `$ref` references, and links between architecture artifacts in `aa/`. `test:unit` uses the built-in Node.js test runner and covers cache key behavior, refresh metadata, parameter defaults, IPv4 matching, dependency maps, and log redaction. `test:ui` is a skip-safe Playwright browser smoke; it runs only when Playwright is installed and a valid CMDBuild session cookie is available.
 
+## Local CMDBuild 4.2 Compatibility Harness
+
+`dev/cmdbuild42/` is an isolated developer-only CMDBuild `4.2.0` test contour. It is not part of the project delivery compose, does not modify the local `4.1.0` instance, and does not publish PostgreSQL. Its CMDBuild endpoint is `http://127.0.0.1:8094/cmdbuild/` by default.
+
+The harness builds from the official WAR instead of a third-party CMDBuild image. Download and validate the vendor artifact, then copy the printed SHA-256 into the local env file:
+
+```bash
+cp dev/cmdbuild42/.env.example dev/cmdbuild42/.env
+scripts/download-cmdbuild42-war.sh
+# set CMDBUILD42_WAR_SHA256=<printed sha256> in dev/cmdbuild42/.env
+docker compose --env-file dev/cmdbuild42/.env -f dev/cmdbuild42/docker-compose.yml up -d --build
+scripts/cmdbuild42-smoke.sh
+```
+
+The first start creates a clean vendor demo database. Stop it without deleting data with:
+
+```bash
+docker compose --env-file dev/cmdbuild42/.env -f dev/cmdbuild42/docker-compose.yml down
+```
+
+Remove only the compatibility database and runtime state with the explicit destructive command:
+
+```bash
+docker compose --env-file dev/cmdbuild42/.env -f dev/cmdbuild42/docker-compose.yml down -v
+```
+
+To exercise this project against CMDBuild `4.2.0`, run a second backend at `http://127.0.0.1:8095`:
+
+```bash
+scripts/run-cmdbuild42-backend.sh
+```
+
+Log in through `http://127.0.0.1:8095/cmdbuild/ui/`, open `/cmdbuild/dynamicpages/ui/designer`, then use schema preview/bootstrap. The compatibility harness uses in-memory cache only and `CMDP_DIAGNOSTIC_MODE=basic`. D2 rendering is disabled and parser health uses the local test stub because this contour validates CMDBuild schema compatibility, not D2 rendering; it must not be used as a production launch command.
+
 Run the backend smoke/e2e check against the local proxy:
 
 ```bash

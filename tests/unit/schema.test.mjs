@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   buildTechnicalSchema,
+  cmdbuildAdministrationViewHeaders,
   schemaParentFromInput,
   technicalSchemaBootstrapInput,
   technicalSchemaBootstrapFailure,
@@ -11,6 +12,10 @@ import {
   technicalSchemaDefinition,
   technicalSchemaRootCause
 } from '../../scripts/dev-proxy-server.mjs';
+
+test('technical schema mutations use the CMDBuild administration view', () => {
+  assert.deepEqual(cmdbuildAdministrationViewHeaders(), { 'CMDBuild-View': 'admin' });
+});
 
 test('technical schema plan derives all project classes from the selected root', () => {
   const schema = buildTechnicalSchema('Acme_QueryTool', {

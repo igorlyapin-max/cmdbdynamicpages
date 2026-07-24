@@ -1,0 +1,42 @@
+services:
+  cmdbuild42-db:
+    image: postgres:17.4-alpine
+    restart: unless-stopped
+    environment:
+      # CMDBuild creates CMDBUILD42_DB_NAME itself via dbconfig create demo.
+      POSTGRES_DB: postgres
+      POSTGRES_USER: ${CMDBUILD42_DB_SUPERUSER}
+      POSTGRES_PASSWORD: ${CMDBUILD42_DB_SUPERUSER_PASSWORD}
+    volumes:
+      - cmdbuild42-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  cmdbuild42:
+    build:
+      context: .
+      args:
+        CMDBUILD_WAR_SHA256: ${CMDBUILD42_WAR_SHA256:?set CMDBUILD42_WAR_SHA256 after downloading the official WAR}
+    image: cmdbdynamicpages-cmdbuild42:local
+    restart: unless-stopped
+    depends_on:
+      cmdbuild42-db:
+        condition: service_healthy
+    environment:
+      CMDBUILD42_DB_NAME: ${CMDBUILD42_DB_NAME}
+      CMDBUILD42_DB_USER: ${CMDBUILD42_DB_USER}
+      CMDBUILD42_DB_PASSWORD: ${CMDBUILD42_DB_PASSWORD}
+      CMDBUILD42_DB_SUPERUSER: ${CMDBUILD42_DB_SUPERUSER}
+      CMDBUILD42_DB_SUPERUSER_PASSWORD: ${CMDBUILD42_DB_SUPERUSER_PASSWORD}
+    ports:
+      - "127.0.0.1:${CMDBUILD42_HOST_PORT}:8080"
+    volumes:
+      - cmdbuild42-runtime:/var/lib/cmdbuild42
+
+volumes:
+  cmdbuild42-postgres:
+  cmdbuild42-runtime:

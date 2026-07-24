@@ -3467,7 +3467,7 @@ test('Extraction preview skips diagram building and D2 rendering', async (t) => 
   assert.equal(backend.exitCode, null);
 });
 
-test('table extraction ignores incomplete D2 mapping and diagram preview returns a safe template fallback', async (t) => {
+test('table extraction ignores incomplete D2 mapping and diagram preview excludes template exemplars', async (t) => {
   const mock = await startMockCmdbuild(t);
   const backendPort = await freePort();
   const backend = await startBackend(t, backendPort, mock.origin, {
@@ -3520,8 +3520,9 @@ test('table extraction ignores incomplete D2 mapping and diagram preview returns
   assert.equal(diagramPreview.statusCode, 200, diagramPreview.body);
   assert.equal(diagramPreview.json.success, true);
   assert.equal(diagramPreview.json.result.d2Workflow.state, 'pending');
-  assert.equal(diagramPreview.json.result.diagnosticPreview.state, 'template-only');
-  assert.match(diagramPreview.json.result.diagnosticPreview.diagrams[0].svg.content, /^<svg data-cmdp-d2-rendered="true"/);
+  assert.equal(diagramPreview.json.result.diagnosticPreview.state, 'unavailable');
+  assert.deepEqual(diagramPreview.json.result.diagnosticPreview.diagrams, []);
+  assert.match(diagramPreview.json.result.diagnosticPreview.message, /No template example objects are shown/);
 
   const strictValidation = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/validate`, {
     template: { code: 'PendingD2Validation', spec },
@@ -3578,6 +3579,63 @@ test('D2 preview executes only diagram mapping dependencies', async (t) => {
   assert.equal(preview.json.result.diagrams[0].nodes.length, 3);
   assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/routerG/cards')), false);
   assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/ARM/cards')), true);
+  assert.equal(backend.exitCode, null);
+});
+
+test('diagram preview uses the configured execution bound and does not duplicate inherited row-limit diagnostics', async (t) => {
+  const cards = Array.from({ length: 30 }, (_, index) => ({
+    _id: index + 1,
+    Code: index < 28 ? `NOISE-${index + 1}` : ['INTERNAL-DNS', 'INTERNAL-AD'][index - 28],
+    Description: index < 28 ? `Noise ${index + 1}` : ['DNS', 'AD'][index - 28]
+  }));
+  const mock = await startMockCmdbuild(t, {
+    classes: [
+      { _id: 1, name: 'TestItem', description: 'Test item', parent: 'Class', active: true },
+      { _id: 2, name: 'Cst_QueryToolConfig', description: 'Config', active: true },
+      { _id: 3, name: 'Cst_QueryTemplate', description: 'Template', active: true }
+    ],
+    attributesByClass: { TestItem: [{ name: 'Code', type: 'string', active: true, _can_read: true }] },
+    cardsByClass: { TestItem: cards },
+    configCards: [{
+      _id: 1,
+      Code: 'Cst_QueryTool',
+      RootCode: 'Cst_QueryTool',
+      Active: true,
+      RuntimeConfigJson: JSON.stringify({ executionLimits: { maxRowsDataPreviewDefault: 100 } })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = testCmdbuildAuthorizationCookie('diagram-preview-execution-bound');
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const spec = {
+    version: 1,
+    steps: [
+      { type: 'selectCards', as: 'allSystems', className: 'TestItem', limit: 100, filters: [], columns: ['Code', 'Description'] },
+      { type: 'filterRows', as: 'internalSystems', from: 'allSystems', filters: [{ column: 'Code', op: 'startsWith', value: 'INTERNAL-' }] }
+    ],
+    result: {
+      tables: [{ name: 'internalSystems', columns: ['Code', 'Description'] }],
+      diagrams: [{
+        id: 'internal-systems', name: 'internalSystems', type: 'topology',
+        maxNodes: 20,
+        nodeMappings: [{ id: 'internal-system', from: 'internalSystems', fields: { id: '_id', label: 'Description' }, importRole: { key: 'internal_system' } }]
+      }]
+    }
+  };
+
+  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=100&executionScope=diagrams`, {
+    template: { code: 'DiagramPreviewExecutionBound', spec }, params: {}
+  }, headers);
+
+  assert.equal(preview.statusCode, 200, preview.body);
+  assert.deepEqual(preview.json.result.tables[0].rows.map((row) => row.Description), ['DNS', 'AD']);
+  assert.deepEqual(preview.json.result.diagrams[0].nodes.map((node) => node.label), ['DNS', 'AD']);
+  assert.equal(preview.json.result.limits.maxRows >= 30, true);
+  assert.equal(preview.json.result.trace.some((item) => /MCP context/i.test(item.warning || '')), false);
+  assert.deepEqual(preview.json.result.limitDiagnostics, []);
   assert.equal(backend.exitCode, null);
 });
 

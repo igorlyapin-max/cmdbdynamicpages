@@ -10,3 +10,4 @@ dist/*.zip
 secrets/
 .env.*
 !.env.example
+!dev/cmdbuild42/.env.example
