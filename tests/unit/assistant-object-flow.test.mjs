@@ -499,7 +499,9 @@ test('object flow compiles a relation-aware existence match without changing the
     caseSensitive: false,
     as: 'externalSystemsWithAcl'
   });
-  assert.deepEqual(objectFlowStageSummaries(flow).at(-1), {
+  const relationAwareStage = objectFlowStageSummaries(flow).at(-1);
+  const { cardSources: relationAwareSources, ...relationAwareSummary } = relationAwareStage;
+  assert.deepEqual(relationAwareSummary, {
     id: 'existsRelated:externalSystemsWithAcl', kind: 'existsRelated', alias: 'externalSystemsWithAcl',
     columns: ['Class', '_id', 'Code', 'Description', 'isExt'],
     from: 'externalSystems',
@@ -518,6 +520,9 @@ test('object flow compiles a relation-aware existence match without changing the
       relation: { alias: 'externalSystemsWithAcl', fromAlias: 'externalSystems', domain: 'ISIpRange', targetClass: 'ipRange', direction: 'source' }
     }]
   });
+  assert.deepEqual(relationAwareSources, [{
+    id: 'current', className: 'IS', classColumn: 'Class', idColumn: '_id', label: 'Result card'
+  }]);
 });
 
 test('compileObjectFlowToSpec replaces only managed object-flow state', () => {
@@ -828,8 +833,9 @@ test('operations reject forward references and retain migrated saved operation o
 
 test('objectFlowStageSummaries returns deterministic cumulative columns', () => {
   const summaries = objectFlowStageSummaries(validFlow());
+  const publicSummaries = summaries.map(({ cardSources, ...stage }) => stage);
 
-  assert.deepEqual(summaries.slice(0, 3), [
+  assert.deepEqual(publicSummaries.slice(0, 3), [
     {
       id: 'selection:routers',
       kind: 'selection',
@@ -861,7 +867,7 @@ test('objectFlowStageSummaries returns deterministic cumulative columns', () => 
       columns: ['Class', '_id', 'Code', 'Description']
     }
   ]);
-  assert.deepEqual(summaries[3], {
+  assert.deepEqual(publicSummaries[3], {
     id: 'match:routerRooms',
     kind: 'match',
     alias: 'routerRooms',
@@ -872,6 +878,7 @@ test('objectFlowStageSummaries returns deterministic cumulative columns', () => 
     ],
     from: 'routers',
     with: 'rooms',
+    rightPrefix: 'Rooms.',
     rules: [{ action: 'include', negate: false, operator: 'equals', leftColumn: 'Location', rightColumn: 'Code' }],
     comparisonBindings: [{
       id: 'comparison:match:routerRooms:1',
@@ -883,6 +890,10 @@ test('objectFlowStageSummaries returns deterministic cumulative columns', () => 
   });
   assert.ok(summaries[4].columns.includes('Rooms.Code'));
   assert.ok(summaries[4].columns.includes('Vlans.Location'));
+  assert.deepEqual(summaries[3].cardSources, [
+    { id: 'current', className: 'Router', classColumn: 'Class', idColumn: '_id', label: 'Result card' },
+    { id: 'Rooms.current', className: 'Room', classColumn: 'Rooms.Class', idColumn: 'Rooms._id', label: 'Compared: Result card' }
+  ]);
 });
 
 test('objectFlowStageSummaries exposes typed set-operation aliases for diagram mapping', () => {
@@ -899,12 +910,17 @@ test('objectFlowStageSummaries exposes typed set-operation aliases for diagram m
 
   const stage = objectFlowStageSummaries(flow).find((item) => item.id === 'set:allInfrastructure');
 
-  assert.deepEqual(stage, {
+  const { cardSources, ...publicStage } = stage;
+  assert.deepEqual(publicStage, {
     id: 'set:allInfrastructure',
     kind: 'set',
     alias: 'allInfrastructure',
     columns: ['Class', '_id', 'Code', 'Description', 'Location']
   });
+  assert.deepEqual(cardSources, [
+    { id: 'current', className: 'Router', classColumn: 'Class', idColumn: '_id', label: 'Result card' },
+    { id: 'current', className: 'Room', classColumn: 'Class', idColumn: '_id', label: 'Result card' }
+  ]);
 });
 
 test('objectFlowStageSummaries retains relation provenance for diagram related bindings', () => {
@@ -927,6 +943,35 @@ test('objectFlowStageSummaries retains relation provenance for diagram related b
   assert.equal(stage.domain, 'RouterNetwork');
   assert.equal(stage.direction, 'source');
   assert.ok(stage.columns.includes('range'));
+});
+
+test('objectFlowStageSummaries exposes deterministic source provenance for nested diagram conditions', () => {
+  const flow = {
+    version: 1,
+    selections: [{
+      id: 'selection:ranges', name: 'Ranges', alias: 'ranges', className: 'ipRange', limit: 100,
+      columns: ['range'], rules: [{ action: 'include', path: 'Code', op: 'matches', regex: '.*' }]
+    }, {
+      id: 'selection:addresses', name: 'Addresses', alias: 'addresses', className: 'IpAddress', from: 'ranges', limit: 100,
+      columns: ['ipAddr'], rules: [{ action: 'include', path: 'ipAddr', op: 'ipv4InCidr', valueColumn: 'range' }]
+    }],
+    operations: [{
+      id: 'relation:servers', type: 'relation', from: 'addresses', as: 'servers', domain: 'ipaddress',
+      targetClass: 'vServer', direction: 'source', columns: ['Code'], limit: 100, distinct: true
+    }],
+    publishedAlias: 'servers'
+  };
+
+  const summaries = objectFlowStageSummaries(flow);
+  const addresses = summaries.find((item) => item.alias === 'addresses');
+  const servers = summaries.find((item) => item.alias === 'servers');
+
+  assert.ok(addresses.columns.includes('Source_range'));
+  assert.ok(servers.columns.includes('Source_Source_range'));
+  assert.ok(servers.columns.includes('Source_ipAddr'));
+  assert.ok(servers.cardSources.some((source) => (
+    source.className === 'ipRange' && source.classColumn === 'Source_Source_Class' && source.idColumn === 'Source_Source__id'
+  )));
 });
 
 test('objectFlowStageSummaries preserves typed relation-pair endpoints for D2 mapping', () => {
@@ -963,7 +1008,7 @@ test('objectFlowStageSummaries preserves typed relation-pair endpoints for D2 ma
   assert.equal(compiled.steps.find((step) => step.as === 'applicationServers').connection, undefined);
 });
 
-test('diagram role mapping keeps a comparison-proven related field from any CMDBuild class', () => {
+test('diagram role mapping does not synthesize related data from comparison metadata', () => {
   const roles = [{ id: 'role:site', selectedSemantic: 'object' }];
   const stages = [
     { id: 'selection:site', kind: 'selection', alias: 'site', className: 'Site', from: '', columns: [] },
@@ -1000,12 +1045,7 @@ test('diagram role mapping keeps a comparison-proven related field from any CMDB
     mapping: { id: 'mapping:site', roleId: 'role:site', source: { alias: 'site' }, primary: {}, related: [] }
   }], roles, stages);
 
-  assert.deepEqual(mapped[0].mapping.related, [{
-    id: mapped[0].mapping.related[0].id,
-    className: 'AddressPool',
-    path: [{ kind: 'domain', name: 'SiteAddressPool', targetClass: 'AddressPool', direction: 'source' }],
-    structuredFields: ['cidr']
-  }]);
+  assert.deepEqual(mapped[0].mapping.related, []);
 });
 
 test('Object Flow persists an ordered output manifest without claiming unrelated tables', () => {

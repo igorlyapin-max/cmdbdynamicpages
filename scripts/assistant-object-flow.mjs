@@ -194,6 +194,79 @@ const SET_OPERATION_TYPES = new Set(['union', 'difference', 'intersect']);
 const RELATION_DIRECTIONS = new Set(['both', 'source', 'destination', 'direct', 'inverse']);
 
 /**
+ * The deterministic executors retain source-row provenance for source-driven
+ * selections and relation expansions. Keep the public stage summary aligned
+ * with those runtime rows so Diagram conditions can use the same fields.
+ *
+ * @param {string[]} columns
+ * @param {{includeBase?: boolean}=} options
+ * @returns {string[]}
+ */
+function sourceProvenanceColumns(columns, options = {}) {
+  const includeBase = options.includeBase !== false;
+  return uniqueStrings((columns || [])
+    .filter((column) => includeBase || !BASE_RESULT_COLUMNS.includes(column))
+    .map((column) => `Source_${column}`));
+}
+
+/**
+ * A deterministic stage can retain cards from earlier steps as provenance.
+ * Keep their class and identity columns alongside the stage's current card so
+ * consumers can safely resolve a CMDBuild path against the intended card.
+ *
+ * @param {unknown[]} values
+ * @returns {Array<{id: string, className: string, classColumn: string, idColumn: string, label: string}>}
+ */
+function uniqueStageCardSources(values) {
+  const result = [];
+  const seen = new Set();
+  for (const value of values || []) {
+    const candidate = isRecord(value) ? value : {};
+    const className = text(candidate.className);
+    const classColumn = text(candidate.classColumn);
+    const idColumn = text(candidate.idColumn);
+    if (!className || !classColumn || !idColumn) continue;
+    const item = {
+      id: text(candidate.id) || `${classColumn}:${idColumn}`,
+      className,
+      classColumn,
+      idColumn,
+      label: text(candidate.label) || className
+    };
+    const key = [item.className, item.classColumn, item.idColumn].join(':').toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(item);
+  }
+  return result;
+}
+
+/**
+ * @param {string} className
+ * @param {string=} label
+ * @returns {{id: string, className: string, classColumn: string, idColumn: string, label: string}}
+ */
+function currentStageCardSource(className, label = 'Result card') {
+  return { id: 'current', className: text(className), classColumn: 'Class', idColumn: '_id', label };
+}
+
+/**
+ * @param {{id: string, className: string, classColumn: string, idColumn: string, label: string}} source
+ * @param {string} prefix
+ * @param {string} labelPrefix
+ * @returns {{id: string, className: string, classColumn: string, idColumn: string, label: string}}
+ */
+function prefixedStageCardSource(source, prefix, labelPrefix) {
+  return {
+    id: `${prefix}${source.id}`,
+    className: source.className,
+    classColumn: `${prefix}${source.classColumn}`,
+    idColumn: `${prefix}${source.idColumn}`,
+    label: `${labelPrefix}${source.label}`
+  };
+}
+
+/**
  * @param {unknown} value
  * @returns {value is Record<string, unknown>}
  */
@@ -1625,9 +1698,20 @@ export function objectFlowStageSummaries(flow) {
   /** @type {ObjectFlowStageSummary[]} */
   const summaries = [];
   const columnsByAlias = new Map();
+  const cardSourcesByAlias = new Map();
+  const sourcesFor = (alias) => cardSourcesByAlias.get(alias) || [];
+  const setSources = (alias, sources) => cardSourcesByAlias.set(alias, uniqueStageCardSources(sources));
   for (const stage of orderedObjectFlowStages(normalized).ordered) {
     if (stage.kind === 'selection') {
       const selection = /** @type {ObjectFlowSelection} */ (stage.item);
+      const sourceColumns = selection.from ? columnsByAlias.get(selection.from) || [] : [];
+      const inheritedSources = selection.from
+        ? sourcesFor(selection.from).map((source) => prefixedStageCardSource(source, 'Source_', 'Source: '))
+        : [];
+      const cardSources = uniqueStageCardSources([
+        currentStageCardSource(selection.className, 'Result card'),
+        ...inheritedSources
+      ]);
       const summary = {
         id: selection.id,
         kind: /** @type {'selection'} */ ('selection'),
@@ -1644,24 +1728,35 @@ export function objectFlowStageSummaries(flow) {
           action: rule.action,
           negate: rule.negate
         })),
-        columns: uniqueStrings(BASE_RESULT_COLUMNS.concat(selection.columns))
+        columns: uniqueStrings(BASE_RESULT_COLUMNS.concat(selection.columns, sourceProvenanceColumns(sourceColumns))),
+        cardSources
       };
       summaries.push(summary);
       columnsByAlias.set(selection.alias, summary.columns);
+      setSources(selection.alias, cardSources);
       continue;
     }
     const operation = /** @type {ObjectFlowOperation} */ (stage.item);
     const leftColumns = columnsByAlias.get(operation.from) || [];
     const rightColumns = columnsByAlias.get(operation.with) || [];
+    const leftSources = sourcesFor(operation.from);
+    const rightSources = sourcesFor(operation.with);
     let columns;
     let kind;
+    let cardSources;
     if (operation.type === 'relation') {
       kind = 'relation';
       columns = uniqueStrings([
         'SourceClass', 'SourceId', 'SourceCode', 'SourceDescription',
         'Domain', 'RelationId', 'RelationDirection', 'RelationSourceSide',
         'RelatedClass', 'RelatedId'
-      ].concat(BASE_RESULT_COLUMNS, operation.columns));
+      ].concat(BASE_RESULT_COLUMNS, operation.columns, sourceProvenanceColumns(leftColumns, { includeBase: false })));
+      const sourceClass = String((leftSources.find((source) => source.id === 'current') || {}).className || '');
+      cardSources = uniqueStageCardSources([
+        currentStageCardSource(operation.targetClass, 'Related card'),
+        { id: 'relation-source', className: sourceClass, classColumn: 'SourceClass', idColumn: 'SourceId', label: 'Relation source card' },
+        ...leftSources.filter((source) => source.id !== 'current').map((source) => prefixedStageCardSource(source, 'Source_', 'Source: '))
+      ]);
     } else if (operation.type === 'match') {
       kind = 'match';
       columns = leftColumns.slice();
@@ -1674,21 +1769,28 @@ export function objectFlowStageSummaries(flow) {
         const rightColumn = `${operation.rightPrefix}${rule.rightColumn}`;
         if (rule.rightColumn && !columns.includes(rightColumn)) columns.push(rightColumn);
       }
+      cardSources = uniqueStageCardSources(leftSources.concat(
+        rightSources.map((source) => prefixedStageCardSource(source, operation.rightPrefix, 'Compared: '))
+      ));
     } else if (operation.type === 'semiJoin') {
       kind = 'semiJoin';
       columns = leftColumns.slice();
+      cardSources = leftSources;
     } else if (operation.type === 'existsRelated') {
       kind = 'existsRelated';
       columns = leftColumns.slice();
+      cardSources = leftSources;
     } else {
       kind = 'set';
       columns = operation.type === 'union' ? uniqueStrings(leftColumns.concat(rightColumns)) : leftColumns.slice();
+      cardSources = operation.type === 'union' ? leftSources.concat(rightSources) : leftSources;
     }
     const summary = {
       id: operation.id,
       kind,
       alias: operation.as,
-      columns
+      columns,
+      cardSources: uniqueStageCardSources(cardSources || [])
     };
     if (operation.type === 'relation') {
       summary.className = operation.targetClass;
@@ -1714,6 +1816,7 @@ export function objectFlowStageSummaries(flow) {
     } else if (operation.type === 'match' || operation.type === 'semiJoin') {
       summary.from = operation.from;
       summary.with = operation.with;
+      if (operation.type === 'match') summary.rightPrefix = operation.rightPrefix;
       if (operation.type === 'semiJoin') summary.ruleJoin = operation.ruleJoin;
       if (operation.connection) summary.connection = cloneJsonValue(operation.connection);
       summary.rules = operation.rules.map((rule) => ({
@@ -1726,6 +1829,7 @@ export function objectFlowStageSummaries(flow) {
     }
     summaries.push(summary);
     columnsByAlias.set(operation.as, columns);
+    setSources(operation.as, summary.cardSources);
   }
   const byAlias = new Map(summaries.map((summary) => [String(summary.alias || ''), summary]));
   const classNameFor = (summary) => String(summary && (summary.className || summary.targetClass) || '').trim();

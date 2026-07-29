@@ -6,6 +6,7 @@ import http from 'node:http';
 import net from 'node:net';
 import { URL } from 'node:url';
 import { compileObjectFlowToSpec } from '../../scripts/assistant-object-flow.mjs';
+import { draftDiagramPreviewMappingPlan } from '../../scripts/dev-proxy-server.mjs';
 
 function apiObjectFlowSpec(selections, operations = []) {
   return compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, {
@@ -103,6 +104,39 @@ function d2StaticPlacementMapping(itemId, roleId) {
     conditions: { ruleJoin: 'any', rules: [] },
     related: []
   };
+}
+
+async function requestD2MappingStages(backendOrigin, headers, body, timeoutMs = 5000) {
+  const endpoint = `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`;
+  const resumeId = crypto.randomUUID();
+  const roles = await requestJson('POST', endpoint, {
+    ...body,
+    stage: 'roles',
+    resumeId
+  }, headers, timeoutMs);
+  if (roles.statusCode !== 202) return roles;
+
+  assert.equal(roles.json?.checkpoint?.resumeId, resumeId, roles.body);
+  assert.equal(roles.json?.checkpoint?.nextStage, 'topology', roles.body);
+  return requestJson('POST', endpoint, {
+    ...body,
+    stage: 'topology',
+    resumeId
+  }, headers, timeoutMs);
+}
+
+function d2PlacementMappings(payload, stageId, reason = 'Mapped to the corresponding deterministic result.') {
+  return (Array.isArray(payload.placements) ? payload.placements : []).map((placement) => {
+    const allowed = Array.isArray(placement && placement.allowedMaterialization)
+      ? placement.allowedMaterialization.map(String)
+      : [];
+    return {
+      structureItemId: placement.structureItemId,
+      materialization: allowed.includes('stage') ? 'stage' : 'structural',
+      stageId: allowed.includes('stage') ? stageId : '',
+      reason
+    };
+  });
 }
 
 test('draft preview executes exact router anchor before selecting ARM cards by Location', async (t) => {
@@ -621,6 +655,58 @@ test('LiteLLM timeout follows the configured MCP timeout', async (t) => {
   assert.equal(response.json.code, 'assistant_timeout');
   assert.match(response.json.message, /timed out after 1000ms/);
   assert.ok(Date.now() - startedAt >= 850, 'LiteLLM request was cancelled before the configured timeout');
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 mapping timeout identifies the deterministic mapping phase', async (t) => {
+  const llm = await startLiteLlmStub(t, { flow: {}, delayMs: 1200 });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{
+      _id: 1,
+      Code: 'Cst_QueryTool',
+      RootCode: 'Cst_QueryTool',
+      Active: true,
+      RuntimeConfigJson: JSON.stringify({
+        assistant: {
+          llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' },
+          mcp: { enabled: false, timeoutMs: 1000 }
+        }
+      })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, {
+    LITELLM_API_KEY: 'unit-test-key',
+    CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin
+  });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-mapping-timeout-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([
+    { alias: 'workstations', className: 'ARM', columns: ['_id', 'Code', 'Description'] }
+  ]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'D2MappingTimeout',
+    currentSpec,
+    d2Source: 'workstation: Workstation'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
+  const response = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
+    prompt: 'Map the workstation role.',
+    currentSpec,
+    proposal: analyzed.json.proposal,
+    roles,
+    stage: 'roles',
+    resumeId: crypto.randomUUID()
+  }, headers, 5000);
+
+  assert.equal(response.statusCode, 504, response.body);
+  assert.equal(response.json.code, 'assistant_timeout');
+  assert.equal(response.json.diagnostics.phase, 'roles.initial');
+  assert.equal(response.json.diagnostics.attempt, 1);
+  assert.match(response.json.message, /сопоставление объектов/);
   assert.equal(backend.exitCode, null);
 });
 
@@ -2975,7 +3061,16 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
     domains: [{
       _id: 'AssetReference', name: 'AssetReference', source: 'routerG', sources: ['routerG'],
       destination: 'ARM', destinations: ['ARM'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: 'N:N'
-    }]
+    }],
+    relationsByCard: {
+      'routerG:301': [{
+        _id: 901,
+        domain: 'AssetReference',
+        _sourceType: 'routerG', _sourceId: 301, _sourceCode: 'router-target', _sourceDescription: 'Маршрутизатор для Test City 300',
+        _destinationType: 'ARM', _destinationId: 501, _destinationCode: 'ARM-001', _destinationDescription: 'АРМ 001',
+        _direction: 'direct'
+      }]
+    }
   });
   const backendPort = await freePort();
   const backend = await startBackend(t, backendPort, mock.origin, {
@@ -2990,15 +3085,15 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
     'x-cmdbdynamicpages-csrf': csrf.json.token
   };
   const currentSpec = apiObjectFlowSpec([
-    { alias: 'routers', className: 'routerG', columns: ['Code', 'Description'] },
-    { alias: 'switches', className: 'ARM', columns: ['Code', 'Description'] }
+    { alias: 'routers', className: 'routerG', columns: ['Code', 'Description', 'Location'] },
+    { alias: 'switches', className: 'ARM', columns: ['Code', 'Description', 'Location'] }
   ], [{
     id: 'match:matchedNetwork',
     from: 'routers',
     with: 'switches',
     as: 'matchedNetwork',
     rightPrefix: 'Selection 2.',
-    rules: [{ action: 'include', negate: false, operator: 'equals', leftColumn: 'Code', leftRegex: '', rightColumn: 'Code', rightRegex: '' }]
+    rules: [{ action: 'include', negate: false, operator: 'equals', leftColumn: 'Location', leftRegex: '', rightColumn: 'Location', rightRegex: '' }]
   }]);
   const source = 'router: Router\nswitch: Switch';
   const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
@@ -3033,7 +3128,7 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
     d2ClassKey: rule.d2ClassKey,
     d2Label: rule.d2Label,
     mode: rule.mode
-  })), [{ d2ElementKey: 'router_switch', d2ClassKey: 'network_link', d2Label: 'network_link', mode: 'direct' }]);
+  })), [{ d2ElementKey: 'router_switch', d2ClassKey: 'network_link', d2Label: 'network_link', mode: 'deterministicEndpoints' }]);
   assert.deepEqual(analyzed.json.proposal.relationRules[0].d2ElementKeys, ['router_switch']);
   assert.match(analyzed.json.proposal.relationRules[0].d2Notes, /dedicated deterministic connection result/);
   assert.equal(analyzed.json.proposal.templateGrammar.edges[0].classKey, 'network_link');
@@ -3073,14 +3168,15 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
     proposal: analyzed.json.proposal,
     roles: []
   }, headers);
-  assert.equal(incomplete.statusCode, 422, incomplete.body);
-  assert.equal(incomplete.json.code, 'diagram_import_topology_unresolved');
-  assert.equal(incomplete.json.errors.length, 3);
-  assert.deepEqual(incomplete.json.errors.map((item) => [item.displayName, item.fields]).sort(([left], [right]) => left.localeCompare(right)), [
-    ['network_link', ['directionPolicy']],
-    ['router', ['D2 node placement router requires a materialized Object Flow result.']],
-    ['switch', ['D2 node placement switch requires a materialized Object Flow result.']]
-  ]);
+  assert.equal(incomplete.statusCode, 200, incomplete.body);
+  assert.equal(incomplete.json.success, true);
+  assert.equal(incomplete.json.status, 'partial');
+  assert.equal(incomplete.json.partial, true);
+  assert.equal(incomplete.json.d2Workflow.state, 'pending');
+  assert.equal(incomplete.json.spec.result.diagrams[0].authoring.d2Import.mappingValidation.status, 'needsValidation');
+  assert.equal(incomplete.json.spec.steps.some((step) => step.managedBy === 'd2ImportV3'), false);
+  assert.equal(incomplete.json.spec.result.diagrams[0].nodeMappings.length, 0);
+  assert.ok(incomplete.json.unresolved.length >= 3);
 
   const assistantConflict = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/interpret`, {
     prompt: 'Interpret roles',
@@ -3108,6 +3204,30 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
     });
   });
   const structureTree = d2StructureTreeWithMaterialization(analyzed.json.proposal, roles);
+  const partialApplied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
+    currentSpec,
+    d2Source: source,
+    proposal: analyzed.json.proposal,
+    roles,
+    structureTree,
+    relationRules: []
+  }, headers);
+  assert.equal(partialApplied.statusCode, 200, partialApplied.body);
+  assert.equal(partialApplied.json.status, 'partial');
+  assert.equal(partialApplied.json.partial, true);
+  assert.equal(partialApplied.json.d2Workflow.state, 'pending');
+  assert.equal(partialApplied.json.spec.result.diagrams[0].nodeMappings.length, 0);
+  assert.equal(partialApplied.json.spec.steps.some((step) => step.managedBy === 'd2ImportV3'), false);
+  assert.ok(partialApplied.json.omissions.some((item) => item.kind === 'connection'));
+  const partialAppliedPreview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=20&executionScope=diagrams`, {
+    template: { code: 'NetworkImport', spec: partialApplied.json.spec },
+    params: {}
+  }, headers);
+  assert.equal(partialAppliedPreview.statusCode, 200, partialAppliedPreview.body);
+  assert.equal(partialAppliedPreview.json.success, true);
+  assert.equal(partialAppliedPreview.json.result.diagramPreview.partial, true);
+  assert.ok(partialAppliedPreview.json.result.diagrams[0].nodes.length > 0);
+  assert.equal(partialAppliedPreview.json.result.diagrams[0].edges.length, 0);
   const applied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
     currentSpec,
     d2Source: source,
@@ -3118,10 +3238,14 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
       ...topologyContract,
       id: 'router_switch_relation',
       kind: 'connection',
-      directionPolicy: 'template',
+      mode: 'deterministicEndpoints',
+      directionPolicy: 'dataFields',
       parentRoleId: roles.find((role) => role.mapping.primary.className === 'routerG').id,
       childRoleId: roles.find((role) => role.mapping.primary.className === 'ARM').id,
-      path: [{ kind: 'domain', name: 'AssetReference', domain: 'AssetReference', targetClass: 'ARM', direction: 'both' }]
+      sourceStageId: 'match:matchedNetwork',
+      sourceField: 'Location',
+      targetField: 'Selection 2.Location',
+      labelField: ''
     }]
   }, headers);
 
@@ -3134,13 +3258,34 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
   assert.equal(applied.json.spec.result.diagrams[0].authoring.d2Import.source, source);
   assert.match(applied.json.spec.result.diagrams[0].authoring.d2Import.structureHash, /^[0-9a-f]{64}$/);
   assert.equal(applied.json.spec.steps[0].as, 'routers');
-  assert.equal(applied.json.spec.steps.filter((step) => step.managedBy === 'd2ImportV3').length, 1);
+  assert.equal(applied.json.spec.steps.filter((step) => step.managedBy === 'd2ImportV3').length, 0);
   assert.equal(applied.json.spec.result.diagrams[0].authoring.d2Import.roleMappings, undefined);
   assert.equal(applied.json.spec.result.diagrams[0].authoring.d2Import.structureTree.items
     .filter((item) => item.mapping.materialization && item.mapping.materialization.kind === 'stage' && item.mapping.materialization.stageId).length, 2);
   assert.equal(applied.json.spec.assistantDraft, undefined);
   assert.equal(applied.json.spec.authoring.d2.source, source);
   assert.equal(applied.json.spec.authoring.d2.sourceHash, applied.json.spec.result.diagrams[0].authoring.d2Import.sourceHash);
+
+  const intermediateSpec = structuredClone(applied.json.spec);
+  intermediateSpec.result.diagrams[0].authoring.d2Import.mappingValidation = { version: 1, status: 'needsValidation' };
+  const invalidPlacement = structuredClone(intermediateSpec.result.diagrams[0].authoring.d2Import.structureTree.items[0]);
+  invalidPlacement.id = 'manual-invalid-router-placement';
+  invalidPlacement.mapping.id = 'mapping:manual-invalid-router-placement';
+  invalidPlacement.mapping.materialization = { kind: 'stage', stageId: 'selection:missing' };
+  intermediateSpec.result.diagrams[0].authoring.d2Import.structureTree.items.push(invalidPlacement);
+  const intermediatePlan = draftDiagramPreviewMappingPlan(intermediateSpec);
+  assert.equal(intermediatePlan.spec.result.diagrams[0].edgeMappings.length, 1);
+  assert.equal(intermediatePlan.spec.steps.some((step) => step.managedBy === 'd2ImportV3'), false);
+  const intermediatePreview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=20&executionScope=diagrams`, {
+    template: { code: 'NetworkImport', spec: intermediateSpec },
+    params: {}
+  }, headers);
+  assert.equal(intermediatePreview.statusCode, 200, intermediatePreview.body);
+  assert.equal(intermediatePreview.json.success, true);
+  assert.equal(intermediatePreview.json.result.d2Workflow.state, 'pending');
+  assert.equal(intermediatePreview.json.result.diagramPreview.partial, true);
+  assert.ok(intermediatePreview.json.result.diagrams[0].nodes.length > 0);
+  assert.ok(intermediatePreview.json.result.diagrams[0].edges.length > 0, intermediatePreview.body);
 
   const lateFailureSpec = structuredClone(applied.json.spec);
   lateFailureSpec.steps.push({
@@ -3269,9 +3414,12 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
       labelField: 'Code'
     }]
   }, headers);
-  assert.equal(missingDirectionPolicy.statusCode, 422, missingDirectionPolicy.body);
-  assert.equal(missingDirectionPolicy.json.code, 'diagram_import_topology_unresolved');
-  const directionError = missingDirectionPolicy.json.errors.find((item) => Array.isArray(item.fields) && item.fields.includes('directionPolicy'));
+  assert.equal(missingDirectionPolicy.statusCode, 200, missingDirectionPolicy.body);
+  assert.equal(missingDirectionPolicy.json.status, 'partial');
+  assert.equal(missingDirectionPolicy.json.partial, true);
+  assert.equal(missingDirectionPolicy.json.d2Workflow.state, 'pending');
+  assert.equal(missingDirectionPolicy.json.spec.result.diagrams[0].edgeMappings.length, 0);
+  const directionError = missingDirectionPolicy.json.unresolved.find((item) => Array.isArray(item.fields) && item.fields.includes('directionPolicy'));
   assert.ok(directionError, missingDirectionPolicy.body);
   assert.equal(directionError.directionPolicySuggestion, topologyContract.directionPolicySuggestion);
 
@@ -3971,41 +4119,32 @@ test('D2 interpretation reports an invalid container visual kind by visible role
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 mapping accepts only catalog-offered direct path ids and materializes the selected path', async (t) => {
+test('D2 mapping rejects direct CMDB paths and requires an Object Flow connection result', async (t) => {
+  const diagramResponse = ({ request }) => {
+    const payload = JSON.parse(request.messages.at(-1).content);
+    if (Array.isArray(payload.topology)) {
+      assert.equal(Object.prototype.hasOwnProperty.call(payload.topology[0], 'directPaths'), false);
+      return {
+        relationRules: [{
+          d2ElementKey: payload.topology[0].d2ElementKey,
+          mode: 'direct',
+          pathId: 'not-offered'
+        }]
+      };
+    }
+    return {
+      mappings: payload.placements.map((placement, index) => ({
+        structureItemId: placement.structureItemId,
+        materialization: placement.allowedMaterialization.includes('stage') ? 'stage' : 'structural',
+        stageId: placement.allowedMaterialization.includes('stage')
+          ? payload.stages[index % payload.stages.length].id
+          : '',
+        reason: 'Mapped to the corresponding deterministic result.'
+      }))
+    };
+  };
   const llm = await startLiteLlmStub(t, {
-    responses: [
-      ({ request }) => {
-        const payload = JSON.parse(request.messages.at(-1).content);
-        return {
-          mappings: payload.roles.map((role, index) => ({ roleId: role.id, stageId: payload.stages[index].id, reason: 'Mapped to the corresponding deterministic stage.' }))
-        };
-      },
-      ({ request }) => {
-        const payload = JSON.parse(request.messages.at(-1).content);
-        return { relationRules: [{ d2ElementKey: payload.topology[0].d2ElementKey, mode: 'direct', pathId: 'not-offered' }] };
-      },
-      ({ request }) => {
-        const payload = JSON.parse(request.messages.at(-1).content);
-        const connection = payload.topology[0];
-        assert.ok(connection.directPaths.length >= 1);
-        assert.deepEqual(connection.directPaths.map((item) => [item.sourceClass, item.targetClass]), [['routerG', 'ARM']]);
-        return { relationRules: [{ d2ElementKey: connection.d2ElementKey, mode: 'direct', pathId: 'not-offered' }] };
-      },
-      ({ request }) => {
-        const payload = JSON.parse(request.messages.at(-1).content);
-        return {
-          mappings: payload.roles.map((role, index) => ({ roleId: role.id, stageId: payload.stages[index].id, reason: 'Mapped to the corresponding deterministic stage.' }))
-        };
-      },
-      ({ request }) => {
-        const payload = JSON.parse(request.messages.at(-1).content);
-        const connection = payload.topology[0];
-        const path = connection.directPaths.find((item) => item.sourceClass === 'routerG' && item.targetClass === 'ARM');
-        return {
-          relationRules: [{ d2ElementKey: connection.d2ElementKey, mode: 'direct', pathId: path.id }]
-        };
-      }
-    ]
+    responses: [diagramResponse, diagramResponse, diagramResponse]
   });
   const mock = await startMockCmdbuild(t, {
     domains: [{
@@ -4033,19 +4172,192 @@ test('D2 mapping accepts only catalog-offered direct path ids and materializes t
   }, headers);
   assert.equal(analyzed.statusCode, 200, analyzed.body);
   const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
-  const invalid = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
+  const invalid = await requestD2MappingStages(backendOrigin, headers, {
     prompt: 'Map the roles and connection.', currentSpec, proposal: analyzed.json.proposal, roles, traversalDepth: 1
-  }, headers);
+  });
   assert.equal(invalid.statusCode, 422, invalid.body);
-  assert.equal(invalid.json.errors[0].code, 'diagram_direct_path_not_offered');
+  assert.ok(invalid.json.errors.some((error) => /Unsupported D2 connection mode direct/.test(error.message)), invalid.body);
+  assert.equal(backend.exitCode, null);
+});
 
-  const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
-    prompt: 'Map the roles and connection.', currentSpec, proposal: analyzed.json.proposal, roles, traversalDepth: 1
+test('D2 mapping resumes the topology stage without repeating confirmed role mapping', async (t) => {
+  const roleResponse = ({ request }) => {
+    const payload = JSON.parse(request.messages.at(-1).content);
+    return {
+      mappings: d2PlacementMappings(payload, 'selection:applications', 'Applications are materialized by the selected result.')
+    };
+  };
+  const topologyResponse = ({ request }) => {
+    const payload = JSON.parse(request.messages.at(-1).content);
+    const connection = payload.topology[0];
+    const candidate = connection.networkEndpointStages.find((item) => item.sourceStageId === 'selection:aclIntrasystem');
+    return {
+      relationRules: [{
+        d2ElementKey: connection.d2ElementKey,
+        mode: 'networkEndpoints',
+        candidateId: candidate.candidateId,
+        sourceStageId: candidate.sourceStageId,
+        sourceField: candidate.sourceField,
+        targetField: candidate.targetField,
+        labelField: candidate.labelField
+      }]
+    };
+  };
+  const llm = await startLiteLlmStub(t, {
+    delays: [0, 1200, 0],
+    responses: [roleResponse, topologyResponse, topologyResponse]
+  });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{
+      _id: 1,
+      Code: 'Cst_QueryTool',
+      RootCode: 'Cst_QueryTool',
+      Active: true,
+      RuntimeConfigJson: JSON.stringify({
+        assistant: {
+          llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' },
+          mcp: { enabled: false, timeoutMs: 1000 }
+        }
+      })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, {
+    LITELLM_API_KEY: 'unit-test-key',
+    CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin
+  });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-resume-topology-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([
+    { alias: 'applications', className: 'ApplicG', columns: ['_id', 'Code', 'Description'] },
+    { alias: 'aclIntrasystem', className: 'ACL', columns: ['_id', 'ipaddress', 'dipaddress', 'Description'] }
+  ]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'ResumeTopologyMapping', currentSpec, d2Source: 'same-role-edges'
   }, headers);
-  assert.equal(mapped.statusCode, 200, mapped.body);
-  assert.equal(mapped.json.relationRules.length, 1);
-  assert.deepEqual(mapped.json.relationRules[0].path, [{ kind: 'domain', name: 'AssetReference', targetClass: 'ARM', direction: 'direct' }]);
-  assert.equal(mapped.json.relationRules[0].pathId, undefined);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
+  const body = {
+    prompt: 'Map applications and one dedicated ACL relation result.',
+    currentSpec,
+    proposal: analyzed.json.proposal,
+    roles
+  };
+  const resumeId = crypto.randomUUID();
+  const endpoint = `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`;
+  const accepted = await requestJson('POST', endpoint, { ...body, stage: 'roles', resumeId }, headers, 5000);
+  assert.equal(accepted.statusCode, 202, accepted.body);
+  assert.equal(accepted.json.checkpoint.nextStage, 'topology');
+  assert.equal(llm.requests, 1);
+
+  const timedOut = await requestJson('POST', endpoint, { ...body, stage: 'topology', resumeId }, headers, 5000);
+  assert.equal(timedOut.statusCode, 504, timedOut.body);
+  assert.equal(timedOut.json.retryable, true, timedOut.body);
+  assert.equal(timedOut.json.resume.resumeId, resumeId);
+  assert.equal(timedOut.json.resume.nextStage, 'topology');
+  assert.equal(timedOut.json.diagnostics.stage, 'topology');
+  assert.equal(timedOut.json.diagnostics.rolesReused, true);
+  assert.match(timedOut.json.message, /сопоставление связей/);
+  assert.match(timedOut.json.message, /сопоставление объектов сохранено временно/);
+  assert.equal(llm.requests, 2);
+
+  const resumed = await requestJson('POST', endpoint, { ...body, stage: 'topology', resumeId }, headers, 5000);
+  assert.equal(resumed.statusCode, 200, resumed.body);
+  assert.equal(resumed.json.mapping.status, 'complete');
+  assert.equal(resumed.json.diagnostics.phases.roles, 'accepted');
+  assert.equal(resumed.json.diagnostics.phases.topology, 'accepted');
+  assert.equal(llm.requests, 3);
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 mapping resumes a timed-out roles stage before starting topology', async (t) => {
+  const roleResponse = ({ request }) => ({
+    mappings: d2PlacementMappings(
+      JSON.parse(request.messages.at(-1).content),
+      'selection:applications',
+      'Applications are materialized by the selected result.'
+    )
+  });
+  const topologyResponse = ({ request }) => {
+    const payload = JSON.parse(request.messages.at(-1).content);
+    const connection = payload.topology[0];
+    const candidate = connection.networkEndpointStages.find((item) => item.sourceStageId === 'selection:aclIntrasystem');
+    return {
+      relationRules: [{
+        d2ElementKey: connection.d2ElementKey,
+        mode: 'networkEndpoints',
+        candidateId: candidate.candidateId,
+        sourceStageId: candidate.sourceStageId,
+        sourceField: candidate.sourceField,
+        targetField: candidate.targetField,
+        labelField: candidate.labelField
+      }]
+    };
+  };
+  const llm = await startLiteLlmStub(t, {
+    delays: [1200, 0, 0],
+    responses: [roleResponse, roleResponse, topologyResponse]
+  });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{
+      _id: 1,
+      Code: 'Cst_QueryTool',
+      RootCode: 'Cst_QueryTool',
+      Active: true,
+      RuntimeConfigJson: JSON.stringify({
+        assistant: {
+          llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' },
+          mcp: { enabled: false, timeoutMs: 1000 }
+        }
+      })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, {
+    LITELLM_API_KEY: 'unit-test-key',
+    CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin
+  });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-resume-roles-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([
+    { alias: 'applications', className: 'ApplicG', columns: ['_id', 'Code', 'Description'] },
+    { alias: 'aclIntrasystem', className: 'ACL', columns: ['_id', 'ipaddress', 'dipaddress', 'Description'] }
+  ]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'ResumeRolesMapping', currentSpec, d2Source: 'same-role-edges'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const body = {
+    prompt: 'Map applications and one dedicated ACL relation result.',
+    currentSpec,
+    proposal: analyzed.json.proposal,
+    roles: analyzed.json.proposal.roles.map((role) => d2RoleOverride(role))
+  };
+  const resumeId = crypto.randomUUID();
+  const endpoint = `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`;
+
+  const timedOut = await requestJson('POST', endpoint, { ...body, stage: 'roles', resumeId }, headers, 5000);
+  assert.equal(timedOut.statusCode, 504, timedOut.body);
+  assert.equal(timedOut.json.retryable, true, timedOut.body);
+  assert.equal(timedOut.json.resume.resumeId, resumeId);
+  assert.equal(timedOut.json.resume.nextStage, 'roles');
+  assert.equal(timedOut.json.diagnostics.stage, 'roles');
+  assert.equal(timedOut.json.diagnostics.rolesReused, false);
+  assert.equal(llm.requests, 1);
+
+  const roles = await requestJson('POST', endpoint, { ...body, stage: 'roles', resumeId }, headers, 5000);
+  assert.equal(roles.statusCode, 202, roles.body);
+  assert.equal(roles.json.checkpoint.nextStage, 'topology');
+  assert.equal(llm.requests, 2);
+
+  const topology = await requestJson('POST', endpoint, { ...body, stage: 'topology', resumeId }, headers, 5000);
+  assert.equal(topology.statusCode, 200, topology.body);
+  assert.equal(topology.json.mapping.status, 'complete');
+  assert.equal(llm.requests, 3);
   assert.equal(backend.exitCode, null);
 });
 
@@ -4055,11 +4367,7 @@ test('D2 mapping aggregates same-role arrows by D2 relation class and preserves 
       ({ request }) => {
         const payload = JSON.parse(request.messages.at(-1).content);
         return {
-          mappings: payload.roles.map((role) => ({
-            roleId: role.id,
-            stageId: payload.stages.find((stage) => stage.id === 'selection:applications').id,
-            reason: 'Applications are materialized by the selected result.'
-          }))
+          mappings: d2PlacementMappings(payload, 'selection:applications', 'Applications are materialized by the selected result.')
         };
       },
       ({ request }) => {
@@ -4111,9 +4419,9 @@ test('D2 mapping aggregates same-role arrows by D2 relation class and preserves 
   assert.match(analyzed.json.proposal.relationRules[0].d2Notes, /Dedicated ACL result/);
 
   const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
-  const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
+  const mapped = await requestD2MappingStages(backendOrigin, headers, {
     prompt: 'Map applications and one dedicated ACL relation result.', currentSpec, proposal: analyzed.json.proposal, roles
-  }, headers);
+  });
   assert.equal(mapped.statusCode, 200, mapped.body);
   assert.equal(mapped.json.mapping.status, 'complete');
   assert.deepEqual([mapped.json.mapping.requiredConnections, mapped.json.mapping.mappedConnections], [1, 1]);
@@ -4127,7 +4435,7 @@ test('D2 mapping reports a missing dedicated result for a same-role relation cla
     responses: [
       ({ request }) => {
         const payload = JSON.parse(request.messages.at(-1).content);
-        return { mappings: payload.roles.map((role) => ({ roleId: role.id, stageId: 'selection:applications', reason: 'Application result.' })) };
+        return { mappings: d2PlacementMappings(payload, 'selection:applications', 'Application result.') };
       },
       () => ({ relationRules: [] })
     ]
@@ -4150,9 +4458,9 @@ test('D2 mapping reports a missing dedicated result for a same-role relation cla
   }, headers);
   assert.equal(analyzed.statusCode, 200, analyzed.body);
   const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
-  const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
+  const mapped = await requestD2MappingStages(backendOrigin, headers, {
     prompt: 'Map only confirmed D2 relation results.', currentSpec, proposal: analyzed.json.proposal, roles
-  }, headers);
+  });
 
   assert.equal(mapped.statusCode, 200, mapped.body);
   assert.equal(mapped.json.mapping.status, 'partial');
@@ -4172,11 +4480,7 @@ test('D2 mapping requires separate named Object Flow results for different D2 re
       ({ request }) => {
         const payload = JSON.parse(request.messages.at(-1).content);
         return {
-          mappings: payload.roles.map((role) => ({
-            roleId: role.id,
-            stageId: 'selection:applications',
-            reason: 'Application result.'
-          }))
+          mappings: d2PlacementMappings(payload, 'selection:applications', 'Application result.')
         };
       },
       ({ request }) => {
@@ -4217,9 +4521,9 @@ test('D2 mapping requires separate named Object Flow results for different D2 re
   assert.deepEqual(analyzed.json.proposal.relationRules.map((rule) => rule.d2ClassKey).sort(), ['acl_intrasystem', 'application_dependency']);
 
   const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
-  const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
+  const mapped = await requestD2MappingStages(backendOrigin, headers, {
     prompt: 'Map each D2 relation class to a dedicated result.', currentSpec, proposal: analyzed.json.proposal, roles
-  }, headers);
+  });
   assert.equal(mapped.statusCode, 200, mapped.body);
   assert.equal(mapped.json.mapping.status, 'partial');
   assert.deepEqual([mapped.json.mapping.requiredConnections, mapped.json.mapping.mappedConnections], [2, 0]);
@@ -4230,12 +4534,12 @@ test('D2 mapping requires separate named Object Flow results for different D2 re
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 mapping reports an uncovered node role without inventing a container stage', async (t) => {
+test('D2 mapping reports an uncovered placement without inventing a container stage', async (t) => {
   const llm = await startLiteLlmStub(t, {
     responses: [({ request }) => {
       const payload = JSON.parse(request.messages.at(-1).content);
-      const role = payload.roles.find((item) => !item.isContainer);
-      return { mappings: [], unresolved: [{ roleId: role.id, reason: 'noCompatibleStage', message: 'No dedicated source stage exists.' }] };
+      const placement = payload.placements.find((item) => item.visualKind !== 'container') || payload.placements[0];
+      return { mappings: [], unresolved: [{ structureItemId: placement.structureItemId, reason: 'noCompatibleStage', message: 'No dedicated source stage exists.' }] };
     }]
   });
   const mock = await startMockCmdbuild(t, {
@@ -4253,17 +4557,21 @@ test('D2 mapping reports an uncovered node role without inventing a container st
   }, headers);
   assert.equal(analyzed.statusCode, 200, analyzed.body);
   const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
-  const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
+  const mapped = await requestD2MappingStages(backendOrigin, headers, {
     prompt: 'Map every dynamic role or state why no source exists.', currentSpec, proposal: analyzed.json.proposal, roles
-  }, headers);
+  });
 
-  assert.equal(mapped.statusCode, 200, mapped.body);
+  assert.equal(mapped.statusCode, 422, mapped.body);
+  assert.equal(mapped.json.code, 'assistant_diagram_stage_retry');
+  assert.equal(mapped.json.retryable, true);
+  assert.equal(mapped.json.retryKind, 'correction');
+  assert.equal(mapped.json.resume.nextStage, 'roles');
   assert.equal(mapped.json.mapping.status, 'partial');
   assert.deepEqual([mapped.json.mapping.mappedRoles, mapped.json.mapping.requiredRoles], [0, 1]);
   assert.equal(mapped.json.mappings.length, 0);
-  assert.equal(mapped.json.mapping.unresolved[0].code, 'noCompatibleStage');
-  assert.equal(mapped.json.mapping.unresolved[0].displayName, 'workstation');
-  assert.equal(mapped.json.mapping.requiredContainers, 0);
+  assert.equal(mapped.json.mapping.unresolved[0].code, 'assistantOmittedPlacement');
+  assert.equal(mapped.json.mapping.unresolved[0].displayName, 'application_group');
+  assert.equal(mapped.json.mapping.requiredContainers, 1);
   assert.equal(mapped.json.mapping.mappedContainers, 0);
   assert.equal(mapped.json.diagnostics.attempts, 1);
   assert.equal(llm.requests, 1);
@@ -4274,8 +4582,7 @@ test('D2 mapping reports complete when every node role is covered by an Object F
   const llm = await startLiteLlmStub(t, {
     responses: [({ request }) => {
       const payload = JSON.parse(request.messages.at(-1).content);
-      const role = payload.roles.find((item) => !item.isContainer);
-      return { mappings: [{ roleId: role.id, stageId: payload.stages[0].id, reason: 'Node source.' }] };
+      return { mappings: d2PlacementMappings(payload, payload.stages[0].id, 'Node source.') };
     }]
   });
   const mock = await startMockCmdbuild(t, {
@@ -4293,18 +4600,233 @@ test('D2 mapping reports complete when every node role is covered by an Object F
   }, headers);
   assert.equal(analyzed.statusCode, 200, analyzed.body);
   const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
-  const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
+  const mapped = await requestD2MappingStages(backendOrigin, headers, {
     prompt: 'Map every dynamic role.', currentSpec, proposal: analyzed.json.proposal, roles
-  }, headers);
+  });
 
   assert.equal(mapped.statusCode, 200, mapped.body);
   assert.equal(mapped.json.mapping.status, 'complete');
   assert.deepEqual([mapped.json.mapping.mappedRoles, mapped.json.mapping.requiredRoles], [1, 1]);
-  assert.deepEqual([mapped.json.mapping.mappedContainers, mapped.json.mapping.requiredContainers], [0, 0]);
+  assert.deepEqual([mapped.json.mapping.mappedContainers, mapped.json.mapping.requiredContainers], [1, 1]);
   assert.deepEqual(mapped.json.mapping.unresolved, []);
-  assert.equal(mapped.json.mappings.length, 1);
+  assert.equal(mapped.json.mappings.length, 2);
   assert.equal(mapped.json.diagnostics.attempts, 1);
   assert.equal(llm.requests, 1);
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 mapping recovers an invalid parentCard response with one deterministic container source', async (t) => {
+  const invalidParentCardResponse = ({ request }) => {
+    const payload = JSON.parse(request.messages.at(-1).content);
+    assert.ok(Array.isArray(payload.placements), JSON.stringify(payload));
+    return {
+      mappings: payload.placements.map((placement) => ({
+        structureItemId: placement.structureItemId,
+        materialization: placement.visualKind === 'container' ? 'structural' : 'parentCard',
+        reason: 'Use the container card for the child.'
+      })),
+      unresolved: []
+    };
+  };
+  const llm = await startLiteLlmStub(t, { responses: [invalidParentCardResponse] });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } }) }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-parent-card-recovery-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([{ alias: 'workstations', className: 'ARM', columns: ['_id', 'Code', 'Description'] }]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'ParentCardRecoveryImport', currentSpec, d2Source: 'container-class users: { operator: Operator }'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
+  const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
+    prompt: 'Map the available workstation result to the D2 container and child.', currentSpec, proposal: analyzed.json.proposal, roles
+  }, headers);
+
+  assert.equal(mapped.statusCode, 200, mapped.body);
+  assert.equal(mapped.json.mapping.status, 'complete');
+  assert.equal(mapped.json.errors.length, 0);
+  assert.equal(mapped.json.diagnostics.attempts, 1);
+  assert.equal(llm.requests, 1);
+  const container = mapped.json.mappings.find((item) => item.mapping?.materialization?.kind === 'stage');
+  const child = mapped.json.mappings.find((item) => item.mapping?.materialization?.kind === 'parentCard');
+  assert.equal(container?.source?.stageId, 'selection:workstations');
+  assert.equal(child?.source?.stageId, 'selection:workstations');
+  assert.ok(mapped.json.warnings.some((warning) => /parentCard/i.test(warning)), JSON.stringify(mapped.json.warnings));
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 mapping normalizes a duplicate placement before completing the roles stage', async (t) => {
+  const response = ({ request }) => {
+    const payload = JSON.parse(request.messages.at(-1).content);
+    const [first, ...rest] = payload.placements;
+    return {
+      mappings: [
+        { structureItemId: first.structureItemId, materialization: 'parentCard', reason: 'Use an inherited card.' },
+        { structureItemId: first.structureItemId, materialization: 'stage', stageId: 'selection:workstations', reason: 'Direct result is executable.' },
+        ...rest.map((placement) => ({ structureItemId: placement.structureItemId, materialization: 'stage', stageId: 'selection:workstations', reason: 'Direct result.' }))
+      ]
+    };
+  };
+  const llm = await startLiteLlmStub(t, { responses: [response] });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } }) }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-duplicate-container-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([
+    { alias: 'workstations', className: 'ARM', columns: ['_id', 'Code', 'Description'] },
+    { alias: 'otherWorkstations', className: 'ARM', columns: ['_id', 'Code', 'Description'] }
+  ]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'DuplicateContainerMapping', currentSpec, d2Source: 'container-class scope_server: { server: Server }'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
+    prompt: 'Map the server scope and server node.', currentSpec, proposal: analyzed.json.proposal,
+    roles: analyzed.json.proposal.roles.map((role) => d2RoleOverride(role))
+  }, headers);
+
+  assert.equal(mapped.statusCode, 202, mapped.body);
+  assert.equal(mapped.json.checkpoint.nextStage, 'topology');
+  assert.deepEqual([mapped.json.mapping.mappedRoles, mapped.json.mapping.requiredRoles], [2, 2]);
+  assert.ok(mapped.json.warnings.some((warning) => /несколько вариантов/i.test(warning)), JSON.stringify(mapped.json.warnings));
+  assert.equal(llm.requests, 1);
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 mapping resumes only invalid placements and keeps its partial role draft', async (t) => {
+  const firstResponse = ({ request }) => {
+    const payload = JSON.parse(request.messages.at(-1).content);
+    const nodePlacement = payload.placements.find((placement) => placement.visualKind === 'node');
+    assert.ok(nodePlacement, JSON.stringify(payload.placements));
+    return {
+      mappings: payload.placements.map((placement, index) => ({
+        structureItemId: placement.structureItemId,
+        materialization: 'stage',
+        stageId: index === 0 ? 'selection:workstations' : 'selection:workstations',
+        reason: 'Direct result.'
+      })).concat({
+        structureItemId: nodePlacement.structureItemId,
+        materialization: 'stage',
+        stageId: 'selection:otherWorkstations',
+        reason: 'Conflicting duplicate result.'
+      })
+    };
+  };
+  const invalidCorrectionResponse = ({ request }) => {
+    const payload = JSON.parse(request.messages.at(-1).content);
+    assert.equal(payload.placements.length, 1, JSON.stringify(payload.placements));
+    assert.equal(payload.placements[0].visualKind, 'node');
+    return {
+      mappings: [{ structureItemId: payload.placements[0].structureItemId, materialization: 'structural', reason: 'Invalid node mapping.' }]
+    };
+  };
+  const correctionResponse = ({ request }) => {
+    const payload = JSON.parse(request.messages.at(-1).content);
+    assert.equal(payload.placements.length, 1, JSON.stringify(payload.placements));
+    assert.equal(payload.placements[0].visualKind, 'node');
+    return {
+      mappings: [{ structureItemId: payload.placements[0].structureItemId, materialization: 'stage', stageId: 'selection:workstations', reason: 'Direct result.' }]
+    };
+  };
+  const llm = await startLiteLlmStub(t, { responses: [firstResponse, invalidCorrectionResponse, correctionResponse] });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } }) }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-branch-resume-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([
+    { alias: 'workstations', className: 'ARM', columns: ['_id', 'Code', 'Description'] },
+    { alias: 'otherWorkstations', className: 'ARM', columns: ['_id', 'Code', 'Description'] }
+  ]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'BranchResumeMapping', currentSpec, d2Source: 'container-class scope_server: { server: Server }'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const body = {
+    prompt: 'Map the server scope and server node.', currentSpec, proposal: analyzed.json.proposal,
+    roles: analyzed.json.proposal.roles.map((role) => d2RoleOverride(role))
+  };
+  const endpoint = `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`;
+  const resumeId = crypto.randomUUID();
+  const rejected = await requestJson('POST', endpoint, { ...body, stage: 'roles', resumeId }, headers);
+  assert.equal(rejected.statusCode, 422, rejected.body);
+  assert.equal(rejected.json.retryKind, 'correction');
+  assert.equal(rejected.json.partial, true);
+  assert.equal(rejected.json.resume.resumeId, resumeId);
+  assert.equal(rejected.json.mappings.length, 1);
+
+  const secondRejected = await requestJson('POST', endpoint, { ...body, stage: 'roles', resumeId }, headers);
+  assert.equal(secondRejected.statusCode, 422, secondRejected.body);
+  assert.equal(secondRejected.json.retryKind, 'correction');
+  assert.equal(secondRejected.json.partial, true);
+  assert.ok(secondRejected.json.errors.some((error) => error.code === 'diagram_materialization_not_allowed'), secondRejected.body);
+  assert.equal(secondRejected.json.resume.resumeId, resumeId);
+
+  const resumed = await requestJson('POST', endpoint, { ...body, stage: 'roles', resumeId }, headers);
+  assert.equal(resumed.statusCode, 202, resumed.body);
+  assert.equal(resumed.json.checkpoint.nextStage, 'topology');
+  assert.deepEqual([resumed.json.mapping.mappedRoles, resumed.json.mapping.requiredRoles], [2, 2]);
+  assert.equal(llm.requests, 3);
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 mapping retries Assistant-omitted placements but preserves explicit unresolved decisions', async (t) => {
+  const firstResponse = ({ request }) => {
+    const payload = JSON.parse(request.messages.at(-1).content);
+    assert.equal(payload.placements.length, 2, JSON.stringify(payload.placements));
+    return { mappings: d2PlacementMappings({ placements: [payload.placements[0]] }, payload.stages[0].id, 'First confirmed placement.') };
+  };
+  const correctionResponse = ({ request }) => {
+    const payload = JSON.parse(request.messages.at(-1).content);
+    assert.equal(payload.placements.length, 1, JSON.stringify(payload.placements));
+    return { mappings: d2PlacementMappings(payload, payload.stages[0].id, 'Recovered omitted placement.') };
+  };
+  const llm = await startLiteLlmStub(t, { responses: [firstResponse, correctionResponse] });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } }) }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-omitted-placement-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([{ alias: 'workstations', className: 'ARM', columns: ['_id', 'Code', 'Description'] }]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'OmittedPlacementRecovery', currentSpec, d2Source: 'container-class scope_server: { server: Server }'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const body = {
+    prompt: 'Map every placement or explicitly explain why no stage is compatible.', currentSpec, proposal: analyzed.json.proposal,
+    roles: analyzed.json.proposal.roles.map((role) => d2RoleOverride(role))
+  };
+  const endpoint = `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`;
+  const resumeId = crypto.randomUUID();
+  const rejected = await requestJson('POST', endpoint, { ...body, stage: 'roles', resumeId }, headers);
+  assert.equal(rejected.statusCode, 422, rejected.body);
+  assert.equal(rejected.json.retryKind, 'correction');
+  assert.equal(rejected.json.partial, true);
+  assert.ok(rejected.json.mapping.unresolved.some((item) => item.code === 'assistantOmittedPlacement'), rejected.body);
+
+  const resumed = await requestJson('POST', endpoint, { ...body, stage: 'roles', resumeId }, headers);
+  assert.equal(resumed.statusCode, 202, resumed.body);
+  assert.deepEqual([resumed.json.mapping.mappedRoles, resumed.json.mapping.requiredRoles], [2, 2]);
+  assert.equal(llm.requests, 2);
   assert.equal(backend.exitCode, null);
 });
 
@@ -4347,11 +4869,168 @@ test('D2 import analysis is read-only while Apply checks the saved template vers
   assert.equal(backend.exitCode, null);
 });
 
+test('saved D2 Assistant checkpoint restores a fresh signed proposal without LiteLLM', async (t) => {
+  const baseSpec = { version: 1, steps: [], result: { tables: [] } };
+  const source = 'router: Router';
+  const initialSpec = {
+    ...baseSpec,
+    authoring: {
+      version: 1,
+      assistant: { objectFlowIntent: { context: '', blocks: [] }, diagramInterpretPrompt: '', diagramMappingPrompt: '' },
+      d2: { source }
+    }
+  };
+  const mock = await startMockCmdbuild(t, { templates: [templateCard('RestoreD2Checkpoint', initialSpec, { canUpdate: true })] });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, {
+    CMDP_D2_IMPORT_ASSISTANT_CHECKPOINT_MAX_BYTES: '16384'
+  });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-restore-checkpoint-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'RestoreD2Checkpoint', baseSpecHash: hashJson(initialSpec), currentSpec: initialSpec, d2Source: source
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const proposal = analyzed.json.proposal;
+  const analysisCheckpoint = {
+    version: 1,
+    proposalId: proposal.proposalId,
+    deterministicSpecHash: proposal.deterministicSpecHash,
+    source: {
+      hash: proposal.source.hash,
+      structureHash: proposal.source.structureHash,
+      mappingContractHash: proposal.source.mappingContractHash
+    },
+    roles: proposal.roles.map((role) => ({ id: role.id, visualKind: role.visualKind, labelTemplate: role.labelTemplate })),
+    relationRules: proposal.relationRules,
+    structureTree: proposal.structureTree
+  };
+  const assistantCheckpoint = {
+    ...analysisCheckpoint,
+    version: 1,
+    interpretation: { explanation: 'Saved interpretation', warnings: [], decisions: [] },
+    mapping: { explanation: 'Saved mapping', warnings: [], result: { mapping: { status: 'partial', mappedRoles: 0, requiredRoles: 1 } } }
+  };
+  const restored = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/restore`, {
+    templateCode: 'RestoreD2Checkpoint', baseSpecHash: hashJson(initialSpec), currentSpec: initialSpec, analysisCheckpoint, assistantCheckpoint
+  }, headers);
+  assert.equal(restored.statusCode, 200, restored.body);
+  assert.equal(restored.json.action, 'diagram-import-restore');
+  assert.equal(restored.json.restoreKind, 'assistant');
+  assert.equal(restored.json.proposal.proposalId, analysisCheckpoint.proposalId);
+  assert.ok(restored.json.proposal.signature, restored.body);
+  assert.equal(restored.json.interpretation.explanation, 'Saved interpretation');
+  assert.equal(restored.json.mapping.result.mapping.status, 'partial');
+
+  const oversizedAnalysisCheckpoint = {
+    ...analysisCheckpoint,
+    relationRules: [{ id: 'checkpoint-size-test', padding: 'x'.repeat(17 * 1024) }]
+  };
+  const oversizedAnalysis = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/restore`, {
+    templateCode: 'RestoreD2Checkpoint',
+    baseSpecHash: hashJson(initialSpec),
+    currentSpec: initialSpec,
+    analysisCheckpoint: oversizedAnalysisCheckpoint
+  }, headers);
+  assert.equal(oversizedAnalysis.statusCode, 422, oversizedAnalysis.body);
+  assert.equal(oversizedAnalysis.json.code, 'd2_import_restore_failed');
+  assert.match(oversizedAnalysis.json.message, /analysisCheckpoint exceeded configured maxBytes=16384/);
+
+  const oversizedAssistantCheckpoint = structuredClone(assistantCheckpoint);
+  oversizedAssistantCheckpoint.mapping.result.padding = 'x'.repeat(17 * 1024);
+  const oversizedAssistant = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/restore`, {
+    templateCode: 'RestoreD2Checkpoint',
+    baseSpecHash: hashJson(initialSpec),
+    currentSpec: initialSpec,
+    analysisCheckpoint,
+    assistantCheckpoint: oversizedAssistantCheckpoint
+  }, headers);
+  assert.equal(oversizedAssistant.statusCode, 200, oversizedAssistant.body);
+  assert.equal(oversizedAssistant.json.restoreKind, 'analysis');
+  assert.match(oversizedAssistant.json.assistantRestoreWarning, /assistantCheckpoint exceeded configured maxBytes=16384/);
+
+  const changed = structuredClone(initialSpec);
+  changed.steps.push({ type: 'selectCards', as: 'routers', className: 'routerG', columns: ['Code'], limit: 10 });
+  const conflict = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/restore`, {
+    templateCode: '', currentSpec: changed, analysisCheckpoint
+  }, headers);
+  assert.equal(conflict.statusCode, 409, conflict.body);
+  assert.equal(conflict.json.code, 'd2_import_analysis_checkpoint_spec_conflict');
+  assert.equal(backend.exitCode, null);
+});
+
+test('saved deterministic D2 analysis restores without an Assistant checkpoint', async (t) => {
+  const baseSpec = { version: 1, steps: [], result: { tables: [] } };
+  const source = 'router: Router';
+  const initialSpec = {
+    ...baseSpec,
+    authoring: {
+      version: 1,
+      assistant: { objectFlowIntent: { context: '', blocks: [] }, diagramInterpretPrompt: '', diagramMappingPrompt: '' },
+      d2: { source }
+    }
+  };
+  const mock = await startMockCmdbuild(t, { templates: [templateCard('RestoreD2Analysis', initialSpec, { canUpdate: true })] });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-restore-analysis-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'RestoreD2Analysis', baseSpecHash: hashJson(initialSpec), currentSpec: initialSpec, d2Source: source
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const proposal = analyzed.json.proposal;
+  const analysisCheckpoint = {
+    version: 1,
+    proposalId: proposal.proposalId,
+    deterministicSpecHash: proposal.deterministicSpecHash,
+    source: {
+      hash: proposal.source.hash,
+      structureHash: proposal.source.structureHash,
+      mappingContractHash: proposal.source.mappingContractHash
+    },
+    roles: proposal.roles.map((role) => ({ id: role.id, visualKind: role.visualKind, labelTemplate: role.labelTemplate })),
+    relationRules: proposal.relationRules,
+    structureTree: proposal.structureTree
+  };
+  const restored = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/restore`, {
+    templateCode: 'RestoreD2Analysis', baseSpecHash: hashJson(initialSpec), currentSpec: initialSpec, analysisCheckpoint
+  }, headers);
+  assert.equal(restored.statusCode, 200, restored.body);
+  assert.equal(restored.json.restoreKind, 'analysis');
+  assert.equal(restored.json.proposal.proposalId, analysisCheckpoint.proposalId);
+  assert.ok(restored.json.proposal.signature, restored.body);
+  assert.deepEqual(restored.json.interpretation, {});
+  assert.deepEqual(restored.json.mapping, {});
+  const fallback = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/restore`, {
+    templateCode: 'RestoreD2Analysis',
+    baseSpecHash: hashJson(initialSpec),
+    currentSpec: initialSpec,
+    analysisCheckpoint,
+    assistantCheckpoint: { version: 1 }
+  }, headers);
+  assert.equal(fallback.statusCode, 200, fallback.body);
+  assert.equal(fallback.json.restoreKind, 'analysis');
+  assert.match(fallback.json.assistantRestoreWarning, /Assistant result is incomplete/i);
+  assert.equal(backend.exitCode, null);
+});
+
 test('D2 import Apply stays local until the normal template Save persists the mapping', async (t) => {
   const currentSpec = apiObjectFlowSpec([
     { alias: 'routers', className: 'routerG', columns: ['Code', 'Description'] },
     { alias: 'switches', className: 'ARM', columns: ['Code', 'Description'] }
-  ]);
+  ], [{
+    id: 'match:matchedNetwork',
+    from: 'routers',
+    with: 'switches',
+    as: 'matchedNetwork',
+    rightPrefix: 'Selection 2.',
+    rules: [{ action: 'include', negate: false, operator: 'equals', leftColumn: 'Code', leftRegex: '', rightColumn: 'Code', rightRegex: '' }]
+  }]);
   const mock = await startMockCmdbuild(t, {
     domains: [{
       _id: 'AssetReference', name: 'AssetReference', source: 'routerG', sources: ['routerG'],
@@ -4410,10 +5089,14 @@ test('D2 import Apply stays local until the normal template Save persists the ma
       ...analyzed.json.proposal.relationRules[0],
       id: 'router_switch_persisted',
       kind: 'connection',
-      directionPolicy: 'template',
+      mode: 'deterministicEndpoints',
+      directionPolicy: 'dataFields',
       parentRoleId: roles.find((role) => role.mapping.primary.className === 'routerG').id,
       childRoleId: roles.find((role) => role.mapping.primary.className === 'ARM').id,
-      path: [{ kind: 'domain', name: 'AssetReference', domain: 'AssetReference', targetClass: 'ARM', direction: 'both' }]
+      sourceStageId: 'match:matchedNetwork',
+      sourceField: 'Code',
+      targetField: 'Selection 2.Code',
+      labelField: ''
     }]
   }, headers);
   assert.equal(applied.statusCode, 200, applied.body);
@@ -4437,11 +5120,18 @@ test('D2 import Apply stays local until the normal template Save persists the ma
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 applied mapping update stays local until normal template Save', async (t) => {
+test('manual D2 mapping changes are persisted by normal template Save without a second apply endpoint', async (t) => {
   const currentSpec = apiObjectFlowSpec([
     { alias: 'routers', className: 'routerG', columns: ['Code', 'Description'] },
     { alias: 'switches', className: 'ARM', columns: ['Code', 'Description'] }
-  ]);
+  ], [{
+    id: 'match:matchedNetwork',
+    from: 'routers',
+    with: 'switches',
+    as: 'matchedNetwork',
+    rightPrefix: 'Selection 2.',
+    rules: [{ action: 'include', negate: false, operator: 'equals', leftColumn: 'Code', leftRegex: '', rightColumn: 'Code', rightRegex: '' }]
+  }]);
   const mock = await startMockCmdbuild(t, {
     domains: [{
       _id: 'AssetReference', name: 'AssetReference', source: 'routerG', sources: ['routerG'],
@@ -4482,10 +5172,14 @@ test('D2 applied mapping update stays local until normal template Save', async (
       ...analyzed.json.proposal.relationRules[0],
       id: 'router_switch_applied_editor',
       kind: 'connection',
-      directionPolicy: 'template',
+      mode: 'deterministicEndpoints',
+      directionPolicy: 'dataFields',
       parentRoleId: roles.find((role) => role.mapping.primary.className === 'routerG').id,
       childRoleId: roles.find((role) => role.mapping.primary.className === 'ARM').id,
-      path: [{ kind: 'domain', name: 'AssetReference', domain: 'AssetReference', targetClass: 'ARM', direction: 'both' }]
+      sourceStageId: 'match:matchedNetwork',
+      sourceField: 'Code',
+      targetField: 'Selection 2.Code',
+      labelField: ''
     }]
   }, headers);
   assert.equal(applied.statusCode, 200, applied.body);
@@ -4502,43 +5196,29 @@ test('D2 applied mapping update stays local until normal template Save', async (
     mappedItemIds.add(item.id);
   }
   assert.ok(mappedItemIds.size > 0);
+  const manualSpec = structuredClone(appliedSpec);
+  const manualImport = manualSpec.result.diagrams[0].authoring.d2Import;
+  manualImport.structureTree = updatedStructureTree;
+  manualImport.mappingValidation = { version: 1, status: 'needsValidation' };
+  delete manualImport.mappingInputRevision;
   const templateWritesBefore = mock.requests.filter((request) => request.method === 'PUT' && request.pathname.includes('/classes/Cst_QueryTemplate/cards/')).length;
-  const updated = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/update-applied`, {
-    templateCode: 'AppliedMappingEditor',
-    baseSpecHash: hashJson(currentSpec),
-    currentSpec: appliedSpec,
-    roles: imported.roles,
-    relationRules: imported.relationRules,
-    structureTree: updatedStructureTree
-  }, headers);
-  assert.equal(updated.statusCode, 200, updated.body);
-  assert.equal(updated.json.action, 'diagram-import-update-applied');
-  assert.equal(updated.json.d2Workflow?.state, 'applied');
-  assert.equal(updated.json.template, undefined);
-  assert.equal(updated.json.versionLog, undefined);
-  assert.equal(updated.json.cacheInvalidation, undefined);
-  const updatedImport = updated.json.spec.result.diagrams[0].authoring.d2Import;
-  assert.equal(updatedImport.source, source);
-  assert.equal(updatedImport.sourceHash, imported.sourceHash);
-  assert.equal(updatedImport.structureHash, imported.structureHash);
-  assert.equal(updatedImport.structureTree.items
-    .filter((item) => mappedItemIds.has(item.id))
-    .every((item) => item.mapping.primary.labelTemplate === '${Description}'), true);
-  const templateWritesAfter = mock.requests.filter((request) => request.method === 'PUT' && request.pathname.includes('/classes/Cst_QueryTemplate/cards/')).length;
-  assert.equal(templateWritesAfter, templateWritesBefore, 'Local D2 mapping updates must not persist implicitly.');
 
   const saved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/AppliedMappingEditor`, {
-    code: 'AppliedMappingEditor', expectedSpecHash: hashJson(currentSpec), spec: updated.json.spec
+    code: 'AppliedMappingEditor', expectedSpecHash: hashJson(currentSpec), spec: manualSpec
   }, headers);
   assert.equal(saved.statusCode, 200, saved.body);
   assert.ok(saved.json.versionLog, saved.body);
   assert.equal(mock.requests.filter((request) => request.method === 'PUT' && request.pathname.includes('/classes/Cst_QueryTemplate/cards/')).length, templateWritesBefore + 1);
+  const savedImport = saved.json.template.spec.result.diagrams[0].authoring.d2Import;
+  assert.equal(savedImport.mappingValidation.status, 'valid');
+  assert.equal(savedImport.structureTree.items
+    .filter((item) => mappedItemIds.has(item.id))
+    .every((item) => item.mapping.primary.labelTemplate === '${Description}'), true);
 
-  const missing = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/update-applied`, {
-    templateCode: 'AppliedMappingEditor', baseSpecHash: saved.json.template.specHash, currentSpec, roles: []
+  const removed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/update-applied`, {
+    templateCode: 'AppliedMappingEditor', baseSpecHash: saved.json.template.specHash, currentSpec: manualSpec
   }, headers);
-  assert.equal(missing.statusCode, 409, missing.body);
-  assert.equal(missing.json.code, 'diagram_import_mapping_missing');
+  assert.equal(removed.statusCode, 404, removed.body);
   assert.equal(backend.exitCode, null);
 });
 
@@ -4602,9 +5282,12 @@ test('D2 analysis and local Apply do not require an update grant', async (t) => 
     roles,
     structureTree: d2StructureTreeWithMaterialization(analyzedReadOnly.json.proposal, roles)
   }, headers);
-  assert.equal(localApply.statusCode, 422, localApply.body);
+  assert.equal(localApply.statusCode, 200, localApply.body);
+  assert.equal(localApply.json.status, 'partial');
+  assert.equal(localApply.json.partial, true);
+  assert.equal(localApply.json.d2Workflow.state, 'pending');
+  assert.ok(localApply.json.omissions.some((item) => item.kind === 'connection'));
   assert.notEqual(localApply.json.reason, 'template_update_forbidden');
-  assert.equal(localApply.json.code, 'diagram_import_topology_unresolved');
 
   const forbiddenSave = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/NoUpdateGrant`, {
     code: 'NoUpdateGrant', expectedSpecHash: hashJson(savedSpec), spec: savedSpec
@@ -5266,6 +5949,53 @@ test('model metadata endpoints read inherited attributes with service scope', as
     item.pathname.endsWith('/classes/routerG/attributes') &&
     item.search === '?scope=service&limit=1000'
   ), true);
+  assert.equal(backend.exitCode, null);
+});
+
+test('model catalog hydrates domain endpoints omitted by the CMDBuild domain list', async (t) => {
+  const mock = await startMockCmdbuild(t, {
+    classes: [
+      { _id: 1, name: 'ZabbixMonitoring', description: 'Monitoring', prototype: true, active: true },
+      { _id: 2, name: 'ipRange', description: 'IP range', parent: 'ZabbixMonitoring', active: true },
+      { _id: 3, name: 'vlan', description: 'VLAN', active: true }
+    ],
+    domains: [{ _id: 1, name: 'Vlan2super', description: 'VLAN relation', active: true }],
+    domainDetails: {
+      Vlan2super: {
+        _id: 1,
+        name: 'Vlan2super',
+        description: 'VLAN relation',
+        source: 'vlan',
+        sources: ['vlan'],
+        destination: 'ZabbixMonitoring',
+        destinations: ['ipRange'],
+        cardinality: 'N:1',
+        active: true
+      }
+    }
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=domain-detail-test-token';
+
+  const catalog = await requestJson(
+    'GET',
+    `${backendOrigin}/cmdbuild/custom-api/model/catalog?maxClasses=5&maxDomains=5&includeAttributes=false`,
+    undefined,
+    { cookie }
+  );
+
+  assert.equal(catalog.statusCode, 200, catalog.body);
+  const domain = catalog.json.catalog.domains.find((item) => item.name === 'Vlan2super');
+  assert.deepEqual(domain && domain.sources, ['vlan']);
+  assert.deepEqual(domain && domain.destinations, ['ipRange']);
+  assert.deepEqual(catalog.json.catalog.domainEndpoints, {
+    version: 1,
+    attempted: true,
+    complete: true
+  });
+  assert.equal(mock.requests.some((item) => item.pathname === '/cmdbuild/services/rest/v3/domains/Vlan2super'), true);
   assert.equal(backend.exitCode, null);
 });
 
@@ -6132,6 +6862,7 @@ async function startMockCmdbuild(t, options = {}) {
     Array.isArray(attributes) ? attributes.map((attribute) => ({ ...attribute })) : []
   ]));
   const domains = Array.isArray(options.domains) ? options.domains : [];
+  const domainDetails = options.domainDetails && typeof options.domainDetails === 'object' ? options.domainDetails : {};
   const cardsByClass = options.cardsByClass || {};
   const relationsByCard = options.relationsByCard || {};
   const server = http.createServer(async (req, res) => {
@@ -6260,7 +6991,7 @@ async function startMockCmdbuild(t, options = {}) {
     const domainMatch = requestUrl.pathname.match(/^\/cmdbuild\/services\/rest\/v3\/domains\/([^/]+)$/);
     if (domainMatch) {
       const name = decodeURIComponent(domainMatch[1]);
-      const domain = domains.find((item) => item && item.name === name);
+      const domain = domainDetails[name] || domains.find((item) => item && item.name === name);
       if (domain) sendJson(res, 200, { data: domain });
       else sendJson(res, 404, { message: `Domain not found: ${name}` });
       return;
@@ -6604,6 +7335,8 @@ test('schema bootstrap returns conflict without attempting mutations', async (t)
   });
   assert.equal(response.statusCode, 409, response.body);
   assert.equal(response.json.schema.status, 'conflict');
+  assert.equal(response.json.schema.rootCause.kind, 'conflict');
+  assert.equal(response.json.schema.conflicts.length, 1);
   assert.equal(mock.requests.some((request) => request.method === 'POST' && request.pathname.includes('/classes')), false);
   assert.equal(backend.exitCode, null);
 });

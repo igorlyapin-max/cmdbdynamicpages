@@ -5,6 +5,8 @@ import vm from 'node:vm';
 
 const launcherSource = fs.readFileSync('src/CmdbDynamicPages.js', 'utf8');
 const proxySource = fs.readFileSync('scripts/dev-proxy-server.mjs', 'utf8');
+const envExampleSource = fs.readFileSync('.env.example', 'utf8');
+const nginxSource = fs.readFileSync('nginx/cmdbdynamicpages.conf', 'utf8');
 
 test('Assistant browser deadline follows the configured MCP timeout with backend response grace', () => {
   const helperStart = proxySource.indexOf('function assistantRequestTimeoutMs(backendPhases)');
@@ -23,7 +25,34 @@ test('Assistant browser deadline follows the configured MCP timeout with backend
   assert.ok(diagramAssistantEnd > diagramAssistantStart, 'Diagram Assistant request helper boundary is missing.');
   assert.match(diagramAssistantSource, /\/assistant\/diagram-import\//);
   assert.match(diagramAssistantSource, /map-selections/);
-  assert.match(diagramAssistantSource, /timeoutMs: assistantRequestTimeoutMs\(\)/);
+  assert.match(proxySource, /function assistantDiagramRequestAttemptCount\(kind\)/);
+  assert.match(proxySource, /boot\.assistantDiagramMaxAttempts/);
+  assert.match(proxySource, /function assistantDiagramMappingStageAttemptCount\(stage\)/);
+  assert.match(proxySource, /function assistantDiagramMappingStageAutoRetryCount\(stage\)/);
+  assert.match(proxySource, /function assistantDiagramMappingStageCorrectionRetryCount\(stage\)/);
+  assert.match(proxySource, /function assistantDiagramMappingStageRetryBudget\(stage\)/);
+  assert.match(proxySource, /function assistantDiagramMappingStageTimeoutMs\(stage\)/);
+  assert.match(proxySource, /retries are separate checkpointed requests\.[\s\S]*return 1;/);
+  assert.match(proxySource, /boot\.assistantDiagramStageAutoRetries/);
+  assert.match(proxySource, /boot\.assistantDiagramStageCorrectionRetries/);
+  assert.match(diagramAssistantSource, /var attemptCount = assistantDiagramRequestAttemptCount\(kind\)/);
+  assert.match(diagramAssistantSource, /timeoutMs: assistantRequestTimeoutMs\(attemptCount\)/);
+  assert.match(diagramAssistantSource, /timeoutMs: assistantDiagramMappingStageTimeoutMs\(stage\)/);
+  assert.match(diagramAssistantSource, /stage: stage, resumeId: mappingResumeId/);
+  assert.match(diagramAssistantSource, /Number\(result\.status \|\| 0\) === 202/);
+  assert.match(proxySource, /assistantDiagramStageMaxAttempts: \{/);
+  assert.match(proxySource, /roles: ASSISTANT_DIAGRAM_MAPPING_STAGE_MAX_ATTEMPTS/);
+  assert.match(proxySource, /topology: ASSISTANT_DIAGRAM_MAPPING_STAGE_MAX_ATTEMPTS/);
+  assert.match(proxySource, /roles: ASSISTANT_DIAGRAM_MAPPING_STAGE_AUTO_RETRIES/);
+  assert.match(proxySource, /topology: ASSISTANT_DIAGRAM_MAPPING_STAGE_AUTO_RETRIES/);
+  assert.match(proxySource, /roles: ASSISTANT_DIAGRAM_MAPPING_STAGE_CORRECTION_RETRIES/);
+  assert.match(proxySource, /topology: ASSISTANT_DIAGRAM_MAPPING_STAGE_CORRECTION_RETRIES/);
+  assert.match(proxySource, /const ASSISTANT_DIAGRAM_MAPPING_STAGE_MAX_ATTEMPTS = 1/);
+  assert.match(proxySource, /const ASSISTANT_DIAGRAM_MAPPING_STAGE_AUTO_RETRIES = 1/);
+  assert.match(proxySource, /const ASSISTANT_DIAGRAM_MAPPING_STAGE_CORRECTION_RETRIES = 2/);
+  assert.match(proxySource, /assistantDiagramMaxAttempts: \{/);
+  assert.match(proxySource, /map: ASSISTANT_DIAGRAM_MAPPING_MAX_ATTEMPTS/);
+  assert.match(proxySource, /interpret: ASSISTANT_DIAGRAM_INTERPRET_MAX_ATTEMPTS/);
   assert.ok(proxySource.includes('/assistant/diagram-import/interpret'), 'Diagram interpretation endpoint is missing.');
   assert.ok(proxySource.includes('/assistant/diagram-import/map-selections'), 'Diagram mapping endpoint is missing.');
   const semanticRouteStart = proxySource.indexOf('/assistant/object-flow/semantic-plan');
@@ -36,6 +65,17 @@ test('Assistant browser deadline follows the configured MCP timeout with backend
   assert.match(proxySource, /const contextDeadlineAt = contextStartedAt \+ contextTimeoutMs/);
   assert.match(proxySource, /MCP context collection stopped after/);
   assert.doesNotMatch(proxySource, /CMDP_ASSISTANT_TIMEOUT_MS/);
+  assert.match(proxySource, /function createRequestAbortContext\(req, res\)/);
+  assert.match(proxySource, /assistant_request_cancelled/);
+  assert.match(proxySource, /assistant\.diagram_mapping\.cancelled/);
+  assert.match(proxySource, /assistant\.diagram_mapping\.failed/);
+  assert.match(proxySource, /assistant\.diagram_mapping\.checkpoint\.saved/);
+  assert.match(proxySource, /assistant-diagram-mapping/);
+  assert.match(proxySource, /D2 mapping of connections needs a resumable deterministic correction/);
+  assert.match(proxySource, /function assertAssistantDiagramMappingCheckpointSize\(checkpoint\)/);
+  assert.match(proxySource, /assistant_diagram_mapping_checkpoint_too_large/);
+  assert.match(proxySource, /CMDP_D2_IMPORT_ASSISTANT_CHECKPOINT_MAX_BYTES/);
+  assert.match(proxySource, /await cacheDelete\('assistant-diagram-mapping', mappingCheckpointOptions\.key/);
 
   const previewHelperStart = proxySource.indexOf('function draftPreviewRequestTimeoutMs()');
   const previewHelperEnd = proxySource.indexOf('function publicSnapshotRunPath', previewHelperStart);
@@ -56,6 +96,22 @@ test('Assistant browser deadline follows the configured MCP timeout with backend
   assert.equal((proxySource.match(/request\(apiPrefix \+ '\/draft\/preview/g) || []).length, 0, 'Draft preview must not use the generic 15s browser request helper.');
 });
 
+test('D2 mapping keeps one LiteLLM call inside each nginx-bounded HTTP stage', () => {
+  const mappingStageStart = proxySource.indexOf("if (input.kind === 'mapping') {");
+  const mappingStageEnd = proxySource.indexOf('async function createAssistantDiagramMappingRolesDraft', mappingStageStart);
+  const mappingStageSource = proxySource.slice(mappingStageStart, mappingStageEnd);
+
+  assert.ok(mappingStageStart >= 0, 'D2 mapping stage builder is missing.');
+  assert.ok(mappingStageEnd > mappingStageStart, 'D2 mapping stage builder boundary is missing.');
+  assert.match(mappingStageSource, /Mapping retries must use a separate HTTP request/);
+  assert.doesNotMatch(mappingStageSource, /callAssistantDiagramStage\(retryInput/);
+  assert.match(proxySource, /const ASSISTANT_DIAGRAM_MAPPING_STAGE_MAX_ATTEMPTS = 1/);
+  assert.match(proxySource, /const ASSISTANT_DIAGRAM_MAPPING_STAGE_AUTO_RETRIES = 1/);
+  assert.match(proxySource, /const ASSISTANT_DIAGRAM_MAPPING_STAGE_CORRECTION_RETRIES = 2/);
+  assert.match(envExampleSource, /CMDP_NGINX_CUSTOM_API_READ_TIMEOUT=70s/);
+  assert.match(nginxSource, /proxy_read_timeout \$\{CMDP_NGINX_CUSTOM_API_READ_TIMEOUT\}/);
+});
+
 function generatedDynamicPagesClientScript() {
   const start = proxySource.indexOf('function dynamicPagesClientScript()');
   const end = proxySource.indexOf('\nfunction readJsonBody', start);
@@ -70,13 +126,15 @@ function generatedDynamicPagesClientScript() {
     'DEFAULT_TEMPLATE_CACHE_TTL_SEC',
     'D2_IMPORT_SEMANTIC_MODEL_REVISION',
     'D2_IMPORT_STRUCTURE_TREE_VERSION',
+    'D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION',
+    'D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION',
     'DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT',
     'DEFAULT_ASSISTANT_OBJECT_FLOW_SEMANTIC_PROMPT',
     'DEFAULT_ASSISTANT_DIAGRAM_INTERPRETATION_PROMPT',
     'DEFAULT_ASSISTANT_DIAGRAM_MAPPING_PROMPT',
     factorySource
   );
-  return factory('empty result', 'permission denied', 3600, 10, 5, 'object flow prompt', 'semantic plan prompt', 'diagram interpretation prompt', 'diagram mapping prompt')();
+  return factory('empty result', 'permission denied', 3600, 10, 5, 1, 1, 'object flow prompt', 'semantic plan prompt', 'diagram interpretation prompt', 'diagram mapping prompt')();
 }
 
 test('generated Dynamic Pages client script parses as browser JavaScript', () => {
@@ -108,12 +166,20 @@ test('generated Dynamic Pages client script parses as browser JavaScript', () =>
   assert.match(clientScript, /var sourceDirectionPolicy = normalizeDiagramDirectionPolicyClient\(candidate\.directionPolicy\)/);
   assert.match(clientScript, /function diagramImportStructureTreeClient\(proposal\)/);
   assert.match(clientScript, /function renderDiagramImportStructureTree\(proposal, spec\)/);
+  assert.match(clientScript, /function diagramImportStructureViewportSnapshot\(preferredItemId\)/);
+  assert.match(clientScript, /function refreshDiagramImportStructureEditor\(proposal, spec, viewportSnapshot\)/);
+  assert.match(clientScript, /function selectDiagramImportStructureItem\(target\)/);
   assert.match(clientScript, /function renderDiagramSvgContract\(diagram\)/);
   assert.match(clientScript, /data-diagram-import-materialization-ledger/);
   assert.match(clientScript, /Материализованные объекты диаграммы/);
   assert.match(clientScript, /Контракт выполнения mapping/);
   assert.match(clientScript, /data-diagram-svg-contract/);
   assert.match(clientScript, /data-diagram-structure-tree/);
+  assert.match(clientScript, /diagramImportCollapsedStructureItemIds: \{\}/);
+  assert.match(clientScript, /function toggleDiagramImportStructureTreeBranch\(itemId\)/);
+  assert.match(clientScript, /function diagramImportStructureTreeExpandAncestorsClient\(tree, itemId, includeItem\)/);
+  assert.match(clientScript, /data-action="diagram-structure-toggle"/);
+  assert.match(clientScript, /aria-expanded="/);
   assert.match(clientScript, /data-diagram-import-placement-mapping/);
   assert.match(clientScript, /data-diagram-import-placement-field="materialization\.kind"/);
   assert.match(clientScript, /data-diagram-import-placement-field="materialization\.stageId"/);
@@ -272,11 +338,13 @@ test('D2 label template keeps related binding identifiers internal', () => {
     'uniqueList',
     'catalogAttributeOptions',
     'diagramImportStageById',
+    'diagramImportStageFieldDisplayLabel',
     'diagramImportFieldDisplayLabel',
     'diagramImportClassDisplayLabel',
     'catalogDomains',
     'diagramImportCatalogDisplayLabel',
     'diagramTemplateParameterTokenRows',
+    'userFacingResultLabel',
     't',
     'diagramImportRoleVisualKindClient',
     `${clientScript.slice(helperStart, helperEnd)}\nreturn { diagramImportLabelTemplateCandidates, diagramImportLabelTemplateHasUnterminatedPlaceholder, diagramImportDisplayLabelTemplate, diagramImportCanonicalLabelTemplate, diagramImportEnsureRelatedTemplateFields };`
@@ -287,11 +355,13 @@ test('D2 label template keeps related binding identifiers internal', () => {
       ? [{ name: 'ipAddr' }, { name: 'Id' }, { name: '_id' }]
       : [{ name: 'Code' }, { name: 'Description' }, { name: 'Id' }, { name: '_id' }, { name: 'Class' }],
     () => ({ columns: ['Code', 'Description', 'Id', '_id', 'Class'] }),
+    (_stage, field) => String(field || ''),
     (_className, field) => field,
     (className) => className,
     () => [],
     (name) => name,
     (spec) => Object.keys(spec && spec.params || {}).sort().map((name) => ({ value: `param.${name}`, label: `Параметр: ${name}` })),
+    (value) => String(value || ''),
     (key, values = {}) => `${values.className || ''} ${values.path || ''} ${values.field || ''}`.trim() || key,
     (role) => String(role && role.visualKind || 'node')
   );
@@ -300,6 +370,7 @@ test('D2 label template keeps related binding identifiers internal', () => {
     primary: { className: 'ARM', structuredFields: [] },
     related: [{
       id: 'related_comparison_abc123',
+      stageId: 'ipaddress',
       className: 'IpAddress',
       path: [{ kind: 'reference', name: 'ipaddress', targetClass: 'IpAddress' }],
       structuredFields: []
@@ -432,32 +503,41 @@ test('client-side D2 diagnostics validate item-owned mappings and matching condi
   assert.match(clientScript, /data-diagram-import-rule-row/);
 });
 
-test('D2 placement filter fields include readable catalog paths outside Object Flow columns', () => {
+test('D2 placement filter candidates include readable catalog paths outside Object Flow columns', () => {
   const clientScript = generatedDynamicPagesClientScript();
-  const helpersStart = clientScript.indexOf('function diagramImportConditionStageFieldOptions(spec, stageId, selectedName)');
+  const helpersStart = clientScript.indexOf('function diagramImportConditionSourceKeyClient(source)');
   const helpersEnd = clientScript.indexOf('\n  function renderDiagramImportPlacementConditionRow', helpersStart);
   assert.ok(helpersStart >= 0, 'D2 placement-filter field helper is missing.');
   assert.ok(helpersEnd > helpersStart, 'D2 placement-filter helper boundary is missing.');
 
   const helpers = new Function(
+    'state',
     'diagramImportStageById',
     'diagramImportStageFieldDisplayLabel',
+    'normalizeDiagramImportConditionCardSourceClient',
+    'diagramImportUniqueStageCardSources',
+    'diagramImportCurrentStageCardSource',
     'uniqueList',
     'catalogScopePathOptions',
     'escapeHtml',
-    `${clientScript.slice(helpersStart, helpersEnd)}\nreturn { diagramImportConditionStageFieldOptions, diagramImportConditionStageFieldIsAvailable };`
+    `${clientScript.slice(helpersStart, helpersEnd)}\nreturn { diagramImportConditionStageFieldCandidates, diagramImportConditionStageFieldOptions, diagramImportConditionStageFieldIsAvailable };`
   )(
+    { catalogRevision: 1, diagramImportConditionCatalogFieldsCache: {} },
     (_spec, stageId) => stageId === 'relation:block_2'
       ? { id: stageId, className: 'vlan', columns: ['Code', 'Description'] }
       : null,
     (_stage, fieldName) => String(fieldName || ''),
+    (source) => source && source.className && source.classColumn && source.idColumn ? source : null,
+    (values) => values || [],
+    (className) => ({ id: 'current', className, classColumn: 'Class', idColumn: '_id', label: 'Карточка результата' }),
     (values) => [...new Set((values || []).filter(Boolean))],
     (className) => className === 'vlan'
       ? [
           { value: 'Code', label: 'Code' },
           { value: 'Description', label: 'Description' },
           { value: 'isNAT', label: 'NAT (isNAT)' },
-          { value: 'ipaddress.ipAddr', label: 'IP address (ipaddress.ipAddr)' }
+          { value: 'ipaddress.ipAddr', label: 'IP address (ipaddress.ipAddr)' },
+          { value: '{IpRangeVlanDomain:vlan}.isNAT', label: 'ipRange -> VLAN -> NAT ({IpRangeVlanDomain:vlan}.isNAT)' }
         ]
       : [],
     (value) => String(value)
@@ -469,12 +549,361 @@ test('D2 placement filter fields include readable catalog paths outside Object F
   );
 
   const options = helpers.diagramImportConditionStageFieldOptions({}, 'relation:block_2', 'isNAT');
+  const candidates = helpers.diagramImportConditionStageFieldCandidates({}, 'relation:block_2', 'isNAT');
+  const catalogCandidates = helpers.diagramImportConditionStageFieldCandidates({}, 'relation:block_2', 'isNAT', null, true);
   assert.match(options, /Уже в результате/);
   assert.match(options, /Будет дочитано из CMDBuild/);
   assert.match(options, /value="isNAT" selected/);
-  assert.match(options, /value="ipaddress\.ipAddr"/);
+  assert.doesNotMatch(options, /value="ipaddress\.ipAddr"/, 'Query-first fields must not eagerly render deep catalog options.');
+  assert.doesNotMatch(options, /value="\{IpRangeVlanDomain:vlan\}\.isNAT"/, 'Query-first fields must not eagerly render domain paths.');
+  assert.equal(candidates.catalog.some((field) => field.value === '{IpRangeVlanDomain:vlan}.isNAT'), false, 'D2 picker must defer deep catalog paths until a query asks for them.');
+  assert.equal(catalogCandidates.catalog.filter((field) => field.value === '{IpRangeVlanDomain:vlan}.isNAT').length, 1);
   assert.equal(helpers.diagramImportConditionStageFieldIsAvailable({}, 'relation:block_2', 'isNAT'), true);
+  assert.equal(helpers.diagramImportConditionStageFieldIsAvailable({}, 'relation:block_2', '{IpRangeVlanDomain:vlan}.isNAT'), true);
   assert.equal(helpers.diagramImportConditionStageFieldIsAvailable({}, 'relation:block_2', 'missingField'), false);
+});
+
+test('query-first pickers retain Diagram field attributes and cap lazy suggestions', () => {
+  const catalogMatchStart = proxySource.indexOf('function catalogFieldPickerMatches(options, selectedName, query)');
+  const catalogPickerStart = proxySource.indexOf('function renderCatalogFieldPicker(fieldAttribute, selectedName, initialOptions, context)');
+  const catalogOptionsStart = proxySource.indexOf('function catalogFieldPickerOptions(picker, query)', catalogPickerStart);
+  const catalogHandlerEnd = proxySource.indexOf('function matchingLeftColumnOptions(', catalogOptionsStart);
+  const hierarchyStart = proxySource.indexOf('function renderDiagramImportHierarchyConditionRow(conditions, childStageId, parentStageId, spec, index)');
+  const hierarchyEnd = proxySource.indexOf('function diagramImportHierarchyStageLabel(', hierarchyStart);
+  const relatedStart = proxySource.indexOf('function renderDiagramImportRelatedConditionRow(related, primaryStageId, spec, index)');
+  const relatedEnd = proxySource.indexOf('function renderDiagramImportRelatedCorrelation(', relatedStart);
+  const conditionMatchStart = proxySource.indexOf('function diagramImportConditionPickerMatches(spec, stageId, selectedName, selectedSource, query)');
+  const conditionPickerStart = proxySource.indexOf('function renderDiagramImportConditionFieldPicker(spec, stageId, fieldAttribute, selectedName, selectedSource)');
+  const conditionPickerEnd = proxySource.indexOf('function closeDiagramImportConditionFieldPickers(', conditionPickerStart);
+  const conditionRefreshStart = proxySource.indexOf('function refreshDiagramImportConditionPickerResults(input)', conditionPickerEnd);
+  const conditionRefreshEnd = proxySource.indexOf('function scheduleDiagramImportConditionPickerResults(input)', conditionRefreshStart);
+  const conditionToggleStart = proxySource.indexOf('function toggleDiagramImportConditionFieldPicker(target)', conditionPickerEnd);
+  const conditionToggleEnd = proxySource.indexOf('function selectDiagramImportConditionPickerField(target)', conditionToggleStart);
+  const relationPathStart = proxySource.indexOf('function renderRelationPathPlanner(model, spec)');
+  const relationPathEnd = proxySource.indexOf('function firstResultTable(', relationPathStart);
+  const classicMappingStart = proxySource.indexOf('function renderDiagramFieldSelect(spec, sourceAlias, fieldName, selectedName)');
+  const classicMappingEnd = proxySource.indexOf('function diagramFieldListFromValue(', classicMappingStart);
+  const dataSelectionStart = proxySource.indexOf('function renderSelectionFilterRow(filter, step)');
+  const dataSelectionEnd = proxySource.indexOf('function renderDataSelectionEditor(selected)', dataSelectionStart);
+  const finalViewStart = proxySource.indexOf('function renderViewComposerColumnRow(column, spec, sourceAlias)');
+  const finalViewEnd = proxySource.indexOf('function renderViewComposerEditor(', finalViewStart);
+  const visualizationPickerStart = proxySource.indexOf('function renderVisualizationColumnPicker(fieldAttribute, selected, tableName, columns)');
+  const visualizationPickerEnd = proxySource.indexOf('function renderVisualizationRowGroupRow(', visualizationPickerStart);
+  const visualizationTableStart = proxySource.indexOf('function renderVisualizationTableRow(table, settings, spec)');
+  const visualizationTableEnd = proxySource.indexOf('function renderVisualizationEditor(selected)', visualizationTableStart);
+  assert.ok(catalogMatchStart >= 0, 'Shared picker match helper is missing.');
+  assert.ok(catalogPickerStart > catalogMatchStart, 'Shared picker renderer is missing.');
+  assert.ok(catalogOptionsStart > catalogPickerStart, 'Shared picker lazy option resolver is missing.');
+  assert.ok(catalogHandlerEnd > catalogOptionsStart, 'Shared picker handler boundary is missing.');
+  assert.ok(hierarchyStart >= 0 && hierarchyEnd > hierarchyStart, 'Diagram hierarchy condition renderer is missing.');
+  assert.ok(relatedStart >= 0 && relatedEnd > relatedStart, 'Diagram related-data condition renderer is missing.');
+  assert.ok(conditionMatchStart >= 0 && conditionPickerStart > conditionMatchStart, 'D2 condition candidate matcher is missing.');
+  assert.ok(conditionPickerStart >= 0 && conditionPickerEnd > conditionPickerStart, 'D2 condition picker renderer is missing.');
+  assert.ok(conditionRefreshStart > conditionPickerEnd && conditionRefreshEnd > conditionRefreshStart, 'D2 condition query refresh is missing.');
+  assert.ok(conditionToggleStart > conditionPickerEnd && conditionToggleEnd > conditionToggleStart, 'D2 condition picker lazy loader is missing.');
+  assert.ok(relationPathStart >= 0 && relationPathEnd > relationPathStart, 'Relation path planner is missing.');
+  assert.ok(classicMappingStart >= 0 && classicMappingEnd > classicMappingStart, 'Classic Diagram mapping field renderer is missing.');
+  assert.ok(dataSelectionStart >= 0 && dataSelectionEnd > dataSelectionStart, 'Data selection field renderer is missing.');
+  assert.ok(finalViewStart >= 0 && finalViewEnd > finalViewStart, 'Final View field renderer is missing.');
+  assert.ok(visualizationPickerStart >= 0 && visualizationPickerEnd > visualizationPickerStart, 'Visualization column picker is missing.');
+  assert.ok(visualizationTableStart >= 0 && visualizationTableEnd > visualizationTableStart, 'Visualization table renderer is missing.');
+
+  const catalogMatchSource = proxySource.slice(catalogMatchStart, catalogPickerStart);
+  const catalogPickerSource = proxySource.slice(catalogPickerStart, catalogOptionsStart);
+  const catalogHandlerSource = proxySource.slice(catalogOptionsStart, catalogHandlerEnd);
+  const hierarchySource = proxySource.slice(hierarchyStart, hierarchyEnd);
+  const relatedSource = proxySource.slice(relatedStart, relatedEnd);
+  const conditionMatchSource = proxySource.slice(conditionMatchStart, conditionPickerStart);
+  const conditionPickerSource = proxySource.slice(conditionPickerStart, conditionPickerEnd);
+  const conditionRefreshSource = proxySource.slice(conditionRefreshStart, conditionRefreshEnd);
+  const conditionToggleSource = proxySource.slice(conditionToggleStart, conditionToggleEnd);
+  const relationPathSource = proxySource.slice(relationPathStart, relationPathEnd);
+  const classicMappingSource = proxySource.slice(classicMappingStart, classicMappingEnd);
+  const dataSelectionSource = proxySource.slice(dataSelectionStart, dataSelectionEnd);
+  const finalViewSource = proxySource.slice(finalViewStart, finalViewEnd);
+  const visualizationPickerSource = proxySource.slice(visualizationPickerStart, visualizationPickerEnd);
+  const visualizationTableSource = proxySource.slice(visualizationTableStart, visualizationTableEnd);
+
+  assert.match(catalogMatchSource, /function renderCatalogFieldPickerRows\(options, selectedName, query\)/);
+  assert.match(catalogMatchSource, /matches\.slice\(0, 60\)/);
+  assert.match(catalogPickerSource, /<input type="hidden" data-catalog-field-picker-value data-catalog-field-picker-selected-label="' \+ escapeHtml\(label\) \+ '" ' \+ fieldAttribute/);
+  assert.match(catalogPickerSource, /data-catalog-field-picker-search/);
+  assert.match(catalogHandlerSource, /function catalogFieldPickerOptions\(picker, query\)/);
+  assert.match(catalogHandlerSource, /function toggleCatalogFieldPicker\(target\)/);
+  assert.match(catalogHandlerSource, /if \(!query\)[\s\S]*renderCatalogFieldPickerPrompt\(\)/);
+  assert.match(catalogHandlerSource, /kind === 'selection'/);
+  assert.match(catalogHandlerSource, /kind === 'visualization'/);
+  assert.match(conditionMatchSource, /\.slice\(0, 60\)/);
+  assert.match(conditionPickerSource, /data-diagram-import-condition-picker-field ' \+ fieldAttribute/);
+  assert.match(conditionPickerSource, /data-diagram-import-condition-picker-search/);
+  assert.match(conditionPickerSource, /renderDiagramImportConditionPickerPrompt\(\)/);
+  assert.match(conditionRefreshSource, /if \(!query\)[\s\S]*renderDiagramImportConditionPickerPrompt\(\)/);
+  assert.match(conditionRefreshSource, /ensureDiagramImportConditionCatalogForStage\(spec, stageId\)/);
+  assert.doesNotMatch(conditionToggleSource, /ensureDiagramImportConditionCatalogForStage/, 'Opening a query-first picker must not eagerly load catalog paths.');
+
+  assert.match(hierarchySource, /renderDiagramImportConditionFieldPicker\(spec, childStageId, 'data-diagram-import-hierarchy-field="left\.column"/);
+  assert.match(hierarchySource, /renderDiagramImportConditionFieldPicker\(spec, parentStageId, 'data-diagram-import-hierarchy-field="right\.column"/);
+  assert.doesNotMatch(hierarchySource, /<select data-diagram-import-hierarchy-field="(?:left|right)\.column"/);
+  assert.match(relatedSource, /renderDiagramImportConditionFieldPicker\(spec, related && related\.stageId \|\| '', 'data-diagram-import-related-condition-field="left\.column"/);
+  assert.match(relatedSource, /renderDiagramImportConditionFieldPicker\(spec, primaryStageId, 'data-diagram-import-related-condition-field="right\.column"/);
+  assert.doesNotMatch(relatedSource, /<select data-diagram-import-related-condition-field="(?:left|right)\.column"/);
+  assert.match(relationPathSource, /renderCatalogFieldPicker\(\s*'data-relation-path'/);
+  assert.match(classicMappingSource, /renderCatalogFieldPicker\(/);
+  assert.match(classicMappingSource, /data-diagram-mapping-field/);
+  assert.match(dataSelectionSource, /renderCatalogFieldPicker\(\s*'data-selection-filter-field="attribute"/);
+  assert.doesNotMatch(dataSelectionSource, /<input data-selection-filter-field="attribute"/);
+  assert.match(finalViewSource, /renderCatalogFieldPicker\(\s*'data-view-column-field="field"/);
+  assert.match(visualizationPickerSource, /renderCatalogFieldPicker\(/);
+  assert.match(visualizationTableSource, /renderVisualizationColumnPicker\('data-visualization-field="sortColumn"/);
+  assert.match(visualizationTableSource, /renderVisualizationColumnPicker\('data-visualization-field="groupBy"/);
+  assert.doesNotMatch(visualizationTableSource, /data-visualization-column-options/);
+});
+
+test('full catalog cache marks successful class attributes as loaded and retries catalog errors', () => {
+  const clientScript = generatedDynamicPagesClientScript();
+  const helperStart = clientScript.indexOf('function applyCatalogCache(record)');
+  const helperEnd = clientScript.indexOf('\n  function viewComposerCatalogClassNames', helperStart);
+  assert.ok(helperStart >= 0, 'Catalog cache helper is missing.');
+  assert.ok(helperEnd > helperStart, 'Catalog cache helper boundary is missing.');
+
+  const state = {
+    catalog: null,
+    catalogRevision: 0,
+    catalogScopePathOptionsCache: { stale: [] },
+    diagramImportConditionCatalogFieldsCache: { stale: [] },
+    catalogAttributeLoaded: {},
+    catalogAttributeLoads: {},
+    catalogAttributeFailedAt: { broken: 1 },
+    catalogStatus: {},
+    selectedClass: '',
+    classAttributes: []
+  };
+  const helpers = new Function(
+    'state',
+    'CATALOG_FRESH_MS',
+    'catalogClassByName',
+    `${clientScript.slice(helperStart, helperEnd)}\nreturn { applyCatalogCache };`
+  )(
+    state,
+    24 * 60 * 60 * 1000,
+    (name) => (state.catalog && state.catalog.classes || []).find((item) => String(item.name).toLowerCase() === String(name).toLowerCase()) || null
+  );
+
+  helpers.applyCatalogCache({
+    updatedAt: new Date().toISOString(),
+    catalog: {
+      limits: { includeAttributes: true },
+      classes: [{ name: 'vlan', attributes: [] }, { name: 'broken', attributes: [] }],
+      warnings: { attributeErrors: [{ className: 'broken', cmdbuildStatus: 403 }] }
+    }
+  });
+
+  assert.equal(state.catalogAttributeLoaded.vlan, true);
+  assert.equal(state.catalogAttributeLoaded.broken, undefined);
+  assert.equal(state.catalogAttributeFailedAt.broken, 1);
+  assert.deepEqual(state.catalogScopePathOptionsCache, {});
+  assert.deepEqual(state.diagramImportConditionCatalogFieldsCache, {});
+});
+
+test('D2 placement filter catalog keeps a readable domain path at configured depth', () => {
+  const clientScript = generatedDynamicPagesClientScript();
+  const helperStart = clientScript.indexOf('function catalogClassInheritsFrom(className, endpointClass)');
+  const helperEnd = clientScript.indexOf('\n  function renderScopePathOptions', helperStart);
+  assert.ok(helperStart >= 0, 'Catalog-path helper is missing.');
+  assert.ok(helperEnd > helperStart, 'Catalog-path helper boundary is missing.');
+
+  const classes = {
+    ZabbixMonitoring: {
+      name: 'ZabbixMonitoring', description: 'Monitoring object', attributes: []
+    },
+    ipRange: {
+      name: 'ipRange', description: 'IP range', parent: 'ZabbixMonitoring', attributes: []
+    },
+    vlan: {
+      name: 'vlan', description: 'VLAN', attributes: [{ name: 'isNAT', description: 'NAT', type: 'boolean' }]
+    }
+  };
+  const domains = [{
+    name: 'Vlan2super', description: 'Range to VLAN',
+    sources: ['vlan'], destinations: ['ZabbixMonitoring'], cardinality: 'N:1'
+  }];
+  const state = { maxTraversalDepth: 3, catalogRevision: 1, catalogScopePathOptionsCache: {} };
+  const helpers = new Function(
+    'state',
+    'catalogAttributeOptions',
+    'catalogClasses',
+    'catalogDomains',
+    'catalogClassByName',
+    'isReferenceAttribute',
+    'domainSources',
+    'domainDestinations',
+    'uniqueCatalogStrings',
+    `${clientScript.slice(helperStart, helperEnd)}\nreturn { catalogScopePathOptions };`
+  )(
+    state,
+    (className) => classes[className] ? classes[className].attributes : [],
+    () => Object.values(classes),
+    () => domains,
+    (className) => classes[className] || null,
+    (attribute) => attribute && attribute.type === 'reference',
+    (domain) => domain.sources || [],
+    (domain) => domain.destinations || [],
+    (values) => [...new Set((values || []).map((value) => String(value || '').trim()).filter(Boolean))]
+  );
+
+  const query = 'isNAT';
+  const unopened = helpers.catalogScopePathOptions('ipRange');
+  assert.equal(
+    unopened.some((item) => item.value === '{Vlan2super:vlan}.isNAT'),
+    false,
+    'Opening a picker without a query must not traverse domain paths.'
+  );
+  const first = helpers.catalogScopePathOptions('ipRange', query);
+  const second = helpers.catalogScopePathOptions('ipRange', query);
+  assert.strictEqual(second, first, 'Same catalog revision, depth, and query must reuse traversal candidates.');
+  const candidate = first.find((item) => item.value === '{Vlan2super:vlan}.isNAT');
+  assert.ok(candidate);
+  assert.match(candidate.label, /IP range -> VLAN -> NAT/);
+  state.catalogRevision += 1;
+  assert.notStrictEqual(helpers.catalogScopePathOptions('ipRange', query), first, 'Catalog revision must invalidate traversal candidates.');
+});
+
+test('D2 placement filter lazily loads every readable class on a deep catalog path', async () => {
+  const clientScript = generatedDynamicPagesClientScript();
+  const helperStart = clientScript.indexOf('function ensureDiagramImportConditionCatalogForStage(spec, stageId)');
+  const helperEnd = clientScript.indexOf('\n  function ensureDiagramImportConditionCatalogForItem', helperStart);
+  assert.ok(helperStart >= 0, 'D2 condition catalog loader is missing.');
+  assert.ok(helperEnd > helperStart, 'D2 condition catalog loader boundary is missing.');
+
+  const classes = {
+    ipRange: { name: 'ipRange', attributes: [] },
+    vlan: { name: 'vlan', attributes: [] }
+  };
+  const attributesByClass = {
+    ipRange: [],
+    vlan: [{ name: 'isNAT', type: 'boolean' }]
+  };
+  const loaded = [];
+  const helpers = new Function(
+    'state',
+    'diagramImportStageById',
+    'defaultSpec',
+    'catalogClassByName',
+    'catalogDomains',
+    'isReferenceAttribute',
+    'domainRelatedClasses',
+    'ensureCatalogAttributesForClass',
+    'writeCatalogCache',
+    'uniqueList',
+    'diagramImportStageCardSourcesClient',
+    'ensureDiagramImportConditionCatalogModel',
+    `${clientScript.slice(helperStart, helperEnd)}\nreturn { ensureDiagramImportConditionCatalogForStage };`
+  )(
+    { maxTraversalDepth: 3, catalog: { classes: Object.values(classes), domains: [] } },
+    (_spec, stageId) => stageId === 'selection:ranges' ? { id: stageId, className: 'ipRange' } : null,
+    () => ({}),
+    (className) => classes[className] || null,
+    () => [{ name: 'IpRangeVlanDomain', sources: ['ipRange'], destinations: ['vlan'] }],
+    (attribute) => attribute && attribute.type === 'reference',
+    (domain, className) => domain.sources.includes(className) ? domain.destinations : domain.destinations.includes(className) ? domain.sources : [],
+    async (className) => {
+      loaded.push(className);
+      classes[className].attributes = attributesByClass[className];
+      return true;
+    },
+    async () => ({})
+    ,
+    (values) => [...new Set((values || []).filter(Boolean))],
+    (stage) => [{ className: stage.className }],
+    async () => false
+  );
+
+  assert.equal(await helpers.ensureDiagramImportConditionCatalogForStage({}, 'selection:ranges'), true);
+  assert.deepEqual(loaded, ['ipRange', 'vlan']);
+});
+
+test('D2 placement filter refreshes a legacy catalog cache before offering deep domain fields', async () => {
+  const clientScript = generatedDynamicPagesClientScript();
+  const helperStart = clientScript.indexOf('function catalogHasResolvedDomainEndpoints()');
+  const helperEnd = clientScript.indexOf('\n  function ensureDiagramImportConditionCatalogForStage', helperStart);
+  assert.ok(helperStart >= 0, 'Catalog endpoint compatibility helper is missing.');
+  assert.ok(helperEnd > helperStart, 'Catalog endpoint compatibility helper boundary is missing.');
+
+  const state = {
+    root: 'Cst_QueryTool',
+    catalog: {
+      classes: [{ name: 'ipRange', attributes: [] }],
+      domains: [{ name: 'Vlan2super' }]
+    }
+  };
+  let requests = 0;
+  let persisted = 0;
+  const helpers = new Function(
+    'state',
+    'uniqueList',
+    'diagramImportUniqueStageCardSources',
+    'diagramImportCurrentStageCardSource',
+    'diagramImportStageCardSourcesClient',
+    'catalogClasses',
+    'catalogClassByName',
+    'catalogDomains',
+    'request',
+    'apiPrefix',
+    'errorText',
+    'writeCatalogCache',
+    'applyCatalogCache',
+    't',
+    'CATALOG_DOMAIN_ENDPOINTS_VERSION',
+    `${clientScript.slice(helperStart, helperEnd)}\nreturn { catalogHasResolvedDomainEndpoints, ensureDiagramImportConditionCatalogModel };`
+  )(
+    state,
+    (values) => [...new Set((values || []).filter(Boolean))],
+    (values) => values || [],
+    (className) => ({ id: 'current', className, classColumn: 'Class', idColumn: '_id', label: className }),
+    () => [{ className: 'ipRange' }],
+    () => state.catalog.classes,
+    (className) => state.catalog.classes.find((item) => item.name === className) || null,
+    () => state.catalog.domains,
+    async (url) => {
+      requests += 1;
+      assert.match(url, /\/model\/catalog\?includeAttributes=true/);
+      return {
+        ok: true,
+        json: {
+          catalog: {
+            classes: [{ name: 'ipRange', attributes: [] }, { name: 'vlan', attributes: [{ name: 'isNAT', type: 'boolean' }] }],
+            domains: [{ name: 'Vlan2super', sources: ['vlan'], destinations: ['ipRange'] }],
+            domainEndpoints: { version: 1, attempted: true, complete: true }
+          }
+        }
+      };
+    },
+    '/cmdbuild/custom-api',
+    (result) => String(result),
+    async (catalog) => {
+      persisted += 1;
+      return { catalog };
+    },
+    (record) => { state.catalog = record.catalog; },
+    (key) => key,
+    1
+  );
+
+  assert.equal(helpers.catalogHasResolvedDomainEndpoints(), false);
+  assert.equal(await helpers.ensureDiagramImportConditionCatalogModel({ id: 'relation:block-5', className: 'ipRange' }), true);
+  assert.equal(requests, 1);
+  assert.equal(persisted, 1);
+  assert.equal(helpers.catalogHasResolvedDomainEndpoints(), true);
+  assert.equal(await helpers.ensureDiagramImportConditionCatalogModel({ id: 'relation:block-5', className: 'ipRange' }), false);
+  assert.equal(requests, 1, 'A current cache must not trigger another catalog request.');
+  state.catalog.domainEndpoints.complete = false;
+  state.message = null;
+  assert.equal(await helpers.ensureDiagramImportConditionCatalogModel({ id: 'relation:block-5', className: 'ipRange' }), false);
+  assert.equal(requests, 1, 'Incomplete endpoint metadata must not cause a retry loop.');
+  assert.deepEqual(state.message, {
+    type: 'warning',
+    text: 'catalogDomainEndpointsIncomplete'
+  });
 });
 
 test('Assistant persists the configurable reference-path depth setting', () => {
@@ -561,9 +990,40 @@ test('Assistant authoring is persisted only through canonical authoring on norma
   assert.doesNotMatch(authoringSource, /legacyAssistantAuthoringClient/);
   assert.match(specWithPromptsSource, /next\.authoring = assistantAuthoringFromState\(next\)/);
   assert.match(specWithPromptsSource, /delete next\.assistantDraft/);
-  assert.match(specWithPromptsSource, /state\.assistantAuthoringDirty/);
   assert.match(saveSource, /assistantSpecWithPrompts\(state\.selectedTemplate && state\.selectedTemplate\.spec \|\| defaultSpec\(\)\)/);
   assert.match(saveSource, /request\(path, \{ method: exists \? 'PUT' : 'POST'/);
+});
+
+test('deterministic editor updates keep canonical Assistant and D2 authoring', () => {
+  const updateStart = proxySource.indexOf('function updateSelectedFromEditor(spec)');
+  const paramsStart = proxySource.indexOf('function applyParamsEditor()', updateStart);
+  const objectGroupStart = proxySource.indexOf('function buildObjectGroupSpec(model, previousSpec)');
+  const relationStart = proxySource.indexOf('function buildRelationExpansionSpec(model, previousSpec)');
+  const captureStart = proxySource.indexOf('function captureVisibleDesignerState()');
+  const nextCaptureFunction = proxySource.indexOf('function defaultAssistantObjectFlowBlock(index, existingIds)', captureStart);
+  const readSpecStart = proxySource.indexOf('function readSpecWithEditorBlocks()');
+  const clearDraftStart = proxySource.indexOf('function clearDraftExecutionState(options)', readSpecStart);
+  assert.ok(updateStart > -1);
+  assert.ok(paramsStart > updateStart);
+  assert.ok(objectGroupStart > -1);
+  assert.ok(relationStart > objectGroupStart);
+  assert.ok(captureStart > -1);
+  assert.ok(nextCaptureFunction > captureStart);
+  assert.ok(readSpecStart > -1);
+  assert.ok(clearDraftStart > readSpecStart);
+  const updateSource = proxySource.slice(updateStart, paramsStart);
+  const objectGroupSource = proxySource.slice(objectGroupStart, relationStart);
+  const relationSource = proxySource.slice(relationStart, readSpecStart);
+  const captureSource = proxySource.slice(captureStart, nextCaptureFunction);
+  const readSpecSource = proxySource.slice(readSpecStart, clearDraftStart);
+
+  assert.match(updateSource, /assistantSpecWithPrompts\(spec\)/);
+  assert.match(updateSource, /canonical Assistant\/D2 authoring envelope/);
+  assert.match(objectGroupSource, /authoring: previousSpec && previousSpec\.authoring/);
+  assert.match(objectGroupSource, /diagrams: Array\.isArray\(previousResult\.diagrams\)/);
+  assert.match(relationSource, /authoring: previousSpec && previousSpec\.authoring/);
+  assert.match(captureSource, /assistantSpecWithPrompts\(applyTemplateKindFromEditor/);
+  assert.match(readSpecSource, /specData\.spec = assistantSpecWithPrompts\(specData\.spec\)/);
 });
 
 test('Assistant authoring has no autosave write endpoint and is excluded from flow staleness checks', () => {
@@ -648,7 +1108,7 @@ test('typed assistant flow renders one in-progress proposal before deterministic
   assert.match(generateSource, /state\.assistantFlowBusy = false/);
 });
 
-test('normal Save reloads canonical authoring without automatic D2 analysis', () => {
+test('normal Save reloads canonical authoring and restores a saved D2 Assistant checkpoint without LLM', () => {
   const hydrateStart = proxySource.indexOf('function hydrateDesignerStateFromTemplate(options)');
   const noticeStart = proxySource.indexOf('function renderNotice(message)', hydrateStart);
   const loadStart = proxySource.indexOf('function loadDesigner(options)');
@@ -672,6 +1132,9 @@ test('normal Save reloads canonical authoring without automatic D2 analysis', ()
   assert.match(loadSource, /preserveAssistantState: preserveAssistantState/);
   assert.match(saveSource, /loadDesigner\(\{ preserveAssistantState: false \}\)/);
   assert.doesNotMatch(hydrateSource, /analyzeDiagramImport\(/);
+  assert.match(proxySource, /function restoreDiagramImportAssistantCheckpoint\(\)/);
+  assert.match(loadSource, /restoreDiagramImportAssistantCheckpoint\(\)/);
+  assert.match(proxySource, /\/draft\/diagram-import\/restore/);
 });
 
 test('assistant status is compact and flow capture uses proposal state without deterministic DOM fields', () => {
@@ -710,7 +1173,7 @@ test('assistant status is compact and flow capture uses proposal state without d
   assert.match(specWithPromptsSource, /delete next\.assistantDraft/);
 });
 
-test('Assistant D2 authoring restores only canonical authoring and does not analyze on reload', () => {
+test('Assistant D2 authoring restores canonical source and saved checkpoint without an LLM request', () => {
   const hydrateStart = proxySource.indexOf('function hydrateDesignerStateFromTemplate(options)');
   const loadDesignerStart = proxySource.indexOf('function loadDesigner(options)', hydrateStart);
   assert.ok(hydrateStart > -1);
@@ -722,6 +1185,8 @@ test('Assistant D2 authoring restores only canonical authoring and does not anal
   assert.ok(authoringStart > -1);
   assert.ok(preserveStart > authoringStart);
   assert.match(hydrateSource, /state\.diagramImportSource = String\(authoring\.d2\.source/);
+  assert.match(hydrateSource, /state\.diagramImportAnalysisCheckpoint = cloneJsonValue\(authoring\.d2\.analysisCheckpoint, null\)/);
+  assert.match(hydrateSource, /state\.diagramImportAssistantCheckpoint = cloneJsonValue\(authoring\.d2\.assistantCheckpoint, null\)/);
   assert.doesNotMatch(hydrateSource, /spec\.assistantDraft/);
   assert.doesNotMatch(hydrateSource, /analyzeDiagramImport\(/);
 });
@@ -904,8 +1369,11 @@ test('diagram editor renders repeatable mapping tables with source-dependent fie
   assert.match(helperSource, /renderDiagramFieldSelect\(spec, sourceAlias, 'edgeType'/);
   assert.match(helperSource, /renderDiagramFieldSelect\(spec, sourceAlias, 'edgeDirection'/);
   assert.match(helperSource, /renderDiagramFieldSelect\(spec, sourceAlias, 'child'/);
-  assert.match(helperSource, /matchingColumnOptionRowsForOutput\(spec \|\| defaultSpec\(\), sourceAlias\)/);
-  assert.match(helperSource, /renderMatchingColumnOptions\(diagramColumnOptionRowsForSource\(spec, sourceAlias\)/);
+  assert.match(helperSource, /matchingColumnOptionRowsForOutput\(spec \|\| defaultSpec\(\), sourceAlias, undefined, true\)/);
+  assert.match(helperSource, /function diagramInitialColumnOptionRowsForSource\(spec, sourceAlias, selectedNames\)/);
+  assert.match(helperSource, /renderCatalogFieldPicker\(/);
+  assert.match(helperSource, /renderCatalogFieldMultiPicker\(/);
+  assert.doesNotMatch(helperSource, /<select data-diagram-mapping-field="' \+ escapeHtml\(fieldName\)/);
 
   assert.match(readSource, /readValue\('cmdp-diagram-name'\)/);
   assert.match(readSource, /readPositiveIntField\('cmdp-diagram-metadata-max-bytes'/);
@@ -969,8 +1437,6 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   const importOverridesStart = proxySource.indexOf('function diagramImportBindingOverrides(proposal)', captureImportStart);
   const appliedEditorStart = proxySource.indexOf('function diagramImportAppliedEditorFromSpec(spec)');
   const appliedEditorEnd = proxySource.indexOf('function activeDiagramImportEditorModel(spec)', appliedEditorStart);
-  const updateAppliedStart = proxySource.indexOf('function applyAppliedDiagramImportChanges()');
-  const updateAppliedEnd = proxySource.indexOf('function refreshAppliedDiagramImportSource()', updateAppliedStart);
   assert.ok(renderStart > -1);
   assert.ok(flowEditorStart > -1);
   assert.ok(diagramAssistantEditorStart > flowEditorStart);
@@ -985,8 +1451,6 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   assert.ok(importOverridesStart > captureImportStart);
   assert.ok(appliedEditorStart > -1);
   assert.ok(appliedEditorEnd > appliedEditorStart);
-  assert.ok(updateAppliedStart > -1);
-  assert.ok(updateAppliedEnd > updateAppliedStart);
 
   const renderSource = proxySource.slice(renderStart, renderEnd);
   const flowEditorSource = proxySource.slice(flowEditorStart, diagramAssistantEditorStart);
@@ -996,7 +1460,6 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   const applySource = proxySource.slice(applyStart, refreshStart);
   const captureImportSource = proxySource.slice(captureImportStart, importOverridesStart);
   const appliedEditorSource = proxySource.slice(appliedEditorStart, appliedEditorEnd);
-  const updateAppliedSource = proxySource.slice(updateAppliedStart, updateAppliedEnd);
   assert.match(renderSource, /cmdp-diagram-import-source/);
   assert.match(renderSource, /cmdp-diagram-import-file/);
   assert.match(renderSource, /diagram-import-analyze/);
@@ -1029,8 +1492,12 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   assert.match(assistantSource, /map-selections/);
   assert.match(assistantSource, /captureAssistantPromptsFromDom\(\)/);
   assert.match(assistantSource, /assistantSpecWithPrompts\(/);
+  assert.match(assistantSource, /var currentSpec = assistantDiagramRequestSpec\(/);
+  assert.match(assistantSource, /currentSpec: currentSpec/);
   assert.match(assistantSource, /ensureDiagramImportProposalForCurrentRevision/);
   assert.match(applySource, /\/draft\/diagram-import\/apply/);
+  assert.match(applySource, /var proposal = state\.diagramImportProposal/);
+  assert.doesNotMatch(applySource, /var proposal = captureDiagramImportProposalFromDom\(\)/);
   assert.match(applySource, /state\.lastDraftPreviewOk = false/);
   assert.match(applySource, /updateSelectedFromEditor\(result\.json\.spec\)/);
   assert.doesNotMatch(proxySource, /assistantSpecWithPrompts\(result\.json\.spec\)/);
@@ -1040,12 +1507,6 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   assert.doesNotMatch(applySource, /state\.diagramImportPreview = null/);
   assert.match(appliedEditorSource, /authoring\.d2Import/);
   assert.match(appliedEditorSource, /editorMode: 'applied'/);
-  assert.match(updateAppliedSource, /\/draft\/diagram-import\/update-applied/);
-  assert.match(updateAppliedSource, /templateCode: String\(selected\.code \|\| ''\)/);
-  assert.match(updateAppliedSource, /currentSpec: assistantSpecWithPrompts\(selected\.spec \|\| defaultSpec\(\)\)/);
-  assert.doesNotMatch(updateAppliedSource, /d2Source:/);
-  assert.doesNotMatch(updateAppliedSource, /proposal:/);
-  assert.doesNotMatch(updateAppliedSource, /\/draft\/diagram-import\/analyze/);
   const currentPreviewStart = proxySource.indexOf('function previewCurrentDiagramImport()');
   const currentPreviewEnd = proxySource.indexOf('function previewAppliedDiagramImport()', currentPreviewStart);
   const currentPreviewSource = proxySource.slice(currentPreviewStart, currentPreviewEnd);
@@ -1083,12 +1544,18 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   assert.match(previewTemplateSource, /var useEditorDraft = editor && editor\.version === 3/);
   assert.match(previewTemplateSource, /var source = String\(state\.diagramImportSource \|\| ''\);/);
   assert.match(previewTemplateSource, /var sourceChanged = Boolean\(source\.trim\(\) && source !== persistedSource\);/);
-  assert.match(previewTemplateSource, /diagramImportUsesCurrentEditorDraft\(baseSpec\) \|\| sourceChanged/);
+  assert.match(previewTemplateSource, /diagramImportPreviewUsesCurrentDraft\(baseSpec, sourceChanged\)/);
   assert.match(previewTemplateSource, /var previewSpec = useEditorDraft/);
   assert.match(proxySource, /function diagramImportAppliedEditorHasUnsavedChanges\(proposal, spec\)/);
   assert.match(proxySource, /function diagramImportUsesCurrentEditorDraft\(spec\)/);
+  assert.match(proxySource, /function diagramImportPreviewUsesCurrentDraft\(spec, sourceChanged\)/);
   assert.match(proxySource, /state\.diagramImportAppliedEditorDirty = diagramImportAppliedEditorHasUnsavedChanges\(proposal, spec\)/);
   assert.match(proxySource, /function retryDiagramImportRuntimePreview\(\)/);
+  const retryPreviewStart = proxySource.indexOf('function retryDiagramImportRuntimePreview()');
+  const retryPreviewEnd = proxySource.indexOf('function applyDiagramImport()', retryPreviewStart);
+  const retryPreviewSource = proxySource.slice(retryPreviewStart, retryPreviewEnd);
+  assert.match(retryPreviewSource, /diagramImportPreviewUsesCurrentDraft\(spec\) \? 'intermediate' : 'applied'/);
+  assert.match(retryPreviewSource, /currentDiagramImportRuntimePreviewRevision\(mode\) === String\(snapshot\.revision \|\| ''\)/);
   assert.match(proxySource, /state\.diagramImportRuntimePreviewSnapshot = snapshot/);
   assert.match(proxySource, /if \(action === 'diagram-import-preview-retry'\) retryDiagramImportRuntimePreview\(\)/);
   assert.match(runtimePreviewSource, /queueDiagramImportRuntimePreview\(snapshot\)/);
@@ -1116,6 +1583,8 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   assert.match(proxySource, /Контракт выполнения mapping/);
   assert.match(proxySource, /data-diagram-import-materialization-ledger/);
   assert.match(proxySource, /Материализованные объекты диаграммы/);
+  assert.match(proxySource, /data-diagram-import-unconfigured-structure/);
+  assert.match(proxySource, /Часть структуры D2 не настроена/);
   assert.match(proxySource, /function renderDiagramSvgContract\(diagram\)/);
   assert.match(proxySource, /Автоматический exemplar/);
   assert.match(proxySource, /Единственный контейнер/);
@@ -1148,16 +1617,18 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   const deterministicEnd = proxySource.indexOf('function renderImportedD2Status(diagram)', deterministicStart);
   const deterministicSource = proxySource.slice(deterministicStart, deterministicEnd);
   assert.match(deterministicSource, /var proposal = activeDiagramImportEditorModel\(spec\)/);
-  assert.match(deterministicSource, /var savedApplied = applied \? null : appliedDiagramImportEditorModel\(spec\)/);
   assert.match(deterministicSource, /data-diagram-import-editor-mode/);
-  assert.match(deterministicSource, /diagram-import-update-applied/);
   assert.match(deterministicSource, /diagramImportProposalReadiness\(proposal\)/);
-  assert.match(deterministicSource, /data-diagram-import-pending-priority/);
+  assert.doesNotMatch(deterministicSource, /data-diagram-import-pending-priority/);
   assert.match(deterministicSource, /renderDiagramImportEditorTabs\(editorTab\)/);
   assert.doesNotMatch(deterministicSource, /renderDiagramImportNodeMappings\(proposal, spec\)/);
   assert.match(deterministicSource, /renderDiagramImportStructureEditor\(proposal, spec\)/);
   assert.match(deterministicSource, /renderDiagramImportRelationRules\(proposal, spec\)/);
-  assert.match(deterministicSource, /diagram-import-apply/);
+  assert.doesNotMatch(deterministicSource, /diagram-import-preview-current/);
+  assert.match(proxySource, /renderActionButton\('diagram-import-preview-current'/);
+  assert.match(deterministicSource, /diagramImportEditorSaveHint/);
+  assert.doesNotMatch(deterministicSource, /diagram-import-apply/);
+  assert.doesNotMatch(deterministicSource, /diagram-import-update-applied/);
   assert.match(captureImportSource, /data-diagram-import-placement-mapping/);
   assert.match(captureImportSource, /mapping\.conditions = capturePlacementConditions\(\)/);
   assert.match(captureImportSource, /renderedAppliedMapping/);
@@ -1166,7 +1637,25 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   assert.match(captureImportSource, /proposal\.structureTree = structureTree/);
   assert.match(captureImportSource, /proposal\.relationRules/);
   assert.match(proxySource, /function templateAuthoringClient\(spec\)/);
+  const authoringStateStart = proxySource.indexOf('function diagramImportAnalysisCheckpointFromState(spec, persistedSource)');
+  const authoringStateEnd = proxySource.indexOf('function assistantSpecWithPrompts(spec)', authoringStateStart);
+  const authoringStateSource = proxySource.slice(authoringStateStart, authoringStateEnd);
+  assert.ok(authoringStateStart > -1);
+  assert.ok(authoringStateEnd > authoringStateStart);
+  assert.match(authoringStateSource, /state\.diagramImportProposal/);
+  assert.match(authoringStateSource, /analysisCheckpoint: diagramImportAnalysisCheckpointFromState\(spec, d2Source\)/);
+  assert.match(authoringStateSource, /assistantCheckpoint: diagramImportAssistantCheckpointFromState\(spec, d2Source\)/);
+  assert.match(authoringStateSource, /var hasAppliedImport = Boolean\(imported && imported\.version === 3/);
+  assert.match(authoringStateSource, /var d2Source = hasAppliedImport/);
   assert.match(proxySource, /function assistantSpecWithPrompts\(spec\)/);
+  const assistantRequestSpecStart = proxySource.indexOf('function assistantDiagramRequestSpec(spec, proposal)');
+  const assistantRequestSpecEnd = proxySource.indexOf('function markAssistantAuthoringChanged()', assistantRequestSpecStart);
+  const assistantRequestSpecSource = proxySource.slice(assistantRequestSpecStart, assistantRequestSpecEnd);
+  assert.ok(assistantRequestSpecStart > -1);
+  assert.ok(assistantRequestSpecEnd > assistantRequestSpecStart);
+  assert.match(assistantRequestSpecSource, /var next = assistantSpecWithPrompts\(spec \|\| defaultSpec\(\)\)/);
+  assert.match(assistantRequestSpecSource, /var proposalSource = String\(proposal && proposal\.sourceText \|\| ''\)/);
+  assert.match(assistantRequestSpecSource, /next\.authoring\.d2\.source = proposalSource/);
   assert.doesNotMatch(proxySource, /function assistantD2AuthoringDraft\(\)/);
   assert.doesNotMatch(proxySource, /function assistantDraftWithAppliedD2Identity\(spec, draft\)/);
   assert.doesNotMatch(proxySource, /function resetAssistantD2AuthoringIdentity\(authoring\)/);
@@ -1185,7 +1674,10 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   const saveFunctionSource = proxySource.slice(saveFunctionStart, saveFunctionEnd);
   assert.ok(saveFunctionStart > -1);
   assert.ok(saveFunctionEnd > saveFunctionStart);
-  assert.match(saveFunctionSource, /state\.diagramImportProposal/);
+  assert.match(saveFunctionSource, /diagramImportSaveBusy/);
+  assert.match(saveFunctionSource, /var activeDiagramEditor = activeDiagramImportEditorModel\(/);
+  assert.match(saveFunctionSource, /captureDiagramImportProposalFromDom\(\) \|\| activeDiagramEditor/);
+  assert.doesNotMatch(saveFunctionSource, /state\.diagramImportAppliedEditorDirty \? captureDiagramImportProposalFromDom\(\) : null/);
   assert.match(saveFunctionSource, /diagramImportSpecWithSavedEditor/);
   assert.match(proxySource, /function diagramImportSpecWithSavedEditor\(spec, proposal\)/);
   assert.doesNotMatch(proxySource, /appliedDiagramImportSpecWithSavedMapping/);
@@ -1193,9 +1685,15 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   assert.match(proxySource, /diagramImportSignedProposal/);
   assert.match(proxySource, /markImportedDiagramChanged/);
   assert.match(proxySource, /assistantResponseStale/);
-  assert.match(proxySource, /state\.selectedTemplate !== requestTemplate/);
-  assert.match(proxySource, /if \(action === 'diagram-import-update-applied'\) applyAppliedDiagramImportChanges\(\)/);
-  assert.match(proxySource, /if \(requestUrl\.pathname === `\$\{BACKEND_PREFIX\}\/draft\/diagram-import\/update-applied`\)/);
+  assert.match(proxySource, /function diagramImportRequestRevisionSnapshot\(/);
+  assert.match(proxySource, /function diagramImportRequestRevisionError\(/);
+  assert.doesNotMatch(analyzeSource + assistantSource + applySource, /state\.selectedTemplate !== requestTemplate/);
+  assert.match(proxySource, /function normalizeD2AnalysisCheckpoint\(/);
+  assert.match(proxySource, /function normalizeD2AssistantCheckpoint\(/);
+  assert.match(proxySource, /D2_IMPORT_ASSISTANT_CHECKPOINT_MAX_BYTES/);
+  assert.match(proxySource, /d2-import-restore/);
+  assert.doesNotMatch(proxySource, /function applyAppliedDiagramImportChanges\(\)/);
+  assert.doesNotMatch(proxySource, /diagram-import-update-applied/);
   const objectFlowRouteStart = proxySource.indexOf("if (requestUrl.pathname === `${BACKEND_PREFIX}/assistant/object-flow/plan`");
   const objectFlowRouteEnd = proxySource.indexOf("if (requestUrl.pathname === `${BACKEND_PREFIX}/draft/object-flow/apply`", objectFlowRouteStart);
   const objectFlowRouteSource = proxySource.slice(objectFlowRouteStart, objectFlowRouteEnd);
@@ -1228,6 +1726,7 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   assert.doesNotMatch(placementMappingSource, /data-diagram-import-placement-field="primary\.idAttribute"/);
   assert.match(proxySource, /function diagramImportPrimaryIdAttribute\(role, primary/);
   assert.match(proxySource, /primary\.idAttribute = '_id'/);
+  assert.doesNotMatch(proxySource, /value\('materialization\.kind'\) \|\| \(diagramImportRoleVisualKindClient\(role\) === 'container' \? 'structural' : 'stage'\)/);
   assert.match(proxySource, /diagram-import-add-related/);
   assert.match(proxySource, /diagram-import-add-rule/);
   assert.match(proxySource, /state\.diagramImportProposal && state\.diagramImportProposal\.version === 3/);
@@ -1238,7 +1737,8 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   assert.match(proxySource, /function appendRelationPath\(\)/);
   assert.match(proxySource, /data-action="append-relation-path"/);
   assert.match(proxySource, /catalogDomainRelationPathOptions/);
-  assert.match(proxySource, /renderDiagramImportAttributeMultiSelect/);
+  assert.match(proxySource, /renderCatalogFieldMultiPicker\(/);
+  assert.doesNotMatch(proxySource, /function renderDiagramImportAttributeMultiSelect/);
   assert.match(proxySource, /diagramImportSelectedValues/);
   assert.match(placementMappingSource, /diagramImportLabelTemplateEditorValue\(role, spec \|\| defaultSpec\(\), mapping, item\.id, proposal, item\)/);
   assert.match(placementMappingSource, /data-diagram-import-label-template/);
@@ -1285,6 +1785,19 @@ test('only the main Diagram editor remains; Diagram editor 2 sandbox UI and API 
   assert.match(proxySource, /data-action="diagram-import-editor-tab"/);
   assert.match(proxySource, /diagramImportEditorTab/);
   assert.match(proxySource, /diagramImportStructureTitle/);
+  assert.match(proxySource, /diagramImportEditorHierarchyTab/);
+  assert.match(proxySource, /function renderDiagramImportRelatedDataForItem\(proposal, spec, item, role, mapping\)/);
+  assert.match(proxySource, /data-diagram-import-related-data-row/);
+  assert.match(proxySource, /function renderDiagramImportHierarchyEditor\(proposal, spec\)/);
+  assert.match(proxySource, /data-diagram-import-hierarchy-row/);
+  assert.match(proxySource, /data-diagram-import-hierarchy-child-stage-id/);
+  assert.match(proxySource, /function diagramImportReplaceStructureItemMappingClient\(proposal, itemId, mapping\)/);
+  assert.match(proxySource, /var hierarchyRuleMutation = action === 'diagram-import-add-hierarchy-condition'/);
+  assert.match(proxySource, /data-diagram-import-open-structure="true"/);
+  assert.match(proxySource, /data-diagram-import-hierarchy-assistant-badge/);
+  assert.doesNotMatch(proxySource, /function renderDiagramImportRelatedDataEditor\(proposal, spec\)/);
+  assert.doesNotMatch(proxySource, /diagramImportRelatedModeTraversal/);
+  assert.match(proxySource, /diagramImportRelatedModeStage/);
   assert.match(proxySource, /function renderDiagramImportStructureTree\(proposal, spec\)/);
 });
 
@@ -1505,7 +2018,7 @@ test('object group path hint filters are conditional and UI-only', () => {
   const readStart = proxySource.indexOf('function readObjectGroupFields()');
   const buildStart = proxySource.indexOf('function buildObjectGroupSpec(model, previousSpec)');
   const applyStart = proxySource.indexOf('function applyObjectPathFilter(container)');
-  const visualizationStart = proxySource.indexOf('function visualizationColumnOptionsHtmlForRowGroup(container)');
+  const visualizationStart = proxySource.indexOf('function visualizationTableNameForRowGroup(container)');
   assert.ok(optionsStart > -1);
   assert.ok(renderStart > optionsStart);
   assert.ok(regexExamplesStart > renderStart);
@@ -1648,7 +2161,7 @@ test('Assistant-managed Object Flow aliases stay internal across deterministic a
 
 test('Relations Apply preserves explicit operation order and source-driven columns', () => {
   const operationsStart = proxySource.indexOf('function flowOperations(model)');
-  const columnsStart = proxySource.indexOf('function flowColumnOptionRows(model, spec, alias, operationIndex, seenAliases)', operationsStart);
+  const columnsStart = proxySource.indexOf('function flowColumnOptionRows(model, spec, alias, operationIndex, seenAliases, includeCatalogPaths)', operationsStart);
   const buildStart = proxySource.indexOf('function buildRelationExpansionSpec(model, previousSpec)', columnsStart);
   const captureStart = proxySource.indexOf('function captureRelationDraftFromDom()', buildStart);
   assert.ok(operationsStart > -1);
@@ -1667,6 +2180,48 @@ test('Relations Apply preserves explicit operation order and source-driven colum
   assert.match(buildSource, /var steps = orderedStages\.ordered\.map/);
   assert.doesNotMatch(buildSource, /deduplicateCards/);
   assert.doesNotMatch(buildSource, /includeSource/);
+});
+
+test('deep catalog fields are lazy, cached, and locally refreshed in the relation editor', () => {
+  const scopeStart = proxySource.indexOf('function catalogScopePathOptions(className, searchQuery)');
+  const relationStart = proxySource.indexOf('function catalogRelationPathOptions(className)');
+  const pickerRowsStart = proxySource.indexOf('function renderCatalogFieldPickerRows(options, selectedName, query)');
+  const pickerStart = proxySource.indexOf('function renderCatalogFieldPicker(fieldAttribute, selectedName, initialOptions, context)');
+  const refreshStart = proxySource.indexOf('function refreshMatchingBlockAfterSourceChange(node)');
+  const refreshEnd = proxySource.indexOf('function clearObjectGroupScopeRuleRow(button)', refreshStart);
+  const changeHandlerStart = proxySource.indexOf("document.addEventListener('change', function (event) {");
+  const popstateStart = proxySource.indexOf("window.addEventListener('popstate'", changeHandlerStart);
+
+  assert.ok(scopeStart > -1);
+  assert.ok(relationStart > scopeStart);
+  assert.ok(pickerRowsStart > relationStart);
+  assert.ok(pickerStart > pickerRowsStart);
+  assert.ok(refreshStart > pickerStart);
+  assert.ok(refreshEnd > refreshStart);
+  assert.ok(changeHandlerStart > refreshStart);
+  assert.ok(popstateStart > changeHandlerStart);
+
+  const scopeSource = proxySource.slice(scopeStart, relationStart);
+  const relationSource = proxySource.slice(relationStart, pickerStart);
+  const pickerRowsSource = proxySource.slice(pickerRowsStart, pickerStart);
+  const pickerSource = proxySource.slice(pickerStart, refreshStart);
+  const refreshSource = proxySource.slice(refreshStart, refreshEnd);
+  const changeHandlerSource = proxySource.slice(changeHandlerStart, popstateStart);
+
+  assert.match(scopeSource, /state\.catalogScopePathOptionsCache/);
+  assert.match(scopeSource, /result\.limitReached = queue\.length > 0/);
+  assert.match(scopeSource, /state\.maxCatalogPathCandidates/);
+  assert.match(relationSource, /state\.catalogRelationPathOptionsCache/);
+  assert.match(relationSource, /cachedDomainRelatedClasses/);
+  assert.match(relationSource, /state\.maxCatalogPathCandidates/);
+  assert.match(pickerRowsSource, /matches\.slice\(0, 60\)/);
+  assert.match(pickerSource, /data-catalog-field-picker-search/);
+  assert.match(pickerSource, /flowColumnOptionRows\(model, readCurrentSpec\(\), sourceAlias, operationIndex, \{\}, true\)/);
+  assert.match(pickerSource, /function scheduleCatalogFieldPickerResults\(input\)/);
+  assert.match(pickerSource, /\}, 120\);/);
+  assert.match(refreshSource, /list\.innerHTML = rows/);
+  assert.doesNotMatch(refreshSource, /renderDesigner\(\)/);
+  assert.match(changeHandlerSource, /refreshMatchingBlockAfterSourceChange\(target\.closest\('\[data-matching-block\]'\)\)/);
 });
 
 test('relation editor shows the persisted Assistant result label instead of a technical alias', () => {
