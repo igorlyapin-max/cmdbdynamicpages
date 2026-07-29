@@ -240,7 +240,7 @@ function printDetail(name, result) {
   }
   if (name === 'backend session') {
     const session = getJson(result).session || {};
-    console.log(`    user=${session.username || ''} role=${session.role || ''}`);
+    console.log(`    authenticated=${Boolean(session.username || session.role)}`);
   }
   if (name === 'model catalog') {
     const counts = getJson(result).catalog && getJson(result).catalog.counts ? getJson(result).catalog.counts : {};
@@ -256,19 +256,11 @@ function printDetail(name, result) {
   }
   if (name === 'client log') {
     const data = getJson(result).data || [];
-    const last = data.slice(-5);
     console.log(`    entries=${data.length}`);
-    last.forEach((item) => {
-      console.log(`    ${item.time || ''} ${item.stage || ''} ${item.message || ''}`);
-    });
   }
   if (name === 'proxy log') {
     const data = getJson(result).data || [];
-    const last = data.slice(-5);
     console.log(`    entries=${data.length}`);
-    last.forEach((item) => {
-      console.log(`    ${item.time || ''} ${item.method || ''} ${item.path || ''}`);
-    });
   }
 }
 

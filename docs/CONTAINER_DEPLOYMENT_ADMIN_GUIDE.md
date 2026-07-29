@@ -39,8 +39,11 @@ cp .env.example .env
 - `CMDBDYNAMIC_IMAGE` - approved registry image, например `registry.example.local/gkm/cmdbdynamicpages:v0.1.0-static-baseline`;
 - `PROXY_HOST` - bind address backend; production default `127.0.0.1`, а внешний TLS reverse proxy публикует только `CMDP_PUBLIC_ORIGIN`;
 - `CMDP_PUBLIC_ORIGIN` - canonical public `http(s)` origin для browser, CMDBuild UI, custom page и custom API; не содержит path, query, fragment или credentials;
+- `CMDP_NGINX_PUBLIC_HOST` - canonical `host[:port]` из `CMDP_PUBLIC_ORIGIN`, который bundled nginx передает как `Host` и `X-Forwarded-Host`;
+- `CMDP_NGINX_PUBLIC_PROTO` - `http` или `https` из `CMDP_PUBLIC_ORIGIN`, который bundled nginx передает как `X-Forwarded-Proto`;
 - `CMDBUILD_ORIGIN` - URL CMDBuild upstream, доступный с backend host;
-- `CMDBDYNAMIC_REDIS_URL` - Redis endpoint без plaintext password в URL, если пароль передается файлом;
+- `CMDBDYNAMIC_REDIS_URL` - production Redis endpoint без plaintext password в URL, предпочтительно `rediss://redis.example.local:6380/0`;
+- `CMDBDYNAMIC_REDIS_TLS_CA_FILE` - optional путь к CA PEM, уже доступному внутри backend container, если private Redis PKI не доверен system trust. Оставить пустым для standard trusted chain;
 - `CMDBDYNAMIC_REDIS_PASSWORD_FILE_HOST` - host path к secret file от PAM/platform;
 - `CMDBDYNAMICPAGES_CSRF_SECRET` - stable external secret из approved secret source;
 - `CMDP_NGINX_CUSTOM_API_READ_TIMEOUT` - timeout для `proxy_read_timeout` и `proxy_send_timeout` только в nginx location `/cmdbuild/custom-api/`; default `70s`. Он должен быть больше максимальной одной LiteLLM-попытки (`60000 ms`) и transport grace. D2 mapping повторяется отдельным checkpointed HTTP-запросом и не требует увеличения этого timeout;
@@ -57,6 +60,8 @@ cp .env.example .env
 
 `replace-me`, `registry.example.local`, `cmdbuild.example.local`, `redis.example.local`, `litellm.example.local` и `syslog.example.local` не являются рабочими значениями. Real `.env` файлы не коммитить.
 
+`redis://` для local и уже существующих deployment остается поддержанным. В production backend запускается, но пишет runtime warning `redis_plaintext_transport`; для нового production deployment использовать `rediss://` и при private CA предоставить `CMDBDYNAMIC_REDIS_TLS_CA_FILE` через approved read-only mount или image trust.
+
 Перед запуском с включенным Assistant проверить secret mount без вывода ключа:
 
 ```bash
@@ -64,7 +69,7 @@ test -f "$LITELLM_API_KEY_FILE_HOST" && test -r "$LITELLM_API_KEY_FILE_HOST"
 docker compose -f docker-compose.runtime.yml exec cmdbdynamicpages sh -c 'test -f /run/secrets/cmdbdynamicpages_litellm_api_key && test -r /run/secrets/cmdbdynamicpages_litellm_api_key'
 ```
 
-`CMDP_PUBLIC_ORIGIN` и `CMDBUILD_ORIGIN` имеют разные роли. Например, browser работает с `https://custom.example.local`, а backend обращается к internal CMDBuild `https://vr2.internal.example`. Internal upstream не должен быть доступен пользователям, попадать в browser URLs, redirect `Location`, `Origin`, `Referer` или CMDBuild cookie domain. Внешний TLS reverse proxy обязан передать public `Host`, `X-Forwarded-Host` и `X-Forwarded-Proto=https`.
+`CMDP_PUBLIC_ORIGIN` и `CMDBUILD_ORIGIN` имеют разные роли. Например, browser работает с `https://custom.example.local`, а backend обращается к internal CMDBuild `https://vr2.internal.example`. Для этого public origin задать `CMDP_NGINX_PUBLIC_HOST=custom.example.local` и `CMDP_NGINX_PUBLIC_PROTO=https`; delivery validation требует совпадения с host/port и protocol `CMDP_PUBLIC_ORIGIN`. Internal upstream не должен быть доступен пользователям, попадать в browser URLs, redirect `Location`, `Origin`, `Referer` или CMDBuild cookie domain. Bundled nginx намеренно не передает в backend client-supplied `Host`, `X-Forwarded-Host` или `X-Forwarded-Proto`.
 
 Для опубликованных static snapshots raw `.d2` source не отдается публичному endpoint по умолчанию. Если заказчик разрешает скачивание `.d2`, включайте `publish.publicD2Source=true` в шаблоне осознанно: source может содержать structured diagram metadata и бизнес-данные, уже зафиксированные в snapshot.
 
@@ -75,7 +80,7 @@ docker compose --env-file .env.example -f docker-compose.runtime.yml config
 docker compose -f docker-compose.nginx.yml config
 ```
 
-Bundled nginx использует штатную template processing entrypoint image `nginx:1.27-alpine`: конфигурация монтируется в `/etc/nginx/templates/default.conf.template`, а Compose передает `CMDP_NGINX_CUSTOM_API_READ_TIMEOUT` со значением `70s` по умолчанию. Не монтировать этот файл напрямую в `/etc/nginx/conf.d/default.conf`, иначе template variable не будет подставлена.
+Bundled nginx использует штатную template processing entrypoint image `nginx:1.27-alpine`: конфигурация монтируется в `/etc/nginx/templates/default.conf.template`, а Compose передает `CMDP_NGINX_PUBLIC_HOST=localhost:8088`, `CMDP_NGINX_PUBLIC_PROTO=http` и `CMDP_NGINX_CUSTOM_API_READ_TIMEOUT=70s` по умолчанию. Эти local defaults совпадают с `CMDP_PUBLIC_ORIGIN=http://localhost:8088`. Не монтировать этот файл напрямую в `/etc/nginx/conf.d/default.conf`, иначе template variable не будет подставлена.
 
 Перед production start проверить уже реальный `.env`:
 
@@ -124,7 +129,7 @@ docker logs --tail=100 cmdbdynamicpages-backend
 - `/health/ready` - readiness: возвращает `200`, только если Redis, CMDBuild upstream и обязательный D2 renderer доступны;
 - `/health/redis` возвращает `200` при доступном Redis;
 - `/metrics` возвращает Prometheus text без cookies, tokens, user names, runtime rows и raw CMDBuild payload;
-- Docker healthcheck использует только `/health/live`; rollout и traffic routing должны использовать `/health/ready`.
+- Backend Docker healthcheck использует только `/health/live`; rollout и traffic routing должны использовать `/health/ready`. Bundled nginx healthcheck выполняет `nginx -t` и проверяет master process по `/var/run/nginx.pid`; он не делает HTTP-запрос через backend.
 
 ## Diagnostic и logging baseline
 

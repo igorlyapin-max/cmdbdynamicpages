@@ -14,8 +14,11 @@ const requiredEnv = [
   'PROXY_HOST',
   'PROXY_PORT',
   'CMDP_PUBLIC_ORIGIN',
+  'CMDP_NGINX_PUBLIC_HOST',
+  'CMDP_NGINX_PUBLIC_PROTO',
   'CMDBUILD_ORIGIN',
   'CMDBDYNAMIC_REDIS_URL',
+  'CMDBDYNAMIC_REDIS_TLS_CA_FILE',
   'CMDBDYNAMIC_REDIS_PASSWORD_FILE',
   'CMDBDYNAMIC_REDIS_PASSWORD_FILE_HOST',
   'CMDBDYNAMIC_REDIS_REQUIRED',
@@ -67,10 +70,45 @@ function rejectPattern(file, regex, label) {
 }
 
 function requireEnvValue(name, expectedValue) {
-  const match = envExample.match(new RegExp(`^${name}=(.*)$`, 'm'));
-  if (!match) return;
-  if (match[1].trim() !== expectedValue) {
+  const value = envValue(name);
+  if (value === undefined) return;
+  if (value !== expectedValue) {
     failures.push(`.env.example: ${name} must be ${expectedValue}`);
+  }
+}
+
+function envValue(name) {
+  const match = envExample.match(new RegExp(`^${name}=(.*)$`, 'm'));
+  return match ? match[1].trim() : undefined;
+}
+
+function validateNginxPublicOrigin() {
+  const originValue = envValue('CMDP_PUBLIC_ORIGIN');
+  const host = envValue('CMDP_NGINX_PUBLIC_HOST');
+  const proto = envValue('CMDP_NGINX_PUBLIC_PROTO');
+
+  if (!originValue || !host || !proto) return;
+  if (!['http', 'https'].includes(proto)) {
+    failures.push('.env.example: CMDP_NGINX_PUBLIC_PROTO must be http or https');
+    return;
+  }
+
+  let origin;
+  try {
+    origin = new URL(originValue);
+  } catch {
+    failures.push('.env.example: CMDP_PUBLIC_ORIGIN must be a valid absolute URL');
+    return;
+  }
+
+  if (origin.username || origin.password || origin.pathname !== '/' || origin.search || origin.hash) {
+    failures.push('.env.example: CMDP_PUBLIC_ORIGIN must contain only scheme, host, and optional port');
+  }
+  if (origin.protocol !== `${proto}:`) {
+    failures.push('.env.example: CMDP_NGINX_PUBLIC_PROTO must match CMDP_PUBLIC_ORIGIN protocol');
+  }
+  if (origin.host !== host) {
+    failures.push('.env.example: CMDP_NGINX_PUBLIC_HOST must match CMDP_PUBLIC_ORIGIN host and port');
   }
 }
 
@@ -85,8 +123,10 @@ requiredEnv.forEach((name) => {
   }
 });
 requireEnvValue('PROXY_HOST', '127.0.0.1');
+requireEnvValue('CMDBDYNAMIC_REDIS_URL', 'rediss://redis.example.local:6380/0');
 requireEnvValue('CMDP_LOG_TARGET', 'stdout,syslog');
 requireEnvValue('LITELLM_API_KEY_FILE_HOST', '');
+validateNginxPublicOrigin();
 
 rejectPattern('docker-compose.runtime.yml', /^\s*build\s*:/m, 'build directive');
 rejectPattern('docker-compose.nginx.yml', /^\s*build\s*:/m, 'build directive');
@@ -105,11 +145,21 @@ requireText('docker-compose.runtime.yml', 'CMDP_SYSLOG_FACILITY', 'syslog facili
 requireText('docker-compose.runtime.yml', 'CMDP_PUBLIC_ORIGIN: ${CMDP_PUBLIC_ORIGIN}', 'public origin wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_LITELLM_ALLOWED_BASE_URLS', 'LiteLLM base URL allowlist wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_EXECUTION_MAX_SELECTION_SCAN_ROWS_ABSOLUTE: ${CMDP_EXECUTION_MAX_SELECTION_SCAN_ROWS_ABSOLUTE:-50000}', 'absolute selection scan limit wiring');
+requireText('docker-compose.runtime.yml', 'CMDBDYNAMIC_REDIS_TLS_CA_FILE', 'Redis TLS CA wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_D2_RENDER_ENABLED', 'D2 render wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_D2_MAX_DIAGRAMS', 'D2 max diagrams wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_D2_CONCURRENCY', 'D2 render concurrency wiring');
 requireText('docker-compose.nginx.yml', '/etc/nginx/templates/default.conf.template', 'nginx template mount');
+requireText('docker-compose.nginx.yml', 'CMDP_NGINX_PUBLIC_HOST: "${CMDP_NGINX_PUBLIC_HOST:-localhost:8088}"', 'local public host default wiring');
+requireText('docker-compose.nginx.yml', 'CMDP_NGINX_PUBLIC_PROTO: "${CMDP_NGINX_PUBLIC_PROTO:-http}"', 'local public protocol default wiring');
 requireText('docker-compose.nginx.yml', 'CMDP_NGINX_CUSTOM_API_READ_TIMEOUT: "${CMDP_NGINX_CUSTOM_API_READ_TIMEOUT:-70s}"', 'custom API timeout default wiring');
+requireText('docker-compose.nginx.yml', 'nginx -t && test -s /var/run/nginx.pid && kill -0 $$(cat /var/run/nginx.pid)', 'nginx config and master-process healthcheck');
+rejectPattern('docker-compose.nginx.yml', /\bwget\b/, 'nginx HTTP healthcheck client');
+requireText('nginx/cmdbdynamicpages.conf', 'proxy_set_header Host ${CMDP_NGINX_PUBLIC_HOST};', 'explicit public Host forwarding');
+requireText('nginx/cmdbdynamicpages.conf', 'proxy_set_header X-Forwarded-Host ${CMDP_NGINX_PUBLIC_HOST};', 'explicit public X-Forwarded-Host forwarding');
+requireText('nginx/cmdbdynamicpages.conf', 'proxy_set_header X-Forwarded-Proto ${CMDP_NGINX_PUBLIC_PROTO};', 'explicit public X-Forwarded-Proto forwarding');
+rejectPattern('nginx/cmdbdynamicpages.conf', /proxy_set_header\s+(?:Host|X-Forwarded-Host)\s+\$http_host;/, 'request Host forwarding');
+rejectPattern('nginx/cmdbdynamicpages.conf', /proxy_set_header\s+X-Forwarded-Proto\s+\$scheme;/, 'request scheme forwarding');
 requireText('Dockerfile', 'HEALTHCHECK', 'Docker HEALTHCHECK');
 requireText('Dockerfile', 'USER node', 'non-root runtime user');
 requireText('Dockerfile', 'PROXY_HOST=127.0.0.1', 'loopback proxy host default');
@@ -134,6 +184,7 @@ requireText('Dockerfile', 'sha256sum -c -', 'D2 checksum validation');
   'CMDP_SYSLOG_PROTOCOL',
   'CMDP_SYSLOG_FACILITY',
   'CMDP_PUBLIC_ORIGIN',
+  'CMDBDYNAMIC_REDIS_TLS_CA_FILE',
   'CMDP_NGINX_CUSTOM_API_READ_TIMEOUT',
   'CMDP_EXECUTION_MAX_SELECTION_SCAN_ROWS_ABSOLUTE',
   'CMDP_LITELLM_ALLOWED_BASE_URLS',

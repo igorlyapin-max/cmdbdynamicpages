@@ -96,9 +96,18 @@ function cmdbDynamicPagesBuildTargetUrl() {
     return '/cmdbuild/dynamicpages/ui/run/' + encodeURIComponent(templateCode) + (runtimeQuery ? '?' + runtimeQuery : '');
 }
 
+function cmdbDynamicPagesIsInternalTarget(target) {
+    if (typeof target !== 'string' || target.charAt(0) !== '/' || target.indexOf('//') === 0) return false;
+    try {
+        return new URL(target, window.location.origin).origin === window.location.origin;
+    } catch (error) {
+        return false;
+    }
+}
+
 function cmdbDynamicPagesRememberTarget(target) {
     try {
-        if (window.sessionStorage && target) {
+        if (window.sessionStorage && cmdbDynamicPagesIsInternalTarget(target)) {
             window.sessionStorage.setItem('cmdbdynamicpages.pendingTarget', target);
         }
     } catch (error) {
@@ -109,7 +118,7 @@ var cmdbDynamicPagesRedirectTarget = '';
 
 function cmdbDynamicPagesOpenExternalUi(reason) {
     var target = cmdbDynamicPagesBuildTargetUrl();
-    if (!target) return;
+    if (!cmdbDynamicPagesIsInternalTarget(target)) return;
     cmdbDynamicPagesRememberTarget(target);
     if (cmdbDynamicPagesRedirectTarget === target) return;
     cmdbDynamicPagesRedirectTarget = target;
@@ -119,7 +128,7 @@ function cmdbDynamicPagesOpenExternalUi(reason) {
 
 function cmdbDynamicPagesScheduleOpenExternalUi(reason) {
     var target = cmdbDynamicPagesBuildTargetUrl();
-    if (!target) return;
+    if (!cmdbDynamicPagesIsInternalTarget(target)) return;
     cmdbDynamicPagesRememberTarget(target);
     if (cmdbDynamicPagesRedirectTarget === target) return;
     window.setTimeout(function () {
@@ -162,6 +171,7 @@ Ext.define('CMDBuildUI.view.custompages.CmdbDynamicPages.CmdbDynamicPages', {
 
     initComponent: function () {
         var target = cmdbDynamicPagesBuildTargetUrl();
+        if (!cmdbDynamicPagesIsInternalTarget(target)) target = '/cmdbuild/dynamicpages/ui/designer';
         cmdbDynamicPagesRememberTarget(target);
         cmdbDynamicPagesClientLog('initComponent', 'launcher');
         this.html = [

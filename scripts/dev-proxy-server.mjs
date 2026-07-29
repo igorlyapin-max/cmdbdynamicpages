@@ -5,6 +5,7 @@ import dgram from 'node:dgram';
 import fs from 'node:fs';
 import os from 'node:os';
 import net from 'node:net';
+import tls from 'node:tls';
 import { spawn } from 'node:child_process';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { URL, pathToFileURL } from 'node:url';
@@ -105,6 +106,7 @@ const SYSLOG_PROTOCOL = normalizeSyslogProtocol(process.env.CMDP_SYSLOG_PROTOCOL
 const SYSLOG_FACILITY = normalizeSyslogFacility(process.env.CMDP_SYSLOG_FACILITY || 'local0');
 const REDIS_URL = process.env.CMDBDYNAMIC_REDIS_URL || 'redis://127.0.0.1:6379/0';
 const REDIS_PASSWORD = readSecretValue(process.env.CMDBDYNAMIC_REDIS_PASSWORD, process.env.CMDBDYNAMIC_REDIS_PASSWORD_FILE);
+const REDIS_TLS_CA_FILE = String(process.env.CMDBDYNAMIC_REDIS_TLS_CA_FILE || '').trim();
 const REDIS_ENABLED = process.env.CMDBDYNAMIC_REDIS_ENABLED !== 'false';
 const REDIS_KEY_PREFIX = process.env.CMDBDYNAMIC_REDIS_KEY_PREFIX || 'cmdp';
 const REDIS_TIMEOUT_MS = Math.max(100, Number(process.env.CMDBDYNAMIC_REDIS_TIMEOUT_MS || 500) || 500);
@@ -705,6 +707,8 @@ function loggingStatus() {
 function validateRuntimeConfig(input = {}) {
   const nodeEnv = String(input.nodeEnv === undefined ? process.env.NODE_ENV || '' : input.nodeEnv || '').trim();
   const csrfSecret = String(input.csrfSecret === undefined ? process.env.CMDBDYNAMICPAGES_CSRF_SECRET || '' : input.csrfSecret || '').trim();
+  const redisUrl = String(input.redisUrl === undefined ? REDIS_URL : input.redisUrl || '').trim();
+  const redisEnabled = input.redisEnabled === undefined ? REDIS_ENABLED : input.redisEnabled !== false;
   const logTargets = input.logTargets || LOG_TARGETS;
   const syslogHost = String(input.syslogHost === undefined ? SYSLOG_HOST : input.syslogHost || '').trim();
   const syslogPort = normalizeSyslogPort(input.syslogPort === undefined ? SYSLOG_PORT : input.syslogPort);
@@ -742,6 +746,33 @@ function validateRuntimeConfig(input = {}) {
       env: 'CMDP_PUBLIC_ORIGIN',
       message: 'Production startup requires CMDP_PUBLIC_ORIGIN for same-origin browser requests.'
     });
+  }
+
+  let redisTransport = { transport: 'invalid', caConfigured: false };
+  if (redisEnabled) {
+    try {
+      const redisConfig = parseRedisUrl(redisUrl);
+      redisTransport = {
+        transport: redisConfig.tls ? 'tls' : 'plaintext',
+        caConfigured: Boolean(redisConfig.tlsCaFile)
+      };
+      if (redisConfig.tls && redisConfig.tlsCaFile && !fs.statSync(redisConfig.tlsCaFile).isFile()) {
+        throw new Error('Redis TLS CA path is not a regular file.');
+      }
+    } catch (error) {
+      errors.push({
+        code: 'redis_url_invalid',
+        env: 'CMDBDYNAMIC_REDIS_URL',
+        message: error && error.message ? error.message : 'Redis URL is invalid.'
+      });
+    }
+    if (nodeEnv.toLowerCase() === 'production' && redisTransport.transport === 'plaintext') {
+      warnings.push({
+        code: 'redis_plaintext_transport',
+        env: 'CMDBDYNAMIC_REDIS_URL',
+        message: 'Redis is configured without TLS. Prefer rediss:// for production deployments.'
+      });
+    }
   }
 
   if (!Array.isArray(logTargets) || !logTargets.includes('stdout')) {
@@ -786,6 +817,7 @@ function validateRuntimeConfig(input = {}) {
     },
     publicOrigin: publicOriginConfiguration.origin,
     publicOriginConfigured: publicOriginConfiguration.configured,
+    redis: redisTransport,
     assistant: assistantStatus(),
     d2: d2RendererConfigSummary(),
     errors,
@@ -801,6 +833,7 @@ function runtimeConfigLogSummary(validation = validateRuntimeConfig()) {
     syslog: validation.syslog || null,
     publicOrigin: validation.publicOrigin || '',
     publicOriginConfigured: Boolean(validation.publicOriginConfigured),
+    redis: validation.redis || redisTransportSecurity(),
     d2: validation.d2 || d2RendererConfigSummary(),
     errors: validation.errors.map((item) => item.code),
     warnings: validation.warnings.map((item) => item.code)
@@ -6717,13 +6750,33 @@ function readOptionalSecretValue(value, filePath) {
 
 function parseRedisUrl(value) {
   const parsed = new URL(value || 'redis://127.0.0.1:6379/0');
+  if (!['redis:', 'rediss:'].includes(parsed.protocol)) {
+    throw new Error('Redis URL must use redis:// or rediss://.');
+  }
   const dbText = parsed.pathname && parsed.pathname !== '/' ? parsed.pathname.slice(1) : '0';
   return {
     host: parsed.hostname || '127.0.0.1',
     port: Number(parsed.port || 6379),
     password: REDIS_PASSWORD || (parsed.password ? decodeURIComponent(parsed.password) : ''),
-    db: Number.isInteger(Number(dbText)) ? Number(dbText) : 0
+    db: Number.isInteger(Number(dbText)) ? Number(dbText) : 0,
+    tls: parsed.protocol === 'rediss:',
+    tlsCaFile: REDIS_TLS_CA_FILE
   };
+}
+
+function redisTransportSecurity(value = REDIS_URL) {
+  try {
+    const config = parseRedisUrl(value);
+    return {
+      transport: config.tls ? 'tls' : 'plaintext',
+      caConfigured: Boolean(config.tlsCaFile)
+    };
+  } catch {
+    return {
+      transport: 'invalid',
+      caConfigured: false
+    };
+  }
 }
 
 function sanitizeRedisUrl(value) {
@@ -6800,6 +6853,19 @@ async function redisCommand(parts, options = {}) {
     throw new Error(redisState.lastError || 'Redis is temporarily unavailable.');
   }
   const config = parseRedisUrl(REDIS_URL);
+  let tlsOptions = null;
+  if (config.tls) {
+    try {
+      tlsOptions = {
+        host: config.host,
+        port: config.port,
+        ...(net.isIP(config.host) ? {} : { servername: config.host }),
+        ...(config.tlsCaFile ? { ca: fs.readFileSync(config.tlsCaFile, 'utf8') } : {})
+      };
+    } catch (error) {
+      throw new Error(`Redis TLS CA file is not readable: ${error && error.code ? error.code : 'read_failed'}.`);
+    }
+  }
   const commands = [];
   if (config.password) commands.push(['AUTH', config.password]);
   if (config.db) commands.push(['SELECT', config.db]);
@@ -6807,7 +6873,9 @@ async function redisCommand(parts, options = {}) {
   return await new Promise((resolve, reject) => {
     let settled = false;
     let buffer = Buffer.alloc(0);
-    const socket = net.createConnection({ host: config.host, port: config.port });
+    const socket = config.tls
+      ? tls.connect(tlsOptions)
+      : net.createConnection({ host: config.host, port: config.port });
     const timer = setTimeout(() => {
       socket.destroy();
       finish(new Error(`Redis command timed out after ${REDIS_TIMEOUT_MS}ms.`));
@@ -6849,7 +6917,7 @@ async function redisCommand(parts, options = {}) {
         resolve(value);
       }
     }
-    socket.on('connect', () => {
+    socket.on(config.tls ? 'secureConnect' : 'connect', () => {
       commands.forEach((command) => socket.write(encodeRedisCommand(command)));
     });
     socket.on('data', (chunk) => {
@@ -7083,6 +7151,7 @@ async function redisStatus(options = {}) {
       backend: 'memory',
       available: false,
       url: sanitizeRedisUrl(REDIS_URL),
+      transportSecurity: redisTransportSecurity(),
       keyPrefix: REDIS_KEY_PREFIX,
       message: 'Redis is disabled by CMDBDYNAMIC_REDIS_ENABLED=false.'
     };
@@ -7095,6 +7164,7 @@ async function redisStatus(options = {}) {
       backend: 'redis',
       available: pong === 'PONG',
       url: sanitizeRedisUrl(REDIS_URL),
+      transportSecurity: redisTransportSecurity(),
       keyPrefix: REDIS_KEY_PREFIX,
       lastCheckedAt: redisState.lastCheckedAt
     };
@@ -7105,6 +7175,7 @@ async function redisStatus(options = {}) {
       backend: 'memory',
       available: false,
       url: sanitizeRedisUrl(REDIS_URL),
+      transportSecurity: redisTransportSecurity(),
       keyPrefix: REDIS_KEY_PREFIX,
       lastCheckedAt: redisState.lastCheckedAt,
       error: error && error.message ? error.message : String(error)
@@ -51645,6 +51716,12 @@ if (isMainModule) {
     logError('app.config_invalid', runtimeConfigLogSummary(runtimeConfig));
     process.exit(1);
   }
+  if (String(runtimeConfig.nodeEnv || '').toLowerCase() === 'production' && runtimeConfig.redis && runtimeConfig.redis.transport === 'plaintext') {
+    logWarn('redis.plaintext_transport', {
+      enabled: REDIS_ENABLED,
+      url: sanitizeRedisUrl(REDIS_URL)
+    });
+  }
   logDiagnosticBasic('app.config_valid', runtimeConfigLogSummary(runtimeConfig));
   installGracefulShutdown(server);
   server.listen(LISTEN_PORT, LISTEN_HOST, () => {
@@ -51657,6 +51734,7 @@ if (isMainModule) {
       redis: {
         enabled: REDIS_ENABLED,
         url: sanitizeRedisUrl(REDIS_URL),
+        transportSecurity: redisTransportSecurity(),
         keyPrefix: REDIS_KEY_PREFIX
       }
     });
@@ -51759,7 +51837,9 @@ export {
   parsePublicOriginConfiguration,
   parseNameSet,
   publicSnapshotParamsFromUrl,
+  parseRedisUrl,
   redactByName,
+  redisTransportSecurity,
   renderRuntimeParamTemplate,
   renderCellTemplate,
   renderD2SourceToSvg,

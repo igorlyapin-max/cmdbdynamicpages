@@ -13,5 +13,7 @@ docker run -d \
   --restart unless-stopped \
   --network host \
   -v "${ROOT_DIR}/nginx/cmdbdynamicpages.conf:/etc/nginx/templates/default.conf.template:ro" \
+  -e CMDP_NGINX_PUBLIC_HOST="${CMDP_NGINX_PUBLIC_HOST:-localhost:8088}" \
+  -e CMDP_NGINX_PUBLIC_PROTO="${CMDP_NGINX_PUBLIC_PROTO:-http}" \
   -e CMDP_NGINX_CUSTOM_API_READ_TIMEOUT=70s \
   nginx:1.27-alpine

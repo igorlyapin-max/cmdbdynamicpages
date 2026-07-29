@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import dgram from 'node:dgram';
-import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import net from 'node:net';
+import tls from 'node:tls';
+import { execFileSync, spawn } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -21,11 +23,13 @@ import {
   normalizeLogFormat,
   normalizeLogLevel,
   normalizeLogTargets,
+  parseRedisUrl,
   parsePublicOriginConfiguration,
   parseNameSet,
   redactByName,
   readOptionalSecretValue,
   redisRequiredError,
+  redisTransportSecurity,
   renderPrometheusMetrics,
   sanitizeTemplateCard,
   sanitizeHeaders,
@@ -75,6 +79,19 @@ test('public origin configuration accepts only a bare HTTP(S) origin', () => {
     origin: '',
     reason: ''
   });
+});
+
+test('Redis URL configuration distinguishes TLS and plaintext transports', () => {
+  const parsed = parseRedisUrl('rediss://:encoded%2Dpassword@redis.example:6380/2');
+  assert.equal(parsed.host, 'redis.example');
+  assert.equal(parsed.port, 6380);
+  assert.equal(parsed.password, 'encoded-password');
+  assert.equal(parsed.db, 2);
+  assert.equal(parsed.tls, true);
+  assert.equal(typeof parsed.tlsCaFile, 'string');
+  assert.equal(redisTransportSecurity('redis://redis.example:6379/0').transport, 'plaintext');
+  assert.equal(redisTransportSecurity('rediss://redis.example:6380/0').transport, 'tls');
+  assert.throws(() => parseRedisUrl('https://redis.example:6380/0'), /redis:\/\/ or rediss:\/\//);
 });
 
 test('same-origin mutation checks use the configured public origin, not the upstream host', () => {
@@ -226,6 +243,7 @@ test('runtime config validation fails closed for production CSRF secret', () => 
     syslogHost: 'collector.internal.example',
     syslogPort: 514,
     publicOrigin: 'https://custom.example',
+    redisUrl: 'rediss://redis.example:6380/0',
     diagnosticMode: 'Verbose'
   });
 
@@ -233,6 +251,33 @@ test('runtime config validation fails closed for production CSRF secret', () => 
   assert.deepEqual(valid.warnings.map((item) => item.code), ['verbose_diagnostic_in_production']);
   assert.equal(valid.assistant.enabled, false);
   assert.equal(valid.assistant.apiKeyConfigured, false);
+
+  const plaintextRedis = validateRuntimeConfig({
+    nodeEnv: 'production',
+    csrfSecret: 'externally-managed-secret',
+    logTargets: ['stdout', 'syslog'],
+    syslogHost: 'collector.internal.example',
+    syslogPort: 514,
+    publicOrigin: 'https://custom.example',
+    redisUrl: 'redis://redis.example:6379/0',
+    diagnosticMode: 'off'
+  });
+  assert.equal(plaintextRedis.ok, true);
+  assert.equal(plaintextRedis.redis.transport, 'plaintext');
+  assert.ok(plaintextRedis.warnings.some((item) => item.code === 'redis_plaintext_transport'));
+
+  const invalidRedis = validateRuntimeConfig({
+    nodeEnv: 'production',
+    csrfSecret: 'externally-managed-secret',
+    logTargets: ['stdout', 'syslog'],
+    syslogHost: 'collector.internal.example',
+    syslogPort: 514,
+    publicOrigin: 'https://custom.example',
+    redisUrl: 'https://redis.example:6380/0',
+    diagnosticMode: 'off'
+  });
+  assert.equal(invalidRedis.ok, false);
+  assert.ok(invalidRedis.errors.some((item) => item.code === 'redis_url_invalid'));
 
   const missingPublicOrigin = validateRuntimeConfig({
     nodeEnv: 'production',
@@ -255,6 +300,75 @@ test('runtime config validation fails closed for production CSRF secret', () => 
     diagnosticMode: 'off'
   });
   assert.deepEqual(invalidPublicOrigin.errors.map((item) => item.code), ['public_origin_invalid']);
+});
+
+test('Redis TLS transport accepts a configured private CA', async (t) => {
+  const certificateDirectory = mkdtempSync(join(tmpdir(), 'cmdbdynamicpages-redis-tls-'));
+  const keyPath = join(certificateDirectory, 'redis-key.pem');
+  const certificatePath = join(certificateDirectory, 'redis-cert.pem');
+  let redisServer = null;
+  let backend = null;
+  try {
+    try {
+      execFileSync('openssl', [
+        'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+        '-keyout', keyPath,
+        '-out', certificatePath,
+        '-subj', '/CN=127.0.0.1',
+        '-addext', 'subjectAltName=IP:127.0.0.1',
+        '-days', '1'
+      ], { stdio: 'ignore' });
+    } catch {
+      t.skip('OpenSSL is required to generate the temporary Redis TLS certificate.');
+      return;
+    }
+
+    redisServer = tls.createServer({
+      key: readFileSync(keyPath),
+      cert: readFileSync(certificatePath)
+    }, (socket) => {
+      socket.on('data', () => socket.write('+PONG\r\n'));
+    });
+    try {
+      await listen(redisServer);
+    } catch (error) {
+      if (error && error.code === 'EPERM') {
+        t.skip('TCP sockets are not permitted by this execution sandbox.');
+        return;
+      }
+      throw error;
+    }
+    const redisPort = redisServer.address().port;
+    const proxyPort = await availablePort();
+    backend = spawn(process.execPath, ['scripts/dev-proxy-server.mjs'], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        NODE_ENV: 'development',
+        PROXY_HOST: '127.0.0.1',
+        PROXY_PORT: String(proxyPort),
+        CMDP_PUBLIC_ORIGIN: `http://127.0.0.1:${proxyPort}`,
+        CMDBDYNAMIC_REDIS_URL: `rediss://127.0.0.1:${redisPort}/0`,
+        CMDBDYNAMIC_REDIS_TLS_CA_FILE: certificatePath,
+        CMDBDYNAMIC_REDIS_REQUIRED: 'false',
+        CMDP_D2_RENDER_ENABLED: 'false',
+        CMDP_LOG_TARGET: 'stdout'
+      },
+      stdio: ['ignore', 'ignore', 'ignore']
+    });
+    const status = await waitForJson(`http://127.0.0.1:${proxyPort}/health/redis`);
+    assert.equal(status.response.status, 200, JSON.stringify(status.json));
+    assert.equal(status.json.redis.backend, 'redis');
+    assert.equal(status.json.redis.available, true);
+    assert.deepEqual(status.json.redis.transportSecurity, { transport: 'tls', caConfigured: true });
+  } finally {
+    if (backend && backend.exitCode === null) {
+      backend.kill('SIGTERM');
+      await new Promise((resolve) => backend.once('exit', resolve));
+    }
+    if (redisServer && redisServer.listening) await new Promise((resolve) => redisServer.close(resolve));
+    rmSync(certificateDirectory, { recursive: true, force: true });
+  }
 });
 
 test('production startup delivers structured app.started to the configured UDP syslog collector', async (t) => {
@@ -282,11 +396,18 @@ test('production startup delivers structured app.started to the configured UDP s
   });
 
   const message = new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('Timed out waiting for the syslog startup event.')), 5000);
-    collector.once('message', (packet) => {
+    const timer = setTimeout(() => {
+      collector.off('message', onMessage);
+      reject(new Error('Timed out waiting for the syslog startup event.'));
+    }, 5000);
+    const onMessage = (packet) => {
+      const value = packet.toString('utf8');
+      if (!value.includes('app.started')) return;
       clearTimeout(timer);
-      resolve(packet.toString('utf8'));
-    });
+      collector.off('message', onMessage);
+      resolve(value);
+    };
+    collector.on('message', onMessage);
   });
   // Start after registering the collector listener so the first structured
   // startup event is part of the delivery contract, not a timing accident.
@@ -438,3 +559,38 @@ test('template cards expose stable specHash and expected hash is opt-in', () => 
   assert.equal(expectedSpecHashFromBody({ expectedSpecHash: card.specHash }), card.specHash);
   assert.equal(expectedSpecHashFromBody({}), '');
 });
+
+function listen(server) {
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', reject);
+      resolve();
+    });
+  });
+}
+
+async function availablePort() {
+  const server = net.createServer();
+  await listen(server);
+  const address = server.address();
+  const port = address && typeof address === 'object' ? address.port : 0;
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
+async function waitForJson(url) {
+  const deadline = Date.now() + 5000;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(url);
+      const json = await response.json();
+      return { response, json };
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+  throw lastError || new Error(`Timed out waiting for ${url}.`);
+}

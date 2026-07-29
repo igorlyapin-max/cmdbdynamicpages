@@ -5,11 +5,13 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
+      CMDP_NGINX_PUBLIC_HOST: "${CMDP_NGINX_PUBLIC_HOST:-localhost:8088}"
+      CMDP_NGINX_PUBLIC_PROTO: "${CMDP_NGINX_PUBLIC_PROTO:-http}"
       CMDP_NGINX_CUSTOM_API_READ_TIMEOUT: "${CMDP_NGINX_CUSTOM_API_READ_TIMEOUT:-70s}"
     volumes:
       - ./nginx/cmdbdynamicpages.conf:/etc/nginx/templates/default.conf.template:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8088/health/live || exit 1"]
+      test: ["CMD-SHELL", "nginx -t && test -s /var/run/nginx.pid && kill -0 $$(cat /var/run/nginx.pid)"]
       interval: 10s
       timeout: 3s
       retries: 3

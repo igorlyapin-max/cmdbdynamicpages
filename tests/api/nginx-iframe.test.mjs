@@ -10,6 +10,7 @@ const cookieJar = process.env.CMDBUILD_COOKIE_JAR || '/tmp/cmdbuild-ui-cookie.tx
 const runtimeTemplate = process.env.CMDBDYNAMIC_E2E_TEMPLATE || 'ProbeClassesByAttributeType';
 const runtimeAttrType = process.env.CMDBDYNAMIC_E2E_ATTR_TYPE || 'reference';
 const cookieHeader = process.env.CMDBUILD_COOKIE_HEADER || readCookieJar(cookieJar);
+const nginxCompose = fs.readFileSync('docker-compose.nginx.yml', 'utf8');
 const nginxAvailable = await canReach(`${nginxOrigin}/health/live`);
 const skipWhenUnavailable = nginxAvailable ? false : `nginx same-origin front did not return healthy /health/live at ${nginxOrigin}`;
 
@@ -30,7 +31,20 @@ test('nginx config exposes only cmdbdynamicpages routes on the same origin', () 
   assert.match(config, /proxy_pass\s+http:\/\/127\.0\.0\.1:8093\/health\/;/);
   assert.match(config, /location\s+\/\s*\{/);
   assert.match(config, /return\s+404;/);
+  assert.equal((config.match(/proxy_set_header Host \$\{CMDP_NGINX_PUBLIC_HOST\};/g) || []).length, 6);
+  assert.equal((config.match(/proxy_set_header X-Forwarded-Host \$\{CMDP_NGINX_PUBLIC_HOST\};/g) || []).length, 6);
+  assert.equal((config.match(/proxy_set_header X-Forwarded-Proto \$\{CMDP_NGINX_PUBLIC_PROTO\};/g) || []).length, 6);
+  assert.doesNotMatch(config, /\$http_host/);
+  assert.doesNotMatch(config, /proxy_set_header X-Forwarded-Proto \$scheme;/);
   assert.doesNotMatch(config, /3000|13000|13001|18080/);
+});
+
+test('nginx compose pins public forwarding defaults and probes only nginx itself', () => {
+  assert.match(nginxCompose, /CMDP_NGINX_PUBLIC_HOST: "\$\{CMDP_NGINX_PUBLIC_HOST:-localhost:8088\}"/);
+  assert.match(nginxCompose, /CMDP_NGINX_PUBLIC_PROTO: "\$\{CMDP_NGINX_PUBLIC_PROTO:-http\}"/);
+  assert.match(nginxCompose, /nginx -t && test -s \/var\/run\/nginx\.pid && kill -0 \$\$\(cat \/var\/run\/nginx\.pid\)/);
+  assert.doesNotMatch(nginxCompose, /\bwget\b/);
+  assert.doesNotMatch(nginxCompose, /\/health\/live/);
 });
 
 test('nginx health route reaches cmdbdynamicpages backend', { skip: skipWhenUnavailable }, async () => {

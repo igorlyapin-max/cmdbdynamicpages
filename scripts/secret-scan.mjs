@@ -16,13 +16,21 @@ const patterns = [
   }
 ];
 
-function scanFiles(dir = '.') {
+const scanRoot = fs.realpathSync('.');
+
+function pathIsInsideScanRoot(filePath) {
+  const relativePath = path.relative(scanRoot, filePath);
+  return Boolean(relativePath) && !relativePath.startsWith(`..${path.sep}`) && relativePath !== '..' && !path.isAbsolute(relativePath);
+}
+
+function scanFiles(dir = scanRoot) {
   const result = [];
   const entries = fs.readdirSync(dir, { withFileTypes: true });
   entries
     .sort((left, right) => left.name.localeCompare(right.name))
     .forEach((entry) => {
       const filePath = path.join(dir, entry.name);
+      if (!pathIsInsideScanRoot(filePath) || entry.isSymbolicLink()) return;
       if (entry.isDirectory()) {
         if (!excludedDirectories.has(entry.name)) {
           result.push(...scanFiles(filePath));
@@ -49,7 +57,7 @@ for (const file of scanFiles()) {
     patterns.forEach((pattern) => {
       if (pattern.regex.test(line)) {
         findings.push({
-          file,
+          file: path.relative(scanRoot, file),
           line: index + 1,
           type: pattern.id
         });

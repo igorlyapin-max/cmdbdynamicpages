@@ -38,6 +38,7 @@ paths:
       tags: [health]
       security: []
       summary: Liveness probe
+      description: Public operational probe. It exposes only backend process liveness and no CMDBuild data.
       responses:
         "200":
           description: Backend process is alive
@@ -50,6 +51,7 @@ paths:
       tags: [health]
       security: []
       summary: Strict Redis health probe
+      description: Public operational probe. It reports Redis availability without credentials or cached business data.
       responses:
         "200":
           description: Redis is available
@@ -64,6 +66,7 @@ paths:
       tags: [health]
       security: []
       summary: Production readiness probe
+      description: Public operational probe. It exposes aggregate dependency readiness only.
       responses:
         "200":
           description: Backend is ready
@@ -97,7 +100,7 @@ paths:
       tags: [diagnostics]
       security: []
       summary: Diagnostic cache status
-      description: Returns 200 even when Redis fallback to memory is active; do not use as strict readiness.
+      description: Public operational diagnostic. Returns 200 even when Redis fallback to memory is active; do not use as strict readiness. Redis credentials and cached business data are never returned.
       responses:
         "200":
           description: Cache diagnostic status
@@ -628,6 +631,7 @@ paths:
       tags: [runtime]
       security: []
       summary: Run public static snapshot
+      description: Public only for an explicitly published static snapshot. It reads the stored snapshot and never executes a CMDBuild query for the viewer.
       responses:
         "200":
           description: Snapshot result or missing snapshot response

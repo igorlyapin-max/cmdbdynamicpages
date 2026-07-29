@@ -931,6 +931,10 @@ test('CMDBuild custom page launcher redirects without relying only on afterrende
   assert.match(launcherSource, /cmdbDynamicPagesScheduleOpenExternalUi\('afterrender'\)/);
   assert.match(launcherSource, /window\.addEventListener\('hashchange'/);
   assert.match(launcherSource, /launcher-redirect/);
+  assert.match(launcherSource, /function cmdbDynamicPagesIsInternalTarget/);
+  assert.match(launcherSource, /target\.charAt\(0\) !== '\/'/);
+  assert.match(launcherSource, /new URL\(target, window\.location\.origin\)\.origin === window\.location\.origin/);
+  assert.match(launcherSource, /if \(!cmdbDynamicPagesIsInternalTarget\(target\)\) return;/);
 });
 
 test('CMDBuild UI proxy injection tracks launcher hash changes', () => {

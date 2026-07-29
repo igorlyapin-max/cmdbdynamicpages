@@ -27,8 +27,11 @@ Minimum production env:
 PROXY_HOST=127.0.0.1
 PROXY_PORT=8093
 CMDP_PUBLIC_ORIGIN=https://cmdb.example.local
+CMDP_NGINX_PUBLIC_HOST=cmdb.example.local
+CMDP_NGINX_PUBLIC_PROTO=https
 CMDBUILD_ORIGIN=http://127.0.0.1:8090
-CMDBDYNAMIC_REDIS_URL=redis://127.0.0.1:6379/0
+CMDBDYNAMIC_REDIS_URL=rediss://redis.example.local:6380/0
+CMDBDYNAMIC_REDIS_TLS_CA_FILE=
 CMDBDYNAMIC_REDIS_PASSWORD_FILE=/run/secrets/cmdbdynamicpages_redis_password
 CMDBDYNAMIC_REDIS_REQUIRED=true
 CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=true
@@ -43,7 +46,7 @@ CMDP_DIAGNOSTIC_MODE=off
 ```
 
 The repository includes a backend `Dockerfile` for container deployment. The image runs as the `node` user, listens on `8093`, and uses `/health/live` only as the container liveness healthcheck. Configure `CMDP_SYSLOG_HOST`, `CMDP_SYSLOG_PORT`, `CMDP_SYSLOG_PROTOCOL`, and `CMDP_SYSLOG_FACILITY` for the approved production collector; `CMDP_LOG_TARGET=stdout,syslog` keeps stdout/stderr as the local operational output.
-Production startup fails closed when `CMDBDYNAMICPAGES_CSRF_SECRET` or `CMDP_PUBLIC_ORIGIN` is missing. `CMDP_PUBLIC_ORIGIN` is the public browser origin; `CMDBUILD_ORIGIN` is the internal backend upstream and they may differ. Enable `CMDP_DIAGNOSTIC_MODE=Verbose` only temporarily during incident diagnostics.
+Production startup fails closed when `CMDBDYNAMICPAGES_CSRF_SECRET` or `CMDP_PUBLIC_ORIGIN` is missing. `CMDP_PUBLIC_ORIGIN` is the public browser origin; `CMDBUILD_ORIGIN` is the internal backend upstream and they may differ. `CMDP_NGINX_PUBLIC_HOST` and `CMDP_NGINX_PUBLIC_PROTO` must match the host[:port] and protocol of `CMDP_PUBLIC_ORIGIN`; bundled nginx uses these configured values instead of request-supplied forwarding headers. Enable `CMDP_DIAGNOSTIC_MODE=Verbose` only temporarily during incident diagnostics.
 Admin-facing container handoff is documented in [CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md](CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md).
 
 If the platform can pass the Redis secret only as a string, these variants are supported:
@@ -63,7 +66,7 @@ For dev:
 docker compose -f docker-compose.nginx.yml up -d redis
 ```
 
-Production Redis must be password-protected. Prefer `CMDBDYNAMIC_REDIS_PASSWORD_FILE`; if string delivery is used, set `CMDBDYNAMIC_REDIS_PASSWORD` or a password inside `CMDBDYNAMIC_REDIS_URL` only through platform secret/env. Do not store the secret in git or in the repository compose file.
+Production Redis must be password-protected and should use `rediss://`. `CMDBDYNAMIC_REDIS_TLS_CA_FILE` is optional: set it to a CA PEM path already mounted in the backend container only when private Redis PKI is not covered by system trust. Prefer `CMDBDYNAMIC_REDIS_PASSWORD_FILE`; if string delivery is used, set `CMDBDYNAMIC_REDIS_PASSWORD` or a password inside `CMDBDYNAMIC_REDIS_URL` only through platform secret/env. Plaintext `redis://` remains supported for local and existing deployments, but production emits the `redis_plaintext_transport` runtime warning. Do not store secrets or CA material in git or in the repository compose file.
 
 LiteLLM Assistant is optional. Leave `LITELLM_API_KEY_FILE_HOST` empty when Assistant is unused so compose mounts `/dev/null`. When enabled, the host path must exist before `docker compose up` and must be a readable regular file; otherwise Docker may create a directory in place of the secret file. Verify without printing the key:
 
@@ -181,7 +184,7 @@ http://localhost:8088/         -> 404
 
 This nginx instance exposes only routes owned by `cmdbdynamicpages`. External portals are deployed and proxied independently.
 
-With an external TLS reverse proxy, the browser must open CMDBuild UI, the custom page, and `/cmdbuild/custom-api/*` through one `CMDP_PUBLIC_ORIGIN`, for example `https://custom.example.local`. The external proxy forwards public `Host`, `X-Forwarded-Host`, and `X-Forwarded-Proto=https`; an internal `CMDBUILD_ORIGIN`, for example `https://vr2.internal.example`, is never user-facing. Confirm that `/cmdbuild/ui/config.js`, redirects, and the CMDBuild session cookie use the public hostname rather than the internal upstream.
+With an external TLS reverse proxy, the browser must open CMDBuild UI, the custom page, and `/cmdbuild/custom-api/*` through one `CMDP_PUBLIC_ORIGIN`, for example `https://custom.example.local`. Set `CMDP_NGINX_PUBLIC_HOST=custom.example.local` and `CMDP_NGINX_PUBLIC_PROTO=https`; bundled nginx forwards those configured values and does not trust client-supplied `Host` or forwarding headers. An internal `CMDBUILD_ORIGIN`, for example `https://vr2.internal.example`, is never user-facing. Confirm that `/cmdbuild/ui/config.js`, redirects, and the CMDBuild session cookie use the public hostname rather than the internal upstream.
 
 ## 8. Post-deployment checks
 

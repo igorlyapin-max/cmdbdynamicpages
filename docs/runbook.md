@@ -24,6 +24,10 @@ Required production configuration:
 ```text
 NODE_ENV=production
 CMDP_PUBLIC_ORIGIN=https://custom.example.local
+CMDP_NGINX_PUBLIC_HOST=custom.example.local
+CMDP_NGINX_PUBLIC_PROTO=https
+CMDBDYNAMIC_REDIS_URL=rediss://redis.example.local:6380/0
+CMDBDYNAMIC_REDIS_TLS_CA_FILE=
 CMDBDYNAMICPAGES_CSRF_SECRET=<external stable secret>
 CMDBDYNAMIC_REDIS_REQUIRED=true
 CMDBDYNAMIC_REDIS_PASSWORD_FILE=/run/secrets/cmdbdynamicpages_redis_password
@@ -52,7 +56,9 @@ Expected result: `/health/live` is `200`; `/health/ready` is `200` only when Red
 
 `CMDBUILD_ORIGIN` is an internal upstream URL reachable only by the backend, for example `https://vr2.internal.example`. It may differ from `CMDP_PUBLIC_ORIGIN`, but it must not appear in browser URLs, `Origin`, `Referer`, redirect `Location`, or cookie domain values.
 
-The external TLS reverse proxy forwards the public `Host`, `X-Forwarded-Host`, and `X-Forwarded-Proto=https`. Publish only the public hostname to users; firewall or ingress rules must close direct user access to the backend, bundled nginx, and internal CMDBuild upstream. Browser JavaScript uses relative `/cmdbuild/...` URLs and never calls `PROXY_PORT` or `CMDBUILD_ORIGIN` directly.
+Use `rediss://` for production Redis. `CMDBDYNAMIC_REDIS_TLS_CA_FILE` is optional and names a CA PEM already mounted in the backend container when system trust does not cover the private Redis PKI. Plaintext `redis://` remains supported for local and existing deployments but reports `redis_plaintext_transport` at production runtime.
+
+Set `CMDP_NGINX_PUBLIC_HOST` to the `host[:port]` of `CMDP_PUBLIC_ORIGIN` and `CMDP_NGINX_PUBLIC_PROTO` to its protocol. Bundled nginx forwards only those configured values, not client-supplied `Host`, `X-Forwarded-Host`, or `X-Forwarded-Proto`. Publish only the public hostname to users; firewall or ingress rules must close direct user access to the backend, bundled nginx, and internal CMDBuild upstream. Browser JavaScript uses relative `/cmdbuild/...` URLs and never calls `PROXY_PORT` or `CMDBUILD_ORIGIN` directly.
 
 After deployment, verify through the public hostname:
 

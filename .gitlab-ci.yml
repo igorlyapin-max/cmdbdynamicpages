@@ -11,6 +11,15 @@ npm_test:
   script:
     - npm run ci
 
+go_vulncheck:
+  stage: test
+  image: golang:1.24-alpine
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+  script:
+    - go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./cmd/cmdp-d2-import
+
 container_image:
   stage: container
   image: docker:27

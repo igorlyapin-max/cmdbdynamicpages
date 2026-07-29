@@ -22,6 +22,8 @@ The current implementation keeps CMDBuild custom page code intentionally small:
 
 In production, `CMDP_PUBLIC_ORIGIN` is the single public browser origin while `CMDBUILD_ORIGIN` remains an internal backend upstream. They may differ behind a TLS-terminated reverse proxy, but the internal URL must not appear in browser traffic.
 
+Bundled nginx forwards `Host`, `X-Forwarded-Host`, and `X-Forwarded-Proto` from explicit `CMDP_NGINX_PUBLIC_HOST` and `CMDP_NGINX_PUBLIC_PROTO` values that match `CMDP_PUBLIC_ORIGIN`; it does not trust client-supplied forwarding headers. Local defaults use `http://localhost:8088`.
+
 The CMDBuild/Tomcat deployment owns the user session lifetime; `cmdbdynamicpages` does not extend it. On the current test stand the server-side idle timeout is 30 minutes. The relevant Tomcat `web.xml` block is approximately:
 
 ```xml
@@ -338,12 +340,15 @@ docker compose -f docker-compose.nginx.yml up -d redis
 
 The dev Redis container uses RDB snapshots (`--save 60 1`) and volume `cmdbdynamicpages-redis-data`. RDB is a pragmatic published-cache store, not strict durable storage: if a static snapshot is absent after a Redis loss, the runtime page shows `Страница отсутствует для загрузки` until an administrator/editor publishes it again.
 
-Production Redis must require a password. Do not store that password in git. Configure the backend with a secret supplied by the deployment platform:
+Production Redis must require a password and should use `rediss://`. Do not store the password or CA material in git. Configure the backend with deployment-platform secrets:
 
 ```text
-CMDBDYNAMIC_REDIS_URL=redis://127.0.0.1:6379/0
+CMDBDYNAMIC_REDIS_URL=rediss://redis.example.local:6380/0
+CMDBDYNAMIC_REDIS_TLS_CA_FILE=
 CMDBDYNAMIC_REDIS_PASSWORD_FILE=/run/secrets/cmdbdynamicpages_redis_password
 ```
+
+`CMDBDYNAMIC_REDIS_TLS_CA_FILE` is optional and names a CA PEM already mounted in the backend container when system trust does not cover private Redis PKI. Plaintext `redis://` remains supported for local and existing deployments; in production it emits the `redis_plaintext_transport` runtime warning.
 
 `CMDBDYNAMIC_REDIS_PASSWORD` and URL form `redis://:password@host:6379/0` are also supported for non-production/dev use, but the file-based secret is preferred. Health/status responses mask Redis credentials before returning the URL.
 
@@ -435,7 +440,7 @@ State-changing custom API routes compare `Origin` or `Referer` with configured `
 Runtime iframe pages call `GET /cmdbuild/custom-api/templates/<code>/run?param=value`. This endpoint still requires the CMDBuild session cookie for dynamic templates, but it is read-only from CMDBuild's perspective and does not require `X-CMDBDynamicPages-CSRF`. `POST /cmdbuild/custom-api/templates/<code>/run` remains available for API/Designer checks and keeps CSRF protection. Both GET and POST runtime executions use standard backend logging only.
 For diagram templates, the same runtime endpoint renders generated `.d2` source through the server-side D2 binary and stores the resulting SVG in runtime cache/static snapshots. `GET /cmdbuild/custom-api/templates/<code>/run?d2=true&diagram=<name>&param=value` downloads the generated D2 source as `text/vnd.d2` for an authenticated viewer. Public static snapshots expose raw `.d2` only when the saved template has `publish.publicD2Source=true`.
 
-Production health/readiness endpoints are unauthenticated and are also available at root aliases `/health/live`, `/health/ready`, and `/health/redis`.
+Production health/readiness endpoints are unauthenticated and are also available at root aliases `/health/live`, `/health/ready`, and `/health/redis`. `/metrics` and `/cmdbuild/custom-api/cache/status` are public operational endpoints too; they return aggregate health/cache state only and never return cookies, Redis credentials, or CMDBuild rows.
 
 - `GET /health/live` returns `200` when the Node process can answer HTTP.
 - `GET /health/redis` performs a strict Redis `PING` and returns `503` when Redis is disabled or unavailable.

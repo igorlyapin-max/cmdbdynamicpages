@@ -51,6 +51,17 @@ test('metrics endpoint exposes aggregate Prometheus text only', { skip: skipWhen
   assert.doesNotMatch(result.body, /cookie|authorization|csrf|secret|CMDBuild-Authorization/i);
 });
 
+test('cache status endpoint is public and does not expose Redis credentials', { skip: skipWhenUnavailable }, async () => {
+  const result = await request('GET', `${proxyOrigin}/cmdbuild/custom-api/cache/status`);
+
+  assert.equal(result.statusCode, 200);
+  const json = JSON.parse(result.body);
+  assert.equal(json.success, true);
+  assert.equal(typeof json.redis, 'object');
+  assert.equal(typeof json.redis.transportSecurity, 'object');
+  assert.doesNotMatch(result.body, /CMDBuild-Authorization|cookie|csrf|password=/i);
+});
+
 test('logging status is protected by CMDBuild authentication', { skip: skipWhenUnavailable }, async () => {
   const result = await request('GET', `${proxyOrigin}/cmdbuild/custom-api/logging/status`);
 

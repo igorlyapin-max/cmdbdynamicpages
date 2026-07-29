@@ -26,6 +26,8 @@ CMDBuild custom page оставлен тонким launcher-компоненто
 
 В production `CMDP_PUBLIC_ORIGIN` задает единственный public browser origin, а `CMDBUILD_ORIGIN` остается internal backend upstream. Они могут различаться при TLS-terminated reverse proxy, но internal URL не должен попадать в browser traffic.
 
+Bundled nginx передает `Host`, `X-Forwarded-Host` и `X-Forwarded-Proto` из явных `CMDP_NGINX_PUBLIC_HOST` и `CMDP_NGINX_PUBLIC_PROTO`, которые совпадают с `CMDP_PUBLIC_ORIGIN`; client-supplied forwarding headers не являются источником доверия. Local defaults используют `http://localhost:8088`.
+
 Срок жизни пользовательской сессии задает CMDBuild/Tomcat, а не `cmdbdynamicpages`. На текущем стенде server-side idle timeout составляет 30 минут неактивности. Ориентировочный блок настройки находится в Tomcat `web.xml`:
 
 ```xml
@@ -115,12 +117,15 @@ npm run nginx:test
 
 ## Redis и секреты
 
-Для production Redis должен быть защищен паролем. Пароль не хранится в git и не должен попадать в compose-файлы репозитория. Предпочтительная настройка:
+Для production Redis должен быть защищен паролем и использовать `rediss://`. Пароль и CA material не хранятся в git и не должны попадать в compose-файлы репозитория. Предпочтительная настройка:
 
 ```text
-CMDBDYNAMIC_REDIS_URL=redis://127.0.0.1:6379/0
+CMDBDYNAMIC_REDIS_URL=rediss://redis.example.local:6380/0
+CMDBDYNAMIC_REDIS_TLS_CA_FILE=
 CMDBDYNAMIC_REDIS_PASSWORD_FILE=/run/secrets/cmdbdynamicpages_redis_password
 ```
+
+`CMDBDYNAMIC_REDIS_TLS_CA_FILE` optional и задает путь к CA PEM, уже смонтированному в backend container, если system trust не покрывает private Redis PKI. Plaintext `redis://` остается поддержанным для local и существующих deployment; в production он дает runtime warning `redis_plaintext_transport`.
 
 Поддерживаются также:
 
@@ -147,6 +152,8 @@ Endpoint'ы без авторизации:
 GET /health/live
 GET /health/ready
 GET /health/redis
+GET /metrics
+GET /cmdbuild/custom-api/cache/status
 GET /cmdbuild/custom-api/health/live
 GET /cmdbuild/custom-api/health/ready
 GET /cmdbuild/custom-api/health/redis
@@ -157,8 +164,9 @@ GET /cmdbuild/custom-api/health/redis
 - `/health/live` возвращает `200`, если Node-процесс отвечает на HTTP.
 - `/health/redis` делает строгий Redis `PING`; при недоступности Redis возвращает `503`.
 - `/health/ready` проверяет процесс, Redis и CMDBuild upstream; при проблеме возвращает `503`.
-- `/cmdbuild/custom-api/cache/status` остается диагностикой и может возвращать `200` даже при fallback на memory.
-- `/cmdbuild/custom-api/logging/status` показывает текущий log level, target и правила маскирования без секретов.
+- `/metrics` возвращает только агрегированные Prometheus counters и gauges.
+- `/cmdbuild/custom-api/cache/status` остается публичной operational diagnostic и может возвращать `200` при fallback на memory; cookies, Redis credentials и CMDBuild rows не возвращаются.
+- `/cmdbuild/custom-api/logging/status` требует CMDBuild session и показывает текущий log level, target и правила маскирования без секретов.
 
 Настройки:
 
