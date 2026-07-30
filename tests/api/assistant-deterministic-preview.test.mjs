@@ -660,6 +660,81 @@ test('full object-flow planning returns a validated proposal without mutating th
   assert.equal(backend.exitCode, null);
 });
 
+test('Object Flow uses a template prompt override from currentSpec and falls back after reset', async (t) => {
+  const globalPrompt = 'GLOBAL OBJECT FLOW SEMANTIC PROMPT';
+  const templatePrompt = 'TEMPLATE OBJECT FLOW SEMANTIC PROMPT';
+  const intent = objectFlowIntentFromText('Выбрать все карточки АРМ.', {
+    name: 'Workstations',
+    entities: 'ARM',
+    expectedResult: 'Список АРМ.'
+  });
+  const semanticPlan = semanticPlanForIntent(intent, { outputClass: 'ARM' });
+  const llm = await startLiteLlmStub(t, {
+    responses: [semanticPlan, semanticPlan]
+  });
+  const mock = await startMockCmdbuild(t, {
+    classes: [
+      { _id: 1, name: 'ARM', description: 'Workstation', parent: 'Class', active: true },
+      { _id: 2, name: 'Cst_QueryToolConfig', description: 'Config', parent: 'Class', active: true },
+      { _id: 3, name: 'Cst_QueryTemplate', description: 'Template', parent: 'Class', active: true }
+    ],
+    configCards: [{
+      _id: 1,
+      Code: 'Cst_QueryTool',
+      RootCode: 'Cst_QueryTool',
+      Active: true,
+      RuntimeConfigJson: JSON.stringify({
+        assistant: {
+          llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' },
+          prompt: { objectFlowSemantic: globalPrompt }
+        }
+      })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, {
+    LITELLM_API_KEY: 'unit-test-key',
+    CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin
+  });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = testCmdbuildAuthorizationCookie('template-prompt-override-token');
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const baseSpec = { version: 1, params: {}, steps: [], result: { tables: [] } };
+  const specWithOverride = {
+    ...baseSpec,
+    authoring: {
+      version: 1,
+      assistant: {
+        objectFlowIntent: { context: '', blocks: [] },
+        diagramInterpretPrompt: '',
+        diagramMappingPrompt: '',
+        systemPromptOverrides: { objectFlowSemantic: templatePrompt }
+      },
+      d2: { source: '' }
+    }
+  };
+  const requestSemanticPlan = async (currentSpec, resumeId) => {
+    const context = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+      stage: 'context', resumeId, templateCode: '', baseSpecHash: '', currentSpec, intent
+    }, headers);
+    assert.equal(context.statusCode, 202, context.body);
+    const planned = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+      stage: 'plan', resumeId, templateCode: '', baseSpecHash: '', currentSpec, intent
+    }, headers);
+    assert.equal(planned.statusCode, 200, planned.body);
+  };
+
+  await requestSemanticPlan(specWithOverride, 'template-prompt-override');
+  assert.ok(llm.lastRequest.messages.some((message) => message.role === 'system' && message.content === templatePrompt), JSON.stringify(llm.lastRequest));
+  assert.equal(llm.lastRequest.messages.some((message) => message.content === globalPrompt), false, JSON.stringify(llm.lastRequest));
+
+  await requestSemanticPlan(baseSpec, 'template-prompt-reset');
+  assert.ok(llm.lastRequest.messages.some((message) => message.role === 'system' && message.content === globalPrompt), JSON.stringify(llm.lastRequest));
+  assert.equal(llm.lastRequest.messages.some((message) => message.content === templatePrompt), false, JSON.stringify(llm.lastRequest));
+  assert.equal(backend.exitCode, null);
+});
+
 test('LiteLLM timeout follows the configured MCP timeout', async (t) => {
   const llm = await startLiteLlmStub(t, { flow: {}, delayMs: 1200 });
   const mock = await startMockCmdbuild(t, {
@@ -4243,6 +4318,76 @@ test('D2 interpretation accepts a container without role-level repeat or owner s
   assert.equal(interpreted.json.decisions.find((item) => item.roleId === containerRole.id).visualKind, 'container');
   assert.equal(interpreted.json.diagnostics.attempts, 1);
   assert.equal(llm.requests, 1);
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 interpretation uses the template-specific system prompt from currentSpec', async (t) => {
+  const globalPrompt = 'GLOBAL D2 INTERPRETATION PROMPT';
+  const templatePrompt = 'TEMPLATE D2 INTERPRETATION PROMPT';
+  const llm = await startLiteLlmStub(t, {
+    responses: [({ request }) => ({
+      decisions: JSON.parse(request.messages.at(-1).content).roles.map((role) => ({
+        roleId: role.id,
+        visualKind: role.isContainer ? 'container' : 'node',
+        confidence: 'high',
+        reason: 'Confirmed by template-specific policy.'
+      }))
+    })]
+  });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{
+      _id: 1,
+      Code: 'Cst_QueryTool',
+      RootCode: 'Cst_QueryTool',
+      Active: true,
+      RuntimeConfigJson: JSON.stringify({
+        assistant: {
+          llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' },
+          prompt: { diagramInterpretation: globalPrompt }
+        }
+      })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, {
+    LITELLM_API_KEY: 'unit-test-key',
+    CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin
+  });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = testCmdbuildAuthorizationCookie('d2-template-prompt-override-token');
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const d2Source = 'workstation: Workstation';
+  const currentSpec = {
+    ...apiObjectFlowSpec([{ alias: 'workstations', className: 'ARM', columns: ['Code', 'Description'] }]),
+    authoring: {
+      version: 1,
+      assistant: {
+        objectFlowIntent: { context: '', blocks: [] },
+        diagramInterpretPrompt: '',
+        diagramMappingPrompt: '',
+        systemPromptOverrides: { diagramInterpretation: templatePrompt }
+      },
+      d2: { source: d2Source }
+    }
+  };
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'TemplatePromptD2Import',
+    currentSpec,
+    d2Source
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+
+  const interpreted = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/interpret`, {
+    prompt: 'Interpret the supplied D2 roles.',
+    currentSpec,
+    proposal: analyzed.json.proposal,
+    roles: []
+  }, headers);
+
+  assert.equal(interpreted.statusCode, 200, interpreted.body);
+  assert.ok(llm.lastRequest.messages.some((message) => message.role === 'system' && message.content === templatePrompt), JSON.stringify(llm.lastRequest));
+  assert.equal(llm.lastRequest.messages.some((message) => message.content === globalPrompt), false, JSON.stringify(llm.lastRequest));
   assert.equal(backend.exitCode, null);
 });
 

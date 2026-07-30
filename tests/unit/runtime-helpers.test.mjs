@@ -62,6 +62,7 @@ import {
   normalizeAssistantDraftSpec,
   normalizeAssistantObjectFlowIntent,
   normalizeAssistantRuntimeConfig,
+  normalizeTemplateAssistantPromptOverrides,
   normalizeRuntimeCacheConfig,
   normalizeDiagramImportIr,
   normalizeTemplateCacheConfig,
@@ -85,8 +86,10 @@ import {
   stripSensitiveDiagramArtifacts,
   sanitizeVisibleClassAttributes,
   templateIsProtected,
+  templateAssistantRuntimeConfig,
   validateDiagramImportV3Catalog,
-  validateTemplateSpec
+  validateTemplateSpec,
+  validateTemplateSpecForStorage
 } from '../../scripts/dev-proxy-server.mjs';
 import { compileObjectFlowToSpec } from '../../scripts/assistant-object-flow.mjs';
 
@@ -96,6 +99,158 @@ test('CMDBuild session failures distinguish invalid authorization from upstream 
   assert.equal(cmdbuildSessionFailureHttpStatus(403), 401);
   assert.equal(cmdbuildSessionFailureHttpStatus(0), 502);
   assert.equal(cmdbuildSessionFailureHttpStatus(500), 502);
+});
+
+test('template Assistant system prompt overrides inherit global policy without mutating it', () => {
+  const runtimeConfig = {
+    assistant: {
+      prompt: {
+        system: 'Global system prompt.',
+        objectFlowSemantic: 'Global semantic prompt.',
+        objectFlow: 'Global flow prompt.',
+        diagramInterpretation: 'Global interpretation prompt.',
+        diagramMapping: 'Global mapping prompt.'
+      }
+    }
+  };
+  const stored = normalizeTemplateSpecForStorage({
+    version: 1,
+    authoring: {
+      version: 1,
+      assistant: {
+        objectFlowIntent: { context: '', blocks: [] },
+        diagramInterpretPrompt: 'Interpret the current D2 source.',
+        diagramMappingPrompt: 'Map the selected results.',
+        systemPromptOverrides: {
+          system: 'Template-specific system prompt.',
+          diagramMapping: 'Template-specific mapping prompt.',
+          unknown: 'Must not be persisted.'
+        }
+      },
+      d2: { source: 'node: Node' }
+    }
+  });
+
+  assert.deepEqual(normalizeTemplateAssistantPromptOverrides(stored.authoring.assistant.systemPromptOverrides), {
+    system: 'Template-specific system prompt.',
+    diagramMapping: 'Template-specific mapping prompt.'
+  });
+  assert.equal(stored.authoring.assistant.systemPromptOverrides.unknown, undefined);
+
+  const effective = normalizeAssistantRuntimeConfig(templateAssistantRuntimeConfig(runtimeConfig, stored));
+  const inherited = normalizeAssistantRuntimeConfig(runtimeConfig);
+  assert.equal(effective.prompt.system, 'Template-specific system prompt.');
+  assert.equal(effective.prompt.diagramMapping, 'Template-specific mapping prompt.');
+  assert.equal(effective.prompt.objectFlow, 'Global flow prompt.');
+  assert.equal(effective.prompt.objectFlowSemantic, 'Global semantic prompt.');
+  assert.equal(effective.prompt.diagramInterpretation, 'Global interpretation prompt.');
+  assert.equal(inherited.prompt.system, 'Global system prompt.');
+  assert.equal(inherited.prompt.diagramMapping, 'Global mapping prompt.');
+  assert.equal(runtimeConfig.assistant.prompt.system, 'Global system prompt.');
+
+  const reset = normalizeTemplateSpecForStorage({
+    ...stored,
+    authoring: {
+      ...stored.authoring,
+      assistant: {
+        ...stored.authoring.assistant,
+        systemPromptOverrides: {}
+      }
+    }
+  });
+  const resetEffective = normalizeAssistantRuntimeConfig(templateAssistantRuntimeConfig(runtimeConfig, reset));
+  assert.equal(reset.authoring.assistant.systemPromptOverrides, undefined);
+  assert.equal(resetEffective.prompt.system, 'Global system prompt.');
+  assert.equal(resetEffective.prompt.diagramMapping, 'Global mapping prompt.');
+});
+
+test('template Assistant prompt overrides reject over-limit input without truncating it', () => {
+  const prompt = 'x'.repeat(20_001);
+  const spec = {
+    version: 1,
+    params: {},
+    steps: [],
+    result: { tables: [] },
+    authoring: {
+      version: 1,
+      assistant: {
+        objectFlowIntent: { context: '', blocks: [] },
+        diagramInterpretPrompt: '',
+        diagramMappingPrompt: '',
+        systemPromptOverrides: { objectFlow: prompt }
+      },
+      d2: { source: '' }
+    }
+  };
+
+  const errors = validateTemplateSpecForStorage(spec);
+  assert.deepEqual(errors, [{
+    path: '$.authoring.assistant.systemPromptOverrides.objectFlow',
+    message: 'Template Assistant prompt override must not exceed 20000 characters.'
+  }]);
+  assert.equal(
+    normalizeTemplateSpecForStorage(spec).authoring.assistant.systemPromptOverrides.objectFlow.length,
+    prompt.length,
+    'The normalizer must not silently shorten a user prompt before the route returns validation errors.'
+  );
+});
+
+test('runtime cache key ignores Assistant authoring overrides but changes for executable template state', () => {
+  const baseSpec = {
+    version: 1,
+    steps: [{
+      type: 'selectCards',
+      as: 'systems',
+      className: 'IS',
+      filters: [],
+      columns: ['Code', 'Description'],
+      limit: 100
+    }],
+    result: { tables: [{ name: 'systems', columns: ['Code', 'Description'] }] }
+  };
+  const withPromptOverride = {
+    ...structuredClone(baseSpec),
+    authoring: {
+      version: 1,
+      assistant: {
+        objectFlowIntent: { context: '', blocks: [] },
+        diagramInterpretPrompt: '',
+        diagramMappingPrompt: '',
+        systemPromptOverrides: { objectFlow: 'Use the result names supplied by this template.' }
+      },
+      d2: { source: 'systems: Systems' }
+    }
+  };
+  const withExecutableChange = structuredClone(baseSpec);
+  withExecutableChange.steps[0].limit = 250;
+  const runtimeCache = normalizeRuntimeCacheConfig(defaultRuntimeConfig());
+  const templateCache = normalizeTemplateCacheConfig({}, runtimeCache);
+  const executionOptions = {
+    maxRows: 100,
+    maxClasses: 20,
+    maxDomains: 20,
+    maxRestCalls: 100,
+    maxTraversalDepth: 1
+  };
+  const cacheKey = (spec) => runtimeCacheKeyParts(
+    'Cst_QueryTool',
+    { code: 'AssistantPromptCache', active: true, spec },
+    {},
+    { username: 'tester' },
+    executionOptions,
+    runtimeCache,
+    templateCache,
+    dependencyMapWithHash(spec),
+    {}
+  );
+
+  const baseline = cacheKey(baseSpec);
+  const authoringOnly = cacheKey(withPromptOverride);
+  const executable = cacheKey(withExecutableChange);
+  assert.equal(authoringOnly.key, baseline.key);
+  assert.equal(authoringOnly.specHash, baseline.specHash);
+  assert.notEqual(executable.key, baseline.key);
+  assert.notEqual(executable.specHash, baseline.specHash);
 });
 
 function selectionFlowSpec(selections, blocks = []) {

@@ -1212,6 +1212,7 @@ test('Assistant persists canonical authoring only through the explicit template 
       interpret: 'Контейнеры являются визуальными группами, а узлы - экземплярами CMDB-классов.',
       mapping: 'Сопоставить выборки с D2-ролями по семантике и доступным атрибутам.'
     };
+    const objectFlowSystemOverride = 'Для этого шаблона сохраняй результаты под пользовательскими именами блоков.';
     const d2Source = 'server: "Server" { class: server }';
     await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
@@ -1234,6 +1235,9 @@ test('Assistant persists canonical authoring only through the explicit template 
     await page.locator('a[data-designer-section="assistant"]').click();
     await page.waitForSelector('#cmdp-assistant-editor', { timeout: 10_000 });
     await addAssistantBusinessBlock(page, prompts.objectFlow);
+    await page.locator('#cmdp-assistant-editor .assistant-template-system-prompts summary').click();
+    await page.locator('[data-action="assistant-template-prompt-override"][data-template-assistant-prompt-key="objectFlow"]').click();
+    await page.locator('#cmdp-template-assistant-system-prompt-objectFlow').fill(objectFlowSystemOverride);
     await page.locator('a[data-designer-section="diagram-assistant"]').click();
     await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 10_000 });
     await page.locator('#cmdp-diagram-import-source').fill(d2Source);
@@ -1255,12 +1259,14 @@ test('Assistant persists canonical authoring only through the explicit template 
     assert.deepEqual(saveRequest?.spec?.authoring?.assistant?.objectFlowIntent, expectedObjectFlowIntent);
     assert.equal(saveRequest?.spec?.authoring?.assistant?.diagramInterpretPrompt, prompts.interpret);
     assert.equal(saveRequest?.spec?.authoring?.assistant?.diagramMappingPrompt, prompts.mapping);
+    assert.equal(saveRequest?.spec?.authoring?.assistant?.systemPromptOverrides?.objectFlow, objectFlowSystemOverride);
     assert.equal(saveRequest?.spec?.authoring?.d2?.source, d2Source);
     const storedAuthoring = saveBody?.template?.spec?.authoring;
     assert.equal(storedAuthoring?.version, 1);
     assert.deepEqual(storedAuthoring?.assistant?.objectFlowIntent, expectedObjectFlowIntent);
     assert.equal(storedAuthoring?.assistant?.diagramInterpretPrompt, prompts.interpret);
     assert.equal(storedAuthoring?.assistant?.diagramMappingPrompt, prompts.mapping);
+    assert.equal(storedAuthoring?.assistant?.systemPromptOverrides?.objectFlow, objectFlowSystemOverride);
     assert.equal(storedAuthoring?.d2?.source, d2Source);
     assert.equal(storedAuthoring?.d2?.sourceHash, createHash('sha256').update(d2Source).digest('hex'));
     assert.equal(saveBody?.template?.spec?.assistantDraft, undefined);
@@ -1278,6 +1284,8 @@ test('Assistant persists canonical authoring only through the explicit template 
     assert.equal(await page.locator('#assistant-flow-0-algorithm').inputValue(), prompts.objectFlow.algorithm);
     assert.equal(await page.locator('#assistant-flow-0-expected-result').inputValue(), prompts.objectFlow.expectedResult);
     assert.equal(await page.locator('[data-assistant-flow-block]').count(), 1);
+    await page.locator('#cmdp-assistant-editor .assistant-template-system-prompts summary').click();
+    assert.equal(await page.locator('#cmdp-template-assistant-system-prompt-objectFlow').inputValue(), objectFlowSystemOverride);
     await page.locator('a[data-designer-section="diagram-assistant"]').click();
     await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 10_000 });
     assert.equal(await page.locator('#cmdp-assistant-diagram-interpret-prompt').inputValue(), prompts.interpret);
@@ -1396,7 +1404,14 @@ test('Assistant keeps an Object Flow response after updating a saved template va
       expectedResult: 'Таблица связанных IP-диапазонов.'
     });
 
+    const unsavedSystemPromptOverride = 'Use only the explicit names from this template before the next Save.';
+    await page.locator('#cmdp-assistant-editor .assistant-template-system-prompts summary').click();
+    await page.locator('[data-action="assistant-template-prompt-override"][data-template-assistant-prompt-key="objectFlowSemantic"]').click();
+    await page.locator('#cmdp-template-assistant-system-prompt-objectFlowSemantic').fill(unsavedSystemPromptOverride);
+
+    let semanticRequestPayload = null;
     await page.route('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*', async (route) => {
+      semanticRequestPayload = route.request().postDataJSON();
       await route.fulfill({
         contentType: 'application/json',
         body: JSON.stringify({
@@ -1422,6 +1437,11 @@ test('Assistant keeps an Object Flow response after updating a saved template va
     const semanticResponsePromise = page.waitForResponse((response) => response.url().includes('/assistant/object-flow/semantic-plan'));
     await page.locator('button[data-action="assistant-flow-prepare"]').click();
     await semanticResponsePromise;
+    assert.equal(
+      semanticRequestPayload?.currentSpec?.authoring?.assistant?.systemPromptOverrides?.objectFlowSemantic,
+      unsavedSystemPromptOverride,
+      'Object Flow must send the current unsaved template prompt override.'
+    );
     await page.locator('button[data-action="assistant-flow-generate"]').click();
     await flowRequestSeenPromise;
     await page.locator('#assistant-flow-0-algorithm').evaluate((node, value) => {

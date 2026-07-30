@@ -1051,6 +1051,47 @@ function legacyAssistantDraftAuthoring(value) {
   };
 }
 
+const TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_KEYS = Object.freeze([
+  'system',
+  'objectFlowSemantic',
+  'objectFlow',
+  'diagramInterpretation',
+  'diagramMapping'
+]);
+const TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_MAX_CHARS = 20_000;
+
+function templateAssistantPromptOverrideValidationErrors(value, path = '$.authoring.assistant.systemPromptOverrides') {
+  if (value === undefined) return [];
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return [{ path, message: 'Template Assistant systemPromptOverrides must be an object.' }];
+  }
+  const errors = [];
+  for (const key of TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_KEYS) {
+    if (value[key] === undefined || value[key] === null) continue;
+    if (typeof value[key] !== 'string') {
+      errors.push({ path: `${path}.${key}`, message: 'Template Assistant prompt override must be a string.' });
+      continue;
+    }
+    if (value[key].trim().length > TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_MAX_CHARS) {
+      errors.push({
+        path: `${path}.${key}`,
+        message: `Template Assistant prompt override must not exceed ${TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_MAX_CHARS} characters.`
+      });
+    }
+  }
+  return errors;
+}
+
+function normalizeTemplateAssistantPromptOverrides(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const overrides = {};
+  for (const key of TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_KEYS) {
+    const prompt = String(source[key] || '').trim();
+    if (prompt) overrides[key] = prompt;
+  }
+  return overrides;
+}
+
 function normalizeD2AnalysisCheckpoint(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const source = value.source && typeof value.source === 'object' && !Array.isArray(value.source) ? value.source : {};
@@ -1159,12 +1200,16 @@ function normalizeTemplateAuthoring(value, legacyDraft = null) {
   }
   const analysisCheckpoint = normalizeD2AnalysisCheckpoint(d2.analysisCheckpoint);
   const assistantCheckpoint = normalizeD2AssistantCheckpoint(d2.assistantCheckpoint);
+  const systemPromptOverrides = normalizeTemplateAssistantPromptOverrides(assistant.systemPromptOverrides);
   return {
     version: 1,
     assistant: {
       objectFlowIntent: cloneJsonValueServer(assistant.objectFlowIntent, { context: '', blocks: [] }),
       diagramInterpretPrompt: truncateText(String(assistant.diagramInterpretPrompt || ''), 6000),
-      diagramMappingPrompt: truncateText(String(assistant.diagramMappingPrompt || ''), 6000)
+      diagramMappingPrompt: truncateText(String(assistant.diagramMappingPrompt || ''), 6000),
+      ...(Object.keys(systemPromptOverrides).length
+        ? { systemPromptOverrides }
+        : {})
     },
     d2: {
       source: d2Source,
@@ -1189,6 +1234,34 @@ function templateAuthoringD2(spec, options = {}) {
   return authoring && authoring.d2 && typeof authoring.d2 === 'object' && !Array.isArray(authoring.d2)
     ? authoring.d2
     : {};
+}
+
+function templateAssistantRuntimeConfig(runtimeConfig, spec) {
+  const authoring = templateAuthoring(spec, { allowLegacy: false });
+  const overrides = normalizeTemplateAssistantPromptOverrides(authoring && authoring.assistant && authoring.assistant.systemPromptOverrides);
+  if (!Object.keys(overrides).length) return runtimeConfig;
+  const next = cloneJsonValueServer(runtimeConfig && typeof runtimeConfig === 'object' ? runtimeConfig : {}, {});
+  const assistant = next.assistant && typeof next.assistant === 'object' && !Array.isArray(next.assistant)
+    ? next.assistant
+    : {};
+  const prompt = assistant.prompt && typeof assistant.prompt === 'object' && !Array.isArray(assistant.prompt)
+    ? assistant.prompt
+    : {};
+  next.assistant = {
+    ...assistant,
+    prompt: { ...prompt, ...overrides }
+  };
+  return next;
+}
+
+function assertAssistantCurrentSpecValid(spec) {
+  const errors = validateTemplateSpecForStorage(spec);
+  if (!errors.length) return;
+  const error = new Error('Assistant current template state failed validation.');
+  error.code = 'assistant_current_spec_invalid';
+  error.statusCode = 400;
+  error.details = errors;
+  throw error;
 }
 
 function executionTemplateSpec(spec) {
@@ -8289,7 +8362,14 @@ function dynamicPagesClientScript() {
       assistantFlowDependencyLaterWarning: 'Uses "{name}", shown later in the editor. This is allowed; planning follows the dependency.',
       assistantFlowDependencyCycleWarning: 'Circular dependencies were found. The Assistant can prepare a plan, but a deterministic draft cannot execute a cycle.',
       remove: 'Remove',
-      assistantPromptGlobalSaveHint: 'Assistant settings are saved with the template by the common Save action.',
+      assistantPromptGlobalSaveHint: 'Template Assistant inputs and overrides are saved by the common Save action.',
+      assistantTemplatePromptOverridesTitle: 'System prompts for this template',
+      assistantTemplatePromptOverridesHelp: 'Global prompts remain the default. Override only the rule that differs for this template; Save stores it in this template only.',
+      assistantTemplatePromptInherited: 'Global default',
+      assistantTemplatePromptOverridden: 'Template override',
+      assistantTemplatePromptUseOverride: 'Change for this template',
+      assistantTemplatePromptResetOverride: 'Use global',
+      assistantTemplatePromptLimit: '{count} / {max} characters',
       savingTemplate: 'Saving template...',
       diagramImportSaveBusy: 'Wait for the Diagram Assistant operation to finish before saving the template.',
       changesReadyToSave: 'Changes are ready. Save the template to persist them.',
@@ -8361,9 +8441,9 @@ function dynamicPagesClientScript() {
       assistantLlmBaseUrl: 'LiteLLM base URL',
       assistantLlmModel: 'LiteLLM model',
       assistantLlmDeploymentHelp: 'API key is deployment-managed through env or secret file and is never stored in RuntimeConfigJson.',
-      assistantPromptSettings: 'System prompt',
+      assistantPromptSettings: 'Global system prompts',
       assistantSystemPrompt: 'Additional system prompt',
-      assistantSystemPromptHelp: 'Added to the backend system prompt when generating drafts. Do not store secrets or personal data here.',
+      assistantSystemPromptHelp: 'Default for every template unless the template defines an override. Do not store secrets or personal data here.',
       assistantObjectFlowSystemPrompt: 'Data flow assistant system prompt',
       assistantObjectFlowSemanticSystemPrompt: 'Semantic plan system prompt',
       assistantDiagramInterpretSystemPrompt: 'D2 interpretation system prompt',
@@ -9427,7 +9507,14 @@ function dynamicPagesClientScript() {
       assistantFlowDependencyLaterWarning: 'Использует «{name}», который расположен ниже в редакторе. Это разрешено: планирование учитывает зависимость.',
       assistantFlowDependencyCycleWarning: 'Обнаружена циклическая зависимость. Assistant может подготовить план, но детерминированный draft не сможет исполнить цикл.',
       remove: 'Удалить',
-      assistantPromptGlobalSaveHint: 'Настройки Assistant сохраняются вместе с шаблоном общей кнопкой «Сохранить».',
+      assistantPromptGlobalSaveHint: 'Входные данные и overrides Assistant сохраняются в шаблоне общей кнопкой «Сохранить».',
+      assistantTemplatePromptOverridesTitle: 'Системные промпты этого шаблона',
+      assistantTemplatePromptOverridesHelp: 'Глобальные промпты остаются значениями по умолчанию. Переопределяйте только правило, которое отличается для этого шаблона; «Сохранить» запишет его только в выбранный шаблон.',
+      assistantTemplatePromptInherited: 'Глобальное значение',
+      assistantTemplatePromptOverridden: 'Переопределено в шаблоне',
+      assistantTemplatePromptUseOverride: 'Изменить для шаблона',
+      assistantTemplatePromptResetOverride: 'Вернуть общий',
+      assistantTemplatePromptLimit: '{count} / {max} символов',
       savingTemplate: 'Шаблон сохраняется...',
       diagramImportSaveBusy: 'Дождитесь завершения операции Ассистента диаграмм перед сохранением шаблона.',
       changesReadyToSave: 'Изменения готовы. Нажмите «Сохранить», чтобы записать их в шаблон.',
@@ -9499,9 +9586,9 @@ function dynamicPagesClientScript() {
       assistantLlmBaseUrl: 'LiteLLM base URL',
       assistantLlmModel: 'LiteLLM model',
       assistantLlmDeploymentHelp: 'API key задается через env или secret file контура и не хранится в RuntimeConfigJson.',
-      assistantPromptSettings: 'Системный промпт',
+      assistantPromptSettings: 'Глобальные системные промпты',
       assistantSystemPrompt: 'Дополнительный системный промпт',
-      assistantSystemPromptHelp: 'Добавляется к backend system prompt при генерации draft. Не храните здесь секреты и персональные данные.',
+      assistantSystemPromptHelp: 'Значение по умолчанию для всех шаблонов, пока шаблон не задаст override. Не храните здесь секреты и персональные данные.',
       assistantObjectFlowSystemPrompt: 'Системный промпт Assistant потока данных',
       assistantObjectFlowSemanticSystemPrompt: 'Системный промпт семантического плана',
       assistantDiagramInterpretSystemPrompt: 'Системный промпт интерпретации D2',
@@ -10327,6 +10414,8 @@ function dynamicPagesClientScript() {
   var CATALOG_FRESH_MS = 24 * 60 * 60 * 1000;
   var CMDB_BUILD_VIEW_KIND = 'cmdbBuildView';
   var DEFAULT_CMDB_BUILD_VIEW_CODE = 'CmdbBuildView';
+  var TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_KEYS = ['system', 'objectFlowSemantic', 'objectFlow', 'diagramInterpretation', 'diagramMapping'];
+  var TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_MAX_CHARS = 20000;
   // Rendering repeatedly asks for user-facing Object Flow labels. Keep the
   // derived manifest attached to the immutable spec object instead of
   // cloning the complete D2 authoring payload for every label.
@@ -10401,6 +10490,7 @@ function dynamicPagesClientScript() {
     assistantFlowDragSourceId: '',
     assistantAuthoringDirty: false,
     savingTemplate: false,
+    assistantTemplatePromptOverrides: {},
     assistantDiagramInterpretPrompt: '',
     assistantDiagramMappingPrompt: '',
     assistantDiagramInterpretBusy: false,
@@ -11530,6 +11620,25 @@ function dynamicPagesClientScript() {
     var mapping = document.getElementById('cmdp-assistant-diagram-mapping-prompt');
     if (interpret) state.assistantDiagramInterpretPrompt = String(interpret.value || '');
     if (mapping) state.assistantDiagramMappingPrompt = String(mapping.value || '');
+    var overrides = normalizeTemplateAssistantPromptOverridesClient(state.assistantTemplatePromptOverrides);
+    Array.prototype.slice.call(document.querySelectorAll('[data-template-assistant-system-prompt]')).forEach(function (field) {
+      var key = String(field.getAttribute('data-template-assistant-system-prompt') || '');
+      if (TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_KEYS.indexOf(key) < 0 || field.disabled || field.readOnly) return;
+      var value = String(field.value || '').trim();
+      if (value) overrides[key] = value;
+      else delete overrides[key];
+    });
+    state.assistantTemplatePromptOverrides = overrides;
+  }
+
+  function normalizeTemplateAssistantPromptOverridesClient(value) {
+    var source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    var overrides = {};
+    TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_KEYS.forEach(function (key) {
+      var prompt = String(source[key] || '').trim();
+      if (prompt) overrides[key] = prompt;
+    });
+    return overrides;
   }
 
   function assistantObjectFlowIntentFromSpec(spec) {
@@ -11553,7 +11662,8 @@ function dynamicPagesClientScript() {
       assistant: {
         objectFlowIntent: assistantObjectFlowIntentFromSpec(source),
         diagramInterpretPrompt: String(assistant.diagramInterpretPrompt || ''),
-        diagramMappingPrompt: String(assistant.diagramMappingPrompt || '')
+        diagramMappingPrompt: String(assistant.diagramMappingPrompt || ''),
+        systemPromptOverrides: normalizeTemplateAssistantPromptOverridesClient(assistant.systemPromptOverrides)
       },
       d2: {
         source: String(d2.source || ''),
@@ -11661,7 +11771,8 @@ function dynamicPagesClientScript() {
       assistant: {
         objectFlowIntent: cloneJsonValue(state.assistantObjectFlowIntent, current.assistant.objectFlowIntent),
         diagramInterpretPrompt: String(state.assistantDiagramInterpretPrompt || ''),
-        diagramMappingPrompt: String(state.assistantDiagramMappingPrompt || '')
+        diagramMappingPrompt: String(state.assistantDiagramMappingPrompt || ''),
+        systemPromptOverrides: normalizeTemplateAssistantPromptOverridesClient(state.assistantTemplatePromptOverrides)
       },
       d2: {
         // Before the first mapping, source is ordinary authoring state and is
@@ -11700,6 +11811,48 @@ function dynamicPagesClientScript() {
 
   function markAssistantAuthoringChanged() {
     state.assistantAuthoringDirty = true;
+  }
+
+  function updateAssistantTemplatePromptLimit(key, value) {
+    var text = String(value || '');
+    Array.prototype.slice.call(document.querySelectorAll('[data-template-assistant-prompt-limit="' + String(key) + '"]')).forEach(function (element) {
+      element.textContent = t('assistantTemplatePromptLimit', {
+        count: String(text.length),
+        max: String(TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_MAX_CHARS)
+      });
+    });
+  }
+
+  function invalidateAssistantPromptDependentDrafts() {
+    // Prompt overrides change the model input. Keep saved deterministic
+    // mapping intact, but never allow an earlier Assistant proposal to apply.
+    invalidateAssistantObjectFlowRequests();
+    resetAssistantObjectFlowProposal();
+    state.assistantDiagramInterpretResult = null;
+    state.assistantDiagramMappingResult = null;
+    state.assistantDiagramMappingResume = null;
+    var flowApplyButton = document.querySelector('button[data-action="assistant-flow-apply"]');
+    if (flowApplyButton) flowApplyButton.disabled = true;
+  }
+
+  function updateTemplateAssistantPromptOverride(key, mode) {
+    if (TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_KEYS.indexOf(key) < 0) return;
+    captureAssistantPromptsFromDom();
+    var overrides = normalizeTemplateAssistantPromptOverridesClient(state.assistantTemplatePromptOverrides);
+    if (mode === 'reset') delete overrides[key];
+    else if (!Object.prototype.hasOwnProperty.call(overrides, key)) {
+      overrides[key] = assistantTemplatePromptDefaults(state.config)[key] || '';
+    }
+    state.assistantTemplatePromptOverrides = overrides;
+    invalidateAssistantPromptDependentDrafts();
+    markAssistantAuthoringChanged();
+    renderDesigner();
+    if (mode !== 'reset') {
+      window.setTimeout(function () {
+        var field = document.getElementById('cmdp-template-assistant-system-prompt-' + key);
+        if (field) field.focus();
+      }, 0);
+    }
   }
 
   function markDiagramImportPromptChanged(kind) {
@@ -12124,6 +12277,7 @@ function dynamicPagesClientScript() {
       state.assistantFlowCanApply = false;
       state.assistantFlowExplanation = '';
       state.assistantFlowWarnings = [];
+      state.assistantTemplatePromptOverrides = normalizeTemplateAssistantPromptOverridesClient(authoring.assistant.systemPromptOverrides);
       state.assistantDiagramInterpretPrompt = String(authoring.assistant.diagramInterpretPrompt || '');
       state.assistantDiagramMappingPrompt = String(authoring.assistant.diagramMappingPrompt || '');
       state.assistantFlowBusy = false;
@@ -15186,6 +15340,57 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
+  function assistantTemplatePromptDefaults(config) {
+    var assistant = assistantConfigForEditor(config);
+    var prompt = assistant && assistant.prompt && typeof assistant.prompt === 'object' && !Array.isArray(assistant.prompt) ? assistant.prompt : {};
+    var fallback = defaultRuntimeConfig().assistant.prompt;
+    return {
+      system: String(prompt.system || fallback.system || ''),
+      objectFlowSemantic: String(prompt.objectFlowSemantic || fallback.objectFlowSemantic || ''),
+      objectFlow: String(prompt.objectFlow || fallback.objectFlow || ''),
+      diagramInterpretation: String(prompt.diagramInterpretation || fallback.diagramInterpretation || ''),
+      diagramMapping: String(prompt.diagramMapping || fallback.diagramMapping || '')
+    };
+  }
+
+  function renderAssistantTemplatePromptOverrides(selected, config) {
+    if (!selected) return '';
+    var overrides = normalizeTemplateAssistantPromptOverridesClient(state.assistantTemplatePromptOverrides);
+    var defaults = assistantTemplatePromptDefaults(config);
+    var labels = {
+      system: 'assistantSystemPrompt',
+      objectFlowSemantic: 'assistantObjectFlowSemanticSystemPrompt',
+      objectFlow: 'assistantObjectFlowSystemPrompt',
+      diagramInterpretation: 'assistantDiagramInterpretSystemPrompt',
+      diagramMapping: 'assistantDiagramMappingSystemPrompt'
+    };
+    var activeCount = Object.keys(overrides).length;
+    var rows = TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_KEYS.map(function (key) {
+      var active = Object.prototype.hasOwnProperty.call(overrides, key);
+      var value = active ? overrides[key] : defaults[key];
+      var rowsCount = key === 'system' ? 8 : 5;
+      var fieldId = 'cmdp-template-assistant-system-prompt-' + key;
+      var limitId = fieldId + '-limit';
+      return [
+        '<div class="assistant-template-prompt-override">',
+        '<div class="toolbar"><strong>' + escapeHtml(t(labels[key])) + '</strong><span class="pill ' + (active ? 'ok' : '') + '">' + escapeHtml(active ? t('assistantTemplatePromptOverridden') : t('assistantTemplatePromptInherited')) + '</span>',
+        '<button type="button" data-action="assistant-template-prompt-override" data-template-assistant-prompt-key="' + escapeHtml(key) + '"' + (active ? ' disabled' : '') + '>' + escapeHtml(t('assistantTemplatePromptUseOverride')) + '</button>',
+        '<button type="button" data-action="assistant-template-prompt-reset" data-template-assistant-prompt-key="' + escapeHtml(key) + '"' + (active ? '' : ' disabled') + '>' + escapeHtml(t('assistantTemplatePromptResetOverride')) + '</button></div>',
+        '<label for="' + escapeHtml(fieldId) + '">' + escapeHtml(active ? t('assistantTemplatePromptOverridden') : t('assistantTemplatePromptInherited')) + '</label>',
+        '<textarea id="' + escapeHtml(fieldId) + '" data-template-assistant-system-prompt="' + escapeHtml(key) + '" rows="' + rowsCount + '" maxlength="' + TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_MAX_CHARS + '" aria-describedby="' + escapeHtml(limitId) + '" style="width:100%"' + (active ? '' : ' readonly') + '>' + escapeHtml(value) + '</textarea>',
+        '<p id="' + escapeHtml(limitId) + '" class="muted" data-template-assistant-prompt-limit="' + escapeHtml(key) + '">' + escapeHtml(t('assistantTemplatePromptLimit', { count: String(value.length), max: String(TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_MAX_CHARS) })) + '</p>',
+        '</div>'
+      ].join('');
+    }).join('');
+    return [
+      '<details class="assistant-template-system-prompts">',
+      '<summary>' + escapeHtml(t('assistantTemplatePromptOverridesTitle')) + ' <span class="muted">' + activeCount + '/' + TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_KEYS.length + '</span></summary>',
+      '<p class="muted">' + escapeHtml(t('assistantTemplatePromptOverridesHelp')) + '</p>',
+      rows,
+      '</details>'
+    ].join('');
+  }
+
   function renderAssistantTaskMode(value) {
     var selected = normalizeOutputMode(value || state.assistantTaskMode);
     var items = [
@@ -15383,6 +15588,7 @@ function dynamicPagesClientScript() {
       '<section class="section" id="cmdp-assistant-editor"><h2>' + t('menuAssistantGroups') + '</h2>',
       '<p class="muted">' + t('assistantProposalOnly') + '</p>',
       renderAssistantStatus(config),
+      renderAssistantTemplatePromptOverrides(selected, config),
       renderAssistantFlowEditor(),
       '</section>'
     ].join('');
@@ -15394,6 +15600,7 @@ function dynamicPagesClientScript() {
       '<section class="section" id="cmdp-diagram-assistant-editor"><h2>' + t('menuDiagramAssistant') + '</h2>',
       '<p class="muted">' + t('assistantProposalOnly') + '</p>',
       renderAssistantStatus(config),
+      renderAssistantTemplatePromptOverrides(selected, config),
       renderAssistantPromptAutosaveControl(),
       renderDiagramImportWorkbench(spec),
       '</section>'
@@ -23558,6 +23765,7 @@ function dynamicPagesClientScript() {
     return {
       templateCode: String(selected.code || ''),
       specFingerprint: stableClientJsonStringify(assistantSpecWithoutPromptDraft(spec)),
+      promptOverridesFingerprint: assistantPromptOverridesFingerprint(templateAuthoringClient(spec || defaultSpec()).assistant.systemPromptOverrides),
       requestGeneration: Number(requestGeneration || 0)
     };
   }
@@ -23569,6 +23777,18 @@ function dynamicPagesClientScript() {
     return next;
   }
 
+  function assistantPromptOverridesFingerprint(value) {
+    return stableClientJsonStringify(normalizeTemplateAssistantPromptOverridesClient(value));
+  }
+
+  function assistantRequestSpecFingerprint(spec) {
+    var authoring = templateAuthoringClient(spec || defaultSpec());
+    return stableClientJsonStringify({
+      deterministicSpec: assistantSpecWithoutPromptDraft(spec),
+      systemPromptOverrides: authoring.assistant.systemPromptOverrides
+    });
+  }
+
   function diagramImportDeterministicSpecSnapshot(spec) {
     return stableClientJsonStringify(assistantSpecWithoutPromptDraft(spec));
   }
@@ -23578,6 +23798,7 @@ function dynamicPagesClientScript() {
     return {
       templateCode: String(selected.code || ''),
       deterministicSpec: diagramImportDeterministicSpecSnapshot(selected.spec || defaultSpec()),
+      promptOverridesFingerprint: assistantPromptOverridesFingerprint(state.assistantTemplatePromptOverrides),
       source: String(source !== undefined ? source : state.diagramImportSource || ''),
       proposalId: String(proposal && proposal.proposalId || '')
     };
@@ -23587,6 +23808,7 @@ function dynamicPagesClientScript() {
     var selected = state.selectedTemplate || {};
     if (String(selected.code || '') !== String(snapshot && snapshot.templateCode || '')) return new Error(t('assistantResponseStaleTemplate'));
     if (diagramImportDeterministicSpecSnapshot(selected.spec || defaultSpec()) !== String(snapshot && snapshot.deterministicSpec || '')) return new Error(t('assistantResponseStaleSpec'));
+    if (assistantPromptOverridesFingerprint(state.assistantTemplatePromptOverrides) !== String(snapshot && snapshot.promptOverridesFingerprint || '')) return new Error(t('assistantResponseStaleRequest'));
     if (String(state.diagramImportSource || '') !== String(snapshot && snapshot.source || '')) return new Error(t('diagramImportStale'));
     if (snapshot && snapshot.proposalId && String(proposal && proposal.proposalId || '') !== String(snapshot.proposalId)) return new Error(t('assistantResponseStaleRequest'));
     return null;
@@ -23597,6 +23819,7 @@ function dynamicPagesClientScript() {
     var currentSpec = selected.spec || defaultSpec();
     if (String(selected.code || '') !== snapshot.templateCode) return 'template';
     if (stableClientJsonStringify(assistantSpecWithoutPromptDraft(currentSpec)) !== snapshot.specFingerprint) return 'spec';
+    if (assistantPromptOverridesFingerprint(state.assistantTemplatePromptOverrides) !== String(snapshot.promptOverridesFingerprint || '')) return 'request';
     if (Number(state.assistantFlowRequestGeneration || 0) !== Number(snapshot.requestGeneration || 0)) return 'request';
     return '';
   }
@@ -26237,7 +26460,7 @@ function dynamicPagesClientScript() {
   function assistantSemanticPlanResumeMatches(resume, intent, spec) {
     return Boolean(resume && resume.resumeId
       && resume.intentFingerprint === stableClientJsonStringify(intent)
-      && resume.specFingerprint === stableClientJsonStringify(assistantSpecWithoutPromptDraft(spec)));
+      && resume.specFingerprint === assistantRequestSpecFingerprint(spec));
   }
 
   function setAssistantSemanticPlanRetryState(resume, diagnostics, checkpointConfirmed) {
@@ -26300,7 +26523,7 @@ function dynamicPagesClientScript() {
   function prepareAssistantObjectFlowSemanticPlan(retry) {
     if (state.assistantFlowBusy) return;
     captureAssistantPromptsFromDom();
-    var requestSpec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
+    var requestSpec = assistantSpecWithPrompts(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
     var intent = cloneJsonValue(state.assistantObjectFlowIntent, { context: '', blocks: [] });
     var duplicateName = assistantObjectFlowDuplicateNameError(intent.blocks);
     if (duplicateName) {
@@ -26315,7 +26538,7 @@ function dynamicPagesClientScript() {
     var resume = previousResume || {
       resumeId: newAssistantSemanticPlanResumeId(),
       intentFingerprint: stableClientJsonStringify(intent),
-      specFingerprint: stableClientJsonStringify(assistantSpecWithoutPromptDraft(requestSpec)),
+      specFingerprint: assistantRequestSpecFingerprint(requestSpec),
       checkpointConfirmed: false
     };
     var requestGeneration = Number(state.assistantFlowRequestGeneration || 0) + 1;
@@ -26388,7 +26611,7 @@ function dynamicPagesClientScript() {
   function generateAssistantObjectFlow(retry) {
     if (state.assistantFlowBusy || !state.assistantFlowSemanticPlan) return;
     captureAssistantPromptsFromDom();
-    var requestSpec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
+    var requestSpec = assistantSpecWithPrompts(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
     var resume = assistantSemanticPlanResumeMatches(state.assistantFlowResume, state.assistantObjectFlowIntent, requestSpec) && state.assistantFlowResume.checkpointConfirmed
       ? state.assistantFlowResume
       : null;
@@ -28025,6 +28248,14 @@ function dynamicPagesClientScript() {
     if (action === 'assistant-flow-apply') applyAssistantObjectFlow();
     if (action === 'assistant-flow-block-add') addAssistantObjectFlowBlock();
     if (action === 'assistant-flow-block-remove') removeAssistantObjectFlowBlock(target.getAttribute('data-block-index'));
+    if (action === 'assistant-template-prompt-override') {
+      updateTemplateAssistantPromptOverride(String(target.getAttribute('data-template-assistant-prompt-key') || ''), 'override');
+      return;
+    }
+    if (action === 'assistant-template-prompt-reset') {
+      updateTemplateAssistantPromptOverride(String(target.getAttribute('data-template-assistant-prompt-key') || ''), 'reset');
+      return;
+    }
     if (action === 'assistant-diagram-interpret') assistantDiagramRequest('interpret');
     if (action === 'assistant-diagram-map') assistantDiagramRequest('map');
     if (action === 'open-assistant-d2') setDesignerSection('diagram-assistant');
@@ -28422,6 +28653,20 @@ function dynamicPagesClientScript() {
   });
 
   document.addEventListener('input', function (event) {
+    if (event.target && event.target.matches && event.target.matches('[data-template-assistant-system-prompt]')) {
+      var promptKey = String(event.target.getAttribute('data-template-assistant-system-prompt') || '');
+      if (TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_KEYS.indexOf(promptKey) >= 0) {
+        var promptOverrides = normalizeTemplateAssistantPromptOverridesClient(state.assistantTemplatePromptOverrides);
+        var promptValue = String(event.target.value || '').trim();
+        if (promptValue) promptOverrides[promptKey] = promptValue;
+        else delete promptOverrides[promptKey];
+        state.assistantTemplatePromptOverrides = promptOverrides;
+        updateAssistantTemplatePromptLimit(promptKey, event.target.value || '');
+        invalidateAssistantPromptDependentDrafts();
+        markAssistantAuthoringChanged();
+      }
+      return;
+    }
     if (event.target && event.target.matches && event.target.matches('[data-diagram-import-condition-picker-search]')) {
       scheduleDiagramImportConditionPickerResults(event.target);
       return;
@@ -31632,7 +31877,9 @@ function dependencyMapWithHash(spec) {
 
 function runtimeCacheKeyParts(root, template, params, sessionData, executionOptions, runtimeCacheConfig, templateCacheConfig, dependencyMap, accessProbe, cacheContext = {}) {
   const userScope = runtimeUserCacheScope(sessionData);
-  const specHash = hashJson(template.spec || {});
+  // Authoring state (Assistant prompts, D2 source, checkpoints) cannot alter
+  // deterministic execution and must therefore not fragment runtime cache.
+  const specHash = executionSpecHash(template.spec || {});
   const paramsHash = hashJson(params || {});
   const contextHash = cacheContext && Object.keys(cacheContext).length ? hashJson(cacheContext) : '';
   const limitsHash = hashJson({
@@ -43995,6 +44242,10 @@ function validateTemplateSpecForStorage(spec) {
     if (!spec.authoring || typeof spec.authoring !== 'object' || Array.isArray(spec.authoring)) {
       errors.push({ path: '$.authoring', message: 'Template authoring must be an object.' });
     } else {
+      const assistant = spec.authoring.assistant && typeof spec.authoring.assistant === 'object' && !Array.isArray(spec.authoring.assistant)
+        ? spec.authoring.assistant
+        : {};
+      errors.push(...templateAssistantPromptOverrideValidationErrors(assistant.systemPromptOverrides));
       try {
         normalizeTemplateAuthoring(spec.authoring);
       } catch (error) {
@@ -50657,7 +50908,22 @@ async function handleBackend(req, res, requestUrl) {
     const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
     const planContext = await resolveAssistantObjectFlowPlanContext(authToken, res, root, body.templateCode);
     if (!planContext) return;
-    const runtimeConfig = await getRuntimeConfig(authToken, root);
+    const currentSpec = body.currentSpec || planContext.template && planContext.template.spec || {};
+    const currentSpecErrors = validateTemplateSpecForStorage(currentSpec);
+    if (currentSpecErrors.length) {
+      sendJson(res, 400, {
+        success: false,
+        action: 'assistant-object-flow-semantic-plan',
+        code: 'assistant_current_spec_invalid',
+        message: 'Assistant current template state failed validation.',
+        errors: currentSpecErrors
+      });
+      return;
+    }
+    const runtimeConfig = templateAssistantRuntimeConfig(
+      await getRuntimeConfig(authToken, root),
+      currentSpec
+    );
     const semanticStage = normalizeAssistantSemanticPlanStage(body.stage);
     const resumeId = normalizeAssistantSemanticPlanResumeId(body.resumeId) || crypto.randomUUID();
     const checkpointScope = executionThrottleScopeFromRequest(req, {
@@ -50674,7 +50940,7 @@ async function handleBackend(req, res, requestUrl) {
     try {
       const plan = await createAssistantObjectFlowSemanticPlan({
         intent: body.intent,
-        currentSpec: body.currentSpec || {},
+        currentSpec,
         templateCode: body.templateCode || '',
         baseSpecHash: body.baseSpecHash || ''
       }, { authToken, runtimeConfig, stage: semanticStage, checkpoint });
@@ -50758,7 +51024,22 @@ async function handleBackend(req, res, requestUrl) {
     const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
     const planContext = await resolveAssistantObjectFlowPlanContext(authToken, res, root, body.templateCode);
     if (!planContext) return;
-    const runtimeConfig = await getRuntimeConfig(authToken, root);
+    const currentSpec = body.currentSpec || planContext.template && planContext.template.spec || {};
+    const currentSpecErrors = validateTemplateSpecForStorage(currentSpec);
+    if (currentSpecErrors.length) {
+      sendJson(res, 400, {
+        success: false,
+        action: 'assistant-object-flow-plan',
+        code: 'assistant_current_spec_invalid',
+        message: 'Assistant current template state failed validation.',
+        errors: currentSpecErrors
+      });
+      return;
+    }
+    const runtimeConfig = templateAssistantRuntimeConfig(
+      await getRuntimeConfig(authToken, root),
+      currentSpec
+    );
     const resumeId = body.resumeId ? normalizeAssistantSemanticPlanResumeId(body.resumeId) : '';
     const checkpointScope = resumeId ? executionThrottleScopeFromRequest(req, {
       action: 'assistant-object-flow-semantic-plan-checkpoint',
@@ -50776,7 +51057,7 @@ async function handleBackend(req, res, requestUrl) {
       checkpoint = await loadAssistantObjectFlowSemanticCheckpoint({
         intent: body.intent,
         semanticPlan: body.semanticPlan,
-        currentSpec: body.currentSpec || {},
+        currentSpec,
         templateCode: body.templateCode || '',
         baseSpecHash: body.baseSpecHash || ''
       }, {
@@ -50786,7 +51067,7 @@ async function handleBackend(req, res, requestUrl) {
       const draft = await createAssistantObjectFlowDraft({
         intent: body.intent,
         semanticPlan: body.semanticPlan,
-        currentSpec: body.currentSpec || {}
+        currentSpec
       }, {
         authToken,
         runtimeConfig,
@@ -50999,6 +51280,7 @@ async function handleBackend(req, res, requestUrl) {
         throw templateError;
       }
       const sourceSpec = cloneJsonValueServer(body.currentSpec || authoring.template && authoring.template.spec || {}, {});
+      assertAssistantCurrentSpecValid(sourceSpec);
       assertDiagramImportProposalDeterministicSpec(proposalInput, sourceSpec, 'using Assistant');
       assertDiagramImportStoredSource(proposalInput, sourceSpec, 'using Assistant');
       const reviewProposal = diagramImportV3WithOverrides(proposalInput, body.roles, body.relationRules, body.structureTree, sourceSpec);
@@ -51043,7 +51325,10 @@ async function handleBackend(req, res, requestUrl) {
           ? 'D2 container. Each structural placement may stay static or select its own Object Flow result.'
           : 'D2 node. Each structural placement maps independently to one confirmed Object Flow result.'
       }));
-      const runtimeConfig = await getRuntimeConfig(authToken, root);
+      const runtimeConfig = templateAssistantRuntimeConfig(
+        await getRuntimeConfig(authToken, root),
+        sourceSpec
+      );
       const placements = mapTask ? assistantDiagramPlacementTargets(reviewProposal, stages, mappingCatalog) : [];
       let draft;
       if (!mapTask) {
@@ -51787,6 +52072,16 @@ async function handleBackend(req, res, requestUrl) {
       if (!requireStateChangingRequest(req, res, authToken)) return;
       if (!requireJsonContentType(req, res)) return;
       const body = await readJsonBody(req, TEMPLATE_REQUEST_MAX_BYTES);
+      const rawSpec = body.spec !== undefined ? body.spec : body.SpecJson;
+      const rawSpecErrors = validateTemplateSpecForStorage(safeJsonValue(rawSpec, rawSpec));
+      if (rawSpecErrors.length) {
+        sendJson(res, 400, {
+          success: false,
+          message: 'Template spec validation failed.',
+          errors: rawSpecErrors
+        });
+        return;
+      }
       const session = await getSessionData(authToken);
       const payload = normalizeTemplatePayload(body, null, session.data && session.data.username);
       const storedSpec = safeJsonValue(payload.SpecJson, null);
@@ -52401,6 +52696,15 @@ async function handleBackend(req, res, requestUrl) {
       const session = await getSessionData(authToken);
       const storageOptions = { d2MappingOutcomes: [] };
       const rawSpec = body.spec !== undefined ? body.spec : body.SpecJson;
+      const rawSpecErrors = validateTemplateSpecForStorage(safeJsonValue(rawSpec, rawSpec));
+      if (rawSpecErrors.length) {
+        sendJson(res, 400, {
+          success: false,
+          message: 'Template spec validation failed.',
+          errors: rawSpecErrors
+        });
+        return;
+      }
       if (diagramImportNeedsRecovery(rawSpec)) {
         const rawAuthoringSource = String(templateAuthoringD2(safeJsonValue(rawSpec, {}), { allowLegacy: true }).source || '');
         if (rawAuthoringSource.trim()) {
@@ -52938,6 +53242,7 @@ export {
   normalizeAssistantDraftSpec,
   normalizeAssistantObjectFlowIntent,
   normalizeAssistantRuntimeConfig,
+  normalizeTemplateAssistantPromptOverrides,
   normalizeLogFormat,
   normalizeLogLevel,
   normalizeLogTargets,
@@ -53001,9 +53306,11 @@ export {
   setMetricGauge,
   shouldRetryCmdbuildResult,
   templateIsProtected,
+  templateAssistantRuntimeConfig,
   validateRuntimeConfig,
   validateDiagramImportV3Catalog,
   validateTemplateSpec,
+  validateTemplateSpecForStorage,
   validateRegexPattern,
   isSafeRuntimeLinkUrl
 };

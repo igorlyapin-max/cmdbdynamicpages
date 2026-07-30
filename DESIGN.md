@@ -38,13 +38,17 @@ Project visual identity and design system.
     "assistant": {
       "objectFlowIntent": "...",
       "diagramInterpretPrompt": "...",
-      "diagramMappingPrompt": "..."
+      "diagramMappingPrompt": "...",
+      "systemPromptOverrides": {
+        "objectFlow": "..."
+      }
     },
     "d2": { "source": "...", "sourceHash": "..." }
   }
   ```
 - Assistant renders prompts, generation state, warnings, and explicit proposal actions only; it must not render deterministic selection, matching, class, attribute, or D2 mapping controls.
 - D2 source and Assistant prompts remain in Assistant. Pending D2 semantic and mapping proposals remain in Assistant and never replace the deterministic Diagram editor state.
+- Global Assistant system prompts remain the inherited default. A non-empty `assistant.systemPromptOverrides` value belongs to one template, overrides only that prompt for its Assistant calls, and is persisted by the normal template Save action.
 - Assistant output is always shown as a reviewable proposal. It must not update the editor draft, Diagram settings, save state, preview input, or publication state until the author invokes an explicit deterministic apply action.
 - Object-flow LLM requests expose only the sanitized flow stages needed for the selected operation and accept one typed `selection` or `block`; complete runtime Spec generation is outside this contract.
 - Diagram source controls list every object-flow selection and every intermediate match stage; the final flow result is not the only eligible source.

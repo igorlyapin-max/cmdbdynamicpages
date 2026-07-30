@@ -1004,11 +1004,49 @@ test('Assistant authoring is persisted only through canonical authoring on norma
 
   assert.match(hydrateSource, /var authoring = templateAuthoringClient\(spec\)/);
   assert.match(authoringSource, /source\.authoring/);
+  assert.match(authoringSource, /systemPromptOverrides: normalizeTemplateAssistantPromptOverridesClient\(assistant\.systemPromptOverrides\)/);
   assert.doesNotMatch(authoringSource, /legacyAssistantAuthoringClient/);
   assert.match(specWithPromptsSource, /next\.authoring = assistantAuthoringFromState\(next\)/);
   assert.match(specWithPromptsSource, /delete next\.assistantDraft/);
   assert.match(saveSource, /assistantSpecWithPrompts\(state\.selectedTemplate && state\.selectedTemplate\.spec \|\| defaultSpec\(\)\)/);
   assert.match(saveSource, /request\(path, \{ method: exists \? 'PUT' : 'POST'/);
+});
+
+test('template Assistant prompt overrides are explicit, resettable, and kept outside global runtime settings', () => {
+  const renderStart = proxySource.indexOf('function renderAssistantTemplatePromptOverrides(selected, config)');
+  const taskModeStart = proxySource.indexOf('function renderAssistantTaskMode(value)', renderStart);
+  const updateStart = proxySource.indexOf('function updateTemplateAssistantPromptOverride(key, mode)');
+  const promptChangedStart = proxySource.indexOf('function markDiagramImportPromptChanged(kind)', updateStart);
+  const inputStart = proxySource.indexOf("document.addEventListener('input', function (event)");
+  const end = proxySource.indexOf("document.addEventListener('change', function (event)", inputStart);
+  assert.ok(renderStart > -1);
+  assert.ok(taskModeStart > renderStart);
+  assert.ok(updateStart > -1);
+  assert.ok(promptChangedStart > updateStart);
+  assert.ok(inputStart > -1);
+  assert.ok(end > inputStart);
+
+  const renderSource = proxySource.slice(renderStart, taskModeStart);
+  const updateSource = proxySource.slice(updateStart, promptChangedStart);
+  const inputSource = proxySource.slice(inputStart, end);
+  assert.match(renderSource, /assistantTemplatePromptInherited/);
+  assert.match(renderSource, /assistantTemplatePromptOverridden/);
+  assert.match(renderSource, /assistant-template-prompt-override/);
+  assert.match(renderSource, /assistant-template-prompt-reset/);
+  assert.match(renderSource, /readonly/);
+  assert.match(renderSource, /TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_MAX_CHARS/);
+  assert.match(updateSource, /assistantTemplatePromptDefaults\(state\.config\)/);
+  assert.match(updateSource, /delete overrides\[key\]/);
+  assert.match(updateSource, /invalidateAssistantPromptDependentDrafts\(\)/);
+  assert.match(inputSource, /\[data-template-assistant-system-prompt\]/);
+  assert.match(inputSource, /state\.assistantTemplatePromptOverrides = promptOverrides/);
+  assert.match(inputSource, /updateAssistantTemplatePromptLimit/);
+  assert.match(proxySource, /function templateAssistantRuntimeConfig\(runtimeConfig, spec\)/);
+  assert.match(proxySource, /const currentSpec = body\.currentSpec \|\| planContext\.template && planContext\.template\.spec \|\| \{\};/);
+  assert.match(proxySource, /templateAssistantRuntimeConfig\(\n\s*await getRuntimeConfig\(authToken, root\),\n\s*currentSpec/);
+  assert.match(proxySource, /templateAssistantPromptOverrideValidationErrors/);
+  assert.match(proxySource, /function prepareAssistantObjectFlowSemanticPlan\(retry\)[\s\S]*?var requestSpec = assistantSpecWithPrompts\(state\.selectedTemplate && state\.selectedTemplate\.spec \|\| defaultSpec\(\)\);/);
+  assert.match(proxySource, /function generateAssistantObjectFlow\(retry\)[\s\S]*?var requestSpec = assistantSpecWithPrompts\(state\.selectedTemplate && state\.selectedTemplate\.spec \|\| defaultSpec\(\)\);/);
 });
 
 test('deterministic editor updates keep canonical Assistant and D2 authoring', () => {
