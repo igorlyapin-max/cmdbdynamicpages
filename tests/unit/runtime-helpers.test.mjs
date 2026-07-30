@@ -39,6 +39,9 @@ import {
   diagramImportDeterministicSpecHash,
   diagramImportImplicitConditionSources,
   diagramImportInferImplicitConditionSource,
+  diagramImportDirectRelationParentCorrelation,
+  diagramImportPrimaryCardSource,
+  diagramImportCardSourceField,
   diagramImportMappingInputRevision,
   diagramImportMappingValidationIsCurrent,
   migrateDiagramImportToCurrentRevision,
@@ -1111,6 +1114,62 @@ test('D2 preview keeps every retained source for a legacy deep condition and nev
   );
 });
 
+test('D2 nested match projects the retained child card instead of its parent card', () => {
+  const stage = {
+    className: 'phServer',
+    cardSources: [
+      { id: 'current', className: 'phServer', classColumn: 'Class', idColumn: '_id', label: 'Физический сервер' },
+      { id: 'relation-source', className: 'ApplicG', classColumn: 'SourceClass', idColumn: 'SourceId', label: 'Приложение' },
+      { id: 'Source_relation-source', className: 'IpAddress', classColumn: 'Source_SourceClass', idColumn: 'Source_SourceId', label: 'IP-адрес' }
+    ]
+  };
+  const projection = diagramImportPrimaryCardSource(stage, { className: 'phServer' }, { className: 'phServer' });
+
+  assert.equal(projection.ambiguous, false);
+  assert.equal(projection.inferred, true);
+  assert.equal(projection.source.className, 'ApplicG');
+  assert.equal(projection.source.idColumn, 'SourceId');
+  assert.equal(diagramImportCardSourceField(projection.source, '_id'), 'SourceId');
+  assert.equal(diagramImportCardSourceField(projection.source, 'Description'), 'SourceDescription');
+});
+
+test('D2 direct retained relation source restores an assistant hierarchy correlation to the parent card', () => {
+  const sourceStage = {
+    id: 'match:applicationsServers',
+    className: 'phServer',
+    cardSources: [
+      { id: 'current', className: 'phServer', classColumn: 'Class', idColumn: '_id', label: 'Сервер' },
+      { id: 'relation-source', className: 'ApplicG', classColumn: 'SourceClass', idColumn: 'SourceId', label: 'Приложение' }
+    ]
+  };
+  const parentStage = {
+    id: 'relation:servers',
+    className: 'phServer',
+    cardSources: [{ id: 'current', className: 'phServer', classColumn: 'Class', idColumn: '_id', label: 'Сервер' }]
+  };
+  const repaired = diagramImportDirectRelationParentCorrelation({
+    primary: { className: 'vServer' },
+    hierarchyConditions: {
+      ruleJoin: 'any',
+      rules: [{
+        origin: 'assistant',
+        action: 'include',
+        operator: 'equals',
+        left: { column: 'phs.Id' },
+        right: { kind: 'stage', stageId: 'relation:servers', column: '_id' }
+      }]
+    }
+  }, sourceStage, parentStage, 'application-placement');
+
+  assert.equal(repaired.changed, true);
+  assert.equal(repaired.correlationChanged, true);
+  assert.equal(repaired.mapping.primary.className, 'ApplicG');
+  assert.equal(repaired.mapping.primary.cardSource.id, 'relation-source');
+  assert.equal(repaired.mapping.hierarchyConditions.rules[0].left.column, '_id');
+  assert.equal(repaired.mapping.hierarchyConditions.rules[0].right.stageId, 'relation:servers');
+  assert.equal(repaired.mapping.hierarchyConditions.rules[0].right.column, '_id');
+});
+
 test('D2 filter rows preserve source-resolution diagnostics for preview bindings', () => {
   const result = executeFilterRows({
     from: 'enriched',
@@ -1177,6 +1236,92 @@ test('D2 mapping keeps its signed executable inputs on reload and ignores a prom
   assert.equal(reviewedImport.mappingValidation.status, 'valid');
   assert.equal(diagramImportMappingValidationIsCurrent(reviewedImport), true);
   assert.equal((await d2WorkflowStatusForSpec(reviewed)).state, 'applied');
+});
+
+test('normal template Save rebases the retained D2 checkpoint after mapping materialization', () => {
+  const { currentSpec, proposal, roles } = d2StructureTreeFixture();
+  const tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
+  const beforeMaterializationHash = proposal.deterministicSpecHash;
+  applied.authoring.d2.analysisCheckpoint = {
+    version: 1,
+    proposalId: proposal.proposalId,
+    deterministicSpecHash: beforeMaterializationHash,
+    source: {
+      hash: proposal.source.hash,
+      structureHash: proposal.source.structureHash,
+      mappingContractHash: proposal.source.mappingContractHash
+    },
+    roles: proposal.roles.map((role) => ({ id: role.id, visualKind: role.visualKind, labelTemplate: role.labelTemplate })),
+    relationRules: proposal.relationRules,
+    structureTree: proposal.structureTree
+  };
+
+  const stored = normalizeTemplateSpecForStorage(applied);
+  const checkpoint = stored.authoring.d2.analysisCheckpoint;
+  assert.notEqual(diagramImportDeterministicSpecHash(applied), beforeMaterializationHash);
+  assert.equal(checkpoint.deterministicSpecHash, diagramImportDeterministicSpecHash(stored));
+  assert.equal(checkpoint.source.hash, stored.result.diagrams[0].authoring.d2Import.sourceHash);
+});
+
+test('normal template Save rebases a checkpoint for a provisional D2 analysis diagram only', () => {
+  const { currentSpec, proposal } = d2StructureTreeFixture();
+  const checkpoint = {
+    version: 1,
+    proposalId: proposal.proposalId,
+    deterministicSpecHash: proposal.deterministicSpecHash,
+    source: {
+      hash: proposal.source.hash,
+      structureHash: proposal.source.structureHash,
+      mappingContractHash: proposal.source.mappingContractHash
+    },
+    roles: proposal.roles.map((role) => ({ id: role.id, visualKind: role.visualKind, labelTemplate: role.labelTemplate })),
+    relationRules: proposal.relationRules,
+    structureTree: proposal.structureTree
+  };
+  const provisional = {
+    ...currentSpec,
+    result: {
+      ...currentSpec.result,
+      diagrams: [{
+        id: 'diagram_provisional',
+        name: 'topology',
+        type: 'topology',
+        authoring: {
+          d2Import: {
+            version: 3,
+            source: proposal.sourceText,
+            sourceHash: proposal.source.hash,
+            structureHash: proposal.source.structureHash,
+            mappingContractHash: proposal.source.mappingContractHash,
+            roles: proposal.roles,
+            relationRules: proposal.relationRules,
+            structureTree: proposal.structureTree,
+            mappingValidation: { version: 1, status: 'needsReview', reasons: ['inputRevision'] }
+          }
+        }
+      }]
+    },
+    authoring: {
+      version: 1,
+      assistant: { objectFlowIntent: { context: '', blocks: [] }, diagramInterpretPrompt: '', diagramMappingPrompt: '' },
+      d2: { source: proposal.sourceText, analysisCheckpoint: checkpoint }
+    }
+  };
+
+  const stored = normalizeTemplateSpecForStorage(provisional);
+  assert.equal(
+    stored.authoring.d2.analysisCheckpoint.deterministicSpecHash,
+    diagramImportDeterministicSpecHash(stored),
+    JSON.stringify({
+      status: stored.result.diagrams[0].authoring.d2Import.mappingValidation.status,
+      reasons: stored.result.diagrams[0].authoring.d2Import.mappingValidation.reasons,
+      sourceHash: stored.result.diagrams[0].authoring.d2Import.sourceHash,
+      checkpointHash: stored.authoring.d2.analysisCheckpoint.deterministicSpecHash,
+      currentHash: diagramImportDeterministicSpecHash(stored)
+    })
+  );
+  assert.equal(stored.result.diagrams[0].authoring.d2Import.mappingValidation.status, 'needsReview');
 });
 
 test('normal Save keeps retired D2 mapping revisions pending re-analysis', async () => {
@@ -3612,6 +3757,51 @@ test('runtime json response exposes visible table rows and safe cell links', () 
   assert.equal(payload.cache.status, 'hit');
 });
 
+test('runtime json automatically links normalized URL cells and honors text override', () => {
+  const result = {
+    tables: [{
+      name: 'final',
+      columns: ['PortalUrl', 'UnsafeUrl'],
+      rows: [{ PortalUrl: 'https://portal.example/item/42', UnsafeUrl: 'javascript:alert(1)' }],
+      cellMeta: {
+        0: {
+          PortalUrl: { autoHref: 'https://portal.example/item/42' },
+          UnsafeUrl: {}
+        }
+      },
+      presentation: {}
+    }]
+  };
+  const automatic = runtimeJsonResponsePayload({ success: true, result });
+  assert.equal(automatic.tables[0].rows[0].links.PortalUrl.href, 'https://portal.example/item/42');
+  assert.equal(Object.hasOwn(automatic.tables[0].rows[0].links, 'UnsafeUrl'), false);
+
+  result.tables[0].presentation = { columnLinks: { PortalUrl: { mode: 'text' } } };
+  const textOnly = runtimeJsonResponsePayload({ success: true, result });
+  assert.deepEqual(textOnly.tables[0].rows[0], {
+    PortalUrl: 'https://portal.example/item/42',
+    UnsafeUrl: 'javascript:alert(1)'
+  });
+
+  result.tables[0].presentation = {
+    columnLinks: {
+      PortalUrl: {
+        mode: 'auto',
+        urlTemplate: 'https://stale.example/${mysource.value}',
+        textTemplate: 'stale label',
+        target: 'blank'
+      }
+    }
+  };
+  const explicitAuto = runtimeJsonResponsePayload({ success: true, result });
+  assert.deepEqual(explicitAuto.tables[0].rows[0].links.PortalUrl, {
+    href: 'https://portal.example/item/42',
+    text: 'https://portal.example/item/42',
+    value: 'https://portal.example/item/42',
+    target: 'blank'
+  });
+});
+
 test('published result table overrides legacy final-table visibility', () => {
   const payload = runtimeJsonResponsePayload({
     success: true,
@@ -4619,7 +4809,7 @@ test('object-flow proposal adapter accepts equivalent LLM field names before str
   assert.equal(candidate.flow.operations[0].with, 'arms');
   assert.equal(candidate.flow.operations[0].rules[0].operator, 'equals');
   assert.deepEqual(candidate.flow.selections[1].rules[0], {
-    action: 'include', path: 'Location', negate: false, op: 'equals', regex: '', value: '', valueParam: '', valueColumn: 'Location'
+    action: 'include', path: 'Location', negate: false, op: 'equals', rightExpression: '${previous.Location}'
   });
 });
 
@@ -4668,10 +4858,7 @@ test('object-flow proposal adapter repairs empty selection rules with an explici
     path: 'Code',
     negate: false,
     op: 'matches',
-    regex: '.*',
-    value: '',
-    valueParam: '',
-    valueColumn: ''
+    rightExpression: '.*'
   }]);
   assert.match(candidate.warnings.join(' '), /selection arms had no usable filter/);
 });
@@ -5455,14 +5642,14 @@ test('assistant draft normalization does not guess ambiguous class or field desc
   assert.equal(validateTemplateSpec(draft.spec).some((error) => error.path === '$.steps[0].className'), true);
 });
 
-test('assistant system prompt documents source-row selection with valueColumn', () => {
+test('assistant system prompt documents source-row selection with rightExpression', () => {
   const messages = assistantMessages({
     intent: 'same location as router',
     currentSpec: { version: 1, steps: [], result: { tables: [] } },
     taskMode: 'tables'
   }, { enabled: false }, defaultRuntimeConfig());
 
-  assert.ok(messages.some((message) => /valueColumn/.test(message.content) && /selectCards\.from/.test(message.content)));
+  assert.ok(messages.some((message) => /rightExpression/.test(message.content) && /selectCards\.from/.test(message.content)));
   assert.ok(messages.some((message) => /explanation text is not executable/.test(message.content) && /spec\.result/.test(message.content)));
   assert.ok(messages.some((message) => /с описанием/.test(message.content) && /Description/.test(message.content) && /equals/.test(message.content)));
 });

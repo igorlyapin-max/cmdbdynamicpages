@@ -435,10 +435,38 @@ test('object flow schedules a source-driven IPv4 selection after its relation ou
   const acls = compiled.steps.at(-1);
   assert.equal(acls.from, 'ipRanges');
   assert.equal(acls.filterJoin, 'any');
-  assert.deepEqual(acls.filters.map((filter) => [filter.scope, filter.path, filter.op, filter.valueColumn]), [
-    ['include', 'ipaddress', 'ipv4InCidr', 'range'],
-    ['include', 'dipaddress', 'ipv4InCidr', 'range']
+  assert.deepEqual(acls.filters.map((filter) => [filter.scope, filter.path, filter.op, filter.valueExpression]), [
+    ['include', 'ipaddress', 'ipv4InCidr', '${previous.range}'],
+    ['include', 'dipaddress', 'ipv4InCidr', '${previous.range}']
   ]);
+});
+
+test('object flow compiles parameter and previous-result expressions as deterministic filters', () => {
+  const flow = {
+    version: 1,
+    selections: [{
+      id: 'selection:systems', name: 'Systems', alias: 'systems', className: 'IS', limit: 10, columns: [],
+      rules: [{ action: 'include', path: 'Name', op: 'equals', rightExpression: '${param.isName}' }]
+    }, {
+      id: 'selection:servers', name: 'Servers', alias: 'servers', className: 'Server', from: 'systems', limit: 100, columns: ['Code'],
+      rules: [{ action: 'include', path: 'Code', op: 'matches', rightExpression: '^${previous.Name}-[0-9]+$' }]
+    }],
+    operations: [],
+    publishedAlias: 'servers'
+  };
+
+  assert.deepEqual(validateObjectFlow(flow), []);
+  const compiled = compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, flow);
+  assert.equal(compiled.steps[0].filters[0].valueExpression, '${param.isName}');
+  assert.equal(compiled.steps[1].filters[0].regexExpression, '^${previous.Name}-[0-9]+$');
+  assert.ok(compiled.steps[0].columns.some((column) => column.path === 'Name'));
+});
+
+test('object flow rejects a previous-result expression without a selected source', () => {
+  const flow = validFlow();
+  flow.selections[0].rules = [{ action: 'include', path: 'Status', op: 'equals', rightExpression: '${previous.Status}' }];
+
+  assert.ok(validateObjectFlow(flow).some((error) => error.path === '$.selections[0].rules[0].rightExpression'));
 });
 
 test('object flow compiles ordinary selection predicates with all semantics', () => {
@@ -607,7 +635,7 @@ test('compileObjectFlowToSpec replaces only managed object-flow state', () => {
     path: 'Status',
     negate: false,
     op: 'equals',
-    value: 'active'
+    valueExpression: 'active'
   }]);
   assert.deepEqual(routers.columns, [
     { path: 'Code', as: 'Code', multiMode: 'join', separator: ', ', emptyRow: true },
@@ -843,7 +871,7 @@ test('objectFlowStageSummaries returns deterministic cumulative columns', () => 
       label: 'Routers',
       className: 'Router',
       from: '',
-      rules: [{ path: 'Status', op: 'equals', value: 'active', valueParam: '', valueColumn: '', action: 'include', negate: false }],
+      rules: [{ path: 'Status', op: 'equals', rightExpression: 'active', action: 'include', negate: false }],
       columns: ['Class', '_id', 'Code', 'Description', 'Location']
     },
     {
@@ -853,7 +881,7 @@ test('objectFlowStageSummaries returns deterministic cumulative columns', () => 
       label: 'Rooms',
       className: 'Room',
       from: '',
-      rules: [{ path: 'Code', op: 'matches', value: '', valueParam: '', valueColumn: '', action: 'include', negate: false }],
+      rules: [{ path: 'Code', op: 'matches', rightExpression: '^DC-', action: 'include', negate: false }],
       columns: ['Class', '_id', 'Code', 'Description']
     },
     {
@@ -863,7 +891,7 @@ test('objectFlowStageSummaries returns deterministic cumulative columns', () => 
       label: 'VLANs',
       className: 'Vlan',
       from: '',
-      rules: [{ path: 'Status', op: 'equals', value: 'retired', valueParam: '', valueColumn: '', action: 'exclude', negate: false }],
+      rules: [{ path: 'Status', op: 'equals', rightExpression: 'retired', action: 'exclude', negate: false }],
       columns: ['Class', '_id', 'Code', 'Description']
     }
   ]);

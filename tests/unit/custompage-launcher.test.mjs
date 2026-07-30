@@ -567,6 +567,8 @@ test('query-first pickers retain Diagram field attributes and cap lazy suggestio
   const catalogMatchStart = proxySource.indexOf('function catalogFieldPickerMatches(options, selectedName, query)');
   const catalogPickerStart = proxySource.indexOf('function renderCatalogFieldPicker(fieldAttribute, selectedName, initialOptions, context)');
   const catalogOptionsStart = proxySource.indexOf('function catalogFieldPickerOptions(picker, query)', catalogPickerStart);
+  const viewportPickerStart = proxySource.indexOf('function positionFieldPickerMenu(picker)', catalogOptionsStart);
+  const viewportPickerEnd = proxySource.indexOf('function closeCatalogFieldPickers(except)', viewportPickerStart);
   const catalogHandlerEnd = proxySource.indexOf('function matchingLeftColumnOptions(', catalogOptionsStart);
   const hierarchyStart = proxySource.indexOf('function renderDiagramImportHierarchyConditionRow(conditions, childStageId, parentStageId, spec, index)');
   const hierarchyEnd = proxySource.indexOf('function diagramImportHierarchyStageLabel(', hierarchyStart);
@@ -594,6 +596,7 @@ test('query-first pickers retain Diagram field attributes and cap lazy suggestio
   assert.ok(catalogMatchStart >= 0, 'Shared picker match helper is missing.');
   assert.ok(catalogPickerStart > catalogMatchStart, 'Shared picker renderer is missing.');
   assert.ok(catalogOptionsStart > catalogPickerStart, 'Shared picker lazy option resolver is missing.');
+  assert.ok(viewportPickerStart > catalogOptionsStart && viewportPickerEnd > viewportPickerStart, 'Shared viewport picker controller is missing.');
   assert.ok(catalogHandlerEnd > catalogOptionsStart, 'Shared picker handler boundary is missing.');
   assert.ok(hierarchyStart >= 0 && hierarchyEnd > hierarchyStart, 'Diagram hierarchy condition renderer is missing.');
   assert.ok(relatedStart >= 0 && relatedEnd > relatedStart, 'Diagram related-data condition renderer is missing.');
@@ -611,6 +614,7 @@ test('query-first pickers retain Diagram field attributes and cap lazy suggestio
   const catalogMatchSource = proxySource.slice(catalogMatchStart, catalogPickerStart);
   const catalogPickerSource = proxySource.slice(catalogPickerStart, catalogOptionsStart);
   const catalogHandlerSource = proxySource.slice(catalogOptionsStart, catalogHandlerEnd);
+  const viewportPickerSource = proxySource.slice(viewportPickerStart, viewportPickerEnd);
   const hierarchySource = proxySource.slice(hierarchyStart, hierarchyEnd);
   const relatedSource = proxySource.slice(relatedStart, relatedEnd);
   const conditionMatchSource = proxySource.slice(conditionMatchStart, conditionPickerStart);
@@ -628,11 +632,20 @@ test('query-first pickers retain Diagram field attributes and cap lazy suggestio
   assert.match(catalogMatchSource, /matches\.slice\(0, 60\)/);
   assert.match(catalogPickerSource, /<input type="hidden" data-catalog-field-picker-value data-catalog-field-picker-selected-label="' \+ escapeHtml\(label\) \+ '" ' \+ fieldAttribute/);
   assert.match(catalogPickerSource, /data-catalog-field-picker-search/);
+  assert.match(catalogPickerSource, /function renderCatalogFieldMultiPicker\(fieldAttribute, selectedNames, initialOptions, context\)/);
+  assert.match(catalogPickerSource, /data-catalog-field-picker-multi-value/);
+  assert.match(proxySource, /function catalogFieldPickerSelectedFieldValues\(field\)/);
   assert.match(catalogHandlerSource, /function catalogFieldPickerOptions\(picker, query\)/);
   assert.match(catalogHandlerSource, /function toggleCatalogFieldPicker\(target\)/);
   assert.match(catalogHandlerSource, /if \(!query\)[\s\S]*renderCatalogFieldPickerPrompt\(\)/);
   assert.match(catalogHandlerSource, /kind === 'selection'/);
   assert.match(catalogHandlerSource, /kind === 'visualization'/);
+  assert.match(catalogHandlerSource, /kind === 'objectGroupSource'/);
+  assert.match(viewportPickerSource, /window\.requestAnimationFrame/);
+  assert.match(viewportPickerSource, /data-catalog-field-picker\], \[data-diagram-import-condition-picker/);
+  assert.match(viewportPickerSource, /--field-picker-max-height/);
+  assert.match(proxySource, /\.diagram-import-condition-picker-menu,\.catalog-field-picker-menu\{position:fixed/);
+  assert.match(proxySource, /document\.addEventListener\('scroll', repositionOpenFieldPickers, true\)/);
   assert.match(conditionMatchSource, /\.slice\(0, 60\)/);
   assert.match(conditionPickerSource, /data-diagram-import-condition-picker-field ' \+ fieldAttribute/);
   assert.match(conditionPickerSource, /data-diagram-import-condition-picker-search/);
@@ -1373,7 +1386,7 @@ test('diagram editor renders repeatable mapping tables with source-dependent fie
   assert.match(helperSource, /renderDiagramFieldSelect\(spec, sourceAlias, 'edgeType'/);
   assert.match(helperSource, /renderDiagramFieldSelect\(spec, sourceAlias, 'edgeDirection'/);
   assert.match(helperSource, /renderDiagramFieldSelect\(spec, sourceAlias, 'child'/);
-  assert.match(helperSource, /matchingColumnOptionRowsForOutput\(spec \|\| defaultSpec\(\), sourceAlias, undefined, true\)/);
+  assert.match(helperSource, /matchingColumnOptionRowsForOutput\(spec \|\| defaultSpec\(\), sourceAlias, undefined, true, searchQuery\)/);
   assert.match(helperSource, /function diagramInitialColumnOptionRowsForSource\(spec, sourceAlias, selectedNames\)/);
   assert.match(helperSource, /renderCatalogFieldPicker\(/);
   assert.match(helperSource, /renderCatalogFieldMultiPicker\(/);
@@ -1734,7 +1747,7 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   assert.match(proxySource, /diagram-import-add-related/);
   assert.match(proxySource, /diagram-import-add-rule/);
   assert.match(proxySource, /state\.diagramImportProposal && state\.diagramImportProposal\.version === 3/);
-  assert.match(proxySource, /function catalogRelationPathOptions\(className\)/);
+  assert.match(proxySource, /function catalogRelationPathOptions\(className, searchQuery\)/);
   assert.match(proxySource, /Number\(state\.maxTraversalDepth\)/);
   assert.match(proxySource, /data-relation-path/);
   assert.match(proxySource, /function renderRelationPathPlanner\(model, spec\)/);
@@ -1940,32 +1953,47 @@ test('dynamic runtime explains that snapshot publication is unavailable', () => 
   assert.match(proxySource, /disabled: !snapshotPublicationEnabled/);
 });
 
-test('final view attribute lazy-load retries after transient class attribute errors', () => {
+test('catalog field pickers load attributes only after a search and retry transient errors', () => {
   const ensureStart = proxySource.indexOf('function ensureCatalogAttributesForClass(className)');
   const viewClassesStart = proxySource.indexOf('function viewComposerCatalogClassNames(spec)');
   const ensureSectionStart = proxySource.indexOf('function ensureCatalogAttributesForDesignerSection()');
+  const pickerClassesStart = proxySource.indexOf('function catalogFieldPickerClassNames(picker)');
+  const refreshStart = proxySource.indexOf('function refreshCatalogFieldPickerResults(input)');
+  const scheduleStart = proxySource.indexOf('function scheduleCatalogFieldPickerResults(input)');
   const extractLanguageStart = proxySource.indexOf('function extractLanguageFromValue(value)');
   assert.ok(ensureStart > -1);
   assert.ok(viewClassesStart > ensureStart);
   assert.ok(ensureSectionStart > viewClassesStart);
+  assert.ok(pickerClassesStart > ensureSectionStart);
+  assert.ok(refreshStart > pickerClassesStart);
+  assert.ok(scheduleStart > refreshStart);
   assert.ok(extractLanguageStart > ensureSectionStart);
   const ensureSource = proxySource.slice(ensureStart, viewClassesStart);
-  const ensureSectionSource = proxySource.slice(ensureSectionStart, extractLanguageStart);
+  const ensureSectionSource = proxySource.slice(ensureSectionStart, pickerClassesStart);
+  const pickerClassesSource = proxySource.slice(pickerClassesStart, refreshStart);
+  const refreshSource = proxySource.slice(refreshStart, scheduleStart);
 
   assert.match(ensureSource, /request\(apiPrefix \+ '\/model\/classes\/' \+ encodeURIComponent\(name\) \+ '\/attributes'\)/);
   assert.match(ensureSource, /state\.catalogAttributeFailedAt\[key\]/);
   assert.match(ensureSource, /return mergeCatalogClassAttributes\(name, result\.json\.data\)/);
   assert.match(ensureSource, /catch\(function \(error\)/);
   assert.match(ensureSource, /return 'failed'/);
-  assert.match(ensureSectionSource, /item === 'failed'/);
+  assert.doesNotMatch(ensureSectionSource, /ensureCatalogAttributesForClass/);
+  assert.match(pickerClassesSource, /kind === 'scope'/);
+  assert.match(pickerClassesSource, /kind === 'objectGroupSource'/);
+  assert.match(proxySource, /function ensureCatalogFieldPickerSearchAttributes\(picker, query\)/);
+  assert.match(refreshSource, /if \(!query\) \{/);
+  assert.match(refreshSource, /ensureCatalogFieldPickerSearchAttributes\(picker, query\)/);
   assert.doesNotMatch(ensureSource, /catch\(function \(error\) \{\s*state\.catalogAttributeLoaded\[key\] = true/);
 });
 
-test('object group editor preserves assistant source-row selection fields', () => {
+test('object group editor uses one right expression for literals, parameters, and previous-result fields', () => {
   const normalizeRuleStart = proxySource.indexOf('function normalizeObjectSelectionRule(rule)');
   const normalizeStart = proxySource.indexOf('function normalizeObjectSelection(selection, index)');
   const inferStart = proxySource.indexOf('function inferObjectGroupModel(spec)');
-  const renderStart = proxySource.indexOf('function renderObjectGroupSelection(selection, index, spec)');
+  const renderStart = proxySource.indexOf('function renderObjectGroupSelection(selection, index, spec, expanded, selections)');
+  const renderRuleStart = proxySource.indexOf('function renderObjectGroupScopeRuleRow(rule, className, selections, selectionIndex, sourceAlias, spec, ruleIndex)');
+  const renderRuleEnd = proxySource.indexOf('function objectGroupPathHintOptions(className)');
   const buildStart = proxySource.indexOf('function buildObjectGroupSpec(model, previousSpec)');
   const captureStart = proxySource.indexOf('function captureObjectGroupDraftFromDom()');
   const matchingStart = proxySource.indexOf('function readRelationExpansionFields()');
@@ -1974,6 +2002,8 @@ test('object group editor preserves assistant source-row selection fields', () =
   assert.ok(normalizeStart > normalizeRuleStart);
   assert.ok(inferStart > normalizeStart);
   assert.ok(renderStart > inferStart);
+  assert.ok(renderRuleStart > -1);
+  assert.ok(renderRuleEnd > renderRuleStart);
   assert.ok(buildStart > renderStart);
   assert.ok(captureStart > buildStart);
   assert.ok(matchingStart > captureStart);
@@ -1981,12 +2011,14 @@ test('object group editor preserves assistant source-row selection fields', () =
   const normalizeSource = proxySource.slice(normalizeRuleStart, inferStart);
   const inferSource = proxySource.slice(inferStart, renderStart);
   const renderSource = proxySource.slice(renderStart, buildStart);
+  const renderRuleSource = proxySource.slice(renderRuleStart, renderRuleEnd);
   const buildSource = proxySource.slice(buildStart, captureStart);
   const captureSource = proxySource.slice(captureStart, matchingStart);
 
   assert.match(normalizeSource, /from: String\(selection\.from/);
   assert.match(normalizeSource, /columns: normalizeObjectSelectionColumns/);
-  assert.match(normalizeSource, /valueColumn: String\(rule\.valueColumn/);
+  assert.match(normalizeSource, /rightExpression: objectGroupRightExpression\(rule, operator\)/);
+  assert.match(proxySource, /function objectGroupRightExpressionTokens\(value\)/);
   assert.match(normalizeSource, /function objectGroupFinalAliasFromSelections\(selections\)/);
   assert.match(normalizeSource, /function ensureObjectGroupValueColumnSources\(selections\)/);
   assert.match(normalizeSource, /stripObjectGroupSourceColumnPrefix\(sourceAlias/);
@@ -1995,13 +2027,21 @@ test('object group editor preserves assistant source-row selection fields', () =
   assert.doesNotMatch(inferSource, /spec\.visualModel && spec\.visualModel\.mode === 'objectGroup'/);
   assert.match(inferSource, /var cardSteps = steps\.filter\(isDataSelectionStep\)/);
   assert.match(inferSource, /from: selection\.from \|\| ''/);
-  assert.match(inferSource, /valueColumn: filter\.valueColumn \|\| filter\.sourceColumn \|\| filter\.fromColumn/);
+  assert.match(inferSource, /rightExpression: filter\.regexExpression !== undefined/);
   assert.match(renderSource, /data-object-selection-field="alias"/);
   assert.match(renderSource, /data-object-selection-field="from"/);
-  assert.match(renderSource, /data-object-selection-field="columns"/);
-  assert.match(renderSource, /data-object-scope-field="valueColumn"/);
+  assert.match(renderSource, /data-object-scope-field="rightExpression"/);
+  assert.match(renderRuleSource, /data-object-scope-field="previousField"/);
+  assert.match(renderSource, /data-action="remove-object-selection"/);
+  assert.match(proxySource, /function renderObjectGroupExpressionSuggestions\(spec, selections, selectionIndex, sourceAlias, ruleIndex\)/);
+  assert.doesNotMatch(renderSource, /data-object-scope-field="valueColumn"/);
+  assert.doesNotMatch(renderSource, /data-object-selection-field="columns"/);
+  assert.doesNotMatch(renderSource, /renderCatalogFieldMultiPicker\('data-object-selection-field="columns"/);
+  assert.match(proxySource, /previous\.Name/);
+  assert.doesNotMatch(renderSource, /objectSelectionColumnsText/);
   assert.match(buildSource, /if \(selection\.from\) step\.from = selection\.from/);
-  assert.match(buildSource, /filter\.valueColumn = rule\.valueColumn/);
+  assert.match(buildSource, /filter\.regexExpression = String\(rule\.rightExpression/);
+  assert.match(buildSource, /filter\.valueExpression = String\(rule\.rightExpression/);
   assert.match(buildSource, /step\.columns = selection\.columns\.slice\(\)/);
   assert.match(buildSource, /ensureObjectGroupValueColumnSources\(selections\)/);
   assert.match(buildSource, /var finalAlias = objectGroupFinalAliasFromSelections\(selections\)/);
@@ -2010,14 +2050,17 @@ test('object group editor preserves assistant source-row selection fields', () =
   assert.match(buildSource, /columns: finalSelection\.columns && finalSelection\.columns\.length/);
   assert.match(buildSource, /var preservedTables = previousTables\.filter/);
   assert.match(captureSource, /data-object-selection-field="from"/);
-  assert.match(captureSource, /data-object-scope-field="valueColumn"/);
+  assert.match(captureSource, /data-object-scope-field="rightExpression"/);
+  assert.match(captureSource, /columns: existing\.columns/);
+  assert.match(proxySource, /function objectSelectionDependencyLabels\(selections, selectionIndex, spec\)/);
+  assert.match(proxySource, /function removeObjectSelection\(index\)/);
 });
 
 test('object group path hint filters are conditional and UI-only', () => {
   const optionsStart = proxySource.indexOf('function objectGroupPathHintOptions(className)');
   const renderStart = proxySource.indexOf('function renderObjectGroupPathHintFilters(className)');
   const regexExamplesStart = proxySource.indexOf('function objectGroupRegexExamples()');
-  const selectionStart = proxySource.indexOf('function renderObjectGroupSelection(selection, index, spec)');
+  const selectionStart = proxySource.indexOf('function renderObjectGroupSelection(selection, index, spec, expanded, selections)');
   const editorStart = proxySource.indexOf('function renderObjectGroupEditor(selected)');
   const readStart = proxySource.indexOf('function readObjectGroupFields()');
   const buildStart = proxySource.indexOf('function buildObjectGroupSpec(model, previousSpec)');
@@ -2095,15 +2138,17 @@ test('object group final alias drives extraction defaults and diagnostics', () =
 });
 
 test('Assistant extraction uses the persisted user-label manifest and never falls back to aliases', () => {
-  const manifestStart = proxySource.indexOf('function assistantObjectFlowOutputManifest(spec)');
-  const outputManifestStart = proxySource.indexOf('function objectFlowOutputManifest(spec)', manifestStart);
+  const manifestStart = proxySource.indexOf('function computeAssistantObjectFlowOutputManifest(spec)');
+  const cacheStart = proxySource.indexOf('function assistantObjectFlowOutputManifest(spec)', manifestStart);
+  const outputManifestStart = proxySource.indexOf('function objectFlowOutputManifest(spec)', cacheStart);
   const finalAliasesStart = proxySource.indexOf('function finalExtractionAliases(spec)', outputManifestStart);
   const extractionOptionsStart = proxySource.indexOf('function extractionResultOptions(spec, tables)', finalAliasesStart);
   const renderStart = proxySource.indexOf('function renderExtractionEditor(selected)', extractionOptionsStart);
   const extractionStart = proxySource.indexOf('function extractByTemplate()', renderStart);
   const selectionStart = proxySource.indexOf('function applyDataSelectionEditor()', extractionStart);
   assert.ok(manifestStart > -1);
-  assert.ok(outputManifestStart > manifestStart);
+  assert.ok(cacheStart > manifestStart);
+  assert.ok(outputManifestStart > cacheStart);
   assert.ok(finalAliasesStart > outputManifestStart);
   assert.ok(extractionOptionsStart > finalAliasesStart);
   assert.ok(renderStart > extractionOptionsStart);
@@ -2122,10 +2167,12 @@ test('Assistant extraction uses the persisted user-label manifest and never fall
   assert.match(manifestSource, /persisted\.blocks/);
   assert.match(manifestSource, /var hasCompiledFlow = Boolean\(objectMatching/);
   assert.match(manifestSource, /error: invalid \? 'invalid manifest'/);
+  assert.match(manifestSource, /assistantObjectFlowManifestCache/);
   assert.match(finalAliasesSource, /if \(assistantManifest\.error\) return \[\]/);
   assert.match(optionsSource, /if \(assistantManifest\.error\) return result/);
   assert.match(renderSource, /assistantFlowOutputManifestInvalid/);
-  assert.match(renderSource, /userFacingResultLabel\(selectedName, spec\)/);
+  assert.match(renderSource, /renderExtractionResultOptions\(state\.extractionSource, spec, optionTables\)/);
+  assert.match(renderSource, /extractionResultSourceHelp/);
   assert.match(extractionSource, /assistantManifest\.assistantManaged && assistantManifest\.error/);
 });
 
@@ -2165,7 +2212,7 @@ test('Assistant-managed Object Flow aliases stay internal across deterministic a
 
 test('Relations Apply preserves explicit operation order and source-driven columns', () => {
   const operationsStart = proxySource.indexOf('function flowOperations(model)');
-  const columnsStart = proxySource.indexOf('function flowColumnOptionRows(model, spec, alias, operationIndex, seenAliases, includeCatalogPaths)', operationsStart);
+  const columnsStart = proxySource.indexOf('function flowColumnOptionRows(model, spec, alias, operationIndex, seenAliases, includeCatalogPaths, searchQuery)', operationsStart);
   const buildStart = proxySource.indexOf('function buildRelationExpansionSpec(model, previousSpec)', columnsStart);
   const captureStart = proxySource.indexOf('function captureRelationDraftFromDom()', buildStart);
   assert.ok(operationsStart > -1);
@@ -2186,9 +2233,9 @@ test('Relations Apply preserves explicit operation order and source-driven colum
   assert.doesNotMatch(buildSource, /includeSource/);
 });
 
-test('deep catalog fields are lazy, cached, and locally refreshed in the relation editor', () => {
+test('deep catalog fields are query-first, cached, and locally refreshed in the relation editor', () => {
   const scopeStart = proxySource.indexOf('function catalogScopePathOptions(className, searchQuery)');
-  const relationStart = proxySource.indexOf('function catalogRelationPathOptions(className)');
+  const relationStart = proxySource.indexOf('function catalogRelationPathOptions(className, searchQuery)');
   const pickerRowsStart = proxySource.indexOf('function renderCatalogFieldPickerRows(options, selectedName, query)');
   const pickerStart = proxySource.indexOf('function renderCatalogFieldPicker(fieldAttribute, selectedName, initialOptions, context)');
   const refreshStart = proxySource.indexOf('function refreshMatchingBlockAfterSourceChange(node)');
@@ -2218,9 +2265,11 @@ test('deep catalog fields are lazy, cached, and locally refreshed in the relatio
   assert.match(relationSource, /state\.catalogRelationPathOptionsCache/);
   assert.match(relationSource, /cachedDomainRelatedClasses/);
   assert.match(relationSource, /state\.maxCatalogPathCandidates/);
+  assert.match(relationSource, /if \(!rootName \|\| !normalizedQuery\) return \[\];/);
+  assert.match(relationSource, /visitedCandidates >= scanLimit/);
   assert.match(pickerRowsSource, /matches\.slice\(0, 60\)/);
   assert.match(pickerSource, /data-catalog-field-picker-search/);
-  assert.match(pickerSource, /flowColumnOptionRows\(model, readCurrentSpec\(\), sourceAlias, operationIndex, \{\}, true\)/);
+  assert.match(pickerSource, /flowColumnOptionRows\(model, readCurrentSpec\(\), sourceAlias, operationIndex, \{\}, true, query\)/);
   assert.match(pickerSource, /function scheduleCatalogFieldPickerResults\(input\)/);
   assert.match(pickerSource, /\}, 120\);/);
   assert.match(refreshSource, /list\.innerHTML = rows/);
@@ -2228,14 +2277,30 @@ test('deep catalog fields are lazy, cached, and locally refreshed in the relatio
   assert.match(changeHandlerSource, /refreshMatchingBlockAfterSourceChange\(target\.closest\('\[data-matching-block\]'\)\)/);
 });
 
+test('object group dependency lookup indexes diagram aliases without serializing the full diagram', () => {
+  const dependencyStart = proxySource.indexOf('function objectSelectionDependencyLabels(selections, selectionIndex, spec)');
+  const dependencyEnd = proxySource.indexOf('function renderCollapsedObjectGroupSelection', dependencyStart);
+  assert.ok(dependencyStart > -1);
+  assert.ok(dependencyEnd > dependencyStart);
+  const dependencySource = proxySource.slice(dependencyStart, dependencyEnd);
+  assert.match(dependencySource, /diagramObjectFlowAliasIndex\(spec \|\| \{\}\)\.has\(alias\)/);
+  assert.match(dependencySource, /function diagramObjectFlowAliasIndex\(spec\)/);
+  assert.match(dependencySource, /assistantFlowStageSummaries\(assistantFlowModel\(spec \|\| defaultSpec\(\)\), spec \|\| defaultSpec\(\)\)/);
+  assert.match(dependencySource, /addStage\(materialization\.stageId\)/);
+  assert.match(dependencySource, /addStage\(rule && rule\.sourceStageId\)/);
+  assert.doesNotMatch(dependencySource, /JSON\.stringify/);
+});
+
 test('relation editor shows the persisted Assistant result label instead of a technical alias', () => {
   const relationStart = proxySource.indexOf('function renderRelationOperation(operation, operationIndex, model, spec)');
-  const targetStart = proxySource.indexOf('function relatedTargetColumnOptions(className, selectedName)', relationStart);
+  const targetStart = proxySource.indexOf('function relatedTargetColumnOptions(className, selectedName, searchQuery)', relationStart);
   assert.ok(relationStart > -1);
   assert.ok(targetStart > relationStart);
 
   const relationSource = proxySource.slice(relationStart, targetStart);
   assert.match(relationSource, /userFacingResultLabel\(operation\.as, spec\)/);
+  assert.match(relationSource, /renderCatalogFieldMultiPicker\('data-relation-operation-field="columns"/);
+  assert.match(proxySource, /renderCatalogFieldMultiPicker\('data-exists-related-field="columns"/);
   assert.match(proxySource, /renderRelationOperation\(operation, index, model, spec\)/);
 });
 
@@ -2252,7 +2317,9 @@ test('operation aliases immediately become available to later operations without
   const refreshSource = proxySource.slice(refreshStart, clearScopeStart);
   const inputSource = proxySource.slice(inputStart, changeStart);
   assert.doesNotMatch(refreshSource, /data-result-set-field="publishedAlias"/);
-  assert.match(proxySource, /data-action="apply-extraction-published"/);
+  assert.doesNotMatch(proxySource, /data-action="apply-extraction-published"/);
+  assert.match(proxySource, /id="cmdp-view-source"/);
+  assert.match(proxySource, /viewComposerSourceHelp/);
   assert.doesNotMatch(proxySource, /assistantFlowExtractionCandidate|assistantFlowCandidateOutput|extractionCandidateBlockId|extractionCandidateAlias/);
   assert.match(proxySource, /roles: input\.modelRoles \|\| input\.roles/);
   assert.match(refreshSource, /renderPriorMaterializedAliasOptions\(state\.relationDraft, index, selected, readCurrentSpec\(\)\)/);

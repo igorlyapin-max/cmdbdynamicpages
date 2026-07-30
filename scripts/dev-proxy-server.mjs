@@ -2037,6 +2037,7 @@ function diagramImportPlacementFilters(value) {
 function diagramImportRoleMappingData(role, source = {}, mappingIndex = 0) {
   const candidate = source && typeof source === 'object' && !Array.isArray(source) ? source : {};
   const primary = candidate.primary && typeof candidate.primary === 'object' && !Array.isArray(candidate.primary) ? candidate.primary : {};
+  const primaryCardSource = normalizeDiagramImportConditionCardSource(primary.cardSource);
   return {
     id: String(candidate.id || diagramImportStableId('role_mapping', `${role.id}:${mappingIndex}`)).trim(),
     label: truncateText(String(candidate.label || candidate.name || '').trim(), 160),
@@ -2049,6 +2050,7 @@ function diagramImportRoleMappingData(role, source = {}, mappingIndex = 0) {
       idAttribute: diagramImportPrimaryIdAttribute(role, primary),
       labelTemplate: String(primary.labelTemplate || '${Description}'),
       structuredFields: diagramImportPrimaryStructuredFields(role, primary),
+      ...(primaryCardSource ? { cardSource: primaryCardSource } : {}),
       filters: []
     },
     conditions: diagramImportPlacementFilters(candidate.conditions),
@@ -2320,6 +2322,74 @@ function diagramImportParentCorrelationCandidates(sourceStage, parentStage) {
   return candidates.filter((candidate) => candidate.provenanceDepth === minimumDepth);
 }
 
+function diagramImportDirectRelationParentCorrelation(mapping, sourceStage, parentStage, treeItemId = '') {
+  const source = mapping && typeof mapping === 'object' && !Array.isArray(mapping) ? mapping : {};
+  const primaryProjection = diagramImportPrimaryCardSource(sourceStage, source.primary || {}, parentStage);
+  const primaryCardSource = primaryProjection.source;
+  const sourceClass = String(sourceStage && sourceStage.className || '').trim();
+  const parentClass = String(parentStage && parentStage.className || '').trim();
+  if (!primaryCardSource || primaryCardSource.id !== 'relation-source' || !sourceClass || sourceClass !== parentClass) {
+    return { mapping: source, changed: false, correlationChanged: false };
+  }
+  const currentSource = diagramImportUniqueStageCardSources(Array.isArray(sourceStage && sourceStage.cardSources) ? sourceStage.cardSources : [])
+    .map((candidate) => normalizeDiagramImportConditionCardSource(candidate))
+    .find((candidate) => candidate && candidate.id === 'current') || diagramImportCurrentStageCardSource(sourceClass);
+  const parentCurrentSource = diagramImportUniqueStageCardSources(Array.isArray(parentStage && parentStage.cardSources) ? parentStage.cardSources : [])
+    .map((candidate) => normalizeDiagramImportConditionCardSource(candidate))
+    .find((candidate) => candidate && candidate.id === 'current') || diagramImportCurrentStageCardSource(parentClass);
+  if (!currentSource || !parentCurrentSource || !currentSource.idColumn || !parentCurrentSource.idColumn) {
+    return { mapping: source, changed: false, correlationChanged: false };
+  }
+  const primary = {
+    ...(source.primary || {}),
+    className: String(primaryCardSource.className || ''),
+    cardSource: primaryCardSource
+  };
+  const hierarchyConditions = diagramImportPlacementFilters(source.hierarchyConditions);
+  const hasManualRule = hierarchyConditions.rules.some((condition) => condition && condition.origin !== 'assistant');
+  if (hasManualRule) {
+    return {
+      mapping: { ...source, primary },
+      changed: true,
+      correlationChanged: false
+    };
+  }
+  const stageId = String(parentStage && parentStage.id || '').trim();
+  const directRule = {
+    id: diagramImportStableId('direct_relation_parent', `${treeItemId}:${String(sourceStage && sourceStage.id || '')}:${stageId}:${currentSource.idColumn}:${parentCurrentSource.idColumn}`),
+    action: 'include',
+    negate: false,
+    origin: 'assistant',
+    operator: 'equals',
+    caseSensitive: false,
+    left: { column: String(currentSource.idColumn), regex: '', source: currentSource },
+    right: {
+      kind: 'stage',
+      value: '',
+      name: '',
+      stageId,
+      column: String(parentCurrentSource.idColumn),
+      regex: '',
+      source: parentCurrentSource
+    }
+  };
+  const alreadyDirect = hierarchyConditions.rules.length === 1 &&
+    String(hierarchyConditions.rules[0] && hierarchyConditions.rules[0].left && hierarchyConditions.rules[0].left.column || '') === String(directRule.left.column) &&
+    String(hierarchyConditions.rules[0] && hierarchyConditions.rules[0].right && hierarchyConditions.rules[0].right.stageId || '') === stageId &&
+    String(hierarchyConditions.rules[0] && hierarchyConditions.rules[0].right && hierarchyConditions.rules[0].right.column || '') === String(directRule.right.column);
+  return {
+    mapping: {
+      ...source,
+      primary,
+      hierarchyConditions: alreadyDirect
+        ? hierarchyConditions
+        : { ruleJoin: 'any', rules: [directRule] }
+    },
+    changed: true,
+    correlationChanged: !alreadyDirect
+  };
+}
+
 function diagramImportPreviewTreeWithParentCorrelationRepairs(tree, roles, currentSpec = {}, structure = null) {
   const normalized = diagramImportStructureTree(tree, structure, roles);
   const repairedTree = cloneJsonValueServer(normalized, { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] });
@@ -2330,7 +2400,7 @@ function diagramImportPreviewTreeWithParentCorrelationRepairs(tree, roles, curre
 
   for (const item of repairedTree.items || []) {
     const role = roleById.get(String(item && item.roleId || '')) || {};
-    const mapping = diagramImportStructureItemMapping(role, item && item.mapping || {}, item && item.id || '');
+    let mapping = diagramImportStructureItemMapping(role, item && item.mapping || {}, item && item.id || '');
     const stageId = diagramImportOwnMaterializedStageId(mapping);
     if (!stageId) continue;
     const ancestor = diagramImportNearestMaterializedAncestor(repairedTree, roles, item);
@@ -2338,6 +2408,18 @@ function diagramImportPreviewTreeWithParentCorrelationRepairs(tree, roles, curre
     const sourceStage = stages.get(stageId);
     const parentStage = stages.get(String(ancestor.stageId));
     if (!sourceStage || !parentStage || diagramImportStageDirectlyDependsOn(sourceStage, parentStage)) continue;
+    const directRelationRepair = diagramImportDirectRelationParentCorrelation(mapping, sourceStage, parentStage, item.id);
+    if (directRelationRepair.changed) {
+      mapping = directRelationRepair.mapping;
+      item.mapping = mapping;
+      if (directRelationRepair.correlationChanged) {
+        repairs.push({
+          structureItemId: String(item.id || ''),
+          roleLabel: String(role.label || role.key || item.id || ''),
+          parentRoleLabel: String(ancestor.role && (ancestor.role.label || ancestor.role.key) || '')
+        });
+      }
+    }
     const hierarchyConditions = diagramImportPlacementFilters(mapping.hierarchyConditions);
     const hasParentCondition = hierarchyConditions.rules.some((condition) => condition && condition.right &&
       condition.right.kind === 'stage' && String(condition.right.stageId || '') === String(ancestor.stageId));
@@ -2769,16 +2851,32 @@ function diagramImportStructureTreeErrors(tree, roles, currentSpec = {}, structu
       errors.push({ path: stagePath, message: `Object Flow result ${stage.label || stage.id} is not a materialized CMDBuild class result.` });
       continue;
     }
+    const primaryProjection = diagramImportPrimaryCardSource(
+      stage,
+      mapping.primary || {},
+      ancestor && ancestor.stageId ? stages.get(String(ancestor.stageId)) : null
+    );
     const expectedClass = String(mapping && mapping.primary && mapping.primary.className || '').trim();
-    if (expectedClass && expectedClass !== String(stage.className || '').trim()) {
-      errors.push({ path: stagePath, message: `Object Flow result ${stage.label || stage.id} returns ${stage.className}, but D2 role ${role.label || role.key} is configured for ${expectedClass}.` });
+    if (primaryProjection.ambiguous) {
+      errors.push({
+        path: `$.structureTree.items[${index}].mapping.primary.cardSource`,
+        message: `Object Flow result ${stage.label || stage.id} contains several CMDBuild cards. Select the card that must materialize D2 role ${role.label || role.key || item.id}.`
+      });
+    } else if (!primaryProjection.inferred && primaryProjection.source && expectedClass && expectedClass !== String(primaryProjection.source.className || '')) {
+      errors.push({
+        path: `$.structureTree.items[${index}].mapping.primary.cardSource`,
+        message: `D2 role ${role.label || role.key || item.id} is configured for ${expectedClass}, but the selected Object Flow card is ${primaryProjection.source.className}.`
+      });
     }
     const available = new Set((stage.columns || []).map(String));
+    const primaryUsesRetainedCard = Boolean(primaryProjection.source && (
+      primaryProjection.source.classColumn !== 'Class' || primaryProjection.source.idColumn !== '_id'
+    ));
     for (const field of uniqueStrings([mapping.primary && mapping.primary.idAttribute]
       .concat(mapping.primary && mapping.primary.structuredFields || [])
       .concat(diagramImportPrimaryTemplateFieldNames(mapping.primary && mapping.primary.labelTemplate || '')))
       .map((field) => String(field || '').replace(/^primary\./, '')).filter(Boolean)) {
-      if (!['_id', 'Class'].includes(field) && !available.has(field)) {
+      if (!primaryUsesRetainedCard && !['_id', 'Class'].includes(field) && !available.has(field)) {
         errors.push({ path: `$.structureTree.items[${index}].mapping.primary`, message: `Field ${field} is not materialized by Object Flow result ${stage.label || stage.id}.` });
       }
     }
@@ -4013,10 +4111,10 @@ function diagramImportCompileTraversal(options) {
   return { alias: from, steps, rootIdField, targetIdField, targetClass: currentClass };
 }
 
-function diagramImportRuntimeLabelTemplate(role, primary = {}) {
+function diagramImportRuntimeLabelTemplate(role, primary = {}, primaryCardSource = null) {
   let template = String(primary && primary.labelTemplate || role && role.labelTemplate || '${Description}');
   template = template.replace(/\$\{primary\.([^{}]+)\}/g, '${$1}');
-  return template;
+  return diagramImportCardSourceLabelTemplate(template, primaryCardSource);
 }
 
 function diagramImportConditionSetOperation(type, from, rightAlias, itemId, suffix) {
@@ -4379,6 +4477,7 @@ function diagramImportCompileRoleMapping(role, mapping, treeItemId = '', stageBy
     });
   }
   const sourceStage = stageById.get(String(source.stageId || '')) || null;
+  const primaryCardSource = normalizeDiagramImportConditionCardSource(primary.cardSource);
   const requiredEnrichment = diagramImportCompileConditionEnrichment(
     primaryAlias,
     sourceStage,
@@ -4417,19 +4516,24 @@ function diagramImportCompileRoleMapping(role, mapping, treeItemId = '', stageBy
     styleHints: cloneJsonValueServer(role.styleHints, {}),
     sourceStageId: String(source.stageId || ''),
     sourceAlias: String(source.baseAlias || source.alias || ''),
-    sourceLabel: String(source.label || '')
+    sourceLabel: String(source.label || ''),
+    ...(primaryCardSource ? { primaryCardSource } : {})
   };
   const runtimeMapping = {
     // Authoring mapping ids identify editable bindings. Runtime mapping ids must
     // remain role-scoped because a repeated group can inherit those bindings.
     id: '',
     from: runtimePrimaryAlias,
-    fields: { id: idAttribute, label: 'Description' },
-    labelTemplate: diagramImportRuntimeLabelTemplate(role, primary),
+    fields: {
+      id: diagramImportCardSourceField(primaryCardSource, idAttribute),
+      label: diagramImportCardSourceField(primaryCardSource, 'Description')
+    },
+    labelTemplate: diagramImportRuntimeLabelTemplate(role, primary, primaryCardSource),
     dataProfile: {
       name: role.key,
       className: primary.className || '',
-      fields: uniqueStrings((primary.structuredFields || []).concat(relatedBindings.flatMap((related) => related.structuredFields.map((field) => `${related.id}.${field}`)))),
+      fields: uniqueStrings((primary.structuredFields || []).map((field) => diagramImportCardSourceField(primaryCardSource, field))
+        .concat(relatedBindings.flatMap((related) => related.structuredFields.map((field) => `${related.id}.${field}`)))),
       includeSourceRef: true
     },
     relatedBindings,
@@ -4506,6 +4610,17 @@ function diagramImportCompileStructureTree(structureTree, roles, stageById) {
   const steps = [];
   const conditionSourceRepairs = [];
   const hierarchyParentFieldRequirements = new Map();
+  for (const item of normalizedTree.items) {
+    const role = roleById.get(String(item && item.roleId || '')) || {};
+    const mapping = diagramImportStructureItemMapping(role, item && item.mapping || {}, String(item && item.id || ''));
+    const stageId = diagramImportOwnMaterializedStageId(mapping);
+    const ancestor = stageId ? diagramImportNearestMaterializedAncestor(normalizedTree, roles, item) : null;
+    const stage = stageById.get(stageId);
+    const parentStage = ancestor && ancestor.stageId ? stageById.get(String(ancestor.stageId)) : null;
+    if (!stage || !parentStage || diagramImportStageDirectlyDependsOn(stage, parentStage)) continue;
+    const directRelationRepair = diagramImportDirectRelationParentCorrelation(mapping, stage, parentStage, String(item && item.id || ''));
+    if (directRelationRepair.changed) item.mapping = cloneJsonValueServer(directRelationRepair.mapping, {});
+  }
   for (const item of normalizedTree.items) {
     const role = roleById.get(String(item && item.roleId || '')) || {};
     const mapping = diagramImportStructureItemMapping(role, item && item.mapping || {}, String(item && item.id || ''));
@@ -4615,6 +4730,22 @@ function diagramImportCompileStructureTree(structureTree, roles, stageById) {
     // source by role or Object Flow stage silently makes sibling D2 placements
     // inherit each other's filters, labels, and related traversals.
     const compiledMapping = cloneJsonValueServer(mapping, {});
+    const primaryProjection = diagramImportPrimaryCardSource(
+      stage,
+      compiledMapping.primary || {},
+      nearestParent && nearestParent.stage || null
+    );
+    if (primaryProjection.source) {
+      compiledMapping.primary = {
+        ...(compiledMapping.primary || {}),
+        className: String(primaryProjection.source.className || ''),
+        cardSource: primaryProjection.source
+      };
+      // Persist an unambiguous projection chosen from the retained Object Flow
+      // cards. Future previews must not fall back to the relation's current
+      // server card after the author selected an application result.
+      item.mapping = cloneJsonValueServer(compiledMapping, {});
+    }
     const runtimeSource = {
       stageId: String(stage.id || ''),
       alias: inherited ? String(inherited.primaryAlias || '') : String(stage.alias || ''),
@@ -4874,6 +5005,70 @@ function diagramImportCurrentStageCardSource(className, label = '') {
     idColumn: '_id',
     label: String(label || 'Карточка результата').trim()
   };
+}
+
+function diagramImportPrimaryCardSource(stage, primary = {}, parentStage = null) {
+  const available = diagramImportUniqueStageCardSources(Array.isArray(stage && stage.cardSources) ? stage.cardSources : [])
+    .map((source) => normalizeDiagramImportConditionCardSource(source))
+    .filter(Boolean);
+  const explicit = normalizeDiagramImportConditionCardSource(primary && primary.cardSource);
+  const sourceKey = (source) => source ? [source.className, source.classColumn, source.idColumn].join('\u0000') : '';
+  const hasSource = (candidate) => available.some((source) => sourceKey(source) === sourceKey(candidate));
+  if (explicit && hasSource(explicit)) return { source: explicit, inferred: false, ambiguous: false };
+
+  const parentClass = String(parentStage && parentStage.className || '').trim();
+  const configuredClass = String(primary && primary.className || '').trim();
+  const stageClass = String(stage && stage.className || '').trim();
+  const distinctFromParent = parentClass
+    ? available.filter((source) => String(source.className || '') !== parentClass)
+    : [];
+  const distinctClasses = uniqueStrings(distinctFromParent.map((source) => source.className));
+  // A match result retains the direct relation source and may also retain
+  // deeper lineage cards. When the current card is the materialized parent,
+  // only the direct relation source is the deterministic child projection;
+  // deeper provenance must never compete with it.
+  const directRelationSource = available.find((source) => source.id === 'relation-source' && String(source.className || '') !== parentClass);
+  if (parentClass && stageClass === parentClass && directRelationSource) {
+    return { source: directRelationSource, inferred: true, ambiguous: false };
+  }
+  // A relation result without a direct source can still be repaired when it
+  // retains exactly one card class distinct from the parent branch.
+  if (parentClass && stageClass === parentClass && distinctClasses.length === 1) {
+    const candidates = distinctFromParent.filter((source) => source.className === distinctClasses[0]);
+    if (candidates.length === 1) return { source: candidates[0], inferred: true, ambiguous: false };
+    return { source: null, inferred: false, ambiguous: true };
+  }
+
+  if (configuredClass) {
+    const candidates = available.filter((source) => source.className === configuredClass);
+    if (candidates.length === 1) return { source: candidates[0], inferred: false, ambiguous: false };
+    if (candidates.length > 1) return { source: null, inferred: false, ambiguous: true };
+  }
+  if (available.length === 1) return { source: available[0], inferred: true, ambiguous: false };
+  const current = available.find((source) => source.id === 'current');
+  if (current) return { source: current, inferred: true, ambiguous: false };
+  return { source: null, inferred: false, ambiguous: available.length > 1 };
+}
+
+function diagramImportCardSourceField(source, field) {
+  const name = String(field || '').trim();
+  if (!name) return '';
+  const normalized = normalizeDiagramImportConditionCardSource(source);
+  if (!normalized || (normalized.classColumn === 'Class' && normalized.idColumn === '_id')) return name;
+  if (name === '_id' || name === 'Id' || name === 'ID') return normalized.idColumn;
+  if (name === 'Class') return normalized.classColumn;
+  const suffix = normalized.classColumn.endsWith('Class')
+    ? normalized.classColumn.slice(0, -'Class'.length)
+    : '';
+  return suffix ? `${suffix}${name}` : name;
+}
+
+function diagramImportCardSourceLabelTemplate(template, source) {
+  return String(template || '').replace(/\$\{([^{}]+)\}/g, (match, token) => {
+    const field = String(token || '').trim();
+    if (!field || field.startsWith('param.') || field.startsWith('params.') || field.startsWith('row.')) return match;
+    return `\${${diagramImportCardSourceField(source, field)}}`;
+  });
 }
 
 function diagramImportPrefixedStageCardSource(source, prefix, labelPrefix = '') {
@@ -5733,11 +5928,75 @@ function synchronizeD2Authoring(spec, imported) {
   spec.authoring = {
     ...authoring,
     d2: {
+      ...(authoring.d2 && typeof authoring.d2 === 'object' && !Array.isArray(authoring.d2) ? authoring.d2 : {}),
       source,
       sourceHash: source ? sha256Hex(source) : ''
     }
   };
   delete spec.assistantDraft;
+}
+
+function diagramImportCheckpointProvisionalBaseMatches(spec, diagram, mapping, checkpoint) {
+  if (!spec || !diagram || !mapping || !checkpoint) return false;
+  if (!mapping.mappingValidation || mapping.mappingValidation.status !== 'needsReview') return false;
+  if (String(mapping.sourceHash || '') !== String(checkpoint.source && checkpoint.source.hash || '') ||
+    String(mapping.structureHash || '') !== String(checkpoint.source && checkpoint.source.structureHash || '') ||
+    String(mapping.mappingContractHash || '') !== String(checkpoint.source && checkpoint.source.mappingContractHash || '')) return false;
+  const hasMaterializedStage = (Array.isArray(mapping.structureTree && mapping.structureTree.items) ? mapping.structureTree.items : [])
+    .some((item) => Boolean(diagramImportOwnMaterializedStageId(item && item.mapping || {})));
+  const hasRelationStage = (Array.isArray(mapping.relationRules) ? mapping.relationRules : [])
+    .some((rule) => String(rule && (rule.sourceStageId || rule.targetStageId) || '').trim());
+  if (hasMaterializedStage || hasRelationStage) return false;
+
+  // D2 analysis writes a provisional topology diagram so its structure can be
+  // edited locally. It is not an executable mapping. Remove only that exact
+  // provisional diagram and require the original deterministic checkpoint hash
+  // to match before rebasing the checkpoint during an ordinary Save.
+  const base = cloneJsonValueServer(spec, {});
+  if (!base.result || !Array.isArray(base.result.diagrams)) return false;
+  base.result.diagrams = base.result.diagrams.filter((candidate) => candidate !== diagram &&
+    String(candidate && candidate.id || '') !== String(diagram && diagram.id || ''));
+  if (base.result.diagrams.length === 0) delete base.result.diagrams;
+  return diagramImportDeterministicSpecHash(base) === String(checkpoint.deterministicSpecHash || '');
+}
+
+function rebaseStoredD2AnalysisCheckpoint(spec) {
+  const authoring = templateAuthoring(spec, { allowLegacy: false });
+  const d2 = authoring && authoring.d2 && typeof authoring.d2 === 'object' && !Array.isArray(authoring.d2)
+    ? authoring.d2
+    : null;
+  const checkpoint = d2 && normalizeD2AnalysisCheckpoint(d2.analysisCheckpoint);
+  if (!checkpoint) return;
+  const sourceHash = String(d2.sourceHash || (d2.source ? sha256Hex(String(d2.source)) : '') || '');
+  const imported = diagramImportForSpec(spec);
+  const diagram = imported && imported.diagram;
+  const mapping = imported && imported.imported;
+  if (!sourceHash || !mapping || String(mapping.sourceHash || '') !== sourceHash) return;
+  const provisionalBaseMatches = diagramImportCheckpointProvisionalBaseMatches(spec, diagram, mapping, checkpoint);
+  const executableMappingIsCurrent = Boolean(mapping.mappingValidation && mapping.mappingValidation.status === 'valid' &&
+    diagramImportMappingValidationIsCurrent(mapping) && diagramImportMappingInputRevisionStatus(spec, mapping).current);
+  if (!provisionalBaseMatches && !executableMappingIsCurrent) return;
+  if (String(checkpoint.source && checkpoint.source.hash || '') !== sourceHash ||
+    String(checkpoint.source && checkpoint.source.structureHash || '') !== String(mapping.structureHash || '') ||
+    String(checkpoint.source && checkpoint.source.mappingContractHash || '') !== String(mapping.mappingContractHash || '')) return;
+  const deterministicSpecHash = diagramImportDeterministicSpecHash(spec);
+  if (checkpoint.deterministicSpecHash === deterministicSpecHash) return;
+  const rebasedCheckpoint = { ...checkpoint, deterministicSpecHash };
+  const assistantCheckpoint = normalizeD2AssistantCheckpoint(d2.assistantCheckpoint);
+  const rebasedAssistantCheckpoint = assistantCheckpoint &&
+    String(assistantCheckpoint.source && assistantCheckpoint.source.hash || '') === sourceHash &&
+    String(assistantCheckpoint.source && assistantCheckpoint.source.structureHash || '') === String(mapping.structureHash || '') &&
+    String(assistantCheckpoint.source && assistantCheckpoint.source.mappingContractHash || '') === String(mapping.mappingContractHash || '')
+    ? { ...assistantCheckpoint, deterministicSpecHash }
+    : assistantCheckpoint;
+  spec.authoring = {
+    ...authoring,
+    d2: {
+      ...d2,
+      analysisCheckpoint: rebasedCheckpoint,
+      ...(rebasedAssistantCheckpoint ? { assistantCheckpoint: rebasedAssistantCheckpoint } : {})
+    }
+  };
 }
 
 function appliedDiagramImportProposalError(message, code, details = []) {
@@ -7729,6 +7988,7 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     .model{display:grid;gap:10px;max-height:520px;overflow:auto}.muted{color:var(--muted)}pre{white-space:pre-wrap;background:#f8fafc;border:1px solid var(--line);padding:8px;overflow:auto}
     .diagram-import-label-template{position:relative}.diagram-import-label-autocomplete{position:absolute;z-index:45;top:calc(100% + 3px);left:0;right:0;max-height:260px;overflow:auto;border:1px solid var(--line);background:#fff;box-shadow:0 8px 22px rgba(15,23,42,.18)}.diagram-import-label-autocomplete[hidden]{display:none}.diagram-import-label-autocomplete button{display:grid;grid-template-columns:minmax(0,1fr);gap:2px;width:100%;border:0;border-bottom:1px solid #edf2f7;background:#fff;padding:7px 8px;text-align:left;color:var(--text);font:inherit}.diagram-import-label-autocomplete button:last-child{border-bottom:0}.diagram-import-label-autocomplete button:hover,.diagram-import-label-autocomplete button[aria-selected="true"]{background:#edf7f6}.diagram-import-label-token{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;color:#07575b;overflow-wrap:anywhere}.diagram-import-label-description{font-size:12px;color:var(--muted);overflow-wrap:anywhere}.diagram-import-label-error{margin:0;color:var(--danger);font-size:12px}.diagram-import-condition-picker,.catalog-field-picker{position:relative;min-width:0}.diagram-import-condition-picker-toggle,.catalog-field-picker-toggle{display:block;width:100%;min-height:32px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}.diagram-import-condition-picker-menu,.catalog-field-picker-menu{position:absolute;z-index:45;top:calc(100% + 3px);left:0;min-width:min(520px,78vw);max-width:min(720px,88vw);border:1px solid var(--line);background:#fff;box-shadow:0 8px 22px rgba(15,23,42,.18);padding:6px}.diagram-import-condition-picker-menu[hidden],.catalog-field-picker-menu[hidden]{display:none}.diagram-import-condition-picker-menu input,.catalog-field-picker-menu input{width:100%;margin-bottom:5px}.diagram-import-condition-picker-menu [role="listbox"],.catalog-field-picker-menu [role="listbox"]{max-height:260px;overflow:auto}.diagram-import-condition-picker-menu button,.catalog-field-picker-menu button{display:grid;grid-template-columns:minmax(0,1fr);gap:2px;width:100%;border:0;border-bottom:1px solid #edf2f7;background:#fff;padding:7px 8px;text-align:left;color:var(--text);font:inherit}.diagram-import-condition-picker-menu button:last-child,.catalog-field-picker-menu button:last-child{border-bottom:0}.diagram-import-condition-picker-menu button:hover,.diagram-import-condition-picker-menu button:focus-visible,.catalog-field-picker-menu button:hover,.catalog-field-picker-menu button:focus-visible,.catalog-field-picker-menu button[aria-selected="true"]{background:#edf7f6}.diagram-import-condition-picker-path,.diagram-import-condition-picker-empty,.catalog-field-picker-path,.catalog-field-picker-empty,.catalog-field-picker-summary{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;color:var(--muted);overflow-wrap:anywhere}.diagram-import-condition-picker-empty,.catalog-field-picker-empty,.catalog-field-picker-summary{padding:8px}.catalog-field-picker-summary{padding:5px 8px;border-bottom:1px solid #edf2f7}
     .catalog-field-picker-selected-values{display:flex;gap:4px;flex-wrap:wrap;margin:0 0 5px}.catalog-field-picker-selected-values .diagram-token-pill{gap:4px;max-width:100%}.catalog-field-picker-selected-values .icon-button{width:18px;height:18px;min-height:18px;padding:0;border:0;background:transparent;color:var(--muted);font-size:15px;line-height:1}
+    .diagram-import-condition-picker-menu,.catalog-field-picker-menu{position:fixed;z-index:60;top:var(--field-picker-top,8px);left:var(--field-picker-left,8px);width:var(--field-picker-width,min(780px,calc(100vw - 16px)));min-width:0;max-width:calc(100vw - 16px);max-height:var(--field-picker-max-height,min(70vh,640px));box-sizing:border-box;display:grid;grid-template-rows:auto minmax(0,1fr)}.diagram-import-condition-picker-menu input,.catalog-field-picker-menu input{min-width:0}.diagram-import-condition-picker-menu [role="listbox"],.catalog-field-picker-menu [role="listbox"]{min-height:0;max-height:none}
     .visual-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.visual-grid label{min-width:0}.visual-grid input,.visual-grid select{width:100%}.diagram-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.diagram-grid label{min-width:0}.diagram-grid input,.diagram-grid select{width:100%;min-width:0}.diagram-editor-sections{display:grid;gap:12px}.diagram-editor-block{display:grid;gap:8px;border-top:1px solid var(--line);padding-top:10px}.diagram-editor-block:first-child{border-top:0;padding-top:0}.diagram-editor-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.diagram-editor-block h4{margin:0;color:#334e68;font-size:12px}.diagram-mapping-table{table-layout:fixed}.diagram-mapping-table th,.diagram-mapping-table td{overflow-wrap:break-word}.diagram-mapping-table select,.diagram-mapping-table input{width:100%;min-width:0}.diagram-mapping-table select[multiple]{min-height:70px}.diagram-mapping-table .diagram-action-cell{width:44px;text-align:right}.diagram-mapping-detail-cell{background:#fbfdff}.diagram-mapping-detail{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;align-items:end}.diagram-mapping-detail label{min-width:0}.diagram-template-field{grid-column:span 2}.diagram-template-suggestions,.diagram-derived-fields{display:grid;gap:4px;align-self:start}.diagram-token-list{display:flex;gap:4px;flex-wrap:wrap}.diagram-token-button,.diagram-token-pill{display:inline-flex;align-items:center;max-width:180px;border:1px solid var(--line);border-radius:999px;padding:2px 7px;background:#fff;color:#334e68;font-size:12px;line-height:1.35;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.diagram-token-button{cursor:pointer}.diagram-token-button:hover{border-color:#9fb3c8;background:#f8fafc}.diagram-add-button{min-width:32px;padding:4px 8px;font-weight:700}.segmented-control{display:inline-flex;align-items:center;gap:0;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}.segmented-control label{margin:0;display:inline-flex;align-items:center;min-height:32px;padding:0 10px;border-right:1px solid var(--line);font-size:13px;cursor:pointer}.segmented-control label:last-child{border-right:0}.segmented-control input{position:absolute;opacity:0;pointer-events:none}.segmented-control label:has(input:checked){background:#e6f4f1;color:#07575b;font-weight:700}.assistant-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr);gap:12px}.assistant-status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.assistant-draft-preview pre{max-height:360px;overflow:auto}.assistant-busy{display:grid;gap:6px;border:1px solid #b7d8d4;background:#f2faf8;padding:8px 10px;margin:0 0 10px}.assistant-busy-head{display:flex;align-items:center;gap:8px;justify-content:space-between;flex-wrap:wrap}.assistant-busy-title{display:inline-flex;align-items:center;gap:8px;font-weight:700;color:#07575b}.assistant-busy-spinner{width:14px;height:14px;border:2px solid #b7d8d4;border-top-color:#236c91;border-radius:50%;animation:cmdp-spin .8s linear infinite}.assistant-busy-elapsed{font-variant-numeric:tabular-nums;color:#334e68;font-size:12px}.assistant-draft-preview[aria-busy="true"]{position:relative}button[disabled]{opacity:.58;cursor:not-allowed}@media(max-width:1100px){.assistant-grid{grid-template-columns:1fr}}.visualization-table{table-layout:fixed}.visualization-table th,.visualization-table td{overflow-wrap:anywhere}.visualization-table th:nth-child(1){width:30%}.visualization-table th:nth-child(2){width:14%}.visualization-table th:nth-child(3){width:15%}.visualization-table th:nth-child(4){width:26%}.visualization-table th:nth-child(5){width:15%}.visualization-table input,.visualization-table select{width:100%;min-width:0}.visualization-link-table{table-layout:fixed}.visualization-link-table th,.visualization-link-table td{overflow-wrap:anywhere}.visualization-link-table input,.visualization-link-table select{width:100%;min-width:0}.visual-row-groups{margin-top:10px;display:grid;gap:6px}.visual-row-group{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.visual-row-group label{flex:1 1 240px;min-width:0}.visual-row-group select{width:100%;min-width:0}.result-table-wrap{margin-top:8px}.result-table-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:6px;min-height:30px;margin:0 0 2px}.result-table-header{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 4px;min-height:30px;flex-wrap:wrap}.result-table-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex:0 0 auto;flex-wrap:wrap;min-width:30px}.cmdp-d2-svg{overflow:auto;background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:6px}.cmdp-d2-svg svg{max-width:100%;height:auto;display:block}.result-table-filter{width:240px;max-width:min(52vw,320px);height:30px;padding:4px 7px}.runtime-cache-control{position:relative;display:inline-flex;align-items:center}.runtime-cache-button{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;font-size:18px;line-height:1}.runtime-cache-button[data-disabled="true"]{opacity:.55;cursor:default}.runtime-cache-button.refreshing{animation:cmdp-spin 1s linear infinite}.runtime-cache-tooltip{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:50;min-width:250px;max-width:min(86vw,420px);padding:8px 10px;border:1px solid var(--line);background:#1f2933;color:#fff;box-shadow:0 8px 22px rgba(15,23,42,.18);font-size:12px;line-height:1.35;text-align:left}.runtime-cache-tooltip span{display:block;white-space:nowrap}.runtime-cache-control:hover .runtime-cache-tooltip,.runtime-cache-control:focus-within .runtime-cache-tooltip{display:block}.runtime-notice-shell{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin:0 0 8px}.runtime-notice-shell .notice{flex:1 1 auto;min-width:160px;overflow-wrap:normal;word-break:normal}.runtime-notice-actions{display:flex;justify-content:flex-end;flex:0 0 auto}.result-table-title{display:flex;align-items:center;gap:8px;flex:1 1 16rem;flex-wrap:wrap;min-width:160px;margin:0}.result-table-title h3{margin:0;font-size:13px;overflow-wrap:normal;word-break:normal;white-space:normal}.result-subtitle{font-size:12px;color:var(--muted);margin:10px 0 4px}.table-sort{border:0;background:transparent;padding:0;color:inherit;font:inherit;text-align:left}.table-sort:after{content:" ↕";font-size:10px;color:var(--muted)}.cmdp-density-compact th,.cmdp-density-compact td{padding:4px 6px}.cmdp-font-small{font-size:12px}.cmdp-font-normal{font-size:13px}.cmdp-font-large{font-size:15px}.cmdp-zebra tbody tr:nth-child(even) td{background:#fbfdff}.cmdp-row-group-cell{background:#f8fafc;font-weight:600;vertical-align:top}@media(max-width:700px){.diagram-template-field{grid-column:span 1}}@media(max-width:420px){.result-table-title{flex-basis:100%;min-width:0}.runtime-notice-shell .notice{min-width:0}}@keyframes cmdp-spin{to{transform:rotate(360deg)}}
     .diagram-import-shell{display:grid;gap:8px;border:1px solid var(--line);padding:10px;background:#fbfdff}.diagram-import-source{width:100%;min-height:140px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.diagram-import-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.diagram-import-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:6px}.diagram-import-shell>.table-wrap{max-width:100%;overflow-x:auto}.diagram-import-binding-table{table-layout:fixed;min-width:900px}.diagram-import-binding-table th,.diagram-import-binding-table td{overflow-wrap:normal;word-break:normal}.diagram-import-binding-table select,.diagram-import-binding-table input{width:100%;min-width:0}.diagram-import-status{font-size:12px;font-weight:700}.diagram-import-status.ready{color:var(--ok)}.diagram-import-status.unresolved,.diagram-import-status.ambiguous{color:var(--warn)}.diagram-import-status.inactive{color:var(--muted)}.diagram-import-preview{min-width:0}.diagram-import-preview-canvas{display:grid;place-items:center;min-height:240px;border:1px solid var(--line);background:#fff;padding:8px;overflow:auto}.diagram-import-preview-canvas>.cmdp-d2-svg{width:100%;min-height:220px;margin:0}.diagram-import-preview-canvas [data-cmdp-d2-key]{cursor:pointer}.diagram-import-preview-canvas [data-cmdp-d2-key]:hover{filter:drop-shadow(0 0 3px #236c91)}.diagram-import-preview-canvas [data-cmdp-d2-key]:focus-visible{outline:2px solid #236c91;outline-offset:3px}.diagram-import-preview-canvas [data-cmdp-d2-selected="true"]{filter:drop-shadow(0 0 4px #0f766e)}.diagram-import-preview[data-diagram-import-preview-state="stale"] .diagram-import-preview-canvas{background:#fffdf5;border-color:#e5c36e}.diagram-import-preview[data-diagram-import-preview-state="loading"] .diagram-import-preview-canvas{background:#f2faf8}.diagram-import-preview[data-diagram-import-preview-state="error"] .diagram-import-preview-canvas{background:#fff7f5;border-color:#f0b8b0}
     .cmdp-diagram-viewport{display:grid;gap:6px;min-width:0}.cmdp-diagram-viewport-controls{display:flex;align-items:center;justify-content:flex-end;gap:4px;min-height:30px}.cmdp-diagram-viewport-button{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:0;font-size:16px;line-height:1}.cmdp-diagram-viewport-reset{min-width:52px;width:auto;padding:0 7px;font-size:12px;font-variant-numeric:tabular-nums}.cmdp-diagram-viewport-scale{min-width:42px;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums;text-align:right}.cmdp-diagram-viewport-canvas{min-width:0;min-height:220px;max-height:70vh;overflow:auto;touch-action:none;cursor:grab;background:#fff;border:1px solid #e5e7eb;border-radius:8px}.cmdp-diagram-viewport-canvas.is-panning{cursor:grabbing;user-select:none}.cmdp-diagram-viewport-stage{position:relative;min-width:1px;min-height:1px}.cmdp-diagram-viewport-content{display:inline-block;transform-origin:0 0}.cmdp-diagram-viewport-content .cmdp-d2-svg{overflow:visible;margin:0}.cmdp-diagram-viewport-content .cmdp-d2-svg svg{max-width:none!important;height:auto;display:block}.diagram-import-preview-canvas>.cmdp-diagram-viewport{width:100%;min-height:220px}.diagram-import-preview-canvas .cmdp-diagram-viewport-canvas{min-height:220px}
@@ -8199,6 +8459,7 @@ function dynamicPagesClientScript() {
       extractionAlias: 'Result alias',
       extractionAllMatches: 'All matches',
       extractionResultSource: 'Show result',
+      extractionResultSourceHelp: 'Extraction shows every readable direct attribute of the selected object result. It does not change the published table.',
       extractionFinalResult: 'Final result',
       applyExtraction: 'Apply extraction',
       previewExtraction: 'Preview extraction',
@@ -8566,6 +8827,7 @@ function dynamicPagesClientScript() {
       visualizationRowGroupHelp: 'Repeated adjacent values in selected columns are rendered as one merged cell.',
       visualizationLinkColumns: 'Column links',
       visualizationLinkColumnsHelp: 'Turn a final data cell into a safe runtime link. URL and text templates can use current cell, row, and input parameter tokens.',
+      visualizationLinkModeAuto: 'Automatically',
       visualizationLinkModeText: 'Text',
       visualizationLinkModeLink: 'Link',
       visualizationLinkTargetSelf: 'Current tab',
@@ -8683,7 +8945,10 @@ function dynamicPagesClientScript() {
       objectSelectionAlias: 'Result alias',
       objectSelectionFrom: 'Source alias',
       objectSelectionLimit: 'Limit',
-      objectSelectionColumns: 'Columns',
+      objectSelectionColumns: 'Result fields',
+      removeObjectSelection: 'Remove selection',
+      objectSelectionDeleteDependencies: 'Used by: {items}',
+      objectSelectionDeleteBlocked: 'The selection cannot be removed while dependent results remain.',
       objectSelectionDefault: 'Selection{number}',
       addObjectSelection: 'Add selection',
       objectGroupSourceClass: 'Source class',
@@ -8702,10 +8967,11 @@ function dynamicPagesClientScript() {
       objectGroupDirectionFilter: 'Direction',
       objectGroupDirectionFilterHelp: 'Direction keeps direct or inverse paths from the source class.',
       objectGroupOperator: 'Operator',
-      objectGroupValue: 'Value / regular expression',
+      objectGroupValue: 'Right expression',
       objectGroupValueParam: 'Parameter',
-      objectGroupValueColumn: 'Source column',
-      objectGroupValueHelp: 'Parameter is not used for exists, is IP, and is IP net. For matches it is a regular expression; for IPv4 comparisons it is CIDR/range/network on the right side.',
+      objectGroupValueColumn: 'Previous result field',
+      objectGroupRightExpression: 'Right expression',
+      objectGroupValueHelp: 'Enter text, a regular expression, $' + '{param.name}, or $' + '{previous.field}. Previous result means the current row of the selection chosen in Source.',
       objectGroupRegex: 'Value / regular expression',
       objectGroupRegexExamples: 'Regular expression examples',
       objectGroupRegexExample: 'Example',
@@ -8758,7 +9024,7 @@ function dynamicPagesClientScript() {
       addRelationOperation: 'Add related objects',
       relationOperation: 'Related objects {number}',
       relationOperationFrom: 'Source objects',
-      relationOperationColumns: 'Target columns',
+      relationOperationColumns: 'Target result fields',
       relationOperationHelp: 'The domain code is executed as an explicit CMDBuild relation traversal. A target class may be an allowed descendant of the domain endpoint superclass.',
       relationOperationDetailsRequired: 'Related objects require both a CMDBuild domain and a target class.',
       relationSelectionSourceOrder: 'A selection source can reference an earlier selection or a declared operation result.',
@@ -9331,6 +9597,7 @@ function dynamicPagesClientScript() {
       extractionAlias: 'Алиас результата',
       extractionAllMatches: 'Все совпадения',
       extractionResultSource: 'Показать результат',
+      extractionResultSourceHelp: 'Извлечение показывает все доступные прямые атрибуты объектов выбранного результата. Оно не меняет публикуемую таблицу.',
       extractionFinalResult: 'Конечный результат',
       applyExtraction: 'Применить извлечение',
       previewExtraction: 'Предпросмотр извлечения',
@@ -9698,6 +9965,7 @@ function dynamicPagesClientScript() {
       visualizationRowGroupHelp: 'Повторяющиеся соседние значения в выбранных колонках выводятся одной объединенной ячейкой.',
       visualizationLinkColumns: 'Ссылки из колонок',
       visualizationLinkColumnsHelp: 'Превращает ячейку итоговых данных в безопасную runtime-ссылку. В шаблонах URL и текста можно использовать текущую ячейку, строку и входные параметры.',
+      visualizationLinkModeAuto: 'Автоматически',
       visualizationLinkModeText: 'Текст',
       visualizationLinkModeLink: 'Ссылка',
       visualizationLinkTargetSelf: 'Текущая вкладка',
@@ -9815,7 +10083,10 @@ function dynamicPagesClientScript() {
       objectSelectionAlias: 'Alias результата',
       objectSelectionFrom: 'Source alias',
       objectSelectionLimit: 'Лимит',
-      objectSelectionColumns: 'Колонки',
+      objectSelectionColumns: 'Поля результата',
+      removeObjectSelection: 'Удалить выборку',
+      objectSelectionDeleteDependencies: 'Используется: {items}',
+      objectSelectionDeleteBlocked: 'Выборку нельзя удалить, пока существуют зависимые результаты.',
       objectSelectionDefault: 'Выборка{number}',
       addObjectSelection: 'Добавить выборку',
       objectGroupSourceClass: 'Стартовый класс',
@@ -9834,10 +10105,11 @@ function dynamicPagesClientScript() {
       objectGroupDirectionFilter: 'Направление',
       objectGroupDirectionFilterHelp: 'Оставляет прямые или обратные пути от стартового класса.',
       objectGroupOperator: 'Оператор',
-      objectGroupValue: 'Значение / регулярное выражение',
+      objectGroupValue: 'Правое значение',
       objectGroupValueParam: 'Параметр',
-      objectGroupValueColumn: 'Колонка источника',
-      objectGroupValueHelp: 'Параметр не используется для exists, is IP и is IP net. Для matches это регулярное выражение; для IPv4-сравнений это CIDR/range/network справа.',
+      objectGroupValueColumn: 'Поле предыдущего результата',
+      objectGroupRightExpression: 'Правое значение',
+      objectGroupValueHelp: 'Введите текст, регулярное выражение, $' + '{param.имя} или $' + '{previous.поле}. Предыдущий результат означает текущую строку выборки, указанной в поле «Источник».',
       objectGroupRegex: 'Значение / регулярное выражение',
       objectGroupRegexExamples: 'Примеры регулярных выражений',
       objectGroupRegexExample: 'Пример',
@@ -9890,7 +10162,7 @@ function dynamicPagesClientScript() {
       addRelationOperation: 'Добавить связанные объекты',
       relationOperation: 'Связанные объекты {number}',
       relationOperationFrom: 'Объекты-источники',
-      relationOperationColumns: 'Колонки целевого объекта',
+      relationOperationColumns: 'Поля целевого результата',
       relationOperationHelp: 'Код domain выполняется как явный переход по связи CMDBuild. Целевой класс может быть разрешённым потомком суперкласса endpoint domain.',
       relationOperationDetailsRequired: 'Для связанных объектов укажите CMDBuild domain и целевой класс.',
       relationSelectionSourceOrder: 'Источник выборки может ссылаться на более раннюю выборку или объявленный результат операции.',
@@ -10055,6 +10327,13 @@ function dynamicPagesClientScript() {
   var CATALOG_FRESH_MS = 24 * 60 * 60 * 1000;
   var CMDB_BUILD_VIEW_KIND = 'cmdbBuildView';
   var DEFAULT_CMDB_BUILD_VIEW_CODE = 'CmdbBuildView';
+  // Rendering repeatedly asks for user-facing Object Flow labels. Keep the
+  // derived manifest attached to the immutable spec object instead of
+  // cloning the complete D2 authoring payload for every label.
+  var assistantObjectFlowManifestCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+  var diagramImportStructureTreeCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+  var diagramImportEditorIndexCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+  var diagramImportTreeChildrenCache = typeof WeakMap === 'function' ? new WeakMap() : null;
   var state = {
     language: activeLanguage,
     root: 'Cst_QueryTool',
@@ -10090,6 +10369,8 @@ function dynamicPagesClientScript() {
     classAttributes: [],
     objectGroupDraft: null,
     relationDraft: null,
+    objectGroupExpandedSelectionId: '',
+    relationExpandedOperationId: '',
     viewComposerDraft: null,
     paramRowsDraft: null,
     extractionPreview: null,
@@ -10548,13 +10829,8 @@ function dynamicPagesClientScript() {
   }
 
   function ensureCatalogAttributesForDesignerSection() {
-    if (boot.mode === 'runtime' || normalizeDesignerSection(state.designerSection) !== 'final-view') return;
-    var selected = state.selectedTemplate || { spec: defaultSpec() };
-    var classes = viewComposerCatalogClassNames(selected.spec || defaultSpec());
-    if (!classes.length) return;
-    Promise.all(classes.map(ensureCatalogAttributesForClass)).then(function (results) {
-      if ((results.some(function (item) { return item === true; }) || results.some(function (item) { return item === 'failed'; })) && normalizeDesignerSection(state.designerSection) === 'final-view') renderDesigner();
-    });
+    // Field pickers are query-first. Opening a Designer section must not load
+    // a class catalog until the author starts searching for a field.
   }
 
   function extractLanguageFromValue(value) {
@@ -11083,6 +11359,12 @@ function dynamicPagesClientScript() {
       if (document.querySelectorAll('[data-view-column-row]').length) {
         state.viewComposerDraft = captureViewComposerDraftFromDom();
       }
+      if (document.querySelectorAll('[data-object-selection]').length) {
+        state.objectGroupDraft = captureObjectGroupDraftFromDom();
+      }
+      if (document.querySelectorAll('[data-flow-operation]').length) {
+        state.relationDraft = captureRelationDraftFromDom();
+      }
       if (document.getElementById('cmdp-assistant-object-flow')) {
         captureAssistantPromptsFromDom();
       }
@@ -11250,6 +11532,15 @@ function dynamicPagesClientScript() {
     if (mapping) state.assistantDiagramMappingPrompt = String(mapping.value || '');
   }
 
+  function assistantObjectFlowIntentFromSpec(spec) {
+    var source = spec && typeof spec === 'object' && !Array.isArray(spec) ? spec : {};
+    var stored = source.authoring && typeof source.authoring === 'object' && !Array.isArray(source.authoring)
+      ? source.authoring
+      : {};
+    var assistant = stored.assistant && typeof stored.assistant === 'object' && !Array.isArray(stored.assistant) ? stored.assistant : {};
+    return normalizeAssistantObjectFlowIntentClient(assistant.objectFlowIntent);
+  }
+
   function templateAuthoringClient(spec) {
     var source = spec && typeof spec === 'object' && !Array.isArray(spec) ? spec : {};
     var stored = source.authoring && typeof source.authoring === 'object' && !Array.isArray(source.authoring)
@@ -11260,7 +11551,7 @@ function dynamicPagesClientScript() {
     return {
       version: 1,
       assistant: {
-        objectFlowIntent: normalizeAssistantObjectFlowIntentClient(assistant.objectFlowIntent),
+        objectFlowIntent: assistantObjectFlowIntentFromSpec(source),
         diagramInterpretPrompt: String(assistant.diagramInterpretPrompt || ''),
         diagramMappingPrompt: String(assistant.diagramMappingPrompt || '')
       },
@@ -11678,6 +11969,7 @@ function dynamicPagesClientScript() {
     query.set('maxRows', String(authoringPreviewMaxRows()));
     if (options.includeDiagrams === false) query.set('includeDiagrams', 'false');
     if (options.executionScope) query.set('executionScope', String(options.executionScope));
+    if (options.extractionSource) query.set('extractionSource', String(options.extractionSource));
     return apiPrefix + '/draft/preview?' + query.toString();
   }
 
@@ -12449,22 +12741,36 @@ function dynamicPagesClientScript() {
     }).join('>');
   }
 
-  function catalogRelationPathOptions(className) {
+  function catalogRelationPathOptions(className, searchQuery) {
     var startedAt = performance.now();
     var rootName = String(className || '').trim();
+    var normalizedQuery = String(searchQuery || '').trim().toLowerCase();
+    if (!rootName || !normalizedQuery) return [];
     var maxDepth = Math.max(1, Math.min(5, Number(state.maxTraversalDepth) || 1));
     var maxOptions = Math.max(100, Math.min(50000, Number(state.maxCatalogPathCandidates) || 5000));
     var cache = state.catalogRelationPathOptionsCache || (state.catalogRelationPathOptionsCache = {});
-    var cacheKey = [Number(state.catalogRevision || 0), maxDepth, rootName.toLowerCase()].join(':');
+    var cacheKey = [Number(state.catalogRevision || 0), maxDepth, maxOptions, rootName.toLowerCase(), normalizedQuery].join(':');
     if (Object.prototype.hasOwnProperty.call(cache, cacheKey)) return cache[cacheKey];
     var result = [];
     var seen = {};
+    var visitedCandidates = 0;
+    var scanLimit = maxOptions;
+
+    function matchesQuery(path, labels) {
+      var haystack = path.map(function (hop) {
+        return [hop.kind, hop.name, hop.domain, hop.targetClass, hop.direction].join(' ');
+      }).concat(labels).join(' ').toLowerCase();
+      return haystack.indexOf(normalizedQuery) !== -1;
+    }
 
     function add(path, labels) {
       var signature = diagramImportRelationPathSignature(path);
-      if (!signature || seen[signature] || result.length >= maxOptions) return;
+      if (!signature || seen[signature] || result.length >= maxOptions || visitedCandidates >= scanLimit) return;
       seen[signature] = true;
-      result.push({ signature: signature, path: cloneJsonValue(path, []), label: labels.join(' > ') });
+      visitedCandidates += 1;
+      if (matchesQuery(path, labels)) {
+        result.push({ signature: signature, path: cloneJsonValue(path, []), label: labels.join(' > ') });
+      }
     }
 
     function domainDirectionForClass(domain, ownerName) {
@@ -12474,12 +12780,12 @@ function dynamicPagesClientScript() {
     }
 
     function visit(owner, path, labels, visited) {
-      if (!owner || path.length >= maxDepth || result.length >= maxOptions) return;
+      if (!owner || path.length >= maxDepth || result.length >= maxOptions || visitedCandidates >= scanLimit) return;
       var ownerKey = String(owner.name || '').toLowerCase();
       var nextVisited = Object.assign({}, visited || {});
       nextVisited[ownerKey] = true;
       (owner.attributes || []).forEach(function (attribute) {
-        if (result.length >= maxOptions) return;
+        if (result.length >= maxOptions || visitedCandidates >= scanLimit) return;
         if (!isReferenceAttribute(attribute)) return;
         var targetClass = String(attribute.targetClass || attribute.targetType || '').trim();
         if (!targetClass) return;
@@ -12490,9 +12796,9 @@ function dynamicPagesClientScript() {
         if (target && !nextVisited[targetClass.toLowerCase()]) visit(target, nextPath, nextLabels, nextVisited);
       });
       catalogDomains().forEach(function (domain) {
-        if (result.length >= maxOptions) return;
+        if (result.length >= maxOptions || visitedCandidates >= scanLimit) return;
         cachedDomainRelatedClasses(domain, owner.name).forEach(function (targetClass) {
-          if (result.length >= maxOptions) return;
+          if (result.length >= maxOptions || visitedCandidates >= scanLimit) return;
           var direction = domainDirectionForClass(domain, owner.name);
           var nextPath = path.concat([{ kind: 'domain', name: domain.name || '', targetClass: targetClass, direction: direction }]);
           var nextLabels = labels.concat(['{' + (domain.name || '') + ':' + targetClass + '} ' + direction]);
@@ -12504,17 +12810,21 @@ function dynamicPagesClientScript() {
     }
 
     visit(catalogClassByName(rootName), [], [], {});
-    result.limitReached = result.length >= maxOptions;
+    result.limitReached = result.length >= maxOptions || visitedCandidates >= scanLimit;
     result.configuredLimit = maxOptions;
+    result.scannedCandidates = visitedCandidates;
+    result.searchQuery = normalizedQuery;
+    result.searchTruncated = result.limitReached;
+    result.searchCandidateLimit = scanLimit;
     cache[cacheKey] = result;
     var elapsedMs = Math.round(performance.now() - startedAt);
-    if (elapsedMs >= 50) clientLog('ui-performance', 'catalog-relation-index ' + elapsedMs + 'ms depth=' + maxDepth + ' candidates=' + result.length);
+    if (elapsedMs >= 50) clientLog('ui-performance', 'catalog-relation-index ' + elapsedMs + 'ms depth=' + maxDepth + ' scanned=' + visitedCandidates + ' matches=' + result.length);
     return result;
   }
 
-  function renderDiagramImportRelationPathOptions(className, selectedPath) {
+  function renderDiagramImportRelationPathOptions(className, selectedPath, searchQuery) {
     var selectedSignature = diagramImportRelationPathSignature(selectedPath);
-    var options = catalogRelationPathOptions(className);
+    var options = catalogRelationPathOptions(className, searchQuery);
     if (selectedSignature && !options.some(function (item) { return item.signature === selectedSignature; })) {
       options.unshift({
         signature: selectedSignature,
@@ -12667,16 +12977,16 @@ function dynamicPagesClientScript() {
     return sourceClassForAlias(spec || defaultSpec(), name);
   }
 
-  function catalogDomainRelationPathOptions(className) {
-    return catalogRelationPathOptions(className).filter(function (item) {
+  function catalogDomainRelationPathOptions(className, searchQuery) {
+    return catalogRelationPathOptions(className, searchQuery).filter(function (item) {
       return item && Array.isArray(item.path) && item.path.length && item.path.every(function (hop) {
         return hop && hop.kind === 'domain' && hop.name && hop.targetClass;
       });
     });
   }
 
-  function renderRelationPathOptions(className, options) {
-    options = options || catalogDomainRelationPathOptions(className);
+  function renderRelationPathOptions(className, options, searchQuery) {
+    options = options || catalogDomainRelationPathOptions(className, searchQuery);
     return '<option value=""></option>' + options.map(function (item) {
       return '<option value="' + escapeHtml(item.signature) + '" data-relation-path="' + escapeHtml(JSON.stringify(item.path)) + '">' + escapeHtml(item.label) + '</option>';
     }).join('');
@@ -13313,7 +13623,7 @@ function dynamicPagesClientScript() {
       from: '',
       limit: 100,
       columns: [],
-      rules: [{ action: 'include', path: 'Code', regex: '.*' }]
+      rules: [{ action: 'include', path: 'Code', rightExpression: '.*' }]
     };
   }
 
@@ -13327,26 +13637,41 @@ function dynamicPagesClientScript() {
     return String(value || '').split(',').map(function (item) { return item.trim(); }).filter(Boolean);
   }
 
-  function objectSelectionColumnsText(selection) {
-    return normalizeObjectSelectionColumns(selection && selection.columns).join(', ');
+  var OBJECT_GROUP_RIGHT_EXPRESSION_TOKEN = /\$\{(param|previous)\.([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\}/g;
+
+  function objectGroupRightExpressionTokens(value) {
+    var tokens = [];
+    var source = String(value || '');
+    var match;
+    while ((match = OBJECT_GROUP_RIGHT_EXPRESSION_TOKEN.exec(source))) {
+      tokens.push({ kind: match[1], name: match[2] });
+    }
+    OBJECT_GROUP_RIGHT_EXPRESSION_TOKEN.lastIndex = 0;
+    return tokens;
+  }
+
+  function objectGroupRightExpression(rule, operator) {
+    rule = rule || {};
+    if (typeof rule.rightExpression === 'string') return rule.rightExpression;
+    var parameter = String(rule.valueParam || rule.valuesParam || '').trim();
+    if (parameter) return '$' + '{param.' + parameter + '}';
+    var sourceField = String(rule.valueColumn || rule.sourceColumn || rule.fromColumn || '').trim();
+    if (sourceField) return '$' + '{previous.' + sourceField + '}';
+    if (normalizeObjectGroupOperator(operator) === 'matches') {
+      return String(rule.regex !== undefined && rule.regex !== '' ? rule.regex : (rule.value !== undefined ? rule.value : rule.legacyValue || ''));
+    }
+    return String(rule.value !== undefined && rule.value !== '' ? rule.value : (rule.regex !== undefined ? rule.regex : rule.legacyValue || ''));
   }
 
   function normalizeObjectSelectionRule(rule) {
     rule = rule || {};
     var operator = normalizeObjectGroupOperator(rule.op || rule.operator || (rule.regex !== undefined ? 'matches' : 'equals'));
-    var legacyValue = rule.value !== undefined ? rule.value : (rule.regex !== undefined ? rule.regex : '');
-    var regexValue = rule.regex !== undefined ? rule.regex : (operator === 'matches' && rule.value !== undefined ? rule.value : '');
-    var value = rule.value !== undefined ? rule.value : (operator !== 'matches' && rule.regex !== undefined ? rule.regex : '');
     return {
       action: rule && (rule.action === 'exclude' || rule.scope === 'exclude') ? 'exclude' : 'include',
       path: rule && (rule.path || rule.field || rule.attribute || rule.column) || '',
       negate: normalizeObjectGroupNegate(rule && (rule.negate !== undefined ? rule.negate : rule.not), rule && (rule.op || rule.operator)),
       op: operator,
-      regex: String(regexValue === undefined || regexValue === null ? '' : regexValue),
-      value: String(value === undefined || value === null ? '' : value),
-      valueParam: String(rule.valueParam || rule.valuesParam || '').trim(),
-      valueColumn: String(rule.valueColumn || rule.sourceColumn || rule.fromColumn || '').trim(),
-      legacyValue: String(legacyValue === undefined || legacyValue === null ? '' : legacyValue)
+      rightExpression: objectGroupRightExpression(rule, operator)
     };
   }
 
@@ -13422,8 +13747,11 @@ function dynamicPagesClientScript() {
       var sourceIndex = objectSelectionIndexFromList(source, sourceAlias);
       if (sourceIndex < 0 || !source[sourceIndex]) return;
       (selection.rules || []).forEach(function (rule) {
-        var column = stripObjectGroupSourceColumnPrefix(sourceAlias, rule && (rule.valueColumn || rule.sourceColumn || rule.fromColumn));
-        if (column) addObjectGroupSelectionColumn(source[sourceIndex], column);
+        objectGroupRightExpressionTokens(rule && rule.rightExpression).forEach(function (token) {
+          if (token.kind !== 'previous') return;
+          var column = stripObjectGroupSourceColumnPrefix(sourceAlias, token.name);
+          if (column) addObjectGroupSelectionColumn(source[sourceIndex], column);
+        });
       });
     });
   }
@@ -13493,11 +13821,10 @@ function dynamicPagesClientScript() {
               action: filter.scope === 'exclude' ? 'exclude' : 'include',
               path: filter.path || filter.attribute || filter.column || filter.field || '',
               negate: normalizeObjectGroupNegate(filter.negate !== undefined ? filter.negate : filter.not, filter.op),
-              op: normalizeObjectGroupOperator(filter.op || (filter.regex !== undefined ? 'matches' : 'equals')),
-              regex: filter.regex,
-              value: filter.value,
-              valueParam: filter.valueParam || filter.valuesParam,
-              valueColumn: filter.valueColumn || filter.sourceColumn || filter.fromColumn
+              op: normalizeObjectGroupOperator(filter.op || (filter.regexExpression !== undefined || filter.regex !== undefined ? 'matches' : 'equals')),
+              rightExpression: filter.regexExpression !== undefined ? filter.regexExpression
+                : filter.valueExpression !== undefined ? filter.valueExpression
+                  : objectGroupRightExpression(filter, filter.op)
             };
           })
         }, index);
@@ -13511,7 +13838,7 @@ function dynamicPagesClientScript() {
 
     var model = {
       className: getSpecClassFallback(spec) || state.selectedClass || '',
-      rules: [{ action: 'include', path: 'Code', regex: '.*' }]
+      rules: [{ action: 'include', path: 'Code', rightExpression: '.*' }]
     };
     model.selections = [normalizeObjectSelection({
       name: defaultObjectSelectionName(0),
@@ -13565,7 +13892,7 @@ function dynamicPagesClientScript() {
     }).join('');
   }
 
-  function matchingColumnOptionRowsForSelection(spec, alias, prefixed, outputPrefix, includeCatalogPaths) {
+  function matchingColumnOptionRowsForSelection(spec, alias, prefixed, outputPrefix, includeCatalogPaths, searchQuery) {
     var rows = selectionOptionRows(spec, alias);
     var selection = rows.find(function (item) { return item.alias === alias; }) || {};
     var prefix = prefixed ? (outputPrefix === undefined ? objectSelectionOutputPrefix(spec || defaultSpec(), alias) : outputPrefix) : '';
@@ -13585,14 +13912,14 @@ function dynamicPagesClientScript() {
     ['Class', '_id', 'Code', 'Description'].forEach(function (column) { add(column, column); });
     tableColumnsForAlias(spec || {}, alias).forEach(function (column) { add(column, column); });
     if (includeCatalogPaths) {
-      catalogScopePathOptions(selection.className || sourceClassForAlias(spec || {}, alias)).filter(Boolean).forEach(function (item) {
+      catalogScopePathOptions(selection.className || sourceClassForAlias(spec || {}, alias), searchQuery).filter(Boolean).forEach(function (item) {
         add(item.value, item.label || item.value);
       });
     }
     return items;
   }
 
-  function matchingColumnOptionRowsForOutput(spec, alias, seenAliases, includeCatalogPaths) {
+  function matchingColumnOptionRowsForOutput(spec, alias, seenAliases, includeCatalogPaths, searchQuery) {
     seenAliases = seenAliases || {};
     var name = String(alias || '').trim();
     if (!name || seenAliases[name]) return [];
@@ -13604,18 +13931,18 @@ function dynamicPagesClientScript() {
       var setStep = (spec && Array.isArray(spec.steps) ? spec.steps : []).find(function (step) {
         return step && ['unionRows', 'differenceRows', 'intersectRows'].indexOf(step.type) !== -1 && step.as === name;
       });
-      if (!setStep) return matchingColumnOptionRowsForSelection(spec, name, false, undefined, includeCatalogPaths);
-      var leftColumns = matchingColumnOptionRowsForOutput(spec, setStep.from, seenAliases, includeCatalogPaths);
+      if (!setStep) return matchingColumnOptionRowsForSelection(spec, name, false, undefined, includeCatalogPaths, searchQuery);
+      var leftColumns = matchingColumnOptionRowsForOutput(spec, setStep.from, seenAliases, includeCatalogPaths, searchQuery);
       if (setStep.type !== 'unionRows') return leftColumns;
-      var rightColumns = matchingColumnOptionRowsForOutput(spec, setStep.with, seenAliases, includeCatalogPaths);
+      var rightColumns = matchingColumnOptionRowsForOutput(spec, setStep.with, seenAliases, includeCatalogPaths, searchQuery);
       rightColumns.forEach(function (item) {
         if (!leftColumns.some(function (existing) { return existing.value === item.value; })) leftColumns.push(item);
       });
       return leftColumns;
     }
-    var result = matchingColumnOptionRowsForOutput(spec, matchStep.from, seenAliases, includeCatalogPaths);
+    var result = matchingColumnOptionRowsForOutput(spec, matchStep.from, seenAliases, includeCatalogPaths, searchQuery);
     var rightPrefix = matchStep.rightPrefix || objectSelectionOutputPrefix(spec || defaultSpec(), matchStep.with);
-    matchingColumnOptionRowsForSelection(spec, matchStep.with, true, rightPrefix, includeCatalogPaths).filter(Boolean).forEach(function (item) {
+    matchingColumnOptionRowsForSelection(spec, matchStep.with, true, rightPrefix, includeCatalogPaths, searchQuery).filter(Boolean).forEach(function (item) {
       if (!result.some(function (existing) { return existing.value === item.value; })) result.push(item);
     });
     (Array.isArray(matchStep.rules || matchStep.where) ? (matchStep.rules || matchStep.where) : []).forEach(function (rule) {
@@ -13675,6 +14002,7 @@ function dynamicPagesClientScript() {
     return summary + visible.map(function (item, index) {
       var value = String(item && item.value || '');
       return '<button type="button" role="option" data-action="catalog-field-picker-select" data-catalog-field-picker-value="' + escapeHtml(value) + '"' +
+        (Array.isArray(item && item.path) ? ' data-catalog-field-picker-path="' + escapeHtml(JSON.stringify(item.path)) + '"' : '') +
         (value === String(selectedName || '') ? ' aria-selected="true"' : '') + ' data-catalog-field-picker-index="' + escapeHtml(String(index)) + '"><span>' +
         escapeHtml(String(item && item.label || value)) + '</span><span class="catalog-field-picker-path">' + escapeHtml(value) + '</span></button>';
     }).join('');
@@ -13696,6 +14024,16 @@ function dynamicPagesClientScript() {
     return (Array.isArray(value) ? value : []).map(function (item) { return String(item || '').trim(); }).filter(Boolean);
   }
 
+  function catalogFieldPickerSelectedFieldValues(field) {
+    if (!field) return [];
+    if (field.matches && field.matches('[data-catalog-field-picker-multi-value]')) {
+      return Array.prototype.slice.call(field.selectedOptions || []).map(function (option) {
+        return String(option && option.value || '').trim();
+      }).filter(Boolean);
+    }
+    return catalogFieldPickerSelectedValues([field.value]);
+  }
+
   function renderCatalogFieldPickerSelectedValues(values, options) {
     var labels = {};
     (Array.isArray(options) ? options : []).forEach(function (item) {
@@ -13711,12 +14049,14 @@ function dynamicPagesClientScript() {
     context = context || {};
     var selected = String(selectedName || '');
     var label = catalogFieldPickerSelectedLabel(initialOptions, selected);
+    var disabled = Boolean(context.disabled);
     var contextAttributes = Object.keys(context).map(function (key) {
+      if (key === 'disabled') return '';
       return ' data-catalog-field-picker-' + escapeHtml(key) + '="' + escapeHtml(String(context[key] || '')) + '"';
     }).join('');
     return '<div class="catalog-field-picker" data-catalog-field-picker' + contextAttributes + '>' +
-      '<input type="hidden" data-catalog-field-picker-value data-catalog-field-picker-selected-label="' + escapeHtml(label) + '" ' + fieldAttribute + ' value="' + escapeHtml(selected) + '">' +
-      '<button type="button" class="catalog-field-picker-toggle" data-action="catalog-field-picker-toggle" aria-expanded="false">' + escapeHtml(label || 'Выберите поле') + '</button>' +
+      '<input type="hidden" data-catalog-field-picker-value data-catalog-field-picker-selected-label="' + escapeHtml(label) + '" ' + fieldAttribute + ' value="' + escapeHtml(selected) + '"' + (disabled ? ' disabled' : '') + '>' +
+      '<button type="button" class="catalog-field-picker-toggle" data-action="catalog-field-picker-toggle" aria-expanded="false"' + (disabled ? ' disabled' : '') + '>' + escapeHtml(label || 'Выберите поле') + '</button>' +
       '<div class="catalog-field-picker-menu" data-catalog-field-picker-menu hidden><input type="search" data-catalog-field-picker-search placeholder="Поиск по имени, описанию или пути" autocomplete="off" aria-label="Поиск поля"><div role="listbox" data-catalog-field-picker-results>' +
         renderCatalogFieldPickerPrompt() + '</div></div></div>';
   }
@@ -13747,9 +14087,17 @@ function dynamicPagesClientScript() {
     if (!picker) return [];
     var kind = String(picker.getAttribute('data-catalog-field-picker-kind') || '').trim();
     if (kind === 'scope') return catalogScopePathOptions(picker.getAttribute('data-catalog-field-picker-class') || '', query);
-    if (kind === 'related') return relatedTargetColumnOptions(picker.getAttribute('data-catalog-field-picker-class') || '', '');
+    if (kind === 'related') return relatedTargetColumnOptions(picker.getAttribute('data-catalog-field-picker-class') || '', '', query);
+    if (kind === 'objectGroupSource') {
+      var groupSelection = picker.closest('[data-object-selection]');
+      var groupSelectionIndex = Number(groupSelection && groupSelection.getAttribute('data-object-selection-index') || 0);
+      var groupDraft = captureObjectGroupDraftFromDom();
+      var groupSelections = groupDraft && Array.isArray(groupDraft.selections) ? groupDraft.selections : [];
+      var sourceAlias = String(groupSelection && groupSelection.querySelector('[data-object-selection-field="from"]') && groupSelection.querySelector('[data-object-selection-field="from"]').value || '').trim();
+      return objectGroupSourceColumnOptions(groupSelections, groupSelectionIndex, sourceAlias, query);
+    }
     if (kind === 'diagram' || kind === 'view') {
-      return diagramColumnOptionRowsForSource(readCurrentSpec(), picker.getAttribute('data-catalog-field-picker-source') || '');
+      return diagramColumnOptionRowsForSource(readCurrentSpec(), picker.getAttribute('data-catalog-field-picker-source') || '', query);
     }
     if (kind === 'selection') {
       var selectionSource = String(picker.getAttribute('data-catalog-field-picker-source') || '').trim();
@@ -13773,8 +14121,8 @@ function dynamicPagesClientScript() {
       });
     }
     if (kind === 'relationPath') {
-      return catalogDomainRelationPathOptions(picker.getAttribute('data-catalog-field-picker-class') || '').map(function (item) {
-        return { value: item.signature, label: item.label };
+      return catalogDomainRelationPathOptions(picker.getAttribute('data-catalog-field-picker-class') || '', query).map(function (item) {
+        return { value: item.signature, label: item.label, path: item.path };
       });
     }
     if (kind !== 'flow') return [];
@@ -13782,17 +14130,122 @@ function dynamicPagesClientScript() {
     var operationIndex = Number(operationNode && operationNode.getAttribute('data-flow-operation-index') || 0);
     var sourceAlias = String(picker.getAttribute('data-catalog-field-picker-source') || '').trim();
     var model = state.relationDraft || captureRelationDraftFromDom();
-    return flowColumnOptionRows(model, readCurrentSpec(), sourceAlias, operationIndex, {}, true);
+    return flowColumnOptionRows(model, readCurrentSpec(), sourceAlias, operationIndex, {}, true, query);
+  }
+
+  function catalogFieldPickerClassNames(picker) {
+    if (!picker) return [];
+    var kind = String(picker.getAttribute('data-catalog-field-picker-kind') || '').trim();
+    var classes = [];
+    function add(className) {
+      var name = String(className || '').trim();
+      if (name && classes.indexOf(name) === -1) classes.push(name);
+    }
+    if (kind === 'scope' || kind === 'related' || kind === 'relationPath') {
+      add(picker.getAttribute('data-catalog-field-picker-class'));
+    } else if (kind === 'objectGroupSource') {
+      var selection = picker.closest('[data-object-selection]');
+      var selectionIndex = Number(selection && selection.getAttribute('data-object-selection-index') || 0);
+      var draft = captureObjectGroupDraftFromDom();
+      var sourceAlias = String(selection && selection.querySelector('[data-object-selection-field="from"]') && selection.querySelector('[data-object-selection-field="from"]').value || '').trim();
+      var source = (draft.selections || []).slice(0, Math.max(0, selectionIndex)).find(function (candidate, index) {
+        return String(candidate && (candidate.alias || objectSelectionAlias(index)) || '').trim() === sourceAlias;
+      });
+      add(source && source.className);
+    } else if (kind === 'diagram' || kind === 'view' || kind === 'selection') {
+      add(sourceClassForAlias(readCurrentSpec(), picker.getAttribute('data-catalog-field-picker-source') || ''));
+    } else if (kind === 'flow') {
+      add(sourceClassForAlias(readCurrentSpec(), picker.getAttribute('data-catalog-field-picker-source') || ''));
+    }
+    return classes;
+  }
+
+  function ensureCatalogFieldPickerSearchAttributes(picker, query) {
+    if (!String(query || '').trim()) return Promise.resolve(false);
+    var classes = catalogFieldPickerClassNames(picker);
+    if (!classes.length) return Promise.resolve(false);
+    return Promise.all(classes.map(ensureCatalogAttributesForClass)).then(function (results) {
+      return results.some(function (result) { return result === true || result === 'failed'; });
+    });
+  }
+
+  function fieldPickerMenu(picker) {
+    return picker && picker.querySelector
+      ? picker.querySelector('[data-catalog-field-picker-menu], [data-diagram-import-condition-picker-menu]')
+      : null;
+  }
+
+  function fieldPickerToggle(picker) {
+    return picker && picker.querySelector
+      ? picker.querySelector('[data-action="catalog-field-picker-toggle"], [data-action="diagram-import-condition-picker-toggle"]')
+      : null;
+  }
+
+  function clampFieldPickerPosition(value, lower, upper) {
+    return Math.max(lower, Math.min(upper, value));
+  }
+
+  function positionFieldPickerMenu(picker) {
+    var menu = fieldPickerMenu(picker);
+    var toggle = fieldPickerToggle(picker);
+    if (!menu || !toggle || menu.hidden) return;
+    var viewportWidth = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+    var viewportHeight = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+    if (!viewportWidth || !viewportHeight) return;
+    var gutter = 8;
+    var gap = 4;
+    var rect = toggle.getBoundingClientRect();
+    var maxWidth = Math.max(1, viewportWidth - gutter * 2);
+    var width = Math.min(maxWidth, Math.max(Math.min(520, maxWidth), Math.min(780, maxWidth), rect.width));
+    var maxHeight = Math.max(120, Math.min(640, Math.floor(viewportHeight * 0.7)));
+    menu.style.setProperty('--field-picker-width', Math.round(width) + 'px');
+    menu.style.setProperty('--field-picker-max-height', String(maxHeight) + 'px');
+    menu.style.setProperty('--field-picker-left', Math.round(clampFieldPickerPosition(rect.left, gutter, Math.max(gutter, viewportWidth - gutter - width))) + 'px');
+    menu.style.setProperty('--field-picker-top', '-10000px');
+    var menuHeight = menu.getBoundingClientRect().height;
+    var below = viewportHeight - rect.bottom - gutter - gap;
+    var above = rect.top - gutter - gap;
+    var openAbove = below < Math.min(menuHeight, 220) && above > below;
+    var available = openAbove ? above : below;
+    var constrainedHeight = Math.max(120, Math.min(maxHeight, Math.max(available, 120)));
+    menu.style.setProperty('--field-picker-max-height', String(constrainedHeight) + 'px');
+    menuHeight = menu.getBoundingClientRect().height;
+    var top = openAbove ? rect.top - gap - menuHeight : rect.bottom + gap;
+    menu.style.setProperty('--field-picker-top', Math.round(clampFieldPickerPosition(top, gutter, Math.max(gutter, viewportHeight - gutter - menuHeight))) + 'px');
+  }
+
+  function scheduleFieldPickerMenuPosition(picker) {
+    if (!picker || picker._fieldPickerPositionFrame) return;
+    picker._fieldPickerPositionFrame = window.requestAnimationFrame(function () {
+      picker._fieldPickerPositionFrame = null;
+      positionFieldPickerMenu(picker);
+    });
+  }
+
+  function closeFieldPickers(except) {
+    Array.prototype.forEach.call(document.querySelectorAll('[data-catalog-field-picker], [data-diagram-import-condition-picker]'), function (picker) {
+      if (except && picker === except) return;
+      var menu = fieldPickerMenu(picker);
+      var toggle = fieldPickerToggle(picker);
+      if (menu) {
+        menu.hidden = true;
+        ['--field-picker-width', '--field-picker-max-height', '--field-picker-left', '--field-picker-top'].forEach(function (property) {
+          menu.style.removeProperty(property);
+        });
+      }
+      if (toggle) toggle.setAttribute('aria-expanded', 'false');
+    });
+  }
+
+  function repositionOpenFieldPickers() {
+    Array.prototype.forEach.call(document.querySelectorAll('[data-catalog-field-picker], [data-diagram-import-condition-picker]'), function (picker) {
+      var menu = fieldPickerMenu(picker);
+      if (menu && !menu.hidden) scheduleFieldPickerMenuPosition(picker);
+    });
   }
 
   function closeCatalogFieldPickers(except) {
-    Array.prototype.forEach.call(document.querySelectorAll('[data-catalog-field-picker]'), function (picker) {
-      if (except && picker === except) return;
-      var menu = picker.querySelector('[data-catalog-field-picker-menu]');
-      var toggle = picker.querySelector('[data-action="catalog-field-picker-toggle"]');
-      if (menu) menu.hidden = true;
-      if (toggle) toggle.setAttribute('aria-expanded', 'false');
-    });
+    closeFieldPickers(except);
   }
 
   function refreshCatalogFieldPickerResults(input) {
@@ -13806,9 +14259,24 @@ function dynamicPagesClientScript() {
       results.innerHTML = renderCatalogFieldPickerPrompt();
       return;
     }
+    var classes = catalogFieldPickerClassNames(picker);
+    var needsLoad = classes.some(function (className) {
+      var key = catalogAttributeLoadKey(className);
+      var failedAt = Number(state.catalogAttributeFailedAt[key] || 0);
+      return !state.catalogAttributeLoaded[key] && !(failedAt && Date.now() - failedAt < 5000);
+    });
+    if (needsLoad) {
+      results.innerHTML = '<div class="catalog-field-picker-empty">Загрузка полей...</div>';
+      ensureCatalogFieldPickerSearchAttributes(picker, query).then(function () {
+        if (input.value === query && document.contains(input)) refreshCatalogFieldPickerResults(input);
+      });
+      return;
+    }
     var startedAt = performance.now();
     var options = catalogFieldPickerOptions(picker, query);
+    picker._catalogFieldPickerOptions = options;
     results.innerHTML = renderCatalogFieldPickerRows(options, hidden.value || '', query);
+    scheduleFieldPickerMenuPosition(picker);
     var elapsedMs = Math.round(performance.now() - startedAt);
     if (elapsedMs >= 50) clientLog('ui-performance', 'catalog-field-picker ' + elapsedMs + 'ms candidates=' + options.length);
   }
@@ -13833,9 +14301,11 @@ function dynamicPagesClientScript() {
     menu.hidden = !open;
     target.setAttribute('aria-expanded', open ? 'true' : 'false');
     if (open && input) {
+      positionFieldPickerMenu(picker);
       input.value = '';
       var results = picker.querySelector('[data-catalog-field-picker-results]');
       if (results) results.innerHTML = renderCatalogFieldPickerPrompt();
+      scheduleFieldPickerMenuPosition(picker);
       window.setTimeout(function () { input.focus(); }, 0);
     }
   }
@@ -13846,6 +14316,23 @@ function dynamicPagesClientScript() {
     var toggle = picker && picker.querySelector('[data-action="catalog-field-picker-toggle"]');
     if (!picker || !hidden || !toggle) return;
     var value = String(target.getAttribute('data-catalog-field-picker-value') || '');
+    if (hidden.matches && hidden.matches('[data-object-scope-field="previousField"]')) {
+      var row = picker.closest('[data-object-scope-row]');
+      var expression = row && row.querySelector('[data-object-scope-field="rightExpression"]');
+      if (!expression || !value) return;
+      var token = '$' + '{previous.' + value + '}';
+      var start = Number.isInteger(expression.selectionStart) ? expression.selectionStart : String(expression.value || '').length;
+      var end = Number.isInteger(expression.selectionEnd) ? expression.selectionEnd : start;
+      var current = String(expression.value || '');
+      expression.value = current.slice(0, start) + token + current.slice(end);
+      var cursor = start + token.length;
+      if (expression.setSelectionRange) expression.setSelectionRange(cursor, cursor);
+      closeCatalogFieldPickers();
+      resetCatalogFieldPicker(picker);
+      clearDraftExecutionState({ clearExtractionSource: true });
+      expression.dispatchEvent(new Event('input', { bubbles: true }));
+      return;
+    }
     if (picker.hasAttribute('data-catalog-field-picker-multiple')) {
       var multi = picker.querySelector('[data-catalog-field-picker-multi-value]');
       if (!multi || !value) return;
@@ -13869,6 +14356,9 @@ function dynamicPagesClientScript() {
       return;
     }
     hidden.value = value;
+    var selectedPath = String(target.getAttribute('data-catalog-field-picker-path') || '');
+    if (selectedPath) hidden.setAttribute('data-catalog-field-picker-selected-path', selectedPath);
+    else hidden.removeAttribute('data-catalog-field-picker-selected-path');
     var selectedLabel = String(target.querySelector('span') && target.querySelector('span').textContent || hidden.value || 'Выберите поле').trim();
     hidden.setAttribute('data-catalog-field-picker-selected-label', selectedLabel);
     toggle.textContent = selectedLabel;
@@ -13922,29 +14412,67 @@ function dynamicPagesClientScript() {
     return matchingColumnOptionRowsForSelection(spec, block.with, false, undefined, includeCatalogPaths);
   }
 
-  function renderObjectGroupScopeRuleRow(rule, className) {
+  function objectGroupSourceColumnOptions(selections, selectionIndex, sourceAlias, searchQuery) {
+    var source = (selections || []).slice(0, Math.max(0, Number(selectionIndex) || 0)).find(function (selection, index) {
+      return String(selection && (selection.alias || objectSelectionAlias(index)) || '').trim() === String(sourceAlias || '').trim();
+    });
+    if (!source) return [];
+    var labels = {};
+    var fields = ['Class', '_id', 'Code', 'Description'].concat(normalizeObjectSelectionColumns(source.columns));
+    if (String(searchQuery || '').trim()) {
+      catalogScopePathOptions(source.className || '', searchQuery).forEach(function (item) {
+        if (!item || !item.value) return;
+        fields.push(item.value);
+        labels[item.value] = item.label || item.value;
+      });
+    }
+    return uniqueList(fields).map(function (field) {
+      return { value: field, label: labels[field] || field };
+    });
+  }
+
+  function objectGroupExpressionSuggestionListId(selectionIndex, ruleIndex) {
+    return 'cmdp-object-right-expression-' + String(selectionIndex) + '-' + String(ruleIndex);
+  }
+
+  function renderObjectGroupExpressionSuggestions(spec, selections, selectionIndex, sourceAlias, ruleIndex) {
+    var params = spec && spec.params && typeof spec.params === 'object' && !Array.isArray(spec.params) ? spec.params : {};
+    var values = Object.keys(params).sort().map(function (name) {
+      return { value: '$' + '{param.' + name + '}', label: t('objectGroupValueParam') + ': ' + name };
+    });
+    objectGroupSourceColumnOptions(selections, selectionIndex, sourceAlias).forEach(function (item) {
+      values.push({ value: '$' + '{previous.' + item.value + '}', label: t('objectGroupValueColumn') + ': ' + item.label });
+    });
+    var seen = {};
+    var options = values.filter(function (item) {
+      if (seen[item.value]) return false;
+      seen[item.value] = true;
+      return true;
+    }).map(function (item) {
+      return '<option value="' + escapeHtml(item.value) + '" label="' + escapeHtml(item.label) + '"></option>';
+    }).join('');
+    return '<datalist id="' + escapeHtml(objectGroupExpressionSuggestionListId(selectionIndex, ruleIndex)) + '">' + options + '</datalist>';
+  }
+
+  function renderObjectGroupScopeRuleRow(rule, className, selections, selectionIndex, sourceAlias, spec, ruleIndex) {
     rule = rule || {};
     var action = rule.action === 'exclude' ? 'exclude' : 'include';
     var operator = normalizeObjectGroupOperator(rule.op || rule.operator || (rule.regex !== undefined ? 'matches' : 'equals'));
     var negate = normalizeObjectGroupNegate(rule.negate !== undefined ? rule.negate : rule.not, rule.op || rule.operator);
     var valueDisabled = objectGroupOperatorUsesValue(operator) ? '' : ' disabled';
-    var value = operator === 'matches'
-      ? (rule.regex !== undefined && rule.regex !== '' ? rule.regex : (rule.value !== undefined ? rule.value : rule.legacyValue || ''))
-      : (rule.value !== undefined && rule.value !== '' ? rule.value : (rule.regex !== undefined ? rule.regex : rule.legacyValue || ''));
+    var expression = objectGroupRightExpression(rule, operator);
+    var expressionListId = objectGroupExpressionSuggestionListId(selectionIndex, ruleIndex);
     return [
       '<tr data-object-scope-row>',
       '<td><select data-object-scope-field="action">',
       '<option value="include"' + (action === 'include' ? ' selected' : '') + '>' + t('objectGroupInclude') + '</option>',
       '<option value="exclude"' + (action === 'exclude' ? ' selected' : '') + '>' + t('objectGroupExclude') + '</option>',
       '</select></td>',
-      '<td>' + renderCatalogFieldPicker('data-object-scope-field="path"', rule.path || '', catalogAttributeOptions(className).map(function (attribute) {
-        return { value: attribute.name, label: attribute.description && attribute.description !== attribute.name ? attribute.description + ' (' + attribute.name + ')' : attribute.name };
-      }), { kind: 'scope', class: className }) + '</td>',
+      '<td>' + renderCatalogFieldPicker('data-object-scope-field="path"', rule.path || '', [], { kind: 'scope', class: className }) + '</td>',
       '<td><select data-object-scope-field="negate">' + renderObjectGroupNegationOptions(negate, operator) + '</select></td>',
       '<td><select data-object-scope-field="op">' + renderObjectGroupOperatorOptions(operator) + '</select></td>',
-      '<td><input data-object-scope-field="value" value="' + escapeHtml(value == null ? '' : String(value)) + '" placeholder="' + escapeHtml('$' + '{param.name}') + '"' + valueDisabled + '></td>',
-      '<td><input data-object-scope-field="valueParam" value="' + escapeHtml(rule.valueParam || rule.valuesParam || '') + '"' + valueDisabled + '></td>',
-      '<td><input data-object-scope-field="valueColumn" value="' + escapeHtml(rule.valueColumn || rule.sourceColumn || rule.fromColumn || '') + '"' + valueDisabled + '></td>',
+      '<td><input data-object-scope-field="rightExpression" value="' + escapeHtml(expression) + '" list="' + escapeHtml(expressionListId) + '" placeholder="' + escapeHtml('$' + '{param.name} / $' + '{previous.field}') + '"' + valueDisabled + '>' + renderObjectGroupExpressionSuggestions(spec, selections, selectionIndex, sourceAlias, ruleIndex) +
+        (sourceAlias ? '<div class="object-group-previous-field"><span class="muted">' + escapeHtml(t('objectGroupValueColumn')) + '</span>' + renderCatalogFieldPicker('data-object-scope-field="previousField"', '', [], { kind: 'objectGroupSource' }) + '</div>' : '') + '</td>',
       '<td><button data-action="clear-object-scope-row">' + t('clear') + '</button></td>',
       '</tr>'
     ].join('');
@@ -14015,8 +14543,8 @@ function dynamicPagesClientScript() {
   }
 
   function objectGroupRegexExamples() {
-    var paramPrefix = '$' + '{param.prefix}';
-    var paramSuffix = '$' + '{param.suffix}';
+    var parameter = '$' + '{param.systemName}';
+    var previous = '$' + '{previous.Name}';
     if (state.language === 'ru') {
       return [
         { regex: '.*', meaning: 'Любое непустое значение.' },
@@ -14031,7 +14559,8 @@ function dynamicPagesClientScript() {
         { regex: '^(dev|test|stage)-', meaning: 'Один из нескольких разрешенных префиксов.' },
         { regex: '\\b[A-Z]{2,4}-\\d{3,6}\\b', meaning: 'Инвентарный или сервисный код вида ABC-12345.' },
         { regex: '^(?!.*deprecated).*$', meaning: 'Значение без слова deprecated.' },
-        { regex: '^' + paramPrefix + '.*' + paramSuffix + '$', meaning: 'Использование входных переменных в regex.' }
+        { regex: '^' + parameter + '$', meaning: 'Параметр шаблона. Его значение экранируется и сравнивается буквально, даже если содержит regex-символы.' },
+        { regex: '^' + previous + '-[0-9]+$', meaning: 'Поле текущей строки предыдущего результата. Оно доступно после выбора «Источник» и подставляется отдельно для каждой его строки.' }
       ];
     }
     return [
@@ -14047,7 +14576,8 @@ function dynamicPagesClientScript() {
       { regex: '^(dev|test|stage)-', meaning: 'One of several allowed prefixes.' },
       { regex: '\\b[A-Z]{2,4}-\\d{3,6}\\b', meaning: 'Inventory or service code like ABC-12345.' },
       { regex: '^(?!.*deprecated).*$', meaning: 'Value without the word deprecated.' },
-      { regex: '^' + paramPrefix + '.*' + paramSuffix + '$', meaning: 'Using input variables in regex.' }
+      { regex: '^' + parameter + '$', meaning: 'Template parameter. Its value is regex-escaped and matched literally.' },
+      { regex: '^' + previous + '-[0-9]+$', meaning: 'Field from the current row of the previous result. It is available after Source is selected and resolves per source row.' }
     ];
   }
 
@@ -14065,11 +14595,106 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
-  function renderObjectGroupSelection(selection, index, spec) {
+  function objectGroupSelectionId(selection, index) {
+    return String(selection && (selection.id || selection.alias) || ('selection:' + objectSelectionAlias(index))).trim();
+  }
+
+  function objectGroupEditorModel(selected) {
+    if (state.objectGroupDraft && Array.isArray(state.objectGroupDraft.selections)) return state.objectGroupDraft;
+    state.objectGroupDraft = inferObjectGroupModel(selected && selected.spec || defaultSpec());
+    return state.objectGroupDraft;
+  }
+
+  function objectSelectionDependencyLabels(selections, selectionIndex, spec) {
+    var selection = selections && selections[selectionIndex] || {};
+    var alias = String(selection.alias || objectSelectionAlias(selectionIndex)).trim();
+    var labels = [];
+    function add(label) {
+      var text = String(label || '').trim();
+      if (text && labels.indexOf(text) === -1) labels.push(text);
+    }
+    if (!alias) return labels;
+    if ((selections || []).length <= 1) add(t('objectGroupEditor'));
+    (selections || []).forEach(function (candidate, index) {
+      if (index === selectionIndex || String(candidate && candidate.from || '').trim() !== alias) return;
+      add(String(candidate && candidate.name || defaultObjectSelectionName(index)) + ' (' + t('objectSelectionFrom') + ')');
+    });
+    var steps = spec && Array.isArray(spec.steps) ? spec.steps : [];
+    steps.forEach(function (step) {
+      if (!step || (step.type === 'selectCards' && String(step.as || '') === alias)) return;
+      if (String(step.from || '') === alias || String(step.with || '') === alias) {
+        add(userFacingResultLabel(step.as || step.type, spec));
+      }
+    });
+    var view = getStoredVisualModel(spec || {}, 'viewComposer');
+    if (view && view.source && String(view.source.alias || '') === alias) add(t('menuFinalView'));
+    if (diagramObjectFlowAliasIndex(spec || {}).has(alias)) add(t('menuDiagram'));
+    return labels;
+  }
+
+  function diagramObjectFlowAliasIndex(spec) {
+    var diagrams = spec && spec.result && Array.isArray(spec.result.diagrams) ? spec.result.diagrams : [];
+    if (state.diagramObjectFlowAliasIndexSpec === spec && state.diagramObjectFlowAliasIndex) return state.diagramObjectFlowAliasIndex;
+    var aliases = new Set();
+    var stageAliases = {};
+    assistantFlowStageSummaries(assistantFlowModel(spec || defaultSpec()), spec || defaultSpec()).forEach(function (stage) {
+      var id = String(stage && stage.id || '').trim();
+      var alias = String(stage && stage.alias || '').trim();
+      if (id && alias) stageAliases[id] = alias;
+    });
+    function addStage(stageId) {
+      var alias = stageAliases[String(stageId || '').trim()];
+      if (alias) aliases.add(alias);
+    }
+    function addConditions(conditions) {
+      var rules = conditions && Array.isArray(conditions.rules) ? conditions.rules : [];
+      rules.forEach(function (rule) {
+        var right = rule && rule.right && typeof rule.right === 'object' ? rule.right : {};
+        if (right.kind === 'stage') addStage(right.stageId);
+      });
+    }
+    diagrams.forEach(function (diagram) {
+      var imported = diagram && diagram.authoring && diagram.authoring.d2Import;
+      if (!imported || typeof imported !== 'object' || Array.isArray(imported)) return;
+      var items = imported.structureTree && Array.isArray(imported.structureTree.items) ? imported.structureTree.items : [];
+      items.forEach(function (item) {
+        var mapping = item && item.mapping && typeof item.mapping === 'object' ? item.mapping : {};
+        var materialization = mapping.materialization && typeof mapping.materialization === 'object' ? mapping.materialization : {};
+        if (materialization.kind === 'stage') addStage(materialization.stageId);
+        addConditions(mapping.conditions);
+        addConditions(mapping.hierarchyConditions);
+        (Array.isArray(mapping.related) ? mapping.related : []).forEach(function (related) {
+          addStage(related && related.stageId);
+          addConditions(related && related.conditions);
+        });
+      });
+      (Array.isArray(imported.relationRules) ? imported.relationRules : []).forEach(function (rule) {
+        addStage(rule && rule.sourceStageId);
+      });
+    });
+    state.diagramObjectFlowAliasIndexSpec = spec;
+    state.diagramObjectFlowAliasIndex = aliases;
+    return aliases;
+  }
+
+  function renderCollapsedObjectGroupSelection(selection, index, spec) {
+    var id = objectGroupSelectionId(selection, index);
+    var rules = Array.isArray(selection && selection.rules) ? selection.rules.length : 0;
+    var className = String(selection && selection.className || '');
+    return '<div class="object-selection object-selection-summary" data-object-selection-summary="' + escapeHtml(id) + '">' +
+      '<button type="button" class="object-selection-summary-button" data-action="object-selection-expand" data-object-selection-id="' + escapeHtml(id) + '">' +
+      '<span><strong>' + escapeHtml(selection && selection.name || defaultObjectSelectionName(index)) + '</strong><span class="muted">' +
+      escapeHtml((className || t('objectGroupSourceClass')) + ' · ' + String(rules) + ' ' + t('addObjectGroupRule')) +
+      '</span></span><span aria-hidden="true">›</span></button></div>';
+  }
+
+  function renderObjectGroupSelection(selection, index, spec, expanded, selections) {
     selection = normalizeObjectSelection(selection, index);
-    var rules = selection.rules && selection.rules.length ? selection.rules : [{ action: 'include', path: 'Code', regex: '.*' }];
-    var ruleRows = rules.map(function (rule) {
-      return renderObjectGroupScopeRuleRow(rule, selection.className);
+    if (!expanded) return renderCollapsedObjectGroupSelection(selection, index, spec);
+    var dependencies = objectSelectionDependencyLabels(selections, index, spec);
+    var rules = selection.rules && selection.rules.length ? selection.rules : [{ action: 'include', path: 'Code', rightExpression: '.*' }];
+    var ruleRows = rules.map(function (rule, ruleIndex) {
+      return renderObjectGroupScopeRuleRow(rule, selection.className, selections, index, selection.from, spec, ruleIndex);
     }).join('');
     var classId = index === 0 ? ' id="cmdp-object-class"' : '';
     var rowsId = index === 0 ? ' id="cmdp-object-scope-rows"' : '';
@@ -14083,13 +14708,13 @@ function dynamicPagesClientScript() {
         ? '<label>' + t('objectSelectionFrom') + '<input type="hidden" data-object-selection-field="from" value="' + escapeHtml(selection.from || '') + '"><output class="result-display-name">' + escapeHtml(selection.from ? userFacingResultLabel(selection.from, spec) : '') + '</output></label>'
         : '<label>' + t('objectSelectionFrom') + '<input data-object-selection-field="from" value="' + escapeHtml(selection.from || '') + '"></label>',
       '<label>' + t('objectSelectionLimit') + '<input data-object-selection-field="limit" value="' + escapeHtml(selection.limit == null ? '' : String(selection.limit)) + '"></label>',
-      '<label>' + t('objectSelectionColumns') + '<input data-object-selection-field="columns" value="' + escapeHtml(objectSelectionColumnsText(selection)) + '"></label>',
       '</div>',
       selection.filterJoin === 'all' ? '<p class="muted">Все условия (AND)</p>' : '',
       '<div class="section-title-row"><h3>' + escapeHtml(selection.name || defaultObjectSelectionName(index)) + '</h3>',
-      '<button data-action="add-object-scope-row">' + t('addObjectGroupRule') + '</button></div>',
+      '<div><button data-action="add-object-scope-row">' + t('addObjectGroupRule') + '</button><button data-action="remove-object-selection" data-object-selection-index="' + index + '"' + (dependencies.length ? ' disabled title="' + escapeHtml(t('objectSelectionDeleteDependencies', { items: dependencies.join(', ') })) + '"' : '') + '>' + escapeHtml(t('removeObjectSelection')) + '</button></div></div>',
+      dependencies.length ? '<p class="notice warning">' + escapeHtml(t('objectSelectionDeleteDependencies', { items: dependencies.join(', ') })) + '</p>' : '',
       renderObjectGroupPathHintFilters(selection.className),
-      '<table class="compact"><thead><tr><th>' + t('objectGroupScopeAction') + '</th><th>' + t('objectGroupPath') + '</th><th>' + t('objectGroupNegation') + '</th><th>' + t('objectGroupOperator') + '</th><th>' + t('objectGroupValue') + '</th><th>' + t('objectGroupValueParam') + '</th><th>' + t('objectGroupValueColumn') + '</th><th></th></tr></thead>',
+      '<table class="compact"><thead><tr><th>' + t('objectGroupScopeAction') + '</th><th>' + t('objectGroupPath') + '</th><th>' + t('objectGroupNegation') + '</th><th>' + t('objectGroupOperator') + '</th><th>' + t('objectGroupRightExpression') + '</th><th></th></tr></thead>',
       '<tbody' + rowsId + '>',
       ruleRows,
       '</tbody></table>',
@@ -14100,12 +14725,14 @@ function dynamicPagesClientScript() {
 
   function renderObjectGroupEditor(selected) {
     var spec = (selected && selected.spec) || defaultSpec();
-    var model = inferObjectGroupModel(spec);
+    var model = objectGroupEditorModel(selected);
     var selections = objectSelectionsFromModel(model);
+    var availableIds = selections.map(objectGroupSelectionId);
+    if (availableIds.indexOf(state.objectGroupExpandedSelectionId) === -1) state.objectGroupExpandedSelectionId = availableIds[0] || '';
     return [
       '<section class="section" id="cmdp-object-group-editor"><h2>' + t('objectGroupEditor') + '</h2>',
       '<p class="muted">' + t('objectGroupHelp') + '</p>',
-      selections.map(function (selection, index) { return renderObjectGroupSelection(selection, index, spec); }).join(''),
+      selections.map(function (selection, index) { return renderObjectGroupSelection(selection, index, spec, objectGroupSelectionId(selection, index) === state.objectGroupExpandedSelectionId, selections); }).join(''),
       renderObjectGroupRegexExamples(),
       '</section>'
     ].join('');
@@ -14207,16 +14834,16 @@ function dynamicPagesClientScript() {
     }).join('');
   }
 
-  function flowColumnOptionRows(model, spec, alias, operationIndex, seenAliases, includeCatalogPaths) {
+  function flowColumnOptionRows(model, spec, alias, operationIndex, seenAliases, includeCatalogPaths, searchQuery) {
     seenAliases = seenAliases || {};
     var name = String(alias || '').trim();
     if (!name || seenAliases[name]) return [];
     seenAliases[name] = true;
     var selection = (model.selections || []).find(function (item, index) { return (item.alias || objectSelectionAlias(index)) === name; });
-    if (selection) return matchingColumnOptionRowsForSelection(spec, name, false, undefined, includeCatalogPaths);
+    if (selection) return matchingColumnOptionRowsForSelection(spec, name, false, undefined, includeCatalogPaths, searchQuery);
     var operation = flowOperations(model).slice(0, operationIndex).find(function (item) { return item && item.as === name; });
-    if (!operation) return matchingColumnOptionRowsForOutput(spec, name, undefined, includeCatalogPaths);
-    var left = flowColumnOptionRows(model, spec, operation.from, operationIndex, seenAliases, includeCatalogPaths);
+    if (!operation) return matchingColumnOptionRowsForOutput(spec, name, undefined, includeCatalogPaths, searchQuery);
+    var left = flowColumnOptionRows(model, spec, operation.from, operationIndex, seenAliases, includeCatalogPaths, searchQuery);
     if (operation.type === 'relation') {
       return uniqueList(['SourceClass', 'SourceId', 'SourceCode', 'SourceDescription', 'Domain', 'RelationId', 'RelationDirection', 'RelationSourceSide', 'RelatedClass', 'RelatedId', 'Class', '_id', 'Code', 'Description'].concat(operation.columns || [])).map(function (column) {
         return { value: column, label: column };
@@ -14224,7 +14851,7 @@ function dynamicPagesClientScript() {
     }
     if (operation.type === 'match') {
       var prefix = operation.rightPrefix || objectSelectionOutputPrefix(spec || defaultSpec(), operation.with);
-      flowColumnOptionRows(model, spec, operation.with, operationIndex, seenAliases, includeCatalogPaths).forEach(function (item) {
+      flowColumnOptionRows(model, spec, operation.with, operationIndex, seenAliases, includeCatalogPaths, searchQuery).forEach(function (item) {
         var value = prefix + item.value;
         if (!left.some(function (existing) { return existing.value === value; })) left.push({ value: value, label: prefix + item.label });
       });
@@ -14232,7 +14859,7 @@ function dynamicPagesClientScript() {
     }
     if (operation.type === 'existsRelated' || operation.type === 'semiJoin') return left;
     if (operation.type === 'union') {
-      flowColumnOptionRows(model, spec, operation.with, operationIndex, seenAliases, includeCatalogPaths).forEach(function (item) {
+      flowColumnOptionRows(model, spec, operation.with, operationIndex, seenAliases, includeCatalogPaths, searchQuery).forEach(function (item) {
         if (!left.some(function (existing) { return existing.value === item.value; })) left.push(item);
       });
     }
@@ -14359,7 +14986,7 @@ function dynamicPagesClientScript() {
       '<label>' + t('relationDomain') + '<select data-relation-operation-field="domain">' + renderDomainOptions(operation.domain) + '</select></label>',
       '<label>' + t('relationTargetClass') + '<select data-relation-operation-field="targetClass">' + renderClassOptions(operation.targetClass) + '</select></label>',
       '<label>' + t('relationDirection') + '<select data-relation-operation-field="direction">' + renderRelationDirectionOptions(operation.direction) + '</select></label>',
-      '<label>' + t('relationOperationColumns') + '<input data-relation-operation-field="columns" value="' + escapeHtml(operation.columns.join(', ')) + '"></label>',
+      '<label>' + t('relationOperationColumns') + renderCatalogFieldMultiPicker('data-relation-operation-field="columns"', operation.columns, [], { kind: 'related', class: operation.targetClass || '' }) + '</label>',
       '<label>' + t('relationLimit') + '<input data-relation-operation-field="limit" type="number" min="1" value="' + escapeHtml(String(operation.limit)) + '"></label>',
       renderResultAliasField('data-relation-operation-field="as"', operation.as, spec),
       '</div>',
@@ -14368,11 +14995,11 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
-  function relatedTargetColumnOptions(className, selectedName) {
-    var options = ['Class', '_id', 'Code', 'Description'].map(function (column) { return { value: column, label: column }; });
-    catalogAttributeOptions(className).forEach(function (attribute) {
-      var name = String(attribute && attribute.name || '').trim();
-      if (name && !options.some(function (item) { return item.value === name; })) options.push({ value: name, label: name });
+  function relatedTargetColumnOptions(className, selectedName, searchQuery) {
+    var query = String(searchQuery || '').trim().toLowerCase();
+    var options = query && 'class'.indexOf(query) >= 0 ? [{ value: 'Class', label: 'Class' }] : [];
+    catalogScopePathOptions(className, query).forEach(function (item) {
+      if (item && item.value && !options.some(function (candidate) { return candidate.value === item.value; })) options.push(item);
     });
     if (selectedName && !options.some(function (item) { return item.value === selectedName; })) options.unshift({ value: selectedName, label: selectedName });
     return options;
@@ -14383,9 +15010,8 @@ function dynamicPagesClientScript() {
     var leftOptions = flowColumnOptionRows(model, spec, operation.with, operationIndex);
     var leftContext = { kind: 'flow', source: operation.with || '' };
     var rightContext = { kind: 'related', class: operation.targetClass || '' };
-    var rightOptions = relatedTargetColumnOptions(operation.targetClass, '');
     var rows = (operation.rules && operation.rules.length ? operation.rules : [defaultMatchingRule()]).map(function (rule) {
-      return renderMatchingRuleRow(rule, leftOptions, relatedTargetColumnOptions(operation.targetClass, rule.rightColumn), leftContext, rightContext);
+      return renderMatchingRuleRow(rule, leftOptions, [], leftContext, rightContext);
     }).join('');
     return [
       '<div class="matching-block" data-flow-operation="existsRelated" data-flow-operation-index="' + operationIndex + '" data-exists-related-operation data-exists-related-operation-id="' + escapeHtml(operation.id) + '">',
@@ -14397,7 +15023,7 @@ function dynamicPagesClientScript() {
       '<label>' + t('relationDomain') + '<select data-exists-related-field="domain">' + renderDomainOptions(operation.domain) + '</select></label>',
       '<label>' + t('relationTargetClass') + '<select data-exists-related-field="targetClass">' + renderClassOptions(operation.targetClass) + '</select></label>',
       '<label>' + t('relationDirection') + '<select data-exists-related-field="direction">' + renderRelationDirectionOptions(operation.direction) + '</select></label>',
-      '<label>' + t('relationOperationColumns') + '<input data-exists-related-field="columns" value="' + escapeHtml(operation.columns.join(', ')) + '"></label>',
+      '<label>' + t('relationOperationColumns') + renderCatalogFieldMultiPicker('data-exists-related-field="columns"', operation.columns, [], { kind: 'related', class: operation.targetClass || '' }) + '</label>',
       '<label>' + t('relationLimit') + '<input data-exists-related-field="limit" type="number" min="1" value="' + escapeHtml(String(operation.limit)) + '"></label>',
       renderResultAliasField('data-exists-related-field="as"', operation.as, spec),
       '</div>',
@@ -14407,9 +15033,32 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
+  function relationOperationId(operation, index) {
+    return String(operation && (operation.id || (operation.type || 'operation') + ':' + (operation.as || index)) || ('operation:' + index)).trim();
+  }
+
+  function relationEditorModel(selected) {
+    if (state.relationDraft && Array.isArray(state.relationDraft.operations)) return state.relationDraft;
+    state.relationDraft = inferRelationExpansionModel(selected && selected.spec || defaultSpec());
+    return state.relationDraft;
+  }
+
+  function renderRelationOperationSummary(operation, index, spec) {
+    var id = relationOperationId(operation, index);
+    var type = String(operation && operation.type || 'operation');
+    var label = operationLabel(operation, index, 0, 0, spec) || type;
+    var inputs = [operation && operation.from, operation && operation.with].filter(Boolean).map(function (alias) {
+      return userFacingResultLabel(alias, spec);
+    }).join(' + ');
+    var ruleCount = Array.isArray(operation && operation.rules) ? operation.rules.length : Array.isArray(operation && operation.on) ? operation.on.length : 0;
+    return '<div class="matching-block matching-block-summary" data-flow-operation-summary="' + escapeHtml(id) + '">' +
+      '<button type="button" class="matching-block-summary-button" data-action="relation-operation-expand" data-relation-operation-id="' + escapeHtml(id) + '">' +
+      '<span><strong>' + escapeHtml(label) + '</strong><span class="muted">' + escapeHtml([type, inputs, ruleCount ? String(ruleCount) + ' rules' : ''].filter(Boolean).join(' · ')) + '</span></span><span aria-hidden="true">›</span></button></div>';
+  }
+
   function renderRelationExpansionEditor(selected) {
     var spec = (selected && selected.spec) || defaultSpec();
-    var model = inferRelationExpansionModel(spec);
+    var model = relationEditorModel(selected);
     if (!model.selections || model.selections.length < 1) {
       return [
         '<section class="section" id="cmdp-relation-expansion-editor"><h2>' + t('relationEditor') + '</h2>',
@@ -14418,6 +15067,8 @@ function dynamicPagesClientScript() {
         '</section>'
       ].join('');
     }
+    var operationIds = flowOperations(model).map(relationOperationId);
+    if (operationIds.indexOf(state.relationExpandedOperationId) === -1) state.relationExpandedOperationId = operationIds[0] || '';
     return [
       '<section class="section" id="cmdp-relation-expansion-editor"><h2>' + t('relationEditor') + '</h2>',
       '<p class="muted">' + t('relationHelp') + '</p>',
@@ -14427,6 +15078,8 @@ function dynamicPagesClientScript() {
         var earlier = flowOperations(model).slice(0, index);
         var matchIndex = earlier.filter(function (item) { return item.type === 'match'; }).length;
         var setIndex = earlier.length - matchIndex;
+        var operationId = relationOperationId(operation, index);
+        if (operationId !== state.relationExpandedOperationId) return renderRelationOperationSummary(operation, index, spec);
         return operation.type === 'match' || operation.type === 'semiJoin'
           ? renderObjectMatchingBlock(operation, index, matchIndex, model, spec)
           : operation.type === 'relation'
@@ -15947,13 +16600,13 @@ function dynamicPagesClientScript() {
     return visual && visual.output && visual.output.alias || '';
   }
 
-  function assistantObjectFlowOutputManifest(spec) {
+  function computeAssistantObjectFlowOutputManifest(spec) {
     var objectMatching = getStoredVisualModel(spec || {}, 'objectMatching');
     var outputs = objectMatching && Array.isArray(objectMatching.outputs) ? objectMatching.outputs : [];
     var persisted = objectMatching && objectMatching.assistantOutputManifest && typeof objectMatching.assistantOutputManifest === 'object'
       ? objectMatching.assistantOutputManifest
       : null;
-    var intent = templateAuthoringClient(spec).assistant.objectFlowIntent;
+    var intent = assistantObjectFlowIntentFromSpec(spec);
     var hasCompiledFlow = Boolean(objectMatching && (
       (Array.isArray(objectMatching.selections) && objectMatching.selections.length)
       || (Array.isArray(objectMatching.operations) && objectMatching.operations.length)
@@ -16009,6 +16662,16 @@ function dynamicPagesClientScript() {
     }).filter(Boolean);
     if (Object.keys(expectedAliases).some(function (alias) { return !seen[alias]; })) invalid = true;
     return { assistantManaged: true, error: invalid ? 'invalid manifest' : '', outputs: invalid ? [] : manifest, blocks: invalid ? [] : blocks };
+  }
+
+  function assistantObjectFlowOutputManifest(spec) {
+    var source = spec && typeof spec === 'object' && !Array.isArray(spec) ? spec : null;
+    if (source && assistantObjectFlowManifestCache && assistantObjectFlowManifestCache.has(source)) {
+      return assistantObjectFlowManifestCache.get(source);
+    }
+    var manifest = computeAssistantObjectFlowOutputManifest(source || spec || {});
+    if (source && assistantObjectFlowManifestCache) assistantObjectFlowManifestCache.set(source, manifest);
+    return manifest;
   }
 
   function objectFlowOutputManifest(spec) {
@@ -16428,10 +17091,8 @@ function dynamicPagesClientScript() {
       '<section class="section" id="cmdp-extraction-editor"><h2>' + t('extractionEditor') + '</h2>',
       assistantManifest.assistantManaged && assistantManifest.error ? '<div class="notice error" role="alert">' + escapeHtml(t('assistantFlowOutputManifestInvalid')) + '</div>' : '',
       '<div class="row">',
-      options ? '<label>' + t('extractionResultSource') + '<select id="cmdp-extraction-source">' + options + '</select></label>' : '',
+      options ? '<label>' + t('extractionResultSource') + '<select id="cmdp-extraction-source">' + options + '</select><span class="muted">' + escapeHtml(t('extractionResultSourceHelp')) + '</span></label>' : '',
       '</div>',
-      options ? '<div class="toolbar"><button type="button" class="primary" data-action="apply-extraction-published">' + escapeHtml(t('extractionPublishSelected')) + '</button></div>' : '',
-      selectedName ? '<p class="muted">' + escapeHtml(t('publishedTable') + ': ' + userFacingResultLabel(selectedName, spec)) + '</p>' : '',
       assistantManifest.assistantManaged && assistantManifest.error ? '' : renderExtractionPreview(spec),
       '</section>'
     ].join('');
@@ -16585,9 +17246,13 @@ function dynamicPagesClientScript() {
       var item = source[column] || {};
       var textTemplate = String(item.textTemplate || item.labelTemplate || '$' + '{mysource.value}').trim() || '$' + '{mysource.value}';
       var target = item.target === 'blank' || item.target === '_blank' ? 'blank' : 'self';
-      if (item.mode !== 'link' && !item.urlTemplate && textTemplate === '$' + '{mysource.value}' && target === 'self') return;
+      var mode = item.mode === 'link' ? 'link' : (item.mode === 'text' ? 'text' : 'auto');
+      if (mode === 'auto') {
+        if (target !== 'self') result[column] = { mode: 'auto', target: target };
+        return;
+      }
       result[column] = {
-        mode: item.mode === 'link' ? 'link' : 'text',
+        mode: mode,
         urlTemplate: String(item.urlTemplate || item.url || '').trim(),
         textTemplate: textTemplate,
         target: target
@@ -16597,7 +17262,8 @@ function dynamicPagesClientScript() {
   }
 
   function renderVisualizationLinkModeOptions(selected) {
-    return '<option value="text"' + (selected !== 'link' ? ' selected' : '') + '>' + t('visualizationLinkModeText') + '</option>' +
+    return '<option value="auto"' + (selected !== 'link' && selected !== 'text' ? ' selected' : '') + '>' + t('visualizationLinkModeAuto') + '</option>' +
+      '<option value="text"' + (selected === 'text' ? ' selected' : '') + '>' + t('visualizationLinkModeText') + '</option>' +
       '<option value="link"' + (selected === 'link' ? ' selected' : '') + '>' + t('visualizationLinkModeLink') + '</option>';
   }
 
@@ -16612,7 +17278,7 @@ function dynamicPagesClientScript() {
       var link = links[column.value] || {};
       return '<tr data-visualization-link-row data-column="' + escapeHtml(column.value) + '">' +
         '<td>' + escapeHtml(column.label || column.value) + '<input type="hidden" data-visualization-link-field="column" value="' + escapeHtml(column.value) + '"></td>' +
-        '<td><select data-visualization-link-field="mode">' + renderVisualizationLinkModeOptions(link.mode || 'text') + '</select></td>' +
+        '<td><select data-visualization-link-field="mode">' + renderVisualizationLinkModeOptions(link.mode || 'auto') + '</select></td>' +
         '<td><input data-visualization-link-field="urlTemplate" value="' + escapeHtml(link.urlTemplate || '') + '" placeholder="/cmdbuild/ui/#classes/$' + '{mysource.sourceClass}/cards/$' + '{mysource.sourceId}"></td>' +
         '<td><input data-visualization-link-field="textTemplate" value="' + escapeHtml(link.textTemplate || '$' + '{mysource.value}') + '"></td>' +
         '<td><select data-visualization-link-field="target">' + renderVisualizationLinkTargetOptions(link.target || 'self') + '</select></td>' +
@@ -16663,8 +17329,12 @@ function dynamicPagesClientScript() {
     if (state.diagramImportProposal && state.diagramImportProposal.version === 3) {
       return { state: 'proposal', readiness: diagramImportProposalReadiness(state.diagramImportProposal) };
     }
-    var authoring = templateAuthoringClient(spec);
-    var source = String(authoring.d2.source || state.diagramImportSource || '');
+    var sourceSpec = spec && typeof spec === 'object' && !Array.isArray(spec) ? spec : {};
+    var stored = sourceSpec.authoring && typeof sourceSpec.authoring === 'object' && !Array.isArray(sourceSpec.authoring)
+      ? sourceSpec.authoring
+      : {};
+    var d2 = stored.d2 && typeof stored.d2 === 'object' && !Array.isArray(stored.d2) ? stored.d2 : {};
+    var source = String(d2.source || state.diagramImportSource || '');
     if (!source.trim()) return { state: 'none' };
     var imported = firstDiagramSpec(spec).authoring && firstDiagramSpec(spec).authoring.d2Import;
     if (state.diagramImportStale) return { state: 'pending', reason: 'changed' };
@@ -16800,6 +17470,7 @@ function dynamicPagesClientScript() {
 
   function storeDiagramImportEditorMutation(proposal) {
     if (!proposal || proposal.version !== 3) return proposal;
+    invalidateDiagramImportEditorIndexes(proposal);
     storeDiagramImportEditorModel(proposal);
     state.diagramImportAuthoringOverrides = diagramImportAuthoringOverrides(proposal);
     if (diagramImportEditorIsApplied(proposal)) markAppliedDiagramImportEditorDirty(proposal);
@@ -16881,8 +17552,8 @@ function dynamicPagesClientScript() {
     return rows;
   }
 
-  function diagramColumnOptionRowsForSource(spec, sourceAlias) {
-    var rows = matchingColumnOptionRowsForOutput(spec || defaultSpec(), sourceAlias, undefined, true).slice();
+  function diagramColumnOptionRowsForSource(spec, sourceAlias, searchQuery) {
+    var rows = matchingColumnOptionRowsForOutput(spec || defaultSpec(), sourceAlias, undefined, true, searchQuery).slice();
     var seen = {};
     rows.forEach(function (item) { if (item && item.value) seen[item.value] = true; });
     ['Class', '_id', 'Code', 'Description', 'id', 'label', 'group', 'parent', 'href', 'source', 'target', 'child'].forEach(function (name) {
@@ -17193,9 +17864,7 @@ function dynamicPagesClientScript() {
   }
 
   function diagramImportNearestMaterializedAncestorClient(proposal, item) {
-    var tree = diagramImportStructureTreeClient(proposal);
-    var byId = {};
-    (tree.items || []).forEach(function (candidate) { if (candidate && candidate.id) byId[String(candidate.id)] = candidate; });
+    var byId = diagramImportEditorIndex(proposal).itemsById;
     var visited = {};
     var parentId = String(item && item.parentId || '');
     while (parentId && !visited[parentId]) {
@@ -17212,9 +17881,7 @@ function dynamicPagesClientScript() {
   }
 
   function diagramImportNearestHierarchyPrerequisiteClient(proposal, item) {
-    var tree = diagramImportStructureTreeClient(proposal);
-    var byId = {};
-    (tree.items || []).forEach(function (candidate) { if (candidate && candidate.id) byId[String(candidate.id)] = candidate; });
+    var byId = diagramImportEditorIndex(proposal).itemsById;
     var visited = {};
     var parentId = String(item && item.parentId || '');
     while (parentId && !visited[parentId]) {
@@ -17356,7 +18023,12 @@ function dynamicPagesClientScript() {
       if (issue) proposal.unresolved.push({ id: item.id, displayName: role.label || role.key || item.id, family: 'structureTree', fields: [issue] });
       var stage = stageById[diagramImportEffectiveSourceStageIdClient(role, item)];
       var expectedClass = String(mapping && mapping.primary && mapping.primary.className || '');
-      if (stage && expectedClass && String(stage.className || '') !== expectedClass) {
+      var ancestor = diagramImportNearestMaterializedAncestorClient(proposal, item);
+      var parentStage = ancestor && ancestor.stageId ? stageById[String(ancestor.stageId)] || {} : {};
+      var primaryProjection = diagramImportPrimaryCardSourceClient(stage || {}, mapping.primary || {}, parentStage);
+      if (stage && primaryProjection.ambiguous) {
+        proposal.unresolved.push({ id: item.id, displayName: role.label || role.key || item.id, family: 'structureTree', fields: ['Выберите карточку результата для элемента диаграммы.'] });
+      } else if (stage && expectedClass && primaryProjection.source && String(primaryProjection.source.className || '') !== expectedClass) {
         proposal.unresolved.push({ id: item.id, displayName: role.label || role.key || item.id, family: 'structureTree', fields: ['Выбранный результат возвращает другой класс CMDBuild.'] });
       }
       (mapping && Array.isArray(mapping.related) ? mapping.related : []).forEach(function (related) {
@@ -17974,6 +18646,12 @@ function dynamicPagesClientScript() {
 
   function diagramImportStructureTreeClient(proposal) {
     if (!proposal || proposal.version !== 3) return { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] };
+    // The focused helper tests evaluate this function without the page-level
+    // cache declarations. Production has the WeakMap; tests remain pure.
+    var structureTreeCache = typeof diagramImportStructureTreeCache === 'undefined' ? null : diagramImportStructureTreeCache;
+    var editorIndexCache = typeof diagramImportEditorIndexCache === 'undefined' ? null : diagramImportEditorIndexCache;
+    var cached = structureTreeCache && structureTreeCache.get(proposal);
+    if (cached && cached.raw === proposal.structureTree) return cached.tree;
     var rolesById = {};
     (proposal.roles || []).forEach(function (role) {
       if (!role || !role.id) return;
@@ -17998,7 +18676,41 @@ function dynamicPagesClientScript() {
       };
     }).filter(function (item) { return item.id; });
     proposal.structureTree = diagramImportMigrateLegacyHierarchyConditionsClient({ version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: items }, rolesById);
+    if (structureTreeCache) structureTreeCache.set(proposal, { raw: proposal.structureTree, tree: proposal.structureTree });
+    if (editorIndexCache) editorIndexCache.delete(proposal);
     return proposal.structureTree;
+  }
+
+  function invalidateDiagramImportEditorIndexes(proposal) {
+    if (!proposal || typeof proposal !== 'object') return;
+    var structureTreeCache = typeof diagramImportStructureTreeCache === 'undefined' ? null : diagramImportStructureTreeCache;
+    var editorIndexCache = typeof diagramImportEditorIndexCache === 'undefined' ? null : diagramImportEditorIndexCache;
+    var treeChildrenCache = typeof diagramImportTreeChildrenCache === 'undefined' ? null : diagramImportTreeChildrenCache;
+    if (structureTreeCache) structureTreeCache.delete(proposal);
+    if (editorIndexCache) editorIndexCache.delete(proposal);
+    if (proposal.structureTree && treeChildrenCache) treeChildrenCache.delete(proposal.structureTree);
+  }
+
+  function diagramImportEditorIndex(proposal) {
+    if (!proposal || proposal.version !== 3) return { tree: { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] }, rolesById: {}, itemsById: {}, childrenByParent: {} };
+    var tree = diagramImportStructureTreeClient(proposal);
+    var editorIndexCache = typeof diagramImportEditorIndexCache === 'undefined' ? null : diagramImportEditorIndexCache;
+    var cached = editorIndexCache && editorIndexCache.get(proposal);
+    if (cached && cached.tree === tree) return cached;
+    var index = { tree: tree, rolesById: {}, itemsById: {}, childrenByParent: {} };
+    (proposal.roles || []).forEach(function (role) {
+      if (role && role.id) index.rolesById[String(role.id)] = role;
+    });
+    (tree.items || []).forEach(function (item) {
+      if (!item || !item.id) return;
+      var id = String(item.id);
+      var parentId = String(item.parentId || '');
+      index.itemsById[id] = item;
+      if (!index.childrenByParent[parentId]) index.childrenByParent[parentId] = [];
+      index.childrenByParent[parentId].push(item);
+    });
+    if (editorIndexCache) editorIndexCache.set(proposal, index);
+    return index;
   }
 
   function diagramImportMigrateLegacyHierarchyConditionsClient(tree, rolesById) {
@@ -18062,7 +18774,8 @@ function dynamicPagesClientScript() {
   }
 
   function diagramImportStructureTreeRoleClient(proposal, item) {
-    return (proposal && proposal.roles || []).find(function (role) { return String(role && role.id || '') === String(item && item.roleId || ''); }) || {};
+    var index = diagramImportEditorIndex(proposal);
+    return index.rolesById[String(item && item.roleId || '')] || {};
   }
 
   function diagramImportStructureItemContextClient(proposal, itemId) {
@@ -18084,7 +18797,10 @@ function dynamicPagesClientScript() {
       changed = true;
       return Object.assign({}, item, { mapping: cloneJsonValue(mapping || {}, {}) });
     });
-    if (changed) proposal.structureTree = tree;
+    if (changed) {
+      proposal.structureTree = tree;
+      invalidateDiagramImportEditorIndexes(proposal);
+    }
     return changed;
   }
 
@@ -18101,7 +18817,19 @@ function dynamicPagesClientScript() {
   }
 
   function diagramImportStructureTreeChildrenClient(tree, parentId) {
-    return (tree && tree.items || []).filter(function (item) { return String(item && item.parentId || '') === String(parentId || ''); });
+    var items = tree && Array.isArray(tree.items) ? tree.items : [];
+    var treeChildrenCache = typeof diagramImportTreeChildrenCache === 'undefined' ? null : diagramImportTreeChildrenCache;
+    var byParent = tree && treeChildrenCache && treeChildrenCache.get(tree);
+    if (!byParent) {
+      byParent = {};
+      items.forEach(function (item) {
+        var key = String(item && item.parentId || '');
+        if (!byParent[key]) byParent[key] = [];
+        byParent[key].push(item);
+      });
+      if (tree && treeChildrenCache) treeChildrenCache.set(tree, byParent);
+    }
+    return byParent[String(parentId || '')] || [];
   }
 
   function diagramImportStructureTreeIsCollapsedClient(itemId) {
@@ -18719,6 +19447,50 @@ function dynamicPagesClientScript() {
     return sources;
   }
 
+  function diagramImportPrimaryCardSourceClient(stage, primary, parentStage) {
+    var available = diagramImportStageCardSourcesClient(stage).map(normalizeDiagramImportConditionCardSourceClient).filter(Boolean);
+    var explicit = normalizeDiagramImportConditionCardSourceClient(primary && primary.cardSource);
+    var sourceKey = function (source) {
+      return source ? [source.className, source.classColumn, source.idColumn].join('\\u0000') : '';
+    };
+    if (explicit && available.some(function (source) { return sourceKey(source) === sourceKey(explicit); })) {
+      return { source: explicit, inferred: false, ambiguous: false };
+    }
+    var parentClass = String(parentStage && parentStage.className || '').trim();
+    var configuredClass = String(primary && primary.className || '').trim();
+    var stageClass = String(stage && stage.className || '').trim();
+    var distinct = parentClass ? available.filter(function (source) { return String(source.className || '') !== parentClass; }) : [];
+    var distinctClasses = uniqueList(distinct.map(function (source) { return source.className; }));
+    var directRelationSource = available.find(function (source) { return source.id === 'relation-source' && String(source.className || '') !== parentClass; });
+    if (parentClass && stageClass === parentClass && directRelationSource) {
+      return { source: directRelationSource, inferred: true, ambiguous: false };
+    }
+    if (parentClass && stageClass === parentClass && distinctClasses.length === 1) {
+      var inferred = distinct.filter(function (source) { return source.className === distinctClasses[0]; });
+      if (inferred.length === 1) return { source: inferred[0], inferred: true, ambiguous: false };
+      return { source: null, inferred: false, ambiguous: true };
+    }
+    if (configuredClass) {
+      var matches = available.filter(function (source) { return source.className === configuredClass; });
+      if (matches.length === 1) return { source: matches[0], inferred: false, ambiguous: false };
+      if (matches.length > 1) return { source: null, inferred: false, ambiguous: true };
+    }
+    if (available.length === 1) return { source: available[0], inferred: true, ambiguous: false };
+    var current = available.find(function (source) { return source.id === 'current'; });
+    return current ? { source: current, inferred: true, ambiguous: false } : { source: null, inferred: false, ambiguous: available.length > 1 };
+  }
+
+  function renderDiagramImportPrimaryCardSourceOptions(stage, selectedSource) {
+    var selected = normalizeDiagramImportConditionCardSourceClient(selectedSource);
+    var selectedKey = diagramImportConditionSourceKeyClient(selected);
+    return '<option value="">Выберите карточку</option>' + diagramImportStageCardSourcesClient(stage).map(function (source) {
+      var normalized = normalizeDiagramImportConditionCardSourceClient(source) || {};
+      var isSelected = diagramImportConditionSourceKeyClient(normalized) === selectedKey;
+      return '<option value="' + escapeHtml(normalized.id || '') + '"' + diagramImportConditionSourceDataAttributes(normalized) + (isSelected ? ' selected' : '') + '>' +
+        escapeHtml(String(normalized.label || normalized.className || '')) + '</option>';
+    }).join('');
+  }
+
   function diagramImportConditionCatalogFields(stage, searchQuery) {
     var sources = diagramImportStageCardSourcesClient(stage);
     var cache = state.diagramImportConditionCatalogFieldsCache || (state.diagramImportConditionCatalogFieldsCache = {});
@@ -18864,13 +19636,7 @@ function dynamicPagesClientScript() {
   }
 
   function closeDiagramImportConditionFieldPickers(except) {
-    Array.prototype.forEach.call(document.querySelectorAll('[data-diagram-import-condition-picker]'), function (picker) {
-      if (except && picker === except) return;
-      var menu = picker.querySelector('[data-diagram-import-condition-picker-menu]');
-      var toggle = picker.querySelector('[data-action="diagram-import-condition-picker-toggle"]');
-      if (menu) menu.hidden = true;
-      if (toggle) toggle.setAttribute('aria-expanded', 'false');
-    });
+    closeFieldPickers(except);
   }
 
   function refreshDiagramImportConditionPickerResults(input) {
@@ -18899,6 +19665,7 @@ function dynamicPagesClientScript() {
         diagramImportConditionSourceFromElement(hidden),
         query
       );
+      scheduleFieldPickerMenuPosition(picker);
     });
   }
 
@@ -18922,9 +19689,11 @@ function dynamicPagesClientScript() {
     menu.hidden = !open;
     target.setAttribute('aria-expanded', open ? 'true' : 'false');
     if (open && input) {
+      positionFieldPickerMenu(picker);
       input.value = '';
       var results = picker.querySelector('[data-diagram-import-condition-picker-results]');
       if (results) results.innerHTML = renderDiagramImportConditionPickerPrompt();
+      scheduleFieldPickerMenuPosition(picker);
       window.setTimeout(function () { input.focus(); }, 0);
     }
   }
@@ -19078,6 +19847,9 @@ function dynamicPagesClientScript() {
       '<td><button type="button" class="icon-button" data-action="diagram-import-remove-condition" title="' + escapeHtml(t('remove')) + '">×</button></td></tr>';
   }
 
+  window.addEventListener('resize', repositionOpenFieldPickers);
+  document.addEventListener('scroll', repositionOpenFieldPickers, true);
+
   function renderDiagramImportPlacementConditions(role, item, mapping, spec, sourceStageId, proposal) {
     var materializationKind = String(mapping && mapping.materialization && mapping.materialization.kind || '');
     if (!materializationKind) return '<p class="muted">Сначала выберите способ наполнения элемента D2.</p>';
@@ -19117,6 +19889,18 @@ function dynamicPagesClientScript() {
     var materializationKind = String(materialization.kind || '');
     var sourceInfo = diagramImportMaterializedStageForItemClient(proposal, item, spec || defaultSpec());
     var stage = sourceInfo.stage || {};
+    var ancestor = diagramImportNearestMaterializedAncestorClient(proposal, item);
+    var parentStage = ancestor && ancestor.stageId
+      ? diagramImportStageById(spec || defaultSpec(), ancestor.stageId) || {}
+      : {};
+    var primaryProjection = diagramImportPrimaryCardSourceClient(stage, primary, parentStage);
+    if (primaryProjection.source) {
+      primary = Object.assign({}, primary, {
+        className: String(primaryProjection.source.className || ''),
+        cardSource: primaryProjection.source
+      });
+      mapping = Object.assign({}, mapping, { primary: primary });
+    }
     var primaryClassName = String(primary.className || stage.className || '');
     var modeOptions = visualKind === 'container'
       ? [['', 'Выберите способ наполнения'], ['structural', 'Структурная рамка'], ['stage', 'Повторять по результату Object Flow']]
@@ -19126,6 +19910,12 @@ function dynamicPagesClientScript() {
     }).join('') + '</select></label>';
     var stageControl = materializationKind === 'stage'
       ? '<label>Результат Object Flow<select data-diagram-import-placement-field="materialization.stageId"><option value="">Выберите результат</option>' + renderDiagramImportStageOptions(spec || defaultSpec(), materialization.stageId || '') + '</select></label>'
+      : '';
+    var primaryCardSourceControl = materializationKind === 'stage' && diagramImportStageCardSourcesClient(stage).length > 1
+      ? '<label>Карточка результата<select data-diagram-import-placement-field="primary.cardSource">' +
+        renderDiagramImportPrimaryCardSourceOptions(stage, primary.cardSource) +
+        '</select></label>' +
+        (primaryProjection.inferred ? '<p class="muted">Выбрана карточка дочернего результата, отличающаяся от родительской ветви.</p>' : '')
       : '';
     var showEmptyControl = visualKind === 'container'
       ? '<label class="checkbox-label"><input type="checkbox" data-diagram-import-placement-field="showEmpty"' + (mapping.showEmpty !== false ? ' checked' : '') + '> Показывать пустой контейнер</label>'
@@ -19137,12 +19927,13 @@ function dynamicPagesClientScript() {
     var labelTemplateError = labelTemplateEditor.errors.length ? '<p class="diagram-import-label-error" data-diagram-import-label-template-error>' + escapeHtml(labelTemplateEditor.errors.join(' ')) + '</p>' : '';
     var labelTemplateControl = '<div class="diagram-import-label-template" data-diagram-import-label-template-field><label>' + escapeHtml(diagramImportLabelTemplateLabel(primaryClassName)) + '<input data-diagram-import-placement-field="primary.labelTemplate" data-diagram-import-label-template data-diagram-import-role-id="' + escapeHtml(item.id || '') + '" value="' + escapeHtml(labelTemplateEditor.value) + '" autocomplete="off" spellcheck="false" aria-autocomplete="list" aria-expanded="false"></label><div class="diagram-import-label-autocomplete" data-diagram-import-label-autocomplete role="listbox" hidden></div>' + renderDiagramImportLabelTemplateParameterSuggestions(spec || defaultSpec()) + labelTemplateError + '</div>';
     if (visualKind !== 'node') {
-      return '<details class="help-details" data-diagram-import-placement-mapping="' + escapeHtml(item.id || '') + '" open><summary><strong>Данные контейнера</strong></summary><div class="diagram-grid">' + materializationControl + stageControl + showEmptyControl + labelTemplateControl + '</div><p class="muted">Снимите флажок, чтобы не выводить рамку без видимых дочерних объектов или контейнеров. Структурная рамка не имеет собственного источника. Она создается один раз в корне или для каждой карточки родительской ветви. В подписи доступны текст, поля выбранного результата и поля прямых дочерних объектов через $' + '{…}.</p>' + renderDiagramImportPlacementConditions(role, item, mapping, spec || defaultSpec(), sourceInfo.stageId, proposal) + renderDiagramImportRelatedDataForItem(proposal, spec || defaultSpec(), item, role, mapping) + '</details>';
+      return '<details class="help-details" data-diagram-import-placement-mapping="' + escapeHtml(item.id || '') + '" open><summary><strong>Данные контейнера</strong></summary><div class="diagram-grid">' + materializationControl + stageControl + primaryCardSourceControl + showEmptyControl + labelTemplateControl + '</div><p class="muted">Снимите флажок, чтобы не выводить рамку без видимых дочерних объектов или контейнеров. Структурная рамка не имеет собственного источника. Она создается один раз в корне или для каждой карточки родительской ветви. В подписи доступны текст, поля выбранного результата и поля прямых дочерних объектов через $' + '{…}.</p>' + renderDiagramImportPlacementConditions(role, item, mapping, spec || defaultSpec(), sourceInfo.stageId, proposal) + renderDiagramImportRelatedDataForItem(proposal, spec || defaultSpec(), item, role, mapping) + '</details>';
     }
     return '<details class="help-details" data-diagram-import-placement-mapping="' + escapeHtml(item.id || '') + '" open><summary><strong>' + escapeHtml(t('diagramImportNodeData')) + '</strong></summary>' +
       '<div class="diagram-grid">' +
       materializationControl +
       stageControl +
+      primaryCardSourceControl +
       labelTemplateControl +
       '</div>' + inheritedControl + '<input type="hidden" data-diagram-import-placement-field="primary.className" value="' + escapeHtml(primaryClassName) + '">' + renderDiagramImportNodeDataFields(role, spec || defaultSpec(), stage, Object.assign({}, primary, { className: primaryClassName }), 'data-diagram-import-placement-field="primary.structuredFields"') + renderDiagramImportPlacementConditions(role, item, mapping, spec || defaultSpec(), sourceInfo.stageId, proposal) + renderDiagramImportRelatedDataForItem(proposal, spec || defaultSpec(), item, role, mapping) + '</details>';
   }
@@ -20202,7 +20993,7 @@ function dynamicPagesClientScript() {
     var visual = getStoredVisualModel(spec, 'viewComposer');
     if (visual) {
       return {
-        sourceAlias: finalSourceAlias || visual.source && visual.source.alias || '',
+        sourceAlias: visual.source && visual.source.alias || finalSourceAlias || '',
         title: visual.output && visual.output.title || '',
         mode: visual.output && visual.output.mode || 'table',
         showOnly: true,
@@ -20246,7 +21037,7 @@ function dynamicPagesClientScript() {
   function renderViewComposerEditor(selected) {
     var spec = (selected && selected.spec) || defaultSpec();
     var model = inferViewComposerModel(spec);
-    model.sourceAlias = finalBaseResultAlias(spec) || model.sourceAlias || '';
+    model.sourceAlias = model.sourceAlias || finalBaseResultAlias(spec) || '';
     var columns = model.columns && model.columns.length ? model.columns : tableColumnsForAlias(spec, model.sourceAlias).slice(0, 6).map(function (field) {
       return { field: field, title: field };
     });
@@ -20257,8 +21048,8 @@ function dynamicPagesClientScript() {
     return [
       '<section class="section" id="cmdp-view-composer-editor"><h2>' + t('viewComposerEditor') + '</h2>',
       '<p class="muted">' + t('viewComposerHelp') + '</p>',
-      '<input type="hidden" id="cmdp-view-source" value="' + escapeHtml(model.sourceAlias || '') + '">',
       '<div class="row">',
+      '<label>' + t('viewComposerSource') + '<select id="cmdp-view-source">' + renderExtractionResultOptions(model.sourceAlias, spec, resultTablesForSpec(spec)) + '</select><span class="muted">' + escapeHtml(t('viewComposerSourceHelp')) + '</span></label>',
       '<label>' + t('viewComposerTitle') + '<input id="cmdp-view-title" value="' + escapeHtml(model.title || '') + '"></label>',
       '<label>' + t('viewComposerMode') + '<select id="cmdp-view-mode">' + renderVisualizationModeOptions(model.mode || 'table') + '</select></label>',
       '</div>',
@@ -20966,8 +21757,10 @@ function dynamicPagesClientScript() {
       return '<table class="' + (compact ? 'compact' : '') + '"><tbody><tr><td>' + escapeHtml(table.emptyText || DEFAULT_EMPTY_RESULT_TEXT) + '</td></tr></tbody></table>';
     }
     return rows.map(function (row, rowIndex) {
+      var indexedRow = Object.assign({ __cmdpRowIndex: rowIndex }, row || {});
       var body = columns.map(function (column) {
-        return '<tr><th>' + escapeHtml(columnLabels[column] || column) + '</th><td>' + escapeHtml(row[column] == null ? '' : String(row[column])) + '</td></tr>';
+        var cell = renderResultCell(indexedRow, column, table, []);
+        return '<tr><th>' + escapeHtml(columnLabels[column] || column) + '</th><td>' + cell.html + '</td></tr>';
       }).join('');
       return (rows.length > 1 ? '<h3>#' + String(rowIndex + 1) + '</h3>' : '') + '<table class="' + (compact ? 'compact' : '') + '"><tbody>' + body + '</tbody></table>';
     }).join('');
@@ -21097,7 +21890,10 @@ function dynamicPagesClientScript() {
     var value = rowColumnText(row, column);
     var rowIndex = row && row.__cmdpRowIndex !== undefined ? String(row.__cmdpRowIndex) : '';
     var meta = table && table.cellMeta && table.cellMeta[rowIndex] && table.cellMeta[rowIndex][column] || {};
-    var linkConfig = table && table.presentation && table.presentation.columnLinks && table.presentation.columnLinks[column] || {};
+    var columnLinks = table && table.presentation && table.presentation.columnLinks || {};
+    var hasExplicitLinkConfig = Object.prototype.hasOwnProperty.call(columnLinks, column);
+    var linkConfig = hasExplicitLinkConfig ? columnLinks[column] || {} : {};
+    var autoLink = (!hasExplicitLinkConfig || linkConfig.mode === 'auto') && meta && isSafeRuntimeLinkUrlClient(meta.autoHref);
     var content = escapeHtml(value);
     if (linkConfig && linkConfig.mode === 'link' && linkConfig.urlTemplate) {
       var thisContext = Object.assign({}, meta, {
@@ -21119,6 +21915,9 @@ function dynamicPagesClientScript() {
         var target = linkConfig.target === 'blank' ? ' target="_blank" rel="noreferrer"' : '';
         content = '<a href="' + escapeHtml(href) + '"' + target + '>' + escapeHtml(text) + '</a>';
       }
+    } else if (autoLink) {
+      var autoTarget = linkConfig.target === 'blank' ? ' target="_blank" rel="noreferrer"' : '';
+      content = '<a href="' + escapeHtml(meta.autoHref) + '"' + autoTarget + '>' + escapeHtml(value) + '</a>';
     }
     var groupIndex = rowGroupColumns.indexOf(column);
     return { value: value, html: content, groupIndex: groupIndex };
@@ -21518,7 +22317,7 @@ function dynamicPagesClientScript() {
   }
 
   function readViewComposerFields() {
-    var sourceAlias = finalBaseResultAlias(readCurrentSpec()) || String(readValue('cmdp-view-source') || '').trim();
+    var sourceAlias = String(readValue('cmdp-view-source') || '').trim() || finalBaseResultAlias(readCurrentSpec());
     var title = String(readValue('cmdp-view-title') || '').trim();
     var mode = String(readValue('cmdp-view-mode') || 'table').trim() || 'table';
     var columns = readViewComposerColumnRows();
@@ -21539,7 +22338,7 @@ function dynamicPagesClientScript() {
     spec.steps = Array.isArray(spec.steps) ? spec.steps.slice() : [];
     spec.result = spec.result && typeof spec.result === 'object' && !Array.isArray(spec.result) ? spec.result : {};
     spec.result.tables = Array.isArray(spec.result.tables) ? spec.result.tables.slice() : [];
-    model.sourceAlias = finalBaseResultAlias(spec) || model.sourceAlias;
+    model.sourceAlias = model.sourceAlias || finalBaseResultAlias(spec);
     model.showOnly = true;
 
     var previousVisual = getStoredVisualModel(spec, 'viewComposer');
@@ -21641,7 +22440,7 @@ function dynamicPagesClientScript() {
       });
     });
     return {
-      sourceAlias: finalBaseResultAlias(readCurrentSpec()) || String(readValue('cmdp-view-source') || '').trim(),
+      sourceAlias: String(readValue('cmdp-view-source') || '').trim() || finalBaseResultAlias(readCurrentSpec()),
       title: String(readValue('cmdp-view-title') || '').trim(),
       mode: String(readValue('cmdp-view-mode') || 'table').trim() || 'table',
       showOnly: true,
@@ -21857,19 +22656,22 @@ function dynamicPagesClientScript() {
           return linkRow.querySelector('[data-visualization-link-field="' + field + '"]');
         }
         var column = String((linkField('column') || {}).value || '').trim();
-        var modeValue = String((linkField('mode') || {}).value || 'text').trim();
+        var modeValue = String((linkField('mode') || {}).value || 'auto').trim();
         var urlTemplate = String((linkField('urlTemplate') || {}).value || '').trim();
         var textTemplate = String((linkField('textTemplate') || {}).value || '').trim() || '$' + '{mysource.value}';
         var target = String((linkField('target') || {}).value || 'self').trim() === 'blank' ? 'blank' : 'self';
         var defaultTextTemplate = '$' + '{mysource.value}';
-        var hasLinkDraft = modeValue === 'link' || urlTemplate || textTemplate !== defaultTextTemplate || target !== 'self';
+        var hasLinkDraft = modeValue !== 'auto' || target !== 'self';
         if (column && hasLinkDraft) {
-          columnLinks[column] = {
-            mode: modeValue === 'link' ? 'link' : 'text',
-            urlTemplate: urlTemplate,
-            textTemplate: textTemplate,
-            target: target
-          };
+          var linkMode = modeValue === 'link' ? 'link' : (modeValue === 'text' ? 'text' : 'auto');
+          columnLinks[column] = linkMode === 'auto'
+            ? { mode: 'auto', target: target }
+            : {
+              mode: linkMode,
+              urlTemplate: urlTemplate,
+              textTemplate: textTemplate,
+              target: target
+            };
         }
       });
       var table = { name: name, mode: mode, titleAlign: titleAlign };
@@ -21951,22 +22753,18 @@ function dynamicPagesClientScript() {
       var pathElement = row.querySelector('[data-object-scope-field="path"]');
       var negateElement = row.querySelector('[data-object-scope-field="negate"]');
       var opElement = row.querySelector('[data-object-scope-field="op"]');
-      var valueElement = row.querySelector('[data-object-scope-field="value"]') || row.querySelector('[data-object-scope-field="regex"]');
-      var valueParamElement = row.querySelector('[data-object-scope-field="valueParam"]');
-      var valueColumnElement = row.querySelector('[data-object-scope-field="valueColumn"]');
+      var expressionElement = row.querySelector('[data-object-scope-field="rightExpression"]');
       var action = String(actionElement && actionElement.value || 'include').trim() === 'exclude' ? 'exclude' : 'include';
       var path = String(pathElement && pathElement.value || '').trim();
       var op = normalizeObjectGroupOperator(opElement && opElement.value || 'matches');
       var negate = normalizeObjectGroupNegate(negateElement && negateElement.value, opElement && opElement.value);
-      var value = String(valueElement && valueElement.value || '').trim();
-      var valueParam = String(valueParamElement && valueParamElement.value || '').trim();
-      var valueColumn = String(valueColumnElement && valueColumnElement.value || '').trim();
-      if (!path && !value && !valueParam && !valueColumn) return;
+      var rightExpression = String(expressionElement && expressionElement.value || '').trim();
+      if (!path && !rightExpression) return;
       if (!path) throw new Error(t('objectGroupNeedsPath'));
-      if (objectGroupOperatorUsesValue(op) && !value && !valueParam && !valueColumn) throw new Error(t('objectGroupNeedsRegex'));
+      if (objectGroupOperatorUsesValue(op) && !rightExpression) throw new Error(t('objectGroupNeedsRegex'));
       if (op === 'matches') {
         try {
-          new RegExp(value.replace(/\$\{(param|var|contractparam)\.([A-Za-z_][A-Za-z0-9_]*)\}/g, ''));
+          new RegExp(rightExpression.replace(/\$\{(?:param|previous)\.[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\}/g, ''));
         } catch (error) {
           throw new Error(t('objectGroupInvalidRegex') + ': ' + (error && error.message ? error.message : String(error)));
         }
@@ -21977,60 +22775,22 @@ function dynamicPagesClientScript() {
         negate: negate,
         op: op
       };
-      if (value) {
-        if (op === 'matches') rule.regex = value;
-        else rule.value = value;
-      }
-      if (valueParam) rule.valueParam = valueParam;
-      if (valueColumn) rule.valueColumn = valueColumn;
+      if (rightExpression) rule.rightExpression = rightExpression;
       rules.push(rule);
     });
     return rules;
   }
 
   function readObjectGroupFields() {
-    var selectionNodes = Array.prototype.slice.call(document.querySelectorAll('[data-object-selection]'));
-    if (!selectionNodes.length && hasField('cmdp-object-class')) {
-      var legacyClassName = String(readValue('cmdp-object-class') || '').trim();
-      var legacyRules = readObjectGroupScopeRows(document);
-      if (!legacyClassName) throw new Error(t('objectGroupNeedsClass'));
-      return {
-        className: legacyClassName,
-        rules: legacyRules.length ? legacyRules : [{ action: 'include', path: 'Code', regex: '.*' }],
-        selections: [normalizeObjectSelection({
-          name: defaultObjectSelectionName(0),
-          alias: 'objects',
-          className: legacyClassName,
-          rules: legacyRules
-        }, 0)]
-      };
-    }
-
-    var selections = selectionNodes.map(function (node, index) {
-      var nameField = node.querySelector('[data-object-selection-field="name"]');
-      var aliasField = node.querySelector('[data-object-selection-field="alias"]');
-      var classField = node.querySelector('[data-object-selection-field="className"]');
-      var fromField = node.querySelector('[data-object-selection-field="from"]');
-      var limitField = node.querySelector('[data-object-selection-field="limit"]');
-      var columnsField = node.querySelector('[data-object-selection-field="columns"]');
-      var className = String(classField && classField.value || '').trim();
-      var alias = String(aliasField && aliasField.value || '').trim() || objectSelectionAlias(index);
-      var limitText = String(limitField && limitField.value || '').trim();
-      var rules = readObjectGroupScopeRows(node);
+    var draft = captureObjectGroupDraftFromDom();
+    var selections = objectSelectionsFromModel(draft);
+    selections.forEach(function (selection, index) {
+      var className = String(selection && selection.className || '').trim();
+      var alias = String(selection && selection.alias || '').trim() || objectSelectionAlias(index);
+      var limit = Number(selection && selection.limit || 0);
       if (!className) throw new Error(t('objectGroupNeedsClass'));
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias)) throw new Error(t('invalidParamName'));
-      if (limitText && (!/^[1-9][0-9]*$/.test(limitText))) throw new Error(t('selectionInvalidLimit'));
-      return normalizeObjectSelection({
-        id: String(node.getAttribute('data-object-selection-id') || '').trim(),
-        name: String(nameField && nameField.value || '').trim() || defaultObjectSelectionName(index),
-        alias: alias,
-        className: className,
-        from: String(fromField && fromField.value || '').trim(),
-        limit: limitText ? Number(limitText) : 100,
-        filterJoin: String(node.getAttribute('data-object-filter-join') || '').trim(),
-        columns: normalizeObjectSelectionColumns(columnsField && columnsField.value),
-        rules: rules.length ? rules : [{ action: 'include', path: 'Code', regex: '.*' }]
-      }, index);
+      if (!Number.isFinite(limit) || limit < 1) throw new Error(t('selectionInvalidLimit'));
     });
     if (!selections.length) selections = [defaultObjectSelection(0, state.selectedClass || '')];
     return {
@@ -22049,7 +22809,7 @@ function dynamicPagesClientScript() {
       : {};
     selections.forEach(function (selection) {
       selection.rules.forEach(function (rule) {
-        String((rule.regex || '') + ' ' + (rule.value || '')).replace(/\$\{param\.([A-Za-z_][A-Za-z0-9_]*)\}/g, function (_, name) {
+        String(rule.rightExpression || '').replace(/\$\{param\.([A-Za-z_][A-Za-z0-9_]*)\}/g, function (_, name) {
           if (!params[name]) params[name] = { type: 'string', required: true };
           return '';
         });
@@ -22057,21 +22817,15 @@ function dynamicPagesClientScript() {
     });
     var steps = selections.map(function (selection, index) {
       var filters = selection.rules.map(function (rule) {
-        var op = normalizeObjectGroupOperator(rule.op || rule.operator || (rule.regex !== undefined ? 'matches' : 'equals'));
+        var op = normalizeObjectGroupOperator(rule.op || rule.operator || 'equals');
         var filter = {
           scope: rule.action === 'exclude' ? 'exclude' : 'include',
           path: rule.path,
           negate: normalizeObjectGroupNegate(rule.negate !== undefined ? rule.negate : rule.not, rule.op || rule.operator),
           op: op
         };
-        if (op === 'matches') {
-          filter.regex = rule.regex !== undefined && rule.regex !== '' ? rule.regex : (rule.value !== undefined && rule.value !== '' ? rule.value : '.*');
-        } else if (objectGroupOperatorUsesValue(op)) {
-          if (rule.valueParam) filter.valueParam = rule.valueParam;
-          if (rule.valueColumn) filter.valueColumn = rule.valueColumn;
-          if (rule.value !== undefined && rule.value !== '') filter.value = rule.value;
-          else if (rule.regex !== undefined && rule.regex !== '') filter.value = rule.regex;
-        }
+        if (op === 'matches') filter.regexExpression = String(rule.rightExpression || '.*');
+        else if (objectGroupOperatorUsesValue(op)) filter.valueExpression = String(rule.rightExpression || '');
         return filter;
       });
       var alias = selection.alias || objectSelectionAlias(index);
@@ -22259,49 +23013,50 @@ function dynamicPagesClientScript() {
         var pathElement = row.querySelector('[data-object-scope-field="path"]');
         var negateElement = row.querySelector('[data-object-scope-field="negate"]');
         var opElement = row.querySelector('[data-object-scope-field="op"]');
-        var valueElement = row.querySelector('[data-object-scope-field="value"]') || row.querySelector('[data-object-scope-field="regex"]');
-        var valueParamElement = row.querySelector('[data-object-scope-field="valueParam"]');
-        var valueColumnElement = row.querySelector('[data-object-scope-field="valueColumn"]');
+        var expressionElement = row.querySelector('[data-object-scope-field="rightExpression"]');
         var path = String(pathElement && pathElement.value || '').trim();
         var op = normalizeObjectGroupOperator(opElement && opElement.value || 'matches');
-        var value = String(valueElement && valueElement.value || '').trim();
-        var valueParam = String(valueParamElement && valueParamElement.value || '').trim();
-        var valueColumn = String(valueColumnElement && valueColumnElement.value || '').trim();
-        if (!path && !value && !valueParam && !valueColumn) return;
+        var rightExpression = String(expressionElement && expressionElement.value || '').trim();
+        if (!path && !rightExpression) return;
         var rule = {
           action: String(actionElement && actionElement.value || 'include').trim() === 'exclude' ? 'exclude' : 'include',
           path: path,
           negate: normalizeObjectGroupNegate(negateElement && negateElement.value, opElement && opElement.value),
           op: op
         };
-        if (value) {
-          if (op === 'matches') rule.regex = value;
-          else rule.value = value;
-        }
-        if (valueParam) rule.valueParam = valueParam;
-        if (valueColumn) rule.valueColumn = valueColumn;
+        if (rightExpression) rule.rightExpression = rightExpression;
         rules.push(rule);
       });
       return rules;
     }
+    var baseline = state.objectGroupDraft && Array.isArray(state.objectGroupDraft.selections)
+      ? objectSelectionsFromModel(state.objectGroupDraft)
+      : objectSelectionsFromModel(inferObjectGroupModel(readCurrentSpec()));
+    var selections = baseline.map(function (selection, index) {
+      return normalizeObjectSelection(selection, index);
+    });
     var selectionNodes = Array.prototype.slice.call(document.querySelectorAll('[data-object-selection]'));
-    var selections = selectionNodes.map(function (node, index) {
+    selectionNodes.forEach(function (node) {
+      var index = Number(node.getAttribute('data-object-selection-index') || 0);
+      if (!Number.isFinite(index) || index < 0) index = 0;
       var nameField = node.querySelector('[data-object-selection-field="name"]');
       var aliasField = node.querySelector('[data-object-selection-field="alias"]');
       var classField = node.querySelector('[data-object-selection-field="className"]');
       var fromField = node.querySelector('[data-object-selection-field="from"]');
       var limitField = node.querySelector('[data-object-selection-field="limit"]');
-      var columnsField = node.querySelector('[data-object-selection-field="columns"]');
       var rules = captureRules(node);
-      return normalizeObjectSelection({
+      var existing = selections[index] || defaultObjectSelection(index, '');
+      selections[index] = normalizeObjectSelection({
         name: String(nameField && nameField.value || '').trim() || defaultObjectSelectionName(index),
         alias: String(aliasField && aliasField.value || '').trim() || objectSelectionAlias(index),
         className: String(classField && classField.value || '').trim(),
         from: String(fromField && fromField.value || '').trim(),
         limit: String(limitField && limitField.value || '').trim() ? Number(limitField.value) : 100,
         filterJoin: String(node.getAttribute('data-object-filter-join') || '').trim(),
-        columns: normalizeObjectSelectionColumns(columnsField && columnsField.value),
-        rules: rules.length ? rules : [{ action: 'include', path: 'Code', regex: '.*' }]
+        // Columns are an internal projection retained for existing templates
+        // and extended automatically from downstream dependencies.
+        columns: existing.columns,
+        rules: rules.length ? rules : [{ action: 'include', path: 'Code', rightExpression: '.*' }]
       }, index);
     });
     if (!selections.length) {
@@ -22310,7 +23065,7 @@ function dynamicPagesClientScript() {
         name: defaultObjectSelectionName(0),
         alias: 'objects',
         className: String(readValue('cmdp-object-class') || '').trim(),
-        rules: legacyRules.length ? legacyRules : [{ action: 'include', path: 'Code', regex: '.*' }]
+        rules: legacyRules.length ? legacyRules : [{ action: 'include', path: 'Code', rightExpression: '.*' }]
       }, 0)];
     }
     var first = selections[0] || defaultObjectSelection(0, '');
@@ -22325,8 +23080,13 @@ function dynamicPagesClientScript() {
     var previousSpec = readCurrentSpec();
     var selections = matchingSelectionsForSpec(previousSpec);
     if (selections.length < 1) throw new Error(t('matchingNeedsSelections'));
-    var operations = [];
-    Array.prototype.slice.call(document.querySelectorAll('[data-flow-operation]')).forEach(function (operationNode, index) {
+    var existingModel = state.relationDraft && Array.isArray(state.relationDraft.operations)
+      ? state.relationDraft
+      : inferRelationExpansionModel(previousSpec);
+    var operations = flowOperations(existingModel).slice();
+    Array.prototype.slice.call(document.querySelectorAll('[data-flow-operation]')).forEach(function (operationNode, renderedIndex) {
+      var index = Number(operationNode.getAttribute('data-flow-operation-index') || renderedIndex);
+      if (!Number.isFinite(index) || index < 0) index = renderedIndex;
       var type = String(operationNode.getAttribute('data-flow-operation') || '').trim().toLowerCase();
       if (type === 'match' || type === 'semijoin') {
         var fromField = operationNode.querySelector('[data-matching-block-field="from"]');
@@ -22376,9 +23136,9 @@ function dynamicPagesClientScript() {
           ruleJoin: String(ruleJoinField && ruleJoinField.value || 'any').trim(),
           rules: rules
         };
-        operations.push(type === 'semijoin'
+        operations[index] = type === 'semijoin'
           ? normalizeSemiJoinOperation(matchingValue, index, selections, operations)
-          : normalizeMatchingBlock(matchingValue, index, selections, operations));
+          : normalizeMatchingBlock(matchingValue, index, selections, operations);
         return;
       }
       if (type === 'relation') {
@@ -22389,7 +23149,7 @@ function dynamicPagesClientScript() {
         var directionField = operationNode.querySelector('[data-relation-operation-field="direction"]');
         var columnsField = operationNode.querySelector('[data-relation-operation-field="columns"]');
         var limitField = operationNode.querySelector('[data-relation-operation-field="limit"]');
-        operations.push(normalizeRelationOperation({
+        operations[index] = normalizeRelationOperation({
           id: String(operationNode.getAttribute('data-relation-operation-id') || '').trim(),
           type: 'relation',
           from: String(relationFromField && relationFromField.value || '').trim(),
@@ -22397,9 +23157,9 @@ function dynamicPagesClientScript() {
           domain: String(domainField && domainField.value || '').trim(),
           targetClass: String(targetClassField && targetClassField.value || '').trim(),
           direction: String(directionField && directionField.value || '').trim(),
-          columns: String(columnsField && columnsField.value || '').split(',').map(function (item) { return item.trim(); }).filter(Boolean),
+          columns: catalogFieldPickerSelectedFieldValues(columnsField),
           limit: Number(limitField && limitField.value || 0)
-        }, index, selections, operations));
+        }, index, selections, operations);
         return;
       }
       if (type === 'existsrelated') {
@@ -22437,7 +23197,7 @@ function dynamicPagesClientScript() {
           });
         });
         if (!existsRules.length) throw new Error(t('matchingNeedsRule'));
-        operations.push(normalizeExistsRelatedOperation({
+        operations[index] = normalizeExistsRelatedOperation({
           id: String(operationNode.getAttribute('data-exists-related-operation-id') || '').trim(),
           type: 'existsRelated',
           from: String(existsFromField && existsFromField.value || '').trim(),
@@ -22446,10 +23206,10 @@ function dynamicPagesClientScript() {
           domain: String(existsDomainField && existsDomainField.value || '').trim(),
           targetClass: String(existsTargetClassField && existsTargetClassField.value || '').trim(),
           direction: String(existsDirectionField && existsDirectionField.value || '').trim(),
-          columns: String(existsColumnsField && existsColumnsField.value || '').split(',').map(function (item) { return item.trim(); }).filter(Boolean),
+          columns: catalogFieldPickerSelectedFieldValues(existsColumnsField),
           limit: Number(existsLimitField && existsLimitField.value || 0),
           rules: existsRules
-        }, index, selections, operations));
+        }, index, selections, operations);
         return;
       }
       var setFromField = operationNode.querySelector('[data-set-operation-field="from"]');
@@ -22465,7 +23225,7 @@ function dynamicPagesClientScript() {
         if (left && right) on.push({ left: left, right: right });
       });
       if (!on.length) throw new Error(t('setOperationKeys'));
-      operations.push(normalizeSetOperation({
+      operations[index] = normalizeSetOperation({
         id: String(operationNode.getAttribute('data-set-operation-id') || '').trim(),
         type: type,
         from: String(setFromField && setFromField.value || '').trim(),
@@ -22473,7 +23233,7 @@ function dynamicPagesClientScript() {
         as: String(setAsField && setAsField.value || '').trim(),
         on: on,
         distinct: Boolean(distinctField && distinctField.checked)
-      }, index, selections, operations));
+      }, index, selections, operations);
     });
     var model = normalizeObjectMatchingModel({
       operations: operations
@@ -22683,7 +23443,10 @@ function dynamicPagesClientScript() {
     var resultTables = objectSpec.result && objectSpec.result.tables ? objectSpec.result.tables.slice() : [];
     operations.forEach(function (operation, index) {
       if (resultTables.some(function (table) { return table && table.name === operation.as; })) return;
-      var columnRows = flowColumnOptionRows(model, specForLabels, operation.as, operations.length, {}, true);
+      // Result table metadata carries only deterministic dependencies. Full
+      // readable-card expansion belongs to Extraction, and user-selected
+      // publication columns belong to Final data.
+      var columnRows = flowColumnOptionRows(model, specForLabels, operation.as, operations.length, {}, false);
       resultTables.push({
         name: operation.as,
         title: assistantManagedObjectFlow(specForLabels)
@@ -22697,7 +23460,7 @@ function dynamicPagesClientScript() {
       resultTables.push({
         name: finalAlias,
         title: assistantManagedObjectFlow(specForLabels) ? userFacingResultLabel(finalAlias, specForLabels) : t('extractionFinalResult'),
-        columns: flowColumnOptionRows(model, specForLabels, finalAlias, operations.length, {}, true).map(function (item) { return item.value; })
+        columns: flowColumnOptionRows(model, specForLabels, finalAlias, operations.length, {}, false).map(function (item) { return item.value; })
       });
     }
     var preservedPublishedTable = previousSpec && previousSpec.result && Array.isArray(previousSpec.result.tables)
@@ -22993,28 +23756,6 @@ function dynamicPagesClientScript() {
     }
   }
 
-  function applyExtractionPublishedTable() {
-    try {
-      var specData = readSpecWithParamEditor();
-      var selectedName = String(readValue('cmdp-extraction-source') || state.extractionSource || '').trim();
-      if (!selectedName) throw new Error(t('viewComposerNeedsSource'));
-      specData.spec = ensureExtractionPreviewTable(specData.spec, selectedName);
-      specData.spec.result.tables.forEach(function (table) {
-        if (!table) return;
-        if (table.name === selectedName) table.published = true;
-        else delete table.published;
-      });
-      state.extractionSource = selectedName;
-      updateSelectedFromEditor(specData.spec);
-      state.runParams = Object.assign({}, specData.examples, state.runParams || {});
-      state.message = { type: 'ok', text: t('extractionPublishedSelected') };
-      renderDesigner();
-    } catch (error) {
-      state.message = { type: 'error', text: error.message || String(error) };
-      renderDesigner();
-    }
-  }
-
   function previewExtraction() {
     try {
       var specData = readSpecWithParamEditor();
@@ -23050,7 +23791,7 @@ function dynamicPagesClientScript() {
       return;
     }
     state.extractionPreview = null;
-    requestDraftPreview(authoringPreviewPath({ includeDiagrams: false }), payload, params).then(function (result) {
+    requestDraftPreview(authoringPreviewPath({ includeDiagrams: false, extractionSource: state.extractionSource }), payload, params).then(function (result) {
       state.extractionPreview = result;
       var sourceWarning = extractionSelectedSourceEmptyWarning(result, state.extractionSource, payload.spec);
       state.message = {
@@ -23247,7 +23988,13 @@ function dynamicPagesClientScript() {
     var classField = selection ? selection.querySelector('[data-object-selection-field="className"]') : null;
     var className = classField && classField.value || readValue('cmdp-object-class') || (state.objectGroupDraft && state.objectGroupDraft.className) || state.selectedClass || '';
     clearDraftExecutionState({ clearExtractionSource: true });
-    if (body) body.insertAdjacentHTML('beforeend', renderObjectGroupScopeRuleRow({ action: 'include', path: 'Code', regex: '.*' }, className));
+    var draft = captureObjectGroupDraftFromDom();
+    var selections = objectSelectionsFromModel(draft);
+    var selectionIndex = Number(selection && selection.getAttribute('data-object-selection-index') || 0);
+    if (!Number.isFinite(selectionIndex) || selectionIndex < 0) selectionIndex = 0;
+    var sourceAlias = selections[selectionIndex] && selections[selectionIndex].from || '';
+    var ruleIndex = selection ? selection.querySelectorAll('[data-object-scope-row]').length : 0;
+    if (body) body.insertAdjacentHTML('beforeend', renderObjectGroupScopeRuleRow({ action: 'include', path: 'Code', rightExpression: '.*' }, className, selections, selectionIndex, sourceAlias, readCurrentSpec(), ruleIndex));
   }
 
   function addObjectSelection() {
@@ -23259,6 +24006,31 @@ function dynamicPagesClientScript() {
       rules: selections[0] && selections[0].rules || [],
       selections: selections
     };
+    state.objectGroupExpandedSelectionId = objectGroupSelectionId(selections[selections.length - 1], selections.length - 1);
+    state.relationDraft = null;
+    state.viewComposerDraft = null;
+    clearDraftExecutionState({ clearExtractionSource: true });
+    renderDesigner();
+  }
+
+  function removeObjectSelection(index) {
+    var draft = captureObjectGroupDraftFromDom();
+    var selections = objectSelectionsFromModel(draft);
+    var targetIndex = Number(index);
+    if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= selections.length) return;
+    var dependencies = objectSelectionDependencyLabels(selections, targetIndex, readCurrentSpec());
+    if (dependencies.length) {
+      state.message = { type: 'warning', text: t('objectSelectionDeleteBlocked') + ' ' + t('objectSelectionDeleteDependencies', { items: dependencies.join(', ') }) };
+      renderDesigner();
+      return;
+    }
+    selections.splice(targetIndex, 1);
+    state.objectGroupDraft = {
+      className: selections[0] && selections[0].className || '',
+      rules: selections[0] && selections[0].rules || [],
+      selections: selections
+    };
+    state.objectGroupExpandedSelectionId = objectGroupSelectionId(selections[Math.min(targetIndex, selections.length - 1)], Math.min(targetIndex, selections.length - 1));
     state.relationDraft = null;
     state.viewComposerDraft = null;
     clearDraftExecutionState({ clearExtractionSource: true });
@@ -23296,7 +24068,22 @@ function dynamicPagesClientScript() {
     var draft = captureRelationDraftFromDom();
     mutator(draft);
     state.relationDraft = normalizeObjectMatchingModel(draft, readCurrentSpec());
+    var operations = flowOperations(state.relationDraft);
+    var lastIndex = operations.length - 1;
+    if (lastIndex >= 0) state.relationExpandedOperationId = relationOperationId(operations[lastIndex], lastIndex);
     clearDraftExecutionState({ clearExtractionSource: true });
+    renderDesigner();
+  }
+
+  function expandObjectGroupSelection(selectionId) {
+    state.objectGroupDraft = captureObjectGroupDraftFromDom();
+    state.objectGroupExpandedSelectionId = String(selectionId || '');
+    renderDesigner();
+  }
+
+  function expandRelationOperation(operationId) {
+    state.relationDraft = captureRelationDraftFromDom();
+    state.relationExpandedOperationId = String(operationId || '');
     renderDesigner();
   }
 
@@ -23342,8 +24129,20 @@ function dynamicPagesClientScript() {
     var sourceAlias = String(sourceField && sourceField.value || '').trim();
     var sourceClass = relationPathSourceClass(state.relationDraft || captureRelationDraftFromDom(), readCurrentSpec(), sourceAlias);
     var signature = String(pathField && pathField.value || '').trim();
-    var pathItem = catalogDomainRelationPathOptions(sourceClass).find(function (item) { return String(item && item.signature || '') === signature; });
-    var path = pathItem && Array.isArray(pathItem.path) ? pathItem.path : [];
+    var serializedPath = String(pathField && pathField.getAttribute && pathField.getAttribute('data-catalog-field-picker-selected-path') || '');
+    var path = [];
+    try {
+      path = JSON.parse(serializedPath || '[]');
+    } catch (error) {
+      path = [];
+    }
+    if (!Array.isArray(path) || !path.length) {
+      var picker = pathField && pathField.closest && pathField.closest('[data-catalog-field-picker]');
+      var pathItem = picker && Array.isArray(picker._catalogFieldPickerOptions) && picker._catalogFieldPickerOptions.find(function (item) {
+        return String(item && item.value || '') === signature;
+      });
+      path = pathItem && Array.isArray(pathItem.path) ? pathItem.path : [];
+    }
     if (!sourceAlias || !path.length || !path.every(function (hop) { return hop && hop.kind === 'domain' && hop.name && hop.targetClass; })) {
       state.message = { type: 'error', text: t('relationPathRequired') };
       renderDesigner();
@@ -23743,7 +24542,23 @@ function dynamicPagesClientScript() {
         delete mapping.source;
         var sourceInfo = diagramImportMaterializedStageForItemClient(proposal, structureItem, state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
         var selectedSourceStage = sourceInfo.stage || {};
-        primary.className = String(selectedSourceStage.className || '') || value('primary.className') || primary.className || '';
+        var ancestor = diagramImportNearestMaterializedAncestorClient(proposal, structureItem);
+        var parentStage = ancestor && ancestor.stageId
+          ? diagramImportStageById(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(), ancestor.stageId) || {}
+          : {};
+        var selectedPrimaryCardSource = diagramImportConditionSourceFromElement(container.querySelector('[data-diagram-import-placement-field="primary.cardSource"]'));
+        var primaryProjection = diagramImportPrimaryCardSourceClient(
+          selectedSourceStage,
+          Object.assign({}, primary, selectedPrimaryCardSource ? { cardSource: selectedPrimaryCardSource } : {}),
+          parentStage
+        );
+        if (primaryProjection.source) {
+          primary.cardSource = primaryProjection.source;
+          primary.className = String(primaryProjection.source.className || '');
+        } else {
+          delete primary.cardSource;
+          primary.className = String(selectedSourceStage.className || '') || value('primary.className') || primary.className || '';
+        }
         primary.idAttribute = '_id';
         mapping.primary = primary;
         var capturePlacementConditions = function () {
@@ -24129,6 +24944,7 @@ function dynamicPagesClientScript() {
         structuredFields: diagramImportPrimaryDataFieldsClient(role, Object.assign({}, primary, {
           structuredFields: dedupe(primary.structuredFields, ['Code', 'Description'])
         })),
+        ...(normalizeDiagramImportConditionCardSourceClient(primary.cardSource) ? { cardSource: normalizeDiagramImportConditionCardSourceClient(primary.cardSource) } : {}),
         filters: []
       },
       conditions: diagramImportPlacementFiltersClient(candidate.conditions),
@@ -24772,8 +25588,11 @@ function dynamicPagesClientScript() {
     var assistantCheckpoint = state.diagramImportAssistantCheckpoint;
     var selected = state.selectedTemplate;
     if (!analysisCheckpoint || !selected || state.diagramImportProposal || state.diagramImportRestorePending) return Promise.resolve(false);
-    var source = String(state.diagramImportSource || templateAuthoringClient(selected.spec || defaultSpec()).d2.source || '');
+    // Restore is only for the saved template selected by the user. Do not let
+    // a stale textarea value turn a saved analysis checkpoint into a conflict.
+    var source = String(templateAuthoringClient(selected.spec || defaultSpec()).d2.source || '');
     if (!source.trim()) return Promise.resolve(false);
+    state.diagramImportSource = source;
     var requestRevision = diagramImportRequestRevisionSnapshot(null, source);
     state.diagramImportRestorePending = true;
     state.diagramImportRestoreError = '';
@@ -26462,6 +27281,8 @@ function dynamicPagesClientScript() {
     state.selectedTemplate = state.templates.find(function (item) { return item.code === code; }) || null;
     state.objectGroupDraft = null;
     state.relationDraft = null;
+    state.objectGroupExpandedSelectionId = '';
+    state.relationExpandedOperationId = '';
     state.viewComposerDraft = null;
     state.paramRowsDraft = null;
     state.result = null;
@@ -26500,6 +27321,8 @@ function dynamicPagesClientScript() {
     };
     state.objectGroupDraft = null;
     state.relationDraft = null;
+    state.objectGroupExpandedSelectionId = '';
+    state.relationExpandedOperationId = '';
     state.viewComposerDraft = null;
     state.paramRowsDraft = null;
     state.extractionPreview = null;
@@ -27099,6 +27922,10 @@ function dynamicPagesClientScript() {
   }
 
   document.addEventListener('click', function (event) {
+    var fieldPicker = event.target && event.target.closest
+      ? event.target.closest('[data-catalog-field-picker], [data-diagram-import-condition-picker]')
+      : null;
+    if (!fieldPicker) closeFieldPickers();
     var sortButton = event.target.closest('[data-result-sort]');
     if (sortButton) {
       event.preventDefault();
@@ -27208,11 +28035,14 @@ function dynamicPagesClientScript() {
     if (action === 'visualize-external') visualizeExternal();
     if (action === 'select-template') selectTemplate(target.getAttribute('data-code'));
     if (action === 'delete-template') deleteTemplate(target.getAttribute('data-code'));
+    if (action === 'object-selection-expand') expandObjectGroupSelection(target.getAttribute('data-object-selection-id'));
     if (action === 'apply-object-group') applyObjectGroupEditor();
     if (action === 'add-object-scope-row') addObjectGroupScopeRuleRow(target);
     if (action === 'add-object-selection') addObjectSelection();
+    if (action === 'remove-object-selection') removeObjectSelection(target.getAttribute('data-object-selection-index'));
     if (action === 'clear-object-scope-row') clearObjectGroupScopeRuleRow(target);
     if (action === 'apply-relation-expansion') applyRelationExpansionEditor();
+    if (action === 'relation-operation-expand') expandRelationOperation(target.getAttribute('data-relation-operation-id'));
     if (action === 'add-matching-block') addMatchingBlock();
     if (action === 'add-relation-operation') addRelationOperation();
     if (action === 'append-relation-path') appendRelationPath();
@@ -27234,7 +28064,6 @@ function dynamicPagesClientScript() {
     if (action === 'clear-param-row') clearParamRow(target);
     if (action === 'extract-template') extractByTemplate();
     if (action === 'apply-extraction') applyExtractionEditor();
-    if (action === 'apply-extraction-published') applyExtractionPublishedTable();
     if (action === 'preview-extraction') previewExtraction();
     if (action === 'add-selection-filter-row') addSelectionFilterRow();
     if (action === 'clear-selection-filter-row') clearSelectionFilterRow(target);
@@ -27830,6 +28659,14 @@ function dynamicPagesClientScript() {
       state.extractionSource = target.value;
       renderDesigner();
     }
+    if (target.id === 'cmdp-view-source') {
+      var viewDraft = captureViewComposerDraftFromDom();
+      viewDraft.sourceAlias = String(target.value || '').trim();
+      viewDraft.columns = [];
+      state.viewComposerDraft = viewDraft;
+      clearDraftExecutionState({ clearExtractionSource: true });
+      renderDesigner();
+    }
     if (target.matches && target.matches('[data-object-selection-field="className"]')) {
       var draft = captureObjectGroupDraftFromDom();
       var selectionNode = target.closest('[data-object-selection]');
@@ -27848,7 +28685,7 @@ function dynamicPagesClientScript() {
     if (target.matches && target.matches('[data-object-scope-field="op"]')) {
       var row = target.closest('[data-object-scope-row]');
       var valueDisabled = !objectGroupOperatorUsesValue(target.value);
-      Array.prototype.slice.call(row ? row.querySelectorAll('[data-object-scope-field="value"], [data-object-scope-field="regex"], [data-object-scope-field="valueParam"], [data-object-scope-field="valueColumn"]') : []).forEach(function (field) {
+      Array.prototype.slice.call(row ? row.querySelectorAll('[data-object-scope-field="rightExpression"]') : []).forEach(function (field) {
         field.disabled = valueDisabled;
         if (field.disabled) field.value = '';
       });
@@ -29900,6 +30737,7 @@ function normalizeTemplateSpecForStorage(spec, code = '', options = {}) {
       }
     }
   }
+  rebaseStoredD2AnalysisCheckpoint(next);
   return next;
 }
 
@@ -31513,10 +32351,15 @@ function runtimeJsonCellLinks(row, rowIndex, columns, table, params) {
   const links = {};
   const columnLinks = table && table.presentation && table.presentation.columnLinks || {};
   (Array.isArray(columns) ? columns : []).forEach((column) => {
-    const linkConfig = columnLinks[column] || {};
-    if (!linkConfig || linkConfig.mode !== 'link' || !linkConfig.urlTemplate) return;
+    const hasExplicitLinkConfig = Object.prototype.hasOwnProperty.call(columnLinks, column);
+    const linkConfig = hasExplicitLinkConfig ? columnLinks[column] || {} : {};
     const value = displayCardValue(row && row[column]);
     const meta = metaByColumn[column] || {};
+    if ((!hasExplicitLinkConfig || linkConfig.mode === 'auto') && isSafeRuntimeLinkUrl(meta.autoHref)) {
+      links[column] = { href: meta.autoHref, text: value, value, target: linkConfig.target === 'blank' ? 'blank' : 'self' };
+      return;
+    }
+    if (!linkConfig || linkConfig.mode !== 'link' || !linkConfig.urlTemplate) return;
     const mysource = {
       ...meta,
       value,
@@ -32817,13 +33660,13 @@ function assistantMessages(body, mcpContext, runtimeConfig) {
     'If you do not know the columns needed to match two sources, do not emit an empty matchRows step; add a warning instead.',
     'For expandRelations.domain, use only CMDBuild domain identifiers from cmdbuild_relation_hints domains[].name; never write domain descriptions or user-facing relation labels into the DSL domain field.',
     'If a relation description cannot be mapped to a CMDBuild domain name, omit expandRelations.domain and add a warning instead of inventing a domain value.',
-    'Use CMDBuild identifiers for className, targetClass, sourceClass, filter path/attribute, columns, and valueColumn/sourceColumn/fromColumn. User-facing descriptions from MCP context are hints only.',
+    'Use CMDBuild identifiers for className, targetClass, sourceClass, filter path/attribute, and columns. Each selection rule has one rightExpression: use ${param.<name>} for a template parameter and ${previous.<field>} for a field of that selection from source. User-facing descriptions from MCP context are hints only.',
     'For class selection, prefer an exact class Description match for the user term over a specialized partial Description match. Use specialized classes only when the user explicitly names their full Description or Code.',
     'When the request contains several class mentions, map each DSL step only to the class mention that describes that step. Do not let the target class mention change the source/anchor class mention.',
     'When the user says a class instance has description "X" or с описанием "X", filter the source selectCards step with {"path":"Description","op":"equals","value":"X"}, not a broad contains filter.',
-    'When the user asks for target cards that have the same attribute value as a named source card, first select the named source card, then use a second selectCards step with "from":"sourceAlias" and a filter like {"path":"Location","op":"equals","valueColumn":"Location"}.',
-    'For same-attribute source-row filtering, prefer selectCards.from plus valueColumn/sourceColumn/fromColumn over matchRows; matchRows is for comparing two already materialized result sets.',
-    'Example source-row pattern: {"type":"selectCards","as":"anchor","className":"Router","filters":[{"path":"Description","op":"contains","value":"Router name"}],"columns":["Code","Description","Location"],"limit":5}, then {"type":"selectCards","as":"arms","from":"anchor","className":"Workstation","filters":[{"path":"Location","op":"equals","valueColumn":"Location"}],"columns":["Code","Description","Location"],"limit":100}.',
+    'When the user asks for target cards that have the same attribute value as a named source card, first select the named source card, then use a second selectCards step with "from":"sourceAlias" and a filter like {"path":"Location","op":"equals","rightExpression":"${previous.Location}"}.',
+    'For same-attribute source-row filtering, prefer selectCards.from plus ${previous.<field>} rightExpression over matchRows; matchRows is for comparing two already materialized result sets.',
+    'Example source-row pattern: {"type":"selectCards","as":"anchor","className":"Router","filters":[{"path":"Description","op":"contains","rightExpression":"Router name"}],"columns":["Code","Description","Location"],"limit":5}, then {"type":"selectCards","as":"arms","from":"anchor","className":"Workstation","filters":[{"path":"Location","op":"equals","rightExpression":"${previous.Location}"}],"columns":["Code","Description","Location"],"limit":100}.',
     'For simple diagrams, use result.diagrams[] with type topology, source.nodes/source.edges, and fields nodeId/nodeLabel/nodeGroup/nodeHref/edgeSource/edgeTarget/edgeLabel.',
     'For graph diagrams with grouping, hierarchy, CMDBuild domains, references, ACL/firewall/route/dependency classes, use deterministic result.diagrams[].nodeMappings, edgeMappings, groupMappings, and hierarchyMappings over existing DSL aliases. Do not output freeform D2 as the runtime spec.',
     'Keep result.tables[] when the user asks for tables; add diagrams when graph/topology is requested.'
@@ -34276,10 +35119,7 @@ function assistantObjectFlowContextSpec(flow) {
         path: rule.path,
         negate: rule.negate,
         op: rule.op,
-        ...(rule.value ? { value: rule.value } : {}),
-        ...(rule.regex ? { regex: rule.regex } : {}),
-        ...(rule.valueParam ? { valueParam: rule.valueParam } : {}),
-        ...(rule.valueColumn ? { valueColumn: rule.valueColumn } : {})
+        ...(rule.rightExpression ? { rightExpression: rule.rightExpression } : {})
       }))
     };
     if (selection.className) step.className = selection.className;
@@ -34402,12 +35242,7 @@ function assistantTypedSelectionStep(candidate, current, warnings) {
       path: String(rule && (rule.path || rule.field || rule.attribute || rule.column) || ''),
       negate: Boolean(rule && (rule.negate || rule.not)),
       op: String(rule && (rule.op || rule.operator) || 'equals'),
-      ...(rule && rule.regex !== undefined ? { regex: String(rule.regex) } : {}),
-      ...(rule && rule.value !== undefined ? { value: String(rule.value) } : {}),
-      ...(rule && rule.valueParam ? { valueParam: String(rule.valueParam) } : {}),
-      ...(rule && (rule.valueColumn || rule.sourceColumn || rule.fromColumn)
-        ? { valueColumn: String(rule.valueColumn || rule.sourceColumn || rule.fromColumn) }
-        : {})
+      ...(rule && rule.rightExpression !== undefined ? { rightExpression: String(rule.rightExpression) } : {})
     }))
   };
 }
@@ -34443,7 +35278,7 @@ function assistantObjectFlowStageMessages(input, mcpContext, runtimeConfig) {
   const assistantConfig = normalizeAssistantRuntimeConfig(runtimeConfig || defaultRuntimeConfig());
   const taskPrompt = String(assistantConfig.prompt[selectionTask ? 'selection' : 'matching'] || '').trim();
   const responseContract = selectionTask
-    ? '{"selection":{"id":"selection:<identifier>","name":"...","alias":"<identifier>","className":"<CMDBuild identifier>","from":"","limit":100,"columns":["Code"],"rules":[{"action":"include","path":"Code","negate":false,"op":"equals","value":"...","regex":"","valueParam":"","valueColumn":""}]},"explanation":"...","warnings":[]}'
+    ? '{"selection":{"id":"selection:<identifier>","name":"...","alias":"<identifier>","className":"<CMDBuild identifier>","from":"","limit":100,"columns":["Code"],"rules":[{"action":"include","path":"Code","negate":false,"op":"equals","rightExpression":"..."}]},"explanation":"...","warnings":[]}'
     : '{"block":{"id":"match:<identifier>","from":"<locked alias>","with":"<locked alias>","as":"<locked alias>","rightPrefix":"Selection 2.","rules":[{"action":"include","negate":false,"operator":"equals","leftColumn":"Code","leftRegex":"","rightColumn":"Code","rightRegex":""}]},"explanation":"...","warnings":[]}';
   const system = [
     'You are a CMDBuild deterministic object-flow stage assistant.',
@@ -34942,15 +35777,12 @@ function normalizeAssistantCandidateFilter(value, block, outputClass, options = 
         path: String(rule.path || '').trim(),
         negate: Boolean(rule.negate),
         op: String(rule.op || '').trim(),
-        regex: String(rule.regex || ''),
-        value: String(rule.value || ''),
-        valueParam: String(rule.valueParam || '').trim(),
-        valueColumn: ''
+        rightExpression: assistantRuleRightExpression(rule)
       };
     });
     if (!ASSISTANT_CMDBUILD_CLASS_IDENTIFIER_PATTERN.test(className)
       || !rules.length
-      || rules.some((rule) => !ASSISTANT_CMDBUILD_IDENTIFIER_PATTERN.test(rule.path) || !ASSISTANT_RESULT_CONTRACT_OPERATORS.has(rule.op) || (!rule.value && !rule.valueParam && !rule.regex))) {
+      || rules.some((rule) => !ASSISTANT_CMDBUILD_IDENTIFIER_PATTERN.test(rule.path) || !ASSISTANT_RESULT_CONTRACT_OPERATORS.has(rule.op) || !rule.rightExpression)) {
       throw assistantCandidateFilterError(
         block,
         'semanticPlanCandidateFilterComparisonSelectionInvalid',
@@ -36600,13 +37432,13 @@ function assistantObjectFlowMessages(input, mcpContext, runtimeConfig, relationR
     'When matchRequirements are present in the user payload, each requirement is binding: create its standalone selection and exactly one match from that selection to a materialized alias of relationClass. Use every listed sourceFields against networkField with the stated operator. Do not use a relation whose source or target is selectionClass for that attribute comparison.',
     'A relation output alias is globally unique and must not duplicate a selection alias. Do not add a standalone selection for a class that is reached only by a confirmed required relation: use the relation output alias in later relations or matches. Do not add any extra relation domain unless the user explicitly asks for that additional relation.',
     'The presence of a domain in MCP context is never itself a request to traverse it. A request that says an IP field is inside a network, CIDR, or range is an attribute comparison; do not replace it with an invented CMDBuild relation.',
-    'For an IP address field compared with a CIDR/network field, use ipv4InCidr. Use ipv4InRange only when the right value is explicitly an IPv4 start-end range. When the network/range rows have already been materialized, prefer a source-driven selection: set the target selection.from to the network alias and add one include rule per IP field with valueColumn set to the network column. Multiple include rules in that selection are OR, so two include rules implement an explicit "or" between Source and Destination IP fields. Use a match only when both independently materialized result sets must be retained together. Use bare materialized column names such as ipaddress and range, never alias-qualified names such as acls.ipaddress. A matched attribute such as Source IP address or Destination IP address belongs to the selected class; never treat its label as a CMDBuild class or a relation target.',
-    'The user payload lists availableParameters from the current template. When the request constrains a selection by one of those input parameters, create an explicit selection rule with that exact valueParam and the requested CMDBuild attribute. Do not replace an explicit parameter condition with a broad Code matches .* rule.',
+    'For an IP address field compared with a CIDR/network field, use ipv4InCidr. Use ipv4InRange only when the right value is explicitly an IPv4 start-end range. When the network/range rows have already been materialized, prefer a source-driven selection: set the target selection.from to the network alias and add one include rule per IP field with rightExpression set to ${previous.<network column>}. Multiple include rules in that selection are OR, so two include rules implement an explicit "or" between Source and Destination IP fields. Use a match only when both independently materialized result sets must be retained together. Use bare materialized column names such as ipaddress and range, never alias-qualified names such as acls.ipaddress. A matched attribute such as Source IP address or Destination IP address belongs to the selected class; never treat its label as a CMDBuild class or a relation target.',
+    'The user payload lists availableParameters from the current template. When the request constrains a selection by one of those input parameters, create an explicit selection rule with rightExpression ${param.<parameter name>} and the requested CMDBuild attribute. Do not replace an explicit parameter condition with a broad Code matches .* rule.',
     'When the business input contains a quoted exact Description for a CMDBuild class, create a Description equals rule with that exact value. Never replace it with a broad Code matches .* rule.',
     'When a later business block explicitly depends on an earlier block and says that a shared attribute is equal, matching, or the same, create a type "match" operation on that attribute. Do not substitute an available CMDBuild domain relation unless the user explicitly requested that relation.',
-    'Selection source filtering is explicit: only set selection.from and a rule.valueColumn when the requested CMDBuild selection itself must be constrained by a prior selection or relation output. The deterministic compiler schedules that selection after its source operation. Never infer filters, joins, deduplication, or operations that were not requested.',
+    'Selection source filtering is explicit: only set selection.from and a rule.rightExpression of the form ${previous.<column>} when the requested CMDBuild selection itself must be constrained by a prior selection or relation output. The deterministic compiler schedules that selection after its source operation. Never infer filters, joins, deduplication, or operations that were not requested.',
     'When the user writes explicit heading ids such as «Выборка 1», «Связь 1.1», or «Сопоставление 7», preserve the human-readable heading in selection.name and explanation. Technical aliases are internal implementation identifiers; do not present invented aliases as user-defined names.',
-    'semanticPlan resultContract is binding. For sourceCards, publish only outputClass. A candidateFilter retains exactly the materialized candidateBlockId result: materialize comparisonSource (reuse its block or create its exact parameterized selection), apply every comparisonPath relation in order, then create one semiJoin from candidates to the terminal comparison alias using ruleJoin and rules. Never replace candidateFilter with a relation starting from candidateClass. Each dependencyPaths item requires one type relation from the materialized sourceClass result of comparisonBlockId to targetClass using its exact domain and direction. This is a direct traversal, not existsRelated or match. Each relationPredicates item requires existsRelated: from retains outputClass cards, with is the materialized comparisonClass result from comparisonBlockId, the domain reaches relatedClass, and every comparisonFields item is compared with relatedField using operator. Each attributePredicates item is a direct comparison between outputClass and a materialized comparisonClass result: create a source-driven outputClass selection with from set to that comparison alias and one include rule per sourceFields item using path=source field, op=operator, and valueColumn=comparisonField. Each referencePathPredicates item is resolved deterministically: create a source-driven selection of terminalClass from its comparison block using terminalField, comparisonField and operator; then materialize every supplied reference hop in reverse order to outputClass and publish that final alias. Do not treat a dotted reference path as a CMDBuild field and do not use Description as a value fallback. Do not create a separate relation output for a sourceCards predicate. For relationPairs domain mode, expand from exactly the selected fromBlockId result, then match RelatedId against _id of exactly the selected withBlockId result; never scan all targetClass cards. For relationPairs match mode, match exactly those two selected results with the supplied rules. If the contract is unresolved, return no flow and explain the ambiguity in warnings.',
+    'semanticPlan resultContract is binding. For sourceCards, publish only outputClass. A candidateFilter retains exactly the materialized candidateBlockId result: materialize comparisonSource (reuse its block or create its exact parameterized selection), apply every comparisonPath relation in order, then create one semiJoin from candidates to the terminal comparison alias using ruleJoin and rules. Never replace candidateFilter with a relation starting from candidateClass. Each dependencyPaths item requires one type relation from the materialized sourceClass result of comparisonBlockId to targetClass using its exact domain and direction. This is a direct traversal, not existsRelated or match. Each relationPredicates item requires existsRelated: from retains outputClass cards, with is the materialized comparisonClass result from comparisonBlockId, the domain reaches relatedClass, and every comparisonFields item is compared with relatedField using operator. Each attributePredicates item is a direct comparison between outputClass and a materialized comparisonClass result: create a source-driven outputClass selection with from set to that comparison alias and one include rule per sourceFields item using path=source field, op=operator, and rightExpression=${previous.<comparison field>}. Each referencePathPredicates item is resolved deterministically: create a source-driven selection of terminalClass from its comparison block using terminalField, comparisonField and operator with rightExpression=${previous.<comparison field>}; then materialize every supplied reference hop in reverse order to outputClass and publish that final alias. Do not treat a dotted reference path as a CMDBuild field and do not use Description as a value fallback. Do not create a separate relation output for a sourceCards predicate. For relationPairs domain mode, expand from exactly the selected fromBlockId result, then match RelatedId against _id of exactly the selected withBlockId result; never scan all targetClass cards. For relationPairs match mode, match exactly those two selected results with the supplied rules. If the contract is unresolved, return no flow and explain the ambiguity in warnings.',
     'Do not save, publish, execute, or mutate the template.'
   ].join('\n');
   const currentFlow = objectFlowFromSpecServer(input.currentSpec || {});
@@ -37104,22 +37936,21 @@ function applyAssistantBusinessAttributeMatchRequirements(flow, requirements, wa
     const sourceSelection = (next.selections || []).find((item) => item.alias === requirement.sourceSelection.alias);
     const targetSelection = (next.selections || []).find((item) => item.alias === requirement.targetSelection.alias);
     if (!sourceSelection || !targetSelection) continue;
-    const sourceReference = `${sourceSelection.alias}.${requirement.leftColumn}`;
     const hasDuplicateSourceFilter = (targetSelection.rules || []).some((rule) => rule
       && rule.path === requirement.rightColumn
-      && (rule.valueColumn === requirement.leftColumn || rule.valueParam === sourceReference));
+      && assistantRulePreviousField(rule) === requirement.leftColumn);
     if (targetSelection.from === sourceSelection.alias || hasDuplicateSourceFilter) {
       targetSelection.from = '';
       const before = targetSelection.rules.length;
       targetSelection.rules = targetSelection.rules.filter((rule) => !(
         rule
         && rule.path === requirement.rightColumn
-        && (rule.valueColumn === requirement.leftColumn || rule.valueParam === sourceReference)
+        && assistantRulePreviousField(rule) === requirement.leftColumn
       ));
       warnings.push(`Assistant converted ${targetSelection.alias} from source-driven filtering to an independent input for the requested attribute comparison.`);
       if (before !== targetSelection.rules.length) warnings.push(`Assistant removed the duplicate ${requirement.rightColumn} valueColumn filter from ${targetSelection.alias}.`);
       if (!targetSelection.rules.length) {
-        targetSelection.rules.push({ action: 'include', path: 'Code', negate: false, op: 'matches', regex: '.*', value: '', valueParam: '', valueColumn: '' });
+        targetSelection.rules.push({ action: 'include', path: 'Code', negate: false, op: 'matches', rightExpression: '.*' });
         warnings.push(`Assistant added a broad Code filter to keep ${targetSelection.alias} executable before the attribute comparison.`);
       }
     }
@@ -37147,11 +37978,17 @@ function applyAssistantBusinessAttributeMatchRequirements(flow, requirements, wa
     targetSelection.rules = (targetSelection.rules || []).filter((rule) => !(
       rule
       && rule.path === requirement.rightColumn
-      && (rule.valueColumn === requirement.leftColumn || rule.valueParam === sourceReference)
+      && assistantRulePreviousField(rule) === requirement.leftColumn
     ));
-    targetSelection.rules.push({ action: 'include', path: requirement.rightColumn, negate: false, op: 'equals', regex: '', value: '', valueParam: '', valueColumn: requirement.leftColumn });
+    targetSelection.rules.push({
+      action: 'include',
+      path: requirement.rightColumn,
+      negate: false,
+      op: 'equals',
+      rightExpression: `\${previous.${requirement.leftColumn}}`
+    });
     next.publishedAlias = targetSelection.alias;
-    warnings.push(`Assistant configured ${targetSelection.alias} as a source-driven ${requirement.rightColumn} filter from ${sourceSelection.alias}.${requirement.leftColumn}.`);
+    warnings.push(`Assistant configured ${targetSelection.alias} as a source-driven ${requirement.rightColumn} expression from ${sourceSelection.alias}.${requirement.leftColumn}.`);
   }
   return normalizeObjectFlow(next);
 }
@@ -37235,7 +38072,7 @@ function assistantReferencePathPredicateFlowState(flow, predicate, outputClass) 
       && rule.action !== 'exclude'
       && rule.op === predicate.operator
       && rule.path === predicate.terminalField
-      && rule.valueColumn === predicate.comparisonField));
+      && assistantRulePreviousField(rule) === predicate.comparisonField));
   const reverseHops = assistantReverseReferencePathHops(predicate);
   const trace = (terminalSelection) => {
     let currentAlias = terminalSelection && String(terminalSelection.alias || '');
@@ -37511,12 +38348,7 @@ function assistantResultContractErrors(flow, semanticPlan, intent, explicitBindi
         const matchingSelections = (flow.selections || []).filter((selection) => selection
           && selection.className === filter.comparisonSource.className
           && (filter.comparisonSource.rules || []).every((expected) => (selection.rules || []).some((rule) => rule
-            && rule.action === expected.action
-            && rule.path === expected.path
-            && rule.op === expected.op
-            && String(rule.value || '') === String(expected.value || '')
-            && String(rule.valueParam || '') === String(expected.valueParam || '')
-            && String(rule.regex || '') === String(expected.regex || ''))));
+            && assistantRuleMatchesExpected(rule, expected))));
         if (matchingSelections.length === 1) comparisonAlias = String(matchingSelections[0].alias || '');
       }
       let missingPath = null;
@@ -37621,7 +38453,7 @@ function assistantResultContractErrors(flow, semanticPlan, intent, explicitBindi
           && rule.action !== 'exclude'
           && rule.op === predicate.operator
           && rule.path === field
-          && rule.valueColumn === predicate.comparisonField)));
+          && assistantRulePreviousField(rule) === predicate.comparisonField)));
       if (!candidate) {
         return [{
           code: 'assistant_result_contract_attribute_predicate',
@@ -37747,16 +38579,11 @@ function assistantObjectFlowBlockOutput(flow, semanticPlan, intent, blockId) {
       && rule.action !== 'exclude'
       && rule.op === predicate.operator
       && rule.path === field
-      && rule.valueColumn === predicate.comparisonField));
+      && assistantRulePreviousField(rule) === predicate.comparisonField));
   const selectionMatchesCandidateSource = (selection, source) => selection
     && selection.className === source.className
     && (source.rules || []).every((expected) => (selection.rules || []).some((rule) => rule
-      && rule.action === expected.action
-      && rule.path === expected.path
-      && rule.op === expected.op
-      && String(rule.value || '') === String(expected.value || '')
-      && String(rule.valueParam || '') === String(expected.valueParam || '')
-      && String(rule.regex || '') === String(expected.regex || '')));
+      && assistantRuleMatchesExpected(rule, expected)));
   const resolve = (blockId) => {
     if (memo.has(blockId)) return memo.get(blockId);
     if (resolving.has(blockId)) return '';
@@ -37819,7 +38646,7 @@ function assistantObjectFlowBlockOutput(flow, semanticPlan, intent, blockId) {
           && rule.action !== 'exclude'
           && rule.op === predicate.operator
           && rule.path === predicate.terminalField
-          && rule.valueColumn === predicate.comparisonField)).map((terminal) => {
+          && assistantRulePreviousField(rule) === predicate.comparisonField)).map((terminal) => {
         let currentAlias = String(terminal.alias || '');
         for (const hop of reverseHops) {
           const nextAlias = uniqueAlias(operations.filter((operation) => operation
@@ -38499,7 +39326,7 @@ function assistantMatchRequirementsErrors(flow, requirements) {
         && rule.action !== 'exclude'
         && rule.op === requirement.operator
         && rule.path === field
-        && rule.valueColumn === requirement.networkField));
+        && assistantRulePreviousField(rule) === requirement.networkField));
     });
     if (sourceDriven) continue;
     const matches = (flow.operations || []).filter((operation) => operation && operation.type === 'match'
@@ -38791,6 +39618,39 @@ function assistantFlowOperator(value, fallback) {
   return operator || fallback;
 }
 
+function assistantRuleRightExpression(rule) {
+  const source = rule && typeof rule === 'object' && !Array.isArray(rule) ? rule : {};
+  if (typeof source.rightExpression === 'string') return source.rightExpression;
+  const valueParam = String(source.valueParam || source.parameter || '').trim();
+  if (valueParam) return `\${param.${valueParam}}`;
+  const valueColumn = String(source.valueColumn || source.sourceColumn || source.fromColumn || '').trim();
+  if (valueColumn) return `\${previous.${valueColumn}}`;
+  const operator = assistantFlowOperator(source.op || source.operator, 'equals');
+  return String(operator === 'matches' && source.regex !== undefined ? source.regex : source.value || '');
+}
+
+function assistantRuleTokenName(rule, kind) {
+  const expression = assistantRuleRightExpression(rule);
+  const match = new RegExp(`^\\$\\{${kind}\\.([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)\\}$`).exec(expression);
+  return match ? match[1] : '';
+}
+
+function assistantRulePreviousField(rule) {
+  return assistantRuleTokenName(rule, 'previous');
+}
+
+function assistantRuleParameterName(rule) {
+  return assistantRuleTokenName(rule, 'param');
+}
+
+function assistantRuleMatchesExpected(rule, expected) {
+  return Boolean(rule && expected
+    && rule.action === expected.action
+    && rule.path === expected.path
+    && rule.op === expected.op
+    && assistantRuleRightExpression(rule) === assistantRuleRightExpression(expected));
+}
+
 function assistantFlowRelationDirection(value, warnings, relationIndex) {
   const raw = assistantFlowTextCandidate(value);
   const normalized = raw.toLowerCase().replace(/[\s_\-/>]+/g, '');
@@ -38829,18 +39689,36 @@ function assistantFlowSetKeys(value) {
   }).filter((item) => item.left && item.right);
 }
 
-function assistantFlowSelectionRules(value, alias, warnings) {
+function assistantFlowSelectionRules(value, alias, warnings, sourceAlias = '') {
   const source = Array.isArray(value) ? value : [];
-  const rules = source.map((rule) => ({
-    action: rule && (rule.action === 'exclude' || rule.scope === 'exclude') ? 'exclude' : 'include',
-    path: assistantFlowTextCandidate(rule && rule.path, rule && rule.field, rule && rule.attribute, rule && rule.column),
-    negate: Boolean(rule && (rule.negate || rule.not)),
-    op: assistantFlowOperator(assistantFlowTextCandidate(rule && rule.op, rule && rule.operator), 'equals'),
-    regex: rule && rule.regex !== undefined ? String(rule.regex) : '',
-    value: rule && rule.value !== undefined ? String(rule.value) : '',
-    valueParam: assistantFlowTextCandidate(rule && rule.valueParam, rule && rule.parameter),
-    valueColumn: assistantFlowTextCandidate(rule && rule.valueColumn, rule && rule.sourceColumn, rule && rule.fromColumn)
-  })).filter((rule) => rule.path);
+  const rules = source.map((rule) => {
+    const op = assistantFlowOperator(assistantFlowTextCandidate(rule && rule.op, rule && rule.operator), 'equals');
+    const valueParam = assistantFlowTextCandidate(rule && rule.valueParam, rule && rule.parameter);
+    const valueColumn = assistantFlowTextCandidate(rule && rule.valueColumn, rule && rule.sourceColumn, rule && rule.fromColumn);
+    const sourceReference = String(sourceAlias || '').trim();
+    const sourceField = sourceReference && valueParam.indexOf(sourceReference + '.') === 0
+      ? valueParam.slice(sourceReference.length + 1)
+      : '';
+    const rightExpression = assistantFlowTextCandidate(rule && rule.rightExpression)
+      || (sourceField ? `\${previous.${sourceField}}` : '')
+      || (valueParam ? `\${param.${valueParam}}` : '')
+      || (valueColumn ? `\${previous.${valueColumn}}` : '')
+      || String(op === 'matches' && rule && rule.regex !== undefined ? rule.regex : rule && rule && rule.value !== undefined ? rule.value : '');
+    return {
+      action: rule && (rule.action === 'exclude' || rule.scope === 'exclude') ? 'exclude' : 'include',
+      path: assistantFlowTextCandidate(rule && rule.path, rule && rule.field, rule && rule.attribute, rule && rule.column),
+      negate: Boolean(rule && (rule.negate || rule.not)),
+      op,
+      rightExpression,
+      // The deterministic semantic normalizers below still inspect these
+      // fields while assembling relation contracts. They are derived only
+      // from rightExpression and never exposed by the Object Group editor.
+      regex: op === 'matches' ? rightExpression : '',
+      value: op === 'matches' ? '' : rightExpression,
+      valueParam,
+      valueColumn
+    };
+  }).filter((rule) => rule.path);
   if (rules.length) return rules;
   warnings.push(`Assistant selection ${alias} had no usable filter; normalized to Code matches .*.`);
   return [{
@@ -38848,6 +39726,7 @@ function assistantFlowSelectionRules(value, alias, warnings) {
     path: 'Code',
     negate: false,
     op: 'matches',
+    rightExpression: '.*',
     regex: '.*',
     value: '',
     valueParam: '',
@@ -38914,7 +39793,7 @@ function assistantObjectFlowCandidate(value, options = {}) {
       from: assistantFlowTextCandidate(item.from, item.sourceAlias, item.leftAlias),
       limit: Number(item.limit) || 100,
       columns: columns.map((column) => assistantFlowTextCandidate(column, column && column.name, column && column.path)).filter(Boolean),
-      rules: assistantFlowSelectionRules(rawRules, alias, warnings)
+      rules: assistantFlowSelectionRules(rawRules, alias, warnings, assistantFlowTextCandidate(item.from, item.sourceAlias, item.leftAlias))
     };
   });
   const operations = rawOperations.map((rawOperation, index) => {
@@ -40191,7 +41070,13 @@ function assistantDeterministicSemanticFlow(intent, semanticPlan, mcpContext, cu
       const predicates = contract.attributePredicates;
       const comparisonAlias = aliases.get(String(predicates[0].comparisonBlockId || ''));
       if (!comparisonAlias || predicates.some((predicate) => predicate.comparisonBlockId !== predicates[0].comparisonBlockId || predicate.comparisonClass !== predicates[0].comparisonClass)) fail(block, 'attribute predicates do not share one materialized comparison result');
-      const rules = predicates.flatMap((predicate) => predicate.sourceFields.map((field) => ({ action: 'include', path: field, negate: false, op: predicate.operator, regex: '', value: '', valueParam: '', valueColumn: predicate.comparisonField })));
+      const rules = predicates.flatMap((predicate) => predicate.sourceFields.map((field) => ({
+        action: 'include',
+        path: field,
+        negate: false,
+        op: predicate.operator,
+        rightExpression: `\${previous.${predicate.comparisonField}}`
+      })));
       aliases.set(block.id, addSelection(block, outputClass, comparisonAlias, rules, '', true, 'any'));
       continue;
     }
@@ -40205,7 +41090,7 @@ function assistantDeterministicSemanticFlow(intent, semanticPlan, mcpContext, cu
       });
       let currentAlias = addSelection(block, predicate.terminalClass, comparisonAlias, [{
         action: 'include', path: predicate.terminalField, negate: false, op: predicate.operator,
-        regex: '', value: '', valueParam: '', valueColumn: predicate.comparisonField
+        rightExpression: `\${previous.${predicate.comparisonField}}`
       }], `reference ${predicate.terminalClass}`);
       reverseHops.forEach((hop, hopIndex) => {
         const alias = hopIndex === reverseHops.length - 1 ? aliasFor(block.id) : aliasFor(`${block.id}_reference_${hopIndex + 1}`);
@@ -40355,16 +41240,13 @@ async function createAssistantObjectFlowDraft(input, options = {}) {
     const exact = matching[0];
     const existing = (selection.rules || []).find((rule) => normalizedAssistantLookupText(rule.path) === 'description');
     if (existing) {
-      const changed = existing.op !== 'equals' || existing.value !== exact.description || existing.valueParam || existing.valueColumn || existing.regex;
+      const changed = existing.op !== 'equals' || existing.rightExpression !== exact.description;
       existing.op = 'equals';
-      existing.value = exact.description;
-      existing.valueParam = '';
-      existing.valueColumn = '';
-      existing.regex = '';
+      existing.rightExpression = exact.description;
       if (changed) warnings.push(`Assistant normalized the exact Description filter for ${selection.className}.`);
       return;
     }
-    selection.rules.push({ action: 'include', path: 'Description', negate: false, op: 'equals', regex: '', value: exact.description, valueParam: '', valueColumn: '' });
+    selection.rules.push({ action: 'include', path: 'Description', negate: false, op: 'equals', rightExpression: exact.description });
     warnings.push(`Assistant added the exact Description filter for ${selection.className} from the business input.`);
   });
   const businessAttributeMatches = assistantBusinessAttributeMatchRequirements(flow, intent, mcpContext);
@@ -40478,10 +41360,9 @@ function assistantSelectionSuggestionFromSpec(spec, stageId, expectedAlias, stag
       path: String(filter && (filter.path || filter.field || filter.attribute || filter.column) || ''),
       negate: Boolean(filter && (filter.negate || filter.not)),
       op: String(filter && (filter.op || filter.operator) || 'equals'),
-      value: filter && filter.value !== undefined ? String(filter.value) : '',
-      regex: filter && filter.regex !== undefined ? String(filter.regex) : '',
-      valueParam: String(filter && filter.valueParam || ''),
-      valueColumn: String(filter && (filter.valueColumn || filter.sourceColumn || filter.fromColumn) || '')
+      rightExpression: filter && filter.regexExpression !== undefined ? String(filter.regexExpression)
+        : filter && filter.valueExpression !== undefined ? String(filter.valueExpression)
+          : objectGroupRightExpression(filter, filter && filter.op)
     })).filter((rule) => rule.path)
   };
 }
@@ -40529,7 +41410,14 @@ function assistantDiagramSelectionMappings(spec, proposal, stages) {
     if (!structureItemId || !role.id || !stage) return null;
     const available = new Set(Array.isArray(stage.columns) ? stage.columns.map(String) : []);
     const primary = rawMapping.primary && typeof rawMapping.primary === 'object' ? cloneJsonValueServer(rawMapping.primary, {}) : {};
-    primary.className = String(primary.className || stage.className || '');
+    const primaryProjection = diagramImportPrimaryCardSource(stage, primary);
+    if (primaryProjection.source) {
+      primary.className = String(primaryProjection.source.className || '');
+      primary.cardSource = primaryProjection.source;
+    } else {
+      primary.className = String(primary.className || stage.className || '');
+      delete primary.cardSource;
+    }
     primary.idAttribute = diagramImportPrimaryIdAttribute(role, primary);
     primary.structuredFields = diagramImportPrimaryStructuredFields(role, primary).filter((field) => available.has(String(field)));
     primary.labelTemplate = String(primary.labelTemplate || '${Description}');
@@ -41236,9 +42124,17 @@ function assistantDiagramPlacementDraftFromResponse(input, parsedObject) {
     if (String(mapping.materialization && mapping.materialization.kind || '') !== 'stage') continue;
     const childStageId = String(mapping.materialization.stageId || '');
     const parentStageId = nearestParentStageIdForItem(item.structureItemId);
-    if (!childStageId || !parentStageId || childStageId === parentStageId) continue;
     const childStage = stageById.get(childStageId);
     const parentStage = stageById.get(parentStageId);
+    const primaryProjection = diagramImportPrimaryCardSource(childStage, mapping.primary || {}, parentStage || null);
+    if (primaryProjection.source) {
+      mapping.primary = {
+        ...(mapping.primary || {}),
+        className: String(primaryProjection.source.className || ''),
+        cardSource: primaryProjection.source
+      };
+    }
+    if (!childStageId || !parentStageId || childStageId === parentStageId) continue;
     const hierarchyConditions = diagramImportPlacementFilters(mapping.hierarchyConditions);
     if (!childStage || !parentStage || hierarchyConditions.rules.length || diagramImportStageDirectlyDependsOn(childStage, parentStage)) continue;
     const correlationCandidates = diagramImportParentCorrelationCandidates(childStage, parentStage);
@@ -42600,10 +43496,14 @@ function validateTemplateSpec(spec) {
             if (filter.op !== undefined && !allowedOps.includes(filter.op)) {
               errors.push({ path: `${filterPath}.op`, message: `selectCards filter op must be one of: ${allowedOps.join(', ')}.` });
             }
-            if ((filter.op === 'matches' || filter.op === 'notMatches' || filter.regex !== undefined) && typeof filter.regex !== 'string') {
+            var regexExpression = filter.regexExpression !== undefined ? filter.regexExpression : filter.regex;
+            if ((filter.op === 'matches' || filter.op === 'notMatches' || regexExpression !== undefined) && typeof regexExpression !== 'string') {
               errors.push({ path: `${filterPath}.regex`, message: 'selectCards regex filter requires a regular expression string.' });
-            } else if (filter.regex !== undefined) {
-              errors.push(...validateRegexPattern(filter.regex, '', `${filterPath}.regex`, false));
+            } else if (regexExpression !== undefined) {
+              errors.push(...validateRegexPattern(regexExpression, '', `${filterPath}.${filter.regexExpression !== undefined ? 'regexExpression' : 'regex'}`, false));
+            }
+            if (filter.valueExpression !== undefined && typeof filter.valueExpression !== 'string') {
+              errors.push({ path: `${filterPath}.valueExpression`, message: 'selectCards valueExpression must be a string.' });
             }
             if (filter.negate !== undefined && typeof filter.negate !== 'boolean') {
               errors.push({ path: `${filterPath}.negate`, message: 'selectCards filter negate must be boolean.' });
@@ -45921,12 +46821,15 @@ function sourceCellMetaForRow(row, column) {
   };
 }
 
-function buildResultCellMeta(rows, columns) {
+function buildResultCellMeta(rows, columns, overrides = {}) {
   const result = {};
   (Array.isArray(rows) ? rows : []).forEach((row, rowIndex) => {
     const rowMeta = {};
     (Array.isArray(columns) ? columns : []).forEach((column) => {
-      rowMeta[column] = sourceCellMetaForRow(row, column);
+      rowMeta[column] = {
+        ...sourceCellMetaForRow(row, column),
+        ...(overrides && overrides[String(rowIndex)] && overrides[String(rowIndex)][column] || {})
+      };
     });
     result[String(rowIndex)] = rowMeta;
   });
@@ -45963,6 +46866,153 @@ function isSafeRuntimeLinkUrl(value) {
   if (lower.startsWith('javascript:') || lower.startsWith('data:') || lower.startsWith('vbscript:')) return false;
   if (/^[a-z][a-z0-9+\.\-]*:/i.test(text)) return /^https?:/i.test(text) || /^mailto:/i.test(text);
   return true;
+}
+
+function decodeHtmlEntities(value) {
+  return String(value || '').replace(/&(?:#x([0-9a-f]+)|#(\d+)|([a-z]+));/gi, (match, hex, decimal, named) => {
+    if (hex || decimal) {
+      const codePoint = Number.parseInt(hex || decimal, hex ? 16 : 10);
+      if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) return match;
+      try {
+        return String.fromCodePoint(codePoint);
+      } catch {
+        return match;
+      }
+    }
+    const entities = { amp: '&', apos: "'", gt: '>', lt: '<', nbsp: ' ', quot: '"' };
+    return entities[String(named || '').toLowerCase()] || match;
+  });
+}
+
+function extractHtmlAnchorHref(value) {
+  const text = String(value || '');
+  const match = text.match(/<a\b[^>]*\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>"']+))/i);
+  return match ? decodeHtmlEntities(match[1] || match[2] || match[3] || '').trim() : '';
+}
+
+function plainTextFromHtml(value) {
+  return decodeHtmlEntities(String(value || '').replace(/<[^>]*>/g, '')).trim();
+}
+
+function normalizeUrlResultValue(value) {
+  const raw = displayCardValue(value).trim();
+  const href = extractHtmlAnchorHref(raw);
+  const text = href || plainTextFromHtml(raw);
+  return {
+    value: text,
+    autoHref: isSafeRuntimeLinkUrl(text) ? text : ''
+  };
+}
+
+function resultTableSourceStep(spec, tableName) {
+  const steps = Array.isArray(spec && spec.steps) ? spec.steps : [];
+  for (let index = steps.length - 1; index >= 0; index -= 1) {
+    if (String(steps[index] && steps[index].as || '').trim() === String(tableName || '').trim()) return steps[index];
+  }
+  return null;
+}
+
+function resultTableColumnPaths(spec, tableName, columns) {
+  const paths = new Map((Array.isArray(columns) ? columns : []).map((column) => [String(column), String(column)]));
+  const step = resultTableSourceStep(spec, tableName);
+  if (!step) return paths;
+  const configured = normalizePathColumnSpecs(step.columns || step.fields || step.cardColumns || step.outputColumns || []);
+  configured.forEach((column) => paths.set(column.as, column.path));
+  return paths;
+}
+
+function resultRowColumnContext(row, column, path) {
+  const columnName = String(column || '').trim();
+  const configuredPath = String(path || columnName).trim();
+  const sourceColumn = columnName.startsWith('Source_');
+  const technicalColumns = new Set([
+    'SourceClass', 'SourceId', 'SourceCode', 'SourceDescription',
+    'Domain', 'RelationId', 'RelationDirection', 'RelationSourceSide',
+    'RelatedClass', 'RelatedId', 'RelatedReadStatus', 'Class', '_id', 'Code', 'Description'
+  ]);
+  if (!row || technicalColumns.has(columnName)) return { className: '', path: configuredPath };
+  return {
+    className: String(sourceColumn
+      ? row.SourceClass
+      : (row.Class || row.RelatedClass || row.SourceClass) || '').trim(),
+    path: sourceColumn && configuredPath.startsWith('Source_')
+      ? configuredPath.slice('Source_'.length)
+      : configuredPath,
+    sourceColumn
+  };
+}
+
+function attributeByName(attributes, name) {
+  const target = String(name || '').toLowerCase();
+  return (Array.isArray(attributes) ? attributes : []).find((attribute) => String(attribute && attribute.name || '').toLowerCase() === target) || null;
+}
+
+async function resolveResultColumnAttribute(cmdbuildExecRequest, pathCache, sourceClass, path) {
+  const text = String(path || '').trim();
+  if (!sourceClass || !text || text.startsWith('{') || text.startsWith('_')) return null;
+  const segments = text.split('.').map((segment) => segment.trim()).filter(Boolean);
+  if (!segments.length) return null;
+  let className = sourceClass;
+  for (let index = 0; index < segments.length; index += 1) {
+    const attribute = attributeByName(await getPathClassAttributes(cmdbuildExecRequest, pathCache, className), segments[index]);
+    if (!attribute) return null;
+    if (index === segments.length - 1) return { attribute, className, path: text };
+    const targetClass = String(attribute.targetClass || attribute.targetType || '').trim();
+    if (!targetClass) return null;
+    className = targetClass;
+  }
+  return null;
+}
+
+function normalizedLookupResultValue(row, column, attributeName) {
+  const keys = [
+    `_${column}_description_translation`,
+    `_${attributeName}_description_translation`,
+    `_${column}_description`,
+    `_${attributeName}_description`
+  ];
+  if (String(column || '').startsWith('Source_')) {
+    keys.unshift(
+      `Source__${attributeName}_description_translation`,
+      `Source__${attributeName}_description`
+    );
+  }
+  for (const key of keys) {
+    const value = displayCardValue(row && row[key]);
+    if (value) return value;
+  }
+  return displayCardValue(row && row[column]);
+}
+
+async function normalizeFinalTableRows(cmdbuildExecRequest, spec, table, rows, columns, pathCache = { attributes: new Map() }) {
+  const columnPaths = resultTableColumnPaths(spec, table && table.name, columns);
+  const normalizedRows = [];
+  const cellMeta = {};
+  for (const [rowIndex, sourceRow] of (Array.isArray(rows) ? rows : []).entries()) {
+    const row = { ...(sourceRow && typeof sourceRow === 'object' ? sourceRow : {}) };
+    const rowMeta = {};
+    for (const column of Array.isArray(columns) ? columns : []) {
+      const columnContext = resultRowColumnContext(row, column, columnPaths.get(String(column)) || column);
+      const resolved = await resolveResultColumnAttribute(cmdbuildExecRequest, pathCache, columnContext.className, columnContext.path);
+      if (!resolved) continue;
+      const type = String(resolved.attribute.type || '').toLowerCase();
+      rowMeta[column] = {
+        attribute: resolved.attribute.name || String(column),
+        attributePath: resolved.path,
+        attributeType: type
+      };
+      if (type === 'lookup') {
+        row[column] = normalizedLookupResultValue(row, column, resolved.attribute.name || column);
+      } else if (type === 'url') {
+        const url = normalizeUrlResultValue(row[column]);
+        row[column] = url.value;
+        if (url.autoHref) rowMeta[column].autoHref = url.autoHref;
+      }
+    }
+    normalizedRows.push(row);
+    if (Object.keys(rowMeta).length) cellMeta[String(rowIndex)] = rowMeta;
+  }
+  return { rows: normalizedRows, cellMeta };
 }
 
 function uniqueStrings(values) {
@@ -46057,7 +47107,7 @@ function normalizeRegexFlags(flags, allMatches) {
 }
 
 function stripRegexParamPlaceholders(pattern) {
-  return String(pattern || '').replace(/\$\{(param|var|contractparam)\.([A-Za-z_][A-Za-z0-9_]*)\}/g, '');
+  return String(pattern || '').replace(/\$\{(?:param|var|contractparam|previous)\.[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\}/g, '');
 }
 
 function regexHasNestedQuantifier(pattern) {
@@ -46323,6 +47373,9 @@ function resolveSelectionClassName(step, params, driverRow) {
 }
 
 function resolveSelectionExpected(filter, params, driverRow) {
+  if (Object.prototype.hasOwnProperty.call(filter, 'valueExpression')) {
+    return resolveSelectionRightExpression(filter.valueExpression, params, driverRow, false);
+  }
   if (Object.prototype.hasOwnProperty.call(filter, 'valueColumn')) {
     return driverRow[filter.valueColumn];
   }
@@ -46616,6 +47669,27 @@ function substituteRegexParams(pattern, params) {
   });
 }
 
+const SELECTION_RIGHT_EXPRESSION_TOKEN = /\$\{(param|previous)\.([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\}/g;
+
+function escapeRegexLiteral(value) {
+  return String(value === undefined || value === null ? '' : value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function resolveSelectionRightExpression(expression, params, driverRow, escapeForRegex) {
+  return String(expression || '').replace(SELECTION_RIGHT_EXPRESSION_TOKEN, (_, kind, name) => {
+    const value = kind === 'previous'
+      ? driverRow && Object.prototype.hasOwnProperty.call(driverRow, name) ? driverRow[name] : undefined
+      : params && Object.prototype.hasOwnProperty.call(params, name) ? params[name] : undefined;
+    if (value === undefined || value === null) {
+      throw new Error(kind === 'previous'
+        ? `Previous-result field ${name} is not available for this selection row.`
+        : `Template parameter ${name} is not available.`);
+    }
+    const text = displayCardValue(value);
+    return escapeForRegex ? escapeRegexLiteral(text) : text;
+  });
+}
+
 async function getPathClassAttributes(cmdbuildExecRequest, pathCache, className) {
   const key = String(className || '').toLowerCase();
   if (pathCache.attributes.has(key)) return pathCache.attributes.get(key);
@@ -46710,8 +47784,10 @@ async function cardMatchesSelectionFilter(cmdbuildExecRequest, pathCache, classN
 
   let matched = false;
   if (op === 'matches') {
-    const pattern = substituteRegexParams(filter.regex, params);
-    assertRegexPatternAllowed(pattern, '', 'selectCards.filter.regex', false);
+    const pattern = filter.regexExpression !== undefined
+      ? resolveSelectionRightExpression(filter.regexExpression, params, driverRow, true)
+      : substituteRegexParams(filter.regex, params);
+    assertRegexPatternAllowed(pattern, '', filter.regexExpression !== undefined ? 'selectCards.filter.regexExpression' : 'selectCards.filter.regex', false);
     const regex = new RegExp(pattern, caseSensitive ? '' : 'i');
     const values = pathValues || [displayCardValue(actualRaw)];
     matched = values.some((value) => regex.test(assertRegexInputAllowed(value, 'selectCards filter value')));
@@ -46969,6 +48045,29 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
     rowLimit: maxRows,
     selectionScan: selectionScan()
   };
+}
+
+async function materializeExtractionTableRows(cmdbuildExecRequest, sourceRows, sourceColumns) {
+  const rows = [];
+  const columns = Array.isArray(sourceColumns) ? sourceColumns.slice() : [];
+  const cards = new Map();
+  for (const sourceRow of Array.isArray(sourceRows) ? sourceRows : []) {
+    const row = { ...(sourceRow && typeof sourceRow === 'object' ? sourceRow : {}) };
+    const className = String(row.Class || '').trim();
+    const cardId = row._id === undefined || row._id === null ? '' : String(row._id).trim();
+    if (className && cardId && /^[A-Za-z][A-Za-z0-9_]*$/.test(className)) {
+      const related = await readRelatedCard(cmdbuildExecRequest, cards, className, cardId);
+      if (related.card) {
+        for (const key of Object.keys(related.card)) {
+          if (!key || key.startsWith('_')) continue;
+          row[key] = cardAttributeDisplayValue(related.card, key);
+          addColumnOnce(columns, key);
+        }
+      }
+    }
+    rows.push(row);
+  }
+  return { rows, columns };
 }
 
 function normalizeStringList(value) {
@@ -48643,10 +49742,23 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
   const defaultEmptyText = emptyResultTextFromSpec(spec);
   const defaultPermissionDeniedText = permissionDeniedTextFromSpec(spec);
   const resultTables = Array.isArray(spec.result && spec.result.tables) ? spec.result.tables : [];
-  const tables = resultTables.map((table) => {
+  const finalTableNormalizationCache = { attributes: new Map() };
+  const tables = [];
+  const extractionSource = String(options.extractionSource || '').trim();
+  for (const table of resultTables) {
     const source = context[table.name] || { columns: [], rows: [], truncated: false };
-    const columns = Array.isArray(table.columns) && table.columns.length ? table.columns : source.columns;
+    let columns = Array.isArray(table.columns) && table.columns.length ? table.columns : source.columns;
     const sourceRows = Array.isArray(source.rows) ? source.rows : [];
+    let rows = sourceRows;
+    if (extractionSource && table.name === extractionSource) {
+      const materialized = await materializeExtractionTableRows(cmdbuildExecRequest, sourceRows, columns);
+      columns = materialized.columns;
+      rows = materialized.rows;
+    }
+    // Final tables are presentation boundaries. Keep execution rows intact, but
+    // normalize typed CMDBuild values before preview, publication and JSON output.
+    const normalized = await normalizeFinalTableRows(cmdbuildExecRequest, spec, table, rows, columns, finalTableNormalizationCache);
+    rows = normalized.rows;
     const namedPresentation = globalTablePresentations.find((item) => item && item.name === table.name) || {};
     const tablePresentation = table.presentation && typeof table.presentation === 'object' && !Array.isArray(table.presentation)
       ? table.presentation
@@ -48662,7 +49774,7 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
       ...tablePresentation
     };
     delete presentation.tables;
-    return {
+    tables.push({
       name: table.name,
       published: table.published === true,
       title: renderedTitle || titleParam || table.name,
@@ -48672,11 +49784,11 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
       columns,
       columnLabels: table.columnLabels && typeof table.columnLabels === 'object' && !Array.isArray(table.columnLabels) ? table.columnLabels : {},
       presentation,
-      cellMeta: buildResultCellMeta(sourceRows, columns),
-      rows: projectRows(sourceRows, columns),
+      cellMeta: buildResultCellMeta(rows, columns, normalized.cellMeta),
+      rows: projectRows(rows, columns),
       truncated: Boolean(source.truncated)
-    };
-  });
+    });
+  }
   const includeDiagrams = options.includeDiagrams !== false;
   const d2Workflow = includeDiagrams ? await d2WorkflowStatusForSpec(spec) : { state: 'not-requested' };
   const partialDiagramPreview = includeDiagrams && options.allowPartialDiagramPreview === true && d2Workflow.state === 'pending';
@@ -50535,6 +51647,7 @@ async function handleBackend(req, res, requestUrl) {
       maxTraversalDepthMax: executionLimits.maxTraversalDepthMax,
       includeDiagrams: includeDraftDiagrams,
       executionScope: draftExecutionScope,
+      extractionSource: draftExecutionScope === 'tables' ? String(requestUrl.searchParams.get('extractionSource') || '').trim() : '',
       allowPartialDiagramPreview: Boolean(partialDiagramPlan),
       partialDiagramOmissions: partialDiagramPlan ? partialDiagramPlan.omissions : [],
       partialDiagramRepairs: partialDiagramPlan ? partialDiagramPlan.repairs : [],
@@ -51796,6 +52909,9 @@ export {
   diagramImportDeterministicSpecHash,
   diagramImportImplicitConditionSources,
   diagramImportInferImplicitConditionSource,
+  diagramImportDirectRelationParentCorrelation,
+  diagramImportPrimaryCardSource,
+  diagramImportCardSourceField,
   diagramImportMappingInputRevision,
   diagramImportMappingInputRevisionStatus,
   diagramImportMappingValidationIsCurrent,

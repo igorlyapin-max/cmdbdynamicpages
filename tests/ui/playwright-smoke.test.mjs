@@ -550,6 +550,73 @@ test('Diagram structure selection keeps the scrolled tree viewport', { skip: ski
   });
 });
 
+test('testtemplate keeps deep editors lazy and bounds render serialization', { skip: skipReason, timeout: 90_000 }, async () => {
+  await withPage(async (page) => {
+    await page.addInitScript(() => {
+      const originalStringify = JSON.stringify;
+      const metrics = window.__cmdpRenderMetrics = { calls: 0, bytes: 0, longTasks: [] };
+      JSON.stringify = function (...args) {
+        const value = originalStringify.apply(this, args);
+        metrics.calls += 1;
+        metrics.bytes += value.length;
+        return value;
+      };
+      if (typeof PerformanceObserver === 'function') {
+        new PerformanceObserver((entries) => {
+          entries.getEntries().forEach((entry) => metrics.longTasks.push(Math.round(entry.duration)));
+        }).observe({ type: 'longtask', buffered: true });
+      }
+    });
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    const templateButton = page.locator(`[data-action="select-template"][data-code="${runtimeDiagramTemplate}"]`);
+    await templateButton.waitFor({ state: 'visible', timeout: 20_000 });
+    await templateButton.click();
+
+    async function open(section, marker) {
+      await page.evaluate(() => {
+        window.__cmdpRenderMetrics.calls = 0;
+        window.__cmdpRenderMetrics.bytes = 0;
+        window.__cmdpRenderMetrics.longTasks = [];
+      });
+      await page.locator(`a[data-designer-section="${section}"]`).click();
+      await page.locator(marker).waitFor({ state: 'visible', timeout: 30_000 });
+      await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      return page.evaluate(() => ({
+        activeObjectSelections: document.querySelectorAll('[data-object-selection]').length,
+        objectSelectionSummaries: document.querySelectorAll('[data-object-selection-summary]').length,
+        activeFlowOperations: document.querySelectorAll('[data-flow-operation]').length,
+        flowOperationSummaries: document.querySelectorAll('[data-flow-operation-summary]').length,
+        selectOptions: document.querySelectorAll('select option').length,
+        structureRows: document.querySelectorAll('[data-diagram-structure-tree-row]').length,
+        metrics: window.__cmdpRenderMetrics
+      }));
+    }
+
+    const objectGroup = await open('object-group', '#cmdp-object-group-editor');
+    assert.equal(objectGroup.activeObjectSelections, 1);
+    assert.ok(objectGroup.objectSelectionSummaries >= 1, JSON.stringify(objectGroup));
+    assert.ok(objectGroup.selectOptions <= 64, JSON.stringify(objectGroup));
+    assert.equal(objectGroup.metrics.calls, 0, JSON.stringify(objectGroup));
+
+    const relations = await open('relations', '#cmdp-relation-expansion-editor');
+    assert.equal(relations.activeFlowOperations, 1);
+    assert.ok(relations.flowOperationSummaries >= 1, JSON.stringify(relations));
+    assert.ok(relations.selectOptions <= 96, JSON.stringify(relations));
+    assert.equal(relations.metrics.calls, 0, JSON.stringify(relations));
+
+    const diagram = await open('diagram', '[data-diagram-import-editor-panel="structure"]');
+    assert.ok(diagram.structureRows >= 1, JSON.stringify(diagram));
+    assert.ok(diagram.selectOptions <= 64, JSON.stringify(diagram));
+    // A cold template load can still perform small JSON clones while normalizing
+    // the persisted D2 structure. The old full-spec rebuild exceeded 34k calls
+    // and 500 MB for this fixture; keep the regression guard above that noise.
+    assert.ok(diagram.metrics.calls < 20_000, JSON.stringify(diagram));
+    assert.ok(diagram.metrics.bytes < 1_000_000, JSON.stringify(diagram));
+    assert.ok(diagram.metrics.longTasks.every((duration) => duration < 250), JSON.stringify(diagram));
+  });
+});
+
 test('Diagram editor offers template parameters in D2 mapping labels without changing D2 source', { skip: skipReason, timeout: 90_000 }, async () => {
   await withPage(async (page) => {
     const code = `DiagramParameterUiSmoke${Date.now()}`;
@@ -674,7 +741,7 @@ test('Diagram editor separates element data from hierarchy correlations', { skip
       await page.waitForSelector('#cmdp-object-group-editor', { timeout: 10_000 });
       for (let index = 0; index < 2; index += 1) {
         if (index > 0) await page.locator('button[data-action="add-object-selection"]').click();
-        const selection = page.locator('[data-object-selection]').nth(index);
+        const selection = page.locator('[data-object-selection]').first();
         const className = selection.locator('[data-object-selection-field="className"]');
         if (await className.locator('option[value="ARM"]').count() === 0) {
           await page.locator('#cmdp-catalog-header').click();
@@ -683,7 +750,6 @@ test('Diagram editor separates element data from hierarchy correlations', { skip
         await selection.locator('[data-object-selection-field="name"]').fill(index === 0 ? 'Родительский результат' : 'Дочерний результат');
         await selection.locator('[data-object-selection-field="alias"]').fill(index === 0 ? 'hierarchyParent' : 'hierarchyChild');
         await className.selectOption('ARM');
-        await selection.locator('[data-object-selection-field="columns"]').fill('Code, Description');
       }
       await page.locator('button[data-action="apply-object-group"]').click();
       const assistantLink = page.locator('a[data-designer-section="diagram-assistant"]');
@@ -845,8 +911,52 @@ test('Diagram editor separates element data from hierarchy correlations', { skip
       await addHierarchyCondition.click();
       const hierarchyCondition = readyHierarchy.locator('[data-diagram-import-hierarchy-condition-row]').first();
       await hierarchyCondition.waitFor({ state: 'visible', timeout: 10_000 });
-      await hierarchyCondition.locator('[data-diagram-import-hierarchy-field="left.column"]').selectOption('Code');
-      await hierarchyCondition.locator('[data-diagram-import-hierarchy-field="right.column"]').selectOption('Code');
+      await page.setViewportSize({ width: 1280, height: 900 });
+      const childFieldPicker = hierarchyCondition.locator('[data-diagram-import-condition-picker]').first();
+      await childFieldPicker.locator('button[data-action="diagram-import-condition-picker-toggle"]').click();
+      await childFieldPicker.locator('[data-diagram-import-condition-picker-search]').fill('Code');
+      const childFieldOption = childFieldPicker.locator('button[data-action="diagram-import-condition-picker-select"]').first();
+      await childFieldOption.waitFor({ state: 'visible', timeout: 10_000 });
+      const hierarchyPickerLayout = await childFieldPicker.evaluate((picker) => {
+        const menu = picker.querySelector('[data-diagram-import-condition-picker-menu]');
+        const rect = menu.getBoundingClientRect();
+        const style = getComputedStyle(menu);
+        const clippingAncestor = picker.closest('.table-wrap');
+        const ancestorRect = clippingAncestor && clippingAncestor.getBoundingClientRect();
+        return {
+          position: style.position,
+          width: rect.width,
+          maxHeight: Number.parseFloat(style.maxHeight),
+          left: rect.left,
+          right: rect.right,
+          top: rect.top,
+          bottom: rect.bottom,
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+          ancestorRight: ancestorRect && ancestorRect.right
+        };
+      });
+      assert.equal(hierarchyPickerLayout.position, 'fixed', JSON.stringify(hierarchyPickerLayout));
+      assert.ok(hierarchyPickerLayout.width >= 500, JSON.stringify(hierarchyPickerLayout));
+      assert.ok(hierarchyPickerLayout.maxHeight > 260, JSON.stringify(hierarchyPickerLayout));
+      assert.ok(hierarchyPickerLayout.left >= 0 && hierarchyPickerLayout.right <= hierarchyPickerLayout.viewportWidth, JSON.stringify(hierarchyPickerLayout));
+      assert.ok(hierarchyPickerLayout.top >= 0 && hierarchyPickerLayout.bottom <= hierarchyPickerLayout.viewportHeight, JSON.stringify(hierarchyPickerLayout));
+      assert.ok(hierarchyPickerLayout.right > hierarchyPickerLayout.ancestorRight, JSON.stringify(hierarchyPickerLayout));
+      await page.setViewportSize({ width: 960, height: 620 });
+      await page.waitForFunction(() => {
+        const menu = document.querySelector('[data-diagram-import-condition-picker-menu]:not([hidden])');
+        if (!menu) return false;
+        const rect = menu.getBoundingClientRect();
+        return rect.left >= 0 && rect.right <= window.innerWidth && rect.top >= 0 && rect.bottom <= window.innerHeight;
+      }, null, { timeout: 10_000 });
+      await page.setViewportSize({ width: 1280, height: 900 });
+      await childFieldOption.click();
+      const parentFieldPicker = hierarchyCondition.locator('[data-diagram-import-condition-picker]').nth(1);
+      await parentFieldPicker.locator('button[data-action="diagram-import-condition-picker-toggle"]').click();
+      await parentFieldPicker.locator('[data-diagram-import-condition-picker-search]').fill('Code');
+      const parentFieldOption = parentFieldPicker.locator('button[data-action="diagram-import-condition-picker-select"]').first();
+      await parentFieldOption.waitFor({ state: 'visible', timeout: 10_000 });
+      await parentFieldOption.click();
       await connectionsTab.click();
       await hierarchyTab.click();
       const retainedHierarchyCondition = hierarchyPanel.locator('[data-diagram-import-hierarchy-condition-row]').first();
@@ -1956,13 +2066,12 @@ test('Relations Apply keeps 3-stage dependency order and custom match columns', 
 
     for (let index = 0; index < 3; index += 1) {
       if (index > 0) await page.locator('button[data-action="add-object-selection"]').click();
-      const selection = page.locator('[data-object-selection]').nth(index);
+      const selection = page.locator('[data-object-selection]').first();
       if (await selection.locator('[data-object-selection-field="className"] option[value="ARM"]').count() === 0) {
         await page.locator('#cmdp-catalog-header').click();
         await selection.locator('[data-object-selection-field="className"] option[value="ARM"]').waitFor({ state: 'attached', timeout: 60_000 });
       }
       await selection.locator('[data-object-selection-field="className"]').selectOption('ARM');
-      await selection.locator('[data-object-selection-field="columns"]').fill(index === 0 ? 'model' : index === 1 ? 'model2' : 'Location');
     }
     await page.locator('button[data-action="apply-object-group"]').click();
     await page.locator('a[data-designer-section="relations"]').click();
@@ -1981,8 +2090,29 @@ test('Relations Apply keeps 3-stage dependency order and custom match columns', 
     await relationPicker.locator('button[data-action="catalog-field-picker-toggle"]').click();
     await relationPicker.locator('[data-catalog-field-picker-search]').fill('model');
     assert.ok(await relationPicker.locator('button[data-action="catalog-field-picker-select"]').count() <= 60, 'Relation field picker must bound rendered suggestions.');
+    const relationPickerLayout = await relationPicker.evaluate((picker) => {
+      const menu = picker.querySelector('[data-catalog-field-picker-menu]');
+      const rect = menu.getBoundingClientRect();
+      const style = getComputedStyle(menu);
+      return {
+        position: style.position,
+        width: rect.width,
+        maxHeight: Number.parseFloat(style.maxHeight),
+        left: rect.left,
+        right: rect.right,
+        top: rect.top,
+        bottom: rect.bottom,
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight
+      };
+    });
+    assert.equal(relationPickerLayout.position, 'fixed', JSON.stringify(relationPickerLayout));
+    assert.ok(relationPickerLayout.width >= 500, JSON.stringify(relationPickerLayout));
+    assert.ok(relationPickerLayout.maxHeight > 260, JSON.stringify(relationPickerLayout));
+    assert.ok(relationPickerLayout.left >= 0 && relationPickerLayout.right <= relationPickerLayout.viewportWidth, JSON.stringify(relationPickerLayout));
+    assert.ok(relationPickerLayout.top >= 0 && relationPickerLayout.bottom <= relationPickerLayout.viewportHeight, JSON.stringify(relationPickerLayout));
     await page.locator('button[data-action="add-matching-block"]').click();
-    matchingBlock = page.locator('[data-matching-block]').nth(1);
+    matchingBlock = page.locator('[data-matching-block]').first();
     assert.deepEqual(await matchingBlock.locator('[data-matching-block-field="from"] option').evaluateAll((options) => options.map((option) => option.value).filter(Boolean)), ['objects', 'objects2', 'objects3', 'matchedObjects']);
     await matchingBlock.locator('[data-matching-block-field="from"]').selectOption('matchedObjects');
     await matchingBlock.locator('[data-matching-block-field="with"]').selectOption('objects3');
@@ -2039,16 +2169,20 @@ test('Relations Apply keeps 3-stage dependency order and custom match columns', 
     assert.equal(finalTable?.columns?.includes('model'), true, JSON.stringify(finalTable));
     assert.ok(finalTable?.columns?.some((column) => String(column).endsWith('model2')), JSON.stringify(finalTable));
     assert.ok(finalTable?.columns?.some((column) => String(column).endsWith('Location')), JSON.stringify(finalTable));
-    assert.equal(spec.result?.tables?.find((table) => table.name === 'allArms')?.published, true);
     const previewStatus = previewResponse.status();
     assert.equal(previewStatus, 200, previewStatus === 200 ? '' : await previewResponse.text());
 
     await page.locator('a[data-designer-section="relations"]').click();
+    await page.locator('[data-flow-operation-summary] button[data-action="relation-operation-expand"]').first().click();
+    await page.locator('[data-matching-block]').waitFor({ state: 'visible', timeout: 10_000 });
     await page.locator('button[data-action="clear-matching-block"]').first().click();
-    assert.equal(await page.locator('[data-matching-block]').count(), 2);
+    assert.equal(await page.locator('[data-matching-block]').count(), 1);
+    assert.equal(await page.locator('[data-flow-operation-summary]').count(), 2);
     await page.locator('[role="alert"]').waitFor({ timeout: 10_000 });
-    assert.match(await page.locator('[role="alert"]').innerText(), /Cannot remove matchedObjects/);
+    assert.match(await page.locator('[role="alert"]').innerText(), /Cannot remove Matching block 1/);
 
+    await page.locator('[data-flow-operation-summary] button[data-action="relation-operation-expand"]').last().click();
+    await page.locator('[data-set-operation]').waitFor({ state: 'visible', timeout: 10_000 });
     await page.locator('[data-set-operation-field="from"]').selectOption('');
     await page.locator('button[data-action="apply-relation-expansion"]').click();
     await page.locator('[role="alert"]').waitFor({ timeout: 10_000 });
@@ -2268,7 +2402,6 @@ test('Diagram Assistant applies valid D2 mappings partially and previews only co
       await selection.locator('[data-object-selection-field="name"]').fill('Workstations');
       await selection.locator('[data-object-selection-field="alias"]').fill('workstations');
       await selection.locator('[data-object-selection-field="className"]').selectOption('ARM');
-      await selection.locator('[data-object-selection-field="columns"]').fill('Code, Description');
       await page.locator('button[data-action="apply-object-group"]').click();
       await page.locator('a[data-designer-section="diagram-assistant"]').click();
       await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 10_000 });
@@ -2477,7 +2610,6 @@ test('Diagram Assistant continues a staged D2 mapping through bounded correction
     await selection.locator('[data-object-selection-field="name"]').fill('Workstations');
     await selection.locator('[data-object-selection-field="alias"]').fill('workstations');
     await selection.locator('[data-object-selection-field="className"]').selectOption('ARM');
-    await selection.locator('[data-object-selection-field="columns"]').fill('Code, Description');
     await page.locator('button[data-action="apply-object-group"]').click();
     await page.locator('a[data-designer-section="diagram-assistant"]').click();
     await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 10_000 });
@@ -2645,7 +2777,15 @@ test('Designer restores saved D2 analysis after selecting a template from the li
       await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
       const restoreResponse = await restoreResponsePromise;
       const restoreText = await restoreResponse.text();
-      assert.equal(restoreResponse.status(), 200, restoreText);
+      const restoreRequest = restoreResponse.request().postDataJSON();
+      const restoredImport = restoreRequest.currentSpec && restoreRequest.currentSpec.result && Array.isArray(restoreRequest.currentSpec.result.diagrams)
+        ? restoreRequest.currentSpec.result.diagrams.find((diagram) => diagram && diagram.authoring && diagram.authoring.d2Import)?.authoring?.d2Import
+        : null;
+      assert.equal(restoreResponse.status(), 200, `${restoreText}\nRestore context: ${JSON.stringify({
+        checkpointHash: restoreRequest.analysisCheckpoint && restoreRequest.analysisCheckpoint.deterministicSpecHash,
+        provisionalMappingStatus: restoredImport && restoredImport.mappingValidation && restoredImport.mappingValidation.status,
+        provisionalMappingReasons: restoredImport && restoredImport.mappingValidation && restoredImport.mappingValidation.reasons
+      })}`);
       const restoreBody = JSON.parse(restoreText);
       assert.equal(restoreBody.restoreKind, 'analysis', JSON.stringify(restoreBody));
       await page.locator('a[data-designer-section="diagram-assistant"]').click();
@@ -2717,7 +2857,6 @@ test('Designer analyzes and applies a reviewed D2 structure template', { skip: s
     await firstSelection.locator('[data-object-selection-field="name"]').fill('Workstations');
     await firstSelection.locator('[data-object-selection-field="alias"]').fill('workstations');
     await firstSelection.locator('[data-object-selection-field="className"]').selectOption('ARM');
-    await firstSelection.locator('[data-object-selection-field="columns"]').fill('Code, Description, model, model2');
     await page.locator('button[data-action="apply-object-group"]').click();
     await page.locator('a[data-designer-section="diagram-assistant"]').click();
     await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 10_000 });
@@ -3405,7 +3544,7 @@ test('Assistant generates an ARM by router Location object group and preview ren
         from: '',
         limit: 1,
         columns: ['Code', 'Description', 'Location'],
-        rules: [{ action: 'include', path: 'Description', negate: false, op: 'equals', regex: '', value: 'Маршрутизатор для Test City 300', valueParam: '', valueColumn: '' }]
+        rules: [{ action: 'include', path: 'Description', negate: false, op: 'equals', rightExpression: 'Маршрутизатор для Test City 300' }]
       }, {
         id: 'selection:arms',
         name: 'АРМ в местоположении маршрутизатора',
@@ -3414,7 +3553,7 @@ test('Assistant generates an ARM by router Location object group and preview ren
         from: 'routerAnchor',
         limit: 100,
         columns: ['Code', 'Description', 'Location', 'model', 'model2'],
-        rules: [{ action: 'include', path: 'Location', negate: false, op: 'equals', regex: '', value: '', valueParam: '', valueColumn: 'Location' }]
+        rules: [{ action: 'include', path: 'Location', negate: false, op: 'equals', rightExpression: '${previous.Location}' }]
       }],
       operations: [],
       blocks: [],
@@ -3453,9 +3592,9 @@ test('Assistant generates an ARM by router Location object group and preview ren
     assert.equal(flowResponse.status(), 200, JSON.stringify(flowBody));
     assert.equal(flowBody.flow?.selections?.[0]?.className, 'routerG');
     assert.equal(flowBody.flow?.selections?.[1]?.className, 'ARM');
-    assert.ok(flowBody.flow?.selections?.[0]?.rules?.some((rule) => rule.path === 'Description' && rule.op === 'equals' && rule.value === 'Маршрутизатор для Test City 300'), JSON.stringify(flowBody));
+    assert.ok(flowBody.flow?.selections?.[0]?.rules?.some((rule) => rule.path === 'Description' && rule.op === 'equals' && rule.rightExpression === 'Маршрутизатор для Test City 300'), JSON.stringify(flowBody));
     assert.equal(flowBody.flow?.selections?.[1]?.from, flowBody.flow?.selections?.[0]?.alias, JSON.stringify(flowBody));
-    assert.ok(flowBody.flow?.selections?.[1]?.rules?.some((rule) => rule.path === 'Location' && rule.op === 'equals' && rule.valueColumn === 'Location'), JSON.stringify(flowBody));
+    assert.ok(flowBody.flow?.selections?.[1]?.rules?.some((rule) => rule.path === 'Location' && rule.op === 'equals' && rule.rightExpression === '${previous.Location}'), JSON.stringify(flowBody));
     assert.equal(flowBody.flow?.operations?.some((operation) => operation.type === 'match'), false, JSON.stringify(flowBody));
     assert.equal(await page.locator('[data-object-selection], [data-matching-block], [data-matching-rule-row]').count(), 0);
     assert.equal(await page.locator('[data-object-selection], [data-matching-block], [data-matching-rule-row]').count(), 0);
@@ -3492,7 +3631,7 @@ test('Assistant generates an ARM by router Location object group and preview ren
     const finalExtractionSource = extractionOptions.find((item) => item.text === 'АРМ в местоположении маршрутизатора')?.value || '';
     assert.ok(finalExtractionSource, `Extraction source options do not include a final matching stage: ${JSON.stringify(extractionOptions)}`);
     await page.locator('#cmdp-extraction-source').selectOption(finalExtractionSource);
-    const extractionPreviewRoute = /\/cmdbuild\/custom-api\/draft\/preview\?maxRows=100&includeDiagrams=false$/;
+    const extractionPreviewRoute = /\/cmdbuild\/custom-api\/draft\/preview\?maxRows=100&includeDiagrams=false&extractionSource=[^&]+$/;
     let delayedExtractionPreview = false;
     await page.route(extractionPreviewRoute, async (route) => {
       const response = await route.fetch();
@@ -3523,14 +3662,22 @@ test('Assistant generates an ARM by router Location object group and preview ren
 
     await page.locator('a[data-designer-section="object-group"]').click();
     await page.waitForSelector('#cmdp-object-group-editor', { timeout: 10_000 });
-    const selections = await objectGroupSelections(page);
+    assert.equal(await page.locator('[data-object-selection-field="columns"]').count(), 0, 'Object Group must not expose internal result projections.');
+    assert.ok(await page.locator('button[data-action="remove-object-selection"]').count() > 0, 'Object Group must expose removal for an open selection.');
+    // The editor keeps one Object Flow selection open. Read the first source,
+    // then expand and read the source-driven selection without changing that UX.
+    const firstSelection = (await objectGroupSelections(page))[0];
+    await page.locator('[data-object-selection-summary] button[data-action="object-selection-expand"]').click();
+    const secondSelection = (await objectGroupSelections(page))[0];
+    const selections = [firstSelection, secondSelection];
     const routerSelection = selections.find((item) => item.className === 'routerG');
     const armSelection = selections.find((item) => item.className === 'ARM');
     assert.ok(routerSelection, `routerG object selection was not rendered: ${JSON.stringify(selections)}`);
     assert.ok(armSelection, `ARM object selection was not rendered: ${JSON.stringify(selections)}`);
-    assert.ok(routerSelection.rules.some((rule) => rule.path === 'Description' && rule.op === 'equals' && rule.value === 'Маршрутизатор для Test City 300'), `routerG selection has no exact Description filter: ${JSON.stringify(routerSelection.rules)}`);
+    assert.ok(routerSelection.rules.some((rule) => rule.path === 'Description' && rule.op === 'equals' && rule.rightExpression === 'Маршрутизатор для Test City 300'), `routerG selection has no exact Description filter: ${JSON.stringify(routerSelection.rules)}`);
     assert.equal(armSelection.from, routerSelection.alias, `ARM selection is not source-driven from the router anchor: ${JSON.stringify(armSelection)}`);
-    assert.ok(armSelection.rules.some((rule) => rule.path === 'Location' && rule.valueColumn === 'Location'), `ARM selection has no Location valueColumn filter: ${JSON.stringify(armSelection.rules)}`);
+    assert.ok(armSelection.rules.some((rule) => rule.path === 'Location' && rule.rightExpression === '${previous.Location}'), `ARM selection has no source-row expression filter: ${JSON.stringify(armSelection.rules)}`);
+    assert.equal(await page.locator('[data-object-scope-field="valueParam"], [data-object-scope-field="valueColumn"]').count(), 0);
     await page.locator('a[data-designer-section="relations"]').click();
     await page.waitForSelector('#cmdp-relation-expansion-editor', { timeout: 10_000 });
     assert.equal(await page.locator('[data-matching-block]').count(), 0);
@@ -3596,6 +3743,43 @@ test('Runtime page renders the compact runtime shell and table area', { skip: sk
     assert.equal(await page.locator('header').count(), 0);
     const hasResultShell = await page.locator('.result-table-wrap, .notice').count();
     assert.ok(hasResultShell > 0, 'Runtime page did not render a result table or notice.');
+  });
+});
+
+test('Runtime renders normalized URL values as safe automatic links', { skip: skipReason }, async () => {
+  await withPage(async (page) => {
+    await page.route('**/cmdbuild/custom-api/templates/*/run**', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          success: true,
+          result: {
+            tables: [{
+              name: 'urls',
+              title: 'URLs',
+              columns: ['PortalUrl', 'UnsafeUrl'],
+              rows: [{ PortalUrl: 'https://portal.example/item/42', UnsafeUrl: 'javascript:alert(1)' }],
+              cellMeta: {
+                0: {
+                  PortalUrl: { autoHref: 'https://portal.example/item/42' },
+                  UnsafeUrl: {}
+                }
+              },
+              presentation: {}
+            }]
+          }
+        })
+      });
+    });
+    await page.goto(runtimeUrl(), { waitUntil: 'domcontentloaded' });
+    const table = page.locator('[data-result-table]').first();
+    await table.waitFor({ timeout: 15_000 });
+    const portalLink = table.locator('a[href="https://portal.example/item/42"]');
+    await portalLink.waitFor({ timeout: 10_000 });
+    assert.equal(await portalLink.innerText(), 'https://portal.example/item/42');
+    assert.equal(await table.locator('a[href^="javascript:"]').count(), 0);
+    assert.match(await table.innerText(), /javascript:alert\(1\)/);
   });
 });
 
@@ -3787,6 +3971,117 @@ test('Assistant data blocks collapse, retain forward dependencies, and support m
   });
 });
 
+test('Object Group exposes one right expression for parameters and previous-result fields', { skip: skipReason, timeout: 90_000 }, async () => {
+  await withPage(async (page) => {
+    const code = `ObjectGroupRightExpressionUiSmoke${Date.now()}`;
+    const semanticPlan = {
+      version: 1,
+      blocks: [{
+        id: 'block-1',
+        name: 'Маршрутизатор',
+        summary: 'Маршрутизатор по параметру.',
+        resolvedEntities: ['routerG'],
+        relationPaths: [],
+        dependencies: [],
+        expectedResult: 'Карточка маршрутизатора.',
+        resultContract: { outputKind: 'sourceCards', outputClass: 'routerG', dependencyPaths: [], relationPredicates: [], attributePredicates: [] },
+        warnings: []
+      }, {
+        id: 'block-2',
+        name: 'АРМ маршрутизатора',
+        summary: 'АРМ с тем же Location.',
+        resolvedEntities: ['ARM'],
+        relationPaths: [],
+        dependencies: ['block-1'],
+        expectedResult: 'Карточки АРМ.',
+        resultContract: {
+          outputKind: 'sourceCards', outputClass: 'ARM', dependencyPaths: [], relationPredicates: [],
+          attributePredicates: [{
+            sourceClass: 'ARM', comparisonBlockId: 'block-1', comparisonClass: 'routerG',
+            sourceFields: ['Location'], comparisonField: 'Location', operator: 'equals'
+          }]
+        },
+        warnings: []
+      }],
+      explanation: 'Семантический план готов.',
+      warnings: []
+    };
+    const flow = {
+      version: 1,
+      selections: [{
+        id: 'selection:router', name: 'Маршрутизатор', alias: 'router', className: 'routerG', from: '', limit: 10,
+        columns: ['Code', 'Location'],
+        rules: [{ action: 'include', path: 'Description', negate: false, op: 'matches', rightExpression: '^${param.routerName}$' }]
+      }, {
+        id: 'selection:arms', name: 'АРМ маршрутизатора', alias: 'arms', className: 'ARM', from: 'router', limit: 100,
+        columns: ['Code', 'Location'],
+        rules: [{ action: 'include', path: 'Location', negate: false, op: 'equals', rightExpression: '${previous.Location}' }]
+      }],
+      operations: [], blocks: [], setOperations: [], publishedAlias: 'arms'
+    };
+
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.locator('button[data-action="new-template"]').click();
+    await page.locator('#cmdp-code').fill(code);
+    await page.locator('#cmdp-description').fill('Object Group right expression UI smoke');
+    const createResponsePromise = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/templates') && response.request().method() === 'POST');
+    await page.locator('button[data-action="save-template"]').click();
+    const createResponse = await createResponsePromise;
+    assert.equal(createResponse.status(), 201, await createResponse.text());
+
+    try {
+      await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
+      await page.locator('a[data-designer-section="assistant"]').click();
+      await page.waitForSelector('#cmdp-assistant-editor', { timeout: 10_000 });
+      await addAssistantBusinessBlock(page, { name: 'Маршрутизатор', entities: 'routerG', algorithm: 'Выбрать маршрутизатор.', expectedResult: 'Карточка маршрутизатора.' });
+      await page.locator('button[data-action="assistant-flow-block-add"]').click();
+      await page.waitForFunction(() => document.querySelectorAll('[data-assistant-flow-block]').length === 2);
+      await addAssistantBusinessBlock(page, { name: 'АРМ маршрутизатора', entities: 'ARM', algorithm: 'Выбрать АРМ по Location.', expectedResult: 'Карточки АРМ.' });
+      await page.locator('[data-assistant-flow-block]').nth(1).locator('[data-assistant-flow-field="uses"]').selectOption('block-1');
+      await page.route('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*', async (route) => {
+        await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ success: true, semanticPlan }) });
+      });
+      await page.route('**/cmdbuild/custom-api/assistant/object-flow/plan?*', async (route) => {
+        await route.fulfill({
+          contentType: 'application/json',
+          body: JSON.stringify({
+            success: true, flow, canApply: true,
+            outputBindings: [{ blockId: 'block-1', alias: 'router' }, { blockId: 'block-2', alias: 'arms' }],
+            explanation: 'Flow ready.', warnings: []
+          })
+        });
+      });
+      await page.locator('button[data-action="assistant-flow-prepare"]').click();
+      await page.locator('[data-assistant-flow-semantic-plan]').waitFor({ timeout: 30_000 });
+      await page.locator('button[data-action="assistant-flow-generate"]').click();
+      await page.waitForFunction(() => !document.querySelector('button[data-action="assistant-flow-apply"]')?.disabled, null, { timeout: 30_000 });
+      await page.locator('button[data-action="assistant-flow-apply"]').click();
+      await page.waitForFunction(() => /изменения готовы|changes are ready/i.test(String(document.querySelector('.notice')?.textContent || '')), null, { timeout: 30_000 });
+
+      await page.locator('a[data-designer-section="object-group"]').click();
+      await page.waitForSelector('#cmdp-object-group-editor', { timeout: 10_000 });
+      assert.equal(await page.locator('[data-object-scope-field="rightExpression"]').count(), 1);
+      assert.equal(await page.locator('[data-object-scope-field="value"], [data-object-scope-field="valueParam"], [data-object-scope-field="valueColumn"]').count(), 0);
+      assert.equal(await page.locator('[data-object-scope-field="rightExpression"]').inputValue(), '^${param.routerName}$');
+      await page.locator('[data-object-selection-summary] button[data-action="object-selection-expand"]').click();
+      await page.locator('[data-object-scope-field="rightExpression"]').waitFor({ timeout: 10_000 });
+      assert.equal(await page.locator('[data-object-scope-field="rightExpression"]').inputValue(), '${previous.Location}');
+      await page.locator('#cmdp-object-group-editor details summary').last().click();
+      const examples = await page.locator('#cmdp-object-group-editor').innerText();
+      assert.match(examples, /предыдущего результата|previous result/i);
+      assert.match(examples, /параметр шаблона|template parameter/i);
+    } finally {
+      await page.locator('a[data-designer-section="templates"]').click();
+      const deleteButton = page.locator(`[data-action="delete-template"][data-code="${code}"]`);
+      if (await deleteButton.count()) {
+        page.once('dialog', (dialog) => dialog.accept());
+        await deleteButton.click();
+      }
+    }
+  });
+});
+
 async function withPage(fn, options = {}) {
   const launchOptions = { headless: true };
   const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || findChromeExecutable();
@@ -3806,6 +4101,9 @@ async function objectGroupSelections(page) {
   return await page.locator('[data-object-selection]').evaluateAll((nodes) => nodes.map((node) => {
     function value(selector) {
       const field = node.querySelector(selector);
+      if (field && field.matches('[data-catalog-field-picker-multi-value]')) {
+        return Array.from(field.selectedOptions).map((option) => String(option.value || '').trim()).filter(Boolean).join(', ');
+      }
       return String(field && field.value || '').trim();
     }
     const rules = Array.from(node.querySelectorAll('[data-object-scope-row]')).map((row) => {
@@ -3816,9 +4114,7 @@ async function objectGroupSelections(page) {
       return {
         path: ruleValue('[data-object-scope-field="path"]'),
         op: ruleValue('[data-object-scope-field="op"]'),
-        value: ruleValue('[data-object-scope-field="value"], [data-object-scope-field="regex"]'),
-        valueParam: ruleValue('[data-object-scope-field="valueParam"]'),
-        valueColumn: ruleValue('[data-object-scope-field="valueColumn"]')
+        rightExpression: ruleValue('[data-object-scope-field="rightExpression"]')
       };
     });
     return {

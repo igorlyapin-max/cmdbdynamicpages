@@ -7,10 +7,7 @@
  * @property {string} path
  * @property {boolean} negate
  * @property {string} op
- * @property {string} regex
- * @property {string} value
- * @property {string} valueParam
- * @property {string} valueColumn
+ * @property {string} rightExpression
  */
 /**
  * @typedef {object} ObjectFlowSelection
@@ -192,6 +189,42 @@ const RELATION_OPERATION_ID_PATTERN = /^relation:[A-Za-z_][A-Za-z0-9_]*$/;
 const EXISTS_RELATED_OPERATION_ID_PATTERN = /^existsRelated:[A-Za-z_][A-Za-z0-9_]*$/;
 const SET_OPERATION_TYPES = new Set(['union', 'difference', 'intersect']);
 const RELATION_DIRECTIONS = new Set(['both', 'source', 'destination', 'direct', 'inverse']);
+const RIGHT_EXPRESSION_TOKEN = /\$\{(param|previous)\.([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\}/g;
+
+/**
+ * Object Flow exposes one expression for the right side of a selection rule.
+ * The executor resolves only explicit template parameters and fields from the
+ * selection's declared source; it never evaluates arbitrary expressions.
+ *
+ * @param {string} expression
+ * @returns {Array<{kind: 'param' | 'previous', name: string}>}
+ */
+function rightExpressionTokens(expression) {
+  const tokens = [];
+  const source = String(expression || '');
+  for (const match of source.matchAll(RIGHT_EXPRESSION_TOKEN)) {
+    tokens.push({ kind: /** @type {'param' | 'previous'} */ (match[1]), name: match[2] });
+  }
+  return tokens;
+}
+
+/**
+ * @param {unknown} rule
+ * @param {string} operator
+ * @returns {string}
+ */
+function normalizeRightExpression(rule, operator) {
+  if (!isRecord(rule)) return '';
+  if (typeof rule.rightExpression === 'string') return rule.rightExpression;
+  // Older persisted templates are read into the new editor representation.
+  // New Object Flow writes only rightExpression.
+  if (text(rule.valueParam)) return `\${param.${text(rule.valueParam)}}`;
+  if (text(rule.valueColumn || rule.sourceColumn || rule.fromColumn)) {
+    return `\${previous.${text(rule.valueColumn || rule.sourceColumn || rule.fromColumn)}}`;
+  }
+  if (REGEX_SELECTION_OPERATORS.has(operator)) return text(rule.regex || rule.value);
+  return text(rule.value || rule.regex);
+}
 
 /**
  * The deterministic executors retain source-row provenance for source-driven
@@ -339,24 +372,21 @@ function normalizeBoolean(value) {
  */
 function normalizeSelectionRule(value) {
   const rule = isRecord(value) ? value : {};
-  const regex = text(rule.regex);
-  const valueText = text(rule.value);
   const operator = text(rule.op) || (Object.prototype.hasOwnProperty.call(rule, 'regex') ? 'matches' : 'equals');
   return {
     action: text(rule.action) || 'include',
     path: text(rule.path),
     negate: normalizeBoolean(rule.negate),
     op: operator,
-    regex,
-    value: valueText,
-    valueParam: text(rule.valueParam),
-    valueColumn: text(rule.valueColumn)
+    rightExpression: normalizeRightExpression(rule, operator)
   };
 }
 
 function inferredSelectionFilterJoin(rules) {
   const includeRules = rules.filter((rule) => rule.action === 'include');
-  const valueColumns = new Set(includeRules.map((rule) => rule.valueColumn).filter(Boolean));
+  const valueColumns = new Set(includeRules.map((rule) => rightExpressionTokens(rule.rightExpression)
+    .filter((token) => token.kind === 'previous')
+    .map((token) => token.name).join('\u0000')).filter(Boolean));
   const operators = new Set(includeRules.map((rule) => rule.op).filter(Boolean));
   const paths = new Set(includeRules.map((rule) => rule.path).filter(Boolean));
   return includeRules.length > 1 && valueColumns.size === 1 && operators.size === 1 && paths.size > 1 ? 'any' : 'all';
@@ -772,6 +802,18 @@ export function validateObjectFlow(flow) {
       if (!SELECTION_OPERATORS.includes(rule.op)) {
         addError(errors, `${rulePath}.op`, `Selection rule op must be one of: ${SELECTION_OPERATORS.join(', ')}.`);
       }
+      if (!VALUELESS_SELECTION_OPERATORS.has(rule.op) && !rule.rightExpression) {
+        addError(errors, `${rulePath}.rightExpression`, 'Selection rule requires a right expression.');
+      }
+      const malformedTokens = String(rule.rightExpression || '').match(/\$\{[^}]*\}/g) || [];
+      malformedTokens.forEach((token) => {
+        if (!/^\$\{(?:param|previous)\.[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\}$/.test(token)) {
+          addError(errors, `${rulePath}.rightExpression`, `Unsupported expression token ${token}. Use \${param.<name>} or \${previous.<field>}.`);
+        }
+      });
+      if (rightExpressionTokens(rule.rightExpression).some((token) => token.kind === 'previous') && !selection.from) {
+        addError(errors, `${rulePath}.rightExpression`, 'Previous-result fields require a selection source.');
+      }
     });
   });
 
@@ -886,8 +928,10 @@ export function validateObjectFlow(flow) {
       const selection = /** @type {ObjectFlowSelection} */ (stage.item);
       const sourceColumns = selection.from ? materializedColumns.get(selection.from) : undefined;
       for (const [ruleIndex, rule] of selection.rules.entries()) {
-        if (rule.valueColumn && sourceColumns && !sourceColumns.includes(rule.valueColumn)) {
-          addError(errors, `${stage.path}.rules[${ruleIndex}].valueColumn`, `Selection valueColumn ${rule.valueColumn} is not materialized by source ${selection.from}.`);
+        for (const token of rightExpressionTokens(rule.rightExpression)) {
+          if (token.kind === 'previous' && sourceColumns && !sourceColumns.includes(token.name)) {
+            addError(errors, `${stage.path}.rules[${ruleIndex}].rightExpression`, `Previous-result field ${token.name} is not materialized by source ${selection.from}.`);
+          }
         }
       }
       materializedColumns.set(selection.alias, uniqueStrings(
@@ -1032,6 +1076,15 @@ function collectMatchingSelectionColumns(flow) {
     columnsByAlias.set(normalizedAlias, columns);
   };
 
+  for (const selection of flow.selections) {
+    if (!selection.from) continue;
+    for (const rule of selection.rules) {
+      for (const token of rightExpressionTokens(rule.rightExpression)) {
+        if (token.kind === 'previous') add(selection.from, token.name);
+      }
+    }
+  }
+
   for (const operation of flow.operations) {
     if (operation.type !== 'match' && operation.type !== 'semiJoin' && operation.type !== 'existsRelated') continue;
     for (const rule of operation.rules) {
@@ -1063,12 +1116,9 @@ function compileSelectionRule(rule) {
     op: rule.op
   };
   if (REGEX_SELECTION_OPERATORS.has(rule.op)) {
-    filter.regex = rule.regex || rule.value || '.*';
+    filter.regexExpression = rule.rightExpression || '.*';
   } else if (!VALUELESS_SELECTION_OPERATORS.has(rule.op)) {
-    if (rule.valueParam) filter.valueParam = rule.valueParam;
-    if (rule.valueColumn) filter.valueColumn = rule.valueColumn;
-    if (rule.value) filter.value = rule.value;
-    else if (rule.regex) filter.value = rule.regex;
+    filter.valueExpression = rule.rightExpression;
   }
   return filter;
 }
@@ -1722,9 +1772,7 @@ export function objectFlowStageSummaries(flow) {
         rules: selection.rules.map((rule) => ({
           path: rule.path,
           op: rule.op,
-          value: rule.value,
-          valueParam: rule.valueParam,
-          valueColumn: rule.valueColumn,
+          rightExpression: rule.rightExpression,
           action: rule.action,
           negate: rule.negate
         })),
@@ -1850,19 +1898,22 @@ export function objectFlowStageSummaries(flow) {
     if (summary.kind === 'selection') {
       const comparisonStage = byAlias.get(String(summary.from || ''));
       for (const rule of Array.isArray(summary.rules) ? summary.rules : []) {
-        if (!rule.valueColumn || !comparisonStage) continue;
-        addBinding(summary,
-          { alias: summary.alias, className: classNameFor(summary), field: String(rule.path || '') },
-          { alias: comparisonStage.alias, className: classNameFor(comparisonStage), field: String(rule.valueColumn) },
-          String(rule.op || ''),
-          'selectionValueColumn',
-          comparisonStage.kind === 'relation' ? {
-            alias: comparisonStage.alias,
-            fromAlias: String(comparisonStage.from || ''),
-            domain: String(comparisonStage.domain || ''),
-            targetClass: classNameFor(comparisonStage),
-            direction: String(comparisonStage.direction || 'both')
-          } : null);
+        if (!comparisonStage) continue;
+        for (const token of rightExpressionTokens(rule.rightExpression)) {
+          if (token.kind !== 'previous') continue;
+          addBinding(summary,
+            { alias: summary.alias, className: classNameFor(summary), field: String(rule.path || '') },
+            { alias: comparisonStage.alias, className: classNameFor(comparisonStage), field: token.name },
+            String(rule.op || ''),
+            'selectionRightExpression',
+            comparisonStage.kind === 'relation' ? {
+              alias: comparisonStage.alias,
+              fromAlias: String(comparisonStage.from || ''),
+              domain: String(comparisonStage.domain || ''),
+              targetClass: classNameFor(comparisonStage),
+              direction: String(comparisonStage.direction || 'both')
+            } : null);
+        }
       }
     } else if (summary.kind === 'match' || summary.kind === 'semiJoin') {
       const left = byAlias.get(String(summary.from || ''));

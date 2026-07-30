@@ -155,7 +155,7 @@ test('draft preview executes exact router anchor before selecting ARM cards by L
         type: 'selectCards',
         as: 'routerAnchor',
         className: 'routerG',
-        filters: [{ path: 'Description', op: 'equals', value: 'Маршрутизатор для Test City 300' }],
+        filters: [{ path: 'Description', op: 'equals', valueExpression: '${param.routerDescription}' }],
         columns: ['Code', 'Description', 'Location'],
         limit: 1
       },
@@ -164,7 +164,7 @@ test('draft preview executes exact router anchor before selecting ARM cards by L
         as: 'arms',
         from: 'routerAnchor',
         className: 'ARM',
-        filters: [{ path: 'Location', op: 'equals', valueColumn: 'Location' }],
+        filters: [{ path: 'Location', op: 'equals', valueExpression: '${previous.Location}' }],
         columns: ['Code', 'Description', 'Location', 'model', 'model2'],
         limit: 100
       }
@@ -178,7 +178,7 @@ test('draft preview executes exact router anchor before selecting ARM cards by L
       code: 'RouterArmPreview',
       spec
     },
-    params: {}
+    params: { routerDescription: 'Маршрутизатор для Test City 300' }
   }, {
     cookie,
     origin: backendOrigin,
@@ -210,6 +210,53 @@ test('draft preview executes exact router anchor before selecting ARM cards by L
   assert.ok(requestedAttributes.split(',').includes('model'));
   assert.ok(requestedAttributes.split(',').includes('model2'));
   assert.equal(mock.requests.some((item) => item.pathname.includes('/relations')), false);
+  assert.equal(backend.exitCode, null);
+});
+
+test('draft preview resolves right-expression parameters and previous rows as escaped regex literals', async (t) => {
+  const mock = await startMockCmdbuild(t, {
+    classes: [
+      { _id: 1, name: 'TestItem', description: 'Test item', active: true },
+      { _id: 2, name: 'Cst_QueryToolConfig', description: 'Config', active: true },
+      { _id: 3, name: 'Cst_QueryTemplate', description: 'Template', active: true }
+    ],
+    attributesByClass: { TestItem: [{ name: 'Code', type: 'string', active: true, _can_read: true }] },
+    cardsByClass: {
+      TestItem: [
+        { _id: 1, Code: 'literal.1', Description: 'source' },
+        { _id: 2, Code: 'literalX1', Description: 'regex decoy' },
+        { _id: 3, Code: 'literal.1-child', Description: 'child' },
+        { _id: 4, Code: 'literalX1-child', Description: 'child decoy' }
+      ]
+    }
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=right-expression-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const spec = {
+    version: 1,
+    steps: [{
+      type: 'selectCards', as: 'source', className: 'TestItem',
+      filters: [{ path: 'Code', op: 'matches', regexExpression: '^${param.literalCode}$' }],
+      columns: ['Code'], limit: 20
+    }, {
+      type: 'selectCards', as: 'children', from: 'source', className: 'TestItem',
+      filters: [{ path: 'Code', op: 'matches', regexExpression: '^${previous.Code}-child$' }],
+      columns: ['Code'], limit: 20
+    }],
+    result: { tables: [{ name: 'children', columns: ['Code'] }] }
+  };
+  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=20&maxClasses=20&maxRestCalls=50`, {
+    template: { code: 'RightExpressionPreview', spec },
+    params: { literalCode: 'literal.1' }
+  }, { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
+
+  assert.equal(preview.statusCode, 200, preview.body);
+  assert.deepEqual(preview.json.result.trace.map((item) => [item.as, item.rows]), [['source', 1], ['children', 1]]);
+  const children = preview.json.result.tables.find((item) => item.name === 'children');
+  assert.deepEqual(children.rows.map((row) => row.Code), ['literal.1-child']);
   assert.equal(backend.exitCode, null);
 });
 
@@ -1772,9 +1819,9 @@ test('object-flow planning restores exact Description and an explicit business a
   assert.equal(response.json.success, true, response.body);
   const router = response.json.flow.selections.find((selection) => selection.className === 'routerG');
   const arm = response.json.flow.selections.find((selection) => selection.className === 'ARM');
-  assert.ok(router.rules.some((rule) => rule.path === 'Description' && rule.op === 'equals' && rule.value === 'Маршрутизатор для Test City 300'));
+  assert.ok(router.rules.some((rule) => rule.path === 'Description' && rule.op === 'equals' && rule.rightExpression === 'Маршрутизатор для Test City 300'));
   assert.equal(arm.from, 'router');
-  assert.equal(arm.rules.some((rule) => rule.path === 'Location' && rule.valueColumn === 'Location'), true);
+  assert.equal(arm.rules.some((rule) => rule.path === 'Location' && rule.rightExpression === '${previous.Location}'), true);
   assert.equal(response.json.flow.operations.some((operation) => operation.type === 'relation'), false);
   assert.equal(response.json.flow.operations.some((operation) => operation.type === 'match'), false);
   assert.equal(response.json.flow.publishedAlias, 'arm');
@@ -2467,9 +2514,9 @@ test('assistant keeps confirmed relation requirements and executes source-driven
   });
   const plannedAcls = planned.json.flow.selections.find((selection) => selection.alias === 'acls');
   assert.equal(plannedAcls.from, 'ipRanges');
-  assert.deepEqual(plannedAcls.rules.map((rule) => [rule.op, rule.valueColumn]), [
-    ['ipv4InCidr', 'range'],
-    ['ipv4InCidr', 'range']
+  assert.deepEqual(plannedAcls.rules.map((rule) => [rule.op, rule.rightExpression]), [
+    ['ipv4InCidr', '${previous.range}'],
+    ['ipv4InCidr', '${previous.range}']
   ]);
   assert.ok(llm.lastRequest.messages.some((message) => /prefer a source-driven selection/.test(message.content)), JSON.stringify(llm.lastRequest));
 
@@ -2732,9 +2779,9 @@ test('assistant keeps an IS list when related ipRange is only an ACL IPv4 predic
   assert.equal(rebuilt.statusCode, 200, rebuilt.body);
   assert.deepEqual(rebuilt.json.diagnostics.objectFlow.fallback, { kind: 'semanticContractCompiler', used: true });
   const rebuiltIsSource = rebuilt.json.flow.selections.find((selection) => selection.className === 'IS');
-  assert.deepEqual(rebuiltIsSource.rules.map((rule) => [rule.path, rule.op, rule.value, rule.valueParam]), [
-    ['Name', 'notEquals', '', 'isName'],
-    ['isExt', 'equals', 'false', '']
+  assert.deepEqual(rebuiltIsSource.rules.map((rule) => [rule.path, rule.op, rule.rightExpression]), [
+    ['Name', 'notEquals', '${param.isName}'],
+    ['isExt', 'equals', 'false']
   ]);
   const spec = compileObjectFlowToSpec({ version: 1, params: { isName: { type: 'string', required: true } }, steps: [], result: { tables: [] } }, planned.json.flow);
   delete spec.steps.find((step) => step.as === 'externalIs').filterJoin;
@@ -2839,9 +2886,9 @@ test('assistant preserves source cards for a direct cross-block IPv4 attribute p
   assert.equal(planned.statusCode, 200, planned.body);
   assert.equal(planned.json.flow.publishedAlias, 'acls');
   assert.equal(planned.json.flow.operations.length, 0);
-  assert.deepEqual(planned.json.flow.selections[1].rules.map((rule) => [rule.path, rule.op, rule.valueColumn]), [
-    ['ipaddress', 'ipv4InCidr', 'range'],
-    ['dipaddress', 'ipv4InCidr', 'range']
+  assert.deepEqual(planned.json.flow.selections[1].rules.map((rule) => [rule.path, rule.op, rule.rightExpression]), [
+    ['ipaddress', 'ipv4InCidr', '${previous.range}'],
+    ['dipaddress', 'ipv4InCidr', '${previous.range}']
   ]);
   assert.ok(llm.lastRequest.messages.some((message) => /attributePredicates item is a direct comparison/.test(message.content)), JSON.stringify(llm.lastRequest));
 
@@ -2861,9 +2908,9 @@ test('assistant preserves source cards for a direct cross-block IPv4 attribute p
     ['ipRange', ''],
     ['ACL', rebuilt.json.flow.selections[0].alias]
   ]);
-  assert.deepEqual(rebuilt.json.flow.selections[1].rules.map((rule) => [rule.path, rule.op, rule.valueColumn]), [
-    ['ipaddress', 'ipv4InCidr', 'range'],
-    ['dipaddress', 'ipv4InCidr', 'range']
+  assert.deepEqual(rebuilt.json.flow.selections[1].rules.map((rule) => [rule.path, rule.op, rule.rightExpression]), [
+    ['ipaddress', 'ipv4InCidr', '${previous.range}'],
+    ['dipaddress', 'ipv4InCidr', '${previous.range}']
   ]);
 
   const spec = compileObjectFlowToSpec({ version: 1, params: {}, steps: [], result: { tables: [] } }, planned.json.flow);
@@ -3612,6 +3659,147 @@ test('Extraction preview skips diagram building and D2 rendering', async (t) => 
   assert.equal(preview.json.success, true);
   assert.deepEqual(preview.json.result.diagrams, []);
   assert.ok(preview.json.result.tables.find((table) => table.name === 'arms')?.rows.length > 0);
+  assert.equal(backend.exitCode, null);
+});
+
+test('Extraction preview materializes all readable direct attributes for its selected result only', async (t) => {
+  const mock = await startMockCmdbuild(t, {
+    classes: [{ _id: 1, name: 'Widget', description: 'Widget', active: true }],
+    attributesByClass: {
+      Widget: [
+        { name: 'Code', type: 'string', active: true, _can_read: true },
+        { name: 'Owner', type: 'lookup', active: true, _can_read: true },
+        { name: 'PortalUrl', type: 'url', active: true, _can_read: true },
+        { name: 'UnsafeUrl', type: 'url', active: true, _can_read: true },
+        { name: 'SerialNumber', type: 'string', active: true, _can_read: true }
+      ]
+    },
+    cardsByClass: {
+      Widget: [{
+        _id: 41,
+        Code: 'W-001',
+        Description: 'Selected widget',
+        Owner: 7,
+        _Owner_description: 'Operations team',
+        PortalUrl: '<a href="https://portal.example/widgets/41">Widget page</a>',
+        UnsafeUrl: '<a href="javascript:alert(1)">Unsafe page</a>',
+        SerialNumber: 'SN-42'
+      }]
+    }
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=materialized-extraction-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=20&includeDiagrams=false&extractionSource=widgets`, {
+    template: {
+      code: 'MaterializedExtraction',
+      spec: {
+        version: 1,
+        steps: [{ type: 'selectCards', as: 'widgets', className: 'Widget', filters: [], columns: ['Code'], limit: 20 }],
+        result: { tables: [{ name: 'widgets', columns: ['Code'] }] }
+      }
+    },
+    params: {}
+  }, headers);
+  assert.equal(preview.statusCode, 200, preview.body);
+  const table = preview.json.result.tables.find((item) => item.name === 'widgets');
+  assert.ok(table, preview.body);
+  assert.ok(table.columns.includes('Owner'));
+  assert.ok(table.columns.includes('SerialNumber'));
+  assert.equal(table.rows[0].Owner, 'Operations team');
+  assert.equal(table.rows[0].SerialNumber, 'SN-42');
+  assert.equal(table.rows[0].PortalUrl, 'https://portal.example/widgets/41');
+  assert.equal(table.cellMeta[0].PortalUrl.autoHref, 'https://portal.example/widgets/41');
+  assert.equal(table.rows[0].UnsafeUrl, 'javascript:alert(1)');
+  assert.equal(table.cellMeta[0].UnsafeUrl.autoHref, undefined);
+  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/Widget/cards/41')), true);
+  assert.equal(backend.exitCode, null);
+});
+
+test('relation result tables normalize typed fields by related card class and reuse attribute metadata', async (t) => {
+  const mock = await startMockCmdbuild(t, {
+    classes: [
+      { _id: 1, name: 'Source', description: 'Source', active: true },
+      { _id: 2, name: 'Target', description: 'Target', active: true }
+    ],
+    attributesByClass: {
+      Source: [
+        { name: 'Owner', type: 'string', active: true, _can_read: true },
+        { name: 'PortalUrl', type: 'string', active: true, _can_read: true }
+      ],
+      Target: [
+        { name: 'Owner', type: 'lookup', active: true, _can_read: true },
+        { name: 'PortalUrl', type: 'url', active: true, _can_read: true }
+      ]
+    },
+    cardsByClass: {
+      Source: [{
+        _id: 11,
+        Code: 'SOURCE-1',
+        Description: 'Source card',
+        Owner: 'source-owner',
+        PortalUrl: 'https://source.example/item/11'
+      }],
+      Target: [{
+        _id: 21,
+        Code: 'TARGET-1',
+        Description: 'Target card',
+        Owner: 7,
+        _Owner_description: 'Target owner',
+        PortalUrl: '<a href="https://target.example/item/21">Target page</a>'
+      }]
+    },
+    relationsByCard: {
+      'Source:11': [{
+        _id: 31,
+        domain: 'SourceTarget',
+        _sourceType: 'Source', _sourceId: 11, _sourceCode: 'SOURCE-1', _sourceDescription: 'Source card',
+        _destinationType: 'Target', _destinationId: 21, _destinationCode: 'TARGET-1', _destinationDescription: 'Target card',
+        _direction: 'direct'
+      }]
+    }
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=relation-normalization-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=20&includeDiagrams=false`, {
+    template: {
+      code: 'RelationNormalization',
+      spec: {
+        version: 1,
+        steps: [
+          { type: 'selectCards', as: 'sources', className: 'Source', filters: [], columns: ['Owner', 'PortalUrl'], limit: 20 },
+          { type: 'expandRelations', as: 'relatedOne', from: 'sources', domain: 'SourceTarget', targetClass: 'Target', direction: 'source', columns: ['Owner', 'PortalUrl'], limit: 20 },
+          { type: 'expandRelations', as: 'relatedTwo', from: 'sources', domain: 'SourceTarget', targetClass: 'Target', direction: 'source', columns: ['Owner', 'PortalUrl'], limit: 20 }
+        ],
+        result: {
+          tables: [
+            { name: 'relatedOne', columns: ['Owner', 'PortalUrl', 'Source_Owner', 'Source_PortalUrl'] },
+            { name: 'relatedTwo', columns: ['Owner', 'PortalUrl'] }
+          ]
+        }
+      }
+    },
+    params: {}
+  }, headers);
+
+  assert.equal(preview.statusCode, 200, preview.body);
+  const first = preview.json.result.tables.find((table) => table.name === 'relatedOne');
+  const second = preview.json.result.tables.find((table) => table.name === 'relatedTwo');
+  assert.equal(first.rows[0].Owner, 'Target owner');
+  assert.equal(first.rows[0].PortalUrl, 'https://target.example/item/21');
+  assert.equal(first.cellMeta[0].PortalUrl.autoHref, 'https://target.example/item/21');
+  assert.equal(first.rows[0].Source_Owner, 'source-owner');
+  assert.equal(first.rows[0].Source_PortalUrl, 'https://source.example/item/11');
+  assert.equal(first.cellMeta[0].Source_PortalUrl?.autoHref, undefined);
+  assert.equal(second.rows[0].Owner, 'Target owner');
+  assert.equal(mock.requests.filter((item) => item.pathname === '/cmdbuild/services/rest/v3/classes/Target/attributes').length, 1);
   assert.equal(backend.exitCode, null);
 });
 
@@ -6251,7 +6439,7 @@ test('semantic planning defers an explicit IPv4 reference path to deterministic 
   assert.equal(draft.json.success, true, draft.body);
   assert.ok(draft.json.warnings.some((warning) => /resolved user reference path ipaddress\.ipAddr/i.test(warning)), draft.body);
   assert.equal(draft.json.flow.publishedAlias, 'applications');
-  assert.ok(draft.json.flow.selections.some((selection) => selection.className === 'IpAddress' && selection.rules.some((rule) => rule.path === 'ipAddr' && rule.op === 'ipv4InCidr' && rule.valueColumn === 'range')));
+  assert.ok(draft.json.flow.selections.some((selection) => selection.className === 'IpAddress' && selection.rules.some((rule) => rule.path === 'ipAddr' && rule.op === 'ipv4InCidr' && rule.rightExpression === '${previous.range}')), draft.body);
   assert.ok(draft.json.flow.operations.some((operation) => operation.type === 'relation' && operation.domain === 'ApplicGIpaddressDomain' && operation.targetClass === 'ApplicG' && operation.direction === 'source'));
 
   const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview`, {
