@@ -6,6 +6,7 @@ import {
   normalizeObjectFlow,
   objectFlowResultOutputs,
   objectFlowStageSummaries,
+  resolveObjectFlowContract,
   validateObjectFlow
 } from '../../scripts/assistant-object-flow.mjs';
 import {
@@ -234,6 +235,34 @@ test('validateObjectFlow accepts explicit operations and selection-only flows', 
     }],
     blocks: []
   }), []);
+});
+
+test('canonical Object Flow contract materializes legacy blocks and rejects unresolved stages', () => {
+  const legacy = validFlow();
+  legacy.blocks = legacy.operations;
+  delete legacy.operations;
+  const contract = resolveObjectFlowContract(legacy);
+  assert.deepEqual(contract.errors, []);
+  assert.deepEqual(contract.aliases, ['routers', 'rooms', 'vlans', 'routerRooms', 'routerRoomVlans']);
+  assert.deepEqual(contract.flow.operations.map((operation) => operation.as), ['routerRooms', 'routerRoomVlans']);
+
+  const canonicalWins = validFlow();
+  canonicalWins.blocks = [{
+    type: 'match', from: 'routers', with: 'rooms', as: 'staleLegacyResult',
+    rules: [{ action: 'include', operator: 'equals', leftColumn: 'Location', rightColumn: 'Code' }]
+  }];
+  canonicalWins.setOperations = [];
+  const canonicalContract = resolveObjectFlowContract(canonicalWins);
+  assert.deepEqual(canonicalContract.errors, []);
+  assert.equal(canonicalContract.aliases.includes('staleLegacyResult'), false);
+  assert.deepEqual(canonicalContract.flow.operations.map((operation) => operation.as), ['routerRooms', 'routerRoomVlans']);
+
+  const invalid = validFlow();
+  invalid.operations[0].from = 'missingAlias';
+  const invalidContract = resolveObjectFlowContract(invalid);
+  assert.ok(invalidContract.errors.some((error) => error.path === '$.operations[0].from'));
+  assert.deepEqual(invalidContract.aliases, []);
+  assert.throws(() => objectFlowResultOutputs(invalid), { code: 'object_flow_invalid' });
 });
 
 test('validateObjectFlow reports ids, aliases, operation references, actions, and operators', () => {
@@ -1127,7 +1156,7 @@ test('Assistant output metadata gives named blocks ownership of visible tables w
     ['routerRoomVlans', 'block-4', ['block-4']]
   ]);
   assert.equal(compiled.result.tables.find((table) => table.name === 'routerRooms').title, 'VLAN текущей ИС: Сопоставление 1');
-  assert.equal(compiled.result.tables.find((table) => table.name === 'routerRoomVlans').title, 'Список VLAN');
+  assert.equal(compiled.result.tables.find((table) => table.name === 'routerRoomVlans').title, 'Final result');
   assert.equal(compiled.visualModels.find((model) => model.mode === 'objectMatching').output.title, 'Список VLAN');
   assert.deepEqual(compiled.visualModels.find((model) => model.mode === 'objectMatching').assistantOutputManifest, assistantOutputManifest);
 });
@@ -1163,6 +1192,26 @@ test('Assistant output metadata requires a complete persisted ownership manifest
           { id: 'block-2', name: ' result ', order: 2 }
         ]
       }
+    }),
+    { code: 'assistant_output_manifest_invalid' }
+  );
+  assert.throws(
+    () => compileObjectFlowToSpec(currentSpec, flow, {
+      outputMetadata: completeMetadata,
+      assistantOutputManifest: {
+        version: 1,
+        blocks: [
+          { id: 'block-1', name: 'Result', order: 1 },
+          { id: 'block-2', name: 'Unused result', order: 2 }
+        ]
+      }
+    }),
+    { code: 'assistant_output_manifest_invalid' }
+  );
+  assert.throws(
+    () => compileObjectFlowToSpec(currentSpec, flow, {
+      outputMetadata: completeMetadata,
+      assistantOutputManifest: { version: 1, blocks: [{ id: 'block-1', name: 'Result' }] }
     }),
     { code: 'assistant_output_manifest_invalid' }
   );

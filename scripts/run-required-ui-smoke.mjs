@@ -3,7 +3,13 @@ import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 
-const TEST_NAME_PATTERN = '^(Designer opens on the template list with fixed menu and action bar|About screen displays the embedded application version)$';
+const REQUIRED_TEST_NAMES = [
+  'Designer opens on the template list with fixed menu and action bar',
+  'Designer asks for a normal Save when a recovered D2 mapping is ready but not persisted',
+  'Extraction remains usable with recovered Object Flow labels when Assistant is unavailable',
+  'About screen displays the embedded application version'
+];
+const TEST_NAME_PATTERN = `^(${REQUIRED_TEST_NAMES.join('|')})$`;
 const backendLogs = [];
 
 function sendJson(response, statusCode, body, headers = {}) {
@@ -12,6 +18,13 @@ function sendJson(response, statusCode, body, headers = {}) {
     ...headers
   });
   response.end(JSON.stringify(body));
+}
+
+async function readJson(request) {
+  const chunks = [];
+  for await (const chunk of request) chunks.push(chunk);
+  const body = Buffer.concat(chunks).toString('utf8');
+  return body ? JSON.parse(body) : {};
 }
 
 function listen(server) {
@@ -73,7 +86,19 @@ function createMockCmdbuild() {
     { _id: 3, name: 'Cst_QueryTemplate', description: 'Cst_QueryTemplate', active: true },
     { _id: 4, name: 'Cst_QueryTemplateVersion', description: 'Cst_QueryTemplateVersion', active: true }
   ];
-  return http.createServer((request, response) => {
+  const templateCards = [{
+    _id: 'required-ui-template',
+    Code: 'RequiredUiFixture',
+    Description: 'Required UI fixture',
+    Active: true,
+    SpecJson: JSON.stringify({ version: 1, params: {}, steps: [], result: { tables: [] } }),
+    ParamsSchemaJson: '{}',
+    ResultSchemaJson: '{}',
+    Owner: 'ui-fixture',
+    UpdatedAt: '2026-01-01T00:00:00.000Z'
+  }];
+  const templateVersionCards = [];
+  return http.createServer(async (request, response) => {
     const url = new URL(request.url || '/', 'http://127.0.0.1');
     if (url.pathname === '/cmdbuild/services/rest/v3/sessions' && request.method === 'POST') {
       sendJson(response, 200, { data: { _id: 'required-ui-fixture-session' } }, {
@@ -106,6 +131,35 @@ function createMockCmdbuild() {
     }
     if (url.pathname === '/cmdbuild/services/rest/v3/domains' || url.pathname === '/cmdbuild/services/rest/v3/lookup_types') {
       sendJson(response, 200, { data: [] });
+      return;
+    }
+    if (url.pathname === '/cmdbuild/services/rest/v3/classes/Cst_QueryTemplate/cards' && request.method === 'GET') {
+      sendJson(response, 200, { data: templateCards });
+      return;
+    }
+    const templateCardMatch = url.pathname.match(/^\/cmdbuild\/services\/rest\/v3\/classes\/Cst_QueryTemplate\/cards\/([^/]+)$/);
+    if (templateCardMatch && request.method === 'PUT') {
+      const cardId = decodeURIComponent(templateCardMatch[1]);
+      const cardIndex = templateCards.findIndex((card) => String(card._id) === cardId);
+      if (cardIndex < 0) {
+        sendJson(response, 404, { message: `Unknown template card ${cardId}` });
+        return;
+      }
+      templateCards[cardIndex] = { ...templateCards[cardIndex], ...await readJson(request) };
+      sendJson(response, 200, { data: templateCards[cardIndex] });
+      return;
+    }
+    if (url.pathname === '/cmdbuild/services/rest/v3/classes/Cst_QueryTemplateVersion/cards' && request.method === 'GET') {
+      const timer = setTimeout(() => {
+        if (!response.destroyed) sendJson(response, 200, { data: templateVersionCards });
+      }, 1_000);
+      response.once('close', () => clearTimeout(timer));
+      return;
+    }
+    if (url.pathname === '/cmdbuild/services/rest/v3/classes/Cst_QueryTemplateVersion/cards' && request.method === 'POST') {
+      const card = { _id: `required-ui-version-${templateVersionCards.length + 1}`, ...await readJson(request) };
+      templateVersionCards.push(card);
+      sendJson(response, 200, { data: card });
       return;
     }
     if (/^\/cmdbuild\/services\/rest\/v3\/classes\/[^/]+\/cards$/.test(url.pathname)) {
@@ -180,8 +234,9 @@ try {
   if (result.code !== 0 || result.signal) {
     throw new Error(`Required browser UI smoke failed with ${result.signal || `exit code ${result.code}`}.`);
   }
-  if (!/pass\s+2\b/i.test(result.output) || /skipped\s+[1-9]\d*/i.test(result.output)) {
-    throw new Error(`Required browser UI smoke did not execute both scenarios.\n${result.output}`);
+  const passPattern = new RegExp(`pass\\s+${REQUIRED_TEST_NAMES.length}\\b`, 'i');
+  if (!passPattern.test(result.output) || /skipped\s+[1-9]\d*/i.test(result.output)) {
+    throw new Error(`Required browser UI smoke did not execute all ${REQUIRED_TEST_NAMES.length} scenarios.\n${result.output}`);
   }
 } finally {
   if (backend && backend.exitCode === null) {

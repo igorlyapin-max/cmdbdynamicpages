@@ -23,6 +23,7 @@ import {
   normalizeObjectFlow,
   objectFlowResultOutputs,
   objectFlowStageSummaries,
+  resolveObjectFlowContract,
   validateObjectFlow
 } from './assistant-object-flow.mjs';
 
@@ -5977,7 +5978,7 @@ function objectFlowFromSpecServer(spec) {
     models.push(spec.visualModel);
   }
   const objectGroup = models.find((model) => model && model.mode === 'objectGroup') || {};
-  const objectMatching = models.find((model) => model && model.mode === 'objectMatching') || {};
+  const objectMatching = storedObjectMatchingModel(spec)?.model || {};
   const selections = Array.isArray(objectMatching.selections) && objectMatching.selections.length
     ? objectMatching.selections
     : (Array.isArray(objectGroup.selections) ? objectGroup.selections.map((selection) => ({
@@ -5991,7 +5992,12 @@ function objectFlowFromSpecServer(spec) {
     : null;
   const flow = {
     selections,
-    publishedAlias: String(publishedOutput && publishedOutput.alias || publishedTable && publishedTable.name || '').trim()
+    publishedAlias: String(
+      publishedOutput && publishedOutput.alias
+      || publishedTable && publishedTable.name
+      || objectMatching && objectMatching.output && objectMatching.output.alias
+      || ''
+    ).trim()
   };
   if (Array.isArray(objectMatching.operations)) {
     flow.operations = objectMatching.operations;
@@ -9239,7 +9245,7 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     h1{font-size:18px;margin:0} h2{font-size:15px;margin:0 0 10px} h3{font-size:13px;margin:12px 0 6px;color:#334e68}
     p{margin:0 0 8px}.guide-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.guide-card{border:1px solid var(--line);padding:10px;background:#fbfdff}.guide-card h3{margin-top:0}.steps{margin:8px 0 0;padding-left:20px}.steps li{margin:4px 0}.code-inline{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:#f8fafc;border:1px solid var(--line);padding:1px 4px;border-radius:3px}
     main{padding:14px 16px}.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
-    .runtime-page{background:#fff}.runtime-page main{padding:8px}.runtime-page .result-table-wrap:first-child{margin-top:0}.runtime-page .notice{margin:0}.run-launch-url{display:grid;grid-template-columns:max-content minmax(0,1fr);align-items:start;gap:4px 8px;min-width:0;max-width:100%;flex:1 1 420px}.run-launch-url span,.run-launch-params span{color:var(--muted);font-size:12px;white-space:nowrap}.run-launch-url a{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--accent);min-width:0;max-width:100%;word-break:normal;overflow-wrap:break-word;white-space:normal}.run-launch-params{display:grid;grid-template-columns:max-content minmax(0,1fr);align-items:start;gap:4px 8px;min-width:0;max-width:100%;flex:1 1 100%;font-size:12px}.run-launch-params code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:#334e68;background:#f8fafc;border:1px solid var(--line);padding:2px 4px;min-width:0;max-width:100%;word-break:normal;overflow-wrap:break-word;white-space:normal}
+    .runtime-page{background:#fff}.runtime-page main{padding:8px}.runtime-page .result-table-wrap:first-child{margin-top:0}.runtime-page .notice{margin:0}.run-launch-url{display:grid;grid-template-columns:max-content minmax(0,1fr);align-items:start;gap:4px 8px;min-width:0;max-width:100%;flex:1 1 420px}.run-launch-url span,.run-launch-params span{color:var(--muted);font-size:12px;white-space:nowrap}.run-launch-url a{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--accent);min-width:0;max-width:100%;word-break:normal;overflow-wrap:break-word;white-space:normal}.run-launch-url a[aria-disabled="true"]{color:var(--muted);text-decoration:none;cursor:not-allowed}.run-launch-params{display:grid;grid-template-columns:max-content minmax(0,1fr);align-items:start;gap:4px 8px;min-width:0;max-width:100%;flex:1 1 100%;font-size:12px}.run-launch-params code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:#334e68;background:#f8fafc;border:1px solid var(--line);padding:2px 4px;min-width:0;max-width:100%;word-break:normal;overflow-wrap:break-word;white-space:normal}
     .designer-menu{position:fixed;left:16px;top:64px;bottom:14px;width:246px;overflow:auto;border:1px solid var(--line);background:#fff;padding:10px;display:grid;gap:10px;z-index:10}.designer-main{margin-left:266px}.designer-actionbar{position:sticky;top:0;z-index:30;border:1px solid var(--line);background:rgba(255,255,255,.96);box-shadow:0 6px 16px rgba(15,23,42,.08);padding:8px 10px;margin:0 0 12px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.designer-actionbar-title{font-weight:bold;color:#334e68;white-space:nowrap}.designer-actionbar-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;min-width:0;flex:1 1 auto}.designer-actionbar-context{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));align-items:start;gap:6px 12px;min-width:0;max-width:100%;flex:1 1 100%}.designer-actionbar-context .run-launch-url,.designer-actionbar-context .run-launch-params{grid-template-columns:1fr;min-width:0;flex:initial}.menu-groups{display:grid;grid-template-columns:1fr;gap:10px}.menu-group strong{display:block;font-size:12px;color:#334e68;margin-bottom:6px}.menu-links{display:grid;grid-template-columns:1fr;gap:5px}.menu-links a{border:1px solid var(--line);background:#f8fafc;color:var(--text);padding:5px 7px;border-radius:4px;text-decoration:none;font-size:12px}.menu-links a.active{background:#e6f4f1;border-color:#86b7b3;color:#07575b;font-weight:bold}.menu-links a.disabled{background:#f4f6f8;color:#9aa5b1;border-color:#e4e7eb;cursor:not-allowed}.template-context{border:1px solid #b7d8d4;background:#f2faf8;padding:8px 10px;margin-bottom:12px}.template-context strong{margin-right:6px}.template-context .code-inline{font-weight:bold}
     button,a.button{border:1px solid #9fb3c8;background:#fff;color:var(--text);padding:6px 10px;border-radius:4px;cursor:pointer;text-decoration:none;display:inline-block}
     button.primary,a.button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
@@ -9547,6 +9553,8 @@ function dynamicPagesClientScript() {
       assistantFlowAlgorithm: 'Algorithm',
       assistantFlowExpectedResult: 'Expected result',
       assistantFlowOutputManifestInvalid: 'Assistant result labels are incomplete. Generate and apply the data flow again before using Extraction.',
+      assistantFlowOutputManifestRecovered: 'Some result labels were recovered without Assistant. Extraction remains available; save the template to persist the recovered labels.',
+      assistantFlowStoredFlowInvalid: 'The saved Object Flow contains an unresolved dependency. Stored results were not changed; correct the affected group or matching operation before execution.',
       assistantFlowOwnershipIncomplete: 'The data flow cannot be applied because Assistant result ownership is incomplete.',
       assistantFlowOwnershipIncompleteAction: 'Regenerate the flow so every named data block resolves to one deterministic result.',
       assistantFlowOwnershipMissing: 'Block "{name}" has no unique deterministic result. Available results: {aliases}.',
@@ -9847,6 +9855,9 @@ function dynamicPagesClientScript() {
       d2WorkflowAppliedHelp: 'Deterministic node, group, and edge mappings are applied for {roles} D2 roles. Save the template before publishing.',
       d2WorkflowPublicationBlockedTitle: 'Diagram publication is blocked until D2 mapping is complete',
       d2WorkflowPublicationBlockedHelp: 'Only table-only publication is available while the saved D2 source has no executable deterministic mapping. Complete it in Diagram Assistant or Diagram Editor, then save the template.',
+      d2RecoverySaveRequiredTitle: 'Save the recovered D2 mapping',
+      d2RecoverySaveRequiredHelp: 'The deterministic D2 mapping was recovered from the saved template and is ready. Save the template once to persist its current validation before execution or publication. Diagram Assistant does not need to run again.',
+      d2RecoverySaveRequiredAction: 'Save template',
       d2WorkflowMappingNode: 'Node',
       d2WorkflowMappingGroup: 'Group',
       d2WorkflowMappingStructural: 'Structural container',
@@ -10698,6 +10709,8 @@ function dynamicPagesClientScript() {
       assistantFlowAlgorithm: 'Алгоритм',
       assistantFlowExpectedResult: 'Ожидаемый результат',
       assistantFlowOutputManifestInvalid: 'Подписи результатов Assistant неполны. Сформируйте и примените поток данных повторно перед использованием «Извлечения».',
+      assistantFlowOutputManifestRecovered: 'Часть подписей результатов восстановлена без Assistant. «Извлечение» доступно; сохраните шаблон, чтобы зафиксировать восстановленные подписи.',
+      assistantFlowStoredFlowInvalid: 'Сохраненный Object Flow содержит неразрешенную зависимость. Результаты не изменены; исправьте соответствующую группу или операцию сопоставления перед запуском.',
       assistantFlowOwnershipIncomplete: 'Поток данных нельзя применить: не определена принадлежность результатов Assistant.',
       assistantFlowOwnershipIncompleteAction: 'Сформируйте поток повторно так, чтобы каждый именованный блок данных имел один детерминированный результат.',
       assistantFlowOwnershipMissing: 'Для блока «{name}» не определен единственный детерминированный результат. Доступные результаты: {aliases}.',
@@ -10998,6 +11011,9 @@ function dynamicPagesClientScript() {
       d2WorkflowAppliedHelp: 'Применены детерминированные mapping узлов, групп и связей для D2 roles: {roles}. Перед публикацией сохраните шаблон.',
       d2WorkflowPublicationBlockedTitle: 'Публикация диаграммы заблокирована до завершения D2 mapping',
       d2WorkflowPublicationBlockedHelp: 'Пока для сохранённого D2 source нет исполнимого детерминированного mapping, доступна только публикация таблицы. Завершите mapping в «Ассистенте диаграмм» или «Редакторе диаграмм» и сохраните шаблон.',
+      d2RecoverySaveRequiredTitle: 'Сохраните восстановленный D2 mapping',
+      d2RecoverySaveRequiredHelp: 'Детерминированный D2 mapping восстановлен из сохраненного шаблона и готов. Один раз сохраните шаблон, чтобы записать актуальную валидацию перед запуском или публикацией. Повторно запускать «Ассистент диаграмм» не требуется.',
+      d2RecoverySaveRequiredAction: 'Сохранить шаблон',
       d2WorkflowMappingNode: 'Узел',
       d2WorkflowMappingGroup: 'Группа',
       d2WorkflowMappingStructural: 'Структурный контейнер',
@@ -12286,6 +12302,9 @@ function dynamicPagesClientScript() {
 
   function errorText(result) {
     if (!result) return t('requestFailed');
+    if (result.json && result.json.reason === 'd2_mapping_recovery_save_required') {
+      return t('d2RecoverySaveRequiredHelp');
+    }
     if (result.json && (result.json.rootCause || result.json.schema && result.json.schema.rootCause)) {
       return schemaBootstrapRootCauseText(result.json.rootCause || result.json.schema.rootCause);
     }
@@ -14450,9 +14469,10 @@ function dynamicPagesClientScript() {
 
   function getStoredVisualModel(spec, mode) {
     if (!spec || !mode) return null;
-    if (spec.visualModel && spec.visualModel.mode === mode) return spec.visualModel;
     var models = Array.isArray(spec.visualModels) ? spec.visualModels : [];
-    return models.find(function (model) { return model && model.mode === mode; }) || null;
+    var canonical = models.find(function (model) { return model && model.mode === mode; });
+    if (canonical) return canonical;
+    return spec.visualModel && spec.visualModel.mode === mode ? spec.visualModel : null;
   }
 
   function upsertStoredVisualModel(spec, visualModel) {
@@ -14792,15 +14812,105 @@ function dynamicPagesClientScript() {
     });
   }
 
+  function objectFlowOperationKind(operation) {
+    var type = String(operation && (operation.type || operation.operation) || '').trim();
+    if (type === 'relation') return 'relation';
+    if (type === 'existsRelated') return 'existsRelated';
+    if (type === 'match') return 'match';
+    if (type === 'semiJoin') return 'semiJoin';
+    return 'set';
+  }
+
+  function objectMatchingSourceOperations(model) {
+    if (model && Array.isArray(model.operations)) return model.operations.slice();
+    return [].concat(
+      model && Array.isArray(model.blocks)
+        ? model.blocks.map(function (block) { return Object.assign({ type: 'match' }, block); })
+        : [],
+      model && Array.isArray(model.setOperations) ? model.setOperations : []
+    );
+  }
+
+  function objectFlowNeutralLabel(kind, item, index) {
+    if (kind === 'selection') return item && (item.name || item.title) || defaultObjectSelectionName(index);
+    if (kind === 'match') return t('matchingBlock', { number: index + 1 });
+    if (kind === 'semiJoin') return t('semiJoinOperation', { number: index + 1 });
+    if (kind === 'relation') return t('relationOperation', { number: index + 1 });
+    if (kind === 'existsRelated') return t('existsRelatedOperation', { number: index + 1 });
+    return t('setOperation', { number: index + 1 });
+  }
+
+  function objectFlowStoredLabel(value, alias) {
+    var label = String(value || '').trim();
+    return label && label !== String(alias || '').trim() ? label : '';
+  }
+
+  function objectMatchingPresentationOutputs(model, spec, metadataSource) {
+    model = model || {};
+    spec = spec || defaultSpec();
+    metadataSource = metadataSource || model;
+    var sourceOutputs = Array.isArray(metadataSource.outputs) ? metadataSource.outputs : [];
+    var outputByAlias = {};
+    sourceOutputs.forEach(function (output) {
+      var alias = String(output && output.alias || '').trim();
+      if (alias && !outputByAlias[alias]) outputByAlias[alias] = output;
+    });
+    var tableByAlias = {};
+    resultTablesForSpec(spec).forEach(function (table) {
+      var alias = String(table && table.name || '').trim();
+      if (alias && !tableByAlias[alias]) tableByAlias[alias] = table;
+    });
+    var counters = { selection: 0, match: 0, semiJoin: 0, relation: 0, existsRelated: 0, set: 0 };
+    var modelSelections = Array.isArray(model.selections) && model.selections.length
+      ? model.selections
+      : matchingSelectionsForSpec(spec);
+    var sourceOperations = objectMatchingSourceOperations(model);
+    var ordered = orderedRelationFlowStages(modelSelections, sourceOperations).ordered;
+    var stages = ordered.map(function (stage) {
+      return {
+        alias: stage.alias,
+        kind: stage.kind === 'selection' ? 'selection' : objectFlowOperationKind(stage.item),
+        item: stage.item
+      };
+    });
+    return stages.filter(function (stage) { return stage.alias; }).map(function (stage) {
+      var index = counters[stage.kind] || 0;
+      counters[stage.kind] = index + 1;
+      var existing = outputByAlias[stage.alias];
+      var table = tableByAlias[stage.alias];
+      var editedSelectionLabel = stage.kind === 'selection' && !(existing && existing.assistantManaged === true)
+        ? String(stage.item && (stage.item.name || stage.item.title) || '').trim()
+        : '';
+      var label = objectFlowStoredLabel(editedSelectionLabel, stage.alias)
+        || objectFlowStoredLabel(existing && existing.label, stage.alias)
+        || objectFlowStoredLabel(table && (table.title || table.label), stage.alias)
+        || objectFlowNeutralLabel(stage.kind, stage.item, index);
+      return Object.assign({}, existing || {}, {
+        alias: stage.alias,
+        label: label,
+        kind: stage.kind
+      });
+    });
+  }
+
+  function objectMatchingAliasSet(model, spec) {
+    return objectMatchingPresentationOutputs(model || {}, spec || defaultSpec(), {}).map(function (output) { return output.alias; }).sort();
+  }
+
+  function sameObjectMatchingAliases(left, right, spec) {
+    var leftAliases = objectMatchingAliasSet(left, spec);
+    var rightAliases = objectMatchingAliasSet(right, spec);
+    return leftAliases.length === rightAliases.length && leftAliases.every(function (alias, index) { return alias === rightAliases[index]; });
+  }
+
   function normalizeObjectMatchingModel(model, spec) {
     spec = spec || defaultSpec();
+    var stored = getStoredVisualModel(spec, 'objectMatching');
+    var metadataSource = model && Array.isArray(model.outputs)
+      ? model
+      : stored && Array.isArray(stored.outputs) ? stored : model || stored || {};
     var selections = matchingSelectionsForSpec(spec);
-    var sourceOperations = model && Array.isArray(model.operations)
-      ? model.operations.slice()
-      : [].concat(
-        model && Array.isArray(model.blocks) ? model.blocks.map(function (block) { return Object.assign({ type: 'match' }, block); }) : [],
-        model && Array.isArray(model.setOperations) ? model.setOperations : []
-      );
+    var sourceOperations = objectMatchingSourceOperations(model);
     var operations = [];
     sourceOperations.forEach(function (operation, index) {
       var type = String(operation && (operation.type || operation.operation) || 'match').trim().toLowerCase();
@@ -14822,7 +14932,7 @@ function dynamicPagesClientScript() {
       var published = spec.result.tables.find(function (table) { return table && table.published === true; });
       publishedAlias = String(published && published.name || '').trim();
     }
-    return {
+    var normalized = {
       version: 1,
       mode: 'objectMatching',
       selections: selections,
@@ -14830,10 +14940,23 @@ function dynamicPagesClientScript() {
       blocks: blocks,
       setOperations: setOperations,
       output: {
-        alias: publishedAlias || (operations[operations.length - 1] || {}).as || '',
+        alias: publishedAlias,
         title: t('extractionFinalResult')
       }
     };
+    var aliasesUnchanged = metadataSource && sameObjectMatchingAliases(normalized, metadataSource, spec);
+    normalized.outputs = objectMatchingPresentationOutputs(normalized, spec, metadataSource).map(function (output) {
+      if (aliasesUnchanged) return output;
+      var next = Object.assign({}, output);
+      delete next.assistantManaged;
+      delete next.assistantBlockId;
+      delete next.assistantBlockIds;
+      return next;
+    });
+    if (aliasesUnchanged && metadataSource.assistantOutputManifest && typeof metadataSource.assistantOutputManifest === 'object') {
+      normalized.assistantOutputManifest = cloneJsonValue(metadataSource.assistantOutputManifest, null);
+    }
+    return normalized;
   }
 
   function inferRelationExpansionModel(spec) {
@@ -17395,16 +17518,22 @@ function dynamicPagesClientScript() {
     return 'HTML: ' + htmlQuery + ' | JSON: ' + jsonQuery;
   }
 
-  function renderTemplateLaunchUrl(selected) {
+  function renderTemplateLaunchUrl(selected, options) {
+    options = options || {};
     var code = readTemplateCode(selected);
     if (!code) return '<div class="notice error">' + escapeHtml(t('templateCodeRequired')) + '</div>';
     var params = runUrlParamsForTemplate(selected, false);
     var url = absoluteRuntimeTemplateUrl(code, params);
     var jsonParams = Object.assign({}, params, { json: 'true' });
     var jsonUrl = absoluteRuntimeTemplateUrl(code, jsonParams);
+    var disabled = Boolean(options.disabled);
+    var linkTitle = disabled ? String(options.title || t('d2RecoverySaveRequiredHelp')) : t('runLaunchUrlHelp');
+    var linkAttributes = disabled
+      ? ' aria-disabled="true" tabindex="-1"'
+      : ' target="_blank" rel="noreferrer"';
     return [
-      '<div class="run-launch-url" title="' + escapeHtml(t('runLaunchUrlHelp')) + '"><span>' + escapeHtml(t('runLaunchUrl')) + '</span><a id="cmdp-run-launch-url" data-template-code="' + escapeHtml(code) + '" href="' + escapeHtml(url) + '" target="_blank" rel="noreferrer">' + escapeHtml(url) + '</a></div>',
-      '<div class="run-launch-url" title="' + escapeHtml(t('runLaunchUrlHelp')) + '"><span>' + escapeHtml(t('runLaunchJsonUrl')) + '</span><a id="cmdp-run-launch-json-url" data-template-code="' + escapeHtml(code) + '" href="' + escapeHtml(jsonUrl) + '" target="_blank" rel="noreferrer">' + escapeHtml(jsonUrl) + '</a></div>',
+      '<div class="run-launch-url" title="' + escapeHtml(linkTitle) + '"><span>' + escapeHtml(t('runLaunchUrl')) + '</span><a id="cmdp-run-launch-url" data-template-code="' + escapeHtml(code) + '"' + (disabled ? '' : ' href="' + escapeHtml(url) + '"') + linkAttributes + '>' + escapeHtml(url) + '</a></div>',
+      '<div class="run-launch-url" title="' + escapeHtml(linkTitle) + '"><span>' + escapeHtml(t('runLaunchJsonUrl')) + '</span><a id="cmdp-run-launch-json-url" data-template-code="' + escapeHtml(code) + '"' + (disabled ? '' : ' href="' + escapeHtml(jsonUrl) + '"') + linkAttributes + '>' + escapeHtml(jsonUrl) + '</a></div>',
       '<div class="run-launch-params" title="' + escapeHtml(t('runLaunchParamsHelp')) + '"><span>' + escapeHtml(t('runLaunchParams')) + '</span><code id="cmdp-run-launch-params">' + escapeHtml(runParamVariantsText(params)) + '</code></div>'
     ].join('');
   }
@@ -17425,11 +17554,38 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
+  function templateD2RecoveryRequiresSave(selected) {
+    var recovery = selected && selected.authoringRecovery && typeof selected.authoringRecovery === 'object'
+      ? selected.authoringRecovery
+      : null;
+    return Boolean(recovery && recovery.requiresSave === true && recovery.executionReadyAfterSave === true);
+  }
+
+  function templateD2RecoveryBlocksStrictActions(selected) {
+    if (!templateD2RecoveryRequiresSave(selected)) return false;
+    var spec = selected && selected.spec && typeof selected.spec === 'object' ? selected.spec : {};
+    var presentation = spec.result && spec.result.presentation && typeof spec.result.presentation === 'object'
+      ? spec.result.presentation
+      : {};
+    return normalizeOutputMode(presentation.outputMode || 'both') !== 'tables';
+  }
+
+  function renderTemplateD2RecoveryNotice(selected) {
+    if (!templateD2RecoveryRequiresSave(selected)) return '';
+    return [
+      '<div class="notice warning" role="status" data-d2-recovery-save-required>',
+      '<strong>' + escapeHtml(t('d2RecoverySaveRequiredTitle')) + '</strong><br>',
+      escapeHtml(t('d2RecoverySaveRequiredHelp')),
+      '<div class="toolbar"><button type="button" class="primary" data-action="save-template">' + escapeHtml(t('d2RecoverySaveRequiredAction')) + '</button></div>',
+      '</div>'
+    ].join('');
+  }
+
   function renderPublicationEditor(selected) {
     var spec = (selected && selected.spec) || defaultSpec();
     var publish = publishModelForSpec(spec);
     var d2Workflow = d2WorkflowStatusForEditor(spec);
-    var d2Warning = d2Workflow.state === 'pending'
+    var d2Warning = !templateD2RecoveryRequiresSave(selected) && d2Workflow.state === 'pending'
       ? '<div class="notice warning"><strong>' + escapeHtml(t('d2WorkflowPublicationBlockedTitle')) + '</strong><br>' + escapeHtml(t('d2WorkflowPublicationBlockedHelp')) + '<div class="toolbar"><button type="button" data-action="open-assistant-d2">' + escapeHtml(t('menuDiagramAssistant')) + '</button></div></div>'
       : '';
     return [
@@ -17607,12 +17763,16 @@ function dynamicPagesClientScript() {
     ];
     var context = '';
     var templateSelected = Boolean(state.selectedTemplate);
+    var recoverySaveRequired = templateD2RecoveryRequiresSave(state.selectedTemplate);
+    var recoveryBlocksStrictActions = templateD2RecoveryBlocksStrictActions(state.selectedTemplate);
     var saveDisabled = !templateSelected || state.savingTemplate;
     var saveTitle = !templateSelected
         ? t('templateSelectionRequired')
         : state.savingTemplate
           ? t('savingTemplate')
-          : '';
+          : recoverySaveRequired
+            ? t('d2RecoverySaveRequiredHelp')
+            : '';
 
     // This is the single persistence action for every template-bound section.
     // Local Apply actions validate and update only the in-browser draft.
@@ -17655,31 +17815,43 @@ function dynamicPagesClientScript() {
     } else if (section === 'cmdb-build-view') {
       actions.push(renderActionButton('apply-cmdb-build-view', t('apply'), { primary: true }));
     } else if (section === 'extraction') {
-      var extractionManifest = assistantObjectFlowOutputManifest(selected && selected.spec || defaultSpec());
       actions.push(renderActionButton('extract-template', t('extractByTemplate'), {
-        primary: true,
-        disabled: extractionManifest.assistantManaged && Boolean(extractionManifest.error),
-        title: extractionManifest.assistantManaged && extractionManifest.error ? t('assistantFlowOutputManifestInvalid') : ''
+        primary: true
       }));
     } else if (section === 'visualization') {
       actions.push(renderActionButton('apply-visualization', t('applyVisualization'), { primary: true }));
     } else if (section === 'cache') {
       actions.push(renderActionButton('apply-cache', t('cacheApply'), { primary: true }));
-      if (readTemplateCode(selected)) context = renderTemplateLaunchUrl(selected);
+      if (readTemplateCode(selected)) context = renderTemplateLaunchUrl(selected, {
+        disabled: recoveryBlocksStrictActions,
+        title: recoveryBlocksStrictActions ? t('d2RecoverySaveRequiredHelp') : ''
+      });
     } else if (section === 'publication') {
       actions.push(renderActionButton('apply-publication', t('applyPublication')));
       var snapshotPublicationEnabled = publishModelForSpec(selected && selected.spec || defaultSpec()).mode === 'staticSnapshot';
       actions.push(renderActionButton('publish-snapshot', t('publishSnapshot'), {
         primary: true,
-        disabled: !snapshotPublicationEnabled,
-        title: snapshotPublicationEnabled ? '' : t('publicationDynamicHint')
+        disabled: !snapshotPublicationEnabled || recoveryBlocksStrictActions,
+        title: recoveryBlocksStrictActions ? t('d2RecoverySaveRequiredHelp') : snapshotPublicationEnabled ? '' : t('publicationDynamicHint')
       }));
-      if (readTemplateCode(selected)) context = renderTemplateLaunchUrl(selected);
+      if (readTemplateCode(selected)) context = renderTemplateLaunchUrl(selected, {
+        disabled: recoveryBlocksStrictActions,
+        title: recoveryBlocksStrictActions ? t('d2RecoverySaveRequiredHelp') : ''
+      });
     } else if (section === 'run') {
       actions.push(renderActionButton('visualize-editor', t('visualizeInEditor'), { primary: true }));
-      actions.push(renderActionButton('force-refresh-editor', t('forceRefreshInEditor')));
-      actions.push(renderActionButton('visualize-external', t('visualizeExternal')));
-      if (readTemplateCode(selected)) context = renderTemplateLaunchUrl(selected);
+      actions.push(renderActionButton('force-refresh-editor', t('forceRefreshInEditor'), {
+        disabled: recoveryBlocksStrictActions,
+        title: recoveryBlocksStrictActions ? t('d2RecoverySaveRequiredHelp') : ''
+      }));
+      actions.push(renderActionButton('visualize-external', t('visualizeExternal'), {
+        disabled: recoveryBlocksStrictActions,
+        title: recoveryBlocksStrictActions ? t('d2RecoverySaveRequiredHelp') : ''
+      }));
+      if (readTemplateCode(selected)) context = renderTemplateLaunchUrl(selected, {
+        disabled: recoveryBlocksStrictActions,
+        title: recoveryBlocksStrictActions ? t('d2RecoverySaveRequiredHelp') : ''
+      });
     } else if (section === 'selection') {
       actions.push(renderActionButton('add-selection-filter-row', t('addFilter')));
       actions.push(renderActionButton('apply-selection', t('applySelection'), { primary: true }));
@@ -17759,6 +17931,7 @@ function dynamicPagesClientScript() {
       '<div class="designer-main">',
       renderDesignerActionBar(selected),
       renderNotice(state.message),
+      renderTemplateD2RecoveryNotice(state.selectedTemplate),
       renderTemplateContext(selected),
       renderDesignerSection(selected, config, templateRows),
       '</div>'
@@ -17936,10 +18109,8 @@ function dynamicPagesClientScript() {
     var name = String(alias || '');
     if (!name) return '';
     var assistantManifest = assistantObjectFlowOutputManifest(spec || {});
-    if (assistantManifest.assistantManaged) {
-      var assistantOutput = assistantManifest.outputs.find(function (output) { return output.alias === name; });
-      return assistantOutput ? assistantOutput.label : assistantManifest.error ? t('assistantFlowOutputManifestInvalid') : '';
-    }
+    var assistantOutput = assistantManifest.outputs.find(function (output) { return output.alias === name; });
+    if (assistantOutput && assistantOutput.label) return assistantOutput.label;
     var visual = getStoredVisualModel(spec || {}, 'objectGroup');
     var selections = visual && Array.isArray(visual.selections) ? visual.selections : [];
     var selection = selections.find(function (item) {
@@ -17990,9 +18161,8 @@ function dynamicPagesClientScript() {
     if (!name) return '';
     var assistantManifest = assistantObjectFlowOutputManifest(spec || {});
     if (assistantManifest.assistantManaged) {
-      if (assistantManifest.error) return t('assistantFlowOutputManifestInvalid');
       var output = assistantManifest.outputs.find(function (item) { return item.alias === name; });
-      return output && output.label ? output.label : t('assistantFlowOutputManifestInvalid');
+      if (output && output.label) return output.label;
     }
     var draftLabel = assistantDraftResultLabel(name);
     if (draftLabel) return draftLabel;
@@ -18020,7 +18190,7 @@ function dynamicPagesClientScript() {
   function userFacingResultText(text, spec) {
     var value = String(text == null ? '' : text);
     var manifest = assistantObjectFlowOutputManifest(spec || {});
-    if (!manifest.assistantManaged || manifest.error) return value;
+    if (!manifest.outputs.length) return value;
     manifest.outputs.forEach(function (output) {
       var alias = String(output && output.alias || '').trim();
       var label = String(output && output.label || '').trim();
@@ -18110,26 +18280,23 @@ function dynamicPagesClientScript() {
     var persisted = objectMatching && objectMatching.assistantOutputManifest && typeof objectMatching.assistantOutputManifest === 'object'
       ? objectMatching.assistantOutputManifest
       : null;
-    var intent = assistantObjectFlowIntentFromSpec(spec);
-    var hasCompiledFlow = Boolean(objectMatching && (
-      (Array.isArray(objectMatching.selections) && objectMatching.selections.length)
-      || (Array.isArray(objectMatching.operations) && objectMatching.operations.length)
-    ));
-    var isAssistantFlow = Boolean(outputs.some(function (output) { return output && output.assistantManaged === true; }) || (intent.blocks.length && hasCompiledFlow));
-    if (!isAssistantFlow) return { assistantManaged: false, error: '', outputs: [] };
-    if (!objectMatching || !outputs.length || !persisted || Number(persisted.version) !== 1 || !Array.isArray(persisted.blocks) || !persisted.blocks.length) {
-      return { assistantManaged: true, error: 'missing manifest', outputs: [] };
-    }
-    var availableAliases = {};
+    var executableAliases = {};
     ((spec && spec.steps) || []).forEach(function (step) {
-      if (step && step.as) availableAliases[String(step.as)] = true;
+      var alias = String(step && step.as || '').trim();
+      if (alias) executableAliases[alias] = true;
     });
+    var hasExecutableAliases = Object.keys(executableAliases).length > 0;
+    var presentationOutputs = objectMatchingPresentationOutputs(objectMatching || {}, spec || {}, objectMatching || {}).filter(function (output) {
+      return !hasExecutableAliases || executableAliases[String(output && output.alias || '')];
+    });
+    var isAssistantFlow = Boolean(outputs.some(function (output) { return output && output.assistantManaged === true; }) || persisted);
+    if (!isAssistantFlow) return { assistantManaged: false, error: '', warning: '', outputs: presentationOutputs, blocks: [] };
+    if (!objectMatching || !outputs.length || !persisted || Number(persisted.version) !== 1 || !Array.isArray(persisted.blocks) || !persisted.blocks.length) {
+      return { assistantManaged: true, error: '', warning: 'incomplete manifest', outputs: presentationOutputs, blocks: [] };
+    }
     var expectedAliases = {};
-    (Array.isArray(objectMatching.selections) ? objectMatching.selections : []).forEach(function (selection) {
-      if (selection && selection.alias) expectedAliases[String(selection.alias)] = true;
-    });
-    (Array.isArray(objectMatching.operations) ? objectMatching.operations : []).forEach(function (operation) {
-      if (operation && operation.as) expectedAliases[String(operation.as)] = true;
+    presentationOutputs.forEach(function (output) {
+      if (output && output.alias) expectedAliases[String(output.alias)] = true;
     });
     var knownBlockIds = {};
     var knownBlockNames = {};
@@ -18138,24 +18305,27 @@ function dynamicPagesClientScript() {
       var id = String(raw && raw.id || '').trim();
       var name = String(raw && raw.name || '').trim();
       var nameKey = name.replace(/\s+/g, ' ').toLocaleLowerCase('ru-RU');
-      if (!id || !name || knownBlockIds[id] || knownBlockNames[nameKey] || Number(raw && raw.order || index + 1) !== index + 1) invalid = true;
+      if (!id || !name || knownBlockIds[id] || knownBlockNames[nameKey]
+        || !raw || !Object.prototype.hasOwnProperty.call(raw, 'order') || Number(raw.order) !== index + 1) invalid = true;
       knownBlockIds[id] = true;
       knownBlockNames[nameKey] = true;
       return { id: id, name: name, order: index + 1 };
     });
     var seen = {};
+    var referencedBlockIds = {};
     var manifest = outputs.map(function (output) {
       var alias = String(output && output.alias || '').trim();
       var ownerIds = Array.isArray(output && output.assistantBlockIds)
         ? output.assistantBlockIds.map(function (id) { return String(id || '').trim(); }).filter(Boolean)
         : [String(output && output.assistantBlockId || '').trim()].filter(Boolean);
-      if (!alias || !availableAliases[alias] || !expectedAliases[alias] || seen[alias]
-        || !output || output.assistantManaged !== true || !String(output.label || '').trim()
+      if (!alias || !expectedAliases[alias] || seen[alias]
+        || !output || output.assistantManaged !== true || !objectFlowStoredLabel(output.label, alias)
         || !ownerIds.length || ownerIds.some(function (id) { return !knownBlockIds[id]; })) {
         invalid = true;
         return null;
       }
       seen[alias] = true;
+      ownerIds.forEach(function (id) { referencedBlockIds[id] = true; });
       return {
         alias: alias,
         label: String(output && output.label || alias).trim() || alias,
@@ -18165,7 +18335,11 @@ function dynamicPagesClientScript() {
       };
     }).filter(Boolean);
     if (Object.keys(expectedAliases).some(function (alias) { return !seen[alias]; })) invalid = true;
-    return { assistantManaged: true, error: invalid ? 'invalid manifest' : '', outputs: invalid ? [] : manifest, blocks: invalid ? [] : blocks };
+    if (Object.keys(knownBlockIds).some(function (id) { return !referencedBlockIds[id]; })) invalid = true;
+    if (invalid) {
+      return { assistantManaged: true, error: '', warning: 'incomplete manifest', outputs: presentationOutputs, blocks: [] };
+    }
+    return { assistantManaged: true, error: '', warning: '', outputs: manifest, blocks: blocks };
   }
 
   function assistantObjectFlowOutputManifest(spec) {
@@ -18186,7 +18360,6 @@ function dynamicPagesClientScript() {
     spec = spec || defaultSpec();
     var assistantManifest = assistantObjectFlowOutputManifest(spec);
     if (assistantManifest.assistantManaged) {
-      if (assistantManifest.error) return [];
       return assistantManifest.outputs.length ? [assistantManifest.outputs[assistantManifest.outputs.length - 1].alias] : [];
     }
     var objectFlowOutputs = objectFlowOutputManifest(spec);
@@ -18301,15 +18474,15 @@ function dynamicPagesClientScript() {
     resultTables.forEach(function (table) {
       if (!table || !table.name) return;
       var existing = tableSettings[table.name] || {};
-      var title = table.title || table.label || existing.title || '';
-      var legacyTitleParam = table.titleParam || existing.titleParam || '';
+      var title = existing.title || (table.presentation && table.presentation.title) || table.title || table.label || '';
+      var legacyTitleParam = existing.titleParam || table.titleParam || '';
       if (!title && legacyTitleParam) title = '$' + '{param.' + legacyTitleParam + '}';
       tableSettings[table.name] = Object.assign({}, existing, table.presentation || {}, {
         name: table.name,
         title: title,
-        titleParam: table.titleParam || existing.titleParam || '',
-        titleAlign: (table.presentation && table.presentation.titleAlign) || table.titleAlign || existing.titleAlign || 'left',
-        mode: table.mode || table.view || existing.mode || 'table'
+        titleParam: existing.titleParam || table.titleParam || '',
+        titleAlign: existing.titleAlign || (table.presentation && table.presentation.titleAlign) || table.titleAlign || 'left',
+        mode: existing.mode || table.mode || table.view || 'table'
       });
     });
     var firstTableEmptyText = '';
@@ -18478,22 +18651,28 @@ function dynamicPagesClientScript() {
   }
 
   function extractionResultOptions(spec, tables) {
+    var options = arguments[2] || {};
     var result = [];
     var seen = {};
+    var assistantManifest = assistantObjectFlowOutputManifest(spec);
+    var executableAliases = {};
+    ((spec && spec.steps) || []).forEach(function (step) {
+      var alias = String(step && step.as || '').trim();
+      if (alias) executableAliases[alias] = true;
+    });
+    var restrictToExecutable = Boolean(assistantManifest.warning || options.executableOnly);
     function add(name, label) {
       var text = String(name || '').trim();
-      if (!text || seen[text]) return;
+      if (!text || seen[text] || restrictToExecutable && !executableAliases[text]) return;
       seen[text] = true;
       var baseLabel = label || userFacingResultLabel(text, spec) || text;
       result.push({ name: text, label: baseLabel });
     }
-    var assistantManifest = assistantObjectFlowOutputManifest(spec);
     if (assistantManifest.assistantManaged) {
-      if (assistantManifest.error) return result;
       assistantManifest.outputs.forEach(function (output) {
         add(output.alias, output.label);
       });
-      return result;
+      if (!assistantManifest.warning) return result;
     }
     var relation = getStoredVisualModel(spec || {}, 'relationExpansion');
     var relationStep = getRelationExpansionStep(spec || {});
@@ -18561,7 +18740,8 @@ function dynamicPagesClientScript() {
   }
 
   function renderExtractionResultOptions(selectedName, spec, tables) {
-    var options = extractionResultOptions(spec, tables);
+    var preparedOptions = arguments[3];
+    var options = preparedOptions || extractionResultOptions(spec, tables);
     selectedName = preferredExtractionResultName(spec, tables, selectedName, options);
     return options.map(function (item) {
       return '<option value="' + escapeHtml(item.name) + '"' + (item.name === selectedName ? ' selected' : '') + '>' + escapeHtml(item.label) + '</option>';
@@ -18589,15 +18769,24 @@ function dynamicPagesClientScript() {
     var specTables = spec && spec.result && Array.isArray(spec.result.tables) ? spec.result.tables : [];
     var optionTables = previewTables.length ? previewTables : specTables;
     var assistantManifest = assistantObjectFlowOutputManifest(spec);
-    var options = renderExtractionResultOptions(state.extractionSource, spec, optionTables);
-    var selectedName = preferredExtractionResultName(spec, optionTables, state.extractionSource);
+    var objectFlowRecovery = selected && selected.objectFlowRecovery && typeof selected.objectFlowRecovery === 'object'
+      ? selected.objectFlowRecovery
+      : null;
+    var invalidStoredFlow = Boolean(objectFlowRecovery && objectFlowRecovery.status === 'skipped_invalid_flow');
+    var recoveredLabels = Boolean(assistantManifest.warning || objectFlowRecovery && objectFlowRecovery.requiresSave === true);
+    var resultOptions = extractionResultOptions(spec, optionTables, { executableOnly: invalidStoredFlow });
+    var options = invalidStoredFlow
+      ? renderExtractionResultOptions(state.extractionSource, spec, optionTables, resultOptions)
+      : renderExtractionResultOptions(state.extractionSource, spec, optionTables);
+    var selectedName = preferredExtractionResultName(spec, optionTables, state.extractionSource, resultOptions);
     return [
       '<section class="section" id="cmdp-extraction-editor"><h2>' + t('extractionEditor') + '</h2>',
-      assistantManifest.assistantManaged && assistantManifest.error ? '<div class="notice error" role="alert">' + escapeHtml(t('assistantFlowOutputManifestInvalid')) + '</div>' : '',
+      invalidStoredFlow ? '<div class="notice warning" role="status" data-object-flow-invalid>' + escapeHtml(t('assistantFlowStoredFlowInvalid')) + '</div>' : '',
+      recoveredLabels ? '<div class="notice warning" role="status" data-object-flow-recovery>' + escapeHtml(t('assistantFlowOutputManifestRecovered')) + '</div>' : '',
       '<div class="row">',
       options ? '<label>' + t('extractionResultSource') + '<select id="cmdp-extraction-source">' + options + '</select><span class="muted">' + escapeHtml(t('extractionResultSourceHelp')) + '</span></label>' : '',
       '</div>',
-      assistantManifest.assistantManaged && assistantManifest.error ? '' : renderExtractionPreview(spec),
+      renderExtractionPreview(spec),
       '</section>'
     ].join('');
   }
@@ -25397,22 +25586,27 @@ function dynamicPagesClientScript() {
     var orderedStages = orderedRelationFlowStages(selectionSteps, operationSteps);
     if (orderedStages.unresolved.length) throw new Error(t('relationFlowDependencyCycle'));
     var steps = orderedStages.ordered.map(function (stage) { return stage.item; });
-    var finalAlias = model.output && model.output.alias || (operations[operations.length - 1] || {}).as || '';
+    var finalAlias = model.output && model.output.alias || '';
     var resultTables = objectSpec.result && objectSpec.result.tables ? objectSpec.result.tables.slice() : [];
+    var outputLabels = {};
+    (Array.isArray(model.outputs) ? model.outputs : []).forEach(function (output) {
+      var alias = String(output && output.alias || '').trim();
+      var label = String(output && output.label || '').trim();
+      if (alias && label) outputLabels[alias] = label;
+    });
     operations.forEach(function (operation, index) {
       if (resultTables.some(function (table) { return table && table.name === operation.as; })) return;
       resultTables.push({
         name: operation.as,
-        title: assistantManagedObjectFlow(specForLabels)
-          ? userFacingResultLabel(operation.as, specForLabels)
-          : (operation.as === finalAlias ? t('extractionFinalResult') : operation.type === 'match' ? t('matchingBlock', { number: index + 1 }) : operation.type === 'semiJoin' ? t('semiJoinOperation', { number: index + 1 }) : operation.type === 'relation' ? t('relationOperation', { number: index + 1 }) : operation.type === 'existsRelated' ? t('existsRelatedOperation', { number: index + 1 }) : operation.as),
+        title: outputLabels[operation.as]
+          || (operation.as === finalAlias ? t('extractionFinalResult') : operation.type === 'match' ? t('matchingBlock', { number: index + 1 }) : operation.type === 'semiJoin' ? t('semiJoinOperation', { number: index + 1 }) : operation.type === 'relation' ? t('relationOperation', { number: index + 1 }) : operation.type === 'existsRelated' ? t('existsRelatedOperation', { number: index + 1 }) : t('setOperation', { number: index + 1 })),
         columns: []
       });
     });
     if (finalAlias && !resultTables.some(function (table) { return table && table.name === finalAlias; })) {
       resultTables.push({
         name: finalAlias,
-        title: assistantManagedObjectFlow(specForLabels) ? userFacingResultLabel(finalAlias, specForLabels) : t('extractionFinalResult'),
+        title: outputLabels[finalAlias] || t('extractionFinalResult'),
         columns: []
       });
     }
@@ -25448,21 +25642,26 @@ function dynamicPagesClientScript() {
     if (previousSpec && previousSpec.result && previousSpec.result.presentation) {
       spec.result.presentation = cloneJsonValue(previousSpec.result.presentation, {});
     }
-    return upsertStoredVisualModel(spec, {
+    var storedObjectMatching = {
       version: 1,
       mode: 'objectMatching',
       selections: model.selections,
       operations: operations,
       blocks: model.blocks,
       setOperations: model.setOperations,
+      outputs: Array.isArray(model.outputs) ? cloneJsonValue(model.outputs, []) : [],
       output: {
         alias: finalAlias,
-        title: t('extractionFinalResult')
+        title: outputLabels[finalAlias] || t('extractionFinalResult')
       },
       catalog: {
         maxTraversalDepth: Number(state.maxTraversalDepth) || 1
       }
-    });
+    };
+    if (model.assistantOutputManifest && typeof model.assistantOutputManifest === 'object') {
+      storedObjectMatching.assistantOutputManifest = cloneJsonValue(model.assistantOutputManifest, null);
+    }
+    return upsertStoredVisualModel(spec, storedObjectMatching);
   }
 
   function captureRelationDraftFromDom() {
@@ -25749,8 +25948,6 @@ function dynamicPagesClientScript() {
     try {
       payload = readEditorPayload();
       params = readRunParams();
-      var assistantManifest = assistantObjectFlowOutputManifest(payload.spec);
-      if (assistantManifest.assistantManaged && assistantManifest.error) throw new Error(t('assistantFlowOutputManifestInvalid'));
       var specTables = payload.spec && payload.spec.result && Array.isArray(payload.spec.result.tables) ? payload.spec.result.tables : [];
       state.extractionSource = preferredExtractionResultName(payload.spec, specTables, readValue('cmdp-extraction-source') || state.extractionSource || '');
       payload.spec = ensureExtractionPreviewTable(payload.spec, state.extractionSource);
@@ -32896,6 +33093,226 @@ function normalizeStoredDiagramImport(spec, diagram, options = {}) {
   return { ...diagram, authoring: { ...authoring, d2Import: imported } };
 }
 
+function storedObjectMatchingModel(spec) {
+  const models = Array.isArray(spec && spec.visualModels) ? spec.visualModels : [];
+  const index = models.findIndex((model) => model && model.mode === 'objectMatching');
+  const mirror = spec && spec.visualModel && spec.visualModel.mode === 'objectMatching'
+    ? spec.visualModel
+    : null;
+  if (index >= 0) {
+    return {
+      model: models[index],
+      index,
+      primary: false,
+      mirror,
+      mirrorConflict: Boolean(mirror && stableJsonStringify(mirror) !== stableJsonStringify(models[index]))
+    };
+  }
+  if (mirror) {
+    return { model: mirror, index: -1, primary: true, mirror, mirrorConflict: false };
+  }
+  return null;
+}
+
+function storedObjectFlowLabel(value, alias) {
+  const label = String(value || '').trim();
+  return label && label !== String(alias || '').trim() ? label : '';
+}
+
+function storedAssistantOutputProvenanceIsValid(outputs, manifest, aliases) {
+  if (!manifest || Number(manifest.version) !== 1 || !Array.isArray(manifest.blocks) || !manifest.blocks.length) return false;
+  const expected = new Set(aliases);
+  const blockIds = new Set();
+  const blockNames = new Set();
+  for (let index = 0; index < manifest.blocks.length; index += 1) {
+    const block = manifest.blocks[index] || {};
+    const id = String(block.id || '').trim();
+    const name = String(block.name || '').trim();
+    const nameKey = name.replace(/\s+/g, ' ').toLocaleLowerCase('ru-RU');
+    if (!id || !name || blockIds.has(id) || blockNames.has(nameKey)
+      || !Object.prototype.hasOwnProperty.call(block, 'order') || Number(block.order) !== index + 1) return false;
+    blockIds.add(id);
+    blockNames.add(nameKey);
+  }
+  const seen = new Set();
+  for (const output of outputs) {
+    const alias = String(output && output.alias || '').trim();
+    const ownerIds = uniqueStrings(Array.isArray(output && output.assistantBlockIds)
+      ? output.assistantBlockIds.map((id) => String(id || '').trim()).filter(Boolean)
+      : [String(output && output.assistantBlockId || '').trim()].filter(Boolean));
+    if (!alias || !expected.has(alias) || seen.has(alias) || output.assistantManaged !== true || !storedObjectFlowLabel(output.label, alias) || !ownerIds.length) return false;
+    if (ownerIds.some((id) => !blockIds.has(id))) return false;
+    seen.add(alias);
+  }
+  if (seen.size !== expected.size) return false;
+  const referencedBlockIds = new Set(outputs.flatMap((output) => (
+    Array.isArray(output && output.assistantBlockIds)
+      ? output.assistantBlockIds
+      : [output && output.assistantBlockId]
+  )).map((id) => String(id || '').trim()).filter(Boolean));
+  return Array.from(blockIds).every((id) => referencedBlockIds.has(id));
+}
+
+function recordObjectFlowStorageOutcome(options, outcome) {
+  if (!options || !Array.isArray(options.objectFlowOutcomes) || !outcome) return;
+  options.objectFlowOutcomes.push(outcome);
+}
+
+function storedObjectFlowExecutableContractErrors(spec, contract) {
+  const expectedAliases = new Set(contract.aliases);
+  const executableAliases = new Set();
+  for (const step of Array.isArray(spec && spec.steps) ? spec.steps : []) {
+    const alias = String(step && step.as || '').trim();
+    const purpose = String(step && step.purpose || '').trim();
+    if (alias && (expectedAliases.has(alias) || purpose === 'objectGroup' || purpose === 'objectMatching')) {
+      executableAliases.add(alias);
+    }
+  }
+  const errors = [];
+  for (const alias of expectedAliases) {
+    if (!executableAliases.has(alias)) {
+      errors.push({ path: '$.steps', message: `Object Flow result ${alias} has no executable step.` });
+    }
+  }
+  for (const alias of executableAliases) {
+    if (!expectedAliases.has(alias)) {
+      errors.push({ path: '$.steps', message: `Executable Object Flow step ${alias} has no canonical visual stage.` });
+    }
+  }
+  const tableAliases = new Set((spec && spec.result && Array.isArray(spec.result.tables) ? spec.result.tables : [])
+    .map((table) => String(table && table.name || '').trim()).filter(Boolean));
+  for (const alias of expectedAliases) {
+    if (!tableAliases.has(alias)) {
+      errors.push({ path: '$.result.tables', message: `Object Flow result ${alias} has no result table.` });
+    }
+  }
+  if (contract.flow.publishedAlias && !tableAliases.has(contract.flow.publishedAlias)) {
+    errors.push({ path: '$.publishedAlias', message: `Published Object Flow result ${contract.flow.publishedAlias} has no result table.` });
+  }
+  return errors;
+}
+
+function normalizeStoredObjectFlowPresentation(spec, options = {}) {
+  const located = storedObjectMatchingModel(spec);
+  if (!located || !located.model) return spec;
+  const before = stableJsonStringify({
+    visualModels: Array.isArray(spec && spec.visualModels) ? spec.visualModels : [],
+    visualModel: spec && spec.visualModel || null
+  });
+  const contract = resolveObjectFlowContract(objectFlowFromSpecServer(spec));
+  const contractErrors = contract.errors.concat(contract.errors.length ? [] : storedObjectFlowExecutableContractErrors(spec, contract));
+  if (contractErrors.length) {
+    recordObjectFlowStorageOutcome(options, {
+      status: 'skipped_invalid_flow',
+      changed: false,
+      executionReadyAfterSave: false,
+      reasons: contractErrors.slice(0, 16).map((error) => ({
+        path: String(error && error.path || ''),
+        message: String(error && error.message || '')
+      }))
+    });
+    return spec;
+  }
+  const defaults = objectFlowResultOutputs(contract.flow);
+  const current = located.model;
+  const rawOutputs = Array.isArray(current.outputs) ? current.outputs : [];
+  const existingByAlias = new Map();
+  for (const output of rawOutputs) {
+    const alias = String(output && output.alias || '').trim();
+    if (alias && !existingByAlias.has(alias)) existingByAlias.set(alias, output);
+  }
+  const tables = spec && spec.result && Array.isArray(spec.result.tables) ? spec.result.tables : [];
+  const tableByAlias = new Map(tables.filter((table) => table && String(table.name || '').trim()).map((table) => [String(table.name), table]));
+  let preservedLabels = 0;
+  let generatedLabels = 0;
+  const labelOrdinals = new Map();
+  const outputs = defaults.map((fallback) => {
+    const existing = existingByAlias.get(fallback.alias);
+    const table = tableByAlias.get(fallback.alias);
+    const existingLabel = storedObjectFlowLabel(existing && existing.label, fallback.alias);
+    const tableLabel = storedObjectFlowLabel(table && (table.title || table.label), fallback.alias);
+    const ordinal = (labelOrdinals.get(fallback.kind) || 0) + 1;
+    labelOrdinals.set(fallback.kind, ordinal);
+    const neutralLabel = storedObjectFlowLabel(fallback.label, fallback.alias) || ({
+      selection: `Выборка ${ordinal}`,
+      match: `Сопоставление ${ordinal}`,
+      semiJoin: `Полусоединение ${ordinal}`,
+      relation: `Связь ${ordinal}`,
+      existsRelated: `Отбор по связям ${ordinal}`,
+      set: `Операция множеств ${ordinal}`
+    }[fallback.kind] || `Результат ${ordinal}`);
+    const label = fallback.kind === 'selection'
+      ? neutralLabel || existingLabel || tableLabel
+      : existingLabel || tableLabel || neutralLabel;
+    if (existingLabel || tableLabel) preservedLabels += 1;
+    else generatedLabels += 1;
+    return {
+      ...(existing || {}),
+      alias: fallback.alias,
+      label,
+      kind: fallback.kind
+    };
+  });
+  const aliases = outputs.map((output) => output.alias);
+  const explicitAssistantOwnership = Boolean(
+    rawOutputs.some((output) => output && output.assistantManaged === true)
+      || current.assistantOutputManifest && typeof current.assistantOutputManifest === 'object'
+  );
+  const retainedOwnership = explicitAssistantOwnership && storedAssistantOutputProvenanceIsValid(rawOutputs, current.assistantOutputManifest, aliases);
+  const normalizedOutputs = retainedOwnership ? outputs : outputs.map((output) => {
+    const normalized = { ...output };
+    delete normalized.assistantManaged;
+    delete normalized.assistantBlockId;
+    delete normalized.assistantBlockIds;
+    return normalized;
+  });
+  const publishedAlias = String(contract.flow.publishedAlias || '').trim();
+  const publishedOutput = normalizedOutputs.find((output) => output.alias === publishedAlias);
+  const nextModel = {
+    ...current,
+    version: 1,
+    mode: 'objectMatching',
+    selections: cloneJsonValueServer(contract.flow.selections, []),
+    operations: cloneJsonValueServer(contract.flow.operations, []),
+    blocks: cloneJsonValueServer(contract.flow.blocks, []),
+    setOperations: cloneJsonValueServer(contract.flow.setOperations, []),
+    outputs: normalizedOutputs,
+    output: {
+      ...(current.output && typeof current.output === 'object' && !Array.isArray(current.output) ? current.output : {}),
+      alias: publishedAlias,
+      title: String(publishedOutput && publishedOutput.label || current.output && current.output.title || '').trim()
+    }
+  };
+  if (!retainedOwnership) delete nextModel.assistantOutputManifest;
+  const models = Array.isArray(spec.visualModels) ? spec.visualModels.slice() : [];
+  const matchingIndex = models.findIndex((model) => model && model.mode === 'objectMatching');
+  if (matchingIndex >= 0) models[matchingIndex] = nextModel;
+  else models.push(nextModel);
+  spec.visualModels = models;
+  if (spec.visualModel && spec.visualModel.mode === 'objectMatching') spec.visualModel = nextModel;
+  const after = stableJsonStringify({
+    visualModels: spec.visualModels,
+    visualModel: spec.visualModel || null
+  });
+  const changed = before !== after;
+  const reasons = [];
+  if (located.primary) reasons.push('canonicalVisualModels');
+  if (located.mirrorConflict) reasons.push('visualModelMirrorConflict');
+  if (!Array.isArray(current.operations)) reasons.push('canonicalOperations');
+  if (!retainedOwnership && explicitAssistantOwnership) reasons.push('assistantOwnershipDowngraded');
+  if (generatedLabels) reasons.push('labelsRecovered');
+  recordObjectFlowStorageOutcome(options, {
+    status: changed ? 'recovered' : 'current',
+    changed,
+    executionReadyAfterSave: true,
+    reasons,
+    preservedLabels,
+    generatedLabels,
+    ownership: retainedOwnership ? 'retained' : explicitAssistantOwnership ? 'downgraded' : 'unmanaged'
+  });
+  return spec;
+}
+
 function normalizeTemplateSpecForStorage(spec, code = '', options = {}) {
   const parsed = safeJsonValue(spec, spec);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return spec;
@@ -32920,6 +33337,7 @@ function normalizeTemplateSpecForStorage(spec, code = '', options = {}) {
   if (authoring) next.authoring = authoring;
   else delete next.authoring;
   delete next.assistantDraft;
+  next = normalizeStoredObjectFlowPresentation(next, options);
   if (next.result && typeof next.result === 'object' && !Array.isArray(next.result) && Array.isArray(next.result.diagrams)) {
     const before = next.result.diagrams.map((diagram) => cloneJsonValueServer(diagram, diagram));
     next.result.diagrams = next.result.diagrams.map((diagram) => normalizeStoredDiagramImport(next, diagram, options));
@@ -32988,32 +33406,95 @@ function sanitizeTemplateCard(card) {
 
 async function sanitizeTemplateCardForRead(card) {
   const sanitized = sanitizeTemplateCard(card);
-  if (!sanitized || !diagramImportNeedsRecovery(sanitized.spec)) return sanitized;
-  const source = String(templateAuthoringD2(sanitized.spec, { allowLegacy: true }).source || '');
-  if (!source.trim()) return sanitized;
-  const identity = await d2SourceStructureIdentity(source);
-  if (!identity.ok) return sanitized;
-  const outcomes = [];
-  const normalized = normalizeTemplateSpecForStorage(sanitized.spec, sanitized.code, {
-    d2SourceIdentities: [identity],
-    d2MappingOutcomes: outcomes
+  if (!sanitized) return sanitized;
+  const objectFlowOutcomes = [];
+  let normalized = normalizeStoredObjectFlowPresentation(cloneJsonValueServer(sanitized.spec, sanitized.spec), {
+    objectFlowOutcomes
   });
-  const migrated = outcomes.some((item) => ['materialization_migrated', 'recompiled', 'migrated', 'reattested', 'topology_migrated', 'topology_migrated_partial', 'topology_normalized'].includes(String(item && item.status || '')));
-  if (!migrated) {
-    const statuses = uniqueStrings(outcomes.map((item) => String(item && item.status || '')).filter(Boolean));
-    const reasons = uniqueStrings(outcomes.flatMap((item) => Array.isArray(item && item.reasons) ? item.reasons : []).map(String).filter(Boolean));
-    return statuses.length
-      ? { ...sanitized, authoringRecovery: { requiresSave: false, statuses, ...(reasons.length ? { reasons } : {}) } }
-      : sanitized;
+  const objectFlowChanged = objectFlowOutcomes.some((item) => item && item.changed === true);
+  const objectFlowSummary = objectFlowOutcomes.find((item) => item && ['recovered', 'skipped_invalid_flow'].includes(String(item.status || '')));
+  let authoringRecovery = null;
+
+  if (diagramImportNeedsRecovery(normalized)) {
+    const source = String(templateAuthoringD2(normalized, { allowLegacy: true }).source || '');
+    if (source.trim()) {
+      const identity = await d2SourceStructureIdentity(source);
+      if (identity.ok) {
+        const outcomes = [];
+        normalized = normalizeTemplateSpecForStorage(normalized, sanitized.code, {
+          d2SourceIdentities: [identity],
+          d2MappingOutcomes: outcomes
+        });
+        const statuses = uniqueStrings(outcomes.map((item) => String(item && item.status || '')).filter(Boolean));
+        const reasons = uniqueStrings(outcomes.flatMap((item) => Array.isArray(item && item.reasons) ? item.reasons : []).map(String).filter(Boolean));
+        const migrated = outcomes.some((item) => ['materialization_migrated', 'recompiled', 'migrated', 'reattested', 'topology_migrated', 'topology_migrated_partial', 'topology_normalized'].includes(String(item && item.status || '')));
+        if (migrated) {
+          authoringRecovery = {
+            requiresSave: true,
+            executionReadyAfterSave: validateTemplateSpecForExecution(normalized).length === 0,
+            statuses,
+            ...(reasons.length ? { reasons } : {})
+          };
+        } else if (statuses.length) {
+          authoringRecovery = { requiresSave: false, statuses, ...(reasons.length ? { reasons } : {}) };
+        }
+      }
+    }
   }
+
+  if (!objectFlowChanged && !objectFlowSummary && !authoringRecovery) return sanitized;
   return {
     ...sanitized,
-    // Keep the persisted hash for optimistic concurrency. The client can use
-    // the read-time canonical model immediately, while normal Save persists it.
-    spec: normalized,
-    authoringRecovery: {
-      requiresSave: true,
-      statuses: uniqueStrings(outcomes.map((item) => String(item && item.status || '')).filter(Boolean))
+    // Keep the persisted hash for optimistic concurrency. Read-time recovery
+    // is immediately executable; ordinary Save persists the canonical model.
+    ...(objectFlowChanged || authoringRecovery && authoringRecovery.requiresSave ? { spec: normalized } : {}),
+    ...(objectFlowSummary ? {
+      objectFlowRecovery: {
+        requiresSave: objectFlowSummary.changed === true,
+        executionReadyAfterSave: objectFlowSummary.executionReadyAfterSave === true,
+        status: String(objectFlowSummary.status || ''),
+        ...(Array.isArray(objectFlowSummary.reasons) && objectFlowSummary.reasons.length
+          ? { reasons: cloneJsonValueServer(objectFlowSummary.reasons, []) }
+          : {}),
+        preservedLabels: Number(objectFlowSummary.preservedLabels || 0),
+        generatedLabels: Number(objectFlowSummary.generatedLabels || 0),
+        ownership: String(objectFlowSummary.ownership || 'unmanaged')
+      }
+    } : {}),
+    ...(authoringRecovery ? { authoringRecovery } : {})
+  };
+}
+
+function templateOutputIncludesDiagrams(spec) {
+  return normalizeRuntimeOutputMode(resultPresentationFromSpec(spec).outputMode || 'both') !== 'tables';
+}
+
+async function templateD2RecoverySaveRequirement(card, template, options = {}) {
+  if (options.includeDiagrams === false || !template || !diagramImportNeedsRecovery(template.spec)) return null;
+  const recoveredTemplate = await sanitizeTemplateCardForRead(card);
+  const recovery = recoveredTemplate && recoveredTemplate.authoringRecovery;
+  if (!recovery || recovery.requiresSave !== true || recovery.executionReadyAfterSave !== true) return null;
+  return {
+    requiresSave: true,
+    executionReadyAfterSave: true,
+    statuses: uniqueStrings(Array.isArray(recovery.statuses) ? recovery.statuses.map(String).filter(Boolean) : []),
+    ...(Array.isArray(recovery.reasons) && recovery.reasons.length ? { reasons: uniqueStrings(recovery.reasons.map(String).filter(Boolean)) } : {})
+  };
+}
+
+function d2RecoverySaveRequiredPayload(template, action, authoringRecovery) {
+  return {
+    success: false,
+    action,
+    reason: 'd2_mapping_recovery_save_required',
+    message: 'The D2 mapping was deterministically recovered and is ready to execute, but the recovered validation has not been persisted. Save the template once and retry. Re-running Diagram Assistant is not required.',
+    nextAction: 'saveTemplate',
+    authoringRecovery,
+    template: {
+      code: template.code,
+      description: template.description,
+      active: template.active,
+      specHash: template.specHash
     }
   };
 }
@@ -34140,6 +34621,9 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
   const now = Date.now();
   const runtimeCacheConfig = normalizeRuntimeCacheConfig(options.runtimeCacheConfig || defaultRuntimeConfig());
   const templateCacheConfig = normalizeTemplateCacheConfig(template.spec, runtimeCacheConfig);
+  const executionSpec = executionOptions.includeDiagrams === false
+    ? templateSpecForTableExecution(template.spec)
+    : template.spec;
   if (!templateCacheConfig.enabled || templateCacheConfig.scopeMode === 'disabled') {
     return {
       result: await executeTemplateSpec(authToken, template.spec, params, {
@@ -34153,8 +34637,8 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
       }
     };
   }
-  const dependencyMap = dependencyMapWithHash(template.spec);
-  const accessProbe = await probeTemplateAccess(authToken, template.spec, params, executionOptions, dependencyMap, templateCacheConfig);
+  const dependencyMap = dependencyMapWithHash(executionSpec);
+  const accessProbe = await probeTemplateAccess(authToken, executionSpec, params, executionOptions, dependencyMap, templateCacheConfig);
   if (!accessProbe.ok) {
     const error = runtimeAccessError(accessProbe.message || 'CMDBuild cache permission probe failed.', accessProbe.cmdbuildStatus || 403);
     error.reason = accessProbe.reason || '';
@@ -46586,7 +47070,9 @@ function validateTemplateSpecForExecution(spec, options = {}) {
 }
 
 function executionValidationForSpec(spec) {
-  const errors = validateTemplateSpecForExecution(spec);
+  const errors = validateTemplateSpecForExecution(spec, {
+    includeDiagrams: templateOutputIncludesDiagrams(spec)
+  });
   return {
     executable: errors.length === 0,
     errors
@@ -54782,7 +55268,13 @@ async function handleBackend(req, res, requestUrl) {
       if (templateAction === 'publish' && !await requireTemplateUpdatePermission(authToken, res, found.schema, found.card, templateCode)) return;
 
       const template = sanitizeTemplateCard(found.card);
-      const errors = validateTemplateSpecForExecution(template.spec);
+      const includeDiagrams = templateOutputIncludesDiagrams(template.spec);
+      const recoverySaveRequirement = await templateD2RecoverySaveRequirement(found.card, template, { includeDiagrams });
+      if (recoverySaveRequirement) {
+        sendJson(res, 409, d2RecoverySaveRequiredPayload(template, templateAction, recoverySaveRequirement));
+        return;
+      }
+      const errors = validateTemplateSpecForExecution(template.spec, { includeDiagrams });
       if (templateAction === 'validate') {
         sendJson(res, errors.length ? 400 : 200, {
           success: errors.length === 0,
@@ -54859,7 +55351,9 @@ async function handleBackend(req, res, requestUrl) {
         maxRestCallsMax: executionLimits.maxRestCallsMax,
         maxTraversalDepth: getPositiveInt(requestUrl.searchParams, 'maxTraversalDepth', executionLimits.maxTraversalDepthMax, executionLimits.maxTraversalDepthMax),
         traversalDepthDefault: executionLimits.maxTraversalDepthDefault,
-        maxTraversalDepthMax: executionLimits.maxTraversalDepthMax
+        maxTraversalDepthMax: executionLimits.maxTraversalDepthMax,
+        includeDiagrams,
+        ...(includeDiagrams ? {} : { executionScope: 'tables' })
       };
       const cacheDisabled = requestUrl.searchParams.get('noCache') === '1' || body.noCache === true;
       const forceRefreshRequested = !runtimeReadOnly && (
@@ -55251,7 +55745,7 @@ async function handleBackend(req, res, requestUrl) {
         return;
       }
       const session = await getSessionData(authToken);
-      const storageOptions = { d2MappingOutcomes: [] };
+      const storageOptions = { d2MappingOutcomes: [], objectFlowOutcomes: [] };
       const rawSpec = body.spec !== undefined ? body.spec : body.SpecJson;
       const rawSpecErrors = validateTemplateSpecForStorage(safeJsonValue(rawSpec, rawSpec));
       if (rawSpecErrors.length) {
@@ -55361,6 +55855,8 @@ async function handleBackend(req, res, requestUrl) {
         runtimeCacheInvalidated: cacheInvalidation && cacheInvalidation[0].invalidated || 0,
         staticSnapshotsInvalidated: cacheInvalidation && cacheInvalidation[1].invalidated || 0,
         cacheInvalidationComplete: cacheInvalidation ? cacheInvalidation.every((item) => item.complete) : false,
+        objectFlowOutcomes: storageOptions.objectFlowOutcomes.map((item) => String(item && item.status || '')).filter(Boolean),
+        objectFlowOwnership: storageOptions.objectFlowOutcomes.map((item) => String(item && item.ownership || '')).filter(Boolean),
         d2MappingOutcomes: storageOptions.d2MappingOutcomes.map((item) => String(item && item.status || '')).filter(Boolean),
         d2MappingReasons: uniqueStrings(storageOptions.d2MappingOutcomes.flatMap((item) => Array.isArray(item && item.reasons) ? item.reasons.map(String) : []))
       });
@@ -55372,6 +55868,15 @@ async function handleBackend(req, res, requestUrl) {
         template: sanitizeTemplateCard(updated.json && updated.json.data),
         versionLog,
         executionValidation,
+        objectFlowRecovery: storageOptions.objectFlowOutcomes.map((item) => ({
+          status: String(item && item.status || ''),
+          changed: Boolean(item && item.changed),
+          executionReadyAfterSave: item && item.executionReadyAfterSave === true,
+          reasons: Array.isArray(item && item.reasons) ? cloneJsonValueServer(item.reasons, []) : [],
+          preservedLabels: Number(item && item.preservedLabels || 0),
+          generatedLabels: Number(item && item.generatedLabels || 0),
+          ownership: String(item && item.ownership || '')
+        })),
         authoringRecovery: storageOptions.d2MappingOutcomes.map((item) => ({
           status: String(item && item.status || ''),
           recoveredFromVersion: item && item.recoveredFromVersion || null,
@@ -55799,6 +56304,7 @@ export {
   d2ImporterHealth,
   d2RendererHealth,
   embedDiagramSvgMetadata,
+  executionValidationForSpec,
   executeFilterRows,
   executionThrottleScopeKey,
   expectedSpecHashFromBody,
@@ -55820,6 +56326,7 @@ export {
   normalizeLogLevel,
   normalizeLogTargets,
   normalizeRuntimeCacheConfig,
+  normalizeStoredObjectFlowPresentation,
   normalizeDiagramImportIr,
   diagramImportUnresolvedDiagnostics,
   diagramImportAssistantSpec,
@@ -55879,6 +56386,7 @@ export {
   setMetricGauge,
   shouldRetryCmdbuildResult,
   templateIsProtected,
+  templateOutputIncludesDiagrams,
   templateAssistantRuntimeConfig,
   validateRuntimeConfig,
   validateDiagramImportV3Catalog,

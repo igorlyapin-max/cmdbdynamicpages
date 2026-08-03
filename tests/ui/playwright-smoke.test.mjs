@@ -73,6 +73,192 @@ test('Designer opens on the template list with fixed menu and action bar', { ski
   });
 });
 
+test('Designer asks for a normal Save when a recovered D2 mapping is ready but not persisted', { skip: skipReason }, async () => {
+  await withPage(async (page) => {
+    let recoveredCode = '';
+    await page.route('**/cmdbuild/custom-api/templates?**', async (route) => {
+      const response = await route.fetch();
+      const payload = await response.json();
+      const templates = Array.isArray(payload && payload.data) ? payload.data : [];
+      if (templates.length) {
+        recoveredCode = String(templates[0].code || '');
+        templates[0] = {
+          ...templates[0],
+          spec: {
+            ...(templates[0].spec || {}),
+            result: {
+              ...(templates[0].spec?.result || {}),
+              presentation: {
+                ...(templates[0].spec?.result?.presentation || {}),
+                outputMode: 'both'
+              }
+            },
+            publish: { mode: 'staticSnapshot', paramsMode: 'exact', warningAccepted: true }
+          },
+          authoringRecovery: {
+            requiresSave: true,
+            executionReadyAfterSave: true,
+            statuses: ['reattested']
+          }
+        };
+      }
+      await route.fulfill({ response, json: payload });
+    });
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    assert.ok(recoveredCode, 'The Designer fixture must expose at least one readable template.');
+    await page.locator(`[data-action="select-template"][data-code="${recoveredCode}"]`).click();
+
+    const notice = page.locator('[data-d2-recovery-save-required]');
+    await notice.waitFor({ state: 'visible', timeout: 10_000 });
+    const noticeBox = await notice.boundingBox();
+    assert.ok(noticeBox && noticeBox.width > 0 && noticeBox.height > 0, JSON.stringify(noticeBox));
+    assert.match(await notice.innerText(), /Save the recovered D2 mapping|Сохраните восстановленный D2 mapping/);
+    assert.equal(await notice.locator('button[data-action="save-template"]').isEnabled(), true);
+
+    await page.locator('a[data-designer-section="publication"]').click();
+    await page.waitForSelector('#cmdp-publication-editor', { timeout: 10_000 });
+    assert.equal(await page.locator('[data-d2-recovery-save-required]').isVisible(), true);
+    assert.equal(await page.locator('button[data-action="publish-snapshot"]').isDisabled(), true);
+    assert.equal(await page.locator('[data-d2-recovery-save-required] [data-action="open-assistant-d2"]').count(), 0);
+
+    await page.locator('a[data-designer-section="run"]').click();
+    await page.waitForSelector('#cmdp-run-params-editor', { timeout: 10_000 });
+    assert.equal(await page.locator('button[data-action="visualize-editor"]').isEnabled(), true);
+    assert.equal(await page.locator('button[data-action="force-refresh-editor"]').isDisabled(), true);
+    assert.equal(await page.locator('button[data-action="visualize-external"]').isDisabled(), true);
+    assert.equal(await page.locator('#cmdp-run-launch-url').getAttribute('aria-disabled'), 'true');
+    assert.equal(await page.locator('#cmdp-run-launch-url').getAttribute('href'), null);
+  });
+});
+
+test('Extraction remains usable with recovered Object Flow labels when Assistant is unavailable', { skip: skipReason }, async () => {
+  await withPage(async (page) => {
+    const alias = 'block_legacy_internal_systems';
+    const label = 'Внутренние ИС';
+    let templateCode = '';
+    let assistantRequests = 0;
+    let recoveredPending = true;
+    page.on('request', (request) => {
+      if (request.url().includes('/cmdbuild/custom-api/assistant/')) assistantRequests += 1;
+    });
+    await page.route('**/cmdbuild/custom-api/templates?**', async (route) => {
+      const response = await route.fetch();
+      const payload = await response.json();
+      const templates = Array.isArray(payload && payload.data) ? payload.data : [];
+      if (templates.length) {
+        templateCode = String(templates[0].code || '');
+        const selection = {
+          id: 'selection:' + alias,
+          name: label,
+          alias,
+          className: 'IS',
+          from: '',
+          limit: 100,
+          columns: [],
+          rules: [{ action: 'include', path: 'Code', op: 'exists' }]
+        };
+        const objectMatching = {
+          version: 1,
+          mode: 'objectMatching',
+          selections: [selection],
+          operations: [],
+          blocks: [],
+          setOperations: [],
+          outputs: [{ alias, label, kind: 'selection' }],
+          output: { alias, title: label }
+        };
+        templates[0] = {
+          ...templates[0],
+          protected: false,
+          spec: {
+            version: 1,
+            params: {},
+            visualModel: { version: 1, mode: 'objectGroup', selections: [selection], output: { alias, title: label } },
+            visualModels: [
+              { version: 1, mode: 'objectGroup', selections: [selection] },
+              objectMatching
+            ],
+            steps: [{ type: 'selectCards', className: 'IS', filters: [], limit: 100, as: alias }],
+            result: { tables: [{ name: alias, title: label, columns: [] }] },
+            authoring: {
+              version: 1,
+              assistant: { objectFlowIntent: { version: 2, context: '', blocks: [{ id: 'block-1', name: label, entities: 'IS', algorithm: 'Выбрать внутренние ИС.', expectedResult: label, usesBlockIds: [], order: 1 }] } },
+              d2: { source: '' }
+            }
+          },
+          ...(recoveredPending ? {
+            objectFlowRecovery: {
+              requiresSave: true,
+              executionReadyAfterSave: true,
+              status: 'recovered',
+              preservedLabels: 1,
+              generatedLabels: 0,
+              ownership: 'downgraded'
+            }
+          } : {})
+        };
+      }
+      await route.fulfill({ response, json: payload });
+    });
+    await page.route('**/cmdbuild/custom-api/templates/*', async (route) => {
+      if (route.request().method() !== 'PUT') {
+        await route.continue();
+        return;
+      }
+      const response = await route.fetch();
+      if (response.status() === 200) recoveredPending = false;
+      await route.fulfill({ response });
+    });
+    await page.route('**/cmdbuild/custom-api/draft/preview?*', (route) => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        success: true,
+        result: {
+          tables: [{ name: alias, title: label, columns: ['Description'], rows: [{ Description: 'DNS' }] }],
+          diagrams: [],
+          trace: []
+        }
+      })
+    }));
+
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    assert.ok(templateCode, 'The Designer fixture must expose at least one readable template.');
+    await page.locator(`[data-action="select-template"][data-code="${templateCode}"]`).click();
+    await page.locator('a[data-designer-section="extraction"]').click();
+    await page.waitForSelector('#cmdp-extraction-editor', { timeout: 10_000 });
+
+    const recoveryNotice = page.locator('[data-object-flow-recovery]');
+    await recoveryNotice.waitFor({ state: 'visible', timeout: 10_000 });
+    assert.match(await recoveryNotice.innerText(), /recovered without Assistant|восстановлена без Assistant/);
+    assert.equal(await page.getByText(/Подписи результатов Assistant неполны|Assistant result labels are incomplete/).count(), 0);
+    assert.deepEqual(await page.locator('#cmdp-extraction-source option').evaluateAll((options) => options.map((option) => option.textContent?.trim())), [label]);
+    assert.equal(await page.locator('#cmdp-extraction-source').inputValue(), alias);
+    const extract = page.locator('button[data-action="extract-template"]');
+    assert.equal(await extract.isEnabled(), true);
+
+    const previewResponse = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/draft/preview'));
+    await extract.click();
+    assert.equal((await previewResponse).status(), 200);
+    await page.locator('#cmdp-extraction-editor td', { hasText: 'DNS' }).waitFor({ state: 'visible', timeout: 10_000 });
+    assert.equal(assistantRequests, 0);
+
+    const saveResponse = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/templates/') && response.request().method() === 'PUT');
+    await page.locator('button[data-action="save-template"]').first().click();
+    assert.equal((await saveResponse).status(), 200);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+    await page.locator(`[data-action="select-template"][data-code="${templateCode}"]`).click();
+    await page.locator('a[data-designer-section="extraction"]').click();
+    await page.waitForSelector('#cmdp-extraction-editor', { timeout: 10_000 });
+    assert.equal(await page.locator('[data-object-flow-recovery]').count(), 0);
+    assert.deepEqual(await page.locator('#cmdp-extraction-source option').evaluateAll((options) => options.map((option) => option.textContent?.trim())), [label]);
+    assert.equal(assistantRequests, 0);
+  });
+});
+
 test('About screen displays the embedded application version', { skip: skipReason }, async () => {
   await withPage(async (page) => {
     await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer/about`, { waitUntil: 'domcontentloaded' });

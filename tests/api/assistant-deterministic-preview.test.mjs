@@ -6,7 +6,11 @@ import http from 'node:http';
 import net from 'node:net';
 import { URL } from 'node:url';
 import { compileObjectFlowToSpec } from '../../scripts/assistant-object-flow.mjs';
-import { draftDiagramPreviewMappingPlan } from '../../scripts/dev-proxy-server.mjs';
+import {
+  diagramImportMappingInputRevisionStatus,
+  diagramImportMappingValidationIsCurrent,
+  draftDiagramPreviewMappingPlan
+} from '../../scripts/dev-proxy-server.mjs';
 
 function apiObjectFlowSpec(selections, operations = []) {
   return compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, {
@@ -656,6 +660,116 @@ test('full object-flow planning returns a validated proposal without mutating th
   assert.equal(duplicateName.statusCode, 400, duplicateName.body);
   assert.equal(duplicateName.json.code, 'assistant_object_flow_intent_invalid');
   assert.equal(llm.requests, 1);
+  assert.equal(backend.exitCode, null);
+});
+
+test('template read recovers incomplete Assistant labels without LiteLLM when LLM is disabled', async (t) => {
+  const templateCode = 'RecoveredAssistantLabels';
+  const alias = 'legacyArmsInternal';
+  const label = 'АРМ в Test City 300';
+  const legacySpec = compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, {
+    version: 1,
+    selections: [{
+      id: 'selection:arms', name: label, alias, className: 'ARM', from: '', limit: 100,
+      columns: ['Code', 'Description'],
+      rules: [{ action: 'include', path: 'Code', negate: false, op: 'matches', regex: '.*', value: '', valueParam: '', valueColumn: '' }]
+    }],
+    operations: [],
+    blocks: [],
+    setOperations: [],
+    publishedAlias: alias
+  });
+  legacySpec.authoring = {
+    version: 1,
+    assistant: { objectFlowIntent: objectFlowIntentFromText('Выбрать АРМ.', { name: label, entities: 'ARM' }) },
+    d2: { source: '' }
+  };
+  const legacyModel = legacySpec.visualModels.find((model) => model.mode === 'objectMatching');
+  legacyModel.outputs = legacyModel.outputs.map((output) => ({
+    ...output,
+    label: output.alias,
+    assistantManaged: true,
+    assistantBlockId: 'block-1'
+  }));
+  delete legacyModel.assistantOutputManifest;
+  legacySpec.result.tables.find((table) => table.name === alias).title = 'Legacy table title';
+  legacySpec.result.presentation = { tables: [{ name: alias, title: 'Опубликованные АРМ' }] };
+
+  const invalidTemplateCode = 'InvalidStoredObjectFlow';
+  const invalidSpec = structuredClone(legacySpec);
+  const invalidModel = invalidSpec.visualModels.find((model) => model.mode === 'objectMatching');
+  invalidModel.operations = [{
+    id: 'match:unresolved', type: 'match', from: 'missing_alias', with: alias, as: 'unresolved', rightPrefix: 'Right.',
+    rules: [{ action: 'include', operator: 'equals', leftColumn: 'Code', rightColumn: 'Code' }]
+  }];
+  invalidModel.blocks = invalidModel.operations.map((operation) => ({ ...operation }));
+  invalidModel.outputs.push({ alias: 'unresolved', label: 'Неразрешенный результат', kind: 'match', assistantManaged: true, assistantBlockId: 'block-1' });
+  invalidModel.output = { alias: 'unresolved', title: 'Неразрешенный результат' };
+  invalidSpec.result.tables.push({ name: 'unresolved', title: 'Неразрешенный результат', columns: [] });
+
+  const llm = await startLiteLlmStub(t, { flow: { version: 1, selections: [], operations: [] } });
+  const mock = await startMockCmdbuild(t, {
+    templates: [
+      templateCard(templateCode, legacySpec, { canUpdate: true }),
+      templateCard(invalidTemplateCode, invalidSpec, { canUpdate: true })
+    ],
+    configCards: [{
+      _id: 1,
+      Code: 'Cst_QueryTool',
+      RootCode: 'Cst_QueryTool',
+      Active: true,
+      RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: false, baseUrl: llm.origin, model: 'unit-test-model' } } })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, {
+    LITELLM_API_KEY: '',
+    LITELLM_API_KEY_FILE: '/tmp/cmdbcustompages-missing-litellm-key',
+    CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin
+  });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=recovered-labels-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+
+  const read = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/templates?root=Cst_QueryTool`, undefined, { cookie });
+  assert.equal(read.statusCode, 200, read.body);
+  const recovered = read.json.data.find((template) => template.code === templateCode);
+  assert.equal(recovered.objectFlowRecovery.requiresSave, true);
+  assert.equal(recovered.objectFlowRecovery.ownership, 'downgraded');
+  const recoveredModel = recovered.spec.visualModels.find((model) => model.mode === 'objectMatching');
+  assert.deepEqual(recoveredModel.outputs.map((output) => [output.alias, output.label]), [[alias, label]]);
+  assert.equal(recoveredModel.outputs.some((output) => output.label === output.alias), false);
+  assert.equal(recoveredModel.outputs.some((output) => output.assistantManaged === true), false);
+  assert.equal(recoveredModel.assistantOutputManifest, undefined);
+  assert.equal(recovered.spec.result.tables.find((table) => table.name === alias).title, 'Legacy table title');
+  assert.equal(recovered.spec.result.presentation.tables[0].title, 'Опубликованные АРМ');
+  assert.equal(llm.requests, 0);
+
+  const invalidStored = read.json.data.find((template) => template.code === invalidTemplateCode);
+  assert.equal(invalidStored.objectFlowRecovery.status, 'skipped_invalid_flow');
+  assert.equal(invalidStored.objectFlowRecovery.requiresSave, false);
+  assert.equal(invalidStored.objectFlowRecovery.executionReadyAfterSave, false);
+  const invalidStoredModel = invalidStored.spec.visualModels.find((model) => model.mode === 'objectMatching');
+  assert.ok(invalidStoredModel.operations.some((operation) => operation.as === 'unresolved'));
+  assert.ok(invalidStoredModel.outputs.some((output) => output.alias === 'unresolved'));
+
+  const saved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}`, {
+    code: templateCode,
+    expectedSpecHash: recovered.specHash,
+    spec: recovered.spec
+  }, headers);
+  assert.equal(saved.statusCode, 200, saved.body);
+  const savedModel = saved.json.template.spec.visualModels.find((model) => model.mode === 'objectMatching');
+  assert.deepEqual(savedModel.outputs.map((output) => [output.alias, output.label]), [[alias, label]]);
+  assert.equal(savedModel.assistantOutputManifest, undefined);
+  assert.equal(saved.json.template.spec.result.tables.find((table) => table.name === alias).title, 'Legacy table title');
+  assert.equal(saved.json.template.spec.result.presentation.tables[0].title, 'Опубликованные АРМ');
+
+  const reread = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/templates?root=Cst_QueryTool`, undefined, { cookie });
+  const persisted = reread.json.data.find((template) => template.code === templateCode);
+  assert.equal(persisted.objectFlowRecovery, undefined);
+  assert.equal(llm.requests, 0);
   assert.equal(backend.exitCode, null);
 });
 
@@ -5678,6 +5792,145 @@ test('manual D2 mapping changes are persisted by normal template Save without a 
     templateCode: 'AppliedMappingEditor', baseSpecHash: partiallySaved.json.template.specHash, currentSpec: partialSaveSpec
   }, headers);
   assert.equal(removed.statusCode, 404, removed.body);
+  assert.equal(backend.exitCode, null);
+});
+
+test('strict diagram actions require one normal Save after deterministic read-time recovery', async (t) => {
+  const templateCode = 'RecoveredMappingSaveRequired';
+  const currentSpec = apiObjectFlowSpec([
+    { alias: 'routers', className: 'routerG', columns: ['Code', 'Description'] },
+    { alias: 'switches', className: 'ARM', columns: ['Code', 'Description'] }
+  ], [{
+    id: 'match:matchedNetwork',
+    from: 'routers',
+    with: 'switches',
+    as: 'matchedNetwork',
+    rightPrefix: 'Selection 2.',
+    rules: [{ action: 'include', negate: false, operator: 'equals', leftColumn: 'Code', leftRegex: '', rightColumn: 'Code', rightRegex: '' }]
+  }]);
+  const templateCards = [templateCard(templateCode, currentSpec, { canUpdate: true })];
+  const mock = await startMockCmdbuild(t, { templates: templateCards });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-recovery-save-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const source = 'router: Router';
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode, baseSpecHash: hashJson(currentSpec), currentSpec, d2Source: source
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const roles = analyzed.json.proposal.roles.map((role) => {
+    const isRouter = role.key === 'router';
+    return d2RoleOverride(role, {
+      materialization: { kind: 'stage', stageId: isRouter ? 'selection:routers' : 'selection:switches' },
+      primary: { className: isRouter ? 'routerG' : 'ARM', idAttribute: '_id', labelTemplate: '${Description}', structuredFields: ['Code', 'Description'], filters: [] },
+      related: []
+    }, { labelTemplate: '${Description}' });
+  });
+  const structureTree = d2StructureTreeWithMaterialization(analyzed.json.proposal, roles);
+  const routerRole = roles.find((role) => role.mapping.primary.className === 'routerG');
+  const switchRole = roles.find((role) => role.mapping.primary.className === 'ARM');
+  const relationRules = [{
+    ...analyzed.json.proposal.relationRules[0],
+    id: 'router_switch_recovery',
+    kind: 'connection',
+    mode: 'deterministicEndpoints',
+    directionPolicy: 'dataFields',
+    parentRoleId: routerRole.id,
+    childRoleId: switchRole.id,
+    sourceStageId: 'match:matchedNetwork',
+    sourceField: 'Code',
+    targetField: 'Selection 2.Code',
+    labelField: ''
+  }];
+  const applied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
+    templateCode,
+    baseSpecHash: hashJson(currentSpec),
+    currentSpec,
+    d2Source: source,
+    proposal: analyzed.json.proposal,
+    persist: true,
+    roles,
+    structureTree,
+    relationRules
+  }, headers);
+  assert.equal(applied.statusCode, 200, applied.body);
+
+  const baselineSave = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}`, {
+    code: templateCode,
+    expectedSpecHash: hashJson(currentSpec),
+    spec: applied.json.spec
+  }, headers);
+  assert.equal(baselineSave.statusCode, 200, baselineSave.body);
+  assert.equal(baselineSave.json.template.spec.result.diagrams[0].authoring.d2Import.mappingValidation.status, 'valid');
+
+  const staleSpec = structuredClone(baselineSave.json.template.spec);
+  staleSpec.result.diagrams[0].authoring.d2Import.mappingValidation.signature = 'stale-signature';
+  templateCards[0].SpecJson = JSON.stringify(staleSpec);
+
+  const listed = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/templates?root=Cst_QueryTool`, undefined, { cookie });
+  assert.equal(listed.statusCode, 200, listed.body);
+  const recovered = listed.json.data.find((item) => item.code === templateCode);
+  const recoveredDraftValidation = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/validate`, {
+    template: { code: templateCode, spec: recovered.spec },
+    params: {}
+  }, headers);
+  const recoveredImport = recovered.spec.result.diagrams[0].authoring.d2Import;
+  assert.equal(recovered.authoringRecovery.requiresSave, true);
+  assert.equal(recovered.authoringRecovery.executionReadyAfterSave, true, JSON.stringify({
+    response: recoveredDraftValidation.json,
+    validationCurrent: diagramImportMappingValidationIsCurrent(recoveredImport),
+    inputRevision: diagramImportMappingInputRevisionStatus(recovered.spec, recoveredImport),
+    validation: recoveredImport.mappingValidation
+  }));
+  assert.ok(recovered.authoringRecovery.statuses.includes('reattested'), listed.body);
+  assert.equal(recovered.spec.result.diagrams[0].authoring.d2Import.mappingValidation.status, 'valid');
+  assert.notEqual(recovered.spec.result.diagrams[0].authoring.d2Import.mappingValidation.signature, 'stale-signature');
+
+  for (const [action, request] of [
+    ['validate', () => requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}/validate`, {}, headers)],
+    ['run', () => requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}/run?json=true`, undefined, { cookie })],
+    ['publish', () => requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}/publish`, { params: {}, savedSpecHash: recovered.specHash }, headers)]
+  ]) {
+    const response = await request();
+    assert.equal(response.statusCode, 409, `${action}: ${response.body}`);
+    assert.equal(response.json.reason, 'd2_mapping_recovery_save_required', response.body);
+    assert.equal(response.json.nextAction, 'saveTemplate', response.body);
+    assert.equal(response.json.authoringRecovery.requiresSave, true, response.body);
+    assert.match(response.json.message, /Save the template once/);
+  }
+
+  const tableOnlySpec = structuredClone(staleSpec);
+  tableOnlySpec.result.presentation = { ...(tableOnlySpec.result.presentation || {}), outputMode: 'tables' };
+  tableOnlySpec.publish = { mode: 'staticSnapshot', paramsMode: 'exact', warningAccepted: true };
+  templateCards[0].SpecJson = JSON.stringify(tableOnlySpec);
+  const tableOnlyValidation = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}/validate`, {}, headers);
+  assert.equal(tableOnlyValidation.statusCode, 200, tableOnlyValidation.body);
+  assert.equal(tableOnlyValidation.json.success, true);
+  const tableOnlyRun = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}/run?json=true&noCache=1`, undefined, { cookie });
+  assert.equal(tableOnlyRun.statusCode, 200, tableOnlyRun.body);
+  assert.deepEqual(tableOnlyRun.json.diagrams, []);
+  const tableOnlyPublish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}/publish`, {
+    params: {},
+    savedSpecHash: hashJson(tableOnlySpec)
+  }, headers);
+  assert.equal(tableOnlyPublish.statusCode, 200, tableOnlyPublish.body);
+  assert.deepEqual(tableOnlyPublish.json.result.diagrams, []);
+
+  templateCards[0].SpecJson = JSON.stringify(staleSpec);
+  const saved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}`, {
+    code: templateCode,
+    expectedSpecHash: recovered.specHash,
+    spec: recovered.spec
+  }, headers);
+  assert.equal(saved.statusCode, 200, saved.body);
+  assert.equal(saved.json.template.spec.result.diagrams[0].authoring.d2Import.mappingValidation.status, 'valid');
+
+  const validatedAfterSave = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}/validate`, {}, headers);
+  assert.equal(validatedAfterSave.statusCode, 200, validatedAfterSave.body);
+  assert.equal(validatedAfterSave.json.success, true);
   assert.equal(backend.exitCode, null);
 });
 

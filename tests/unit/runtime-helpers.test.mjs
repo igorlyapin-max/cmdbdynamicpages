@@ -54,6 +54,7 @@ import {
   diagramImportStructureTree,
   diagramImportStructureTreeErrors,
   embedDiagramSvgMetadata,
+  executionValidationForSpec,
   diagramImportAssistantSpec,
   defaultRuntimeConfig,
   dependencyMapWithHash,
@@ -91,6 +92,7 @@ import {
   stripSensitiveDiagramArtifacts,
   sanitizeVisibleClassAttributes,
   templateIsProtected,
+  templateOutputIncludesDiagrams,
   templateAssistantRuntimeConfig,
   validateRuntimeConfig,
   validateDiagramImportV3Catalog,
@@ -559,6 +561,205 @@ test('template Save migrates retired assistantDraft into canonical authoring and
       sourceHash: crypto.createHash('sha256').update('server: Server').digest('hex')
     }
   });
+});
+
+test('template storage recovers Object Flow labels without Assistant and is idempotent', () => {
+  const before = {
+    version: 1,
+    authoring: {
+      version: 1,
+      assistant: {
+        objectFlowIntent: {
+          version: 2,
+          context: '',
+          blocks: [{ id: 'block-1', name: 'Внутренние ИС', entities: 'IS', algorithm: 'Select IS.', expectedResult: 'Внутренние ИС', usesBlockIds: [], order: 1 }]
+        }
+      },
+      d2: { source: '' }
+    },
+    visualModels: [{
+      version: 1,
+      mode: 'objectMatching',
+      selections: [
+        { id: 'selection:block_1', name: 'Внутренние ИС', alias: 'block_1', className: 'IS', from: '', limit: 100, columns: [], rules: [{ action: 'include', path: 'Code', op: 'exists' }] },
+        { id: 'selection:block_2', name: 'block_2', alias: 'block_2', className: 'IS', from: '', limit: 100, columns: [], rules: [{ action: 'include', path: 'Code', op: 'exists' }] }
+      ],
+      operations: [],
+      outputs: [
+        { alias: 'block_1', label: 'Внутренние ИС', kind: 'selection', assistantManaged: true, assistantBlockId: 'block-1' },
+        { alias: 'block_2', label: 'block_2', kind: 'selection', assistantManaged: true, assistantBlockId: 'block-1' }
+      ],
+      output: { alias: 'block_2', title: 'block_2' }
+    }],
+    steps: [
+      { type: 'selectCards', className: 'IS', filters: [], limit: 100, as: 'block_1' },
+      { type: 'selectCards', className: 'IS', filters: [], limit: 100, as: 'block_2' }
+    ],
+    result: {
+      tables: [
+        { name: 'block_1', title: 'Внутренние ИС', columns: [] },
+        { name: 'block_2', title: 'block_2', columns: [] }
+      ]
+    }
+  };
+
+  const stored = normalizeTemplateSpecForStorage(before);
+  const model = stored.visualModels.find((item) => item.mode === 'objectMatching');
+  assert.deepEqual(model.outputs.map((output) => ({ alias: output.alias, label: output.label, assistantManaged: output.assistantManaged })), [
+    { alias: 'block_1', label: 'Внутренние ИС', assistantManaged: undefined },
+    { alias: 'block_2', label: 'Выборка 2', assistantManaged: undefined }
+  ]);
+  assert.equal(model.assistantOutputManifest, undefined);
+  assert.deepEqual(stored.result.tables.map((table) => [table.name, table.title]), [
+    ['block_1', 'Внутренние ИС'],
+    ['block_2', 'block_2']
+  ]);
+  assert.equal(stored.authoring.assistant.objectFlowIntent.blocks[0].name, 'Внутренние ИС');
+  assert.deepEqual(normalizeTemplateSpecForStorage(stored), stored);
+});
+
+test('Object Flow storage canonicalizes legacy operations without losing the final result', () => {
+  const before = {
+    version: 1,
+    visualModels: [{
+      version: 1,
+      mode: 'objectMatching',
+      selections: [
+        { id: 'selection:left', name: 'Левая выборка', alias: 'left', className: 'Asset', limit: 100, columns: ['Code'], rules: [{ action: 'include', path: 'Code', op: 'exists' }] },
+        { id: 'selection:right', name: 'Правая выборка', alias: 'right', className: 'Asset', limit: 100, columns: ['Code'], rules: [{ action: 'include', path: 'Code', op: 'exists' }] }
+      ],
+      blocks: [{
+        id: 'match:joined', from: 'left', with: 'right', as: 'joined', rightPrefix: 'Right.',
+        rules: [{ action: 'include', operator: 'equals', leftColumn: 'Code', rightColumn: 'Code' }]
+      }],
+      setOperations: [],
+      output: { alias: 'joined', title: 'Результат сопоставления' }
+    }],
+    steps: [
+      { type: 'selectCards', className: 'Asset', filters: [], limit: 100, as: 'left' },
+      { type: 'selectCards', className: 'Asset', filters: [], limit: 100, as: 'right' },
+      { type: 'matchRows', from: 'left', with: 'right', rules: [], rightPrefix: 'Right.', as: 'joined' }
+    ],
+    result: { tables: [
+      { name: 'left', title: 'Левая выборка', columns: [] },
+      { name: 'right', title: 'Правая выборка', columns: [] },
+      { name: 'joined', title: 'Пользовательский заголовок', columns: [] }
+    ] }
+  };
+  const outcomes = [];
+  const stored = normalizeTemplateSpecForStorage(before, '', { objectFlowOutcomes: outcomes });
+  const model = stored.visualModels.find((item) => item.mode === 'objectMatching');
+
+  assert.deepEqual(model.operations.map((operation) => operation.as), ['joined']);
+  assert.deepEqual(model.outputs.map((output) => output.alias), ['left', 'right', 'joined']);
+  assert.equal(stored.result.tables.find((table) => table.name === 'joined').title, 'Пользовательский заголовок');
+  assert.equal(outcomes[0].status, 'recovered');
+  assert.ok(outcomes[0].reasons.includes('canonicalOperations'));
+});
+
+test('Object Flow storage preserves an invalid authoring model instead of dropping unresolved outputs', () => {
+  const model = {
+    version: 1,
+    mode: 'objectMatching',
+    selections: [{ id: 'selection:assets', name: 'Активы', alias: 'assets', className: 'Asset', limit: 100, columns: ['Code'], rules: [{ action: 'include', path: 'Code', op: 'exists' }] }],
+    operations: [{ id: 'match:missing', type: 'match', from: 'missing', with: 'assets', as: 'unresolved', rightPrefix: 'Assets.', rules: [{ action: 'include', operator: 'equals', leftColumn: 'Code', rightColumn: 'Code' }] }],
+    outputs: [{ alias: 'assets', label: 'Активы' }, { alias: 'unresolved', label: 'Неразрешенный результат' }],
+    output: { alias: 'unresolved', title: 'Неразрешенный результат' }
+  };
+  const before = {
+    version: 1,
+    visualModels: [structuredClone(model)],
+    steps: [{ type: 'selectCards', className: 'Asset', filters: [], limit: 100, as: 'assets' }],
+    result: { tables: [{ name: 'assets', title: 'Активы' }, { name: 'unresolved', title: 'Неразрешенный результат' }] }
+  };
+  const outcomes = [];
+  const stored = normalizeTemplateSpecForStorage(before, '', { objectFlowOutcomes: outcomes });
+
+  assert.deepEqual(stored.visualModels[0], model);
+  assert.deepEqual(stored.result.tables, before.result.tables);
+  assert.equal(outcomes[0].status, 'skipped_invalid_flow');
+  assert.equal(outcomes[0].changed, false);
+  assert.ok(outcomes[0].reasons.some((reason) => reason.path === '$.operations[0].from'));
+
+  const aliasMismatch = {
+    version: 1,
+    visualModels: [{
+      version: 1,
+      mode: 'objectMatching',
+      selections: [{ id: 'selection:visual_alias', name: 'Визуальный результат', alias: 'visual_alias', className: 'Asset', limit: 100, columns: [], rules: [{ action: 'include', path: 'Code', op: 'exists' }] }],
+      operations: [],
+      outputs: [{ alias: 'visual_alias', label: 'Визуальный результат' }],
+      output: { alias: 'visual_alias', title: 'Визуальный результат' }
+    }],
+    steps: [{ type: 'selectCards', purpose: 'objectGroup', className: 'Asset', filters: [], limit: 100, as: 'runtime_alias' }],
+    result: { tables: [{ name: 'visual_alias', title: 'Визуальный результат' }, { name: 'runtime_alias', title: 'Исполняемый результат' }] }
+  };
+  const mismatchOutcomes = [];
+  const mismatchStored = normalizeTemplateSpecForStorage(aliasMismatch, '', { objectFlowOutcomes: mismatchOutcomes });
+  assert.deepEqual(mismatchStored.visualModels, aliasMismatch.visualModels);
+  assert.equal(mismatchOutcomes[0].status, 'skipped_invalid_flow');
+  assert.ok(mismatchOutcomes[0].reasons.some((reason) => /no executable step/.test(reason.message)));
+});
+
+test('visualModels wins over a divergent visualModel mirror and table presentation remains independent', () => {
+  const canonical = {
+    version: 1,
+    mode: 'objectMatching',
+    selections: [{ id: 'selection:assets', name: 'Активы', alias: 'assets', className: 'Asset', limit: 100, columns: [], rules: [{ action: 'include', path: 'Code', op: 'exists' }] }],
+    operations: [],
+    outputs: [{ alias: 'assets', label: 'Активы', kind: 'selection' }],
+    output: { alias: 'assets', title: 'Активы' }
+  };
+  const staleMirror = {
+    ...structuredClone(canonical),
+    selections: [{ ...canonical.selections[0], name: 'Старое имя', alias: 'stale_assets' }],
+    outputs: [{ alias: 'stale_assets', label: 'Старое имя', kind: 'selection' }],
+    output: { alias: 'stale_assets', title: 'Старое имя' }
+  };
+  const before = {
+    version: 1,
+    visualModels: [canonical],
+    visualModel: staleMirror,
+    steps: [{ type: 'selectCards', className: 'Asset', filters: [], limit: 100, as: 'assets' }],
+    result: {
+      tables: [{ name: 'assets', title: 'Legacy table title', columns: [] }],
+      presentation: { tables: [{ name: 'assets', title: 'Published assets' }] }
+    }
+  };
+  const outcomes = [];
+  const stored = normalizeTemplateSpecForStorage(before, '', { objectFlowOutcomes: outcomes });
+
+  assert.deepEqual(stored.visualModel, stored.visualModels.find((item) => item.mode === 'objectMatching'));
+  assert.equal(stored.visualModel.outputs[0].alias, 'assets');
+  assert.equal(stored.result.tables[0].title, 'Legacy table title');
+  assert.equal(stored.result.presentation.tables[0].title, 'Published assets');
+  assert.ok(outcomes[0].reasons.includes('visualModelMirrorConflict'));
+});
+
+test('primary-only Object Flow migrates to visualModels without publishing a result implicitly', () => {
+  const primary = {
+    version: 1,
+    mode: 'objectMatching',
+    selections: [{ id: 'selection:assets', name: 'Активы', alias: 'assets', className: 'Asset', limit: 100, columns: [], rules: [{ action: 'include', path: 'Code', op: 'exists' }] }],
+    operations: [],
+    outputs: [{ alias: 'assets', label: 'Активы', kind: 'selection' }],
+    output: { alias: '', title: '' }
+  };
+  const before = {
+    version: 1,
+    visualModel: primary,
+    steps: [{ type: 'selectCards', purpose: 'objectGroup', className: 'Asset', filters: [], limit: 100, as: 'assets' }],
+    result: { tables: [{ name: 'assets', title: 'Активы', columns: [] }] }
+  };
+  const outcomes = [];
+  const stored = normalizeTemplateSpecForStorage(before, '', { objectFlowOutcomes: outcomes });
+  const canonical = stored.visualModels.find((item) => item.mode === 'objectMatching');
+
+  assert.ok(canonical);
+  assert.equal(canonical.output.alias, '');
+  assert.equal(stored.visualModel.output.alias, '');
+  assert.deepEqual(stored.visualModel, canonical);
+  assert.ok(outcomes[0].reasons.includes('canonicalVisualModels'));
 });
 
 test('D2 workflow accepts only canonical authoring source and matching deterministic mapping', async () => {
@@ -2229,6 +2430,21 @@ test('normal Save reattests a current D2 mapping after signing-secret rotation',
   assert.equal(reattestedImport.mappingValidation.status, 'valid');
   assert.equal(diagramImportMappingValidationIsCurrent(reattestedImport), true);
   assert.equal((await d2WorkflowStatusForSpec(reattested)).state, 'applied');
+});
+
+test('table-only execution ignores D2 recovery while diagram execution remains strict', () => {
+  const { currentSpec, proposal, roles } = d2StructureTreeFixture();
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA'));
+  const stale = structuredClone(applied);
+  stale.result.diagrams[0].authoring.d2Import.mappingValidation.signature = 'stale-signature';
+
+  assert.equal(templateOutputIncludesDiagrams(stale), true);
+  assert.equal(executionValidationForSpec(stale).executable, false);
+
+  const tableOnly = structuredClone(stale);
+  tableOnly.result.presentation = { ...(tableOnly.result.presentation || {}), outputMode: 'tables' };
+  assert.equal(templateOutputIncludesDiagrams(tableOnly), false);
+  assert.equal(executionValidationForSpec(tableOnly).executable, true);
 });
 
 test('normal Save does not recompile a retired D2 mapping after signing-secret rotation', () => {

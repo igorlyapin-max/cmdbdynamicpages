@@ -687,6 +687,26 @@ function orderedObjectFlowStages(flow) {
 }
 
 /**
+ * Resolve the canonical executable contract for an Object Flow. Consumers
+ * must use this result instead of deriving aliases independently from visual
+ * models, result tables, or partially ordered operations.
+ *
+ * @param {unknown} flow
+ * @returns {{flow: ObjectFlow, errors: ObjectFlowValidationError[], stages: ObjectFlowStage[], aliases: string[]}}
+ */
+export function resolveObjectFlowContract(flow) {
+  const normalized = normalizeObjectFlow(flow);
+  const errors = validateObjectFlow(normalized);
+  const order = orderedObjectFlowStages(normalized);
+  return {
+    flow: normalized,
+    errors,
+    stages: errors.length ? [] : order.ordered,
+    aliases: errors.length ? [] : order.ordered.map((stage) => stage.alias).filter(Boolean)
+  };
+}
+
+/**
  * @param {ObjectFlowOperation} operation
  * @param {Map<string, string[]>} materializedColumns
  * @returns {string[]}
@@ -1407,6 +1427,10 @@ function normalizeAssistantOutputManifest(value, outputs) {
   if (outputs.some((output) => !output.assistantManaged || !output.assistantBlockIds?.length || output.assistantBlockIds.some((id) => !knownBlockIds.has(id)))) {
     throw contractError('Assistant ownership manifest must own every materialized Assistant result.', 'assistant_output_manifest_invalid', 422);
   }
+  const referencedBlockIds = new Set(outputs.flatMap((output) => output.assistantBlockIds || []));
+  if (blocks.some((block) => !referencedBlockIds.has(block.id))) {
+    throw contractError('Every Assistant ownership manifest block must resolve to a materialized result.', 'assistant_output_manifest_invalid', 422);
+  }
   return {
     version: 1,
     blocks
@@ -1475,9 +1499,7 @@ function generatedResultTables(flow, existingByName, outputs) {
   const tables = flow.selections.map((selection) => ({
     ...(existingByName.get(selection.alias) || {}),
     name: selection.alias,
-    title: outputByAlias.get(selection.alias)?.assistantManaged
-      ? outputByAlias.get(selection.alias)?.label
-      : text(existingByName.get(selection.alias)?.title) || outputByAlias.get(selection.alias)?.label || selection.name,
+    title: text(existingByName.get(selection.alias)?.title) || outputByAlias.get(selection.alias)?.label || selection.name,
     columns: Array.isArray(existingByName.get(selection.alias)?.columns)
       ? cloneJsonValue(existingByName.get(selection.alias).columns)
       : []
@@ -1488,9 +1510,7 @@ function generatedResultTables(flow, existingByName, outputs) {
     tables.push({
       ...existing,
       name: stage.alias,
-      title: outputByAlias.get(stage.alias)?.assistantManaged
-        ? outputByAlias.get(stage.alias)?.label
-        : text(existing.title) || outputByAlias.get(stage.alias)?.label || stage.alias,
+      title: text(existing.title) || outputByAlias.get(stage.alias)?.label || stage.alias,
       columns: Array.isArray(existing.columns) ? cloneJsonValue(existing.columns) : [],
       ...(stage.kind === 'match' || stage.kind === 'semiJoin' ? { columnLabels: resultColumnLabels(stage.columns) } : {})
     });
@@ -1507,10 +1527,17 @@ function generatedResultTables(flow, existingByName, outputs) {
  * @returns {ObjectFlowResultOutput[]}
  */
 export function objectFlowResultOutputs(flow, outputMetadata = []) {
-  const normalized = normalizeObjectFlow(flow);
-  const materializedAliases = new Set(orderedObjectFlowStages(normalized).ordered.map((stage) => (
-    stage.kind === 'selection' ? stage.item.alias : stage.item.as
-  )).filter(Boolean));
+  const contract = resolveObjectFlowContract(flow);
+  if (contract.errors.length) {
+    throw contractError(
+      `Object flow is invalid: ${contract.errors[0].path}: ${contract.errors[0].message}`,
+      'object_flow_invalid',
+      422,
+      contract.errors
+    );
+  }
+  const normalized = contract.flow;
+  const materializedAliases = new Set(contract.aliases);
   const metadataByAlias = new Map();
   if (!Array.isArray(outputMetadata)) {
     throw contractError('Object-flow output metadata must be an array.', 'object_flow_output_metadata_invalid', 422);
@@ -1545,7 +1572,7 @@ export function objectFlowResultOutputs(flow, outputMetadata = []) {
   let relationIndex = 0;
   let existsRelatedIndex = 0;
   let setIndex = 0;
-  for (const stage of orderedObjectFlowStages(normalized).ordered) {
+  for (const stage of contract.stages) {
     const alias = stage.kind === 'selection' ? stage.item.alias : stage.item.as;
     if (!alias) continue;
     let label = alias;
@@ -1591,13 +1618,12 @@ export function objectFlowResultOutputs(flow, outputMetadata = []) {
  * @returns {Set<string>}
  */
 function storedObjectGroupAliases(spec) {
-  const models = [];
-  if (Array.isArray(spec.visualModels)) models.push(...spec.visualModels);
-  if (isRecord(spec.visualModel)) models.push(spec.visualModel);
+  const models = Array.isArray(spec.visualModels) ? spec.visualModels : [];
+  const canonical = models.find((model) => isRecord(model) && text(model.mode) === 'objectGroup');
+  const stored = canonical || (isRecord(spec.visualModel) && text(spec.visualModel.mode) === 'objectGroup' ? spec.visualModel : null);
   const aliases = new Set();
-  for (const model of models) {
-    if (!isRecord(model) || text(model.mode) !== 'objectGroup' || !Array.isArray(model.selections)) continue;
-    for (const selection of model.selections) {
+  if (isRecord(stored) && Array.isArray(stored.selections)) {
+    for (const selection of stored.selections) {
       if (!isRecord(selection)) continue;
       const alias = text(selection.alias || isRecord(selection.output) && selection.output.alias);
       if (alias) aliases.add(alias);
@@ -1615,13 +1641,12 @@ function storedObjectGroupAliases(spec) {
  * @returns {Set<string>}
  */
 function storedObjectFlowOutputAliases(spec) {
-  const models = [];
-  if (Array.isArray(spec.visualModels)) models.push(...spec.visualModels);
-  if (isRecord(spec.visualModel)) models.push(spec.visualModel);
+  const models = Array.isArray(spec.visualModels) ? spec.visualModels : [];
+  const canonical = models.find((model) => isRecord(model) && text(model.mode) === 'objectMatching');
+  const stored = canonical || (isRecord(spec.visualModel) && text(spec.visualModel.mode) === 'objectMatching' ? spec.visualModel : null);
   const aliases = new Set();
-  for (const model of models) {
-    if (!isRecord(model) || text(model.mode) !== 'objectMatching' || !Array.isArray(model.outputs)) continue;
-    for (const output of model.outputs) {
+  if (isRecord(stored) && Array.isArray(stored.outputs)) {
+    for (const output of stored.outputs) {
       const alias = isRecord(output) ? text(output.alias) : '';
       if (alias) aliases.add(alias);
     }

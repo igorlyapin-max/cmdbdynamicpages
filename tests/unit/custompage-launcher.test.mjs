@@ -2293,7 +2293,7 @@ test('object group final alias drives extraction defaults and diagnostics', () =
   assert.match(aliasSource, /objectSelectionsFromModel\(visual\)/);
   assert.match(aliasSource, /objectGroupFinalAliasFromSelections\(selections\)/);
   assert.match(resultLabelSource, /assistantManifest\.assistantManaged/);
-  assert.match(resultLabelSource, /assistantFlowOutputManifestInvalid/);
+  assert.doesNotMatch(resultLabelSource, /assistantFlowOutputManifestInvalid/);
   assert.match(resultLabelSource, /output && output\.label/);
   assert.match(finalAliasesSource, /add\(getObjectGroupOutputAlias\(spec\)\)/);
   assert.match(finalBaseSource, /var objectGroupAlias = getObjectGroupOutputAlias\(spec\)/);
@@ -2308,7 +2308,7 @@ test('object group final alias drives extraction defaults and diagnostics', () =
   assert.match(extractSource, /sourceWarning \|\| t\('extractionCompleted'\)/);
 });
 
-test('Assistant extraction uses the persisted user-label manifest and never falls back to aliases', () => {
+test('Assistant extraction warns on incomplete provenance and keeps safe labels available', () => {
   const manifestStart = proxySource.indexOf('function computeAssistantObjectFlowOutputManifest(spec)');
   const cacheStart = proxySource.indexOf('function assistantObjectFlowOutputManifest(spec)', manifestStart);
   const outputManifestStart = proxySource.indexOf('function objectFlowOutputManifest(spec)', cacheStart);
@@ -2336,15 +2336,18 @@ test('Assistant extraction uses the persisted user-label manifest and never fall
   assert.match(manifestSource, /assistantBlockIds/);
   assert.match(manifestSource, /assistantOutputManifest/);
   assert.match(manifestSource, /persisted\.blocks/);
-  assert.match(manifestSource, /var hasCompiledFlow = Boolean\(objectMatching/);
-  assert.match(manifestSource, /error: invalid \? 'invalid manifest'/);
+  assert.match(manifestSource, /var isAssistantFlow = Boolean\(outputs\.some/);
+  assert.doesNotMatch(manifestSource, /hasCompiledFlow|assistantObjectFlowIntentFromSpec/);
+  assert.match(manifestSource, /warning: 'incomplete manifest'/);
   assert.match(manifestSource, /assistantObjectFlowManifestCache/);
-  assert.match(finalAliasesSource, /if \(assistantManifest\.error\) return \[\]/);
-  assert.match(optionsSource, /if \(assistantManifest\.error\) return result/);
-  assert.match(renderSource, /assistantFlowOutputManifestInvalid/);
+  assert.doesNotMatch(finalAliasesSource, /assistantManifest\.error/);
+  assert.doesNotMatch(optionsSource, /assistantManifest\.error/);
+  assert.match(renderSource, /data-object-flow-recovery/);
+  assert.match(renderSource, /assistantManifest\.warning/);
+  assert.doesNotMatch(renderSource, /assistantFlowOutputManifestInvalid/);
   assert.match(renderSource, /renderExtractionResultOptions\(state\.extractionSource, spec, optionTables\)/);
   assert.match(renderSource, /extractionResultSourceHelp/);
-  assert.match(extractionSource, /assistantManifest\.assistantManaged && assistantManifest\.error/);
+  assert.doesNotMatch(extractionSource, /assistantManifest\.assistantManaged|assistantManifest\.error/);
 });
 
 test('Assistant-managed Object Flow aliases stay internal across deterministic and Diagram editors', () => {
@@ -2535,6 +2538,9 @@ test('operation aliases immediately become available to later operations without
   assert.match(refreshSource, /\['from', 'with'\]/);
   assert.match(inputSource, /\[data-set-operation-field="as"\], \[data-matching-block-field="as"\]/);
   assert.match(inputSource, /refreshRelationOperationAliases\(\)/);
+  assert.match(proxySource, /alias: publishedAlias,/);
+  assert.match(proxySource, /var finalAlias = model\.output && model\.output\.alias \|\| '';/);
+  assert.doesNotMatch(proxySource, /publishedAlias \|\| \(operations\[operations\.length - 1\]/);
 });
 
 test('runtime result UI renders execution-limit warnings returned by preview or run', () => {
