@@ -117,6 +117,14 @@ requiredFiles.forEach((file) => {
 });
 
 const envExample = read('.env.example');
+if (fs.existsSync('VERSION')) {
+  const version = read('VERSION');
+  if (!/^\d{2}\.\d{2}\.\d{2}\.\d{2}\n$/.test(version)) {
+    failures.push('VERSION: must contain exactly XX.YY.ZZ.NN followed by a newline');
+  } else if (version === '00.00.00.00\n') {
+    failures.push('VERSION: 00.00.00.00 is reserved for the pre-handoff image fallback');
+  }
+}
 requiredEnv.forEach((name) => {
   if (!new RegExp(`^${name}=`, 'm').test(envExample)) {
     failures.push(`.env.example: missing ${name}`);
@@ -167,6 +175,14 @@ requireText('Dockerfile', 'CMDP_LOG_TARGET=stdout,syslog', 'production stdout an
 requireText('Dockerfile', `path:'/health/live'`, 'Docker liveness healthcheck');
 requireText('Dockerfile', 'd2-v${D2_VERSION}', 'pinned D2 binary download');
 requireText('Dockerfile', 'sha256sum -c -', 'D2 checksum validation');
+requireText('Dockerfile', 'ARG APP_VERSION=00.00.00.00', 'pre-handoff application version build argument');
+requireText('Dockerfile', 'ARG APP_VERSION', 'runtime application version build argument');
+requireText('Dockerfile', 'FROM d2-import-builder AS d2-import-test', 'D2 importer test target');
+requireText('Dockerfile', 'RUN go test ./cmd/cmdp-d2-import', 'D2 importer test target command');
+requireText('Dockerfile', "printf '%s\\n' \"$APP_VERSION\" | grep -Ex '[0-9]{2}\\.[0-9]{2}\\.[0-9]{2}\\.[0-9]{2}' > ./VERSION", 'strict embedded application version validation');
+rejectPattern('Dockerfile', /^COPY\s+\.\s+\.$/m, 'broad build-context copy');
+requireText('.dockerignore', '*.d2', 'local D2 template exclusion');
+requireText('.dockerignore', '.tmp-*', 'local temporary artifact exclusion');
 
 [
   'private registry',
@@ -203,11 +219,9 @@ requireText('Dockerfile', 'sha256sum -c -', 'D2 checksum validation');
   'docs/deployment-guide.ru.md'
 ].forEach((file) => rejectPattern(file, /\bCMDP_EXTERNAL_LOG_SINK\b/, 'unsupported external log sink variable'));
 
-[
-  'Dockerfile',
-  'docker-compose.runtime.yml',
-  '.env.example'
-].forEach((file) => rejectPattern(file, /\b0\.0\.0\.0\b/, 'public backend bind default'));
+rejectPattern('Dockerfile', /\bPROXY_HOST\s*=\s*0\.0\.0\.0\b/, 'public backend bind default');
+rejectPattern('docker-compose.runtime.yml', /PROXY_HOST:\s*\$\{PROXY_HOST:-0\.0\.0\.0\}/, 'public backend bind default');
+rejectPattern('.env.example', /^PROXY_HOST=0\.0\.0\.0$/m, 'public backend bind default');
 
 [
   '.omk/',
@@ -244,9 +258,15 @@ requireText('Dockerfile', 'sha256sum -c -', 'D2 checksum validation');
 
 requireText('.github/workflows/ci.yml', 'docker build', 'Docker image build gate');
 requireText('.github/workflows/ci.yml', 'docker push', 'Docker image push gate');
+requireText('.github/workflows/ci.yml', 'go test ./cmd/cmdp-d2-import', 'D2 importer test gate');
+requireText('.github/workflows/ci.yml', 'npm run test:ui:required', 'required browser UI gate');
+requireText('.github/workflows/ci.yml', '--build-arg APP_VERSION="$app_version"', 'Docker application version build argument');
 requireText('.github/workflows/ci.yml', 'docker compose --env-file .env.example -f docker-compose.runtime.yml config', 'runtime compose config gate');
 requireText('.gitlab-ci.yml', 'docker build', 'Docker image build gate');
 requireText('.gitlab-ci.yml', 'docker push', 'Docker image push gate');
+requireText('.gitlab-ci.yml', 'go test ./cmd/cmdp-d2-import', 'D2 importer test gate');
+requireText('.gitlab-ci.yml', 'npm run test:ui:required', 'required browser UI gate');
+requireText('.gitlab-ci.yml', '--build-arg APP_VERSION="$APP_VERSION"', 'Docker application version build argument');
 requireText('.gitlab-ci.yml', 'docker compose --env-file .env.example -f docker-compose.runtime.yml config', 'runtime compose config gate');
 requireText('.gitlab-ci.yml', 'bash scripts/nginx-test.sh', 'nginx template syntax gate');
 

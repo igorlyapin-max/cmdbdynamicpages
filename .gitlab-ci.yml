@@ -11,6 +11,17 @@ npm_test:
   script:
     - npm run ci
 
+ui_smoke_required:
+  stage: test
+  image: node:20-bookworm
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+  script:
+    - npm install --no-save --no-package-lock playwright@1.61.1
+    - npx playwright install --with-deps chromium
+    - npm run test:ui:required
+
 go_vulncheck:
   stage: test
   image: golang:1.24-alpine
@@ -18,6 +29,7 @@ go_vulncheck:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH'
   script:
+    - go test ./cmd/cmdp-d2-import
     - go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./cmd/cmdp-d2-import
 
 container_image:
@@ -37,6 +49,8 @@ container_image:
     - docker compose --env-file .env.example -f docker-compose.runtime.yml config >/dev/null
     - docker compose -f docker-compose.nginx.yml config >/dev/null
     - export IMAGE_TAG="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
-    - docker build -t "$CI_REGISTRY_IMAGE:$IMAGE_TAG" .
+    - export APP_VERSION="${APP_VERSION:-00.00.00.00}"
+    - if [ -f VERSION ]; then export APP_VERSION="$(tr -d '\r\n' < VERSION)"; fi
+    - docker build --build-arg APP_VERSION="$APP_VERSION" -t "$CI_REGISTRY_IMAGE:$IMAGE_TAG" .
     - docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
     - docker push "$CI_REGISTRY_IMAGE:$IMAGE_TAG"

@@ -277,7 +277,7 @@ test('semiJoin normalization preserves canonical operations for any and all rule
   }
 });
 
-test('validateObjectFlow enforces the semiJoin id, aliases, rule join, rules, operators, and columns', () => {
+test('validateObjectFlow enforces the semiJoin id, aliases, rule join, rules, operators, and nested columns', () => {
   const invalid = semiJoinFlow('some');
   invalid.operations[0].id = 'match:eligibleAssets';
   invalid.operations[0].from = 'missingLeft';
@@ -301,7 +301,7 @@ test('validateObjectFlow enforces the semiJoin id, aliases, rule join, rules, op
     with: 'routerRoomVlans',
     as: 'invalidColumns',
     ruleJoin: 'all',
-    rules: [{ action: 'include', operator: 'unsupported', leftColumn: 'MissingLeft', rightColumn: 'MissingRight' }]
+    rules: [{ action: 'include', operator: 'unsupported', leftColumn: 'MissingLeft.value', rightColumn: 'MissingRight.value' }]
   });
   const invalidRulePaths = validateObjectFlow(invalidRule).map((error) => error.path);
   assert.ok(invalidRulePaths.includes('$.operations[2].rules[0].operator'));
@@ -341,9 +341,7 @@ test('semiJoin compiles any and all rule joins while preserving exactly the left
     assert.deepEqual(summary.columns, leftColumns);
     assert.equal(summary.kind, 'semiJoin');
     assert.equal(summary.ruleJoin, ruleJoin);
-    assert.deepEqual(table.columns, leftColumns);
-    assert.equal(table.columns.includes('Site'), false);
-    assert.equal(table.columns.includes('Scope'), false);
+    assert.deepEqual(table.columns, []);
     assert.equal(visualOperation.type, 'semiJoin');
     assert.equal(visualOperation.ruleJoin, ruleJoin);
     assert.equal(objectFlowResultOutputs(normalized).at(-1).kind, 'semiJoin');
@@ -394,13 +392,12 @@ test('object flow compiles a typed domain relation without inventing a match att
     domain: 'ISZabbixMonitoringDomain',
     targetClass: 'ipRange',
     direction: 'source',
-    columns: ['range'],
-    limit: 100,
+    columns: [],
     distinct: true,
     as: 'ipRanges'
   });
   assert.equal(compiled.result.tables.find((table) => table.name === 'ipRanges').published, undefined);
-  assert.equal(compiled.result.tables.find((table) => table.name === 'ipRanges').columns.includes('range'), true);
+  assert.deepEqual(compiled.result.tables.find((table) => table.name === 'ipRanges').columns, []);
   assert.equal(compiled.steps.some((step) => step.type === 'matchRows'), false);
 });
 
@@ -459,7 +456,7 @@ test('object flow compiles parameter and previous-result expressions as determin
   const compiled = compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, flow);
   assert.equal(compiled.steps[0].filters[0].valueExpression, '${param.isName}');
   assert.equal(compiled.steps[1].filters[0].regexExpression, '^${previous.Name}-[0-9]+$');
-  assert.ok(compiled.steps[0].columns.some((column) => column.path === 'Name'));
+  assert.equal(Object.hasOwn(compiled.steps[0], 'columns'), false);
 });
 
 test('object flow rejects a previous-result expression without a selected source', () => {
@@ -517,8 +514,7 @@ test('object flow compiles a relation-aware existence match without changing the
     domain: 'ISIpRange',
     targetClass: 'ipRange',
     direction: 'source',
-    columns: ['range'],
-    limit: 100,
+    columns: [],
     distinct: true,
     rules: [{
       action: 'include', negate: false, operator: 'ipv4InCidr',
@@ -637,20 +633,13 @@ test('compileObjectFlowToSpec replaces only managed object-flow state', () => {
     op: 'equals',
     valueExpression: 'active'
   }]);
-  assert.deepEqual(routers.columns, [
-    { path: 'Code', as: 'Code', multiMode: 'join', separator: ', ', emptyRow: true },
-    { path: 'Location', as: 'Location', multiMode: 'join', separator: ', ', emptyRow: true }
-  ]);
-  assert.deepEqual(rooms.columns, [
-    { path: 'Code', as: 'Code', multiMode: 'join', separator: ', ', emptyRow: true }
-  ]);
+  assert.equal(Object.hasOwn(routers, 'columns'), false);
+  assert.equal(Object.hasOwn(rooms, 'columns'), false);
   assert.equal(Object.hasOwn(rooms, 'from'), false);
   assert.equal(Object.hasOwn(rooms, 'includeSource'), false);
   assert.equal(Object.hasOwn(rooms, 'deduplicateCards'), false);
   assert.equal(rooms.filters.some((filter) => filter.valueColumn), false);
-  assert.deepEqual(vlans.columns, [
-    { path: 'Location', as: 'Location', multiMode: 'join', separator: ', ', emptyRow: true }
-  ]);
+  assert.equal(Object.hasOwn(vlans, 'columns'), false);
 
   const firstMatch = compiled.steps.find((step) => step.as === 'routerRooms');
   const secondMatch = compiled.steps.find((step) => step.as === 'routerRoomVlans');
@@ -688,9 +677,7 @@ test('compileObjectFlowToSpec replaces only managed object-flow state', () => {
   assert.equal(compiled.result.tables.some((table) => table.name === 'oldMatch'), false);
   assert.deepEqual(compiled.result.tables.find((table) => table.name === 'audit'), currentSpec.result.tables[2]);
   const finalTable = compiled.result.tables.find((table) => table.name === 'routerRoomVlans');
-  assert.ok(finalTable.columns.includes('Rooms.Code'));
-  assert.ok(finalTable.columns.includes('Vlans.Location'));
-  assert.ok(finalTable.columns.includes('Vlans.Description'));
+  assert.deepEqual(finalTable.columns, []);
 });
 
 test('compileObjectFlowToSpec rejects invalid flows and unsupported Spec versions', () => {
@@ -778,7 +765,7 @@ test('object flow compiles typed set operations without selecting a published ta
   assert.deepEqual(setStep.on, [{ left: 'Class', right: 'Class' }, { left: '_id', right: '_id' }]);
   assert.equal(compiled.result.tables.find((table) => table.name === 'activeAssets').published, undefined);
   assert.equal(compiled.result.tables.filter((table) => table.published).length, 0);
-  assert.ok(compiled.result.tables.find((table) => table.name === 'matchedAssets').columns.includes('Red.Code'));
+  assert.deepEqual(compiled.result.tables.find((table) => table.name === 'matchedAssets').columns, []);
   assert.deepEqual(validateObjectFlow({
     version: 1,
     selections: [{ alias: 'assets', className: 'Asset', rules: [{ action: 'include', path: 'Code', op: 'exists' }] }],
@@ -1198,7 +1185,7 @@ test('match stage summaries retain custom columns from every materialized select
   assert.ok(finalMatch.columns.includes('RouterModel'));
   assert.ok(finalMatch.columns.includes('Rooms.RoomModel'));
   assert.ok(finalMatch.columns.includes('Vlans.VlanModel'));
-  assert.ok(finalTable.columns.includes('Vlans.VlanModel'));
+  assert.deepEqual(finalTable.columns, []);
 });
 
 test('object flow rejects unknown set operations and forward selection sources', () => {
@@ -1221,9 +1208,9 @@ test('object flow rejects unknown set operations and forward selection sources',
   assert.ok(validateObjectFlow(forwardSelection).some((error) => error.path === '$.selections[1].from'));
 });
 
-test('object flow rejects operation columns absent from intermediate materialized stages', () => {
+test('object flow rejects nested operation columns absent from intermediate materialized stages', () => {
   const flow = validFlow();
-  flow.operations[1].rules[0].leftColumn = 'MissingIntermediateColumn';
+  flow.operations[1].rules[0].leftColumn = 'MissingIntermediateColumn.value';
 
   const errors = validateObjectFlow(flow);
   assert.ok(errors.some((error) => error.path === '$.operations[1].rules[0].leftColumn'));

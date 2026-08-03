@@ -87,9 +87,10 @@ npm test
 npm run test:static
 npm run test:unit
 npm run test:ui
+npm run test:ui:required
 ```
 
-`test:static` validates required OpenAPI paths, local component `$ref` references, and links between architecture artifacts in `aa/`. `test:unit` uses the built-in Node.js test runner and covers cache key behavior, refresh metadata, parameter defaults, IPv4 matching, dependency maps, and log redaction. `test:ui` is a skip-safe Playwright browser smoke; it runs only when Playwright is installed and a valid CMDBuild session cookie is available.
+`test:static` validates required OpenAPI paths, local component `$ref` references, and links between architecture artifacts in `aa/`. `test:unit` uses the built-in Node.js test runner and covers cache key behavior, refresh metadata, parameter defaults, IPv4 matching, dependency maps, and log redaction. `test:ui` is a skip-safe Playwright browser smoke; it runs only when Playwright is installed and a valid CMDBuild session cookie is available. `test:ui:required` starts an isolated mock CMDBuild and backend, then requires actual Chromium execution of the Designer shell smoke; it is the CI browser gate.
 
 ## Local CMDBuild 4.2 Compatibility Harness
 

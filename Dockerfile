@@ -1,3 +1,5 @@
+ARG APP_VERSION=00.00.00.00
+
 FROM node:20-alpine AS d2
 
 ARG D2_VERSION=0.7.1
@@ -28,7 +30,13 @@ RUN go mod download
 COPY cmd/cmdp-d2-import ./cmd/cmdp-d2-import
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/cmdp-d2-import ./cmd/cmdp-d2-import
 
+FROM d2-import-builder AS d2-import-test
+
+RUN go test ./cmd/cmdp-d2-import
+
 FROM node:20-alpine
+
+ARG APP_VERSION
 
 ENV NODE_ENV=production \
     PROXY_HOST=127.0.0.1 \
@@ -42,6 +50,8 @@ WORKDIR /app
 
 COPY --from=d2 --chown=node:node /usr/local/bin/d2 /usr/local/bin/d2
 COPY --from=d2-import-builder --chown=node:node /out/cmdp-d2-import /usr/local/bin/cmdp-d2-import
+RUN set -eu; \
+  printf '%s\n' "$APP_VERSION" | grep -Ex '[0-9]{2}\.[0-9]{2}\.[0-9]{2}\.[0-9]{2}' > ./VERSION
 COPY --chown=node:node package.json ./
 COPY --chown=node:node src ./src
 COPY --chown=node:node scripts ./scripts

@@ -26,6 +26,12 @@ import {
   validateObjectFlow
 } from './assistant-object-flow.mjs';
 
+const APPLICATION_VERSION_FALLBACK = '0.0.0.0';
+const APPLICATION_VERSION_PRE_HANDOFF_SENTINEL = '00.00.00.00';
+const APPLICATION_VERSION_FILE_URL = new URL('../VERSION', import.meta.url);
+let applicationVersionConfigurationError = '';
+const APPLICATION_VERSION = readApplicationVersion();
+
 const syslogFacilityCodes = {
   kern: 0,
   user: 1,
@@ -147,7 +153,18 @@ const D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION = 1;
 // The immediately preceding v4 tree can be migrated only when its explicit
 // source.stageId bindings and current D2 identity make the meaning unambiguous.
 // Older placements remain unsupported and require explicit re-analysis.
-const D2_IMPORT_SEMANTIC_MODEL_REVISION = 11;
+// Revision 14 makes a D2 connection class one deterministic connection
+// algorithm over every compatible placement comparison rule. Template arrows
+// describe visual style only; they never multiply or constrain business rules.
+const D2_IMPORT_SEMANTIC_MODEL_REVISION = 14;
+// Endpoint profiles are additive authoring metadata. Keeping their version
+// separate preserves an already analysed D2 structure while making old
+// network edge rules reviewable in the manual editor.
+const D2_IMPORT_ENDPOINT_PROFILE_VERSION = 3;
+// This version belongs to the server-side compiler, not to browser authoring
+// state. It lets a stored editor configuration pick up deterministic runtime
+// fixes without asking the user to repeat D2 analysis or Assistant mapping.
+const D2_IMPORT_ENDPOINT_COMPILATION_VERSION = 1;
 const D2_IMPORT_STRUCTURE_TREE_VERSION = 5;
 // Mapping input v2 intentionally tracks only executable deterministic inputs.
 // Assistant prompts guide future proposals but do not change an already applied
@@ -181,7 +198,7 @@ const DEFAULT_ASSISTANT_SYSTEM_PROMPT = [
 ].join('\n\n');
 const DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT = [
   'Ты планируешь полный детерминированный поток CMDBuild данных по подтвержденному бизнес-плану. Пользователь описывает сущности, алгоритм и ожидаемый результат; он не обязан знать названия DSL-операций, alias, domain Code или внутреннюю структуру Object Flow.',
-  'Сформируй выборки и упорядоченный список operations. Каждая выборка должна иметь один доступный CMDBuild class identifier, полезные колонки и хотя бы одно исполнимое правило. Операция бывает relation, match, existsRelated, union, difference или intersect. relation означает подтвержденный переход по CMDBuild domain и указывает from, as, domain, targetClass, direction, columns и limit; она не содержит with или полей сравнения. existsRelated сохраняет карточки из from, только если через подтвержденный domain существует связанная карточка targetClass, совпадающая со строкой из with.',
+  'Сформируй выборки и упорядоченный список operations. Каждая выборка должна иметь один доступный CMDBuild class identifier, полезные колонки и хотя бы одно исполнимое правило. Операция бывает relation, match, existsRelated, union, difference или intersect. relation означает подтвержденный переход по CMDBuild domain и указывает только from, as, domain, targetClass и direction; она не содержит with, полей сравнения, columns или limit. Поля для последующих сравнений выводятся детерминированно из правил, а общий лимит связей задаёт Runtime-настройка. existsRelated сохраняет карточки из from, только если через подтвержденный domain существует связанная карточка targetClass, совпадающая со строкой из with.',
   'Нельзя добавлять совмещение только потому, что создано несколько выборок. Используй match, только если это требуется задачей. Каждый from и with ссылается на alias выборки либо на результат операции, сформированный раньше в том же списке. Не допускай forward reference или цикл.',
   'Контракт результата семантического плана обязателен. Если outputKind равен sourceCards, publishedAlias обязан содержать только карточки outputClass. Фраза «Список <основного класса>» означает sourceCards: другой результат может быть только условием отбора, либо через existsRelated по подтвержденному domain, либо через source-driven сравнение атрибутов; он не становится отдельными строками или столбцами результата. Если пользователь явно просит пары или поля связанных объектов, используй relationPairs с двумя явно выбранными endpoint-блоками. Не подставляй широкий класс вместо отсутствующего endpoint-блока.',
   'Для union/difference/intersect используй явные ключи on. Для CMDB-карточек используй Class + _id; не сравнивай label или Description как идентичность карточки. publishedAlias указывает один materialized alias для таблицы, а узлы и рёбра диаграммы остаются отдельными mapping sources.',
@@ -215,12 +232,13 @@ const DEFAULT_ASSISTANT_DIAGRAM_MAPPING_PROMPT = [
   'Одна D2 node-роль имеет одну совместимую primary-класс схему. Не создавай role variants. Если физический и виртуальный серверы являются разными CMDBuild классами, используй отдельные D2-роли; если это один класс в разных ветках, назначай разные Object Flow результаты отдельным экземплярам сохраненного дерева структуры.',
   'Сопоставляй источник node-ролям. Источник динамического container выбирается вручную в сохраненном дереве структуры для каждого экземпляра; пустой источник контейнера оставляет статическую рамку, повторяемую под родительской веткой. Дочерняя визуальная деталь, являющаяся атрибутом primary-карточки, не требует самостоятельного source.',
   'Не меняй дерево структуры: оно является явным детерминированным контрактом пользователя. Для связи между разными ролями используй только подтвержденный CMDB path или materialized result stage.',
-  'Связи не ограничены IPv4. Для каждого D2-класса связи используй отдельный именованный deterministic result. Если result уже содержит идентификаторы двух сопоставленных объектов, используй deterministicEndpoints независимо от предметного правила: domain/reference, relation object, сравнение атрибутов, множества, город/улица или другой поддерживаемый Object Flow operator. Для результата с IPv4 source и destination используй networkEndpoints: runtime сначала ищет точный IPv4, затем наиболее специфичную содержащую сеть. При отсутствии endpoint сохраняется стрелка с отдельным fake-экземпляром ожидаемой template-роли «Заглушка». Не проси пользователя создавать alias.',
+  'Связи не ограничены IPv4. Для каждого D2-класса связи используй один отдельный именованный deterministic result. Если result уже содержит идентификаторы двух сопоставленных объектов, используй deterministicEndpoints независимо от предметного правила: domain/reference, relation object, сравнение атрибутов, множества, город/улица или другой поддерживаемый Object Flow operator. Для результата с полями endpoint используй attributeEndpoints и отдельный supported deterministic operator для начала и конца стрелки. Участников начала и конца пользователь явно выбирает в редакторе из правил атрибутов конкретных объектов и контейнеров; D2 примеры стрелок не являются ограничением бизнес-пар. Runtime сравнивает только выбранные участники. При отсутствии endpoint пропускай стрелку и возвращай диагностическое предупреждение; никогда не создавай синтетический объект. Не проси пользователя создавать alias.',
   'Label template и structured data должны использовать только колонки выбранного результата. Не меняй D2 source, семантику roles, flow, Spec JSON, save, publish или runtime execution. Верни только typed mapping proposals для supplied exact ids.'
 ].join('\n\n');
 const STARTED_AT = new Date();
 const ABSOLUTE_EXECUTION_LIMITS = {
   maxRows: 2000,
+  maxRelationsPerCard: Math.max(1, Number(process.env.CMDP_EXECUTION_MAX_RELATIONS_PER_CARD_ABSOLUTE || 50000) || 50000),
   maxSelectionScanRows: Math.max(1, Number(process.env.CMDP_EXECUTION_MAX_SELECTION_SCAN_ROWS_ABSOLUTE || 50000) || 50000),
   maxClasses: 500,
   maxDomains: 500,
@@ -619,6 +637,28 @@ function logError(event, fields) {
   writeStructuredLog('error', event, fields);
 }
 
+function normalizeApplicationVersion(value) {
+  if (value === undefined || value === null) return APPLICATION_VERSION_FALLBACK;
+  const raw = String(value);
+  if (!/^\d{2}\.\d{2}\.\d{2}\.\d{2}\n$/.test(raw)) {
+    throw new Error('VERSION must contain exactly XX.YY.ZZ.NN followed by a newline.');
+  }
+  const version = raw.slice(0, -1);
+  return version === APPLICATION_VERSION_PRE_HANDOFF_SENTINEL ? APPLICATION_VERSION_FALLBACK : version;
+}
+
+function readApplicationVersion(fileUrl = APPLICATION_VERSION_FILE_URL) {
+  try {
+    return normalizeApplicationVersion(fs.readFileSync(fileUrl, 'utf8'));
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return APPLICATION_VERSION_FALLBACK;
+    applicationVersionConfigurationError = error && error.message
+      ? String(error.message)
+      : 'VERSION is invalid.';
+    return APPLICATION_VERSION_FALLBACK;
+  }
+}
+
 function parsePublicOriginConfiguration(value) {
   const rawValue = String(value || '').trim();
   if (!rawValue) {
@@ -714,6 +754,9 @@ function validateRuntimeConfig(input = {}) {
   const syslogPort = normalizeSyslogPort(input.syslogPort === undefined ? SYSLOG_PORT : input.syslogPort);
   const syslogProtocol = normalizeSyslogProtocol(input.syslogProtocol === undefined ? SYSLOG_PROTOCOL : input.syslogProtocol);
   const diagnosticMode = normalizeDiagnosticMode(input.diagnosticMode === undefined ? DIAGNOSTIC_MODE : input.diagnosticMode);
+  const versionError = String(input.applicationVersionError === undefined
+    ? applicationVersionConfigurationError
+    : input.applicationVersionError || '').trim();
   const publicOriginConfiguration = parsePublicOriginConfiguration(input.publicOrigin === undefined ? process.env.CMDP_PUBLIC_ORIGIN || '' : input.publicOrigin);
   const errors = [];
   const warnings = [];
@@ -730,6 +773,13 @@ function validateRuntimeConfig(input = {}) {
       code: 'csrf_secret_placeholder',
       env: 'CMDBDYNAMICPAGES_CSRF_SECRET',
       message: 'Production startup requires a non-placeholder CSRF secret.'
+    });
+  }
+  if (versionError) {
+    errors.push({
+      code: 'application_version_invalid',
+      file: 'VERSION',
+      message: versionError
     });
   }
 
@@ -819,6 +869,7 @@ function validateRuntimeConfig(input = {}) {
     publicOriginConfigured: publicOriginConfiguration.configured,
     redis: redisTransport,
     assistant: assistantStatus(),
+    applicationVersion: APPLICATION_VERSION,
     d2: d2RendererConfigSummary(),
     errors,
     warnings
@@ -833,6 +884,7 @@ function runtimeConfigLogSummary(validation = validateRuntimeConfig()) {
     syslog: validation.syslog || null,
     publicOrigin: validation.publicOrigin || '',
     publicOriginConfigured: Boolean(validation.publicOriginConfigured),
+    applicationVersion: validation.applicationVersion || APPLICATION_VERSION,
     redis: validation.redis || redisTransportSecurity(),
     d2: validation.d2 || d2RendererConfigSummary(),
     errors: validation.errors.map((item) => item.code),
@@ -1312,7 +1364,9 @@ function d2MappingStructureHash(ir) {
     parentPathSegments: Array.isArray(item && item.parentPathSegments) ? item.parentPathSegments.map(String) : [],
     childPathSegments: Array.isArray(item && item.childPathSegments) ? item.childPathSegments.map(String) : [],
     direction: String(item && item.direction || ''),
-    classKeys: Array.isArray(item && item.classKeys) ? item.classKeys.map(String).sort() : []
+    classKeys: Array.isArray(item && item.classKeys) ? item.classKeys.map(String).sort() : [],
+    notes: String(item && item.notes || ''),
+    templateStatic: Boolean(item && item.templateStatic)
   })).sort((left, right) => left.key.localeCompare(right.key));
   return hashJson({
     version: 1,
@@ -1332,8 +1386,90 @@ function d2MappingContractHash(ir) {
       key: String(item && item.key || ''),
       notes: String(item && item.notes || ''),
       directionPolicy: normalizeDiagramDirectionPolicy(item && item.directionPolicy)
+    })).filter((item) => item.key).sort((left, right) => left.key.localeCompare(right.key)),
+    staticElements: [].concat(
+      Array.isArray(ir && ir.elements && ir.elements.groups) ? ir.elements.groups : [],
+      Array.isArray(ir && ir.elements && ir.elements.nodes) ? ir.elements.nodes : []
+    ).filter((item) => item && item.templateStatic).map((item) => ({
+      key: String(item.key || ''),
+      notes: String(item.notes || '')
     })).filter((item) => item.key).sort((left, right) => left.key.localeCompare(right.key))
   });
+}
+
+function diagramImportStaticSubtreeContains(staticKeys, key) {
+  const value = String(key || '').trim();
+  return Array.from(staticKeys || []).some((root) => value === root || value.startsWith(`${root}.`));
+}
+
+function diagramImportDynamicStructureHash(structure, staticKeys) {
+  const elements = structure && typeof structure === 'object' ? structure : {};
+  const isStatic = (item) => {
+    const source = item && typeof item === 'object' ? item : {};
+    return diagramImportStaticSubtreeContains(staticKeys, source.key) ||
+      diagramImportStaticSubtreeContains(staticKeys, source.parentKey) ||
+      diagramImportStaticSubtreeContains(staticKeys, source.childKey) ||
+      diagramImportStaticSubtreeContains(staticKeys, source.sourceKey) ||
+      diagramImportStaticSubtreeContains(staticKeys, source.targetKey);
+  };
+  const normalize = (value) => (Array.isArray(value) ? value : []).filter((item) => !isStatic(item)).map((item) => ({
+    key: String(item && item.key || ''),
+    parentKey: String(item && item.parentKey || ''),
+    childKey: String(item && item.childKey || ''),
+    childrenKeys: Array.isArray(item && item.childrenKeys) ? item.childrenKeys.map(String).sort() : [],
+    groupKeys: Array.isArray(item && item.groupKeys) ? item.groupKeys.map(String).sort() : [],
+    sourceKey: String(item && item.sourceKey || ''),
+    targetKey: String(item && item.targetKey || ''),
+    pathSegments: Array.isArray(item && item.pathSegments) ? item.pathSegments.map(String) : [],
+    sourcePathSegments: Array.isArray(item && item.sourcePathSegments) ? item.sourcePathSegments.map(String) : [],
+    targetPathSegments: Array.isArray(item && item.targetPathSegments) ? item.targetPathSegments.map(String) : [],
+    parentPathSegments: Array.isArray(item && item.parentPathSegments) ? item.parentPathSegments.map(String) : [],
+    childPathSegments: Array.isArray(item && item.childPathSegments) ? item.childPathSegments.map(String) : [],
+    direction: String(item && item.direction || ''),
+    classKeys: Array.isArray(item && item.classKeys) ? item.classKeys.map(String).sort() : [],
+    notes: String(item && item.notes || '')
+  })).sort((left, right) => left.key.localeCompare(right.key));
+  return hashJson({
+    version: 1,
+    nodes: normalize(elements.nodes),
+    edges: normalize(elements.edges),
+    groups: normalize(elements.groups),
+    hierarchies: normalize(elements.hierarchies)
+  });
+}
+
+function diagramImportClassContractHash(classes) {
+  return hashJson((Array.isArray(classes) ? classes : []).map((item) => ({
+    key: String(item && item.key || ''),
+    notes: String(item && item.notes || ''),
+    directionPolicy: normalizeDiagramDirectionPolicy(item && item.directionPolicy)
+  })).filter((item) => item.key).sort((left, right) => left.key.localeCompare(right.key)));
+}
+
+function diagramImportStaticExtensionCompatible(imported, ir) {
+  const staticKeys = diagramImportTemplateStaticElementKeys(ir && ir.elements || {});
+  if (!staticKeys.size || !imported || !imported.structure) return false;
+  return diagramImportDynamicStructureHash(imported.structure, staticKeys) ===
+    diagramImportDynamicStructureHash(ir.elements, staticKeys) &&
+    diagramImportClassContractHash(imported.classes) === diagramImportClassContractHash(ir.classes);
+}
+
+function diagramImportStructureTreeWithStaticExtension(previousTree, structure, roles) {
+  const previous = diagramImportStructureTree(previousTree, structure, roles);
+  const seeded = diagramImportStructureTreeSeed(structure, roles);
+  // The same D2 key used to have a non-static context ID. Once its root is
+  // marked static the context ID changes, so normalization cannot rely on the
+  // legacy item's templateStatic flag. Classify it by its current D2 element
+  // key and replace the whole old subtree with one static seed.
+  const dynamicItems = previous.items.filter((item) => item && !diagramImportElementIsTemplateStatic(
+    structure,
+    String(item.templateElementKey || '')
+  ));
+  const staticItems = seeded.filter((item) => item && item.templateStatic === true);
+  return diagramImportStructureTree({
+    version: D2_IMPORT_STRUCTURE_TREE_VERSION,
+    items: dynamicItems.concat(staticItems)
+  }, structure, roles);
 }
 
 async function d2SourceStructureIdentity(source) {
@@ -1746,6 +1882,8 @@ function normalizeDiagramImportElement(value, fallbackKey = '') {
     childPathSegments: Array.isArray(source.childPathSegments) ? source.childPathSegments.map(String) : [],
     direction: String(source.direction || '').trim(),
     classKeys: uniqueStrings(Array.isArray(source.classKeys) ? source.classKeys : Array.isArray(source.classes) ? source.classes : []),
+    notes: truncateText(String(source.notes || source.Notes || '').trim(), 8000),
+    templateStatic: source.static === true || source.templateStatic === true,
     suggestedRole: normalizeDiagramImportSemantic(source.suggestedRole),
     selectedRole: normalizeDiagramImportSemantic(source.selectedRole),
     semanticReason: truncateText(String(source.semanticReason || ''), 300),
@@ -1903,10 +2041,9 @@ function diagramImportStableId(prefix, value) {
 }
 
 function diagramImportPrimaryIdAttribute(role, primary = {}) {
-  // A node represents one CMDBuild card. Its identity must remain stable even
-  // when a user-facing Code or Description changes.
-  if (diagramImportRoleVisualKind(role) === 'node') return '_id';
-  return String(primary && primary.idAttribute || '_id').trim() || '_id';
+  // Every materialized CMDBuild card uses its stable technical identifier.
+  // The selected card source determines which retained card `_id` denotes.
+  return '_id';
 }
 
 function diagramImportRelatedBindingSignatureServer(binding) {
@@ -1949,9 +2086,9 @@ function diagramImportChildTemplateTokens(template) {
 
 function diagramImportPrimaryTemplateFieldNames(template) {
   return uniqueStrings(diagramTemplateFieldNames(template || '')
-    .filter((field) => !diagramImportChildTemplateToken(field) && !String(field || '').startsWith('child.') && !String(field || '').startsWith('child:'))
+    .filter((field) => !diagramImportChildTemplateToken(field) && !String(field || '').startsWith('child.') && !String(field || '').startsWith('child:') && !String(field || '').startsWith('param.') && !String(field || '').startsWith('params.') && !String(field || '').startsWith('row.'))
     .map((field) => String(field || '').replace(/^primary\./, '').trim())
-    .filter((field) => field && !field.includes('.')));
+    .filter(Boolean));
 }
 
 function diagramImportPrimaryTemplateFields(template) {
@@ -1962,9 +2099,25 @@ function diagramImportPrimaryStructuredFields(role, primary = {}) {
   const configured = Array.isArray(primary && primary.structuredFields)
     ? primary.structuredFields
     : ['Code', 'Description'];
-  const labelTemplate = String(primary && primary.labelTemplate || role && role.labelTemplate || '${Description}');
+  const labelTemplate = diagramImportPrimaryLabelTemplate(primary, diagramImportRoleLabelTemplate(role, '${Description}'));
   return uniqueStrings(diagramImportPrimaryTemplateFields(labelTemplate)
     .concat(configured)).filter((field) => field !== '_id');
+}
+
+function diagramImportPrimaryLabelTemplate(primary = {}, fallback = '${Description}') {
+  const source = primary && typeof primary === 'object' && !Array.isArray(primary) ? primary : {};
+  // An empty template is a deliberate authoring decision for a D2 placement.
+  // Do not replace it with a class label or a data-field fallback at runtime.
+  return Object.prototype.hasOwnProperty.call(source, 'labelTemplate')
+    ? String(source.labelTemplate ?? '')
+    : String(fallback ?? '');
+}
+
+function diagramImportRoleLabelTemplate(role = {}, fallback = '') {
+  const source = role && typeof role === 'object' && !Array.isArray(role) ? role : {};
+  return Object.prototype.hasOwnProperty.call(source, 'labelTemplate')
+    ? String(source.labelTemplate ?? '')
+    : String(fallback ?? '');
 }
 
 const DIAGRAM_IMPORT_CONDITION_OPERATORS = new Set([
@@ -1976,6 +2129,12 @@ const DIAGRAM_IMPORT_CONDITION_OPERATORS = new Set([
   'ipv4CidrOverlaps',
   'ipv4CidrContains'
 ]);
+
+// A D2 endpoint comparison is a deterministic binary predicate. Keep this
+// registry shared with placement conditions so new comparison algorithms are
+// added once and become available to both editors and runtime validation.
+const DIAGRAM_IMPORT_COMPARISON_OPERATORS = DIAGRAM_IMPORT_CONDITION_OPERATORS;
+const DIAGRAM_IMPORT_CONNECTION_MODES = new Set(['relationCard', 'attributeEndpoints', 'networkEndpoints', 'deterministicEndpoints']);
 
 const DIAGRAM_IMPORT_MATERIALIZATION_KINDS = new Set(['structural', 'stage', 'parentCard']);
 const DIAGRAM_IMPORT_RELATED_MODES = new Set(['stage']);
@@ -2121,7 +2280,7 @@ function diagramImportRoleMappingData(role, source = {}, mappingIndex = 0) {
     primary: {
       className: String(primary.className || '').trim(),
       idAttribute: diagramImportPrimaryIdAttribute(role, primary),
-      labelTemplate: String(primary.labelTemplate || '${Description}'),
+      labelTemplate: diagramImportPrimaryLabelTemplate(primary, diagramImportRoleLabelTemplate(role, '${Description}')),
       structuredFields: diagramImportPrimaryStructuredFields(role, primary),
       ...(primaryCardSource ? { cardSource: primaryCardSource } : {}),
       filters: []
@@ -2175,9 +2334,40 @@ function diagramImportRoleExemplar(role, structure) {
     : { key: '', automatic: false };
 }
 
+function diagramImportTemplateStaticElementKeys(structure) {
+  const all = [].concat(
+    Array.isArray(structure && structure.groups) ? structure.groups : [],
+    Array.isArray(structure && structure.nodes) ? structure.nodes : []
+  );
+  const byKey = new Map(all.map((element) => [String(element && element.key || ''), element]).filter(([key]) => key));
+  const staticKeys = new Set();
+  for (const element of all) {
+    const key = String(element && element.key || '').trim();
+    if (!key) continue;
+    const visited = new Set();
+    let current = element;
+    while (current) {
+      const currentKey = String(current && current.key || '').trim();
+      if (!currentKey || visited.has(currentKey)) break;
+      visited.add(currentKey);
+      if (current.templateStatic === true) {
+        staticKeys.add(key);
+        break;
+      }
+      current = byKey.get(String(current && current.parentKey || '').trim()) || null;
+    }
+  }
+  return staticKeys;
+}
+
+function diagramImportElementIsTemplateStatic(structure, elementKey) {
+  return diagramImportTemplateStaticElementKeys(structure).has(String(elementKey || '').trim());
+}
+
 function diagramImportClassRoleDefinitions(ir) {
   const elements = ir && ir.elements || { nodes: [], groups: [] };
   const allElements = (elements.nodes || []).concat(elements.groups || []);
+  const staticElementKeys = diagramImportTemplateStaticElementKeys(elements);
   const declared = new Map((Array.isArray(ir && ir.classes) ? ir.classes : []).map((item) => [String(item.key || ''), item]));
   for (const element of allElements) {
     for (const classKey of Array.isArray(element && element.classKeys) ? element.classKeys : []) {
@@ -2199,6 +2389,7 @@ function diagramImportClassRoleDefinitions(ir) {
       key: classKey,
       label: definition.label || classKey,
       notes: String(definition.notes || '').trim(),
+      templateStatic: usages.every((item) => staticElementKeys.has(String(item && item.key || ''))),
       elementKeys: usages.map((item) => item.key),
       containerKeys: containerUsages.map((item) => item.key),
       visualKind,
@@ -2221,6 +2412,8 @@ function diagramImportClassRoleDefinitions(ir) {
       kind: 'untypedContainer',
       key: group.key,
       label: group.label || group.key,
+      notes: String(group.notes || '').trim(),
+      templateStatic: staticElementKeys.has(String(group.key || '')),
       elementKeys: [group.key],
       containerKeys: [group.key],
       visualKind: 'container',
@@ -2232,6 +2425,28 @@ function diagramImportClassRoleDefinitions(ir) {
       exemplarKey: '',
       exemplarRequired: false,
       styleHints: cloneJsonValueServer(group.styleHints, {})
+    });
+  }
+  for (const node of elements.nodes || []) {
+    if (!staticElementKeys.has(String(node && node.key || '')) || (Array.isArray(node && node.classKeys) && node.classKeys.length)) continue;
+    roles.push({
+      id: diagramImportStableId('d2_static_node', node.key),
+      kind: 'staticTemplateNode',
+      key: `static:${node.key}`,
+      label: node.label || node.key,
+      notes: String(node.notes || '').trim(),
+      templateStatic: true,
+      elementKeys: [node.key],
+      containerKeys: [],
+      visualKind: 'node',
+      labelTemplate: '${Description}',
+      visualKindOptions: ['node'],
+      suggestedSemantic: 'static',
+      semanticReason: 'D2 node belongs to a template-only static subtree and is rendered without CMDBuild data.',
+      options: ['node'],
+      exemplarKey: '',
+      exemplarRequired: false,
+      styleHints: cloneJsonValueServer(node.styleHints, {})
     });
   }
   return roles;
@@ -2254,26 +2469,23 @@ function diagramImportPreviousRoleModel(role, previousRole) {
   return diagramImportApplyRoleModel({
     ...role,
     visualKind: previous.visualKind,
-    labelTemplate: previous.labelTemplate || role.labelTemplate
+    labelTemplate: diagramImportRoleLabelTemplate(previous, role.labelTemplate)
   });
 }
 
 function normalizeDiagramDirectionPolicy(value) {
   const policy = String(value || '').trim();
-  return ['dataFields', 'template', 'undirected'].includes(policy) ? policy : '';
+  // Connection semantics are driven by the selected result fields: source
+  // always becomes the arrow source and target becomes the arrow target.
+  // D2 template arrows are visual blueprints only. The author may explicitly
+  // suppress direction for an undirected connection.
+  return policy === 'undirected' ? 'undirected' : 'dataFields';
 }
 
 function diagramImportDirectionPolicySuggestion(rule) {
   const direction = String(rule && rule.direction || '').trim();
   if (direction === '<->' || direction === '--') return 'undirected';
-  const text = [
-    rule && rule.d2ClassKey,
-    rule && rule.d2Notes,
-    ...(Array.isArray(rule && rule.d2ExampleLabels) ? rule.d2ExampleLabels : [])
-  ].map((item) => String(item || '')).join('\n');
-  return /(?:\bacl\b|\b(?:tcp|udp|sctp|icmp)\b|source|destination|источник|назначени|endpoint|ip\s*address)/i.test(text)
-    ? 'dataFields'
-    : 'template';
+  return 'template';
 }
 
 function diagramImportEffectiveSourceStageId(role, item) {
@@ -2397,6 +2609,9 @@ function diagramImportParentCorrelationCandidates(sourceStage, parentStage) {
 
 function diagramImportDirectRelationParentCorrelation(mapping, sourceStage, parentStage, treeItemId = '') {
   const source = mapping && typeof mapping === 'object' && !Array.isArray(mapping) ? mapping : {};
+  // A match can retain the parent card and one related card. If the current
+  // card is the parent, the unique relation source is the deterministic child
+  // card; retain that explicit projection and correlate it to the parent.
   const primaryProjection = diagramImportPrimaryCardSource(sourceStage, source.primary || {}, parentStage);
   const primaryCardSource = primaryProjection.source;
   const sourceClass = String(sourceStage && sourceStage.className || '').trim();
@@ -2421,11 +2636,7 @@ function diagramImportDirectRelationParentCorrelation(mapping, sourceStage, pare
   const hierarchyConditions = diagramImportPlacementFilters(source.hierarchyConditions);
   const hasManualRule = hierarchyConditions.rules.some((condition) => condition && condition.origin !== 'assistant');
   if (hasManualRule) {
-    return {
-      mapping: { ...source, primary },
-      changed: true,
-      correlationChanged: false
-    };
+    return { mapping: { ...source, primary }, changed: true, correlationChanged: false };
   }
   const stageId = String(parentStage && parentStage.id || '').trim();
   const directRule = {
@@ -2436,28 +2647,14 @@ function diagramImportDirectRelationParentCorrelation(mapping, sourceStage, pare
     operator: 'equals',
     caseSensitive: false,
     left: { column: String(currentSource.idColumn), regex: '', source: currentSource },
-    right: {
-      kind: 'stage',
-      value: '',
-      name: '',
-      stageId,
-      column: String(parentCurrentSource.idColumn),
-      regex: '',
-      source: parentCurrentSource
-    }
+    right: { kind: 'stage', value: '', name: '', stageId, column: String(parentCurrentSource.idColumn), regex: '', source: parentCurrentSource }
   };
   const alreadyDirect = hierarchyConditions.rules.length === 1 &&
     String(hierarchyConditions.rules[0] && hierarchyConditions.rules[0].left && hierarchyConditions.rules[0].left.column || '') === String(directRule.left.column) &&
     String(hierarchyConditions.rules[0] && hierarchyConditions.rules[0].right && hierarchyConditions.rules[0].right.stageId || '') === stageId &&
     String(hierarchyConditions.rules[0] && hierarchyConditions.rules[0].right && hierarchyConditions.rules[0].right.column || '') === String(directRule.right.column);
   return {
-    mapping: {
-      ...source,
-      primary,
-      hierarchyConditions: alreadyDirect
-        ? hierarchyConditions
-        : { ruleJoin: 'any', rules: [directRule] }
-    },
+    mapping: { ...source, primary, hierarchyConditions: alreadyDirect ? hierarchyConditions : { ruleJoin: 'any', rules: [directRule] } },
     changed: true,
     correlationChanged: !alreadyDirect
   };
@@ -2529,6 +2726,7 @@ function diagramImportStructureTreeContextCatalog(structure, roles) {
     return leftDepth - rightDepth || String(left && left.key || '').localeCompare(String(right && right.key || ''));
   });
   const roleByElementKey = new Map();
+  const staticElementKeys = diagramImportTemplateStaticElementKeys(structure);
   for (const role of Array.isArray(roles) ? roles : []) {
     for (const elementKey of Array.isArray(role && role.elementKeys) ? role.elementKeys : []) {
       if (elementKey && !roleByElementKey.has(String(elementKey))) roleByElementKey.set(String(elementKey), role);
@@ -2542,15 +2740,17 @@ function diagramImportStructureTreeContextCatalog(structure, roles) {
     if (!elementKey || !role.id) continue;
     const parentContextKey = contextByElementKey.get(String(element && element.parentKey || '').trim()) || '';
     const parentContext = contextsByKey.get(parentContextKey) || null;
+    const templateStatic = staticElementKeys.has(elementKey);
     const rolePath = parentContext
-      ? parentContext.rolePath.concat(String(role.id))
-      : [String(role.id)];
+      ? parentContext.rolePath.concat(templateStatic ? `${String(role.id)}@${elementKey}` : String(role.id))
+      : [templateStatic ? `${String(role.id)}@${elementKey}` : String(role.id)];
     const key = diagramImportStableId('structure_context', rolePath.join('>'));
     const context = contextsByKey.get(key) || {
       key,
       roleId: String(role.id),
       rolePath,
       parentContextKey,
+      templateStatic,
       elementKeys: []
     };
     context.elementKeys.push(elementKey);
@@ -2579,7 +2779,7 @@ function diagramImportStructureTreeSeed(structure, roles) {
     // explicit choice so later validation can distinguish it from an older
     // saved tree that omitted materialization altogether.
     mapping.materialization = {
-      kind: diagramImportRoleVisualKind(role) === 'container' ? 'structural' : 'stage',
+      kind: context.templateStatic || diagramImportRoleVisualKind(role) === 'container' ? 'structural' : 'stage',
       stageId: ''
     };
     return {
@@ -2589,6 +2789,7 @@ function diagramImportStructureTreeSeed(structure, roles) {
       templateElementKey: String(context.elementKeys[0] || ''),
       templateElementKeys: context.elementKeys,
       parentId: itemIdByContextKey.get(context.parentContextKey) || '',
+      templateStatic: context.templateStatic === true,
       mapping
     };
   });
@@ -2603,11 +2804,22 @@ function diagramImportStructureTree(value, structure, roles) {
       ? source.items
       : [];
   const roleById = new Map((Array.isArray(roles) ? roles : []).map((role) => [String(role && role.id || ''), role]));
+  const contextByKey = structure ? diagramImportStructureTreeContextByKey(structure, roles) : new Map();
   const normalized = rawItems.slice(0, D2_IMPORT_MAX_ELEMENTS).map((item, index) => {
     const roleId = String(item && item.roleId || '').trim();
     const role = roleById.get(roleId) || {};
     const requestedElementKey = String(item && item.templateElementKey || '').trim();
     const requestedElementKeys = uniqueStrings(Array.isArray(item && item.templateElementKeys) ? item.templateElementKeys : [requestedElementKey]).sort();
+    const context = contextByKey.get(String(item && item.templateContextKey || '').trim()) || null;
+    const templateStatic = context ? context.templateStatic === true : item && item.templateStatic === true;
+    const mapping = diagramImportStructureItemMapping(role, item && item.mapping || {}, String(item && item.id || `${roleId}:${requestedElementKey}:${index}`));
+    if (templateStatic) {
+      mapping.materialization = { kind: 'structural', stageId: '' };
+      mapping.conditions = { ruleJoin: 'any', rules: [] };
+      mapping.hierarchyConditions = { ruleJoin: 'any', rules: [] };
+      mapping.related = [];
+      if (diagramImportRoleVisualKind(role) === 'container') mapping.showEmpty = true;
+    }
     return {
       id: String(item && item.id || diagramImportStableId('structure_item', `${roleId}:${requestedElementKey}:${index}`)).trim(),
       roleId,
@@ -2617,7 +2829,8 @@ function diagramImportStructureTree(value, structure, roles) {
       templateElementKey: requestedElementKey || String(requestedElementKeys[0] || '').trim(),
       templateElementKeys: requestedElementKeys,
       parentId: String(item && item.parentId || '').trim(),
-      mapping: diagramImportStructureItemMapping(role, item && item.mapping || {}, String(item && item.id || `${roleId}:${requestedElementKey}:${index}`))
+      templateStatic,
+      mapping
     };
   }).filter((item) => item.id);
   const itemById = new Map(normalized.map((item) => [String(item && item.id || ''), item]).filter(([id]) => id));
@@ -2654,6 +2867,132 @@ function diagramImportStructureTree(value, structure, roles) {
     version: D2_IMPORT_STRUCTURE_TREE_VERSION,
     items: hasExplicitItems ? normalized : diagramImportStructureTreeSeed(structure, roles)
   }, roles);
+}
+
+function diagramImportLegacyTreeItemIdentity(roleId, elementKey) {
+  return `${String(roleId || '').trim()}\u0000${String(elementKey || '').trim()}`;
+}
+
+// Version 8/3 stored one placement per D2 element, with a retired `source`
+// contract. The current tree adds explicit materialization and context IDs.
+// Rebuild the tree from the current D2 IR, then attach legacy user choices by
+// the two stable identifiers that existed in both contracts: role and D2 path.
+function diagramImportMigrateLegacyStructureTree(imported, structure, roles, diagnostics = []) {
+  const legacyTree = imported && imported.structureTree && typeof imported.structureTree === 'object' && !Array.isArray(imported.structureTree)
+    ? imported.structureTree
+    : {};
+  const legacyItems = Array.isArray(legacyTree.items) ? legacyTree.items : [];
+  if (!legacyItems.length) return null;
+
+  const legacyRoleById = new Map((Array.isArray(imported && imported.roles) ? imported.roles : [])
+    .map((role) => [String(role && role.id || '').trim(), String(role && role.key || '').trim()])
+    .filter(([id]) => id));
+  const currentRoleById = new Map((Array.isArray(roles) ? roles : [])
+    .map((role) => [String(role && role.id || '').trim(), role])
+    .filter(([id]) => id));
+  const currentRoleByKey = new Map((Array.isArray(roles) ? roles : [])
+    .map((role) => [String(role && role.key || '').trim(), role])
+    .filter(([key]) => key));
+  const seed = diagramImportStructureTreeSeed(structure, roles);
+  const seedByIdentity = new Map();
+  for (const item of seed) {
+    const identity = diagramImportLegacyTreeItemIdentity(item && item.roleId, item && item.templateElementKey);
+    const items = seedByIdentity.get(identity) || [];
+    items.push(item);
+    seedByIdentity.set(identity, items);
+  }
+
+  const availableSeedByIdentity = new Map(Array.from(seedByIdentity.entries()).map(([identity, items]) => [identity, items.slice()]));
+  const assignedBySeedId = new Map();
+  const legacyIdToCurrentId = new Map();
+  const extraItems = [];
+
+  const mappedLegacyRole = (legacyItem) => {
+    const originalRoleId = String(legacyItem && legacyItem.roleId || '').trim();
+    if (currentRoleById.has(originalRoleId)) return currentRoleById.get(originalRoleId);
+    const roleKey = legacyRoleById.get(originalRoleId) || '';
+    return currentRoleByKey.get(roleKey) || null;
+  };
+  const migratedMapping = (role, legacyItem, seedItem, itemId) => {
+    const legacyMapping = legacyItem && legacyItem.mapping && typeof legacyItem.mapping === 'object' && !Array.isArray(legacyItem.mapping)
+      ? cloneJsonValueServer(legacyItem.mapping, {})
+      : {};
+    const legacySource = legacyMapping.source && typeof legacyMapping.source === 'object' && !Array.isArray(legacyMapping.source)
+      ? legacyMapping.source
+      : {};
+    const stageId = String(legacySource.stageId || '').trim();
+    const executableRelated = (Array.isArray(legacyMapping.related) ? legacyMapping.related : []).filter((related) => {
+      const item = related && typeof related === 'object' && !Array.isArray(related) ? related : {};
+      return Boolean(String(item.stageId || '').trim()) &&
+        String(item.mode || '') !== 'traversal' &&
+        !(Array.isArray(item.path) && item.path.length);
+    });
+    delete legacyMapping.source;
+    legacyMapping.related = executableRelated;
+    // A legacy domain traversal cannot be reconstructed as a named Object
+    // Flow stage without changing data semantics. Preserve primary bindings
+    // and require an explicit modern related-data mapping instead.
+    const seedMapping = seedItem && seedItem.mapping && typeof seedItem.mapping === 'object' ? seedItem.mapping : {};
+    const preservedMaterialization = normalizeDiagramImportMaterialization(role, legacyMapping.materialization);
+    legacyMapping.materialization = stageId
+      ? { kind: 'stage', stageId }
+      : DIAGRAM_IMPORT_MATERIALIZATION_KINDS.has(String(preservedMaterialization.kind || ''))
+        ? preservedMaterialization
+        : normalizeDiagramImportMaterialization(role, seedMapping.materialization);
+    return diagramImportStructureItemMapping(role, legacyMapping, itemId);
+  };
+
+  for (const legacyItem of legacyItems) {
+    const role = mappedLegacyRole(legacyItem);
+    const elementKey = String(legacyItem && legacyItem.templateElementKey || '').trim();
+    if (!role || !elementKey) {
+      diagnostics.push('legacyStructureRoleOrElementMissing');
+      return null;
+    }
+    const identity = diagramImportLegacyTreeItemIdentity(role.id, elementKey);
+    const candidates = availableSeedByIdentity.get(identity) || [];
+    const seedItem = candidates.shift() || (seedByIdentity.get(identity) || [])[0] || null;
+    if (!seedItem) {
+      diagnostics.push('legacyStructureContextMissing');
+      return null;
+    }
+    const itemId = String(legacyItem && legacyItem.id || '').trim();
+    if (!itemId || legacyIdToCurrentId.has(itemId)) {
+      diagnostics.push('legacyStructureItemIdInvalid');
+      return null;
+    }
+    const migrated = {
+      ...seedItem,
+      id: itemId,
+      mapping: migratedMapping(role, legacyItem, seedItem, itemId)
+    };
+    legacyIdToCurrentId.set(itemId, itemId);
+    if (assignedBySeedId.has(seedItem.id)) extraItems.push({ legacyItem, seedItem, migrated });
+    else assignedBySeedId.set(seedItem.id, { legacyItem, migrated });
+  }
+
+  const migratedItems = seed.map((seedItem) => {
+    const assigned = assignedBySeedId.get(seedItem.id);
+    return assigned ? assigned.migrated : seedItem;
+  }).concat(extraItems.map((entry) => entry.migrated));
+  const replacementIdBySeedId = new Map(seed.map((seedItem) => {
+    const assigned = assignedBySeedId.get(seedItem.id);
+    return [seedItem.id, assigned ? assigned.migrated.id : seedItem.id];
+  }));
+  const legacyById = new Map(legacyItems.map((item) => [String(item && item.id || '').trim(), item]).filter(([id]) => id));
+  const normalizedItems = migratedItems.map((item) => {
+    const legacyItem = legacyById.get(String(item && item.id || '').trim());
+    const legacyParentId = String(legacyItem && legacyItem.parentId || '').trim();
+    const parentId = legacyParentId
+      ? legacyIdToCurrentId.get(legacyParentId) || ''
+      : replacementIdBySeedId.get(String(item && item.parentId || '').trim()) || String(item && item.parentId || '').trim();
+    return { ...item, parentId };
+  });
+  const tree = diagramImportStructureTree({
+    version: D2_IMPORT_STRUCTURE_TREE_VERSION,
+    items: normalizedItems
+  }, structure, roles);
+  return tree;
 }
 
 function diagramImportCopiedStructureMapping(role, sourceMapping = {}, itemId = '') {
@@ -2881,6 +3220,7 @@ function diagramImportStructureTreeErrors(tree, roles, currentSpec = {}, structu
     const visualKind = diagramImportRoleVisualKind(role);
     const materialization = mapping.materialization || {};
     const materializationKind = String(materialization.kind || '');
+    const templateStatic = item && item.templateStatic === true;
     const ancestor = diagramImportNearestMaterializedAncestor(normalized, roles, item);
     let stageId = '';
     if (materializationKind === 'stage') {
@@ -2896,7 +3236,7 @@ function diagramImportStructureTreeErrors(tree, roles, currentSpec = {}, structu
     } else if (materializationKind !== 'structural') {
       errors.push({ path: `$.structureTree.items[${index}].mapping.materialization.kind`, message: 'D2 placement must choose structural, stage, or parentCard materialization.' });
     }
-    if (visualKind === 'node' && materializationKind === 'structural') {
+    if (visualKind === 'node' && materializationKind === 'structural' && !templateStatic) {
       errors.push({
         path: `$.structureTree.items[${index}].mapping.materialization.kind`,
         message: `D2 node placement ${role && (role.label || role.key || role.id) || item.id} must use a stage or inherit a parent card.`
@@ -2924,32 +3264,12 @@ function diagramImportStructureTreeErrors(tree, roles, currentSpec = {}, structu
       errors.push({ path: stagePath, message: `Object Flow result ${stage.label || stage.id} is not a materialized CMDBuild class result.` });
       continue;
     }
-    const primaryProjection = diagramImportPrimaryCardSource(
-      stage,
-      mapping.primary || {},
-      ancestor && ancestor.stageId ? stages.get(String(ancestor.stageId)) : null
-    );
-    const expectedClass = String(mapping && mapping.primary && mapping.primary.className || '').trim();
-    if (primaryProjection.ambiguous) {
-      errors.push({
-        path: `$.structureTree.items[${index}].mapping.primary.cardSource`,
-        message: `Object Flow result ${stage.label || stage.id} contains several CMDBuild cards. Select the card that must materialize D2 role ${role.label || role.key || item.id}.`
-      });
-    } else if (!primaryProjection.inferred && primaryProjection.source && expectedClass && expectedClass !== String(primaryProjection.source.className || '')) {
-      errors.push({
-        path: `$.structureTree.items[${index}].mapping.primary.cardSource`,
-        message: `D2 role ${role.label || role.key || item.id} is configured for ${expectedClass}, but the selected Object Flow card is ${primaryProjection.source.className}.`
-      });
-    }
     const available = new Set((stage.columns || []).map(String));
-    const primaryUsesRetainedCard = Boolean(primaryProjection.source && (
-      primaryProjection.source.classColumn !== 'Class' || primaryProjection.source.idColumn !== '_id'
-    ));
-    for (const field of uniqueStrings([mapping.primary && mapping.primary.idAttribute]
+    for (const field of uniqueStrings(['_id']
       .concat(mapping.primary && mapping.primary.structuredFields || [])
       .concat(diagramImportPrimaryTemplateFieldNames(mapping.primary && mapping.primary.labelTemplate || '')))
       .map((field) => String(field || '').replace(/^primary\./, '')).filter(Boolean)) {
-      if (!primaryUsesRetainedCard && !['_id', 'Class'].includes(field) && !available.has(field)) {
+      if (!['_id', 'Class'].includes(field) && !available.has(field)) {
         errors.push({ path: `$.structureTree.items[${index}].mapping.primary`, message: `Field ${field} is not materialized by Object Flow result ${stage.label || stage.id}.` });
       }
     }
@@ -3119,10 +3439,30 @@ function migrateDiagramImportToCurrentRevision(spec, value, options = {}) {
   const revision = Number(imported.semanticModelRevision || 0);
   const treeVersion = Number(imported.structureTree && imported.structureTree.version || 0);
   const currentRevision = revision === D2_IMPORT_SEMANTIC_MODEL_REVISION && treeVersion === D2_IMPORT_STRUCTURE_TREE_VERSION;
-  if (!currentRevision || !Array.isArray(imported.structureTree && imported.structureTree.items)) {
+  const legacyStructureRevision = revision === 8 && treeVersion === 3;
+  // Revisions 11-13 already have the current structure tree. Their
+  // connection contracts can be
+  // rebuilt from a verified current D2 identity without replacing authored
+  // placements.
+  const previousConnectionModelRevision = [11, 12, 13].includes(revision) && treeVersion === D2_IMPORT_STRUCTURE_TREE_VERSION;
+  const legacyTopology = diagramImportHasLegacyClassRelationRules(imported);
+  // Revisions 11-13 already have the current tree, but their mapping
+  // contracts may carry a retired manual participant set. Revision 14
+  // changes this to one algorithm over all compatible placement rules. It needs
+  // the same relaxed mapping-identity check as a legacy topology, but must
+  // not be passed to the revision-8 tree migrator.
+  const legacyMappingContract = legacyStructureRevision || legacyTopology || previousConnectionModelRevision;
+  const legacyTreeMigration = legacyStructureRevision || legacyTopology;
+  if ((!currentRevision && !legacyStructureRevision && !previousConnectionModelRevision) || !Array.isArray(imported.structureTree && imported.structureTree.items)) {
     return rejectDiagramImportMigration(options, 'materializationRevisionRequired');
   }
-  if (diagramImportStoredMaterializationIssues(imported).length) {
+  // A retired structure representation may only be rebuilt from a fresh,
+  // verified D2 identity. Returning it unchanged lets a normal Save promote
+  // obsolete placement semantics as if they were a current mapping.
+  if (!currentRevision && options.rebuildCurrent !== true) {
+    return rejectDiagramImportMigration(options, 'materializationRevisionRequired');
+  }
+  if (currentRevision && !legacyMappingContract && diagramImportStoredMaterializationIssues(imported).length) {
     return rejectDiagramImportMigration(options, 'materializationContractRequired');
   }
   if (options.rebuildCurrent !== true) return imported;
@@ -3143,8 +3483,9 @@ function migrateDiagramImportToCurrentRevision(spec, value, options = {}) {
   const ir = identity && identity.ok && identity.ir && typeof identity.ir === 'object' ? identity.ir : null;
   if (!ir ||
     String(identity.sourceHash || '') !== String(imported.sourceHash || '') ||
-    String(identity.structureHash || '') !== String(imported.structureHash || '') ||
-    String(identity.mappingContractHash || '') !== String(imported.mappingContractHash || '')) {
+    (!legacyMappingContract &&
+      (String(identity.structureHash || '') !== String(imported.structureHash || '') ||
+        String(identity.mappingContractHash || '') !== String(imported.mappingContractHash || '')))) {
     return rejectDiagramImportMigration(options, 'sourceIdentityMismatch');
   }
   const structure = ir.elements && typeof ir.elements === 'object' && !Array.isArray(ir.elements) ? ir.elements : null;
@@ -3159,36 +3500,81 @@ function migrateDiagramImportToCurrentRevision(spec, value, options = {}) {
     })),
     structure
   );
+  const topologyOnlyMigration = () => ({
+    ...imported,
+    version: 3,
+    semanticModelRevision: D2_IMPORT_SEMANTIC_MODEL_REVISION,
+    diagramId: ownerId || importedDiagramId,
+    sourceHash: String(identity.sourceHash || ''),
+    structureHash: String(identity.structureHash || ''),
+    mappingContractHash: String(identity.mappingContractHash || ''),
+    parser: String(ir.source && ir.source.parser || imported.parser || ''),
+    source,
+    template: cloneJsonValueServer(template, {}),
+    structure: cloneJsonValueServer(structure, {}),
+    classes: cloneJsonValueServer(classes, []),
+    roles,
+    endpointProfiles: diagramImportEndpointProfiles(imported.endpointProfiles),
+    relationRules: diagramImportBindRelationRulesToStructureItems(
+      diagramImportTopologyRules(roles, structure, imported.relationRules || [], classes, imported.endpointProfiles),
+      imported.structureTree,
+      imported.endpointProfiles
+    ),
+    templateGrammar: diagramImportTemplateGrammar(roles, structure, classes)
+  });
+  // Revisions 11-13 already persist the current structure tree and
+  // user-created copies. Revision 14 changes only connection authoring. Revalidating every
+  // historical placement against newer hierarchy semantics here would reject
+  // an otherwise editable mapping and force an unnecessary Assistant cycle.
+  // Keep the authored tree, rebuild class-level connection algorithms, and leave
+  // normal validation to the explicit Apply/Save path.
+  if (previousConnectionModelRevision) return topologyOnlyMigration();
   const roleById = new Map(roles.map((role) => [String(role && role.id || ''), role]));
   const migratedItems = [];
-  for (const item of imported.structureTree.items) {
-    const role = roleById.get(String(item && item.roleId || ''));
-    if (!role) return rejectDiagramImportMigration(options, 'roleSetMismatch');
-    const existing = item && item.mapping && typeof item.mapping === 'object' && !Array.isArray(item.mapping)
-      ? cloneJsonValueServer(item.mapping, {})
-      : {};
-    const explicit = existing.materialization && typeof existing.materialization === 'object' && !Array.isArray(existing.materialization)
-      ? existing.materialization
-      : {};
-    const explicitKind = String(explicit.kind || '').trim();
-    if (!DIAGRAM_IMPORT_MATERIALIZATION_KINDS.has(explicitKind) ||
-      (explicitKind === 'stage' && !String(explicit.stageId || '').trim()) ||
-      Object.prototype.hasOwnProperty.call(existing, 'source')) {
-      return rejectDiagramImportMigration(options, 'materializationContractRequired');
+  const structureTree = legacyTreeMigration
+    ? diagramImportMigrateLegacyStructureTree(imported, structure, roles, options.diagnostics || [])
+    : (() => {
+        for (const item of imported.structureTree.items) {
+          const role = roleById.get(String(item && item.roleId || ''));
+          if (!role) return null;
+          const existing = item && item.mapping && typeof item.mapping === 'object' && !Array.isArray(item.mapping)
+            ? cloneJsonValueServer(item.mapping, {})
+            : {};
+          const explicit = existing.materialization && typeof existing.materialization === 'object' && !Array.isArray(existing.materialization)
+            ? existing.materialization
+            : {};
+          const explicitKind = String(explicit.kind || '').trim();
+          if (!DIAGRAM_IMPORT_MATERIALIZATION_KINDS.has(explicitKind) ||
+            (explicitKind === 'stage' && !String(explicit.stageId || '').trim()) ||
+            Object.prototype.hasOwnProperty.call(existing, 'source')) {
+            return null;
+          }
+          existing.materialization = {
+            kind: explicitKind,
+            stageId: explicitKind === 'stage' ? String(explicit.stageId || '').trim() : ''
+          };
+          const mapping = diagramImportStructureItemMapping(role, existing, String(item && item.id || ''));
+          migratedItems.push({ ...item, mapping });
+        }
+        return diagramImportStructureTree({
+          version: D2_IMPORT_STRUCTURE_TREE_VERSION,
+          items: migratedItems
+        }, structure, roles);
+      })();
+  if (!structureTree) {
+    if (legacyTopology) {
+      if (Array.isArray(options.diagnostics)) options.diagnostics.push('legacyTopologyOnly');
+      return topologyOnlyMigration();
     }
-    existing.materialization = {
-      kind: explicitKind,
-      stageId: explicitKind === 'stage' ? String(explicit.stageId || '').trim() : ''
-    };
-    const mapping = diagramImportStructureItemMapping(role, existing, String(item && item.id || ''));
-    migratedItems.push({ ...item, mapping });
+    return rejectDiagramImportMigration(options, legacyTreeMigration ? 'legacyStructureMigrationRequired' : 'materializationContractRequired');
   }
-  const structureTree = diagramImportStructureTree({
-    version: D2_IMPORT_STRUCTURE_TREE_VERSION,
-    items: migratedItems
-  }, structure, roles);
-  if (diagramImportStructureTreeErrors(structureTree, roles, spec || {}, structure).length) {
-    return rejectDiagramImportMigration(options, 'materializationSemanticsRequired');
+  const structureErrors = diagramImportStructureTreeErrors(structureTree, roles, spec || {}, structure);
+  if (structureErrors.length) {
+    if (legacyTopology) {
+      if (Array.isArray(options.diagnostics)) options.diagnostics.push('legacyTopologyOnly');
+      return topologyOnlyMigration();
+    }
+    return rejectDiagramImportMigration(options, legacyTreeMigration ? 'legacyStructureMigrationRequired' : 'materializationSemanticsRequired');
   }
 
   return {
@@ -3205,7 +3591,12 @@ function migrateDiagramImportToCurrentRevision(spec, value, options = {}) {
     structure: cloneJsonValueServer(structure, {}),
     classes: cloneJsonValueServer(classes, []),
     roles,
-    relationRules: diagramImportTopologyRules(roles, structure, imported.relationRules || [], classes),
+    endpointProfiles: diagramImportEndpointProfiles(imported.endpointProfiles),
+    relationRules: diagramImportBindRelationRulesToStructureItems(
+      diagramImportTopologyRules(roles, structure, imported.relationRules || [], classes, imported.endpointProfiles),
+      structureTree,
+      imported.endpointProfiles
+    ),
     structureTree,
     templateGrammar: diagramImportTemplateGrammar(roles, structure, classes)
   };
@@ -3230,6 +3621,7 @@ function diagramImportMigrationProposal(spec, imported) {
     structure: cloneJsonValueServer(imported && imported.structure, {}),
     classes: cloneJsonValueServer(imported && imported.classes, []),
     roles: cloneJsonValueServer(imported && imported.roles, []),
+    endpointProfiles: diagramImportEndpointProfiles(imported && imported.endpointProfiles),
     relationRules: cloneJsonValueServer(imported && imported.relationRules, []),
     structureTree: cloneJsonValueServer(imported && imported.structureTree, { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] }),
     templateGrammar: cloneJsonValueServer(imported && imported.templateGrammar, {}),
@@ -3239,7 +3631,7 @@ function diagramImportMigrationProposal(spec, imported) {
   };
 }
 
-function diagramImportV3Unresolved(roles, relationRules = [], structureTree, currentSpec = {}, structure = null) {
+function diagramImportV3Unresolved(roles, relationRules = [], structureTree, currentSpec = {}, structure = null, endpointProfiles = []) {
   const unresolved = [];
   const normalizedTreeCandidate = diagramImportStructureTree(structureTree, structure, roles);
   const roleById = new Map((Array.isArray(roles) ? roles : []).map((role) => [String(role && role.id || ''), role]));
@@ -3297,11 +3689,17 @@ function diagramImportV3Unresolved(roles, relationRules = [], structureTree, cur
     }
   }
   for (const rule of Array.isArray(relationRules) ? relationRules : []) {
-    if (!rule || !rule.parentRoleId || !rule.childRoleId || !['relationCard', 'networkEndpoints', 'deterministicEndpoints'].includes(String(rule.mode || ''))) {
-      unresolved.push({ id: rule && rule.id || 'relation', family: 'relationRules', fields: ['parentRoleId', 'childRoleId', 'Object Flow result'] });
+    if (!diagramImportRelationRuleIsEnabled(rule)) continue;
+    if (!rule || !String(rule.d2ClassKey || rule.d2ElementKey || '').trim() || !DIAGRAM_IMPORT_CONNECTION_MODES.has(String(rule.mode || ''))) {
+      unresolved.push({ id: rule && rule.id || 'relation', family: 'relationRules', fields: ['тип связи D2', 'Object Flow result'] });
     }
   }
-  unresolved.push(...diagramImportTopologyUnresolved(roles, relationRules));
+  const executableEndpointProfiles = diagramImportEligibleEndpointProfilesForStructure(
+    endpointProfiles,
+    normalizedTreeCandidate,
+    roles
+  );
+  unresolved.push(...diagramImportTopologyUnresolved(roles, relationRules, executableEndpointProfiles));
   return unresolved;
 }
 
@@ -3320,126 +3718,482 @@ function diagramImportEdgeClassContract(edge, classes = []) {
   };
 }
 
-function diagramImportTopologyRules(roles, structure, explicitRules = [], classes = []) {
-  const roleByElementKey = new Map();
-  for (const role of Array.isArray(roles) ? roles : []) {
-    for (const key of Array.isArray(role && role.elementKeys) ? role.elementKeys : []) {
-      const text = String(key || '').trim();
-      if (text && !roleByElementKey.has(text)) roleByElementKey.set(text, role);
+function diagramImportIsLegacyClassRelationRule(rule) {
+  const value = rule && typeof rule === 'object' && !Array.isArray(rule) ? rule : {};
+  const classKey = String(value.d2ClassKey || '').trim();
+  if (!classKey) return false;
+  // A complete endpoint contract is a current class-level mapping even when
+  // its label equals the D2 class name. Treating it as a retired placeholder
+  // creates a second automatic edge beside the reviewed rule on Apply.
+  if (diagramImportConnectionRuleHasEndpointContract(value)) return false;
+  const elementKeys = Array.isArray(value.d2ElementKeys)
+    ? value.d2ElementKeys.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  // Retired placeholders had no endpoint contract and used the class key as
+  // their label. They must not be treated as intentional sample-arrow rules.
+  return elementKeys.length > 1 || String(value.d2Label || '').trim() === classKey;
+}
+
+function diagramImportHasLegacyClassRelationRules(imported) {
+  return Boolean(imported && Array.isArray(imported.relationRules) &&
+    imported.relationRules.some((rule) => diagramImportIsLegacyClassRelationRule(rule)));
+}
+
+function diagramImportHasDuplicateClassConnectionRules(imported) {
+  const seen = new Set();
+  for (const rule of Array.isArray(imported && imported.relationRules) ? imported.relationRules : []) {
+    const classKey = String(rule && rule.d2ClassKey || '').trim();
+    if (!classKey || classKey.startsWith('edge:')) continue;
+    if (seen.has(classKey)) return true;
+    seen.add(classKey);
+  }
+  return false;
+}
+
+function diagramImportEndpointProfiles(value) {
+  const profiles = Array.isArray(value) ? value : [];
+  const seen = new Set();
+  return profiles.flatMap((entry, index) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+    const profile = entry;
+    const originalId = String(profile.id || '').trim();
+    const fallbackId = diagramImportStableId('endpoint_profile_draft', `${index}:${String(profile.structureItemId || '')}:${String(profile.roleId || '')}:${String(profile.label || '')}:${String(profile.field || '')}`);
+    const baseId = originalId || fallbackId;
+    let id = baseId;
+    let collisionIndex = 1;
+    while (seen.has(id)) {
+      id = diagramImportStableId('endpoint_profile_duplicate', `${baseId}:${index}:${collisionIndex}`);
+      collisionIndex += 1;
+    }
+    const roleId = String(profile.roleId || '').trim();
+    const structureItemId = String(profile.structureItemId || '').trim();
+    seen.add(id);
+    const legacyIpv4 = String(profile.valueKind || 'ipv4').trim() === 'ipv4';
+    const operators = uniqueStrings(Array.isArray(profile.operators) ? profile.operators : [])
+      .filter((operator) => DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(operator));
+    return [{
+      id,
+      structureItemId,
+      roleId,
+      label: truncateText(String(profile.label || ''), 240),
+      stageId: String(profile.stageId || '').trim(),
+      field: String(profile.field || '').trim(),
+      // The field name alone is not sufficient for a match/relation result:
+      // the same CMDBuild attribute may belong to several retained cards.
+      // Keep the selected card source as authoring intent; legacy mappings
+      // without it remain readable and are resolved only when unambiguous.
+      ...(normalizeDiagramImportConditionCardSource(profile.source || profile.fieldSource)
+        ? { source: normalizeDiagramImportConditionCardSource(profile.source || profile.fieldSource) }
+        : {}),
+      // valueKind is retained solely to read existing saved templates. New
+      // authoring uses operators, which describes the deterministic predicate
+      // rather than guessing a field meaning from its name.
+      valueKind: String(profile.valueKind || 'ipv4').trim() || 'ipv4',
+      operators: operators.length
+        ? operators
+        : legacyIpv4
+          ? ['ipv4InCidr', 'ipv4InRange', 'ipv4CidrOverlaps', 'ipv4CidrContains']
+          : ['equals']
+    }];
+  });
+}
+
+function diagramImportEndpointProfileEffectiveStageId(tree, roles, item) {
+  const itemsById = new Map((Array.isArray(tree && tree.items) ? tree.items : [])
+    .map((candidate) => [String(candidate && candidate.id || ''), candidate])
+    .filter(([id]) => id));
+  const rolesById = new Map((Array.isArray(roles) ? roles : [])
+    .map((role) => [String(role && role.id || ''), role])
+    .filter(([id]) => id));
+  const resolve = (candidate, visited = new Set()) => {
+    const itemId = String(candidate && candidate.id || '');
+    if (!candidate || !itemId || visited.has(itemId)) return '';
+    const role = rolesById.get(String(candidate.roleId || '')) || {};
+    const mapping = diagramImportStructureItemMapping(role, candidate.mapping || {}, itemId);
+    const materialization = mapping.materialization || {};
+    if (String(materialization.kind || '') === 'stage') return String(materialization.stageId || '').trim();
+    if (String(materialization.kind || '') !== 'parentCard') return '';
+    return resolve(itemsById.get(String(candidate.parentId || '')), new Set(visited).add(itemId));
+  };
+  return resolve(item);
+}
+
+// A parentCard node is the visible object for its parent container card. The
+// container still owns grouping/layout, but cannot represent the same card as
+// a second endpoint for an independently calculated D2 connection.
+function diagramImportEndpointProfileEligibility(profile, structureTree, roles) {
+  const tree = structureTree && typeof structureTree === 'object' && !Array.isArray(structureTree)
+    ? structureTree
+    : { items: [] };
+  const items = Array.isArray(tree.items) ? tree.items : [];
+  const item = items.find((candidate) => String(candidate && candidate.id || '') === String(profile && profile.structureItemId || ''));
+  if (!item) return { eligible: true, reason: '', representedBy: [] };
+  const rolesById = new Map((Array.isArray(roles) ? roles : [])
+    .map((role) => [String(role && role.id || ''), role])
+    .filter(([id]) => id));
+  const role = rolesById.get(String(item.roleId || '')) || {};
+  const mapping = diagramImportStructureItemMapping(role, item.mapping || {}, String(item.id || ''));
+  if (item.templateStatic === true || diagramImportRoleVisualKind(role) !== 'container' ||
+    String(mapping && mapping.materialization && mapping.materialization.kind || '') === 'structural') {
+    return { eligible: true, reason: '', representedBy: [] };
+  }
+  const representedBy = items.flatMap((child) => {
+    if (String(child && child.parentId || '') !== String(item.id || '')) return [];
+    const childRole = rolesById.get(String(child && child.roleId || '')) || {};
+    const childMapping = diagramImportStructureItemMapping(childRole, child && child.mapping || {}, String(child && child.id || ''));
+    return diagramImportRoleVisualKind(childRole) === 'node' &&
+      String(childMapping && childMapping.materialization && childMapping.materialization.kind || '') === 'parentCard'
+      ? [{
+          structureItemId: String(child && child.id || ''),
+          label: String(childRole.label || childRole.key || child && child.id || '')
+        }]
+      : [];
+  });
+  return representedBy.length
+    ? { eligible: false, reason: 'representedByParentCardChild', representedBy }
+    : { eligible: true, reason: '', representedBy: [] };
+}
+
+function diagramImportEligibleEndpointProfilesForStructure(value, structureTree, roles) {
+  return diagramImportEndpointProfiles(value).filter((profile) => (
+    diagramImportEndpointProfileEligibility(profile, structureTree, roles).eligible
+  ));
+}
+
+function diagramImportEndpointProfilesForStructure(value, structureTree, roles) {
+  const tree = structureTree && typeof structureTree === 'object' && !Array.isArray(structureTree)
+    ? structureTree
+    : { items: [] };
+  const items = Array.isArray(tree.items) ? tree.items : [];
+  const rolesById = new Map((Array.isArray(roles) ? roles : [])
+    .map((role) => [String(role && role.id || ''), role])
+    .filter(([id]) => id));
+  const itemsById = new Map(items.map((item) => [String(item && item.id || ''), item]).filter(([id]) => id));
+  return diagramImportEndpointProfiles(value).flatMap((profile) => {
+    const direct = itemsById.get(String(profile.structureItemId || ''));
+    if (direct) {
+      return {
+        ...profile,
+        structureItemId: String(direct.id || ''),
+        roleId: String(direct.roleId || ''),
+        stageId: ''
+      };
+    }
+    const candidates = items.filter((item) => String(item && item.roleId || '') === String(profile.roleId || ''))
+      .filter((item) => {
+        const stageId = diagramImportEndpointProfileEffectiveStageId(tree, roles, item);
+        return !profile.stageId || stageId === String(profile.stageId || '');
+      });
+    if (!candidates.length) return [profile];
+    // A legacy profile belonged to a D2 type. When that type was already
+    // duplicated before this migration, preserve the old behaviour by giving
+    // every compatible placement an independent copy of the rule.
+    return candidates.map((candidate, index) => ({
+      ...profile,
+      id: index === 0 ? profile.id : diagramImportStableId('endpoint_profile_migrated', `${profile.id}:${String(candidate.id || '')}`),
+      structureItemId: String(candidate.id || ''),
+      roleId: String(candidate.roleId || ''),
+      stageId: ''
+    }));
+  });
+}
+
+function diagramImportConnectionRuleSideOperator(rule, side) {
+  const source = rule && typeof rule === 'object' && !Array.isArray(rule) ? rule : {};
+  const explicit = String(source[`${side}Operator`] || '').trim();
+  if (explicit) return explicit;
+  // `endpointOperator` is the v12 representation. Keep saved mappings
+  // executable while moving authoring to one predicate for each endpoint.
+  return String(source.endpointOperator || '').trim();
+}
+
+function diagramImportConnectionRuleSideProfiles(rule, profiles = [], side) {
+  const source = rule && typeof rule === 'object' && !Array.isArray(rule) ? rule : {};
+  const operator = diagramImportConnectionRuleSideOperator(source, side);
+  return diagramImportEndpointProfiles(profiles).filter((profile) => (
+    String(profile.field || '').trim() &&
+    Array.isArray(profile.operators) && profile.operators.includes(operator)
+  ));
+}
+
+function diagramImportConnectionRuleWithProfileIds(rule, profiles = []) {
+  // Kept as a compatibility entry point for callers that used to materialize
+  // a selected profile pair. Revision 14 has no side-specific participant
+  // set: every placement rule compatible with the side operator participates.
+  return diagramImportNormalizeRelationRule(rule);
+}
+
+function diagramImportConnectionRuleIncompleteMessage(rule, profiles = []) {
+  const source = rule && typeof rule === 'object' && !Array.isArray(rule) ? rule : {};
+  const missing = [];
+  if (!String(source.sourceStageId || '').trim()) missing.push('результат Object Flow');
+  if (!String(source.sourceField || '').trim()) missing.push('поле источника');
+  if (!String(source.targetField || '').trim()) missing.push('поле назначения');
+  if (['networkEndpoints', 'attributeEndpoints'].includes(String(source.mode || ''))) {
+    for (const side of ['source', 'target']) {
+      const operator = diagramImportConnectionRuleSideOperator(source, side);
+      if (!DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(operator)) {
+        missing.push(`метод сравнения ${side === 'source' ? 'источника' : 'назначения'}`);
+      } else if (!diagramImportConnectionRuleSideProfiles(source, profiles, side).length) {
+        missing.push(`правила сопоставления ${side === 'source' ? 'источника' : 'назначения'}`);
+      }
     }
   }
-  const previousRules = Array.isArray(explicitRules) ? cloneJsonValueServer(explicitRules, []) : [];
-  const contracts = new Map();
+  return missing.length ? `Не заполнено: ${uniqueStrings(missing).join(', ')}.` : '';
+}
+
+function diagramImportConnectionProfileValidationErrors(rule, profiles, roleById, path) {
+  if (!['networkEndpoints', 'attributeEndpoints'].includes(String(rule && rule.mode || ''))) return [];
+  const errors = [];
+  for (const side of ['source', 'target']) {
+    const field = side === 'source' ? 'sourceOperator' : 'targetOperator';
+    const compatible = diagramImportConnectionRuleSideProfiles(rule, profiles, side);
+    if (!compatible.length) errors.push({
+      path: `${path}.${field}`,
+      message: `Connection ${side} must have at least one placement comparison rule compatible with the selected deterministic operator.`
+    });
+  }
+  return errors;
+}
+
+function diagramImportConnectionRuleComparisonValidationErrors(rule, profiles, roleById, path) {
+  if (String(rule && rule.mode || '') !== 'attributeEndpoints') return [];
+  const errors = [];
+  for (const side of ['source', 'target']) {
+    const operator = diagramImportConnectionRuleSideOperator(rule, side);
+    if (!DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(operator)) {
+      errors.push({ path: `${path}.${side}Operator`, message: `Connection ${side} comparison must select a supported deterministic operator.` });
+      continue;
+    }
+    if (!diagramImportConnectionRuleSideProfiles(rule, profiles, side).length) {
+      errors.push({
+        path: `${path}.${side}Operator`,
+        message: `Connection ${side} has no placement comparison rule for its deterministic operator.`
+      });
+    }
+  }
+  return errors;
+}
+
+function diagramImportConnectionRuleHasEndpointContract(rule) {
+  const source = rule && typeof rule === 'object' && !Array.isArray(rule) ? rule : {};
+  return DIAGRAM_IMPORT_CONNECTION_MODES.has(String(source.mode || '')) &&
+    Boolean(String(source.sourceStageId || '').trim()) &&
+    Boolean(String(source.sourceField || '').trim()) &&
+    Boolean(String(source.targetField || '').trim());
+}
+
+function diagramImportRelationLabelTemplate(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const template = String(source.labelTemplate || '').trim();
+  if (template) return template;
+  const legacyField = String(source.labelField || '').trim();
+  return legacyField ? `\${${legacyField}}` : '';
+}
+
+function diagramImportNormalizeRelationRule(rule) {
+  const source = rule && typeof rule === 'object' && !Array.isArray(rule) ? rule : {};
+  const {
+    labelField,
+    sourceEndpointProfileIds,
+    targetEndpointProfileIds,
+    sourceProfileId,
+    targetProfileId,
+    sourceStructureItemId,
+    targetStructureItemId,
+    parentRoleId,
+    childRoleId,
+    sourceElementKey,
+    targetElementKey,
+    d2RolePairs,
+    ...withoutLegacyConnectionParticipants
+  } = source;
+  return {
+    ...withoutLegacyConnectionParticipants,
+    // networkEndpoints was the former IPv4-only authoring mode. Preserve its
+    // saved fields but let it run through the generic attribute contract.
+    mode: String(source.mode || '') === 'networkEndpoints' ? 'attributeEndpoints' : String(source.mode || ''),
+    endpointOperator: String(source.endpointOperator || 'ipv4InCidr').trim() || 'ipv4InCidr',
+    sourceOperator: diagramImportConnectionRuleSideOperator(source, 'source') || 'ipv4InCidr',
+    targetOperator: diagramImportConnectionRuleSideOperator(source, 'target') || 'ipv4InCidr',
+    labelTemplate: diagramImportRelationLabelTemplate(source)
+  };
+}
+
+function diagramImportRelationRuleIsEnabled(rule) {
+  return !(rule && rule.enabled === false);
+}
+
+function diagramImportConnectionRuleMappingSignature(rule) {
+  const source = rule && typeof rule === 'object' && !Array.isArray(rule) ? rule : {};
+  return [
+    String(source.mode || ''),
+    String(source.sourceStageId || ''),
+    String(source.candidateId || ''),
+    String(source.sourceField || ''),
+    String(source.targetField || ''),
+    diagramImportConnectionRuleSideOperator(source, 'source'),
+    diagramImportConnectionRuleSideOperator(source, 'target'),
+    diagramImportRelationLabelTemplate(source),
+    normalizeDiagramDirectionPolicy(source.directionPolicy)
+  ].join('\u0000');
+}
+
+function diagramImportBindRelationRulesToStructureItems(relationRules, structureTree, endpointProfiles = []) {
+  // Kept as a compatibility entry point for the import pipeline. Connection
+  // semantics are deliberately not bound to template element pairs or a
+  // manually selected subset of structure placements.
+  return (Array.isArray(relationRules) ? relationRules : [])
+    .map((rule) => diagramImportConnectionRuleWithProfileIds(rule, endpointProfiles));
+}
+
+function diagramImportTopologyRules(roles, structure, explicitRules = [], classes = [], endpointProfiles = []) {
+  const previousRules = Array.isArray(explicitRules)
+    ? cloneJsonValueServer(explicitRules, []).map(diagramImportNormalizeRelationRule)
+    : [];
+  const staticElementKeys = diagramImportTemplateStaticElementKeys(structure);
+  const contractsByKey = new Map();
   for (const edge of Array.isArray(structure && structure.edges) ? structure.edges : []) {
     const d2ElementKey = String(edge && edge.key || '').trim();
-    const sourceRole = roleByElementKey.get(String(edge && edge.sourceKey || '').trim());
-    const targetRole = roleByElementKey.get(String(edge && edge.targetKey || '').trim());
-    if (!d2ElementKey || !sourceRole || !targetRole) continue;
+    if (staticElementKeys.has(String(edge && edge.sourceKey || '').trim()) && staticElementKeys.has(String(edge && edge.targetKey || '').trim())) continue;
+    if (!d2ElementKey) continue;
     const edgeClass = diagramImportEdgeClassContract(edge, classes);
-    const direction = String(edge && edge.direction || '->').trim() || '->';
-    const contractId = `${edgeClass.key}\u0000${sourceRole.id}\u0000${targetRole.id}\u0000${direction}`;
-    const existing = contracts.get(contractId);
+    const contractId = edgeClass.synthetic ? `edge:${d2ElementKey}` : edgeClass.key;
+    const existing = contractsByKey.get(contractId);
     if (existing) {
       existing.d2ElementKeys.push(d2ElementKey);
       existing.d2ExampleLabels.push(String(edge.label || `${edge.sourceKey} -> ${edge.targetKey}`).trim());
       continue;
     }
-    contracts.set(contractId, {
+    contractsByKey.set(contractId, {
       contractId,
       d2ClassKey: edgeClass.key,
       d2ClassKeys: edgeClass.classKeys,
       d2Notes: edgeClass.notes,
       directionPolicy: edgeClass.directionPolicy,
+      d2ElementKey,
       d2ElementKeys: [d2ElementKey],
+      // Mapping is defined by this exact D2 endpoint pair. Concrete example
+      // labels are retained only for rendering and Assistant context.
+      d2Label: edgeClass.synthetic ? String(edge.label || `${edge.sourceKey} -> ${edge.targetKey}`).trim() : edgeClass.key,
       d2ExampleLabels: [String(edge.label || `${edge.sourceKey} -> ${edge.targetKey}`).trim()],
-      direction,
-      parentRoleId: sourceRole.id,
-      childRoleId: targetRole.id
+      direction: String(edge && edge.direction || '->').trim() || '->'
     });
   }
+  const contracts = Array.from(contractsByKey.values());
   const rules = [];
   const consumed = new Set();
-  for (const contract of contracts.values()) {
-    const previousIndex = previousRules.findIndex((rule, index) => !consumed.has(index) &&
-      String(rule && rule.d2ClassKey || '') === contract.d2ClassKey &&
-      String(rule && rule.parentRoleId || '') === String(contract.parentRoleId) &&
-      String(rule && rule.childRoleId || '') === String(contract.childRoleId));
-    const previous = previousIndex >= 0 ? previousRules[previousIndex] : {};
-    if (previousIndex >= 0) consumed.add(previousIndex);
+  for (const contract of contracts) {
+    const matchingRules = previousRules.flatMap((rule, index) => {
+      if (String(rule && rule.d2ClassKey || '') !== contract.d2ClassKey) return [];
+      return [{ rule, index }];
+    });
+    matchingRules.forEach(({ index }) => consumed.add(index));
+    const candidates = matchingRules.map(({ rule }) => diagramImportConnectionRuleWithProfileIds(rule, endpointProfiles));
+    const signatures = uniqueStrings(candidates.map(diagramImportConnectionRuleMappingSignature));
+    const active = candidates[0] || {};
     rules.push({
-      ...previous,
-      id: String(previous && previous.id || diagramImportStableId('topology_rule', contract.contractId)),
+      ...active,
+      id: String(active.id || diagramImportStableId('connection_algorithm', contract.contractId)),
       kind: 'connection',
-      mode: ['relationCard', 'networkEndpoints', 'deterministicEndpoints'].includes(String(previous && previous.mode || ''))
-        ? String(previous.mode)
-        : 'deterministicEndpoints',
+      mode: DIAGRAM_IMPORT_CONNECTION_MODES.has(String(active.mode || '')) ? String(active.mode) : 'deterministicEndpoints',
       d2ClassKey: contract.d2ClassKey,
       d2ClassKeys: contract.d2ClassKeys,
       d2Notes: contract.d2Notes,
       d2ElementKey: contract.d2ElementKeys[0],
-      d2ElementKeys: contract.d2ElementKeys,
-      d2ExampleLabels: contract.d2ExampleLabels,
-      d2Label: contract.d2ClassKeys.length ? contract.d2ClassKey : contract.d2ExampleLabels[0],
-      parentRoleId: contract.parentRoleId,
-      childRoleId: contract.childRoleId,
+      d2ElementKeys: uniqueStrings(contract.d2ElementKeys),
+      d2ExampleLabels: uniqueStrings(contract.d2ExampleLabels),
+      d2Label: contract.d2Label,
       direction: contract.direction,
-      directionPolicy: normalizeDiagramDirectionPolicy(contract.directionPolicy) || normalizeDiagramDirectionPolicy(previous && previous.directionPolicy),
-      directionPolicySuggestion: normalizeDiagramDirectionPolicy(contract.directionPolicy) || diagramImportDirectionPolicySuggestion({
-        direction: contract.direction,
-        d2ClassKey: contract.d2ClassKey,
-        d2Notes: contract.d2Notes,
-        d2ExampleLabels: contract.d2ExampleLabels
-      }),
+      enabled: candidates.length ? candidates.some((rule) => rule.enabled !== false) : true,
+      directionPolicy: normalizeDiagramDirectionPolicy(active.directionPolicy) || normalizeDiagramDirectionPolicy(contract.directionPolicy),
+      directionPolicySuggestion: normalizeDiagramDirectionPolicy(active.directionPolicy) ||
+        normalizeDiagramDirectionPolicy(contract.directionPolicy) || diagramImportDirectionPolicySuggestion(contract),
       path: [],
-      automatic: true
+      automatic: true,
+      ...(signatures.length > 1 ? {
+        mappingConflict: {
+          message: 'Для одного типа стрелок сохранены разные алгоритмы. Выберите один результат и поля для всего типа связи.'
+        }
+      } : {})
     });
   }
   previousRules.forEach((rule, index) => {
-    if (!consumed.has(index) && !String(rule && rule.d2ElementKey || '') && !String(rule && rule.d2ClassKey || '')) rules.push(rule);
+    if (consumed.has(index)) return;
+    const classKey = String(rule && rule.d2ClassKey || '').trim();
+    const elementKeys = uniqueStrings([String(rule && rule.d2ElementKey || '')].concat(Array.isArray(rule && rule.d2ElementKeys) ? rule.d2ElementKeys.map(String) : [])).filter(Boolean);
+    if (!classKey && !elementKeys.length) {
+      rules.push(rule);
+      return;
+    }
+    // A rule with a known D2 class but no matching template arrow is stale.
+    // Never resurrect it as an extra editor row for the current template.
+    if (classKey || elementKeys.length) return;
+    rules.push(rule);
   });
-  return rules;
+  return rules.map((rule) => diagramImportConnectionRuleWithProfileIds(rule, endpointProfiles));
 }
 
-function diagramImportTopologyUnresolved(roles, relationRules = []) {
-  const roleById = new Map((Array.isArray(roles) ? roles : []).map((role) => [String(role && role.id || ''), role]));
+function diagramImportCanShareConnectionResult(entries) {
+  // One Object Flow result may deliberately feed several independent D2
+  // connection algorithms (for example external, internal and intra-system
+  // ACLs). Each algorithm evaluates all compatible placement rules.
+  return true;
+}
+
+function diagramImportTopologyUnresolved(roles, relationRules = [], endpointProfiles = []) {
   const result = [];
   for (const rule of Array.isArray(relationRules) ? relationRules : []) {
+    if (!diagramImportRelationRuleIsEnabled(rule)) continue;
     if (!rule || (!rule.d2ElementKey && !rule.d2ClassKey)) continue;
-    const sourceRole = roleById.get(String(rule.parentRoleId || ''));
-    const targetRole = roleById.get(String(rule.childRoleId || ''));
-    if (!sourceRole || !targetRole) continue;
-    const directionReady = Boolean(normalizeDiagramDirectionPolicy(rule && rule.directionPolicy));
-    // Direction is part of the runtime edge contract. A connection can still
-    // be materialized from a dedicated result when one D2 endpoint is a
-    // structural/static role, so do not skip this validation by role semantic.
-    if (!directionReady) {
-      const label = String(rule.d2Label || rule.d2ClassKey || rule.d2ElementKey || '').trim();
+    const label = String(rule.d2Label || rule.d2ClassKey || rule.d2ElementKey || '').trim();
+    if (rule.mappingConflict) {
       result.push({
         id: `topology:connection:${String(rule.d2ClassKey || rule.d2ElementKey || rule.id || '')}`,
         family: 'topology',
         displayName: label,
-        fields: ['directionPolicy'],
-        directionPolicySuggestion: normalizeDiagramDirectionPolicy(rule.directionPolicySuggestion),
-        sourceRoleId: sourceRole.id,
-        targetRoleId: targetRole.id,
+        fields: ['единый endpoint-контракт'],
         d2ClassKey: String(rule.d2ClassKey || ''),
         d2ClassKeys: Array.isArray(rule.d2ClassKeys) ? rule.d2ClassKeys.map(String).filter(Boolean) : [],
         d2ElementKeys: Array.isArray(rule.d2ElementKeys) ? rule.d2ElementKeys.map(String) : [String(rule.d2ElementKey || '')].filter(Boolean)
       });
       continue;
     }
-    if (!diagramImportRoleNeedsStage(sourceRole) || !diagramImportRoleNeedsStage(targetRole)) continue;
-    const cardReady = directionReady && rule && ['relationCard', 'networkEndpoints', 'deterministicEndpoints'].includes(String(rule.mode || '')) && String(rule.sourceStageId || '').trim() && String(rule.sourceField || '').trim() && String(rule.targetField || '').trim();
+    const directionReady = Boolean(normalizeDiagramDirectionPolicy(rule && rule.directionPolicy));
+    // Direction is part of the runtime edge contract. A connection can still
+    // be materialized from a dedicated result when one D2 endpoint is a
+    // structural/static role, so do not skip this validation by role semantic.
+    if (!directionReady) {
+      result.push({
+        id: `topology:connection:${String(rule.d2ClassKey || rule.d2ElementKey || rule.id || '')}`,
+        family: 'topology',
+        displayName: label,
+        fields: ['directionPolicy'],
+        directionPolicySuggestion: normalizeDiagramDirectionPolicy(rule.directionPolicySuggestion),
+        d2ClassKey: String(rule.d2ClassKey || ''),
+        d2ClassKeys: Array.isArray(rule.d2ClassKeys) ? rule.d2ClassKeys.map(String).filter(Boolean) : [],
+        d2ElementKeys: Array.isArray(rule.d2ElementKeys) ? rule.d2ElementKeys.map(String) : [String(rule.d2ElementKey || '')].filter(Boolean)
+      });
+      continue;
+    }
+    const mode = String(rule && rule.mode || '');
+    const profilesReady = !['networkEndpoints', 'attributeEndpoints'].includes(mode) ||
+      (DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(diagramImportConnectionRuleSideOperator(rule, 'source')) &&
+        DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(diagramImportConnectionRuleSideOperator(rule, 'target')) &&
+        diagramImportConnectionRuleSideProfiles(rule, endpointProfiles, 'source').length > 0 &&
+        diagramImportConnectionRuleSideProfiles(rule, endpointProfiles, 'target').length > 0);
+    const cardReady = directionReady && rule && DIAGRAM_IMPORT_CONNECTION_MODES.has(mode) &&
+      String(rule.sourceStageId || '').trim() && String(rule.sourceField || '').trim() &&
+      String(rule.targetField || '').trim() && profilesReady;
     if (cardReady) continue;
-    const label = String(rule.d2Label || rule.d2ClassKey || rule.d2ElementKey || '').trim();
     result.push({
       id: `topology:connection:${String(rule.d2ClassKey || rule.d2ElementKey || rule.id || '')}`,
       family: 'topology',
       displayName: label,
-      fields: directionReady ? ['connection relation rule'] : ['directionPolicy'],
+      fields: directionReady
+        ? profilesReady ? ['connection relation rule'] : ['правила сопоставления объектов и контейнеров']
+        : ['directionPolicy'],
       directionPolicySuggestion: normalizeDiagramDirectionPolicy(rule.directionPolicySuggestion),
-      sourceRoleId: sourceRole.id,
-      targetRoleId: targetRole.id,
       d2ClassKey: String(rule.d2ClassKey || ''),
       d2ClassKeys: Array.isArray(rule.d2ClassKeys) ? rule.d2ClassKeys.map(String).filter(Boolean) : [],
       d2ElementKeys: Array.isArray(rule.d2ElementKeys) ? rule.d2ElementKeys.map(String) : [String(rule.d2ElementKey || '')].filter(Boolean)
@@ -3453,7 +4207,7 @@ function diagramImportUnresolvedDiagnostics(proposal, currentSpec = null) {
   const roleById = new Map(roles.map((role) => [String(role && role.id || ''), role]));
   const unresolved = Array.isArray(proposal && proposal.unresolved)
     ? proposal.unresolved
-    : diagramImportV3Unresolved(roles, proposal && proposal.relationRules, proposal && proposal.structureTree, currentSpec || {}, proposal && proposal.structure);
+    : diagramImportV3Unresolved(roles, proposal && proposal.relationRules, proposal && proposal.structureTree, currentSpec || {}, proposal && proposal.structure, proposal && proposal.endpointProfiles);
   return unresolved.map((item) => {
     const role = roleById.get(String(item && item.id || ''));
     const relatedOwner = !role && item && item.family === 'related'
@@ -3530,6 +4284,13 @@ function diagramImportAppliedMappingForReanalysis(currentDiagram, ir) {
   if (sourceMatches && structureMatches && mappingContractMatches && revision === D2_IMPORT_SEMANTIC_MODEL_REVISION) {
     return { value: imported, mode: 'full', warning: '' };
   }
+  if (diagramImportStaticExtensionCompatible(imported, ir)) {
+    return {
+      value: imported,
+      mode: 'static-extension',
+      warning: 'A static D2 template subtree was added. Existing dynamic placements were retained and the static subtree was prepared automatically.'
+    };
+  }
   return {
     value: {},
     mode: 'none',
@@ -3568,13 +4329,18 @@ function createDiagramImportProposal(currentSpec, ir, options = {}) {
     };
   });
   const roles = diagramImportWithRoleModelCandidates(rawRoles, ir.elements);
-  const relationRules = diagramImportTopologyRules(roles, ir.elements, Array.isArray(previousImport.relationRules) ? cloneJsonValueServer(previousImport.relationRules, []) : [], ir.classes);
-  const preserveTree = String(previousImport.sourceHash || '') === String(ir.source && ir.source.hash || '');
-  const structureTree = diagramImportStructureTree(
-    preserveTree ? previousImport.structureTree : null,
-    ir.elements,
-    roles
-  );
+  const endpointProfiles = diagramImportEndpointProfiles(previousImport.endpointProfiles);
+  const rawRelationRules = diagramImportTopologyRules(roles, ir.elements, Array.isArray(previousImport.relationRules) ? cloneJsonValueServer(previousImport.relationRules, []) : [], ir.classes, endpointProfiles);
+  const preserveTree = previousMapping.mode === 'full';
+  const hasStaticTemplateSubtree = diagramImportTemplateStaticElementKeys(ir.elements).size > 0;
+  const structureTree = previousMapping.mode === 'static-extension' || hasStaticTemplateSubtree
+    ? diagramImportStructureTreeWithStaticExtension(previousImport.structureTree, ir.elements, roles)
+    : diagramImportStructureTree(
+      preserveTree ? previousImport.structureTree : null,
+      ir.elements,
+      roles
+    );
+  const relationRules = diagramImportBindRelationRulesToStructureItems(rawRelationRules, structureTree, endpointProfiles);
   const templateGrammar = diagramImportTemplateGrammar(roles, ir.elements, ir.classes);
   const catalog = options.catalog && typeof options.catalog === 'object' ? options.catalog : null;
   const warnings = [];
@@ -3594,11 +4360,12 @@ function createDiagramImportProposal(currentSpec, ir, options = {}) {
     classes: cloneJsonValueServer(ir.classes, []),
     catalogHash: catalog ? hashJson({ classes: catalog.classes, domains: catalog.domains }) : '',
     roles,
+    endpointProfiles,
     relationRules,
     structureTree,
     templateGrammar,
     diagramId: String(currentDiagram.id || diagramImportStableId('diagram', currentDiagram.name || options.templateCode || 'topology')).trim(),
-    unresolved: diagramImportV3Unresolved(roles, relationRules, structureTree, sourceSpec, ir.elements),
+    unresolved: diagramImportV3Unresolved(roles, relationRules, structureTree, sourceSpec, ir.elements, endpointProfiles),
     warnings
   };
 }
@@ -3776,7 +4543,7 @@ function diagramImportRolesForStoredStructure(imported) {
       label: String(stored.label || role.label || role.key || ''),
       notes: String(stored.notes !== undefined ? stored.notes : role.notes || ''),
       visualKind: diagramImportRoleVisualKind(modeled),
-      labelTemplate: String(stored.labelTemplate || role.labelTemplate || '')
+      labelTemplate: diagramImportRoleLabelTemplate(stored, role.labelTemplate)
     });
   });
   return diagramImportWithRoleModelCandidates(restored, structure);
@@ -3920,6 +4687,7 @@ function diagramImportAssistantSpec(currentSpec, proposal = null) {
             mapping: diagramImportStructureItemMapping(role, item && item.mapping || {}, item && item.id || '')
           };
         }),
+      endpointProfiles: diagramImportEndpointProfiles(proposal.endpointProfiles),
       relationRules: cloneJsonValueServer(proposal.relationRules, []),
       structureTree: cloneJsonValueServer(proposal.structureTree, {}),
       templateGrammar: cloneJsonValueServer(proposal.templateGrammar, {})
@@ -3936,7 +4704,7 @@ function diagramImportAssistantSpec(currentSpec, proposal = null) {
   return next;
 }
 
-function diagramImportV3WithOverrides(proposal, roleOverrides = [], relationRules, structureTree, currentSpec = {}) {
+function diagramImportV3WithOverrides(proposal, roleOverrides = [], relationRules, structureTree, currentSpec = {}, endpointProfiles) {
   const next = cloneJsonValueServer(proposal, {});
   const overrides = new Map((Array.isArray(roleOverrides) ? roleOverrides : []).filter((item) => item && item.id).map((item) => [String(item.id), item]));
   const structure = next.structure && typeof next.structure === 'object' && !Array.isArray(next.structure) ? next.structure : {};
@@ -3951,27 +4719,51 @@ function diagramImportV3WithOverrides(proposal, roleOverrides = [], relationRule
     return { ...modeled, structure };
   });
   next.roles = diagramImportWithRoleModelCandidates(next.roles, structure);
+  const suppliedEndpointProfiles = endpointProfiles === undefined
+    ? diagramImportEndpointProfiles(next.endpointProfiles)
+    : diagramImportEndpointProfiles(endpointProfiles);
   if (Array.isArray(relationRules)) next.relationRules = cloneJsonValueServer(relationRules, []);
   const requestedStructureTree = structureTree === undefined ? next.structureTree : structureTree;
   next.structureTree = requestedStructureTree && typeof requestedStructureTree === 'object' && !Array.isArray(requestedStructureTree) &&
     Number(requestedStructureTree.version || 0) === D2_IMPORT_STRUCTURE_TREE_VERSION && Array.isArray(requestedStructureTree.items)
     ? diagramImportStructureTree(requestedStructureTree, next.structure, next.roles)
     : null;
-  next.relationRules = diagramImportTopologyRules(next.roles, next.structure, next.relationRules, next.classes);
+  next.endpointProfiles = diagramImportEndpointProfilesForStructure(
+    suppliedEndpointProfiles,
+    next.structureTree,
+    next.roles
+  );
+  next.relationRules = diagramImportBindRelationRulesToStructureItems(
+    diagramImportTopologyRules(next.roles, next.structure, next.relationRules, next.classes, next.endpointProfiles),
+    next.structureTree,
+    next.endpointProfiles
+  );
   next.templateGrammar = diagramImportTemplateGrammar(next.roles, next.structure, next.classes);
-  next.unresolved = diagramImportV3Unresolved(next.roles, next.relationRules, next.structureTree, currentSpec, next.structure);
+  next.unresolved = diagramImportV3Unresolved(next.roles, next.relationRules, next.structureTree, currentSpec, next.structure, next.endpointProfiles);
   return next;
 }
 
-function diagramImportRoleMappedClassNames(proposal, roleId) {
+function diagramImportRoleMappedClassNames(proposal, roleId, currentSpec = {}) {
+  const tree = diagramImportStructureTree(proposal && proposal.structureTree, proposal && proposal.structure, proposal && proposal.roles);
   const roles = new Map((Array.isArray(proposal && proposal.roles) ? proposal.roles : []).map((role) => [String(role && role.id || ''), role]));
-  return uniqueStrings((proposal && proposal.structureTree && Array.isArray(proposal.structureTree.items) ? proposal.structureTree.items : [])
+  const itemsById = new Map((tree.items || []).map((item) => [String(item && item.id || ''), item]));
+  const stagesById = new Map(assistantObjectFlowDiagramStages(currentSpec, objectFlowFromSpecServer(currentSpec))
+    .map((stage) => [String(stage && stage.id || ''), stage]));
+  const effectiveStageId = (item, visited = new Set()) => {
+    const itemId = String(item && item.id || '');
+    if (!item || !itemId || visited.has(itemId)) return '';
+    const role = roles.get(String(item.roleId || '')) || {};
+    const mapping = diagramImportStructureItemMapping(role, item.mapping || {}, itemId);
+    if (String(mapping.materialization && mapping.materialization.kind || '') === 'stage') {
+      return String(mapping.materialization.stageId || '');
+    }
+    if (String(mapping.materialization && mapping.materialization.kind || '') !== 'parentCard') return '';
+    return effectiveStageId(itemsById.get(String(item.parentId || '')), new Set(visited).add(itemId));
+  };
+  return uniqueStrings((tree.items || [])
     .filter((item) => String(item && item.roleId || '') === String(roleId || ''))
-    .map((item) => {
-      const role = roles.get(String(item && item.roleId || '')) || {};
-      const mapping = diagramImportStructureItemMapping(role, item && item.mapping || {}, item && item.id || '');
-      return String(mapping && mapping.primary && mapping.primary.className || '').trim();
-    }).filter(Boolean));
+    .map((item) => String(stagesById.get(effectiveStageId(item)) && stagesById.get(effectiveStageId(item)).className || '').trim())
+    .filter(Boolean));
 }
 
 // The uploaded D2 document is an immutable role/style catalog. The saved
@@ -4001,6 +4793,7 @@ function diagramImportTemplateGrammar(roles, structure, classes = []) {
       kind,
       roleId: String(role.id || ''),
       roleKey: String(role.key || ''),
+      templateStatic: element && element.templateStatic === true,
       pathSegments: Array.isArray(element && element.pathSegments) ? element.pathSegments.map(String) : [],
       parentKey,
       parentRoleId: String(parentRole.id || ''),
@@ -4025,6 +4818,7 @@ function diagramImportTemplateGrammar(roles, structure, classes = []) {
       label: String(role && (role.labelTemplate || role.label || role.key) || ''),
       visualKind,
       semantic: diagramImportInternalSemantic(role),
+      templateStatic: roleElements.length > 0 && roleElements.every((element) => element.templateStatic === true),
       rootAllowed: roleElements.some((element) => !element.parentKey),
       parentRoleKeys,
       childRoleKeys,
@@ -4088,6 +4882,7 @@ function diagramImportTemplateGrammar(roles, structure, classes = []) {
     key: String(context.key || ''),
     roleId: String(context.roleId || ''),
     parentContextKey: String(context.parentContextKey || ''),
+    templateStatic: context.templateStatic === true,
     elementKeys: uniqueStrings(context.elementKeys || []).sort()
   }));
   return {
@@ -4184,10 +4979,17 @@ function diagramImportCompileTraversal(options) {
   return { alias: from, steps, rootIdField, targetIdField, targetClass: currentClass };
 }
 
-function diagramImportRuntimeLabelTemplate(role, primary = {}, primaryCardSource = null) {
-  let template = String(primary && primary.labelTemplate || role && role.labelTemplate || '${Description}');
+function diagramImportRuntimeLabelTemplate(role, primary = {}, primaryCardSource = null, fieldColumns = new Map()) {
+  let template = diagramImportPrimaryLabelTemplate(primary, diagramImportRoleLabelTemplate(role, '${Description}'));
   template = template.replace(/\$\{primary\.([^{}]+)\}/g, '${$1}');
-  return diagramImportCardSourceLabelTemplate(template, primaryCardSource);
+  template = diagramImportCardSourceLabelTemplate(template, primaryCardSource);
+  return template.replace(/\$\{([^{}]+)\}/g, (match, token) => {
+    const field = String(token || '').trim();
+    if (!field || field.startsWith('param.') || field.startsWith('params.') || field.startsWith('row.') || field.startsWith('child.') || field.startsWith('child:')) return match;
+    const rawField = diagramImportCardSourceRawField(primaryCardSource, field);
+    const materialized = fieldColumns.get(`primary:${rawField}`);
+    return materialized ? `\${${materialized}}` : match;
+  });
 }
 
 function diagramImportConditionSetOperation(type, from, rightAlias, itemId, suffix) {
@@ -4522,7 +5324,7 @@ function diagramImportCompileHierarchyCorrelations(mapping, treeItemId, primaryA
   };
 }
 
-function diagramImportCompileRoleMapping(role, mapping, treeItemId = '', stageById = new Map(), runtimeSource = {}, parentFieldColumns = new Map(), requiredFields = []) {
+function diagramImportCompileRoleMapping(role, mapping, treeItemId = '', stageById = new Map(), runtimeSource = {}, parentFieldColumns = new Map(), requiredFields = [], endpointProfiles = []) {
   const source = runtimeSource && typeof runtimeSource === 'object' && !Array.isArray(runtimeSource)
     ? runtimeSource
     : {};
@@ -4534,8 +5336,14 @@ function diagramImportCompileRoleMapping(role, mapping, treeItemId = '', stageBy
     : 'object';
   const idAttribute = diagramImportPrimaryIdAttribute(role, primary);
   const steps = [];
-  const primaryAlias = String(source.alias || '').trim() || (primary.className ? diagramImportManagedAlias('d2_primary', `${role.id}:${treeItemId || 'mapping'}`) : '');
+  const sourceStage = stageById.get(String(source.stageId || '')) || null;
+  const sourceClassName = String(source.className || sourceStage && sourceStage.className || '').trim();
+  const primaryProjection = diagramImportPrimaryCardSource(sourceStage, primary);
+  const primaryCardSource = primaryProjection.source;
+  const primaryClassName = String(primaryCardSource && primaryCardSource.className || sourceClassName).trim();
+  const primaryAlias = String(source.alias || '').trim() || (sourceClassName ? diagramImportManagedAlias('d2_primary', `${role.id}:${treeItemId || 'mapping'}`) : '');
   const relatedBindings = [];
+  const sourceRelated = Array.isArray(mapping.related) ? mapping.related : [];
   if (primaryAlias && !source.alias) {
     const columns = uniqueStrings(['Class', '_id', 'Code', 'Description', idAttribute]
       .concat(primary.structuredFields || [])
@@ -4543,16 +5351,38 @@ function diagramImportCompileRoleMapping(role, mapping, treeItemId = '', stageBy
     steps.push({
       type: 'selectCards',
       as: primaryAlias,
-      className: primary.className,
+      className: sourceClassName,
       columns,
       limit: semantic === 'static' ? 2 : undefined,
       managedBy: 'd2ImportV3'
     });
   }
-  const sourceStage = stageById.get(String(source.stageId || '')) || null;
-  const primaryCardSource = normalizeDiagramImportConditionCardSource(primary.cardSource);
-  const requiredEnrichment = diagramImportCompileConditionEnrichment(
+  // Direct attributes are already retained in Object Flow rows. Reference and
+  // relation paths are projected only when this D2 placement explicitly uses
+  // them, from the primary card selected by the author.
+  const primaryDataFields = uniqueStrings([idAttribute, 'Code', 'Description']
+    .concat(primary.structuredFields || [])
+    .concat(diagramImportPrimaryTemplateFieldNames(primary.labelTemplate || ''))
+    .map((field) => diagramImportCardSourceRawField(primaryCardSource, field)))
+    .filter((field) => String(field || '').includes('.'));
+  const primaryDataEnrichment = diagramImportCompileConditionEnrichment(
     primaryAlias,
+    sourceStage,
+    primaryDataFields.map((field) => ({ key: `primary:${field}`, path: field, source: primaryCardSource })),
+    treeItemId,
+    'primary-data'
+  );
+  const primaryField = (field) => {
+    const rawField = diagramImportCardSourceRawField(primaryCardSource, field);
+    return primaryDataEnrichment.fieldColumns.get(`primary:${rawField}`) ||
+      diagramImportCardSourceField(primaryCardSource, rawField);
+  };
+  const runtimeIdField = primaryField(idAttribute);
+  const runtimeLabelField = primaryField('Description');
+  const runtimeStructuredFields = uniqueStrings((primary.structuredFields || [])
+    .map((field) => primaryField(field)));
+  const requiredEnrichment = diagramImportCompileConditionEnrichment(
+    primaryDataEnrichment.alias,
     sourceStage,
     requiredFields,
     treeItemId,
@@ -4560,10 +5390,10 @@ function diagramImportCompileRoleMapping(role, mapping, treeItemId = '', stageBy
   );
   const filters = diagramImportCompileMappingConditions({ conditions: mapping.conditions }, treeItemId || role.id, requiredEnrichment.alias, stageById, sourceStage);
   const hierarchy = diagramImportCompileHierarchyCorrelations(mapping, treeItemId || role.id, filters.alias, sourceStage, parentFieldColumns);
-  steps.push(...requiredEnrichment.steps, ...filters.steps, ...hierarchy.steps);
-  const runtimePrimaryAlias = hierarchy.alias;
+  steps.push(...primaryDataEnrichment.steps, ...requiredEnrichment.steps, ...filters.steps, ...hierarchy.steps);
+  let runtimePrimaryAlias = hierarchy.alias;
   if (runtimePrimaryAlias) {
-    for (const related of Array.isArray(mapping.related) ? mapping.related : []) {
+    for (const related of sourceRelated) {
       const relatedStage = stageById.get(String(related && related.stageId || '')) || null;
       if (!relatedStage || !String(relatedStage.alias || '').trim()) continue;
       relatedBindings.push({
@@ -4577,6 +5407,27 @@ function diagramImportCompileRoleMapping(role, mapping, treeItemId = '', stageBy
       });
     }
   }
+  const placementEndpointProfiles = diagramImportEndpointProfiles(endpointProfiles)
+    .filter((profile) => String(profile.structureItemId || '') === String(treeItemId || ''));
+  // Endpoint rules are authored against semantic Object Flow card sources.
+  // Project only the selected paths for this placement; do not force authors
+  // to widen the Object Flow result merely to make an edge editable.
+  const endpointEnrichment = diagramImportCompileConditionEnrichment(
+    runtimePrimaryAlias,
+    sourceStage,
+    placementEndpointProfiles.map((profile, index) => ({
+      key: `endpoint:${index}`,
+      path: profile.field,
+      source: profile.source
+    })),
+    treeItemId,
+    'endpoint'
+  );
+  steps.push(...endpointEnrichment.steps);
+  runtimePrimaryAlias = endpointEnrichment.alias;
+  const runtimeEndpointProfiles = runtimePrimaryAlias
+    ? diagramImportCompileEndpointProfiles(role, mapping, treeItemId, sourceStage, stageById, endpointProfiles, relatedBindings, endpointEnrichment.fieldColumns)
+    : [];
   const importRole = {
     roleId: String(role.id || ''),
     key: role.key,
@@ -4590,7 +5441,7 @@ function diagramImportCompileRoleMapping(role, mapping, treeItemId = '', stageBy
     sourceStageId: String(source.stageId || ''),
     sourceAlias: String(source.baseAlias || source.alias || ''),
     sourceLabel: String(source.label || ''),
-    ...(primaryCardSource ? { primaryCardSource } : {})
+    primaryCardSourceClassName: primaryClassName
   };
   const runtimeMapping = {
     // Authoring mapping ids identify editable bindings. Runtime mapping ids must
@@ -4598,17 +5449,23 @@ function diagramImportCompileRoleMapping(role, mapping, treeItemId = '', stageBy
     id: '',
     from: runtimePrimaryAlias,
     fields: {
-      id: diagramImportCardSourceField(primaryCardSource, idAttribute),
-      label: diagramImportCardSourceField(primaryCardSource, 'Description')
+      id: runtimeIdField,
+      label: runtimeLabelField,
+      code: diagramImportCardSourceField(primaryCardSource, 'Code')
     },
-    labelTemplate: diagramImportRuntimeLabelTemplate(role, primary, primaryCardSource),
+    labelTemplate: diagramImportRuntimeLabelTemplate(role, primary, primaryCardSource, primaryDataEnrichment.fieldColumns),
     dataProfile: {
       name: role.key,
-      className: primary.className || '',
-      fields: uniqueStrings((primary.structuredFields || []).map((field) => diagramImportCardSourceField(primaryCardSource, field))
+      className: primaryClassName,
+      fields: uniqueStrings(runtimeStructuredFields
         .concat(relatedBindings.flatMap((related) => related.structuredFields.map((field) => `${related.id}.${field}`)))),
       includeSourceRef: true
     },
+    // A primary Object Flow stage may already materialize an address or a
+    // network. Preserve that fact for endpoint resolution instead of forcing
+    // every D2 role through an artificial related-data binding.
+    endpointFields: diagramImportNetworkEndpointFields(sourceStage),
+    endpointProfiles: runtimeEndpointProfiles,
     relatedBindings,
     disableImplicitGroup: true,
     singleton: semantic === 'static' && Boolean(runtimePrimaryAlias),
@@ -4669,17 +5526,25 @@ function diagramImportCompileRoleMapping(role, mapping, treeItemId = '', stageBy
       stageId: String(source.stageId || '')
     })),
     mappingId: String(mapping && mapping.id || ''),
-    className: String(primary.className || '')
+    className: sourceClassName
   };
 }
 
-function diagramImportCompileStructureTree(structureTree, roles, stageById) {
-  const normalizedTree = diagramImportStructureTree(structureTree, null, roles);
+function diagramImportCompileStructureTree(structureTree, roles, stageById, structure = {}, endpointProfiles = []) {
+  const normalizedTree = diagramImportStructureTree(structureTree, structure, roles);
+  const executableEndpointProfiles = diagramImportEligibleEndpointProfilesForStructure(endpointProfiles, normalizedTree, roles);
   const roleById = new Map((Array.isArray(roles) ? roles : []).map((role) => [String(role && role.id || ''), role]));
   const itemById = new Map(normalizedTree.items.map((item) => [String(item && item.id || ''), item]).filter(([id]) => id));
+  const declaredElements = [].concat(
+    Array.isArray(structure && structure.groups) ? structure.groups : [],
+    Array.isArray(structure && structure.nodes) ? structure.nodes : []
+  );
+  const declaredByKey = new Map(declaredElements.map((element) => [String(element && element.key || ''), element]).filter(([key]) => key));
+  const staticElementKeys = diagramImportTemplateStaticElementKeys(structure);
   const compiledByItemId = new Map();
   const compiledByRoleId = new Map();
   const runtimeMappings = [];
+  const staticEdgeMappings = [];
   const steps = [];
   const conditionSourceRepairs = [];
   const hierarchyParentFieldRequirements = new Map();
@@ -4748,6 +5613,51 @@ function diagramImportCompileStructureTree(structureTree, roles, stageById) {
     const inherited = materializationKind === 'parentCard' ? nearestParent : null;
     if (inherited) stage = inherited.stage || null;
     const visualKind = diagramImportRoleVisualKind(role);
+    if (item.templateStatic === true) {
+      const declared = declaredByKey.get(String(item && item.templateElementKey || '')) || {};
+      const importRole = {
+        roleId: String(role.id || ''),
+        key: String(role.key || ''),
+        label: String(role.label || role.key || ''),
+        kind: String(role.kind || ''),
+        semantic: 'static',
+        visualKind,
+        materialization: 'structural',
+        ...(visualKind === 'container' ? { showEmpty: true } : {}),
+        elementKey: String(item.templateElementKey || ''),
+        elementKeys: uniqueStrings(item && item.templateElementKeys || [String(item.templateElementKey || '')]).filter(Boolean),
+        structureItemId: String(item.id || ''),
+        parentStructureItemId: String(item.parentId || ''),
+        templateStatic: true,
+        styleHints: cloneJsonValueServer(role.styleHints || declared.styleHints || {}, {})
+      };
+      const family = visualKind === 'container' ? 'groupMappings' : 'nodeMappings';
+      runtimeMappings.push({
+        family,
+        item,
+        mapping: {
+          id: diagramImportStableId('mapping', `structure:${item.id}:template-static:${family}`),
+          from: '',
+          fields: family === 'groupMappings'
+            ? { id: '_id', label: 'Description', parent: 'ParentKey' }
+            : { id: '_id', label: 'Description', group: 'GroupKey' },
+          dataProfile: { name: String(role.key || ''), className: '', fields: [], includeSourceRef: false },
+          disableImplicitGroup: true,
+          staticRows: [{
+            id: String(declared.key || item.templateElementKey || item.id || ''),
+            _id: String(declared.key || item.templateElementKey || item.id || ''),
+            Code: String(declared.key || item.templateElementKey || item.id || ''),
+            Description: Object.prototype.hasOwnProperty.call(declared, 'label') ? String(declared.label || '') : String(role.label || role.key || ''),
+            Class: family === 'groupMappings' ? 'D2StaticContainer' : 'D2StaticNode',
+            ParentKey: String(declared.parentKey || ''),
+            GroupKey: String(declared.parentKey || '')
+          }],
+          importRole
+        }
+      });
+      compiledByItemId.set(String(item.id), { item, role, stage: null, primaryAlias: '', primaryStep: null, runtimeMappings: [] });
+      continue;
+    }
     const importRole = {
       roleId: String(role.id || ''),
       key: String(role.key || ''),
@@ -4803,20 +5713,30 @@ function diagramImportCompileStructureTree(structureTree, roles, stageById) {
     // source by role or Object Flow stage silently makes sibling D2 placements
     // inherit each other's filters, labels, and related traversals.
     const compiledMapping = cloneJsonValueServer(mapping, {});
-    const primaryProjection = diagramImportPrimaryCardSource(
-      stage,
-      compiledMapping.primary || {},
-      nearestParent && nearestParent.stage || null
-    );
+    // A parentCard node is the visual card of its nearest materialized
+    // container. It must inherit that container's already selected primary
+    // source exactly. Re-running source inference with the parent stage would
+    // deliberately choose a relation-source as a "different" card and turn
+    // a VLAN/Application child into its ipRange/server provenance.
+    const inheritedPrimaryCardSource = materializationKind === 'parentCard'
+      ? normalizeDiagramImportConditionCardSource(nearestParent && nearestParent.primaryCardSource)
+      : null;
+    const primaryProjection = inheritedPrimaryCardSource
+      ? { source: inheritedPrimaryCardSource, inferred: false, ambiguous: false }
+      : diagramImportPrimaryCardSource(
+        stage,
+        compiledMapping.primary || {},
+        materializationKind === 'stage' ? nearestParent && nearestParent.stage || null : null
+      );
     if (primaryProjection.source) {
       compiledMapping.primary = {
         ...(compiledMapping.primary || {}),
         className: String(primaryProjection.source.className || ''),
         cardSource: primaryProjection.source
       };
-      // Persist an unambiguous projection chosen from the retained Object Flow
-      // cards. Future previews must not fall back to the relation's current
-      // server card after the author selected an application result.
+      // The selected Object Flow row can retain a different primary CMDBuild
+      // card (for example Application on a server/Application match). Keep
+      // the confirmed projection for future previews and editor saves.
       item.mapping = cloneJsonValueServer(compiledMapping, {});
     }
     const runtimeSource = {
@@ -4831,11 +5751,13 @@ function diagramImportCompileStructureTree(structureTree, roles, stageById) {
     };
     compiledMapping.primary = {
       ...(compiledMapping.primary || {}),
-      className: String(compiledMapping.primary && compiledMapping.primary.className || stage.className || '')
+      className: String(compiledMapping.primary && compiledMapping.primary.className || stage.className || ''),
+      idAttribute: '_id'
     };
     const compilerRole = {
       ...cloneJsonValueServer(role, {}),
-      id: `${String(role.id || 'role')}_${sha256Hex(String(item.id || '')).slice(0, 12)}`
+      id: `${String(role.id || 'role')}_${sha256Hex(String(item.id || '')).slice(0, 12)}`,
+      endpointRoleId: String(role.id || '')
     };
     const compiled = diagramImportCompileRoleMapping(
       compilerRole,
@@ -4844,15 +5766,22 @@ function diagramImportCompileStructureTree(structureTree, roles, stageById) {
       stageById,
       runtimeSource,
       nearestParent && nearestParent.hierarchyFieldColumns || new Map(),
-      hierarchyParentFieldRequirements.get(String(item.id || '')) || []
+      hierarchyParentFieldRequirements.get(String(item.id || '')) || [],
+      executableEndpointProfiles
     );
     compiled.role = role;
     compiled.stage = stage;
     compiled.item = item;
-    compiled.className = String(compiledMapping.primary && compiledMapping.primary.className || stage.className || '');
+    compiled.className = String(stage.className || '');
     steps.push(...(compiled.steps || []));
     conditionSourceRepairs.push(...(compiled.conditionSourceRepairs || []));
-    compiledByItemId.set(String(item.id), { ...compiled, item, role, stage });
+    compiledByItemId.set(String(item.id), {
+      ...compiled,
+      item,
+      role,
+      stage,
+      primaryCardSource: normalizeDiagramImportConditionCardSource(compiledMapping.primary && compiledMapping.primary.cardSource)
+    });
     const roleCompilations = compiledByRoleId.get(String(role.id || '')) || [];
     roleCompilations.push(compiled);
     compiledByRoleId.set(String(role.id || ''), roleCompilations);
@@ -4887,16 +5816,68 @@ function diagramImportCompileStructureTree(structureTree, roles, stageById) {
       runtimeMappings.push({ family: runtime.family, item, mapping: mappingValue });
     }
   }
-  return { tree: normalizedTree, runtimeMappings, steps, compiledByItemId, compiledByRoleId, conditionSourceRepairs };
+  const itemByElementKey = new Map(normalizedTree.items.map((item) => [String(item && item.templateElementKey || ''), item]).filter(([key]) => key));
+  for (const edge of Array.isArray(structure && structure.edges) ? structure.edges : []) {
+    const sourceKey = String(edge && edge.sourceKey || '').trim();
+    const targetKey = String(edge && edge.targetKey || '').trim();
+    if (!staticElementKeys.has(sourceKey) || !staticElementKeys.has(targetKey)) continue;
+    const sourceItem = itemByElementKey.get(sourceKey);
+    const targetItem = itemByElementKey.get(targetKey);
+    const sourceRole = sourceItem && roleById.get(String(sourceItem.roleId || ''));
+    const targetRole = targetItem && roleById.get(String(targetItem.roleId || ''));
+    if (!sourceItem || !targetItem || !sourceRole || !targetRole ||
+      diagramImportRoleVisualKind(sourceRole) !== 'node' || diagramImportRoleVisualKind(targetRole) !== 'node') continue;
+    const edgeKey = String(edge && edge.key || '').trim();
+    if (!edgeKey) continue;
+    staticEdgeMappings.push({
+      id: diagramImportStableId('mapping', `template-static-edge:${edgeKey}`),
+      type: 'computed',
+      from: '',
+      fields: { source: 'Source', target: 'Target', label: 'Label' },
+      labelTemplate: '',
+      direction: String(edge && edge.direction || '->'),
+      staticRows: [{
+        id: edgeKey,
+        _id: edgeKey,
+        Source: sourceKey,
+        Target: targetKey,
+        Label: String(edge && edge.label || '')
+      }],
+      importRole: {
+        key: `static:${edgeKey}`,
+        label: String(edge && edge.label || edgeKey),
+        semantic: 'static',
+        elementKey: edgeKey,
+        elementKeys: [edgeKey],
+        sourceKey: String(sourceRole.key || ''),
+        targetKey: String(targetRole.key || ''),
+        directionPolicy: 'template',
+        templateStatic: true,
+        styleHints: cloneJsonValueServer(edge && edge.styleHints || {}, {})
+      }
+    });
+  }
+  return {
+    tree: normalizedTree,
+    runtimeMappings,
+    staticEdgeMappings,
+    steps,
+    compiledByItemId,
+    compiledByRoleId,
+    conditionSourceRepairs,
+    endpointProfiles: executableEndpointProfiles
+  };
 }
 
-function diagramImportCompileRelationRule(rule, roleById, compiledByItemId, stageById = new Map()) {
-  const parentRole = roleById.get(String(rule.parentRoleId || ''));
-  const childRole = roleById.get(String(rule.childRoleId || ''));
+function diagramImportCompileRelationRule(rule, roleById, compiledByItemId, stageById = new Map(), endpointProfiles = []) {
+  if (!diagramImportRelationRuleIsEnabled(rule)) return [];
   const mode = String(rule && rule.mode || '');
   const stage = stageById.get(String(rule && rule.sourceStageId || ''));
-  if (!parentRole || !childRole || !['relationCard', 'networkEndpoints', 'deterministicEndpoints'].includes(mode) ||
+  if (!String(rule && (rule.d2ClassKey || rule.d2ElementKey) || '').trim() || !DIAGRAM_IMPORT_CONNECTION_MODES.has(mode) ||
     !stage || !String(rule.sourceField || '').trim() || !String(rule.targetField || '').trim()) return [];
+  // Compile the source stage even when the endpoint placements are unfinished.
+  // Preview then reports row counts and the exact missing side instead of
+  // hiding the relation source together with the arrows.
   const cardSources = Array.isArray(stage.cardSources) ? stage.cardSources : [];
   const matchEndpointSources = mode === 'deterministicEndpoints' && String(stage.kind || '') === 'match' && cardSources.length >= 2
     ? [cardSources[0], cardSources[1]]
@@ -4913,26 +5894,24 @@ function diagramImportCompileRelationRule(rule, roleById, compiledByItemId, stag
     steps: [],
     rootIdField: sourceField,
     targetIdField: targetField,
-    labelField: String(rule.labelField || '').trim()
+    labelTemplate: diagramImportRelationLabelTemplate(rule)
   }];
 }
 
-function diagramImportRuntimeRelationMappings(compiledRules, roleById, templateGrammar) {
+function diagramImportRuntimeRelationMappings(compiledRules, roleById, templateGrammar, endpointProfiles = []) {
   const edgeMappings = [];
   const hierarchyMappings = [];
   const classRelationRules = [];
   for (const compiled of compiledRules) {
     const rule = compiled.rule || {};
-    const parentRole = roleById.get(String(rule.parentRoleId || ''));
-    const childRole = roleById.get(String(rule.childRoleId || ''));
     const edgeBlueprint = (templateGrammar && Array.isArray(templateGrammar.edges) ? templateGrammar.edges : [])
       .find((edge) => String(edge && edge.key || '') === String(rule.d2ElementKey || '')) || {};
     const mapping = {
-      id: diagramImportStableId('mapping', `${rule.id}:${compiled.sourceStructureItemId || compiled.alias || ''}`),
+      id: diagramImportStableId('mapping', `${rule.id}:${compiled.alias || ''}`),
       from: compiled.alias,
       fields: rule.kind === 'hierarchy'
         ? { parent: compiled.rootIdField, child: compiled.targetIdField, label: 'Domain' }
-        : { source: compiled.rootIdField, target: compiled.targetIdField, label: compiled.labelField || 'Domain' },
+        : { source: compiled.rootIdField, target: compiled.targetIdField, label: 'Domain' },
       importRole: {
         key: rule.id,
         label: String(edgeBlueprint.label || rule.d2Label || ''),
@@ -4943,35 +5922,42 @@ function diagramImportRuntimeRelationMappings(compiledRules, roleById, templateG
         edgeClassKeys: Array.isArray(rule.d2ClassKeys) ? rule.d2ClassKeys.map(String) : [],
         edgeClassNotes: truncateText(String(rule.d2Notes || ''), 8000),
         edgeClassExampleLabels: Array.isArray(rule.d2ExampleLabels) ? rule.d2ExampleLabels.map(String) : [],
-        parentKey: parentRole && parentRole.key || '',
-        childKey: childRole && childRole.key || '',
-        sourceKey: parentRole && parentRole.key || '',
-        targetKey: childRole && childRole.key || '',
+        sourceOperator: diagramImportConnectionRuleSideOperator(rule, 'source'),
+        targetOperator: diagramImportConnectionRuleSideOperator(rule, 'target'),
         directionPolicy: normalizeDiagramDirectionPolicy(rule.directionPolicy),
         styleHints: cloneJsonValueServer(edgeBlueprint.styleHints, {})
       },
-      direction: normalizeDiagramDirectionPolicy(rule.directionPolicy) === 'undirected' ? '--' : String(edgeBlueprint.direction || '->'),
+      // The relation row defines source and target. The D2 sample arrow only
+      // supplies its visual blueprint, never the business orientation.
+      direction: normalizeDiagramDirectionPolicy(rule.directionPolicy) === 'undirected' ? '--' : '->',
       label: String(edgeBlueprint.label || rule.d2Label || ''),
-      labelTemplate: String(rule.labelTemplate || '').trim()
+      labelTemplate: compiled.labelTemplate,
+      labelFallbackDisabled: rule.kind !== 'hierarchy'
     };
     if (rule.kind === 'hierarchy') hierarchyMappings.push(mapping);
     else if (rule.kind === 'group') classRelationRules.push({
       ...rule,
       alias: compiled.alias,
       sourceField: compiled.rootIdField,
-      targetField: compiled.targetIdField,
-      parentRoleKey: parentRole && parentRole.key || '',
-      childRoleKey: childRole && childRole.key || ''
+      targetField: compiled.targetIdField
     });
-    else if (String(rule.mode || '') === 'networkEndpoints') {
+    else if (['networkEndpoints', 'attributeEndpoints'].includes(String(rule.mode || ''))) {
       edgeMappings.push({
         ...mapping,
-        type: 'networkEndpoints',
+        type: 'attributeEndpoints',
         endpointResolution: {
-          strategy: 'ipv4ObjectThenRange',
+          strategy: 'comparisonRules',
+          // Every matching rule attached to a materialized structure item is
+          // considered. Template sample arrows do not constrain business
+          // endpoint pairs and no per-connection participant list is stored.
+          sourceOperator: diagramImportConnectionRuleSideOperator(rule, 'source'),
+          targetOperator: diagramImportConnectionRuleSideOperator(rule, 'target'),
+          operator: diagramImportConnectionRuleSideOperator(rule, 'source'),
           sourceField: compiled.rootIdField,
           targetField: compiled.targetIdField,
-          directionPolicy: normalizeDiagramDirectionPolicy(rule.directionPolicy)
+          directionPolicy: normalizeDiagramDirectionPolicy(rule.directionPolicy),
+          profileScope: 'allCompatiblePlacements',
+          unmatchedPolicy: 'omit'
         }
       });
     } else {
@@ -5112,14 +6098,18 @@ function diagramImportPrimaryCardSource(stage, primary = {}, parentStage = null)
     return { source: null, inferred: false, ambiguous: true };
   }
 
-  if (configuredClass) {
-    const candidates = available.filter((source) => source.className === configuredClass);
-    if (candidates.length === 1) return { source: candidates[0], inferred: false, ambiguous: false };
-    if (candidates.length > 1) return { source: null, inferred: false, ambiguous: true };
-  }
   if (available.length === 1) return { source: available[0], inferred: true, ambiguous: false };
   const current = available.find((source) => source.id === 'current');
   if (current) return { source: current, inferred: true, ambiguous: false };
+  // Before primary.cardSource existed, mappings persisted only className.
+  // That value was an implementation detail of an inferred source, not an
+  // author decision. It must not replace the actual Object Flow result after
+  // reload. Use it only when the stage has no current card to select.
+  if (configuredClass) {
+    const candidates = available.filter((source) => source.className === configuredClass);
+    if (candidates.length === 1) return { source: candidates[0], inferred: true, ambiguous: false };
+    if (candidates.length > 1) return { source: null, inferred: false, ambiguous: true };
+  }
   return { source: null, inferred: false, ambiguous: available.length > 1 };
 }
 
@@ -5133,13 +6123,33 @@ function diagramImportCardSourceField(source, field) {
   const suffix = normalized.classColumn.endsWith('Class')
     ? normalized.classColumn.slice(0, -'Class'.length)
     : '';
+  // Earlier editor versions persisted projected relation fields such as
+  // SourceDescription in label templates. Keep them valid when the selected
+  // primary card is restored instead of projecting the same source twice.
+  if (suffix && name.startsWith(suffix)) return name;
   return suffix ? `${suffix}${name}` : name;
+}
+
+function diagramImportCardSourceRawField(source, field) {
+  const name = String(field || '').trim();
+  const normalized = normalizeDiagramImportConditionCardSource(source);
+  if (!name || !normalized || (normalized.classColumn === 'Class' && normalized.idColumn === '_id')) return name;
+  if (name === normalized.idColumn) return '_id';
+  if (name === normalized.classColumn) return 'Class';
+  const prefix = normalized.classColumn.endsWith('Class')
+    ? normalized.classColumn.slice(0, -'Class'.length)
+    : '';
+  return prefix && name.startsWith(prefix) ? name.slice(prefix.length) : name;
 }
 
 function diagramImportCardSourceLabelTemplate(template, source) {
   return String(template || '').replace(/\$\{([^{}]+)\}/g, (match, token) => {
-    const field = String(token || '').trim();
-    if (!field || field.startsWith('param.') || field.startsWith('params.') || field.startsWith('row.')) return match;
+    let field = String(token || '').trim();
+    if (!field || field.startsWith('param.') || field.startsWith('params.') || field.startsWith('row.') || field.startsWith('child.') || field.startsWith('child:')) return match;
+    if (field.startsWith('primary.')) field = field.slice('primary.'.length);
+    // Related binding tokens have their own materialized namespace. A retained
+    // primary-card source must not rewrite them to Source_* columns.
+    if (!field || field.includes('.')) return match;
     return `\${${diagramImportCardSourceField(source, field)}}`;
   });
 }
@@ -5467,11 +6477,29 @@ function validateDiagramImportV3Catalog(proposal, catalog, currentSpec = {}) {
       continue;
     }
     const primary = mapping.primary || {};
+    const primaryProjection = diagramImportPrimaryCardSource(stage, primary);
+    const primaryCardSource = primaryProjection.source;
     const available = new Set((stage.columns || []).map(String));
-    const fields = uniqueStrings([primary.idAttribute].concat(primary.structuredFields || []).concat(diagramImportPrimaryTemplateFieldNames(primary.labelTemplate || '')))
-      .map((field) => String(field).replace(/^primary\./, ''));
+    const fields = uniqueStrings(['_id'].concat(primary.structuredFields || []).concat(diagramImportPrimaryTemplateFieldNames(primary.labelTemplate || '')))
+      .map((field) => diagramImportCardSourceRawField(primaryCardSource, String(field).replace(/^primary\./, '')));
+    if (primaryCardSource) {
+      const retained = (Array.isArray(stage.cardSources) ? stage.cardSources : []).some((candidate) => (
+        String(candidate && candidate.className || '') === primaryCardSource.className &&
+        String(candidate && candidate.classColumn || '') === primaryCardSource.classColumn &&
+        String(candidate && candidate.idColumn || '') === primaryCardSource.idColumn
+      ));
+      if (!retained) {
+        errors.push({ path: sourcePath, message: `Primary card source ${primaryCardSource.label || primaryCardSource.className} is not retained by Object Flow result ${stage.label || stage.id}.` });
+      } else {
+        for (const technicalField of [primaryCardSource.classColumn, primaryCardSource.idColumn]) {
+          if (!available.has(technicalField)) errors.push({ path: sourcePath, message: `Primary card source ${primaryCardSource.label || primaryCardSource.className} is missing field ${technicalField} in Object Flow result ${stage.label || stage.id}.` });
+        }
+      }
+    }
+    const fieldClassName = String(primaryCardSource && primaryCardSource.className || stage.className || '').trim();
     for (const field of fields) {
-      if (field && !available.has(field)) errors.push({ path: sourcePath, message: `Field ${field} is not materialized by Object Flow result ${stage.label || stage.id}.` });
+      if (!field || field === '_id' || field === 'Id' || field === 'ID' || field === 'Class') continue;
+      validateFieldPath(fieldClassName, field, sourcePath);
     }
     const conditionSets = [
       { name: 'conditions', value: diagramImportPlacementFilters(mapping.conditions) },
@@ -5515,17 +6543,7 @@ function validateDiagramImportV3Catalog(proposal, catalog, currentSpec = {}) {
   for (const [roleId, mappedItems] of mappingsByRoleId.entries()) {
     const role = (proposal.roles || []).find((candidate) => String(candidate && candidate.id || '') === roleId) || {};
     for (const { item, mapping, index } of mappedItems) {
-      const primary = mapping.primary || {};
       const basePath = `$.structureTree.items[${index}].mapping`;
-      validateClass(primary.className, `${basePath}.primary.className`);
-      if (primary.className) {
-        for (const field of uniqueStrings([primary.idAttribute].concat(primary.structuredFields || []).concat(diagramImportPrimaryTemplateFieldNames(primary.labelTemplate || '')))) {
-          const plain = String(field || '').replace(/^primary\./, '');
-          if (plain && !['_id', 'Code', 'Description', 'Class'].includes(plain) && !classAttribute(primary.className, plain)) {
-            errors.push({ path: `${basePath}.primary`, message: `Attribute ${primary.className}.${plain} is not readable.` });
-          }
-        }
-      }
       for (const [relatedIndex, related] of (mapping.related || []).entries()) {
         const relatedPath = `${basePath}.related[${relatedIndex}]`;
         if (related && related.legacyTraversal) {
@@ -5575,25 +6593,77 @@ function validateDiagramImportV3Catalog(proposal, catalog, currentSpec = {}) {
     }
   }
   const roleById = new Map((proposal.roles || []).map((role) => [String(role.id), role]));
+  const endpointProfiles = diagramImportEndpointProfiles(proposal.endpointProfiles);
+  const executableEndpointProfiles = diagramImportEligibleEndpointProfilesForStructure(
+    endpointProfiles,
+    structureTree,
+    proposal.roles || []
+  );
+  for (const [index, profile] of endpointProfiles.entries()) {
+    if (!diagramImportEndpointProfileEligibility(profile, structureTree, proposal.roles || []).eligible) continue;
+    const item = structureItemById.get(String(profile.structureItemId || ''));
+    const role = item && roleById.get(String(item.roleId || ''));
+    if (!role || !['node', 'container'].includes(diagramImportRoleVisualKind(role))) {
+      errors.push({ path: `$.endpointProfiles[${index}].structureItemId`, message: 'Comparison rule must reference one dynamic D2 placement in the saved structure.' });
+    }
+    const stageId = item ? effectiveStageId(item) : '';
+    if (!stageId || !stageById.has(stageId)) {
+      errors.push({ path: `$.endpointProfiles[${index}].structureItemId`, message: 'Comparison rule placement must inherit or select one materialized Object Flow result.' });
+    }
+    if (!String(profile.field || '').trim()) {
+      errors.push({ path: `$.endpointProfiles[${index}].field`, message: 'Comparison rule must select a result attribute.' });
+    }
+    const stage = stageById.get(stageId);
+    const field = String(profile.field || '').trim();
+    const source = normalizeDiagramImportConditionCardSource(profile.source);
+    if (stage && field) {
+      if (source) {
+        const retained = (Array.isArray(stage.cardSources) ? stage.cardSources : []).some((candidate) => (
+          String(candidate && candidate.className || '') === source.className &&
+          String(candidate && candidate.classColumn || '') === source.classColumn &&
+          String(candidate && candidate.idColumn || '') === source.idColumn
+        ));
+        if (!retained) {
+          errors.push({ path: `$.endpointProfiles[${index}].field`, message: `Comparison rule source ${source.label || source.className} is not retained by Object Flow result ${stage.label || stage.id}.` });
+        } else {
+          validateFieldPath(source.className, field, `$.endpointProfiles[${index}].field`);
+        }
+      } else if (!(Array.isArray(stage.columns) ? stage.columns : []).map(String).includes(field)) {
+        // Legacy profiles did not retain source provenance. A direct field of
+        // the current result stays valid, while multi-card results must be
+        // corrected explicitly in the editor instead of guessing a card.
+        const currentSources = diagramImportUniqueStageCardSources(stage.cardSources || [])
+          .filter((candidate) => String(candidate.id || '') === 'current');
+        if (currentSources.length === 1) validateFieldPath(currentSources[0].className, field, `$.endpointProfiles[${index}].field`);
+        else errors.push({ path: `$.endpointProfiles[${index}].field`, message: 'Comparison rule must select the retained Object Flow card that owns this attribute.' });
+      }
+    }
+    if (!Array.isArray(profile.operators) || !profile.operators.length) {
+      errors.push({ path: `$.endpointProfiles[${index}].operators`, message: 'Comparison rule must allow at least one deterministic method.' });
+    }
+  }
   for (const [index, rule] of (proposal.relationRules || []).entries()) {
-    const parent = roleById.get(String(rule.parentRoleId || ''));
-    const child = roleById.get(String(rule.childRoleId || ''));
+    if (!diagramImportRelationRuleIsEnabled(rule)) continue;
     errors.push(...diagramImportLabelTemplateSyntaxErrors(
-      String(rule && rule.labelTemplate || ''),
+      diagramImportRelationLabelTemplate(rule),
       `$.relationRules[${index}].labelTemplate`
     ));
-    if (!['relationCard', 'networkEndpoints', 'deterministicEndpoints'].includes(String(rule.mode || ''))) {
+    if (!DIAGRAM_IMPORT_CONNECTION_MODES.has(String(rule.mode || ''))) {
       errors.push({ path: `$.relationRules[${index}].mode`, message: 'D2 connection must use a materialized Object Flow result; CMDB relation paths are configured in Object Flow.' });
       continue;
     }
+    if (['networkEndpoints', 'attributeEndpoints'].includes(String(rule.mode || ''))) {
+      errors.push(...diagramImportConnectionProfileValidationErrors(rule, executableEndpointProfiles, roleById, `$.relationRules[${index}]`));
+    }
+    errors.push(...diagramImportConnectionRuleComparisonValidationErrors(rule, executableEndpointProfiles, roleById, `$.relationRules[${index}]`));
     const stage = stageById.get(String(rule.sourceStageId || ''));
     if (!stage) {
       errors.push({ path: `$.relationRules[${index}].sourceStageId`, message: 'Connection source must reference a materialized Object Flow result.' });
       continue;
     }
     const available = new Set(Array.isArray(stage.columns) ? stage.columns.map(String) : []);
-    const requiredFields = ['sourceField', 'targetField', 'labelField'];
-    for (const field of uniqueStrings(requiredFields.concat(diagramTemplateFieldNames(rule.labelTemplate || '')))) {
+    const requiredFields = ['sourceField', 'targetField'];
+    for (const field of uniqueStrings(requiredFields.concat(diagramTemplateFieldNames(diagramImportRelationLabelTemplate(rule))))) {
       const value = String(requiredFields.includes(field) ? rule[field] || '' : field).trim();
       if (value && !available.has(value)) {
         errors.push({
@@ -5605,20 +6675,21 @@ function validateDiagramImportV3Catalog(proposal, catalog, currentSpec = {}) {
   }
   const connectionRulesByStage = new Map();
   for (const [index, rule] of (proposal.relationRules || []).entries()) {
-    if (!['relationCard', 'networkEndpoints', 'deterministicEndpoints'].includes(String(rule && rule.mode || ''))) continue;
+    if (!diagramImportRelationRuleIsEnabled(rule)) continue;
+    if (!DIAGRAM_IMPORT_CONNECTION_MODES.has(String(rule && rule.mode || ''))) continue;
     const stageId = String(rule && rule.sourceStageId || '').trim();
     if (!stageId) continue;
     if (!connectionRulesByStage.has(stageId)) connectionRulesByStage.set(stageId, []);
     connectionRulesByStage.get(stageId).push({ index, rule });
   }
   for (const [stageId, entries] of connectionRulesByStage.entries()) {
-    const classKeys = uniqueStrings(entries.map(({ rule }) => String(rule && (rule.d2ClassKey || rule.d2ElementKey) || '')).filter(Boolean));
-    if (classKeys.length < 2) continue;
+    if (entries.length < 2 || diagramImportCanShareConnectionResult(entries)) continue;
     for (const { index, rule } of entries) {
+      const label = String(rule && (rule.d2Label || rule.d2ElementKey || rule.d2ClassKey) || 'D2 connection');
       errors.push({
         path: `$.relationRules[${index}].sourceStageId`,
         code: 'diagram_connection_result_not_dedicated',
-        message: `Connection source ${stageId} is shared by D2 relation classes ${classKeys.join(', ')}. Create a separate named Object Flow result for ${String(rule && (rule.d2ClassKey || rule.d2ElementKey) || '')}.`
+        message: `Object Flow result ${stageId} is assigned to several incompatible D2 relation classes. Create and select a separate named result for “${label}”.`
       });
     }
   }
@@ -5784,7 +6855,7 @@ function diagramImportCatalogPathCandidates(catalog, sourceClass, targetClass, m
   return results;
 }
 
-function applyDiagramImportProposal(currentSpec, proposal, roleOverrides = [], relationRules, structureTree) {
+function applyDiagramImportProposal(currentSpec, proposal, roleOverrides = [], relationRules, structureTree, endpointProfiles) {
   const sourceSpec = cloneJsonValueServer(currentSpec, {});
   if (!proposal || proposal.version !== 3) {
     const error = new Error('D2 import proposal version is no longer supported. Analyze the D2 source again.');
@@ -5793,10 +6864,10 @@ function applyDiagramImportProposal(currentSpec, proposal, roleOverrides = [], r
     throw error;
   }
   assertDiagramImportProposalDeterministicSpec(proposal, sourceSpec, 'applying it');
-  const reviewed = diagramImportV3WithOverrides(proposal, roleOverrides, relationRules, structureTree, sourceSpec);
+  const reviewed = diagramImportV3WithOverrides(proposal, roleOverrides, relationRules, structureTree, sourceSpec, endpointProfiles);
   const appliedFlow = objectFlowFromSpecServer(sourceSpec);
   const stageById = new Map(assistantObjectFlowDiagramStages(sourceSpec, appliedFlow).map((stage) => [String(stage.id || ''), stage]));
-  reviewed.unresolved = diagramImportV3Unresolved(reviewed.roles, reviewed.relationRules, reviewed.structureTree, sourceSpec, reviewed.structure);
+  reviewed.unresolved = diagramImportV3Unresolved(reviewed.roles, reviewed.relationRules, reviewed.structureTree, sourceSpec, reviewed.structure, reviewed.endpointProfiles);
   if (reviewed.unresolved.length) {
     const topologyUnresolved = reviewed.unresolved.filter((item) => item && item.family === 'topology');
     const error = new Error(topologyUnresolved.length
@@ -5808,8 +6879,14 @@ function applyDiagramImportProposal(currentSpec, proposal, roleOverrides = [], r
     throw error;
   }
   const roleById = new Map(reviewed.roles.map((role) => [String(role.id), role]));
-  const compiledTree = diagramImportCompileStructureTree(reviewed.structureTree, reviewed.roles, stageById);
-  const compiledRules = (reviewed.relationRules || []).flatMap((rule) => diagramImportCompileRelationRule(rule, roleById, compiledTree.compiledByItemId, stageById));
+  const compiledTree = diagramImportCompileStructureTree(reviewed.structureTree, reviewed.roles, stageById, reviewed.structure, reviewed.endpointProfiles);
+  const compiledRules = (reviewed.relationRules || []).flatMap((rule) => diagramImportCompileRelationRule(
+    rule,
+    roleById,
+    compiledTree.compiledByItemId,
+    stageById,
+    compiledTree.endpointProfiles
+  ));
   // D2 source often contains several sample arrows of the same visual type.
   // One dynamic relation-card stage must materialize its CMDB rows once, not
   // once per sample arrow, otherwise every ACL row is duplicated in runtime.
@@ -5817,12 +6894,11 @@ function applyDiagramImportProposal(currentSpec, proposal, roleOverrides = [], r
   const compiledRuleKeys = new Set();
   for (const compiled of compiledRules) {
     const rule = compiled.rule || {};
-    const key = String(rule.mode || '') === 'networkEndpoints'
-      ? [
-        'networkEndpoints', String(rule.d2ClassKey || rule.d2ElementKey || rule.id || ''), compiled.alias, compiled.rootIdField, compiled.targetIdField,
-        compiled.labelField, rule.parentRoleId, rule.childRoleId
-      ].join(':')
-      : `rule:${String(rule.id || '')}:${String(compiled.sourceStructureItemId || '')}`;
+    const key = [
+      String(rule.d2ClassKey || rule.d2ElementKey || rule.id || ''),
+      String(rule.mode || ''), compiled.alias, compiled.rootIdField, compiled.targetIdField,
+      compiled.labelTemplate
+    ].join(':');
     if (compiledRuleKeys.has(key)) continue;
     compiledRuleKeys.add(key);
     distinctCompiledRules.push(compiled);
@@ -5842,12 +6918,13 @@ function applyDiagramImportProposal(currentSpec, proposal, roleOverrides = [], r
   const { edgeMappings, hierarchyMappings, classRelationRules } = diagramImportRuntimeRelationMappings(
     distinctCompiledRules,
     roleById,
-    reviewed.templateGrammar
+    reviewed.templateGrammar,
+    compiledTree.endpointProfiles
   );
   assertDiagramImportRuntimeMappingsContract({
     nodeMappings,
     groupMappings,
-    edgeMappings,
+    edgeMappings: compiledTree.staticEdgeMappings.concat(edgeMappings),
     hierarchyMappings
   }, reviewed.templateGrammar);
   const diagram = {
@@ -5858,7 +6935,7 @@ function applyDiagramImportProposal(currentSpec, proposal, roleOverrides = [], r
     type: 'topology',
     nodeMappings,
     groupMappings,
-    edgeMappings,
+    edgeMappings: compiledTree.staticEdgeMappings.concat(edgeMappings),
     hierarchyMappings,
     classRelationRules,
     templateGrammar: cloneJsonValueServer(reviewed.templateGrammar, {}),
@@ -5911,8 +6988,10 @@ function diagramImportAuthoringFromReviewed(previousDiagram, reviewed, structure
         notes: truncateText(String(role.notes || ''), 8000),
         semanticModelRevision: D2_IMPORT_SEMANTIC_MODEL_REVISION,
         visualKind: diagramImportRoleVisualKind(role),
-        labelTemplate: String(role.labelTemplate || role.label || '')
+        labelTemplate: diagramImportRoleLabelTemplate(role, role.label)
       })),
+      endpointProfiles: cloneJsonValueServer(reviewed.endpointProfiles, []),
+      endpointProfileCompilationVersion: D2_IMPORT_ENDPOINT_COMPILATION_VERSION,
       relationRules: cloneJsonValueServer(reviewed.relationRules, []),
       structureTree: cloneJsonValueServer(structureTree, {}),
       templateGrammar: cloneJsonValueServer(reviewed.templateGrammar, {})
@@ -5924,7 +7003,7 @@ function diagramImportAuthoringFromReviewed(previousDiagram, reviewed, structure
 // authoring state. Preview recompiles only independently valid placements from
 // this structure; runtime and publication remain fail-closed until a full
 // mapping passes applyDiagramImportProposal above.
-function applyPartialDiagramImportProposal(currentSpec, proposal, roleOverrides = [], relationRules, structureTree) {
+function applyPartialDiagramImportProposal(currentSpec, proposal, roleOverrides = [], relationRules, structureTree, endpointProfiles) {
   const sourceSpec = cloneJsonValueServer(currentSpec, {});
   if (!proposal || proposal.version !== 3) {
     const error = new Error('D2 import proposal version is no longer supported. Analyze the D2 source again.');
@@ -5933,8 +7012,8 @@ function applyPartialDiagramImportProposal(currentSpec, proposal, roleOverrides 
     throw error;
   }
   assertDiagramImportProposalDeterministicSpec(proposal, sourceSpec, 'applying it');
-  const reviewed = diagramImportV3WithOverrides(proposal, roleOverrides, relationRules, structureTree, sourceSpec);
-  reviewed.unresolved = diagramImportV3Unresolved(reviewed.roles, reviewed.relationRules, reviewed.structureTree, sourceSpec, reviewed.structure);
+  const reviewed = diagramImportV3WithOverrides(proposal, roleOverrides, relationRules, structureTree, sourceSpec, endpointProfiles);
+  reviewed.unresolved = diagramImportV3Unresolved(reviewed.roles, reviewed.relationRules, reviewed.structureTree, sourceSpec, reviewed.structure, reviewed.endpointProfiles);
   const diagrams = Array.isArray(sourceSpec.result && sourceSpec.result.diagrams) ? sourceSpec.result.diagrams.slice() : [];
   const diagramIndex = diagrams.findIndex((item) => item && (item.id === reviewed.diagramId || (!item.id && item.name)));
   const previous = diagramIndex >= 0 ? diagrams[diagramIndex] : {};
@@ -5944,8 +7023,9 @@ function applyPartialDiagramImportProposal(currentSpec, proposal, roleOverrides 
     name: String(previous.name || reviewed.template && (reviewed.template.name || reviewed.template.title) || 'topology').trim() || 'topology',
     title: String(reviewed.template && reviewed.template.title || previous.title || 'Topology').trim() || 'Topology',
     type: 'topology',
-    // Remove previous executable D2 output. A new preview must compile only
-    // the valid subset of the current reviewed tree, never stale mappings.
+    // Remove previous executable D2 output first. The independently valid
+    // subset below is rebuilt from the reviewed editor state, never retained
+    // from an older mapping.
     nodeMappings: [],
     groupMappings: [],
     edgeMappings: [],
@@ -5967,6 +7047,23 @@ function applyPartialDiagramImportProposal(currentSpec, proposal, roleOverrides 
     reasons: ['partialMapping']
   };
   delete diagram.authoring.d2Import.mappingInputRevision;
+  let omissions = [];
+  let repairs = [];
+  try {
+    // The partial plan compiles every independently valid placement and D2
+    // connection into the persisted deterministic runtime representation.
+    // Invalid siblings remain in authoring state and are reported as omitted.
+    const previewPlan = draftDiagramPreviewMappingPlan(sourceSpec);
+    omissions = previewPlan.omissions;
+    repairs = previewPlan.repairs;
+    sourceSpec.steps = previewPlan.spec.steps;
+    sourceSpec.result = previewPlan.spec.result;
+  } catch (error) {
+    omissions = [{
+      kind: 'mapping',
+      message: 'The valid subset could not be compiled for preview. Correct the listed D2 mapping fields in Diagram Editor.'
+    }];
+  }
   const errors = validateTemplateSpecForStorage(sourceSpec);
   if (errors.length) {
     const error = new Error('D2 partial mapping produced an invalid authoring template spec.');
@@ -5974,18 +7071,6 @@ function applyPartialDiagramImportProposal(currentSpec, proposal, roleOverrides 
     error.statusCode = 422;
     error.details = errors;
     throw error;
-  }
-  let omissions = [];
-  let repairs = [];
-  try {
-    const previewPlan = draftDiagramPreviewMappingPlan(sourceSpec);
-    omissions = previewPlan.omissions;
-    repairs = previewPlan.repairs;
-  } catch (error) {
-    omissions = [{
-      kind: 'mapping',
-      message: 'The valid subset could not be compiled for preview. Correct the listed D2 mapping fields in Diagram Editor.'
-    }];
   }
   return { spec: sourceSpec, reviewed, omissions, repairs };
 }
@@ -6033,6 +7118,67 @@ function diagramImportCheckpointProvisionalBaseMatches(spec, diagram, mapping, c
   return diagramImportDeterministicSpecHash(base) === String(checkpoint.deterministicSpecHash || '');
 }
 
+function diagramImportAnalysisCheckpointMatchesAppliedMapping(mapping, checkpoint) {
+  if (!mapping || !checkpoint) return false;
+  const checkpointRoles = (Array.isArray(checkpoint.roles) ? checkpoint.roles : []).map((role) => ({
+    id: String(role && role.id || ''),
+    visualKind: normalizeDiagramImportVisualKind(role && role.visualKind, ''),
+    labelTemplate: String(role && role.labelTemplate || '')
+  })).filter((role) => role.id).sort((left, right) => left.id.localeCompare(right.id));
+  const mappingRoles = (Array.isArray(mapping.roles) ? mapping.roles : []).map((role) => ({
+    id: String(role && role.id || ''),
+    visualKind: normalizeDiagramImportVisualKind(role && role.visualKind, ''),
+    labelTemplate: String(role && role.labelTemplate || '')
+  })).filter((role) => role.id).sort((left, right) => left.id.localeCompare(right.id));
+  return stableJsonStringify(checkpointRoles) === stableJsonStringify(mappingRoles) &&
+    stableJsonStringify(checkpoint.relationRules || []) === stableJsonStringify(mapping.relationRules || []) &&
+    stableJsonStringify(checkpoint.structureTree || {}) === stableJsonStringify(mapping.structureTree || {});
+}
+
+function diagramImportCheckpointCanFollowCurrentMapping(mapping, checkpoint, sourceHash) {
+  if (!mapping || !checkpoint || !sourceHash) return false;
+  if (Number(mapping.version || 0) !== 3 ||
+    Number(mapping.semanticModelRevision || 0) !== D2_IMPORT_SEMANTIC_MODEL_REVISION ||
+    Number(mapping.structureTree && mapping.structureTree.version || 0) !== D2_IMPORT_STRUCTURE_TREE_VERSION) return false;
+  return String(mapping.sourceHash || '') === String(sourceHash) &&
+    String(mapping.sourceHash || '') === String(checkpoint.source && checkpoint.source.hash || '') &&
+    String(mapping.structureHash || '') === String(checkpoint.source && checkpoint.source.structureHash || '') &&
+    String(mapping.mappingContractHash || '') === String(checkpoint.source && checkpoint.source.mappingContractHash || '');
+}
+
+function diagramImportCheckpointForCurrentMapping(checkpoint, mapping, deterministicSpecHash) {
+  return normalizeD2AnalysisCheckpoint({
+    ...checkpoint,
+    proposalId: String(mapping && mapping.proposalId || checkpoint && checkpoint.proposalId || ''),
+    deterministicSpecHash,
+    source: {
+      hash: String(mapping && mapping.sourceHash || checkpoint && checkpoint.source && checkpoint.source.hash || ''),
+      structureHash: String(mapping && mapping.structureHash || checkpoint && checkpoint.source && checkpoint.source.structureHash || ''),
+      mappingContractHash: String(mapping && mapping.mappingContractHash || checkpoint && checkpoint.source && checkpoint.source.mappingContractHash || '')
+    },
+    roles: cloneJsonValueServer(mapping && mapping.roles, []),
+    relationRules: cloneJsonValueServer(mapping && mapping.relationRules, []),
+    structureTree: cloneJsonValueServer(mapping && mapping.structureTree, {})
+  });
+}
+
+function diagramImportAssistantCheckpointForCurrentMapping(checkpoint, mapping, deterministicSpecHash) {
+  if (!checkpoint) return null;
+  return normalizeD2AssistantCheckpoint({
+    ...checkpoint,
+    proposalId: String(mapping && mapping.proposalId || checkpoint.proposalId || ''),
+    deterministicSpecHash,
+    source: {
+      hash: String(mapping && mapping.sourceHash || checkpoint.source && checkpoint.source.hash || ''),
+      structureHash: String(mapping && mapping.structureHash || checkpoint.source && checkpoint.source.structureHash || ''),
+      mappingContractHash: String(mapping && mapping.mappingContractHash || checkpoint.source && checkpoint.source.mappingContractHash || '')
+    },
+    roles: cloneJsonValueServer(mapping && mapping.roles, []),
+    relationRules: cloneJsonValueServer(mapping && mapping.relationRules, []),
+    structureTree: cloneJsonValueServer(mapping && mapping.structureTree, {})
+  });
+}
+
 function rebaseStoredD2AnalysisCheckpoint(spec) {
   const authoring = templateAuthoring(spec, { allowLegacy: false });
   const d2 = authoring && authoring.d2 && typeof authoring.d2 === 'object' && !Array.isArray(authoring.d2)
@@ -6046,22 +7192,32 @@ function rebaseStoredD2AnalysisCheckpoint(spec) {
   const mapping = imported && imported.imported;
   if (!sourceHash || !mapping || String(mapping.sourceHash || '') !== sourceHash) return;
   const provisionalBaseMatches = diagramImportCheckpointProvisionalBaseMatches(spec, diagram, mapping, checkpoint);
+  const checkpointMatchesAppliedMapping = diagramImportAnalysisCheckpointMatchesAppliedMapping(mapping, checkpoint);
+  const currentMappingMayRebaseCheckpoint = diagramImportCheckpointCanFollowCurrentMapping(mapping, checkpoint, sourceHash);
   const executableMappingIsCurrent = Boolean(mapping.mappingValidation && mapping.mappingValidation.status === 'valid' &&
     diagramImportMappingValidationIsCurrent(mapping) && diagramImportMappingInputRevisionStatus(spec, mapping).current);
-  if (!provisionalBaseMatches && !executableMappingIsCurrent) return;
+  if (!provisionalBaseMatches && !checkpointMatchesAppliedMapping && !currentMappingMayRebaseCheckpoint && !executableMappingIsCurrent) return;
   if (String(checkpoint.source && checkpoint.source.hash || '') !== sourceHash ||
     String(checkpoint.source && checkpoint.source.structureHash || '') !== String(mapping.structureHash || '') ||
     String(checkpoint.source && checkpoint.source.mappingContractHash || '') !== String(mapping.mappingContractHash || '')) return;
   const deterministicSpecHash = diagramImportDeterministicSpecHash(spec);
-  if (checkpoint.deterministicSpecHash === deterministicSpecHash) return;
-  const rebasedCheckpoint = { ...checkpoint, deterministicSpecHash };
+  const rebasedCheckpoint = currentMappingMayRebaseCheckpoint
+    ? diagramImportCheckpointForCurrentMapping(checkpoint, mapping, deterministicSpecHash)
+    : { ...checkpoint, deterministicSpecHash };
+  if (!rebasedCheckpoint) return;
   const assistantCheckpoint = normalizeD2AssistantCheckpoint(d2.assistantCheckpoint);
-  const rebasedAssistantCheckpoint = assistantCheckpoint &&
+  const assistantCheckpointMatchesMapping = assistantCheckpoint &&
     String(assistantCheckpoint.source && assistantCheckpoint.source.hash || '') === sourceHash &&
     String(assistantCheckpoint.source && assistantCheckpoint.source.structureHash || '') === String(mapping.structureHash || '') &&
-    String(assistantCheckpoint.source && assistantCheckpoint.source.mappingContractHash || '') === String(mapping.mappingContractHash || '')
-    ? { ...assistantCheckpoint, deterministicSpecHash }
-    : assistantCheckpoint;
+    String(assistantCheckpoint.source && assistantCheckpoint.source.mappingContractHash || '') === String(mapping.mappingContractHash || '');
+  const rebasedAssistantCheckpoint = assistantCheckpointMatchesMapping && currentMappingMayRebaseCheckpoint
+    ? diagramImportAssistantCheckpointForCurrentMapping(assistantCheckpoint, mapping, deterministicSpecHash)
+    : assistantCheckpointMatchesMapping
+      ? { ...assistantCheckpoint, deterministicSpecHash }
+      : assistantCheckpoint;
+  if (checkpoint.deterministicSpecHash === deterministicSpecHash &&
+    stableJsonStringify(rebasedCheckpoint) === stableJsonStringify(checkpoint) &&
+    stableJsonStringify(rebasedAssistantCheckpoint) === stableJsonStringify(assistantCheckpoint)) return;
   spec.authoring = {
     ...authoring,
     d2: {
@@ -6146,7 +7302,7 @@ async function appliedDiagramImportProposalFromSpec(currentSpec) {
       label: String(stored.label || role.label || role.key || ''),
       notes: String(stored.notes !== undefined ? stored.notes : role.notes || ''),
       visualKind: diagramImportRoleVisualKind(modeled),
-      labelTemplate: String(stored.labelTemplate || role.labelTemplate || '')
+      labelTemplate: diagramImportRoleLabelTemplate(stored, role.labelTemplate)
     };
   });
   const proposal = {
@@ -6161,6 +7317,7 @@ async function appliedDiagramImportProposalFromSpec(currentSpec) {
     structure: cloneJsonValueServer(identity.ir.elements, {}),
     classes: cloneJsonValueServer(identity.ir.classes, []),
     roles,
+    endpointProfiles: diagramImportEndpointProfiles(imported.endpointProfiles),
     relationRules: cloneJsonValueServer(imported.relationRules, []),
     structureTree: cloneJsonValueServer(imported.structureTree, {}),
     templateGrammar: cloneJsonValueServer(imported.templateGrammar, {}),
@@ -6173,17 +7330,29 @@ async function appliedDiagramImportProposalFromSpec(currentSpec) {
     visualKind: diagramImportRoleVisualKind(role),
     labelTemplate: String(role.labelTemplate || '')
   }));
-  return diagramImportV3WithOverrides(proposal, roleOverrides, proposal.relationRules, proposal.structureTree, sourceSpec);
+  return diagramImportV3WithOverrides(
+    proposal,
+    roleOverrides,
+    proposal.relationRules,
+    proposal.structureTree,
+    sourceSpec,
+    proposal.endpointProfiles
+  );
 }
 
 function diagramImportCurrentInputRecompileRequired(spec) {
   const found = diagramImportForSpec(spec || {});
+  const imported = found && found.imported && typeof found.imported === 'object'
+    ? found.imported
+    : {};
   const validation = found && found.imported && found.imported.mappingValidation && typeof found.imported.mappingValidation === 'object'
     ? found.imported.mappingValidation
     : {};
   const status = String(validation.status || '');
   const reasons = uniqueStrings(Array.isArray(validation.reasons) ? validation.reasons.map(String) : []);
-  return status === 'needsValidation' || (status === 'needsReview' && reasons.length === 1 && reasons[0] === 'inputRevision');
+  return Number(imported.endpointProfileCompilationVersion || 0) !== D2_IMPORT_ENDPOINT_COMPILATION_VERSION ||
+    status === 'needsValidation' ||
+    (status === 'needsReview' && reasons.length === 1 && reasons[0] === 'inputRevision');
 }
 
 async function recompileDiagramImportForCurrentInput(spec) {
@@ -6192,13 +7361,52 @@ async function recompileDiagramImportForCurrentInput(spec) {
   }
   try {
     const proposal = await appliedDiagramImportProposalFromSpec(spec);
+    const recompiled = applyDiagramImportProposal(
+      spec,
+      proposal,
+      [],
+      proposal.relationRules,
+      proposal.structureTree,
+      proposal.endpointProfiles
+    );
+    // Recompilation changes result.diagrams after the ordinary storage
+    // normalizer rebased the analysis checkpoint. Bind the checkpoint to the
+    // final compiled spec so a later reload restores this exact mapping.
+    rebaseStoredD2AnalysisCheckpoint(recompiled);
     return {
-      spec: applyDiagramImportProposal(spec, proposal, [], proposal.relationRules, proposal.structureTree),
+      spec: recompiled,
       recompiled: true,
       error: null
     };
   } catch (error) {
-    return { spec, recompiled: false, error };
+    // Normal Save must not discard the editor's valid part solely because a
+    // sibling placement or arrow is incomplete. Rebuild the same proposal via
+    // the partial compiler; it persists executable mappings and keeps the
+    // unresolved rows in authoring state for the next edit.
+    try {
+      const proposal = await appliedDiagramImportProposalFromSpec(spec);
+      const partial = applyPartialDiagramImportProposal(
+        spec,
+        proposal,
+        [],
+        proposal.relationRules,
+        proposal.structureTree,
+        proposal.endpointProfiles
+      );
+      // The partial compiler also changes executable bindings. It is a valid
+      // saved authoring state, so keep its deterministic checkpoint aligned
+      // with the resulting spec rather than forcing a redundant analysis.
+      rebaseStoredD2AnalysisCheckpoint(partial.spec);
+      return {
+        spec: partial.spec,
+        recompiled: true,
+        partial: true,
+        omissions: partial.omissions,
+        error
+      };
+    } catch (partialError) {
+      return { spec, recompiled: false, error, partialError };
+    }
   }
 }
 
@@ -6347,7 +7555,7 @@ function completeDiagramImportV3FromSpec(proposal, assistantSpec) {
     });
   }
   next.structureTree = importedTree;
-  next.unresolved = diagramImportV3Unresolved(next.roles, next.relationRules, next.structureTree, assistantSpec || {}, next.structure);
+  next.unresolved = diagramImportV3Unresolved(next.roles, next.relationRules, next.structureTree, assistantSpec || {}, next.structure, next.endpointProfiles);
   if (!suggestedMappings.size) next.warnings = uniqueStrings([...(next.warnings || []), 'Assistant returned no D2 placement mapping suggestions; manual catalog mapping is still required.']);
   return next;
 }
@@ -6442,7 +7650,7 @@ async function restoreD2AnalysisCheckpoint(source, currentSpec, checkpoint, opti
     currentSpec
   );
   proposal.proposalId = restoredCheckpoint.proposalId;
-  proposal.unresolved = diagramImportV3Unresolved(proposal.roles, proposal.relationRules, proposal.structureTree, currentSpec, proposal.structure);
+  proposal.unresolved = diagramImportV3Unresolved(proposal.roles, proposal.relationRules, proposal.structureTree, currentSpec, proposal.structure, proposal.endpointProfiles);
   proposal.warnings = uniqueStrings(proposal.warnings || []);
   return {
     ...analyzed,
@@ -6482,7 +7690,7 @@ function restoreD2AssistantCheckpointOverlay(restoredAnalysis, currentSpec, chec
     currentSpec
   );
   nextProposal.proposalId = restoredCheckpoint.proposalId;
-  nextProposal.unresolved = diagramImportV3Unresolved(nextProposal.roles, nextProposal.relationRules, nextProposal.structureTree, currentSpec, nextProposal.structure);
+  nextProposal.unresolved = diagramImportV3Unresolved(nextProposal.roles, nextProposal.relationRules, nextProposal.structureTree, currentSpec, nextProposal.structure, nextProposal.endpointProfiles);
   nextProposal.warnings = uniqueStrings(nextProposal.warnings || []);
   return {
     ...restoredAnalysis,
@@ -7974,6 +9182,7 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
   const boot = JSON.stringify({
     mode,
     session,
+    appVersion: APPLICATION_VERSION,
     templateCode,
     designerSection,
     publicRuntime,
@@ -8039,7 +9248,7 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     .lamp{width:13px;height:13px;border-radius:50%;display:inline-block;border:1px solid rgba(0,0,0,.2);background:#9aa5b1;box-shadow:0 0 0 2px rgba(0,0,0,.03)}
     .lamp.ok{background:var(--ok)}.lamp.warn{background:#d99a21}.lamp.error{background:var(--danger)}.lamp.loading{background:#3b82f6}
     .layout{display:grid;grid-template-columns:minmax(280px,1fr) minmax(460px,2fr);gap:14px}.panel{background:var(--panel);border:1px solid var(--line);padding:12px}
-    .section{background:var(--panel);border:1px solid var(--line);padding:12px;margin-bottom:12px}.section-title-row{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin:10px 0 6px}.section-title-row h3,.section-title-row h4{margin:0}
+    .section{background:var(--panel);border:1px solid var(--line);padding:12px;margin-bottom:12px}.section-title-row{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin:10px 0 6px}.section-title-row h3,.section-title-row h4{margin:0}.about-version{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:4px 10px;margin:0 0 10px}.about-version dt{color:var(--muted)}.about-version dd{margin:0;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
     .object-selection{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
     .matching-block{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
     .matching-rule-list{display:grid;gap:10px;margin-top:8px}
@@ -8095,6 +9304,7 @@ function dynamicPagesClientScript() {
   var DEFAULT_PERMISSION_DENIED_TEXT = ${JSON.stringify(DEFAULT_PERMISSION_DENIED_TEXT)};
   var DEFAULT_TEMPLATE_CACHE_TTL_SEC = ${JSON.stringify(DEFAULT_TEMPLATE_CACHE_TTL_SEC)};
   var D2_IMPORT_SEMANTIC_MODEL_REVISION = ${JSON.stringify(D2_IMPORT_SEMANTIC_MODEL_REVISION)};
+  var D2_IMPORT_ENDPOINT_PROFILE_VERSION = ${JSON.stringify(D2_IMPORT_ENDPOINT_PROFILE_VERSION)};
   var D2_IMPORT_STRUCTURE_TREE_VERSION = ${JSON.stringify(D2_IMPORT_STRUCTURE_TREE_VERSION)};
   var D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION = ${JSON.stringify(D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION)};
   var D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION = ${JSON.stringify(D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION)};
@@ -8187,6 +9397,7 @@ function dynamicPagesClientScript() {
       menuGeneralSettings: 'General settings',
       menuRuntimeSettings: 'Runtime settings',
       menuDiagnostics: 'Diagnostics',
+      appVersion: 'Version',
       aboutText: 'Designed and implemented by Igor Lyapin email:igor.lyapin@gmail.com 2026\\n\\nLicensed under GNU GPLv3.',
       generalSettings: 'General settings',
       maxDepthHelp: 'Controls how many relation hops the Designer uses for catalog path hints. It does not change CMDBuild permissions.',
@@ -8212,6 +9423,10 @@ function dynamicPagesClientScript() {
       runtimeMaxRowsDataPreviewDefaultHelp: 'Shared row limit for Extraction and diagram preview. Diagram maxNodes and maxEdges remain separate visual limits.',
       runtimeMaxRowsMax: 'Maximum rows',
       runtimeMaxRowsMaxHelp: 'Upper cap for rows returned by one execution.',
+      runtimeMaxRelationsPerCardDefault: 'Relations per source card',
+      runtimeMaxRelationsPerCardDefaultHelp: 'Shared limit for relations read from one CMDBuild card. It applies to every relation operation.',
+      runtimeMaxRelationsPerCardMax: 'Maximum relations per source card',
+      runtimeMaxRelationsPerCardMaxHelp: 'Upper cap for the shared relation limit.',
       runtimeMaxSelectionScanRowsDefault: 'Default selection scan rows',
       runtimeMaxSelectionScanRowsDefaultHelp: 'Maximum cards inspected for a filtered selection before the result is marked incomplete.',
       runtimeMaxSelectionScanRowsMax: 'Maximum selection scan rows',
@@ -8605,8 +9820,8 @@ function dynamicPagesClientScript() {
       diagramImportApplyPartial: 'Apply available mappings',
       diagramImportPartialApplied: 'Available D2 mappings were applied. Complete the remaining fields in Diagram Editor; the intermediate preview includes only confirmed data.',
       diagramImportApplying: 'Applying deterministic D2 mapping.',
-      diagramImportRefreshAndPreview: 'Update D2 source and run preview',
-      diagramImportRefreshing: 'Checking compatible D2 source and running preview.',
+      diagramImportRefreshAndPreview: 'Update D2 source',
+      diagramImportRefreshing: 'Checking compatible D2 source.',
       diagramImportPreviewing: 'Checking the applied D2 mapping with a draft preview.',
       diagramImportCurrentPreviewing: 'Building an intermediate diagram from the current D2 mapping.',
       diagramImportPreviewBackground: 'D2 mapping is applied. Draft preview is running in the background.',
@@ -8618,8 +9833,8 @@ function dynamicPagesClientScript() {
       diagramImportPendingSave: 'D2 mapping is not applied. Open Diagram Assistant to apply it or complete the listed fields in Diagram Editor.',
       diagramImportUnresolvedHelp: 'Resolve the listed fields before applying D2 mapping. Assistant can apply a complete proposal; use Diagram Editor only to correct it manually.',
       diagramImportUnresolvedMappingTitle: 'Data mappings required: {count}',
-      diagramImportDirectionPolicyTitle: 'Connection direction confirmation required: {count}',
-      diagramImportDirectionPolicyHelp: 'Assistant never selects data direction automatically. Confirm Data fields, D2 template arrow, or Undirected for every listed connection in Diagram Editor. A D2 template can declare this contract with vars.data.cmdp.import.connections.<edge-class>.directionPolicy.',
+      diagramImportDirectionPolicyTitle: 'Undirected connection confirmation required: {count}',
+      diagramImportDirectionPolicyHelp: 'D2 template arrow is used by default. Select Undirected in Diagram Editor only when the connection must not have a direction.',
       diagramImportDirectionPolicyContractHelp: 'Add the following D2 contract to the source and analyze it again. It applies to every connection with the listed D2 class.',
       d2WorkflowPendingTitle: 'D2 mapping is not ready for publication',
       d2WorkflowPendingHelp: 'The D2 source is saved, but its deterministic mapping is incomplete. Analyze it in Diagram Assistant, or correct the mapping in Diagram Editor and save the template.',
@@ -8764,6 +9979,9 @@ function dynamicPagesClientScript() {
       diagramImportLabelTemplate: 'Composite label template',
       diagramImportLabelTemplateForClass: 'Composite label template for {className} attributes',
       diagramImportLabelTemplateForSource: 'Composite label template for selected source',
+      diagramImportLabelTemplateForResult: 'Composite label template for result fields "{sourceName}"',
+      diagramImportLabelTemplateForParentCard: 'Composite label template for parent branch card fields "{sourceName}"',
+      diagramImportLabelTemplateForStructural: 'Composite label template for a static container',
       diagramImportLabelTemplateConfiguredInMapping: 'Configured in the element data mapping.',
       diagramImportLabelTemplateParameters: 'Template parameters',
       diagramImportLabelTemplateParametersHelp: 'Insert as $' + '{param.name}.',
@@ -9085,7 +10303,6 @@ function dynamicPagesClientScript() {
       relationTargetClass: 'Target class',
       relationDirection: 'Direction',
       relationSourceLimit: 'Source limit',
-      relationLimit: 'Relation limit',
       relationTableTitle: 'Table title',
       relationColumns: 'Related-card columns',
       relationColumnField: 'Field',
@@ -9104,7 +10321,6 @@ function dynamicPagesClientScript() {
       addRelationOperation: 'Add related objects',
       relationOperation: 'Related objects {number}',
       relationOperationFrom: 'Source objects',
-      relationOperationColumns: 'Target result fields',
       relationOperationHelp: 'The domain code is executed as an explicit CMDBuild relation traversal. A target class may be an allowed descendant of the domain endpoint superclass.',
       relationOperationDetailsRequired: 'Related objects require both a CMDBuild domain and a target class.',
       relationSelectionSourceOrder: 'A selection source can reference an earlier selection or a declared operation result.',
@@ -9332,6 +10548,7 @@ function dynamicPagesClientScript() {
       menuGeneralSettings: 'Общие настройки',
       menuRuntimeSettings: 'Runtime-настройки',
       menuDiagnostics: 'Диагностика',
+      appVersion: 'Версия',
       aboutText: 'Спроектировано и овеществлено Игорем Ляпиным email:igor.lyapin@gmail.com 2026\\n\\nПод лицензией GNU GPLv3.',
       generalSettings: 'Общие настройки',
       maxDepthHelp: 'Определяет, сколько шагов связей Designer использует для подсказок путей по каталогу. Права CMDBuild эта настройка не меняет.',
@@ -9357,6 +10574,10 @@ function dynamicPagesClientScript() {
       runtimeMaxRowsDataPreviewDefaultHelp: 'Единый лимит строк для «Извлечения» и предпросмотра диаграмм. Визуальные maxNodes и maxEdges задаются отдельно в самой диаграмме.',
       runtimeMaxRowsMax: 'Максимум строк',
       runtimeMaxRowsMaxHelp: 'Верхний предел строк, которые может вернуть одно выполнение.',
+      runtimeMaxRelationsPerCardDefault: 'Связей на одну карточку',
+      runtimeMaxRelationsPerCardDefaultHelp: 'Общий лимит связей, читаемых для одной карточки CMDBuild. Применяется ко всем операциям связей.',
+      runtimeMaxRelationsPerCardMax: 'Максимум связей на одну карточку',
+      runtimeMaxRelationsPerCardMaxHelp: 'Верхний предел общего лимита связей.',
       runtimeMaxSelectionScanRowsDefault: 'Сканирование выборки по умолчанию',
       runtimeMaxSelectionScanRowsDefaultHelp: 'Сколько карточек проверяется для выборки с фильтрами, прежде чем результат будет помечен как неполный.',
       runtimeMaxSelectionScanRowsMax: 'Максимум сканирования выборки',
@@ -9750,8 +10971,8 @@ function dynamicPagesClientScript() {
       diagramImportApplyPartial: 'Применить доступные сопоставления',
       diagramImportPartialApplied: 'Доступные D2-сопоставления применены. Заполните оставшиеся поля в «Редакторе диаграмм»; промежуточный preview содержит только подтвержденные данные.',
       diagramImportApplying: 'Применяется детерминированный D2 mapping.',
-      diagramImportRefreshAndPreview: 'Обновить D2 source и выполнить preview',
-      diagramImportRefreshing: 'Проверяется совместимость D2 source и выполняется preview.',
+      diagramImportRefreshAndPreview: 'Обновить D2 source',
+      diagramImportRefreshing: 'Проверяется совместимость D2 source.',
       diagramImportPreviewing: 'Примененный D2 mapping проверяется draft preview.',
       diagramImportCurrentPreviewing: 'Строится промежуточная диаграмма по текущему D2 mapping.',
       diagramImportPreviewBackground: 'D2 mapping применен. Draft preview выполняется в фоне.',
@@ -9763,8 +10984,8 @@ function dynamicPagesClientScript() {
       diagramImportPendingSave: 'D2 mapping не применен. Откройте «Ассистент диаграмм» для применения или исправьте указанные поля в «Редакторе диаграмм».',
       diagramImportUnresolvedHelp: 'Заполните указанные поля перед применением D2 mapping. Assistant применяет полностью готовое предложение; «Редактор диаграмм» нужен только для ручной корректировки.',
       diagramImportUnresolvedMappingTitle: 'Требуется сопоставление данных: {count}',
-      diagramImportDirectionPolicyTitle: 'Требуется подтверждение направления связей: {count}',
-      diagramImportDirectionPolicyHelp: 'Направление данных не выбирается Assistant автоматически. Для каждой связи подтвердите «По полям результата», «По стрелке D2 template» или «Без направления» в редакторе диаграмм. Шаблон D2 может зафиксировать контракт через vars.data.cmdp.import.connections.<класс-связи>.directionPolicy.',
+      diagramImportDirectionPolicyTitle: 'Требуется подтверждение связи без направления: {count}',
+      diagramImportDirectionPolicyHelp: 'По умолчанию используется стрелка D2 template. Отметьте «Без направления» в редакторе диаграмм только для связи без направления.',
       diagramImportDirectionPolicyContractHelp: 'Добавьте следующий D2 contract в исходник и повторите анализ. Он применяется ко всем связям с указанным D2 class.',
       d2WorkflowPendingTitle: 'D2 mapping не готов к публикации',
       d2WorkflowPendingHelp: 'D2 source сохранён, но детерминированный mapping ещё неполон. Проанализируйте его в «Ассистенте диаграмм» или скорректируйте mapping в «Редакторе диаграмм» и сохраните шаблон.',
@@ -9909,6 +11130,9 @@ function dynamicPagesClientScript() {
       diagramImportLabelTemplate: 'Составной label template',
       diagramImportLabelTemplateForClass: 'Составной label template атрибутов класса {className}',
       diagramImportLabelTemplateForSource: 'Составной label template выбранного источника',
+      diagramImportLabelTemplateForResult: 'Составной label template полей результата «{sourceName}»',
+      diagramImportLabelTemplateForParentCard: 'Составной label template полей карточки родительской ветви «{sourceName}»',
+      diagramImportLabelTemplateForStructural: 'Составной label template статического контейнера',
       diagramImportLabelTemplateConfiguredInMapping: 'Настраивается в сопоставлении данных элемента.',
       diagramImportLabelTemplateParameters: 'Параметры шаблона',
       diagramImportLabelTemplateParametersHelp: 'Вставляйте как $' + '{param.name}.',
@@ -10230,7 +11454,6 @@ function dynamicPagesClientScript() {
       relationTargetClass: 'Целевой класс',
       relationDirection: 'Направление',
       relationSourceLimit: 'Лимит исходных',
-      relationLimit: 'Лимит связей',
       relationTableTitle: 'Заголовок таблицы',
       relationColumns: 'Колонки связанных карточек',
       relationColumnField: 'Поле',
@@ -10249,7 +11472,6 @@ function dynamicPagesClientScript() {
       addRelationOperation: 'Добавить связанные объекты',
       relationOperation: 'Связанные объекты {number}',
       relationOperationFrom: 'Объекты-источники',
-      relationOperationColumns: 'Поля целевого результата',
       relationOperationHelp: 'Код domain выполняется как явный переход по связи CMDBuild. Целевой класс может быть разрешённым потомком суперкласса endpoint domain.',
       relationOperationDetailsRequired: 'Для связанных объектов укажите CMDBuild domain и целевой класс.',
       relationSelectionSourceOrder: 'Источник выборки может ссылаться на более раннюю выборку или объявленный результат операции.',
@@ -10499,7 +11721,7 @@ function dynamicPagesClientScript() {
     assistantDiagramMappingResult: null,
     assistantDiagramMappingResume: null,
     diagramImportSource: '',
-    diagramImportAuthoringOverrides: { roles: [], relationRules: [], structureTree: { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] } },
+    diagramImportAuthoringOverrides: { roles: [], endpointProfiles: [], relationRules: [], structureTree: { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] } },
     diagramImportAnalysisCheckpoint: null,
     diagramImportAssistantCheckpoint: null,
     diagramImportRestorePending: false,
@@ -10516,6 +11738,7 @@ function dynamicPagesClientScript() {
     diagramImportLabelTemplateErrors: {},
     diagramImportLabelAutocomplete: null,
     diagramImportEditorSpecSnapshot: '',
+    diagramImportEditorMutationRevision: 0,
     diagramImportIr: null,
     diagramImportPreview: null,
     diagramImportPreviewSource: '',
@@ -11077,7 +12300,7 @@ function dynamicPagesClientScript() {
       if (topology.length) {
         return (result.json.message || 'D2 mapping is incomplete.') + ' ' + topology.map(function (item) {
           if (Array.isArray(item.fields) && item.fields.indexOf('directionPolicy') >= 0) {
-            var recommendations = { dataFields: 'По полям результата', template: 'По стрелке D2 template', undirected: 'Без направления' };
+            var recommendations = { dataFields: 'По полям результата', undirected: 'Без направления' };
             var suggested = recommendations[String(item.directionPolicySuggestion || '')] || '';
             return String(item.displayName || 'D2 connection') + ': выберите направление данных' + (suggested ? ' (рекомендация: ' + suggested + ')' : '') + '.';
           }
@@ -11108,6 +12331,10 @@ function dynamicPagesClientScript() {
   function clientRequestId() {
     if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
     return 'cmdp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+  }
+
+  function diagramImportEndpointProfileId(prefix) {
+    return String(prefix || 'endpoint_profile') + '_' + clientRequestId();
   }
 
   function requestTimeoutError(path, requestContext) {
@@ -11763,9 +12990,17 @@ function dynamicPagesClientScript() {
       ? diagram.authoring.d2Import
       : null;
     var hasAppliedImport = Boolean(imported && imported.version === 3 && String(imported.sourceHash || '').trim() && String(imported.source || '').trim());
-    var d2Source = hasAppliedImport
+    // An analyzed source is safe to persist with its deterministic checkpoint
+    // even while an older mapping remains applied. The Diagram editor alone
+    // owns result.diagrams; Assistant Save must not replace it merely because
+    // the author inspected a newer D2 source.
+    var analyzedSource = state.diagramImportProposal && state.diagramImportProposal.version === 3 &&
+      String(state.diagramImportProposal.sourceText || '') === String(state.diagramImportSource || '')
+      ? String(state.diagramImportProposal.sourceText || '')
+      : '';
+    var d2Source = analyzedSource || (hasAppliedImport
       ? String(current.d2.source || '')
-      : String(state.diagramImportSource || current.d2.source || '');
+      : String(state.diagramImportSource || current.d2.source || ''));
     return {
       version: 1,
       assistant: {
@@ -12076,6 +13311,8 @@ function dynamicPagesClientScript() {
         maxRowsPreviewDefault: 25,
         maxRowsDataPreviewDefault: 100,
         maxRowsMax: 2000,
+        maxRelationsPerCardDefault: 100,
+        maxRelationsPerCardMax: 5000,
         maxClassesDefault: 100,
         maxClassesMax: 500,
         maxDomainsDefault: 100,
@@ -12262,25 +13499,21 @@ function dynamicPagesClientScript() {
     }
     if (!options.preserveAssistantState) {
       invalidateAssistantObjectFlowRequests();
+      stopAssistantGenerationTimer();
       resetAssistantAuthoringDirty();
       state.assistantDraftIntent = '';
+      state.assistantDraftResult = null;
+      state.assistantGenerating = false;
+      state.assistantGeneratingStartedAt = 0;
       state.assistantTaskMode = normalizeOutputMode(state.assistantTaskMode || 'both');
       state.assistantObjectFlowIntent = normalizeAssistantObjectFlowIntentClient(authoring.assistant.objectFlowIntent);
-      state.assistantFlowProposal = null;
-      state.assistantFlowSemanticPlan = null;
-      state.assistantFlowRefinement = null;
-      state.assistantFlowRejected = null;
-      state.assistantFlowErrors = [];
-      state.assistantFlowDiagnostics = {};
-      state.assistantFlowFeedback = null;
-      state.assistantFlowErrorStage = '';
-      state.assistantFlowCanApply = false;
-      state.assistantFlowExplanation = '';
-      state.assistantFlowWarnings = [];
+      resetAssistantObjectFlowProposal();
       state.assistantTemplatePromptOverrides = normalizeTemplateAssistantPromptOverridesClient(authoring.assistant.systemPromptOverrides);
       state.assistantDiagramInterpretPrompt = String(authoring.assistant.diagramInterpretPrompt || '');
       state.assistantDiagramMappingPrompt = String(authoring.assistant.diagramMappingPrompt || '');
       state.assistantFlowBusy = false;
+      state.assistantFlowExpandedBlockIds = {};
+      state.assistantFlowDragSourceId = '';
       state.assistantDiagramInterpretBusy = false;
       state.assistantDiagramMappingBusy = false;
       state.assistantDiagramInterpretResult = null;
@@ -12298,6 +13531,7 @@ function dynamicPagesClientScript() {
       roles: (Array.isArray(d2Import.roles) ? d2Import.roles : []).map(function (role) {
         return { id: String(role && role.id || ''), visualKind: diagramImportRoleVisualKindClient(role), labelTemplate: String(role && role.labelTemplate || '') };
       }).filter(function (role) { return role.id; }),
+      endpointProfiles: cloneJsonValue(d2Import.endpointProfiles || [], []),
       relationRules: cloneJsonValue(d2Import.relationRules || [], []),
       structureTree: cloneJsonValue(d2Import.structureTree || {}, { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] })
     };
@@ -13039,11 +14273,19 @@ function dynamicPagesClientScript() {
     return diagramImportCatalogDisplayLabel(identifier, item && item.description || '');
   }
 
-  function diagramImportLabelTemplateLabel(className) {
-    var classLabel = diagramImportClassDisplayLabel(className);
-    return classLabel
-      ? t('diagramImportLabelTemplateForClass', { className: classLabel })
-      : t('diagramImportLabelTemplateForSource');
+  function diagramImportLabelTemplateLabel(sourceInfo, materializationKind, spec) {
+    var source = sourceInfo && typeof sourceInfo === 'object' ? sourceInfo : {};
+    var kind = String(materializationKind || '');
+    var stage = source.stage && typeof source.stage === 'object' ? source.stage : {};
+    var sourceName = String(stage.label || userFacingResultLabel(stage.alias || source.stageId || '', spec || defaultSpec()));
+    if (kind === 'stage' && source.stageId) {
+      return t('diagramImportLabelTemplateForResult', { sourceName: sourceName });
+    }
+    if (kind === 'parentCard' && source.stageId) {
+      return t('diagramImportLabelTemplateForParentCard', { sourceName: sourceName });
+    }
+    if (kind === 'structural') return t('diagramImportLabelTemplateForStructural');
+    return t('diagramImportLabelTemplateForSource');
   }
 
   function diagramImportFieldDisplayLabel(className, fieldName) {
@@ -13423,8 +14665,6 @@ function dynamicPagesClientScript() {
       domain: '',
       targetClass: '',
       direction: 'both',
-      columns: ['Code', 'Description'],
-      limit: 100,
       distinct: true
     };
   }
@@ -13440,7 +14680,6 @@ function dynamicPagesClientScript() {
       return fallbackValue;
     };
     var alias = value(['as', 'alias', 'outputAlias'], fallback.as);
-    var columns = Array.isArray(operation.columns) ? operation.columns : (Array.isArray(operation.relatedColumns) ? operation.relatedColumns : fallback.columns);
     return {
       id: value(['id'], 'relation:' + (alias || fallback.as)),
       type: 'relation',
@@ -13449,8 +14688,6 @@ function dynamicPagesClientScript() {
       domain: value(['domain', 'domainName', 'domainCode'], ''),
       targetClass: value(['targetClass', 'className', 'target'], ''),
       direction: value(['direction'], 'both') || 'both',
-      columns: uniqueList(columns.map(function (column) { return String(column || '').trim(); }).filter(Boolean)),
-      limit: Number(operation.limit) || fallback.limit,
       distinct: operation.distinct !== false
     };
   }
@@ -13466,8 +14703,6 @@ function dynamicPagesClientScript() {
       domain: '',
       targetClass: '',
       direction: 'both',
-      columns: [],
-      limit: 100,
       distinct: true,
       rules: [defaultMatchingRule()]
     };
@@ -13484,7 +14719,6 @@ function dynamicPagesClientScript() {
       return fallbackValue;
     };
     var alias = value(['as', 'alias', 'outputAlias'], fallback.as);
-    var columns = Array.isArray(operation.columns) ? operation.columns : (Array.isArray(operation.relatedColumns) ? operation.relatedColumns : fallback.columns);
     var rawRules = Array.isArray(operation.rules || operation.where) ? (operation.rules || operation.where) : [];
     var rules = rawRules.map(normalizeMatchingRule).filter(function (rule) {
       return rule.leftColumn || rule.rightColumn || rule.leftRegex || rule.rightRegex;
@@ -13499,8 +14733,6 @@ function dynamicPagesClientScript() {
       domain: value(['domain', 'domainName', 'domainCode'], ''),
       targetClass: value(['targetClass', 'className', 'target'], ''),
       direction: value(['direction'], 'both') || 'both',
-      columns: uniqueList(columns.map(function (column) { return String(column || '').trim(); }).filter(Boolean)),
-      limit: Number(operation.limit) || fallback.limit,
       distinct: operation.distinct !== false,
       rules: rules
     };
@@ -13647,8 +14879,6 @@ function dynamicPagesClientScript() {
               domain: step.domain,
               targetClass: step.targetClass,
               direction: step.direction,
-              columns: step.columns || step.relatedColumns || [],
-              limit: step.limit,
               distinct: step.distinct
             };
           }
@@ -13662,8 +14892,6 @@ function dynamicPagesClientScript() {
               domain: step.domain,
               targetClass: step.targetClass,
               direction: step.direction,
-              columns: step.columns || step.relatedColumns || [],
-              limit: step.limit,
               distinct: step.distinct,
               rules: step.rules || step.where || []
             };
@@ -14248,7 +15476,7 @@ function dynamicPagesClientScript() {
       var groupDraft = captureObjectGroupDraftFromDom();
       var groupSelections = groupDraft && Array.isArray(groupDraft.selections) ? groupDraft.selections : [];
       var sourceAlias = String(groupSelection && groupSelection.querySelector('[data-object-selection-field="from"]') && groupSelection.querySelector('[data-object-selection-field="from"]').value || '').trim();
-      return objectGroupSourceColumnOptions(groupSelections, groupSelectionIndex, sourceAlias, query);
+      return objectGroupSourceColumnOptions(groupSelections, groupSelectionIndex, sourceAlias, query, readCurrentSpec());
     }
     if (kind === 'diagram' || kind === 'view') {
       return diagramColumnOptionRowsForSource(readCurrentSpec(), picker.getAttribute('data-catalog-field-picker-source') || '', query);
@@ -14269,10 +15497,13 @@ function dynamicPagesClientScript() {
     }
     if (kind === 'stage') {
       var spec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
-      var stage = diagramImportStageById(spec, picker.getAttribute('data-catalog-field-picker-stage') || '') || {};
-      return uniqueList(stage.columns || []).map(function (name) {
-        return { value: name, label: diagramImportStageFieldDisplayLabel(stage, name) || name };
+      var stageSource = normalizeDiagramImportConditionCardSourceClient({
+        className: picker.getAttribute('data-catalog-field-picker-card-class') || '',
+        classColumn: picker.getAttribute('data-catalog-field-picker-card-class-column') || '',
+        idColumn: picker.getAttribute('data-catalog-field-picker-card-id-column') || '',
+        label: picker.getAttribute('data-catalog-field-picker-card-label') || ''
       });
+      return diagramImportStageFieldOptions(spec, picker.getAttribute('data-catalog-field-picker-stage') || '', query, stageSource);
     }
     if (kind === 'relationPath') {
       return catalogDomainRelationPathOptions(picker.getAttribute('data-catalog-field-picker-class') || '', query).map(function (item) {
@@ -14302,14 +15533,20 @@ function dynamicPagesClientScript() {
       var selectionIndex = Number(selection && selection.getAttribute('data-object-selection-index') || 0);
       var draft = captureObjectGroupDraftFromDom();
       var sourceAlias = String(selection && selection.querySelector('[data-object-selection-field="from"]') && selection.querySelector('[data-object-selection-field="from"]').value || '').trim();
-      var source = (draft.selections || []).slice(0, Math.max(0, selectionIndex)).find(function (candidate, index) {
-        return String(candidate && (candidate.alias || objectSelectionAlias(index)) || '').trim() === sourceAlias;
-      });
-      add(source && source.className);
+      flowCatalogRootClassNames(draft, readCurrentSpec(), sourceAlias, selectionIndex).forEach(add);
     } else if (kind === 'diagram' || kind === 'view' || kind === 'selection') {
       add(sourceClassForAlias(readCurrentSpec(), picker.getAttribute('data-catalog-field-picker-source') || ''));
+    } else if (kind === 'stage') {
+      var stageSpec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
+      var stage = diagramImportStageById(stageSpec, picker.getAttribute('data-catalog-field-picker-stage') || '') || {};
+      var sourceClass = String(picker.getAttribute('data-catalog-field-picker-card-class') || '').trim();
+      if (sourceClass) add(sourceClass);
+      else diagramImportStageDirectClassNames(stage).forEach(add);
     } else if (kind === 'flow') {
-      add(sourceClassForAlias(readCurrentSpec(), picker.getAttribute('data-catalog-field-picker-source') || ''));
+      var operationNode = picker.closest('[data-flow-operation]');
+      var operationIndex = Number(operationNode && operationNode.getAttribute('data-flow-operation-index') || 0);
+      var flowDraft = state.relationDraft || captureRelationDraftFromDom();
+      flowCatalogRootClassNames(flowDraft, readCurrentSpec(), picker.getAttribute('data-catalog-field-picker-source') || '', operationIndex).forEach(add);
     }
     return classes;
   }
@@ -14566,7 +15803,10 @@ function dynamicPagesClientScript() {
     return matchingColumnOptionRowsForSelection(spec, block.with, false, undefined, includeCatalogPaths);
   }
 
-  function objectGroupSourceColumnOptions(selections, selectionIndex, sourceAlias, searchQuery) {
+  function objectGroupSourceColumnOptions(selections, selectionIndex, sourceAlias, searchQuery, spec) {
+    var currentSpec = spec || defaultSpec();
+    var semantic = matchingColumnOptionRowsForOutput(currentSpec, sourceAlias, {}, true, searchQuery);
+    if (semantic.length) return semantic;
     var source = (selections || []).slice(0, Math.max(0, Number(selectionIndex) || 0)).find(function (selection, index) {
       return String(selection && (selection.alias || objectSelectionAlias(index)) || '').trim() === String(sourceAlias || '').trim();
     });
@@ -14594,7 +15834,7 @@ function dynamicPagesClientScript() {
     var values = Object.keys(params).sort().map(function (name) {
       return { value: '$' + '{param.' + name + '}', label: t('objectGroupValueParam') + ': ' + name };
     });
-    objectGroupSourceColumnOptions(selections, selectionIndex, sourceAlias).forEach(function (item) {
+    objectGroupSourceColumnOptions(selections, selectionIndex, sourceAlias, '', spec).forEach(function (item) {
       values.push({ value: '$' + '{previous.' + item.value + '}', label: t('objectGroupValueColumn') + ': ' + item.label });
     });
     var seen = {};
@@ -14999,9 +16239,31 @@ function dynamicPagesClientScript() {
     if (!operation) return matchingColumnOptionRowsForOutput(spec, name, undefined, includeCatalogPaths, searchQuery);
     var left = flowColumnOptionRows(model, spec, operation.from, operationIndex, seenAliases, includeCatalogPaths, searchQuery);
     if (operation.type === 'relation') {
-      return uniqueList(['SourceClass', 'SourceId', 'SourceCode', 'SourceDescription', 'Domain', 'RelationId', 'RelationDirection', 'RelationSourceSide', 'RelatedClass', 'RelatedId', 'Class', '_id', 'Code', 'Description'].concat(operation.columns || [])).map(function (column) {
+      var relationColumns = ['SourceClass', 'SourceId', 'SourceCode', 'SourceDescription', 'Domain', 'RelationId', 'RelationDirection', 'RelationSourceSide', 'RelatedClass', 'RelatedId', 'Class', '_id', 'Code', 'Description'].map(function (column) {
         return { value: column, label: column };
       });
+      // A relation retains its related card as the current row and the full
+      // source row under Source*/Source_* provenance. Expose both semantic
+      // card sources; declared runtime columns are only a projection, not this list.
+      left.forEach(function (item) {
+        var value = String(item && item.value || '');
+        if (!value) return;
+        var target = value === 'Class' ? 'SourceClass'
+          : value === '_id' ? 'SourceId'
+            : value === 'Code' ? 'SourceCode'
+              : value === 'Description' ? 'SourceDescription'
+                : 'Source_' + value;
+        if (!relationColumns.some(function (candidate) { return candidate.value === target; })) {
+          relationColumns.push({ value: target, label: 'Исходная карточка: ' + String(item.label || value) });
+        }
+      });
+      if (includeCatalogPaths) {
+        catalogScopePathOptions(operation.targetClass || sourceClassForAlias(spec || {}, name), searchQuery).forEach(function (item) {
+          if (!item || !item.value || relationColumns.some(function (candidate) { return candidate.value === item.value; })) return;
+          relationColumns.push({ value: item.value, label: item.label || item.value });
+        });
+      }
+      return relationColumns;
     }
     if (operation.type === 'match') {
       var prefix = operation.rightPrefix || objectSelectionOutputPrefix(spec || defaultSpec(), operation.with);
@@ -15018,6 +16280,40 @@ function dynamicPagesClientScript() {
       });
     }
     return left;
+  }
+
+  // All editable Object Flow fields are derived from the retained card
+  // lineage, not from the narrow technical columns declaration. This
+  // function is shared by query-first pickers to lazy-load every class that
+  // can legitimately contribute a field to an intermediate result.
+  function flowCatalogRootClassNames(model, spec, alias, operationIndex, seenAliases) {
+    var seen = seenAliases || {};
+    var name = String(alias || '').trim();
+    if (!name || seen[name]) return [];
+    seen[name] = true;
+    var classes = [];
+    var add = function (className) {
+      var value = String(className || '').trim();
+      if (value && classes.indexOf(value) < 0) classes.push(value);
+    };
+    var selection = (model && model.selections || []).find(function (item, index) {
+      return String(item && (item.alias || objectSelectionAlias(index)) || '') === name;
+    });
+    if (selection) {
+      add(selection.className || sourceClassForAlias(spec || defaultSpec(), name));
+      return classes;
+    }
+    var operations = flowOperations(model || {}).slice(0, Number.isFinite(Number(operationIndex)) ? Number(operationIndex) : undefined);
+    var operation = operations.find(function (item) { return item && String(item.as || '') === name; });
+    if (!operation) {
+      add(sourceClassForAlias(spec || defaultSpec(), name));
+      return classes;
+    }
+    if (operation.type === 'relation') add(operation.targetClass || sourceClassForAlias(spec || defaultSpec(), name));
+    [operation.from, operation.with].forEach(function (candidate) {
+      flowCatalogRootClassNames(model, spec, candidate, operationIndex, seen).forEach(add);
+    });
+    return classes;
   }
 
   function renderObjectMatchingBlock(block, operationIndex, matchIndex, model, spec) {
@@ -15140,8 +16436,6 @@ function dynamicPagesClientScript() {
       '<label>' + t('relationDomain') + '<select data-relation-operation-field="domain">' + renderDomainOptions(operation.domain) + '</select></label>',
       '<label>' + t('relationTargetClass') + '<select data-relation-operation-field="targetClass">' + renderClassOptions(operation.targetClass) + '</select></label>',
       '<label>' + t('relationDirection') + '<select data-relation-operation-field="direction">' + renderRelationDirectionOptions(operation.direction) + '</select></label>',
-      '<label>' + t('relationOperationColumns') + renderCatalogFieldMultiPicker('data-relation-operation-field="columns"', operation.columns, [], { kind: 'related', class: operation.targetClass || '' }) + '</label>',
-      '<label>' + t('relationLimit') + '<input data-relation-operation-field="limit" type="number" min="1" value="' + escapeHtml(String(operation.limit)) + '"></label>',
       renderResultAliasField('data-relation-operation-field="as"', operation.as, spec),
       '</div>',
       '<p class="muted">' + t('relationOperationHelp') + '</p>',
@@ -15177,8 +16471,6 @@ function dynamicPagesClientScript() {
       '<label>' + t('relationDomain') + '<select data-exists-related-field="domain">' + renderDomainOptions(operation.domain) + '</select></label>',
       '<label>' + t('relationTargetClass') + '<select data-exists-related-field="targetClass">' + renderClassOptions(operation.targetClass) + '</select></label>',
       '<label>' + t('relationDirection') + '<select data-exists-related-field="direction">' + renderRelationDirectionOptions(operation.direction) + '</select></label>',
-      '<label>' + t('relationOperationColumns') + renderCatalogFieldMultiPicker('data-exists-related-field="columns"', operation.columns, [], { kind: 'related', class: operation.targetClass || '' }) + '</label>',
-      '<label>' + t('relationLimit') + '<input data-exists-related-field="limit" type="number" min="1" value="' + escapeHtml(String(operation.limit)) + '"></label>',
       renderResultAliasField('data-exists-related-field="as"', operation.as, spec),
       '</div>',
       '<div class="matching-rule-list" data-matching-rule-list>', rows, '</div>',
@@ -15622,6 +16914,8 @@ function dynamicPagesClientScript() {
       renderNumberSetting('cmdp-runtime-max-rows-preview-default', 'runtimeMaxRowsPreviewDefault', 'runtimeMaxRowsPreviewDefaultHelp', executionLimits.maxRowsPreviewDefault, { max: 2000 }),
       renderNumberSetting('cmdp-runtime-max-rows-data-preview-default', 'runtimeMaxRowsDataPreviewDefault', 'runtimeMaxRowsDataPreviewDefaultHelp', executionLimits.maxRowsDataPreviewDefault, { max: 2000 }),
       renderNumberSetting('cmdp-runtime-max-rows-max', 'runtimeMaxRowsMax', 'runtimeMaxRowsMaxHelp', executionLimits.maxRowsMax, { max: 2000 }),
+      renderNumberSetting('cmdp-runtime-max-relations-per-card-default', 'runtimeMaxRelationsPerCardDefault', 'runtimeMaxRelationsPerCardDefaultHelp', executionLimits.maxRelationsPerCardDefault, { max: executionLimits.maxRelationsPerCardMax }),
+      renderNumberSetting('cmdp-runtime-max-relations-per-card-max', 'runtimeMaxRelationsPerCardMax', 'runtimeMaxRelationsPerCardMaxHelp', executionLimits.maxRelationsPerCardMax, { max: 50000 }),
       renderNumberSetting('cmdp-runtime-max-selection-scan-rows-default', 'runtimeMaxSelectionScanRowsDefault', 'runtimeMaxSelectionScanRowsDefaultHelp', executionLimits.maxSelectionScanRowsDefault, { max: executionLimits.maxSelectionScanRowsMax }),
       renderNumberSetting('cmdp-runtime-max-selection-scan-rows-max', 'runtimeMaxSelectionScanRowsMax', 'runtimeMaxSelectionScanRowsMaxHelp', executionLimits.maxSelectionScanRowsMax, { max: 50000 }),
       renderNumberSetting('cmdp-runtime-max-classes-default', 'runtimeMaxClassesDefault', 'runtimeMaxClassesDefaultHelp', executionLimits.maxClassesDefault, { max: 500 }),
@@ -16204,6 +17498,7 @@ function dynamicPagesClientScript() {
   function renderAbout() {
     return [
       '<section class="section" id="cmdp-about"><h2>' + t('menuAbout') + '</h2>',
+      '<dl class="about-version"><dt>' + escapeHtml(t('appVersion')) + '</dt><dd data-app-version>' + escapeHtml(String(boot.appVersion || '0.0.0.0')) + '</dd></dl>',
       '<p>' + escapeHtml(t('aboutText')).replace(/\\n/g, '<br>') + '</p>',
       '</section>'
     ].join('');
@@ -16333,9 +17628,11 @@ function dynamicPagesClientScript() {
       actions.push(renderActionButton('new-template', t('newTemplate'), { primary: true }));
       actions.push(renderActionButton('new-cmdb-build-view', t('templateKindCmdbBuildView')));
       actions.push(renderActionButton('save-template', t('save'), { disabled: saveDisabled, title: saveTitle }));
-    } else if (section === 'assistant' || section === 'diagram-assistant') {
+    } else if (section === 'assistant') {
       actions.push(renderActionButton('draft-validate', t('validate')));
       actions.push(renderActionButton('draft-preview', t('preview')));
+    } else if (section === 'diagram-assistant') {
+      actions.push(renderActionButton('draft-validate', t('validate')));
     } else if (section === 'params') {
       actions.push(renderActionButton('add-param-row', t('addParam')));
       actions.push(renderActionButton('apply-params', t('applyParams'), { primary: true }));
@@ -17577,6 +18874,10 @@ function dynamicPagesClientScript() {
       : null;
     var source = String(imported.source || '');
     var storedRoles = Array.isArray(imported.roles) ? imported.roles : [];
+    var legacyPrimarySource = Array.isArray(imported.structureTree && imported.structureTree.items) && imported.structureTree.items.some(function (item) {
+      var mapping = item && item.mapping && typeof item.mapping === 'object' ? item.mapping : {};
+      return Boolean(mapping.primary && mapping.primary.cardSource);
+    });
     var semanticRevisionCurrent = Number(imported.semanticModelRevision || 0) === D2_IMPORT_SEMANTIC_MODEL_REVISION;
     if (!semanticRevisionCurrent || !structure || !source.trim() || !storedRoles.length || !imported.structureTree || Number(imported.structureTree.version || 0) !== D2_IMPORT_STRUCTURE_TREE_VERSION || !Array.isArray(imported.structureTree.items)) {
       return {
@@ -17612,6 +18913,33 @@ function dynamicPagesClientScript() {
       role.styleHints = cloneJsonValue(classByKey[key] && classByKey[key].styleHints || role.styleHints || {}, {});
       return role;
     });
+    var relationRulesRestored = false;
+    var relationRules = cloneJsonValue(imported.relationRules || [], []).map(function (rule) {
+      var current = rule && typeof rule === 'object' && !Array.isArray(rule) ? rule : {};
+      var complete = ['relationCard', 'attributeEndpoints', 'networkEndpoints', 'deterministicEndpoints'].indexOf(String(current.mode || '')) >= 0 &&
+        Boolean(String(current.sourceStageId || '').trim()) &&
+        Boolean(String(current.sourceField || '').trim()) &&
+        Boolean(String(current.targetField || '').trim());
+      var legacy = current.legacySuggestion && typeof current.legacySuggestion === 'object' && !Array.isArray(current.legacySuggestion)
+        ? current.legacySuggestion
+        : null;
+      var legacyComplete = legacy && ['relationCard', 'attributeEndpoints', 'networkEndpoints', 'deterministicEndpoints'].indexOf(String(legacy.mode || '')) >= 0 &&
+        Boolean(String(legacy.sourceStageId || '').trim()) &&
+        Boolean(String(legacy.sourceField || '').trim()) &&
+        Boolean(String(legacy.targetField || '').trim());
+      if (complete || !legacyComplete) return current;
+      relationRulesRestored = true;
+      var restored = cloneJsonValue(current, {});
+      delete restored.legacySuggestion;
+      restored.mode = String(legacy.mode || '');
+      restored.sourceStageId = String(legacy.sourceStageId || '');
+      restored.sourceField = String(legacy.sourceField || '');
+      restored.targetField = String(legacy.targetField || '');
+      restored.labelTemplate = String(legacy.labelTemplate || '') || (String(legacy.labelField || '').trim() ? '$' + '{' + String(legacy.labelField || '').trim() + '}' : '');
+      delete restored.labelField;
+      restored.directionPolicy = String(current.directionPolicy || legacy.directionPolicy || '');
+      return restored;
+    });
     var proposal = {
       version: 3,
       editorMode: 'applied',
@@ -17629,12 +18957,23 @@ function dynamicPagesClientScript() {
       structure: structure,
       classes: cloneJsonValue(imported.classes || [], []),
       roles: roles,
-      relationRules: cloneJsonValue(imported.relationRules || [], []),
+      endpointProfiles: cloneJsonValue(imported.endpointProfiles || [], []),
+      relationRules: relationRules,
       templateGrammar: cloneJsonValue(imported.templateGrammar || {}, {}),
       structureTree: cloneJsonValue(imported.structureTree || {}, {}),
-      warnings: [],
+      warnings: [].concat(
+        legacyPrimarySource
+          ? ['Сохраненное сопоставление переведено на поля выбранного результата Object Flow. Нажмите «Сохранить шаблон», чтобы закрепить новую форму mapping.']
+          : [],
+        relationRulesRestored
+          ? ['Сохраненное правило связи восстановлено из точного детерминированного class-level contract. Нажмите «Сохранить шаблон», чтобы закрепить его в текущей форме.']
+          : []
+      ),
       unresolved: []
     };
+    if (diagramImportEndpointProfilesForPlacementsClient(proposal, spec)) {
+      proposal.warnings.push('Правила сопоставления переведены с типа D2 на конкретные элементы структуры. Нажмите «Сохранить шаблон», чтобы закрепить изменения.');
+    }
     refreshDiagramImportSemanticState(proposal);
     return proposal;
   }
@@ -17677,6 +19016,7 @@ function dynamicPagesClientScript() {
 
   function storeDiagramImportEditorMutation(proposal) {
     if (!proposal || proposal.version !== 3) return proposal;
+    state.diagramImportEditorMutationRevision = Number(state.diagramImportEditorMutationRevision || 0) + 1;
     invalidateDiagramImportEditorIndexes(proposal);
     storeDiagramImportEditorModel(proposal);
     state.diagramImportAuthoringOverrides = diagramImportAuthoringOverrides(proposal);
@@ -18140,6 +19480,7 @@ function dynamicPagesClientScript() {
           key: String(context && context.key || ''),
           roleId: String(context && context.roleId || ''),
           parentContextKey: String(context && context.parentContextKey || ''),
+          templateStatic: context && context.templateStatic === true,
           elementKeys: uniqueList(context && context.elementKeys || []).sort()
         };
       }).filter(function (context) { return context.key && context.roleId && context.elementKeys.length; });
@@ -18165,12 +19506,13 @@ function dynamicPagesClientScript() {
       if (!elementKey || !role.id) return;
       var parentContextKey = contextByElementKey[String(element && element.parentKey || '').trim()] || '';
       var parentContext = contextsByKey[parentContextKey] || null;
-      var rolePath = parentContext ? parentContext.rolePath.concat(String(role.id)) : [String(role.id)];
+      var templateStatic = Boolean(element && element.templateStatic) || Boolean(parentContext && parentContext.templateStatic);
+      var rolePath = parentContext ? parentContext.rolePath.concat(templateStatic ? String(role.id) + '@' + elementKey : String(role.id)) : [templateStatic ? String(role.id) + '@' + elementKey : String(role.id)];
       // A proposal without server-provided context metadata is stale. Keep a
       // local fallback only for UI diagnostics; validation will require a new
       // analysis before the mapping can be applied.
       var key = 'stale_structure_context_' + diagramImportClientStableSuffix(rolePath.join('>'));
-      var context = contextsByKey[key] || { key: key, roleId: String(role.id), rolePath: rolePath, parentContextKey: parentContextKey, elementKeys: [] };
+      var context = contextsByKey[key] || { key: key, roleId: String(role.id), rolePath: rolePath, parentContextKey: parentContextKey, templateStatic: templateStatic, elementKeys: [] };
       context.elementKeys.push(elementKey);
       contextsByKey[key] = context;
       contextByElementKey[elementKey] = key;
@@ -18200,6 +19542,7 @@ function dynamicPagesClientScript() {
     item.templateContextKey = String(context.key || '');
     item.templateElementKeys = uniqueList(context.elementKeys || []).sort();
     item.templateElementKey = String(item.templateElementKeys[0] || '');
+    item.templateStatic = context.templateStatic === true;
     return Boolean(item.templateContextKey && item.templateElementKey);
   }
 
@@ -18211,7 +19554,7 @@ function dynamicPagesClientScript() {
 
   function normalizeDiagramDirectionPolicyClient(value) {
     var policy = String(value || '').trim();
-    return ['dataFields', 'template', 'undirected'].indexOf(policy) >= 0 ? policy : '';
+    return policy === 'undirected' ? 'undirected' : 'dataFields';
   }
 
   function refreshDiagramImportSemanticState(proposal) {
@@ -18229,15 +19572,6 @@ function dynamicPagesClientScript() {
       var issue = String(treeIssues[String(item.id)] || '');
       if (issue) proposal.unresolved.push({ id: item.id, displayName: role.label || role.key || item.id, family: 'structureTree', fields: [issue] });
       var stage = stageById[diagramImportEffectiveSourceStageIdClient(role, item)];
-      var expectedClass = String(mapping && mapping.primary && mapping.primary.className || '');
-      var ancestor = diagramImportNearestMaterializedAncestorClient(proposal, item);
-      var parentStage = ancestor && ancestor.stageId ? stageById[String(ancestor.stageId)] || {} : {};
-      var primaryProjection = diagramImportPrimaryCardSourceClient(stage || {}, mapping.primary || {}, parentStage);
-      if (stage && primaryProjection.ambiguous) {
-        proposal.unresolved.push({ id: item.id, displayName: role.label || role.key || item.id, family: 'structureTree', fields: ['Выберите карточку результата для элемента диаграммы.'] });
-      } else if (stage && expectedClass && primaryProjection.source && String(primaryProjection.source.className || '') !== expectedClass) {
-        proposal.unresolved.push({ id: item.id, displayName: role.label || role.key || item.id, family: 'structureTree', fields: ['Выбранный результат возвращает другой класс CMDBuild.'] });
-      }
       (mapping && Array.isArray(mapping.related) ? mapping.related : []).forEach(function (related) {
         if (related && related.legacyTraversal) {
           proposal.unresolved.push({ id: related.id, family: 'related', fields: ['named Object Flow result'] });
@@ -18257,20 +19591,23 @@ function dynamicPagesClientScript() {
       });
     });
     (Array.isArray(proposal.relationRules) ? proposal.relationRules : []).forEach(function (rule) {
+      if (rule && rule.enabled === false) return;
       if (rule && rule.d2ElementKey) {
         var d2ClassKeys = Array.isArray(rule.d2ClassKeys) ? rule.d2ClassKeys.map(function (value) { return String(value || '').trim(); }).filter(Boolean) : [];
         if (!d2ClassKeys.length && String(rule.d2ClassKey || '').trim()) d2ClassKeys.push(String(rule.d2ClassKey).trim());
         var d2ElementKeys = Array.isArray(rule.d2ElementKeys) ? rule.d2ElementKeys.map(function (value) { return String(value || '').trim(); }).filter(Boolean) : [];
         if (!d2ElementKeys.length && String(rule.d2ElementKey || '').trim()) d2ElementKeys.push(String(rule.d2ElementKey).trim());
-        if (!String(rule.directionPolicy || '')) {
+        if (!normalizeDiagramDirectionPolicyClient(rule.directionPolicy)) {
           proposal.unresolved.push({ id: rule.id, displayName: rule.d2ClassKey || rule.d2Label || rule.d2ElementKey, family: 'topology', fields: ['directionPolicy'], directionPolicySuggestion: String(rule.directionPolicySuggestion || '').trim(), d2ClassKey: String(rule.d2ClassKey || ''), d2ClassKeys: d2ClassKeys, d2ElementKeys: d2ElementKeys });
           return;
         }
-        var cardReady = ['relationCard', 'networkEndpoints', 'deterministicEndpoints'].includes(String(rule.mode || '')) && String(rule.sourceStageId || '') && String(rule.sourceField || '') && String(rule.targetField || '');
+        var cardReady = ['relationCard', 'attributeEndpoints', 'networkEndpoints', 'deterministicEndpoints'].includes(String(rule.mode || '')) && String(rule.sourceStageId || '') && String(rule.sourceField || '') && String(rule.targetField || '');
         if (!cardReady) proposal.unresolved.push({ id: rule.id, displayName: rule.d2ClassKey || rule.d2Label || rule.d2ElementKey, family: 'topology', fields: ['connection Object Flow result'] });
         return;
       }
-      if (!rule.parentRoleId || !rule.childRoleId) proposal.unresolved.push({ id: rule.id, family: 'relationRules', fields: ['template endpoints'] });
+      // Current connection algorithms are keyed by a D2 class. They do not
+      // own a pair of template endpoints or a selected endpoint subset:
+      // every compatible placement rule participates at runtime.
     });
     return proposal;
   }
@@ -18323,27 +19660,43 @@ function dynamicPagesClientScript() {
     var result = [];
     String(template || '').replace(/\\$\\{([^}]+)\\}/g, function (match, raw) {
       var token = String(raw || '').trim();
-      if (diagramImportChildTemplateTokenClient(token) || token.indexOf('child.') === 0 || token.indexOf('child:') === 0) return match;
+      if (diagramImportChildTemplateTokenClient(token) || token.indexOf('child.') === 0 || token.indexOf('child:') === 0 || token.indexOf('param.') === 0 || token.indexOf('params.') === 0 || token.indexOf('row.') === 0) return match;
       var field = token.replace(/^row\\./, '').replace(/^primary\\./, '');
-      if (field && field.indexOf('.') < 0 && result.indexOf(field) < 0) result.push(field);
+      if (field && result.indexOf(field) < 0) result.push(field);
       return match;
     });
     return result;
   }
 
+  function diagramImportPrimaryLabelTemplateClient(primary, fallback) {
+    var source = primary && typeof primary === 'object' && !Array.isArray(primary) ? primary : {};
+    // A blank value is an intentional label for this concrete D2 placement.
+    // It must not be replaced with a role/class label or \${Description}.
+    return Object.prototype.hasOwnProperty.call(source, 'labelTemplate')
+      ? String(source.labelTemplate === undefined || source.labelTemplate === null ? '' : source.labelTemplate)
+      : String(fallback === undefined || fallback === null ? '\${Description}' : fallback);
+  }
+
+  function diagramImportRoleLabelTemplateClient(role, fallback) {
+    var source = role && typeof role === 'object' && !Array.isArray(role) ? role : {};
+    return Object.prototype.hasOwnProperty.call(source, 'labelTemplate')
+      ? String(source.labelTemplate === undefined || source.labelTemplate === null ? '' : source.labelTemplate)
+      : String(fallback === undefined || fallback === null ? '' : fallback);
+  }
+
   function diagramImportPrimaryDataFieldsClient(role, primary) {
-    var template = String(primary && primary.labelTemplate || role && role.labelTemplate || '\${Description}');
+    var template = diagramImportPrimaryLabelTemplateClient(primary, diagramImportRoleLabelTemplateClient(role, '\${Description}'));
     return uniqueList(diagramImportPrimaryTemplateFieldsClient(template).concat(primary && primary.structuredFields || ['Code', 'Description']))
       .filter(function (field) { return field !== '_id'; });
   }
 
   function renderDiagramImportNodeDataFields(role, spec, stage, primary, fieldAttribute) {
-    var className = String(primary && primary.className || stage && stage.className || '');
-    var required = diagramImportPrimaryTemplateFieldsClient(primary && primary.labelTemplate || role && role.labelTemplate || '\${Description}');
+    var required = diagramImportPrimaryTemplateFieldsClient(diagramImportPrimaryLabelTemplateClient(primary, diagramImportRoleLabelTemplateClient(role, '\${Description}')));
     var selected = diagramImportPrimaryDataFieldsClient(role, primary).filter(function (field) { return field !== '_id'; });
-    var available = uniqueList((stage && Array.isArray(stage.columns) && stage.columns.length
-      ? stage.columns
-      : catalogAttributeOptions(className).map(function (item) { return item.name; })).concat(selected)).filter(function (field) { return field !== '_id'; });
+    var primarySource = diagramImportPrimaryCardSourceClient(stage, primary || {}, null).source || null;
+    var available = uniqueList(diagramImportStageFieldOptions(spec || defaultSpec(), stage && stage.id || '', '', primarySource).map(function (item) {
+      return item && item.value;
+    }).concat(selected)).filter(function (field) { return field !== '_id'; });
     var optional = selected.filter(function (field) { return required.indexOf(field) < 0; });
     var row = function (field) {
       return '<tr data-diagram-import-data-field-row="' + escapeHtml(field) + '"><td>' + escapeHtml(diagramImportStageFieldDisplayLabel(stage, field) || field) + '</td><td>' +
@@ -18365,7 +19718,12 @@ function dynamicPagesClientScript() {
         'data-diagram-import-add-data-field',
         '',
         availableOptions,
-        stage && stage.id ? { kind: 'stage', stage: stage.id } : { kind: 'scope', class: className }
+        stage && stage.id ? Object.assign({ kind: 'stage', stage: stage.id }, primarySource ? {
+          cardClass: primarySource.className,
+          cardClassColumn: primarySource.classColumn,
+          cardIdColumn: primarySource.idColumn,
+          cardLabel: primarySource.label
+        } : {}) : null
       ) + '</label><button type="button" class="diagram-add-button" data-action="diagram-import-add-data-field" title="' + escapeHtml(t('diagramImportAddDataField')) + '">+</button></div>' +
       '<select multiple hidden ' + String(fieldAttribute || 'data-diagram-import-placement-field="primary.structuredFields"') + '>' + hiddenOptions + '</select></details>';
   }
@@ -18379,7 +19737,7 @@ function dynamicPagesClientScript() {
 
   function diagramImportIsUserVisibleLabelField(value) {
     var field = String(value || '').trim();
-    return Boolean(field) && field.indexOf('.') < 0 && ['_id', 'Id', 'Class', 'SourceId', 'RelatedId'].indexOf(field) < 0;
+    return Boolean(field) && ['_id', 'Id', 'Class', 'SourceId', 'RelatedId'].indexOf(field) < 0;
   }
 
   function diagramImportRelatedTokenDescriptors(primaryClassName, relatedItems, spec) {
@@ -18446,12 +19804,10 @@ function dynamicPagesClientScript() {
       if (diagramImportRoleVisualKindClient(childRole) !== 'node') return;
       var childMapping = diagramImportStructureItemMappingClient(childRole, child && child.mapping || {}, child && child.id || '');
       var childStage = diagramImportMaterializedStageForItemClient(proposal, child, spec).stage;
-      var className = String(childMapping && childMapping.primary && childMapping.primary.className || childStage.className || '');
-      if (!className) return;
       var childId = String(child && child.id || '');
       var namespace = namespaces[childId] || diagramImportLabelTokenIdentifier(child && child.templateElementKey || childId, 'child');
       var childLabel = String(childRole.label || childRole.key || child.templateElementKey || childId);
-      uniqueList((childStage.columns || []).concat(childMapping && childMapping.primary && childMapping.primary.structuredFields || []).concat(catalogAttributeOptions(className).map(function (attribute) { return attribute.name; }))).forEach(function (field) {
+      uniqueList((childStage.columns || []).concat(childMapping && childMapping.primary && childMapping.primary.structuredFields || [])).forEach(function (field) {
         var name = String(field || '').trim();
         if (!diagramImportIsUserVisibleLabelField(name)) return;
         result.push({
@@ -18460,7 +19816,7 @@ function dynamicPagesClientScript() {
           childField: name,
           displayToken: 'child.' + namespace + '.' + name,
           canonicalToken: diagramImportChildTemplateCanonicalTokenClient(childId, 'primary', name, ''),
-          label: 'Дочерний элемент ' + childLabel + ': ' + diagramImportFieldDisplayLabel(className, name)
+          label: 'Дочерний элемент ' + childLabel + ': ' + (diagramImportStageFieldDisplayLabel(childStage, name) || name)
         });
       });
       var usedRelatedNamespaces = {};
@@ -18499,7 +19855,9 @@ function dynamicPagesClientScript() {
   function diagramImportLabelTemplateCandidates(role, spec, mapping, proposal, parentItem) {
     var primary = mapping && mapping.primary || {};
     var stage = parentItem ? diagramImportMaterializedStageForItemClient(proposal, parentItem, spec).stage : {};
-    var className = String(primary.className || stage.className || '');
+    var primarySource = typeof diagramImportPrimaryCardSourceClient === 'function'
+      ? diagramImportPrimaryCardSourceClient(stage, primary, null).source || null
+      : null;
     var result = [];
     var seenCanonical = {};
     function add(candidate) {
@@ -18507,18 +19865,21 @@ function dynamicPagesClientScript() {
       seenCanonical[candidate.canonicalToken] = true;
       result.push(candidate);
     }
-    uniqueList((stage.columns || []).concat(primary.structuredFields || []).concat(catalogAttributeOptions(className).map(function (item) { return item.name; }))).forEach(function (field) {
+    var primaryFields = typeof diagramImportStageFieldOptions === 'function'
+      ? diagramImportStageFieldOptions(spec || defaultSpec(), stage && stage.id || '', '', primarySource).map(function (item) { return item && item.value; })
+      : (stage.columns || []);
+    uniqueList(primaryFields.concat(primary.structuredFields || [])).forEach(function (field) {
       var name = String(field || '').trim();
       if (!diagramImportIsUserVisibleLabelField(name)) return;
       add({
         kind: 'primary',
         displayToken: name,
         canonicalToken: name,
-        label: diagramImportFieldDisplayLabel(className, name)
+        label: diagramImportStageFieldDisplayLabel(stage, name) || name
       });
     });
-    var template = String(primary.labelTemplate || role && role.labelTemplate || '');
-    diagramImportRelatedTokenDescriptors(className, mapping && mapping.related, spec).forEach(function (descriptor) {
+    var template = diagramImportPrimaryLabelTemplateClient(primary, diagramImportRoleLabelTemplateClient(role, '\${Description}'));
+    diagramImportRelatedTokenDescriptors(String(stage && stage.className || ''), mapping && mapping.related, spec).forEach(function (descriptor) {
       var related = descriptor.related || {};
       var relatedStage = diagramImportStageById(spec || defaultSpec(), related.stageId || '') || {};
       var fields = uniqueList((related.structuredFields || []).concat(diagramImportReferencedRelatedFields(template, descriptor.canonicalPrefix)));
@@ -18657,7 +20018,7 @@ function dynamicPagesClientScript() {
       return { value: String(drafts[roleId] || ''), candidates: candidates, errors: state.diagramImportLabelTemplateErrors[roleId] || [] };
     }
     var primary = mapping && mapping.primary || {};
-    var rendered = diagramImportDisplayLabelTemplate(primary.labelTemplate || role && role.labelTemplate || '\${Description}', candidates);
+    var rendered = diagramImportDisplayLabelTemplate(diagramImportPrimaryLabelTemplateClient(primary, diagramImportRoleLabelTemplateClient(role, '\${Description}')), candidates);
     if (rendered.errors.length) state.diagramImportLabelTemplateErrors[roleId] = rendered.errors;
     else delete state.diagramImportLabelTemplateErrors[roleId];
     return { value: rendered.value, candidates: candidates, errors: rendered.errors };
@@ -18820,17 +20181,74 @@ function dynamicPagesClientScript() {
     return diagramImportStageRows(spec).find(function (stage) { return String(stage.id || '') === String(stageId || ''); }) || null;
   }
 
-  function renderDiagramImportStageFields(spec, stageId, selectedNames, attribute) {
-    var selected = uniqueList(Array.isArray(selectedNames) ? selectedNames : [selectedNames]);
-    var stage = diagramImportStageById(spec, stageId) || {};
-    var columns = uniqueList((stage.columns || []).concat(selected)).map(function (name) {
-      return { value: name, label: diagramImportStageFieldDisplayLabel(stage, name) || name };
+  function diagramImportStageDirectClassNames(stage) {
+    var source = stage && typeof stage === 'object' ? stage : {};
+    var currentSources = (Array.isArray(source.cardSources) ? source.cardSources : []).filter(function (item) {
+      return String(item && item.id || '') === 'current';
     });
+    return uniqueList([String(source.className || '')].concat(currentSources.map(function (item) {
+      return String(item && item.className || '');
+    }))).filter(Boolean);
+  }
+
+  function diagramImportStageFieldOptions(spec, stageId, searchQuery, selectedSource) {
+    var stage = diagramImportStageById(spec, stageId) || {};
+    var query = String(searchQuery || '').trim();
+    var source = normalizeDiagramImportConditionCardSourceClient(selectedSource);
+    if (!source) {
+      source = diagramImportPrimaryCardSourceClient(stage, {}, null).source ||
+        diagramImportStageCardSourcesClient(stage)[0] || null;
+    }
+    var options = [];
+    var seen = {};
+    function add(value, label) {
+      var name = String(value || '').trim();
+      if (!name || seen[name]) return;
+      seen[name] = true;
+      options.push({ value: name, label: label || diagramImportStageFieldDisplayLabel(stage, name) || name });
+    }
+    if (!source) {
+      uniqueList(stage.columns || []).forEach(function (name) { add(name); });
+      return options;
+    }
+    ['_id', 'Code', 'Description'].forEach(function (field) { add(field); });
+    catalogAttributeOptions(source.className).forEach(function (item) {
+      add(item && item.name, item && (item.label || item.name));
+    });
+    if (query) {
+      catalogScopePathOptions(source.className, query).forEach(function (item) {
+        add(item && item.value, item && item.label);
+      });
+    }
+    return options;
+  }
+
+  function renderDiagramImportStageFields(spec, stageId, selectedNames, attribute, selectedSource) {
+    var selected = uniqueList(Array.isArray(selectedNames) ? selectedNames : [selectedNames]);
+    // Object Flow may project a narrow column set while the selected CMDBuild
+    // card class still owns the endpoint needed for a new D2 connection.
+    // Direct attributes are fetched lazily on stage selection and then served
+    // from the per-class catalog cache.
+    var source = normalizeDiagramImportConditionCardSourceClient(selectedSource);
+    var knownOptions = diagramImportStageFieldOptions(spec, stageId, '', source);
+    var columns = knownOptions.concat(selected.filter(function (name) {
+      return !knownOptions.some(function (item) { return item.value === name; });
+    }).map(function (name) { return { value: name, label: name }; }));
     var multi = String(attribute || '').indexOf('structuredFields') >= 0;
     if (multi) {
-      return renderCatalogFieldMultiPicker(attribute, selected, columns, { kind: 'stage', stage: stageId });
+      return renderCatalogFieldMultiPicker(attribute, selected, columns, Object.assign({ kind: 'stage', stage: stageId }, source ? {
+        cardClass: source.className,
+        cardClassColumn: source.classColumn,
+        cardIdColumn: source.idColumn,
+        cardLabel: source.label
+      } : {}));
     }
-    return renderCatalogFieldPicker(attribute, selected[0] || '', columns, { kind: 'stage', stage: stageId });
+    return renderCatalogFieldPicker(attribute, selected[0] || '', columns, Object.assign({ kind: 'stage', stage: stageId }, source ? {
+      cardClass: source.className,
+      cardClassColumn: source.classColumn,
+      cardIdColumn: source.idColumn,
+      cardLabel: source.label
+    } : {}));
   }
 
   function normalizeDiagramImportEditorTab(value) {
@@ -18879,6 +20297,7 @@ function dynamicPagesClientScript() {
         templateElementKey: requested || String(requestedKeys[0] || ''),
         templateElementKeys: requestedKeys,
         parentId: String(item && item.parentId || '').trim(),
+        templateStatic: item && item.templateStatic === true,
         mapping: diagramImportStructureItemMappingClient(role, item && item.mapping || {}, String(item && item.id || 'structure_item_' + String(index + 1)))
       };
     }).filter(function (item) { return item.id; });
@@ -19183,7 +20602,7 @@ function dynamicPagesClientScript() {
         var materializationKind = String(materialization.kind || '');
         var ancestor = diagramImportNearestMaterializedAncestorClient(proposal, item);
         if (!['structural', 'stage', 'parentCard'].includes(materializationKind)) issues[id] = 'Выберите способ наполнения элемента D2.';
-        else if (diagramImportRoleVisualKindClient(role) === 'node' && materializationKind === 'structural') issues[id] = 'Узел должен повторяться по результату Object Flow или наследовать карточку родителя.';
+        else if (diagramImportRoleVisualKindClient(role) === 'node' && materializationKind === 'structural' && item.templateStatic !== true) issues[id] = 'Узел должен повторяться по результату Object Flow или наследовать карточку родителя.';
         else if (materializationKind === 'stage' && !String(materialization.stageId || '')) issues[id] = 'Выберите результат Object Flow для этого элемента D2.';
         else if (materializationKind === 'parentCard' && !ancestor) issues[id] = 'Для наследования нужна карточка в родительской ветви.';
         else if (materializationKind === 'parentCard' && diagramImportRoleVisualKindClient(role) !== 'node') issues[id] = 'Карточку родителя может наследовать только узел D2.';
@@ -19205,11 +20624,11 @@ function dynamicPagesClientScript() {
             : 'Для независимого результата задайте правило сопоставления с результатом родительской ветви.';
         }
         var invalidRule = condition.rules.find(function (rule) {
-          if (!rule.left || !rule.left.column || !diagramImportConditionStageFieldIsAvailable(spec || defaultSpec(), sourceInfo.stageId, rule.left.column)) return true;
+          if (!rule.left || !rule.left.column || !diagramImportConditionStageFieldIsAvailable(spec || defaultSpec(), sourceInfo.stageId, rule.left.column, rule.left.source)) return true;
           if (rule.right && rule.right.kind === 'param') return !spec || !spec.params || !Object.prototype.hasOwnProperty.call(spec.params, String(rule.right.name || ''));
           if (rule.right && rule.right.kind === 'stage') {
             var comparison = diagramImportStageById(spec || defaultSpec(), rule.right.stageId);
-            return !comparison || !diagramImportConditionStageFieldIsAvailable(spec || defaultSpec(), rule.right.stageId, rule.right.column);
+            return !comparison || !diagramImportConditionStageFieldIsAvailable(spec || defaultSpec(), rule.right.stageId, rule.right.column, rule.right.source);
           }
           return false;
         });
@@ -19279,11 +20698,14 @@ function dynamicPagesClientScript() {
         var stageId = sourceInfo.stageId;
         var stage = sourceInfo.stage || {};
         var isContainer = diagramImportRoleVisualKindClient(role) === 'container';
+        var templateStatic = item && item.templateStatic === true;
         var childItems = diagramImportStructureTreeChildrenClient(tree, item.id);
         var expanded = !diagramImportStructureTreeIsCollapsedClient(item.id);
         var issue = String(issues[String(item.id)] || '');
         var status = issue ? 'pending' : 'complete';
-        var stageLabel = materializationKind === 'structural'
+        var stageLabel = templateStatic
+          ? 'Статический фрагмент template'
+          : materializationKind === 'structural'
           ? 'Структурная рамка'
           : materializationKind === 'parentCard'
             ? (stageId ? 'Карточка родительской ветви: ' + String(stage.label || userFacingResultLabel(stage.alias || stageId, spec || defaultSpec())) : 'Нет карточки родительской ветви')
@@ -19297,12 +20719,12 @@ function dynamicPagesClientScript() {
           ? '<span class="diagram-element-tree-hidden-count">+' + escapeHtml(String(childItems.length)) + '</span>'
           : '';
         var row = '<div class="diagram-element-tree-row ' + (isContainer ? 'group ' : '') + status + (selectedId === String(item.id) ? ' selected' : '') + '" data-diagram-structure-tree-row="' + escapeHtml(item.id) + '" data-diagram-structure-tree-drop-target="' + escapeHtml(item.id) + '" data-diagram-structure-tree-kind="' + (isContainer ? 'container' : 'node') + '">' +
-          '<button type="button" class="diagram-element-drag-handle" draggable="true" data-diagram-structure-tree-drag="' + escapeHtml(item.id) + '" title="' + escapeHtml(t('diagramImportKeyboardMove')) + '" aria-label="' + escapeHtml(t('diagramImportKeyboardMove')) + '" aria-keyshortcuts="Control+ArrowUp Control+ArrowDown">↕</button>' +
+          (templateStatic ? '<span class="diagram-element-drag-handle" aria-hidden="true"></span>' : '<button type="button" class="diagram-element-drag-handle" draggable="true" data-diagram-structure-tree-drag="' + escapeHtml(item.id) + '" title="' + escapeHtml(t('diagramImportKeyboardMove')) + '" aria-label="' + escapeHtml(t('diagramImportKeyboardMove')) + '" aria-keyshortcuts="Control+ArrowUp Control+ArrowDown">↕</button>') +
           disclosure +
           '<button type="button" class="diagram-element-tree-select" data-action="diagram-structure-select" data-diagram-structure-item-id="' + escapeHtml(item.id) + '"><span class="diagram-element-tree-status"></span><span class="diagram-element-tree-label">' + escapeHtml(String(role.label || role.key || item.roleId)) + '</span>' + hiddenCount + '<span class="muted">' + escapeHtml(stageLabel) + '</span></button>' +
           '<div class="diagram-element-tree-actions">' +
-          (isContainer ? '<button type="button" class="icon-button" data-action="diagram-structure-add-child" data-diagram-structure-parent-id="' + escapeHtml(item.id) + '" title="' + escapeHtml(t('diagramImportStructureAddTo', { container: String(role.label || role.key || item.roleId) })) + '">+</button><button type="button" class="icon-button" data-action="diagram-structure-duplicate" data-diagram-structure-item-id="' + escapeHtml(item.id) + '" title="' + escapeHtml(t('diagramImportStructureDuplicateBranch')) + '">⧉</button>' : '') +
-          '<button type="button" class="diagram-structure-delete-button" data-action="diagram-structure-remove" data-diagram-structure-item-id="' + escapeHtml(item.id) + '" data-diagram-structure-item-kind="' + (isContainer ? 'container' : 'node') + '" title="' + escapeHtml(t('diagramImportStructureDelete')) + '">' + escapeHtml(t('diagramImportStructureDelete')) + '</button></div>' +
+          (!templateStatic && isContainer ? '<button type="button" class="icon-button" data-action="diagram-structure-add-child" data-diagram-structure-parent-id="' + escapeHtml(item.id) + '" title="' + escapeHtml(t('diagramImportStructureAddTo', { container: String(role.label || role.key || item.roleId) })) + '">+</button><button type="button" class="icon-button" data-action="diagram-structure-duplicate" data-diagram-structure-item-id="' + escapeHtml(item.id) + '" title="' + escapeHtml(t('diagramImportStructureDuplicateBranch')) + '">⧉</button>' : '') +
+          (!templateStatic ? '<button type="button" class="diagram-structure-delete-button" data-action="diagram-structure-remove" data-diagram-structure-item-id="' + escapeHtml(item.id) + '" data-diagram-structure-item-kind="' + (isContainer ? 'container' : 'node') + '" title="' + escapeHtml(t('diagramImportStructureDelete')) + '">' + escapeHtml(t('diagramImportStructureDelete')) + '</button>' : '') + '</div>' +
           '</div>';
         return '<div class="diagram-element-tree-node" data-diagram-structure-tree-node="' + escapeHtml(item.id) + '">' + row + renderAddMenu(item.id, item, String(role.label || role.key || item.roleId)) + (expanded ? renderBranch(item.id) : '') + '</div>';
       }).join('') + '</div>';
@@ -19313,7 +20735,7 @@ function dynamicPagesClientScript() {
     var inspector = '';
     if (selected) {
       inspector = '<div class="diagram-editor-block" data-diagram-structure-tree-inspector="' + escapeHtml(selected.id) + '"><div class="diagram-editor-heading"><h4>Выбранный элемент</h4></div><div class="diagram-grid">' +
-        '<label>' + escapeHtml(t('diagramImportParentContainer')) + '<select data-diagram-structure-field="parentId">' + renderDiagramImportStructureTreeParentOptions(proposal, tree, selected) + '</select></label>' +
+        (selected.templateStatic === true ? '<label>' + escapeHtml(t('diagramImportParentContainer')) + '<input value="Определено D2 template" disabled></label>' : '<label>' + escapeHtml(t('diagramImportParentContainer')) + '<select data-diagram-structure-field="parentId">' + renderDiagramImportStructureTreeParentOptions(proposal, tree, selected) + '</select></label>') +
         '</div>' + renderDiagramImportPlacementMapping(selectedRole, selected, spec || defaultSpec(), proposal) + (selectedIssue ? '<div class="notice warning">' + escapeHtml(selectedIssue) + '</div>' : '') + '</div>';
     }
     var warning = Object.keys(issues).length ? '<div class="notice warning">Настройте способ наполнения, результаты Object Flow и условия сопоставления для конкретных элементов D2.</div>' : '';
@@ -19677,25 +21099,61 @@ function dynamicPagesClientScript() {
       if (inferred.length === 1) return { source: inferred[0], inferred: true, ambiguous: false };
       return { source: null, inferred: false, ambiguous: true };
     }
-    if (configuredClass) {
-      var matches = available.filter(function (source) { return source.className === configuredClass; });
-      if (matches.length === 1) return { source: matches[0], inferred: false, ambiguous: false };
-      if (matches.length > 1) return { source: null, inferred: false, ambiguous: true };
-    }
     if (available.length === 1) return { source: available[0], inferred: true, ambiguous: false };
     var current = available.find(function (source) { return source.id === 'current'; });
-    return current ? { source: current, inferred: true, ambiguous: false } : { source: null, inferred: false, ambiguous: available.length > 1 };
+    if (current) return { source: current, inferred: true, ambiguous: false };
+    if (configuredClass) {
+      var matches = available.filter(function (source) { return source.className === configuredClass; });
+      if (matches.length === 1) return { source: matches[0], inferred: true, ambiguous: false };
+      if (matches.length > 1) return { source: null, inferred: false, ambiguous: true };
+    }
+    return { source: null, inferred: false, ambiguous: available.length > 1 };
   }
 
-  function renderDiagramImportPrimaryCardSourceOptions(stage, selectedSource) {
+  function renderDiagramImportPrimaryCardSourceOptions(stage, selectedSource, includeEmpty) {
     var selected = normalizeDiagramImportConditionCardSourceClient(selectedSource);
     var selectedKey = diagramImportConditionSourceKeyClient(selected);
-    return '<option value="">Выберите карточку</option>' + diagramImportStageCardSourcesClient(stage).map(function (source) {
+    var sources = diagramImportStageCardSourcesClient(stage);
+    if (!sources.length) return '<option value="">Карточки результата недоступны</option>';
+    return (includeEmpty ? '<option value="">Выберите карточку</option>' : '') + sources.map(function (source) {
       var normalized = normalizeDiagramImportConditionCardSourceClient(source) || {};
       var isSelected = diagramImportConditionSourceKeyClient(normalized) === selectedKey;
       return '<option value="' + escapeHtml(normalized.id || '') + '"' + diagramImportConditionSourceDataAttributes(normalized) + (isSelected ? ' selected' : '') + '>' +
-        escapeHtml(String(normalized.label || normalized.className || '')) + '</option>';
+        escapeHtml(String(normalized.label || normalized.className || '') + ' (' + String(normalized.className || '') + ')') + '</option>';
     }).join('');
+  }
+
+  function diagramImportCardSourceFieldClient(source, field) {
+    var name = String(field || '').trim();
+    var normalized = normalizeDiagramImportConditionCardSourceClient(source);
+    if (!name || !normalized || (normalized.classColumn === 'Class' && normalized.idColumn === '_id')) return name;
+    if (name === '_id' || name === 'Id' || name === 'ID') return normalized.idColumn;
+    if (name === 'Class') return normalized.classColumn;
+    var suffix = String(normalized.classColumn || '').endsWith('Class')
+      ? String(normalized.classColumn || '').slice(0, -'Class'.length)
+      : '';
+    // Mappings saved by an earlier editor can already use projected fields,
+    // for example SourceDescription. Re-selecting their retained primary card
+    // must not turn them into SourceSourceDescription in the browser draft.
+    if (suffix && name.indexOf(suffix) === 0) return name;
+    return suffix ? suffix + name : name;
+  }
+
+  function renderDiagramImportPrimaryCardSourceControl(stage, primary, parentStage) {
+    var projection = diagramImportPrimaryCardSourceClient(stage, primary || {}, parentStage || null);
+    var source = projection.source || null;
+    if (!source) return '';
+    var sourceLabel = String(source.label || source.className || 'Карточка результата');
+    var identityField = diagramImportCardSourceFieldClient(source, '_id');
+    var labelField = diagramImportCardSourceFieldClient(source, 'Description');
+    var notice = projection.inferred
+      ? '<p class="muted">Текущий выбор предложен по структуре связи. Вы можете изменить его перед сохранением.</p>'
+      : '';
+    return '<label>Карточка результата для повторения<select data-diagram-import-placement-field="primary.cardSource">' +
+      renderDiagramImportPrimaryCardSourceOptions(stage, source, false) +
+      '</select></label><p class="muted">Каждая уникальная карточка «' + escapeHtml(sourceLabel) + '» класса <strong>' + escapeHtml(String(source.className || '')) +
+      '</strong> создаёт отдельный элемент в одной ветви. Идентификатор: <code>' + escapeHtml(identityField) +
+      '</code>; поля подписи: <code>' + escapeHtml(labelField) + '</code>.</p>' + notice;
   }
 
   function diagramImportConditionCatalogFields(stage, searchQuery) {
@@ -20025,12 +21483,18 @@ function dynamicPagesClientScript() {
     });
   }
 
-  function diagramImportConditionStageFieldIsAvailable(spec, stageId, fieldName) {
+  function diagramImportConditionStageFieldIsAvailable(spec, stageId, fieldName, selectedSource) {
     var field = String(fieldName || '');
     if (!field) return false;
     var stage = diagramImportStageById(spec || defaultSpec(), stageId) || {};
-    return (stage.columns || []).map(String).indexOf(field) >= 0 ||
-      catalogScopePathOptions(stage.className || '', field).some(function (candidate) { return String(candidate && candidate.value || '') === field; });
+    if ((stage.columns || []).map(String).indexOf(field) >= 0) return true;
+    var source = normalizeDiagramImportConditionCardSourceClient(selectedSource);
+    var sources = source ? [source] : diagramImportStageCardSourcesClient(stage);
+    return sources.some(function (candidate) {
+      return catalogScopePathOptions(candidate.className || '', field).some(function (option) {
+        return String(option && option.value || '') === field;
+      });
+    });
   }
 
   function renderDiagramImportPlacementConditionRow(condition, stageId, spec, index) {
@@ -20090,25 +21554,20 @@ function dynamicPagesClientScript() {
 
   function renderDiagramImportPlacementMapping(role, item, spec, proposal) {
     var mapping = diagramImportStructureItemMappingClient(role, item && item.mapping || {}, item && item.id || '');
+    if (item && item.templateStatic === true) {
+      return '<details class="help-details" data-diagram-import-placement-mapping="' + escapeHtml(item.id || '') + '" open><summary><strong>Статический фрагмент template</strong></summary><p class="muted">Элемент и его вложенная ветвь берутся из D2 template, выводятся на каждой диаграмме и не используют Object Flow, фильтры или CMDBuild-сопоставление.</p></details>';
+    }
     var primary = mapping.primary || {};
     var visualKind = diagramImportRoleVisualKindClient(role);
     var materialization = mapping.materialization || {};
     var materializationKind = String(materialization.kind || '');
     var sourceInfo = diagramImportMaterializedStageForItemClient(proposal, item, spec || defaultSpec());
     var stage = sourceInfo.stage || {};
-    var ancestor = diagramImportNearestMaterializedAncestorClient(proposal, item);
-    var parentStage = ancestor && ancestor.stageId
-      ? diagramImportStageById(spec || defaultSpec(), ancestor.stageId) || {}
-      : {};
-    var primaryProjection = diagramImportPrimaryCardSourceClient(stage, primary, parentStage);
-    if (primaryProjection.source) {
-      primary = Object.assign({}, primary, {
-        className: String(primaryProjection.source.className || ''),
-        cardSource: primaryProjection.source
-      });
-      mapping = Object.assign({}, mapping, { primary: primary });
-    }
-    var primaryClassName = String(primary.className || stage.className || '');
+    primary = Object.assign({}, primary, {
+      className: String(stage.className || ''),
+      idAttribute: '_id'
+    });
+    mapping = Object.assign({}, mapping, { primary: primary });
     var modeOptions = visualKind === 'container'
       ? [['', 'Выберите способ наполнения'], ['structural', 'Структурная рамка'], ['stage', 'Повторять по результату Object Flow']]
       : [['', 'Выберите способ наполнения'], ['stage', 'Результат Object Flow'], ['parentCard', 'Использовать карточку родительской ветви']];
@@ -20118,11 +21577,12 @@ function dynamicPagesClientScript() {
     var stageControl = materializationKind === 'stage'
       ? '<label>Результат Object Flow<select data-diagram-import-placement-field="materialization.stageId"><option value="">Выберите результат</option>' + renderDiagramImportStageOptions(spec || defaultSpec(), materialization.stageId || '') + '</select></label>'
       : '';
-    var primaryCardSourceControl = materializationKind === 'stage' && diagramImportStageCardSourcesClient(stage).length > 1
-      ? '<label>Карточка результата<select data-diagram-import-placement-field="primary.cardSource">' +
-        renderDiagramImportPrimaryCardSourceOptions(stage, primary.cardSource) +
-        '</select></label>' +
-        (primaryProjection.inferred ? '<p class="muted">Выбрана карточка дочернего результата, отличающаяся от родительской ветви.</p>' : '')
+    var ancestor = diagramImportNearestMaterializedAncestorClient(proposal, item);
+    var parentStage = ancestor && ancestor.stageId
+      ? diagramImportStageById(spec || defaultSpec(), ancestor.stageId) || {}
+      : {};
+    var primaryCardSourceControl = materializationKind === 'stage' && sourceInfo.stageId
+      ? renderDiagramImportPrimaryCardSourceControl(stage, primary, parentStage)
       : '';
     var showEmptyControl = visualKind === 'container'
       ? '<label class="checkbox-label"><input type="checkbox" data-diagram-import-placement-field="showEmpty"' + (mapping.showEmpty !== false ? ' checked' : '') + '> Показывать пустой контейнер</label>'
@@ -20130,11 +21590,14 @@ function dynamicPagesClientScript() {
     var inheritedControl = materializationKind === 'parentCard'
       ? '<p class="muted">Используется карточка родительской ветви' + (sourceInfo.stageId ? ': ' + escapeHtml(String(stage.label || userFacingResultLabel(stage.alias || sourceInfo.stageId, spec || defaultSpec()))) : '. Карточка в родительской ветви пока не выбрана.') + '</p>'
       : '';
+    var labelSourceHint = materializationKind === 'stage' && sourceInfo.stageId
+      ? '<p class="muted">Подпись использует поля результата: <strong>' + escapeHtml(String(stage.label || userFacingResultLabel(stage.alias || sourceInfo.stageId, spec || defaultSpec()))) + '</strong>.</p>'
+      : inheritedControl;
     var labelTemplateEditor = diagramImportLabelTemplateEditorValue(role, spec || defaultSpec(), mapping, item.id, proposal, item);
     var labelTemplateError = labelTemplateEditor.errors.length ? '<p class="diagram-import-label-error" data-diagram-import-label-template-error>' + escapeHtml(labelTemplateEditor.errors.join(' ')) + '</p>' : '';
-    var labelTemplateControl = '<div class="diagram-import-label-template" data-diagram-import-label-template-field><label>' + escapeHtml(diagramImportLabelTemplateLabel(primaryClassName)) + '<input data-diagram-import-placement-field="primary.labelTemplate" data-diagram-import-label-template data-diagram-import-role-id="' + escapeHtml(item.id || '') + '" value="' + escapeHtml(labelTemplateEditor.value) + '" autocomplete="off" spellcheck="false" aria-autocomplete="list" aria-expanded="false"></label><div class="diagram-import-label-autocomplete" data-diagram-import-label-autocomplete role="listbox" hidden></div>' + renderDiagramImportLabelTemplateParameterSuggestions(spec || defaultSpec()) + labelTemplateError + '</div>';
+    var labelTemplateControl = '<div class="diagram-import-label-template" data-diagram-import-label-template-field><label>' + escapeHtml(diagramImportLabelTemplateLabel(sourceInfo, materializationKind, spec || defaultSpec())) + '<input data-diagram-import-placement-field="primary.labelTemplate" data-diagram-import-label-template data-diagram-import-role-id="' + escapeHtml(item.id || '') + '" value="' + escapeHtml(labelTemplateEditor.value) + '" autocomplete="off" spellcheck="false" aria-autocomplete="list" aria-expanded="false"></label><div class="diagram-import-label-autocomplete" data-diagram-import-label-autocomplete role="listbox" hidden></div>' + renderDiagramImportLabelTemplateParameterSuggestions(spec || defaultSpec()) + labelTemplateError + '</div>';
     if (visualKind !== 'node') {
-      return '<details class="help-details" data-diagram-import-placement-mapping="' + escapeHtml(item.id || '') + '" open><summary><strong>Данные контейнера</strong></summary><div class="diagram-grid">' + materializationControl + stageControl + primaryCardSourceControl + showEmptyControl + labelTemplateControl + '</div><p class="muted">Снимите флажок, чтобы не выводить рамку без видимых дочерних объектов или контейнеров. Структурная рамка не имеет собственного источника. Она создается один раз в корне или для каждой карточки родительской ветви. В подписи доступны текст, поля выбранного результата и поля прямых дочерних объектов через $' + '{…}.</p>' + renderDiagramImportPlacementConditions(role, item, mapping, spec || defaultSpec(), sourceInfo.stageId, proposal) + renderDiagramImportRelatedDataForItem(proposal, spec || defaultSpec(), item, role, mapping) + '</details>';
+      return '<details class="help-details" data-diagram-import-placement-mapping="' + escapeHtml(item.id || '') + '" open><summary><strong>Данные контейнера</strong></summary><div class="diagram-grid">' + materializationControl + stageControl + showEmptyControl + primaryCardSourceControl + labelTemplateControl + '</div>' + labelSourceHint + '<p class="muted">Снимите флажок, чтобы не выводить рамку без видимых дочерних объектов или контейнеров. Структурная рамка не имеет собственного источника. Она создается один раз в корне или для каждой карточки родительской ветви. В подписи доступны текст, поля выбранного результата и поля прямых дочерних объектов через $' + '{…}.</p>' + renderDiagramImportPlacementConditions(role, item, mapping, spec || defaultSpec(), sourceInfo.stageId, proposal) + renderDiagramImportRelatedDataForItem(proposal, spec || defaultSpec(), item, role, mapping) + '</details>';
     }
     return '<details class="help-details" data-diagram-import-placement-mapping="' + escapeHtml(item.id || '') + '" open><summary><strong>' + escapeHtml(t('diagramImportNodeData')) + '</strong></summary>' +
       '<div class="diagram-grid">' +
@@ -20142,68 +21605,290 @@ function dynamicPagesClientScript() {
       stageControl +
       primaryCardSourceControl +
       labelTemplateControl +
-      '</div>' + inheritedControl + '<input type="hidden" data-diagram-import-placement-field="primary.className" value="' + escapeHtml(primaryClassName) + '">' + renderDiagramImportNodeDataFields(role, spec || defaultSpec(), stage, Object.assign({}, primary, { className: primaryClassName }), 'data-diagram-import-placement-field="primary.structuredFields"') + renderDiagramImportPlacementConditions(role, item, mapping, spec || defaultSpec(), sourceInfo.stageId, proposal) + renderDiagramImportRelatedDataForItem(proposal, spec || defaultSpec(), item, role, mapping) + '</details>';
+      '</div>' + labelSourceHint + renderDiagramImportNodeDataFields(role, spec || defaultSpec(), stage, primary, 'data-diagram-import-placement-field="primary.structuredFields"') + renderDiagramImportPlacementConditions(role, item, mapping, spec || defaultSpec(), sourceInfo.stageId, proposal) + renderDiagramImportRelatedDataForItem(proposal, spec || defaultSpec(), item, role, mapping) + '</details>';
   }
 
   function renderDiagramImportRelationRules(proposal, spec) {
+    var comparisonOperators = [
+      ['equals', 'Равно'],
+      ['contains', 'Содержит'],
+      ['regexMatch', 'Регулярное выражение'],
+      ['ipv4InCidr', 'IPv4: адрес входит в сеть'],
+      ['ipv4InRange', 'IPv4: адрес входит в диапазон'],
+      ['ipv4CidrOverlaps', 'IPv4: сети пересекаются'],
+      ['ipv4CidrContains', 'IPv4: сеть содержит сеть']
+    ];
+    function comparisonOperatorOptions(selected) {
+      return '<option value="">Выберите метод</option>' + comparisonOperators.map(function (entry) {
+        return '<option value="' + entry[0] + '"' + (entry[0] === String(selected || '') ? ' selected' : '') + '>' + entry[1] + '</option>';
+      }).join('');
+    }
     var roles = proposal.roles || [];
-    var rows = (proposal.relationRules || []).map(function (rule, index) {
-      var parent = roles.find(function (role) { return role.id === rule.parentRoleId; }) || {};
-      var child = roles.find(function (role) { return role.id === rule.childRoleId; }) || {};
-      var mode = ['relationCard', 'networkEndpoints', 'deterministicEndpoints'].includes(String(rule.mode || ''))
+    var allRules = Array.isArray(proposal.relationRules) ? proposal.relationRules : [];
+    var activeRules = allRules.filter(function (rule) { return !rule || rule.enabled !== false; });
+    var rows = activeRules.map(function (rule, index) {
+      var mode = ['relationCard', 'attributeEndpoints', 'networkEndpoints', 'deterministicEndpoints'].includes(String(rule.mode || ''))
         ? String(rule.mode || '')
         : 'deterministicEndpoints';
-      var networkEndpoints = mode === 'networkEndpoints';
+      var attributeEndpoints = mode === 'attributeEndpoints' || mode === 'networkEndpoints';
+      // One D2 class is one data algorithm. Template arrows are only visual
+      // examples; every compatible structure rule participates at runtime.
       var caption = String(rule.d2ClassKey || rule.d2Label || rule.id || ('Связь ' + String(index + 1)));
-      var exampleCount = Array.isArray(rule.d2ElementKeys) ? rule.d2ElementKeys.length : 1;
+      var classCaption = String(rule.d2ClassKey || '');
       var notes = String(rule.d2Notes || '');
-      var directionPolicy = String(rule.directionPolicy || '');
-      var directionSuggestion = String(rule.directionPolicySuggestion || 'template');
-      var labelTemplate = String(rule.labelTemplate || '');
-      var directionPolicyField = '<td><select data-diagram-import-rule-field="directionPolicy"><option value="">Выберите (рекомендация: ' + escapeHtml(directionSuggestion) + ')</option><option value="dataFields"' + (directionPolicy === 'dataFields' ? ' selected' : '') + '>По полям результата</option><option value="template"' + (directionPolicy === 'template' ? ' selected' : '') + '>По стрелке D2 template</option><option value="undirected"' + (directionPolicy === 'undirected' ? ' selected' : '') + '>Без направления</option></select></td>';
+      var directionPolicy = normalizeDiagramDirectionPolicyClient(rule.directionPolicy);
+      var labelTemplate = String(rule.labelTemplate || '') || (String(rule.labelField || '').trim() ? '$' + '{' + String(rule.labelField || '').trim() + '}' : '');
+      var directionPolicyField = '<td><label class="checkbox-label"><input type="checkbox" data-diagram-import-rule-field="undirected"' + (directionPolicy === 'undirected' ? ' checked' : '') + '> Без направления</label><p class="muted">Иначе: источник результата → назначение результата.</p></td>';
+      var profileHint = attributeEndpoints
+        ? '<p class="muted">Стрелка строится по карточкам выбранного результата. Источник сопоставляется со всеми правилами элементов структуры, поддерживающими метод источника; назначение - со всеми правилами метода назначения. Примеры стрелок D2 задают только оформление.</p>'
+        : '';
+      var incompleteFields = [];
+      if (!String(rule.sourceStageId || '').trim()) incompleteFields.push('результат Object Flow');
+      if (!String(rule.sourceField || '').trim()) incompleteFields.push('поле источника');
+      if (!String(rule.targetField || '').trim()) incompleteFields.push('поле назначения');
+      if (attributeEndpoints && !String(rule.sourceOperator || rule.endpointOperator || '').trim()) incompleteFields.push('метод сравнения источника');
+      if (attributeEndpoints && !String(rule.targetOperator || rule.endpointOperator || '').trim()) incompleteFields.push('метод сравнения назначения');
+      var incompleteHint = incompleteFields.length
+        ? '<p class="diagram-import-label-error">Не заполнено: ' + escapeHtml(incompleteFields.join(', ')) + '. Этот вариант не будет показан в preview до заполнения.</p>'
+        : '';
       var cardFields = '<td><div class="diagram-grid">' +
         '<label>Результат Object Flow<select data-diagram-import-rule-field="sourceStageId">' + renderDiagramImportStageOptions(spec || defaultSpec(), rule.sourceStageId || '') + '</select></label>' +
         '<label>Источник endpoint' + renderDiagramImportStageFields(spec || defaultSpec(), rule.sourceStageId || '', [rule.sourceField || ''], 'data-diagram-import-rule-field="sourceField"') + '</label>' +
         '<label>Назначение endpoint' + renderDiagramImportStageFields(spec || defaultSpec(), rule.sourceStageId || '', [rule.targetField || ''], 'data-diagram-import-rule-field="targetField"') + '</label>' +
-        '<label>Поле подписи' + renderDiagramImportStageFields(spec || defaultSpec(), rule.sourceStageId || '', [rule.labelField || ''], 'data-diagram-import-rule-field="labelField"') + '</label>' +
-        '</div></td>';
-      var labelTemplateField = '<td><label class="diagram-template-field">Шаблон подписи связи<input data-diagram-import-rule-field="labelTemplate" value="' + escapeHtml(labelTemplate) + '" placeholder="$' + '{param.name}"></label>' + renderDiagramImportRelationTemplateSuggestions(spec || defaultSpec(), rule.sourceStageId || '') + '</td>';
-      return '<tr data-diagram-import-rule-row="' + index + '"><td><strong>' + escapeHtml(caption) + '</strong><br><span class="muted">' + escapeHtml(parent.label || parent.key || '-') + ' → ' + escapeHtml(child.label || child.key || '-') + '; примеров: ' + escapeHtml(String(exampleCount)) + '</span>' + (notes ? '<details class="help-details"><summary>Notes</summary><p>' + escapeHtml(notes) + '</p></details>' : '') + '</td>' +
-        '<td><select data-diagram-import-rule-field="mode"><option value="deterministicEndpoints"' + (mode === 'deterministicEndpoints' ? ' selected' : '') + '>Поля результата</option><option value="relationCard"' + (mode === 'relationCard' ? ' selected' : '') + '>Карточка связи</option><option value="networkEndpoints"' + (networkEndpoints ? ' selected' : '') + '>IPv4 endpoints</option></select></td>' +
+        (attributeEndpoints
+          ? '<label>Метод сравнения источника<select data-diagram-import-rule-field="sourceOperator">' + comparisonOperatorOptions(rule.sourceOperator || rule.endpointOperator || 'ipv4InCidr') + '</select></label>' +
+            '<label>Метод сравнения назначения<select data-diagram-import-rule-field="targetOperator">' + comparisonOperatorOptions(rule.targetOperator || rule.endpointOperator || 'ipv4InCidr') + '</select></label>'
+          : '') +
+        '</div>' + profileHint + '</td>';
+      var labelTemplateField = '<td><label class="diagram-template-field">Подпись связи<input data-diagram-import-rule-field="labelTemplate" value="' + escapeHtml(labelTemplate) + '" placeholder="Например: TCP $' + '{protocol}: $' + '{Description}"></label><p class="muted">Текст и поля результата через $' + '{…}; пустое значение не выводит подпись.</p>' + renderDiagramImportRelationTemplateSuggestions(spec || defaultSpec(), rule.sourceStageId || '') + '</td>';
+      var legacyStage = rule.legacySuggestion && rule.legacySuggestion.sourceStageId
+        ? (diagramImportStageById(spec || defaultSpec(), rule.legacySuggestion.sourceStageId) || {})
+        : {};
+      var legacyHint = rule.legacySuggestion && rule.legacySuggestion.sourceStageId
+        ? '<p class="muted">Ранее общий результат «' + escapeHtml(String(legacyStage.label || legacyStage.name || legacyStage.alias || rule.legacySuggestion.sourceStageId)) + '» был назначен классу связей. Проверьте endpoint-поля перед сохранением.</p>'
+        : '';
+      var mappingConflictHint = rule.mappingConflict
+        ? '<p class="diagram-import-label-error">' + escapeHtml(String(rule.mappingConflict.message || 'Для класса связи сохранено несколько разных endpoint-контрактов.')) + '</p>' +
+          '<button type="button" class="secondary-button" data-action="diagram-import-confirm-rule-contract">Использовать текущие настройки для всего класса</button>'
+        : '';
+      var rolePairConflictHint = rule.rolePairConflict
+        ? '<p class="diagram-import-label-error">' + escapeHtml(String(rule.rolePairConflict.message || 'Класс связи используется с разными типами объектов.')) + '</p>'
+        : '';
+      return '<tr data-diagram-import-rule-row="' + index + '" data-diagram-import-rule-id="' + escapeHtml(String(rule.id || '')) + '"><td><strong>' + escapeHtml(caption) + '</strong><br><span class="muted">Один алгоритм для типа связи' + (rule.d2ElementKeys && rule.d2ElementKeys.length > 1 ? '; примеров в template: ' + escapeHtml(String(rule.d2ElementKeys.length)) : '') + (classCaption && classCaption !== caption ? '; класс: ' + escapeHtml(classCaption) : '') + '</span>' + incompleteHint + legacyHint + mappingConflictHint + rolePairConflictHint + (notes ? '<details class="help-details"><summary>Notes</summary><p>' + escapeHtml(notes) + '</p></details>' : '') + '</td>' +
+        '<td><select data-diagram-import-rule-field="mode"><option value="deterministicEndpoints"' + (mode === 'deterministicEndpoints' ? ' selected' : '') + '>Поля результата</option><option value="relationCard"' + (mode === 'relationCard' ? ' selected' : '') + '>Карточка связи</option><option value="attributeEndpoints"' + (attributeEndpoints ? ' selected' : '') + '>Сопоставление атрибутов</option></select></td>' +
         cardFields + labelTemplateField + directionPolicyField +
-        '<td class="muted">Определено D2 template</td></tr>';
+        '<td><button type="button" class="icon-button" title="Не строить этот тип стрелок" aria-label="Не строить этот тип стрелок" data-action="diagram-import-disable-rule">×</button></td></tr>';
     }).join('');
     return '<div class="diagram-editor-block"><div class="diagram-editor-heading"><h4>Связи D2</h4></div>' +
-      '<p class="muted">Каждая связь D2 использует только отдельный именованный результат Object Flow. Domain, reference, IPv4 и другие правила формируются в «Группе объектов» или «Сопоставлении с объектами». Стрелки template задают структуру; отсутствующий endpoint остается отдельной «Заглушкой».</p>' +
-      '<div class="table-wrap"><table class="compact"><thead><tr><th>Стрелка D2</th><th>Тип результата</th><th>Результат и поля endpoint</th><th>Подпись</th><th>Направление данных</th><th>' + t('diagramImportActions') + '</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>';
+      '<p class="muted">Каждая строка задаёт алгоритм одного типа стрелок D2. Поля источника и назначения выбранного результата сопоставляются со всеми совместимыми правилами элементов структуры. Визуальный класс D2 задаёт только оформление. Если алгоритм заполнен не полностью, preview пропускает только этот тип связей и показывает причину в диагностике.</p>' +
+      '<div class="table-wrap"><table class="compact"><thead><tr><th>Тип связи D2</th><th>Тип результата</th><th>Результат и правила сравнения</th><th>Подпись</th><th>Направление</th><th>' + t('diagramImportActions') + '</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>' +
+      renderDiagramImportEndpointProfiles(proposal, spec);
+  }
+
+  function diagramImportNetworkEndpointFieldsClient(stage) {
+    var technical = { _id: true, Id: true, ID: true, Class: true, Code: true, Description: true, Name: true, SourceId: true, RelatedId: true };
+    return uniqueList(Array.isArray(stage && stage.columns) ? stage.columns : []).map(function (field) {
+      return String(field || '').trim();
+    }).filter(function (field) {
+      return field && !technical[field] && /(?:ip|addr|address|range|cidr|network)/i.test(field);
+    });
+  }
+
+  function diagramImportEndpointProfileCorrelationCandidatesClient(endpointStage, primaryStage) {
+    var endpointColumns = new Set(Array.isArray(endpointStage && endpointStage.columns) ? endpointStage.columns.map(String) : []);
+    var primaryColumns = new Set(Array.isArray(primaryStage && primaryStage.columns) ? primaryStage.columns.map(String) : []);
+    var candidates = [];
+    var add = function (leftColumn, rightColumn) {
+      var left = String(leftColumn || '').trim();
+      var right = String(rightColumn || '').trim();
+      if (!left || !right || !endpointColumns.has(left) || !primaryColumns.has(right)) return;
+      var key = left + '\\u0000' + right;
+      if (!candidates.some(function (candidate) { return candidate.key === key; })) candidates.push({ key: key, leftColumn: left, rightColumn: right });
+    };
+    diagramImportStageCardSourcesClient(endpointStage).forEach(function (endpointSource) {
+      diagramImportStageCardSourcesClient(primaryStage).forEach(function (primarySource) {
+        if (String(endpointSource && endpointSource.className || '') !== String(primarySource && primarySource.className || '')) return;
+        add(endpointSource && endpointSource.idColumn, primarySource && primarySource.idColumn);
+      });
+    });
+    return candidates;
+  }
+
+  function diagramImportEndpointProfileEligibilityClient(proposal, item) {
+    var tree = diagramImportStructureTreeClient(proposal);
+    var roles = Array.isArray(proposal && proposal.roles) ? proposal.roles : [];
+    var roleFor = function (candidate) {
+      return roles.find(function (role) {
+        return String(role && role.id || '') === String(candidate && candidate.roleId || '');
+      }) || {};
+    };
+    var role = roleFor(item);
+    var mapping = diagramImportStructureItemMappingClient(role, item && item.mapping || {}, item && item.id || '');
+    if (!item || item.templateStatic === true || diagramImportRoleVisualKindClient(role) !== 'container' ||
+      String(mapping && mapping.materialization && mapping.materialization.kind || '') === 'structural') {
+      return { eligible: true, reason: '', representedBy: [] };
+    }
+    var representedBy = (tree.items || []).flatMap(function (child) {
+      if (String(child && child.parentId || '') !== String(item && item.id || '')) return [];
+      var childRole = roleFor(child);
+      var childMapping = diagramImportStructureItemMappingClient(childRole, child && child.mapping || {}, child && child.id || '');
+      return diagramImportRoleVisualKindClient(childRole) === 'node' &&
+        String(childMapping && childMapping.materialization && childMapping.materialization.kind || '') === 'parentCard'
+        ? [{ structureItemId: String(child && child.id || ''), label: String(childRole.label || childRole.key || child && child.id || '') }]
+        : [];
+    });
+    return representedBy.length
+      ? { eligible: false, reason: 'representedByParentCardChild', representedBy: representedBy }
+      : { eligible: true, reason: '', representedBy: [] };
+  }
+
+  function diagramImportEndpointProfilePlacementEntries(proposal, spec) {
+    var tree = diagramImportStructureTreeClient(proposal);
+    var roles = Array.isArray(proposal && proposal.roles) ? proposal.roles : [];
+    var byId = {};
+    (tree.items || []).forEach(function (item) { byId[String(item && item.id || '')] = item; });
+    var pathFor = function (item) {
+      var visited = {};
+      var current = item;
+      var labels = [];
+      while (current && !visited[String(current.id || '')]) {
+        visited[String(current.id || '')] = true;
+        var currentRole = roles.find(function (candidate) { return String(candidate && candidate.id || '') === String(current && current.roleId || ''); }) || {};
+        labels.unshift(String(currentRole.label || currentRole.key || current.id || ''));
+        current = byId[String(current.parentId || '')] || null;
+      }
+      return labels.join(' / ');
+    };
+    var entries = (tree.items || []).flatMap(function (item) {
+      var role = roles.find(function (candidate) { return String(candidate && candidate.id || '') === String(item && item.roleId || ''); }) || {};
+      if (!['node', 'container'].includes(diagramImportRoleVisualKindClient(role))) return [];
+      var source = diagramImportMaterializedStageForItemClient(proposal, item, spec || defaultSpec());
+      var primaryStage = source && source.stageId ? diagramImportStageById(spec || defaultSpec(), source.stageId) : null;
+      if (!primaryStage) return [];
+      var eligibility = diagramImportEndpointProfileEligibilityClient(proposal, item);
+      return [{
+        structureItemId: String(item && item.id || ''),
+        roleId: String(role.id || ''),
+        stageId: String(primaryStage.id || ''),
+        placementLabel: pathFor(item),
+        sourceLabel: String(primaryStage.label || primaryStage.name || userFacingResultLabel(primaryStage.alias, spec || defaultSpec()) || primaryStage.id || ''),
+        sourceKind: source && source.inherited ? 'Карточка родительской связи' : 'Карточка результата для повторения',
+        eligible: eligibility.eligible,
+        eligibilityReason: eligibility.reason,
+        representedBy: eligibility.representedBy
+      }];
+    }).sort(function (left, right) {
+      return left.placementLabel.localeCompare(right.placementLabel) || left.sourceLabel.localeCompare(right.sourceLabel);
+    });
+    var totals = {};
+    entries.forEach(function (entry) {
+      var key = entry.placementLabel + '\u0000' + entry.sourceLabel;
+      totals[key] = Number(totals[key] || 0) + 1;
+    });
+    var ordinals = {};
+    return entries.map(function (entry) {
+      var key = entry.placementLabel + '\u0000' + entry.sourceLabel;
+      ordinals[key] = Number(ordinals[key] || 0) + 1;
+      return Object.assign({}, entry, {
+        copyIndex: ordinals[key],
+        copyCount: totals[key],
+        displayLabel: entry.placementLabel + (totals[key] > 1 ? ' (копия ' + String(ordinals[key]) + ')' : '')
+      });
+    });
+  }
+
+  function diagramImportEndpointProfilesForPlacementsClient(proposal, spec) {
+    var profiles = Array.isArray(proposal && proposal.endpointProfiles) ? proposal.endpointProfiles : [];
+    var entries = diagramImportEndpointProfilePlacementEntries(proposal, spec);
+    var changed = false;
+    var normalized = profiles.flatMap(function (profile, index) {
+      var current = profile && typeof profile === 'object' ? profile : {};
+      if (String(current.structureItemId || '').trim()) return [current];
+      var candidates = entries.filter(function (entry) {
+        return entry.roleId === String(current.roleId || '') &&
+          (!String(current.stageId || '') || entry.stageId === String(current.stageId || ''));
+      });
+      if (!candidates.length) return [current];
+      changed = true;
+      return candidates.map(function (entry, candidateIndex) {
+        return Object.assign({}, current, {
+          id: candidateIndex === 0 ? String(current.id || ('endpoint_profile_legacy_' + String(index + 1))) : 'endpoint_profile_migrated_' + String(index + 1) + '_' + String(candidateIndex + 1),
+          structureItemId: entry.structureItemId,
+          roleId: entry.roleId,
+          stageId: ''
+        });
+      });
+    });
+    if (changed) proposal.endpointProfiles = normalized;
+    return changed;
+  }
+
+  function renderDiagramImportEndpointProfiles(proposal, spec) {
+    var entries = diagramImportEndpointProfilePlacementEntries(proposal, spec);
+    var profiles = Array.isArray(proposal.endpointProfiles) ? proposal.endpointProfiles : [];
+    var placementOptions = function (selectedItemId) {
+      return '<option value="">Выберите элемент структуры</option>' + entries.filter(function (entry) {
+        return entry.eligible || entry.structureItemId === String(selectedItemId || '');
+      }).map(function (entry) {
+        return '<option value="' + escapeHtml(entry.structureItemId) + '"' +
+          (entry.structureItemId === String(selectedItemId || '') ? ' selected' : '') +
+          (entry.eligible ? '' : ' disabled') + '>' + escapeHtml(entry.displayLabel || entry.placementLabel) + '</option>';
+      }).join('');
+    };
+    var entryByPlacement = function (structureItemId) {
+      return entries.find(function (entry) { return entry.structureItemId === String(structureItemId || ''); }) || null;
+    };
+    var operatorOptions = function (selected) {
+      var values = Array.isArray(selected) && selected.length ? selected : ['ipv4InCidr'];
+      return [['equals', 'Равно'], ['contains', 'Содержит'], ['regexMatch', 'Регулярное выражение'], ['ipv4InCidr', 'IPv4: адрес входит в сеть'], ['ipv4InRange', 'IPv4: адрес входит в диапазон'], ['ipv4CidrOverlaps', 'IPv4: сети пересекаются'], ['ipv4CidrContains', 'IPv4: сеть содержит сеть']].map(function (entry) {
+        return '<option value="' + entry[0] + '"' + (values.includes(entry[0]) ? ' selected' : '') + '>' + entry[1] + '</option>';
+      }).join('');
+    };
+    var rows = profiles.map(function (profile, index) {
+      var current = profile && typeof profile === 'object' ? profile : {};
+      var structureItemId = String(current.structureItemId || '');
+      var entry = entryByPlacement(structureItemId);
+      var disabledReason = entry && !entry.eligible && entry.eligibilityReason === 'representedByParentCardChild'
+        ? '<p class="diagram-import-label-error">Не участвует в построении связей: карточку этой рамки представляет дочерний узел «' + escapeHtml((entry.representedBy || []).map(function (child) { return child.label; }).join('», «')) + '».</p>'
+        : '';
+      return '<tr data-diagram-import-endpoint-profile-row="' + index + '" data-diagram-import-endpoint-profile-id="' + escapeHtml(String(current.id || '')) + '">' +
+        '<td><select data-diagram-import-endpoint-profile-field="structureItemId">' + placementOptions(structureItemId) + '</select></td>' +
+        '<td>' + (entry ? '<strong>' + escapeHtml(entry.sourceLabel) + '</strong><br><span class="muted">' + escapeHtml(entry.sourceKind) + '</span>' + disabledReason : '<span class="muted">Источник не определен</span>') + '</td>' +
+        '<td><input data-diagram-import-endpoint-profile-field="label" value="' + escapeHtml(String(current.label || '')) + '" placeholder="Например: Сеть ИС"></td>' +
+        '<td>' + (entry
+          ? renderDiagramImportConditionFieldPicker(spec || defaultSpec(), entry.stageId, 'data-diagram-import-endpoint-profile-field="field"', current.field, current.source)
+          : '<span class="muted">Сначала выберите элемент структуры</span>') + '</td>' +
+        '<td><select multiple size="3" data-diagram-import-endpoint-profile-field="operators">' + operatorOptions(current.operators) + '</select></td>' +
+        '<td><button type="button" class="icon-button" title="Удалить правило" aria-label="Удалить правило" data-action="diagram-import-remove-endpoint-profile">×</button></td>' +
+      '</tr>';
+    }).join('');
+    return '<div class="diagram-editor-block"><div class="diagram-editor-heading"><h4>Поля сопоставления объектов и контейнеров</h4><button type="button" class="diagram-add-button" data-action="diagram-import-add-endpoint-profile" title="Добавить правило">+</button></div>' +
+      '<p class="muted">Правило принадлежит конкретной копии элемента в структуре и определяет её атрибут для алгоритмов связей D2. Любая связь, у которой метод на соответствующей стороне совпадает с разрешенным методом правила, автоматически проверяет этот элемент. Динамическая рамка с непосредственным дочерним узлом «Карточка родительской ветви» не участвует в связях: её карточку представляет этот узел. Сохраненные правила такой рамки остаются видимыми, но не исполняются. Поиск атрибутов показывает все подтвержденные карточки результата Object Flow с указанием источника; технический набор колонок результата его не ограничивает.</p>' +
+      '<div class="table-wrap"><table class="compact"><thead><tr><th>Элемент структуры</th><th>Источник Object Flow</th><th>Имя правила</th><th>Атрибут</th><th>Разрешенные методы</th><th></th></tr></thead><tbody>' +
+        (rows || '<tr><td colspan="6" class="muted">Правила сопоставления еще не заданы.</td></tr>') +
+      '</tbody></table></div></div>';
   }
 
   function renderDiagramImportRelationTemplateSuggestions(spec, stageId) {
-    var stage = diagramImportStageById(spec || defaultSpec(), stageId || '') || {};
-    var fields = (stage.columns || []).map(function (column) {
-      var name = String(column || '').trim();
-      return name ? { value: name, label: diagramImportStageFieldDisplayLabel(stage, name) || name } : null;
-    }).filter(Boolean);
+    var fields = diagramImportStageFieldOptions(spec || defaultSpec(), stageId || '');
     return renderDiagramTemplateSuggestionButtons(diagramTemplateParameterTokenRows(spec).concat(fields));
   }
 
   function diagramImportDirectionPolicyGroups(unresolved) {
     var byKey = {};
     (Array.isArray(unresolved) ? unresolved : []).forEach(function (item) {
-      var classKeys = Array.isArray(item && item.d2ClassKeys) ? item.d2ClassKeys.map(function (value) { return String(value || '').trim(); }).filter(Boolean) : [];
-      var classKey = classKeys.length === 1 ? classKeys[0] : '';
       var elementKeys = Array.isArray(item && item.d2ElementKeys) ? item.d2ElementKeys.map(function (value) { return String(value || '').trim(); }).filter(Boolean) : [];
-      var key = classKey ? 'class:' + classKey : 'edge:' + (elementKeys.join(',') || String(item && item.id || ''));
+      var key = 'edge:' + (elementKeys.join(',') || String(item && item.id || ''));
       var group = byKey[key];
       if (!group) {
         group = {
           id: key,
           family: 'topology',
           fields: ['directionPolicy'],
-          d2ClassKey: classKey,
-          d2ClassKeys: classKeys,
+          d2ClassKey: String(item && item.d2ClassKey || ''),
+          d2ClassKeys: Array.isArray(item && item.d2ClassKeys) ? item.d2ClassKeys.map(function (value) { return String(value || '').trim(); }).filter(Boolean) : [],
           d2ElementKeys: [],
-          displayName: classKey || String(item && item.displayName || item && item.id || 'D2 connection'),
+          displayName: String(item && item.displayName || item && item.id || 'D2 connection'),
           suggestions: []
         };
         byKey[key] = group;
@@ -20216,9 +21901,7 @@ function dynamicPagesClientScript() {
     });
     return Object.keys(byKey).map(function (key) {
       var group = byKey[key];
-      var count = group.d2ElementKeys.length || 1;
       group.directionPolicySuggestion = group.suggestions.length === 1 ? group.suggestions[0] : '';
-      if (group.d2ClassKey) group.displayName += ' (' + String(count) + ')';
       return group;
     });
   }
@@ -20381,10 +22064,14 @@ function dynamicPagesClientScript() {
       : validationRequired
         ? t('diagramImportSavedIncomplete')
         : readiness.canApply ? t('diagramImportReady') : t('diagramImportReview');
+    var migrationWarnings = (Array.isArray(proposal.warnings) ? proposal.warnings : []).map(function (warning) {
+      return '<div class="notice warning" role="status">' + escapeHtml(String(warning || '')) + '</div>';
+    }).join('');
     return [
       '<div class="diagram-editor-block" data-diagram-editor-section="d2-mappings" data-diagram-import-editor-mode="' + (applied ? 'applied' : 'proposal') + '">',
       '<div class="diagram-editor-heading"><h4>' + title + '</h4><span class="pill ' + (readiness.canApply && applied && !state.diagramImportAppliedEditorDirty && !validationRequired ? 'ok' : '') + '">' + escapeHtml(editorState) + '</span></div>',
       '<p class="muted">' + escapeHtml(t('diagramImportEditorSaveHint')) + '</p>',
+      migrationWarnings,
       renderDiagramImportEditorTabs(editorTab),
       editorPanel,
       '<div class="toolbar"><button type="button" data-action="open-assistant-d2">' + t('diagramEditInAssistant') + '</button></div>',
@@ -20465,14 +22152,14 @@ function dynamicPagesClientScript() {
       return String(left && left.key || '').localeCompare(String(right && right.key || ''));
     });
     if (!notesRoles.length) {
-      return '<div class="diagram-editor-block" data-diagram-element-binding-editor><div class="diagram-editor-heading"><h4>Элементы D2 и данные</h4></div><p class="muted">В D2 source нет class-ролей с Notes. Добавьте Notes в classes.&lt;role&gt; и повторите анализ.</p></div>';
+      return '<div class="diagram-editor-block" data-diagram-element-binding-editor><div class="diagram-editor-heading"><h4>Элементы D2 и данные</h4></div><p class="muted">В D2 source нет ролей с Notes. Добавьте Notes к class-роли или контейнеру D2 и повторите анализ.</p></div>';
     }
     var rows = notesRoles.map(function (role) {
       var elementKeys = Array.isArray(role && role.elementKeys) ? role.elementKeys.map(String) : [];
       var selected = elementKeys.indexOf(selectedElementKey) >= 0;
-      return '<article class="diagram-mapping-detail diagram-notes-role' + (selected ? ' selected' : '') + '" data-diagram-notes-role="' + escapeHtml(role.id || '') + '"><div><strong>' + escapeHtml(role.key || role.label || role.id || '') + '</strong>' + (elementKeys.length ? '<br><span class="muted">' + escapeHtml(elementKeys.join(', ')) + '</span>' : '') + '</div><div class="diagram-notes-role-description"><textarea rows="5" readonly aria-label="Notes роли ' + escapeHtml(role.key || role.label || role.id || '') + '">' + escapeHtml(role.notes || '') + '</textarea></div></article>';
+      return '<article class="diagram-mapping-detail diagram-notes-role' + (selected ? ' selected' : '') + '" data-diagram-notes-role="' + escapeHtml(role.id || '') + '"><div><strong>' + escapeHtml(role.key || role.label || role.id || '') + '</strong>' + (role.templateStatic === true ? '<br><span class="muted">Статический фрагмент template</span>' : '') + (elementKeys.length ? '<br><span class="muted">' + escapeHtml(elementKeys.join(', ')) + '</span>' : '') + '</div><div class="diagram-notes-role-description"><textarea rows="5" readonly aria-label="Notes роли ' + escapeHtml(role.key || role.label || role.id || '') + '">' + escapeHtml(role.notes || '') + '</textarea></div></article>';
     }).join('');
-    return '<div class="diagram-editor-block" data-diagram-element-binding-editor><div class="diagram-editor-heading"><h4>Элементы D2 и данные</h4></div><p class="muted">Показаны только class-роли с Notes. Notes передаются Assistant как обязательный контекст; дерево структуры и источники данных редактируются отдельно.</p><div class="diagram-notes-role-list">' + rows + '</div></div>';
+    return '<div class="diagram-editor-block" data-diagram-element-binding-editor><div class="diagram-editor-heading"><h4>Элементы D2 и данные</h4></div><p class="muted">Показаны роли D2 с Notes. Notes передаются Assistant как обязательный контекст; статические фрагменты template не используют источники CMDBuild.</p><div class="diagram-notes-role-list">' + rows + '</div></div>';
   }
 
   function selectDiagramImportElement(elementKey) {
@@ -20546,7 +22233,6 @@ function dynamicPagesClientScript() {
       '<div class="assistant-d2-prompt"><h4>' + t('assistantDiagramStructureTitle') + '</h4><p class="muted">' + t('assistantDiagramStructureHelp') + '</p><label>' + t('assistantDiagramInterpretPrompt') + '<textarea id="cmdp-assistant-diagram-interpret-prompt" rows="4">' + escapeHtml(state.assistantDiagramInterpretPrompt || '') + '</textarea></label><div class="toolbar"><button type="button" data-action="assistant-diagram-interpret"' + (busy || !hasSource ? ' disabled' : '') + '>' + t('assistantDiagramInterpret') + '</button></div></div>',
       '<div class="assistant-d2-prompt"><h4>' + t('assistantDiagramMappingTitle') + '</h4><p class="muted">' + t('assistantDiagramMappingHelp') + '</p><label>' + t('assistantDiagramMappingPrompt') + '<textarea id="cmdp-assistant-diagram-mapping-prompt" rows="4">' + escapeHtml(state.assistantDiagramMappingPrompt || '') + '</textarea></label><div class="toolbar"><button type="button" data-action="assistant-diagram-map"' + (busy || !hasSource || !hasAppliedFlowStages || semanticBlocked && Boolean(proposal) && !state.diagramImportStale ? ' disabled' : '') + '>' + t('assistantDiagramMap') + '</button></div>' + (!proposal ? '<p class="muted">' + escapeHtml(mappingApplied ? t('diagramImportAppliedAssistantHelp') : t('assistantDiagramAnalysisRequired')) + '</p>' : '') + (proposal && !hasAppliedFlowStages ? '<p class="muted">Сначала примените поток данных к draft: только примененные детерминированные результаты доступны для сопоставления.</p>' : '') + '</div>',
       renderDiagramImportAssistantProposal(spec),
-      renderDiagramImportRuntimePreview(),
       '</div>',
       '</div>'
     ].join('');
@@ -20718,6 +22404,7 @@ function dynamicPagesClientScript() {
   function renderDiagramImportRuntimeExecution(diagrams, spec) {
     var rows = [];
     var itemRows = [];
+    var connectionRows = [];
     var emptyBindings = [];
     var unconfiguredItems = [];
     function resolutionText(value, labels, emptyText) {
@@ -20777,6 +22464,26 @@ function dynamicPagesClientScript() {
         }
         rows.push('<tr><td>' + escapeHtml(displayName) + '</td><td>' + escapeHtml(sourceLabel) + '</td><td>' + escapeHtml(String(inputRows)) + '</td><td>' + escapeHtml(String(materialized)) + '</td><td>' + escapeHtml(templateText) + '</td><td>' + escapeHtml(placementText) + '</td><td>' + escapeHtml(String(Math.max(0, Number(binding.duplicates) || 0))) + '</td><td>' + escapeHtml(omissionText) + '</td></tr>');
       });
+      (Array.isArray(execution.connections) ? execution.connections : []).forEach(function (connection) {
+        var relation = connection && connection.relation && typeof connection.relation === 'object' ? connection.relation : {};
+        var source = connection && connection.source && typeof connection.source === 'object' ? connection.source : {};
+        var skipped = connection && connection.skipped && typeof connection.skipped === 'object' ? connection.skipped : {};
+        var skippedParts = [
+          ['нет источника', skipped.sourceUnresolved],
+          ['нет назначения', skipped.targetUnresolved],
+          ['нет обоих концов', skipped.bothUnresolved],
+          ['несовместимая ветвь', skipped.incompatible]
+        ].map(function (item) {
+          var count = Math.max(0, Number(item[1]) || 0);
+          return count ? item[0] + ': ' + count : '';
+        }).filter(Boolean);
+        var duplicates = Math.max(0, Number(connection && connection.duplicatePairs) || 0);
+        var inputDuplicates = Math.max(0, Number(connection && connection.duplicateInputRows) || 0);
+        var duplicateText = duplicates || inputDuplicates
+          ? 'пары: ' + String(duplicates) + '; строки: ' + String(inputDuplicates)
+          : 'нет';
+        connectionRows.push('<tr><td>' + escapeHtml(String(relation.label || relation.key || 'Связь D2')) + '</td><td>' + escapeHtml(diagramImportExecutionSourceLabel(source, spec)) + '</td><td>' + escapeHtml(String(Math.max(0, Number(connection && connection.inputRows) || 0))) + '</td><td>' + escapeHtml(String(Math.max(0, Number(connection && connection.uniqueCards) || 0))) + '</td><td>' + escapeHtml(String(Math.max(0, Number(connection && connection.emittedPairs) || 0))) + '</td><td>' + escapeHtml(duplicateText) + '</td><td>' + escapeHtml(skippedParts.join('; ') || 'нет') + '</td></tr>');
+      });
       (Array.isArray(execution.items) ? execution.items : []).forEach(function (item) {
         var role = item && item.role && typeof item.role === 'object' ? item.role : {};
         var source = item && item.source && typeof item.source === 'object' ? item.source : {};
@@ -20791,13 +22498,16 @@ function dynamicPagesClientScript() {
     var ledger = itemRows.length
       ? '<details class="help-details" data-diagram-import-materialization-ledger open><summary><strong>Материализованные объекты диаграммы</strong></summary><div class="table-wrap"><table class="compact"><thead><tr><th>Элемент D2</th><th>Источник Object Flow</th><th>Объект</th><th>Статус</th><th>Размещение</th></tr></thead><tbody>' + itemRows.join('') + '</tbody></table></div></details>'
       : '';
+    var connections = connectionRows.length
+      ? '<details class="help-details" data-diagram-import-connection-diagnostics><summary><strong>Диагностика связей D2</strong></summary><p class="muted">Стрелки строятся только между найденными объектами утверждённой структуры. Одна карточка связи может дать несколько реальных пар; повтор одной и той же пары исключается.</p><div class="table-wrap"><table class="compact"><thead><tr><th>Связь D2</th><th>Источник Object Flow</th><th>Строки</th><th>Карточки связи</th><th>Построено пар</th><th>Дубликаты</th><th>Пропущено</th></tr></thead><tbody>' + connectionRows.join('') + '</tbody></table></div></details>'
+      : '';
     var emptySourceWarning = emptyBindings.length
       ? '<div class="notice warning" data-diagram-import-empty-bindings><strong>Часть элементов D2 не показана</strong><ul class="steps">' + emptyBindings.map(function (message) { return '<li>' + escapeHtml(message) + '</li>'; }).join('') + '</ul></div>'
       : '';
     var unconfiguredWarning = unconfiguredItems.length
       ? '<div class="notice warning" data-diagram-import-unconfigured-structure><strong>Часть структуры D2 не настроена</strong><ul class="steps">' + unconfiguredItems.map(function (message) { return '<li>' + escapeHtml(message) + '</li>'; }).join('') + '</ul></div>'
       : '';
-    return unconfiguredWarning + emptySourceWarning + contract + ledger;
+    return unconfiguredWarning + emptySourceWarning + contract + connections + ledger;
   }
 
   function renderDiagramImportRuntimePreview() {
@@ -23063,7 +24773,7 @@ function dynamicPagesClientScript() {
       var selection = selections[selectionIndex] || {};
       var next = Object.assign({}, table);
       if (!Array.isArray(next.columns) || !next.columns.length) {
-        next.columns = selection.columns && selection.columns.length ? selection.columns.slice() : ['Class', 'Code', 'Description'];
+        next.columns = [];
       }
       return next;
     }) : selections.map(function (selection, index) {
@@ -23071,14 +24781,14 @@ function dynamicPagesClientScript() {
       return {
         name: alias,
         title: selection.name || defaultObjectSelectionName(index),
-        columns: selection.columns && selection.columns.length ? selection.columns.slice() : ['Class', 'Code', 'Description']
+        columns: []
       };
     });
     if (finalAlias && !tables.some(function (table) { return table && table.name === finalAlias; })) {
       tables.push({
         name: finalAlias,
         title: finalSelection.name || defaultObjectSelectionName(finalSelectionIndex >= 0 ? finalSelectionIndex : 0),
-        columns: finalSelection.columns && finalSelection.columns.length ? finalSelection.columns.slice() : ['Class', 'Code', 'Description']
+        columns: []
       });
     }
     var first = selections[0] || defaultObjectSelection(0, '');
@@ -23104,7 +24814,7 @@ function dynamicPagesClientScript() {
         output: {
           alias: alias,
           title: selection.name || defaultObjectSelectionName(index),
-          columns: selection.columns && selection.columns.length ? selection.columns.slice() : ['Class', 'Code', 'Description']
+          columns: []
         }
       };
     });
@@ -23126,7 +24836,7 @@ function dynamicPagesClientScript() {
         output: {
           alias: finalAlias || first.alias || 'objects',
           title: finalSelection.name || first.name || defaultObjectSelectionName(0),
-          columns: finalSelection.columns && finalSelection.columns.length ? finalSelection.columns.slice() : ['Class', 'Code', 'Description']
+          columns: []
         },
         catalog: {
           maxTraversalDepth: Number(state.maxTraversalDepth) || 1
@@ -23354,8 +25064,6 @@ function dynamicPagesClientScript() {
         var domainField = operationNode.querySelector('[data-relation-operation-field="domain"]');
         var targetClassField = operationNode.querySelector('[data-relation-operation-field="targetClass"]');
         var directionField = operationNode.querySelector('[data-relation-operation-field="direction"]');
-        var columnsField = operationNode.querySelector('[data-relation-operation-field="columns"]');
-        var limitField = operationNode.querySelector('[data-relation-operation-field="limit"]');
         operations[index] = normalizeRelationOperation({
           id: String(operationNode.getAttribute('data-relation-operation-id') || '').trim(),
           type: 'relation',
@@ -23363,9 +25071,7 @@ function dynamicPagesClientScript() {
           as: String(relationAsField && relationAsField.value || '').trim(),
           domain: String(domainField && domainField.value || '').trim(),
           targetClass: String(targetClassField && targetClassField.value || '').trim(),
-          direction: String(directionField && directionField.value || '').trim(),
-          columns: catalogFieldPickerSelectedFieldValues(columnsField),
-          limit: Number(limitField && limitField.value || 0)
+          direction: String(directionField && directionField.value || '').trim()
         }, index, selections, operations);
         return;
       }
@@ -23376,8 +25082,6 @@ function dynamicPagesClientScript() {
         var existsDomainField = operationNode.querySelector('[data-exists-related-field="domain"]');
         var existsTargetClassField = operationNode.querySelector('[data-exists-related-field="targetClass"]');
         var existsDirectionField = operationNode.querySelector('[data-exists-related-field="direction"]');
-        var existsColumnsField = operationNode.querySelector('[data-exists-related-field="columns"]');
-        var existsLimitField = operationNode.querySelector('[data-exists-related-field="limit"]');
         var existsRules = [];
         Array.prototype.slice.call(operationNode.querySelectorAll('[data-matching-rule-row]')).forEach(function (row) {
           var actionElement = row.querySelector('[data-matching-rule-field="action"]');
@@ -23413,8 +25117,6 @@ function dynamicPagesClientScript() {
           domain: String(existsDomainField && existsDomainField.value || '').trim(),
           targetClass: String(existsTargetClassField && existsTargetClassField.value || '').trim(),
           direction: String(existsDirectionField && existsDirectionField.value || '').trim(),
-          columns: catalogFieldPickerSelectedFieldValues(existsColumnsField),
-          limit: Number(existsLimitField && existsLimitField.value || 0),
           rules: existsRules
         }, index, selections, operations);
         return;
@@ -23513,23 +25215,70 @@ function dynamicPagesClientScript() {
     if (columnsByAlias[sourceAlias].indexOf(field) === -1) columnsByAlias[sourceAlias].push(field);
   }
 
-  function collectMatchingSelectionColumns(model) {
-    var columnsByAlias = {};
+  function isDerivedRelationPathColumn(column) {
+    var field = String(column || '').trim();
+    return field.indexOf('.') >= 0 || field.indexOf('{') >= 0;
+  }
+
+  function collectMatchingMaterializedColumns(model) {
+    var selectionColumns = {};
+    var relationColumns = {};
     var selectionAliases = (model.selections || []).map(function (selection, index) {
       return selection.alias || objectSelectionAlias(index);
     });
+    var operationsByAlias = {};
+    flowOperations(model).forEach(function (operation) {
+      if (operation && operation.as) operationsByAlias[operation.as] = operation;
+    });
+
+    function add(alias, column, seen) {
+      var targetAlias = String(alias || '').trim();
+      var field = String(column || '').trim();
+      if (!targetAlias || !field) return;
+      seen = seen || {};
+      var key = targetAlias + ':' + field;
+      if (seen[key]) return;
+      seen[key] = true;
+      if (selectionAliases.indexOf(targetAlias) !== -1) {
+        addSelectionMaterializedColumn(selectionColumns, targetAlias, field);
+        return;
+      }
+      var operation = operationsByAlias[targetAlias];
+      if (!operation) return;
+      if (operation.type === 'relation') {
+        if (!isDerivedRelationPathColumn(field)) return;
+        if (!relationColumns[targetAlias]) relationColumns[targetAlias] = [];
+        if (relationColumns[targetAlias].indexOf(field) === -1) relationColumns[targetAlias].push(field);
+        return;
+      }
+      if (operation.type === 'match') {
+        var prefix = operation.rightPrefix || objectSelectionOutputPrefixFromList(model.selections || [], operation.with);
+        if (prefix && field.indexOf(prefix) === 0) add(operation.with, field.slice(prefix.length), seen);
+        else add(operation.from, field, seen);
+        return;
+      }
+      if (operation.type === 'existsRelated' || operation.type === 'semiJoin') {
+        add(operation.from, field, seen);
+        return;
+      }
+      if (['union', 'difference', 'intersect'].indexOf(operation.type) !== -1) {
+        add(operation.from, field, seen);
+        add(operation.with, field, seen);
+      }
+    }
+
     flowOperations(model).forEach(function (operation) {
       if (operation.type !== 'match' && operation.type !== 'semiJoin' && operation.type !== 'existsRelated') return;
       (operation.rules || []).forEach(function (rule) {
         if (operation.type === 'existsRelated') {
-          if (selectionAliases.indexOf(operation.with) !== -1) addSelectionMaterializedColumn(columnsByAlias, operation.with, rule.leftColumn);
+          add(operation.with, rule.leftColumn);
         } else {
-          if (selectionAliases.indexOf(operation.from) !== -1) addSelectionMaterializedColumn(columnsByAlias, operation.from, rule.leftColumn);
-          if (selectionAliases.indexOf(operation.with) !== -1) addSelectionMaterializedColumn(columnsByAlias, operation.with, rule.rightColumn);
+          add(operation.from, rule.leftColumn);
+          add(operation.with, rule.rightColumn);
         }
       });
     });
-    return columnsByAlias;
+    return { selectionColumns: selectionColumns, relationColumns: relationColumns };
   }
 
   function buildSelectionColumnSpecs(columns) {
@@ -23544,11 +25293,11 @@ function dynamicPagesClientScript() {
       selections: model.selections
     }, previousSpec || defaultSpec());
     var specForLabels = objectSpec || previousSpec || defaultSpec();
-    var columnsByAlias = collectMatchingSelectionColumns(model);
+    var materializedColumns = collectMatchingMaterializedColumns(model);
     var selectionSteps = (objectSpec.steps || []).map(function (step) {
       var copy = Object.assign({}, step);
-      var materializedColumns = columnsByAlias[copy.as] || [];
-      if (materializedColumns.length) copy.columns = buildSelectionColumnSpecs(normalizeObjectSelectionColumns(copy.columns).concat(materializedColumns));
+      var requiredColumns = materializedColumns.selectionColumns[copy.as] || [];
+      if (requiredColumns.length) copy.columns = buildSelectionColumnSpecs(normalizeObjectSelectionColumns(copy.columns).concat(requiredColumns));
       return copy;
     });
     var operations = flowOperations(model);
@@ -23594,21 +25343,22 @@ function dynamicPagesClientScript() {
         };
       }
       if (operation.type === 'relation') {
-        return {
+        var relationStep = {
           type: 'expandRelations',
           purpose: 'objectMatching',
           from: operation.from,
           domain: operation.domain,
           targetClass: operation.targetClass,
           direction: operation.direction,
-          columns: operation.columns,
-          limit: operation.limit,
           distinct: operation.distinct !== false,
           as: operation.as
         };
+        var relationColumns = materializedColumns.relationColumns[operation.as] || [];
+        if (relationColumns.length) relationStep.columns = relationColumns;
+        return relationStep;
       }
       if (operation.type === 'existsRelated') {
-        return {
+        var existsStep = {
           type: 'existsRelatedRows',
           purpose: 'objectMatching',
           from: operation.from,
@@ -23616,8 +25366,6 @@ function dynamicPagesClientScript() {
           domain: operation.domain,
           targetClass: operation.targetClass,
           direction: operation.direction,
-          columns: uniqueList((operation.columns || []).concat((operation.rules || []).map(function (rule) { return rule.rightColumn; }))),
-          limit: operation.limit,
           distinct: operation.distinct !== false,
           rules: operation.rules.map(function (rule) {
             return {
@@ -23631,6 +25379,9 @@ function dynamicPagesClientScript() {
           caseSensitive: false,
           as: operation.as
         };
+        var relatedColumns = uniqueList((operation.rules || []).map(function (rule) { return rule.rightColumn; }).filter(isDerivedRelationPathColumn));
+        if (relatedColumns.length) existsStep.columns = relatedColumns;
+        return existsStep;
       }
       return {
         type: operation.type + 'Rows',
@@ -23650,24 +25401,19 @@ function dynamicPagesClientScript() {
     var resultTables = objectSpec.result && objectSpec.result.tables ? objectSpec.result.tables.slice() : [];
     operations.forEach(function (operation, index) {
       if (resultTables.some(function (table) { return table && table.name === operation.as; })) return;
-      // Result table metadata carries only deterministic dependencies. Full
-      // readable-card expansion belongs to Extraction, and user-selected
-      // publication columns belong to Final data.
-      var columnRows = flowColumnOptionRows(model, specForLabels, operation.as, operations.length, {}, false);
       resultTables.push({
         name: operation.as,
         title: assistantManagedObjectFlow(specForLabels)
           ? userFacingResultLabel(operation.as, specForLabels)
           : (operation.as === finalAlias ? t('extractionFinalResult') : operation.type === 'match' ? t('matchingBlock', { number: index + 1 }) : operation.type === 'semiJoin' ? t('semiJoinOperation', { number: index + 1 }) : operation.type === 'relation' ? t('relationOperation', { number: index + 1 }) : operation.type === 'existsRelated' ? t('existsRelatedOperation', { number: index + 1 }) : operation.as),
-        columns: columnRows.map(function (item) { return item.value; }),
-        columnLabels: columnRows.reduce(function (labels, item) { labels[item.value] = item.label; return labels; }, {})
+        columns: []
       });
     });
     if (finalAlias && !resultTables.some(function (table) { return table && table.name === finalAlias; })) {
       resultTables.push({
         name: finalAlias,
         title: assistantManagedObjectFlow(specForLabels) ? userFacingResultLabel(finalAlias, specForLabels) : t('extractionFinalResult'),
-        columns: flowColumnOptionRows(model, specForLabels, finalAlias, operations.length, {}, false).map(function (item) { return item.value; })
+        columns: []
       });
     }
     var preservedPublishedTable = previousSpec && previousSpec.result && Array.isArray(previousSpec.result.tables)
@@ -24769,18 +26515,19 @@ function dynamicPagesClientScript() {
         var parentStage = ancestor && ancestor.stageId
           ? diagramImportStageById(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(), ancestor.stageId) || {}
           : {};
-        var selectedPrimaryCardSource = diagramImportConditionSourceFromElement(container.querySelector('[data-diagram-import-placement-field="primary.cardSource"]'));
-        var primaryProjection = diagramImportPrimaryCardSourceClient(
-          selectedSourceStage,
-          Object.assign({}, primary, selectedPrimaryCardSource ? { cardSource: selectedPrimaryCardSource } : {}),
-          parentStage
-        );
+        var primaryCardSourceField = container.querySelector('[data-diagram-import-placement-field="primary.cardSource"]');
+        var selectedPrimarySource = primaryCardSourceField
+          ? diagramImportConditionSourceFromElement(primaryCardSourceField)
+          : null;
+        var primaryProjection = selectedPrimarySource
+          ? { source: selectedPrimarySource, inferred: false, ambiguous: false }
+          : diagramImportPrimaryCardSourceClient(selectedSourceStage, primary, parentStage);
         if (primaryProjection.source) {
           primary.cardSource = primaryProjection.source;
           primary.className = String(primaryProjection.source.className || '');
         } else {
           delete primary.cardSource;
-          primary.className = String(selectedSourceStage.className || '') || value('primary.className') || primary.className || '';
+          primary.className = String(selectedSourceStage.className || '');
         }
         primary.idAttribute = '_id';
         mapping.primary = primary;
@@ -24815,7 +26562,7 @@ function dynamicPagesClientScript() {
         };
         if (diagramImportRoleVisualKindClient(role) !== 'node') {
           mapping.conditions = capturePlacementConditions();
-          var rawContainerLabelTemplate = value('primary.labelTemplate') || primary.labelTemplate || role.labelTemplate || '\${Description}';
+          var rawContainerLabelTemplate = value('primary.labelTemplate');
           var containerCandidates = diagramImportLabelTemplateCandidates(role, state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(), mapping, proposal, structureItem);
           var containerLabelTemplate = diagramImportCanonicalLabelTemplate(rawContainerLabelTemplate, containerCandidates);
           if (containerLabelTemplate.errors.length) {
@@ -24825,13 +26572,13 @@ function dynamicPagesClientScript() {
           } else {
             delete state.diagramImportLabelTemplateDrafts[structureItem.id];
             delete state.diagramImportLabelTemplateErrors[structureItem.id];
-            primary.labelTemplate = containerLabelTemplate.value || '\${Description}';
+            primary.labelTemplate = containerLabelTemplate.value;
             diagramImportEnsureChildTemplateFields(proposal, structureItem, primary.labelTemplate, containerCandidates);
           }
           structureItem.mapping = mapping;
           return;
         }
-        var rawLabelTemplate = value('primary.labelTemplate') || primary.labelTemplate || role.labelTemplate || '\${Description}';
+        var rawLabelTemplate = value('primary.labelTemplate');
         var labelTemplateCandidates = diagramImportLabelTemplateCandidates(role, state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(), mapping, proposal, structureItem);
         var labelTemplate = diagramImportCanonicalLabelTemplate(rawLabelTemplate, labelTemplateCandidates);
         if (labelTemplate.errors.length) {
@@ -24841,7 +26588,7 @@ function dynamicPagesClientScript() {
         } else {
           delete state.diagramImportLabelTemplateDrafts[structureItem.id];
           delete state.diagramImportLabelTemplateErrors[structureItem.id];
-          primary.labelTemplate = labelTemplate.value || '\${Description}';
+          primary.labelTemplate = labelTemplate.value;
           diagramImportEnsureRelatedTemplateFields(mapping, primary.labelTemplate, labelTemplateCandidates);
         }
         primary.structuredFields = diagramImportPrimaryDataFieldsClient(role, Object.assign({}, primary, {
@@ -24934,32 +26681,89 @@ function dynamicPagesClientScript() {
       delete proposal.elementBindings;
       delete proposal.navigatorGroups;
       delete proposal.navigatorHierarchies;
+      // Only the active Connections tab renders endpoint profiles. Capturing a
+      // different tab must preserve their saved authoring state instead of
+      // replacing it with the empty DOM selection.
+      var endpointProfilePanel = document.querySelector('[data-diagram-import-editor-panel="connections"]');
+      if (endpointProfilePanel) {
+        var endpointProfileEntries = diagramImportEndpointProfilePlacementEntries(proposal, spec);
+        var endpointProfileRows = Array.prototype.slice.call(endpointProfilePanel.querySelectorAll('[data-diagram-import-endpoint-profile-row]'));
+        proposal.endpointProfiles = endpointProfileRows.map(function (row, index) {
+          var field = function (name) { return row.querySelector('[data-diagram-import-endpoint-profile-field="' + name + '"]'); };
+          var existingId = String(row.getAttribute('data-diagram-import-endpoint-profile-id') || '').trim();
+          var operatorsControl = field('operators');
+          var structureItemId = String(field('structureItemId') && field('structureItemId').value || '').trim();
+          var entry = endpointProfileEntries.find(function (candidate) { return candidate.structureItemId === structureItemId; }) || {};
+          var endpointField = field('field');
+          var endpointSource = diagramImportConditionSourceFromElement(endpointField);
+          return {
+            id: existingId || ('endpoint_profile_legacy_' + String(index + 1)),
+            structureItemId: structureItemId,
+            roleId: String(entry.roleId || '').trim(),
+            label: String(field('label') && field('label').value || '').trim(),
+            field: String(endpointField && endpointField.value || '').trim(),
+            ...(endpointSource ? { source: endpointSource } : {}),
+            operators: Array.prototype.slice.call(operatorsControl && operatorsControl.selectedOptions || []).map(function (option) {
+              return String(option && option.value || '').trim();
+            }).filter(Boolean)
+          };
+        }).filter(function (profile) { return profile.id; });
+      }
       var relationRuleRows = Array.prototype.slice.call(document.querySelectorAll('[data-diagram-import-rule-row]'));
-      if (relationRuleRows.length) proposal.relationRules = relationRuleRows.map(function (row, index) {
+      if (relationRuleRows.length) {
+        var existingRulesById = {};
+        (Array.isArray(proposal.relationRules) ? proposal.relationRules : []).forEach(function (rule, index) {
+          var id = String(rule && rule.id || 'relation_rule_' + String(index + 1));
+          existingRulesById[id] = rule || {};
+        });
+        var capturedRules = relationRuleRows.map(function (row, index) {
         var field = function (name) { return row.querySelector('[data-diagram-import-rule-field="' + name + '"]'); };
         var selectedField = function (name) {
           var control = field(name);
           return String(control && (control.selectedOptions && control.selectedOptions[0] ? control.selectedOptions[0].value : control.value) || '').trim();
         };
-        var existing = proposal.relationRules[index] || {};
+        var existingId = String(row.getAttribute('data-diagram-import-rule-id') || '').trim();
+        var existing = existingRulesById[existingId] || proposal.relationRules[index] || {};
+        var legacyLabelField = String(existing.labelField || '').trim();
+        var existingWithoutLegacyLabelField = Object.assign({}, existing);
+        delete existingWithoutLegacyLabelField.labelField;
+        delete existingWithoutLegacyLabelField.sourceEndpointProfileIds;
+        delete existingWithoutLegacyLabelField.targetEndpointProfileIds;
+        delete existingWithoutLegacyLabelField.sourceProfileId;
+        delete existingWithoutLegacyLabelField.targetProfileId;
+        delete existingWithoutLegacyLabelField.sourceStructureItemId;
+        delete existingWithoutLegacyLabelField.targetStructureItemId;
+        delete existingWithoutLegacyLabelField.parentRoleId;
+        delete existingWithoutLegacyLabelField.childRoleId;
+        var labelTemplateControl = field('labelTemplate');
         return {
-          ...existing,
+          ...existingWithoutLegacyLabelField,
           id: existing.id || 'relation_rule_' + String(index + 1),
+          enabled: true,
           kind: String(field('kind') && field('kind').value || 'connection'),
           mode: String(field('mode') && field('mode').value || existing.mode || 'deterministicEndpoints'),
           d2ElementKey: String(existing.d2ElementKey || ''),
           d2Label: String(existing.d2Label || ''),
-          parentRoleId: String(existing.parentRoleId || ''),
-          childRoleId: String(existing.childRoleId || ''),
-          directionPolicy: String(field('directionPolicy') && field('directionPolicy').value || ''),
+          directionPolicy: field('undirected') && field('undirected').checked ? 'undirected' : 'dataFields',
           path: [],
           sourceStageId: selectedField('sourceStageId'),
           sourceField: selectedField('sourceField'),
           targetField: selectedField('targetField'),
-          labelField: selectedField('labelField'),
-          labelTemplate: String(field('labelTemplate') && field('labelTemplate').value || '')
+          // Comparison rules are owned by individual structure placements.
+          // Runtime evaluates every rule whose allowed methods include the
+          // selected side operator; no participant pair is persisted here.
+          sourceOperator: selectedField('sourceOperator') || selectedField('endpointOperator') || 'ipv4InCidr',
+          targetOperator: selectedField('targetOperator') || selectedField('endpointOperator') || 'ipv4InCidr',
+          endpointOperator: selectedField('sourceOperator') || selectedField('endpointOperator') || 'ipv4InCidr',
+          labelTemplate: labelTemplateControl
+            ? String(labelTemplateControl.value || '')
+            : (String(existing.labelTemplate || '') || (legacyLabelField ? '$' + '{' + legacyLabelField + '}' : ''))
         };
-      });
+        });
+        proposal.relationRules = capturedRules.concat((Array.isArray(proposal.relationRules) ? proposal.relationRules : []).filter(function (rule) {
+          return rule && rule.enabled === false;
+        }));
+      }
       refreshDiagramImportSemanticState(proposal);
       storeDiagramImportEditorModel(proposal);
       if (diagramImportEditorIsApplied(proposal)) {
@@ -24986,7 +26790,7 @@ function dynamicPagesClientScript() {
   }
 
   function diagramImportAuthoringOverrides(proposal) {
-    if (!proposal || proposal.version !== 3) return { semanticModelRevision: 0, diagramId: '', sourceHash: '', structureHash: '', mappingContractHash: '', roles: [], relationRules: [], structureTree: { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] } };
+    if (!proposal || proposal.version !== 3) return { semanticModelRevision: 0, diagramId: '', sourceHash: '', structureHash: '', mappingContractHash: '', roles: [], endpointProfiles: [], relationRules: [], structureTree: { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] } };
     return {
       semanticModelRevision: Number(proposal.semanticModelRevision || D2_IMPORT_SEMANTIC_MODEL_REVISION),
       diagramId: String(proposal.diagramId || ''),
@@ -24994,6 +26798,7 @@ function dynamicPagesClientScript() {
       structureHash: String(proposal.source && proposal.source.structureHash || ''),
       mappingContractHash: String(proposal.source && proposal.source.mappingContractHash || ''),
       roles: diagramImportBindingOverrides(proposal),
+      endpointProfiles: cloneJsonValue(proposal.endpointProfiles || [], []),
       relationRules: cloneJsonValue(proposal.relationRules || [], []),
       structureTree: cloneJsonValue(diagramImportStructureTreeClient(proposal), { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] })
     };
@@ -25059,10 +26864,12 @@ function dynamicPagesClientScript() {
         notes: String(role.notes !== undefined ? role.notes : stored.notes || ''),
         semanticModelRevision: Number(proposal.semanticModelRevision || stored.semanticModelRevision || 0),
         visualKind: String(override.visualKind || diagramImportRoleVisualKindClient(role)),
-        labelTemplate: String(override.labelTemplate || role.labelTemplate || stored.labelTemplate || '')
+        labelTemplate: diagramImportRoleLabelTemplateClient(override, diagramImportRoleLabelTemplateClient(role, diagramImportRoleLabelTemplateClient(stored, '')))
       });
     });
     delete imported.roleMappings;
+    imported.endpointProfileVersion = D2_IMPORT_ENDPOINT_PROFILE_VERSION;
+    imported.endpointProfiles = cloneJsonValue(proposal.endpointProfiles || [], []);
     imported.relationRules = cloneJsonValue(proposal.relationRules || [], []);
     imported.structureTree = cloneJsonValue(diagramImportStructureTreeClient(proposal), { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] });
     delete imported.placementRules;
@@ -25146,6 +26953,7 @@ function dynamicPagesClientScript() {
   function diagramImportRoleMappingDataClient(role, source, mappingIndex) {
     var candidate = source && typeof source === 'object' && !Array.isArray(source) ? source : {};
     var primary = candidate.primary && typeof candidate.primary === 'object' && !Array.isArray(candidate.primary) ? candidate.primary : {};
+    var primaryCardSource = normalizeDiagramImportConditionCardSourceClient(primary.cardSource);
     var roleId = String(role && role.id || 'role');
     var dedupe = function (values, fallback) {
       var result = [];
@@ -25162,12 +26970,12 @@ function dynamicPagesClientScript() {
       ...(diagramImportRoleVisualKindClient(role) === 'container' ? { showEmpty: candidate.showEmpty !== false } : {}),
       primary: {
         className: String(primary.className || '').trim(),
-        idAttribute: diagramImportRoleVisualKindClient(role) === 'node' ? '_id' : (String(primary.idAttribute || '_id').trim() || '_id'),
-        labelTemplate: String(primary.labelTemplate || '\${Description}'),
+        idAttribute: '_id',
+        labelTemplate: diagramImportPrimaryLabelTemplateClient(primary, diagramImportRoleLabelTemplateClient(role, '\${Description}')),
         structuredFields: diagramImportPrimaryDataFieldsClient(role, Object.assign({}, primary, {
           structuredFields: dedupe(primary.structuredFields, ['Code', 'Description'])
         })),
-        ...(normalizeDiagramImportConditionCardSourceClient(primary.cardSource) ? { cardSource: normalizeDiagramImportConditionCardSourceClient(primary.cardSource) } : {}),
+        ...(primaryCardSource ? { cardSource: primaryCardSource } : {}),
         filters: []
       },
       conditions: diagramImportPlacementFiltersClient(candidate.conditions),
@@ -25227,9 +27035,32 @@ function dynamicPagesClientScript() {
       role.labelTemplate = String(overrideValue('labelTemplate', role.labelTemplate) || '');
       unmatched = unmatched.filter(function (id) { return id !== String(role.id || ''); });
     });
+    if (Array.isArray(overrides.endpointProfiles)) proposal.endpointProfiles = cloneJsonValue(overrides.endpointProfiles, []);
     if (Array.isArray(overrides.relationRules)) proposal.relationRules = cloneJsonValue(overrides.relationRules, []);
     if (overrides.structureTree && typeof overrides.structureTree === 'object' && !Array.isArray(overrides.structureTree)) {
-      proposal.structureTree = cloneJsonValue(overrides.structureTree, { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] });
+      var currentTree = proposal.structureTree && typeof proposal.structureTree === 'object' && !Array.isArray(proposal.structureTree)
+        ? proposal.structureTree
+        : { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] };
+      var currentItems = Array.isArray(currentTree.items) ? currentTree.items : [];
+      var staticElementKeys = {};
+      currentItems.filter(function (item) { return item && item.templateStatic === true; }).forEach(function (item) {
+        uniqueList(Array.isArray(item.templateElementKeys) ? item.templateElementKeys : [item.templateElementKey]).forEach(function (key) {
+          if (key) staticElementKeys[String(key)] = true;
+        });
+      });
+      var overriddenItems = Array.isArray(overrides.structureTree.items) ? overrides.structureTree.items : [];
+      var overriddenDynamicItems = overriddenItems.filter(function (item) {
+        var keys = uniqueList(Array.isArray(item && item.templateElementKeys) ? item.templateElementKeys : [item && item.templateElementKey]);
+        // A static D2 subtree has no editable mapping. Never restore an old
+        // dynamic placement for it over the canonical structure just parsed
+        // from the current source.
+        return !keys.some(function (key) { return staticElementKeys[String(key)] === true; });
+      });
+      var currentStaticItems = currentItems.filter(function (item) { return item && item.templateStatic === true; });
+      proposal.structureTree = {
+        version: D2_IMPORT_STRUCTURE_TREE_VERSION,
+        items: cloneJsonValue(overriddenDynamicItems.concat(currentStaticItems), [])
+      };
     }
     if (unmatched.length) {
       proposal.warnings = Array.isArray(proposal.warnings) ? proposal.warnings : [];
@@ -25297,6 +27128,17 @@ function dynamicPagesClientScript() {
     });
     tree.items = (tree.items || []).concat(copies);
     proposal.structureTree = tree;
+    var copiedProfiles = (Array.isArray(proposal.endpointProfiles) ? proposal.endpointProfiles : []).flatMap(function (profile, index) {
+      var sourceItemId = String(profile && profile.structureItemId || '');
+      var copiedItemId = copiedIds[sourceItemId];
+      if (!copiedItemId) return [];
+      return [Object.assign({}, profile, {
+        id: diagramImportEndpointProfileId('endpoint_profile_copy'),
+        structureItemId: copiedItemId,
+        stageId: ''
+      })];
+    });
+    proposal.endpointProfiles = (Array.isArray(proposal.endpointProfiles) ? proposal.endpointProfiles : []).concat(copiedProfiles);
     return { rootId: copiedIds[sourceId], count: copies.length };
   }
 
@@ -25430,7 +27272,7 @@ function dynamicPagesClientScript() {
       var removeField = String(target.getAttribute('data-diagram-import-data-field') || '').trim();
       if (removeDataContext && removeField) {
         var removePrimary = removeDataContext.mapping && removeDataContext.mapping.primary || {};
-        var requiredFields = diagramImportPrimaryTemplateFieldsClient(removePrimary.labelTemplate || removeDataContext.role.labelTemplate || '\${Description}');
+        var requiredFields = diagramImportPrimaryTemplateFieldsClient(diagramImportPrimaryLabelTemplateClient(removePrimary, diagramImportRoleLabelTemplateClient(removeDataContext.role, '\${Description}')));
         if (requiredFields.indexOf(removeField) < 0) {
           removePrimary.structuredFields = (removePrimary.structuredFields || []).filter(function (field) { return String(field) !== removeField; });
           removeDataContext.mapping.primary = removePrimary;
@@ -25489,13 +27331,43 @@ function dynamicPagesClientScript() {
         removeConditionContext.mapping.conditions = removeConditions;
         removeConditionContext.item.mapping = removeConditionContext.mapping;
       }
-    } else if (action === 'diagram-import-add-rule') {
-      proposal.relationRules = Array.isArray(proposal.relationRules) ? proposal.relationRules : [];
-      proposal.relationRules.push({ id: 'relation_rule_' + Date.now(), kind: 'connection', parentRoleId: '', childRoleId: '', path: [] });
-    } else if (action === 'diagram-import-remove-rule') {
+    } else if (action === 'diagram-import-enable-rule') {
+      var enabledRuleControl = document.querySelector('[data-diagram-import-enable-rule]');
+      var enabledRuleId = String(enabledRuleControl && enabledRuleControl.value || '').trim();
+      proposal.relationRules = (Array.isArray(proposal.relationRules) ? proposal.relationRules : []).map(function (rule) {
+        return String(rule && rule.id || '') === enabledRuleId ? Object.assign({}, rule, { enabled: true }) : rule;
+      });
+    } else if (action === 'diagram-import-disable-rule') {
       var ruleRow = target.closest('[data-diagram-import-rule-row]');
-      var ruleIndex = Number(ruleRow && ruleRow.getAttribute('data-diagram-import-rule-row'));
-      if (Number.isInteger(ruleIndex)) proposal.relationRules.splice(ruleIndex, 1);
+      var disabledRuleId = String(ruleRow && ruleRow.getAttribute('data-diagram-import-rule-id') || '').trim();
+      proposal.relationRules = (Array.isArray(proposal.relationRules) ? proposal.relationRules : []).map(function (rule) {
+        return String(rule && rule.id || '') === disabledRuleId ? Object.assign({}, rule, { enabled: false }) : rule;
+      });
+    } else if (action === 'diagram-import-confirm-rule-contract') {
+      var conflictRuleRow = target.closest('[data-diagram-import-rule-row]');
+      var conflictRuleId = String(conflictRuleRow && conflictRuleRow.getAttribute('data-diagram-import-rule-id') || '').trim();
+      proposal.relationRules = (Array.isArray(proposal.relationRules) ? proposal.relationRules : []).map(function (rule) {
+        if (String(rule && rule.id || '') !== conflictRuleId) return rule;
+        var resolvedRule = Object.assign({}, rule || {});
+        delete resolvedRule.mappingConflict;
+        return resolvedRule;
+      });
+    } else if (action === 'diagram-import-add-endpoint-profile') {
+      proposal.endpointProfiles = Array.isArray(proposal.endpointProfiles) ? proposal.endpointProfiles : [];
+      proposal.endpointProfiles.push({
+        id: diagramImportEndpointProfileId(),
+        structureItemId: '',
+        roleId: '',
+        label: '',
+        field: '',
+        operators: ['ipv4InCidr']
+      });
+    } else if (action === 'diagram-import-remove-endpoint-profile') {
+      var profileRow = target.closest('[data-diagram-import-endpoint-profile-row]');
+      var profileId = String(profileRow && profileRow.getAttribute('data-diagram-import-endpoint-profile-id') || '');
+      proposal.endpointProfiles = (Array.isArray(proposal.endpointProfiles) ? proposal.endpointProfiles : []).filter(function (profile) {
+        return String(profile && profile.id || '') !== profileId;
+      });
     } else if (action === 'diagram-structure-add-root' || action === 'diagram-structure-add-child') {
       var requestedParentId = action === 'diagram-structure-add-child'
         ? String(target.getAttribute('data-diagram-structure-parent-id') || '')
@@ -25567,6 +27439,9 @@ function dynamicPagesClientScript() {
       }
       removeTree.items = (removeTree.items || []).filter(function (item) { return !removeIds[String(item && item.id || '')]; });
       proposal.structureTree = removeTree;
+      proposal.endpointProfiles = (Array.isArray(proposal.endpointProfiles) ? proposal.endpointProfiles : []).filter(function (profile) {
+        return !removeIds[String(profile && profile.structureItemId || '')];
+      });
       Object.keys(removeIds).forEach(function (id) { delete state.diagramImportCollapsedStructureItemIds[id]; });
       state.diagramImportSelectedStructureItemId = '';
       state.diagramImportStructureNotice = '';
@@ -25771,6 +27646,19 @@ function dynamicPagesClientScript() {
       if (!result.ok || !result.json || !result.json.proposal) throw new Error(errorText(result));
       state.diagramImportSignedProposal = cloneJsonValue(result.json.proposal, null);
       state.diagramImportProposal = cloneJsonValue(result.json.proposal, null);
+      // The restore endpoint re-analyzes the D2 source and therefore owns the
+      // canonical element/edge structure. Do not let an older saved editor
+      // snapshot replace it in the Diagram editor. Keep it as an applied
+      // local draft so normal Save can persist the migration, while preview
+      // and manual connection editing immediately use the exact D2 arrows.
+      var selected = state.selectedTemplate || {};
+      var savedAppliedEditor = diagramImportAppliedEditorFromSpec(selected.spec || defaultSpec());
+      if (savedAppliedEditor && !savedAppliedEditor.invalid) {
+        var restoredAppliedEditor = cloneJsonValue(result.json.proposal, null);
+        restoredAppliedEditor.editorMode = 'applied';
+        state.diagramImportAppliedEditor = restoredAppliedEditor;
+        state.diagramImportAppliedEditorDirty = diagramImportAppliedEditorHasUnsavedChanges(restoredAppliedEditor, selected.spec || defaultSpec());
+      }
       applyDiagramImportAuthoringOverrides(state.diagramImportProposal);
       state.diagramImportEditorSpecSnapshot = requestEditorSpecSnapshot;
       state.diagramImportIr = result.json.ir || null;
@@ -26166,6 +28054,7 @@ function dynamicPagesClientScript() {
         d2Source: state.diagramImportSource,
         proposal: state.diagramImportSignedProposal,
         roles: diagramImportBindingOverrides(proposal),
+        endpointProfiles: cloneJsonValue(proposal.endpointProfiles || [], []),
         relationRules: cloneJsonValue(proposal.relationRules || [], []),
         structureTree: cloneJsonValue(diagramImportStructureTreeClient(proposal), { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] })
       }
@@ -26193,7 +28082,6 @@ function dynamicPagesClientScript() {
       state.message = { type: 'ok', text: result.json.partial ? t('diagramImportPartialApplied') : t('changesReadyToSave') };
       state.diagramImportBusy = false;
       renderDesigner();
-      return previewAppliedDiagramImport();
     }).catch(function (error) {
       state.message = { type: 'error', text: error.message || String(error) };
     }).finally(function () {
@@ -26337,10 +28225,12 @@ function dynamicPagesClientScript() {
     }
     if (!captureVisibleDesignerState()) return;
     var savedDiagramEditorState = false;
-    // The deterministic Diagram editor may save both an applied mapping and
-    // an analyzed/manual mapping. The latter remains non-executable through
-    // mappingValidation=needsValidation until its explicit D2 Apply action.
-    var activeDiagramEditor = activeDiagramImportEditorModel(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
+    // The deterministic Diagram editor saves both Assistant-proposed and
+    // manually edited mappings. Normal template Save recompiles the current
+    // editor state; no Assistant action is required for manual corrections.
+    var activeDiagramEditor = state.designerSection === 'diagram'
+      ? activeDiagramImportEditorModel(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec())
+      : null;
     var diagramEditor = activeDiagramEditor && activeDiagramEditor.version === 3
       ? (captureDiagramImportProposalFromDom() || activeDiagramEditor)
       : null;
@@ -26941,42 +28831,37 @@ function dynamicPagesClientScript() {
           proposal.structureTree = tree;
         });
         if (Array.isArray(result.json.relationRules)) {
-          var byD2ElementKey = {};
+          var byD2ClassKey = {};
           (proposal.relationRules || []).forEach(function (rule) {
-            if (rule && rule.d2ElementKey) byD2ElementKey[String(rule.d2ElementKey)] = rule;
+            if (rule && rule.d2ClassKey) byD2ClassKey[String(rule.d2ClassKey)] = rule;
           });
           result.json.relationRules.forEach(function (candidate) {
-            var currentRule = byD2ElementKey[String(candidate && candidate.d2ElementKey || '')];
+            var currentRule = byD2ClassKey[String(candidate && candidate.d2ClassKey || '')];
             if (!currentRule) return;
             var nextMode = String(candidate.mode || currentRule.mode || 'deterministicEndpoints');
             var nextCandidateId = String(candidate.candidateId || currentRule.candidateId || '');
             var nextSourceStageId = String(candidate.sourceStageId || currentRule.sourceStageId || '');
             var nextSourceField = String(candidate.sourceField || currentRule.sourceField || '');
             var nextTargetField = String(candidate.targetField || currentRule.targetField || '');
-            var nextParentRoleId = String(candidate.parentRoleId || currentRule.parentRoleId || '');
-            var nextChildRoleId = String(candidate.childRoleId || currentRule.childRoleId || '');
             var contractChanged = String(currentRule.mode || 'deterministicEndpoints') !== nextMode ||
               String(currentRule.candidateId || '') !== nextCandidateId ||
               String(currentRule.sourceStageId || '') !== nextSourceStageId ||
               String(currentRule.sourceField || '') !== nextSourceField ||
-              String(currentRule.targetField || '') !== nextTargetField ||
-              String(currentRule.parentRoleId || '') !== nextParentRoleId ||
-              String(currentRule.childRoleId || '') !== nextChildRoleId;
+              String(currentRule.targetField || '') !== nextTargetField;
             currentRule.mode = nextMode;
             currentRule.path = [];
             currentRule.candidateId = nextCandidateId;
             currentRule.sourceStageId = nextSourceStageId;
             currentRule.sourceField = nextSourceField;
             currentRule.targetField = nextTargetField;
-            currentRule.parentRoleId = nextParentRoleId;
-            currentRule.childRoleId = nextChildRoleId;
-            currentRule.labelField = String(candidate.labelField || currentRule.labelField || '');
+            currentRule.labelTemplate = String(candidate.labelTemplate || currentRule.labelTemplate || '');
+            delete currentRule.labelField;
             // A policy declared in D2 source is the immutable contract for
             // every edge with that class. A manual policy is retained only
             // when the endpoint contract did not change.
             var sourceDirectionPolicy = normalizeDiagramDirectionPolicyClient(candidate.directionPolicy);
             currentRule.directionPolicy = sourceDirectionPolicy || (contractChanged ? '' : String(currentRule.directionPolicy || ''));
-            currentRule.directionPolicySuggestion = String(candidate.directionPolicySuggestion || currentRule.directionPolicySuggestion || 'template');
+            currentRule.directionPolicySuggestion = String(candidate.directionPolicySuggestion || currentRule.directionPolicySuggestion || 'dataFields');
           });
         }
       }
@@ -27058,6 +28943,17 @@ function dynamicPagesClientScript() {
         return includeBase !== false || baseColumns.indexOf(column) < 0;
       }).map(function (column) { return 'Source_' + column; }));
     };
+    // Object Flow is the canonical lineage for browser-side D2 editing. The
+    // legacy compiled spec.steps may not yet contain an Assistant-created
+    // alias, but its current card source is already known at this point.
+    var currentSourceClass = function (sources) {
+      var classes = uniqueList((sources || []).filter(function (source) {
+        return String(source && source.id || '') === 'current';
+      }).map(function (source) {
+        return String(source && source.className || '').trim();
+      }).filter(Boolean));
+      return classes.length === 1 ? classes[0] : '';
+    };
     var matchIndex = 0;
     var setIndex = 0;
     var addSelection = function (selection, index) {
@@ -27091,7 +28987,7 @@ function dynamicPagesClientScript() {
         cardSources = diagramImportUniqueStageCardSources(leftSources.concat(rightSources.map(function (source) {
           return diagramImportPrefixedStageCardSource(source, operation.rightPrefix || '', 'Сопоставленный: ');
         })));
-        summaries.push({ id: operation.id, kind: 'match', index: matchIndex, label: userFacingResultLabel(operation.as, spec) || t('matchingBlock', { number: matchIndex + 1 }), alias: operation.as, columns: columns, cardSources: cardSources });
+        summaries.push({ id: operation.id, kind: 'match', index: matchIndex, label: userFacingResultLabel(operation.as, spec) || t('matchingBlock', { number: matchIndex + 1 }), alias: operation.as, className: currentSourceClass(leftSources), columns: columns, cardSources: cardSources });
         matchIndex += 1;
       } else if (operation.type === 'relation') {
         columns = uniqueList(['SourceClass', 'SourceId', 'SourceCode', 'SourceDescription', 'Domain', 'RelationId', 'RelationDirection', 'RelationSourceSide', 'RelatedClass', 'RelatedId'].concat(baseColumns, operation.columns || [], sourceColumns(leftColumns, false)));
@@ -27106,15 +29002,15 @@ function dynamicPagesClientScript() {
       } else if (operation.type === 'existsRelated') {
         columns = leftColumns.slice();
         cardSources = diagramImportUniqueStageCardSources(leftSources);
-        summaries.push({ id: operation.id, kind: 'existsRelated', index: index, label: userFacingResultLabel(operation.as, spec) || t('existsRelatedOperation', { number: index + 1 }), alias: operation.as, className: sourceClassForAlias(spec || defaultSpec(), operation.as), columns: columns, cardSources: cardSources });
+        summaries.push({ id: operation.id, kind: 'existsRelated', index: index, label: userFacingResultLabel(operation.as, spec) || t('existsRelatedOperation', { number: index + 1 }), alias: operation.as, className: currentSourceClass(cardSources) || sourceClassForAlias(spec || defaultSpec(), operation.as), columns: columns, cardSources: cardSources });
       } else if (operation.type === 'semiJoin') {
         columns = leftColumns.slice();
         cardSources = diagramImportUniqueStageCardSources(leftSources);
-        summaries.push({ id: operation.id, kind: 'semiJoin', index: index, label: userFacingResultLabel(operation.as, spec) || t('semiJoinOperation', { number: index + 1 }), alias: operation.as, className: sourceClassForAlias(spec || defaultSpec(), operation.as), columns: columns, cardSources: cardSources });
+        summaries.push({ id: operation.id, kind: 'semiJoin', index: index, label: userFacingResultLabel(operation.as, spec) || t('semiJoinOperation', { number: index + 1 }), alias: operation.as, className: currentSourceClass(cardSources) || sourceClassForAlias(spec || defaultSpec(), operation.as), columns: columns, cardSources: cardSources });
       } else {
         columns = operation.type === 'union' ? uniqueList(leftColumns.concat(rightColumns)) : leftColumns.slice();
         cardSources = diagramImportUniqueStageCardSources(operation.type === 'union' ? leftSources.concat(rightSources) : leftSources);
-        summaries.push({ id: operation.id, kind: 'set', index: setIndex, label: userFacingResultLabel(operation.as, spec) || t('setOperation', { number: setIndex + 1 }), alias: operation.as, className: sourceClassForAlias(spec || defaultSpec(), operation.as), columns: columns, cardSources: cardSources });
+        summaries.push({ id: operation.id, kind: 'set', index: setIndex, label: userFacingResultLabel(operation.as, spec) || t('setOperation', { number: setIndex + 1 }), alias: operation.as, className: currentSourceClass(cardSources) || sourceClassForAlias(spec || defaultSpec(), operation.as), columns: columns, cardSources: cardSources });
         setIndex += 1;
       }
       columnsByAlias[operation.as] = columns;
@@ -27358,6 +29254,8 @@ function dynamicPagesClientScript() {
       ['cmdp-runtime-max-rows-preview-default', 'runtimeMaxRowsPreviewDefault', 'maxRowsPreviewDefault'],
       ['cmdp-runtime-max-rows-data-preview-default', 'runtimeMaxRowsDataPreviewDefault', 'maxRowsDataPreviewDefault'],
       ['cmdp-runtime-max-rows-max', 'runtimeMaxRowsMax', 'maxRowsMax'],
+      ['cmdp-runtime-max-relations-per-card-default', 'runtimeMaxRelationsPerCardDefault', 'maxRelationsPerCardDefault'],
+      ['cmdp-runtime-max-relations-per-card-max', 'runtimeMaxRelationsPerCardMax', 'maxRelationsPerCardMax'],
       ['cmdp-runtime-max-selection-scan-rows-default', 'runtimeMaxSelectionScanRowsDefault', 'maxSelectionScanRowsDefault'],
       ['cmdp-runtime-max-selection-scan-rows-max', 'runtimeMaxSelectionScanRowsMax', 'maxSelectionScanRowsMax'],
       ['cmdp-runtime-max-classes-default', 'runtimeMaxClassesDefault', 'maxClassesDefault'],
@@ -27501,6 +29399,7 @@ function dynamicPagesClientScript() {
   }
 
   function selectTemplate(code) {
+    var editorMutationRevision = Number(state.diagramImportEditorMutationRevision || 0);
     state.selectedTemplate = state.templates.find(function (item) { return item.code === code; }) || null;
     state.objectGroupDraft = null;
     state.relationDraft = null;
@@ -27524,6 +29423,8 @@ function dynamicPagesClientScript() {
     return restoreDiagramImportAssistantCheckpoint().then(function () {
       return fetchVersions(code);
     }).then(function () {
+      if (!state.selectedTemplate || String(state.selectedTemplate.code || '') !== String(code || '')) return;
+      if (Number(state.diagramImportEditorMutationRevision || 0) !== editorMutationRevision) return;
       renderDesigner();
     });
   }
@@ -27793,6 +29694,7 @@ function dynamicPagesClientScript() {
     state.classCheckResult = null;
     state.classAttributes = [];
     state.result = null;
+    hydrateDesignerStateFromTemplate({ replaceRunParams: true });
     state.message = null;
     state.designerSection = 'template';
     if (window.history && window.history.pushState) window.history.pushState({ designerSection: 'template' }, '', designerSectionUrl('template'));
@@ -27824,6 +29726,7 @@ function dynamicPagesClientScript() {
     state.classCheckResult = null;
     state.classAttributes = [];
     state.result = null;
+    hydrateDesignerStateFromTemplate({ replaceRunParams: true });
     state.message = null;
     state.designerSection = 'template';
     if (window.history && window.history.pushState) window.history.pushState({ designerSection: 'template' }, '', designerSectionUrl('template'));
@@ -28324,7 +30227,7 @@ function dynamicPagesClientScript() {
         : t('diagramImportStructureDeleteItemConfirm');
       if (!window.confirm(removeConfirmation)) return;
     }
-    if (['diagram-import-add-related-data', 'diagram-import-remove-related-data', 'diagram-import-add-related-condition', 'diagram-import-remove-related-condition', 'diagram-import-add-data-field', 'diagram-import-remove-data-field', 'diagram-import-add-condition', 'diagram-import-add-parent-correlation', 'diagram-import-remove-condition', 'diagram-import-add-rule', 'diagram-import-remove-rule', 'diagram-structure-add-root', 'diagram-structure-add-child', 'diagram-structure-add-role', 'diagram-structure-cancel-add', 'diagram-structure-duplicate', 'diagram-structure-remove'].indexOf(action) >= 0) mutateDiagramImportV3(action, target);
+    if (['diagram-import-add-related-data', 'diagram-import-remove-related-data', 'diagram-import-add-related-condition', 'diagram-import-remove-related-condition', 'diagram-import-add-data-field', 'diagram-import-remove-data-field', 'diagram-import-add-condition', 'diagram-import-add-parent-correlation', 'diagram-import-remove-condition', 'diagram-import-enable-rule', 'diagram-import-disable-rule', 'diagram-import-confirm-rule-contract', 'diagram-import-add-endpoint-profile', 'diagram-import-remove-endpoint-profile', 'diagram-structure-add-root', 'diagram-structure-add-child', 'diagram-structure-add-role', 'diagram-structure-cancel-add', 'diagram-structure-duplicate', 'diagram-structure-remove'].indexOf(action) >= 0) mutateDiagramImportV3(action, target);
     if (action === 'apply-view-composer') applyViewComposerEditor();
     if (action === 'add-visual-row-group') addVisualizationRowGroup(target);
     if (action === 'clear-visual-row-group') clearVisualizationRowGroup(target);
@@ -28764,6 +30667,7 @@ function dynamicPagesClientScript() {
   });
 
   document.addEventListener('change', function (event) {
+    if (event.target && event.target._diagramImportPickerCommitted) return;
     if (event.target && event.target.matches && event.target.matches('[data-assistant-flow-field="uses"]')) {
       state.assistantObjectFlowIntent = readAssistantObjectFlowIntentFromDom();
       resetAssistantObjectFlowProposal();
@@ -28831,7 +30735,16 @@ function dynamicPagesClientScript() {
       renderDesigner();
       return;
     }
-    if (target.matches && target.matches('[data-diagram-import-placement-field], [data-diagram-import-condition-field], [data-diagram-import-related-field], [data-diagram-import-hierarchy-field], [data-diagram-import-rule-field], [data-diagram-structure-field], [data-diagram-relation-policy-card]')) {
+    if (target.matches && target.matches('[data-diagram-import-rule-field="sourceStageId"]')) {
+      var connectionProposal = captureDiagramImportProposalFromDom();
+      if (connectionProposal) storeDiagramImportEditorMutation(connectionProposal);
+      var connectionStage = diagramImportStageById(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(), String(target.value || '')) || {};
+      Promise.all(diagramImportStageDirectClassNames(connectionStage).map(ensureCatalogAttributesForClass)).then(function () {
+        renderDesigner();
+      });
+      return;
+    }
+    if (target.matches && target.matches('[data-diagram-import-placement-field], [data-diagram-import-condition-field], [data-diagram-import-related-field], [data-diagram-import-hierarchy-field], [data-diagram-import-rule-field], [data-diagram-import-endpoint-profile-field], [data-diagram-structure-field], [data-diagram-relation-policy-card]')) {
       var changedProposal = captureDiagramImportProposalFromDom();
       if (changedProposal) storeDiagramImportEditorMutation(changedProposal);
       if (target.matches('[data-diagram-import-label-template]')) {
@@ -30814,12 +32727,16 @@ function diagramImportNeedsRecovery(value) {
   const status = String(validation.status || '').trim();
   const legacyPlacement = imported && Number(imported.imported.semanticModelRevision || 0) === 8 &&
     Number(imported.imported.structureTree && imported.imported.structureTree.version || 0) === 3;
+  const legacyTopology = imported && diagramImportHasLegacyClassRelationRules(imported.imported);
+  const duplicateClassTopology = imported && diagramImportHasDuplicateClassConnectionRules(imported.imported);
+  const previousConnectionModel = imported && [11, 12, 13].includes(Number(imported.imported.semanticModelRevision || 0)) &&
+    Number(imported.imported.structureTree && imported.imported.structureTree.version || 0) === D2_IMPORT_STRUCTURE_TREE_VERSION;
   const signatureReattestation = imported &&
     status === 'valid' &&
     !diagramImportMappingValidationIsCurrent(imported.imported) &&
     Number(imported.imported.semanticModelRevision || 0) === D2_IMPORT_SEMANTIC_MODEL_REVISION &&
     Number(imported.imported.structureTree && imported.imported.structureTree.version || 0) === D2_IMPORT_STRUCTURE_TREE_VERSION;
-  return Boolean(imported && (signatureReattestation ||
+  return Boolean(imported && (legacyTopology || duplicateClassTopology || previousConnectionModel || signatureReattestation ||
     (!imported.imported.mappingInputRevision &&
       (['valid', 'needsValidation', 'incomplete'].includes(status) || legacyPlacement))));
 }
@@ -30846,8 +32763,9 @@ function normalizeStoredDiagramImport(spec, diagram, options = {}) {
   const validation = original.mappingValidation && typeof original.mappingValidation === 'object' && !Array.isArray(original.mappingValidation)
     ? original.mappingValidation
     : {};
+  const legacyTopology = diagramImportHasLegacyClassRelationRules(original);
   const materializationIssues = diagramImportStoredMaterializationIssues(original);
-  if (materializationIssues.length && String(validation.status || '') === 'valid') {
+  if (materializationIssues.length && String(validation.status || '') === 'valid' && !legacyTopology) {
     const imported = {
       ...original,
       mappingValidation: { version: 1, status: 'needsReview', reasons: ['materializationContract'] }
@@ -30857,22 +32775,50 @@ function normalizeStoredDiagramImport(spec, diagram, options = {}) {
   }
   const inputStatus = diagramImportMappingInputRevisionStatus(spec, original);
   const migrationIdentity = diagramImportStorageIdentity(options, original);
-  const currentSignedMapping = sourceMatches && diagramImportMappingValidationIsCurrent(original) && inputStatus.current;
+  const hasConcreteTopology = Array.isArray(original.relationRules) && original.relationRules.some((rule) =>
+    rule && !diagramImportIsLegacyClassRelationRule(rule) && String(rule.d2ElementKey || '').trim());
+  // `needsValidation` means that a saved manual mapping still requires a
+  // complete executable contract. Normalize every saved connection to one
+  // class-level algorithm over compatible placement comparison rules.
+  if (hasConcreteTopology && sourceMatches &&
+    Number(original.semanticModelRevision || 0) === D2_IMPORT_SEMANTIC_MODEL_REVISION &&
+    String(validation.status || '') === 'needsValidation') {
+    const roles = diagramImportRolesForStoredStructure(original);
+    const imported = {
+      ...original,
+      roles,
+      relationRules: diagramImportBindRelationRulesToStructureItems(
+        diagramImportTopologyRules(roles, original.structure, original.relationRules, original.classes, original.endpointProfiles),
+        original.structureTree,
+        original.endpointProfiles
+      )
+    };
+    recordD2MappingStorageOutcome(options, { status: 'topology_normalized' });
+    return { ...diagram, authoring: { ...authoring, d2Import: imported } };
+  }
+  const currentSignedMapping = !legacyTopology && sourceMatches && diagramImportMappingValidationIsCurrent(original) && inputStatus.current;
   const signatureReattestationEligible = sourceMatches &&
     !currentSignedMapping &&
+    !legacyTopology &&
     inputStatus.current &&
     String(validation.status || '') === 'valid' &&
     Number(original.semanticModelRevision || 0) === D2_IMPORT_SEMANTIC_MODEL_REVISION &&
     Number(original.structureTree && original.structureTree.version || 0) === D2_IMPORT_STRUCTURE_TREE_VERSION &&
     Boolean(migrationIdentity);
+  // Revision 14 replaces selected endpoint participants with every
+  // compatible placement comparison rule. The source identity preserves the
+  // authored tree and migrates the old connection contract without an
+  // Assistant round-trip.
+  const topologyMigrationEligible = sourceMatches && Boolean(migrationIdentity) &&
+    (legacyTopology || [11, 12, 13].includes(Number(original.semanticModelRevision || 0)));
   const legacyPlacement = Number(original.semanticModelRevision || 0) === 8 &&
     Number(original.structureTree && original.structureTree.version || 0) === 3;
-  const recoveryEligible = sourceMatches && !original.mappingInputRevision &&
+  const recoveryEligible = !hasConcreteTopology && sourceMatches && !original.mappingInputRevision &&
     (['valid', 'needsValidation', 'incomplete'].includes(String(validation.status || '')) || legacyPlacement);
   const recovered = !currentSignedMapping && recoveryEligible
     ? diagramImportRecoveryCandidate(spec, original, options.recoveryVersions)
     : null;
-  const trusted = currentSignedMapping || signatureReattestationEligible ? original : recovered && recovered.imported;
+  const trusted = currentSignedMapping || signatureReattestationEligible || topologyMigrationEligible ? original : recovered && recovered.imported;
 
   if (trusted) {
     const trustedMigrationIdentity = diagramImportStorageIdentity(options, trusted);
@@ -30880,18 +32826,40 @@ function normalizeStoredDiagramImport(spec, diagram, options = {}) {
     const migrated = migrateDiagramImportToCurrentRevision(spec, trusted, {
       diagramId: String(diagram && diagram.id || ''),
       identity: trustedMigrationIdentity,
-      rebuildCurrent: signatureReattestationEligible,
+      rebuildCurrent: signatureReattestationEligible || topologyMigrationEligible,
       diagnostics: migrationDiagnostics
     });
     if (migrated) {
       const prepared = withDiagramImportMappingInputRevision(spec, migrated);
-      prepared.mappingValidation = {
-        version: 1,
-        status: 'valid',
-        signature: signDiagramImportMappingValidation(prepared)
-      };
+      const connectionConflict = (Array.isArray(prepared.relationRules) ? prepared.relationRules : [])
+        .some((rule) => rule && rule.mappingConflict);
+      const originalStatus = String(validation.status || '').trim();
+      // A semantic migration can normalize connection rules but cannot prove
+      // a manually unfinished tree executable. Keep its validation state so
+      // the editor can still produce a partial preview without inventing a
+      // completed mapping or forcing a new Assistant analysis.
+      const preservesIncompleteMapping = topologyMigrationEligible && originalStatus !== 'valid';
+      prepared.mappingValidation = topologyMigrationEligible && connectionConflict
+        ? { version: 1, status: 'needsValidation', reasons: ['connectionAlgorithmConflict'] }
+        : preservesIncompleteMapping
+          ? {
+              version: 1,
+              status: 'needsValidation',
+              reasons: uniqueStrings(Array.isArray(validation.reasons) && validation.reasons.length
+                ? validation.reasons
+                : ['partialMapping'])
+            }
+          : {
+              version: 1,
+              status: 'valid',
+              signature: signDiagramImportMappingValidation(prepared)
+            };
       recordD2MappingStorageOutcome(options, {
-        status: signatureReattestationEligible ? 'reattested' : recovered ? 'recovered' : Number(original.semanticModelRevision || 0) !== D2_IMPORT_SEMANTIC_MODEL_REVISION ? 'migrated' : 'retained',
+        status: topologyMigrationEligible
+          ? (connectionConflict
+              ? 'topology_migration_review_required'
+              : preservesIncompleteMapping ? 'topology_migrated_partial' : 'topology_migrated')
+          : signatureReattestationEligible ? 'reattested' : recovered ? 'recovered' : Number(original.semanticModelRevision || 0) !== D2_IMPORT_SEMANTIC_MODEL_REVISION ? 'migrated' : 'retained',
         recoveredFromVersion: recovered && recovered.version || null,
         verification: recovered && recovered.verification || ''
       });
@@ -30961,6 +32929,7 @@ function normalizeTemplateSpecForStorage(spec, code = '', options = {}) {
       return previousImport && imported &&
         (Number(previousImport.semanticModelRevision || 0) !== D2_IMPORT_SEMANTIC_MODEL_REVISION ||
           Number(previousImport.structureTree && previousImport.structureTree.version || 0) !== D2_IMPORT_STRUCTURE_TREE_VERSION) &&
+        previousImport.mappingValidation && previousImport.mappingValidation.status === 'valid' &&
         imported.mappingValidation && imported.mappingValidation.status === 'valid';
     });
     for (const { diagram } of migrations) {
@@ -30970,15 +32939,27 @@ function normalizeTemplateSpecForStorage(spec, code = '', options = {}) {
         next = applyDiagramImportProposal(next, proposal, [], proposal.relationRules, proposal.structureTree);
         recordD2MappingStorageOutcome(options, { status: 'recompiled' });
       } catch (error) {
+        logWarn('d2_import.mapping_migration_rebuild_failed', {
+          diagramId: String(imported && imported.diagramId || ''),
+          code: String(error && error.code || ''),
+          statusCode: Number(error && error.statusCode || 0) || null,
+          message: truncateText(String(error && error.message || 'Unknown D2 mapping migration error.'), 800),
+          unresolved: Array.isArray(error && error.details)
+            ? error.details.slice(0, 32).map((item) => ({
+                family: String(item && item.family || ''),
+                fields: uniqueStrings(Array.isArray(item && item.fields) ? item.fields : []).slice(0, 8)
+              }))
+            : []
+        });
         const failed = diagramImportForSpec(next, String(imported && imported.diagramId || ''));
         if (failed && failed.imported) {
           failed.imported.mappingValidation = {
             version: 1,
-            status: 'needsReview',
-            reasons: ['migrationRebuild']
+            status: 'needsValidation',
+            reasons: ['migrationPartial']
           };
         }
-        recordD2MappingStorageOutcome(options, { status: 'migration_rebuild_failed' });
+        recordD2MappingStorageOutcome(options, { status: 'migration_rebuild_partial' });
       }
     }
   }
@@ -31017,8 +32998,14 @@ async function sanitizeTemplateCardForRead(card) {
     d2SourceIdentities: [identity],
     d2MappingOutcomes: outcomes
   });
-  const migrated = outcomes.some((item) => ['materialization_migrated', 'recompiled', 'migrated', 'reattested'].includes(String(item && item.status || '')));
-  if (!migrated) return sanitized;
+  const migrated = outcomes.some((item) => ['materialization_migrated', 'recompiled', 'migrated', 'reattested', 'topology_migrated', 'topology_migrated_partial', 'topology_normalized'].includes(String(item && item.status || '')));
+  if (!migrated) {
+    const statuses = uniqueStrings(outcomes.map((item) => String(item && item.status || '')).filter(Boolean));
+    const reasons = uniqueStrings(outcomes.flatMap((item) => Array.isArray(item && item.reasons) ? item.reasons : []).map(String).filter(Boolean));
+    return statuses.length
+      ? { ...sanitized, authoringRecovery: { requiresSave: false, statuses, ...(reasons.length ? { reasons } : {}) } }
+      : sanitized;
+  }
   return {
     ...sanitized,
     // Keep the persisted hash for optimistic concurrency. The client can use
@@ -31318,6 +33305,8 @@ function defaultRuntimeConfig() {
       maxRowsPreviewDefault: 25,
       maxRowsDataPreviewDefault: 100,
       maxRowsMax: 2000,
+      maxRelationsPerCardDefault: 100,
+      maxRelationsPerCardMax: 5000,
       maxSelectionScanRowsDefault: 10000,
       maxSelectionScanRowsMax: 50000,
       maxClassesDefault: 100,
@@ -31403,6 +33392,7 @@ function normalizeExecutionLimitConfig(runtimeConfig) {
   const defaults = defaultRuntimeConfig().executionLimits;
   const source = runtimeConfig && runtimeConfig.executionLimits ? runtimeConfig.executionLimits : {};
   const maxRowsMax = toPositiveInt(source.maxRowsMax, defaults.maxRowsMax, ABSOLUTE_EXECUTION_LIMITS.maxRows);
+  const maxRelationsPerCardMax = toPositiveInt(source.maxRelationsPerCardMax, defaults.maxRelationsPerCardMax, ABSOLUTE_EXECUTION_LIMITS.maxRelationsPerCard);
   const maxSelectionScanRowsMax = toPositiveInt(source.maxSelectionScanRowsMax, defaults.maxSelectionScanRowsMax, ABSOLUTE_EXECUTION_LIMITS.maxSelectionScanRows);
   const maxClassesMax = toPositiveInt(source.maxClassesMax, defaults.maxClassesMax, ABSOLUTE_EXECUTION_LIMITS.maxClasses);
   const maxDomainsMax = toPositiveInt(source.maxDomainsMax, defaults.maxDomainsMax, ABSOLUTE_EXECUTION_LIMITS.maxDomains);
@@ -31414,6 +33404,8 @@ function normalizeExecutionLimitConfig(runtimeConfig) {
     maxRowsPreviewDefault: toPositiveInt(source.maxRowsPreviewDefault, defaults.maxRowsPreviewDefault, maxRowsMax),
     maxRowsDataPreviewDefault: toPositiveInt(source.maxRowsDataPreviewDefault, defaults.maxRowsDataPreviewDefault, maxRowsMax),
     maxRowsMax,
+    maxRelationsPerCardDefault: toPositiveInt(source.maxRelationsPerCardDefault, defaults.maxRelationsPerCardDefault, maxRelationsPerCardMax),
+    maxRelationsPerCardMax,
     maxSelectionScanRowsDefault: toPositiveInt(source.maxSelectionScanRowsDefault, defaults.maxSelectionScanRowsDefault, maxSelectionScanRowsMax),
     maxSelectionScanRowsMax,
     maxClassesDefault: toPositiveInt(source.maxClassesDefault, defaults.maxClassesDefault, maxClassesMax),
@@ -35382,8 +37374,6 @@ function assistantObjectFlowContextSpec(flow) {
       domain: operation.domain,
       targetClass: operation.targetClass,
       direction: operation.direction,
-      columns: operation.columns,
-      limit: operation.limit,
       distinct: operation.distinct,
       as: operation.as
     }
@@ -35432,8 +37422,6 @@ function assistantObjectFlowContextSpec(flow) {
           domain: operation.domain,
           targetClass: operation.targetClass,
           direction: operation.direction,
-          columns: operation.columns,
-          limit: operation.limit,
           distinct: operation.distinct,
           as: operation.as,
           rules: operation.rules.map((rule) => ({
@@ -37671,7 +39659,7 @@ function assistantObjectFlowMessages(input, mcpContext, runtimeConfig, relationR
     'Return exactly one JSON object: {"flow":{"version":1,"selections":[...],"operations":[...],"publishedAlias":"..."},"explanation":"...","warnings":[...]}.',
     'Return no markdown, comments, prose outside JSON, DSL Spec wrapper, D2 source, or fields outside that contract.',
     'Every selection must use a CMDBuild class identifier, a stable selection:<identifier> id, a unique alias, useful columns, and a non-empty rules array.',
-    'operations is an ordered list. Use type "relation" for a CMDBuild domain traversal, type "match" for field matching, type "semiJoin" to retain left/source cards that match at least one right row without adding right columns, type "existsRelated" to retain the source cards only when a related card matches a row from a comparison set, or union/difference/intersect for a set operation. A relation needs relation:<identifier> id, an earlier from alias, unique as alias, CMDBuild domain, targetClass, direction, columns and limit; it never has with or match rules. A semiJoin needs semiJoin:<identifier> id, earlier from and with aliases, unique as alias, ruleJoin any|all, and non-empty rules. An existsRelated operation needs existsRelated:<identifier> id, from source cards to retain, with comparison rows, domain, targetClass, direction, columns, limit, and non-empty rules. Its rules compare with.leftColumn to the related card rightColumn, and its output preserves only from columns. Every other operation from/with must refer to a selection alias or an operation alias materialized earlier in this exact list; forward references and cycles are invalid.',
+    'operations is an ordered list. Use type "relation" for a CMDBuild domain traversal, type "match" for field matching, type "semiJoin" to retain left/source cards that match at least one right row without adding right columns, type "existsRelated" to retain the source cards only when a related card matches a row from a comparison set, or union/difference/intersect for a set operation. A relation needs relation:<identifier> id, an earlier from alias, unique as alias, CMDBuild domain, targetClass and direction; it never has with, match rules, columns or limit. A semiJoin needs semiJoin:<identifier> id, earlier from and with aliases, unique as alias, ruleJoin any|all, and non-empty rules. An existsRelated operation needs existsRelated:<identifier> id, from source cards to retain, with comparison rows, domain, targetClass, direction and non-empty rules. Its rules compare with.leftColumn to the related card rightColumn, and its output preserves only from columns. The compiler materializes required deep fields from those rules and uses the common runtime relation limit. Every other operation from/with must refer to a selection alias or an operation alias materialized earlier in this exact list; forward references and cycles are invalid.',
     'A match operation needs stable match:<identifier> id, unique output alias, and a non-empty rules array with leftColumn, rightColumn, and operator. A set operation needs stable set:<identifier> id, unique output alias, and non-empty on key pairs. Use Class + _id keys for CMDB cards.',
     'Use only permission-filtered CMDBuild class and attribute identifiers present in MCP context. When the request says related, relation, domain, or linked objects, use a confirmed type "relation" operation and the matching relation hint. Domain endpoint superclasses and their explicitly allowed descendants are valid relation candidates. Do not replace a domain relation with an invented reference attribute or a match operation.',
     'MCP diagnostics.relationPaths contains confirmed domain transitions for candidate classes. For each relation choose its exact domain and direction from that list, and verify that sourceClass and targetClass are on opposite domain endpoints. A class name never implies a domain identifier.',
@@ -41309,7 +43297,7 @@ function assistantDeterministicSemanticFlow(intent, semanticPlan, mcpContext, cu
       const from = aliases.get(String(path.comparisonBlockId || ''));
       if (!from) fail(block, 'dependency source result is not materialized', { comparisonBlockId: String(path.comparisonBlockId || '') });
       const alias = aliasFor(block.id);
-      operations.push({ id: `relation:${alias}`, type: 'relation', from, as: alias, domain: path.domain, targetClass: outputClass, direction: path.direction, columns: uniqueStrings(['Code', 'Description'].concat(requiredColumnsByBlockId.get(String(block.id || '')) || [])), limit: 1000, distinct: true });
+      operations.push({ id: `relation:${alias}`, type: 'relation', from, as: alias, domain: path.domain, targetClass: outputClass, direction: path.direction, distinct: true });
       aliases.set(block.id, alias);
       continue;
     }
@@ -41344,8 +43332,7 @@ function assistantDeterministicSemanticFlow(intent, semanticPlan, mcpContext, cu
         operations.push({
           id: `relation:${alias}`, type: 'relation', from: currentAlias, as: alias,
           domain: hop.domain, targetClass: hop.targetClass, direction: hop.direction,
-          columns: uniqueStrings(['Code', 'Description'].concat(hopIndex === reverseHops.length - 1 ? requiredColumnsByBlockId.get(String(block.id || '')) || [] : [])),
-          limit: 1000, distinct: true
+          distinct: true
         });
         currentAlias = alias;
       });
@@ -41362,7 +43349,7 @@ function assistantDeterministicSemanticFlow(intent, semanticPlan, mcpContext, cu
       operations.push({
         id: `existsRelated:${alias}`, type: 'existsRelated', from: source, with: comparisonAlias, as: alias,
         domain: predicate.domain, targetClass: predicate.relatedClass, direction: predicate.direction,
-        columns: ['Code', 'Description', predicate.relatedField], limit: 1000, distinct: true,
+        distinct: true,
         rules: predicate.comparisonFields.map((field) => ({ action: 'include', negate: false, operator: predicate.operator, leftColumn: field, leftRegex: '', rightColumn: predicate.relatedField, rightRegex: '' }))
       });
       aliases.set(block.id, alias);
@@ -41382,7 +43369,7 @@ function assistantDeterministicSemanticFlow(intent, semanticPlan, mcpContext, cu
     const path = preferred[0];
     const source = addSelection(block, path.sourceClass, '', assistantDeterministicSelectionRules(intentBlock, path.sourceClass, params, mcpContext), 'source', false);
     const alias = aliasFor(block.id);
-    operations.push({ id: `relation:${alias}`, type: 'relation', from: source, as: alias, domain: path.domain, targetClass: outputClass, direction: path.direction, columns: uniqueStrings(['Code', 'Description'].concat(requiredColumnsByBlockId.get(String(block.id || '')) || [])), limit: 1000, distinct: true });
+    operations.push({ id: `relation:${alias}`, type: 'relation', from: source, as: alias, domain: path.domain, targetClass: outputClass, direction: path.direction, distinct: true });
     aliases.set(block.id, alias);
   }
   const lastBlock = (intent.blocks || []).at(-1);
@@ -41659,15 +43646,15 @@ function assistantDiagramSelectionMappings(spec, proposal, stages) {
     const primary = rawMapping.primary && typeof rawMapping.primary === 'object' ? cloneJsonValueServer(rawMapping.primary, {}) : {};
     const primaryProjection = diagramImportPrimaryCardSource(stage, primary);
     if (primaryProjection.source) {
-      primary.className = String(primaryProjection.source.className || '');
       primary.cardSource = primaryProjection.source;
+      primary.className = String(primaryProjection.source.className || '');
     } else {
-      primary.className = String(primary.className || stage.className || '');
       delete primary.cardSource;
+      primary.className = String(stage.className || '');
     }
     primary.idAttribute = diagramImportPrimaryIdAttribute(role, primary);
     primary.structuredFields = diagramImportPrimaryStructuredFields(role, primary).filter((field) => available.has(String(field)));
-    primary.labelTemplate = String(primary.labelTemplate || '${Description}');
+    primary.labelTemplate = diagramImportPrimaryLabelTemplate(primary, diagramImportRoleLabelTemplate(role, '${Description}'));
     return {
       roleId,
       structureItemId,
@@ -41686,20 +43673,167 @@ function assistantDiagramSelectionMappings(spec, proposal, stages) {
   }).filter(Boolean);
 }
 
-function assistantDiagramAttachRelatedNetworkStages(items, roles, stages) {
-  // Diagram authoring is intentionally not a second Object Flow editor. A
-  // related binding is valid only when it already names a materialized result
-  // and an explicit correlation. Do not synthesize domain/reference traversals
-  // from catalog hints or relation-source metadata.
-  return (Array.isArray(items) ? items : []).map((item) => ({
-    ...item,
-    mapping: {
-      ...(item && item.mapping && typeof item.mapping === 'object' ? item.mapping : {}),
-      related: Array.isArray(item && item.mapping && item.mapping.related)
-        ? item.mapping.related.filter((related) => String(related && related.stageId || '').trim())
-        : []
+function diagramImportNetworkEndpointFields(stage) {
+  const technical = new Set(['_id', 'Id', 'ID', 'Class', 'Code', 'Description', 'Name', 'SourceId', 'RelatedId']);
+  return uniqueStrings(Array.isArray(stage && stage.columns) ? stage.columns : [])
+    .map((field) => String(field || '').trim())
+    .filter((field) => field && !technical.has(field))
+    // This helper is deliberately limited to network endpoint mappings. Other
+    // deterministic edges use their card identities and do not need this hint.
+    .filter((field) => /(?:ip|addr|address|range|cidr|network)/i.test(field));
+}
+
+function diagramImportRelatedEndpointCorrelationCandidates(relatedStage, primaryStage) {
+  const relatedColumns = new Set(Array.isArray(relatedStage && relatedStage.columns) ? relatedStage.columns.map(String) : []);
+  const primaryColumns = new Set(Array.isArray(primaryStage && primaryStage.columns) ? primaryStage.columns.map(String) : []);
+  const candidates = [];
+  const add = (leftColumn, rightColumn, score) => {
+    const left = String(leftColumn || '').trim();
+    const right = String(rightColumn || '').trim();
+    if (!left || !right || !relatedColumns.has(left) || !primaryColumns.has(right)) return;
+    const key = `${left}\u0000${right}`;
+    if (candidates.some((candidate) => candidate.key === key)) return;
+    candidates.push({ key, leftColumn: left, rightColumn: right, score });
+  };
+  for (const relatedSource of Array.isArray(relatedStage && relatedStage.cardSources) ? relatedStage.cardSources : []) {
+    for (const primarySource of Array.isArray(primaryStage && primaryStage.cardSources) ? primaryStage.cardSources : []) {
+      if (!relatedSource || !primarySource ||
+        String(relatedSource.className || '') !== String(primarySource.className || '')) continue;
+      // The same retained CMDBuild card is an explicit deterministic bridge.
+      // It covers both relation target -> source and a related card selected
+      // directly from the primary result without inventing a CMDB path.
+      add(relatedSource.idColumn, primarySource.idColumn,
+        (String(relatedSource.id || '') === 'current' ? 0 : 1) + (String(primarySource.id || '') === 'current' ? 0 : 1));
     }
-  }));
+  }
+  for (const candidate of diagramImportParentCorrelationCandidates(relatedStage, primaryStage)) {
+    add(candidate.leftColumn, candidate.rightColumn, 2 + Number(candidate.provenanceDepth || 0));
+  }
+  if (!candidates.length) return [];
+  const minimumScore = Math.min(...candidates.map((candidate) => candidate.score));
+  return candidates.filter((candidate) => candidate.score === minimumScore);
+}
+
+function diagramImportCompileEndpointProfiles(role, mapping, treeItemId, sourceStage, stageById, endpointProfiles, relatedBindings, fieldColumns = new Map()) {
+  const profiles = diagramImportEndpointProfiles(endpointProfiles)
+    .filter((profile) => String(profile.structureItemId || '') === String(treeItemId || ''));
+  const normalizedSourceStageId = String(sourceStage && sourceStage.id || '');
+  const runtimeProfiles = [];
+  for (const [index, profile] of profiles.entries()) {
+    const endpointField = String(profile && profile.field || '').trim();
+    // A comparison rule belongs to one structure placement. Its source is
+    // already determined by the placement materialization (own stage or
+    // inherited parent card), therefore an endpoint rule must never add an
+    // implicit related Object Flow stage or infer a CMDB correlation.
+    if (!normalizedSourceStageId || !endpointField) continue;
+    const field = fieldColumns.get(`endpoint:${index}`) || endpointField;
+    runtimeProfiles.push({ ...cloneJsonValueServer(profile, {}), field });
+  }
+  return runtimeProfiles;
+}
+
+function diagramImportNetworkEndpointRoleIds(topology = [], relationRules = []) {
+  const fromTopology = (Array.isArray(topology) ? topology : [])
+    .filter((requirement) => Array.isArray(requirement && requirement.networkEndpointStages) && requirement.networkEndpointStages.length)
+    .flatMap((requirement) => [String(requirement.sourceRoleId || ''), String(requirement.targetRoleId || '')]);
+  const fromRules = (Array.isArray(relationRules) ? relationRules : [])
+    .filter((rule) => String(rule && rule.mode || '') === 'networkEndpoints')
+    .flatMap((rule) => [String(rule.parentRoleId || ''), String(rule.childRoleId || '')]);
+  return new Set(fromTopology.concat(fromRules).filter(Boolean));
+}
+
+function diagramImportEnsureNetworkEndpointBindings(items, stages, networkRoleIds = new Set(), roles = []) {
+  // Diagram authoring must not invent CMDB traversal. It can, however, reuse a
+  // materialized Object Flow stage when it has one exact card-identity bridge
+  // to the primary D2 card. This makes IPv4 endpoints available to runtime
+  // without asking the model to guess SourceId/RelatedId correlations.
+  const stageById = new Map((Array.isArray(stages) ? stages : []).map((stage) => [String(stage && stage.id || ''), stage]));
+  const roleById = new Map((Array.isArray(roles) ? roles : []).map((role) => [String(role && role.id || ''), role]));
+  const itemLabel = (item) => {
+    const role = roleById.get(String(item && item.roleId || '')) || {};
+    return String(item && item.mapping && item.mapping.label || role.displayName || role.label || role.key || 'элемента диаграммы');
+  };
+  const warnings = [];
+  const normalizedItems = (Array.isArray(items) ? items : []).map((item) => {
+    const mapping = item && item.mapping && typeof item.mapping === 'object' ? cloneJsonValueServer(item.mapping, {}) : {};
+    const related = Array.isArray(mapping.related)
+      ? mapping.related.filter((binding) => String(binding && binding.stageId || '').trim())
+      : [];
+    const roleId = String(item && item.roleId || '');
+    const primaryStage = stageById.get(String(item && item.source && item.source.stageId || mapping.materialization && mapping.materialization.stageId || ''));
+    if (!networkRoleIds.has(roleId) || !primaryStage) return { ...item, mapping: { ...mapping, related } };
+    const directFields = diagramImportNetworkEndpointFields(primaryStage);
+    const existingEndpointFields = directFields.concat(related.flatMap((binding) => uniqueStrings(binding && binding.structuredFields || [])));
+    if (existingEndpointFields.length) return { ...item, mapping: { ...mapping, related } };
+    const primaryAlias = String(primaryStage.alias || '').trim();
+    const candidates = (Array.isArray(stages) ? stages : []).flatMap((relatedStage) => {
+      if (!relatedStage || String(relatedStage.id || '') === String(primaryStage.id || '')) return [];
+      const structuredFields = diagramImportNetworkEndpointFields(relatedStage);
+      if (!structuredFields.length) return [];
+      const correlations = diagramImportRelatedEndpointCorrelationCandidates(relatedStage, primaryStage);
+      if (correlations.length !== 1) return [];
+      const lineage = Array.isArray(relatedStage.lineageAliases) ? relatedStage.lineageAliases.map(String) : [];
+      const lineageDistance = primaryAlias ? lineage.indexOf(primaryAlias) : -1;
+      return [{
+        relatedStage,
+        structuredFields,
+        correlation: correlations[0],
+        // A stage directly derived from the mapped Object Flow result is more
+        // specific than any unrelated stage which happens to retain the same
+        // CMDBuild card class. This remains provenance-based and does not
+        // invent a CMDB traversal.
+        provenanceDistance: lineageDistance >= 0 ? lineageDistance : Number.POSITIVE_INFINITY
+      }];
+    });
+    const closestDistance = candidates.length ? Math.min(...candidates.map((candidate) => candidate.provenanceDistance)) : Number.POSITIVE_INFINITY;
+    const closestCandidates = candidates.filter((candidate) => candidate.provenanceDistance === closestDistance);
+    const bestCorrelationScore = closestCandidates.length
+      ? Math.min(...closestCandidates.map((candidate) => Number(candidate.correlation && candidate.correlation.score || 0)))
+      : Number.POSITIVE_INFINITY;
+    const bestCandidates = closestCandidates.filter((candidate) => Number(candidate.correlation && candidate.correlation.score || 0) === bestCorrelationScore);
+    if (bestCandidates.length !== 1) {
+      if (bestCandidates.length > 1) warnings.push(`Для элемента «${itemLabel(item)}» найдено несколько равнозначных подтверждённых источников IPv4 endpoint. Выберите связанный результат вручную.`);
+      return { ...item, mapping: { ...mapping, related } };
+    }
+    const { relatedStage, structuredFields, correlation } = bestCandidates[0];
+    const bindingId = diagramImportStableId('endpoint_binding', `${String(item && item.structureItemId || roleId)}:${String(relatedStage.id || '')}`);
+    related.push({
+      id: bindingId,
+      stageId: String(relatedStage.id || ''),
+      labelValueMode: 'single',
+      labelSeparator: ', ',
+      structuredFields,
+      conditions: {
+        ruleJoin: 'all',
+        rules: [{
+          id: diagramImportStableId('endpoint_correlation', `${bindingId}:${correlation.leftColumn}:${correlation.rightColumn}`),
+          action: 'include',
+          negate: false,
+          origin: 'deterministicEndpointBinding',
+          operator: 'equals',
+          caseSensitive: false,
+          left: { column: correlation.leftColumn, regex: '' },
+          right: { kind: 'stage', value: '', name: '', stageId: String(primaryStage.id || ''), column: correlation.rightColumn, regex: '' }
+        }]
+      }
+    });
+    warnings.push(`Для элемента «${itemLabel(item)}» добавлен подтверждённый источник IPv4 endpoint.`);
+    return { ...item, mapping: { ...mapping, related } };
+  });
+  return { items: normalizedItems, warnings: uniqueStrings(warnings) };
+}
+
+function assistantDiagramEnsureNetworkEndpointBindings(items, roles, stages, topology = []) {
+  return diagramImportEnsureNetworkEndpointBindings(
+    items,
+    stages,
+    diagramImportNetworkEndpointRoleIds(topology),
+    roles
+  );
+}
+
+function assistantDiagramAttachRelatedNetworkStages(items, roles, stages, topology = []) {
+  return assistantDiagramEnsureNetworkEndpointBindings(items, roles, stages, topology).items;
 }
 
 function assistantDiagramSemanticTokens(values) {
@@ -41752,18 +43886,6 @@ function assistantDiagramRankConnectionCandidates(requirement, candidates, roles
 }
 
 function assistantDiagramTopologyRequirements(relationRules, roles, mappings = [], stages = [], catalog = null, traversalDepth = 1) {
-  const names = new Map((Array.isArray(roles) ? roles : []).map((role) => [String(role && role.id || ''), String(role && (role.displayName || role.label || role.key) || '')]));
-  const roleById = new Map((Array.isArray(roles) ? roles : []).map((role) => [String(role && role.id || ''), role]));
-  const mappedClassesByRoleId = new Map();
-  for (const mapping of Array.isArray(mappings) ? mappings : []) {
-    const roleId = String(mapping && mapping.roleId || '').trim();
-    const className = String(mapping && mapping.source && mapping.source.className || '').trim();
-    if (!roleId || !className) continue;
-    mappedClassesByRoleId.set(roleId, diagramImportCatalogStrings([mappedClassesByRoleId.get(roleId)].concat(className)));
-  }
-  const roleClasses = (roleId) => {
-    return mappedClassesByRoleId.get(String(roleId || '')) || [];
-  };
   const networkEndpointStages = (Array.isArray(stages) ? stages : []).flatMap((stage) => {
     const columns = Array.isArray(stage && stage.columns) ? stage.columns.map(String) : [];
     const sourceField = columns.find((field) => /^(?:source|src|ip)address$/i.test(field));
@@ -41778,7 +43900,7 @@ function assistantDiagramTopologyRequirements(relationRules, roles, mappings = [
       stage,
       sourceField,
       targetField,
-      labelField: columns.includes('Description') ? 'Description' : (columns.includes('Code') ? 'Code' : '')
+      labelTemplate: columns.includes('Description') ? '${Description}' : (columns.includes('Code') ? '${Code}' : '')
     }];
   });
   const relationCardStages = (Array.isArray(stages) ? stages : []).flatMap((stage) => {
@@ -41798,7 +43920,7 @@ function assistantDiagramTopologyRequirements(relationRules, roles, mappings = [
       targetClass: String(connection && connection.withClass || ''),
       sourceField,
       targetField,
-      labelField: columns.includes('Domain') ? 'Domain' : (columns.includes('Description') ? 'Description' : '')
+      labelTemplate: columns.includes('Domain') ? '${Domain}' : (columns.includes('Description') ? '${Description}' : '')
     }];
   });
   const deterministicEndpointStages = (Array.isArray(stages) ? stages : []).flatMap((stage) => {
@@ -41816,7 +43938,35 @@ function assistantDiagramTopologyRequirements(relationRules, roles, mappings = [
       targetField: String(stage && stage.connection && stage.connection.targetField || '')
     }];
   }).slice(0, 96);
-  return (Array.isArray(relationRules) ? relationRules : []).filter((rule) => rule && rule.d2ElementKey).map((rule) => {
+  // A visual D2 class is one connection algorithm. Template arrows only
+  // provide style and examples; they are never business endpoint pairs.
+  const contracts = new Map();
+  for (const rawRule of Array.isArray(relationRules) ? relationRules : []) {
+    if (!rawRule || !rawRule.d2ElementKey) continue;
+    const rule = rawRule && typeof rawRule === 'object' ? rawRule : {};
+    const d2ClassKey = String(rule.d2ClassKey || rule.d2ElementKey || '').trim();
+    const existing = contracts.get(d2ClassKey);
+    const elementKeys = uniqueStrings([String(rule.d2ElementKey || '')]
+      .concat(Array.isArray(rule.d2ElementKeys) ? rule.d2ElementKeys.map(String) : [])).filter(Boolean);
+    const exampleLabels = uniqueStrings([String(rule.d2Label || '')]
+      .concat(Array.isArray(rule.d2ExampleLabels) ? rule.d2ExampleLabels.map(String) : [])).filter(Boolean);
+    if (!existing) {
+      contracts.set(d2ClassKey, {
+        ...rule,
+        d2ClassKey,
+        d2ElementKey: elementKeys[0],
+        d2ElementKeys: elementKeys,
+        d2ExampleLabels: exampleLabels,
+        direction: String(rule.direction || '->').trim() || '->'
+      });
+      continue;
+    }
+    existing.d2ElementKeys = uniqueStrings(existing.d2ElementKeys.concat(elementKeys));
+    existing.d2ExampleLabels = uniqueStrings(existing.d2ExampleLabels.concat(exampleLabels));
+    existing.d2ClassKeys = uniqueStrings((Array.isArray(existing.d2ClassKeys) ? existing.d2ClassKeys : [])
+      .concat(Array.isArray(rule.d2ClassKeys) ? rule.d2ClassKeys.map(String) : []));
+  }
+  return Array.from(contracts.values()).map((rule) => {
     const requirement = {
       d2ElementKey: String(rule.d2ElementKey),
       d2ElementKeys: Array.isArray(rule.d2ElementKeys) ? rule.d2ElementKeys.map(String) : [String(rule.d2ElementKey)],
@@ -41825,10 +43975,6 @@ function assistantDiagramTopologyRequirements(relationRules, roles, mappings = [
       notes: truncateText(String(rule.d2Notes || ''), 8000),
       exampleLabels: Array.isArray(rule.d2ExampleLabels) ? rule.d2ExampleLabels.map(String) : [String(rule.d2Label || '')].filter(Boolean),
       label: String(rule.d2Label || rule.d2ElementKey),
-      sourceRoleId: String(rule.parentRoleId || ''),
-      sourceRole: names.get(String(rule.parentRoleId || '')) || '',
-      targetRoleId: String(rule.childRoleId || ''),
-      targetRole: names.get(String(rule.childRoleId || '')) || '',
       directionPolicy: normalizeDiagramDirectionPolicy(rule.directionPolicy),
       trafficOrProtocol: /(?:\b(?:tcp|udp|sctp|icmp|acl)\b|\b(?:src|source|dst|dest|destination)\.?port\b|\bport\s*[:/=]?\s*\d+|ip\s*address|источник|назначени)/i.test([
         rule.d2Label,
@@ -41837,7 +43983,7 @@ function assistantDiagramTopologyRequirements(relationRules, roles, mappings = [
         ...(Array.isArray(rule.d2ExampleLabels) ? rule.d2ExampleLabels : [])
       ].map((item) => String(item || '')).join('\n')),
       directionPolicySuggestion: normalizeDiagramDirectionPolicy(rule.directionPolicy) || diagramImportDirectionPolicySuggestion(rule),
-      supportedModes: ['relationCard', 'networkEndpoints', 'deterministicEndpoints'],
+      supportedModes: ['relationCard', 'attributeEndpoints', 'deterministicEndpoints'],
       dedicatedResultRequired: true,
       networkEndpointStages: [],
       relationCardStages,
@@ -41846,6 +43992,16 @@ function assistantDiagramTopologyRequirements(relationRules, roles, mappings = [
     requirement.networkEndpointStages = assistantDiagramRankConnectionCandidates(requirement, networkEndpointStages, roles, mappings);
     return requirement;
   });
+}
+
+function assistantDiagramAutofillNetworkTopologyRules(relationRules, topology = []) {
+  // A connection result is an authoring decision, not a ranking hint. Even a
+  // unique candidate may be semantically wrong for the D2 pair, so never add
+  // an ACL/network binding that Assistant did not explicitly return. The
+  // incomplete variant remains in the editor and partial preview reports it.
+  return Array.isArray(relationRules)
+    ? relationRules.filter((rule) => rule && typeof rule === 'object')
+    : [];
 }
 
 function assistantDiagramPlacementTargets(proposal, stages = [], catalog = null) {
@@ -42008,7 +44164,7 @@ function assistantDiagramStageMessages(input, runtimeConfig) {
   const correction = mappingCorrection || topologyCorrection;
   const contract = mapTask
     ? mappingPhase === 'topology'
-      ? '{"relationRules":[{"d2ElementKey":"<exact offered D2 relation-class contract key>","mode":"deterministicEndpoints|relationCard|networkEndpoints","candidateId":"<exact offered connection candidate id>","sourceStageId":"<exact dedicated deterministic result id>","sourceField":"<exact offered endpoint field>","targetField":"<exact offered endpoint field>","labelField":"<optional offered field>"}],"explanation":"...","warnings":[]}'
+      ? '{"relationRules":[{"d2ClassKey":"<exact offered D2 connection class>","mode":"deterministicEndpoints|relationCard|attributeEndpoints","candidateId":"<exact offered connection candidate id>","sourceStageId":"<exact dedicated deterministic result id>","sourceField":"<exact offered endpoint field>","targetField":"<exact offered endpoint field>","sourceOperator":"<supported operator for source side when attributeEndpoints>","targetOperator":"<supported operator for target side when attributeEndpoints>","labelTemplate":"<optional offered label template>"}],"explanation":"...","warnings":[]}'
       : '{"mappings":[{"structureItemId":"<exact D2 placement id>","materialization":"structural|stage|parentCard","stageId":"<exact stage id for stage materialization>","hierarchyConditions":{"ruleJoin":"any|all","rules":[]},"confidence":"high|medium|low","reason":"..."}],"unresolved":[{"structureItemId":"<exact D2 placement id>","reason":"noCompatibleStage|ambiguousStage|needsStaticDecision","message":"..."}],"explanation":"...","warnings":[]}'
     : '';
   const system = [
@@ -42018,7 +44174,7 @@ function assistantDiagramStageMessages(input, runtimeConfig) {
     'Use only exact role ids and stage ids supplied in the user payload. Each role may include notes extracted from the D2 class definition. Notes are authoritative authoring intent: follow them for static versus dynamic behavior, grouping, hierarchy and connection meaning; never treat them as CMDBuild identifiers and never infer identifiers not supplied in the catalog-backed payload.',
     mapTask
       ? mappingPhase === 'topology'
-        ? 'Map only the supplied D2 relation-class contracts. Role-to-stage mappings are already confirmed and immutable. Each relation contract includes authoritative D2 class Notes and all sample arrows covered by it. Return at most one relationRule for each d2ElementKey. Every rule must use one dedicated named Object Flow result and its exact candidateId; never reuse one result for different d2ClassKey values. Connection candidates are ordered by deterministic semanticScore computed from user-facing result labels, recursive lineage, mapped roles, and D2 Notes: prefer the first uniquely highest candidate and never replace a dedicated filtered descendant with its broad ancestor selection. Do not return or select a CMDB path, domain, reference, class, or pathId: that logic belongs to Object Flow. Use deterministicEndpoints when a dedicated deterministic result materializes source and target object ids through any business rule, including attribute comparison, set membership, or city/street matching. When trafficOrProtocol is true and networkEndpointStages is non-empty, use networkEndpoints with exactly one supplied endpoint candidate and its fields. Use relationCard only for an offered relationCardStages candidate. Do not choose directionPolicy: it is a D2 source contract or explicit deterministic-editor confirmation. If no dedicated supplied result describes a relation class, omit it so deterministic coverage marks it unresolved. Do not return role mappings, unresolved roles, classes, aliases, paths, or invented fields.'
+        ? 'Map only the supplied D2 connection class contracts. Role-to-stage mappings are already confirmed and immutable. A topology item combines every template arrow with the same D2 class into one connection algorithm. Return at most one relationRule for each offered D2 class and use its exact d2ClassKey. Do not use template arrow endpoints as business constraints. Every rule must use one dedicated named Object Flow result and its exact candidateId; a result may be reused by different connection classes when their deterministic algorithms are different. Connection candidates are ordered by deterministic semanticScore computed from user-facing result labels, recursive lineage and D2 Notes: prefer the first uniquely highest candidate and never replace a dedicated filtered descendant with its broad ancestor selection. Use the offered labelTemplate unchanged when it is present; it is the only connection-label setting. Do not return endpoint participant ids, a CMDB path, domain, reference, class, pathId, labelField, or invented fields: every placement comparison rule compatible with a relation side is applied automatically by the deterministic Diagram Editor. Use deterministicEndpoints when a dedicated deterministic result materializes source and target object ids through any business rule, including attribute comparison, set membership, or city/street matching. Use attributeEndpoints when the result contains source and target values for an attribute comparison. Use relationCard only for an offered relationCardStages candidate. Do not choose directionPolicy: source result field points to target result field unless the user explicitly marks the connection undirected. If no dedicated supplied result describes a class, omit it so deterministic coverage marks that class unresolved. Do not return role mappings, unresolved roles, aliases, paths, or invented fields.'
       : 'Map every supplied D2 placement independently, or return it once in unresolved with a supported reason. A node must use stage or parentCard; structural is never valid for a node. A container must explicitly choose structural or stage. A stage container repeats once per selected Object Flow row; use parentCard for a direct child node that renders that same row. A visual container described as static only because it has no independent CMDBuild card must still use stage when it is the per-card frame for one mapped child; choose that child stage for the container and parentCard for the child. Use structural only for a frame intentionally rendered once without a card label or data source. Every parentCard placement requires a direct or ancestor placement that uses stage in the same response. The placement payload includes parentCardContract and childPlacements; treat these as a dependency graph. Before returning a parentCard decision, return a compatible stage decision for its required ancestor. If you cannot choose an exact stage, return the child once in unresolved with noCompatibleStage or ambiguousStage instead of parentCard. Never copy one placement decision to a sibling that has another D2 parent or another Notes contract. For a nested independent stage, put only parent-child card comparisons in hierarchyConditions: the right side must use the nearest materialized parent stage and an offered field. Do not put ordinary result filters there. Each stage exposes its user-facing label and exact deterministic rules: preserve their meaning when choosing a source. Do not use a stage filtered for one semantic group (for example external systems) for its opposite visual role (for example internal systems). Do not return relation rules, classes, aliases, paths, or invented identifiers.'
       : '',
     mappingCorrection
@@ -42093,7 +44249,12 @@ function assistantDiagramRoleModelDraftFromResponse(input, parsedObject) {
     return {
       roleId,
       visualKind,
-      labelTemplate: truncateText(String(candidate && candidate.labelTemplate || role.labelTemplate || ''), 1000),
+      labelTemplate: truncateText(
+        candidate && Object.prototype.hasOwnProperty.call(candidate, 'labelTemplate')
+          ? String(candidate.labelTemplate ?? '')
+          : diagramImportRoleLabelTemplate(role),
+        1000
+      ),
       confidence: ['high', 'medium', 'low'].includes(String(candidate && candidate.confidence || '')) ? String(candidate.confidence) : 'medium',
       reason: truncateText(String(candidate && candidate.reason || ''), 1000)
     };
@@ -42318,13 +44479,22 @@ function assistantDiagramPlacementDraftFromResponse(input, parsedObject) {
       continue;
     }
     const current = target.currentMapping && typeof target.currentMapping === 'object' ? target.currentMapping : {};
+    const parentTarget = targetById.get(String(target.parentStructureItemId || ''));
+    const parentStage = parentTarget
+      ? stageById.get(resolvedStageIdForItem(String(parentTarget.structureItemId || parentTarget.id || '')))
+      : null;
+    const primaryProjection = stage ? diagramImportPrimaryCardSource(stage, current.primary || {}, parentStage || null) : { source: null };
     const primary = {
       ...(current.primary || {}),
-      className: String(stage && stage.className || current.primary && current.primary.className || ''),
+      className: String(primaryProjection.source && primaryProjection.source.className || stage && stage.className || current.primary && current.primary.className || ''),
       idAttribute: '_id',
-      labelTemplate: String(candidate.labelTemplate || current.primary && current.primary.labelTemplate || '${Description}'),
+      labelTemplate: Object.prototype.hasOwnProperty.call(candidate, 'labelTemplate')
+        ? String(candidate.labelTemplate ?? '')
+        : diagramImportPrimaryLabelTemplate(current.primary),
       structuredFields: uniqueStrings(current.primary && current.primary.structuredFields || [])
     };
+    if (primaryProjection.source) primary.cardSource = primaryProjection.source;
+    else delete primary.cardSource;
     const source = stage ? { stageId: String(stage.id || ''), alias: String(stage.alias || ''), kind: String(stage.kind || ''), className: String(stage.className || '') } : {};
     const assistantHierarchyConditions = diagramImportPlacementFilters(candidate.hierarchyConditions);
     assistantHierarchyConditions.rules = assistantHierarchyConditions.rules.map((rule) => ({ ...rule, origin: 'assistant' }));
@@ -42367,19 +44537,29 @@ function assistantDiagramPlacementDraftFromResponse(input, parsedObject) {
     return nearestParentStageIdForItem(parentId, new Set(visited).add(parentId));
   };
   for (const item of items) {
-    const mapping = item && item.mapping || {};
+    let mapping = item && item.mapping || {};
     if (String(mapping.materialization && mapping.materialization.kind || '') !== 'stage') continue;
     const childStageId = String(mapping.materialization.stageId || '');
     const parentStageId = nearestParentStageIdForItem(item.structureItemId);
     const childStage = stageById.get(childStageId);
     const parentStage = stageById.get(parentStageId);
     const primaryProjection = diagramImportPrimaryCardSource(childStage, mapping.primary || {}, parentStage || null);
-    if (primaryProjection.source) {
-      mapping.primary = {
-        ...(mapping.primary || {}),
-        className: String(primaryProjection.source.className || ''),
-        cardSource: primaryProjection.source
-      };
+    mapping.primary = {
+      ...(mapping.primary || {}),
+      className: String(primaryProjection.source && primaryProjection.source.className || childStage && childStage.className || ''),
+      ...(primaryProjection.source ? { cardSource: primaryProjection.source } : {}),
+      idAttribute: '_id'
+    };
+    if (!primaryProjection.source) delete mapping.primary.cardSource;
+    const directRelationRepair = diagramImportDirectRelationParentCorrelation(
+      mapping,
+      childStage,
+      parentStage,
+      String(item.structureItemId || '')
+    );
+    if (directRelationRepair.changed) {
+      mapping = directRelationRepair.mapping;
+      item.mapping = mapping;
     }
     if (!childStageId || !parentStageId || childStageId === parentStageId) continue;
     const hierarchyConditions = diagramImportPlacementFilters(mapping.hierarchyConditions);
@@ -42569,7 +44749,7 @@ function assistantDiagramRecoverParentCardMappings(input, draft) {
               ...childPrimary,
               className: String(stage.className || childPrimary.className || ''),
               idAttribute: '_id',
-              labelTemplate: String(childPrimary.labelTemplate || '${Description}'),
+              labelTemplate: diagramImportPrimaryLabelTemplate(childPrimary),
               structuredFields: uniqueStrings(childPrimary.structuredFields || [])
             },
             conditions: diagramImportPlacementFilters(current.conditions),
@@ -42649,6 +44829,13 @@ function assistantDiagramStageDraftFromResponse(input, parsedObject) {
       reason: String(item && item.reason || '')
     }));
     response.unresolved = [];
+    const suppliedRelationRuleCount = Array.isArray(response.relationRules) ? response.relationRules.length : 0;
+    response.relationRules = assistantDiagramAutofillNetworkTopologyRules(response.relationRules, input.topology);
+    if (response.relationRules.length > suppliedRelationRuleCount) {
+      response.warnings = (Array.isArray(response.warnings) ? response.warnings : []).concat(
+        'Неоднозначность отсутствовала: IPv4-связи с единственным подтверждённым результатом Object Flow добавлены детерминированно.'
+      );
+    }
   } else if (mappingPhase === 'roles') {
     // Connection paths are selected only after the role-to-stage bindings are
     // known. Ignore any hallucinated first-phase connection payload.
@@ -42762,24 +44949,27 @@ function assistantDiagramStageDraftFromResponse(input, parsedObject) {
     const seenRelationRuleKeys = new Set();
     if (response.relationRules !== undefined && !Array.isArray(response.relationRules)) errors.push({ path: '$.relationRules', message: 'Assistant response relationRules must be an array when present.' });
     (Array.isArray(response.relationRules) ? response.relationRules : []).forEach((candidate, index) => {
+      const requestedClassKey = String(candidate && candidate.d2ClassKey || '').trim();
       const requestedConnectionKey = String(candidate && candidate.d2ElementKey || '').trim();
       let d2ElementKey = requestedConnectionKey;
       let requirement = topologyByKey.get(d2ElementKey);
-      if (!requirement && requestedConnectionKey) {
+      const requestedIdentifier = requestedClassKey || requestedConnectionKey;
+      if (!requirement && requestedIdentifier) {
         const classMatches = (Array.isArray(input.topology) ? input.topology : [])
-          .filter((item) => String(item && item.d2ClassKey || '').trim() === requestedConnectionKey);
+          .filter((item) => String(item && item.d2ClassKey || '').trim() === requestedIdentifier);
         if (classMatches.length === 1) {
           requirement = classMatches[0];
           d2ElementKey = String(requirement.d2ElementKey || '');
-          warnings.push(`Assistant normalized D2 relation class ${requestedConnectionKey} to its unique connection contract ${d2ElementKey}.`);
+          if (requestedClassKey) warnings.push(`Assistant selected D2 relation class ${requestedClassKey}.`);
+          else warnings.push(`Assistant normalized D2 relation class ${requestedConnectionKey} to its one connection contract.`);
         }
       }
       const mode = String(candidate && candidate.mode || '').trim();
       if (!requirement) {
-        errors.push({ path: `$.relationRules[${index}].d2ElementKey`, message: `Unknown or ambiguous D2 connection ${requestedConnectionKey || '(empty)'}.` });
+        errors.push({ path: `$.relationRules[${index}].d2ClassKey`, message: `Unknown or ambiguous D2 relation class ${requestedIdentifier || '(empty)'}.` });
         return;
       }
-      if (!['relationCard', 'networkEndpoints', 'deterministicEndpoints'].includes(mode)) {
+      if (!['relationCard', 'attributeEndpoints', 'networkEndpoints', 'deterministicEndpoints'].includes(mode)) {
         errors.push({ path: `$.relationRules[${index}].mode`, message: `Unsupported D2 connection mode ${mode || '(empty)'}.` });
         return;
       }
@@ -42788,8 +44978,8 @@ function assistantDiagramStageDraftFromResponse(input, parsedObject) {
           path: `$.relationRules[${index}].d2ElementKey`,
           code: 'diagram_connection_rule_duplicate',
           d2ElementKey,
-          displayName: String(requirement.label || d2ElementKey),
-          message: `D2 connection ${d2ElementKey} must have exactly one relation rule.`
+          displayName: String(requirement.d2ClassKey || requirement.label || d2ElementKey),
+          message: `D2 connection variant ${String(requirement.d2ClassKey || d2ElementKey)} must have exactly one relation rule.`
         });
         return;
       }
@@ -42802,22 +44992,24 @@ function assistantDiagramStageDraftFromResponse(input, parsedObject) {
         d2ElementKeys: Array.isArray(requirement.d2ElementKeys) ? requirement.d2ElementKeys.map(String) : [d2ElementKey],
         d2ExampleLabels: Array.isArray(requirement.exampleLabels) ? requirement.exampleLabels.map(String) : [],
         directionPolicy: normalizeDiagramDirectionPolicy(requirement.directionPolicy),
-        directionPolicySuggestion: normalizeDiagramDirectionPolicy(requirement.directionPolicy) || normalizeDiagramDirectionPolicy(requirement.directionPolicySuggestion) || 'template',
+        directionPolicySuggestion: normalizeDiagramDirectionPolicy(requirement.directionPolicy) || normalizeDiagramDirectionPolicy(requirement.directionPolicySuggestion) || 'dataFields',
         mode,
         path: [],
         candidateId: String(candidate && candidate.candidateId || '').trim(),
         sourceStageId: String(candidate && candidate.sourceStageId || '').trim(),
         sourceField: String(candidate && candidate.sourceField || '').trim(),
         targetField: String(candidate && candidate.targetField || '').trim(),
-        labelField: String(candidate && candidate.labelField || '').trim()
+        sourceOperator: String(candidate && (candidate.sourceOperator || candidate.endpointOperator) || (mode === 'attributeEndpoints' || mode === 'networkEndpoints' ? 'ipv4InCidr' : '')).trim(),
+        targetOperator: String(candidate && (candidate.targetOperator || candidate.endpointOperator) || (mode === 'attributeEndpoints' || mode === 'networkEndpoints' ? 'ipv4InCidr' : '')).trim(),
+        labelTemplate: diagramImportRelationLabelTemplate(candidate)
       };
       const stage = stageById.get(rule.sourceStageId);
       if (!stage || !rule.sourceField || !rule.targetField) {
-        errors.push({ path: `$.relationRules[${index}]`, message: `D2 connection ${d2ElementKey} requires an existing connection stage and materialized source/target fields.` });
+        errors.push({ path: `$.relationRules[${index}]`, message: `D2 relation class ${String(requirement.d2ClassKey || d2ElementKey)} requires an existing connection stage and materialized source/target fields.` });
         return;
       }
       {
-        const candidateList = mode === 'networkEndpoints'
+        const candidateList = mode === 'networkEndpoints' || mode === 'attributeEndpoints'
           ? requirement.networkEndpointStages
           : mode === 'relationCard'
             ? requirement.relationCardStages
@@ -42834,8 +45026,8 @@ function assistantDiagramStageDraftFromResponse(input, parsedObject) {
             path: `$.relationRules[${index}]`,
             code: 'diagram_connection_candidate_not_offered',
             d2ElementKey,
-            displayName: String(requirement.d2ClassKey || requirement.label || d2ElementKey),
-            message: `D2 relation class ${requirement.d2ClassKey || d2ElementKey} must use one exact offered ${mode} candidate and endpoint fields.`
+            displayName: String(requirement.label || requirement.d2ClassKey || d2ElementKey),
+            message: `D2 relation class ${String(requirement.d2ClassKey || requirement.label || d2ElementKey)} must use one exact offered ${mode} candidate and endpoint fields.`
           });
           return;
         }
@@ -42847,19 +45039,19 @@ function assistantDiagramStageDraftFromResponse(input, parsedObject) {
             path: `$.relationRules[${index}]`,
             code: 'diagram_connection_candidate_stage_mismatch',
             d2ElementKey,
-            displayName: String(requirement.d2ClassKey || requirement.label || d2ElementKey),
-            message: `D2 relation class ${requirement.d2ClassKey || d2ElementKey} connection candidate does not match the mapped source and target CMDBuild classes.`
+            displayName: String(requirement.label || requirement.d2ClassKey || d2ElementKey),
+            message: `D2 relation class ${String(requirement.d2ClassKey || requirement.label || d2ElementKey)} connection candidate does not match the mapped source and target CMDBuild classes.`
           });
           return;
         }
-        if (rule.labelField && mode !== 'deterministicEndpoints' && String(offered.labelField || '') !== rule.labelField) {
-          errors.push({ path: `$.relationRules[${index}].labelField`, message: `D2 relation class ${requirement.d2ClassKey || d2ElementKey} labelField must match the offered connection candidate.` });
+        if (rule.labelTemplate && mode !== 'deterministicEndpoints' && diagramImportRelationLabelTemplate(offered) !== rule.labelTemplate) {
+          errors.push({ path: `$.relationRules[${index}].labelTemplate`, message: `D2 relation class ${String(requirement.d2ClassKey || requirement.label || d2ElementKey)} labelTemplate must match the offered connection candidate.` });
           return;
         }
       }
       if (stage) {
         const fields = new Set(Array.isArray(stage.columns) ? stage.columns.map(String) : []);
-        for (const field of [rule.sourceField, rule.targetField, rule.labelField].filter(Boolean)) {
+        for (const field of [rule.sourceField, rule.targetField].concat(diagramTemplateFieldNames(rule.labelTemplate || '')).filter(Boolean)) {
           if (!fields.has(field)) errors.push({ path: `$.relationRules[${index}]`, message: `Connection field ${field} is not materialized by stage ${stage.id}.` });
         }
       }
@@ -42871,11 +45063,10 @@ function assistantDiagramStageDraftFromResponse(input, parsedObject) {
       reusedBeforeRepair.get(rule.sourceStageId).push(rule);
     }
     for (const [stageId, stageRules] of reusedBeforeRepair.entries()) {
-      const classKeys = uniqueStrings(stageRules.map((rule) => rule.d2ClassKey));
-      if (classKeys.length < 2) continue;
+      if (stageRules.length < 2) continue;
       const replacements = stageRules.map((rule) => {
         const requirement = topologyByKey.get(String(rule.d2ElementKey || '')) || {};
-        const candidates = rule.mode === 'networkEndpoints'
+        const candidates = rule.mode === 'networkEndpoints' || rule.mode === 'attributeEndpoints'
           ? requirement.networkEndpointStages
           : rule.mode === 'relationCard'
             ? requirement.relationCardStages
@@ -42894,8 +45085,8 @@ function assistantDiagramStageDraftFromResponse(input, parsedObject) {
         rule.sourceStageId = String(candidate.sourceStageId || '');
         rule.sourceField = String(candidate.sourceField || '');
         rule.targetField = String(candidate.targetField || '');
-        rule.labelField = String(candidate.labelField || '');
-        warnings.push(`D2 relation class ${rule.d2ClassKey} was normalized from shared result ${stageId} to uniquely matching named result ${rule.sourceStageId}.`);
+        rule.labelTemplate = diagramImportRelationLabelTemplate(candidate);
+        warnings.push(`D2 relation class ${String(rule.d2ClassKey || rule.d2Label || rule.d2ElementKey)} was normalized from shared result ${stageId} to a uniquely matching named result ${rule.sourceStageId}.`);
       }
     }
     const reusedStages = new Map();
@@ -42905,16 +45096,15 @@ function assistantDiagramStageDraftFromResponse(input, parsedObject) {
     }
     const rejectedConnectionKeys = new Set();
     for (const [stageId, stageRules] of reusedStages.entries()) {
-      const classKeys = uniqueStrings(stageRules.map((rule) => rule.d2ClassKey));
-      if (classKeys.length < 2) continue;
+      if (stageRules.length < 2) continue;
       for (const rule of stageRules) {
         rejectedConnectionKeys.add(rule.d2ElementKey);
         connectionUnresolved.push({
           connectionKey: rule.d2ElementKey,
           d2ClassKey: rule.d2ClassKey,
-          displayName: rule.d2ClassKey,
+          displayName: String(rule.d2ClassKey || rule.d2Label || rule.d2ElementKey),
           code: 'sharedConnectionResult',
-          message: `Object Flow result ${stageId} was offered for several D2 relation classes (${classKeys.join(', ')}). Create and select a separate named result for ${rule.d2ClassKey}.`
+          message: `Object Flow result ${stageId} was selected for several incompatible D2 relation classes. Create and select a separate named result for ${String(rule.d2ClassKey || rule.d2Label || rule.d2ElementKey)}.`
         });
       }
     }
@@ -42929,7 +45119,7 @@ function assistantDiagramStageDraftFromResponse(input, parsedObject) {
         d2ClassKey: String(requirement.d2ClassKey || connectionKey),
         displayName: String(requirement.d2ClassKey || requirement.label || connectionKey),
         code: 'missingDedicatedConnectionResult',
-        message: `No dedicated named Object Flow result was mapped to D2 relation class ${requirement.d2ClassKey || connectionKey}.`
+        message: `No dedicated named Object Flow result was mapped to D2 relation class ${String(requirement.d2ClassKey || requirement.label || connectionKey)}.`
       });
     }
     response._validatedRelationRules = acceptedRelationRules;
@@ -42980,7 +45170,7 @@ function assistantDiagramMappingCoverage(input, items, unresolved, relationRules
       family: 'connections',
       connectionKey: String(requirement && requirement.d2ElementKey || ''),
       d2ClassKey: String(requirement && requirement.d2ClassKey || ''),
-      displayName: String(requirement && (requirement.d2ClassKey || requirement.label || requirement.d2ElementKey) || ''),
+      displayName: String(requirement && (requirement.label || requirement.d2ClassKey || requirement.d2ElementKey) || ''),
       code: 'assistantOmittedConnection',
       message: `Assistant did not map a dedicated named Object Flow result for D2 relation class ${String(requirement && (requirement.d2ClassKey || requirement.label || requirement.d2ElementKey) || '')}.`,
       ...(explicitConnections.get(String(requirement && requirement.d2ElementKey || '')) || {})
@@ -43304,6 +45494,15 @@ async function createAssistantDiagramMappingRolesDraft(input, runtimeConfig) {
     input.catalog,
     input.traversalDepth
   );
+  const endpointBindings = assistantDiagramEnsureNetworkEndpointBindings(
+    roleDraft.items,
+    input.roles,
+    input.stages,
+    topology
+  );
+  roleDraft.items = endpointBindings.items;
+  roleDraft.warnings = uniqueStrings((roleDraft.warnings || []).concat(endpointBindings.warnings));
+  roleDraft.mapping = assistantDiagramMappingCoverage(input, roleDraft.items, roleDraft.unresolved);
   return { success: true, roleDraft, topology };
 }
 
@@ -44208,7 +46407,7 @@ function validateTemplateSpec(spec) {
           }
         });
       }
-      const allowedEdgeMappingTypes = ['domain', 'reference', 'object', 'relationObject', 'relation-object', 'networkEndpoints', 'match', 'computed', 'generic', 'hierarchy'];
+      const allowedEdgeMappingTypes = ['domain', 'reference', 'object', 'relationObject', 'relation-object', 'networkEndpoints', 'attributeEndpoints', 'match', 'computed', 'generic', 'hierarchy'];
       edgeMappings.forEach((mapping, mappingIndex) => {
         const mappingType = String(mapping.type || mapping.kind || 'generic').trim();
         if (mappingType && !allowedEdgeMappingTypes.includes(mappingType)) {
@@ -44220,7 +46419,19 @@ function validateTemplateSpec(spec) {
             errors.push({ path: `${path}.edgeMappings[${mappingIndex}].endpointResolution.strategy`, message: 'networkEndpoints mapping requires endpointResolution.strategy ipv4ObjectThenRange.' });
           }
           if (!normalizeDiagramDirectionPolicy(resolution.directionPolicy)) {
-            errors.push({ path: `${path}.edgeMappings[${mappingIndex}].endpointResolution.directionPolicy`, message: 'networkEndpoints mapping requires explicit directionPolicy dataFields, template, or undirected.' });
+            errors.push({ path: `${path}.edgeMappings[${mappingIndex}].endpointResolution.directionPolicy`, message: 'networkEndpoints mapping requires dataFields or undirected directionPolicy.' });
+          }
+        }
+        if (mappingType === 'attributeEndpoints') {
+          const resolution = mapping.endpointResolution && typeof mapping.endpointResolution === 'object' && !Array.isArray(mapping.endpointResolution) ? mapping.endpointResolution : {};
+          if (resolution.strategy !== 'comparisonRules') {
+            errors.push({ path: `${path}.edgeMappings[${mappingIndex}].endpointResolution.strategy`, message: 'attributeEndpoints mapping requires endpointResolution.strategy comparisonRules.' });
+          }
+          if (!DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(String(resolution.operator || ''))) {
+            errors.push({ path: `${path}.edgeMappings[${mappingIndex}].endpointResolution.operator`, message: 'attributeEndpoints mapping requires a supported deterministic comparison operator.' });
+          }
+          if (!normalizeDiagramDirectionPolicy(resolution.directionPolicy)) {
+            errors.push({ path: `${path}.edgeMappings[${mappingIndex}].endpointResolution.directionPolicy`, message: 'attributeEndpoints mapping requires dataFields or undirected directionPolicy.' });
           }
         }
       });
@@ -44428,12 +46639,22 @@ function diagramImportRuntimeMappingContractError(mapping, family, grammarElemen
     const blueprint = grammarElements.get(elementKey);
     if (!roleKey || !grammarRoles.has(roleKey)) return `${mappingId}: missing declared D2 role.`;
     if (!blueprint || blueprint.kind !== kind || blueprint.roleKey !== roleKey) return `${mappingId}: missing declared ${kind} blueprint.`;
+    const expectedClassName = String(role.primaryCardSourceClassName || '').trim();
+    const actualClassName = String(mapping && mapping.dataProfile && mapping.dataProfile.className || '').trim();
+    if (expectedClassName && expectedClassName !== actualClassName) {
+      return `${mappingId}: primary card source class ${expectedClassName} does not match runtime mapping class ${actualClassName || '(empty)'}.`;
+    }
     return '';
   }
   const blueprint = grammarEdges.get(elementKey);
   const sourceRoleKey = String(family === 'hierarchyMappings' ? role.parentKey : role.sourceKey || '').trim();
   const targetRoleKey = String(family === 'hierarchyMappings' ? role.childKey : role.targetKey || '').trim();
   if (!blueprint) return `${mappingId}: missing declared D2 edge blueprint.`;
+  // A relation class contributes style and an available D2 edge blueprint.
+  // Its business endpoints are resolved from the algorithm's selected Object
+  // Flow result and compatible placement comparison rules, not this arrow.
+  // Hierarchy and static mappings remain tied to the declared D2 pair.
+  if (family === 'edgeMappings' && String(role.edgeClassKey || '').trim()) return '';
   if (!sourceRoleKey || !targetRoleKey || !grammarRoles.has(sourceRoleKey) || !grammarRoles.has(targetRoleKey)) {
     return `${mappingId}: missing declared D2 endpoint role.`;
   }
@@ -44475,6 +46696,12 @@ function diagramMappingField(mapping, names, fallback = '') {
   for (const name of names) {
     const fieldValue = fields[name];
     if (typeof fieldValue === 'string' && fieldValue.trim()) return fieldValue.trim();
+  }
+  // `fields` is the current deterministic mapping contract. Older saved
+  // mappings can still carry top-level aliases such as nodeId=SourceId; they
+  // must be a fallback only, otherwise a newly selected primary card appears
+  // as the relation provenance after reload.
+  for (const name of names) {
     const value = mapping && mapping[name];
     if (typeof value === 'string' && value.trim()) return value.trim();
   }
@@ -44746,12 +46973,28 @@ function diagramLabelRowWithRelatedPolicies(row, mapping, warnings, path) {
   return labelRow;
 }
 
+function diagramImportStructureHasExplicitLabelTemplate(mapping) {
+  return Boolean(
+    mapping && mapping.importRole && typeof mapping.importRole === 'object' &&
+    String(mapping.importRole.structureItemId || '').trim() &&
+    Object.prototype.hasOwnProperty.call(mapping, 'labelTemplate')
+  );
+}
+
 function diagramLabelForRow(row, mapping, fallbackField, fallbackValue, params, warnings, path) {
+  const isD2StructurePlacement = diagramImportStructureHasExplicitLabelTemplate(mapping);
   const template = diagramMappingLabelTemplate(mapping);
+  // A D2 structure item's label belongs exclusively to its saved placement
+  // template. In particular, an explicit blank must not become Description of
+  // the materialized parent card through the generic diagram fallback.
+  if (isD2StructurePlacement) {
+    return renderDiagramRowTemplate(template, diagramLabelRowWithRelatedPolicies(row, mapping, warnings, path), params, warnings, path).trim();
+  }
   if (template) {
     const rendered = renderDiagramRowTemplate(template, diagramLabelRowWithRelatedPolicies(row, mapping, warnings, path), params, warnings, path).trim();
     if (rendered) return rendered;
   }
+  if (mapping && mapping.labelFallbackDisabled === true) return '';
   const fields = diagramMappingLabelFields(mapping, fallbackField);
   if (fields.length > 1 || (fields.length === 1 && fields[0] !== fallbackField)) {
     const rendered = fields.map((field) => diagramRowDisplayValue(row || {}, field)).filter(Boolean).join(' ').trim();
@@ -44772,25 +47015,31 @@ function diagramIpv4EndpointIndex(nodes) {
   const exact = new Map();
   const networks = [];
   const networkKeys = new Set();
-  const addExact = (ip, nodeId, roleKey) => {
+  const addExact = (ip, nodeId, roleKey, profileId = '') => {
     if (!exact.has(ip)) exact.set(ip, []);
-    if (!exact.get(ip).some((item) => item.nodeId === nodeId)) exact.get(ip).push({ nodeId, roleKey });
+    if (!exact.get(ip).some((item) => item.nodeId === nodeId && item.profileId === profileId)) exact.get(ip).push({ nodeId, roleKey, profileId });
   };
   for (const node of nodes) {
     if (!node || node.placeholder || !node.endpointRow) continue;
-    for (const field of uniqueStrings(node.endpointFields || [])) {
+    const profiles = Array.isArray(node.endpointProfiles) && node.endpointProfiles.length
+      ? node.endpointProfiles.map((profile) => ({ id: String(profile && profile.id || ''), field: String(profile && profile.field || '') }))
+      : uniqueStrings(node.endpointFields || []).map((field) => ({ id: '', field }));
+    for (const profile of profiles) {
+      const field = String(profile.field || '').trim();
+      if (!field) continue;
       const value = rowValueByField(node.endpointRow, field);
       if (value === undefined) continue;
       for (const text of diagramIpv4ScalarValues(value)) {
         const parsed = parseIpv4Network(text);
         if (!parsed) continue;
         const roleKey = String(node.importRole && node.importRole.key || '').trim();
-        if (parsed.start === parsed.end) addExact(parsed.start, node.id, roleKey);
+        const profileId = String(profile.id || '').trim();
+        if (parsed.start === parsed.end) addExact(parsed.start, node.id, roleKey, profileId);
         else {
-          const networkKey = `${parsed.start}:${parsed.end}:${node.id}:${roleKey}`;
+          const networkKey = `${parsed.start}:${parsed.end}:${node.id}:${roleKey}:${profileId}`;
           if (networkKeys.has(networkKey)) continue;
           networkKeys.add(networkKey);
-          networks.push({ start: parsed.start, end: parsed.end, width: parsed.end - parsed.start, nodeId: node.id, roleKey, value: text });
+          networks.push({ start: parsed.start, end: parsed.end, width: parsed.end - parsed.start, nodeId: node.id, roleKey, profileId, value: text });
         }
       }
     }
@@ -44806,12 +47055,18 @@ function diagramMappingEndpointFields(mapping) {
   return uniqueStrings(explicit.concat(related));
 }
 
-function diagramIpv4PreferredEndpointRoleKeys(value, index) {
+function diagramMappingEndpointProfiles(mapping) {
+  return diagramImportEndpointProfiles(mapping && mapping.endpointProfiles).filter((profile) => String(profile.field || '').trim());
+}
+
+function diagramIpv4PreferredEndpointRoleKeys(value, index, requiredProfileId = '') {
   const parsed = parseIpv4ToInt(displayCardValue(value).trim());
   if (parsed === null) return [];
-  const exact = Array.from(index.exact.get(parsed) || []);
+  const profileId = String(requiredProfileId || '').trim();
+  const exact = Array.from(index.exact.get(parsed) || []).filter((candidate) => !profileId || candidate.profileId === profileId);
   if (exact.length) return uniqueStrings(exact.map((candidate) => candidate.roleKey).filter(Boolean));
   const containing = index.networks
+    .filter((candidate) => !profileId || candidate.profileId === profileId)
     .filter((candidate) => candidate.start <= parsed && candidate.end >= parsed)
     .sort((left, right) => left.width - right.width || String(left.nodeId).localeCompare(String(right.nodeId)));
   if (!containing.length) return [];
@@ -44822,12 +47077,15 @@ function diagramIpv4PreferredEndpointRoleKeys(value, index) {
     .filter(Boolean));
 }
 
-function diagramResolveIpv4Endpoint(value, index, requiredRoleKey = '') {
+function diagramResolveIpv4Endpoint(value, index, requiredRoleKey = '', requiredProfileId = '') {
   const supplied = displayCardValue(value).trim();
   const parsed = parseIpv4ToInt(supplied);
   if (parsed === null) return { supplied, nodeId: '', reason: supplied ? 'invalidIpv4' : 'missingIpv4' };
   const roleKey = String(requiredRoleKey || '').trim();
-  const exact = Array.from(index.exact.get(parsed) || []).filter((candidate) => !roleKey || candidate.roleKey === roleKey);
+  const profileId = String(requiredProfileId || '').trim();
+  const exact = Array.from(index.exact.get(parsed) || []).filter((candidate) =>
+    (!roleKey || candidate.roleKey === roleKey) && (!profileId || candidate.profileId === profileId)
+  );
   const exactNodeIds = uniqueStrings(exact.map((candidate) => candidate.nodeId)).sort();
   if (exactNodeIds.length) return {
     supplied,
@@ -44835,7 +47093,9 @@ function diagramResolveIpv4Endpoint(value, index, requiredRoleKey = '') {
     nodeIds: exactNodeIds,
     reason: exactNodeIds.length === 1 ? 'exactIp' : 'multipleExactIp'
   };
-  const containing = index.networks.filter((candidate) => (!roleKey || candidate.roleKey === roleKey) && candidate.start <= parsed && candidate.end >= parsed)
+  const containing = index.networks.filter((candidate) =>
+    (!roleKey || candidate.roleKey === roleKey) && (!profileId || candidate.profileId === profileId) && candidate.start <= parsed && candidate.end >= parsed
+  )
     .sort((left, right) => left.width - right.width || String(left.nodeId).localeCompare(String(right.nodeId)));
   if (!containing.length) return { supplied, nodeId: '', reason: 'unresolvedIpv4' };
   const narrowestWidth = containing[0].width;
@@ -44845,6 +47105,60 @@ function diagramResolveIpv4Endpoint(value, index, requiredRoleKey = '') {
     nodeId: nodeIds.length === 1 ? nodeIds[0] : '',
     nodeIds,
     reason: nodeIds.length === 1 ? 'containingNetwork' : 'multipleContainingNetworks'
+  };
+}
+
+function diagramComparisonRuleValues(value, depth = 0) {
+  if (depth > 3 || value === undefined || value === null) return [];
+  if (Array.isArray(value)) return uniqueStrings(value.flatMap((item) => diagramComparisonRuleValues(item, depth + 1)));
+  if (typeof value === 'object') return uniqueStrings(Object.values(value).flatMap((item) => diagramComparisonRuleValues(item, depth + 1)));
+  const text = displayCardValue(value).trim();
+  return text ? [text] : [];
+}
+
+function diagramResolveAttributeEndpoint(value, runtimeObjects, requiredRoleKey = '', operator = '', requiredStructureItemId = '', requiredProfileId = '') {
+  const supplied = displayCardValue(value).trim();
+  const roleKey = String(requiredRoleKey || '').trim();
+  const normalizedOperator = String(operator || '').trim();
+  const structureItemId = String(requiredStructureItemId || '').trim();
+  const profileId = String(requiredProfileId || '').trim();
+  if (!supplied) return { supplied, objectIds: [], reason: 'missingValue' };
+  if (!DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(normalizedOperator)) {
+    return { supplied, objectIds: [], reason: 'unsupportedOperator' };
+  }
+  const matches = [];
+  for (const object of Array.isArray(runtimeObjects) ? runtimeObjects : []) {
+    if (!object || object.placeholder || !object.endpointRow) continue;
+    const objectRoleKey = String(object.importRole && object.importRole.key || '').trim();
+    if (roleKey && objectRoleKey !== roleKey) continue;
+    const objectStructureItemId = String(object.importRole && object.importRole.structureItemId || '').trim();
+    if (structureItemId && objectStructureItemId !== structureItemId) continue;
+    const profiles = diagramImportEndpointProfiles(object.endpointProfiles).filter((profile) =>
+      profile.field &&
+      profile.operators.includes(normalizedOperator) &&
+      (!profileId || profile.id === profileId));
+    for (const profile of profiles) {
+      const profileValue = rowValueByField(object.endpointRow, profile.field);
+      const matchedValues = diagramComparisonRuleValues(profileValue).filter((candidate) =>
+        scalarMatchRowsValues(supplied, candidate, normalizedOperator, false));
+      for (const matchedValue of matchedValues) {
+        matches.push({
+          objectId: String(object.id || ''),
+          roleKey: objectRoleKey,
+          structureItemId: objectStructureItemId,
+          profileId: profile.id,
+          value: matchedValue
+        });
+      }
+    }
+  }
+  const objectIds = uniqueStrings(matches.map((item) => item.objectId).filter(Boolean)).sort();
+  return {
+    supplied,
+    matches,
+    objectIds,
+    objectId: objectIds.length === 1 ? objectIds[0] : '',
+    reason: objectIds.length ? (objectIds.length === 1 ? 'matched' : 'multipleMatched') : 'unresolved'
   };
 }
 
@@ -44931,6 +47245,19 @@ function diagramSourceRefFromRow(row, className = '') {
   };
 }
 
+function diagramSourceRefForMappingRow(row, mapping, className = '') {
+  const source = row && typeof row === 'object' ? row : {};
+  const idField = diagramMappingField(mapping, ['nodeId', 'groupId', 'id', 'idColumn'], '_id');
+  const labelField = diagramMappingField(mapping, ['nodeLabel', 'groupLabel', 'label', 'labelColumn'], 'Description');
+  const codeField = diagramMappingField(mapping, ['nodeCode', 'groupCode', 'code', 'codeColumn'], 'Code');
+  return {
+    className: String(className || source.Class || source.className || source.sourceClass || source.targetClass || '').trim(),
+    id: displayCardValue(rowValueByField(source, idField, ['_id', 'Id', 'id'])),
+    code: displayCardValue(rowValueByField(source, codeField, ['Code', 'code'])),
+    description: displayCardValue(rowValueByField(source, labelField, ['Description', 'description']))
+  };
+}
+
 function safeDiagramDataValue(value) {
   if (value === undefined) return null;
   return cloneJsonValueServer(value, displayCardValue(value));
@@ -44938,7 +47265,13 @@ function safeDiagramDataValue(value) {
 
 function buildDiagramObjectData(kind, id, label, sourceName, row, mapping, extra = {}) {
   const profile = normalizeDiagramDataProfile(mapping);
-  const sourceRef = diagramSourceRefFromRow(row, profile.className);
+  const importedD2Mapping = Boolean(mapping && mapping.importRole && typeof mapping.importRole === 'object' && !Array.isArray(mapping.importRole));
+  // Generic graph mappings expose the CMDB row that produced them. Imported
+  // D2 placements may deliberately project a retained card from that row, so
+  // their source reference must follow the explicit primary-card selection.
+  const sourceRef = importedD2Mapping
+    ? diagramSourceRefForMappingRow(row, mapping, profile.className)
+    : diagramSourceRefFromRow(row, profile.className);
   const dataFields = uniqueStrings(profile.fields
     .concat(diagramMappingStructuredFields(kind, mapping))
     .concat(diagramMappingLabelFields(mapping, diagramMappingField(mapping, ['label'], ''))));
@@ -45133,6 +47466,26 @@ function d2Path(value) {
   return String(value || '').split('.').filter(Boolean).map(d2Key).join('.');
 }
 
+function runtimeD2EdgeGroups(edges) {
+  const groups = new Map();
+  for (const edge of Array.isArray(edges) ? edges : []) {
+    if (!edge || !edge.sourceD2Id || !edge.targetD2Id) continue;
+    const source = d2Path(edge.sourceD2Id);
+    const target = d2Path(edge.targetD2Id);
+    const direction = String(edge.direction || '->');
+    const key = [source, direction, target].join('\u0000');
+    const group = groups.get(key) || { source, direction, target, edges: [] };
+    group.edges.push(edge);
+    groups.set(key, group);
+  }
+  return Array.from(groups.values())
+    .sort((left, right) => `${left.source}\u0000${left.direction}\u0000${left.target}`.localeCompare(`${right.source}\u0000${right.direction}\u0000${right.target}`))
+    .map((group) => ({
+      ...group,
+      edges: group.edges.slice().sort((left, right) => String(left && left.id || '').localeCompare(String(right && right.id || '')))
+    }));
+}
+
 function buildD2Source(diagramResult, cmdpMetadata) {
   const lines = [];
   const groups = (Array.isArray(diagramResult.groups) ? diagramResult.groups : []).filter((group) => group && group.d2Id);
@@ -45213,13 +47566,20 @@ function buildD2Source(diagramResult, cmdpMetadata) {
   for (const node of nodes) {
     if (!renderedNodes.has(node.id)) lines.push(`${d2Key(node.d2Id)}: ${d2Literal(buildNodeShape(node))}`);
   }
-  lines.push(...compositeEdges);
-  for (const edge of Array.isArray(diagramResult.edges) ? diagramResult.edges : []) {
-    if (!edge || !edge.sourceD2Id || !edge.targetD2Id) continue;
-    const edgeShape = diagramTemplateShape(edge, edge.label || edge.kind || edge.mappingType || '', ['cmdp_edge'].concat(edge.mappingType ? [`cmdp_${edge.mappingType}`] : []));
-    delete edgeShape.shape;
-    lines.push(`${d2Path(edge.sourceD2Id)} ${edge.direction || '->'} ${d2Path(edge.targetD2Id)}: ${d2Literal(edgeShape)}`);
+  for (const group of runtimeD2EdgeGroups(diagramResult.edges)) {
+    // D2 selectors address an existing connection. Declare every runtime edge
+    // first, then decorate the exact stable ordinal. This keeps parallel ACL
+    // rows distinct even when their source and target visual objects match.
+    for (const edge of group.edges) {
+      lines.push(`${group.source} ${group.direction} ${group.target}`);
+    }
+    group.edges.forEach((edge, index) => {
+      const edgeShape = diagramTemplateShape(edge, edge.label || edge.kind || edge.mappingType || '', ['cmdp_edge'].concat(edge.mappingType ? [`cmdp_${edge.mappingType}`] : []));
+      delete edgeShape.shape;
+      lines.push(`(${group.source} ${group.direction} ${group.target})[${index}]: ${d2Literal(edgeShape)}`);
+    });
   }
+  lines.push(...compositeEdges);
   return `${lines.join('\n')}\n`;
 }
 
@@ -45309,6 +47669,8 @@ function buildTopologyDiagram(diagram, context, params, limits) {
   const unplaced = [];
   const unplacedRuntimeIds = new Set();
   const executionBindings = [];
+  const connectionDiagnostics = [];
+  const connectionDiagnosticByMapping = new Map();
   const executionItemDrafts = [];
   const unconfiguredStructureItems = [];
   const hiddenEmptyGroups = new Map();
@@ -45330,6 +47692,13 @@ function buildTopologyDiagram(diagram, context, params, limits) {
   const grammarRolesById = new Map((templateGrammar && Array.isArray(templateGrammar.roles) ? templateGrammar.roles : []).map((role) => [String(role && role.roleId || ''), role]));
   const grammarEdges = new Map((templateGrammar && Array.isArray(templateGrammar.edges) ? templateGrammar.edges : []).map((edge) => [String(edge && edge.key || ''), edge]));
   const templateRoleVisualKind = (role) => String(role && (role.visualKind || (Array.isArray(role.groupElementKeys) && role.groupElementKeys.length ? 'container' : 'node')) || '');
+  const endpointProfileRoles = Array.isArray(diagram && diagram.authoring && diagram.authoring.d2Import && diagram.authoring.d2Import.roles)
+    ? diagram.authoring.d2Import.roles
+    : Array.from(grammarRolesById.values()).map((role) => ({
+      id: String(role && role.roleId || ''),
+      key: String(role && role.roleKey || ''),
+      visualKind: templateRoleVisualKind(role)
+    }));
   const structureTreeItems = Array.isArray(structureTree && structureTree.items) ? structureTree.items : [];
   const structureItemById = new Map(structureTreeItems
     .map((item) => [String(item && item.id || ''), item])
@@ -45350,11 +47719,20 @@ function buildTopologyDiagram(diagram, context, params, limits) {
     .map((mapping) => [String(mapping && mapping.importRole && mapping.importRole.structureItemId || '').trim(), mapping])
     .filter(([structureItemId]) => rootStructuralContainerIds.has(structureItemId)));
   const rootStructuralMappingWarnings = new Set();
+  const runtimeMappingWithEligibleEndpointProfiles = (mapping, family) => {
+    if (!['nodeMappings', 'groupMappings'].includes(String(family || ''))) return mapping;
+    const profiles = Array.isArray(mapping && mapping.endpointProfiles) ? mapping.endpointProfiles : [];
+    if (!profiles.length || !structureTreeItems.length) return mapping;
+    return {
+      ...mapping,
+      endpointProfiles: diagramImportEligibleEndpointProfilesForStructure(profiles, structureTree, endpointProfileRoles)
+    };
+  };
   const runtimeMappings = (family) => {
     if (!templateGrammar) {
-      if (family === 'nodeMappings') return diagramNodeMappings(diagram);
+      if (family === 'nodeMappings') return diagramNodeMappings(diagram).map((mapping) => runtimeMappingWithEligibleEndpointProfiles(mapping, family));
       if (family === 'edgeMappings') return diagramEdgeMappings(diagram);
-      return normalizeDiagramMappingList(diagram && diagram[family]);
+      return normalizeDiagramMappingList(diagram && diagram[family]).map((mapping) => runtimeMappingWithEligibleEndpointProfiles(mapping, family));
     }
     const accepted = [];
     for (const mapping of normalizeDiagramMappingList(diagram && diagram[family])) {
@@ -45369,12 +47747,52 @@ function buildTopologyDiagram(diagram, context, params, limits) {
       }
       const contractError = diagramImportRuntimeMappingContractError(mapping, family, grammarElements, grammarRoles, grammarEdges);
       if (!contractError) {
-        accepted.push(mapping);
+        accepted.push(runtimeMappingWithEligibleEndpointProfiles(mapping, family));
         continue;
       }
       warnings.push(`Ignored D2 runtime mapping outside the current template contract: ${contractError}`);
     }
     return accepted;
+  };
+  const connectionDiagnosticFor = (mapping, sourceName) => {
+    const importRole = mapping && mapping.importRole && typeof mapping.importRole === 'object' && !Array.isArray(mapping.importRole)
+      ? mapping.importRole
+      : {};
+    const key = String(mapping && mapping.id || importRole.elementKey || importRole.edgeClassKey || sourceName || 'connection').trim();
+    if (connectionDiagnosticByMapping.has(key)) return connectionDiagnosticByMapping.get(key);
+    const diagnostic = {
+      relation: {
+        key: String(importRole.edgeClassKey || importRole.key || key),
+        label: String(importRole.label || importRole.edgeClassKey || importRole.key || 'Связь D2')
+      },
+      source: {
+        stageLabel: String(importRole.sourceLabel || ''),
+        alias: String(sourceName || '')
+      },
+      inputRows: 0,
+      uniqueCards: 0,
+      duplicateInputRows: 0,
+      unidentifiedRows: 0,
+      candidatePairs: 0,
+      emittedPairs: 0,
+      duplicatePairs: 0,
+      skipped: { sourceUnresolved: 0, targetUnresolved: 0, bothUnresolved: 0, incompatible: 0 },
+      cardIds: new Set()
+    };
+    connectionDiagnostics.push(diagnostic);
+    connectionDiagnosticByMapping.set(key, diagnostic);
+    return diagnostic;
+  };
+  const recordConnectionInput = (diagnostic, row) => {
+    if (!diagnostic) return;
+    diagnostic.inputRows += 1;
+    const cardId = displayCardValue(row && (row._id || row.Id || row.id || row.RelationId || row.Code)).trim();
+    if (!cardId) {
+      diagnostic.unidentifiedRows += 1;
+      return;
+    }
+    if (diagnostic.cardIds.has(cardId)) diagnostic.duplicateInputRows += 1;
+    else diagnostic.cardIds.add(cardId);
   };
   const startExecutionBinding = (family, mapping, sourceName, rowCount) => {
     const importRole = mapping && mapping.importRole && typeof mapping.importRole === 'object' && !Array.isArray(mapping.importRole)
@@ -45507,11 +47925,13 @@ function buildTopologyDiagram(diagram, context, params, limits) {
       const existing = groupMap.get(id);
       const label = displayCardValue(labelValue).trim();
       const parent = displayCardValue(parentValue).trim();
-      if (label) existing.label = label;
+      if (label || diagramImportStructureHasExplicitLabelTemplate(mapping)) existing.label = label;
       if (parent) existing.parent = parent;
       if (Object.keys(importRole).length) existing.importRole = importRole;
       if (Object.keys(styleHints).length) existing.styleHints = styleHints;
       if (sourceRow) existing.endpointRow = sourceRow;
+      if (sourceRow) existing.endpointFields = diagramMappingEndpointFields(mapping);
+      if (sourceRow) existing.endpointProfiles = diagramMappingEndpointProfiles(mapping);
       if (sourceRow) existing.data = buildDiagramObjectData('group', id, existing.label, sourceName, sourceRow, mapping, { businessId, parent: existing.parent });
       return true;
     }
@@ -45520,7 +47940,9 @@ function buildTopologyDiagram(diagram, context, params, limits) {
       return false;
     }
     const blueprint = blueprintFor('group', businessId, importRole);
-    const label = runtimeLabelFallback(labelValue, sourceRow, importRole);
+    const label = diagramImportStructureHasExplicitLabelTemplate(mapping)
+      ? displayCardValue(labelValue).trim()
+      : runtimeLabelFallback(labelValue, sourceRow, importRole);
     const parent = displayCardValue(parentValue).trim();
     groupMap.set(id, {
       id,
@@ -45533,6 +47955,8 @@ function buildTopologyDiagram(diagram, context, params, limits) {
       blueprintResolution: blueprint.resolution,
       styleHints,
       endpointRow: sourceRow && typeof sourceRow === 'object' ? sourceRow : null,
+      endpointFields: diagramMappingEndpointFields(mapping),
+      endpointProfiles: diagramMappingEndpointProfiles(mapping),
       data: buildDiagramObjectData('group', id, label, sourceName, sourceRow, mapping, { businessId, parent })
     });
     if (!groupBusinessIndex.has(businessId)) groupBusinessIndex.set(businessId, []);
@@ -45600,6 +48024,7 @@ function buildTopologyDiagram(diagram, context, params, limits) {
       d2Template: materializeDiagramCompositeTemplate(mapping && mapping.d2Template, sourceRow, params, warnings, `node ${id}`),
       d2Id: diagramD2Id('node', id),
       endpointFields: diagramMappingEndpointFields(mapping),
+      endpointProfiles: diagramMappingEndpointProfiles(mapping),
       endpointRow: sourceRow && typeof sourceRow === 'object' ? sourceRow : null,
       data: buildDiagramObjectData('node', id, label, sourceName, sourceRow, mapping, { businessId, group, parent, type, href })
     });
@@ -45657,67 +48082,6 @@ function buildTopologyDiagram(diagram, context, params, limits) {
   const ipv4EndpointIndex = diagramIpv4EndpointIndex(Array.from(nodeMap.values()));
   const edges = [];
   const edgeIdentityKeys = new Set();
-  // An imported D2 template is a closed visual contract. It may not invent
-  // endpoint nodes when an Object Flow result is incomplete: the missing
-  // endpoint and its edge are simply absent and the preview explains why.
-  const allowSyntheticEndpoints = !templateGrammar;
-  const addMissingEndpointNode = (side, businessId, mapping = {}, row = null, sourceName = '') => {
-    if (!allowSyntheticEndpoints) return '';
-    const suppliedId = displayCardValue(businessId).trim();
-    const rowIdentity = displayCardValue(row && (row._id || row.Id || row.id || row.Code)).trim() || String(edges.length + 1);
-    const mappingIdentity = String(mapping && mapping.id || sourceName || 'edge').trim();
-    const endpointIdentity = suppliedId ? `${mappingIdentity}:${side}:${suppliedId}` : `${mappingIdentity}:${rowIdentity}:${side}:missing`;
-    const id = `missing-endpoint:${sha256Hex(endpointIdentity).slice(0, 16)}`;
-    if (nodeMap.has(id)) return id;
-    if (nodeMap.size >= maxNodes || expandedShapeCount >= maxNodes) {
-      expandedShapeLimitHit = true;
-      warnings.push(`Skipped missing ${side} endpoint: maxNodes=${maxNodes} reached.`);
-      return '';
-    }
-    const edgeRole = mapping && mapping.importRole && typeof mapping.importRole === 'object' && !Array.isArray(mapping.importRole) ? mapping.importRole : {};
-    const edgeBlueprint = grammarEdges.get(String(edgeRole.elementKey || '').trim()) || {};
-    const expectedRoleKey = String(side === 'source'
-      ? edgeBlueprint.sourceRoleKey || edgeRole.sourceKey
-      : edgeBlueprint.targetRoleKey || edgeRole.targetKey).trim();
-    const expectedRole = grammarRoles.get(expectedRoleKey) || {};
-    const importRole = {
-      roleId: String(expectedRole.roleId || ''),
-      key: expectedRoleKey,
-      label: String(expectedRole.label || expectedRoleKey),
-      semantic: 'object',
-      elementKey: String((expectedRole.nodeElementKeys || [])[0] || ''),
-      diagnostic: 'missingEndpoint'
-    };
-    const label = 'Заглушка';
-    const blueprint = blueprintFor('node', suppliedId, importRole);
-    nodeMap.set(id, {
-      id,
-      businessId: suppliedId,
-      label,
-      group: '',
-      parent: '',
-      type: 'Заглушка',
-      href: '',
-      fakeEndpoint: true,
-      placeholder: false,
-      importRole,
-      blueprintKey: blueprint.key,
-      blueprintResolution: blueprint.resolution,
-      styleHints: {
-        shape: 'rectangle',
-        style: { stroke: '#D97706', 'stroke-dash': 4, fill: '#FFFBEB' }
-      },
-      d2Template: null,
-      d2Id: diagramD2Id('missing_endpoint', id),
-      data: buildDiagramObjectData('missingEndpoint', id, label, sourceName, row, mapping, {
-        endpoint: side,
-        suppliedId: suppliedId || null,
-        unresolved: true
-      })
-    });
-    expandedShapeCount += 1;
-    return id;
-  };
   const resolveNodeIds = (value, preferredRoleKey = '') => {
     const id = displayCardValue(value).trim();
     const candidates = nodeBusinessIndex.get(id) || [];
@@ -45740,14 +48104,29 @@ function buildTopologyDiagram(diagram, context, params, limits) {
     }
     return path;
   };
+  const runtimeObjectById = (id) => nodeMap.get(String(id || '')) || groupMap.get(String(id || '')) || null;
+  const runtimeObjectPath = (id) => {
+    const object = runtimeObjectById(id);
+    if (!object) return [];
+    if (nodeMap.has(String(id || ''))) return nodeGroupPath(id);
+    const path = [];
+    const seen = new Set();
+    let current = object;
+    while (current && current.id && !seen.has(String(current.id))) {
+      seen.add(String(current.id));
+      path.push(String(current.id));
+      current = groupMap.get(String(current.parent || '')) || null;
+    }
+    return path;
+  };
   const compatibleNodePairs = (sourceIds, targetIds) => {
     const pairs = [];
     for (const sourceId of uniqueStrings(sourceIds || [])) {
-      if (!nodeMap.has(sourceId)) continue;
-      const sourcePath = new Set(nodeGroupPath(sourceId));
+      if (!runtimeObjectById(sourceId)) continue;
+      const sourcePath = new Set(runtimeObjectPath(sourceId));
       for (const targetId of uniqueStrings(targetIds || [])) {
-        if (!nodeMap.has(targetId)) continue;
-        const score = nodeGroupPath(targetId).reduce((count, groupId) => count + (sourcePath.has(groupId) ? 1 : 0), 0);
+        if (!runtimeObjectById(targetId)) continue;
+        const score = runtimeObjectPath(targetId).reduce((count, groupId) => count + (sourcePath.has(groupId) ? 1 : 0), 0);
         pairs.push({ sourceId, targetId, score });
       }
     }
@@ -45764,40 +48143,28 @@ function buildTopologyDiagram(diagram, context, params, limits) {
     const hierarchyMapping = String(mapping && (mapping.type || mapping.mappingType) || '') === 'hierarchy';
     const sourceRoleKey = hierarchyMapping ? edgeImportRole.parentKey : edgeImportRole.sourceKey;
     const targetRoleKey = hierarchyMapping ? edgeImportRole.childKey : edgeImportRole.targetKey;
-    let sourceIds = nodeMap.has(String(resolvedEndpoints.sourceNodeId || ''))
-      ? [String(resolvedEndpoints.sourceNodeId)]
+    const explicitSourceIds = uniqueStrings(Array.isArray(resolvedEndpoints.sourceIds)
+      ? resolvedEndpoints.sourceIds
+      : [resolvedEndpoints.sourceNodeId]).filter((id) => runtimeObjectById(id));
+    const explicitTargetIds = uniqueStrings(Array.isArray(resolvedEndpoints.targetIds)
+      ? resolvedEndpoints.targetIds
+      : [resolvedEndpoints.targetNodeId]).filter((id) => runtimeObjectById(id));
+    let sourceIds = explicitSourceIds.length
+      ? explicitSourceIds
       : resolveNodeIds(sourceBusinessId, sourceRoleKey);
-    let targetIds = nodeMap.has(String(resolvedEndpoints.targetNodeId || ''))
-      ? [String(resolvedEndpoints.targetNodeId)]
+    let targetIds = explicitTargetIds.length
+      ? explicitTargetIds
       : resolveNodeIds(targetBusinessId, targetRoleKey);
-    if (!sourceIds.length && sourceBusinessId && !(nodeBusinessIndex.get(sourceBusinessId) || []).length) {
-      const source = addMissingEndpointNode('source', sourceBusinessId, mapping, row, sourceName);
-      if (source) sourceIds = [source];
-    }
-    if (!targetIds.length && targetBusinessId && !(nodeBusinessIndex.get(targetBusinessId) || []).length) {
-      const target = addMissingEndpointNode('target', targetBusinessId, mapping, row, sourceName);
-      if (target) targetIds = [target];
-    }
-    if (!sourceIds.length) {
-      const source = addMissingEndpointNode('source', sourceBusinessId, mapping, row, sourceName);
-      if (source) sourceIds = [source];
-    }
-    if (!targetIds.length) {
-      const target = addMissingEndpointNode('target', targetBusinessId, mapping, row, sourceName);
-      if (target) targetIds = [target];
-    }
     if (!sourceIds.length || !targetIds.length) {
       const connectionLabel = String(edgeImportRole.label || edgeImportRole.elementKey || 'D2 connection').trim();
-      warnings.push(allowSyntheticEndpoints
-        ? `Skipped edge ${sourceBusinessId || '(missing)'} -> ${targetBusinessId || '(missing)'}: missing endpoint node limit was reached.`
-        : `Skipped ${connectionLabel}: one or both endpoint cards are absent from the approved D2 structure.`);
-      return false;
+      warnings.push(`Skipped ${connectionLabel}: one or both endpoint cards are absent from the approved D2 structure.`);
+      return { emittedPairs: 0, duplicatePairs: 0, reason: 'unresolved' };
     }
     const pairs = compatibleNodePairs(sourceIds, targetIds);
     if (!pairs.length) {
       const connectionLabel = String(edgeImportRole.label || edgeImportRole.elementKey || 'D2 connection').trim();
       warnings.push(`Skipped ${connectionLabel}: one or both endpoint cards are absent from the approved D2 structure.`);
-      return false;
+      return { emittedPairs: 0, duplicatePairs: 0, reason: 'incompatible' };
     }
     const labelField = diagramMappingField(mapping, ['edgeLabel', 'edgeTitle', 'label', 'labelColumn'], 'label');
     const edgeTypeField = diagramMappingField(mapping, ['edgeType', 'kindColumn', 'typeColumn'], '');
@@ -45806,20 +48173,23 @@ function buildTopologyDiagram(diagram, context, params, limits) {
     const kind = (row && edgeTypeField ? diagramRowDisplayValue(row, edgeTypeField, ['Type', 'Kind', 'Relation', 'Domain']) : '') || diagramConstantValue(mapping, ['kind', 'edgeKind']) || mappingType;
     const direction = row && directionField ? diagramRowDisplayValue(row, directionField, ['Direction', 'direction']) : diagramConstantValue(mapping, ['direction']);
     const label = diagramLabelForRow(row, mapping, labelField, labelValue || diagramConstantValue(mapping, ['label']), params, warnings, `edge mapping ${mapping && mapping.id || sourceName}`);
-    const rowIdentity = displayCardValue(row && (row._id || row.Id || row.id || row.RelationId || row.Code)).trim();
+    const rowIdentity = displayCardValue(row && (row._id || row.Id || row.id || row.RelationId || row.Code)).trim()
+      || `row:${sha256Hex(JSON.stringify(row && typeof row === 'object' ? row : {})).slice(0, 16)}`;
     const relationIdentity = String(edgeImportRole.edgeClassKey || mapping && mapping.id || sourceName || 'edge').trim();
-    let added = false;
+    let emittedPairs = 0;
+    let duplicatePairs = 0;
     for (const pair of pairs) {
       if (edges.length >= maxEdges) break;
       const source = pair.sourceId;
       const target = pair.targetId;
-      const edgeIdentity = `${relationIdentity}\u0000${rowIdentity || label}\u0000${source}\u0000${target}`;
+      const endpointMatchIdentity = String(resolvedEndpoints && resolvedEndpoints.matchIdentity || '');
+      const edgeIdentity = `${relationIdentity}\u0000${rowIdentity || label}\u0000${source}\u0000${target}\u0000${endpointMatchIdentity}`;
       if (edgeIdentityKeys.has(edgeIdentity)) {
-        added = true;
+        duplicatePairs += 1;
         continue;
       }
-      const sourceNode = nodeMap.get(source);
-      const targetNode = nodeMap.get(target);
+      const sourceNode = runtimeObjectById(source);
+      const targetNode = runtimeObjectById(target);
       const edgeId = diagramD2Id('edge', edgeIdentity);
       const edge = {
       id: edgeId,
@@ -45833,15 +48203,13 @@ function buildTopologyDiagram(diagram, context, params, limits) {
         ? cloneJsonValueServer(mapping.importRole, {})
         : {},
       blueprintKey: String(mapping && mapping.importRole && mapping.importRole.elementKey || ''),
-      sourcePlaceholder: Boolean(nodeMap.get(source) && nodeMap.get(source).placeholder),
-      targetPlaceholder: Boolean(nodeMap.get(target) && nodeMap.get(target).placeholder),
-      sourceMissing: Boolean(nodeMap.get(source) && nodeMap.get(source).fakeEndpoint),
-      targetMissing: Boolean(nodeMap.get(target) && nodeMap.get(target).fakeEndpoint),
+      sourcePlaceholder: Boolean(sourceNode && sourceNode.placeholder),
+      targetPlaceholder: Boolean(targetNode && targetNode.placeholder),
       data: buildDiagramObjectData('edge', edgeId, label, sourceName, row, mapping, {
         source,
         target,
-        sourcePlaceholder: Boolean(nodeMap.get(source) && nodeMap.get(source).placeholder),
-        targetPlaceholder: Boolean(nodeMap.get(target) && nodeMap.get(target).placeholder),
+        sourcePlaceholder: Boolean(sourceNode && sourceNode.placeholder),
+        targetPlaceholder: Boolean(targetNode && targetNode.placeholder),
         endpointResolution: resolvedEndpoints && resolvedEndpoints.diagnostics ? resolvedEndpoints.diagnostics : undefined
       }),
       runtimeSourceBusinessId: String(sourceNode && sourceNode.businessId || sourceBusinessId || ''),
@@ -45858,45 +48226,50 @@ function buildTopologyDiagram(diagram, context, params, limits) {
       if (direction) edge.direction = direction;
       edgeIdentityKeys.add(edgeIdentity);
       edges.push(edge);
-      added = true;
+      emittedPairs += 1;
     }
-    return added;
+    return { emittedPairs, duplicatePairs, reason: emittedPairs || duplicatePairs ? '' : 'limit' };
   };
   for (const mapping of runtimeMappings('edgeMappings')) {
+    // Attribute comparisons need the fully materialized tree because either
+    // endpoint may be a dynamic container. They are resolved after the
+    // structure placement pass below.
+    if (String(mapping && (mapping.type || mapping.mappingType) || '') === 'attributeEndpoints') continue;
     const sourceField = diagramMappingField(mapping, ['edgeSource', 'source', 'sourceId', 'sourceColumn', 'from'], 'source');
     const targetField = diagramMappingField(mapping, ['edgeTarget', 'target', 'targetId', 'targetColumn', 'to'], 'target');
     const labelField = diagramMappingField(mapping, ['edgeLabel', 'edgeTitle', 'label', 'labelColumn'], 'label');
     const source = diagramRowsForMapping(context, mapping);
+    const networkEndpoints = String(mapping && (mapping.type || mapping.mappingType) || '') === 'networkEndpoints';
+    const diagnostic = networkEndpoints ? connectionDiagnosticFor(mapping, source.sourceName) : null;
     for (const row of source.rows) {
       if (edges.length >= maxEdges) break;
+      recordConnectionInput(diagnostic, row);
       const sourceValue = rowValueByField(row, sourceField, ['Source', 'SourceId', 'sourceId', 'from', 'From']);
       const targetValue = rowValueByField(row, targetField, ['Target', 'TargetId', 'targetId', 'to', 'To']);
-      const networkEndpoints = String(mapping && (mapping.type || mapping.mappingType) || '') === 'networkEndpoints';
       const edgeRole = mapping && mapping.importRole && typeof mapping.importRole === 'object' && !Array.isArray(mapping.importRole) ? mapping.importRole : {};
       const directionPolicy = normalizeDiagramDirectionPolicy(edgeRole.directionPolicy || mapping && mapping.endpointResolution && mapping.endpointResolution.directionPolicy);
       if (networkEndpoints && !directionPolicy) throw new Error(`D2 network endpoint mapping ${mapping && mapping.id || '(unknown)'} requires an explicit directionPolicy.`);
-      let sourceEndpoint = networkEndpoints ? diagramResolveIpv4Endpoint(sourceValue, ipv4EndpointIndex, edgeRole.sourceKey) : null;
-      let targetEndpoint = networkEndpoints ? diagramResolveIpv4Endpoint(targetValue, ipv4EndpointIndex, edgeRole.targetKey) : null;
+      const sourceProfileId = String(edgeRole.sourceProfileId || '').trim();
+      const targetProfileId = String(edgeRole.targetProfileId || '').trim();
+      // A selected object profile is an explicit authoring decision. Older
+      // saved mappings may predate endpointResolution.requiresProfiles, but
+      // they must not silently fall back to legacy placeholder endpoints once
+      // either side has been bound to a profile.
+      const requiresProfiles = Boolean(
+        mapping && mapping.endpointResolution && mapping.endpointResolution.requiresProfiles === true ||
+        sourceProfileId ||
+        targetProfileId
+      );
+      if (networkEndpoints && requiresProfiles && (!sourceProfileId || !targetProfileId)) {
+        if (diagnostic) diagnostic.skipped.incompatible += 1;
+        const rowId = displayCardValue(row && (row._id || row.Id || row.id || row.Code)).trim() || '(unknown)';
+        warnings.push(`Skipped D2 network row ${rowId} for relation class ${String(edgeRole.edgeClassKey || mapping.id || '')}: source and target D2 object profiles must be selected.`);
+        continue;
+      }
+      let sourceEndpoint = networkEndpoints ? diagramResolveIpv4Endpoint(sourceValue, ipv4EndpointIndex, edgeRole.sourceKey, sourceProfileId) : null;
+      let targetEndpoint = networkEndpoints ? diagramResolveIpv4Endpoint(targetValue, ipv4EndpointIndex, edgeRole.targetKey, targetProfileId) : null;
       let endpointOrientation = 'template';
       let effectiveMapping = mapping;
-      if (networkEndpoints && ['dataFields', 'undirected'].includes(directionPolicy)) {
-        const inverseSource = diagramResolveIpv4Endpoint(sourceValue, ipv4EndpointIndex, edgeRole.targetKey);
-        const inverseTarget = diagramResolveIpv4Endpoint(targetValue, ipv4EndpointIndex, edgeRole.sourceKey);
-        const resolvedScore = (endpoint) => endpoint && (endpoint.nodeId || Array.isArray(endpoint.nodeIds) && endpoint.nodeIds.length) ? 1 : 0;
-        const directScore = resolvedScore(sourceEndpoint) + resolvedScore(targetEndpoint);
-        const inverseScore = resolvedScore(inverseSource) + resolvedScore(inverseTarget);
-        if (inverseScore > directScore) {
-          sourceEndpoint = inverseSource;
-          targetEndpoint = inverseTarget;
-          endpointOrientation = 'dataFieldsReversed';
-          effectiveMapping = {
-            ...mapping,
-            importRole: { ...edgeRole, sourceKey: edgeRole.targetKey, targetKey: edgeRole.sourceKey, directionPolicy }
-          };
-        } else {
-          endpointOrientation = 'dataFields';
-        }
-      }
       if (networkEndpoints) {
         const effectiveRole = effectiveMapping && effectiveMapping.importRole && typeof effectiveMapping.importRole === 'object'
           ? effectiveMapping.importRole
@@ -45905,11 +48278,15 @@ function buildTopologyDiagram(diagram, context, params, limits) {
           { side: 'source', value: sourceValue, endpoint: sourceEndpoint, expectedRoleKey: String(effectiveRole.sourceKey || '') },
           { side: 'target', value: targetValue, endpoint: targetEndpoint, expectedRoleKey: String(effectiveRole.targetKey || '') }
         ].filter((candidate) => {
-          const preferredRoleKeys = diagramIpv4PreferredEndpointRoleKeys(candidate.value, ipv4EndpointIndex);
+          const profileId = candidate.side === 'source'
+            ? String(effectiveRole.sourceProfileId || '')
+            : String(effectiveRole.targetProfileId || '');
+          const preferredRoleKeys = diagramIpv4PreferredEndpointRoleKeys(candidate.value, ipv4EndpointIndex, profileId);
           candidate.roleKeys = preferredRoleKeys;
           return preferredRoleKeys.length > 0 && !preferredRoleKeys.includes(candidate.expectedRoleKey);
         });
         if (foreignEndpoints.length) {
+          if (diagnostic) diagnostic.skipped.incompatible += 1;
           warnings.push(`Skipped D2 network row ${displayCardValue(row && (row._id || row.Id || row.id || row.Code)).trim() || '(unknown)'} for relation class ${String(edgeRole.edgeClassKey || mapping.id || '')}: ${foreignEndpoints.map((item) => `${item.side} belongs to ${item.roleKeys.join(', ')}`).join('; ')}.`);
           continue;
         }
@@ -45917,8 +48294,7 @@ function buildTopologyDiagram(diagram, context, params, limits) {
       if (networkEndpoints) {
         for (const [side, endpoint] of [['source', sourceEndpoint], ['target', targetEndpoint]]) {
           if (!endpoint || ['exactIp', 'containingNetwork', 'multipleExactIp', 'multipleContainingNetworks'].includes(endpoint.reason)) continue;
-          const outcome = allowSyntheticEndpoints ? 'a synthetic endpoint may be shown' : 'the corresponding D2 connection will be omitted';
-          warnings.push(`D2 network endpoint ${side} ${endpoint.supplied || '(missing)'} was not resolved (${endpoint.reason}); ${outcome}.`);
+          warnings.push(`D2 network endpoint ${side} ${endpoint.supplied || '(missing)'} was not resolved (${endpoint.reason}); the corresponding D2 connection will be omitted.`);
         }
       }
       const sourceNodeIds = networkEndpoints && Array.isArray(sourceEndpoint && sourceEndpoint.nodeIds) && sourceEndpoint.nodeIds.length
@@ -45927,13 +48303,21 @@ function buildTopologyDiagram(diagram, context, params, limits) {
       const targetNodeIds = networkEndpoints && Array.isArray(targetEndpoint && targetEndpoint.nodeIds) && targetEndpoint.nodeIds.length
         ? targetEndpoint.nodeIds
         : [targetEndpoint && targetEndpoint.nodeId || ''];
-      if (networkEndpoints && (sourceNodeIds.length > 1 || targetNodeIds.length > 1)) {
-        warnings.push(`Expanded D2 network row ${displayCardValue(row && (row._id || row.Id || row.id || row.Code)).trim() || '(unknown)'} to ${sourceNodeIds.length * targetNodeIds.length} endpoint combinations.`);
+      if (diagnostic) diagnostic.candidatePairs += sourceNodeIds.filter(Boolean).length * targetNodeIds.filter(Boolean).length;
+      if (networkEndpoints && (!sourceNodeIds[0] || !targetNodeIds[0])) {
+        if (diagnostic) {
+          if (!sourceNodeIds[0] && !targetNodeIds[0]) diagnostic.skipped.bothUnresolved += 1;
+          else if (!sourceNodeIds[0]) diagnostic.skipped.sourceUnresolved += 1;
+          else diagnostic.skipped.targetUnresolved += 1;
+        }
+        const rowId = displayCardValue(row && (row._id || row.Id || row.id || row.Code)).trim() || '(unknown)';
+        warnings.push(`Skipped D2 network row ${rowId} for relation class ${String(edgeRole.edgeClassKey || mapping.id || '')}: ${!sourceNodeIds[0] ? 'source' : 'target'} endpoint was not resolved by the selected D2 object profile.`);
+        continue;
       }
       for (const sourceNodeId of sourceNodeIds) {
         for (const targetNodeId of targetNodeIds) {
           if (edges.length >= maxEdges) break;
-          addEdge(
+          const outcome = addEdge(
             sourceValue,
             targetValue,
             rowValueByField(row, labelField, ['Label', 'Type', 'Relation', 'Domain']),
@@ -45946,6 +48330,11 @@ function buildTopologyDiagram(diagram, context, params, limits) {
               diagnostics: { source: sourceEndpoint, target: targetEndpoint, policy: 'exactIpThenContainingNetwork', directionPolicy, orientation: endpointOrientation }
             } : {}
           );
+          if (diagnostic) {
+            diagnostic.emittedPairs += Math.max(0, Number(outcome && outcome.emittedPairs) || 0);
+            diagnostic.duplicatePairs += Math.max(0, Number(outcome && outcome.duplicatePairs) || 0);
+            if (outcome && outcome.reason === 'incompatible') diagnostic.skipped.incompatible += 1;
+          }
         }
       }
     }
@@ -46461,6 +48850,10 @@ function buildTopologyDiagram(diagram, context, params, limits) {
   if (templateGrammar && edges.length) {
     const pendingEdges = edges.splice(0);
     edgeIdentityKeys.clear();
+    // The first pass discovers endpoint cards before final tree placement.
+    // Rebuild the emitted-pair metric from the final visual occurrences while
+    // retaining the observed input rows and suppressed duplicate count.
+    for (const diagnostic of connectionDiagnostics) diagnostic.emittedPairs = 0;
     for (const edge of pendingEdges) {
       if (edges.length >= maxEdges) break;
       const sourceBusinessId = String(edge && edge.runtimeSourceBusinessId || '');
@@ -46468,7 +48861,113 @@ function buildTopologyDiagram(diagram, context, params, limits) {
       const mapping = edge && edge.runtimeMapping && typeof edge.runtimeMapping === 'object'
         ? edge.runtimeMapping
         : { importRole: edge && edge.importRole || {} };
-      addEdge(sourceBusinessId, targetBusinessId, String(edge && edge.label || ''), mapping, edge && edge.runtimeRow || null, String(edge && edge.runtimeSourceName || ''));
+      const sourceName = String(edge && edge.runtimeSourceName || '');
+      const outcome = addEdge(sourceBusinessId, targetBusinessId, String(edge && edge.label || ''), mapping, edge && edge.runtimeRow || null, sourceName);
+      if (String(mapping && (mapping.type || mapping.mappingType) || '') === 'networkEndpoints') {
+        const diagnostic = connectionDiagnosticFor(mapping, sourceName);
+        diagnostic.emittedPairs += Math.max(0, Number(outcome && outcome.emittedPairs) || 0);
+        if (outcome && outcome.reason === 'incompatible') diagnostic.skipped.incompatible += 1;
+      }
+    }
+  }
+  // Attribute-based D2 connections are resolved only after the saved
+  // structure tree has materialized nodes and dynamic container frames. This
+  // lets the same rule attach an edge to a node for parentCard materialization
+  // and to a container frame for an independently repeated container.
+  for (const mapping of runtimeMappings('edgeMappings')) {
+    if (String(mapping && (mapping.type || mapping.mappingType) || '') !== 'attributeEndpoints') continue;
+    const sourceField = diagramMappingField(mapping, ['edgeSource', 'source', 'sourceId', 'sourceColumn', 'from'], 'source');
+    const targetField = diagramMappingField(mapping, ['edgeTarget', 'target', 'targetId', 'targetColumn', 'to'], 'target');
+    const labelField = diagramMappingField(mapping, ['edgeLabel', 'edgeTitle', 'label', 'labelColumn'], 'label');
+    const source = diagramRowsForMapping(context, mapping);
+    const edgeRole = mapping && mapping.importRole && typeof mapping.importRole === 'object' && !Array.isArray(mapping.importRole) ? mapping.importRole : {};
+    const resolution = mapping && mapping.endpointResolution && typeof mapping.endpointResolution === 'object' && !Array.isArray(mapping.endpointResolution)
+      ? mapping.endpointResolution
+      : {};
+    const sourceOperator = String(resolution.sourceOperator || edgeRole.sourceOperator || resolution.operator || '').trim();
+    const targetOperator = String(resolution.targetOperator || edgeRole.targetOperator || resolution.operator || '').trim();
+    const directionPolicy = normalizeDiagramDirectionPolicy(edgeRole.directionPolicy || resolution.directionPolicy);
+    if (!DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(sourceOperator) || !DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(targetOperator) || !directionPolicy) {
+      warnings.push(`Skipped D2 attribute connection ${String(edgeRole.edgeClassKey || mapping.id || '')}: its source comparison, target comparison, or direction is not configured.`);
+      continue;
+    }
+    const runtimeObjects = () => Array.from(nodeMap.values()).concat(Array.from(groupMap.values()));
+    // A relation row is compared to every materialized object/container rule
+    // whose selected method accepts the corresponding relation endpoint.
+    // Connection classes do not own manual source/target participant lists.
+    const placementHasProfile = (operator) => runtimeObjects().some((object) => (
+      object && !object.placeholder &&
+      diagramMappingEndpointProfiles(object).some((profile) => (
+        String(profile.field || '') &&
+        Array.isArray(profile.operators) && profile.operators.includes(operator)
+      ))
+    ));
+    const sourceAvailable = placementHasProfile(sourceOperator);
+    const targetAvailable = placementHasProfile(targetOperator);
+    const diagnostic = connectionDiagnosticFor(mapping, source.sourceName);
+    if (!sourceAvailable || !targetAvailable) {
+      const missingSides = [!sourceAvailable ? 'source' : '', !targetAvailable ? 'target' : ''].filter(Boolean).join(' and ');
+      for (const row of source.rows) {
+        recordConnectionInput(diagnostic, row);
+        if (!sourceAvailable && !targetAvailable) diagnostic.skipped.bothUnresolved += 1;
+        else if (!sourceAvailable) diagnostic.skipped.sourceUnresolved += 1;
+        else diagnostic.skipped.targetUnresolved += 1;
+      }
+      warnings.push(`Skipped D2 attribute connection ${String(edgeRole.edgeClassKey || mapping.id || '')}: ${missingSides} side has no materialized compatible comparison rule.`);
+      continue;
+    }
+    for (const row of source.rows) {
+      if (edges.length >= maxEdges) break;
+      recordConnectionInput(diagnostic, row);
+      const sourceValue = rowValueByField(row, sourceField, ['Source', 'SourceId', 'sourceId', 'from', 'From']);
+      const targetValue = rowValueByField(row, targetField, ['Target', 'TargetId', 'targetId', 'to', 'To']);
+      const sourceEndpoint = diagramResolveAttributeEndpoint(sourceValue, runtimeObjects(), '', sourceOperator);
+      const targetEndpoint = diagramResolveAttributeEndpoint(targetValue, runtimeObjects(), '', targetOperator);
+      const sourceMatches = Array.isArray(sourceEndpoint.matches) ? sourceEndpoint.matches : [];
+      const targetMatches = Array.isArray(targetEndpoint.matches) ? targetEndpoint.matches : [];
+      diagnostic.candidatePairs += sourceMatches.length * targetMatches.length;
+      if (!sourceMatches.length || !targetMatches.length) {
+        if (!sourceMatches.length && !targetMatches.length) diagnostic.skipped.bothUnresolved += 1;
+        else if (!sourceMatches.length) diagnostic.skipped.sourceUnresolved += 1;
+        else diagnostic.skipped.targetUnresolved += 1;
+        warnings.push(`Skipped D2 attribute connection ${String(edgeRole.label || edgeRole.edgeClassKey || mapping.id || '')}: ${!sourceMatches.length && !targetMatches.length ? 'source and target comparison rules' : !sourceMatches.length ? 'source comparison rule' : 'target comparison rule'} did not match a materialized D2 object.`);
+        continue;
+      }
+      for (const sourceMatch of sourceMatches) {
+        for (const targetMatch of targetMatches) {
+          const outcome = addEdge(
+            sourceValue,
+            targetValue,
+            rowValueByField(row, labelField, ['Label', 'Type', 'Relation', 'Domain']),
+            mapping,
+            row,
+            source.sourceName,
+            {
+              sourceIds: [sourceMatch.objectId],
+              targetIds: [targetMatch.objectId],
+              matchIdentity: [
+                sourceMatch.structureItemId,
+                sourceMatch.profileId,
+                sourceMatch.value,
+                targetMatch.structureItemId,
+                targetMatch.profileId,
+                targetMatch.value
+              ].join('\u0000'),
+              diagnostics: {
+                source: sourceEndpoint,
+                target: targetEndpoint,
+                sourceOperator,
+                targetOperator,
+                directionPolicy,
+                orientation: directionPolicy === 'undirected' ? 'undirected' : 'dataFields'
+              }
+            }
+          );
+          diagnostic.emittedPairs += Math.max(0, Number(outcome && outcome.emittedPairs) || 0);
+          diagnostic.duplicatePairs += Math.max(0, Number(outcome && outcome.duplicatePairs) || 0);
+          if (outcome && outcome.reason === 'incompatible') diagnostic.skipped.incompatible += 1;
+        }
+      }
     }
   }
   for (const mapping of runtimeMappings('hierarchyMappings')) {
@@ -46496,27 +48995,14 @@ function buildTopologyDiagram(diagram, context, params, limits) {
   // every edge that would otherwise retain a synthetic/root-level endpoint.
   for (let index = edges.length - 1; index >= 0; index -= 1) {
     const edge = edges[index];
-    if (nodeMap.has(String(edge && edge.source || '')) && nodeMap.has(String(edge && edge.target || ''))) continue;
+    if (runtimeObjectById(String(edge && edge.source || '')) && runtimeObjectById(String(edge && edge.target || ''))) continue;
     const connectionLabel = String(edge && edge.importRole && (edge.importRole.label || edge.importRole.elementKey) || 'D2 connection').trim();
     warnings.push(`Skipped ${connectionLabel}: one or both endpoint cards are outside the resolved D2 structure.`);
     edges.splice(index, 1);
   }
   if (templateGrammar) {
     // Roles and edge blueprints must remain declared by the immutable source.
-    // The saved tree is the only placement authority, including placeholders.
-    for (const node of nodeMap.values()) {
-      if (!node.fakeEndpoint) continue;
-      const roleKey = String(node.importRole && node.importRole.key || '');
-      const candidateParents = uniqueStrings(treeItems
-        .filter((item) => {
-          const itemRole = grammarRolesById.get(String(item && item.roleId || '')) || {};
-          return String(itemRole.roleKey || '') === roleKey && String(item && item.parentId || '');
-        })
-        .flatMap((item) => groupsForTreeItem(String(item && item.parentId || '')).map((group) => String(group && group.id || '')))
-        .filter(Boolean));
-      if (candidateParents.length === 1) node.group = candidateParents[0];
-      else if (candidateParents.length > 1) warnings.push(`Missing endpoint for role ${roleKey || '(unknown)'} has several configured structure-tree parents and was kept at the diagram root.`);
-    }
+    // The saved tree is the only placement authority.
     const violations = [];
     const validateItem = (item, kind) => {
       const roleKey = String(item && item.importRole && item.importRole.key || '').trim();
@@ -46534,26 +49020,8 @@ function buildTopologyDiagram(diagram, context, params, limits) {
     for (const node of nodeMap.values()) validateItem(node, 'node');
     for (const edge of edges) {
       const blueprint = grammarEdges.get(String(edge.blueprintKey || ''));
-      const source = nodeMap.get(String(edge.source || ''));
-      const target = nodeMap.get(String(edge.target || ''));
-      const sourceRoleKey = String(source && source.importRole && source.importRole.key || '');
-      const targetRoleKey = String(target && target.importRole && target.importRole.key || '');
-      const directionPolicy = normalizeDiagramDirectionPolicy(edge && edge.importRole && edge.importRole.directionPolicy);
-      const reversedEndpointsAllowed = ['dataFields', 'undirected'].includes(directionPolicy) &&
-        sourceRoleKey === String(blueprint && blueprint.targetRoleKey || '') &&
-        targetRoleKey === String(blueprint && blueprint.sourceRoleKey || '');
       if (!blueprint) {
         violations.push({ code: 'undeclaredEdge', id: edge.id, blueprintKey: edge.blueprintKey || '' });
-      } else if (!reversedEndpointsAllowed && (sourceRoleKey !== blueprint.sourceRoleKey || targetRoleKey !== blueprint.targetRoleKey)) {
-        violations.push({
-          code: 'invalidEdgeEndpoints',
-          id: edge.id,
-          blueprintKey: blueprint.key,
-          sourceRoleKey,
-          targetRoleKey,
-          expectedSourceRoleKey: blueprint.sourceRoleKey,
-          expectedTargetRoleKey: blueprint.targetRoleKey
-        });
       }
     }
     if (violations.length) {
@@ -46581,8 +49049,8 @@ function buildTopologyDiagram(diagram, context, params, limits) {
   });
   assignDiagramD2Paths(nodes, groups, warnings);
   for (const edge of edges) {
-    const sourceNode = nodeMap.get(edge.source);
-    const targetNode = nodeMap.get(edge.target);
+    const sourceNode = runtimeObjectById(edge.source);
+    const targetNode = runtimeObjectById(edge.target);
     edge.sourceD2Id = sourceNode && (sourceNode.d2Path || sourceNode.d2Id) || edge.sourceD2Id;
     edge.targetD2Id = targetNode && (targetNode.d2Path || targetNode.d2Id) || edge.targetD2Id;
     delete edge.runtimeSourceBusinessId;
@@ -46632,6 +49100,18 @@ function buildTopologyDiagram(diagram, context, params, limits) {
     execution: {
       version: 2,
       bindings: executionBindings,
+      connections: connectionDiagnostics.map((diagnostic) => ({
+        relation: cloneJsonValueServer(diagnostic.relation, {}),
+        source: cloneJsonValueServer(diagnostic.source, {}),
+        inputRows: diagnostic.inputRows,
+        uniqueCards: diagnostic.cardIds.size,
+        duplicateInputRows: diagnostic.duplicateInputRows,
+        unidentifiedRows: diagnostic.unidentifiedRows,
+        candidatePairs: diagnostic.candidatePairs,
+        emittedPairs: diagnostic.emittedPairs,
+        duplicatePairs: diagnostic.duplicatePairs,
+        skipped: cloneJsonValueServer(diagnostic.skipped, {})
+      })),
       items: executionItems,
       unconfigured: unconfiguredStructureItems,
       svgContract: { status: 'pending', expected: 0, verified: 0, missing: [] },
@@ -46691,6 +49171,9 @@ function draftDiagramPreviewMappingPlan(spec) {
     const roles = diagramImportRolesForStoredStructure(imported);
     const sourceTree = imported && imported.structureTree;
     const structure = imported && imported.structure;
+    const rawRelationRules = imported
+      ? diagramImportTopologyRules(roles, structure, imported.relationRules, imported.classes, imported.endpointProfiles)
+      : [];
     if (!imported || !roles.length || !sourceTree) {
       omissions.push({
         diagramIndex,
@@ -46713,6 +49196,10 @@ function draftDiagramPreviewMappingPlan(spec) {
     const repairPlan = diagramImportPreviewTreeWithParentCorrelationRepairs(sourceTree, roles, previewSpec, structure);
     const previewTree = repairPlan.tree;
     const normalizedTree = diagramImportStructureTree(previewTree, structure, roles);
+    // The saved relation rule is anchored to D2 element keys. Bind it against
+    // the same repaired structure tree that will be compiled below so preview
+    // cannot silently drop a valid manually configured endpoint profile.
+    const relationRules = diagramImportBindRelationRulesToStructureItems(rawRelationRules, normalizedTree, imported && imported.endpointProfiles);
     repairs.push(...repairPlan.repairs.map((repair) => ({ diagramIndex, ...repair })));
     const validationErrors = diagramImportStructureTreeErrors(previewTree, roles, previewSpec, structure);
     const invalidIndexes = new Set();
@@ -46760,7 +49247,7 @@ function draftDiagramPreviewMappingPlan(spec) {
       }
     }
     const roleById = new Map(roles.map((role) => [String(role && role.id || ''), role]));
-    const safeItems = [];
+    let safeItems = [];
     const validRoleIds = new Set();
     normalizedTree.items.forEach((item, index) => {
       const role = roleById.get(String(item && item.roleId || '')) || {};
@@ -46779,10 +49266,15 @@ function draftDiagramPreviewMappingPlan(spec) {
       });
     });
 
+    // Preview must not enrich a manual mapping with a guessed endpoint source.
+    // Assistant proposals already carry their reviewed related-data bindings;
+    // manual endpoint profiles are compiled below from the exact Object Flow
+    // result selected by the author.
+
     const compiledTree = diagramImportCompileStructureTree({
       version: D2_IMPORT_STRUCTURE_TREE_VERSION,
       items: safeItems
-    }, roles, stageById);
+    }, roles, stageById, structure, imported.endpointProfiles);
     repairs.push(...(compiledTree.conditionSourceRepairs || []).map((repair) => ({
       diagramIndex,
       kind: 'conditionSource',
@@ -46798,26 +49290,32 @@ function draftDiagramPreviewMappingPlan(spec) {
       else nodeMappings.push(runtime.mapping);
     }
     const compiledRelationRules = [];
-    for (const rule of Array.isArray(imported.relationRules) ? imported.relationRules : []) {
-      const sourceRoleId = String(rule && rule.parentRoleId || '');
-      const targetRoleId = String(rule && rule.childRoleId || '');
+    for (const rule of relationRules) {
+      if (!diagramImportRelationRuleIsEnabled(rule)) continue;
       const label = String(rule && (rule.d2Label || rule.d2ClassKey || rule.d2ElementKey || rule.id) || '');
-      if (!validRoleIds.has(sourceRoleId) || !validRoleIds.has(targetRoleId)) {
+      if (!normalizeDiagramDirectionPolicy(rule && rule.directionPolicy)) {
         omissions.push({
           diagramIndex,
           kind: 'connection',
           label,
-          message: 'Connection was omitted because one or both endpoint roles are not confirmed.'
+          message: 'Connection was omitted because its data direction is not selected.'
         });
         continue;
       }
-      const compiled = diagramImportCompileRelationRule(rule, roleById, compiledTree.compiledByItemId, stageById);
+      const compiled = diagramImportCompileRelationRule(
+        rule,
+        roleById,
+        compiledTree.compiledByItemId,
+        stageById,
+        compiledTree.endpointProfiles
+      );
       if (!compiled.length) {
+        const reason = diagramImportConnectionRuleIncompleteMessage(rule, compiledTree.endpointProfiles);
         omissions.push({
           diagramIndex,
           kind: 'connection',
           label,
-          message: 'Connection was omitted because its deterministic source or endpoint fields are incomplete.'
+          message: reason || 'Connection was omitted because its deterministic source or endpoint fields are incomplete.'
         });
         continue;
       }
@@ -46827,12 +49325,11 @@ function draftDiagramPreviewMappingPlan(spec) {
     const relationRuleKeys = new Set();
     for (const compiled of compiledRelationRules) {
       const rule = compiled.rule || {};
-      const key = String(rule.mode || '') === 'networkEndpoints'
-        ? [
-          'networkEndpoints', String(rule.d2ClassKey || rule.d2ElementKey || rule.id || ''), compiled.alias, compiled.rootIdField, compiled.targetIdField,
-          compiled.labelField, rule.parentRoleId, rule.childRoleId
-        ].join(':')
-        : `rule:${String(rule.id || '')}:${String(compiled.sourceStructureItemId || '')}`;
+      const key = [
+        String(rule.d2ClassKey || rule.d2ElementKey || rule.id || ''),
+        String(rule.mode || ''), compiled.alias, compiled.rootIdField, compiled.targetIdField,
+        compiled.labelTemplate
+      ].join(':');
       if (relationRuleKeys.has(key)) continue;
       relationRuleKeys.add(key);
       distinctRelationRules.push(compiled);
@@ -46844,13 +49341,14 @@ function draftDiagramPreviewMappingPlan(spec) {
     const relationMappings = diagramImportRuntimeRelationMappings(
       distinctRelationRules,
       roleById,
-      diagram && diagram.templateGrammar || imported.templateGrammar
+      diagram && diagram.templateGrammar || imported.templateGrammar,
+      compiledTree.endpointProfiles
     );
     return {
       ...cloneJsonValueServer(diagram, {}),
       nodeMappings,
       groupMappings,
-      edgeMappings: relationMappings.edgeMappings,
+      edgeMappings: compiledTree.staticEdgeMappings.concat(relationMappings.edgeMappings),
       hierarchyMappings: relationMappings.hierarchyMappings,
       classRelationRules: relationMappings.classRelationRules,
       structureTree: compiledTree.tree
@@ -47961,8 +50459,17 @@ function referenceValueId(value) {
 async function readRelationsForPath(cmdbuildExecRequest, pathCache, className, id) {
   const key = `${className}:${id}`;
   if (pathCache.relations.has(key)) return pathCache.relations.get(key);
-  const response = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}/cards/${encodeURIComponent(id)}/relations?limit=100`);
-  const relations = response.ok && Array.isArray(response.json && response.json.data) ? response.json.data : [];
+  const relationLimit = toPositiveInt(
+    pathCache.maxRelationsPerCard,
+    100,
+    pathCache.maxRelationsPerCardMax || ABSOLUTE_EXECUTION_LIMITS.maxRelationsPerCard
+  );
+  const relationLimitMax = pathCache.maxRelationsPerCardMax || ABSOLUTE_EXECUTION_LIMITS.maxRelationsPerCard;
+  const readLimit = Math.min(relationLimit + 1, relationLimitMax);
+  const response = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}/cards/${encodeURIComponent(id)}/relations?limit=${readLimit}`);
+  const items = response.ok && Array.isArray(response.json && response.json.data) ? response.json.data : [];
+  if (items.length > relationLimit) pathCache.relationLimitReached = true;
+  const relations = items.slice(0, relationLimit);
   pathCache.relations.set(key, relations);
   return relations;
 }
@@ -48111,6 +50618,11 @@ function buildSelectionResultRow(className, card, driverRow, columns, step) {
   addColumnOnce(columns, '_id');
   addColumnOnce(columns, 'Code');
   addColumnOnce(columns, 'Description');
+  for (const [key, value] of Object.entries(card || {})) {
+    if (!key || key.startsWith('_') || key === 'Code' || key === 'Description') continue;
+    row[key] = cardAttributeDisplayValue(card, key);
+    addColumnOnce(columns, key);
+  }
 
   const includeSource = step.includeSource !== false && driverRow && driverRow.__source;
   const sourcePrefix = step.sourcePrefix === undefined ? 'Source_' : String(step.sourcePrefix);
@@ -48181,13 +50693,6 @@ async function requestCardsForSelectionScan(cmdbuildExecRequest, className, scan
   };
 }
 
-function selectionReadFields(step, requestedColumns) {
-  const fields = ['Code', 'Description'];
-  addFilterDependencyFields(fields, step.filters || step.where);
-  for (const column of requestedColumns || []) addColumnDependency(fields, column.path);
-  return uniqueStrings(fields.map(directCardFieldFromPath).filter(Boolean));
-}
-
 function assistantObjectFlowSelectionAliases(spec) {
   const models = Array.isArray(spec && spec.visualModels) ? spec.visualModels : [];
   const matching = models.find((model) => model && model.mode === 'objectMatching' && model.assistantOutputManifest);
@@ -48218,7 +50723,10 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
   const requestedColumns = normalizePathColumnSpecs([]
     .concat(step.columns || step.cardColumns || step.outputColumns || [])
     .concat((dependency && dependency.fields || []).map((field) => ({ path: field, as: field }))));
-  const readFields = selectionReadFields(step, requestedColumns);
+  // Read every direct, permission-filtered card attribute. Deep paths remain
+  // an explicit compiler projection below, but the working result is never
+  // narrowed by a presentation field list.
+  const readFields = [];
   const columns = [];
   const rows = [];
   const deduplicateCards = step.deduplicateCards === true || step.dedupeCards === true;
@@ -48227,7 +50735,13 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
   let scanTruncated = false;
   const classesCache = { loaded: false, classes: [], ok: false };
   const resolvedClassCache = new Map();
-  const pathCache = { attributes: new Map(), cards: new Map(), relations: new Map() };
+  const pathCache = {
+    attributes: new Map(),
+    cards: new Map(),
+    relations: new Map(),
+    maxRelationsPerCard: limits.maxRelationsPerCard,
+    maxRelationsPerCardMax: limits.maxRelationsPerCardMax
+  };
 
   const selectionScan = () => scanTruncated ? {
     scanLimit,
@@ -48281,7 +50795,8 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
             truncated: true,
             rowLimitReached: true,
             rowLimit: maxRows,
-            selectionScan: selectionScan()
+            selectionScan: selectionScan(),
+            relationLimitReached: Boolean(pathCache.relationLimitReached)
           };
         }
       }
@@ -48291,10 +50806,11 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
   return {
     columns,
     rows,
-    truncated: scanTruncated,
+    truncated: scanTruncated || Boolean(pathCache.relationLimitReached),
     rowLimitReached: false,
     rowLimit: maxRows,
-    selectionScan: selectionScan()
+    selectionScan: selectionScan(),
+    relationLimitReached: Boolean(pathCache.relationLimitReached)
   };
 }
 
@@ -48538,23 +51054,23 @@ async function buildRelationResultRow(cmdbuildExecRequest, pathCache, driverRow,
   }
 
   const requestedColumns = normalizeStringList(step.columns || step.relatedColumns);
-  if (requestedColumns.length) {
-    await materializeRowPathColumns(cmdbuildExecRequest, pathCache, row, relatedClass, relatedCard, requestedColumns, columns);
-  } else {
-    for (const [key, value] of Object.entries(relatedCard || {})) {
-      if (key.startsWith('_') || key === 'Code' || key === 'Description') continue;
-      row[key] = cardAttributeDisplayValue(relatedCard, key);
-      addColumnOnce(columns, key);
-    }
+  // Direct readable attributes are always part of a relation result. Only
+  // reference/domain paths are a derived technical projection.
+  for (const [key, value] of Object.entries(relatedCard || {})) {
+    if (key.startsWith('_') || key === 'Code' || key === 'Description') continue;
+    row[key] = cardAttributeDisplayValue(relatedCard, key);
+    addColumnOnce(columns, key);
   }
+  const requestedPaths = requestedColumns.filter((column) => String(column || '').includes('.') || String(column || '').includes('{'));
+  if (requestedPaths.length) await materializeRowPathColumns(cmdbuildExecRequest, pathCache, row, relatedClass, relatedCard, requestedPaths, columns);
 
   return row;
 }
 
 async function executeExpandRelations(cmdbuildExecRequest, step, params, context, limits) {
   const driverRows = resolveRelationDriverRows(step, context, limits);
-  const maxRows = toPositiveInt(step.limit, limits.maxRows, limits.maxRows);
-  const perCardLimit = toPositiveInt(step.perCardLimit, maxRows, maxRows);
+  const maxRows = limits.maxRows;
+  const perCardLimit = toPositiveInt(limits.maxRelationsPerCard, 100, limits.maxRelationsPerCardMax || ABSOLUTE_EXECUTION_LIMITS.maxRelationsPerCard);
   const domainFilter = new Set(normalizeStringList(readStepOrParam(step, params, 'domain', 'domainParam')).map((item) => item.toLowerCase()));
   const targetClassNames = normalizeStringList(readStepOrParam(step, params, 'targetClass', 'targetClassParam'));
   const targetClassFilter = new Set();
@@ -48571,10 +51087,17 @@ async function executeExpandRelations(cmdbuildExecRequest, step, params, context
   const fetchRelated = step.fetchRelated !== false;
   const distinct = Boolean(step.distinct);
   const relatedCardCache = new Map();
-  const pathCache = { attributes: new Map(), cards: relatedCardCache, relations: new Map() };
+  const pathCache = {
+    attributes: new Map(),
+    cards: relatedCardCache,
+    relations: new Map(),
+    maxRelationsPerCard: limits.maxRelationsPerCard,
+    maxRelationsPerCardMax: limits.maxRelationsPerCardMax
+  };
   const seen = new Set();
   const columns = [];
   const rows = [];
+  let relationLimitReached = false;
 
   for (const driverRow of driverRows) {
     const sourceClass = resolveRelationSourceClass(step, params, driverRow);
@@ -48585,13 +51108,15 @@ async function executeExpandRelations(cmdbuildExecRequest, step, params, context
     }
     validateCmdbuildIdentifier(sourceClass, 'expandRelations sourceClass');
 
-    const relations = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(sourceClass)}/cards/${encodeURIComponent(sourceId)}/relations?limit=${perCardLimit}`);
+    const relationReadLimit = Math.min(perCardLimit + 1, limits.maxRelationsPerCardMax || ABSOLUTE_EXECUTION_LIMITS.maxRelationsPerCard);
+    const relations = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(sourceClass)}/cards/${encodeURIComponent(sourceId)}/relations?limit=${relationReadLimit}`);
     if (!relations.ok) {
       throw new Error(`CMDBuild relations request for ${sourceClass}/${sourceId} failed with status ${relations.statusCode}.`);
     }
 
     const relationItems = Array.isArray(relations.json && relations.json.data) ? relations.json.data : [];
-    for (const relation of relationItems) {
+    if (relationItems.length > perCardLimit) relationLimitReached = true;
+    for (const relation of relationItems.slice(0, perCardLimit)) {
       const domain = relationDomainName(relation);
       if (domainFilter.size && !domainFilter.has(domain.toLowerCase())) continue;
 
@@ -48609,11 +51134,14 @@ async function executeExpandRelations(cmdbuildExecRequest, step, params, context
         ? await readRelatedCard(cmdbuildExecRequest, relatedCardCache, relatedClass, chosen.relatedEndpoint.id)
         : { card: null, statusCode: '' };
       rows.push(await buildRelationResultRow(cmdbuildExecRequest, pathCache, driverRow, relation, sourceClass, sourceId, chosen.sourceSide, chosen.relatedEndpoint, relatedCardInfo, columns, step));
+      if (pathCache.relationLimitReached) relationLimitReached = true;
       if (rows.length >= maxRows) {
         return {
           columns,
           rows,
-          truncated: true
+          truncated: true,
+          relationLimitReached,
+          truncationReason: relationLimitReached ? 'maxRelationsPerCard' : 'maxRows'
         };
       }
     }
@@ -48622,7 +51150,9 @@ async function executeExpandRelations(cmdbuildExecRequest, step, params, context
   return {
     columns,
     rows,
-    truncated: false
+    truncated: relationLimitReached,
+    relationLimitReached,
+    truncationReason: relationLimitReached ? 'maxRelationsPerCard' : ''
   };
 }
 
@@ -48636,7 +51166,13 @@ async function executeEnrichRows(cmdbuildExecRequest, step, params, context, lim
   const enrichColumns = normalizePathColumnSpecs(step.columns || step.fields);
   const classColumn = step.classColumn || 'Class';
   const idColumn = step.idColumn || '_id';
-  const pathCache = { attributes: new Map(), cards: new Map(), relations: new Map() };
+  const pathCache = {
+    attributes: new Map(),
+    cards: new Map(),
+    relations: new Map(),
+    maxRelationsPerCard: limits.maxRelationsPerCard,
+    maxRelationsPerCardMax: limits.maxRelationsPerCardMax
+  };
   const rows = [];
   const sourceResolution = { resolved: 0, equivalent: 0, ambiguous: 0, unavailable: 0 };
   let truncated = Boolean(source.truncated) || (Array.isArray(source.rows) && source.rows.length > sourceRows.length);
@@ -49308,7 +51844,9 @@ async function executeExistsRelatedRows(cmdbuildExecRequest, step, params, conte
   return {
     columns: sourceColumns,
     rows,
-    truncated: Boolean(source.truncated || comparison.truncated || related.truncated)
+    truncated: Boolean(source.truncated || comparison.truncated || related.truncated),
+    relationLimitReached: Boolean(related.relationLimitReached),
+    truncationReason: related.relationLimitReached ? 'maxRelationsPerCard' : ''
   };
 }
 
@@ -49809,6 +52347,7 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
   const executionDeadlineAt = Number(options.executionDeadlineAt || 0);
   const executionDeadlineTimeoutMs = Number(options.executionDeadlineTimeoutMs || DRAFT_PREVIEW_TIMEOUT_MS);
   const maxRowsMax = Math.min(options.maxRowsMax || ABSOLUTE_EXECUTION_LIMITS.maxRows, ABSOLUTE_EXECUTION_LIMITS.maxRows);
+  const maxRelationsPerCardMax = Math.min(options.maxRelationsPerCardMax || ABSOLUTE_EXECUTION_LIMITS.maxRelationsPerCard, ABSOLUTE_EXECUTION_LIMITS.maxRelationsPerCard);
   const maxSelectionScanRowsMax = Math.min(options.maxSelectionScanRowsMax || ABSOLUTE_EXECUTION_LIMITS.maxSelectionScanRows, ABSOLUTE_EXECUTION_LIMITS.maxSelectionScanRows);
   const maxClassesMax = Math.min(options.maxClassesMax || ABSOLUTE_EXECUTION_LIMITS.maxClasses, ABSOLUTE_EXECUTION_LIMITS.maxClasses);
   const maxDomainsMax = Math.min(options.maxDomainsMax || ABSOLUTE_EXECUTION_LIMITS.maxDomains, ABSOLUTE_EXECUTION_LIMITS.maxDomains);
@@ -49820,6 +52359,8 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
     maxDomains: Math.min(options.maxDomains || 100, maxDomainsMax),
     maxRows: Math.min(options.maxRows || 500, maxRowsMax),
     maxRowsMax,
+    maxRelationsPerCard: Math.min(options.maxRelationsPerCard || 100, maxRelationsPerCardMax),
+    maxRelationsPerCardMax,
     maxSelectionScanRows: Math.min(options.maxSelectionScanRows || 10000, maxSelectionScanRowsMax),
     maxSelectionScanRowsMax,
     maxRestCalls: Math.min(options.maxRestCalls || 250, maxRestCallsMax),
@@ -49902,7 +52443,8 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
         .filter((value) => value && typeof value === 'object');
       const inheritedTruncation = sourceResults.some((value) => value.truncated === true);
       const outputRows = Array.isArray(output.rows) ? output.rows.length : 0;
-      const rowLimit = Number(output.rowLimit || step.limit || limits.maxRows);
+      const relationOperation = step.type === 'expandRelations' || step.type === 'existsRelatedRows';
+      const rowLimit = Number(output.rowLimit || (relationOperation ? limits.maxRows : step.limit || limits.maxRows));
       // `truncated` is propagated through set/relation operations to preserve
       // completeness information. Emit a maxRows diagnostic only at the step
       // that actually reached its own row bound, not at every downstream step.
@@ -49936,6 +52478,17 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
           total: selectionScan.availableTotal,
           truncated: true,
           reason: 'selection-scan-limit'
+        });
+      }
+      if (output.relationLimitReached === true) {
+        limitDiagnostics.push({
+          source: 'template-execution',
+          limitHit: true,
+          limitName: 'maxRelationsPerCard',
+          configuredLimit: limits.maxRelationsPerCard,
+          returned: outputRows,
+          truncated: true,
+          reason: 'relation-per-card-limit'
         });
       }
       const limitWarnings = assistantLimitWarningsFromDiagnostics(limitDiagnostics);
@@ -50786,8 +53339,8 @@ async function handleBackend(req, res, requestUrl) {
         throw sourceError;
       }
       const sourceProposal = await proposalWithCompatibleD2Source(proposal, d2Source);
-      const reviewedProposal = diagramImportV3WithOverrides(sourceProposal, body.roles, body.relationRules, body.structureTree, sourceSpec);
-      reviewedProposal.unresolved = diagramImportV3Unresolved(reviewedProposal.roles, reviewedProposal.relationRules, reviewedProposal.structureTree, sourceSpec, reviewedProposal.structure);
+      const reviewedProposal = diagramImportV3WithOverrides(sourceProposal, body.roles, body.relationRules, body.structureTree, sourceSpec, body.endpointProfiles);
+      reviewedProposal.unresolved = diagramImportV3Unresolved(reviewedProposal.roles, reviewedProposal.relationRules, reviewedProposal.structureTree, sourceSpec, reviewedProposal.structure, reviewedProposal.endpointProfiles);
       const partial = reviewedProposal.unresolved.length > 0;
       if (!partial) {
         const catalogRequestUrl = await configuredModelCatalogRequestUrl(authToken, root, new URL('http://127.0.0.1/model/catalog?includeAttributes=true'));
@@ -50808,8 +53361,8 @@ async function handleBackend(req, res, requestUrl) {
         }
       }
       const applied = partial
-        ? applyPartialDiagramImportProposal(sourceSpec, sourceProposal, body.roles, body.relationRules, body.structureTree)
-        : { spec: applyDiagramImportProposal(sourceSpec, sourceProposal, body.roles, body.relationRules, body.structureTree), omissions: [], repairs: [] };
+        ? applyPartialDiagramImportProposal(sourceSpec, sourceProposal, body.roles, body.relationRules, body.structureTree, body.endpointProfiles)
+        : { spec: applyDiagramImportProposal(sourceSpec, sourceProposal, body.roles, body.relationRules, body.structureTree, body.endpointProfiles), omissions: [], repairs: [] };
       const spec = applied.spec;
       const roleModelCounts = (Array.isArray(body.roles) ? body.roles : []).reduce((counts, item) => {
         const visualKind = diagramImportRoleVisualKind(item);
@@ -51314,7 +53867,7 @@ async function handleBackend(req, res, requestUrl) {
         kind: role.kind,
         notes: truncateText(String(role.notes || ''), 8000),
         elementKeys: Array.isArray(role.elementKeys) ? role.elementKeys.map(String) : [],
-        mappedClassNames: diagramImportCatalogStrings(diagramImportRoleMappedClassNames(reviewProposal, role && role.id)),
+        mappedClassNames: diagramImportCatalogStrings(diagramImportRoleMappedClassNames(reviewProposal, role && role.id, sourceSpec)),
         visualKind: diagramImportRoleVisualKind(role),
         visualKindOptions: Array.isArray(role.visualKindOptions) ? role.visualKindOptions.map(String) : [diagramImportRoleVisualKind(role)],
         labelTemplate: String(role.labelTemplate || ''),
@@ -51919,6 +54472,8 @@ async function handleBackend(req, res, requestUrl) {
     const previewExecutionOptions = {
       maxRows: getPositiveInt(requestUrl.searchParams, 'maxRows', executionLimits.maxRowsPreviewDefault, executionLimits.maxRowsMax),
       maxRowsMax: executionLimits.maxRowsMax,
+      maxRelationsPerCard: executionLimits.maxRelationsPerCardDefault,
+      maxRelationsPerCardMax: executionLimits.maxRelationsPerCardMax,
       maxSelectionScanRows: executionLimits.maxSelectionScanRowsDefault,
       maxSelectionScanRowsMax: executionLimits.maxSelectionScanRowsMax,
       maxClasses: getPositiveInt(requestUrl.searchParams, 'maxClasses', executionLimits.maxClassesDefault, executionLimits.maxClassesMax),
@@ -52292,6 +54847,8 @@ async function handleBackend(req, res, requestUrl) {
       const executionOptions = {
         maxRows,
         maxRowsMax: executionLimits.maxRowsMax,
+        maxRelationsPerCard: executionLimits.maxRelationsPerCardDefault,
+        maxRelationsPerCardMax: executionLimits.maxRelationsPerCardMax,
         maxSelectionScanRows: executionLimits.maxSelectionScanRowsDefault,
         maxSelectionScanRowsMax: executionLimits.maxSelectionScanRowsMax,
         maxClasses: getPositiveInt(requestUrl.searchParams, 'maxClasses', executionLimits.maxClassesDefault, executionLimits.maxClassesMax),
@@ -52746,7 +55303,15 @@ async function handleBackend(req, res, requestUrl) {
       if (d2Recompile.recompiled) {
         storedSpec = d2Recompile.spec;
         payload = { ...payload, SpecJson: JSON.stringify(storedSpec) };
-        recordD2MappingStorageOutcome(storageOptions, { status: 'current_input_recompiled' });
+        recordD2MappingStorageOutcome(storageOptions, {
+          status: d2Recompile.partial ? 'current_input_partially_recompiled' : 'current_input_recompiled',
+          reasons: d2Recompile.partial ? ['partialMapping'] : []
+        });
+      } else if (d2Recompile.error) {
+        recordD2MappingStorageOutcome(storageOptions, {
+          status: 'current_input_recompile_preserved',
+          reasons: [String(d2Recompile.error && d2Recompile.error.code || 'recompileFailed')]
+        });
       }
       const specErrors = validateTemplateSpecForStorage(storedSpec);
       if (specErrors.length) {
@@ -53159,6 +55724,7 @@ if (isMainModule) {
 }
 
 export {
+  APPLICATION_VERSION,
   DEFAULT_TEMPLATE_CACHE_TTL_SEC,
   applyTemplateParamDefaults,
   assistantCandidateClassesFromSummary,
@@ -53214,8 +55780,14 @@ export {
   diagramImportImplicitConditionSources,
   diagramImportInferImplicitConditionSource,
   diagramImportDirectRelationParentCorrelation,
+  diagramImportBindRelationRulesToStructureItems,
+  diagramImportTopologyRules,
+  diagramImportEndpointProfiles,
+  diagramImportEndpointProfilesForStructure,
   diagramImportPrimaryCardSource,
   diagramImportCardSourceField,
+  diagramMappingField,
+  diagramImportCompileRoleMapping,
   diagramImportMappingInputRevision,
   diagramImportMappingInputRevisionStatus,
   diagramImportMappingValidationIsCurrent,
@@ -53242,6 +55814,7 @@ export {
   normalizeAssistantDraftSpec,
   normalizeAssistantObjectFlowIntent,
   normalizeAssistantRuntimeConfig,
+  normalizeApplicationVersion,
   normalizeTemplateAssistantPromptOverrides,
   normalizeLogFormat,
   normalizeLogLevel,

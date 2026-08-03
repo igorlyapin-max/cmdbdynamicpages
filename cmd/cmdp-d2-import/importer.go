@@ -102,6 +102,8 @@ type edgeElement struct {
 type groupElement struct {
 	ID             string            `json:"id"`
 	Label          string            `json:"label"`
+	Notes          string            `json:"notes,omitempty"`
+	Static         bool              `json:"static,omitempty"`
 	Shape          string            `json:"shape,omitempty"`
 	ClassKeys      []string          `json:"classKeys"`
 	Style          map[string]string `json:"style,omitempty"`
@@ -172,6 +174,14 @@ type connectionPolicyEntry struct {
 
 type connectionPolicyIndex map[string]connectionPolicyEntry
 
+// staticElementIndex marks a top-level D2 container whose declared subtree is
+// rendered from the template itself, without CMDBuild data bindings.
+type staticElementEntry struct {
+	Range *sourceRange
+}
+
+type staticElementIndex map[string]staticElementEntry
+
 type classUsage struct {
 	count   int
 	samples []string
@@ -212,7 +222,7 @@ func newImportResult(input []byte) importResult {
 
 func importD2(input []byte, maxElements int) importResult {
 	result := newImportResult(input)
-	compilerInput, notesByClass := stripClassNotes(input)
+	compilerInput, notesByClass, notesByElement := stripAuthoringNotes(input)
 
 	ast, err := d2parser.Parse(sourcePath, bytes.NewReader(compilerInput), nil)
 	if err != nil {
@@ -248,6 +258,11 @@ func importD2(input []byte, maxElements int) importResult {
 		result.Source.Errors = append(result.Source.Errors, policyErrors...)
 		return result
 	}
+	staticElements, staticErrors := extractStaticElementIndex(ir)
+	if len(staticErrors) != 0 {
+		result.Source.Errors = append(result.Source.Errors, staticErrors...)
+		return result
+	}
 
 	graph, _, err := d2compiler.Compile(sourcePath, bytes.NewReader(compilerInput), &d2compiler.CompileOptions{FS: nil})
 	if err != nil {
@@ -260,6 +275,10 @@ func importD2(input []byte, maxElements int) importResult {
 		result.Source.Errors = append(result.Source.Errors, semanticErrors...)
 		return result
 	}
+	if staticErrors = validateStaticElementTargets(visits, staticElements); len(staticErrors) != 0 {
+		result.Source.Errors = append(result.Source.Errors, staticErrors...)
+		return result
+	}
 	elementCount := countNormalizedElements(visits, maxElements)
 	if elementCount > maxElements {
 		result.Source.Errors = append(result.Source.Errors, sourceError{
@@ -269,7 +288,7 @@ func importD2(input []byte, maxElements int) importResult {
 		return result
 	}
 
-	result.Elements = normalizeElements(visits, semanticRoles)
+	result.Elements = normalizeElements(visits, semanticRoles, staticElements, notesByElement)
 	if policyErrors = validateConnectionPolicyTargets(result.Elements, connectionPolicies); len(policyErrors) != 0 {
 		result.Source.Errors = append(result.Source.Errors, policyErrors...)
 		return result
@@ -279,24 +298,36 @@ func importD2(input []byte, maxElements int) importResult {
 	return result
 }
 
-// stripClassNotes supports Notes as authoring-only guidance inside classes.<role>.
-// D2 v0.7.1 rejects arbitrary class fields, so the compiler receives a source
+// stripAuthoringNotes supports Notes as authoring-only guidance on D2 classes
+// and containers. D2 v0.7.1 rejects arbitrary class fields and otherwise
+// treats container Notes as graph content, so the compiler receives a source
 // with exactly the same line count while the importer retains the annotation.
-func stripClassNotes(input []byte) ([]byte, map[string]string) {
+func stripAuthoringNotes(input []byte) ([]byte, map[string]string, map[string]string) {
 	lines := strings.SplitAfter(string(input), "\n")
 	notesByClass := make(map[string]string)
+	notesByElement := make(map[string]string)
 	output := make([]string, 0, len(lines))
-	depth, classesDepth, classDepth := 0, -1, -1
-	classKey := ""
+	type frame struct {
+		depth int
+		path  []string
+	}
+	depth := 0
+	frames := make([]frame, 0)
 	scanner := d2SourceScanner{}
-	noteClass := ""
+	noteTarget := ""
+	noteIsClass := false
 	noteLines := make([]string, 0)
 	for _, line := range lines {
-		if noteClass != "" {
+		if noteTarget != "" {
 			output = append(output, newlineOnly(line))
 			if isD2MarkdownEnd(line) {
-				notesByClass[noteClass] = strings.TrimSpace(strings.Join(noteLines, "\n"))
-				noteClass = ""
+				if noteIsClass {
+					notesByClass[noteTarget] = strings.TrimSpace(strings.Join(noteLines, "\n"))
+				} else {
+					notesByElement[noteTarget] = strings.TrimSpace(strings.Join(noteLines, "\n"))
+				}
+				noteTarget = ""
+				noteIsClass = false
 				noteLines = noteLines[:0]
 			} else {
 				noteLines = append(noteLines, strings.TrimSpace(line))
@@ -313,35 +344,53 @@ func stripClassNotes(input []byte) ([]byte, map[string]string) {
 
 		code := scanner.codeLine(line)
 		fieldName, fieldValue, hasField := d2Field(code)
-		if classesDepth < 0 && hasField && fieldName == "classes" && d2MapValue(fieldValue) {
-			classesDepth = depth + 1
+		var currentPath []string
+		for index := len(frames) - 1; index >= 0; index-- {
+			if frames[index].depth == depth {
+				currentPath = frames[index].path
+				break
+			}
 		}
-		if classesDepth >= 0 && depth == classesDepth && hasField && d2MapValue(fieldValue) {
-			classKey = fieldName
-			classDepth = depth + 1
-		}
-		if classKey != "" && depth == classDepth && hasField && strings.EqualFold(fieldName, "notes") && d2MarkdownValue(fieldValue) {
-			noteClass = classKey
-			noteLines = noteLines[:0]
-			output = append(output, newlineOnly(line))
-			continue
+		if hasField && strings.EqualFold(fieldName, "notes") && d2MarkdownValue(fieldValue) && len(currentPath) > 0 {
+			if currentPath[0] == "classes" && len(currentPath) == 2 {
+				noteTarget = currentPath[1]
+				noteIsClass = true
+			} else if currentPath[0] != "vars" && currentPath[0] != "classes" {
+				noteTarget = strings.Join(currentPath, ".")
+				noteIsClass = false
+			}
+			if noteTarget != "" {
+				noteLines = noteLines[:0]
+				output = append(output, newlineOnly(line))
+				continue
+			}
 		}
 		output = append(output, line)
 		if hasField && d2MarkdownValue(fieldValue) {
 			scanner.markdown = true
 		}
+		if hasField && d2MapValue(fieldValue) {
+			path := append(append([]string(nil), currentPath...), fieldName)
+			frames = append(frames, frame{depth: depth + 1, path: path})
+		}
 		depth += d2BraceDelta(code)
-		if classKey != "" && depth < classDepth {
-			classKey, classDepth = "", -1
-		}
-		if classesDepth >= 0 && depth < classesDepth {
-			classesDepth = -1
+		for len(frames) > 0 && frames[len(frames)-1].depth > depth {
+			frames = frames[:len(frames)-1]
 		}
 	}
-	if noteClass != "" {
-		notesByClass[noteClass] = strings.TrimSpace(strings.Join(noteLines, "\n"))
+	if noteTarget != "" {
+		if noteIsClass {
+			notesByClass[noteTarget] = strings.TrimSpace(strings.Join(noteLines, "\n"))
+		} else {
+			notesByElement[noteTarget] = strings.TrimSpace(strings.Join(noteLines, "\n"))
+		}
 	}
-	return []byte(strings.Join(output, "")), notesByClass
+	return []byte(strings.Join(output, "")), notesByClass, notesByElement
+}
+
+func stripClassNotes(input []byte) ([]byte, map[string]string) {
+	output, notesByClass, _ := stripAuthoringNotes(input)
+	return output, notesByClass
 }
 
 // d2SourceScanner keeps only structural D2 syntax in codeLine. Braces in
@@ -519,6 +568,48 @@ func extractConnectionPolicyIndex(ir *d2ir.Map) (connectionPolicyIndex, []source
 	return result, errors
 }
 
+// extractStaticElementIndex reads explicit template-only D2 subtrees from
+// vars.data.cmdp.import.static. D2 IR expands an unquoted dotted key such as
+// root.child: true into nested maps, so both that form and a quoted canonical
+// key ("root.child": true) are normalized to the same container id.
+func extractStaticElementIndex(ir *d2ir.Map) (staticElementIndex, []sourceError) {
+	result := make(staticElementIndex)
+	current := ir
+	var staticField *d2ir.Field
+	for _, name := range []string{"vars", "data", "cmdp", "import", "static"} {
+		staticField = current.GetField(d2ast.FlatUnquotedString(name))
+		if staticField == nil {
+			return result, nil
+		}
+		if staticField.Map() == nil {
+			return result, []sourceError{{Code: "invalid_static_elements", Message: fmt.Sprintf("vars.data.cmdp.import.static path component %q must be a map", name), Range: rangeFromD2(staticField.AST().GetRange())}}
+		}
+		current = staticField.Map()
+	}
+	errors := collectStaticElementEntries(current, "", result)
+	return result, errors
+}
+
+func collectStaticElementEntries(current *d2ir.Map, prefix string, result staticElementIndex) []sourceError {
+	errors := make([]sourceError, 0)
+	for _, field := range current.Fields {
+		key := field.Name.ScalarString()
+		if prefix != "" {
+			key = prefix + "." + key
+		}
+		if nested := field.Map(); nested != nil {
+			errors = append(errors, collectStaticElementEntries(nested, key, result)...)
+			continue
+		}
+		if field.Primary() == nil || field.Primary().Value.ScalarString() != "true" {
+			errors = append(errors, sourceError{Code: "invalid_static_element", Message: fmt.Sprintf("static D2 element %q must be true", key), Range: rangeFromD2(field.AST().GetRange())})
+			continue
+		}
+		result[key] = staticElementEntry{Range: rangeFromD2(field.AST().GetRange())}
+	}
+	return errors
+}
+
 func validateConnectionPolicyTargets(value elements, policies connectionPolicyIndex) []sourceError {
 	edgeClasses := make(map[string]struct{})
 	for _, edge := range value.Edges {
@@ -659,6 +750,29 @@ func validateSemanticRoleTargets(visits []graphVisit, roles semanticRoleIndex) [
 	return errors
 }
 
+func validateStaticElementTargets(visits []graphVisit, staticElements staticElementIndex) []sourceError {
+	groups := make(map[string]string)
+	for _, visit := range visits {
+		for _, object := range visit.graph.Objects {
+			if isGroup(object) {
+				groups[elementID(visit.board, object.AbsID())] = elementParentID(visit, object)
+			}
+		}
+	}
+	errors := make([]sourceError, 0)
+	for key, entry := range staticElements {
+		parent, ok := groups[key]
+		if !ok {
+			errors = append(errors, sourceError{Code: "unknown_static_element_target", Message: fmt.Sprintf("static D2 element target %q must be a container with declared children", key), Range: entry.Range})
+			continue
+		}
+		if parent != "" {
+			errors = append(errors, sourceError{Code: "nested_static_element_target", Message: fmt.Sprintf("static D2 element target %q must be a top-level container", key), Range: entry.Range})
+		}
+	}
+	return errors
+}
+
 func validContainerRole(value string) bool {
 	return value == "composite" || value == "group" || value == "decorative"
 }
@@ -753,7 +867,7 @@ func countNormalizedElements(visits []graphVisit, limit int) int {
 	return count
 }
 
-func normalizeElements(visits []graphVisit, semanticRoles semanticRoleIndex) elements {
+func normalizeElements(visits []graphVisit, semanticRoles semanticRoleIndex, staticElements staticElementIndex, notesByElement map[string]string) elements {
 	result := elements{
 		Nodes:       make([]nodeElement, 0),
 		Edges:       make([]edgeElement, 0),
@@ -763,7 +877,7 @@ func normalizeElements(visits []graphVisit, semanticRoles semanticRoleIndex) ele
 	for _, visit := range visits {
 		for _, object := range visit.graph.Objects {
 			if isGroup(object) || hasSemanticRole(visit, object, semanticRoles) {
-				result.Groups = append(result.Groups, normalizeGroup(visit, object, semanticRoles))
+				result.Groups = append(result.Groups, normalizeGroup(visit, object, semanticRoles, staticElements, notesByElement))
 			} else {
 				result.Nodes = append(result.Nodes, normalizeNode(visit, object))
 			}
@@ -807,7 +921,7 @@ func normalizeNode(visit graphVisit, object *d2graph.Object) nodeElement {
 	}
 }
 
-func normalizeGroup(visit graphVisit, object *d2graph.Object, semanticRoles semanticRoleIndex) groupElement {
+func normalizeGroup(visit graphVisit, object *d2graph.Object, semanticRoles semanticRoleIndex, staticElements staticElementIndex, notesByElement map[string]string) groupElement {
 	children := make([]string, 0, len(object.ChildrenArray))
 	for _, child := range object.ChildrenArray {
 		children = append(children, elementID(visit.board, child.AbsID()))
@@ -817,9 +931,13 @@ func normalizeGroup(visit graphVisit, object *d2graph.Object, semanticRoles sema
 	if entry, ok := semanticRoles[elementID(visit.board, object.AbsID())]; ok {
 		selectedRole = entry.Role
 	}
+	id := elementID(visit.board, object.AbsID())
+	_, isStatic := staticElements[id]
 	return groupElement{
-		ID:             elementID(visit.board, object.AbsID()),
+		ID:             id,
 		Label:          objectLabel(object),
+		Notes:          strings.TrimSpace(notesByElement[id]),
+		Static:         isStatic,
 		Shape:          object.Shape.Value,
 		ClassKeys:      copyClassKeys(object.Classes),
 		Style:          normalizeStyle(object.Style),

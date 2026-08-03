@@ -207,8 +207,7 @@ test('draft preview executes exact router anchor before selecting ARM cards by L
   assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/ARM/cards')), true);
   const armCardsRequest = mock.requests.find((item) => item.pathname.endsWith('/classes/ARM/cards'));
   const requestedAttributes = new URLSearchParams(armCardsRequest.search).get('attributes') || '';
-  assert.ok(requestedAttributes.split(',').includes('model'));
-  assert.ok(requestedAttributes.split(',').includes('model2'));
+  assert.equal(requestedAttributes, '');
   assert.equal(mock.requests.some((item) => item.pathname.includes('/relations')), false);
   assert.equal(backend.exitCode, null);
 });
@@ -3338,7 +3337,7 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
   assert.equal(partialApplied.json.status, 'partial');
   assert.equal(partialApplied.json.partial, true);
   assert.equal(partialApplied.json.d2Workflow.state, 'pending');
-  assert.equal(partialApplied.json.spec.result.diagrams[0].nodeMappings.length, 0);
+  assert.equal(partialApplied.json.spec.result.diagrams[0].nodeMappings.length, 2);
   assert.equal(partialApplied.json.spec.steps.some((step) => step.managedBy === 'd2ImportV3'), false);
   assert.ok(partialApplied.json.omissions.some((item) => item.kind === 'connection'));
   const partialAppliedPreview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=20&executionScope=diagrams`, {
@@ -3454,7 +3453,7 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
       id: 'router_switch_acl',
       kind: 'connection',
       mode: 'relationCard',
-      directionPolicy: 'template',
+      directionPolicy: 'dataFields',
       parentRoleId: roles.find((role) => role.mapping.primary.className === 'routerG').id,
       childRoleId: roles.find((role) => role.mapping.primary.className === 'ARM').id,
       sourceStageId: 'selection:routers',
@@ -3491,29 +3490,58 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
   assert.equal(deterministicEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].type, 'computed');
   assert.equal(deterministicEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].from, 'matchedNetwork');
 
-  const networkEndpointsApplied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
+  const attributeEndpointProfiles = [
+    {
+      id: 'router-code',
+      structureItemId: structureTree.items.find((item) => item.roleId === roles.find((role) => role.mapping.primary.className === 'routerG').id).id,
+      roleId: roles.find((role) => role.mapping.primary.className === 'routerG').id,
+      field: 'Code',
+      operators: ['equals']
+    },
+    {
+      id: 'switch-code',
+      structureItemId: structureTree.items.find((item) => item.roleId === roles.find((role) => role.mapping.primary.className === 'ARM').id).id,
+      roleId: roles.find((role) => role.mapping.primary.className === 'ARM').id,
+      field: 'Code',
+      operators: ['equals']
+    }
+  ];
+  const attributeEndpointsApplied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
     currentSpec,
     d2Source: source,
     proposal: analyzed.json.proposal,
     roles,
     structureTree,
+    endpointProfiles: attributeEndpointProfiles,
     relationRules: [{
       ...topologyContract,
-      id: 'router_switch_network',
+      id: 'router_switch_attribute',
       kind: 'connection',
-      mode: 'networkEndpoints',
+      mode: 'attributeEndpoints',
       directionPolicy: 'dataFields',
       parentRoleId: roles.find((role) => role.mapping.primary.className === 'routerG').id,
       childRoleId: roles.find((role) => role.mapping.primary.className === 'ARM').id,
       sourceStageId: 'selection:routers',
       sourceField: 'Code',
-      targetField: 'Description',
+      targetField: 'Code',
+      sourceOperator: 'equals',
+      targetOperator: 'equals',
+      endpointOperator: 'equals',
       labelField: 'Code'
     }]
   }, headers);
-  assert.equal(networkEndpointsApplied.statusCode, 200, networkEndpointsApplied.body);
-  assert.equal(networkEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].type, 'networkEndpoints');
-  assert.equal(networkEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].endpointResolution.strategy, 'ipv4ObjectThenRange');
+  assert.equal(attributeEndpointsApplied.statusCode, 200, attributeEndpointsApplied.body);
+  assert.equal(attributeEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].type, 'attributeEndpoints');
+  assert.equal(attributeEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].endpointResolution.strategy, 'comparisonRules');
+  assert.equal(attributeEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].endpointResolution.operator, 'equals');
+  assert.equal(attributeEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].endpointResolution.sourceOperator, 'equals');
+  assert.equal(attributeEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].endpointResolution.targetOperator, 'equals');
+  assert.equal(attributeEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].endpointResolution.profileScope, 'allCompatiblePlacements');
+  assert.equal(Object.hasOwn(attributeEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].endpointResolution, 'sourceEndpointProfileIds'), false);
+  assert.equal(Object.hasOwn(attributeEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].endpointResolution, 'targetEndpointProfileIds'), false);
+  assert.equal(Object.hasOwn(attributeEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].importRole, 'sourceProfileId'), false);
+  assert.equal(Object.hasOwn(attributeEndpointsApplied.json.spec.result.diagrams[0].edgeMappings[0].importRole, 'targetProfileId'), false);
+  assert.equal(attributeEndpointsApplied.json.spec.result.diagrams[0].authoring.d2Import.endpointProfiles.length, 2);
 
   const missingDirectionPolicy = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
     currentSpec,
@@ -3521,29 +3549,31 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
     proposal: analyzed.json.proposal,
     roles,
     structureTree,
+    endpointProfiles: attributeEndpointProfiles,
     relationRules: [{
       ...topologyContract,
       id: 'router_switch_network_missing_direction',
       kind: 'connection',
-      mode: 'networkEndpoints',
+      mode: 'attributeEndpoints',
       directionPolicy: '',
       directionPolicySuggestion: 'dataFields',
       parentRoleId: roles.find((role) => role.mapping.primary.className === 'routerG').id,
       childRoleId: roles.find((role) => role.mapping.primary.className === 'ARM').id,
       sourceStageId: 'selection:routers',
       sourceField: 'Code',
-      targetField: 'Description',
+      targetField: 'Code',
+      sourceOperator: 'equals',
+      targetOperator: 'equals',
+      endpointOperator: 'equals',
       labelField: 'Code'
     }]
   }, headers);
   assert.equal(missingDirectionPolicy.statusCode, 200, missingDirectionPolicy.body);
-  assert.equal(missingDirectionPolicy.json.status, 'partial');
-  assert.equal(missingDirectionPolicy.json.partial, true);
-  assert.equal(missingDirectionPolicy.json.d2Workflow.state, 'pending');
-  assert.equal(missingDirectionPolicy.json.spec.result.diagrams[0].edgeMappings.length, 0);
-  const directionError = missingDirectionPolicy.json.unresolved.find((item) => Array.isArray(item.fields) && item.fields.includes('directionPolicy'));
-  assert.ok(directionError, missingDirectionPolicy.body);
-  assert.equal(directionError.directionPolicySuggestion, topologyContract.directionPolicySuggestion);
+  assert.equal(missingDirectionPolicy.json.status, 'complete', missingDirectionPolicy.body);
+  assert.equal(missingDirectionPolicy.json.partial, false);
+  assert.equal(missingDirectionPolicy.json.d2Workflow.state, 'applied');
+  assert.equal(missingDirectionPolicy.json.spec.result.diagrams[0].edgeMappings.length, 1);
+  assert.equal(missingDirectionPolicy.json.spec.result.diagrams[0].edgeMappings[0].endpointResolution.directionPolicy, 'dataFields');
 
   const formattingRefresh = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/refresh`, {
     templateCode: 'NetworkImport',
@@ -3574,7 +3604,7 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
   assert.equal(backend.exitCode, null);
 });
 
-test('network endpoint edges prefer exact IP objects, then ranges, and retain unresolved endpoints', async (t) => {
+test('network endpoint edges prefer exact IP objects, then ranges, and omit unresolved endpoints', async (t) => {
   const mock = await startMockCmdbuild(t);
   const backendPort = await freePort();
   const backend = await startBackend(t, backendPort, mock.origin);
@@ -3603,7 +3633,7 @@ test('network endpoint edges prefer exact IP objects, then ranges, and retain un
                 { sourceIp: '10.0.0.77', targetIp: '10.0.0.8', label: 'ACL reverse roles' }
               ],
               fields: { source: 'sourceIp', target: 'targetIp', label: 'label' },
-              endpointResolution: { strategy: 'ipv4ObjectThenRange', directionPolicy: 'dataFields' },
+              endpointResolution: { strategy: 'ipv4ObjectThenRange', directionPolicy: 'template' },
               importRole: { key: 'acl-edge', sourceKey: 'host', targetKey: 'range' }
             }]
           }]
@@ -3614,18 +3644,15 @@ test('network endpoint edges prefer exact IP objects, then ranges, and retain un
   }, headers);
   assert.equal(preview.statusCode, 200, preview.body);
   const diagram = preview.json.result.diagrams[0];
-  assert.equal(diagram.edges.length, 3);
+  assert.equal(diagram.edges.length, 1);
   const resolved = diagram.edges.find((edge) => edge.label === 'ACL allow');
   assert.equal(diagram.nodes.find((node) => node.id === resolved.source).businessId, 'host-1');
   assert.equal(diagram.nodes.find((node) => node.id === resolved.target).businessId, 'range-1');
-  const outside = diagram.edges.find((edge) => edge.label === 'ACL outside');
-  assert.equal(outside.targetMissing, true);
-  assert.ok(diagram.nodes.some((node) => node.fakeEndpoint && node.label === 'Заглушка'));
+  assert.equal(diagram.edges.some((edge) => edge.label === 'ACL outside'), false);
+  assert.equal(diagram.nodes.some((node) => node.fakeEndpoint), false);
   assert.equal(diagram.nodes.some((node) => String(node.label || '').includes('203.0.113.5')), false);
   assert.ok(diagram.warnings.some((warning) => warning.includes('203.0.113.5')));
-  const reversed = diagram.edges.find((edge) => edge.label === 'ACL reverse roles');
-  assert.equal(diagram.nodes.find((node) => node.id === reversed.source).businessId, 'range-1');
-  assert.equal(diagram.nodes.find((node) => node.id === reversed.target).businessId, 'host-1');
+  assert.equal(diagram.edges.some((edge) => edge.label === 'ACL reverse roles'), false);
   assert.equal(backend.exitCode, null);
 });
 
@@ -3807,7 +3834,8 @@ test('relation result tables normalize typed fields by related card class and re
       ],
       Target: [
         { name: 'Owner', type: 'lookup', active: true, _can_read: true },
-        { name: 'PortalUrl', type: 'url', active: true, _can_read: true }
+        { name: 'PortalUrl', type: 'url', active: true, _can_read: true },
+        { name: 'DisplayOnly', type: 'string', active: true, _can_read: true }
       ]
     },
     cardsByClass: {
@@ -3824,7 +3852,8 @@ test('relation result tables normalize typed fields by related card class and re
         Description: 'Target card',
         Owner: 7,
         _Owner_description: 'Target owner',
-        PortalUrl: '<a href="https://target.example/item/21">Target page</a>'
+        PortalUrl: '<a href="https://target.example/item/21">Target page</a>',
+        DisplayOnly: 'Materialized direct attribute'
       }]
     },
     relationsByCard: {
@@ -3856,7 +3885,7 @@ test('relation result tables normalize typed fields by related card class and re
         result: {
           tables: [
             { name: 'relatedOne', columns: ['Owner', 'PortalUrl', 'Source_Owner', 'Source_PortalUrl'] },
-            { name: 'relatedTwo', columns: ['Owner', 'PortalUrl'] }
+            { name: 'relatedTwo', columns: [] }
           ]
         }
       }
@@ -3874,7 +3903,86 @@ test('relation result tables normalize typed fields by related card class and re
   assert.equal(first.rows[0].Source_PortalUrl, 'https://source.example/item/11');
   assert.equal(first.cellMeta[0].Source_PortalUrl?.autoHref, undefined);
   assert.equal(second.rows[0].Owner, 'Target owner');
+  assert.ok(second.columns.includes('DisplayOnly'));
+  assert.equal(second.rows[0].DisplayOnly, 'Materialized direct attribute');
   assert.equal(mock.requests.filter((item) => item.pathname === '/cmdbuild/services/rest/v3/classes/Target/attributes').length, 1);
+  assert.equal(backend.exitCode, null);
+});
+
+test('all relation execution paths use the shared runtime per-card limit', async (t) => {
+  const mock = await startMockCmdbuild(t, {
+    classes: [
+      { _id: 1, name: 'Source', description: 'Source', active: true },
+      { _id: 2, name: 'Target', description: 'Target', active: true }
+    ],
+    attributesByClass: {
+      Source: [{ name: 'Name', type: 'string', active: true, _can_read: true }],
+      Target: [{ name: 'Value', type: 'string', active: true, _can_read: true }]
+    },
+    cardsByClass: {
+      Source: [{ _id: 11, Code: 'SOURCE-1', Description: 'Source card', Name: 'Source 1' }],
+      Target: [
+        { _id: 21, Code: 'TARGET-1', Description: 'Target one', Value: 'one' },
+        { _id: 22, Code: 'TARGET-2', Description: 'Target two', Value: 'two' }
+      ]
+    },
+    relationsByCard: {
+      'Source:11': [
+        {
+          _id: 31,
+          domain: 'SourceTarget',
+          _sourceType: 'Source', _sourceId: 11, _sourceCode: 'SOURCE-1', _sourceDescription: 'Source card',
+          _destinationType: 'Target', _destinationId: 21, _destinationCode: 'TARGET-1', _destinationDescription: 'Target one',
+          _direction: 'direct'
+        },
+        {
+          _id: 32,
+          domain: 'SourceTarget',
+          _sourceType: 'Source', _sourceId: 11, _sourceCode: 'SOURCE-1', _sourceDescription: 'Source card',
+          _destinationType: 'Target', _destinationId: 22, _destinationCode: 'TARGET-2', _destinationDescription: 'Target two',
+          _direction: 'direct'
+        }
+      ]
+    },
+    configCards: [{
+      _id: 1,
+      Code: 'Cst_QueryTool',
+      RootCode: 'Cst_QueryTool',
+      Active: true,
+      RuntimeConfigJson: JSON.stringify({ executionLimits: { maxRelationsPerCardDefault: 1, maxRelationsPerCardMax: 4 } })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin);
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=relation-limit-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const preview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=20&includeDiagrams=false`, {
+    template: {
+      code: 'SharedRelationLimit',
+      spec: {
+        version: 1,
+        steps: [
+          { type: 'selectCards', as: 'sources', className: 'Source', filters: [], columns: [], limit: 20 },
+          // A legacy per-step limit must not override the Runtime relation bound.
+          { type: 'expandRelations', as: 'targets', from: 'sources', domain: 'SourceTarget', targetClass: 'Target', direction: 'source', limit: 20, columns: [] }
+        ],
+        result: { tables: [{ name: 'targets', columns: [] }] }
+      }
+    },
+    params: {}
+  }, headers);
+
+  assert.equal(preview.statusCode, 200, preview.body);
+  const targets = preview.json.result.tables.find((table) => table.name === 'targets');
+  assert.deepEqual(targets.rows.map((row) => row.Value), ['one']);
+  assert.equal(targets.truncated, true);
+  const relationTrace = preview.json.result.trace.find((item) => item.as === 'targets');
+  assert.ok(relationTrace.limitDiagnostics.some((item) => item.limitName === 'maxRelationsPerCard'));
+  const relationRead = mock.requests.find((item) => item.pathname === '/cmdbuild/services/rest/v3/classes/Source/cards/11/relations');
+  assert.ok(relationRead, JSON.stringify(mock.requests));
+  assert.equal(new URLSearchParams(relationRead.search).get('limit'), '2');
   assert.equal(backend.exitCode, null);
 });
 
@@ -4526,7 +4634,7 @@ test('D2 mapping resumes the topology stage without repeating confirmed role map
     const candidate = connection.networkEndpointStages.find((item) => item.sourceStageId === 'selection:aclIntrasystem');
     return {
       relationRules: [{
-        d2ElementKey: connection.d2ElementKey,
+        d2ClassKey: connection.d2ClassKey,
         mode: 'networkEndpoints',
         candidateId: candidate.candidateId,
         sourceStageId: candidate.sourceStageId,
@@ -4599,6 +4707,7 @@ test('D2 mapping resumes the topology stage without repeating confirmed role map
   const resumed = await requestJson('POST', endpoint, { ...body, stage: 'topology', resumeId }, headers, 5000);
   assert.equal(resumed.statusCode, 200, resumed.body);
   assert.equal(resumed.json.mapping.status, 'complete');
+  assert.deepEqual(resumed.json.mapping.connectionCoverage, { mapped: 1, required: 1 });
   assert.equal(resumed.json.diagnostics.phases.roles, 'accepted');
   assert.equal(resumed.json.diagnostics.phases.topology, 'accepted');
   assert.equal(llm.requests, 3);
@@ -4619,7 +4728,7 @@ test('D2 mapping resumes a timed-out roles stage before starting topology', asyn
     const candidate = connection.networkEndpointStages.find((item) => item.sourceStageId === 'selection:aclIntrasystem');
     return {
       relationRules: [{
-        d2ElementKey: connection.d2ElementKey,
+        d2ClassKey: connection.d2ClassKey,
         mode: 'networkEndpoints',
         candidateId: candidate.candidateId,
         sourceStageId: candidate.sourceStageId,
@@ -4690,11 +4799,12 @@ test('D2 mapping resumes a timed-out roles stage before starting topology', asyn
   const topology = await requestJson('POST', endpoint, { ...body, stage: 'topology', resumeId }, headers, 5000);
   assert.equal(topology.statusCode, 200, topology.body);
   assert.equal(topology.json.mapping.status, 'complete');
+  assert.deepEqual(topology.json.mapping.connectionCoverage, { mapped: 1, required: 1 });
   assert.equal(llm.requests, 3);
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 mapping aggregates same-role arrows by D2 relation class and preserves class Notes', async (t) => {
+test('D2 mapping combines same-class arrows into one Object Flow relation contract', async (t) => {
   const llm = await startLiteLlmStub(t, {
     responses: [
       ({ request }) => {
@@ -4705,18 +4815,15 @@ test('D2 mapping aggregates same-role arrows by D2 relation class and preserves 
       },
       ({ request }) => {
         const payload = JSON.parse(request.messages.at(-1).content);
-        const connection = payload.topology[0];
-        const candidate = connection.networkEndpointStages.find((item) => item.sourceStageId === 'selection:aclIntrasystem');
-        assert.equal(connection.d2ClassKey, 'acl_intrasystem');
-        assert.deepEqual(connection.d2ElementKeys.sort(), ['application_a_b_1', 'application_a_b_2']);
-        assert.match(connection.notes, /Dedicated ACL result/);
-        assert.equal(connection.sourceRoleId, connection.targetRoleId);
-        assert.equal(connection.dedicatedResultRequired, true);
-        assert.deepEqual(connection.d2ClassKeys, ['acl_intrasystem']);
-        assert.deepEqual(connection.exampleLabels.sort(), ['TCP 443', 'UDP 443']);
+        assert.equal(payload.topology.length, 1);
+        assert.equal(payload.topology[0].d2ClassKey, 'acl_intrasystem');
+        assert.deepEqual(payload.topology[0].d2ElementKeys.sort(), ['application_a_b_1', 'application_a_b_2']);
+        assert.match(payload.topology[0].notes, /Dedicated ACL result/);
+        assert.equal(payload.topology[0].sourceRoleId, payload.topology[0].targetRoleId);
+        const candidate = payload.topology[0].networkEndpointStages.find((item) => item.sourceStageId === 'selection:aclIntrasystem');
         return {
           relationRules: [{
-            d2ElementKey: connection.d2ElementKey,
+            d2ClassKey: payload.topology[0].d2ClassKey,
             mode: 'networkEndpoints',
             candidateId: candidate.candidateId,
             sourceStageId: candidate.sourceStageId,
@@ -4747,23 +4854,25 @@ test('D2 mapping aggregates same-role arrows by D2 relation class and preserves 
   assert.equal(analyzed.statusCode, 200, analyzed.body);
   assert.equal(analyzed.json.proposal.relationRules.length, 1);
   assert.equal(analyzed.json.proposal.relationRules[0].d2ClassKey, 'acl_intrasystem');
-  assert.equal(analyzed.json.proposal.relationRules[0].parentRoleId, analyzed.json.proposal.relationRules[0].childRoleId);
+  assert.equal(Object.hasOwn(analyzed.json.proposal.relationRules[0], 'parentRoleId'), false);
+  assert.equal(Object.hasOwn(analyzed.json.proposal.relationRules[0], 'childRoleId'), false);
   assert.deepEqual(analyzed.json.proposal.relationRules[0].d2ElementKeys.sort(), ['application_a_b_1', 'application_a_b_2']);
   assert.match(analyzed.json.proposal.relationRules[0].d2Notes, /Dedicated ACL result/);
 
   const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
   const mapped = await requestD2MappingStages(backendOrigin, headers, {
-    prompt: 'Map applications and one dedicated ACL relation result.', currentSpec, proposal: analyzed.json.proposal, roles
+    prompt: 'Map applications and one dedicated ACL relation result for the acl_intrasystem class.', currentSpec, proposal: analyzed.json.proposal, roles
   });
   assert.equal(mapped.statusCode, 200, mapped.body);
   assert.equal(mapped.json.mapping.status, 'complete');
   assert.deepEqual([mapped.json.mapping.requiredConnections, mapped.json.mapping.mappedConnections], [1, 1]);
   assert.equal(mapped.json.relationRules.length, 1);
-  assert.deepEqual(mapped.json.relationRules[0].d2ElementKeys.sort(), ['application_a_b_1', 'application_a_b_2']);
+  assert.equal(mapped.json.relationRules[0].d2ClassKey, 'acl_intrasystem');
+  assert.equal(mapped.json.connectionUnresolved.length, 0);
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 mapping reports a missing dedicated result for a same-role relation class', async (t) => {
+test('D2 mapping leaves an omitted connection result unresolved instead of auto-selecting a unique candidate', async (t) => {
   const llm = await startLiteLlmStub(t, {
     responses: [
       ({ request }) => {
@@ -4802,8 +4911,6 @@ test('D2 mapping reports a missing dedicated result for a same-role relation cla
   assert.equal(mapped.json.relationRules.length, 0);
   assert.equal(mapped.json.connectionUnresolved.length, 1);
   assert.equal(mapped.json.connectionUnresolved[0].code, 'missingDedicatedConnectionResult');
-  assert.equal(mapped.json.connectionUnresolved[0].d2ClassKey, 'acl_intrasystem');
-  assert.equal(mapped.json.mapping.unresolved[0].family, 'connections');
   assert.equal(backend.exitCode, null);
 });
 
@@ -5548,8 +5655,27 @@ test('manual D2 mapping changes are persisted by normal template Save without a 
     .filter((item) => mappedItemIds.has(item.id))
     .every((item) => item.mapping.primary.labelTemplate === '${Description}'), true);
 
+  // An unfinished sibling must not erase the edge and placements that were
+  // already valid before the normal Save.
+  const partialSaveSpec = structuredClone(saved.json.template.spec);
+  const partialImport = partialSaveSpec.result.diagrams[0].authoring.d2Import;
+  const invalidSibling = structuredClone(partialImport.structureTree.items[0]);
+  invalidSibling.id = 'manual-incomplete-placement';
+  invalidSibling.mapping.id = 'mapping:manual-incomplete-placement';
+  invalidSibling.mapping.materialization = { kind: 'stage', stageId: 'selection:not-present' };
+  partialImport.structureTree.items.push(invalidSibling);
+  partialImport.mappingValidation = { version: 1, status: 'needsValidation' };
+  delete partialImport.mappingInputRevision;
+  const partiallySaved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/AppliedMappingEditor`, {
+    code: 'AppliedMappingEditor', expectedSpecHash: saved.json.template.specHash, spec: partialSaveSpec
+  }, headers);
+  assert.equal(partiallySaved.statusCode, 200, partiallySaved.body);
+  assert.ok(partiallySaved.json.authoringRecovery.some((item) => item.status === 'current_input_partially_recompiled'), partiallySaved.body);
+  assert.equal(partiallySaved.json.template.spec.result.diagrams[0].edgeMappings.length, 1);
+  assert.equal(partiallySaved.json.template.spec.result.diagrams[0].authoring.d2Import.mappingValidation.status, 'needsValidation');
+
   const removed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/update-applied`, {
-    templateCode: 'AppliedMappingEditor', baseSpecHash: saved.json.template.specHash, currentSpec: manualSpec
+    templateCode: 'AppliedMappingEditor', baseSpecHash: partiallySaved.json.template.specHash, currentSpec: partialSaveSpec
   }, headers);
   assert.equal(removed.statusCode, 404, removed.body);
   assert.equal(backend.exitCode, null);

@@ -161,6 +161,87 @@ app: Application { class: application }
 	}
 }
 
+func TestImportD2PreservesStaticTemplateContainerAndNotes(t *testing.T) {
+	input := []byte(`vars: {
+  data: {
+    cmdp: {
+      import: {
+        static: { legend: true }
+      }
+    }
+  }
+}
+legend: "Типы ACL-связей" {
+  Notes: |md
+    Весь блок статический и показывается на каждой диаграмме.
+  |
+  external: "Внешняя связь"
+  internal: "Внутренняя связь"
+  external -> internal: "пример"
+}
+`)
+
+	result := importD2(input, 20)
+	if len(result.Source.Errors) != 0 {
+		t.Fatalf("unexpected source errors: %#v", result.Source.Errors)
+	}
+	legend := findGroupByID(t, result.Elements.Groups, "legend")
+	if !legend.Static {
+		t.Fatalf("legend must be marked static: %#v", legend)
+	}
+	if got := legend.Notes; got != "Весь блок статический и показывается на каждой диаграмме." {
+		t.Fatalf("legend notes = %q", got)
+	}
+	if len(legend.Children) != 2 || legend.Children[0] != "legend.external" || legend.Children[1] != "legend.internal" {
+		t.Fatalf("legend children = %#v", legend.Children)
+	}
+}
+
+func TestImportD2RejectsUnknownOrNestedStaticTemplateContainer(t *testing.T) {
+	unknown := importD2([]byte(`vars: { data: { cmdp: { import: { static: { missing: true } } } } }
+legend: { node: Example }
+`), 20)
+	if len(unknown.Source.Errors) != 1 || unknown.Source.Errors[0].Code != "unknown_static_element_target" {
+		t.Fatalf("unexpected unknown static target errors: %#v", unknown.Source.Errors)
+	}
+	assertEmptyElements(t, unknown.Elements)
+
+	nested := importD2([]byte(`vars: { data: { cmdp: { import: { static: { root.child: true } } } } }
+root: {
+  child: { node: Example }
+}
+`), 20)
+	if len(nested.Source.Errors) != 1 || nested.Source.Errors[0].Code != "nested_static_element_target" {
+		t.Fatalf("unexpected nested static target errors: %#v", nested.Source.Errors)
+	}
+	assertEmptyElements(t, nested.Elements)
+
+	nestedQuoted := importD2([]byte(`vars: { data: { cmdp: { import: { static: { "root.child": true } } } } }
+root: {
+  child: { node: Example }
+}
+`), 20)
+	if len(nestedQuoted.Source.Errors) != 1 || nestedQuoted.Source.Errors[0].Code != "nested_static_element_target" {
+		t.Fatalf("unexpected quoted nested static target errors: %#v", nestedQuoted.Source.Errors)
+	}
+	assertEmptyElements(t, nestedQuoted.Elements)
+}
+
+func TestImportD2RejectsInvalidNestedStaticElementValue(t *testing.T) {
+	result := importD2([]byte(`vars: { data: { cmdp: { import: { static: { root.child: false } } } } }
+root: {
+  child: { node: Example }
+}
+`), 20)
+	if len(result.Source.Errors) != 1 || result.Source.Errors[0].Code != "invalid_static_element" {
+		t.Fatalf("unexpected invalid nested static element errors: %#v", result.Source.Errors)
+	}
+	if !strings.Contains(result.Source.Errors[0].Message, "root.child") {
+		t.Fatalf("invalid nested static element error = %#v", result.Source.Errors[0])
+	}
+	assertEmptyElements(t, result.Elements)
+}
+
 func TestStripClassNotesIgnoresBracesInQuotedLiterals(t *testing.T) {
 	input := []byte(`classes: {
   application: {

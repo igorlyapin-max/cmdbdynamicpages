@@ -16,3 +16,5 @@ id_rsa
 id_ed25519
 credentials.json
 service-account*.json
+*.d2
+.tmp-*

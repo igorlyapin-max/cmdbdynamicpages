@@ -116,6 +116,26 @@
 
 Целевой authoring contract размещает импорт self-contained `.d2` в `Assistant`. Pinned parser helper формирует class-aware structural IR v3 детерминированно, без LLM. Каждый реально используемый D2 `class` становится одной reusable visual role независимо от количества exemplar paths; template-element bindings остаются внутренним контрактом и не являются полем автора. D2 class никогда не считается именем класса CMDBuild автоматически: primary CMDBuild class определяется выбранным результатом Object Flow, после чего пользователь настраивает составной label, дополнительные structured fields и связанные классы через permission-filtered reference/domain paths. Дополнительные поля сохраняются в structured data объекта и попадают в видимый label только при явном `${...}`. Один объект строится на primary card, а N:N related data остаются массивами. Untyped containers остаются structural roles и по умолчанию дают один static container; размещение, группировка, иерархия и связи задаются явными role rules. DSL aliases генерируются backend и не показываются в UI. `Assistant` предлагает семантику и selection-to-role mappings, а `Diagram` владеет принятыми deterministic settings/mappings. Apply меняет только editor draft, а save новой версии выполняется отдельно после deterministic preview и инвалидирует indexed runtime cache entries template.
 
+### Статические фрагменты D2 template
+
+Легенды, пояснения и другие всегда видимые части шаблона не должны выглядеть как незаполненный CMDBuild mapping. Автор явно помечает root-контейнер в структурированных метаданных D2:
+
+```d2
+vars: {
+  data: {
+    cmdp: {
+      import: {
+        static: {
+          legend: true
+        }
+      }
+    }
+  }
+}
+```
+
+`legend` — canonical ID существующего D2 container. Весь его объявленный subtree, включая узлы и стрелки, становится статическим template-фрагментом: без Object Flow source, CMDBuild mapping, фильтров и Assistant relation rules. `Notes` контейнера остаются пользовательским описанием: показываются в Assistant и передаются в LLM-контекст, но не заменяют machine-readable hint. Preview, runtime и publication обязаны отображать статическую ветвь даже при пустом наборе данных. Редактор показывает её read-only и не предлагает перенос, дублирование, удаление или привязку к результату. Неизвестный контейнер или значение, отличное от `true`, являются ошибкой детерминированного анализа.
+
 Graph builder должен:
 
 - строить nodes/edges только из данных, уже полученных под текущим пользователем CMDBuild;

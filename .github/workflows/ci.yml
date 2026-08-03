@@ -27,6 +27,14 @@ jobs:
       - name: Run CI gate
         run: npm run ci
 
+      - name: Install required browser fixture
+        run: |
+          npm install --no-save --no-package-lock playwright@1.61.1
+          npx playwright install --with-deps chromium
+
+      - name: Run required browser UI smoke
+        run: npm run test:ui:required
+
   go_vulncheck:
     runs-on: ubuntu-latest
     steps:
@@ -37,6 +45,9 @@ jobs:
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.24.x'
+
+      - name: Test D2 importer
+        run: go test ./cmd/cmdp-d2-import
 
       - name: Check D2 importer dependencies
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./cmd/cmdp-d2-import
@@ -66,7 +77,9 @@ jobs:
           raw_tag="${GITHUB_REF_NAME:-${GITHUB_SHA}}"
           tag="$(echo "$raw_tag" | tr '[:upper:]' '[:lower:]' | tr '/:@' '---' | tr -cd 'a-z0-9_.-')"
           if [ -z "$tag" ]; then tag="$GITHUB_SHA"; fi
-          docker build -t "$image:$tag" .
+          app_version="00.00.00.00"
+          if [ -f VERSION ]; then app_version="$(tr -d '\r\n' < VERSION)"; fi
+          docker build --build-arg APP_VERSION="$app_version" -t "$image:$tag" .
           echo "CMDBDYNAMIC_CI_IMAGE=$image:$tag" >> "$GITHUB_ENV"
 
       - name: Login to GHCR

@@ -699,13 +699,38 @@ function operationOutputColumns(operation, materializedColumns) {
       'SourceClass', 'SourceId', 'SourceCode', 'SourceDescription',
       'Domain', 'RelationId', 'RelationDirection', 'RelationSourceSide',
       'RelatedClass', 'RelatedId'
-    ].concat(BASE_RESULT_COLUMNS, operation.columns));
+    ].concat(BASE_RESULT_COLUMNS, operation.columns.filter(isTechnicalObjectFlowColumn)));
   }
   if (operation.type === 'match') {
     return uniqueStrings(leftColumns.concat(rightColumns.map((column) => `${operation.rightPrefix}${column}`)));
   }
   if (operation.type === 'semiJoin' || operation.type === 'existsRelated') return leftColumns.slice();
   return operation.type === 'union' ? uniqueStrings(leftColumns.concat(rightColumns)) : leftColumns.slice();
+}
+
+/**
+ * Direct CMDBuild card attributes are materialized by the runtime for every
+ * selected or related card. Only a nested reference/relation path needs an
+ * explicit technical projection in a generated step.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isTechnicalObjectFlowColumn(value) {
+  return text(value).includes('.');
+}
+
+/**
+ * @param {string[] | undefined} columns
+ * @param {unknown} column
+ * @returns {boolean}
+ */
+function isRuntimeMaterializedObjectFlowColumn(columns, column) {
+  const normalized = text(column);
+  return Boolean(normalized) && (
+    !isTechnicalObjectFlowColumn(normalized)
+    || Boolean(columns && columns.includes(normalized))
+  );
 }
 
 /**
@@ -929,7 +954,7 @@ export function validateObjectFlow(flow) {
       const sourceColumns = selection.from ? materializedColumns.get(selection.from) : undefined;
       for (const [ruleIndex, rule] of selection.rules.entries()) {
         for (const token of rightExpressionTokens(rule.rightExpression)) {
-          if (token.kind === 'previous' && sourceColumns && !sourceColumns.includes(token.name)) {
+          if (token.kind === 'previous' && sourceColumns && !isRuntimeMaterializedObjectFlowColumn(sourceColumns, token.name)) {
             addError(errors, `${stage.path}.rules[${ruleIndex}].rightExpression`, `Previous-result field ${token.name} is not materialized by source ${selection.from}.`);
           }
         }
@@ -954,19 +979,19 @@ export function validateObjectFlow(flow) {
         const ruleRightColumns = isExistsRelated
           ? uniqueStrings(BASE_RESULT_COLUMNS.concat(operation.columns))
           : rightColumns;
-        if (rule.leftColumn && ruleLeftColumns && !ruleLeftColumns.includes(rule.leftColumn)) {
+        if (rule.leftColumn && ruleLeftColumns && !isRuntimeMaterializedObjectFlowColumn(ruleLeftColumns, rule.leftColumn)) {
           addError(errors, `${rulePath}.leftColumn`, `${isExistsRelated ? 'Related-existence' : isSemiJoin ? 'Semi-join' : 'Match'} rule column ${rule.leftColumn} is not materialized by source ${isExistsRelated ? operation.with : operation.from}.`);
         }
-        if (rule.rightColumn && ruleRightColumns && !ruleRightColumns.includes(rule.rightColumn)) {
+        if (rule.rightColumn && ruleRightColumns && !isRuntimeMaterializedObjectFlowColumn(ruleRightColumns, rule.rightColumn)) {
           addError(errors, `${rulePath}.rightColumn`, `${isExistsRelated ? 'Related-existence' : isSemiJoin ? 'Semi-join' : 'Match'} rule column ${rule.rightColumn} is not materialized by ${isExistsRelated ? 'related class' : `source ${operation.with}`}.`);
         }
       });
     } else if (operation.type !== 'relation') {
       operation.on.forEach((key, keyIndex) => {
-        if (leftColumns && !leftColumns.includes(key.left)) {
+        if (leftColumns && !isRuntimeMaterializedObjectFlowColumn(leftColumns, key.left)) {
           addError(errors, `${path}.on[${keyIndex}].left`, `Set operation key ${key.left} is not materialized by source ${operation.from}.`);
         }
-        if (rightColumns && !rightColumns.includes(key.right)) {
+        if (rightColumns && !isRuntimeMaterializedObjectFlowColumn(rightColumns, key.right)) {
           addError(errors, `${path}.on[${keyIndex}].right`, `Set operation key ${key.right} is not materialized by source ${operation.with}.`);
         }
       });
@@ -1070,7 +1095,7 @@ function collectMatchingSelectionColumns(flow) {
   const add = (alias, column) => {
     const normalizedAlias = text(alias);
     const normalizedColumn = text(column);
-    if (!normalizedAlias || !normalizedColumn) return;
+    if (!normalizedAlias || !normalizedColumn || !isTechnicalObjectFlowColumn(normalizedColumn)) return;
     const columns = columnsByAlias.get(normalizedAlias) || [];
     if (!columns.includes(normalizedColumn)) columns.push(normalizedColumn);
     columnsByAlias.set(normalizedAlias, columns);
@@ -1143,10 +1168,11 @@ function compileObjectFlowSteps(flow) {
     };
     if (selection.from) step.from = selection.from;
     const requiredColumns = matchingColumns.get(selection.alias) || [];
-    if (requiredColumns.length) {
-      step.columns = buildSelectionColumnSpecs(selection.columns.concat(requiredColumns));
-    } else if (selection.columns.length) {
-      step.columns = selection.columns.slice();
+    const technicalColumns = uniqueStrings(selection.columns
+      .filter(isTechnicalObjectFlowColumn)
+      .concat(requiredColumns));
+    if (technicalColumns.length) {
+      step.columns = buildSelectionColumnSpecs(technicalColumns);
     }
     return step;
   };
@@ -1195,8 +1221,7 @@ function compileObjectFlowSteps(flow) {
         domain: operation.domain,
         targetClass: operation.targetClass,
         direction: operation.direction,
-        columns: operation.columns.slice(),
-        limit: operation.limit,
+        columns: operation.columns.filter(isTechnicalObjectFlowColumn),
         distinct: operation.distinct,
         as: operation.as
       };
@@ -1210,8 +1235,9 @@ function compileObjectFlowSteps(flow) {
         domain: operation.domain,
         targetClass: operation.targetClass,
         direction: operation.direction,
-        columns: uniqueStrings(operation.columns.concat(operation.rules.map((rule) => rule.rightColumn))),
-        limit: operation.limit,
+        columns: uniqueStrings(operation.columns
+          .concat(operation.rules.map((rule) => rule.rightColumn))
+          .filter(isTechnicalObjectFlowColumn)),
         distinct: operation.distinct,
         rules: operation.rules.map((rule) => ({
           action: rule.action,
@@ -1452,7 +1478,9 @@ function generatedResultTables(flow, existingByName, outputs) {
     title: outputByAlias.get(selection.alias)?.assistantManaged
       ? outputByAlias.get(selection.alias)?.label
       : text(existingByName.get(selection.alias)?.title) || outputByAlias.get(selection.alias)?.label || selection.name,
-    columns: selection.columns.length ? selection.columns.slice() : BASE_RESULT_COLUMNS.slice()
+    columns: Array.isArray(existingByName.get(selection.alias)?.columns)
+      ? cloneJsonValue(existingByName.get(selection.alias).columns)
+      : []
   }));
   const stages = objectFlowStageSummaries(flow);
   for (const stage of stages.filter((item) => item.kind !== 'selection')) {
@@ -1463,7 +1491,7 @@ function generatedResultTables(flow, existingByName, outputs) {
       title: outputByAlias.get(stage.alias)?.assistantManaged
         ? outputByAlias.get(stage.alias)?.label
         : text(existing.title) || outputByAlias.get(stage.alias)?.label || stage.alias,
-      columns: stage.columns,
+      columns: Array.isArray(existing.columns) ? cloneJsonValue(existing.columns) : [],
       ...(stage.kind === 'match' || stage.kind === 'semiJoin' ? { columnLabels: resultColumnLabels(stage.columns) } : {})
     });
   }
