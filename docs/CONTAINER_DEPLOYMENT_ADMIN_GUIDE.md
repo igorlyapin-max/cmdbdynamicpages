@@ -98,9 +98,28 @@ Compose template не содержит `build:` и использует толь
 
 `docker compose build --no-cache` с этим template не собирает backend. `--no-cache` управляет только повторным использованием слоёв во время реального `docker build` и не обновляет существующий container.
 
-### Контролируемая local-сборка
+### Ручная Docker-only сборка
 
-Production deployment использует опубликованный CI image. Local source build допустим для разработки и incident recovery. Канонический helper вычисляет manifest по полному runtime source contract, передает его digest в Docker build и после сборки сравнивает весь embedded manifest с checkout.
+Production deployment использует опубликованный CI image. Если заказчику требуется собрать исходники самостоятельно без Node.js на host, default Docker target формирует рабочий образ с provenance `unverified-local`:
+
+```bash
+docker build -t cmdbdynamicpages:manual .
+docker run --rm --entrypoint node cmdbdynamicpages:manual scripts/build-identity.mjs verify-runtime --root /app --expect-provenance unverified-local
+```
+
+Manual target сам формирует `RUNTIME_SOURCE_MANIFEST.json`, вычисляет его digest и записывает фактические version/digest в `BUILD_INFO.json`. Git revision и dirty state внутри такого образа неизвестны; manual image не получает canonical version/revision/manifest OCI labels и не считается verified release.
+
+Чтобы использовать этот tag с image-only Compose, задайте в deployment `.env`:
+
+```dotenv
+CMDBDYNAMIC_IMAGE=cmdbdynamicpages:manual
+```
+
+После запуска проверьте `/health/live`: `provenance` должен быть `unverified-local`, а `runtimeManifestSha256` — непустым lowercase SHA-256. Не присваивайте `BUILD_PROVENANCE=verified` вручную.
+
+### Каноническая source-сборка
+
+Канонический helper вычисляет manifest по полному runtime source contract, передает его digest в отдельный canonical Docker target и после сборки сравнивает весь embedded manifest с checkout.
 
 Cross-platform build из checkout с Git metadata:
 
@@ -116,7 +135,7 @@ npm run container:build -- --tag cmdbdynamicpages:verified-local --require-clean
 npm run container:verify -- --image cmdbdynamicpages:verified-local --require-clean
 ```
 
-Прямой `docker build .` не является provenance path: Dockerfile требует согласованные `APP_VERSION` и `RUNTIME_MANIFEST_SHA256`, поэтому используйте helper. Не присваивайте `BUILD_PROVENANCE=verified` вручную. Customer release принимается из approved registry по image digest. Node, Go и GitLab Docker base images также закреплены immutable SHA-256 digest; их обновление выполняется отдельным проверяемым изменением CI/Dockerfile.
+Прямой `docker build .` является только manual `unverified-local` path. Customer release принимается из approved registry по image digest и собирается только canonical helper/CI. `--no-cache` не меняет provenance. Node, Go и GitLab Docker base images также закреплены immutable SHA-256 digest; их обновление выполняется отдельным проверяемым изменением CI/Dockerfile.
 
 ## Запуск и остановка
 

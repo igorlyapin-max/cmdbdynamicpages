@@ -97,6 +97,22 @@ function buildMetadataForOptions(workspace, options = {}) {
   };
 }
 
+function canonicalDockerBuildArguments(metadata, options = {}) {
+  const args = ['build'];
+  if (options.noCache) args.push('--no-cache');
+  args.push(
+    '--target', 'runtime-canonical',
+    '--build-arg', `APP_VERSION=${metadata.version}`,
+    '--build-arg', `VCS_REF=${metadata.revision}`,
+    '--build-arg', `SOURCE_DIRTY=${metadata.dirty}`,
+    '--build-arg', `BUILD_PROVENANCE=${metadata.provenance}`,
+    '--build-arg', `RUNTIME_MANIFEST_SHA256=${metadata.runtimeManifestSha256}`,
+    '-t', options.tag,
+    '.'
+  );
+  return args;
+}
+
 function imageInspect(image) {
   const inspected = JSON.parse(command('docker', ['image', 'inspect', image]));
   if (!Array.isArray(inspected) || !inspected[0]) throw new Error(`Docker image ${image} was not found.`);
@@ -241,18 +257,7 @@ function buildImage(options) {
   const tag = String(options.tag || '').trim();
   if (!tag) throw new Error('build requires --tag <image>.');
   const metadata = buildMetadataForOptions(readWorkspaceMetadata(), options);
-
-  const args = ['build'];
-  if (options.noCache) args.push('--no-cache');
-  args.push(
-    '--build-arg', `APP_VERSION=${metadata.version}`,
-    '--build-arg', `VCS_REF=${metadata.revision}`,
-    '--build-arg', `SOURCE_DIRTY=${metadata.dirty}`,
-    '--build-arg', `BUILD_PROVENANCE=${metadata.provenance}`,
-    '--build-arg', `RUNTIME_MANIFEST_SHA256=${metadata.runtimeManifestSha256}`,
-    '-t', tag,
-    '.'
-  );
+  const args = canonicalDockerBuildArguments(metadata, { ...options, tag });
   command('docker', args, { cwd: DEFAULT_WORKSPACE_ROOT, stdio: 'inherit' });
   return assertImageIdentity({ image: tag, requireClean: options.requireClean });
 }
@@ -298,6 +303,7 @@ export {
   assertImageIdentity,
   buildMetadataForOptions,
   buildImage,
+  canonicalDockerBuildArguments,
   compareRuntimeSourceManifests,
   parseOptions,
   readWorkspaceMetadata,

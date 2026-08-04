@@ -95,6 +95,9 @@ jobs:
           test -z "$(git status --porcelain --untracked-files=all)"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           if [ "$GITHUB_REF_TYPE" = tag ]; then test "$GITHUB_REF_NAME" = "v$app_version"; fi
+          manual_image="$image:manual-$tag"
+          docker build -t "$manual_image" .
+          docker run --rm --entrypoint node "$manual_image" scripts/build-identity.mjs verify-runtime --root /app --expect-provenance unverified-local
           node scripts/container-image.mjs build --tag "$image:$tag" --require-clean
           node scripts/container-image.mjs verify --image "$image:$tag" --require-clean
           echo "CMDBDYNAMIC_CI_IMAGE=$image:$tag" >> "$GITHUB_ENV"

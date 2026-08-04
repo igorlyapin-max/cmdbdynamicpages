@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 
 import {
   buildMetadataForOptions,
+  canonicalDockerBuildArguments,
   compareRuntimeSourceManifests,
   requireCleanVerificationErrors,
   parseOptions
@@ -32,6 +34,53 @@ test('strict verified build rejects a dirty checkout', () => {
     () => buildMetadataForOptions({ ...cleanWorkspace, dirty: true }, { requireClean: true }),
     /verified build requires a clean checkout/
   );
+});
+
+test('canonical image helper always selects the runtime-canonical target', () => {
+  assert.deepEqual(canonicalDockerBuildArguments(cleanWorkspace, {
+    tag: 'example:test',
+    noCache: true
+  }), [
+    'build',
+    '--no-cache',
+    '--target', 'runtime-canonical',
+    '--build-arg', 'APP_VERSION=00.00.00.02',
+    '--build-arg', `VCS_REF=${'a'.repeat(40)}`,
+    '--build-arg', 'SOURCE_DIRTY=false',
+    '--build-arg', 'BUILD_PROVENANCE=unverified-local',
+    '--build-arg', `RUNTIME_MANIFEST_SHA256=${'c'.repeat(64)}`,
+    '-t', 'example:test',
+    '.'
+  ]);
+});
+
+test('Dockerfile keeps manual default identity separate from canonical labels and digest input', () => {
+  const dockerfile = fs.readFileSync(new URL('../../Dockerfile', import.meta.url), 'utf8');
+  const stages = [...dockerfile.matchAll(/^FROM .+ AS ([^\s]+)$/gm)].map((match) => match[1]);
+  assert.equal(stages.at(-1), 'runtime-manual');
+
+  const manualManifestStart = dockerfile.indexOf('FROM runtime-source AS runtime-source-manifest-manual');
+  const canonicalManifestStart = dockerfile.indexOf('FROM runtime-source AS runtime-source-manifest-canonical');
+  const canonicalRuntimeStart = dockerfile.indexOf('FROM runtime-base AS runtime-canonical');
+  const manualRuntimeStart = dockerfile.indexOf('FROM runtime-base AS runtime-manual');
+  assert.ok(manualManifestStart > 0);
+  assert.ok(canonicalManifestStart > manualManifestStart);
+  assert.ok(manualRuntimeStart > canonicalRuntimeStart);
+
+  const manualManifestStage = dockerfile.slice(manualManifestStart, canonicalManifestStart);
+  const canonicalManifestStage = dockerfile.slice(canonicalManifestStart, dockerfile.indexOf('FROM node:', canonicalManifestStart));
+  const canonicalRuntimeStage = dockerfile.slice(canonicalRuntimeStart, manualRuntimeStart);
+  const manualRuntimeStage = dockerfile.slice(manualRuntimeStart);
+  assert.doesNotMatch(manualManifestStage, /--expect-sha256/);
+  assert.match(canonicalManifestStage, /--expect-sha256 "\$RUNTIME_MANIFEST_SHA256"/);
+  assert.match(canonicalRuntimeStage, /org\.opencontainers\.image\.version/);
+  assert.match(canonicalRuntimeStage, /org\.opencontainers\.image\.revision/);
+  assert.match(canonicalRuntimeStage, /io\.gkm\.cmdbdynamicpages\.runtime-source-manifest-sha256/);
+  assert.match(manualRuntimeStage, /io\.gkm\.cmdbdynamicpages\.provenance="unverified-local"/);
+  assert.doesNotMatch(manualRuntimeStage, /org\.opencontainers\.image\.version/);
+  assert.doesNotMatch(manualRuntimeStage, /org\.opencontainers\.image\.revision/);
+  assert.doesNotMatch(manualRuntimeStage, /io\.gkm\.cmdbdynamicpages\.runtime-source-manifest-sha256/);
+  assert.match(manualRuntimeStage, /"revision":"unknown","dirty":null,"provenance":"unverified-local"/);
 });
 
 test('strict verification requires both a clean checkout and image dirty=false', () => {

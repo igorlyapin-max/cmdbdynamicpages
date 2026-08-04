@@ -44,9 +44,7 @@ FROM d2-import-builder AS d2-import-test
 
 RUN go test ./cmd/cmdp-d2-import
 
-FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS runtime-source-manifest
-
-ARG RUNTIME_MANIFEST_SHA256
+FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS runtime-source
 
 WORKDIR /source
 
@@ -55,18 +53,23 @@ COPY scripts ./scripts
 COPY cmd/cmdp-d2-import ./cmd/cmdp-d2-import
 COPY go.mod go.sum package.json VERSION ./
 
+FROM runtime-source AS runtime-source-manifest-manual
+
+RUN node scripts/build-identity.mjs manifest \
+  --root /source \
+  --output /out/RUNTIME_SOURCE_MANIFEST.json
+
+FROM runtime-source AS runtime-source-manifest-canonical
+
+ARG RUNTIME_MANIFEST_SHA256
+
 RUN node scripts/build-identity.mjs manifest \
   --root /source \
   --output /out/RUNTIME_SOURCE_MANIFEST.json \
   --expect-sha256 "$RUNTIME_MANIFEST_SHA256"
 
-FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293
+FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS runtime-base
 
-ARG APP_VERSION
-ARG VCS_REF
-ARG SOURCE_DIRTY
-ARG BUILD_PROVENANCE
-ARG RUNTIME_MANIFEST_SHA256
 ARG SOURCE_URL
 
 ENV NODE_ENV=production \
@@ -80,22 +83,43 @@ ENV NODE_ENV=production \
 WORKDIR /app
 
 LABEL org.opencontainers.image.title="cmdbdynamicpages" \
-      org.opencontainers.image.source="${SOURCE_URL}" \
-      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.source="${SOURCE_URL}"
+
+COPY --from=d2 --chown=node:node /usr/local/bin/d2 /usr/local/bin/d2
+COPY --from=d2-import-builder --chown=node:node /out/cmdp-d2-import /usr/local/bin/cmdp-d2-import
+COPY --from=runtime-source --chown=node:node /source/package.json /source/VERSION ./
+COPY --from=runtime-source --chown=node:node /source/src ./src
+COPY --from=runtime-source --chown=node:node /source/scripts ./scripts
+RUN set -eu; \
+  file_version="$(tr -d '\r\n' < ./VERSION)"; \
+  printf '%s\n' "$file_version" | grep -Ex '[0-9]{2}\.[0-9]{2}\.[0-9]{2}\.[0-9]{2}' >/dev/null; \
+  test "$file_version" != '00.00.00.00'; \
+  printf '%s\n' "$file_version" > ./VERSION
+
+EXPOSE 8093
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD node -e "const http=require('node:http');const port=process.env.PROXY_PORT||8093;const req=http.get({host:'127.0.0.1',port,path:'/health/live',timeout:2000},res=>{res.resume();process.exit(res.statusCode>=200&&res.statusCode<300?0:1)});req.on('timeout',()=>req.destroy(new Error('timeout')));req.on('error',()=>process.exit(1));"
+
+CMD ["node", "scripts/dev-proxy-server.mjs"]
+
+FROM runtime-base AS runtime-canonical
+
+ARG APP_VERSION
+ARG VCS_REF
+ARG SOURCE_DIRTY
+ARG BUILD_PROVENANCE
+ARG RUNTIME_MANIFEST_SHA256
+
+LABEL org.opencontainers.image.version="${APP_VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       io.gkm.cmdbdynamicpages.provenance="${BUILD_PROVENANCE}" \
       io.gkm.cmdbdynamicpages.source-dirty="${SOURCE_DIRTY}" \
       io.gkm.cmdbdynamicpages.runtime-source-manifest-sha256="${RUNTIME_MANIFEST_SHA256}"
 
-COPY --from=d2 --chown=node:node /usr/local/bin/d2 /usr/local/bin/d2
-COPY --from=d2-import-builder --chown=node:node /out/cmdp-d2-import /usr/local/bin/cmdp-d2-import
-COPY --from=runtime-source-manifest --chown=node:node /source/VERSION ./VERSION
-COPY --from=runtime-source-manifest --chown=node:node /out/RUNTIME_SOURCE_MANIFEST.json ./RUNTIME_SOURCE_MANIFEST.json
+COPY --from=runtime-source-manifest-canonical --chown=node:node /out/RUNTIME_SOURCE_MANIFEST.json ./RUNTIME_SOURCE_MANIFEST.json
 RUN set -eu; \
   file_version="$(tr -d '\r\n' < ./VERSION)"; \
-  printf '%s\n' "$file_version" | grep -Ex '[0-9]{2}\.[0-9]{2}\.[0-9]{2}\.[0-9]{2}' >/dev/null; \
-  test "$file_version" != '00.00.00.00'; \
-  printf '%s\n' "$file_version" > ./VERSION; \
   if [ "$APP_VERSION" != "$file_version" ]; then \
     echo "APP_VERSION $APP_VERSION does not match VERSION $file_version" >&2; \
     exit 1; \
@@ -115,16 +139,21 @@ RUN set -eu; \
   fi; \
   if [ "$SOURCE_DIRTY" = 'unknown' ]; then dirty_json='null'; else dirty_json="$SOURCE_DIRTY"; fi; \
   printf '{"version":"%s","revision":"%s","dirty":%s,"provenance":"%s","runtimeManifestSha256":"%s"}\n' \
-    "$file_version" "$VCS_REF" "$dirty_json" "$BUILD_PROVENANCE" "$RUNTIME_MANIFEST_SHA256" > ./BUILD_INFO.json
-COPY --from=runtime-source-manifest --chown=node:node /source/package.json ./
-COPY --from=runtime-source-manifest --chown=node:node /source/src ./src
-COPY --from=runtime-source-manifest --chown=node:node /source/scripts ./scripts
+    "$file_version" "$VCS_REF" "$dirty_json" "$BUILD_PROVENANCE" "$RUNTIME_MANIFEST_SHA256" > ./BUILD_INFO.json; \
+  node scripts/build-identity.mjs verify-runtime --root /app --expect-provenance "$BUILD_PROVENANCE"
 
 USER node
 
-EXPOSE 8093
+FROM runtime-base AS runtime-manual
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD node -e "const http=require('node:http');const port=process.env.PROXY_PORT||8093;const req=http.get({host:'127.0.0.1',port,path:'/health/live',timeout:2000},res=>{res.resume();process.exit(res.statusCode>=200&&res.statusCode<300?0:1)});req.on('timeout',()=>req.destroy(new Error('timeout')));req.on('error',()=>process.exit(1));"
+LABEL io.gkm.cmdbdynamicpages.provenance="unverified-local"
 
-CMD ["node", "scripts/dev-proxy-server.mjs"]
+COPY --from=runtime-source-manifest-manual --chown=node:node /out/RUNTIME_SOURCE_MANIFEST.json ./RUNTIME_SOURCE_MANIFEST.json
+RUN set -eu; \
+  file_version="$(tr -d '\r\n' < ./VERSION)"; \
+  runtime_manifest_sha256="$(sha256sum ./RUNTIME_SOURCE_MANIFEST.json | cut -d ' ' -f 1)"; \
+  printf '{"version":"%s","revision":"unknown","dirty":null,"provenance":"unverified-local","runtimeManifestSha256":"%s"}\n' \
+    "$file_version" "$runtime_manifest_sha256" > ./BUILD_INFO.json; \
+  node scripts/build-identity.mjs verify-runtime --root /app --expect-provenance unverified-local
+
+USER node

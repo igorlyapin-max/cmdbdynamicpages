@@ -212,14 +212,17 @@ requireText('Dockerfile', 'for attempt in 1 2 3', 'bounded Go module download re
 requirePattern('Dockerfile', /^FROM node:20-alpine@sha256:[0-9a-f]{64}(?:\s|$)/m, 'digest-pinned Node base image');
 requirePattern('Dockerfile', /^FROM golang:1\.25\.11-alpine@sha256:[0-9a-f]{64}(?:\s|$)/m, 'digest-pinned patched Go base image');
 requireDigestPinnedReferences('Dockerfile', /^FROM\s+((?:node|golang):[^\s]+)(?:\s|$)/gmi, 'Node or Go base image references');
-requireText('Dockerfile', 'AS runtime-source-manifest', 'runtime source manifest build stage');
+requireText('Dockerfile', 'AS runtime-source-manifest-manual', 'manual runtime source manifest build stage');
+requireText('Dockerfile', 'AS runtime-source-manifest-canonical', 'canonical runtime source manifest build stage');
+requireText('Dockerfile', 'AS runtime-canonical', 'canonical runtime image target');
+requireText('Dockerfile', 'AS runtime-manual', 'default manual runtime image target');
 requireText('Dockerfile', 'COPY src ./src', 'runtime manifest src source copy');
 requireText('Dockerfile', 'COPY scripts ./scripts', 'runtime manifest scripts source copy');
 requireText('Dockerfile', 'COPY cmd/cmdp-d2-import ./cmd/cmdp-d2-import', 'runtime manifest D2 importer source copy');
 requireText('Dockerfile', 'COPY go.mod go.sum package.json VERSION ./', 'runtime manifest root source copy');
 requireText('Dockerfile', '--output /out/RUNTIME_SOURCE_MANIFEST.json', 'deterministic runtime source manifest generation');
 requireText('Dockerfile', '--expect-sha256 "$RUNTIME_MANIFEST_SHA256"', 'runtime source manifest digest verification');
-requireText('Dockerfile', '/source/VERSION ./VERSION', 'root VERSION image copy');
+requireText('Dockerfile', '/source/package.json /source/VERSION ./', 'root package and VERSION image copy');
 requireText('Dockerfile', `printf '%s\\n' "$file_version" > ./VERSION`, 'normalized LF VERSION in image');
 requireText('Dockerfile', 'APP_VERSION $APP_VERSION does not match VERSION $file_version', 'build argument and VERSION consistency check');
 requireText('Dockerfile', './BUILD_INFO.json', 'embedded build identity');
@@ -236,10 +239,12 @@ requireText('scripts/build-identity.mjs', "'go.mod'", 'runtime manifest go.mod c
 requireText('scripts/build-identity.mjs', "'go.sum'", 'runtime manifest go.sum coverage');
 requireText('scripts/build-identity.mjs', "'package.json'", 'runtime manifest package.json coverage');
 requireText('scripts/build-identity.mjs', "'VERSION'", 'runtime manifest VERSION coverage');
+requireText('scripts/build-identity.mjs', 'verify-runtime --root <runtime-root>', 'embedded manual runtime identity verification command');
 requireText('scripts/container-image.mjs', 'workspace.runtimeManifestText !== embedded.runtimeManifestText', 'whole runtime manifest comparison');
 requireText('scripts/container-image.mjs', 'a clean verification requires a clean Git checkout', 'strict clean checkout verification');
 requireText('scripts/container-image.mjs', 'a clean verification requires image dirty=false', 'strict image dirty verification');
 requireText('scripts/container-image.mjs', '`RUNTIME_MANIFEST_SHA256=${metadata.runtimeManifestSha256}`', 'runtime manifest Docker build argument');
+requireText('scripts/container-image.mjs', "'--target', 'runtime-canonical'", 'canonical Docker target selection');
 requireText('package.json', '"container:build": "node scripts/container-image.mjs build"', 'canonical container build command');
 requireText('package.json', '"container:verify": "node scripts/container-image.mjs verify"', 'container identity verification command');
 rejectPattern('Dockerfile', /^COPY\s+\.\s+\.$/m, 'broad build-context copy');
@@ -278,6 +283,9 @@ requireText('.dockerignore', '.tmp-*', 'local temporary artifact exclusion');
   'raw D2 source',
   'RUNTIME_SOURCE_MANIFEST.json',
   'runtimeManifestSha256',
+  'docker build -t cmdbdynamicpages:manual .',
+  'verify-runtime --root /app --expect-provenance unverified-local',
+  'CMDBDYNAMIC_IMAGE=cmdbdynamicpages:manual',
   'vXX.YY.ZZ.NN',
   '--require-clean'
 ].forEach((text) => requireText('docs/CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md', text));
@@ -341,6 +349,8 @@ rejectPattern('.env.example', /^PROXY_HOST=0\.0\.0\.0$/m, 'public backend bind d
 
 requireText('.github/workflows/ci.yml', 'node scripts/container-image.mjs build --tag "$image:$tag" --require-clean', 'canonical verified Docker image build gate');
 requireText('.github/workflows/ci.yml', 'node scripts/container-image.mjs verify --image "$image:$tag" --require-clean', 'whole-manifest Docker image verification gate');
+requireText('.github/workflows/ci.yml', 'docker build -t "$manual_image" .', 'plain manual Docker image build gate');
+requireText('.github/workflows/ci.yml', 'verify-runtime --root /app --expect-provenance unverified-local', 'manual Docker image identity gate');
 requireText('.github/workflows/ci.yml', 'docker push', 'Docker image push gate');
 requireText('.github/workflows/ci.yml', 'needs:', 'Docker image dependency gate');
 requireText('.github/workflows/ci.yml', '- test', 'Docker image npm/UI dependency');
@@ -357,6 +367,8 @@ requireText('.github/workflows/ci.yml', 'git rev-parse HEAD', 'GitHub checkout r
 requireText('.github/workflows/ci.yml', 'docker compose --env-file .env.example -f docker-compose.runtime.yml config', 'runtime compose config gate');
 requireText('.gitlab-ci.yml', 'node scripts/container-image.mjs build --tag "$CI_REGISTRY_IMAGE:$IMAGE_TAG" --require-clean', 'canonical GitLab verified Docker image build gate');
 requireText('.gitlab-ci.yml', 'node scripts/container-image.mjs verify --image "$CI_REGISTRY_IMAGE:$IMAGE_TAG" --require-clean', 'GitLab whole-manifest Docker image verification gate');
+requireText('.gitlab-ci.yml', 'docker build -t "$MANUAL_IMAGE" .', 'plain GitLab manual Docker image build gate');
+requireText('.gitlab-ci.yml', 'verify-runtime --root /app --expect-provenance unverified-local', 'GitLab manual Docker image identity gate');
 requireText('.gitlab-ci.yml', 'docker push', 'Docker image push gate');
 requireText('.gitlab-ci.yml', 'dist/cmdbdynamicpages-custompage.zip', 'GitLab custom page artifact path');
 requirePattern('.gitlab-ci.yml', /npm_test:[\s\S]*?rules:[\s\S]*?CI_COMMIT_TAG[\s\S]*?script:/, 'npm test gate for tag pipelines');

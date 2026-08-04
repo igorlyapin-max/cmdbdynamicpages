@@ -10,7 +10,9 @@ import {
   createRuntimeSourceManifestArtifact,
   normalizeApplicationBuildInfo,
   normalizeApplicationVersion,
-  readApplicationBuildIdentity
+  readApplicationBuildIdentity,
+  runVerifyRuntimeCommand,
+  runtimeVerificationExitCode
 } from '../../scripts/build-identity.mjs';
 
 function fixture(files) {
@@ -94,6 +96,25 @@ test('verified build info requires the exact version, revision, and clean source
   }, '00.00.00.02'), /runtimeManifestSha256/);
 });
 
+test('verified build info fails closed when any required identity field is missing', () => {
+  const complete = {
+    version: '00.00.00.02',
+    revision: 'a'.repeat(40),
+    dirty: false,
+    provenance: 'verified',
+    runtimeManifestSha256: 'b'.repeat(64)
+  };
+  for (const field of ['version', 'revision', 'dirty', 'runtimeManifestSha256']) {
+    const incomplete = { ...complete };
+    delete incomplete[field];
+    assert.throws(
+      () => normalizeApplicationBuildInfo(incomplete, '00.00.00.02'),
+      Error,
+      `verified metadata without ${field} must be rejected`
+    );
+  }
+});
+
 test('runtime source manifest is deterministic and covers every declared source group', (context) => {
   const files = runtimeSourceFixture();
   context.after(() => fs.rmSync(files.directory, { recursive: true, force: true }));
@@ -174,6 +195,46 @@ test('runtime identity accepts only build info bound to the embedded manifest', 
   const mismatched = readApplicationBuildIdentity(options);
   assert.equal(mismatched.provenance, 'unverified-local');
   assert.match(mismatched.buildInfoError, /does not match RUNTIME_SOURCE_MANIFEST/);
+});
+
+test('verify-runtime returns JSON-safe output and a failing exit code for a changed editor', (context) => {
+  const files = runtimeSourceFixture();
+  context.after(() => fs.rmSync(files.directory, { recursive: true, force: true }));
+  const artifact = createRuntimeSourceManifestArtifact(files.directory);
+  fs.writeFileSync(path.join(files.directory, 'RUNTIME_SOURCE_MANIFEST.json'), artifact.text);
+  fs.writeFileSync(path.join(files.directory, 'BUILD_INFO.json'), `${JSON.stringify({
+    version: '00.00.00.02',
+    revision: 'unknown',
+    dirty: null,
+    provenance: 'unverified-local',
+    runtimeManifestSha256: artifact.sha256
+  })}\n`);
+
+  const args = [
+    '--root', files.directory,
+    '--expect-provenance', 'unverified-local'
+  ];
+  const verifiedSummary = JSON.parse(JSON.stringify(runVerifyRuntimeCommand(args)));
+  assert.equal(verifiedSummary.success, true);
+  assert.equal(runtimeVerificationExitCode(verifiedSummary), 0);
+  assert.equal(verifiedSummary.version, '00.00.00.02');
+  assert.equal(verifiedSummary.buildInfo.revision, 'unknown');
+  assert.equal(verifiedSummary.buildInfo.dirty, null);
+  assert.equal(verifiedSummary.runtimeManifestSha256, artifact.sha256);
+  assert.equal(
+    verifiedSummary.editorSha256,
+    artifact.manifest.files.find((entry) => entry.path === 'scripts/dev-proxy-server.mjs').sha256
+  );
+  assert.deepEqual(verifiedSummary.errors, []);
+
+  fs.writeFileSync(path.join(files.directory, 'scripts/dev-proxy-server.mjs'), 'export const editor = false;\n');
+  const rejectedSummary = JSON.parse(JSON.stringify(runVerifyRuntimeCommand(args)));
+  assert.equal(rejectedSummary.success, false);
+  assert.equal(runtimeVerificationExitCode(rejectedSummary), 1);
+  assert.match(
+    rejectedSummary.errors.join('\n'),
+    /scripts\/dev-proxy-server\.mjs SHA-256 does not match RUNTIME_SOURCE_MANIFEST/
+  );
 });
 
 test('invalid build info is reported without hiding the executable source hash', (context) => {

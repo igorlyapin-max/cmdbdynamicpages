@@ -9,6 +9,7 @@ const APPLICATION_VERSION_PATTERN = /^\d{2}\.\d{2}\.\d{2}\.\d{2}$/;
 const GIT_REVISION_PATTERN = /^[0-9a-f]{40}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const RUNTIME_SOURCE_MANIFEST_SCHEMA_VERSION = 1;
+const RUNTIME_EDITOR_SOURCE_PATH = 'scripts/dev-proxy-server.mjs';
 const RUNTIME_SOURCE_MANIFEST_INCLUDES = Object.freeze([
   'src/**',
   'scripts/**',
@@ -34,7 +35,7 @@ const DEFAULT_RUNTIME_SOURCE_ROOT_URL = new URL('../', import.meta.url);
 const DEFAULT_VERSION_FILE_URL = new URL('../VERSION', import.meta.url);
 const DEFAULT_BUILD_INFO_FILE_URL = new URL('../BUILD_INFO.json', import.meta.url);
 const DEFAULT_RUNTIME_SOURCE_MANIFEST_FILE_URL = new URL('../RUNTIME_SOURCE_MANIFEST.json', import.meta.url);
-const DEFAULT_EDITOR_SOURCE_FILE_URL = new URL('./dev-proxy-server.mjs', import.meta.url);
+const DEFAULT_EDITOR_SOURCE_FILE_URL = new URL(`../${RUNTIME_EDITOR_SOURCE_PATH}`, import.meta.url);
 
 function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -243,6 +244,104 @@ function editorSourceSha256(fileUrl = DEFAULT_EDITOR_SOURCE_FILE_URL) {
   return digest;
 }
 
+function runtimeManifestFileErrors(manifest, relativePath, content) {
+  const entry = manifest.files.find((candidate) => candidate.path === relativePath);
+  if (!entry) return [`RUNTIME_SOURCE_MANIFEST.json does not contain ${relativePath}.`];
+
+  const errors = [];
+  if (entry.size !== content.length) {
+    errors.push(`Runtime source ${relativePath} size does not match RUNTIME_SOURCE_MANIFEST.json.`);
+  }
+  if (entry.sha256 !== sha256(content)) {
+    errors.push(`Runtime source ${relativePath} SHA-256 does not match RUNTIME_SOURCE_MANIFEST.json.`);
+  }
+  return errors;
+}
+
+function errorMessage(error, fallback) {
+  return error && error.message ? String(error.message) : fallback;
+}
+
+function verifyRuntimeIdentity(options = {}) {
+  const runtimeRoot = rootPath(options.root || DEFAULT_RUNTIME_SOURCE_ROOT_URL);
+  const expectedProvenance = String(options.expectedProvenance || '').trim();
+  if (!['verified', 'unverified-local'].includes(expectedProvenance)) {
+    throw new Error('Expected provenance must be verified or unverified-local.');
+  }
+
+  const errors = [];
+  let version = '';
+  let versionContent = null;
+  let buildInfo = null;
+  let manifestArtifact = null;
+  let editorSha256 = '';
+
+  try {
+    versionContent = fs.readFileSync(path.join(runtimeRoot, 'VERSION'));
+    version = normalizeApplicationVersion(versionContent.toString('utf8'));
+    if (!APPLICATION_VERSION_PATTERN.test(version) || version === APPLICATION_VERSION_PRE_HANDOFF_SENTINEL) {
+      throw new Error('VERSION must contain a non-sentinel XX.YY.ZZ.NN value followed by a newline.');
+    }
+  } catch (error) {
+    version = '';
+    versionContent = null;
+    errors.push(errorMessage(error, 'VERSION is invalid.'));
+  }
+
+  try {
+    manifestArtifact = readRuntimeSourceManifest(path.join(runtimeRoot, 'RUNTIME_SOURCE_MANIFEST.json'));
+  } catch (error) {
+    errors.push(errorMessage(error, 'RUNTIME_SOURCE_MANIFEST.json is invalid.'));
+  }
+
+  if (manifestArtifact && versionContent) {
+    errors.push(...runtimeManifestFileErrors(manifestArtifact.manifest, 'VERSION', versionContent));
+  }
+
+  try {
+    const editorContent = fs.readFileSync(path.join(runtimeRoot, ...RUNTIME_EDITOR_SOURCE_PATH.split('/')));
+    editorSha256 = sha256(editorContent);
+    if (manifestArtifact) {
+      errors.push(...runtimeManifestFileErrors(manifestArtifact.manifest, RUNTIME_EDITOR_SOURCE_PATH, editorContent));
+    }
+  } catch (error) {
+    errors.push(errorMessage(error, 'Editor source SHA-256 is unavailable.'));
+  }
+
+  try {
+    if (!version) throw new Error('BUILD_INFO.json requires a valid VERSION.');
+    buildInfo = normalizeApplicationBuildInfo(
+      JSON.parse(fs.readFileSync(path.join(runtimeRoot, 'BUILD_INFO.json'), 'utf8')),
+      version
+    );
+  } catch (error) {
+    errors.push(errorMessage(error, 'BUILD_INFO.json is invalid.'));
+  }
+
+  if (buildInfo) {
+    if (buildInfo.provenance !== expectedProvenance) {
+      errors.push(`BUILD_INFO.json provenance ${buildInfo.provenance} does not match expected ${expectedProvenance}.`);
+    }
+    if (!manifestArtifact) {
+      errors.push('BUILD_INFO.json requires RUNTIME_SOURCE_MANIFEST.json.');
+    } else if (buildInfo.runtimeManifestSha256 !== manifestArtifact.sha256) {
+      errors.push('BUILD_INFO.json runtimeManifestSha256 does not match RUNTIME_SOURCE_MANIFEST.json.');
+    }
+  }
+
+  return {
+    success: errors.length === 0,
+    root: runtimeRoot,
+    expectedProvenance,
+    version,
+    buildInfo,
+    runtimeManifestSha256: manifestArtifact ? manifestArtifact.sha256 : '',
+    runtimeManifestFileCount: manifestArtifact ? manifestArtifact.manifest.files.length : 0,
+    editorSha256,
+    errors
+  };
+}
+
 function readApplicationBuildIdentity(options = {}) {
   const versionFileUrl = options.versionFileUrl || DEFAULT_VERSION_FILE_URL;
   const buildInfoFileUrl = options.buildInfoFileUrl || DEFAULT_BUILD_INFO_FILE_URL;
@@ -342,6 +441,33 @@ function manifestUsage() {
   return 'Usage: node scripts/build-identity.mjs manifest --root <checkout> --output <file> [--expect-sha256 <digest>]';
 }
 
+function parseVerifyRuntimeCommandOptions(args) {
+  const options = {};
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index];
+    if (value === '--root' || value === '--expect-provenance') {
+      const next = args[index + 1];
+      if (!next || next.startsWith('--')) throw new Error(`${value} requires a value.`);
+      if (value === '--root') options.root = next;
+      else options.expectedProvenance = next;
+      index += 1;
+    } else if (value === '--help' || value === '-h') {
+      options.help = true;
+    } else {
+      throw new Error(`Unknown option: ${value}`);
+    }
+  }
+  return options;
+}
+
+function verifyRuntimeUsage() {
+  return 'Usage: node scripts/build-identity.mjs verify-runtime --root <runtime-root> --expect-provenance <verified|unverified-local>';
+}
+
+function usage() {
+  return `${manifestUsage()}\n${verifyRuntimeUsage()}`;
+}
+
 function runManifestCommand(args) {
   const options = parseManifestCommandOptions(args);
   if (options.help) {
@@ -364,14 +490,43 @@ function runManifestCommand(args) {
   return artifact;
 }
 
+function runVerifyRuntimeCommand(args) {
+  const options = parseVerifyRuntimeCommandOptions(args);
+  if (options.help) {
+    console.log(verifyRuntimeUsage());
+    return null;
+  }
+  if (!options.root) throw new Error('verify-runtime requires --root <runtime-root>.');
+  if (!options.expectedProvenance) {
+    throw new Error('verify-runtime requires --expect-provenance <verified|unverified-local>.');
+  }
+  return verifyRuntimeIdentity(options);
+}
+
+function runtimeVerificationExitCode(summary) {
+  return summary && summary.success === true ? 0 : 1;
+}
+
 function main(argv = process.argv.slice(2)) {
   const [action, ...rest] = argv;
   if (!action || action === '--help' || action === '-h') {
-    console.log(manifestUsage());
+    console.log(usage());
     return;
   }
-  if (action !== 'manifest') throw new Error(`Unknown action: ${action}`);
-  runManifestCommand(rest);
+  if (action === 'manifest') {
+    runManifestCommand(rest);
+    return;
+  }
+  if (action === 'verify-runtime') {
+    const summary = runVerifyRuntimeCommand(rest);
+    if (summary) {
+      console.log(JSON.stringify(summary, null, 2));
+      const exitCode = runtimeVerificationExitCode(summary);
+      if (exitCode !== 0) process.exitCode = exitCode;
+    }
+    return;
+  }
+  throw new Error(`Unknown action: ${action}`);
 }
 
 const isMainModule = process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url;
@@ -380,7 +535,7 @@ if (isMainModule) {
     main();
   } catch (error) {
     console.error(error && error.message ? error.message : String(error));
-    process.exit(1);
+    process.exitCode = 1;
   }
 }
 
@@ -398,6 +553,9 @@ export {
   readApplicationBuildIdentity,
   readRuntimeSourceManifest,
   runManifestCommand,
+  runVerifyRuntimeCommand,
+  runtimeVerificationExitCode,
   runtimeSourceManifestSha256,
-  serializeRuntimeSourceManifest
+  serializeRuntimeSourceManifest,
+  verifyRuntimeIdentity
 };
