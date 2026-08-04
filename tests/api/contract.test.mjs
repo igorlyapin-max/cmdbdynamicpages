@@ -1,8 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
-import { URL } from 'node:url';
+import path from 'node:path';
+import { fileURLToPath, URL } from 'node:url';
+import { validateOpenapiText } from '../../scripts/validate-openapi.mjs';
+
+const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const openapiPath = path.join(repositoryRoot, 'aa/openapi.yaml');
 
 const proxyOrigin = process.env.CMDBDYNAMIC_PROXY || 'http://127.0.0.1:8093';
 const cmdbuildOrigin = process.env.CMDBUILD_LOGIN_ORIGIN || process.env.CMDBUILD_ORIGIN || 'http://127.0.0.1:8090';
@@ -18,6 +24,52 @@ const authenticatedSession = proxyAvailable ? await resolveAuthenticatedSession(
   skip: skipWhenUnavailable
 };
 
+test('OpenAPI Diagram Assistant contract passes the dependency-free validator', () => {
+  const result = validateOpenapiText(fs.readFileSync(openapiPath, 'utf8'));
+
+  assert.deepEqual(result.errors, []);
+  assert.ok(result.pathCount > 0);
+  assert.ok(result.refCount > 0);
+});
+
+test('OpenAPI validator rejects Diagram Assistant field, status, and component drift', async (t) => {
+  const source = fs.readFileSync(openapiPath, 'utf8');
+  const mutations = [
+    {
+      name: 'request field',
+      expectedError: /semanticsPrompt/,
+      mutate: (value) => value.replace('\n        semanticsPrompt:\n', '\n        semanticsPromptDrift:\n')
+    },
+    {
+      name: 'response status',
+      expectedError: /response status drift/,
+      mutate: (value) => mutateOpenapiPath(value, '/cmdbuild/custom-api/assistant/diagram-import/map-selections', (block) => (
+        block.replace('        "504":', '        "599":')
+      ))
+    },
+    {
+      name: 'typed component',
+      expectedError: /AssistantDiagramModels/,
+      mutate: (value) => value.replace('\n    AssistantDiagramModels:\n', '\n    AssistantDiagramModelsDrift:\n')
+    },
+    {
+      name: 'invalid nullable oneOf',
+      expectedError: /nullable cannot be applied to a oneOf schema/,
+      mutate: (value) => value.replace('        id:\n          oneOf:\n', '        id:\n          nullable: true\n          oneOf:\n')
+    }
+  ];
+
+  for (const [index, mutation] of mutations.entries()) {
+    await t.test(mutation.name, () => {
+      const mutated = mutation.mutate(source);
+      assert.notEqual(mutated, source, `mutation ${mutation.name} did not change the contract`);
+      const result = validateOpenapiText(mutated);
+      assert.ok(result.errors.length > 0, `mutation ${index} was not rejected`);
+      assert.match(result.errors.join('\n'), mutation.expectedError);
+    });
+  }
+});
+
 test('health live endpoint is public and reports process liveness', { skip: skipWhenUnavailable }, async () => {
   const result = await request('GET', `${proxyOrigin}/health/live`);
 
@@ -25,6 +77,15 @@ test('health live endpoint is public and reports process liveness', { skip: skip
   const json = JSON.parse(result.body);
   assert.equal(json.service, 'cmdbdynamicpages');
   assert.equal(json.live, true);
+  assert.match(json.build.version, /^(?:0\.0\.0\.0|\d{2}\.\d{2}\.\d{2}\.\d{2})$/);
+  assert.match(json.build.revision, /^(?:unknown|[0-9a-f]{40})$/);
+  assert.ok(['verified', 'unverified-local'].includes(json.build.provenance));
+  assert.ok(json.build.dirty === null || typeof json.build.dirty === 'boolean');
+  assert.match(json.build.editorSha256, /^[0-9a-f]{64}$/);
+  assert.equal(result.headers['x-cmdp-version'], json.build.version);
+  assert.equal(result.headers['x-cmdp-revision'], json.build.revision);
+  assert.equal(result.headers['x-cmdp-provenance'], json.build.provenance);
+  assert.equal(result.headers['x-cmdp-editor-sha256'], json.build.editorSha256);
 });
 
 test('health ready endpoint returns a production readiness payload', { skip: skipWhenUnavailable }, async () => {
@@ -222,4 +283,18 @@ function request(method, url, body, extraHeaders = {}, timeoutMs = 5000) {
 function hasHeader(headers, name) {
   const normalized = String(name || '').toLowerCase();
   return Object.keys(headers).some((key) => key.toLowerCase() === normalized);
+}
+
+function mutateOpenapiPath(source, apiPath, mutate) {
+  const header = `  ${apiPath}:`;
+  const start = source.indexOf(header);
+  assert.ok(start >= 0, `OpenAPI path is missing: ${apiPath}`);
+  const nextPath = source.indexOf('\n  /', start + header.length);
+  const components = source.indexOf('\ncomponents:', start + header.length);
+  const endCandidates = [nextPath, components].filter((value) => value >= 0);
+  const end = endCandidates.length ? Math.min(...endCandidates) : source.length;
+  const block = source.slice(start, end);
+  const mutatedBlock = mutate(block);
+  assert.notEqual(mutatedBlock, block, `OpenAPI path mutation did not change ${apiPath}`);
+  return `${source.slice(0, start)}${mutatedBlock}${source.slice(end)}`;
 }

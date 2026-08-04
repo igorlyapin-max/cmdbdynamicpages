@@ -3,13 +3,13 @@ import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 
-const REQUIRED_TEST_NAMES = [
-  'Designer opens on the template list with fixed menu and action bar',
-  'Designer asks for a normal Save when a recovered D2 mapping is ready but not persisted',
-  'Extraction remains usable with recovered Object Flow labels when Assistant is unavailable',
-  'About screen displays the embedded application version'
+const REQUIRED_TEST_IDS = [
+  'designer-shell',
+  'd2-recovery-save',
+  'object-flow-recovery-extraction',
+  'build-identity'
 ];
-const TEST_NAME_PATTERN = `^(${REQUIRED_TEST_NAMES.join('|')})$`;
+const TEST_NAME_PATTERN = `\\[required:(${REQUIRED_TEST_IDS.join('|')})\\]`;
 const backendLogs = [];
 
 function sendJson(response, statusCode, body, headers = {}) {
@@ -234,9 +234,9 @@ try {
   if (result.code !== 0 || result.signal) {
     throw new Error(`Required browser UI smoke failed with ${result.signal || `exit code ${result.code}`}.`);
   }
-  const passPattern = new RegExp(`pass\\s+${REQUIRED_TEST_NAMES.length}\\b`, 'i');
+  const passPattern = new RegExp(`pass\\s+${REQUIRED_TEST_IDS.length}\\b`, 'i');
   if (!passPattern.test(result.output) || /skipped\s+[1-9]\d*/i.test(result.output)) {
-    throw new Error(`Required browser UI smoke did not execute all ${REQUIRED_TEST_NAMES.length} scenarios.\n${result.output}`);
+    throw new Error(`Required browser UI smoke did not execute all ${REQUIRED_TEST_IDS.length} scenarios.\n${result.output}`);
   }
 } finally {
   if (backend && backend.exitCode === null) {

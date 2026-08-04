@@ -1,7 +1,7 @@
 ---
 title: "Design System"
 description: "Project visual identity and design system"
-version: "1.1.18"
+version: "1.1.19"
 ---
 
 # DESIGN.md
@@ -27,6 +27,26 @@ Project visual identity and design system.
 - Use tokens before inventing new values.
 - Keep components compact and status-aware.
 
+## UI Interaction Contract
+
+- Each localized surface uses one natural language for labels, actions, placeholders, help, status, validation, loading, empty, and error text. Verbatim exceptions are limited to the shared technical-token allowlist: `CMDBuild`, `D2`, `JSON`, `API`, `REST`, `URL`, `HTTP`, `MCP`, `LLM`, `LiteLLM`, `Redis`, `Spec`, `${...}`, common domain abbreviations such as `IP`, `ACL`, `VLAN`, and `SQL`, and user-authored or data identifiers such as class and attribute names, aliases, paths, and template names. Do not introduce other mixed-language prose.
+- Context help uses a fixed-size `?` icon button in a reserved slot beside its owning label or header. Help opens in a viewport-contained overlay and never expands inline; it is available on hover/focus and click/tap, has an accessible name and associated tooltip semantics, closes with `Escape`, and does not steal or lose the user's focus.
+- Disclosure headers keep the same title, indicator, and action geometry when collapsed or expanded. Content opens below the header; the indicator uses a fixed slot, and the semantic header control exposes `aria-expanded` and `aria-controls`.
+- A known finite multi-select uses a compact dropdown with checkboxes. Its bounded trigger summarizes selected labels or their count, the option list opens as an overlay, and selection never creates a growing chip row or resizes adjacent controls.
+- Catalog pickers are query-first: before a non-empty query they do not enumerate or preload catalog options. Search, loading, empty, and error results stay inside the picker overlay, and an existing selection remains visible while the query changes.
+- Expression-enabled inputs offer autocomplete only while the caret is inside `${...}`. The global diagram title exposes only template parameters; a source-bound label exposes template parameters plus readable fields of that bound source, never fields from unrelated sources. Suggestions update when the binding changes and support keyboard selection without replacing text outside the active expression.
+- Help, dropdowns, catalog results, autocomplete, async state, and selection changes must not shift surrounding layout. Reserve stable trigger and header dimensions, render overlays outside document flow, truncate or summarize variable text, and allow only intentional disclosure content to expand below its unchanged header.
+- Desktop keeps controls compact, overlays anchored to their trigger, and every workflow operable by pointer and keyboard. Mobile preserves the same capabilities in one column, keeps overlays within the viewport, avoids horizontal overflow and hover-only behavior, and uses touch targets of at least `44px`.
+- Use native or equivalent semantic buttons, checkboxes, and combobox/listbox patterns with programmatic labels, visible `focus-visible` state, logical focus order, keyboard navigation, `Escape` dismissal, focus return, screen-reader status announcements, sufficient contrast, and no state communicated by color alone.
+
+## Build Identity Contract
+
+- Root `VERSION` is the displayed release version. A container build embeds that exact file; build arguments may validate it but never replace it.
+- Every container embeds `BUILD_INFO.json` and matching OCI labels with version, Git revision, source dirty state, and provenance. Canonical CI/release builds use `verified`; an ordinary local build is explicitly `unverified-local`.
+- Build and deployment verification compare the SHA-256 of the served editor source with the current checkout or canonical build input. `--no-cache` alone is not evidence that a running container contains current code.
+- `/health/live`, response headers, startup diagnostics, and `About` expose one consistent public build identity. They never expose secrets or raw environment values.
+- Replacing a container image requires recreation of the container. A process restart against the old image id is not a deployment.
+
 ## Assistant / Diagram Ownership
 
 - `Assistant` is the authoring surface for D2 import, semantic interpretation, object-flow selection/match proposals, and selection-to-role proposals.
@@ -37,8 +57,10 @@ Project visual identity and design system.
     "version": 1,
     "assistant": {
       "objectFlowIntent": "...",
-      "diagramInterpretPrompt": "...",
-      "diagramMappingPrompt": "...",
+      "promptContractVersion": 2,
+      "diagramSemanticsPrompt": "...",
+      "diagramPlacementPrompt": "...",
+      "diagramConnectionsPrompt": "...",
       "systemPromptOverrides": {
         "objectFlow": "..."
       }
@@ -46,6 +68,16 @@ Project visual identity and design system.
     "d2": { "source": "...", "sourceHash": "..." }
   }
   ```
+- Assistant prompt contract v2 separates `diagramSemantics`, `diagramPlacement`, and `diagramConnections`. Legacy `diagramInterpretation`/`diagramMapping` and template `diagramInterpretPrompt`/`diagramMappingPrompt` are read-only migration inputs: normalization fans the old mapping prompt into placement and connections, while every subsequent Save writes only v2 fields.
+- D2 Role Notes and Placement Notes may contain one machine-readable line `materialization: structural|stage|parentCard`. Placement Notes override Role Notes. The deterministic structural model validates the hint against the visual kind and narrows `allowedMaterialization`; Assistant may choose a source but may not override the declared materialization mode. This directive is generic D2 authoring metadata, not a CMDBuild class or customer-specific convention.
+- Diagram Assistant exchanges five independently versioned, hash-addressed contracts:
+  - `DataSemanticModel` contains named deterministic Object Flow stages, dependencies, lineage, materialized card sources, classes, and fields.
+  - `D2StructuralModel` contains exact reusable roles, exact placement ids and parents, D2 connection classes, and Notes scoped by their source location.
+  - `D2SemanticModel` contains only node/container meaning and label intent for exact role ids.
+  - `D2BindingModel` contains accepted placement-to-stage materialization and hierarchy conditions. The connection stage receives this model as immutable input.
+  - `CoverageModel` reports required, mapped, and unresolved roles, containers, and connection classes. It is evidence, not a source for implicit autofill.
+- Assistant stages are ordered `semantics -> placement -> connections`. Each stage has its own system prompt and optional template prompt, accepts only the typed models needed by that stage, and passes deterministic validation before its output can become input to the next stage. Runtime execution never invokes LLM.
+- D2 `Notes` are interpreted by location: Notes on a class define reusable role semantics, Notes on a concrete element define only that placement, and Notes on a connection class or exemplar define only the connection algorithm. Notes guide selection among supplied identifiers but never create CMDBuild identifiers, relations, stages, or fields.
 - Assistant renders prompts, generation state, warnings, and explicit proposal actions only; it must not render deterministic selection, matching, class, attribute, or D2 mapping controls.
 - D2 source and Assistant prompts remain in Assistant. Pending D2 semantic and mapping proposals remain in Assistant and never replace the deterministic Diagram editor state.
 - Global Assistant system prompts remain the inherited default. A non-empty `assistant.systemPromptOverrides` value belongs to one template, overrides only that prompt for its Assistant calls, and is persisted by the normal template Save action.
@@ -65,7 +97,7 @@ Project visual identity and design system.
 - Поле сопоставления принадлежит конкретному `structureTree` placement: `stage` использует собственную карточку результата, `parentCard` — карточку ближайшего materialized parent. Динамический контейнер участвует в endpoint-сопоставлении только когда его карточка не представлена непосредственным дочерним узлом `parentCard`; в противном случае контейнер остаётся рамкой, а endpoint — дочерний узел. Копирование ветки создаёт независимое правило. Каждая D2-связь хранится один раз на `d2ClassKey` как алгоритм и задаёт только результат связи, поля source/target и методы сравнения. Runtime сопоставляет каждую сторону со всеми materialized placement-правилами, которые поддерживают соответствующий метод. Примеры стрелок D2 задают оформление, но не ограничивают бизнес-пары объектов.
 - Направление связи определяется полями результата: `source` → `target`. Редактор предоставляет только признак «Без направления»; он выводит `--`. Шаблонная стрелка D2 задает стиль, но не переопределяет направление данных.
 - «Связи иерархии» редактируют только parent-child сопоставление именованных materialized результатов Object Flow. Данные для label и structured data настраиваются в инспекторе выбранного контейнера или узла. Domain, reference и path настраиваются в «Группе объектов» или «Сопоставлении с объектами» и не редактируются повторно в Diagram. Статический контейнер не имеет источника данных; старые traversal mappings требуют ручного пересмотра, legacy не поддержана и не запланирована.
-- «Сопоставление с объектами» и «Редактор диаграмм» используют один permission-filtered catalog field picker. До поискового запроса picker не строит graph class/reference/domain; после ввода показывает только readable прямые атрибуты и подтвержденные paths в границах Runtime depth. Операции связей не имеют собственных limit или output-column controls: `executionLimits.maxRelationsPerCardDefault` и `maxRelationsPerCardMax` применяются ко всем relation reads, включая paths.
+- «Сопоставление с объектами» и «Редактор диаграмм» используют query-first catalog picker из общего UI contract. Picker является permission-filtered: до поискового запроса он не строит graph class/reference/domain, а после ввода показывает только readable прямые атрибуты и подтвержденные paths в границах Runtime depth. Операции связей не имеют собственных limit или output-column controls: `executionLimits.maxRelationsPerCardDefault` и `maxRelationsPerCardMax` применяются ко всем relation reads, включая paths.
 - Runtime materializes все readable прямые атрибуты карточек Object Flow. Compiler добавляет только явно использованные deep fields как техническую проекцию для rules, labels, hierarchy и D2 edges. Видимые колонки таблицы принадлежат только «Итоговым данным»; «Извлечение» показывает материализованные данные источника.
 - Подписи materialized результатов Object Flow являются самостоятельным детерминированным presentation contract и не зависят от доступности LLM. Только явные `assistantManaged` outputs или сохранённый `assistantOutputManifest` задают Assistant provenance; один `objectFlowIntent` не делает поток Assistant-managed. При неполном legacy provenance read-path сохраняет однозначные пользовательские подписи, создаёт нейтральные подписи для остальных результатов и оставляет «Извлечение» доступным; обычный `Сохранить` фиксирует восстановленный contract без повторного запуска Assistant.
 - `objectMatching.operations` является каноническим порядком Object Flow. `blocks` и `setOperations` остаются только синхронизированными представлениями редактора; aliases вычисляются из валидного dependency graph и обязаны соответствовать executable `steps`. Невалидный authoring сохраняется без удаления стадий, но не создаёт phantom-результаты в «Извлечении».

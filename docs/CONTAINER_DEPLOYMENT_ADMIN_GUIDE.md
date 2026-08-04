@@ -1,10 +1,12 @@
 # CMDB Dynamic Pages: container deployment handoff
 
-Статус: admin-facing deployment guide для `v0.1.0-static-baseline`.
+Статус: admin-facing deployment guide для image-only release delivery.
 
 ## Что поставляется
 
-- Backend image `cmdbdynamicpages`, tag должен совпадать с release tag, например `v0.1.0-static-baseline`.
+- Backend image `cmdbdynamicpages`, tag должен совпадать с release tag формата `vXX.YY.ZZ.NN`.
+- Verified release image содержит root `VERSION`, Git revision, `RUNTIME_SOURCE_MANIFEST.json` и OCI labels. Manifest детерминированно покрывает `src/**`, `scripts/**`, `cmd/cmdp-d2-import/**`, `go.mod`, `go.sum`, `package.json` и `VERSION`; его `runtimeManifestSha256` записан в `BUILD_INFO.json` и label `io.gkm.cmdbdynamicpages.runtime-source-manifest-sha256`.
+- `/health/live` возвращает ту же build identity, manifest digest и SHA-256 фактически исполняемого Designer.
 - Image-only compose template: `docker-compose.runtime.yml`.
 - Safe env template: `.env.example`.
 - Custom page zip artifact: `dist/cmdbdynamicpages-custompage.zip`, собирается в CI/release через `npm run build:zip`.
@@ -36,7 +38,7 @@ cp .env.example .env
 
 Заменить placeholders:
 
-- `CMDBDYNAMIC_IMAGE` - approved registry image, например `registry.example.local/gkm/cmdbdynamicpages:v0.1.0-static-baseline`;
+- `CMDBDYNAMIC_IMAGE` - approved registry image, например `registry.example.local/gkm/cmdbdynamicpages:vXX.YY.ZZ.NN`;
 - `PROXY_HOST` - bind address backend; production default `127.0.0.1`, а внешний TLS reverse proxy публикует только `CMDP_PUBLIC_ORIGIN`;
 - `CMDP_PUBLIC_ORIGIN` - canonical public `http(s)` origin для browser, CMDBuild UI, custom page и custom API; не содержит path, query, fragment или credentials;
 - `CMDP_NGINX_PUBLIC_HOST` - canonical `host[:port]` из `CMDP_PUBLIC_ORIGIN`, который bundled nginx передает как `Host` и `X-Forwarded-Host`;
@@ -52,6 +54,7 @@ cp .env.example .env
 - `CMDP_ASSISTANT_ENABLED` - deprecated/no-op compatibility variable; фактическое включение Designer draft assistant хранится в `Cst_QueryToolConfig.RuntimeConfigJson.assistant.llm.enabled`;
 - `LITELLM_BASE_URL`, `LITELLM_MODEL`, `LITELLM_API_KEY_FILE_HOST` - optional LiteLLM assistant endpoint/model/API-key secret file. Leave `LITELLM_API_KEY_FILE_HOST` empty when Assistant is unused: compose mounts `/dev/null`. When Assistant is enabled, the host path must already be a readable regular file; do not create a directory at the secret path;
 - `CMDP_LITELLM_ALLOWED_BASE_URLS` - server-side allowlist для LiteLLM-compatible endpoints; RuntimeConfig baseUrl не должен выводить API key за этот список;
+- `CMDP_ASSISTANT_LLM_MAX_REQUEST_BYTES_ABSOLUTE` и `CMDP_ASSISTANT_LLM_MAX_RESPONSE_BYTES_ABSOLUTE` - deployment ceilings для LiteLLM request/response, defaults `2097152` и `4194304` bytes. Настройки `Cst_QueryToolConfig.RuntimeConfigJson.assistant.llm.maxRequestBytes` (default `524288`) и `assistant.llm.maxResponseBytes` (default `1048576`) могут быть ниже, но server-side clamp не позволяет превысить absolute caps;
 - `Cst_QueryToolConfig.RuntimeConfigJson.assistant.mcp` - runtime-настройки read-only MCP tools для Designer Assistant; secrets здесь не хранить;
 - `CMDP_D2_RENDER_ENABLED`, `CMDP_D2_BINARY`, `CMDP_D2_TIMEOUT_MS`, `CMDP_D2_MAX_INPUT_BYTES`, `CMDP_D2_MAX_OUTPUT_BYTES`, `CMDP_D2_MAX_DIAGRAMS`, `CMDP_D2_CONCURRENCY`, `CMDP_D2_LAYOUT`, `CMDP_D2_LAYOUT_ALLOWLIST` - обязательный по умолчанию server-side D2 SVG render. В штатном image binary уже лежит в `/usr/local/bin/d2`; при `CMDP_D2_RENDER_ENABLED=true` `/health/ready` требует рабочий binary;
 - `CMDP_D2_IMPORT_BINARY`, `CMDP_D2_IMPORT_TIMEOUT_MS`, `CMDP_D2_IMPORT_MAX_INPUT_BYTES`, `CMDP_D2_IMPORT_MAX_OUTPUT_BYTES`, `CMDP_D2_IMPORT_MAX_ELEMENTS`, `CMDP_D2_IMPORT_PROPOSAL_TTL_MS`, `CMDP_D2_IMPORT_ASSISTANT_MAX_SPEC_BYTES`, `CMDP_D2_IMPORT_ASSISTANT_CHECKPOINT_MAX_BYTES`, `CMDP_TEMPLATE_REQUEST_MAX_BYTES` - bounded import self-contained `.d2` в Designer. Штатный image содержит `/usr/local/bin/cmdp-d2-import`; readiness проверяет parser helper отдельно. Proposal подписан, привязан к CMDBuild session/template version и по умолчанию действует 30 минут. Перед LiteLLM raw D2 source/structural IR и composite template удаляются, размер sanitized spec ограничен. `CMDP_D2_IMPORT_ASSISTANT_CHECKPOINT_MAX_BYTES` ограничивает и authoring checkpoint, и server-side resumable mapping checkpoint; превышение очищает mapping checkpoint и возвращает `413 assistant_diagram_mapping_checkpoint_too_large`. После reload checkpoints переаттестуются без LLM и не содержат runtime payload. Общий body limit Preview/Create/Update должен вмещать разрешённые source и normalized IR. Raw D2 source и CMDBuild payload не должны попадать в operational logs;
@@ -61,6 +64,8 @@ cp .env.example .env
 `replace-me`, `registry.example.local`, `cmdbuild.example.local`, `redis.example.local`, `litellm.example.local` и `syslog.example.local` не являются рабочими значениями. Real `.env` файлы не коммитить.
 
 `redis://` для local и уже существующих deployment остается поддержанным. В production backend запускается, но пишет runtime warning `redis_plaintext_transport`; для нового production deployment использовать `rediss://` и при private CA предоставить `CMDBDYNAMIC_REDIS_TLS_CA_FILE` через approved read-only mount или image trust.
+
+В LiteLLM могут передаваться authoring literals, введённые в Assistant prompts, filters, D2 Notes, templates и mapping rules. Runtime rows, resolved parameter values, CMDBuild cards и raw D2 source автоматически не отправляются; они попадут в запрос только если пользователь явно включит их в authoring text.
 
 Перед запуском с включенным Assistant проверить secret mount без вывода ключа:
 
@@ -91,12 +96,34 @@ docker compose --env-file .env -f docker-compose.nginx.yml config
 
 Compose template не содержит `build:` и использует только prebuilt `image:`.
 
+`docker compose build --no-cache` с этим template не собирает backend. `--no-cache` управляет только повторным использованием слоёв во время реального `docker build` и не обновляет существующий container.
+
+### Контролируемая local-сборка
+
+Production deployment использует опубликованный CI image. Local source build допустим для разработки и incident recovery. Канонический helper вычисляет manifest по полному runtime source contract, передает его digest в Docker build и после сборки сравнивает весь embedded manifest с checkout.
+
+Cross-platform build из checkout с Git metadata:
+
+```bash
+npm run container:build -- --tag cmdbdynamicpages:local --no-cache
+npm run container:verify -- --image cmdbdynamicpages:local
+```
+
+Обычная local-сборка получает provenance `unverified-local` и фактический dirty state. Только canonical helper mode `--require-clean` и CI формируют `verified` image. Strict mode до build отклоняет dirty checkout, а verification после build требует одновременно clean checkout, provenance `verified` и image `dirty=false`:
+
+```bash
+npm run container:build -- --tag cmdbdynamicpages:verified-local --require-clean
+npm run container:verify -- --image cmdbdynamicpages:verified-local --require-clean
+```
+
+Прямой `docker build .` не является provenance path: Dockerfile требует согласованные `APP_VERSION` и `RUNTIME_MANIFEST_SHA256`, поэтому используйте helper. Не присваивайте `BUILD_PROVENANCE=verified` вручную. Customer release принимается из approved registry по image digest. Node, Go и GitLab Docker base images также закреплены immutable SHA-256 digest; их обновление выполняется отдельным проверяемым изменением CI/Dockerfile.
+
 ## Запуск и остановка
 
 ```bash
 docker login <approved-registry>
 docker compose --env-file .env -f docker-compose.runtime.yml pull
-docker compose --env-file .env -f docker-compose.runtime.yml up -d
+docker compose --env-file .env -f docker-compose.runtime.yml up -d --force-recreate
 docker compose --env-file .env -f docker-compose.runtime.yml ps
 ```
 
@@ -110,7 +137,7 @@ Rollback:
 
 1. Вернуть `CMDBDYNAMIC_IMAGE` в `.env` на предыдущий approved tag.
 2. Выполнить `docker compose --env-file .env -f docker-compose.runtime.yml pull`.
-3. Выполнить `docker compose --env-file .env -f docker-compose.runtime.yml up -d`.
+3. Выполнить `docker compose --env-file .env -f docker-compose.runtime.yml up -d --force-recreate`.
 4. Повторить health/metrics checks.
 
 ## Health, metrics и логи
@@ -122,6 +149,16 @@ curl -fsS http://127.0.0.1:8093/health/redis
 curl -fsS http://127.0.0.1:8093/metrics
 docker logs --tail=100 cmdbdynamicpages-backend
 ```
+
+После deploy сравнить выбранный image и реально запущенный container:
+
+```bash
+docker compose --env-file .env -f docker-compose.runtime.yml config --images
+docker inspect cmdbdynamicpages-backend --format 'configured={{.Config.Image}} running={{.Image}} started={{.State.StartedAt}}'
+npm run container:verify -- --image "$(docker compose --env-file .env -f docker-compose.runtime.yml config --images | head -n 1)" --container cmdbdynamicpages-backend
+```
+
+`container:verify` сравнивает не отдельный entrypoint, а полный canonical `RUNTIME_SOURCE_MANIFEST.json`, его digest в `BUILD_INFO.json`, OCI label и, при `--container`, файлы реально запущенного container. Поле `build.runtimeManifestSha256` в `/health/live` должно совпадать с image metadata; поля `build.version`, `build.revision`, `build.provenance` и `build.editorSha256` также должны совпадать с меню «О программе» и соответствующими HTTP headers `X-CMDP-*`. Если checkout, image и container имеют разные manifest/Designer SHA-256, проблема находится до reverse proxy. Если они совпадают, а public UI отличается, проверить routing внешнего proxy и открыть новую вкладку: Designer отвечает с `Cache-Control: no-store`, но уже открытая SPA продолжает исполнять ранее загруженный JavaScript.
 
 Ожидания:
 

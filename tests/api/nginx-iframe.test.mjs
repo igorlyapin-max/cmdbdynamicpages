@@ -54,6 +54,10 @@ test('nginx health route reaches cmdbdynamicpages backend', { skip: skipWhenUnav
   const json = JSON.parse(result.body || '{}');
   assert.equal(json.service, 'cmdbdynamicpages');
   assert.equal(json.live, true);
+  assert.equal(result.headers['x-cmdp-version'], json.build.version);
+  assert.equal(result.headers['x-cmdp-revision'], json.build.revision);
+  assert.equal(result.headers['x-cmdp-provenance'], json.build.provenance);
+  assert.equal(result.headers['x-cmdp-editor-sha256'], json.build.editorSha256);
 });
 
 test('dynamicpages runtime route is iframe-compatible through nginx origin', { skip: skipWhenUnavailable }, async () => {

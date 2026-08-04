@@ -5,16 +5,21 @@ import vm from 'node:vm';
 
 const launcherSource = fs.readFileSync('src/CmdbDynamicPages.js', 'utf8');
 const proxySource = fs.readFileSync('scripts/dev-proxy-server.mjs', 'utf8');
+const buildIdentitySource = fs.readFileSync('scripts/build-identity.mjs', 'utf8');
 const envExampleSource = fs.readFileSync('.env.example', 'utf8');
 const nginxSource = fs.readFileSync('nginx/cmdbdynamicpages.conf', 'utf8');
 
-test('About screen receives the embedded application version', () => {
-  assert.match(proxySource, /const APPLICATION_VERSION_FALLBACK = '0\.0\.0\.0';/);
-  assert.match(proxySource, /const APPLICATION_VERSION = readApplicationVersion\(\);/);
+test('About screen receives the embedded application build identity', () => {
+  assert.match(buildIdentitySource, /const APPLICATION_VERSION_FALLBACK = '0\.0\.0\.0';/);
+  assert.match(proxySource, /const APPLICATION_BUILD_IDENTITY = readApplicationBuildIdentity\(\);/);
   assert.match(proxySource, /appVersion: APPLICATION_VERSION/);
+  assert.match(proxySource, /build: APPLICATION_BUILD/);
   assert.match(proxySource, /appVersion: 'Version'/);
   assert.match(proxySource, /appVersion: 'Версия'/);
   assert.match(proxySource, /data-app-version/);
+  assert.match(proxySource, /data-app-revision/);
+  assert.match(proxySource, /data-app-provenance/);
+  assert.match(proxySource, /data-app-editor-sha256/);
 });
 
 test('Assistant browser deadline follows the configured MCP timeout with backend response grace', () => {
@@ -138,13 +143,16 @@ function generatedDynamicPagesClientScript() {
     'D2_IMPORT_STRUCTURE_TREE_VERSION',
     'D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION',
     'D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION',
+    'ASSISTANT_PROMPT_CONTRACT_VERSION',
+    'DEFAULT_ASSISTANT_SYSTEM_PROMPT',
     'DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT',
     'DEFAULT_ASSISTANT_OBJECT_FLOW_SEMANTIC_PROMPT',
-    'DEFAULT_ASSISTANT_DIAGRAM_INTERPRETATION_PROMPT',
-    'DEFAULT_ASSISTANT_DIAGRAM_MAPPING_PROMPT',
+    'DEFAULT_ASSISTANT_DIAGRAM_SEMANTICS_PROMPT',
+    'DEFAULT_ASSISTANT_DIAGRAM_PLACEMENT_PROMPT',
+    'DEFAULT_ASSISTANT_DIAGRAM_CONNECTIONS_PROMPT',
     factorySource
   );
-  return factory('empty result', 'permission denied', 3600, 10, 1, 5, 1, 1, 'object flow prompt', 'semantic plan prompt', 'diagram interpretation prompt', 'diagram mapping prompt')();
+  return factory('empty result', 'permission denied', 3600, 10, 1, 5, 1, 2, 2, 'assistant system prompt', 'object flow prompt', 'semantic plan prompt', 'diagram semantics prompt', 'diagram placement prompt', 'diagram connections prompt')();
 }
 
 test('generated Dynamic Pages client script parses as browser JavaScript', () => {
@@ -1236,7 +1244,8 @@ test('typed assistant flow renders one in-progress proposal before deterministic
   assert.match(renderSource, /assistant-flow-disclosure/);
   assert.match(renderSource, /assistant-flow-business-actions/);
   assert.match(renderSource, /assistantObjectFlowDependencyDiagnostics/);
-  assert.match(renderSource, /assistantFlowVisualOrderWarning/);
+  assert.match(proxySource, /function renderAssistantFlowDependencyNotice\(dependencyDiagnostics\)/);
+  assert.match(proxySource, /assistantFlowVisualOrderWarning/);
   assert.doesNotMatch(renderSource, /assistant-flow-block-up/);
   assert.doesNotMatch(renderSource, /assistant-flow-block-down/);
   assert.match(renderSource, /assistant-flow-generate/);
@@ -1481,7 +1490,7 @@ test('diagram editor renders repeatable mapping tables with source-dependent fie
   assert.match(proxySource, /diagramGeneralSettings: 'General diagram settings'/);
   assert.match(proxySource, /diagramGeneralSettings: 'Общие настройки диаграммы'/);
   assert.match(proxySource, /diagramAddMapping: 'Add mapping'/);
-  assert.match(proxySource, /diagramAddMapping: 'Добавить mapping'/);
+  assert.match(proxySource, /diagramAddMapping: 'Добавить сопоставление'/);
   assert.match(proxySource, /diagramMappingSourceRequired/);
   assert.match(proxySource, /var primaryCardSource = normalizeDiagramImportConditionCardSourceClient\(primary\.cardSource\);/);
   assert.match(proxySource, /\.\.\.\(primaryCardSource \? \{ cardSource: primaryCardSource \} : \{\}\)/);
@@ -2155,6 +2164,49 @@ test('catalog field pickers load attributes only after a search and retry transi
   assert.match(refreshSource, /if \(!query\) \{/);
   assert.match(refreshSource, /ensureCatalogFieldPickerSearchAttributes\(picker, query\)/);
   assert.doesNotMatch(ensureSource, /catch\(function \(error\) \{\s*state\.catalogAttributeLoaded\[key\] = true/);
+});
+
+test('shared authoring controls keep localized, stable, and compact UI contracts', () => {
+  const numberSettingStart = proxySource.indexOf('function renderNumberSetting(id, labelKey, helpKey, value, options)');
+  const numberSettingEnd = proxySource.indexOf('function assistantConfigForEditor(config)', numberSettingStart);
+  const compactStart = proxySource.indexOf('function renderCompactMultiSelect(fieldAttribute, selectedValues, items, options)');
+  const compactEnd = proxySource.indexOf('function catalogFieldPickerOptions(picker, query)', compactStart);
+  const collapsedStart = proxySource.indexOf('function renderCollapsedObjectGroupSelection(selection, index, spec)');
+  const collapsedEnd = proxySource.indexOf('function renderObjectGroupSelection(selection, index, spec, expanded, selections)', collapsedStart);
+  const diagramTitleStart = proxySource.indexOf('function renderDiagramEditor(spec, outputMode, options)');
+  const diagramTitleEnd = proxySource.indexOf('function renderVisualizationTableRow(table, settings, spec)', diagramTitleStart);
+  assert.ok(numberSettingStart > -1 && numberSettingEnd > numberSettingStart);
+  assert.ok(compactStart > -1 && compactEnd > compactStart);
+  assert.ok(collapsedStart > -1 && collapsedEnd > collapsedStart);
+  assert.ok(diagramTitleStart > -1 && diagramTitleEnd > diagramTitleStart);
+
+  const numberSettingSource = proxySource.slice(numberSettingStart, numberSettingEnd);
+  const compactSource = proxySource.slice(compactStart, compactEnd);
+  const collapsedSource = proxySource.slice(collapsedStart, collapsedEnd);
+  const diagramTitleSource = proxySource.slice(diagramTitleStart, diagramTitleEnd);
+  const russianLocaleSource = proxySource.slice(proxySource.indexOf('    ru: {'), proxySource.indexOf('  function t(key, vars)'));
+  assert.match(russianLocaleSource, /menuRuntimeSettings: 'Настройки выполнения'/);
+  assert.doesNotMatch(russianLocaleSource, /Runtime-настройки|draft generation/);
+  assert.match(numberSettingSource, /class="field-help-button"/);
+  assert.match(numberSettingSource, /role="tooltip"/);
+  assert.match(numberSettingSource, /aria-describedby/);
+  assert.doesNotMatch(numberSettingSource, /class="muted"/);
+  assert.match(compactSource, /<select multiple hidden data-compact-multi-select-value/);
+  assert.match(compactSource, /type="checkbox" data-compact-multi-select-option/);
+  assert.match(compactSource, /compactMultiSelectSummary/);
+  assert.match(proxySource, /if \(target\.matches\('\[data-diagram-import-endpoint-profile-field="label"\]'\)\) \{\s*return;\s*\}/);
+  assert.match(proxySource, /fieldPickerPrompt: 'Введите минимум 1 символ для поиска\.'/);
+  assert.match(proxySource, /fieldPickerSearch: 'Поиск по имени, описанию или пути'/);
+  assert.match(proxySource, /function renderCatalogFieldPickerRows[\s\S]*t\('fieldPickerNoMatches'\)/);
+  assert.doesNotMatch(proxySource.slice(proxySource.indexOf('function renderCatalogFieldPickerRows'), proxySource.indexOf('function compactMultiSelectSummary')), />Ничего не найдено\.|>Введите минимум 1 символ|>Добавить поле</);
+  assert.match(collapsedSource, /object-selection-summary-kind/);
+  assert.match(collapsedSource, /object-selection-summary-name/);
+  assert.match(collapsedSource, /object-selection-summary-meta/);
+  assert.match(collapsedSource, /objectSelectionRulesCount/);
+  assert.doesNotMatch(collapsedSource, /addObjectGroupRule/);
+  assert.match(diagramTitleSource, /data-diagram-template-expression="params"/);
+  assert.doesNotMatch(diagramTitleSource, /renderDiagramTemplateSuggestions\(spec, ''\)/);
+  assert.match(proxySource, /matches\('\[data-diagram-template-expression="params"\]'\)/);
 });
 
 test('object group editor uses one right expression for literals, parameters, and previous-result fields', () => {

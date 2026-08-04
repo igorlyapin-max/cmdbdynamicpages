@@ -1,6 +1,11 @@
-ARG APP_VERSION=00.00.00.00
+ARG APP_VERSION=unknown
+ARG VCS_REF=unknown
+ARG SOURCE_DIRTY=unknown
+ARG BUILD_PROVENANCE=unverified-local
+ARG RUNTIME_MANIFEST_SHA256=unknown
+ARG SOURCE_URL=https://github.com/igorlyapin-max/cmdbdynamicpages
 
-FROM node:20-alpine AS d2
+FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS d2
 
 ARG D2_VERSION=0.7.1
 ARG TARGETARCH
@@ -20,12 +25,17 @@ RUN set -eux; \
   install -m 0755 "/tmp/d2-v${D2_VERSION}/bin/d2" /usr/local/bin/d2; \
   /usr/local/bin/d2 --version
 
-FROM golang:1.24-alpine AS d2-import-builder
+FROM golang:1.25.11-alpine@sha256:523c3effe300580ed375e43f43b1c9b091b68e935a7c3a92bfcc4e7ed55b18c2 AS d2-import-builder
 
 WORKDIR /src
 
 COPY go.mod go.sum ./
-RUN go mod download
+RUN set -eu; \
+  for attempt in 1 2 3; do \
+    if go mod download; then exit 0; fi; \
+    if [ "$attempt" -lt 3 ]; then sleep "$((attempt * 3))"; fi; \
+  done; \
+  exit 1
 
 COPY cmd/cmdp-d2-import ./cmd/cmdp-d2-import
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/cmdp-d2-import ./cmd/cmdp-d2-import
@@ -34,9 +44,30 @@ FROM d2-import-builder AS d2-import-test
 
 RUN go test ./cmd/cmdp-d2-import
 
-FROM node:20-alpine
+FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS runtime-source-manifest
+
+ARG RUNTIME_MANIFEST_SHA256
+
+WORKDIR /source
+
+COPY src ./src
+COPY scripts ./scripts
+COPY cmd/cmdp-d2-import ./cmd/cmdp-d2-import
+COPY go.mod go.sum package.json VERSION ./
+
+RUN node scripts/build-identity.mjs manifest \
+  --root /source \
+  --output /out/RUNTIME_SOURCE_MANIFEST.json \
+  --expect-sha256 "$RUNTIME_MANIFEST_SHA256"
+
+FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293
 
 ARG APP_VERSION
+ARG VCS_REF
+ARG SOURCE_DIRTY
+ARG BUILD_PROVENANCE
+ARG RUNTIME_MANIFEST_SHA256
+ARG SOURCE_URL
 
 ENV NODE_ENV=production \
     PROXY_HOST=127.0.0.1 \
@@ -48,13 +79,46 @@ ENV NODE_ENV=production \
 
 WORKDIR /app
 
+LABEL org.opencontainers.image.title="cmdbdynamicpages" \
+      org.opencontainers.image.source="${SOURCE_URL}" \
+      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      io.gkm.cmdbdynamicpages.provenance="${BUILD_PROVENANCE}" \
+      io.gkm.cmdbdynamicpages.source-dirty="${SOURCE_DIRTY}" \
+      io.gkm.cmdbdynamicpages.runtime-source-manifest-sha256="${RUNTIME_MANIFEST_SHA256}"
+
 COPY --from=d2 --chown=node:node /usr/local/bin/d2 /usr/local/bin/d2
 COPY --from=d2-import-builder --chown=node:node /out/cmdp-d2-import /usr/local/bin/cmdp-d2-import
+COPY --from=runtime-source-manifest --chown=node:node /source/VERSION ./VERSION
+COPY --from=runtime-source-manifest --chown=node:node /out/RUNTIME_SOURCE_MANIFEST.json ./RUNTIME_SOURCE_MANIFEST.json
 RUN set -eu; \
-  printf '%s\n' "$APP_VERSION" | grep -Ex '[0-9]{2}\.[0-9]{2}\.[0-9]{2}\.[0-9]{2}' > ./VERSION
-COPY --chown=node:node package.json ./
-COPY --chown=node:node src ./src
-COPY --chown=node:node scripts ./scripts
+  file_version="$(tr -d '\r\n' < ./VERSION)"; \
+  printf '%s\n' "$file_version" | grep -Ex '[0-9]{2}\.[0-9]{2}\.[0-9]{2}\.[0-9]{2}' >/dev/null; \
+  test "$file_version" != '00.00.00.00'; \
+  printf '%s\n' "$file_version" > ./VERSION; \
+  if [ "$APP_VERSION" != "$file_version" ]; then \
+    echo "APP_VERSION $APP_VERSION does not match VERSION $file_version" >&2; \
+    exit 1; \
+  fi; \
+  if [ "$VCS_REF" != 'unknown' ]; then \
+    printf '%s\n' "$VCS_REF" | grep -Ex '[0-9a-f]{40}' >/dev/null; \
+  fi; \
+  case "$SOURCE_DIRTY" in true|false|unknown) ;; *) echo 'SOURCE_DIRTY must be true, false, or unknown' >&2; exit 1 ;; esac; \
+  case "$BUILD_PROVENANCE" in verified|unverified-local) ;; *) echo 'BUILD_PROVENANCE must be verified or unverified-local' >&2; exit 1 ;; esac; \
+  printf '%s\n' "$RUNTIME_MANIFEST_SHA256" | grep -Ex '[0-9a-f]{64}' >/dev/null; \
+  actual_manifest_sha256="$(sha256sum ./RUNTIME_SOURCE_MANIFEST.json | cut -d ' ' -f 1)"; \
+  test "$actual_manifest_sha256" = "$RUNTIME_MANIFEST_SHA256"; \
+  if [ "$BUILD_PROVENANCE" = 'verified' ]; then \
+    test "$APP_VERSION" = "$file_version"; \
+    test "$VCS_REF" != 'unknown'; \
+    test "$SOURCE_DIRTY" = 'false'; \
+  fi; \
+  if [ "$SOURCE_DIRTY" = 'unknown' ]; then dirty_json='null'; else dirty_json="$SOURCE_DIRTY"; fi; \
+  printf '{"version":"%s","revision":"%s","dirty":%s,"provenance":"%s","runtimeManifestSha256":"%s"}\n' \
+    "$file_version" "$VCS_REF" "$dirty_json" "$BUILD_PROVENANCE" "$RUNTIME_MANIFEST_SHA256" > ./BUILD_INFO.json
+COPY --from=runtime-source-manifest --chown=node:node /source/package.json ./
+COPY --from=runtime-source-manifest --chown=node:node /source/src ./src
+COPY --from=runtime-source-manifest --chown=node:node /source/scripts ./scripts
 
 USER node
 

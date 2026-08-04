@@ -23,8 +23,8 @@ tags:
   - name: assistant
     description: >
       API authoring-предложений. Assistant формирует object-flow, D2
-      interpretation и selection-to-role предложения; ответы не сохраняют
-      шаблон. Legacy `/assistant/template-draft`,
+      interpretation, structure-tree placement и topology предложения; ответы
+      не сохраняют шаблон. Legacy `/assistant/template-draft`,
       `/assistant/diagram-import/complete` и
       `/templates/{code}/assistant-draft` не поддержаны и не запланированы;
       последний route возвращает 410.
@@ -42,6 +42,15 @@ paths:
       responses:
         "200":
           description: Backend process is alive
+          headers:
+            X-CMDP-Version:
+              $ref: "#/components/headers/CmdpVersion"
+            X-CMDP-Revision:
+              $ref: "#/components/headers/CmdpRevision"
+            X-CMDP-Provenance:
+              $ref: "#/components/headers/CmdpProvenance"
+            X-CMDP-Editor-SHA256:
+              $ref: "#/components/headers/CmdpEditorSha256"
           content:
             application/json:
               schema:
@@ -55,12 +64,30 @@ paths:
       responses:
         "200":
           description: Redis is available
+          headers:
+            X-CMDP-Version:
+              $ref: "#/components/headers/CmdpVersion"
+            X-CMDP-Revision:
+              $ref: "#/components/headers/CmdpRevision"
+            X-CMDP-Provenance:
+              $ref: "#/components/headers/CmdpProvenance"
+            X-CMDP-Editor-SHA256:
+              $ref: "#/components/headers/CmdpEditorSha256"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/RedisHealth"
         "503":
           description: Redis is unavailable or disabled
+          headers:
+            X-CMDP-Version:
+              $ref: "#/components/headers/CmdpVersion"
+            X-CMDP-Revision:
+              $ref: "#/components/headers/CmdpRevision"
+            X-CMDP-Provenance:
+              $ref: "#/components/headers/CmdpProvenance"
+            X-CMDP-Editor-SHA256:
+              $ref: "#/components/headers/CmdpEditorSha256"
   /health/ready:
     get:
       tags: [health]
@@ -70,12 +97,30 @@ paths:
       responses:
         "200":
           description: Backend is ready
+          headers:
+            X-CMDP-Version:
+              $ref: "#/components/headers/CmdpVersion"
+            X-CMDP-Revision:
+              $ref: "#/components/headers/CmdpRevision"
+            X-CMDP-Provenance:
+              $ref: "#/components/headers/CmdpProvenance"
+            X-CMDP-Editor-SHA256:
+              $ref: "#/components/headers/CmdpEditorSha256"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ReadyHealth"
         "503":
           description: Backend is not ready
+          headers:
+            X-CMDP-Version:
+              $ref: "#/components/headers/CmdpVersion"
+            X-CMDP-Revision:
+              $ref: "#/components/headers/CmdpRevision"
+            X-CMDP-Provenance:
+              $ref: "#/components/headers/CmdpProvenance"
+            X-CMDP-Editor-SHA256:
+              $ref: "#/components/headers/CmdpEditorSha256"
   /metrics:
     get:
       tags: [health]
@@ -677,27 +722,69 @@ paths:
       responses:
         "200":
           description: Structural IR and merge proposal
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportAnalyzeResponse"
+        "400":
+          description: Request body or D2 source is invalid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportErrorResponse"
         "401":
           description: CMDBuild session is invalid or expired
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportErrorResponse"
         "403":
           description: CSRF validation failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportErrorResponse"
         "413":
           description: Configured source, output, or element limit reached
-        "429":
-          description: D2 analysis execution throttle reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportErrorResponse"
+        "415":
+          description: Request content type is not application/json
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportErrorResponse"
         "422":
           description: D2 parse, compile, or import validation failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportErrorResponse"
+        "429":
+          description: D2 analysis execution throttle reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportErrorResponse"
+        "502":
+          description: D2 helper output or CMDBuild catalog is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportErrorResponse"
   /cmdbuild/custom-api/draft/diagram-import/apply:
     post:
       tags: [templates]
-      summary: Apply reviewed D2 class-role mappings to an editor draft
+      summary: Apply reviewed D2 structure mappings to an editor draft
       description: >
         Diagram-owned deterministic apply stage. Принимает только явно
-        проверенные role settings и selection mappings, возвращает новый
-        валидный local draft Spec JSON и не вызывает LLM, не сохраняет и не
-        публикует шаблон, не создаёт версию CMDB и не инвалидирует runtime/static
-        cache. D2 Update использует тот же local contract. Нужны читаемый
-        шаблон и совпадающая CAS revision из proposal, но не update permission.
+        проверенные node/container роли, item-owned structureTree mappings и
+        connection rules, возвращает новый валидный local draft Spec JSON и не
+        вызывает LLM, не сохраняет и не публикует шаблон, не создаёт версию CMDB
+        и не инвалидирует runtime/static cache. Нужны читаемый шаблон и
+        совпадающая CAS revision из proposal, но не update permission.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -710,16 +797,64 @@ paths:
       responses:
         "200":
           description: Validated editor Spec JSON
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportApplyResponse"
+        "400":
+          description: Request body or current D2 source is invalid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportErrorResponse"
         "401":
           description: CMDBuild session is invalid or expired
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportErrorResponse"
         "403":
           description: Не пройдена CSRF-проверка или шаблон недоступен для чтения
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportErrorResponse"
         "409":
           description: Editor draft, saved template, source, or signed proposal changed after D2 analysis
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportErrorResponse"
+        "413":
+          description: Request or normalized mapping exceeds a configured authoring limit
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportErrorResponse"
+        "415":
+          description: Request content type is not application/json
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportErrorResponse"
+        "422":
+          description: Structure mappings or relation rules are unresolved, or the result spec is invalid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportErrorResponse"
         "429":
           description: Authoring execution throttle reached
-        "422":
-          description: Role mappings or relation rules are unresolved, or the result spec is invalid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportErrorResponse"
+        "502":
+          description: CMDBuild catalog is unavailable for deterministic mapping validation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportErrorResponse"
   /cmdbuild/custom-api/assistant/diagram-import/interpret:
     post:
       tags: [assistant]
@@ -745,31 +880,83 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramImportInterpretResponse"
+        "400":
+          description: Request body or Assistant input is invalid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "401":
           description: CMDBuild session is invalid or expired
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "403":
           description: Не пройдена CSRF-проверка или шаблон недоступен для чтения
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "409":
           description: Saved template, source, or signed proposal changed after D2 analysis
-        "429":
-          description: Authoring execution throttle reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
+        "413":
+          description: Request or sanitized Assistant context exceeds a configured limit
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
+        "415":
+          description: Request content type is not application/json
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "422":
           description: Assistant semantic proposal failed deterministic validation
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/AssistantDiagramImportInterpretResponse"
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
+        "429":
+          description: Authoring execution throttle reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
+        "502":
+          description: LiteLLM or an upstream Assistant dependency failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "503":
           description: Assistant is disabled or LiteLLM is not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
+        "504":
+          description: Assistant request exceeded the configured stage timeout
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
   /cmdbuild/custom-api/assistant/diagram-import/map-selections:
     post:
       tags: [assistant]
-      summary: Propose object-flow sources for imported D2 roles
+      summary: Propose staged D2 placement and topology mappings
       description: >
-        Authoring-only LLM proposal. Eligible sources include every object-flow
-        selection and every intermediate match stage. Returned mappings remain
-        proposals until the editor reviews them and explicitly applies the
-        deterministic settings in the Diagram-owned draft.
+        Authoring-only LLM proposal. Stage roles maps each structureTree item to
+        structural, stage, or parentCard materialization. When connections need
+        mapping, HTTP 202 returns a checkpoint and stage topology resumes with
+        the same resumeId while preserving accepted placements. Eligible sources
+        include every object-flow selection and intermediate match stage.
+        Returned mappings remain proposals until explicit deterministic Apply.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -781,27 +968,83 @@ paths:
               $ref: "#/components/schemas/AssistantDiagramImportMapSelectionsRequest"
       responses:
         "200":
-          description: Selection-to-role mapping proposals
+          description: Completed placement and topology mapping proposal
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramImportMapSelectionsResponse"
+        "202":
+          description: Placement mappings accepted and resumable topology stage is pending
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramImportMapCheckpointResponse"
+        "400":
+          description: Request body, stage, or resumeId is invalid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "401":
           description: CMDBuild session is invalid or expired
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "403":
           description: Не пройдена CSRF-проверка или шаблон недоступен для чтения
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "409":
-          description: Editor flow, saved template, source, or signed proposal changed
-        "429":
-          description: Authoring execution throttle reached
+          description: Editor flow, source, proposal, checkpoint input, or requested resume stage changed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
+        "413":
+          description: Request, sanitized model context, or resumable checkpoint exceeds a configured limit
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
+        "415":
+          description: Request content type is not application/json
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "422":
           description: Assistant mapping proposal failed deterministic validation
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/AssistantDiagramImportMapSelectionsResponse"
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
+        "429":
+          description: Authoring execution throttle reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
+        "502":
+          description: CMDBuild catalog, LiteLLM, or another upstream dependency failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "503":
           description: Assistant is disabled or LiteLLM is not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
+        "504":
+          description: Current mapping stage exceeded its configured timeout and may be resumed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
   /cmdbuild/custom-api/draft/preview:
     post:
       tags: [templates]
@@ -819,6 +1062,25 @@ paths:
         "200":
           description: Preview result
 components:
+  headers:
+    CmdpVersion:
+      description: Application version embedded in the running image.
+      schema:
+        type: string
+    CmdpRevision:
+      description: Full Git revision embedded in the running image, or unknown for an unverified local build.
+      schema:
+        type: string
+    CmdpProvenance:
+      description: Build provenance established by the canonical build path.
+      schema:
+        type: string
+        enum: [verified, unverified-local]
+    CmdpEditorSha256:
+      description: SHA-256 of the editor backend source served by this process.
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{64}$'
   securitySchemes:
     cmdbuildCookie:
       type: apiKey
@@ -1289,7 +1551,6 @@ components:
           type: string
           enum: ["2.0"]
         id:
-          nullable: true
           oneOf:
             - type: integer
             - type: string
@@ -1307,7 +1568,6 @@ components:
           type: string
           enum: ["2.0"]
         id:
-          nullable: true
           oneOf:
             - type: integer
             - type: string
@@ -1368,13 +1628,34 @@ components:
         confirm:
           type: boolean
           description: UI confirmation that bootstrap may create only missing classes/attributes and must not move/delete existing objects.
-    LiveHealth:
+    BuildIdentity:
       type: object
-      required: [service, status, live]
+      required: [version, revision, dirty, provenance, editorSha256]
+      properties:
+        version:
+          type: string
+          pattern: '^(0\.0\.0\.0|[0-9]{2}\.[0-9]{2}\.[0-9]{2}\.[0-9]{2})$'
+        revision:
+          type: string
+          pattern: '^(unknown|[0-9a-f]{40})$'
+        dirty:
+          type: boolean
+          nullable: true
+        provenance:
+          type: string
+          enum: [verified, unverified-local]
+        editorSha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+    HealthBase:
+      type: object
+      required: [service, build, timestamp, startedAt, uptimeSec, pid]
       properties:
         service:
           type: string
           example: cmdbdynamicpages
+        build:
+          $ref: "#/components/schemas/BuildIdentity"
         timestamp:
           type: string
           format: date-time
@@ -1385,11 +1666,17 @@ components:
           type: integer
         pid:
           type: integer
-        status:
-          type: string
-          example: live
-        live:
-          type: boolean
+    LiveHealth:
+      allOf:
+        - $ref: "#/components/schemas/HealthBase"
+        - type: object
+          required: [status, live]
+          properties:
+            status:
+              type: string
+              example: live
+            live:
+              type: boolean
     RedisStatus:
       type: object
       properties:
@@ -1418,16 +1705,22 @@ components:
           type: string
     RedisHealth:
       allOf:
-        - $ref: "#/components/schemas/LiveHealth"
+        - $ref: "#/components/schemas/HealthBase"
         - type: object
+          required: [status, redis]
           properties:
+            status:
+              type: string
             redis:
               $ref: "#/components/schemas/RedisStatus"
     ReadyHealth:
       allOf:
-        - $ref: "#/components/schemas/LiveHealth"
+        - $ref: "#/components/schemas/HealthBase"
         - type: object
+          required: [status, ready, checks]
           properties:
+            status:
+              type: string
             ready:
               type: boolean
             checks:
@@ -1670,7 +1963,27 @@ components:
     DiagramImportAnalyzeRequest:
       type: object
       additionalProperties: false
-      required: [templateCode, currentSpec, d2Source]
+      required: [templateCode, baseSpecHash, currentSpec, d2Source]
+      properties:
+        root:
+          type: string
+        templateCode:
+          type: string
+          description: Code читаемого saved template, к revision которого привязывается signed proposal.
+        baseSpecHash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+          description: Full saved Spec hash used as the Diagram authoring CAS identity.
+        currentSpec:
+          type: object
+          additionalProperties: true
+        d2Source:
+          type: string
+          description: Current self-contained D2 source; external imports are not accepted.
+    DiagramImportApplyRequest:
+      type: object
+      additionalProperties: false
+      required: [templateCode, baseSpecHash, currentSpec, d2Source, proposal, roles, structureTree]
       properties:
         root:
           type: string
@@ -1678,24 +1991,15 @@ components:
           type: string
         baseSpecHash:
           type: string
+          pattern: "^[a-f0-9]{64}$"
         currentSpec:
           type: object
           additionalProperties: true
         d2Source:
           type: string
-    DiagramImportApplyRequest:
-      type: object
-      additionalProperties: false
-      required: [currentSpec, proposal]
-      properties:
-        root:
-          type: string
-        currentSpec:
-          type: object
-          additionalProperties: true
+          description: Current D2 source checked against the signed proposal before local deterministic Apply.
         proposal:
-          type: object
-          additionalProperties: true
+          $ref: "#/components/schemas/DiagramImportProposalEnvelope"
         roles:
           type: array
           items:
@@ -1704,17 +2008,132 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/DiagramImportRelationRule"
-        placementRules:
+        structureTree:
+          $ref: "#/components/schemas/DiagramImportStructureTree"
+        endpointProfiles:
           type: array
           items:
-            $ref: "#/components/schemas/DiagramImportPlacementRule"
+            $ref: "#/components/schemas/DiagramImportEndpointProfile"
+    DiagramImportAnalyzeResponse:
+      type: object
+      additionalProperties: false
+      required: [success, action, ir, proposal, diagnostics, preview, catalog]
+      properties:
+        success:
+          type: boolean
+        action:
+          type: string
+          enum: [diagram-import-analyze]
+        ir:
+          type: object
+          description: Normalized structural IR produced by the pinned D2 importer.
+          additionalProperties: true
+        proposal:
+          $ref: "#/components/schemas/DiagramImportProposalEnvelope"
+        diagnostics:
+          $ref: "#/components/schemas/DiagramImportDiagnostics"
+        preview:
+          type: object
+          description: Bounded D2 render status and sanitized SVG preview metadata.
+          additionalProperties: true
+        catalog:
+          type: object
+          description: Permission-filtered CMDBuild catalog used for deterministic validation.
+          additionalProperties: true
+    DiagramImportApplyResponse:
+      type: object
+      additionalProperties: false
+      required: [success, action, spec, specHash, executionSpecHash, d2Workflow, status, partial, unresolved, omissions, repairs, warnings]
+      properties:
+        success:
+          type: boolean
+        action:
+          type: string
+          enum: [diagram-import-apply]
+        spec:
+          type: object
+          description: Local editor draft. The endpoint does not save a template or create a CMDBuild version.
+          additionalProperties: true
+        specHash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        executionSpecHash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        d2Workflow:
+          type: object
+          additionalProperties: true
+        status:
+          type: string
+          enum: [partial, complete]
+        partial:
+          type: boolean
+        unresolved:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantDiagramIssue"
+        omissions:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        repairs:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        warnings:
+          type: array
+          items:
+            type: string
+    DiagramImportDiagnostics:
+      type: object
+      additionalProperties: false
+      required: [elapsedMs, inputBytes, elements]
+      properties:
+        elapsedMs:
+          type: integer
+          minimum: 0
+        inputBytes:
+          type: integer
+          minimum: 0
+        elements:
+          type: integer
+          minimum: 0
+    DiagramImportErrorResponse:
+      type: object
+      additionalProperties: true
+      required: [success]
+      properties:
+        success:
+          type: boolean
+        action:
+          type: string
+          enum: [diagram-import-analyze, diagram-import-apply]
+        code:
+          type: string
+        reason:
+          type: string
+        message:
+          type: string
+        errors:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantDiagramIssue"
     AssistantDiagramImportInterpretRequest:
       type: object
       additionalProperties: false
-      required: [currentSpec, proposal, roles, prompt]
+      required: [templateCode, baseSpecHash, currentSpec, proposal, roles, structureTree, semanticsPrompt]
       properties:
         root:
           type: string
+        templateCode:
+          type: string
+          description: Code читаемого saved template used for authoring CAS and proposal ownership checks.
+        baseSpecHash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+          description: Full saved Spec hash; Assistant calls do not grant template update permission.
         currentSpec:
           type: object
           additionalProperties: true
@@ -1722,8 +2141,16 @@ components:
           $ref: "#/components/schemas/DiagramImportProposalEnvelope"
         prompt:
           type: string
-          minLength: 1
-          description: Author guidance for semantic interpretation; no customer-specific default is part of the API contract.
+          description: Combined UI prompt retained as a compatibility input; semanticsPrompt is authoritative for this stage.
+        semanticsPrompt:
+          type: string
+          description: Author guidance used only to classify D2 roles as node or container and propose label templates.
+        placementPrompt:
+          type: string
+          description: Current placement prompt carried by the shared Assistant request state but not executed by interpretation.
+        connectionsPrompt:
+          type: string
+          description: Current connection prompt carried by the shared Assistant request state but not executed by interpretation.
         roles:
           type: array
           description: Imported roles visible to semantic interpretation.
@@ -1733,14 +2160,12 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/DiagramImportRelationRule"
-        placementRules:
-          type: array
-          items:
-            $ref: "#/components/schemas/DiagramImportPlacementRule"
+        structureTree:
+          $ref: "#/components/schemas/DiagramImportStructureTree"
     AssistantDiagramImportInterpretResponse:
       type: object
       additionalProperties: false
-      required: [success, action]
+      required: [success, action, decisions, models, explanation, warnings, errors, diagnostics]
       properties:
         success:
           type: boolean
@@ -1751,14 +2176,8 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/DiagramImportSemanticProposal"
-        code:
-          type: string
-        message:
-          type: string
-        unresolvedRoleIds:
-          type: array
-          items:
-            type: string
+        models:
+          $ref: "#/components/schemas/AssistantDiagramModels"
         explanation:
           type: string
         warnings:
@@ -1775,10 +2194,17 @@ components:
     AssistantDiagramImportMapSelectionsRequest:
       type: object
       additionalProperties: false
-      required: [currentSpec, proposal, roles, prompt]
+      required: [templateCode, baseSpecHash, currentSpec, proposal, roles, structureTree, placementPrompt, connectionsPrompt, traversalDepth, stage, resumeId]
       properties:
         root:
           type: string
+        templateCode:
+          type: string
+          description: Code читаемого saved template used to scope the resumable checkpoint.
+        baseSpecHash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+          description: Full saved Spec hash included in the immutable checkpoint input identity.
         currentSpec:
           type: object
           additionalProperties: true
@@ -1786,8 +2212,16 @@ components:
           $ref: "#/components/schemas/DiagramImportProposalEnvelope"
         prompt:
           type: string
-          minLength: 1
-          description: Author guidance for selection-to-role mapping.
+          description: Combined UI prompt retained in the checkpoint identity; stage-specific prompts are authoritative.
+        semanticsPrompt:
+          type: string
+          description: Current role semantics prompt carried by the shared Assistant request state.
+        placementPrompt:
+          type: string
+          description: Author guidance for the roles stage that maps each structure-tree placement to materialization and Object Flow source.
+        connectionsPrompt:
+          type: string
+          description: Author guidance for the topology stage that maps each D2 connection class to one deterministic result.
         roles:
           type: array
           items:
@@ -1796,10 +2230,21 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/DiagramImportRelationRule"
-        placementRules:
-          type: array
-          items:
-            $ref: "#/components/schemas/DiagramImportPlacementRule"
+        structureTree:
+          $ref: "#/components/schemas/DiagramImportStructureTree"
+        traversalDepth:
+          type: integer
+          minimum: 1
+          maximum: 5
+          description: Permission-filtered CMDBuild catalog traversal depth used to build mapping candidates.
+        stage:
+          type: string
+          enum: [roles, topology]
+          description: roles creates placement mappings; topology resumes the same checkpoint and preserves accepted roles.
+        resumeId:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$"
+          description: Client-generated opaque checkpoint key reused unchanged for roles retries and the topology continuation.
         stages:
           type: array
           description: Optional client summary; the backend derives and validates the authoritative stages from currentSpec.
@@ -1808,7 +2253,7 @@ components:
     AssistantDiagramImportMapSelectionsResponse:
       type: object
       additionalProperties: false
-      required: [success, action]
+      required: [success, action, mappings, relationRules, connectionUnresolved, structureTree, mapping, models, explanation, warnings, errors, diagnostics, resume]
       properties:
         success:
           type: boolean
@@ -1819,14 +2264,20 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/DiagramSelectionMapping"
-        code:
-          type: string
-        message:
-          type: string
-        unresolvedRoleIds:
+        relationRules:
           type: array
           items:
-            type: string
+            $ref: "#/components/schemas/DiagramImportRelationRule"
+        connectionUnresolved:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantDiagramIssue"
+        structureTree:
+          $ref: "#/components/schemas/DiagramImportStructureTree"
+        mapping:
+          $ref: "#/components/schemas/AssistantDiagramMappingCoverage"
+        models:
+          $ref: "#/components/schemas/AssistantDiagramModels"
         explanation:
           type: string
         warnings:
@@ -1840,9 +2291,42 @@ components:
         diagnostics:
           type: object
           additionalProperties: true
+        resume:
+          allOf:
+            - $ref: "#/components/schemas/AssistantDiagramMappingResume"
+          nullable: true
+    AssistantDiagramImportMapCheckpointResponse:
+      type: object
+      additionalProperties: false
+      required: [success, action, checkpoint, mapping, models, explanation, warnings, errors, diagnostics]
+      properties:
+        success:
+          type: boolean
+        action:
+          type: string
+          enum: [assistant-diagram-import-map-selections-roles]
+        checkpoint:
+          $ref: "#/components/schemas/AssistantDiagramMappingCheckpoint"
+        mapping:
+          $ref: "#/components/schemas/AssistantDiagramMappingCoverage"
+        models:
+          $ref: "#/components/schemas/AssistantDiagramModels"
+        explanation:
+          type: string
+        warnings:
+          type: array
+          items:
+            type: string
+        errors:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantDiagramIssue"
+        diagnostics:
+          type: object
+          additionalProperties: true
     DiagramImportProposalEnvelope:
       type: object
-      description: Signed immutable class-aware IR v3 proposal produced by deterministic D2 analysis.
+      description: Signed immutable class-aware IR v3 proposal produced by deterministic D2 analysis. Unknown signed internals must be returned unchanged.
       required: [version, proposalId, templateCode, baseSpecHash, editorSpecHash, signature]
       additionalProperties: true
       properties:
@@ -1855,40 +2339,41 @@ components:
           type: string
         baseSpecHash:
           type: string
+          pattern: "^[a-f0-9]{64}$"
         editorSpecHash:
           type: string
+          pattern: "^[a-f0-9]{64}$"
         createdAt:
           type: integer
           format: int64
         signature:
           type: string
-    DiagramImportRoleContext:
-      type: object
-      additionalProperties: false
-      required: [id, key]
-      properties:
-        id:
-          type: string
-        key:
-          type: string
-        label:
-          type: string
-        kind:
-          type: string
-        selectedSemantic:
-          type: string
-          nullable: true
-          enum: [object, composite, group, static]
+        roles:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramImportRoleOverride"
+        relationRules:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramImportRelationRule"
+        structureTree:
+          $ref: "#/components/schemas/DiagramImportStructureTree"
+        unresolved:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantDiagramIssue"
     DiagramImportSemanticProposal:
       type: object
       additionalProperties: false
-      required: [roleId, semantic]
+      required: [roleId, visualKind, labelTemplate, confidence, reason]
       properties:
         roleId:
           type: string
-        semantic:
+        visualKind:
           type: string
-          enum: [object, composite, group, static]
+          enum: [node, container]
+        labelTemplate:
+          type: string
         confidence:
           type: string
           enum: [high, medium, low]
@@ -1897,15 +2382,16 @@ components:
     DiagramSelectionMapping:
       type: object
       additionalProperties: false
-      required: [roleId, source, mapping]
+      required: [structureItemId, roleId, source, mapping, confidence, reason]
       properties:
+        structureItemId:
+          type: string
         roleId:
           type: string
         source:
-          $ref: "#/components/schemas/ObjectFlowSourceRef"
+          $ref: "#/components/schemas/AssistantDiagramSourceRef"
         mapping:
-          type: object
-          additionalProperties: true
+          $ref: "#/components/schemas/DiagramImportPlacementMapping"
         confidence:
           type: string
           enum: [high, medium, low]
@@ -1918,16 +2404,13 @@ components:
       properties:
         id:
           type: string
-        selectedSemantic:
+        visualKind:
           type: string
-          nullable: true
-          enum: [object, composite, group, static]
-        exemplarKey:
+          enum: [node, container]
+        labelTemplate:
           type: string
         mapping:
-          type: object
-          description: Explicit primary CMDBuild class plus optional related-class paths and structured fields. Source aliases are backend-managed.
-          additionalProperties: true
+          $ref: "#/components/schemas/DiagramImportPlacementMapping"
     DiagramImportRelationHop:
       type: object
       required: [kind, name, targetClass]
@@ -1948,14 +2431,36 @@ components:
           enum: [direct, inverse, both]
     DiagramImportRelationRule:
       type: object
-      required: [id, kind, parentRoleId, childRoleId, path]
-      additionalProperties: false
+      additionalProperties: true
       properties:
         id:
           type: string
         kind:
           type: string
           enum: [connection, group, hierarchy]
+        d2ElementKey:
+          type: string
+        d2ClassKey:
+          type: string
+        mode:
+          type: string
+          enum: [relationCard, attributeEndpoints, deterministicEndpoints]
+        candidateId:
+          type: string
+        sourceStageId:
+          type: string
+        sourceField:
+          type: string
+        targetField:
+          type: string
+        sourceOperator:
+          type: string
+        targetOperator:
+          type: string
+        labelTemplate:
+          type: string
+        directionPolicy:
+          type: string
         parentRoleId:
           type: string
         childRoleId:
@@ -1965,14 +2470,701 @@ components:
           minItems: 1
           items:
             $ref: "#/components/schemas/DiagramImportRelationHop"
-    DiagramImportPlacementRule:
+    DiagramImportEndpointProfile:
       type: object
-      required: [id, parentRoleId, childRoleId]
-      additionalProperties: false
+      additionalProperties: true
       properties:
         id:
           type: string
-        parentRoleId:
+        roleId:
           type: string
-        childRoleId:
+        stageId:
           type: string
+    DiagramImportStructureTree:
+      type: object
+      additionalProperties: false
+      required: [version, items]
+      properties:
+        version:
+          type: integer
+          enum: [5]
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramImportStructureItem"
+    DiagramImportStructureItem:
+      type: object
+      additionalProperties: true
+      required: [id, roleId, templateContextKey, templateElementKey, templateElementKeys, parentId, mapping]
+      properties:
+        id:
+          type: string
+        roleId:
+          type: string
+        templateContextKey:
+          type: string
+        templateElementKey:
+          type: string
+        templateElementKeys:
+          type: array
+          items:
+            type: string
+        parentId:
+          type: string
+        templateStatic:
+          type: boolean
+        mapping:
+          $ref: "#/components/schemas/DiagramImportPlacementMapping"
+    DiagramImportPlacementMapping:
+      type: object
+      additionalProperties: true
+      required: [id, roleId, materialization, primary]
+      properties:
+        id:
+          type: string
+        roleId:
+          type: string
+        materialization:
+          $ref: "#/components/schemas/DiagramImportMaterialization"
+        primary:
+          $ref: "#/components/schemas/DiagramImportPrimaryMapping"
+        conditions:
+          $ref: "#/components/schemas/DiagramImportFilterSet"
+        hierarchyConditions:
+          $ref: "#/components/schemas/DiagramImportFilterSet"
+        related:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    DiagramImportMaterialization:
+      type: object
+      additionalProperties: false
+      required: [kind, stageId]
+      properties:
+        kind:
+          type: string
+          enum: [structural, stage, parentCard]
+        stageId:
+          type: string
+          description: Required for stage and empty for structural or parentCard; parentCard inherits the nearest materialized ancestor.
+    DiagramImportPrimaryMapping:
+      type: object
+      additionalProperties: true
+      properties:
+        className:
+          type: string
+        idAttribute:
+          type: string
+        labelTemplate:
+          type: string
+        structuredFields:
+          type: array
+          items:
+            type: string
+        filters:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        cardSource:
+          type: object
+          additionalProperties: true
+    DiagramImportFilterSet:
+      type: object
+      additionalProperties: false
+      required: [ruleJoin, rules]
+      properties:
+        ruleJoin:
+          type: string
+          enum: [any, all]
+        rules:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramImportFilterRule"
+    DiagramImportFilterRule:
+      type: object
+      additionalProperties: true
+      required: [action, operator, left, right]
+      properties:
+        id:
+          type: string
+        action:
+          type: string
+          enum: [include, exclude]
+        negate:
+          type: boolean
+        origin:
+          type: string
+        operator:
+          type: string
+        caseSensitive:
+          type: boolean
+        left:
+          type: object
+          additionalProperties: true
+          properties:
+            column:
+              type: string
+        right:
+          $ref: "#/components/schemas/DiagramImportFilterRightOperand"
+    DiagramImportFilterRightOperand:
+      type: object
+      additionalProperties: true
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [literal, param, stage]
+        value:
+          nullable: true
+        name:
+          type: string
+        stageId:
+          type: string
+        column:
+          type: string
+    AssistantDiagramSourceRef:
+      type: object
+      additionalProperties: false
+      properties:
+        stageId:
+          type: string
+        alias:
+          type: string
+        kind:
+          type: string
+        className:
+          type: string
+      description: Empty for structural placements; otherwise identifies the validated Object Flow result used by the mapping.
+    AssistantDiagramIssue:
+      type: object
+      additionalProperties: true
+      properties:
+        path:
+          type: string
+        family:
+          type: string
+        code:
+          type: string
+        message:
+          type: string
+        structureItemId:
+          type: string
+        roleId:
+          type: string
+        connectionKey:
+          type: string
+        d2ClassKey:
+          type: string
+    AssistantDiagramModels:
+      type: object
+      additionalProperties: false
+      required: [dataSemanticModel, d2StructuralModel, d2SemanticModel]
+      properties:
+        dataSemanticModel:
+          $ref: "#/components/schemas/AssistantDataSemanticModel"
+        d2StructuralModel:
+          $ref: "#/components/schemas/AssistantD2StructuralModel"
+        d2SemanticModel:
+          $ref: "#/components/schemas/AssistantD2SemanticModel"
+        d2BindingModel:
+          $ref: "#/components/schemas/AssistantD2BindingModel"
+        coverageModel:
+          $ref: "#/components/schemas/AssistantCoverageModel"
+    AssistantDataSemanticModel:
+      type: object
+      additionalProperties: false
+      required: [kind, version, modelHash, stages]
+      properties:
+        kind:
+          type: string
+          enum: [DataSemanticModel]
+        version:
+          type: integer
+          enum: [2]
+        modelHash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        stages:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantDataSemanticStage"
+    AssistantDataSemanticStage:
+      type: object
+      additionalProperties: true
+      required: [id, label, alias, kind, className, columns, readableFields, rules]
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        alias:
+          type: string
+        kind:
+          type: string
+        className:
+          type: string
+        from:
+          type: string
+        with:
+          type: string
+        operation:
+          type: string
+        domain:
+          type: string
+        direction:
+          type: string
+        targetClass:
+          type: string
+        columns:
+          type: array
+          items:
+            type: string
+        readableFields:
+          type: array
+          items:
+            type: string
+        rules:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantDataSemanticRule"
+        assistantBlockIds:
+          type: array
+          items:
+            type: string
+        lineageAliases:
+          type: array
+          items:
+            type: string
+        lineageLabels:
+          type: array
+          items:
+            type: string
+        relationSource:
+          type: object
+          nullable: true
+          additionalProperties: true
+        connection:
+          type: object
+          nullable: true
+          additionalProperties: true
+        cardSources:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    AssistantDataSemanticRule:
+      type: object
+      additionalProperties: false
+      required: [action, negate, operator, path, rightExpression, expressionKind, leftColumn, rightColumn]
+      properties:
+        action:
+          type: string
+          enum: [include, exclude]
+        negate:
+          type: boolean
+        operator:
+          type: string
+        path:
+          type: string
+        rightExpression:
+          type: string
+          description: Canonical authoring expression, including literal values, ${param.name}, or ${previous.field} references.
+        expressionKind:
+          type: string
+          enum: [empty, literal, parameter, previous]
+        leftColumn:
+          type: string
+        rightColumn:
+          type: string
+    AssistantD2StructuralModel:
+      type: object
+      additionalProperties: false
+      required: [kind, version, modelHash, roles, placements, connections]
+      properties:
+        kind:
+          type: string
+          enum: [D2StructuralModel]
+        version:
+          type: integer
+          enum: [1]
+        modelHash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        roles:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantD2StructuralRole"
+        placements:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantD2StructuralPlacement"
+        connections:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantD2StructuralConnection"
+    AssistantD2StructuralRole:
+      type: object
+      additionalProperties: false
+      required: [id, displayName, kind, visualKind, isContainer, roleNotes, elementKeys]
+      properties:
+        id:
+          type: string
+        displayName:
+          type: string
+        kind:
+          type: string
+        visualKind:
+          type: string
+          enum: [node, container]
+        isContainer:
+          type: boolean
+        roleNotes:
+          type: string
+        elementKeys:
+          type: array
+          items:
+            type: string
+    AssistantD2StructuralPlacement:
+      type: object
+      additionalProperties: false
+      required: [structureItemId, roleId, displayName, templateElementKey, parentStructureItemId, parentDisplayName, visualKind, templateStatic, placementNotes, materializationHint, allowedMaterialization]
+      properties:
+        structureItemId:
+          type: string
+        roleId:
+          type: string
+        displayName:
+          type: string
+        templateElementKey:
+          type: string
+        parentStructureItemId:
+          type: string
+        parentDisplayName:
+          type: string
+        visualKind:
+          type: string
+          enum: [node, container]
+        templateStatic:
+          type: boolean
+        placementNotes:
+          type: string
+        materializationHint:
+          type: string
+          enum: ["", structural, stage, parentCard]
+        allowedMaterialization:
+          type: array
+          items:
+            type: string
+            enum: [structural, stage, parentCard]
+    AssistantD2StructuralConnection:
+      type: object
+      additionalProperties: false
+      required: [d2ElementKey, d2ClassKey, connectionNotes, directionPolicy, supportedModes, exampleLabels]
+      properties:
+        d2ElementKey:
+          type: string
+        d2ClassKey:
+          type: string
+        connectionNotes:
+          type: string
+        directionPolicy:
+          type: string
+        supportedModes:
+          type: array
+          items:
+            type: string
+            enum: [relationCard, attributeEndpoints, deterministicEndpoints]
+        exampleLabels:
+          type: array
+          items:
+            type: string
+    AssistantD2SemanticModel:
+      type: object
+      additionalProperties: false
+      required: [kind, version, modelHash, roles]
+      properties:
+        kind:
+          type: string
+          enum: [D2SemanticModel]
+        version:
+          type: integer
+          enum: [1]
+        modelHash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        roles:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantD2SemanticRole"
+    AssistantD2SemanticRole:
+      type: object
+      additionalProperties: false
+      required: [roleId, visualKind, labelTemplate, reason]
+      properties:
+        roleId:
+          type: string
+        visualKind:
+          type: string
+          enum: [node, container]
+        labelTemplate:
+          type: string
+        reason:
+          type: string
+    AssistantD2BindingModel:
+      type: object
+      additionalProperties: false
+      required: [kind, version, modelHash, placements, connections]
+      properties:
+        kind:
+          type: string
+          enum: [D2BindingModel]
+        version:
+          type: integer
+          enum: [1]
+        modelHash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        placements:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantD2BindingPlacement"
+        connections:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantD2BindingConnection"
+    AssistantD2BindingPlacement:
+      type: object
+      additionalProperties: false
+      required: [structureItemId, roleId, materialization, stageId, className, hierarchyConditions]
+      properties:
+        structureItemId:
+          type: string
+        roleId:
+          type: string
+        materialization:
+          type: string
+          enum: [structural, stage, parentCard, ""]
+        stageId:
+          type: string
+        className:
+          type: string
+        hierarchyConditions:
+          type: object
+          additionalProperties: true
+    AssistantD2BindingConnection:
+      type: object
+      additionalProperties: false
+      required: [d2ElementKey, d2ClassKey, sourceStageId, mode]
+      properties:
+        d2ElementKey:
+          type: string
+        d2ClassKey:
+          type: string
+        sourceStageId:
+          type: string
+        mode:
+          type: string
+    AssistantCoverageModel:
+      type: object
+      additionalProperties: false
+      required: [kind, version, modelHash, status, requiredRoles, mappedRoles, requiredContainers, mappedContainers, staticPlacements, requiredConnections, mappedConnections, unresolved]
+      properties:
+        kind:
+          type: string
+          enum: [CoverageModel]
+        version:
+          type: integer
+          enum: [1]
+        modelHash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        status:
+          type: string
+          enum: [partial, complete, ""]
+        requiredRoles:
+          type: integer
+          minimum: 0
+        mappedRoles:
+          type: integer
+          minimum: 0
+        requiredContainers:
+          type: integer
+          minimum: 0
+        mappedContainers:
+          type: integer
+          minimum: 0
+        staticPlacements:
+          type: integer
+          minimum: 0
+        requiredConnections:
+          type: integer
+          minimum: 0
+        mappedConnections:
+          type: integer
+          minimum: 0
+        unresolved:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantDiagramIssue"
+    AssistantDiagramMappingCheckpoint:
+      type: object
+      additionalProperties: false
+      required: [resumeId, stage, nextStage, rolesReused, attempt, transientAttempt, correctionAttempt, automaticRetriesRemaining, correctionRetriesRemaining, checkpointTtlSec, expiresAt]
+      properties:
+        resumeId:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$"
+        stage:
+          type: string
+          enum: [roles, topology]
+        nextStage:
+          type: string
+          enum: [roles, topology]
+        rolesReused:
+          type: boolean
+        attempt:
+          type: integer
+          minimum: 1
+        transientAttempt:
+          type: integer
+          minimum: 0
+        correctionAttempt:
+          type: integer
+          minimum: 0
+        automaticRetriesRemaining:
+          type: integer
+          minimum: 0
+        correctionRetriesRemaining:
+          type: integer
+          minimum: 0
+        checkpointTtlSec:
+          type: integer
+          minimum: 1
+        expiresAt:
+          type: string
+          format: date-time
+    AssistantDiagramMappingResume:
+      allOf:
+        - $ref: "#/components/schemas/AssistantDiagramMappingCheckpoint"
+      description: Same opaque checkpoint summary returned on retryable 422/502/503/504 failures; resend resumeId with the indicated nextStage.
+    AssistantDiagramCoverageCount:
+      type: object
+      additionalProperties: false
+      required: [mapped, required]
+      properties:
+        mapped:
+          type: integer
+          minimum: 0
+        required:
+          type: integer
+          minimum: 0
+    AssistantDiagramMappingCoverage:
+      type: object
+      additionalProperties: false
+      required: [status, requiredRoles, mappedRoles, staticContainers, staticPlacements, requiredContainers, mappedContainers, requiredConnections, mappedConnections, objectCoverage, containerCoverage, connectionCoverage, unresolved, missingMappings, missingConnectionMappings]
+      properties:
+        status:
+          type: string
+          enum: [partial, complete]
+        requiredRoles:
+          type: integer
+          minimum: 0
+        mappedRoles:
+          type: integer
+          minimum: 0
+        staticContainers:
+          type: integer
+          minimum: 0
+        staticPlacements:
+          type: integer
+          minimum: 0
+        requiredContainers:
+          type: integer
+          minimum: 0
+        mappedContainers:
+          type: integer
+          minimum: 0
+        requiredConnections:
+          type: integer
+          minimum: 0
+        mappedConnections:
+          type: integer
+          minimum: 0
+        objectCoverage:
+          $ref: "#/components/schemas/AssistantDiagramCoverageCount"
+        containerCoverage:
+          $ref: "#/components/schemas/AssistantDiagramCoverageCount"
+        connectionCoverage:
+          $ref: "#/components/schemas/AssistantDiagramCoverageCount"
+        unresolved:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantDiagramIssue"
+        missingMappings:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantDiagramIssue"
+        missingConnectionMappings:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantDiagramIssue"
+    AssistantDiagramErrorResponse:
+      type: object
+      additionalProperties: true
+      required: [success]
+      properties:
+        success:
+          type: boolean
+        action:
+          type: string
+          enum: [assistant-diagram-import-interpret, assistant-diagram-import-map-selections]
+        code:
+          type: string
+        reason:
+          type: string
+        message:
+          type: string
+        errors:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantDiagramIssue"
+        warnings:
+          type: array
+          items:
+            type: string
+        retryable:
+          type: boolean
+        retryKind:
+          type: string
+          enum: [correction, transient]
+        resume:
+          allOf:
+            - $ref: "#/components/schemas/AssistantDiagramMappingResume"
+          nullable: true
+        partial:
+          type: boolean
+        mappings:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramSelectionMapping"
+        relationRules:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramImportRelationRule"
+        connectionUnresolved:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantDiagramIssue"
+        structureTree:
+          $ref: "#/components/schemas/DiagramImportStructureTree"
+        mapping:
+          allOf:
+            - $ref: "#/components/schemas/AssistantDiagramMappingCoverage"
+          nullable: true
+        models:
+          $ref: "#/components/schemas/AssistantDiagramModels"
+        diagnostics:
+          type: object
+          additionalProperties: true

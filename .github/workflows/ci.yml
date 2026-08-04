@@ -27,6 +27,13 @@ jobs:
       - name: Run CI gate
         run: npm run ci
 
+      - name: Upload CMDBuild custom page
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cmdbdynamicpages-custompage
+          path: dist/cmdbdynamicpages-custompage.zip
+          if-no-files-found: error
+
       - name: Install required browser fixture
         run: |
           npm install --no-save --no-package-lock playwright@1.61.1
@@ -44,15 +51,18 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: '1.24.x'
+          go-version: '1.25.11'
 
       - name: Test D2 importer
         run: go test ./cmd/cmdp-d2-import
 
       - name: Check D2 importer dependencies
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./cmd/cmdp-d2-import
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./cmd/cmdp-d2-import
 
   container:
+    needs:
+      - test
+      - go_vulncheck
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -71,6 +81,9 @@ jobs:
           docker compose --env-file .env.example -f docker-compose.runtime.yml config >/dev/null
           docker compose -f docker-compose.nginx.yml config >/dev/null
 
+      - name: Validate nginx templates
+        run: bash scripts/nginx-test.sh
+
       - name: Build Docker image
         run: |
           image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
@@ -79,7 +92,11 @@ jobs:
           if [ -z "$tag" ]; then tag="$GITHUB_SHA"; fi
           app_version="00.00.00.00"
           if [ -f VERSION ]; then app_version="$(tr -d '\r\n' < VERSION)"; fi
-          docker build --build-arg APP_VERSION="$app_version" -t "$image:$tag" .
+          test -z "$(git status --porcelain --untracked-files=all)"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then test "$GITHUB_REF_NAME" = "v$app_version"; fi
+          node scripts/container-image.mjs build --tag "$image:$tag" --require-clean
+          node scripts/container-image.mjs verify --image "$image:$tag" --require-clean
           echo "CMDBDYNAMIC_CI_IMAGE=$image:$tag" >> "$GITHUB_ENV"
 
       - name: Login to GHCR

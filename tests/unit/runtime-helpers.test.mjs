@@ -10,8 +10,14 @@ import {
   assistantDiagramAttachRelatedNetworkStages,
   assistantDiagramPlacementCorrection,
   assistantDiagramPlacementDraftFromResponse,
+  assistantDiagramPlacementExecutionValidation,
   assistantDiagramRecoverParentCardMappings,
   assistantDiagramPlacementTargets,
+  assistantDataSemanticModel,
+  assistantD2StructuralModel,
+  assistantD2SemanticModel,
+  assistantD2BindingModel,
+  assistantCoverageModel,
   assistantDiagramResolveStageId,
   assistantDiagramStageDraftFromResponse,
   assistantDiagramTopologyRequirements,
@@ -67,6 +73,7 @@ import {
   normalizeAssistantDraftSpec,
   normalizeAssistantObjectFlowIntent,
   normalizeAssistantRuntimeConfig,
+  normalizeAssistantPromptContract,
   normalizeApplicationVersion,
   normalizeTemplateAssistantPromptOverrides,
   normalizeRuntimeCacheConfig,
@@ -134,6 +141,22 @@ test('invalid application version is reported through runtime configuration vali
   }]);
 });
 
+test('invalid build identity is reported through runtime configuration validation', () => {
+  const validation = validateRuntimeConfig({
+    nodeEnv: 'development',
+    redisEnabled: false,
+    logTargets: ['stdout'],
+    applicationBuildError: 'BUILD_INFO.json version does not match VERSION.'
+  });
+
+  assert.equal(validation.ok, false);
+  assert.deepEqual(validation.errors.filter((error) => error.code === 'application_build_invalid'), [{
+    code: 'application_build_invalid',
+    file: 'BUILD_INFO.json',
+    message: 'BUILD_INFO.json version does not match VERSION.'
+  }]);
+});
+
 test('template Assistant system prompt overrides inherit global policy without mutating it', () => {
   const runtimeConfig = {
     assistant: {
@@ -166,19 +189,22 @@ test('template Assistant system prompt overrides inherit global policy without m
 
   assert.deepEqual(normalizeTemplateAssistantPromptOverrides(stored.authoring.assistant.systemPromptOverrides), {
     system: 'Template-specific system prompt.',
-    diagramMapping: 'Template-specific mapping prompt.'
+    diagramPlacement: 'Template-specific mapping prompt.',
+    diagramConnections: 'Template-specific mapping prompt.'
   });
   assert.equal(stored.authoring.assistant.systemPromptOverrides.unknown, undefined);
 
   const effective = normalizeAssistantRuntimeConfig(templateAssistantRuntimeConfig(runtimeConfig, stored));
   const inherited = normalizeAssistantRuntimeConfig(runtimeConfig);
   assert.equal(effective.prompt.system, 'Template-specific system prompt.');
-  assert.equal(effective.prompt.diagramMapping, 'Template-specific mapping prompt.');
+  assert.equal(effective.prompt.diagramPlacement, 'Template-specific mapping prompt.');
+  assert.equal(effective.prompt.diagramConnections, 'Template-specific mapping prompt.');
   assert.equal(effective.prompt.objectFlow, 'Global flow prompt.');
   assert.equal(effective.prompt.objectFlowSemantic, 'Global semantic prompt.');
-  assert.equal(effective.prompt.diagramInterpretation, 'Global interpretation prompt.');
+  assert.equal(effective.prompt.diagramSemantics, 'Global interpretation prompt.');
   assert.equal(inherited.prompt.system, 'Global system prompt.');
-  assert.equal(inherited.prompt.diagramMapping, 'Global mapping prompt.');
+  assert.equal(inherited.prompt.diagramPlacement, 'Global mapping prompt.');
+  assert.equal(inherited.prompt.diagramConnections, 'Global mapping prompt.');
   assert.equal(runtimeConfig.assistant.prompt.system, 'Global system prompt.');
 
   const reset = normalizeTemplateSpecForStorage({
@@ -194,7 +220,8 @@ test('template Assistant system prompt overrides inherit global policy without m
   const resetEffective = normalizeAssistantRuntimeConfig(templateAssistantRuntimeConfig(runtimeConfig, reset));
   assert.equal(reset.authoring.assistant.systemPromptOverrides, undefined);
   assert.equal(resetEffective.prompt.system, 'Global system prompt.');
-  assert.equal(resetEffective.prompt.diagramMapping, 'Global mapping prompt.');
+  assert.equal(resetEffective.prompt.diagramPlacement, 'Global mapping prompt.');
+  assert.equal(resetEffective.prompt.diagramConnections, 'Global mapping prompt.');
 });
 
 test('template Assistant prompt overrides reject over-limit input without truncating it', () => {
@@ -397,6 +424,73 @@ test('D2 mapping executable identity ignores Assistant prompts but preserves sou
   assert.equal((await d2WorkflowStatusForSpec(applied)).reason, 'source_changed');
 });
 
+test('D2 mapping input revision tracks executable stage inputs but ignores presentation and unused columns', () => {
+  const { currentSpec, proposal, roles } = d2StructureTreeFixture();
+  const tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsB');
+  tree.items = tree.items.map((item) => String(item.roleId) === String(roles.vlan.id)
+    ? {
+        ...item,
+        mapping: {
+          ...item.mapping,
+          primary: { ...(item.mapping && item.mapping.primary || {}), labelTemplate: '${Code}' },
+          conditions: {
+            ruleJoin: 'all',
+            rules: [{
+              action: 'include', operator: 'equals', left: { column: 'Code' },
+              right: { kind: 'literal', value: 'active' }
+            }]
+          }
+        }
+      }
+    : item);
+  const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
+  const imported = structuredClone(applied.result.diagrams[0].authoring.d2Import);
+  imported.relationRules = [{
+    d2ElementKey: 'used-field-contract',
+    sourceStageId: 'selection:systemsB',
+    sourceField: 'BusinessKey',
+    targetField: 'BusinessKey'
+  }];
+  const objectMatching = (spec) => spec.visualModels.find((model) => model.mode === 'objectMatching');
+  const selection = (spec, alias) => objectMatching(spec).selections.find((item) => item.alias === alias);
+  const updateSelectionColumns = (spec, alias, update) => {
+    for (const model of Array.isArray(spec.visualModels) ? spec.visualModels : []) {
+      for (const item of Array.isArray(model && model.selections) ? model.selections : []) {
+        if (String(item && item.alias || '') !== alias) continue;
+        item.columns = update(Array.isArray(item.columns) ? item.columns.slice() : []);
+        if (item.source && Array.isArray(item.source.columns)) item.source.columns = item.columns.slice();
+        if (item.output && Array.isArray(item.output.columns)) item.output.columns = item.columns.slice();
+      }
+    }
+    for (const table of spec.result && Array.isArray(spec.result.tables) ? spec.result.tables : []) {
+      if (String(table && table.name || '') === alias) table.columns = update(Array.isArray(table.columns) ? table.columns.slice() : []);
+    }
+  };
+  updateSelectionColumns(applied, 'systemsB', (columns) => Array.from(new Set(columns.concat('BusinessKey'))));
+  const revision = (mutate) => {
+    const spec = structuredClone(applied);
+    mutate(spec);
+    return diagramImportMappingInputRevision(spec, imported);
+  };
+  const baseline = diagramImportMappingInputRevision(applied, imported);
+
+  assert.notDeepEqual(revision((spec) => {
+    selection(spec, 'systemsB').rules[0].rightExpression = 'active';
+  }), baseline, 'a selected-stage filter changes executable mapping input');
+  assert.notDeepEqual(revision((spec) => {
+    selection(spec, 'systemsB').from = 'systemsA';
+  }), baseline, 'a selected-stage dependency changes executable mapping input');
+  assert.notDeepEqual(revision((spec) => {
+    updateSelectionColumns(spec, 'systemsB', (columns) => columns.filter((field) => field !== 'BusinessKey'));
+  }), baseline, 'removing a field used by the mapping changes executable mapping input');
+  assert.deepEqual(revision((spec) => {
+    selection(spec, 'systemsB').name = 'Presentation-only label';
+  }), baseline, 'a stage label is not executable mapping input');
+  assert.deepEqual(revision((spec) => {
+    updateSelectionColumns(spec, 'systemsB', (columns) => columns.concat('UnusedPresentationColumn'));
+  }), baseline, 'an unused materialized column is not executable mapping input');
+});
+
 test('only CmdbBuildView templates are protected by spec protection flag', () => {
   assert.equal(templateIsProtected({ code: 'CmdbBuildView', spec: { version: 1 } }), true);
   assert.equal(templateIsProtected({ code: 'networkview', spec: { version: 1, protected: true, endpoint: { kind: 'runtime' } } }), false);
@@ -553,8 +647,10 @@ test('template Save migrates retired assistantDraft into canonical authoring and
     version: 1,
     assistant: {
       objectFlowIntent: { context: '', blocks: [] },
-      diagramInterpretPrompt: '',
-      diagramMappingPrompt: ''
+      promptContractVersion: 2,
+      diagramSemanticsPrompt: '',
+      diagramPlacementPrompt: '',
+      diagramConnectionsPrompt: ''
     },
     d2: {
       source: 'server: Server',
@@ -875,8 +971,10 @@ test('template storage migrates old D2 source into canonical authoring and disca
   assert.equal(authoring.d2.sourceHash, crypto.createHash('sha256').update(source).digest('hex'));
   assert.equal(authoring.d2.source, source);
   assert.deepEqual(authoring.assistant.objectFlowIntent, { context: '', blocks: [] });
-  assert.equal(authoring.assistant.diagramInterpretPrompt, '');
-  assert.equal(authoring.assistant.diagramMappingPrompt, '');
+  assert.equal(authoring.assistant.promptContractVersion, 2);
+  assert.equal(authoring.assistant.diagramSemanticsPrompt, '');
+  assert.equal(authoring.assistant.diagramPlacementPrompt, '');
+  assert.equal(authoring.assistant.diagramConnectionsPrompt, '');
 });
 
 test('non-special templates drop stale protected flags and legacy BAA fields before storage', () => {
@@ -2050,7 +2148,7 @@ test('D2 mapping keeps its signed executable inputs on reload and ignores a prom
   const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
   const appliedImport = applied.result.diagrams[0].authoring.d2Import;
 
-  assert.equal(appliedImport.mappingInputRevision.version, 2);
+  assert.equal(appliedImport.mappingInputRevision.version, 3);
   assert.equal(diagramImportMappingValidationIsCurrent(appliedImport), true);
   assert.deepEqual(await d2WorkflowStatusForSpec(applied), {
     state: 'applied',
@@ -2886,6 +2984,19 @@ test('D2 static template subtree keeps its Notes, nodes, and arrows without Obje
   assert.ok(proposal.structureTree.items.every((item) => item.templateStatic === true));
   assert.deepEqual(diagramImportStructureTreeErrors(proposal.structureTree, proposal.roles, currentSpec, proposal.structure), []);
 
+  const placementTargets = assistantDiagramPlacementTargets(proposal, [], { classes: [] });
+  assert.ok(placementTargets.every((placement) => placement.templateStatic === true));
+  assert.ok(placementTargets.every((placement) => placement.allowedMaterialization.join(',') === 'structural'));
+  const placementDraft = assistantDiagramPlacementDraftFromResponse({ placements: placementTargets, stages: [] }, {
+    mappings: [],
+    unresolved: []
+  });
+  assert.equal(placementDraft.success, true);
+  assert.equal(placementDraft.items.length, placementTargets.length);
+  assert.ok(placementDraft.items.every((item) => item.mapping.materialization.kind === 'structural'));
+  const structuralModel = assistantD2StructuralModel(proposal.roles, placementTargets, proposal.relationRules);
+  assert.ok(structuralModel.placements.every((placement) => placement.templateStatic === true));
+
   const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], proposal.structureTree);
   const diagramSpec = applied.result.diagrams[0];
   assert.equal(diagramSpec.nodeMappings.length, 2);
@@ -3552,6 +3663,232 @@ test('D2 Assistant coalesces identical placement mappings and corrects only an i
   assert.deepEqual(new Set(correction.invalidMappings.map((item) => item.code)), new Set(['diagram_parent_card_parent_missing']));
 });
 
+test('D2 Assistant correction resolves parentCard through immutable accepted bindings', () => {
+  const stages = [{ id: 'selection:vlans', alias: 'vlans', label: 'VLAN', className: 'vlan', columns: ['_id', 'Code', 'Description'] }];
+  const acceptedItems = [{
+    structureItemId: 'scope',
+    roleId: 'scope-role',
+    source: { stageId: 'selection:vlans', alias: 'vlans', kind: 'selection', className: 'vlan' },
+    mapping: { materialization: { kind: 'stage', stageId: 'selection:vlans' } }
+  }];
+  const placements = [{
+    structureItemId: 'vlan', roleId: 'vlan-role', displayName: 'vlan', parentStructureItemId: 'scope',
+    visualKind: 'node', allowedMaterialization: ['stage', 'parentCard'], currentMapping: { primary: { labelTemplate: '' } }
+  }];
+  const draft = assistantDiagramPlacementDraftFromResponse({ kind: 'mapping', placements, stages, acceptedItems }, {
+    mappings: [
+      { structureItemId: 'scope', materialization: 'stage', stageId: 'selection:vlans' },
+      { structureItemId: 'vlan', materialization: 'parentCard' }
+    ],
+    unresolved: []
+  });
+
+  assert.equal(draft.success, true);
+  assert.equal(draft.items.length, 1);
+  assert.deepEqual(draft.items[0].mapping.materialization, { kind: 'parentCard', stageId: '' });
+  assert.ok(draft.warnings.some((warning) => /already accepted D2 placement/.test(warning)));
+});
+
+test('D2 Assistant rejects conflicting duplicate placements and disallowed materialization', () => {
+  const stages = [
+    { id: 'selection:systemsA', alias: 'systemsA', className: 'IS', kind: 'selection', columns: ['_id', 'Code'] },
+    { id: 'selection:systemsB', alias: 'systemsB', className: 'IS', kind: 'selection', columns: ['_id', 'Code'] }
+  ];
+  const placements = [{
+    structureItemId: 'system', roleId: 'system-role', displayName: 'System', parentStructureItemId: '',
+    visualKind: 'node', allowedMaterialization: ['stage'], currentMapping: { primary: { labelTemplate: '${Code}' } }
+  }];
+  const input = { kind: 'mapping', placements, stages };
+
+  const conflicting = assistantDiagramPlacementDraftFromResponse(input, {
+    mappings: [
+      { structureItemId: 'system', materialization: 'stage', stageId: 'selection:systemsA' },
+      { structureItemId: 'system', materialization: 'stage', stageId: 'selection:systemsB' }
+    ],
+    unresolved: []
+  });
+  assert.equal(conflicting.success, false);
+  assert.deepEqual(conflicting.items, []);
+  assert.equal(conflicting.errors.length, 1);
+  assert.equal(conflicting.errors[0].code, 'diagram_placement_duplicate');
+  assert.equal(conflicting.errors[0].structureItemId, 'system');
+
+  const invalidMaterialization = assistantDiagramPlacementDraftFromResponse(input, {
+    mappings: [{ structureItemId: 'system', materialization: 'structural' }],
+    unresolved: []
+  });
+  assert.equal(invalidMaterialization.success, false);
+  assert.deepEqual(invalidMaterialization.items, []);
+  assert.equal(invalidMaterialization.errors.length, 1);
+  assert.equal(invalidMaterialization.errors[0].code, 'diagram_materialization_not_allowed');
+  assert.deepEqual(invalidMaterialization.errors[0].allowedMaterialization, ['stage']);
+  assert.equal(invalidMaterialization.errors[0].receivedMaterialization, 'structural');
+});
+
+test('D2 Assistant drops empty placement rules and keeps literal filters separate from hierarchy', () => {
+  const { currentSpec, proposal, roles } = d2StructureTreeFixture();
+  const stages = assistantObjectFlowDiagramStages(currentSpec);
+  const placements = assistantDiagramPlacementTargets(proposal, stages);
+  const scopeItems = proposal.structureTree.items.filter((item) => item.roleId === roles['scope-vlan'].id);
+  const vlanItems = proposal.structureTree.items.filter((item) => item.roleId === roles.vlan.id);
+  const structuralItems = proposal.structureTree.items.filter((item) => !scopeItems.includes(item) && !vlanItems.includes(item));
+  const response = {
+    mappings: [
+      ...structuralItems.map((item) => ({ structureItemId: item.id, materialization: 'structural' })),
+      ...scopeItems.map((item, index) => ({
+        structureItemId: item.id,
+        materialization: 'stage',
+        stageId: index ? 'selection:systemsB' : 'selection:systemsA',
+        conditions: {
+          rules: [{ operator: 'equals', left: { column: 'Code' }, right: { kind: 'literal', value: index ? 'root' : 'dmz' } }]
+        },
+        hierarchyConditions: { rules: [{}] }
+      })),
+      ...vlanItems.map((item) => ({ structureItemId: item.id, materialization: 'parentCard' }))
+    ],
+    unresolved: []
+  };
+  const draft = assistantDiagramPlacementDraftFromResponse({ kind: 'mapping', placements, stages }, response);
+
+  assert.equal(draft.success, true);
+  assert.ok(draft.warnings.some((warning) => /empty D2 placement rule/.test(warning)));
+  const scopeMappings = draft.items.filter((item) => item.roleId === roles['scope-vlan'].id).map((item) => item.mapping);
+  assert.ok(scopeMappings.every((mapping) => mapping.conditions.rules.length === 1));
+  assert.ok(scopeMappings.every((mapping) => mapping.hierarchyConditions.rules.length === 0));
+  const validation = assistantDiagramPlacementExecutionValidation({
+    placements,
+    stages,
+    currentSpec,
+    structureTree: proposal.structureTree,
+    structure: proposal.structure,
+    validationRoles: proposal.roles
+  }, draft.items);
+  assert.equal(validation.checked, true);
+  assert.deepEqual(validation.errors, []);
+});
+
+test('D2 Assistant resolves parentCard and nested match cards through the nearest materialized ancestor', () => {
+  const stages = [
+    {
+      id: 'relation:servers', alias: 'servers', label: 'Servers', kind: 'relation', className: 'phServer',
+      columns: ['Class', '_id', 'Code', 'Description', 'SourceClass', 'SourceId', 'SourceDescription'],
+      cardSources: [
+        { id: 'current', className: 'phServer', classColumn: 'Class', idColumn: '_id', label: 'Server' },
+        { id: 'relation-source', className: 'ipRange', classColumn: 'SourceClass', idColumn: 'SourceId', label: 'Network' }
+      ]
+    },
+    {
+      id: 'match:applications', alias: 'applications', label: 'Applications', kind: 'match', className: 'phServer',
+      from: 'application_relations', with: 'servers',
+      columns: ['Class', '_id', 'Code', 'Description', 'SourceClass', 'SourceId', 'SourceDescription'],
+      cardSources: [
+        { id: 'current', className: 'phServer', classColumn: 'Class', idColumn: '_id', label: 'Server' },
+        { id: 'relation-source', className: 'ApplicG', classColumn: 'SourceClass', idColumn: 'SourceId', label: 'Application' }
+      ]
+    }
+  ];
+  const placements = [
+    {
+      structureItemId: 'scope', roleId: 'scope-role', displayName: 'scope_server', parentStructureItemId: '',
+      visualKind: 'container', allowedMaterialization: ['structural', 'stage'], currentMapping: { primary: { labelTemplate: '${Description}' } }
+    },
+    {
+      structureItemId: 'server', roleId: 'server-role', displayName: 'server', parentStructureItemId: 'scope',
+      visualKind: 'node', allowedMaterialization: ['stage', 'parentCard'], currentMapping: { primary: { labelTemplate: '${Description}' } }
+    },
+    {
+      structureItemId: 'applications-group', roleId: 'group-role', displayName: 'applications_group', parentStructureItemId: 'scope',
+      visualKind: 'container', allowedMaterialization: ['structural', 'stage'], currentMapping: { primary: { labelTemplate: '' } }
+    },
+    {
+      structureItemId: 'application', roleId: 'application-role', displayName: 'application', parentStructureItemId: 'applications-group',
+      visualKind: 'node', allowedMaterialization: ['stage', 'parentCard'], currentMapping: { id: 'application-mapping', primary: { labelTemplate: '${Description}' } }
+    }
+  ];
+  const invalidHierarchy = {
+    rules: [{
+      operator: 'equals', left: { column: 'SourceId' },
+      right: { kind: 'stage', stageId: 'structure_mapping.current', column: '_id' }
+    }]
+  };
+  const draft = assistantDiagramPlacementDraftFromResponse({ kind: 'mapping', placements, stages }, {
+    mappings: [
+      { structureItemId: 'scope', materialization: 'stage', stageId: 'relation:servers' },
+      { structureItemId: 'server', materialization: 'parentCard', hierarchyConditions: invalidHierarchy },
+      { structureItemId: 'applications-group', materialization: 'structural' },
+      { structureItemId: 'application-mapping', materialization: 'stage', stageId: 'match:applications', hierarchyConditions: invalidHierarchy }
+    ],
+    unresolved: [{
+      structureItemId: 'application', reason: 'ambiguousStage',
+      message: 'Redundant uncertainty after returning an executable mapping.'
+    }]
+  });
+
+  assert.equal(draft.success, true, JSON.stringify(draft.errors));
+  const server = draft.items.find((item) => item.structureItemId === 'server');
+  const application = draft.items.find((item) => item.structureItemId === 'application');
+  assert.equal(server.mapping.primary.cardSource.id, 'current');
+  assert.equal(server.mapping.primary.className, 'phServer');
+  assert.deepEqual(server.mapping.hierarchyConditions.rules, []);
+  assert.equal(application.mapping.primary.cardSource.id, 'relation-source');
+  assert.equal(application.mapping.primary.className, 'ApplicG');
+  assert.deepEqual(application.mapping.hierarchyConditions.rules.map((rule) => ({
+    left: rule.left.column,
+    stageId: rule.right.stageId,
+    right: rule.right.column
+  })), [{ left: '_id', stageId: 'relation:servers', right: '_id' }]);
+  assert.ok(draft.warnings.some((warning) => /normalized to its unique current structure item/.test(warning)));
+  assert.ok(draft.warnings.some((warning) => /both mapped and unresolved/.test(warning)));
+  assert.ok(draft.warnings.some((warning) => /exact materialized parent contract/.test(warning)));
+});
+
+test('D2 Assistant execution gate rejects an invalid child-parent field contract before apply', () => {
+  const { currentSpec, proposal, roles } = d2StructureTreeFixture();
+  const stages = assistantObjectFlowDiagramStages(currentSpec);
+  const placements = assistantDiagramPlacementTargets(proposal, stages);
+  const scopeItems = proposal.structureTree.items.filter((item) => item.roleId === roles['scope-vlan'].id);
+  const vlanItems = proposal.structureTree.items.filter((item) => item.roleId === roles.vlan.id);
+  const structuralItems = proposal.structureTree.items.filter((item) => !scopeItems.includes(item) && !vlanItems.includes(item));
+  const draft = assistantDiagramPlacementDraftFromResponse({ kind: 'mapping', placements, stages }, {
+    mappings: [
+      ...structuralItems.map((item) => ({ structureItemId: item.id, materialization: 'structural' })),
+      { structureItemId: scopeItems[0].id, materialization: 'stage', stageId: 'selection:systemsA' },
+      { structureItemId: vlanItems[0].id, materialization: 'stage', stageId: 'selection:systemsB' },
+      { structureItemId: scopeItems[1].id, materialization: 'stage', stageId: 'selection:systemsB' },
+      { structureItemId: vlanItems[1].id, materialization: 'parentCard' }
+    ],
+    unresolved: []
+  });
+  const invalidItem = draft.items.find((item) => item.structureItemId === vlanItems[0].id);
+  invalidItem.mapping.hierarchyConditions = {
+    ruleJoin: 'any',
+    rules: [{
+      id: 'invalid-assistant-rule', action: 'include', negate: false, origin: 'assistant', operator: 'equals', caseSensitive: false,
+      left: { column: 'NotMaterialized', regex: '' },
+      right: { kind: 'stage', value: '', name: '', stageId: 'selection:systemsB', column: 'Code', regex: '' }
+    }]
+  };
+  const validation = assistantDiagramPlacementExecutionValidation({
+    placements,
+    stages,
+    currentSpec,
+    structureTree: proposal.structureTree,
+    structure: proposal.structure,
+    validationRoles: proposal.roles
+  }, draft.items);
+
+  assert.equal(validation.checked, true);
+  assert.ok(validation.errors.some((error) => error.code === 'diagram_hierarchy_condition_invalid' && error.structureItemId === vlanItems[0].id));
+  assert.ok(validation.errors.some((error) => /not offered/.test(error.message)));
+  assert.ok(validation.errors.some((error) => /nearest materialized parent/.test(error.message)));
+  const correction = assistantDiagramPlacementCorrection(validation.errors, placements, stages);
+  assert.ok(correction);
+  assert.ok(correction.retryPlacementIds.includes(vlanItems[0].id));
+  assert.ok(correction.retryPlacementIds.includes(scopeItems[0].id));
+  assert.ok(correction.invalidMappings[0].selectedStage.fields.includes('Code'));
+  assert.ok(correction.invalidMappings[0].parentStage.fields.includes('Code'));
+});
+
 test('D2 Assistant recovers a parentCard dependency only when one deterministic stage is available', () => {
   const stages = [{ id: 'selection:vlans', alias: 'vlans', label: 'VLAN', className: 'vlan', columns: ['_id', 'Code', 'Description'] }];
   const placements = [
@@ -3756,13 +4093,20 @@ test('D2 partial preview recompiles current structure mappings instead of stale 
 
 test('D2 Assistant offers readable CMDBuild attributes for placement-only filters', () => {
   const { proposal } = d2StructureTreeFixture();
-  const targets = assistantDiagramPlacementTargets(proposal, [{
+  const stages = [{
     id: 'selection:vlans',
     alias: 'vlans',
     label: 'Все VLAN',
     className: 'vlan',
     columns: ['_id', 'Code', 'Description']
-  }], {
+  }];
+  const targets = assistantDiagramPlacementTargets(proposal, stages, {
+    classes: [{
+      name: 'vlan',
+      attributes: [{ name: 'isNAT' }, { name: 'NetworkRole' }]
+    }]
+  });
+  const dataModel = assistantDataSemanticModel(stages, {
     classes: [{
       name: 'vlan',
       attributes: [{ name: 'isNAT' }, { name: 'NetworkRole' }]
@@ -3770,7 +4114,8 @@ test('D2 Assistant offers readable CMDBuild attributes for placement-only filter
   });
 
   assert.ok(targets.length > 0);
-  assert.deepEqual(targets[0].stages[0].filterFields, ['_id', 'Code', 'Description', 'isNAT', 'NetworkRole']);
+  assert.equal(targets[0].stages, undefined);
+  assert.deepEqual(dataModel.stages[0].readableFields, ['_id', 'Code', 'Description', 'isNAT', 'NetworkRole']);
 });
 
 test('D2 placement filters apply independently to dynamic containers and inherited nodes', () => {
@@ -4930,6 +5275,7 @@ test('D2 topology leaves an omitted network connection unresolved instead of aut
     roles: [{ id: 'external', displayName: 'External', visualKind: 'node' }, { id: 'application', displayName: 'Application', visualKind: 'node' }],
     acceptedItems: [
       { roleId: 'external', source: { stageId: 'selection:external', alias: 'external', className: 'IS' }, mapping: { id: 'external-map' } },
+      { roleId: 'external', structureItemId: 'external-static-example', source: { stageId: '', alias: '', className: '' }, mapping: { id: 'external-static-map', materialization: { kind: 'structural' } } },
       { roleId: 'application', source: { stageId: 'selection:applications', alias: 'applications', className: 'ApplicG' }, mapping: { id: 'application-map' } }
     ],
     topology: [{
@@ -4941,6 +5287,7 @@ test('D2 topology leaves an omitted network connection unresolved instead of aut
   }, { relationRules: [] });
 
   assert.equal(draft.success, true);
+  assert.equal(draft.items.length, 2);
   assert.deepEqual(draft.relationRules, []);
   assert.deepEqual(draft.connectionUnresolved, [{
     connectionKey: 'external-acl',
@@ -4949,6 +5296,45 @@ test('D2 topology leaves an omitted network connection unresolved instead of aut
     code: 'missingDedicatedConnectionResult',
     message: 'No dedicated named Object Flow result was mapped to D2 relation class acl_external.'
   }]);
+});
+
+test('D2 topology rejects a candidate id offered only for another connection mode', () => {
+  const systems = { id: 'selection:systems', alias: 'systems', className: 'IS', kind: 'selection', columns: ['_id', 'Description'] };
+  const applications = { id: 'selection:applications', alias: 'applications', className: 'ApplicG', kind: 'selection', columns: ['_id', 'Description'] };
+  const acl = { id: 'semiJoin:internalAcl', alias: 'internalAcl', className: 'ACL', kind: 'semiJoin', columns: ['_id', 'ipaddress', 'dipaddress', 'Description'] };
+  const draft = assistantDiagramStageDraftFromResponse({
+    kind: 'mapping', mappingPhase: 'topology', stages: [systems, applications, acl],
+    roles: [{ id: 'system', displayName: 'System', visualKind: 'node' }, { id: 'application', displayName: 'Application', visualKind: 'node' }],
+    acceptedItems: [
+      { roleId: 'system', source: { stageId: systems.id, alias: systems.alias, className: systems.className }, mapping: { id: 'system-map' } },
+      { roleId: 'application', source: { stageId: applications.id, alias: applications.alias, className: applications.className }, mapping: { id: 'application-map' } }
+    ],
+    topology: [{
+      d2ElementKey: 'internal-edge', d2ClassKey: 'acl_internal', label: 'Internal ACL', sourceRoleId: 'system', targetRoleId: 'application',
+      directionPolicy: 'dataFields',
+      networkEndpointStages: [{ candidateId: 'network-candidate', sourceStageId: acl.id, sourceField: 'ipaddress', targetField: 'dipaddress' }],
+      deterministicEndpointStages: [{ candidateId: 'deterministic-candidate', sourceStageId: acl.id, fields: ['_id', 'ipaddress', 'dipaddress', 'Description'] }],
+      relationCardStages: []
+    }]
+  }, {
+    relationRules: [{
+      d2ClassKey: 'acl_internal', mode: 'deterministicEndpoints', candidateId: 'network-candidate',
+      sourceStageId: acl.id, sourceField: 'ipaddress', targetField: 'dipaddress'
+    }]
+  });
+
+  assert.equal(draft.success, false);
+  assert.deepEqual(draft.relationRules, []);
+  assert.equal(draft.errors.length, 1);
+  assert.equal(draft.errors[0].code, 'diagram_connection_candidate_not_offered');
+  assert.deepEqual(draft.errors[0].received, {
+    mode: 'deterministicEndpoints',
+    candidateId: 'network-candidate',
+    sourceStageId: acl.id,
+    sourceField: 'ipaddress',
+    targetField: 'dipaddress'
+  });
+  assert.deepEqual(draft.errors[0].offeredCandidates.map((candidate) => candidate.candidateId), ['deterministic-candidate']);
 });
 
 test('D2 topology validation replaces one reused broad result with unique named descendants', () => {
@@ -6639,8 +7025,10 @@ test('assistant prompt config has default and preserves custom system prompt', (
   assert.doesNotMatch(defaultConfig.assistant.prompt.system, /Маршрутизатор ядра/);
   assert.equal(normalizedDefault.prompt.system, defaultConfig.assistant.prompt.system);
   assert.match(defaultConfig.assistant.prompt.objectFlow, /ObjectFlowProposal/);
-  assert.match(defaultConfig.assistant.prompt.diagramInterpretation, /D2 class/);
-  assert.match(defaultConfig.assistant.prompt.diagramMapping, /stage ids/);
+  assert.equal(defaultConfig.assistant.prompt.version, 2);
+  assert.match(defaultConfig.assistant.prompt.diagramSemantics, /D2 class/);
+  assert.match(defaultConfig.assistant.prompt.diagramPlacement, /structureItemId/);
+  assert.match(defaultConfig.assistant.prompt.diagramConnections, /connection classes/);
   assert.equal(normalizedDefault.prompt.objectFlow, defaultConfig.assistant.prompt.objectFlow);
 
   const legacyConfig = normalizeAssistantRuntimeConfig({
@@ -6668,6 +7056,107 @@ test('assistant prompt config has default and preserves custom system prompt', (
     }
   });
   assert.equal(blankConfig.prompt.system, defaultConfig.assistant.prompt.system);
+
+  const migrated = normalizeAssistantPromptContract({
+    diagramInterpretation: 'Legacy semantics.',
+    diagramMapping: 'Legacy mapping.'
+  }, defaultConfig.assistant.prompt);
+  assert.equal(migrated.version, 2);
+  assert.equal(migrated.diagramSemantics, 'Legacy semantics.');
+  assert.equal(migrated.diagramPlacement, 'Legacy mapping.');
+  assert.equal(migrated.diagramConnections, 'Legacy mapping.');
+});
+
+test('DataSemanticModel preserves canonical rightExpression values and expression kinds', () => {
+  const model = assistantDataSemanticModel([{
+    id: 'selection:systems', alias: 'systems', kind: 'selection', className: 'IS', columns: ['_id', 'Active', 'Code', 'Location'],
+    rules: [
+      { action: 'include', path: 'Active', op: 'equals', rightExpression: true },
+      { action: 'exclude', path: 'Active', op: 'equals', rightExpression: false },
+      { action: 'include', path: 'Code', op: 'equals', rightExpression: '${param.systemCode}' },
+      { action: 'include', path: 'Location', op: 'equals', rightExpression: '${previous.Location}' }
+    ]
+  }]);
+
+  assert.equal(model.kind, 'DataSemanticModel');
+  assert.equal(model.version, 2);
+  assert.deepEqual(model.stages[0].rules.map((rule) => ({
+    rightExpression: rule.rightExpression,
+    expressionKind: rule.expressionKind
+  })), [
+    { rightExpression: 'true', expressionKind: 'literal' },
+    { rightExpression: 'false', expressionKind: 'literal' },
+    { rightExpression: '${param.systemCode}', expressionKind: 'parameter' },
+    { rightExpression: '${previous.Location}', expressionKind: 'previous' }
+  ]);
+  assert.equal(model.stages[0].rules.some((rule) => Object.hasOwn(rule, 'value') || Object.hasOwn(rule, 'valueParam') || Object.hasOwn(rule, 'valueColumn')), false);
+});
+
+test('D2 Assistant exchanges versioned semantic, structural, binding, and coverage models', () => {
+  const stages = [{
+    id: 'selection:systems', label: 'Systems', alias: 'systems', kind: 'selection', className: 'IS',
+    columns: ['_id', 'Description'], lineageLabels: ['Systems'],
+    rules: [{ action: 'include', path: 'isExt', op: 'equals', rightExpression: 'false' }],
+    cardSources: [{ id: 'current', label: 'IS', className: 'IS', classColumn: '_type', idColumn: '_id' }]
+  }];
+  const roles = [{ id: 'role-system', displayName: 'System', kind: 'node', notes: 'One system card.', visualKind: 'node', labelTemplate: '${Description}' }];
+  const placements = [{
+    structureItemId: 'placement-system', roleId: 'role-system', displayName: 'System', templateElementKey: 'systems.sample',
+    parentStructureItemId: '', placementNotes: 'Place in the systems branch.', allowedMaterialization: ['stage']
+  }];
+  const connections = [{ d2ElementKey: 'connection-example', d2ClassKey: 'depends_on', connectionNotes: 'Dependency.', directionPolicy: 'dataFields' }];
+
+  const data = assistantDataSemanticModel(stages);
+  const structure = assistantD2StructuralModel(roles, placements, connections);
+  const semantics = assistantD2SemanticModel(roles);
+  const binding = assistantD2BindingModel([{
+    structureItemId: 'placement-system', roleId: 'role-system', source: { stageId: 'selection:systems', className: 'IS' },
+    mapping: { materialization: { kind: 'stage', stageId: 'selection:systems' } }
+  }]);
+  const coverage = assistantCoverageModel({ status: 'complete', requiredRoles: 1, mappedRoles: 1, requiredConnections: 0, mappedConnections: 0, unresolved: [] });
+
+  assert.deepEqual([data.kind, structure.kind, semantics.kind, binding.kind, coverage.kind], [
+    'DataSemanticModel', 'D2StructuralModel', 'D2SemanticModel', 'D2BindingModel', 'CoverageModel'
+  ]);
+  assert.deepEqual([data.version, structure.version, semantics.version, binding.version, coverage.version], [2, 1, 1, 1, 1]);
+  assert.ok([data, structure, semantics, binding, coverage].every((model) => /^[a-f0-9]{64}$/.test(model.modelHash)));
+  assert.equal(structure.roles[0].roleNotes, 'One system card.');
+  assert.equal(structure.placements[0].placementNotes, 'Place in the systems branch.');
+  assert.equal(structure.placements[0].materializationHint, '');
+  assert.equal(structure.connections[0].connectionNotes, 'Dependency.');
+  assert.equal(binding.placements[0].stageId, 'selection:systems');
+  assert.equal(coverage.status, 'complete');
+  assert.deepEqual(data.stages[0].rules, [{
+    action: 'include', negate: false, operator: 'equals', path: 'isExt', rightExpression: 'false', expressionKind: 'literal', leftColumn: '', rightColumn: ''
+  }]);
+});
+
+test('D2 placement materialization hints narrow role defaults and allow placement overrides', () => {
+  const { proposal } = d2StructureTreeFixture();
+  const scopeRole = proposal.roles.find((role) => role.key === 'scope-vlan');
+  const vlanRole = proposal.roles.find((role) => role.key === 'vlan');
+  assert.ok(scopeRole && vlanRole);
+
+  scopeRole.notes = 'materialization: stage\nDynamic frame.';
+  vlanRole.notes = 'materialization: stage\nDynamic node.';
+  const vlanItem = proposal.structureTree.items.find((item) => String(item.roleId) === String(vlanRole.id));
+  assert.ok(vlanItem);
+  const vlanElement = proposal.structure.nodes.find((item) => String(item.key) === String(vlanItem.templateElementKey));
+  assert.ok(vlanElement);
+  vlanElement.notes = 'materialization: parentCard\nUse the nearest materialized ancestor.';
+
+  const targets = assistantDiagramPlacementTargets(proposal, [], { classes: [] });
+  const scopeTarget = targets.find((target) => String(target.roleId) === String(scopeRole.id));
+  const vlanTarget = targets.find((target) => String(target.structureItemId) === String(vlanItem.id));
+  assert.deepEqual(scopeTarget.allowedMaterialization, ['stage']);
+  assert.equal(scopeTarget.materializationHint, 'stage');
+  assert.deepEqual(vlanTarget.allowedMaterialization, ['parentCard']);
+  assert.equal(vlanTarget.materializationHint, 'parentCard');
+
+  const structuralModel = assistantD2StructuralModel(proposal.roles, targets, proposal.relationRules);
+  const modeledVlan = structuralModel.placements.find((placement) => placement.structureItemId === vlanTarget.structureItemId);
+  assert.equal(modeledVlan.materializationHint, 'parentCard');
+  assert.deepEqual(modeledVlan.allowedMaterialization, ['parentCard']);
 });
 
 test('object-flow planning messages keep the full-flow contract and configured prompt separate from user input', () => {

@@ -143,6 +143,130 @@ function d2PlacementMappings(payload, stageId, reason = 'Mapped to the correspon
   });
 }
 
+function d2AssistantPayloadStages(payload) {
+  return Array.isArray(payload && payload.models && payload.models.dataSemanticModel && payload.models.dataSemanticModel.stages)
+    ? payload.models.dataSemanticModel.stages
+    : [];
+}
+
+test('LiteLLM request payload returns 413 before provider fetch when maxRequestBytes is exceeded', async (t) => {
+  const maxRequestBytes = 64 * 1024;
+  const llm = await startLiteLlmStub(t, {
+    flow: { version: 1, selections: [], operations: [], publishedAlias: '' }
+  });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{
+      _id: 1,
+      Code: 'Cst_QueryTool',
+      RootCode: 'Cst_QueryTool',
+      Active: true,
+      RuntimeConfigJson: JSON.stringify({
+        assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model', maxRequestBytes } }
+      })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, {
+    LITELLM_API_KEY: 'unit-test-key',
+    CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin
+  });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=assistant-request-bytes-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const currentSpec = { version: 1, params: {}, steps: [], result: { tables: [] } };
+  const intent = {
+    context: '',
+    blocks: Array.from({ length: 12 }, (_, index) => ({
+      id: `arm-${index + 1}`,
+      name: `ARM result ${index + 1}`,
+      entities: 'ARM cards.',
+      algorithm: `Select ARM cards for bounded request ${index + 1}. ${'x'.repeat(5900)}`,
+      expectedResult: 'ARM cards.',
+      uses: []
+    }))
+  };
+  const response = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+    templateCode: '',
+    baseSpecHash: '',
+    currentSpec,
+    intent
+  }, {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token
+  });
+
+  assert.equal(response.statusCode, 413, response.body);
+  assert.equal(response.json.success, false);
+  assert.equal(response.json.action, 'assistant-object-flow-semantic-plan');
+  assert.equal(response.json.code, 'assistant_request_too_large');
+  assert.equal(response.json.errors.length, 1, response.body);
+  assert.equal(response.json.errors[0].configuredLimit, maxRequestBytes);
+  assert.ok(response.json.errors[0].bytes > maxRequestBytes, response.body);
+  assert.equal(llm.requests, 0, 'provider fetch must not start for an oversized serialized request');
+  assert.equal(backend.exitCode, null);
+});
+
+test('LiteLLM bounded streaming response returns 502 when maxResponseBytes is exceeded', async (t) => {
+  const maxResponseBytes = 64 * 1024;
+  const streamChunkBytes = 4 * 1024;
+  const initialSpec = { version: 1, params: {}, steps: [], result: { tables: [] } };
+  const templateCode = 'AssistantResponseBytes';
+  const llm = await startLiteLlmStub(t, {
+    streamResponse: {
+      contentBytes: 512 * 1024,
+      chunkBytes: streamChunkBytes,
+      delayMs: 2
+    }
+  });
+  const mock = await startMockCmdbuild(t, {
+    templates: [templateCard(templateCode, initialSpec)],
+    configCards: [{
+      _id: 1,
+      Code: 'Cst_QueryTool',
+      RootCode: 'Cst_QueryTool',
+      Active: true,
+      RuntimeConfigJson: JSON.stringify({
+        assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model', maxResponseBytes } }
+      })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, {
+    LITELLM_API_KEY: 'unit-test-key',
+    CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin
+  });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=assistant-response-bytes-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const response = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/plan`, {
+    templateCode,
+    baseSpecHash: hashJson(initialSpec),
+    currentSpec: initialSpec,
+    ...objectFlowPlanRequest('Select ARM cards.', { outputClass: 'ARM' })
+  }, {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token
+  });
+
+  assert.equal(response.statusCode, 502, response.body);
+  assert.equal(response.json.success, false);
+  assert.equal(response.json.action, 'assistant-object-flow-plan');
+  assert.equal(response.json.code, 'litellm_response_too_large');
+  assert.equal(response.json.errors.length, 1, response.body);
+  assert.equal(response.json.errors[0].configuredLimit, maxResponseBytes);
+  assert.ok(response.json.errors[0].bytes > maxResponseBytes, response.body);
+  assert.ok(response.json.errors[0].bytes <= maxResponseBytes + streamChunkBytes * 2, response.body);
+  assert.equal(llm.requests, 1);
+  await waitFor(() => llm.streamClosedEarly, 2000, () => JSON.stringify({
+    streamBytesWritten: llm.streamBytesWritten,
+    streamBytesPlanned: llm.streamBytesPlanned
+  }));
+  assert.ok(llm.streamBytesWritten < llm.streamBytesPlanned, 'backend must cancel the provider stream after reaching the response limit');
+  assert.equal(backend.exitCode, null);
+});
+
 test('draft preview executes exact router anchor before selecting ARM cards by Location', async (t) => {
   const mock = await startMockCmdbuild(t);
   const backendPort = await freePort();
@@ -2180,8 +2304,10 @@ test('normal template Save migrates legacy Assistant authoring and retires the s
   const stored = saved.json.template.spec;
   assert.equal(stored.assistantDraft, undefined);
   assert.equal(stored.authoring.version, 1);
-  assert.equal(stored.authoring.assistant.diagramInterpretPrompt, 'Интерпретировать контейнеры.');
-  assert.equal(stored.authoring.assistant.diagramMappingPrompt, 'Сопоставить выборки с узлами.');
+  assert.equal(stored.authoring.assistant.promptContractVersion, 2);
+  assert.equal(stored.authoring.assistant.diagramSemanticsPrompt, 'Интерпретировать контейнеры.');
+  assert.equal(stored.authoring.assistant.diagramPlacementPrompt, 'Сопоставить выборки с узлами.');
+  assert.equal(stored.authoring.assistant.diagramConnectionsPrompt, 'Сопоставить выборки с узлами.');
   assert.equal(stored.authoring.d2.source, 'node: "Node" { class: server }');
   assert.equal(stored.authoring.d2.sourceHash, crypto.createHash('sha256').update(stored.authoring.d2.source).digest('hex'));
   assert.ok(saved.json.versionLog, saved.body);
@@ -4565,7 +4691,7 @@ test('D2 interpretation uses the template-specific system prompt from currentSpe
       RuntimeConfigJson: JSON.stringify({
         assistant: {
           llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' },
-          prompt: { diagramInterpretation: globalPrompt }
+          prompt: { diagramSemantics: globalPrompt }
         }
       })
     }]
@@ -4586,9 +4712,11 @@ test('D2 interpretation uses the template-specific system prompt from currentSpe
       version: 1,
       assistant: {
         objectFlowIntent: { context: '', blocks: [] },
-        diagramInterpretPrompt: '',
-        diagramMappingPrompt: '',
-        systemPromptOverrides: { diagramInterpretation: templatePrompt }
+        promptContractVersion: 2,
+        diagramSemanticsPrompt: '',
+        diagramPlacementPrompt: '',
+        diagramConnectionsPrompt: '',
+        systemPromptOverrides: { diagramSemantics: templatePrompt }
       },
       d2: { source: d2Source }
     }
@@ -4610,6 +4738,12 @@ test('D2 interpretation uses the template-specific system prompt from currentSpe
   assert.equal(interpreted.statusCode, 200, interpreted.body);
   assert.ok(llm.lastRequest.messages.some((message) => message.role === 'system' && message.content === templatePrompt), JSON.stringify(llm.lastRequest));
   assert.equal(llm.lastRequest.messages.some((message) => message.content === globalPrompt), false, JSON.stringify(llm.lastRequest));
+  const assistantPayload = JSON.parse(llm.lastRequest.messages.at(-1).content);
+  assert.equal(assistantPayload.models.d2StructuralModel.kind, 'D2StructuralModel');
+  assert.equal(assistantPayload.models.d2StructuralModel.version, 1);
+  assert.match(assistantPayload.models.d2StructuralModel.modelHash, /^[a-f0-9]{64}$/);
+  assert.equal(interpreted.json.models.d2SemanticModel.kind, 'D2SemanticModel');
+  assert.equal(interpreted.json.models.d2StructuralModel.modelHash, assistantPayload.models.d2StructuralModel.modelHash);
   assert.equal(backend.exitCode, null);
 });
 
@@ -4687,12 +4821,13 @@ test('D2 mapping rejects direct CMDB paths and requires an Object Flow connectio
         }]
       };
     }
+    const stages = d2AssistantPayloadStages(payload);
     return {
       mappings: payload.placements.map((placement, index) => ({
         structureItemId: placement.structureItemId,
         materialization: placement.allowedMaterialization.includes('stage') ? 'stage' : 'structural',
         stageId: placement.allowedMaterialization.includes('stage')
-          ? payload.stages[index % payload.stages.length].id
+          ? stages[index % stages.length].id
           : '',
         reason: 'Mapped to the corresponding deterministic result.'
       }))
@@ -4732,6 +4867,85 @@ test('D2 mapping rejects direct CMDB paths and requires an Object Flow connectio
   });
   assert.equal(invalid.statusCode, 422, invalid.body);
   assert.ok(invalid.json.errors.some((error) => /Unsupported D2 connection mode direct/.test(error.message)), invalid.body);
+  assert.equal(invalid.json.partial, true, invalid.body);
+  assert.ok(invalid.json.mappings.some((mapping) => mapping.structureItemId), invalid.body);
+  assert.equal(invalid.json.mapping.mappedRoles, invalid.json.mapping.requiredRoles, invalid.body);
+  assert.equal(invalid.json.models.d2BindingModel.placements.length, invalid.json.mappings.length, invalid.body);
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 mapping validates a partial placement draft before starting topology', async (t) => {
+  const llm = await startLiteLlmStub(t, {
+    responses: [({ request }) => {
+      const payload = JSON.parse(request.messages.at(-1).content);
+      assert.ok(Array.isArray(payload.placements), JSON.stringify(payload));
+      const [mapped, ...unresolved] = payload.placements;
+      return {
+        mappings: [{
+          structureItemId: mapped.structureItemId,
+          materialization: 'stage',
+          stageId: 'selection:applications',
+          conditions: {
+            rules: [{
+              operator: 'equals',
+              left: { column: 'NotMaterialized' },
+              right: { kind: 'literal', value: 'active' }
+            }]
+          }
+        }],
+        unresolved: unresolved.map((placement) => ({
+          structureItemId: placement.structureItemId,
+          reason: 'noCompatibleStage',
+          message: 'No compatible result was selected for this placement.'
+        }))
+      };
+    }]
+  });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{
+      _id: 1,
+      Code: 'Cst_QueryTool',
+      RootCode: 'Cst_QueryTool',
+      Active: true,
+      RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, {
+    LITELLM_API_KEY: 'unit-test-key',
+    CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin
+  });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=test-session';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([
+    { alias: 'applications', className: 'ApplicG', columns: ['_id', 'Code', 'Description'] },
+    { alias: 'aclIntrasystem', className: 'ACL', columns: ['_id', 'ipaddress', 'dipaddress', 'Description'] }
+  ]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'PartialPlacementValidation', currentSpec, d2Source: 'same-role-edges'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const endpoint = `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`;
+  const response = await requestJson('POST', endpoint, {
+    prompt: 'Map only independently valid placements.',
+    currentSpec,
+    proposal: analyzed.json.proposal,
+    roles: analyzed.json.proposal.roles.map((role) => d2RoleOverride(role)),
+    stage: 'roles',
+    resumeId: crypto.randomUUID()
+  }, headers, 5000);
+
+  assert.equal(response.statusCode, 422, response.body);
+  assert.equal(response.json.code, 'assistant_diagram_stage_retry');
+  assert.equal(response.json.retryKind, 'correction');
+  assert.equal(response.json.resume.nextStage, 'roles');
+  assert.equal(response.json.diagnostics.executionValidation.checked, true);
+  assert.equal(response.json.diagnostics.executionValidation.failures, 1);
+  assert.ok(response.json.errors.some((error) => error.code === 'diagram_placement_condition_invalid' && /NotMaterialized/.test(error.message)), response.body);
+  assert.equal(llm.requests, 1, 'topology must not call the provider before partial placement validation succeeds');
+  assert.equal(JSON.parse(llm.requestLog[0].messages.at(-1).content).topology, undefined);
   assert.equal(backend.exitCode, null);
 });
 
@@ -4759,7 +4973,7 @@ test('D2 mapping resumes the topology stage without repeating confirmed role map
     };
   };
   const llm = await startLiteLlmStub(t, {
-    delays: [0, 1200, 0],
+    delays: [0, 1200, 250],
     responses: [roleResponse, topologyResponse, topologyResponse]
   });
   const mock = await startMockCmdbuild(t, {
@@ -4796,6 +5010,8 @@ test('D2 mapping resumes the topology stage without repeating confirmed role map
   const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
   const body = {
     prompt: 'Map applications and one dedicated ACL relation result.',
+    placementPrompt: 'Map only exact D2 placements.',
+    connectionsPrompt: 'Map only exact D2 connection classes.',
     currentSpec,
     proposal: analyzed.json.proposal,
     roles
@@ -4816,15 +5032,43 @@ test('D2 mapping resumes the topology stage without repeating confirmed role map
   assert.equal(timedOut.json.diagnostics.rolesReused, true);
   assert.match(timedOut.json.message, /сопоставление связей/);
   assert.match(timedOut.json.message, /сопоставление объектов сохранено временно/);
+  assert.equal(timedOut.json.models.d2BindingModel.kind, 'D2BindingModel');
+  assert.equal(timedOut.json.models.coverageModel.kind, 'CoverageModel');
+  assert.equal(timedOut.json.models.coverageModel.status, 'partial');
+  assert.deepEqual({
+    requiredConnections: timedOut.json.models.coverageModel.requiredConnections,
+    mappedConnections: timedOut.json.models.coverageModel.mappedConnections
+  }, { requiredConnections: 1, mappedConnections: 0 });
   assert.equal(llm.requests, 2);
 
-  const resumed = await requestJson('POST', endpoint, { ...body, stage: 'topology', resumeId }, headers, 5000);
+  const concurrentResumes = await Promise.all([
+    requestJson('POST', endpoint, { ...body, stage: 'topology', resumeId }, headers, 5000),
+    requestJson('POST', endpoint, { ...body, stage: 'topology', resumeId }, headers, 5000)
+  ]);
+  assert.deepEqual(concurrentResumes.map((response) => response.statusCode).sort((left, right) => left - right), [200, 409]);
+  const resumed = concurrentResumes.find((response) => response.statusCode === 200);
+  const contended = concurrentResumes.find((response) => response.statusCode === 409);
+  assert.ok(resumed, concurrentResumes.map((response) => response.body).join('\n'));
+  assert.equal(contended.json.success, false, contended.body);
   assert.equal(resumed.statusCode, 200, resumed.body);
   assert.equal(resumed.json.mapping.status, 'complete');
   assert.deepEqual(resumed.json.mapping.connectionCoverage, { mapped: 1, required: 1 });
   assert.equal(resumed.json.diagnostics.phases.roles, 'accepted');
   assert.equal(resumed.json.diagnostics.phases.topology, 'accepted');
-  assert.equal(llm.requests, 3);
+  assert.equal(resumed.json.models.dataSemanticModel.kind, 'DataSemanticModel');
+  assert.equal(resumed.json.models.d2StructuralModel.kind, 'D2StructuralModel');
+  assert.equal(resumed.json.models.d2BindingModel.kind, 'D2BindingModel');
+  assert.equal(resumed.json.models.coverageModel.kind, 'CoverageModel');
+  assert.equal(resumed.json.models.coverageModel.status, 'complete');
+  const rolePayload = JSON.parse(llm.requestLog[0].messages.at(-1).content);
+  const topologyPayload = JSON.parse(llm.requestLog.at(-1).messages.at(-1).content);
+  assert.equal(rolePayload.prompt, 'Map only exact D2 placements.');
+  assert.equal(rolePayload.stages, undefined);
+  assert.equal(rolePayload.models.dataSemanticModel.kind, 'DataSemanticModel');
+  assert.equal(rolePayload.models.d2StructuralModel.kind, 'D2StructuralModel');
+  assert.equal(topologyPayload.prompt, 'Map only exact D2 connection classes.');
+  assert.equal(topologyPayload.models.d2BindingModel.kind, 'D2BindingModel');
+  assert.equal(llm.requests, 3, 'concurrent resume claims must produce exactly one provider call');
   assert.equal(backend.exitCode, null);
 });
 
@@ -4836,6 +5080,17 @@ test('D2 mapping resumes a timed-out roles stage before starting topology', asyn
       'Applications are materialized by the selected result.'
     )
   });
+  const invalidRoleResponse = ({ request }) => {
+    const payload = JSON.parse(request.messages.at(-1).content);
+    const invalid = payload.placements.find((placement) => placement.visualKind === 'node') || payload.placements[0];
+    return {
+      mappings: d2PlacementMappings(payload, 'selection:applications').map((mapping) => (
+        mapping.structureItemId === invalid.structureItemId
+          ? { structureItemId: mapping.structureItemId, materialization: 'structural', reason: 'Invalid materialization for correction coverage.' }
+          : mapping
+      ))
+    };
+  };
   const topologyResponse = ({ request }) => {
     const payload = JSON.parse(request.messages.at(-1).content);
     const connection = payload.topology[0];
@@ -4853,8 +5108,8 @@ test('D2 mapping resumes a timed-out roles stage before starting topology', asyn
     };
   };
   const llm = await startLiteLlmStub(t, {
-    delays: [1200, 0, 0],
-    responses: [roleResponse, roleResponse, topologyResponse]
+    delays: [1200, 0, 0, 0],
+    responses: [roleResponse, invalidRoleResponse, roleResponse, topologyResponse]
   });
   const mock = await startMockCmdbuild(t, {
     configCards: [{
@@ -4901,20 +5156,30 @@ test('D2 mapping resumes a timed-out roles stage before starting topology', asyn
   assert.equal(timedOut.json.retryable, true, timedOut.body);
   assert.equal(timedOut.json.resume.resumeId, resumeId);
   assert.equal(timedOut.json.resume.nextStage, 'roles');
+  assert.equal(timedOut.json.resume.automaticRetriesRemaining, 0);
+  assert.equal(timedOut.json.resume.correctionRetriesRemaining, 2);
   assert.equal(timedOut.json.diagnostics.stage, 'roles');
   assert.equal(timedOut.json.diagnostics.rolesReused, false);
   assert.equal(llm.requests, 1);
 
+  const correction = await requestJson('POST', endpoint, { ...body, stage: 'roles', resumeId }, headers, 5000);
+  assert.equal(correction.statusCode, 422, correction.body);
+  assert.equal(correction.json.retryKind, 'correction');
+  assert.equal(correction.json.resume.nextStage, 'roles');
+  assert.equal(correction.json.resume.automaticRetriesRemaining, 0);
+  assert.equal(correction.json.resume.correctionRetriesRemaining, 1);
+  assert.equal(llm.requests, 2);
+
   const roles = await requestJson('POST', endpoint, { ...body, stage: 'roles', resumeId }, headers, 5000);
   assert.equal(roles.statusCode, 202, roles.body);
   assert.equal(roles.json.checkpoint.nextStage, 'topology');
-  assert.equal(llm.requests, 2);
+  assert.equal(llm.requests, 3);
 
   const topology = await requestJson('POST', endpoint, { ...body, stage: 'topology', resumeId }, headers, 5000);
   assert.equal(topology.statusCode, 200, topology.body);
   assert.equal(topology.json.mapping.status, 'complete');
   assert.deepEqual(topology.json.mapping.connectionCoverage, { mapped: 1, required: 1 });
-  assert.equal(llm.requests, 3);
+  assert.equal(llm.requests, 4);
   assert.equal(backend.exitCode, null);
 });
 
@@ -5136,7 +5401,7 @@ test('D2 mapping reports complete when every node role is covered by an Object F
   const llm = await startLiteLlmStub(t, {
     responses: [({ request }) => {
       const payload = JSON.parse(request.messages.at(-1).content);
-      return { mappings: d2PlacementMappings(payload, payload.stages[0].id, 'Node source.') };
+      return { mappings: d2PlacementMappings(payload, d2AssistantPayloadStages(payload)[0].id, 'Node source.') };
     }]
   });
   const mock = await startMockCmdbuild(t, {
@@ -5215,10 +5480,12 @@ test('D2 mapping recovers an invalid parentCard response with one deterministic 
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 mapping normalizes a duplicate placement before completing the roles stage', async (t) => {
+test('D2 mapping rejects conflicting duplicate placements with an explicit correction contract', async (t) => {
+  let conflictingItemId = '';
   const response = ({ request }) => {
     const payload = JSON.parse(request.messages.at(-1).content);
     const [first, ...rest] = payload.placements;
+    conflictingItemId = first.structureItemId;
     return {
       mappings: [
         { structureItemId: first.structureItemId, materialization: 'parentCard', reason: 'Use an inherited card.' },
@@ -5245,15 +5512,88 @@ test('D2 mapping normalizes a duplicate placement before completing the roles st
     templateCode: 'DuplicateContainerMapping', currentSpec, d2Source: 'container-class scope_server: { server: Server }'
   }, headers);
   assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const resumeId = crypto.randomUUID();
   const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
     prompt: 'Map the server scope and server node.', currentSpec, proposal: analyzed.json.proposal,
-    roles: analyzed.json.proposal.roles.map((role) => d2RoleOverride(role))
+    roles: analyzed.json.proposal.roles.map((role) => d2RoleOverride(role)),
+    stage: 'roles',
+    resumeId
+  }, headers);
+
+  assert.equal(mapped.statusCode, 422, mapped.body);
+  assert.equal(mapped.json.success, false);
+  assert.equal(mapped.json.code, 'assistant_diagram_stage_retry');
+  assert.equal(mapped.json.retryable, true);
+  assert.equal(mapped.json.retryKind, 'correction');
+  assert.equal(mapped.json.resume.resumeId, resumeId);
+  assert.equal(mapped.json.resume.nextStage, 'roles');
+  const conflict = mapped.json.errors.find((error) => error.code === 'diagram_placement_duplicate');
+  assert.ok(conflict, mapped.body);
+  assert.equal(conflict.path, '$.mappings[1].structureItemId');
+  assert.equal(conflict.structureItemId, conflictingItemId);
+  assert.equal(mapped.json.partial, true);
+  assert.equal(mapped.json.mappings.length, 1);
+  assert.equal(llm.requests, 1);
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 mapping deduplicates exact-identical placements before completing the roles stage', async (t) => {
+  const response = ({ request }) => {
+    const payload = JSON.parse(request.messages.at(-1).content);
+    const [first, ...rest] = payload.placements;
+    const duplicate = {
+      structureItemId: first.structureItemId,
+      materialization: 'stage',
+      stageId: 'selection:workstations',
+      reason: 'Direct result is executable.'
+    };
+    return {
+      mappings: [
+        duplicate,
+        structuredClone(duplicate),
+        ...rest.map((placement) => ({
+          structureItemId: placement.structureItemId,
+          materialization: 'stage',
+          stageId: 'selection:workstations',
+          reason: 'Direct result.'
+        }))
+      ]
+    };
+  };
+  const llm = await startLiteLlmStub(t, { responses: [response] });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } }) }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-identical-duplicate-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([
+    { alias: 'workstations', className: 'ARM', columns: ['_id', 'Code', 'Description'] },
+    { alias: 'otherWorkstations', className: 'ARM', columns: ['_id', 'Code', 'Description'] }
+  ]);
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'IdenticalDuplicateMapping', currentSpec, d2Source: 'container-class scope_server: { server: Server }'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const resumeId = crypto.randomUUID();
+  const mapped = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`, {
+    prompt: 'Map the server scope and server node.', currentSpec, proposal: analyzed.json.proposal,
+    roles: analyzed.json.proposal.roles.map((role) => d2RoleOverride(role)),
+    stage: 'roles',
+    resumeId
   }, headers);
 
   assert.equal(mapped.statusCode, 202, mapped.body);
+  assert.equal(mapped.json.success, true);
   assert.equal(mapped.json.checkpoint.nextStage, 'topology');
   assert.deepEqual([mapped.json.mapping.mappedRoles, mapped.json.mapping.requiredRoles], [2, 2]);
-  assert.ok(mapped.json.warnings.some((warning) => /несколько вариантов/i.test(warning)), JSON.stringify(mapped.json.warnings));
+  assert.equal(mapped.json.models.d2BindingModel.kind, 'D2BindingModel');
+  assert.equal(mapped.json.models.d2BindingModel.placements.length, 2);
+  assert.equal(new Set(mapped.json.models.d2BindingModel.placements.map((placement) => placement.structureItemId)).size, 2);
+  assert.ok(mapped.json.warnings.some((warning) => /идентичные варианты объединены/i.test(warning)), JSON.stringify(mapped.json.warnings));
   assert.equal(llm.requests, 1);
   assert.equal(backend.exitCode, null);
 });
@@ -5281,6 +5621,8 @@ test('D2 mapping resumes only invalid placements and keeps its partial role draf
     const payload = JSON.parse(request.messages.at(-1).content);
     assert.equal(payload.placements.length, 1, JSON.stringify(payload.placements));
     assert.equal(payload.placements[0].visualKind, 'node');
+    assert.equal(payload.models.d2BindingModel.kind, 'D2BindingModel');
+    assert.equal(payload.models.d2BindingModel.placements.length, 1);
     return {
       mappings: [{ structureItemId: payload.placements[0].structureItemId, materialization: 'structural', reason: 'Invalid node mapping.' }]
     };
@@ -5289,6 +5631,8 @@ test('D2 mapping resumes only invalid placements and keeps its partial role draf
     const payload = JSON.parse(request.messages.at(-1).content);
     assert.equal(payload.placements.length, 1, JSON.stringify(payload.placements));
     assert.equal(payload.placements[0].visualKind, 'node');
+    assert.equal(payload.models.d2BindingModel.kind, 'D2BindingModel');
+    assert.equal(payload.models.d2BindingModel.placements.length, 1);
     return {
       mappings: [{ structureItemId: payload.placements[0].structureItemId, materialization: 'stage', stageId: 'selection:workstations', reason: 'Direct result.' }]
     };
@@ -5343,12 +5687,12 @@ test('D2 mapping retries Assistant-omitted placements but preserves explicit unr
   const firstResponse = ({ request }) => {
     const payload = JSON.parse(request.messages.at(-1).content);
     assert.equal(payload.placements.length, 2, JSON.stringify(payload.placements));
-    return { mappings: d2PlacementMappings({ placements: [payload.placements[0]] }, payload.stages[0].id, 'First confirmed placement.') };
+    return { mappings: d2PlacementMappings({ placements: [payload.placements[0]] }, d2AssistantPayloadStages(payload)[0].id, 'First confirmed placement.') };
   };
   const correctionResponse = ({ request }) => {
     const payload = JSON.parse(request.messages.at(-1).content);
     assert.equal(payload.placements.length, 1, JSON.stringify(payload.placements));
-    return { mappings: d2PlacementMappings(payload, payload.stages[0].id, 'Recovered omitted placement.') };
+    return { mappings: d2PlacementMappings(payload, d2AssistantPayloadStages(payload)[0].id, 'Recovered omitted placement.') };
   };
   const llm = await startLiteLlmStub(t, { responses: [firstResponse, correctionResponse] });
   const mock = await startMockCmdbuild(t, {
@@ -5658,8 +6002,10 @@ test('D2 import Apply stays local until the normal template Save persists the ma
   assert.equal(applied.json.template, undefined);
   assert.equal(applied.json.versionLog, undefined);
   assert.equal(applied.json.cacheInvalidation, undefined);
-  assert.equal(applied.json.spec.authoring.assistant.diagramInterpretPrompt, 'Проверить контейнеры.');
-  assert.equal(applied.json.spec.authoring.assistant.diagramMappingPrompt, 'Сопоставить этапы с ролями.');
+  assert.equal(applied.json.spec.authoring.assistant.promptContractVersion, 2);
+  assert.equal(applied.json.spec.authoring.assistant.diagramSemanticsPrompt, 'Проверить контейнеры.');
+  assert.equal(applied.json.spec.authoring.assistant.diagramPlacementPrompt, 'Сопоставить этапы с ролями.');
+  assert.equal(applied.json.spec.authoring.assistant.diagramConnectionsPrompt, 'Сопоставить этапы с ролями.');
   assert.equal(applied.json.spec.result.diagrams[0].authoring.d2Import.source, source);
   assert.equal(mock.requests.some((item) => item.method === 'PUT' && item.pathname.includes('/classes/Cst_QueryTemplate/cards/')), false);
 
@@ -7791,6 +8137,10 @@ async function startMockCmdbuild(t, options = {}) {
 async function startLiteLlmStub(t, proposal) {
   let requests = 0;
   let lastRequest = null;
+  let streamBytesWritten = 0;
+  let streamBytesPlanned = 0;
+  let streamClosedEarly = false;
+  const requestLog = [];
   const server = http.createServer(async (req, res) => {
     if (req.method !== 'POST' || req.url !== '/v1/chat/completions') {
       sendJson(res, 404, { message: 'Unknown LiteLLM route.' });
@@ -7798,11 +8148,44 @@ async function startLiteLlmStub(t, proposal) {
     }
     requests += 1;
     lastRequest = await readRequestJson(req);
+    requestLog.push(lastRequest);
     const delayMs = Array.isArray(proposal.delays)
       ? Number(proposal.delays[Math.min(requests - 1, proposal.delays.length - 1)])
       : Number(proposal.delayMs);
     if (delayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    if (proposal.streamResponse) {
+      const prefix = '{"choices":[{"message":{"content":"';
+      const suffix = '"}}]}';
+      const contentBytes = Math.max(1, Number(proposal.streamResponse.contentBytes) || 1);
+      const chunkBytes = Math.max(1, Number(proposal.streamResponse.chunkBytes) || 1024);
+      const streamDelayMs = Math.max(0, Number(proposal.streamResponse.delayMs) || 0);
+      streamBytesPlanned = Buffer.byteLength(prefix) + contentBytes + Buffer.byteLength(suffix);
+      res.once('close', () => {
+        if (streamBytesWritten < streamBytesPlanned) streamClosedEarly = true;
+      });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      const writeChunk = async (chunk) => {
+        if (res.destroyed || res.writableEnded) {
+          streamClosedEarly = true;
+          return false;
+        }
+        streamBytesWritten += Buffer.byteLength(chunk);
+        res.write(chunk);
+        if (streamDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, streamDelayMs));
+        return true;
+      };
+      if (!await writeChunk(prefix)) return;
+      let remaining = contentBytes;
+      while (remaining > 0) {
+        const size = Math.min(chunkBytes, remaining);
+        if (!await writeChunk('x'.repeat(size))) return;
+        remaining -= size;
+      }
+      if (!await writeChunk(suffix)) return;
+      res.end();
+      return;
     }
     const configuredResponse = Array.isArray(proposal.responses)
       ? proposal.responses[Math.min(requests - 1, proposal.responses.length - 1)]
@@ -7820,7 +8203,11 @@ async function startLiteLlmStub(t, proposal) {
   return {
     origin: `http://127.0.0.1:${address.port}/v1`,
     get requests() { return requests; },
-    get lastRequest() { return lastRequest; }
+    get lastRequest() { return lastRequest; },
+    get requestLog() { return requestLog.slice(); },
+    get streamBytesWritten() { return streamBytesWritten; },
+    get streamBytesPlanned() { return streamBytesPlanned; },
+    get streamClosedEarly() { return streamClosedEarly; }
   };
 }
 
