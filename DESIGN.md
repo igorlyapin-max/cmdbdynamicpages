@@ -56,11 +56,19 @@ Project visual identity and design system.
   {
     "version": 1,
     "assistant": {
-      "objectFlowIntent": "...",
-      "promptContractVersion": 2,
-      "diagramSemanticsPrompt": "...",
-      "diagramPlacementPrompt": "...",
-      "diagramConnectionsPrompt": "...",
+      "objectFlowIntent": {
+        "context": "...",
+        "blocks": [
+          {
+            "name": "Результат 1",
+            "description": "...",
+            "resultKind": "cards",
+            "uses": []
+          }
+        ]
+      },
+      "promptContractVersion": 4,
+      "diagramIntentPrompt": "...",
       "systemPromptOverrides": {
         "objectFlow": "..."
       }
@@ -68,15 +76,22 @@ Project visual identity and design system.
     "d2": { "source": "...", "sourceHash": "..." }
   }
   ```
-- Assistant prompt contract v2 separates `diagramSemantics`, `diagramPlacement`, and `diagramConnections`. Legacy `diagramInterpretation`/`diagramMapping` and template `diagramInterpretPrompt`/`diagramMappingPrompt` are read-only migration inputs: normalization fans the old mapping prompt into placement and connections, while every subsequent Save writes only v2 fields.
+- Assistant prompt contract v4 exposes one user-authored `diagramIntentPrompt`. Internal stages remain separate (`semantics -> binding intent -> placement -> connections -> critique`) and receive the same intent under stage-specific system policies. Legacy diagram prompt fields are read-only migration inputs; normalization joins unique non-empty values and every subsequent Save writes only v4 fields.
+- Assistant authoring requests use `templateRef` plus a bounded editor delta. The saved template is the server-side base; full `currentSpec` is not sent by the browser on each LLM stage. Diagram output is excluded from D2 mapping input identity so applying a mapping cannot invalidate its own analysis.
 - D2 Role Notes and Placement Notes may contain one machine-readable line `materialization: structural|stage|parentCard`. Placement Notes override Role Notes. The deterministic structural model validates the hint against the visual kind and narrows `allowedMaterialization`; Assistant may choose a source but may not override the declared materialization mode. This directive is generic D2 authoring metadata, not a CMDBuild class or customer-specific convention.
-- Diagram Assistant exchanges five independently versioned, hash-addressed contracts:
+- Diagram Assistant exchanges independently versioned, hash-addressed contracts:
+  - `BusinessBlockManifest` exposes each named user block, its one terminal result, helper results, primary class, output kind, row grain, and materialized fields. Newly applied Assistant flows persist `assistantStageRole=terminal|helper`: every user block owns exactly one unshared terminal result, and a helper cannot be published as that block. Legacy flows are recovered only when the dependency graph has one sink inside the block; labels never decide terminal ownership.
   - `DataSemanticModel` contains named deterministic Object Flow stages, dependencies, lineage, materialized card sources, classes, and fields.
   - `D2StructuralModel` contains exact reusable roles, exact placement ids and parents, D2 connection classes, and Notes scoped by their source location.
   - `D2SemanticModel` contains only node/container meaning and label intent for exact role ids.
+  - `D2BindingIntent` binds each dynamic placement and connection class to one named business block without selecting a technical stage or field.
   - `D2BindingModel` contains accepted placement-to-stage materialization and hierarchy conditions. The connection stage receives this model as immutable input.
+  - `SemanticObligationMatrix` records the terminal-result, filter, membership, row-grain, endpoint-mode, and endpoint-field requirements that must remain true in the generated mapping.
+  - `D2MappingCritique` reports semantic concerns only through exact obligation ids and cannot approve an obligation that deterministic validation marked unsatisfied.
   - `CoverageModel` reports required, mapped, and unresolved roles, containers, and connection classes. It is evidence, not a source for implicit autofill.
-- Assistant stages are ordered `semantics -> placement -> connections`. Each stage has its own system prompt and optional template prompt, accepts only the typed models needed by that stage, and passes deterministic validation before its output can become input to the next stage. Runtime execution never invokes LLM.
+- Assistant stages are ordered `semantics -> binding intent -> placement -> connections -> semantic critic`. Binding intent sees named business blocks but no technical stages. Placement receives only stages allowed by the accepted intent; connections receive only candidates from the selected business block and use terminal results unless Notes explicitly allow a helper. The final result is accepted only when every deterministic semantic obligation is satisfied. At most two targeted correction passes are allowed across the whole mapping workflow. Runtime execution never invokes LLM.
+- D2 Notes are natural-language authoring input by default. Binding intent translates explicit branch filters, parent membership, row grain, endpoint fields and operators into a typed obligation contract, and deterministic validation checks that later placement/connection stages satisfy it. Advanced machine-readable lines (`binding-result`, `stage-policy`, `row-grain`, `membership`, repeated `required-condition`/`required-membership`, `endpoint-mode`, repeated `endpoint-field`/`endpoint-operator`, `source-field`/`source-operator`, `target-field`/`target-operator`, and `exemplars`) remain authoritative when present. Fixed materialization, exact business-block ownership, typed conditions, membership rules, and endpoint profiles are compiled by the deterministic adapter; LLM may enrich ambiguous natural-language intent but cannot replace or omit those constraints. `endpoint-field` is resolved from the exact card source selected for each concrete placement; backend then creates one deterministic endpoint profile per placement and field.
+- `CoverageModel.status=complete` requires the same executable endpoint-profile and operator checks as D2 Apply. A mapped connection class without compatible source and target profiles remains `partial`; Assistant cannot report success that deterministic Apply would immediately reject.
 - D2 `Notes` are interpreted by location: Notes on a class define reusable role semantics, Notes on a concrete element define only that placement, and Notes on a connection class or exemplar define only the connection algorithm. Notes guide selection among supplied identifiers but never create CMDBuild identifiers, relations, stages, or fields.
 - Assistant renders prompts, generation state, warnings, and explicit proposal actions only; it must not render deterministic selection, matching, class, attribute, or D2 mapping controls.
 - D2 source and Assistant prompts remain in Assistant. Pending D2 semantic and mapping proposals remain in Assistant and never replace the deterministic Diagram editor state.

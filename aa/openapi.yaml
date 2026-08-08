@@ -386,6 +386,50 @@ paths:
           description: Authoring execution throttle reached
         "503":
           description: Assistant is disabled or LiteLLM is not configured
+  /cmdbuild/custom-api/assistant/object-flow/semantic-plan:
+    post:
+      tags: [assistant]
+      summary: Prepare or resume the semantic plan for named Object Flow blocks
+      description: >
+        Two-stage authoring operation. Stage context stores a bounded,
+        session-scoped MCP checkpoint and returns HTTP 202. Stage plan resumes
+        that checkpoint and produces one semantic contract per named user
+        block. The browser sends a saved-template reference and a bounded
+        editor delta; it never transfers the complete currentSpec.
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AssistantObjectFlowSemanticPlanRequest"
+      responses:
+        "200":
+          description: Semantic plan is ready
+        "202":
+          description: Bounded context checkpoint is ready for the plan stage
+        "400":
+          description: Request, template reference, or editor delta is invalid
+        "401":
+          description: CMDBuild session is invalid or expired
+        "403":
+          description: CSRF check failed or the saved template is not readable
+        "409":
+          description: Saved template or checkpoint identity changed
+        "413":
+          description: Bounded context or checkpoint exceeds configured limits
+        "422":
+          description: Semantic plan failed deterministic validation
+        "429":
+          description: Authoring execution throttle reached
+        "502":
+          description: LiteLLM or MCP context preparation failed
+        "503":
+          description: Assistant is disabled or LiteLLM is not configured
+        "504":
+          description: Semantic-plan stage timed out and may be resumed
   /cmdbuild/custom-api/draft/object-flow/apply:
     post:
       tags: [templates]
@@ -955,7 +999,8 @@ paths:
         structural, stage, or parentCard materialization. When connections need
         mapping, HTTP 202 returns a checkpoint and stage topology resumes with
         the same resumeId while preserving accepted placements. Eligible sources
-        include every object-flow selection and intermediate match stage.
+        are named terminal Object Flow results; helper stages are excluded unless
+        an explicit advanced contract allows one.
         Returned mappings remain proposals until explicit deterministic Apply.
       security:
         - cmdbuildCookie: []
@@ -1271,23 +1316,123 @@ components:
     AssistantObjectFlowPlanRequest:
       type: object
       additionalProperties: false
-      required: [templateCode, baseSpecHash, currentSpec, prompt]
+      required: [templateRef, editorDelta, intent, semanticPlan, resumeId]
+      properties:
+        templateRef:
+          $ref: "#/components/schemas/AssistantTemplateRef"
+        editorDelta:
+          $ref: "#/components/schemas/AssistantEditorDelta"
+        intent:
+          $ref: "#/components/schemas/AssistantObjectFlowIntent"
+        semanticPlan:
+          type: object
+          additionalProperties: true
+          description: Previously validated semantic plan for the same intent and checkpoint.
+        resumeId:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$"
+    AssistantObjectFlowSemanticPlanRequest:
+      type: object
+      additionalProperties: false
+      required: [templateRef, editorDelta, intent, stage, resumeId]
+      properties:
+        templateRef:
+          $ref: "#/components/schemas/AssistantTemplateRef"
+        editorDelta:
+          $ref: "#/components/schemas/AssistantEditorDelta"
+        intent:
+          $ref: "#/components/schemas/AssistantObjectFlowIntent"
+        stage:
+          type: string
+          enum: [context, plan]
+        resumeId:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$"
+    AssistantTemplateRef:
+      type: object
+      additionalProperties: false
+      required: [root, templateCode, baseSpecHash]
       properties:
         root:
           type: string
+          minLength: 1
         templateCode:
           type: string
-          description: Code существующего читаемого шаблона для local authoring CAS.
+          description: Empty only while authoring an unsaved local template draft.
         baseSpecHash:
           type: string
-          description: Hash сохранённого шаблона для optimistic authoring conflict detection; не означает update permission.
-        currentSpec:
-          type: object
-          additionalProperties: true
-        prompt:
+          description: Empty only while authoring an unsaved local template draft; otherwise the saved template hash used for optimistic authoring CAS.
+    AssistantEditorDelta:
+      type: object
+      additionalProperties: false
+      required: [version, spec]
+      properties:
+        version:
+          type: integer
+          enum: [1]
+        hash:
           type: string
-          minLength: 1
-          description: Full author-provided data-flow intent, including selections and joins.
+          pattern: "^[a-f0-9]{64}$"
+        spec:
+          type: object
+          additionalProperties: false
+          description: Bounded unsaved editor fields layered over the referenced saved template.
+          properties:
+            version:
+              type: integer
+            params:
+              type: array
+              items: {}
+            steps:
+              type: array
+              items: {}
+            visualModel:
+              type: object
+              additionalProperties: true
+            visualModels:
+              type: array
+              items: {}
+            result:
+              type: object
+              additionalProperties: false
+              properties:
+                tables:
+                  type: array
+                  items: {}
+                emptyText:
+                  type: string
+                permissionDeniedText:
+                  type: string
+            authoring:
+              type: object
+              additionalProperties: true
+    AssistantObjectFlowIntent:
+      type: object
+      additionalProperties: false
+      required: [context, blocks]
+      properties:
+        context:
+          type: string
+        blocks:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, name, description, resultKind, dependsOn]
+            properties:
+              id:
+                type: string
+              name:
+                type: string
+              description:
+                type: string
+              resultKind:
+                type: string
+                enum: [auto, sourceCards, relationPairs]
+              dependsOn:
+                type: array
+                items:
+                  type: string
     AssistantObjectFlowPlanResponse:
       type: object
       additionalProperties: false
@@ -2123,34 +2268,18 @@ components:
     AssistantDiagramImportInterpretRequest:
       type: object
       additionalProperties: false
-      required: [templateCode, baseSpecHash, currentSpec, proposal, roles, structureTree, semanticsPrompt]
+      required: [templateRef, editorDelta, proposal, roles, structureTree, prompt]
       properties:
-        root:
-          type: string
-        templateCode:
-          type: string
-          description: Code читаемого saved template used for authoring CAS and proposal ownership checks.
-        baseSpecHash:
-          type: string
-          pattern: "^[a-f0-9]{64}$"
-          description: Full saved Spec hash; Assistant calls do not grant template update permission.
-        currentSpec:
-          type: object
-          additionalProperties: true
+        templateRef:
+          $ref: "#/components/schemas/AssistantTemplateRef"
+        editorDelta:
+          $ref: "#/components/schemas/AssistantEditorDelta"
         proposal:
           $ref: "#/components/schemas/DiagramImportProposalEnvelope"
         prompt:
           type: string
-          description: Combined UI prompt retained as a compatibility input; semanticsPrompt is authoritative for this stage.
-        semanticsPrompt:
-          type: string
-          description: Author guidance used only to classify D2 roles as node or container and propose label templates.
-        placementPrompt:
-          type: string
-          description: Current placement prompt carried by the shared Assistant request state but not executed by interpretation.
-        connectionsPrompt:
-          type: string
-          description: Current connection prompt carried by the shared Assistant request state but not executed by interpretation.
+          minLength: 1
+          description: One user-facing diagram intent; internal semantic, placement, and connection system stages remain separate.
         roles:
           type: array
           description: Imported roles visible to semantic interpretation.
@@ -2194,34 +2323,18 @@ components:
     AssistantDiagramImportMapSelectionsRequest:
       type: object
       additionalProperties: false
-      required: [templateCode, baseSpecHash, currentSpec, proposal, roles, structureTree, placementPrompt, connectionsPrompt, traversalDepth, stage, resumeId]
+      required: [templateRef, editorDelta, proposal, roles, structureTree, prompt, traversalDepth, stage, resumeId]
       properties:
-        root:
-          type: string
-        templateCode:
-          type: string
-          description: Code читаемого saved template used to scope the resumable checkpoint.
-        baseSpecHash:
-          type: string
-          pattern: "^[a-f0-9]{64}$"
-          description: Full saved Spec hash included in the immutable checkpoint input identity.
-        currentSpec:
-          type: object
-          additionalProperties: true
+        templateRef:
+          $ref: "#/components/schemas/AssistantTemplateRef"
+        editorDelta:
+          $ref: "#/components/schemas/AssistantEditorDelta"
         proposal:
           $ref: "#/components/schemas/DiagramImportProposalEnvelope"
         prompt:
           type: string
-          description: Combined UI prompt retained in the checkpoint identity; stage-specific prompts are authoritative.
-        semanticsPrompt:
-          type: string
-          description: Current role semantics prompt carried by the shared Assistant request state.
-        placementPrompt:
-          type: string
-          description: Author guidance for the roles stage that maps each structure-tree placement to materialization and Object Flow source.
-        connectionsPrompt:
-          type: string
-          description: Author guidance for the topology stage that maps each D2 connection class to one deterministic result.
+          minLength: 1
+          description: One user-facing intent retained in the checkpoint identity.
         roles:
           type: array
           items:
@@ -2247,13 +2360,13 @@ components:
           description: Client-generated opaque checkpoint key reused unchanged for roles retries and the topology continuation.
         stages:
           type: array
-          description: Optional client summary; the backend derives and validates the authoritative stages from currentSpec.
+          description: Optional client summary; the backend derives authoritative terminal stages from the referenced template plus editor delta.
           items:
             $ref: "#/components/schemas/ObjectFlowSourceRef"
     AssistantDiagramImportMapSelectionsResponse:
       type: object
       additionalProperties: false
-      required: [success, action, mappings, relationRules, connectionUnresolved, structureTree, mapping, models, explanation, warnings, errors, diagnostics, resume]
+      required: [success, action, mappings, endpointProfiles, relationRules, connectionUnresolved, structureTree, mapping, models, explanation, warnings, errors, diagnostics, resume]
       properties:
         success:
           type: boolean
@@ -2264,6 +2377,11 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/DiagramSelectionMapping"
+        endpointProfiles:
+          type: array
+          description: Deterministic placement comparison rules derived from explicit D2 Notes and preserved compatible editor mappings.
+          items:
+            $ref: "#/components/schemas/DiagramImportEndpointProfile"
         relationRules:
           type: array
           items:
@@ -2682,7 +2800,7 @@ components:
           enum: [DataSemanticModel]
         version:
           type: integer
-          enum: [2]
+          enum: [3]
         modelHash:
           type: string
           pattern: "^[a-f0-9]{64}$"
@@ -2976,7 +3094,7 @@ components:
           enum: [CoverageModel]
         version:
           type: integer
-          enum: [1]
+          enum: [2]
         modelHash:
           type: string
           pattern: "^[a-f0-9]{64}$"

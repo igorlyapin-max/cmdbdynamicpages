@@ -121,11 +121,12 @@ npm run nginx:test
 
 ```text
 CMDBDYNAMIC_REDIS_URL=rediss://redis.example.local:6380/0
-CMDBDYNAMIC_REDIS_TLS_CA_FILE=
+CMDP_TLS_CA_FILE=
+CMDP_TLS_CA_FILE_HOST=
 CMDBDYNAMIC_REDIS_PASSWORD_FILE=/run/secrets/cmdbdynamicpages_redis_password
 ```
 
-`CMDBDYNAMIC_REDIS_TLS_CA_FILE` optional и задает путь к CA PEM, уже смонтированному в backend container, если system trust не покрывает private Redis PKI. Plaintext `redis://` остается поддержанным для local и существующих deployment; в production он дает runtime warning `redis_plaintext_transport`.
+При private PKI CMDBuild, Redis или LiteLLM задать вместе `CMDP_TLS_CA_FILE_HOST` и `CMDP_TLS_CA_FILE=/run/certs/cmdbdynamicpages-ca.pem`. Compose смонтирует PEM bundle read-only, Node использует его для HTTPS trust, а Redis использует тот же файл. Plaintext `redis://` остается поддержанным для local и существующих deployment; в production он дает runtime warning `redis_plaintext_transport`.
 
 Поддерживаются также:
 

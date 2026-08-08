@@ -7,17 +7,31 @@ import {
   assistantCandidateClassesFromSummary,
   assistantClassMentionsFromText,
   assistantDiagramSelectionMappings,
+  assistantDiagramNotesHasNaturalLanguage,
+  assistantEditorDeltaFromSpec,
+  applyAssistantEditorDelta,
   assistantDiagramAttachRelatedNetworkStages,
   assistantDiagramPlacementCorrection,
   assistantDiagramPlacementDraftFromResponse,
   assistantDiagramPlacementExecutionValidation,
   assistantDiagramRecoverParentCardMappings,
   assistantDiagramPlacementTargets,
+  assistantDiagramEndpointProfilesFromBindings,
+  assistantObjectFlowBusinessBlockManifest,
   assistantDataSemanticModel,
   assistantD2StructuralModel,
   assistantD2SemanticModel,
+  assistantD2BindingIntentModel,
   assistantD2BindingModel,
+  assistantSemanticObligationModel,
+  assistantD2CritiqueModel,
   assistantCoverageModel,
+  assistantDiagramBindingIntentSeed,
+  normalizeAssistantDiagramBindingIntentResponse,
+  assistantDiagramBindingIntentDraftFromResponse,
+  assistantDiagramMappingCoverage,
+  assistantDiagramTopologyWithBindingIntent,
+  assistantDiagramSemanticObligations,
   assistantDiagramResolveStageId,
   assistantDiagramStageDraftFromResponse,
   assistantDiagramTopologyRequirements,
@@ -34,11 +48,13 @@ import {
   cmdbuildSessionFailureHttpStatus,
   createDiagramImportProposal,
   callLiteLLM,
+  boundedMcpText,
   cmdbuildClassAttributesPath,
   d2RendererConfigSummary,
   d2CacheContext,
   d2SourceForCompiler,
   d2WorkflowStatusForSpec,
+  diagramAuthoringStatusForSpec,
   decorateD2MarkdownFrames,
   diagramSvgExecutionContract,
   d2ImportConfigSummary,
@@ -54,7 +70,6 @@ import {
   diagramMappingField,
   diagramImportMappingInputRevision,
   diagramImportMappingValidationIsCurrent,
-  migrateDiagramImportToCurrentRevision,
   signDiagramImportMappingValidation,
   diagramImportCloneStructureBranch,
   diagramImportStructureTree,
@@ -85,7 +100,6 @@ import {
   renderRuntimeParamTemplate,
   applyDiagramImportProposal,
   applyPartialDiagramImportProposal,
-  diagramImportCurrentInputRecompileRequired,
   diagramImportRolesForStoredStructure,
   draftDiagramPreviewMappingPlan,
   draftDiagramPreviewRequiresPartialPlan,
@@ -164,8 +178,9 @@ test('template Assistant system prompt overrides inherit global policy without m
         system: 'Global system prompt.',
         objectFlowSemantic: 'Global semantic prompt.',
         objectFlow: 'Global flow prompt.',
-        diagramInterpretation: 'Global interpretation prompt.',
-        diagramMapping: 'Global mapping prompt.'
+        diagramSemantics: 'Global interpretation prompt.',
+        diagramPlacement: 'Global placement prompt.',
+        diagramConnections: 'Global connection prompt.'
       }
     }
   };
@@ -188,23 +203,22 @@ test('template Assistant system prompt overrides inherit global policy without m
   });
 
   assert.deepEqual(normalizeTemplateAssistantPromptOverrides(stored.authoring.assistant.systemPromptOverrides), {
-    system: 'Template-specific system prompt.',
-    diagramPlacement: 'Template-specific mapping prompt.',
-    diagramConnections: 'Template-specific mapping prompt.'
+    system: 'Template-specific system prompt.'
   });
   assert.equal(stored.authoring.assistant.systemPromptOverrides.unknown, undefined);
 
   const effective = normalizeAssistantRuntimeConfig(templateAssistantRuntimeConfig(runtimeConfig, stored));
   const inherited = normalizeAssistantRuntimeConfig(runtimeConfig);
   assert.equal(effective.prompt.system, 'Template-specific system prompt.');
-  assert.equal(effective.prompt.diagramPlacement, 'Template-specific mapping prompt.');
-  assert.equal(effective.prompt.diagramConnections, 'Template-specific mapping prompt.');
+  assert.equal(effective.prompt.diagramSemantics, 'Global interpretation prompt.');
+  assert.equal(effective.prompt.diagramPlacement, 'Global placement prompt.');
+  assert.equal(effective.prompt.diagramConnections, 'Global connection prompt.');
   assert.equal(effective.prompt.objectFlow, 'Global flow prompt.');
   assert.equal(effective.prompt.objectFlowSemantic, 'Global semantic prompt.');
   assert.equal(effective.prompt.diagramSemantics, 'Global interpretation prompt.');
   assert.equal(inherited.prompt.system, 'Global system prompt.');
-  assert.equal(inherited.prompt.diagramPlacement, 'Global mapping prompt.');
-  assert.equal(inherited.prompt.diagramConnections, 'Global mapping prompt.');
+  assert.equal(inherited.prompt.diagramPlacement, 'Global placement prompt.');
+  assert.equal(inherited.prompt.diagramConnections, 'Global connection prompt.');
   assert.equal(runtimeConfig.assistant.prompt.system, 'Global system prompt.');
 
   const reset = normalizeTemplateSpecForStorage({
@@ -220,8 +234,37 @@ test('template Assistant system prompt overrides inherit global policy without m
   const resetEffective = normalizeAssistantRuntimeConfig(templateAssistantRuntimeConfig(runtimeConfig, reset));
   assert.equal(reset.authoring.assistant.systemPromptOverrides, undefined);
   assert.equal(resetEffective.prompt.system, 'Global system prompt.');
-  assert.equal(resetEffective.prompt.diagramPlacement, 'Global mapping prompt.');
-  assert.equal(resetEffective.prompt.diagramConnections, 'Global mapping prompt.');
+  assert.equal(resetEffective.prompt.diagramPlacement, 'Global placement prompt.');
+  assert.equal(resetEffective.prompt.diagramConnections, 'Global connection prompt.');
+});
+
+test('Assistant editor delta excludes generated diagrams and preserves saved output state on merge', () => {
+  const saved = {
+    version: 1,
+    params: [{ name: 'systemCode', type: 'string' }],
+    result: {
+      tables: [{ name: 'old' }],
+      diagrams: [{ name: 'saved-diagram' }],
+      cache: { enabled: true }
+    },
+    publish: { mode: 'tableAndDiagram' }
+  };
+  const edited = structuredClone(saved);
+  edited.result.tables = [{ name: 'new' }];
+  edited.result.diagrams = [{ name: 'generated-preview' }];
+  edited.authoring = { version: 1, assistant: { diagramIntentPrompt: 'Show dependencies.' } };
+
+  const delta = assistantEditorDeltaFromSpec(edited);
+  assert.equal(delta.version, 1);
+  assert.match(delta.hash, /^[a-f0-9]{64}$/);
+  assert.equal(Object.hasOwn(delta.spec.result, 'diagrams'), false);
+  assert.equal(Object.hasOwn(delta.spec, 'publish'), false);
+
+  const merged = applyAssistantEditorDelta(saved, delta);
+  assert.deepEqual(merged.result.tables, [{ name: 'new' }]);
+  assert.deepEqual(merged.result.diagrams, [{ name: 'saved-diagram' }]);
+  assert.deepEqual(merged.result.cache, { enabled: true });
+  assert.deepEqual(merged.publish, { mode: 'tableAndDiagram' });
 });
 
 test('template Assistant prompt overrides reject over-limit input without truncating it', () => {
@@ -625,7 +668,7 @@ test('legacy D2 endpoint rules become independent rules for copied placements', 
   assert.ok(profiles.every((profile) => profile.stageId === ''));
 });
 
-test('template Save migrates retired assistantDraft into canonical authoring and removes the sandbox', () => {
+test('template storage preserves retired assistantDraft for an explicit current-only reset', () => {
   const before = {
     version: 1,
     steps: [{ type: 'selectCards', as: 'assets', className: 'ARM', columns: ['Code'] }],
@@ -642,21 +685,8 @@ test('template Save migrates retired assistantDraft into canonical authoring and
     }
   };
   const stored = normalizeTemplateSpecForStorage(before);
-  assert.equal(Object.hasOwn(stored, 'assistantDraft'), false);
-  assert.deepEqual(stored.authoring, {
-    version: 1,
-    assistant: {
-      objectFlowIntent: { context: '', blocks: [] },
-      promptContractVersion: 2,
-      diagramSemanticsPrompt: '',
-      diagramPlacementPrompt: '',
-      diagramConnectionsPrompt: ''
-    },
-    d2: {
-      source: 'server: Server',
-      sourceHash: crypto.createHash('sha256').update('server: Server').digest('hex')
-    }
-  });
+  assert.deepEqual(stored, before);
+  assert.equal(diagramAuthoringStatusForSpec(stored).status, 'unsupported');
 });
 
 test('template storage recovers Object Flow labels without Assistant and is idempotent', () => {
@@ -861,7 +891,7 @@ test('primary-only Object Flow migrates to visualModels without publishing a res
 test('D2 workflow accepts only canonical authoring source and matching deterministic mapping', async () => {
   const source = 'app: "Application"';
   const sourceHash = crypto.createHash('sha256').update(source).digest('hex');
-  const semanticModelRevision = 14;
+  const semanticModelRevision = 15;
   const diagramId = 'd2_test';
   const structureHash = 'structure_test';
   const mappingContractHash = 'mapping_contract_test';
@@ -943,7 +973,7 @@ test('D2 workflow accepts only canonical authoring source and matching determini
   });
 });
 
-test('template storage migrates old D2 source into canonical authoring and discards retired overrides', () => {
+test('template storage leaves an old D2 authoring contract unchanged', () => {
   const source = 'app: "Application"';
   const normalized = normalizeTemplateSpecForStorage({
     version: 1,
@@ -966,15 +996,39 @@ test('template storage migrates old D2 source into canonical authoring and disca
       }
     }
   });
-  assert.equal(Object.hasOwn(normalized, 'assistantDraft'), false);
-  const authoring = normalized.authoring;
-  assert.equal(authoring.d2.sourceHash, crypto.createHash('sha256').update(source).digest('hex'));
-  assert.equal(authoring.d2.source, source);
-  assert.deepEqual(authoring.assistant.objectFlowIntent, { context: '', blocks: [] });
-  assert.equal(authoring.assistant.promptContractVersion, 2);
-  assert.equal(authoring.assistant.diagramSemanticsPrompt, '');
-  assert.equal(authoring.assistant.diagramPlacementPrompt, '');
-  assert.equal(authoring.assistant.diagramConnectionsPrompt, '');
+  assert.equal(normalized.assistantDraft.d2Authoring.source, source);
+  assert.equal(normalized.authoring, undefined);
+});
+
+test('template storage removes retired diagram prompts from the current authoring contract', async () => {
+  const legacy = {
+    version: 1,
+    authoring: {
+      version: 1,
+      assistant: {
+        promptContractVersion: 3,
+        diagramSemanticsPrompt: 'Системы являются объектами.',
+        diagramPlacementPrompt: 'Системы являются объектами.',
+        diagramConnectionsPrompt: 'Связи строятся по карточкам ACL.'
+      },
+      d2: { source: '' }
+    }
+  };
+  const stored = normalizeTemplateSpecForStorage(legacy);
+  assert.deepEqual(stored, {
+    version: 1,
+    authoring: {
+      version: 1,
+      assistant: {
+        objectFlowIntent: { context: '', blocks: [] },
+        promptContractVersion: 4,
+        diagramIntentPrompt: ''
+      },
+      d2: { source: '', sourceHash: '' }
+    }
+  });
+  assert.equal(diagramAuthoringStatusForSpec(stored).status, 'absent');
+  assert.equal((await d2WorkflowStatusForSpec(stored)).state, 'none');
 });
 
 test('non-special templates drop stale protected flags and legacy BAA fields before storage', () => {
@@ -1685,8 +1739,8 @@ test('D2 mapping source catalog retains intermediate Assistant results', () => {
   };
   const spec = compileObjectFlowToSpec({ version: 1, steps: [], result: { tables: [] } }, flow, {
     outputMetadata: [
-      { alias: 'systems', label: 'Результат 1', assistantBlockId: 'block-1' },
-      { alias: 'ipRanges', label: 'Результат 2', assistantBlockId: 'block-2' }
+      { alias: 'systems', label: 'Результат 1', assistantBlockId: 'block-1', assistantStageRole: 'terminal' },
+      { alias: 'ipRanges', label: 'Результат 2', assistantBlockId: 'block-2', assistantStageRole: 'terminal' }
     ],
     assistantOutputManifest: {
       version: 1,
@@ -2170,7 +2224,7 @@ test('D2 mapping keeps its signed executable inputs on reload and ignores a prom
   assert.equal((await d2WorkflowStatusForSpec(reviewed)).state, 'applied');
 });
 
-test('normal template Save rebases the retained D2 checkpoint after mapping materialization', () => {
+test('normal template Save keeps the D2 analysis identity stable after generated mapping materialization', () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   const tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
   const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
@@ -2191,7 +2245,7 @@ test('normal template Save rebases the retained D2 checkpoint after mapping mate
 
   const stored = normalizeTemplateSpecForStorage(applied);
   const checkpoint = stored.authoring.d2.analysisCheckpoint;
-  assert.notEqual(diagramImportDeterministicSpecHash(applied), beforeMaterializationHash);
+  assert.equal(diagramImportDeterministicSpecHash(applied), beforeMaterializationHash);
   assert.equal(checkpoint.deterministicSpecHash, diagramImportDeterministicSpecHash(stored));
   assert.equal(checkpoint.source.hash, stored.result.diagrams[0].authoring.d2Import.sourceHash);
 });
@@ -2298,10 +2352,6 @@ test('normal Save keeps retired D2 mapping revisions pending re-analysis', async
     }
   };
 
-  assert.equal(migrateDiagramImportToCurrentRevision(lostMarker, versionImport, {
-    diagramId: versionImport.diagramId
-  }), null, 'A retained legacy tree must never be promoted without a fresh D2 identity.');
-
   const recovered = normalizeTemplateSpecForStorage(lostMarker, '', {
     recoveryVersions: [{ version: 53, spec: historicVersion }],
     d2SourceIdentities: [identity]
@@ -2309,9 +2359,10 @@ test('normal Save keeps retired D2 mapping revisions pending re-analysis', async
   const recoveredImport = recovered.result.diagrams[0].authoring.d2Import;
   assert.equal(recoveredImport.semanticModelRevision, 8);
   assert.equal(recoveredImport.structureTree.version, 3);
-  assert.equal(recoveredImport.mappingValidation.status, 'needsReview');
+  assert.equal(recoveredImport.mappingValidation.status, 'needsValidation');
   assert.equal(diagramImportMappingValidationIsCurrent(recoveredImport), false);
   assert.equal((await d2WorkflowStatusForSpec(recovered)).state, 'pending');
+  assert.equal(diagramAuthoringStatusForSpec(recovered).status, 'needsReanalysis');
 
   const changedPrompt = structuredClone(lostMarker);
   changedPrompt.authoring.assistant.diagramInterpretPrompt = 'Новый prompt без повторного mapping';
@@ -2319,10 +2370,10 @@ test('normal Save keeps retired D2 mapping revisions pending re-analysis', async
     recoveryVersions: [{ version: 53, spec: historicVersion }],
     d2SourceIdentities: [identity]
   });
-  assert.equal(notRecovered.result.diagrams[0].authoring.d2Import.mappingValidation.status, 'needsReview');
+  assert.equal(notRecovered.result.diagrams[0].authoring.d2Import.mappingValidation.status, 'needsValidation');
 });
 
-test('normal Save migrates revision 11 D2 connections to one class algorithm without discarding the structure tree', () => {
+test('normal Save retains revision 11 D2 mapping as historical non-executable state', async () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   const applied = applyDiagramImportProposal(
     currentSpec,
@@ -2355,14 +2406,16 @@ test('normal Save migrates revision 11 D2 connections to one class algorithm wit
   const stored = normalizeTemplateSpecForStorage(before, '', { d2SourceIdentities: [identity] });
   const migrated = stored.result.diagrams[0].authoring.d2Import;
 
-  assert.equal(migrated.semanticModelRevision, 14);
+  assert.equal(migrated.semanticModelRevision, 11);
   assert.equal(migrated.structureTree.version, 5);
   assert.deepEqual(migrated.structureTree.items.map((item) => item.id), beforeImport.structureTree.items.map((item) => item.id));
   assert.equal(migrated.mappingValidation.status, 'valid');
   assert.equal(diagramImportMappingValidationIsCurrent(migrated), true);
+  assert.equal(diagramAuthoringStatusForSpec(stored).status, 'needsReanalysis');
+  assert.equal((await d2WorkflowStatusForSpec(stored)).state, 'pending');
 });
 
-test('D2 connection migration preserves an unfinished manual mapping as previewable', () => {
+test('normal Save retains revision 12 D2 mapping for explicit re-analysis', async () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   const applied = applyDiagramImportProposal(
     currentSpec,
@@ -2395,10 +2448,12 @@ test('D2 connection migration preserves an unfinished manual mapping as previewa
   const stored = normalizeTemplateSpecForStorage(before, '', { d2SourceIdentities: [identity] });
   const migrated = stored.result.diagrams[0].authoring.d2Import;
 
-  assert.equal(migrated.semanticModelRevision, 14);
+  assert.equal(migrated.semanticModelRevision, 12);
   assert.equal(migrated.mappingValidation.status, 'needsValidation');
   assert.deepEqual(migrated.mappingValidation.reasons, ['partialMapping']);
   assert.equal(diagramImportMappingValidationIsCurrent(migrated), false);
+  assert.equal(diagramAuthoringStatusForSpec(stored).status, 'needsReanalysis');
+  assert.equal((await d2WorkflowStatusForSpec(stored)).state, 'pending');
 });
 
 test('retired D2 source-stage mappings require an explicit current materialization', () => {
@@ -2450,10 +2505,11 @@ test('retired D2 source-stage mappings require an explicit current materializati
     mappingContractHash: proposal.source.mappingContractHash,
     ir
   };
-  const migrationDiagnostics = [];
-  const migrated = migrateDiagramImportToCurrentRevision(currentSpec, legacy, { diagramId: proposal.diagramId, identity, diagnostics: migrationDiagnostics });
-  assert.equal(migrated, null);
-  assert.ok(migrationDiagnostics.includes('materializationRevisionRequired'));
+  const stored = normalizeTemplateSpecForStorage({
+    ...currentSpec,
+    result: { diagrams: [{ id: proposal.diagramId, authoring: { d2Import: legacy } }] }
+  });
+  assert.equal(diagramAuthoringStatusForSpec(stored).status, 'needsReanalysis');
 });
 
 test('normal Save keeps a retired D2 source-stage mapping pending explicit review', async () => {
@@ -2501,7 +2557,7 @@ test('normal Save keeps a retired D2 source-stage mapping pending explicit revie
   assert.equal((await d2WorkflowStatusForSpec(migrated)).state, 'pending');
 });
 
-test('normal Save reattests a current D2 mapping after signing-secret rotation', async () => {
+test('normal Save does not reattest a D2 mapping after signing-secret rotation', async () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA'));
   const stale = structuredClone(applied);
@@ -2523,11 +2579,11 @@ test('normal Save reattests a current D2 mapping after signing-secret rotation',
   const reattested = normalizeTemplateSpecForStorage(stale, '', { d2SourceIdentities: [identity] });
   const reattestedImport = reattested.result.diagrams[0].authoring.d2Import;
 
-  assert.equal(reattestedImport.semanticModelRevision, 14);
+  assert.equal(reattestedImport.semanticModelRevision, 15);
   assert.equal(reattestedImport.structureTree.version, 5);
   assert.equal(reattestedImport.mappingValidation.status, 'valid');
-  assert.equal(diagramImportMappingValidationIsCurrent(reattestedImport), true);
-  assert.equal((await d2WorkflowStatusForSpec(reattested)).state, 'applied');
+  assert.equal(diagramImportMappingValidationIsCurrent(reattestedImport), false);
+  assert.equal((await d2WorkflowStatusForSpec(reattested)).state, 'pending');
 });
 
 test('table-only execution ignores D2 recovery while diagram execution remains strict', () => {
@@ -2659,7 +2715,7 @@ test('normal Save does not collapse retired placements into a current structure 
   });
   const recoveredImport = recovered.result.diagrams[0].authoring.d2Import;
   assert.equal(recoveredImport.structureTree.items.filter((item) => item.roleId === systemRole.id).length, 2);
-  assert.equal(recoveredImport.mappingValidation.status, 'needsReview');
+  assert.equal(recoveredImport.mappingValidation.status, 'needsValidation');
   assert.equal(diagramImportMappingValidationIsCurrent(recoveredImport), false);
 });
 
@@ -3176,7 +3232,7 @@ test('D2 hierarchy conditions repeat one child card in every matching parent bra
   assert.ok(diagram.edges.every((edge) => edge.source === edge.target));
 });
 
-test('D2 structure tree exposes saved parent comparisons through hierarchy conditions', () => {
+test('D2 structure tree preserves saved parent comparisons as placement conditions', () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   const scopeItem = proposal.structureTree.items.find((item) => String(item.roleId) === String(roles['scope-vlan'].id));
   const vlanItem = proposal.structureTree.items.find((item) => String(item.parentId) === String(scopeItem.id) && String(item.roleId) === String(roles.vlan.id));
@@ -3196,12 +3252,12 @@ test('D2 structure tree exposes saved parent comparisons through hierarchy condi
   const normalized = diagramImportStructureTree(tree, proposal.structure, proposal.roles);
   const child = normalized.items.find((item) => String(item.id) === String(vlanItem.id));
 
-  assert.deepEqual(child.mapping.conditions.rules, []);
-  assert.deepEqual(child.mapping.hierarchyConditions.rules.map((rule) => ({
+  assert.deepEqual(child.mapping.conditions.rules.map((rule) => ({
     left: rule.left.column,
     rightStageId: rule.right.stageId,
     right: rule.right.column
   })), [{ left: 'Code', rightStageId: 'selection:systemsA', right: 'Code' }]);
+  assert.deepEqual(child.mapping.hierarchyConditions.rules, []);
   assert.deepEqual(diagramImportStructureTreeErrors(normalized, proposal.roles, currentSpec, proposal.structure), []);
 });
 
@@ -3420,7 +3476,7 @@ test('partial D2 preview omits a legacy server scope instead of rendering an emp
   staleScope.mapping.source = { stageId: 'selection:systemsA', alias: 'systemsA', className: 'IS' };
 
   const workflow = await d2WorkflowStatusForSpec(stale);
-  assert.equal(workflow.reason, 'materialization_contract_required');
+  assert.equal(workflow.reason, 'semantic_model_revision_required');
   const partial = draftDiagramPreviewMappingPlan(stale);
   const diagram = partial.spec.result.diagrams[0];
 
@@ -3959,32 +4015,19 @@ test('D2 Assistant leaves parentCard mapping unresolved when no deterministic pa
   assert.match(recovered.unresolved[0].message, /scope_vlan/);
 });
 
-test('D2 preview recognizes a complete saved mapping that needs only Object Flow input recompilation', () => {
+test('D2 preview requires current semantic mapping instead of implicit Object Flow input recompilation', async () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   let tree = structureTreeWithStage(proposal.structureTree, roles['scope-vlan'].id, 'selection:systemsA');
   tree.items = tree.items.map((item) => String(item.roleId) === String(roles.vlan.id)
     ? { ...item, mapping: { ...(item.mapping || {}), materialization: { kind: 'parentCard', stageId: '' } } }
     : item);
   const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
-  const preEligibilityCompiler = structuredClone(applied);
-  delete preEligibilityCompiler.result.diagrams[0].authoring.d2Import.endpointProfileCompilationVersion;
-  assert.equal(diagramImportCurrentInputRecompileRequired(preEligibilityCompiler), true);
-
   const stale = structuredClone(applied);
-  stale.steps[0].limit = Number(stale.steps[0].limit || 100) + 1;
-  stale.result.diagrams[0].authoring.d2Import.mappingValidation = {
-    version: 1,
-    status: 'needsReview',
-    reasons: ['inputRevision']
-  };
-
-  assert.equal(diagramImportCurrentInputRecompileRequired(stale), true);
-  stale.result.diagrams[0].authoring.d2Import.mappingValidation = {
-    version: 1,
-    status: 'needsReview',
-    reasons: ['source']
-  };
-  assert.equal(diagramImportCurrentInputRecompileRequired(stale), false);
+  stale.result.diagrams[0].authoring.d2Import.semanticModelRevision = 14;
+  assert.equal(diagramAuthoringStatusForSpec(stale).status, 'needsReanalysis');
+  const workflow = await d2WorkflowStatusForSpec(stale);
+  assert.equal(workflow.state, 'pending');
+  assert.equal(workflow.reason, 'semantic_model_revision_required');
 });
 
 test('D2 structure normalizes a node mapped to its parent stage into parentCard', () => {
@@ -4862,7 +4905,7 @@ test('D2 assistant interpretation changes role semantics but not the persisted s
   const role = { id: 'role-workstation', visualKind: 'node', visualKindOptions: ['node', 'container'] };
   const roleModel = assistantDiagramStageDraftFromResponse({
     kind: 'interpretation',
-    roleModelRevision: 14,
+    roleModelRevision: 15,
     roles: [role]
   }, {
     decisions: [{ roleId: role.id, visualKind: 'node', confidence: 'high', reason: 'Leaf card.' }]
@@ -6906,6 +6949,26 @@ test('assistant MCP config keeps known allowed tools and bounded defaults', () =
   assert.deepEqual(mcpToolDefinitions(unknownOnlyConfig), []);
 });
 
+test('bounded MCP payload remains valid JSON and exposes resumable truncation evidence', () => {
+  const source = {
+    classes: Array.from({ length: 200 }, (_, index) => ({
+      name: `Class${index}`,
+      description: `Class ${index} ${'x'.repeat(200)}`,
+      attributes: Array.from({ length: 12 }, (__, attributeIndex) => ({ name: `Field${attributeIndex}`, help: 'y'.repeat(120) }))
+    }))
+  };
+  const bounded = boundedMcpText(source, 4096);
+  const parsed = JSON.parse(bounded.text);
+
+  assert.ok(Buffer.byteLength(bounded.text) <= 4096);
+  assert.equal(parsed.complete, false);
+  assert.match(parsed.nextCursor, /^bounded:/);
+  assert.match(parsed.catalogRevision, /^[a-f0-9]{64}$/);
+  assert.equal(parsed.evidence.originalBytes, bounded.bytes);
+  assert.equal(parsed.evidence.returnedBytes, bounded.returnedBytes);
+  assert.equal(bounded.truncated, true);
+});
+
 test('assistant MCP limits fall back to runtime execution limits and surface warnings', () => {
   const config = normalizeAssistantRuntimeConfig({
     assistant: {
@@ -7025,10 +7088,12 @@ test('assistant prompt config has default and preserves custom system prompt', (
   assert.doesNotMatch(defaultConfig.assistant.prompt.system, /Маршрутизатор ядра/);
   assert.equal(normalizedDefault.prompt.system, defaultConfig.assistant.prompt.system);
   assert.match(defaultConfig.assistant.prompt.objectFlow, /ObjectFlowProposal/);
-  assert.equal(defaultConfig.assistant.prompt.version, 2);
+  assert.equal(defaultConfig.assistant.prompt.version, 4);
   assert.match(defaultConfig.assistant.prompt.diagramSemantics, /D2 class/);
+  assert.match(defaultConfig.assistant.prompt.diagramBindingIntent, /business/i);
   assert.match(defaultConfig.assistant.prompt.diagramPlacement, /structureItemId/);
   assert.match(defaultConfig.assistant.prompt.diagramConnections, /connection classes/);
+  assert.match(defaultConfig.assistant.prompt.diagramCritique, /BusinessBlockManifest/);
   assert.equal(normalizedDefault.prompt.objectFlow, defaultConfig.assistant.prompt.objectFlow);
 
   const legacyConfig = normalizeAssistantRuntimeConfig({
@@ -7057,14 +7122,14 @@ test('assistant prompt config has default and preserves custom system prompt', (
   });
   assert.equal(blankConfig.prompt.system, defaultConfig.assistant.prompt.system);
 
-  const migrated = normalizeAssistantPromptContract({
+  const ignoredLegacy = normalizeAssistantPromptContract({
     diagramInterpretation: 'Legacy semantics.',
     diagramMapping: 'Legacy mapping.'
   }, defaultConfig.assistant.prompt);
-  assert.equal(migrated.version, 2);
-  assert.equal(migrated.diagramSemantics, 'Legacy semantics.');
-  assert.equal(migrated.diagramPlacement, 'Legacy mapping.');
-  assert.equal(migrated.diagramConnections, 'Legacy mapping.');
+  assert.equal(ignoredLegacy.version, 4);
+  assert.equal(ignoredLegacy.diagramSemantics, defaultConfig.assistant.prompt.diagramSemantics);
+  assert.equal(ignoredLegacy.diagramPlacement, defaultConfig.assistant.prompt.diagramPlacement);
+  assert.equal(ignoredLegacy.diagramConnections, defaultConfig.assistant.prompt.diagramConnections);
 });
 
 test('DataSemanticModel preserves canonical rightExpression values and expression kinds', () => {
@@ -7079,7 +7144,7 @@ test('DataSemanticModel preserves canonical rightExpression values and expressio
   }]);
 
   assert.equal(model.kind, 'DataSemanticModel');
-  assert.equal(model.version, 2);
+  assert.equal(model.version, 3);
   assert.deepEqual(model.stages[0].rules.map((rule) => ({
     rightExpression: rule.rightExpression,
     expressionKind: rule.expressionKind
@@ -7118,7 +7183,7 @@ test('D2 Assistant exchanges versioned semantic, structural, binding, and covera
   assert.deepEqual([data.kind, structure.kind, semantics.kind, binding.kind, coverage.kind], [
     'DataSemanticModel', 'D2StructuralModel', 'D2SemanticModel', 'D2BindingModel', 'CoverageModel'
   ]);
-  assert.deepEqual([data.version, structure.version, semantics.version, binding.version, coverage.version], [2, 1, 1, 1, 1]);
+  assert.deepEqual([data.version, structure.version, semantics.version, binding.version, coverage.version], [3, 1, 1, 1, 2]);
   assert.ok([data, structure, semantics, binding, coverage].every((model) => /^[a-f0-9]{64}$/.test(model.modelHash)));
   assert.equal(structure.roles[0].roleNotes, 'One system card.');
   assert.equal(structure.placements[0].placementNotes, 'Place in the systems branch.');
@@ -7129,6 +7194,418 @@ test('D2 Assistant exchanges versioned semantic, structural, binding, and covera
   assert.deepEqual(data.stages[0].rules, [{
     action: 'include', negate: false, operator: 'equals', path: 'isExt', rightExpression: 'false', expressionKind: 'literal', leftColumn: '', rightColumn: ''
   }]);
+});
+
+test('D2 business intent exposes only terminal block results and deterministic obligations reject semantic substitutions', () => {
+  const stages = [{
+    id: 'selection:external-source', alias: 'external_source', label: 'External source', className: 'IS',
+    columns: ['_id', 'Description', 'isExt'], assistantBlockIds: ['block-external'], stageRole: 'helper', outputKind: 'sourceCards', rowGrain: 'card'
+  }, {
+    id: 'match:external-terminal', alias: 'external_terminal', label: 'Внешние ИС', className: 'IS',
+    columns: ['_id', 'Description', 'isExt'], assistantBlockIds: ['block-external'], stageRole: 'terminal', outputKind: 'sourceCards', rowGrain: 'card'
+  }, {
+    id: 'match:acl-helper', alias: 'acl_helper', label: 'ACL helper', className: 'ACL',
+    columns: ['_id', 'ipaddress', 'dipaddress'], assistantBlockIds: ['block-acl'], stageRole: 'helper', outputKind: 'sourceCards', rowGrain: 'card'
+  }, {
+    id: 'match:acl-terminal', alias: 'acl_terminal', label: 'ACL внешних ИС', className: 'ACL',
+    columns: ['_id', 'ipaddress', 'dipaddress'], assistantBlockIds: ['block-acl'], stageRole: 'terminal', outputKind: 'sourceCards', rowGrain: 'card'
+  }];
+  const manifest = assistantObjectFlowBusinessBlockManifest({
+    authoring: { version: 1, assistant: { objectFlowIntent: { context: '', blocks: [
+      { id: 'block-external', name: 'Внешние ИС', entities: 'IS', algorithm: 'Only external systems.', expectedResult: 'IS cards.' },
+      { id: 'block-acl', name: 'ACL внешних ИС', entities: 'ACL', algorithm: 'Selected ACL cards.', expectedResult: 'ACL cards.' }
+    ] } } }
+  }, stages);
+  assert.equal(manifest.blocks.find((block) => block.id === 'block-external').terminalStageId, 'match:external-terminal');
+  assert.deepEqual(manifest.blocks.find((block) => block.id === 'block-external').helperStageIds, ['selection:external-source']);
+
+  const placements = [{
+    structureItemId: 'placement-external', roleId: 'role-external', displayName: 'external_system', visualKind: 'node',
+    allowedMaterialization: ['stage'], directives: {
+      'binding-result': 'Внешние ИС',
+      'stage-policy': 'terminal-only',
+      'required-condition': ['isExt equals true'],
+      'endpoint-field': ['{ISZabbixMonitoringDomain:ipRange}.range'],
+      'endpoint-operator': ['ipv4InCidr']
+    }
+  }];
+  const relationRules = [{
+    d2ClassKey: 'acl_external', d2ElementKey: 'edge-external',
+    d2Notes: 'binding-result: ACL внешних ИС\nstage-policy: terminal-only\nrow-grain: card\nendpoint-mode: attributeEndpoints\nsource-field: ipaddress\nsource-operator: ipv4InCidr\ntarget-field: dipaddress\ntarget-operator: equals'
+  }];
+  const intentDraft = assistantDiagramBindingIntentDraftFromResponse({
+    placements,
+    relationRules,
+    businessBlockManifest: manifest
+  }, {
+    placementBindings: [{ structureItemId: 'placement-external', materializationIntent: 'stage', businessBlockId: 'block-external' }],
+    connectionBindings: [{ d2ClassKey: 'acl_external', businessBlockId: 'block-acl' }],
+    unresolved: []
+  });
+  assert.equal(intentDraft.success, true, JSON.stringify(intentDraft.errors));
+  const deterministicSeed = assistantDiagramBindingIntentSeed({
+    placements,
+    relationRules,
+    businessBlockManifest: manifest
+  });
+  assert.deepEqual(deterministicSeed.pendingPlacementIds, []);
+  assert.deepEqual(deterministicSeed.pendingConnectionKeys, []);
+  assert.deepEqual(deterministicSeed.placementBindings, [{
+    structureItemId: 'placement-external', materializationIntent: 'stage', businessBlockId: 'block-external'
+  }]);
+  assert.deepEqual(deterministicSeed.connectionBindings, [{
+    d2ClassKey: 'acl_external', businessBlockId: 'block-acl'
+  }]);
+  const cardlessSeed = assistantDiagramBindingIntentSeed({
+    placements: [{
+      structureItemId: 'placement-group', roleId: 'role-group', displayName: 'group_external', visualKind: 'container',
+      materializationHint: 'structural', allowedMaterialization: ['structural'], directives: {}
+    }, {
+      structureItemId: 'placement-child', roleId: 'role-child', displayName: 'server', visualKind: 'node',
+      materializationHint: 'parentCard', allowedMaterialization: ['parentCard'], directives: {}
+    }],
+    relationRules: [],
+    businessBlockManifest: manifest
+  });
+  assert.deepEqual(cardlessSeed.pendingPlacementIds, []);
+  assert.deepEqual(cardlessSeed.placementBindings, [{
+    structureItemId: 'placement-group', materializationIntent: 'structural'
+  }, {
+    structureItemId: 'placement-child', materializationIntent: 'parentCard'
+  }]);
+  const bindingIntent = intentDraft.intent;
+  assert.equal(assistantD2BindingIntentModel(bindingIntent).placements[0].businessBlockId, 'block-external');
+  assert.deepEqual(bindingIntent.placements[0].endpointFields, ['{ISZabbixMonitoringDomain:ipRange}.range']);
+  assert.equal(bindingIntent.connections[0].sourceOperator, 'ipv4InCidr');
+  assert.equal(bindingIntent.connections[0].targetOperator, 'equals');
+
+  const topology = assistantDiagramTopologyWithBindingIntent([{
+    d2ElementKey: 'edge-external', d2ClassKey: 'acl_external',
+    networkEndpointStages: stages.slice(2).map((stage) => ({
+      candidateId: `candidate:${stage.id}`, sourceStageId: stage.id, sourceField: 'ipaddress', targetField: 'dipaddress',
+      stageRole: stage.stageRole, businessBlockIds: stage.assistantBlockIds, outputKind: stage.outputKind, rowGrain: stage.rowGrain
+    })),
+    relationCardStages: [], deterministicEndpointStages: []
+  }], bindingIntent);
+  assert.deepEqual(topology[0].networkEndpointStages.map((candidate) => candidate.sourceStageId), ['match:acl-terminal']);
+
+  const badDraft = {
+    items: [{
+      structureItemId: 'placement-external', roleId: 'role-external', source: { stageId: 'selection:external-source' },
+      mapping: { materialization: { kind: 'stage', stageId: 'selection:external-source' }, conditions: { rules: [] }, hierarchyConditions: { rules: [] } }
+    }],
+    relationRules: [{ d2ClassKey: 'acl_external', sourceStageId: 'match:acl-helper', mode: 'attributeEndpoints', sourceField: 'ipaddress', targetField: 'dipaddress' }]
+  };
+  const badMatrix = assistantDiagramSemanticObligations({ placements, stages, bindingIntent }, badDraft);
+  assert.ok(badMatrix.obligations.some((item) => item.family === 'placementBusinessResult' && item.status === 'unsatisfied'));
+  assert.ok(badMatrix.obligations.some((item) => item.family === 'placementCondition' && item.status === 'unsatisfied'));
+  assert.ok(badMatrix.obligations.some((item) => item.family === 'connectionBusinessResult' && item.status === 'unsatisfied'));
+
+  const goodDraft = {
+    items: [{
+      structureItemId: 'placement-external', roleId: 'role-external', source: { stageId: 'match:external-terminal' },
+      mapping: {
+        materialization: { kind: 'stage', stageId: 'match:external-terminal' },
+        primary: {
+          className: 'IS',
+          cardSource: { id: 'current', label: 'Карточка результата', className: 'IS', classColumn: 'Class', idColumn: '_id' }
+        },
+        conditions: { rules: [{ operator: 'equals', left: { column: 'isExt' }, right: { kind: 'literal', value: true } }] },
+        hierarchyConditions: { rules: [] }
+      }
+    }],
+    relationRules: [{
+      d2ClassKey: 'acl_external', sourceStageId: 'match:acl-terminal', mode: 'attributeEndpoints',
+      sourceField: 'ipaddress', sourceOperator: 'ipv4InCidr', targetField: 'dipaddress', targetOperator: 'equals'
+    }]
+  };
+  goodDraft.endpointProfiles = assistantDiagramEndpointProfilesFromBindings({ placements }, goodDraft.items);
+  assert.equal(goodDraft.endpointProfiles.length, 1);
+  assert.equal(goodDraft.endpointProfiles[0].field, '{ISZabbixMonitoringDomain:ipRange}.range');
+  assert.deepEqual(goodDraft.endpointProfiles[0].operators, ['ipv4InCidr']);
+  assert.equal(goodDraft.endpointProfiles[0].source.className, 'IS');
+  const goodMatrix = assistantDiagramSemanticObligations({ placements, stages, bindingIntent }, goodDraft);
+  assert.ok(goodMatrix.obligations.length > 0);
+  assert.ok(goodMatrix.obligations.every((item) => item.status === 'satisfied'), JSON.stringify(goodMatrix.obligations));
+  assert.equal(assistantSemanticObligationModel(goodMatrix).status, 'satisfied');
+  assert.equal(assistantD2CritiqueModel({ approved: true, violations: [] }).approved, true);
+});
+
+test('BusinessBlockManifest v2 never selects one of several terminal results implicitly', () => {
+  const manifest = assistantObjectFlowBusinessBlockManifest({
+    authoring: {
+      version: 1,
+      assistant: {
+        objectFlowIntent: {
+          context: 'Network inventory.',
+          blocks: [{
+            id: 'block-systems',
+            name: 'Внутренние ИС',
+            description: 'Выбрать внутренние информационные системы.',
+            resultKind: 'sourceCards',
+            dependsOn: []
+          }]
+        }
+      }
+    }
+  }, [{
+    id: 'selection:systems-a', alias: 'systems_a', className: 'IS', stageRole: 'terminal',
+    outputKind: 'sourceCards', assistantBlockIds: ['block-systems']
+  }, {
+    id: 'selection:systems-b', alias: 'systems_b', className: 'IS', stageRole: 'terminal',
+    outputKind: 'sourceCards', assistantBlockIds: ['block-systems']
+  }]);
+
+  assert.equal(manifest.version, 2);
+  assert.equal(manifest.blocks[0].status, 'ambiguous');
+  assert.equal(manifest.blocks[0].terminalStageId, '');
+  assert.equal(manifest.blocks[0].terminalAlias, '');
+  assert.equal(manifest.blocks[0].terminalContract, null);
+  assert.deepEqual(manifest.blocks[0].terminalCandidateStageIds.sort(), ['selection:systems-a', 'selection:systems-b']);
+  assert.deepEqual(manifest.blocks[0].helperStageIds, []);
+});
+
+test('legacy Assistant output ownership recovers one terminal per block from the dependency graph', () => {
+  const spec = {
+    visualModels: [{
+      mode: 'objectMatching',
+      assistantOutputManifest: { version: 1, blocks: [{ id: 'block-systems', name: 'Внутренние ИС', order: 1 }] },
+      selections: [{ id: 'selection:source', alias: 'systems_source', className: 'IS', columns: ['_id', 'Description'] }],
+      operations: [{
+        id: 'relation:systems', type: 'relation', from: 'systems_source', as: 'systems',
+        domain: 'SystemRelation', targetClass: 'IS', direction: 'source', columns: ['_id', 'Description']
+      }],
+      outputs: [{
+        alias: 'systems_source', label: 'Внутренние ИС: Выборка 1', kind: 'selection', assistantManaged: true,
+        assistantBlockId: 'block-systems', assistantBlockIds: ['block-systems']
+      }, {
+        alias: 'systems', label: 'Внутренние ИС: Соединение 1', kind: 'relation', assistantManaged: true,
+        assistantBlockId: 'block-systems', assistantBlockIds: ['block-systems']
+      }]
+    }],
+    authoring: { version: 1, assistant: { objectFlowIntent: { context: '', blocks: [{ id: 'block-systems', name: 'Внутренние ИС', description: 'Внутренние системы.', resultKind: 'sourceCards', uses: [] }] } } }
+  };
+  const stages = assistantObjectFlowDiagramStages(spec);
+  assert.equal(stages.find((stage) => stage.alias === 'systems_source').stageRole, 'helper');
+  assert.equal(stages.find((stage) => stage.alias === 'systems').stageRole, 'terminal');
+});
+
+test('explicit Assistant helper ownership never falls back to a terminal', () => {
+  const spec = {
+    visualModels: [{
+      mode: 'objectMatching',
+      assistantOutputManifest: { version: 1, blocks: [{ id: 'block-systems', name: 'Внутренние ИС', order: 1 }] },
+      selections: [{ id: 'selection:systems', alias: 'systems', className: 'IS', columns: ['_id'] }],
+      outputs: [{
+        alias: 'systems', label: 'Внутренние ИС', kind: 'selection', assistantManaged: true,
+        assistantBlockId: 'block-systems', assistantBlockIds: ['block-systems'], assistantStageRole: 'helper'
+      }]
+    }],
+    authoring: { version: 1, assistant: { objectFlowIntent: { context: '', blocks: [{ id: 'block-systems', name: 'Внутренние ИС', description: 'Внутренние системы.', resultKind: 'sourceCards', uses: [] }] } } }
+  };
+  const stages = assistantObjectFlowDiagramStages(spec);
+  const manifest = assistantObjectFlowBusinessBlockManifest(spec, stages);
+  assert.equal(stages[0].stageRole, 'helper');
+  assert.equal(manifest.blocks[0].status, 'missing');
+  assert.deepEqual(manifest.blocks[0].terminalCandidateStageIds, []);
+});
+
+test('legacy Assistant terminal is selected by graph sink rather than a matching upstream label', () => {
+  const spec = {
+    visualModels: [{
+      mode: 'objectMatching',
+      assistantOutputManifest: { version: 1, blocks: [{ id: 'block-systems', name: 'Внутренние ИС', order: 1 }] },
+      selections: [{ id: 'selection:source', alias: 'systems_source', className: 'IS', columns: ['_id'] }],
+      operations: [{
+        id: 'relation:systems', type: 'relation', from: 'systems_source', as: 'systems',
+        domain: 'SystemRelation', targetClass: 'IS', direction: 'source', columns: ['_id']
+      }],
+      outputs: [{
+        alias: 'systems_source', label: 'Внутренние ИС', kind: 'selection', assistantManaged: true,
+        assistantBlockId: 'block-systems', assistantBlockIds: ['block-systems']
+      }, {
+        alias: 'systems', label: 'Внутренние ИС: Соединение 1', kind: 'relation', assistantManaged: true,
+        assistantBlockId: 'block-systems', assistantBlockIds: ['block-systems']
+      }]
+    }],
+    authoring: { version: 1, assistant: { objectFlowIntent: { context: '', blocks: [{ id: 'block-systems', name: 'Внутренние ИС', description: 'Внутренние системы.', resultKind: 'sourceCards', uses: [] }] } } }
+  };
+  const stages = assistantObjectFlowDiagramStages(spec);
+  assert.equal(stages.find((stage) => stage.alias === 'systems_source').stageRole, 'helper');
+  assert.equal(stages.find((stage) => stage.alias === 'systems').stageRole, 'terminal');
+});
+
+test('legacy Assistant terminal remains terminal when a later business block consumes it', () => {
+  const spec = {
+    visualModels: [{
+      mode: 'objectMatching',
+      assistantOutputManifest: {
+        version: 1,
+        blocks: [
+          { id: 'block-systems', name: 'Внутренние ИС', order: 1 },
+          { id: 'block-ranges', name: 'Сети внутренних ИС', order: 2 }
+        ]
+      },
+      selections: [{ id: 'selection:systems', alias: 'systems', className: 'IS', columns: ['_id', 'Description'] }],
+      operations: [{
+        id: 'relation:ranges', type: 'relation', from: 'systems', as: 'ranges',
+        domain: 'SystemRange', targetClass: 'ipRange', direction: 'source', columns: ['_id', 'range']
+      }],
+      outputs: [{
+        alias: 'systems', label: 'Внутренние ИС', kind: 'selection', assistantManaged: true,
+        assistantBlockId: 'block-systems', assistantBlockIds: ['block-systems']
+      }, {
+        alias: 'ranges', label: 'Сети внутренних ИС', kind: 'relation', assistantManaged: true,
+        assistantBlockId: 'block-ranges', assistantBlockIds: ['block-ranges']
+      }]
+    }],
+    authoring: {
+      version: 1,
+      assistant: {
+        objectFlowIntent: {
+          context: '',
+          blocks: [
+            { id: 'block-systems', name: 'Внутренние ИС', description: 'Внутренние системы.', resultKind: 'sourceCards', uses: [] },
+            { id: 'block-ranges', name: 'Сети внутренних ИС', description: 'Связанные сети.', resultKind: 'relatedCards', uses: ['block-systems'] }
+          ]
+        }
+      }
+    }
+  };
+  const stages = assistantObjectFlowDiagramStages(spec);
+  assert.equal(stages.find((stage) => stage.alias === 'systems').stageRole, 'terminal');
+  assert.equal(stages.find((stage) => stage.alias === 'ranges').stageRole, 'terminal');
+});
+
+test('binding-intent adapter enforces deterministic Notes constraints and removes exact duplicates', () => {
+  const manifest = assistantObjectFlowBusinessBlockManifest({
+    authoring: { version: 1, assistant: { objectFlowIntent: { context: '', blocks: [{ id: 'block-external', name: 'Внешние ИС', description: 'Внешние системы.', resultKind: 'sourceCards', uses: [] }] } } }
+  }, [{
+    id: 'match:external', alias: 'external', className: 'IS', stageRole: 'terminal', outputKind: 'sourceCards',
+    assistantBlockIds: ['block-external']
+  }]);
+  const input = {
+    businessBlockManifest: manifest,
+    placements: [{
+      structureItemId: 'placement-group', displayName: 'group_external', templateStatic: false,
+      materializationHint: 'structural', allowedMaterialization: ['structural'], directives: {}, notes: 'Статическая рамка.'
+    }],
+    relationRules: [{ d2ClassKey: 'acl_external', d2Notes: 'binding-result: Внешние ИС\nstage-policy: terminal-only' }]
+  };
+  const normalized = normalizeAssistantDiagramBindingIntentResponse(input, {
+    placementBindings: [{ structureItemId: 'placement-group', materializationIntent: 'stage', businessBlockId: 'block-external' }, {
+      structureItemId: 'placement-group', materializationIntent: 'stage', businessBlockId: 'block-external'
+    }],
+    connectionBindings: [{ d2ClassKey: 'acl_external', businessBlockId: 'invented' }],
+    unresolved: [], warnings: []
+  });
+  assert.deepEqual(normalized.placementBindings, [{
+    structureItemId: 'placement-group',
+    materializationIntent: 'structural',
+    membership: 'structural',
+    requiredConditions: [],
+    requiredMembership: [],
+    endpointFields: [],
+    endpointOperators: []
+  }]);
+  assert.equal(normalized.connectionBindings[0].businessBlockId, 'block-external');
+  assert.match(normalized.warnings[0], /exact duplicate/);
+});
+
+test('binding-intent seed keeps deterministic Notes bindings while requesting natural-language enrichment', () => {
+  const businessBlockManifest = assistantObjectFlowBusinessBlockManifest({
+    authoring: { version: 1, assistant: { objectFlowIntent: { context: '', blocks: [{ id: 'block-vlan', name: 'VLAN', description: 'VLAN cards.', resultKind: 'sourceCards', uses: [] }] } } }
+  }, [{
+    id: 'selection:vlan', alias: 'vlan', className: 'vlan', stageRole: 'terminal', outputKind: 'sourceCards',
+    assistantBlockIds: ['block-vlan']
+  }]);
+  const seed = assistantDiagramBindingIntentSeed({
+    businessBlockManifest,
+    placements: [{
+      structureItemId: 'scope-vlan', templateStatic: false, materializationHint: 'stage', allowedMaterialization: ['stage'],
+      directives: { 'binding-result': 'VLAN', 'stage-policy': 'terminal-only', 'required-condition': ['isNAT equals true'] },
+      notes: 'binding-result: VLAN\nrequired-condition: isNAT equals true\nПовторить контейнер для каждой VLAN.'
+    }],
+    relationRules: []
+  });
+  assert.deepEqual(seed.placementBindings, [{
+    structureItemId: 'scope-vlan', materializationIntent: 'stage', businessBlockId: 'block-vlan'
+  }]);
+  assert.deepEqual(seed.pendingPlacementIds, ['scope-vlan']);
+});
+
+test('placement adapter compiles fixed binding intent and typed conditions without repeating LLM choices', () => {
+  const input = {
+    placements: [{
+      structureItemId: 'group', roleId: 'role-group', displayName: 'group', visualKind: 'container', templateStatic: false,
+      allowedMaterialization: ['structural'], currentMapping: {}
+    }, {
+      structureItemId: 'scope-vlan', roleId: 'role-vlan', displayName: 'scope_vlan', visualKind: 'container', templateStatic: false,
+      allowedMaterialization: ['stage'], currentMapping: {}
+    }],
+    stages: [{
+      id: 'selection:vlan', alias: 'vlan', kind: 'selection', className: 'vlan', columns: ['_id', 'isNAT'],
+      assistantBlockIds: ['block-vlan'], stageRole: 'terminal', cardSources: [{ id: 'current', className: 'vlan', classColumn: 'Class', idColumn: '_id' }]
+    }],
+    bindingIntent: {
+      placements: [{ structureItemId: 'group', materializationIntent: 'structural', membership: 'structural' }, {
+        structureItemId: 'scope-vlan', materializationIntent: 'stage', businessBlockId: 'block-vlan', stagePolicy: 'terminal-only',
+        requiredConditions: ['isNAT equals true', 'isNAT equals ${param.isNat}']
+      }]
+    }
+  };
+  const draft = assistantDiagramPlacementDraftFromResponse(input, {
+    mappings: [{ structureItemId: 'group', materialization: 'stage', stageId: 'invented' }, {
+      structureItemId: 'scope-vlan', materialization: 'stage', stageId: 'invented'
+    }],
+    unresolved: []
+  });
+  assert.equal(draft.success, true, JSON.stringify(draft.errors));
+  assert.equal(draft.items.find((item) => item.structureItemId === 'group').mapping.materialization.kind, 'structural');
+  const vlan = draft.items.find((item) => item.structureItemId === 'scope-vlan');
+  assert.equal(vlan.mapping.materialization.stageId, 'selection:vlan');
+  assert.equal(vlan.mapping.conditions.rules.length, 2);
+  assert.equal(vlan.mapping.conditions.rules[0].right.kind, 'literal');
+  assert.equal(vlan.mapping.conditions.rules[1].right.kind, 'param');
+  assert.equal(vlan.mapping.conditions.rules[1].right.name, 'isNat');
+});
+
+test('natural D2 Notes require typed binding interpretation while machine-only directives remain deterministic', () => {
+  assert.equal(assistantDiagramNotesHasNaturalLanguage([
+    'binding-result: Внешние ИС',
+    'stage-policy: terminal-only',
+    'endpoint-field: ipRange.range',
+    'endpoint-operator: ipv4InCidr'
+  ].join('\n')), false);
+  assert.equal(assistantDiagramNotesHasNaturalLanguage([
+    'binding-result: Внешние ИС',
+    'Размещать только системы, адреса которых входят в сети выбранного результата.'
+  ].join('\n')), true);
+});
+
+test('D2 mapping coverage stays partial until mapped attribute connections have executable endpoint profiles', () => {
+  const input = {
+    roles: [{ id: 'role-application', visualKind: 'node' }],
+    placements: [{ structureItemId: 'application-a', roleId: 'role-application', visualKind: 'node', templateStatic: false }],
+    topology: [{ d2ElementKey: 'edge-acl', d2ClassKey: 'acl_internal', label: 'ACL internal' }]
+  };
+  const items = [{ structureItemId: 'application-a', roleId: 'role-application' }];
+  const relationRules = [{
+    d2ElementKey: 'edge-acl', d2ClassKey: 'acl_internal', mode: 'attributeEndpoints', directionPolicy: 'dataFields',
+    sourceStageId: 'selection:acl', sourceField: 'ipaddress', sourceOperator: 'equals',
+    targetField: 'dipaddress', targetOperator: 'equals'
+  }];
+  const partial = assistantDiagramMappingCoverage(input, items, [], relationRules, [], []);
+  assert.equal(partial.status, 'partial');
+  assert.equal(partial.mappedConnections, 0);
+  assert.match(partial.unresolved[0].message, /endpoint comparison rules are incomplete/);
+
+  const complete = assistantDiagramMappingCoverage(input, items, [], relationRules, [], [{
+    id: 'application-address', structureItemId: 'application-a', roleId: 'role-application', field: 'ipaddress.ipAddr', operators: ['equals']
+  }]);
+  assert.equal(complete.status, 'complete');
+  assert.equal(complete.mappedConnections, 1);
+  assert.deepEqual(complete.unresolved, []);
 });
 
 test('D2 placement materialization hints narrow role defaults and allow placement overrides', () => {

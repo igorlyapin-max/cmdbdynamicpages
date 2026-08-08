@@ -118,7 +118,8 @@ const SYSLOG_PROTOCOL = normalizeSyslogProtocol(process.env.CMDP_SYSLOG_PROTOCOL
 const SYSLOG_FACILITY = normalizeSyslogFacility(process.env.CMDP_SYSLOG_FACILITY || 'local0');
 const REDIS_URL = process.env.CMDBDYNAMIC_REDIS_URL || 'redis://127.0.0.1:6379/0';
 const REDIS_PASSWORD = readSecretValue(process.env.CMDBDYNAMIC_REDIS_PASSWORD, process.env.CMDBDYNAMIC_REDIS_PASSWORD_FILE);
-const REDIS_TLS_CA_FILE = String(process.env.CMDBDYNAMIC_REDIS_TLS_CA_FILE || '').trim();
+const TLS_CA_FILE = String(process.env.CMDP_TLS_CA_FILE || '').trim();
+const NODE_EXTRA_CA_CERTS = String(process.env.NODE_EXTRA_CA_CERTS || '').trim();
 const REDIS_ENABLED = process.env.CMDBDYNAMIC_REDIS_ENABLED !== 'false';
 const REDIS_KEY_PREFIX = process.env.CMDBDYNAMIC_REDIS_KEY_PREFIX || 'cmdp';
 const REDIS_TIMEOUT_MS = Math.max(100, Number(process.env.CMDBDYNAMIC_REDIS_TIMEOUT_MS || 500) || 500);
@@ -153,22 +154,30 @@ const D2_IMPORT_ASSISTANT_CHECKPOINT_MAX_BYTES = Math.max(16 * 1024, Math.min(
 ));
 const D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION = 1;
 const D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION = 3;
-const ASSISTANT_PROMPT_CONTRACT_VERSION = 2;
-const ASSISTANT_DATA_SEMANTIC_MODEL_VERSION = 2;
+const ASSISTANT_DIAGRAM_MAPPING_CHECKPOINT_VERSION = 2;
+const ASSISTANT_PROMPT_CONTRACT_VERSION = 4;
+const ASSISTANT_EDITOR_DELTA_VERSION = 1;
+const ASSISTANT_DATA_SEMANTIC_MODEL_VERSION = 3;
 const ASSISTANT_D2_STRUCTURAL_MODEL_VERSION = 1;
 const ASSISTANT_D2_SEMANTIC_MODEL_VERSION = 1;
 const ASSISTANT_D2_BINDING_MODEL_VERSION = 1;
-const ASSISTANT_COVERAGE_MODEL_VERSION = 1;
+const ASSISTANT_BUSINESS_BLOCK_MANIFEST_VERSION = 2;
+const ASSISTANT_D2_BINDING_INTENT_VERSION = 1;
+const ASSISTANT_SEMANTIC_OBLIGATION_MODEL_VERSION = 1;
+const ASSISTANT_D2_CRITIQUE_MODEL_VERSION = 1;
+const ASSISTANT_COVERAGE_MODEL_VERSION = 2;
 // Revision 10 separates a placement's visual structure from the way it is
 // materialized. A placement is either a structural frame, repeated from one
 // Object Flow stage, or inherits its nearest data-bearing parent card.
 // The immediately preceding v4 tree can be migrated only when its explicit
 // source.stageId bindings and current D2 identity make the meaning unambiguous.
 // Older placements remain unsupported and require explicit re-analysis.
+// Revision 15 keeps revision 14 connection algorithms and separates D2
+// mapping input identity from the generated diagram output itself.
 // Revision 14 makes a D2 connection class one deterministic connection
 // algorithm over every compatible placement comparison rule. Template arrows
 // describe visual style only; they never multiply or constrain business rules.
-const D2_IMPORT_SEMANTIC_MODEL_REVISION = 14;
+const D2_IMPORT_SEMANTIC_MODEL_REVISION = 15;
 // Endpoint profiles are additive authoring metadata. Keeping their version
 // separate preserves an already analysed D2 structure while making old
 // network edge rules reviewable in the manual editor.
@@ -208,7 +217,7 @@ const DEFAULT_ASSISTANT_LLM_MAX_REQUEST_BYTES = Math.min(512 * 1024, ASSISTANT_L
 const DEFAULT_ASSISTANT_LLM_MAX_RESPONSE_BYTES = Math.min(1024 * 1024, ASSISTANT_LLM_MAX_RESPONSE_BYTES_ABSOLUTE);
 const DEFAULT_ASSISTANT_SYSTEM_PROMPT = [
   'Этот prompt задаёт только семантику CMDBuild. Он не задаёт синтаксис DSL, типы шагов, JSON-контракт или порядок операций: их определяет специализированный prompt текущей задачи.',
-  'Пользователь может называть CMDBuild классы, атрибуты, lookup значения и связи по Name, Description или Code. При неоднозначности используй permission-filtered MCP context и предпочитай точное совпадение Name, затем Description, затем Code. Частичное совпадение допустимо только как явно отмеченный fallback при отсутствии точного совпадения в доступном context.',
+  'Пользователь может называть CMDBuild классы, атрибуты, lookup значения и связи по Name, Description, Code, Alias или терминам из Help. При неоднозначности используй permission-filtered MCP context и предпочитай точное совпадение Name, затем Description, затем Code. Alias и Help являются дополнительными семантическими доказательствами, но не заменяют подтвержденный CMDBuild identifier. Частичное совпадение допустимо только как явно отмеченный fallback при отсутствии точного совпадения в доступном context.',
   'Не отождествляй название класса с названием атрибута. Перед выбором поля проверь его тип и принадлежность выбранному классу в MCP context.',
   'Пользовательские формулировки могут ссылаться на атрибуты напрямую, на связи через domains, на reference-поля и на lookup-поля. Для lookup, reference и domain пользователь обычно оперирует отображаемым значением или Description связанного объекта, а не внутренним id. Не сравнивай такие поля как raw id, если модель предоставляет человекочитаемое значение.',
   'Связи между объектами могут быть 1:N, N:1 и N:N. Анализируй все подходящие related cards и подтвержденные paths в пределах видимых настроенных лимитов. Учитывай domain суперклассов и разрешённые типы объектов на другой стороне связи.',
@@ -228,7 +237,7 @@ const DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT = [
 ].join('\n\n');
 const DEFAULT_ASSISTANT_OBJECT_FLOW_SEMANTIC_PROMPT = [
   'Ты строишь проверяемый семантический план CMDBuild из пользовательских бизнес-блоков. Не создавай Object Flow, DSL, alias, Spec JSON, D2 source или результат выполнения.',
-  'Для каждого блока сохрани его id и название, кратко опиши предполагаемую выборку, перечисли подтвержденные классы, атрибуты и пути связей только из permission-filtered MCP context. Укажи зависимости только между переданными блоками.',
+  'Для каждого блока сохрани его id и название, кратко опиши предполагаемую выборку, перечисли подтвержденные классы, атрибуты и пути связей только из permission-filtered MCP context. Укажи зависимости только между переданными блоками. Переданный resultKind является обязательным контрактом; auto можно разрешить только из явно сформулированного ожидаемого результата.',
   'Для каждого блока зафиксируй контракт результата. outputKind sourceCards означает только карточки outputClass. outputKind relationPairs означает пары строк из двух уже выбранных endpoint-блоков и обязан содержать pair. pair.mode=domain использует fromBlockId, withBlockId, fromClass, withClass, domain и direction; pair.mode=match использует те же endpoint-поля и непустой rules с leftColumn, rightColumn и operator. Оба endpoint-блока должны быть явно выбраны в «Использует результаты блоков» и возвращать sourceCards; не создавай второй endpoint широким сканированием класса. Если ожидаемый результат говорит «Список <класса>», другой блок не становится отдельным output. Прямой переход от результата dependency к outputClass через CMDBuild domain описывай dependencyPaths: comparisonBlockId, sourceClass, domain, direction и targetClass. relationPredicate используй только когда нужно сохранить outputClass, пройти к relatedClass и сравнить поля связанной карточки с другим результатом: он всегда обязан содержать comparisonBlockId, comparisonClass, domain, direction, comparisonFields, relatedField и operator. Для прямого сравнения атрибутов outputClass с атрибутами другого блока используй attributePredicate с comparisonBlockId, comparisonClass, sourceFields, comparisonField и оператором; у него нет domain и direction. Для поля reference используй referencePathPredicates: comparisonBlockId, comparisonClass, sourcePath и comparisonField с оператором. sourcePath — массив сегментов от outputClass до читаемого terminal field; каждый сегмент может быть Code, Name или Description, но backend подтвердит и сохранит только CMDBuild identifiers. Не передавай reference path как строку sourceFields с точкой и не помещай terminal field reference-цели в attributePredicate: верни полный referencePathPredicate либо unresolved. Если пользователь пишет «Provider email», сначала проверь точное прямое поле outputClass, затем единственный доступный reference target field; при неоднозначности верни unresolved. Если пользователь явно указал domain, который не соединяет классы, используй единственный подтвержденный MCP path и добавь warning; при нескольких кандидатах верни unresolved. Не создавай внутренние aliases в контракте.',
   'Ожидаемый результат определяет outputClass: при «Список <класса A>» outputClass обязан быть A. Класс B, нужный только чтобы пройти связь или взять поле для проверки, не становится output. Когда требуется сохранить A, перейти к B и сравнить B с результатом C, используй relationPredicate с outputClass=A, relatedClass=B и comparisonClass=C; это не dependencyPath C -> B.',
   'Проверка IPv4 «адрес входит в сеть/range» является сравнением атрибутов, а не переходом по CMDBuild domain. Если IP-поля карточек outputClass сравниваются с network/range полем результата dependency, используй attributePredicate. Если для сохранения outputClass сначала нужно пройти к связанной карточке с network/range, используй relationPredicate. Не описывай такую проверку как dependencyPath и не делай superclass сети outputClass.',
@@ -244,6 +253,14 @@ const DEFAULT_ASSISTANT_DIAGRAM_SEMANTICS_PROMPT = [
   'Подписи, structured data и прочие детали карточки по умолчанию являются атрибутами primary-карточки, а не самостоятельными D2-узлами.',
   'Не выбирай CMDB classes, attributes, aliases, object-flow stages, relation paths или mapping. Не добавляй и не удаляй элементы диаграммы. Верни только typed semantic decisions для supplied exact role ids.'
 ].join('\n\n');
+const DEFAULT_ASSISTANT_DIAGRAM_BINDING_INTENT_PROMPT = [
+  'Сопоставь смысл каждого exact D2 placement и connection class только с именованным пользовательским бизнес-блоком из BusinessBlockManifest. На этом этапе запрещено выбирать stageId, поля, operators или connection mode.',
+  'Для placement сначала выбери materializationIntent из allowedMaterialization. structural не имеет источника данных; parentCard наследует карточку ближайшего materialized parent; только stage требует businessBlockId.',
+  'Именованный бизнес-блок означает его terminal result. Helper stages являются техническими промежуточными результатами и не выбираются, если Notes явно не содержат stage-policy: helper-allowed.',
+  'Для connection class выбери один businessBlockId, строка которого действительно является карточкой или записью требуемой связи. Вспомогательный relation/path stage не является результатом связи.',
+  'Exact Placement Notes и Connection Notes имеют приоритет над шаблонным prompt; Role Notes задают только повторно используемый visual contract. Переведи естественный текст Notes в typed obligations: обязательные условия строк, принадлежность родителю, row grain, endpoint mode, поля и операторы. Machine directives endpoint-field, endpoint-operator, source-operator и target-operator являются advanced authoritative overrides и применяются backend детерминированно. Не считай Notes исполненными только потому, что выбран похожий business block. При противоречии или неоднозначности верни unresolved, не подбирай ближайшее название.',
+  'Не меняй D2 source, Object Flow, Spec JSON, save, publish или runtime execution. Верни только typed binding intent.'
+].join('\n\n');
 const DEFAULT_ASSISTANT_DIAGRAM_PLACEMENT_PROMPT = [
   'Сопоставь каждое переданное динамическое placement из подтвержденных D2StructuralModel и D2SemanticModel с одним совместимым результатом DataSemanticModel. Placements с templateStatic=true уже детерминированно сохраняют D2 exemplar, не передаются для сопоставления и не должны появляться в ответе. Каждая копия динамической роли в дереве является отдельным placement и может иметь собственный источник.',
   'Поле allowedMaterialization уже учитывает machine-readable materialization hint из Role Notes или Placement Notes. Если список содержит один вариант, используй только его. Placement Notes имеют приоритет над Role Notes; не переопределяй этот контракт рассуждением по label или вложенности.',
@@ -257,7 +274,14 @@ const DEFAULT_ASSISTANT_DIAGRAM_CONNECTIONS_PROMPT = [
   'Для каждого класса связи используй не более одного точного connection candidate и один именованный deterministic Object Flow result. mode, candidateId, sourceStageId и endpoint fields копируй из одного и того же списка candidates выбранного mode; candidateId из соседнего mode недействителен даже при совпадающем stage. Не используй отдельные exemplar-стрелки D2 как ограничение бизнес-пар.',
   'Связь может быть получена из domain/reference, карточки связи, materialized endpoint ids, сравнения атрибутов, операций над множествами или другого поддерживаемого deterministic operator. Выбирай только предложенный режим и точные поля результата.',
   'Connection Notes определяют смысл связи и подписи, но не являются CMDB identifiers. Не выдумывай classes, attributes, aliases, stages, paths или candidates. Если подтвержденного источника нет либо он неоднозначен, верни unresolved.',
+  'Если D2BindingIntent содержит sourceOperator или targetOperator, они являются неизменяемой частью Notes-контракта. Не заменяй их другим оператором и не выбирай участников связи: backend проверяет результат связи против всех совместимых endpoint profiles.',
   'Не меняй placement mapping, D2 source, Object Flow, Spec JSON, save, publish или runtime execution. Верни только typed connection mappings для supplied exact ids.'
+].join('\n\n');
+const DEFAULT_ASSISTANT_DIAGRAM_CRITIQUE_PROMPT = [
+  'Проверь готовый D2 mapping против BusinessBlockManifest, D2BindingIntent, Notes и SemanticObligationMatrix. Не создавай и не исправляй mapping самостоятельно.',
+  'Ищи только смысловые подмены: terminal result заменен helper/source stage, обязательный branch filter потерян, lineage выдана за hierarchy membership, connection использует helper result или несовместимую row grain/mode.',
+  'Каждое нарушение обязано ссылаться на exact obligationId из SemanticObligationMatrix и выбирать targetPhase placements или connections. Не создавай новые identifiers и не оспаривай catalog-backed ограничения.',
+  'Если все обязательства подтверждены, верни approved=true и пустой violations. Не применяй, не сохраняй, не публикуй и не выполняй шаблон.'
 ].join('\n\n');
 const STARTED_AT = new Date();
 const ABSOLUTE_EXECUTION_LIMITS = {
@@ -742,6 +766,9 @@ function loggingStatus() {
       directOutput: false,
       recommendedPipeline: 'stdout/syslog -> collector -> Elasticsearch'
     },
+    tls: {
+      caBundleConfigured: Boolean(TLS_CA_FILE)
+    },
     publicOrigin: publicOriginStatus(),
     assistant: assistantStatus(),
     d2: d2RendererConfigSummary()
@@ -753,6 +780,8 @@ function validateRuntimeConfig(input = {}) {
   const csrfSecret = String(input.csrfSecret === undefined ? process.env.CMDBDYNAMICPAGES_CSRF_SECRET || '' : input.csrfSecret || '').trim();
   const redisUrl = String(input.redisUrl === undefined ? REDIS_URL : input.redisUrl || '').trim();
   const redisEnabled = input.redisEnabled === undefined ? REDIS_ENABLED : input.redisEnabled !== false;
+  const tlsCaFile = String(input.tlsCaFile === undefined ? TLS_CA_FILE : input.tlsCaFile || '').trim();
+  const nodeExtraCaCerts = String(input.nodeExtraCaCerts === undefined ? NODE_EXTRA_CA_CERTS : input.nodeExtraCaCerts || '').trim();
   const logTargets = input.logTargets || LOG_TARGETS;
   const syslogHost = String(input.syslogHost === undefined ? SYSLOG_HOST : input.syslogHost || '').trim();
   const syslogPort = normalizeSyslogPort(input.syslogPort === undefined ? SYSLOG_PORT : input.syslogPort);
@@ -767,6 +796,29 @@ function validateRuntimeConfig(input = {}) {
   const publicOriginConfiguration = parsePublicOriginConfiguration(input.publicOrigin === undefined ? process.env.CMDP_PUBLIC_ORIGIN || '' : input.publicOrigin);
   const errors = [];
   const warnings = [];
+
+  let tlsCaBundle = { configured: Boolean(tlsCaFile), readable: false };
+  if (tlsCaFile || nodeExtraCaCerts) {
+    if (!tlsCaFile || !nodeExtraCaCerts || tlsCaFile !== nodeExtraCaCerts) {
+      errors.push({
+        code: 'tls_ca_bundle_contract_invalid',
+        env: 'CMDP_TLS_CA_FILE,NODE_EXTRA_CA_CERTS',
+        message: 'Private CA configuration requires CMDP_TLS_CA_FILE and NODE_EXTRA_CA_CERTS to reference the same readable PEM file.'
+      });
+    } else {
+      try {
+        if (!fs.statSync(tlsCaFile).isFile()) throw new Error('TLS CA path is not a regular file.');
+        fs.accessSync(tlsCaFile, fs.constants.R_OK);
+        tlsCaBundle = { configured: true, readable: true };
+      } catch (error) {
+        errors.push({
+          code: 'tls_ca_bundle_invalid',
+          env: 'CMDP_TLS_CA_FILE',
+          message: error && error.message ? error.message : 'Private CA bundle is not readable.'
+        });
+      }
+    }
+  }
 
   if (nodeEnv.toLowerCase() === 'production' && !csrfSecret) {
     errors.push({
@@ -818,11 +870,8 @@ function validateRuntimeConfig(input = {}) {
       const redisConfig = parseRedisUrl(redisUrl);
       redisTransport = {
         transport: redisConfig.tls ? 'tls' : 'plaintext',
-        caConfigured: Boolean(redisConfig.tlsCaFile)
+        caConfigured: Boolean(tlsCaBundle.configured)
       };
-      if (redisConfig.tls && redisConfig.tlsCaFile && !fs.statSync(redisConfig.tlsCaFile).isFile()) {
-        throw new Error('Redis TLS CA path is not a regular file.');
-      }
     } catch (error) {
       errors.push({
         code: 'redis_url_invalid',
@@ -881,6 +930,7 @@ function validateRuntimeConfig(input = {}) {
     },
     publicOrigin: publicOriginConfiguration.origin,
     publicOriginConfigured: publicOriginConfiguration.configured,
+    tls: tlsCaBundle,
     redis: redisTransport,
     assistant: assistantStatus(),
     applicationVersion: APPLICATION_VERSION,
@@ -901,6 +951,7 @@ function runtimeConfigLogSummary(validation = validateRuntimeConfig()) {
     publicOriginConfigured: Boolean(validation.publicOriginConfigured),
     applicationVersion: validation.applicationVersion || APPLICATION_VERSION,
     build: validation.build || APPLICATION_BUILD,
+    tls: validation.tls || { configured: Boolean(TLS_CA_FILE), readable: false },
     redis: validation.redis || redisTransportSecurity(),
     d2: validation.d2 || d2RendererConfigSummary(),
     errors: validation.errors.map((item) => item.code),
@@ -1103,22 +1154,105 @@ function hashJson(value) {
   return sha256Hex(stableJsonStringify(value));
 }
 
-function legacyAssistantDraftAuthoring(value) {
-  const draft = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
-  const d2Draft = draft.d2Authoring && typeof draft.d2Authoring === 'object' && !Array.isArray(draft.d2Authoring)
-    ? draft.d2Authoring
-    : {};
+const ASSISTANT_EDITOR_DELTA_SPEC_KEYS = Object.freeze([
+  'version',
+  'params',
+  'steps',
+  'visualModel',
+  'visualModels',
+  'result',
+  'authoring'
+]);
+
+function assistantEditorDeltaFromSpec(spec) {
+  const source = spec && typeof spec === 'object' && !Array.isArray(spec) ? spec : {};
+  const projected = {};
+  for (const key of ASSISTANT_EDITOR_DELTA_SPEC_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
+    if (key === 'result') {
+      const result = source.result && typeof source.result === 'object' && !Array.isArray(source.result) ? source.result : {};
+      projected.result = {
+        ...(Object.prototype.hasOwnProperty.call(result, 'tables') ? { tables: cloneJsonValueServer(result.tables, []) } : {}),
+        ...(Object.prototype.hasOwnProperty.call(result, 'emptyText') ? { emptyText: String(result.emptyText || '') } : {}),
+        ...(Object.prototype.hasOwnProperty.call(result, 'permissionDeniedText') ? { permissionDeniedText: String(result.permissionDeniedText || '') } : {})
+      };
+      continue;
+    }
+    projected[key] = cloneJsonValueServer(source[key], null);
+  }
   return {
-    version: 1,
-    assistant: {
-      objectFlowIntent: cloneJsonValueServer(draft.objectFlowIntent, { context: '', blocks: [] }),
-      promptContractVersion: ASSISTANT_PROMPT_CONTRACT_VERSION,
-      diagramSemanticsPrompt: String(draft.diagramSemanticsPrompt || draft.diagramInterpretPrompt || ''),
-      diagramPlacementPrompt: String(draft.diagramPlacementPrompt || draft.diagramMappingPrompt || ''),
-      diagramConnectionsPrompt: String(draft.diagramConnectionsPrompt || draft.diagramMappingPrompt || '')
-    },
-    d2: { source: String(d2Draft.source || '') }
+    version: ASSISTANT_EDITOR_DELTA_VERSION,
+    spec: projected,
+    hash: hashJson(projected)
   };
+}
+
+function applyAssistantEditorDelta(baseSpec, value) {
+  const base = cloneJsonValueServer(baseSpec, {});
+  const delta = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  if (!delta || Number(delta.version || 0) !== ASSISTANT_EDITOR_DELTA_VERSION || !delta.spec || typeof delta.spec !== 'object' || Array.isArray(delta.spec)) {
+    const error = new Error(`editorDelta must use Assistant editor delta version ${ASSISTANT_EDITOR_DELTA_VERSION}.`);
+    error.statusCode = 400;
+    error.code = 'assistant_editor_delta_invalid';
+    throw error;
+  }
+  const unknown = Object.keys(delta.spec).filter((key) => !ASSISTANT_EDITOR_DELTA_SPEC_KEYS.includes(key));
+  if (unknown.length) {
+    const error = new Error(`editorDelta contains unsupported template fields: ${unknown.join(', ')}.`);
+    error.statusCode = 400;
+    error.code = 'assistant_editor_delta_invalid';
+    error.details = unknown.map((key) => ({ path: `$.editorDelta.spec.${key}`, message: 'Field is not part of the bounded Assistant editor contract.' }));
+    throw error;
+  }
+  if (delta.hash && (!isSpecHash(delta.hash) || String(delta.hash).toLowerCase() !== hashJson(delta.spec))) {
+    const error = new Error('editorDelta hash does not match its content.');
+    error.statusCode = 400;
+    error.code = 'assistant_editor_delta_hash_mismatch';
+    throw error;
+  }
+  for (const key of ASSISTANT_EDITOR_DELTA_SPEC_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(delta.spec, key)) continue;
+    if (key === 'result') {
+      base.result = {
+        ...(base.result && typeof base.result === 'object' && !Array.isArray(base.result) ? base.result : {}),
+        ...cloneJsonValueServer(delta.spec.result, {})
+      };
+      continue;
+    }
+    base[key] = cloneJsonValueServer(delta.spec[key], null);
+  }
+  return base;
+}
+
+function assistantRequestTemplateRef(body) {
+  const source = body && body.templateRef && typeof body.templateRef === 'object' && !Array.isArray(body.templateRef)
+    ? body.templateRef
+    : null;
+  if (!source || !Object.prototype.hasOwnProperty.call(source, 'root') ||
+    !Object.prototype.hasOwnProperty.call(source, 'templateCode') ||
+    !Object.prototype.hasOwnProperty.call(source, 'baseSpecHash')) {
+    const error = new Error('Assistant request must include templateRef with root, templateCode, and baseSpecHash.');
+    error.statusCode = 400;
+    error.code = 'assistant_template_ref_required';
+    throw error;
+  }
+  const root = String(source.root || '').trim();
+  if (!root || typeof source.templateCode !== 'string' || typeof source.baseSpecHash !== 'string') {
+    const error = new Error('Assistant templateRef is invalid. root must be non-empty; templateCode and baseSpecHash must be strings.');
+    error.statusCode = 400;
+    error.code = 'assistant_template_ref_invalid';
+    throw error;
+  }
+  return {
+    root,
+    templateCode: source.templateCode.trim(),
+    baseSpecHash: source.baseSpecHash.trim()
+  };
+}
+
+function resolveAssistantRequestSpec(body, storedSpec) {
+  if (body && body.editorDelta !== undefined) return applyAssistantEditorDelta(storedSpec || {}, body.editorDelta);
+  return cloneJsonValueServer(storedSpec || {}, {});
 }
 
 const TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_KEYS = Object.freeze([
@@ -1126,10 +1260,12 @@ const TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_KEYS = Object.freeze([
   'objectFlowSemantic',
   'objectFlow',
   'diagramSemantics',
+  'diagramBindingIntent',
   'diagramPlacement',
-  'diagramConnections'
+  'diagramConnections',
+  'diagramCritique'
 ]);
-const TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_LEGACY_KEYS = Object.freeze([
+const TEMPLATE_ASSISTANT_PROMPT_UNSUPPORTED_KEYS = Object.freeze([
   'diagramInterpretation',
   'diagramMapping'
 ]);
@@ -1143,6 +1279,27 @@ function firstAssistantPrompt(source, keys, fallback = '') {
   return String(fallback || '').trim();
 }
 
+function assistantDiagramIntentPrompt(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  return truncateText(String(source.diagramIntentPrompt || '').trim(), 12_000);
+}
+
+function assistantObjectFlowBlockDescription(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const explicit = String(source.description || '').trim();
+  if (explicit) return truncateText(explicit, 12_000);
+  return truncateText([
+    String(source.entities || '').trim(),
+    String(source.algorithm || '').trim(),
+    String(source.expectedResult || '').trim()
+  ].filter(Boolean).join('\n\n'), 12_000);
+}
+
+function normalizeAssistantObjectFlowResultKind(value) {
+  const kind = String(value || '').trim();
+  return ['sourceCards', 'relationPairs'].includes(kind) ? kind : 'auto';
+}
+
 function normalizeAssistantPromptContract(value, defaults = {}) {
   const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
   const fallback = defaults && typeof defaults === 'object' && !Array.isArray(defaults) ? defaults : {};
@@ -1151,9 +1308,11 @@ function normalizeAssistantPromptContract(value, defaults = {}) {
     system: firstAssistantPrompt(source, ['system'], fallback.system),
     objectFlowSemantic: firstAssistantPrompt(source, ['objectFlowSemantic'], fallback.objectFlowSemantic),
     objectFlow: firstAssistantPrompt(source, ['objectFlow'], fallback.objectFlow),
-    diagramSemantics: firstAssistantPrompt(source, ['diagramSemantics', 'diagramInterpretation'], fallback.diagramSemantics),
-    diagramPlacement: firstAssistantPrompt(source, ['diagramPlacement', 'diagramMapping'], fallback.diagramPlacement),
-    diagramConnections: firstAssistantPrompt(source, ['diagramConnections', 'diagramMapping'], fallback.diagramConnections)
+    diagramSemantics: firstAssistantPrompt(source, ['diagramSemantics'], fallback.diagramSemantics),
+    diagramBindingIntent: firstAssistantPrompt(source, ['diagramBindingIntent'], fallback.diagramBindingIntent),
+    diagramPlacement: firstAssistantPrompt(source, ['diagramPlacement'], fallback.diagramPlacement),
+    diagramConnections: firstAssistantPrompt(source, ['diagramConnections'], fallback.diagramConnections),
+    diagramCritique: firstAssistantPrompt(source, ['diagramCritique'], fallback.diagramCritique)
   };
 }
 
@@ -1163,7 +1322,7 @@ function templateAssistantPromptOverrideValidationErrors(value, path = '$.author
     return [{ path, message: 'Template Assistant systemPromptOverrides must be an object.' }];
   }
   const errors = [];
-  for (const key of TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_KEYS.concat(TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_LEGACY_KEYS)) {
+  for (const key of TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_KEYS) {
     if (value[key] === undefined || value[key] === null) continue;
     if (typeof value[key] !== 'string') {
       errors.push({ path: `${path}.${key}`, message: 'Template Assistant prompt override must be a string.' });
@@ -1174,6 +1333,11 @@ function templateAssistantPromptOverrideValidationErrors(value, path = '$.author
         path: `${path}.${key}`,
         message: `Template Assistant prompt override must not exceed ${TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_MAX_CHARS} characters.`
       });
+    }
+  }
+  for (const key of TEMPLATE_ASSISTANT_PROMPT_UNSUPPORTED_KEYS) {
+    if (value[key] !== undefined) {
+      errors.push({ path: `${path}.${key}`, message: 'Template Assistant prompt override uses an unsupported legacy field.' });
     }
   }
   return errors;
@@ -1279,12 +1443,8 @@ function normalizeD2AssistantCheckpoint(value) {
   return checkpoint;
 }
 
-function normalizeTemplateAuthoring(value, legacyDraft = null) {
-  const source = value && typeof value === 'object' && !Array.isArray(value)
-    ? value
-    : legacyDraft && typeof legacyDraft === 'object' && !Array.isArray(legacyDraft)
-      ? legacyAssistantDraftAuthoring(legacyDraft)
-      : null;
+function normalizeTemplateAuthoring(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
   if (!source) return null;
   const assistant = source.assistant && typeof source.assistant === 'object' && !Array.isArray(source.assistant)
     ? source.assistant
@@ -1304,9 +1464,7 @@ function normalizeTemplateAuthoring(value, legacyDraft = null) {
     assistant: {
       objectFlowIntent: cloneJsonValueServer(assistant.objectFlowIntent, { context: '', blocks: [] }),
       promptContractVersion: ASSISTANT_PROMPT_CONTRACT_VERSION,
-      diagramSemanticsPrompt: truncateText(String(assistant.diagramSemanticsPrompt || assistant.diagramInterpretPrompt || ''), 6000),
-      diagramPlacementPrompt: truncateText(String(assistant.diagramPlacementPrompt || assistant.diagramMappingPrompt || ''), 6000),
-      diagramConnectionsPrompt: truncateText(String(assistant.diagramConnectionsPrompt || assistant.diagramMappingPrompt || ''), 6000),
+      diagramIntentPrompt: assistantDiagramIntentPrompt(assistant),
       ...(Object.keys(systemPromptOverrides).length
         ? { systemPromptOverrides }
         : {})
@@ -1322,11 +1480,7 @@ function normalizeTemplateAuthoring(value, legacyDraft = null) {
 
 function templateAuthoring(spec, options = {}) {
   const source = spec && typeof spec === 'object' && !Array.isArray(spec) ? spec : {};
-  const authoring = normalizeTemplateAuthoring(source.authoring);
-  if (authoring || options.allowLegacy !== true) return authoring;
-  // Retired assistantDraft is accepted only by the ordinary template-save
-  // migration path. Runtime and authoring actions never treat it as state.
-  return normalizeTemplateAuthoring(null, source.assistantDraft);
+  return normalizeTemplateAuthoring(source.authoring);
 }
 
 function templateAuthoringD2(spec, options = {}) {
@@ -1336,8 +1490,74 @@ function templateAuthoringD2(spec, options = {}) {
     : {};
 }
 
+function diagramAuthoringUnsupportedReasons(spec) {
+  const source = spec && typeof spec === 'object' && !Array.isArray(spec) ? spec : {};
+  const reasons = [];
+  if (Object.prototype.hasOwnProperty.call(source, 'assistantDraft')) reasons.push('assistantDraft');
+  const authoring = source.authoring && typeof source.authoring === 'object' && !Array.isArray(source.authoring)
+    ? source.authoring
+    : {};
+  return uniqueStrings(reasons);
+}
+
+function diagramAuthoringReanalysisReasons(spec) {
+  const source = spec && typeof spec === 'object' && !Array.isArray(spec) ? spec : {};
+  const reasons = [];
+  const diagrams = source.result && Array.isArray(source.result.diagrams) ? source.result.diagrams : [];
+  for (const diagram of diagrams) {
+    const imported = diagram && diagram.authoring && diagram.authoring.d2Import;
+    if (!imported || typeof imported !== 'object' || Array.isArray(imported)) continue;
+    if (Number(imported.version || 0) !== 3) reasons.push('d2Import.version');
+    if (Number(imported.semanticModelRevision || 0) !== D2_IMPORT_SEMANTIC_MODEL_REVISION) reasons.push('d2Import.semanticModelRevision');
+    if (!imported.structureTree || Number(imported.structureTree.version || 0) !== D2_IMPORT_STRUCTURE_TREE_VERSION || !Array.isArray(imported.structureTree.items)) {
+      reasons.push('d2Import.structureTree');
+    }
+    if (diagramImportStoredMaterializationIssues(imported).length) reasons.push('d2Import.materialization');
+    if (diagramImportHasLegacyClassRelationRules(imported)) reasons.push('d2Import.relationRules');
+    for (const field of ['roleMappings', 'placementRules', 'associationRules', 'elementBindings', 'navigatorGroups', 'navigatorHierarchies']) {
+      if (Object.prototype.hasOwnProperty.call(imported, field)) reasons.push(`d2Import.${field}`);
+    }
+  }
+  return uniqueStrings(reasons);
+}
+
+function diagramAuthoringStatusForSpec(spec) {
+  const reasons = diagramAuthoringUnsupportedReasons(spec);
+  if (reasons.length) {
+    return {
+      status: 'unsupported',
+      code: 'd2_authoring_current_contract_required',
+      reasons,
+      message: 'Сохранённое сопоставление D2 создано прежней версией редактора и не поддерживается. Исходные данные не изменены: выполните анализ текущего D2 source и примените новое сопоставление.'
+    };
+  }
+  const reanalysisReasons = diagramAuthoringReanalysisReasons(spec);
+  if (reanalysisReasons.length) {
+    return {
+      status: 'needsReanalysis',
+      code: 'd2_authoring_reanalysis_required',
+      reasons: reanalysisReasons,
+      message: 'Сохранённое сопоставление D2 использует устаревший contract. Оно сохранено, но не выполняется: проанализируйте текущий D2 source и примените новое сопоставление.'
+    };
+  }
+  const source = spec && typeof spec === 'object' && !Array.isArray(spec) ? spec : {};
+  const d2 = templateAuthoringD2(source);
+  const hasSource = Boolean(String(d2.source || '').trim());
+  const diagrams = source.result && Array.isArray(source.result.diagrams) ? source.result.diagrams : [];
+  const hasMapping = diagrams.some((diagram) => Boolean(diagram && diagram.authoring && diagram.authoring.d2Import));
+  if (!hasSource && !hasMapping) return { status: 'absent', code: '', reasons: [], message: '' };
+  const imported = diagrams.map((diagram) => diagram && diagram.authoring && diagram.authoring.d2Import).find(Boolean);
+  const validation = imported && imported.mappingValidation && typeof imported.mappingValidation === 'object' ? imported.mappingValidation : {};
+  return {
+    status: validation.status === 'valid' ? 'current' : 'currentIncomplete',
+    code: validation.status === 'valid' ? '' : 'd2_mapping_incomplete',
+    reasons: [],
+    message: validation.status === 'valid' ? '' : 'Текущее сопоставление D2 сохранено, но ещё не готово к выполнению.'
+  };
+}
+
 function templateAssistantRuntimeConfig(runtimeConfig, spec) {
-  const authoring = templateAuthoring(spec, { allowLegacy: false });
+  const authoring = templateAuthoring(spec);
   const overrides = normalizeTemplateAssistantPromptOverrides(authoring && authoring.assistant && authoring.assistant.systemPromptOverrides);
   if (!Object.keys(overrides).length) return runtimeConfig;
   const next = cloneJsonValueServer(runtimeConfig && typeof runtimeConfig === 'object' ? runtimeConfig : {}, {});
@@ -1371,7 +1591,6 @@ function executionTemplateSpec(spec) {
   // Validation signatures and input fingerprints only govern authoring review;
   // they must not invalidate a published/static result by themselves.
   delete next.authoring;
-  delete next.assistantDraft;
   for (const diagram of next.result && Array.isArray(next.result.diagrams) ? next.result.diagrams : []) {
     const imported = diagram && diagram.authoring && diagram.authoring.d2Import;
     if (!imported || typeof imported !== 'object' || Array.isArray(imported)) continue;
@@ -1386,7 +1605,14 @@ function executionSpecHash(spec) {
 }
 
 function diagramImportDeterministicSpec(spec) {
-  return executionTemplateSpec(spec);
+  const next = executionTemplateSpec(spec);
+  // Diagram mapping is an output of D2 authoring, not an input to its own
+  // semantic identity. Only Object Flow, parameters and table contracts may
+  // invalidate an analyzed source or resumable mapping checkpoint.
+  if (next.result && typeof next.result === 'object' && !Array.isArray(next.result)) {
+    delete next.result.diagrams;
+  }
+  return next;
 }
 
 function diagramImportDeterministicSpecHash(spec) {
@@ -1543,7 +1769,24 @@ async function d2SourceStructureIdentity(source) {
 }
 
 async function d2WorkflowStatusForSpec(spec) {
-  const d2Authoring = templateAuthoringD2(spec, { allowLegacy: false });
+  const authoringStatus = diagramAuthoringStatusForSpec(spec);
+  if (authoringStatus.status === 'unsupported') {
+    return {
+      state: 'unsupported',
+      reason: authoringStatus.code,
+      reasons: authoringStatus.reasons,
+      message: authoringStatus.message
+    };
+  }
+  if (authoringStatus.status === 'needsReanalysis') {
+    return {
+      state: 'pending',
+      reason: 'semantic_model_revision_required',
+      reasons: authoringStatus.reasons,
+      message: authoringStatus.message
+    };
+  }
+  const d2Authoring = templateAuthoringD2(spec);
   const diagrams = spec && spec.result && Array.isArray(spec.result.diagrams) ? spec.result.diagrams : [];
   const importedDiagram = diagrams.find((diagram) => {
     const item = diagram && diagram.authoring && diagram.authoring.d2Import;
@@ -2560,54 +2803,6 @@ function diagramImportNearestMaterializedAncestor(tree, roles, item) {
   return null;
 }
 
-// Older saved mappings stored parent-child comparisons beside ordinary result
-// filters. They execute identically, but must remain editable in the dedicated
-// hierarchy editor after the contract split.
-function diagramImportMigrateLegacyHierarchyConditions(tree, roles) {
-  const normalized = tree && typeof tree === 'object' && !Array.isArray(tree)
-    ? tree
-    : { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] };
-  const roleById = new Map((Array.isArray(roles) ? roles : [])
-    .map((role) => [String(role && role.id || ''), role]));
-  for (const item of Array.isArray(normalized.items) ? normalized.items : []) {
-    const role = roleById.get(String(item && item.roleId || '')) || {};
-    const mapping = diagramImportStructureItemMapping(role, item && item.mapping || {}, item && item.id || '');
-    const ancestor = diagramImportNearestMaterializedAncestor(normalized, roles, item);
-    const ownStageId = diagramImportOwnMaterializedStageId(mapping);
-    if (!ancestor || !ancestor.stageId || !ownStageId || ownStageId === String(ancestor.stageId)) {
-      item.mapping = mapping;
-      continue;
-    }
-    const conditions = diagramImportPlacementFilters(mapping.conditions);
-    const hierarchyConditions = diagramImportPlacementFilters(mapping.hierarchyConditions);
-    const retained = [];
-    for (const condition of conditions.rules) {
-      const isLegacyHierarchyCondition = condition && condition.action === 'include' && !condition.negate &&
-        condition.right && condition.right.kind === 'stage' &&
-        String(condition.right.stageId || '') === String(ancestor.stageId || '');
-      if (!isLegacyHierarchyCondition) {
-        retained.push(condition);
-        continue;
-      }
-      const duplicate = hierarchyConditions.rules.some((existing) => (
-        String(existing && existing.action || '') === String(condition.action || '') &&
-        Boolean(existing && existing.negate) === Boolean(condition.negate) &&
-        String(existing && existing.operator || '') === String(condition.operator || '') &&
-        String(existing && existing.left && existing.left.column || '') === String(condition.left && condition.left.column || '') &&
-        String(existing && existing.right && existing.right.stageId || '') === String(condition.right && condition.right.stageId || '') &&
-        String(existing && existing.right && existing.right.column || '') === String(condition.right && condition.right.column || '')
-      ));
-      if (!duplicate) hierarchyConditions.rules.push(condition);
-    }
-    item.mapping = {
-      ...mapping,
-      conditions: { ...conditions, rules: retained },
-      hierarchyConditions
-    };
-  }
-  return normalized;
-}
-
 function diagramImportSourceProvenanceDescriptor(fieldName) {
   let value = String(fieldName || '');
   let depth = 0;
@@ -2911,10 +3106,10 @@ function diagramImportStructureTree(value, structure, roles) {
       parentId = String(parent.parentId || '');
     }
   }
-  return diagramImportMigrateLegacyHierarchyConditions({
+  return {
     version: D2_IMPORT_STRUCTURE_TREE_VERSION,
     items: hasExplicitItems ? normalized : diagramImportStructureTreeSeed(structure, roles)
-  }, roles);
+  };
 }
 
 function diagramImportLegacyTreeItemIdentity(roleId, elementKey) {
@@ -3492,7 +3687,7 @@ function migrateDiagramImportToCurrentRevision(spec, value, options = {}) {
   // connection contracts can be
   // rebuilt from a verified current D2 identity without replacing authored
   // placements.
-  const previousConnectionModelRevision = [11, 12, 13].includes(revision) && treeVersion === D2_IMPORT_STRUCTURE_TREE_VERSION;
+  const previousConnectionModelRevision = [11, 12, 13, 14].includes(revision) && treeVersion === D2_IMPORT_STRUCTURE_TREE_VERSION;
   const legacyTopology = diagramImportHasLegacyClassRelationRules(imported);
   // Revisions 11-13 already have the current tree, but their mapping
   // contracts may carry a retired manual participant set. Revision 14
@@ -3515,7 +3710,7 @@ function migrateDiagramImportToCurrentRevision(spec, value, options = {}) {
   }
   if (options.rebuildCurrent !== true) return imported;
 
-  const source = String(templateAuthoringD2(spec || {}, { allowLegacy: false }).source || '');
+  const source = String(templateAuthoringD2(spec || {}).source || '');
   if (!source || source !== String(imported.source || '') || sha256Hex(source) !== String(imported.sourceHash || '')) {
     return rejectDiagramImportMigration(options, 'sourceMismatch');
   }
@@ -3651,7 +3846,7 @@ function migrateDiagramImportToCurrentRevision(spec, value, options = {}) {
 }
 
 function diagramImportMigrationProposal(spec, imported) {
-  const source = String(templateAuthoringD2(spec || {}, { allowLegacy: false }).source || '');
+  const source = String(templateAuthoringD2(spec || {}).source || '');
   return {
     version: 3,
     semanticModelRevision: D2_IMPORT_SEMANTIC_MODEL_REVISION,
@@ -4618,7 +4813,7 @@ function diagramImportMappingInputStageContracts(spec, imported) {
 }
 
 function diagramImportMappingInputRevision(spec, imported) {
-  const authoring = templateAuthoring(spec || {}, { allowLegacy: true }) || { d2: { source: '' } };
+  const authoring = templateAuthoring(spec || {}) || { d2: { source: '' } };
   const d2 = authoring.d2 && typeof authoring.d2 === 'object' && !Array.isArray(authoring.d2)
     ? authoring.d2
     : {};
@@ -4720,7 +4915,7 @@ function diagramImportRolesForStoredStructure(imported) {
 }
 
 function diagramImportRecoveryCandidate(spec, imported, recoveryVersions = []) {
-  const currentAuthoring = templateAuthoring(spec, { allowLegacy: true });
+  const currentAuthoring = templateAuthoring(spec);
   const currentSource = String(currentAuthoring && currentAuthoring.d2 && currentAuthoring.d2.source || '');
   if (!currentSource || String(imported && imported.sourceHash || '') !== sha256Hex(currentSource)) return null;
   const currentPayloadHash = diagramImportRecoveryPayloadHash(imported);
@@ -4738,7 +4933,7 @@ function diagramImportRecoveryCandidate(spec, imported, recoveryVersions = []) {
     // signs the result with the current secret.
     const legacyHistoricalAttestation = !verified && diagramImportLegacyHistoricalAttestation(candidate.imported);
     if (!verified && !legacyHistoricalAttestation) continue;
-    const candidateAuthoring = templateAuthoring(versionSpec, { allowLegacy: true });
+    const candidateAuthoring = templateAuthoring(versionSpec);
     const candidateSource = String(candidateAuthoring && candidateAuthoring.d2 && candidateAuthoring.d2.source || '');
     if (candidateSource !== currentSource || String(candidate.imported.sourceHash || '') !== sha256Hex(candidateSource)) continue;
     if (diagramImportRecoveryPayloadHash(candidate.imported) !== currentPayloadHash) continue;
@@ -4804,7 +4999,7 @@ function assertDiagramImportProposalDeterministicSpec(proposal, spec, action = '
 }
 
 function assertDiagramImportStoredSource(proposal, spec, action = 'applying its mapping') {
-  const storedSource = String(templateAuthoringD2(spec, { allowLegacy: false }).source || '');
+  const storedSource = String(templateAuthoringD2(spec).source || '');
   if (!storedSource || sha256Hex(storedSource) === String(proposal && proposal.source && proposal.source.hash || '')) return;
   const error = new Error(`D2 source changed after analysis. Analyze the current source again before ${action}.`);
   error.code = 'diagram_import_source_conflict';
@@ -6177,26 +6372,71 @@ function objectFlowFromSpecServer(spec) {
   return normalizeObjectFlow(flow);
 }
 
-function assistantObjectFlowTerminalAliases(spec) {
+function assistantObjectFlowTerminalAliases(spec, flow = objectFlowFromSpecServer(spec)) {
   const models = Array.isArray(spec && spec.visualModels) ? spec.visualModels : [];
   const objectMatching = models.find((model) => model && model.mode === 'objectMatching') || {};
   const outputs = Array.isArray(objectMatching.outputs) ? objectMatching.outputs : [];
-  const terminalByBlockId = new Map();
-  let assistantManaged = false;
-  for (const output of outputs) {
-    if (!output || output.assistantManaged !== true) continue;
+  const assistantOutputs = outputs.filter((output) => output && output.assistantManaged === true && String(output.alias || '').trim());
+  if (!assistantOutputs.length) return new Set();
+  const outputsByBlockId = new Map();
+  for (const output of assistantOutputs) {
     const alias = String(output.alias || '').trim();
     const blockIds = Array.isArray(output.assistantBlockIds)
       ? output.assistantBlockIds
       : [output.assistantBlockId];
-    if (!alias || !blockIds.length) continue;
-    assistantManaged = true;
+    if (!blockIds.length) continue;
     for (const rawBlockId of blockIds) {
       const blockId = String(rawBlockId || '').trim();
-      if (blockId) terminalByBlockId.set(blockId, alias);
+      if (!blockId) continue;
+      const values = outputsByBlockId.get(blockId) || [];
+      values.push(output);
+      outputsByBlockId.set(blockId, values);
     }
   }
-  return assistantManaged ? new Set(terminalByBlockId.values()) : new Set();
+  const blockIdsByAlias = new Map();
+  for (const [blockId, ownedOutputs] of outputsByBlockId.entries()) {
+    for (const output of ownedOutputs) {
+      const alias = String(output && output.alias || '').trim();
+      if (!alias) continue;
+      const blockIds = blockIdsByAlias.get(alias) || new Set();
+      blockIds.add(blockId);
+      blockIdsByAlias.set(alias, blockIds);
+    }
+  }
+  const consumedAliasesByBlockId = new Map();
+  const markConsumedByOwnedStage = (targetAlias, dependencies) => {
+    const targetBlockIds = blockIdsByAlias.get(String(targetAlias || '').trim()) || new Set();
+    for (const dependency of dependencies) {
+      const dependencyAlias = String(dependency || '').trim();
+      if (!dependencyAlias) continue;
+      const dependencyBlockIds = blockIdsByAlias.get(dependencyAlias) || new Set();
+      for (const blockId of targetBlockIds) {
+        if (!dependencyBlockIds.has(blockId)) continue;
+        const consumed = consumedAliasesByBlockId.get(blockId) || new Set();
+        consumed.add(dependencyAlias);
+        consumedAliasesByBlockId.set(blockId, consumed);
+      }
+    }
+  };
+  for (const selection of Array.isArray(flow && flow.selections) ? flow.selections : []) {
+    markConsumedByOwnedStage(selection && selection.alias, [selection && selection.from]);
+  }
+  for (const operation of Array.isArray(flow && flow.operations) ? flow.operations : []) {
+    markConsumedByOwnedStage(operation && operation.as, [operation && operation.from, operation && operation.with]);
+  }
+  const terminals = new Set();
+  for (const [blockId, ownedOutputs] of outputsByBlockId.entries()) {
+    const hasExplicitRoles = ownedOutputs.some((output) => ['terminal', 'helper'].includes(String(output && output.assistantStageRole || '')));
+    const explicit = ownedOutputs.filter((output) => String(output && output.assistantStageRole || '') === 'terminal');
+    if (hasExplicitRoles) {
+      if (explicit.length === 1) terminals.add(String(explicit[0].alias));
+      continue;
+    }
+    const consumedAliases = consumedAliasesByBlockId.get(blockId) || new Set();
+    const sinks = ownedOutputs.filter((output) => !consumedAliases.has(String(output && output.alias || '').trim()));
+    if (sinks.length === 1) terminals.add(String(sinks[0].alias));
+  }
+  return terminals;
 }
 
 function diagramImportStageCardSourceKey(source) {
@@ -6346,6 +6586,7 @@ function assistantObjectFlowDiagramStages(spec, flow = objectFlowFromSpecServer(
     .filter((output) => output && String(output.alias || '').trim())
     .map((output) => [String(output.alias), output]));
   const rawStages = objectFlowStageSummaries(flow);
+  const terminalAliases = assistantObjectFlowTerminalAliases(spec, flow);
   const rawByAlias = new Map(rawStages.map((stage) => [String(stage && stage.alias || ''), stage]));
   const lineageFor = (stage, seen = new Set()) => {
     const alias = String(stage && stage.alias || '').trim();
@@ -6426,12 +6667,22 @@ function assistantObjectFlowDiagramStages(spec, flow = objectFlowFromSpecServer(
       direction: String(stage.direction || '') === 'source' ? 'destination' : String(stage.direction || '') === 'destination' ? 'source' : 'both',
       structuredFields: relationSourceFields
     } : null;
+    const cardSources = cardSourcesFor(stage);
+    const stageRole = terminalAliases.has(String(stage && stage.alias || '')) ? 'terminal' : 'helper';
+    const declaredStageRole = ['terminal', 'helper'].includes(String(output.assistantStageRole || ''))
+      ? String(output.assistantStageRole)
+      : '';
+    const outputKind = cardSources.length > 1 ? 'relationPairs' : 'sourceCards';
     return {
       ...stage,
       label: String(output.label || stage.label || stage.name || stage.alias || stage.id || ''),
       className: classNameFor(stage),
-      cardSources: cardSourcesFor(stage),
+      cardSources,
       assistantBlockIds,
+      stageRole,
+      declaredStageRole,
+      outputKind,
+      rowGrain: outputKind === 'relationPairs' ? 'pair' : 'card',
       lineageAliases,
       lineageLabels,
       ...(relationSource && relationSource.className && relationSource.domain ? { relationSource } : {})
@@ -7257,9 +7508,7 @@ function synchronizeD2Authoring(spec, imported) {
     assistant: {
       objectFlowIntent: { context: '', blocks: [] },
       promptContractVersion: ASSISTANT_PROMPT_CONTRACT_VERSION,
-      diagramSemanticsPrompt: '',
-      diagramPlacementPrompt: '',
-      diagramConnectionsPrompt: ''
+      diagramIntentPrompt: ''
     },
     d2: { source: '', sourceHash: '' }
   };
@@ -7272,7 +7521,6 @@ function synchronizeD2Authoring(spec, imported) {
       sourceHash: source ? sha256Hex(source) : ''
     }
   };
-  delete spec.assistantDraft;
 }
 
 function diagramImportCheckpointProvisionalBaseMatches(spec, diagram, mapping, checkpoint) {
@@ -7361,7 +7609,7 @@ function diagramImportAssistantCheckpointForCurrentMapping(checkpoint, mapping, 
 }
 
 function rebaseStoredD2AnalysisCheckpoint(spec) {
-  const authoring = templateAuthoring(spec, { allowLegacy: false });
+  const authoring = templateAuthoring(spec);
   const d2 = authoring && authoring.d2 && typeof authoring.d2 === 'object' && !Array.isArray(authoring.d2)
     ? authoring.d2
     : null;
@@ -7519,76 +7767,6 @@ async function appliedDiagramImportProposalFromSpec(currentSpec) {
     sourceSpec,
     proposal.endpointProfiles
   );
-}
-
-function diagramImportCurrentInputRecompileRequired(spec) {
-  const found = diagramImportForSpec(spec || {});
-  const imported = found && found.imported && typeof found.imported === 'object'
-    ? found.imported
-    : {};
-  const validation = found && found.imported && found.imported.mappingValidation && typeof found.imported.mappingValidation === 'object'
-    ? found.imported.mappingValidation
-    : {};
-  const status = String(validation.status || '');
-  const reasons = uniqueStrings(Array.isArray(validation.reasons) ? validation.reasons.map(String) : []);
-  return Number(imported.endpointProfileCompilationVersion || 0) !== D2_IMPORT_ENDPOINT_COMPILATION_VERSION ||
-    status === 'needsValidation' ||
-    (status === 'needsReview' && reasons.length === 1 && reasons[0] === 'inputRevision');
-}
-
-async function recompileDiagramImportForCurrentInput(spec) {
-  if (!diagramImportCurrentInputRecompileRequired(spec)) {
-    return { spec, recompiled: false, error: null };
-  }
-  try {
-    const proposal = await appliedDiagramImportProposalFromSpec(spec);
-    const recompiled = applyDiagramImportProposal(
-      spec,
-      proposal,
-      [],
-      proposal.relationRules,
-      proposal.structureTree,
-      proposal.endpointProfiles
-    );
-    // Recompilation changes result.diagrams after the ordinary storage
-    // normalizer rebased the analysis checkpoint. Bind the checkpoint to the
-    // final compiled spec so a later reload restores this exact mapping.
-    rebaseStoredD2AnalysisCheckpoint(recompiled);
-    return {
-      spec: recompiled,
-      recompiled: true,
-      error: null
-    };
-  } catch (error) {
-    // Normal Save must not discard the editor's valid part solely because a
-    // sibling placement or arrow is incomplete. Rebuild the same proposal via
-    // the partial compiler; it persists executable mappings and keeps the
-    // unresolved rows in authoring state for the next edit.
-    try {
-      const proposal = await appliedDiagramImportProposalFromSpec(spec);
-      const partial = applyPartialDiagramImportProposal(
-        spec,
-        proposal,
-        [],
-        proposal.relationRules,
-        proposal.structureTree,
-        proposal.endpointProfiles
-      );
-      // The partial compiler also changes executable bindings. It is a valid
-      // saved authoring state, so keep its deterministic checkpoint aligned
-      // with the resulting spec rather than forcing a redundant analysis.
-      rebaseStoredD2AnalysisCheckpoint(partial.spec);
-      return {
-        spec: partial.spec,
-        recompiled: true,
-        partial: true,
-        omissions: partial.omissions,
-        error
-      };
-    } catch (partialError) {
-      return { spec, recompiled: false, error, partialError };
-    }
-  }
 }
 
 async function proposalWithCompatibleD2Source(proposal, source) {
@@ -8481,7 +8659,7 @@ function parseRedisUrl(value) {
     password: REDIS_PASSWORD || (parsed.password ? decodeURIComponent(parsed.password) : ''),
     db: Number.isInteger(Number(dbText)) ? Number(dbText) : 0,
     tls: parsed.protocol === 'rediss:',
-    tlsCaFile: REDIS_TLS_CA_FILE
+    tlsCaFile: TLS_CA_FILE
   };
 }
 
@@ -9775,6 +9953,10 @@ function dynamicPagesClientScript() {
       assistantFlowBlock: 'Data block {number}',
       assistantFlowBlockDefault: 'Result {number}',
       assistantFlowBlockName: 'Result name',
+      assistantFlowDescription: 'What this result contains and how to obtain it',
+      assistantFlowDescriptionHelp: 'Use ordinary domain language. Name classes, conditions, dependencies, comparisons, and the expected rows; the Assistant resolves CMDBuild identifiers through MCP.',
+      assistantFlowResultKind: 'Expected row type',
+      assistantFlowResultAuto: 'Determine from description',
       assistantFlowEntities: 'Entities, relations, and input conditions',
       assistantFlowEntitiesExample: 'Description example',
       assistantFlowEntitiesExampleText: 'Describe the primary class, input condition, related classes, and comparison fields. In Expected result, state either a list of the primary class or explicit pairs with the related class.',
@@ -9905,6 +10087,8 @@ function dynamicPagesClientScript() {
       assistantDiagramConnectionsTitle: 'Map deterministic results to D2 connections',
       assistantDiagramConnectionsHelp: 'Describe how named Object Flow results implement connection classes after placements are confirmed.',
       assistantDiagramConnectionsPrompt: 'How should deterministic results be mapped to diagram connections?',
+      assistantDiagramIntentPrompt: 'Diagram meaning and mapping intent',
+      assistantDiagramIntentHelp: 'Describe what roles, containers, hierarchy, and connections mean in business terms. The Assistant runs semantics, placement, and connection checks as separate internal stages.',
       assistantDiagramMap: 'Suggest mapping',
       assistantDiagramAnalysisRequired: 'Analyze D2 deterministically first.',
       assistantProposalOnly: 'Assistant output is a proposal. Review it and apply explicitly.',
@@ -9935,8 +10119,10 @@ function dynamicPagesClientScript() {
       assistantObjectFlowSystemPrompt: 'Data flow assistant system prompt',
       assistantObjectFlowSemanticSystemPrompt: 'Semantic plan system prompt',
       assistantDiagramInterpretSystemPrompt: 'D2 semantics system prompt',
+      assistantDiagramBindingIntentSystemPrompt: 'D2 business binding intent system prompt',
       assistantDiagramMappingSystemPrompt: 'D2 placement system prompt',
       assistantDiagramConnectionsSystemPrompt: 'D2 connections system prompt',
+      assistantDiagramCritiqueSystemPrompt: 'D2 semantic critic system prompt',
       assistantMcpSettings: 'MCP',
       assistantMcpEnabled: 'Use MCP context',
       assistantMcpAllowedTools: 'Allowed tools',
@@ -10975,6 +11161,10 @@ function dynamicPagesClientScript() {
       assistantFlowBlock: 'Блок данных {number}',
       assistantFlowBlockDefault: 'Результат {number}',
       assistantFlowBlockName: 'Название результата',
+      assistantFlowDescription: 'Что содержит результат и как его получить',
+      assistantFlowDescriptionHelp: 'Пишите обычным предметным языком. Укажите классы, условия, зависимости, сравнения и ожидаемые строки; CMDBuild identifiers Assistant разрешит через MCP.',
+      assistantFlowResultKind: 'Ожидаемый тип строк',
+      assistantFlowResultAuto: 'Определить из описания',
       assistantFlowEntities: 'Сущности, связи и входные условия',
       assistantFlowEntitiesExample: 'Пример описания',
       assistantFlowEntitiesExampleText: 'Опишите основной класс, входное условие, связанные классы и поля сравнения. В ожидаемом результате укажите либо список основного класса, либо явные пары с связанным классом.',
@@ -11105,6 +11295,8 @@ function dynamicPagesClientScript() {
       assistantDiagramConnectionsTitle: 'Сопоставление результатов со связями D2',
       assistantDiagramConnectionsHelp: 'Опишите, какие именованные результаты Object Flow реализуют классы связей после подтверждения размещения объектов.',
       assistantDiagramConnectionsPrompt: 'Как сопоставить результаты выборок со связями диаграммы?',
+      assistantDiagramIntentPrompt: 'Смысл диаграммы и правила сопоставления',
+      assistantDiagramIntentHelp: 'Опишите предметный смысл ролей, контейнеров, иерархии и связей. Семантика, размещение и связи проверяются раздельными внутренними этапами Assistant.',
       assistantDiagramMap: 'Предложить сопоставление',
       assistantDiagramAnalysisRequired: 'Сначала выполните детерминированный анализ D2.',
       assistantProposalOnly: 'Результат Assistant является предложением. Проверьте его и примените явно.',
@@ -11135,8 +11327,10 @@ function dynamicPagesClientScript() {
       assistantObjectFlowSystemPrompt: 'Системный промпт потока данных Assistant',
       assistantObjectFlowSemanticSystemPrompt: 'Системный промпт семантического плана',
       assistantDiagramInterpretSystemPrompt: 'Системный промпт семантики D2',
+      assistantDiagramBindingIntentSystemPrompt: 'Системный промпт бизнес-привязки D2',
       assistantDiagramMappingSystemPrompt: 'Системный промпт размещения D2',
       assistantDiagramConnectionsSystemPrompt: 'Системный промпт связей D2',
+      assistantDiagramCritiqueSystemPrompt: 'Системный промпт смысловой проверки D2',
       assistantMcpSettings: 'MCP',
       assistantMcpEnabled: 'Использовать контекст MCP',
       assistantMcpAllowedTools: 'Разрешенные инструменты',
@@ -11968,7 +12162,8 @@ function dynamicPagesClientScript() {
   var CATALOG_FRESH_MS = 24 * 60 * 60 * 1000;
   var CMDB_BUILD_VIEW_KIND = 'cmdbBuildView';
   var DEFAULT_CMDB_BUILD_VIEW_CODE = 'CmdbBuildView';
-  var TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_KEYS = ['system', 'objectFlowSemantic', 'objectFlow', 'diagramSemantics', 'diagramPlacement', 'diagramConnections'];
+  var TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_KEYS = ['system', 'objectFlowSemantic', 'objectFlow', 'diagramSemantics', 'diagramBindingIntent', 'diagramPlacement', 'diagramConnections', 'diagramCritique'];
+  var TEMPLATE_ASSISTANT_PROMPT_UNSUPPORTED_KEYS = ['diagramInterpretation', 'diagramMapping'];
   var TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_MAX_CHARS = 20000;
   // Rendering repeatedly asks for user-facing Object Flow labels. Keep the
   // derived manifest attached to the immutable spec object instead of
@@ -12045,9 +12240,7 @@ function dynamicPagesClientScript() {
     assistantAuthoringDirty: false,
     savingTemplate: false,
     assistantTemplatePromptOverrides: {},
-    assistantDiagramInterpretPrompt: '',
-    assistantDiagramMappingPrompt: '',
-    assistantDiagramConnectionsPrompt: '',
+    assistantDiagramIntentPrompt: '',
     assistantDiagramInterpretBusy: false,
     assistantDiagramMappingBusy: false,
     assistantDiagramInterpretResult: null,
@@ -12619,9 +12812,6 @@ function dynamicPagesClientScript() {
 
   function errorText(result) {
     if (!result) return t('requestFailed');
-    if (result.json && result.json.reason === 'd2_mapping_recovery_save_required') {
-      return t('d2RecoverySaveRequiredHelp');
-    }
     if (result.json && (result.json.rootCause || result.json.schema && result.json.schema.rootCause)) {
       return schemaBootstrapRootCauseText(result.json.rootCause || result.json.schema.rootCause);
     }
@@ -12792,13 +12982,13 @@ function dynamicPagesClientScript() {
   }
 
   function assistantDiagramMappingStageAutoRetryCount(stage) {
-    var key = stage === 'topology' ? 'topology' : 'roles';
+    var key = stage === 'topology' ? 'topology' : stage === 'roles' ? 'roles' : stage;
     var configured = Number(boot.assistantDiagramStageAutoRetries && boot.assistantDiagramStageAutoRetries[key]);
     return Math.max(0, Math.min(1, Number.isInteger(configured) ? configured : 1));
   }
 
   function assistantDiagramMappingStageCorrectionRetryCount(stage) {
-    var key = stage === 'topology' ? 'topology' : 'roles';
+    var key = stage === 'topology' ? 'topology' : stage === 'roles' ? 'roles' : stage;
     var configured = Number(boot.assistantDiagramStageCorrectionRetries && boot.assistantDiagramStageCorrectionRetries[key]);
     return Math.max(0, Math.min(2, Number.isInteger(configured) ? configured : 2));
   }
@@ -12822,6 +13012,12 @@ function dynamicPagesClientScript() {
   function assistantDiagramMappingStageText(stage, retryKind) {
     var retrying = Boolean(retryKind);
     var correction = retryKind === 'correction';
+    if (stage === 'intent') return retrying
+      ? 'Уточняется привязка элементов D2 к именованным бизнес-результатам.'
+      : 'Определяется привязка элементов D2 к именованным бизнес-результатам.';
+    if (stage === 'critique') return retrying
+      ? 'Повторно проверяются смысловые обязательства D2 mapping.'
+      : 'Проверяются смысловые обязательства готового D2 mapping.';
     return stage === 'topology'
       ? (retrying ? (correction ? 'Исправляется сопоставление связей. Подтвержденное сопоставление объектов сохранено временно.' : 'Повторно сопоставляются связи. Подтвержденное сопоставление объектов сохранено временно.') : 'Сопоставление связей выполняется. Подтвержденное сопоставление объектов сохранено временно.')
       : (retrying ? (correction ? 'Исправляется сопоставление объектов D2.' : 'Повторно сопоставляются объекты D2.') : 'Сопоставление объектов выполняется. После проверки будет запущено сопоставление связей.');
@@ -13059,11 +13255,19 @@ function dynamicPagesClientScript() {
     return {
       id: 'block-' + number,
       name: t('assistantFlowBlockDefault', { number: number }),
-      entities: '',
-      algorithm: '',
-      expectedResult: '',
+      description: '',
+      resultKind: 'auto',
       uses: []
     };
+  }
+
+  function assistantObjectFlowBlockDescriptionClient(value) {
+    var item = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    var explicit = String(item.description || '').trim();
+    if (explicit) return explicit;
+    return [item.entities, item.algorithm, item.expectedResult].map(function (part) {
+      return String(part || '').trim();
+    }).filter(Boolean).join('\\n\\n');
   }
 
   function normalizeAssistantObjectFlowIntentClient(value) {
@@ -13078,9 +13282,8 @@ function dynamicPagesClientScript() {
         return {
           id: id,
           name: String(item.name || t('assistantFlowBlockDefault', { number: index + 1 })),
-          entities: String(item.entities || ''),
-          algorithm: String(item.algorithm || ''),
-          expectedResult: String(item.expectedResult || ''),
+          description: assistantObjectFlowBlockDescriptionClient(item),
+          resultKind: ['sourceCards', 'relationPairs'].indexOf(String(item.resultKind || '')) >= 0 ? String(item.resultKind) : 'auto',
           uses: Array.isArray(item.uses) ? item.uses.map(String).filter(function (dependency) { return dependency && dependency !== id; }) : []
         };
       });
@@ -13150,9 +13353,8 @@ function dynamicPagesClientScript() {
         return {
           id: row.getAttribute('data-assistant-flow-block') || 'block-' + (index + 1),
           name: readValue('assistant-flow-' + index + '-name'),
-          entities: readValue('assistant-flow-' + index + '-entities'),
-          algorithm: readValue('assistant-flow-' + index + '-algorithm'),
-          expectedResult: readValue('assistant-flow-' + index + '-expected-result'),
+          description: readValue('assistant-flow-' + index + '-description'),
+          resultKind: readValue('assistant-flow-' + index + '-result-kind') || 'auto',
           uses: uses
         };
       })
@@ -13179,12 +13381,8 @@ function dynamicPagesClientScript() {
   function captureAssistantPromptsFromDom() {
     var intent = document.getElementById('cmdp-assistant-object-flow-intent');
     if (intent) state.assistantObjectFlowIntent = readAssistantObjectFlowIntentFromDom();
-    var interpret = document.getElementById('cmdp-assistant-diagram-interpret-prompt');
-    var mapping = document.getElementById('cmdp-assistant-diagram-mapping-prompt');
-    var connections = document.getElementById('cmdp-assistant-diagram-connections-prompt');
-    if (interpret) state.assistantDiagramInterpretPrompt = String(interpret.value || '');
-    if (mapping) state.assistantDiagramMappingPrompt = String(mapping.value || '');
-    if (connections) state.assistantDiagramConnectionsPrompt = String(connections.value || '');
+    var diagramIntent = document.getElementById('cmdp-assistant-diagram-intent-prompt');
+    if (diagramIntent) state.assistantDiagramIntentPrompt = String(diagramIntent.value || '');
     var overrides = normalizeTemplateAssistantPromptOverridesClient(state.assistantTemplatePromptOverrides);
     Array.prototype.slice.call(document.querySelectorAll('[data-template-assistant-system-prompt]')).forEach(function (field) {
       var key = String(field.getAttribute('data-template-assistant-system-prompt') || '');
@@ -13227,9 +13425,7 @@ function dynamicPagesClientScript() {
       assistant: {
         objectFlowIntent: assistantObjectFlowIntentFromSpec(source),
         promptContractVersion: ${ASSISTANT_PROMPT_CONTRACT_VERSION},
-        diagramSemanticsPrompt: String(assistant.diagramSemanticsPrompt || assistant.diagramInterpretPrompt || ''),
-        diagramPlacementPrompt: String(assistant.diagramPlacementPrompt || assistant.diagramMappingPrompt || ''),
-        diagramConnectionsPrompt: String(assistant.diagramConnectionsPrompt || assistant.diagramMappingPrompt || ''),
+        diagramIntentPrompt: String(assistant.diagramIntentPrompt || ''),
         systemPromptOverrides: normalizeTemplateAssistantPromptOverridesClient(assistant.systemPromptOverrides)
       },
       d2: {
@@ -13346,9 +13542,7 @@ function dynamicPagesClientScript() {
       assistant: {
         objectFlowIntent: cloneJsonValue(state.assistantObjectFlowIntent, current.assistant.objectFlowIntent),
         promptContractVersion: ${ASSISTANT_PROMPT_CONTRACT_VERSION},
-        diagramSemanticsPrompt: String(state.assistantDiagramInterpretPrompt || ''),
-        diagramPlacementPrompt: String(state.assistantDiagramMappingPrompt || ''),
-        diagramConnectionsPrompt: String(state.assistantDiagramConnectionsPrompt || ''),
+        diagramIntentPrompt: String(state.assistantDiagramIntentPrompt || ''),
         systemPromptOverrides: normalizeTemplateAssistantPromptOverridesClient(state.assistantTemplatePromptOverrides)
       },
       d2: {
@@ -13365,8 +13559,33 @@ function dynamicPagesClientScript() {
   function assistantSpecWithPrompts(spec) {
     var next = cloneSpecForEdit(spec || defaultSpec());
     next.authoring = assistantAuthoringFromState(next);
-    delete next.assistantDraft;
     return next;
+  }
+
+  function assistantEditorDeltaClient(spec) {
+    var source = spec && typeof spec === 'object' && !Array.isArray(spec) ? spec : {};
+    var projected = {};
+    ['version', 'params', 'steps', 'visualModel', 'visualModels', 'result', 'authoring'].forEach(function (key) {
+      if (!Object.prototype.hasOwnProperty.call(source, key)) return;
+      if (key === 'result') {
+        var result = source.result && typeof source.result === 'object' && !Array.isArray(source.result) ? source.result : {};
+        projected.result = {};
+        if (Object.prototype.hasOwnProperty.call(result, 'tables')) projected.result.tables = cloneJsonValue(result.tables, []);
+        if (Object.prototype.hasOwnProperty.call(result, 'emptyText')) projected.result.emptyText = String(result.emptyText || '');
+        if (Object.prototype.hasOwnProperty.call(result, 'permissionDeniedText')) projected.result.permissionDeniedText = String(result.permissionDeniedText || '');
+        return;
+      }
+      projected[key] = cloneJsonValue(source[key], null);
+    });
+    return { version: 1, spec: projected };
+  }
+
+  function assistantTemplateRefClient() {
+    return {
+      root: String(state.root || 'Cst_QueryTool'),
+      templateCode: String(state.selectedTemplate && state.selectedTemplate.code || ''),
+      baseSpecHash: String(state.selectedTemplate && state.selectedTemplate.specHash || '')
+    };
   }
 
   function assistantDiagramRequestSpec(spec, proposal) {
@@ -13604,12 +13823,20 @@ function dynamicPagesClientScript() {
     return ${JSON.stringify(DEFAULT_ASSISTANT_DIAGRAM_SEMANTICS_PROMPT)};
   }
 
+  function defaultAssistantDiagramBindingIntentPrompt() {
+    return ${JSON.stringify(DEFAULT_ASSISTANT_DIAGRAM_BINDING_INTENT_PROMPT)};
+  }
+
   function defaultAssistantDiagramPlacementPrompt() {
     return ${JSON.stringify(DEFAULT_ASSISTANT_DIAGRAM_PLACEMENT_PROMPT)};
   }
 
   function defaultAssistantDiagramConnectionsPrompt() {
     return ${JSON.stringify(DEFAULT_ASSISTANT_DIAGRAM_CONNECTIONS_PROMPT)};
+  }
+
+  function defaultAssistantDiagramCritiquePrompt() {
+    return ${JSON.stringify(DEFAULT_ASSISTANT_DIAGRAM_CRITIQUE_PROMPT)};
   }
 
   function normalizeAssistantPromptContractClient(value, defaults) {
@@ -13627,9 +13854,11 @@ function dynamicPagesClientScript() {
       system: first(['system'], fallback.system),
       objectFlowSemantic: first(['objectFlowSemantic'], fallback.objectFlowSemantic),
       objectFlow: first(['objectFlow'], fallback.objectFlow),
-      diagramSemantics: first(['diagramSemantics', 'diagramInterpretation'], fallback.diagramSemantics),
-      diagramPlacement: first(['diagramPlacement', 'diagramMapping'], fallback.diagramPlacement),
-      diagramConnections: first(['diagramConnections', 'diagramMapping'], fallback.diagramConnections)
+      diagramSemantics: first(['diagramSemantics'], fallback.diagramSemantics),
+      diagramBindingIntent: first(['diagramBindingIntent'], fallback.diagramBindingIntent),
+      diagramPlacement: first(['diagramPlacement'], fallback.diagramPlacement),
+      diagramConnections: first(['diagramConnections'], fallback.diagramConnections),
+      diagramCritique: first(['diagramCritique'], fallback.diagramCritique)
     };
   }
 
@@ -13666,8 +13895,10 @@ function dynamicPagesClientScript() {
           objectFlow: defaultAssistantObjectFlowPrompt(),
           objectFlowSemantic: defaultAssistantObjectFlowSemanticPrompt(),
           diagramSemantics: defaultAssistantDiagramSemanticsPrompt(),
+          diagramBindingIntent: defaultAssistantDiagramBindingIntentPrompt(),
           diagramPlacement: defaultAssistantDiagramPlacementPrompt(),
-          diagramConnections: defaultAssistantDiagramConnectionsPrompt()
+          diagramConnections: defaultAssistantDiagramConnectionsPrompt(),
+          diagramCritique: defaultAssistantDiagramCritiquePrompt()
         }
       },
       executionLimits: {
@@ -13874,9 +14105,7 @@ function dynamicPagesClientScript() {
       state.assistantObjectFlowIntent = normalizeAssistantObjectFlowIntentClient(authoring.assistant.objectFlowIntent);
       resetAssistantObjectFlowProposal();
       state.assistantTemplatePromptOverrides = normalizeTemplateAssistantPromptOverridesClient(authoring.assistant.systemPromptOverrides);
-      state.assistantDiagramInterpretPrompt = String(authoring.assistant.diagramSemanticsPrompt || '');
-      state.assistantDiagramMappingPrompt = String(authoring.assistant.diagramPlacementPrompt || '');
-      state.assistantDiagramConnectionsPrompt = String(authoring.assistant.diagramConnectionsPrompt || '');
+      state.assistantDiagramIntentPrompt = String(authoring.assistant.diagramIntentPrompt || '');
       state.assistantFlowBusy = false;
       state.assistantFlowExpandedBlockIds = {};
       state.assistantFlowDragSourceId = '';
@@ -13887,7 +14116,10 @@ function dynamicPagesClientScript() {
       state.assistantDiagramMappingResume = null;
     }
     var diagram = firstDiagramSpec(spec);
-    var d2Import = diagram.authoring && diagram.authoring.d2Import && typeof diagram.authoring.d2Import === 'object' ? diagram.authoring.d2Import : {};
+    var authoringStatus = diagramAuthoringStatusForEditorSpec(spec);
+    var d2Import = authoringStatus.status === 'unsupported'
+      ? {}
+      : diagram.authoring && diagram.authoring.d2Import && typeof diagram.authoring.d2Import === 'object' ? diagram.authoring.d2Import : {};
     var d2AuthoringOverrides = {
       semanticModelRevision: Number(d2Import.semanticModelRevision || 0),
       diagramId: String(d2Import.diagramId || diagram.id || ''),
@@ -17260,8 +17492,10 @@ function dynamicPagesClientScript() {
       objectFlowSemantic: 'assistantObjectFlowSemanticSystemPrompt',
       objectFlow: 'assistantObjectFlowSystemPrompt',
       diagramSemantics: 'assistantDiagramInterpretSystemPrompt',
+      diagramBindingIntent: 'assistantDiagramBindingIntentSystemPrompt',
       diagramPlacement: 'assistantDiagramMappingSystemPrompt',
-      diagramConnections: 'assistantDiagramConnectionsSystemPrompt'
+      diagramConnections: 'assistantDiagramConnectionsSystemPrompt',
+      diagramCritique: 'assistantDiagramCritiqueSystemPrompt'
     };
     var activeCount = Object.keys(overrides).length;
     var rows = TEMPLATE_ASSISTANT_PROMPT_OVERRIDE_KEYS.map(function (key) {
@@ -17400,12 +17634,10 @@ function dynamicPagesClientScript() {
         + '</summary>'
         + '<div class="assistant-flow-business-fields">'
         + '<label>' + escapeHtml(t('assistantFlowBlockName')) + '<input data-assistant-flow-field="name" id="assistant-flow-' + index + '-name" value="' + escapeHtml(block.name) + '"' + (state.assistantFlowBusy ? ' disabled' : '') + '></label>'
-        + '<label>' + escapeHtml(t('assistantFlowEntities')) + '<textarea id="assistant-flow-' + index + '-entities" rows="3"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(block.entities) + '</textarea></label>'
-        + '<details class="help-details" data-assistant-flow-entities-example><summary>' + escapeHtml(t('assistantFlowEntitiesExample')) + '</summary><p class="muted">' + escapeHtml(t('assistantFlowEntitiesExampleText')) + '</p></details>'
+        + '<label>' + escapeHtml(t('assistantFlowDescription')) + '<textarea id="assistant-flow-' + index + '-description" rows="7"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(block.description) + '</textarea><span class="muted">' + escapeHtml(t('assistantFlowDescriptionHelp')) + '</span></label>'
         + '<label>' + escapeHtml(t('assistantFlowDependencies')) + renderCompactMultiSelect('data-assistant-flow-field="uses"', block.uses, dependencyItems, { kind: 'assistantDependencies', disabled: !available.length || state.assistantFlowBusy }) + '</label>'
         + warningHtml
-        + '<label>' + escapeHtml(t('assistantFlowAlgorithm')) + '<textarea id="assistant-flow-' + index + '-algorithm" rows="4"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(block.algorithm) + '</textarea></label>'
-        + '<label>' + escapeHtml(t('assistantFlowExpectedResult')) + '<textarea id="assistant-flow-' + index + '-expected-result" rows="3"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(block.expectedResult) + '</textarea></label>'
+        + '<label>' + escapeHtml(t('assistantFlowResultKind')) + '<select id="assistant-flow-' + index + '-result-kind"' + (state.assistantFlowBusy ? ' disabled' : '') + '><option value="auto"' + (block.resultKind === 'auto' ? ' selected' : '') + '>' + escapeHtml(t('assistantFlowResultAuto')) + '</option><option value="sourceCards"' + (block.resultKind === 'sourceCards' ? ' selected' : '') + '>' + escapeHtml(t('assistantFlowOutputSourceCards')) + '</option><option value="relationPairs"' + (block.resultKind === 'relationPairs' ? ' selected' : '') + '>' + escapeHtml(t('assistantFlowOutputRelationPairs')) + '</option></select></label>'
         + '<div class="assistant-flow-business-actions"><button type="button" class="danger" data-action="assistant-flow-block-remove" data-block-index="' + index + '" title="' + escapeHtml(t('assistantFlowRemoveBlock')) + '" aria-label="' + escapeHtml(t('assistantFlowRemoveBlock')) + '"' + (state.assistantFlowBusy ? ' disabled' : '') + '>×</button></div>'
         + '</div></details>'
         + '</section>';
@@ -17466,7 +17698,7 @@ function dynamicPagesClientScript() {
           return ['Фильтр кандидатов из «' + candidateName + '»', 'сравнение: ' + source, path, 'условия (' + String(filter.ruleJoin || '') + '): ' + rules].filter(Boolean).join('; ');
         })() : '';
         var details = [block.summary, contractText, pairText, dependencyPathText, attributePredicateText, candidateFilterText, block.resolvedEntities && block.resolvedEntities.length ? block.resolvedEntities.join(', ') : '', block.relationPaths && block.relationPaths.length ? block.relationPaths.join('; ') : '', block.warnings && block.warnings.length ? t('assistantWarnings') + ': ' + block.warnings.join(' ') : ''].filter(Boolean).join(' | ');
-        return '<li><strong>' + escapeHtml(block.name) + ':</strong> ' + escapeHtml(details || block.expectedResult || '') + '</li>';
+        return '<li><strong>' + escapeHtml(block.name) + ':</strong> ' + escapeHtml(details || block.description || '') + '</li>';
       }).join('') + '</ul></div>' : '';
     var flowPreview = proposal ? '<div class="assistant-draft-preview"><h4>' + escapeHtml(t('assistantFlowReady')) + '</h4><p>' + escapeHtml(state.assistantFlowExplanation || '') + '</p><ul class="steps">'
       + (proposal.selections || []).map(function (selection) { return '<li>' + escapeHtml(selection.name + ': ' + selection.className) + '</li>'; }).join('')
@@ -17749,8 +17981,10 @@ function dynamicPagesClientScript() {
     var objectFlowPrompt = String(prompt.objectFlow || '').trim() || defaultRuntimeConfig().assistant.prompt.objectFlow;
     var objectFlowSemanticPrompt = String(prompt.objectFlowSemantic || '').trim() || defaultRuntimeConfig().assistant.prompt.objectFlowSemantic;
     var diagramSemanticsPrompt = String(prompt.diagramSemantics || '').trim() || defaultRuntimeConfig().assistant.prompt.diagramSemantics;
+    var diagramBindingIntentPrompt = String(prompt.diagramBindingIntent || '').trim() || defaultRuntimeConfig().assistant.prompt.diagramBindingIntent;
     var diagramPlacementPrompt = String(prompt.diagramPlacement || '').trim() || defaultRuntimeConfig().assistant.prompt.diagramPlacement;
     var diagramConnectionsPrompt = String(prompt.diagramConnections || '').trim() || defaultRuntimeConfig().assistant.prompt.diagramConnections;
+    var diagramCritiquePrompt = String(prompt.diagramCritique || '').trim() || defaultRuntimeConfig().assistant.prompt.diagramCritique;
     return [
       '<h3>' + t('assistantLlmSettings') + '</h3>',
       '<div class="checkbox-list">',
@@ -17767,8 +18001,10 @@ function dynamicPagesClientScript() {
       '<label>' + t('assistantObjectFlowSemanticSystemPrompt') + '<textarea id="cmdp-assistant-object-flow-semantic-system-prompt" rows="8" style="width:100%">' + escapeHtml(objectFlowSemanticPrompt) + '</textarea></label>',
       '<label>' + t('assistantObjectFlowSystemPrompt') + '<textarea id="cmdp-assistant-object-flow-system-prompt" rows="8" style="width:100%">' + escapeHtml(objectFlowPrompt) + '</textarea></label>',
       '<label>' + t('assistantDiagramInterpretSystemPrompt') + '<textarea id="cmdp-assistant-diagram-interpret-system-prompt" rows="8" style="width:100%">' + escapeHtml(diagramSemanticsPrompt) + '</textarea></label>',
+      '<label>' + t('assistantDiagramBindingIntentSystemPrompt') + '<textarea id="cmdp-assistant-diagram-binding-intent-system-prompt" rows="8" style="width:100%">' + escapeHtml(diagramBindingIntentPrompt) + '</textarea></label>',
       '<label>' + t('assistantDiagramMappingSystemPrompt') + '<textarea id="cmdp-assistant-diagram-mapping-system-prompt" rows="8" style="width:100%">' + escapeHtml(diagramPlacementPrompt) + '</textarea></label>',
       '<label>' + t('assistantDiagramConnectionsSystemPrompt') + '<textarea id="cmdp-assistant-diagram-connections-system-prompt" rows="8" style="width:100%">' + escapeHtml(diagramConnectionsPrompt) + '</textarea></label>',
+      '<label>' + t('assistantDiagramCritiqueSystemPrompt') + '<textarea id="cmdp-assistant-diagram-critique-system-prompt" rows="8" style="width:100%">' + escapeHtml(diagramCritiquePrompt) + '</textarea></label>',
       '<h3>' + t('assistantMcpSettings') + '</h3>',
       '<div class="checkbox-list">',
       '<label class="checkbox checkbox-stacked"><input id="cmdp-assistant-mcp-enabled" type="checkbox" ' + (mcp.enabled ? 'checked' : '') + '> <span><strong>' + t('assistantMcpEnabled') + '</strong></span></label>',
@@ -18038,7 +18274,7 @@ function dynamicPagesClientScript() {
     var jsonParams = Object.assign({}, params, { json: 'true' });
     var jsonUrl = absoluteRuntimeTemplateUrl(code, jsonParams);
     var disabled = Boolean(options.disabled);
-    var linkTitle = disabled ? String(options.title || t('d2RecoverySaveRequiredHelp')) : t('runLaunchUrlHelp');
+    var linkTitle = disabled ? String(options.title || t('runLaunchUrlHelp')) : t('runLaunchUrlHelp');
     var linkAttributes = disabled
       ? ' aria-disabled="true" tabindex="-1"'
       : ' target="_blank" rel="noreferrer"';
@@ -18065,38 +18301,11 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
-  function templateD2RecoveryRequiresSave(selected) {
-    var recovery = selected && selected.authoringRecovery && typeof selected.authoringRecovery === 'object'
-      ? selected.authoringRecovery
-      : null;
-    return Boolean(recovery && recovery.requiresSave === true && recovery.executionReadyAfterSave === true);
-  }
-
-  function templateD2RecoveryBlocksStrictActions(selected) {
-    if (!templateD2RecoveryRequiresSave(selected)) return false;
-    var spec = selected && selected.spec && typeof selected.spec === 'object' ? selected.spec : {};
-    var presentation = spec.result && spec.result.presentation && typeof spec.result.presentation === 'object'
-      ? spec.result.presentation
-      : {};
-    return normalizeOutputMode(presentation.outputMode || 'both') !== 'tables';
-  }
-
-  function renderTemplateD2RecoveryNotice(selected) {
-    if (!templateD2RecoveryRequiresSave(selected)) return '';
-    return [
-      '<div class="notice warning" role="status" data-d2-recovery-save-required>',
-      '<strong>' + escapeHtml(t('d2RecoverySaveRequiredTitle')) + '</strong><br>',
-      escapeHtml(t('d2RecoverySaveRequiredHelp')),
-      '<div class="toolbar"><button type="button" class="primary" data-action="save-template">' + escapeHtml(t('d2RecoverySaveRequiredAction')) + '</button></div>',
-      '</div>'
-    ].join('');
-  }
-
   function renderPublicationEditor(selected) {
     var spec = (selected && selected.spec) || defaultSpec();
     var publish = publishModelForSpec(spec);
     var d2Workflow = d2WorkflowStatusForEditor(spec);
-    var d2Warning = !templateD2RecoveryRequiresSave(selected) && d2Workflow.state === 'pending'
+    var d2Warning = d2Workflow.state === 'pending'
       ? '<div class="notice warning"><strong>' + escapeHtml(t('d2WorkflowPublicationBlockedTitle')) + '</strong><br>' + escapeHtml(t('d2WorkflowPublicationBlockedHelp')) + '<div class="toolbar"><button type="button" data-action="open-assistant-d2">' + escapeHtml(t('menuDiagramAssistant')) + '</button></div></div>'
       : '';
     return [
@@ -18283,16 +18492,14 @@ function dynamicPagesClientScript() {
     ];
     var context = '';
     var templateSelected = Boolean(state.selectedTemplate);
-    var recoverySaveRequired = templateD2RecoveryRequiresSave(state.selectedTemplate);
-    var recoveryBlocksStrictActions = templateD2RecoveryBlocksStrictActions(state.selectedTemplate);
+    var recoverySaveRequired = false;
+    var recoveryBlocksStrictActions = false;
     var saveDisabled = !templateSelected || state.savingTemplate;
     var saveTitle = !templateSelected
         ? t('templateSelectionRequired')
         : state.savingTemplate
           ? t('savingTemplate')
-          : recoverySaveRequired
-            ? t('d2RecoverySaveRequiredHelp')
-            : '';
+          : '';
 
     // This is the single persistence action for every template-bound section.
     // Local Apply actions validate and update only the in-browser draft.
@@ -18343,34 +18550,29 @@ function dynamicPagesClientScript() {
     } else if (section === 'cache') {
       actions.push(renderActionButton('apply-cache', t('cacheApply'), { primary: true }));
       if (readTemplateCode(selected)) context = renderTemplateLaunchUrl(selected, {
-        disabled: recoveryBlocksStrictActions,
-        title: recoveryBlocksStrictActions ? t('d2RecoverySaveRequiredHelp') : ''
+        disabled: false
       });
     } else if (section === 'publication') {
       actions.push(renderActionButton('apply-publication', t('applyPublication')));
       var snapshotPublicationEnabled = publishModelForSpec(selected && selected.spec || defaultSpec()).mode === 'staticSnapshot';
       actions.push(renderActionButton('publish-snapshot', t('publishSnapshot'), {
         primary: true,
-        disabled: !snapshotPublicationEnabled || recoveryBlocksStrictActions,
-        title: recoveryBlocksStrictActions ? t('d2RecoverySaveRequiredHelp') : snapshotPublicationEnabled ? '' : t('publicationDynamicHint')
+        disabled: !snapshotPublicationEnabled,
+        title: snapshotPublicationEnabled ? '' : t('publicationDynamicHint')
       }));
       if (readTemplateCode(selected)) context = renderTemplateLaunchUrl(selected, {
-        disabled: recoveryBlocksStrictActions,
-        title: recoveryBlocksStrictActions ? t('d2RecoverySaveRequiredHelp') : ''
+        disabled: false
       });
     } else if (section === 'run') {
       actions.push(renderActionButton('visualize-editor', t('visualizeInEditor'), { primary: true }));
       actions.push(renderActionButton('force-refresh-editor', t('forceRefreshInEditor'), {
-        disabled: recoveryBlocksStrictActions,
-        title: recoveryBlocksStrictActions ? t('d2RecoverySaveRequiredHelp') : ''
+        disabled: false
       }));
       actions.push(renderActionButton('visualize-external', t('visualizeExternal'), {
-        disabled: recoveryBlocksStrictActions,
-        title: recoveryBlocksStrictActions ? t('d2RecoverySaveRequiredHelp') : ''
+        disabled: false
       }));
       if (readTemplateCode(selected)) context = renderTemplateLaunchUrl(selected, {
-        disabled: recoveryBlocksStrictActions,
-        title: recoveryBlocksStrictActions ? t('d2RecoverySaveRequiredHelp') : ''
+        disabled: false
       });
     } else if (section === 'selection') {
       actions.push(renderActionButton('add-selection-filter-row', t('addFilter')));
@@ -18451,7 +18653,6 @@ function dynamicPagesClientScript() {
       '<div class="designer-main">',
       renderDesignerActionBar(selected),
       renderNotice(state.message),
-      renderTemplateD2RecoveryNotice(state.selectedTemplate),
       renderTemplateContext(selected),
       renderDesignerSection(selected, config, templateRows),
       '</div>'
@@ -19539,6 +19740,23 @@ function dynamicPagesClientScript() {
   }
 
   function d2WorkflowStatusForEditor(spec) {
+    var authoringStatus = diagramAuthoringStatusForEditorSpec(spec);
+    if (authoringStatus.status === 'unsupported') {
+      return {
+        state: 'unsupported',
+        reason: authoringStatus.code,
+        reasons: authoringStatus.reasons,
+        message: authoringStatus.message
+      };
+    }
+    if (authoringStatus.status === 'needsReanalysis') {
+      return {
+        state: 'pending',
+        reason: 'semantic_model_revision_required',
+        reasons: authoringStatus.reasons,
+        message: authoringStatus.message
+      };
+    }
     if (state.diagramImportProposal && state.diagramImportProposal.version === 3) {
       return { state: 'proposal', readiness: diagramImportProposalReadiness(state.diagramImportProposal) };
     }
@@ -19572,6 +19790,45 @@ function dynamicPagesClientScript() {
       return { state: 'applied', imported: imported };
     }
     return { state: 'pending', reason: 'notApplied' };
+  }
+
+  function diagramAuthoringStatusForEditorSpec(spec) {
+    var source = spec && typeof spec === 'object' && !Array.isArray(spec) ? spec : {};
+    var unsupportedReasons = [];
+    var reanalysisReasons = [];
+    if (Object.prototype.hasOwnProperty.call(source, 'assistantDraft')) unsupportedReasons.push('assistantDraft');
+    var diagrams = source.result && Array.isArray(source.result.diagrams) ? source.result.diagrams : [];
+    diagrams.forEach(function (diagram) {
+      var imported = diagram && diagram.authoring && diagram.authoring.d2Import;
+      if (!imported || typeof imported !== 'object' || Array.isArray(imported)) return;
+      if (Number(imported.version || 0) !== 3) reanalysisReasons.push('d2Import.version');
+      if (Number(imported.semanticModelRevision || 0) !== D2_IMPORT_SEMANTIC_MODEL_REVISION) reanalysisReasons.push('d2Import.semanticModelRevision');
+      if (!imported.structureTree || Number(imported.structureTree.version || 0) !== D2_IMPORT_STRUCTURE_TREE_VERSION || !Array.isArray(imported.structureTree.items)) reanalysisReasons.push('d2Import.structureTree');
+      if (diagramImportStoredMaterializationIssuesClient(imported).length) reanalysisReasons.push('d2Import.materialization');
+      if ((Array.isArray(imported.relationRules) ? imported.relationRules : []).some(function (rule) {
+        return String(rule && rule.mode || 'direct') === 'direct' || (Array.isArray(rule && rule.path) && rule.path.length);
+      })) reanalysisReasons.push('d2Import.relationRules');
+      ['roleMappings', 'placementRules', 'associationRules', 'elementBindings', 'navigatorGroups', 'navigatorHierarchies'].forEach(function (field) {
+        if (Object.prototype.hasOwnProperty.call(imported, field)) reanalysisReasons.push('d2Import.' + field);
+      });
+    });
+    if (unsupportedReasons.length) {
+      return {
+        status: 'unsupported',
+        code: 'd2_authoring_current_contract_required',
+        reasons: Array.from(new Set(unsupportedReasons)),
+        message: 'Сохранённое сопоставление D2 создано прежней версией редактора и не поддерживается. Исходные данные не изменены: очистите устаревшее сопоставление, затем выполните анализ текущего D2 source и примените новое сопоставление.'
+      };
+    }
+    if (reanalysisReasons.length) {
+      return {
+        status: 'needsReanalysis',
+        code: 'd2_authoring_reanalysis_required',
+        reasons: Array.from(new Set(reanalysisReasons)),
+        message: 'Сохранённое сопоставление D2 использует устаревший contract. Оно сохранено, но не выполняется: проанализируйте текущий D2 source и примените новое сопоставление.'
+      };
+    }
+    return { status: 'current', code: '', reasons: [], message: '' };
   }
 
   function diagramImportAppliedEditorFromSpec(spec) {
@@ -21026,7 +21283,7 @@ function dynamicPagesClientScript() {
         mapping: diagramImportStructureItemMappingClient(role, item && item.mapping || {}, String(item && item.id || 'structure_item_' + String(index + 1)))
       };
     }).filter(function (item) { return item.id; });
-    proposal.structureTree = diagramImportMigrateLegacyHierarchyConditionsClient({ version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: items }, rolesById);
+    proposal.structureTree = { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: items };
     if (structureTreeCache) structureTreeCache.set(proposal, { raw: proposal.structureTree, tree: proposal.structureTree });
     if (editorIndexCache) editorIndexCache.delete(proposal);
     return proposal.structureTree;
@@ -21062,66 +21319,6 @@ function dynamicPagesClientScript() {
     });
     if (editorIndexCache) editorIndexCache.set(proposal, index);
     return index;
-  }
-
-  function diagramImportMigrateLegacyHierarchyConditionsClient(tree, rolesById) {
-    var items = Array.isArray(tree && tree.items) ? tree.items : [];
-    var byId = {};
-    items.forEach(function (item) { if (item && item.id) byId[String(item.id)] = item; });
-    var nearestMaterializedAncestor = function (item) {
-      var visited = {};
-      var parentId = String(item && item.parentId || '');
-      while (parentId && !visited[parentId]) {
-        visited[parentId] = true;
-        var parent = byId[parentId];
-        if (!parent) return null;
-        var parentRole = rolesById[String(parent.roleId || '')] || {};
-        var parentMapping = diagramImportStructureItemMappingClient(parentRole, parent.mapping || {}, parent.id || '');
-        var materialization = parentMapping.materialization || {};
-        if (String(materialization.kind || '') === 'stage' && String(materialization.stageId || '')) {
-          return { stageId: String(materialization.stageId), item: parent };
-        }
-        parentId = String(parent.parentId || '');
-      }
-      return null;
-    };
-    items.forEach(function (item) {
-      var role = rolesById[String(item && item.roleId || '')] || {};
-      var mapping = diagramImportStructureItemMappingClient(role, item && item.mapping || {}, item && item.id || '');
-      var ancestor = nearestMaterializedAncestor(item);
-      var materialization = mapping && mapping.materialization || {};
-      var ownStageId = String(materialization.kind || '') === 'stage' ? String(materialization.stageId || '') : '';
-      if (!ancestor || !ancestor.stageId || !ownStageId || ownStageId === String(ancestor.stageId)) {
-        item.mapping = mapping;
-        return;
-      }
-      var conditions = diagramImportPlacementFiltersClient(mapping.conditions);
-      var hierarchyConditions = diagramImportPlacementFiltersClient(mapping.hierarchyConditions);
-      var retained = [];
-      conditions.rules.forEach(function (condition) {
-        var isLegacyHierarchyCondition = condition && condition.action === 'include' && !condition.negate &&
-          condition.right && condition.right.kind === 'stage' &&
-          String(condition.right.stageId || '') === String(ancestor.stageId || '');
-        if (!isLegacyHierarchyCondition) {
-          retained.push(condition);
-          return;
-        }
-        var duplicate = hierarchyConditions.rules.some(function (existing) {
-          return String(existing && existing.action || '') === String(condition.action || '') &&
-            Boolean(existing && existing.negate) === Boolean(condition.negate) &&
-            String(existing && existing.operator || '') === String(condition.operator || '') &&
-            String(existing && existing.left && existing.left.column || '') === String(condition.left && condition.left.column || '') &&
-            String(existing && existing.right && existing.right.stageId || '') === String(condition.right && condition.right.stageId || '') &&
-            String(existing && existing.right && existing.right.column || '') === String(condition.right && condition.right.column || '');
-        });
-        if (!duplicate) hierarchyConditions.rules.push(condition);
-      });
-      item.mapping = Object.assign({}, mapping, {
-        conditions: Object.assign({}, conditions, { rules: retained }),
-        hierarchyConditions: hierarchyConditions
-      });
-    });
-    return tree;
   }
 
   function diagramImportStructureTreeRoleClient(proposal, item) {
@@ -22819,13 +23016,16 @@ function dynamicPagesClientScript() {
   function renderD2WorkflowStatus(spec) {
     var status = d2WorkflowStatusForEditor(spec);
     if (status.state === 'none') return '';
+    if (status.state === 'unsupported') {
+      return '<div class="notice warning"><strong>Требуется новое сопоставление D2</strong><br>' + escapeHtml(status.message || '') + '<div class="toolbar"><button type="button" data-action="diagram-import-reset-unsupported">Очистить устаревшее сопоставление</button></div></div>';
+    }
     if (status.state === 'proposal') {
       var readiness = status.readiness || { canApply: false, blockers: ['proposal'] };
       var messages = diagramImportReadinessMessages(readiness);
       return '<div class="notice ' + (readiness.canApply ? 'ok' : 'warning') + '"><strong>' + escapeHtml(readiness.canApply ? t('diagramImportReady') : t('diagramImportReviewBlocked')) + '</strong>' + (messages.length ? '<ul class="steps">' + messages.map(function (message) { return '<li>' + escapeHtml(message) + '</li>'; }).join('') + '</ul>' : '') + '<div class="toolbar"><button type="button" data-action="open-diagram-editor">' + escapeHtml(t('openDiagramEditor')) + '</button></div></div>';
     }
     if (status.state === 'pending') {
-      var help = status.reason === 'changed'
+      var help = status.message || (status.reason === 'changed'
         ? t('d2WorkflowChangedHelp')
         : status.reason === 'prompt_changed' || status.reason === 'mapping_input_review_required'
           ? t('d2WorkflowPromptChangedHelp')
@@ -22835,8 +23035,10 @@ function dynamicPagesClientScript() {
           ? t('d2WorkflowMaterializationRequiredHelp')
         : status.reason === 'mapping_validation_required'
           ? t('d2WorkflowValidationRequiredHelp')
-          : t('d2WorkflowPendingHelp');
-      return '<div class="notice warning"><strong>' + escapeHtml(t('d2WorkflowPendingTitle')) + '</strong><br>' + escapeHtml(help) + '<div class="toolbar"><button type="button" data-action="open-diagram-editor">' + escapeHtml(t('openDiagramEditor')) + '</button></div></div>';
+          : t('d2WorkflowPendingHelp'));
+      var pendingAction = status.reason === 'semantic_model_revision_required' ? 'open-assistant-d2' : 'open-diagram-editor';
+      var pendingLabel = status.reason === 'semantic_model_revision_required' ? t('diagramEditInAssistant') : t('openDiagramEditor');
+      return '<div class="notice warning"><strong>' + escapeHtml(t('d2WorkflowPendingTitle')) + '</strong><br>' + escapeHtml(help) + '<div class="toolbar"><button type="button" data-action="' + pendingAction + '">' + escapeHtml(pendingLabel) + '</button></div></div>';
     }
     var imported = status.imported || {};
     var roles = Array.isArray(imported.roles) ? imported.roles : [];
@@ -22930,6 +23132,7 @@ function dynamicPagesClientScript() {
     var hasSource = Boolean(String(state.diagramImportSource || '').trim());
     var workflow = d2WorkflowStatusForEditor(spec);
     var mappingApplied = workflow.state === 'applied';
+    var authoringUnsupported = workflow.state === 'unsupported';
     var imported = firstDiagramSpec(spec).authoring && firstDiagramSpec(spec).authoring.d2Import;
     var canRefreshAppliedSource = Boolean(!proposal && imported && imported.version === 3 && hasSource && String(imported.source || '') !== String(state.diagramImportSource || ''));
     var hasAppliedFlowStages = diagramImportStageRows(spec || defaultSpec()).length > 0;
@@ -22946,15 +23149,13 @@ function dynamicPagesClientScript() {
       '<label>' + t('diagramImportSource') + '<textarea id="cmdp-diagram-import-source" class="diagram-import-source" spellcheck="false"' + (busy ? ' disabled' : '') + '>' + escapeHtml(state.diagramImportSource || '') + '</textarea></label>',
       '<div class="diagram-import-toolbar">',
       '<label>' + t('diagramImportFile') + '<input id="cmdp-diagram-import-file" type="file" accept=".d2,text/plain"' + (busy ? ' disabled' : '') + '></label>',
-      '<button type="button" data-action="diagram-import-analyze"' + (busy ? ' disabled' : '') + '>' + t('diagramImportAnalyze') + '</button>',
+      '<button type="button" data-action="diagram-import-analyze"' + (busy || authoringUnsupported ? ' disabled' : '') + '>' + t('diagramImportAnalyze') + '</button>',
       canRefreshAppliedSource ? '<button type="button" class="primary" data-action="diagram-import-refresh-source"' + (busy ? ' disabled' : '') + '>' + escapeHtml(t('diagramImportRefreshAndPreview')) + '</button>' : '',
       busy ? '<span class="assistant-busy-title" role="status" aria-live="polite"><span class="assistant-busy-spinner" aria-hidden="true"></span>' + escapeHtml(state.diagramImportBusy ? t('diagramImportAnalyzing') : t('diagramImportAssistantRunning')) + '</span>' : '',
       '</div>',
       '<div data-diagram-import-stale class="diagram-import-status unresolved" role="status" aria-live="polite"' + (state.diagramImportStale ? '' : ' hidden') + '>' + escapeHtml(t('diagramImportStale')) + '</div>',
       renderDiagramImportElementBindings(spec),
-      '<div class="assistant-d2-prompt"><h4>' + t('assistantDiagramStructureTitle') + '</h4><p class="muted">' + t('assistantDiagramStructureHelp') + '</p><label>' + t('assistantDiagramInterpretPrompt') + '<textarea id="cmdp-assistant-diagram-interpret-prompt" rows="4">' + escapeHtml(state.assistantDiagramInterpretPrompt || '') + '</textarea></label><div class="toolbar"><button type="button" data-action="assistant-diagram-interpret"' + (busy || !hasSource ? ' disabled' : '') + '>' + t('assistantDiagramInterpret') + '</button></div></div>',
-      '<div class="assistant-d2-prompt"><h4>' + t('assistantDiagramMappingTitle') + '</h4><p class="muted">' + t('assistantDiagramMappingHelp') + '</p><label>' + t('assistantDiagramMappingPrompt') + '<textarea id="cmdp-assistant-diagram-mapping-prompt" rows="4">' + escapeHtml(state.assistantDiagramMappingPrompt || '') + '</textarea></label></div>',
-      '<div class="assistant-d2-prompt"><h4>' + t('assistantDiagramConnectionsTitle') + '</h4><p class="muted">' + t('assistantDiagramConnectionsHelp') + '</p><label>' + t('assistantDiagramConnectionsPrompt') + '<textarea id="cmdp-assistant-diagram-connections-prompt" rows="4">' + escapeHtml(state.assistantDiagramConnectionsPrompt || '') + '</textarea></label><div class="toolbar"><button type="button" data-action="assistant-diagram-map"' + (busy || !hasSource || !hasAppliedFlowStages || semanticBlocked && Boolean(proposal) && !state.diagramImportStale ? ' disabled' : '') + '>' + t('assistantDiagramMap') + '</button></div>' + (!proposal ? '<p class="muted">' + escapeHtml(mappingApplied ? t('diagramImportAppliedAssistantHelp') : t('assistantDiagramAnalysisRequired')) + '</p>' : '') + (proposal && !hasAppliedFlowStages ? '<p class="muted">Сначала примените поток данных: только примененные детерминированные результаты доступны для сопоставления.</p>' : '') + '</div>',
+      '<div class="assistant-d2-prompt"><h4>' + t('assistantDiagramMappingTitle') + '</h4><p class="muted">' + t('assistantDiagramIntentHelp') + '</p><label>' + t('assistantDiagramIntentPrompt') + '<textarea id="cmdp-assistant-diagram-intent-prompt" rows="8"' + (authoringUnsupported ? ' disabled' : '') + '>' + escapeHtml(state.assistantDiagramIntentPrompt || '') + '</textarea></label><div class="toolbar"><button type="button" data-action="assistant-diagram-interpret"' + (busy || !hasSource || authoringUnsupported ? ' disabled' : '') + '>' + t('assistantDiagramInterpret') + '</button><button type="button" data-action="assistant-diagram-map"' + (busy || !hasSource || authoringUnsupported || !hasAppliedFlowStages || semanticBlocked && Boolean(proposal) && !state.diagramImportStale ? ' disabled' : '') + '>' + t('assistantDiagramMap') + '</button></div>' + (!proposal ? '<p class="muted">' + escapeHtml(authoringUnsupported ? 'Очистите устаревшее сопоставление, чтобы начать новый current-only цикл.' : mappingApplied ? t('diagramImportAppliedAssistantHelp') : t('assistantDiagramAnalysisRequired')) + '</p>' : '') + (proposal && !hasAppliedFlowStages ? '<p class="muted">Сначала примените поток данных: только примененные детерминированные результаты доступны для сопоставления.</p>' : '') + '</div>',
       renderDiagramImportAssistantProposal(spec),
       '</div>',
       '</div>'
@@ -26269,7 +26470,9 @@ function dynamicPagesClientScript() {
   }
 
   function diagramImportDeterministicSpecSnapshot(spec) {
-    return stableClientJsonStringify(assistantSpecWithoutPromptDraft(spec));
+    var next = assistantSpecWithoutPromptDraft(spec);
+    if (next.result && typeof next.result === 'object' && !Array.isArray(next.result)) delete next.result.diagrams;
+    return stableClientJsonStringify(next);
   }
 
   function diagramImportRequestRevisionSnapshot(proposal, source) {
@@ -26317,8 +26520,39 @@ function dynamicPagesClientScript() {
 
   function applyAssistantDraftToSpec(spec, intent, taskMode) {
     var next = cloneSpecForEdit(spec || defaultSpec());
-    delete next.assistantDraft;
     return next;
+  }
+
+  function clearUnsupportedDiagramAuthoring() {
+    var selected = state.selectedTemplate || {};
+    var next = cloneSpecForEdit(selected.spec || defaultSpec());
+    delete next.assistantDraft;
+    if (next.authoring && typeof next.authoring === 'object' && !Array.isArray(next.authoring)) {
+      var assistant = next.authoring.assistant && typeof next.authoring.assistant === 'object' && !Array.isArray(next.authoring.assistant)
+        ? Object.assign({}, next.authoring.assistant)
+        : {};
+      ['diagramSemanticsPrompt', 'diagramInterpretPrompt', 'diagramPlacementPrompt', 'diagramMappingPrompt', 'diagramConnectionsPrompt'].forEach(function (field) { delete assistant[field]; });
+      if (assistant.systemPromptOverrides && typeof assistant.systemPromptOverrides === 'object' && !Array.isArray(assistant.systemPromptOverrides)) {
+        TEMPLATE_ASSISTANT_PROMPT_UNSUPPORTED_KEYS.forEach(function (field) { delete assistant.systemPromptOverrides[field]; });
+      }
+      next.authoring = Object.assign({}, next.authoring, { assistant: assistant });
+      if (next.authoring.d2 && typeof next.authoring.d2 === 'object' && !Array.isArray(next.authoring.d2)) {
+        next.authoring.d2 = Object.assign({}, next.authoring.d2);
+        delete next.authoring.d2.analysisCheckpoint;
+        delete next.authoring.d2.assistantCheckpoint;
+      }
+    }
+    if (next.result && Array.isArray(next.result.diagrams)) {
+      next.result = Object.assign({}, next.result, {
+        diagrams: next.result.diagrams.filter(function (diagram) {
+          return !(diagram && diagram.authoring && diagram.authoring.d2Import);
+        })
+      });
+    }
+    updateSelectedFromEditor(next);
+    hydrateDesignerStateFromTemplate({ preserveAssistantState: true, replaceRunParams: false });
+    state.message = { type: 'ok', text: 'Устаревшее сопоставление D2 очищено только в текущем draft. Выполните анализ D2 source и сохраните шаблон.' };
+    renderDesigner();
   }
 
   function applyAssistantDraftFromDomToSpec(spec) {
@@ -26369,6 +26603,7 @@ function dynamicPagesClientScript() {
       description: readTemplateDescription(selected, code) || selected.description || '',
       active: readTemplateActive(selected),
       spec: normalizedSpec,
+      diagramAuthoringStatus: diagramAuthoringStatusForEditorSpec(normalizedSpec),
       paramsSchema: readCurrentParamsSchema(selected.paramsSchema || {}),
       resultSchema: readCurrentResultSchema(selected.resultSchema || {})
     });
@@ -29178,9 +29413,8 @@ function dynamicPagesClientScript() {
           stage: stage,
           resumeId: resume.resumeId,
           intent: intent,
-          currentSpec: requestSpec,
-          templateCode: state.selectedTemplate && state.selectedTemplate.code || '',
-          baseSpecHash: state.selectedTemplate && state.selectedTemplate.specHash || ''
+          templateRef: assistantTemplateRefClient(),
+          editorDelta: assistantEditorDeltaClient(requestSpec)
         }
       }).then(function (result) {
         var mismatch = assistantTemplateRevisionMismatch(requestRevision);
@@ -29266,9 +29500,8 @@ function dynamicPagesClientScript() {
         resumeId: resume.resumeId,
         intent: state.assistantObjectFlowIntent,
         semanticPlan: state.assistantFlowSemanticPlan,
-        currentSpec: requestSpec,
-        templateCode: state.selectedTemplate && state.selectedTemplate.code || '',
-        baseSpecHash: state.selectedTemplate && state.selectedTemplate.specHash || ''
+        templateRef: assistantTemplateRefClient(),
+        editorDelta: assistantEditorDeltaClient(requestSpec)
       }
     }).then(function (result) {
       var mismatch = assistantTemplateRevisionMismatch(requestRevision);
@@ -29409,15 +29642,9 @@ function dynamicPagesClientScript() {
     if (state.assistantDiagramInterpretBusy || state.assistantDiagramMappingBusy) return;
     if (!captureVisibleDesignerState()) return;
     captureAssistantPromptsFromDom();
-    var prompt = kind === 'interpret' ? state.assistantDiagramInterpretPrompt.trim() : state.assistantDiagramMappingPrompt.trim();
-    var connectionsPrompt = state.assistantDiagramConnectionsPrompt.trim();
-    if (!prompt || kind === 'map' && !connectionsPrompt) {
-      var requiredPromptLabel = kind === 'interpret'
-        ? t('assistantDiagramInterpretPrompt')
-        : !prompt
-          ? t('assistantDiagramMappingPrompt')
-          : t('assistantDiagramConnectionsPrompt');
-      state.message = { type: 'error', text: t('fieldRequired', { label: requiredPromptLabel }) };
+    var prompt = String(state.assistantDiagramIntentPrompt || '').trim();
+    if (!prompt) {
+      state.message = { type: 'error', text: t('fieldRequired', { label: t('assistantDiagramIntentPrompt') }) };
       renderDesigner();
       return;
     }
@@ -29442,28 +29669,25 @@ function dynamicPagesClientScript() {
       var currentSpec = assistantDiagramRequestSpec(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(), proposal);
       var body = {
         prompt: prompt,
-        semanticsPrompt: state.assistantDiagramInterpretPrompt.trim(),
-        placementPrompt: state.assistantDiagramMappingPrompt.trim(),
-        connectionsPrompt: state.assistantDiagramConnectionsPrompt.trim(),
-        templateCode: state.selectedTemplate && state.selectedTemplate.code || '',
-        baseSpecHash: state.selectedTemplate && state.selectedTemplate.specHash || '',
-        currentSpec: currentSpec,
+        templateRef: assistantTemplateRefClient(),
+        editorDelta: assistantEditorDeltaClient(currentSpec),
         proposal: state.diagramImportSignedProposal,
         roles: diagramImportBindingOverrides(proposal),
         relationRules: cloneJsonValue(proposal.relationRules || [], []),
         structureTree: cloneJsonValue(diagramImportStructureTreeClient(proposal), { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] }),
         traversalDepth: Math.max(1, Math.min(5, Number(state.maxTraversalDepth) || 1))
       };
-      if (kind === 'map') body.stages = assistantFlowStageSummaries(assistantFlowModel(body.currentSpec), body.currentSpec);
+      if (kind === 'map') body.stages = assistantFlowStageSummaries(assistantFlowModel(currentSpec), currentSpec);
       var assistantRequest;
       if (kind === 'map') {
         var storedResume = state.assistantDiagramMappingResume;
         var mappingResumeId = storedResume && storedResume.proposal === requestProposal && storedResume.resumeId
           ? String(storedResume.resumeId)
           : clientRequestId();
-        var mappingStage = storedResume && storedResume.proposal === requestProposal && storedResume.nextStage === 'topology'
-          ? 'topology'
-          : 'roles';
+        var initialMappingStage = 'roles';
+        var mappingStage = storedResume && storedResume.proposal === requestProposal && ['roles', 'topology'].includes(String(storedResume.nextStage || ''))
+          ? String(storedResume.nextStage)
+          : initialMappingStage;
         state.assistantDiagramMappingResume = { resumeId: mappingResumeId, nextStage: mappingStage, proposal: requestProposal };
         var requestMappingStage = function (stage, retryBudget, retryKind) {
           state.assistantDiagramMappingResume.nextStage = stage;
@@ -29495,9 +29719,10 @@ function dynamicPagesClientScript() {
             }
             if (Number(result.status || 0) === 202) {
               var checkpoint = result.json.checkpoint || result.json.resume || {};
-              if (!checkpoint.resumeId || checkpoint.nextStage !== 'topology') throw new Error('D2 object mapping checkpoint is incomplete. Start mapping again.');
-              state.assistantDiagramMappingResume = { resumeId: String(checkpoint.resumeId), nextStage: 'topology', proposal: requestProposal };
-              return requestMappingStage('topology', assistantDiagramMappingStageRetryBudget('topology'), '');
+              var nextStage = String(checkpoint.nextStage || '');
+              if (!checkpoint.resumeId || !['roles', 'topology'].includes(nextStage)) throw new Error('D2 mapping checkpoint is incomplete. Start mapping again.');
+              state.assistantDiagramMappingResume = { resumeId: String(checkpoint.resumeId), nextStage: nextStage, proposal: requestProposal };
+              return requestMappingStage(nextStage, assistantDiagramMappingStageRetryBudget(nextStage), '');
             }
             return result;
           }).catch(function (error) {
@@ -29513,9 +29738,6 @@ function dynamicPagesClientScript() {
               var nextBudget = Object.assign({}, retryBudget || {});
               nextBudget[retryKind] = remaining - 1;
               return requestMappingStage(String(error.mappingResume.nextStage || stage), nextBudget, retryKind);
-            }
-            if (error && error.mappingPartial) {
-              return { ok: true, status: 200, json: Object.assign({}, error.mappingPartial, { success: true, partial: true }), requestId: error.requestId || '' };
             }
             throw error;
           });
@@ -29570,6 +29792,9 @@ function dynamicPagesClientScript() {
           item.mapping = diagramImportStructureItemMappingClient(role, updated, item.id);
           proposal.structureTree = tree;
         });
+        if (Array.isArray(result.json.endpointProfiles)) {
+          proposal.endpointProfiles = cloneJsonValue(result.json.endpointProfiles, []);
+        }
         if (Array.isArray(result.json.relationRules)) {
           var byD2ClassKey = {};
           (proposal.relationRules || []).forEach(function (rule) {
@@ -30030,8 +30255,10 @@ function dynamicPagesClientScript() {
       next.assistant.prompt.objectFlow = String(readValue('cmdp-assistant-object-flow-system-prompt') || '').trim() || defaultRuntimeConfig().assistant.prompt.objectFlow;
       next.assistant.prompt.version = ${ASSISTANT_PROMPT_CONTRACT_VERSION};
       next.assistant.prompt.diagramSemantics = String(readValue('cmdp-assistant-diagram-interpret-system-prompt') || '').trim() || defaultRuntimeConfig().assistant.prompt.diagramSemantics;
+      next.assistant.prompt.diagramBindingIntent = String(readValue('cmdp-assistant-diagram-binding-intent-system-prompt') || '').trim() || defaultRuntimeConfig().assistant.prompt.diagramBindingIntent;
       next.assistant.prompt.diagramPlacement = String(readValue('cmdp-assistant-diagram-mapping-system-prompt') || '').trim() || defaultRuntimeConfig().assistant.prompt.diagramPlacement;
       next.assistant.prompt.diagramConnections = String(readValue('cmdp-assistant-diagram-connections-system-prompt') || '').trim() || defaultRuntimeConfig().assistant.prompt.diagramConnections;
+      next.assistant.prompt.diagramCritique = String(readValue('cmdp-assistant-diagram-critique-system-prompt') || '').trim() || defaultRuntimeConfig().assistant.prompt.diagramCritique;
       delete next.assistant.prompt.diagramInterpretation;
       delete next.assistant.prompt.diagramMapping;
       delete next.assistant.prompt.selection;
@@ -30958,6 +31185,7 @@ function dynamicPagesClientScript() {
     if (action === 'clear-diagram-mapping-row') clearDiagramMappingRow(target);
     if (action === 'insert-diagram-template-token') insertDiagramTemplateToken(target);
     if (action === 'diagram-import-analyze') analyzeDiagramImport();
+    if (action === 'diagram-import-reset-unsupported') clearUnsupportedDiagramAuthoring();
     if (action === 'diagram-import-select-element') selectDiagramImportElement(target.getAttribute('data-diagram-element-key') || '');
     if (action === 'diagram-import-apply') applyDiagramImport();
     if (action === 'diagram-import-refresh-source') refreshAppliedDiagramImportSource();
@@ -31375,20 +31603,10 @@ function dynamicPagesClientScript() {
       if (rejectedFlowPreview) rejectedFlowPreview.remove();
       markAssistantAuthoringChanged();
     }
-    if (event.target && event.target.id === 'cmdp-assistant-diagram-interpret-prompt') {
-      state.assistantDiagramInterpretPrompt = String(event.target.value || '');
+    if (event.target && event.target.id === 'cmdp-assistant-diagram-intent-prompt') {
+      state.assistantDiagramIntentPrompt = String(event.target.value || '');
       markAssistantAuthoringChanged();
-      markDiagramImportPromptChanged('interpretPrompt');
-    }
-    if (event.target && event.target.id === 'cmdp-assistant-diagram-mapping-prompt') {
-      state.assistantDiagramMappingPrompt = String(event.target.value || '');
-      markAssistantAuthoringChanged();
-      markDiagramImportPromptChanged('mappingPrompt');
-    }
-    if (event.target && event.target.id === 'cmdp-assistant-diagram-connections-prompt') {
-      state.assistantDiagramConnectionsPrompt = String(event.target.value || '');
-      markAssistantAuthoringChanged();
-      markDiagramImportPromptChanged('connectionsPrompt');
+      markDiagramImportPromptChanged('diagramIntentPrompt');
     }
     if (event.target && event.target.closest && event.target.closest('#cmdp-diagram-editor') && event.target.id !== 'cmdp-diagram-import-source' && event.target.id !== 'cmdp-diagram-import-file' && !(event.target.matches && event.target.matches('[data-diagram-import-field]'))) {
       markImportedDiagramChanged();
@@ -31838,10 +32056,14 @@ function assistantDiagramFailureMessage(error, mapTask, options = {}) {
   if (!mapTask || !error || error.code !== 'assistant_timeout') return error && error.message ? error.message : String(error || '');
   const phase = String(error.assistantPhase || '').trim();
   const labels = {
+    'intent.initial': 'привязка D2 к именованным бизнес-результатам',
+    'intent.retry': 'повторная проверка бизнес-привязки D2',
     'roles.initial': 'сопоставление объектов',
     'roles.retry': 'повторная проверка сопоставления объектов',
     'topology.initial': 'сопоставление связей',
-    'topology.retry': 'повторная проверка сопоставления связей'
+    'topology.retry': 'повторная проверка сопоставления связей',
+    'critique.initial': 'смысловая проверка D2 mapping',
+    'critique.retry': 'повторная смысловая проверка D2 mapping'
   };
   const label = labels[phase] || 'сопоставление диаграммы';
   const continuation = options.rolesReused && options.retryable
@@ -33453,7 +33675,8 @@ async function resolveAssistantObjectFlowPlanContext(authToken, res, root, templ
     const classAccess = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(schema.classNames.template)}`, authToken);
     return {
       session,
-      canApply: Boolean(classAccess.ok && classAccess.json && classAccess.json.data && classAccess.json.data._can_create === true)
+      canApply: Boolean(classAccess.ok && classAccess.json && classAccess.json.data && classAccess.json.data._can_create === true),
+      template: null
     };
   }
   let found;
@@ -33466,8 +33689,8 @@ async function resolveAssistantObjectFlowPlanContext(authToken, res, root, templ
   // Object-flow planning and Apply only compile an in-browser draft. For a
   // saved template, a readable current card is sufficient; write permission
   // is checked only by the normal template Save endpoint.
-  if (!found.response.ok) return { session, canApply: false };
-  return { session, canApply: Boolean(found.card) };
+  if (!found.response.ok) return { session, canApply: false, template: null };
+  return { session, canApply: Boolean(found.card), template: found.card ? sanitizeTemplateCard(found.card) : null };
 }
 
 async function requireAdminClassesModify(authToken, res) {
@@ -33519,7 +33742,7 @@ function diagramImportNeedsRecovery(value) {
     Number(imported.imported.structureTree && imported.imported.structureTree.version || 0) === 3;
   const legacyTopology = imported && diagramImportHasLegacyClassRelationRules(imported.imported);
   const duplicateClassTopology = imported && diagramImportHasDuplicateClassConnectionRules(imported.imported);
-  const previousConnectionModel = imported && [11, 12, 13].includes(Number(imported.imported.semanticModelRevision || 0)) &&
+  const previousConnectionModel = imported && [11, 12, 13, 14].includes(Number(imported.imported.semanticModelRevision || 0)) &&
     Number(imported.imported.structureTree && imported.imported.structureTree.version || 0) === D2_IMPORT_STRUCTURE_TREE_VERSION;
   const signatureReattestation = imported &&
     status === 'valid' &&
@@ -33546,7 +33769,7 @@ function normalizeStoredDiagramImport(spec, diagram, options = {}) {
     : null;
   if (!original) return diagram;
 
-  const d2 = templateAuthoringD2(spec, { allowLegacy: false });
+  const d2 = templateAuthoringD2(spec);
   const source = String(d2.source || '');
   const sourceHash = source ? sha256Hex(source) : '';
   const sourceMatches = Boolean(sourceHash && String(original.sourceHash || '') === sourceHash);
@@ -33600,7 +33823,7 @@ function normalizeStoredDiagramImport(spec, diagram, options = {}) {
   // authored tree and migrates the old connection contract without an
   // Assistant round-trip.
   const topologyMigrationEligible = sourceMatches && Boolean(migrationIdentity) &&
-    (legacyTopology || [11, 12, 13].includes(Number(original.semanticModelRevision || 0)));
+    (legacyTopology || [11, 12, 13, 14].includes(Number(original.semanticModelRevision || 0)));
   const legacyPlacement = Number(original.semanticModelRevision || 0) === 8 &&
     Number(original.structureTree && original.structureTree.version || 0) === 3;
   const recoveryEligible = !hasConcreteTopology && sourceMatches && !original.mappingInputRevision &&
@@ -33923,58 +34146,17 @@ function normalizeTemplateSpecForStorage(spec, code = '', options = {}) {
     if (Object.keys(system).length) next.system = system;
     else delete next.system;
   }
-  // One-time migration on the next ordinary template save. The persisted
-  // contract after this point contains only canonical authoring, never the
-  // retired assistantDraft side channel.
-  const authoring = normalizeTemplateAuthoring(next.authoring, next.assistantDraft);
+  if (diagramAuthoringStatusForSpec(next).status === 'unsupported') return next;
+  const authoring = normalizeTemplateAuthoring(next.authoring);
   if (authoring) next.authoring = authoring;
   else delete next.authoring;
-  delete next.assistantDraft;
   next = normalizeStoredObjectFlowPresentation(next, options);
-  if (next.result && typeof next.result === 'object' && !Array.isArray(next.result) && Array.isArray(next.result.diagrams)) {
-    const before = next.result.diagrams.map((diagram) => cloneJsonValueServer(diagram, diagram));
-    next.result.diagrams = next.result.diagrams.map((diagram) => normalizeStoredDiagramImport(next, diagram, options));
-    const migrations = next.result.diagrams.map((diagram, index) => ({ diagram, previous: before[index] })).filter(({ diagram, previous }) => {
-      const previousImport = previous && previous.authoring && previous.authoring.d2Import;
-      const imported = diagram && diagram.authoring && diagram.authoring.d2Import;
-      return previousImport && imported &&
-        (Number(previousImport.semanticModelRevision || 0) !== D2_IMPORT_SEMANTIC_MODEL_REVISION ||
-          Number(previousImport.structureTree && previousImport.structureTree.version || 0) !== D2_IMPORT_STRUCTURE_TREE_VERSION) &&
-        previousImport.mappingValidation && previousImport.mappingValidation.status === 'valid' &&
-        imported.mappingValidation && imported.mappingValidation.status === 'valid';
-    });
-    for (const { diagram } of migrations) {
-      const imported = diagram && diagram.authoring && diagram.authoring.d2Import;
-      try {
-        const proposal = diagramImportMigrationProposal(next, imported);
-        next = applyDiagramImportProposal(next, proposal, [], proposal.relationRules, proposal.structureTree);
-        recordD2MappingStorageOutcome(options, { status: 'recompiled' });
-      } catch (error) {
-        logWarn('d2_import.mapping_migration_rebuild_failed', {
-          diagramId: String(imported && imported.diagramId || ''),
-          code: String(error && error.code || ''),
-          statusCode: Number(error && error.statusCode || 0) || null,
-          message: truncateText(String(error && error.message || 'Unknown D2 mapping migration error.'), 800),
-          unresolved: Array.isArray(error && error.details)
-            ? error.details.slice(0, 32).map((item) => ({
-                family: String(item && item.family || ''),
-                fields: uniqueStrings(Array.isArray(item && item.fields) ? item.fields : []).slice(0, 8)
-              }))
-            : []
-        });
-        const failed = diagramImportForSpec(next, String(imported && imported.diagramId || ''));
-        if (failed && failed.imported) {
-          failed.imported.mappingValidation = {
-            version: 1,
-            status: 'needsValidation',
-            reasons: ['migrationPartial']
-          };
-        }
-        recordD2MappingStorageOutcome(options, { status: 'migration_rebuild_partial' });
-      }
-    }
+  // Only current D2 contracts may rebase their checkpoint during normal Save.
+  // Historical mappings are preserved verbatim and remain non-executable until
+  // the author performs a fresh current-only analysis.
+  if (diagramAuthoringStatusForSpec(next).status !== 'needsReanalysis') {
+    rebaseStoredD2AnalysisCheckpoint(next);
   }
-  rebaseStoredD2AnalysisCheckpoint(next);
   return next;
 }
 
@@ -34001,46 +34183,15 @@ async function sanitizeTemplateCardForRead(card) {
   const sanitized = sanitizeTemplateCard(card);
   if (!sanitized) return sanitized;
   const objectFlowOutcomes = [];
-  let normalized = normalizeStoredObjectFlowPresentation(cloneJsonValueServer(sanitized.spec, sanitized.spec), {
+  const normalized = normalizeStoredObjectFlowPresentation(cloneJsonValueServer(sanitized.spec, sanitized.spec), {
     objectFlowOutcomes
   });
-  const objectFlowChanged = objectFlowOutcomes.some((item) => item && item.changed === true);
   const objectFlowSummary = objectFlowOutcomes.find((item) => item && ['recovered', 'skipped_invalid_flow'].includes(String(item.status || '')));
-  let authoringRecovery = null;
-
-  if (diagramImportNeedsRecovery(normalized)) {
-    const source = String(templateAuthoringD2(normalized, { allowLegacy: true }).source || '');
-    if (source.trim()) {
-      const identity = await d2SourceStructureIdentity(source);
-      if (identity.ok) {
-        const outcomes = [];
-        normalized = normalizeTemplateSpecForStorage(normalized, sanitized.code, {
-          d2SourceIdentities: [identity],
-          d2MappingOutcomes: outcomes
-        });
-        const statuses = uniqueStrings(outcomes.map((item) => String(item && item.status || '')).filter(Boolean));
-        const reasons = uniqueStrings(outcomes.flatMap((item) => Array.isArray(item && item.reasons) ? item.reasons : []).map(String).filter(Boolean));
-        const migrated = outcomes.some((item) => ['materialization_migrated', 'recompiled', 'migrated', 'reattested', 'topology_migrated', 'topology_migrated_partial', 'topology_normalized'].includes(String(item && item.status || '')));
-        if (migrated) {
-          authoringRecovery = {
-            requiresSave: true,
-            executionReadyAfterSave: validateTemplateSpecForExecution(normalized).length === 0,
-            statuses,
-            ...(reasons.length ? { reasons } : {})
-          };
-        } else if (statuses.length) {
-          authoringRecovery = { requiresSave: false, statuses, ...(reasons.length ? { reasons } : {}) };
-        }
-      }
-    }
-  }
-
-  if (!objectFlowChanged && !objectFlowSummary && !authoringRecovery) return sanitized;
+  const objectFlowChanged = objectFlowOutcomes.some((item) => item && item.changed === true);
+  const spec = objectFlowChanged ? normalized : sanitized.spec;
   return {
     ...sanitized,
-    // Keep the persisted hash for optimistic concurrency. Read-time recovery
-    // is immediately executable; ordinary Save persists the canonical model.
-    ...(objectFlowChanged || authoringRecovery && authoringRecovery.requiresSave ? { spec: normalized } : {}),
+    ...(objectFlowChanged ? { spec } : {}),
     ...(objectFlowSummary ? {
       objectFlowRecovery: {
         requiresSave: objectFlowSummary.changed === true,
@@ -34054,7 +34205,7 @@ async function sanitizeTemplateCardForRead(card) {
         ownership: String(objectFlowSummary.ownership || 'unmanaged')
       }
     } : {}),
-    ...(authoringRecovery ? { authoringRecovery } : {})
+    diagramAuthoringStatus: diagramAuthoringStatusForSpec(spec)
   };
 }
 
@@ -34089,6 +34240,16 @@ function d2RecoverySaveRequiredPayload(template, action, authoringRecovery) {
       active: template.active,
       specHash: template.specHash
     }
+  };
+}
+
+function d2AuthoringCurrentContractRequiredPayload(spec) {
+  const status = diagramAuthoringStatusForSpec(spec);
+  return {
+    success: false,
+    reason: status.code || 'd2_authoring_current_contract_required',
+    message: status.message,
+    diagramAuthoringStatus: status
   };
 }
 
@@ -34189,17 +34350,25 @@ function normalizeAssistantObjectFlowIntent(value, options = {}) {
   const blocks = rawBlocks.map((raw, index) => {
     const item = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
     const id = blockIds[index];
-    const strings = ['name', 'entities', 'algorithm', 'expectedResult'];
-    const normalized = { id };
-    strings.forEach((field) => {
-      if (typeof item[field] !== 'string') {
-        const error = new Error(`assistantObjectFlowIntent.blocks[${index}].${field} must be a string.`);
-        error.statusCode = 400;
-        error.code = 'assistant_object_flow_intent_invalid';
-        throw error;
-      }
-      normalized[field] = truncateText(item[field], 6000);
-    });
+    if (typeof item.name !== 'string') {
+      const error = new Error(`assistantObjectFlowIntent.blocks[${index}].name must be a string.`);
+      error.statusCode = 400;
+      error.code = 'assistant_object_flow_intent_invalid';
+      throw error;
+    }
+    const description = assistantObjectFlowBlockDescription(item);
+    const resultKind = normalizeAssistantObjectFlowResultKind(item.resultKind);
+    const normalized = {
+      id,
+      name: truncateText(item.name, 6000),
+      description,
+      resultKind,
+      // Keep the internal semantic compiler stable while prompt contract v4
+      // exposes one business description instead of three overlapping fields.
+      entities: description,
+      algorithm: description,
+      expectedResult: description
+    };
     const uses = Array.isArray(item.uses) ? item.uses.map((dependency) => String(dependency || '').trim()).filter(Boolean) : [];
     const invalidDependency = uses.find((dependency) => !known.has(dependency));
     if (invalidDependency || uses.includes(id)) {
@@ -34233,7 +34402,7 @@ function normalizeAssistantObjectFlowIntent(value, options = {}) {
       }
       knownNames.add(normalizedName);
       block.name = block.name.trim();
-      ['name', 'entities', 'algorithm', 'expectedResult'].forEach((field) => {
+      ['name', 'description'].forEach((field) => {
         if (block[field].trim()) return;
         const error = new Error(`assistantObjectFlowIntent.blocks[${index}].${field} is required.`);
         error.statusCode = 400;
@@ -34374,8 +34543,10 @@ function defaultRuntimeConfig() {
         objectFlow: DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT,
         objectFlowSemantic: DEFAULT_ASSISTANT_OBJECT_FLOW_SEMANTIC_PROMPT,
         diagramSemantics: DEFAULT_ASSISTANT_DIAGRAM_SEMANTICS_PROMPT,
+        diagramBindingIntent: DEFAULT_ASSISTANT_DIAGRAM_BINDING_INTENT_PROMPT,
         diagramPlacement: DEFAULT_ASSISTANT_DIAGRAM_PLACEMENT_PROMPT,
-        diagramConnections: DEFAULT_ASSISTANT_DIAGRAM_CONNECTIONS_PROMPT
+        diagramConnections: DEFAULT_ASSISTANT_DIAGRAM_CONNECTIONS_PROMPT,
+        diagramCritique: DEFAULT_ASSISTANT_DIAGRAM_CRITIQUE_PROMPT
       }
     },
     executionLimits: {
@@ -35977,7 +36148,22 @@ const MCP_TOOL_DEFINITIONS = [
       properties: {
         maxClasses: { type: 'integer', minimum: 1, maximum: ASSISTANT_MCP_MAX_CLASSES_ABSOLUTE },
         maxDomains: { type: 'integer', minimum: 1, maximum: ASSISTANT_MCP_MAX_DOMAINS_ABSOLUTE }
-      }
+      },
+      additionalProperties: false
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        classes: { type: 'array', items: { type: 'object' } },
+        domains: { type: 'array', items: { type: 'object' } },
+        limits: { type: 'array', items: { type: 'object' } },
+        complete: { type: 'boolean' },
+        nextCursor: { type: ['string', 'null'] },
+        catalogRevision: { type: 'string' },
+        evidence: { type: 'object' }
+      },
+      required: ['complete', 'nextCursor', 'catalogRevision', 'evidence'],
+      additionalProperties: false
     }
   },
   {
@@ -35988,7 +36174,22 @@ const MCP_TOOL_DEFINITIONS = [
       properties: {
         className: { type: 'string' }
       },
-      required: ['className']
+      required: ['className'],
+      additionalProperties: false
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        className: { type: 'string' },
+        attributes: { type: 'array', items: { type: 'object' } },
+        limits: { type: 'array', items: { type: 'object' } },
+        complete: { type: 'boolean' },
+        nextCursor: { type: ['string', 'null'] },
+        catalogRevision: { type: 'string' },
+        evidence: { type: 'object' }
+      },
+      required: ['className', 'attributes', 'complete', 'nextCursor', 'catalogRevision', 'evidence'],
+      additionalProperties: false
     }
   },
   {
@@ -35999,8 +36200,25 @@ const MCP_TOOL_DEFINITIONS = [
       properties: {
         sourceClass: { type: 'string' },
         targetClass: { type: 'string' },
+        domainNames: { type: 'array', items: { type: 'string' } },
         maxDomains: { type: 'integer', minimum: 1, maximum: ASSISTANT_MCP_MAX_DOMAINS_ABSOLUTE }
-      }
+      },
+      additionalProperties: false
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        sourceClass: { type: 'string' },
+        targetClass: { type: 'string' },
+        domains: { type: 'array', items: { type: 'object' } },
+        limits: { type: 'array', items: { type: 'object' } },
+        complete: { type: 'boolean' },
+        nextCursor: { type: ['string', 'null'] },
+        catalogRevision: { type: 'string' },
+        evidence: { type: 'object' }
+      },
+      required: ['domains', 'complete', 'nextCursor', 'catalogRevision', 'evidence'],
+      additionalProperties: false
     }
   },
   {
@@ -36010,7 +36228,26 @@ const MCP_TOOL_DEFINITIONS = [
       type: 'object',
       properties: {
         currentSpec: { type: 'object' }
-      }
+      },
+      additionalProperties: false
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        version: {},
+        params: { type: 'array', items: { type: 'string' } },
+        aliases: { type: 'array', items: { type: 'string' } },
+        steps: { type: 'array', items: { type: 'object' } },
+        tables: { type: 'array', items: { type: 'object' } },
+        diagrams: { type: 'array', items: { type: 'object' } },
+        limits: { type: 'array', items: { type: 'object' } },
+        complete: { type: 'boolean' },
+        nextCursor: { type: ['string', 'null'] },
+        catalogRevision: { type: 'string' },
+        evidence: { type: 'object' }
+      },
+      required: ['complete', 'nextCursor', 'catalogRevision', 'evidence'],
+      additionalProperties: false
     }
   }
 ];
@@ -36169,8 +36406,10 @@ function normalizeAssistantRuntimeConfig(runtimeConfig) {
       objectFlow: prompt.objectFlow,
       objectFlowSemantic: prompt.objectFlowSemantic,
       diagramSemantics: prompt.diagramSemantics,
+      diagramBindingIntent: prompt.diagramBindingIntent,
       diagramPlacement: prompt.diagramPlacement,
-      diagramConnections: prompt.diagramConnections
+      diagramConnections: prompt.diagramConnections,
+      diagramCritique: prompt.diagramCritique
     }
   };
 }
@@ -36179,6 +36418,22 @@ function mcpToolDefinitions(config) {
   const configured = config && config.mcp && Array.isArray(config.mcp.allowedTools) ? config.mcp.allowedTools : allMcpToolNames();
   const allowed = new Set(configured);
   return MCP_TOOL_DEFINITIONS.filter((tool) => allowed.has(tool.name));
+}
+
+function validateMcpToolArguments(name, args) {
+  const definition = MCP_TOOL_DEFINITIONS.find((tool) => tool.name === name);
+  if (!definition) return;
+  const schema = definition.inputSchema || {};
+  const allowed = new Set(Object.keys(schema.properties || {}));
+  const unknown = Object.keys(args || {}).filter((key) => !allowed.has(key));
+  const missing = (schema.required || []).filter((key) => !Object.prototype.hasOwnProperty.call(args || {}, key));
+  if (!unknown.length && !missing.length) return;
+  const error = new Error([
+    unknown.length ? `unsupported arguments: ${unknown.join(', ')}` : '',
+    missing.length ? `missing required arguments: ${missing.join(', ')}` : ''
+  ].filter(Boolean).join('; '));
+  error.code = 'mcp_tool_arguments_invalid';
+  throw error;
 }
 
 function mcpJsonRpcResult(id, result) {
@@ -36358,15 +36613,89 @@ function logLimitDiagnostics(event, base, limits) {
   });
 }
 
-function boundedMcpText(value, maxBytes) {
-  const text = JSON.stringify(value, null, 2);
-  const limit = Math.max(1024, Number(maxBytes || DEFAULT_ASSISTANT_MCP_MAX_CONTEXT_BYTES));
-  const bytes = Buffer.byteLength(text);
-  if (bytes <= limit) return { text, truncated: false, bytes, limit };
+function compactMcpValue(value, options = {}, depth = 0) {
+  const arrayLimit = Math.max(0, Number(options.arrayLimit || 0));
+  const stringLimit = Math.max(16, Number(options.stringLimit || 256));
+  if (typeof value === 'string') return truncateText(value, stringLimit);
+  if (value === null || typeof value !== 'object') return value;
+  if (depth >= 10) return Array.isArray(value) ? [] : {};
+  if (Array.isArray(value)) {
+    return value.slice(0, arrayLimit).map((item) => compactMcpValue(item, options, depth + 1));
+  }
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, compactMcpValue(item, options, depth + 1)]));
+}
+
+function mcpResultEnvelope(value, metadata) {
+  const payload = value && typeof value === 'object' && !Array.isArray(value)
+    ? { ...value }
+    : { items: Array.isArray(value) ? value : [value] };
   return {
-    text: text.slice(0, limit),
-    truncated: true,
+    ...payload,
+    complete: metadata.complete,
+    nextCursor: metadata.complete ? null : metadata.nextCursor,
+    catalogRevision: metadata.catalogRevision,
+    evidence: {
+      originalBytes: metadata.originalBytes,
+      returnedBytes: metadata.returnedBytes,
+      maxBytes: metadata.maxBytes
+    }
+  };
+}
+
+function boundedMcpText(value, maxBytes) {
+  const limit = Math.max(1024, Number(maxBytes || DEFAULT_ASSISTANT_MCP_MAX_CONTEXT_BYTES));
+  const originalText = JSON.stringify(value);
+  const bytes = Buffer.byteLength(originalText);
+  const catalogRevision = hashJson(value);
+  let arrayLimit = 256;
+  let stringLimit = 4096;
+  let compacted = value;
+  let envelope = mcpResultEnvelope(compacted, {
+    complete: true,
+    nextCursor: null,
+    catalogRevision,
+    originalBytes: bytes,
+    returnedBytes: 0,
+    maxBytes: limit
+  });
+  let text = JSON.stringify(envelope, null, 2);
+  while (Buffer.byteLength(text) > limit && (arrayLimit > 1 || stringLimit > 64)) {
+    arrayLimit = Math.max(1, Math.floor(arrayLimit / 2));
+    stringLimit = Math.max(64, Math.floor(stringLimit / 2));
+    compacted = compactMcpValue(value, { arrayLimit, stringLimit });
+    envelope = mcpResultEnvelope(compacted, {
+      complete: false,
+      nextCursor: `bounded:${arrayLimit}`,
+      catalogRevision,
+      originalBytes: bytes,
+      returnedBytes: 0,
+      maxBytes: limit
+    });
+    text = JSON.stringify(envelope, null, 2);
+  }
+  if (Buffer.byteLength(text) > limit) {
+    envelope = mcpResultEnvelope({}, {
+      complete: false,
+      nextCursor: 'bounded:0',
+      catalogRevision,
+      originalBytes: bytes,
+      returnedBytes: 0,
+      maxBytes: limit
+    });
+    text = JSON.stringify(envelope, null, 2);
+  }
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const returnedBytes = Buffer.byteLength(text);
+    if (envelope.evidence.returnedBytes === returnedBytes) break;
+    envelope.evidence.returnedBytes = returnedBytes;
+    text = JSON.stringify(envelope, null, 2);
+  }
+  return {
+    text,
+    value: envelope,
+    truncated: envelope.complete === false,
     bytes,
+    returnedBytes: envelope.evidence.returnedBytes,
     limit
   };
 }
@@ -36426,7 +36755,7 @@ function classNamesFromTemplateSpec(spec) {
       if (typeof value === 'string' && /^[A-Za-z][A-Za-z0-9_]*$/.test(value)) values.push(value);
     });
   });
-  return uniqueStrings(values).slice(0, 5);
+  return uniqueStrings(values);
 }
 
 async function mcpReadModelSummary(authToken, args, config) {
@@ -36473,12 +36802,16 @@ async function mcpReadModelSummary(authToken, args, config) {
     classes: classItems.filter((item) => item && item._can_read !== false).map((item) => ({
       name: item.name || '',
       description: item._description_translation || item.description || '',
+      alias: item.alias || '',
+      help: item._help_translation || item.help || '',
       parent: item.parent || '',
       canRead: item._can_read !== false
     })),
     domains: domainItems.map((item) => ({
       name: item.name || '',
       description: item._description_translation || item.description || '',
+      directDescription: item._descriptionDirect_translation || item.descriptionDirect || item.directDescription || '',
+      inverseDescription: item._descriptionInverse_translation || item.descriptionInverse || item.inverseDescription || '',
       source: item.source || '',
       destination: item.destination || '',
       cardinality: item.cardinality || ''
@@ -36494,12 +36827,18 @@ async function mcpReadClassFields(authToken, args) {
     className,
     attributes: attrs.attributes.map((item) => ({
       name: item.name || '',
-      description: item.description || '',
+      description: item._description_translation || item.description || '',
+      alias: item.alias || '',
+      help: item._help_translation || item.help || '',
+      helpAlwaysVisible: Boolean(item.helpAlwaysVisible),
       type: item.type || '',
       targetClass: item.targetClass || item.target || '',
       domain: item.domain || item.referenceDomainName || '',
       direction: item.direction || '',
       lookupType: item.lookupType || '',
+      declaringClass: item.className || item.owner || (item.inherited ? '' : className),
+      defaultValue: item.defaultValue ?? '',
+      validationRegexp: item.validationRegexp || item.validationRegex || '',
       mandatory: Boolean(item.mandatory),
       inherited: Boolean(item.inherited)
     }))
@@ -36559,13 +36898,19 @@ async function mcpReadRelationHints(authToken, args, config) {
     domains: filtered.map((item) => ({
       name: item.name || '',
       description: item._description_translation || item.description || '',
+      directDescription: item._descriptionDirect_translation || item.descriptionDirect || item.directDescription || '',
+      inverseDescription: item._descriptionInverse_translation || item.descriptionInverse || item.inverseDescription || '',
       source: item.source || '',
       destination: item.destination || '',
       sources: endpointClasses(item, 'source'),
       destinations: endpointClasses(item, 'destination'),
       disabledSourceDescendants: Array.isArray(item.disabledSourceDescendants) ? item.disabledSourceDescendants : [],
       disabledDestinationDescendants: Array.isArray(item.disabledDestinationDescendants) ? item.disabledDestinationDescendants : [],
-      cardinality: item.cardinality || ''
+      cardinality: item.cardinality || '',
+      orientation: {
+        sourceToDestination: 'source',
+        destinationToSource: 'destination'
+      }
     }))
   };
 }
@@ -36578,6 +36923,7 @@ async function callMcpTool(authToken, name, args, config) {
     error.code = 'mcp_tool_not_allowed';
     throw error;
   }
+  validateMcpToolArguments(name, args || {});
   if (name === 'cmdbuild_model_summary') return mcpReadModelSummary(authToken, args || {}, config);
   if (name === 'cmdbuild_class_fields') return mcpReadClassFields(authToken, args || {});
   if (name === 'cmdbuild_relation_hints') return mcpReadRelationHints(authToken, args || {}, config);
@@ -36626,9 +36972,10 @@ async function handleMcpJsonRpc(authToken, body, config) {
       }
       return mcpJsonRpcResult(id, {
         content: [{ type: 'text', text: bounded.text }],
-        structuredContent: bounded.truncated
-          ? { truncated: true, limits: limitDiagnostics.filter((item) => item.limitHit) }
-          : { ...result, limits: limitDiagnostics },
+        structuredContent: {
+          ...bounded.value,
+          limits: limitDiagnostics.filter((item) => item.limitHit)
+        },
         isError: false
       });
     } catch (error) {
@@ -36699,6 +37046,8 @@ function assistantObjectFlowMcpPayload(results, diagnostics) {
     .map((item) => ({
       name: String(item && item.name || ''),
       description: String(item && item.description || ''),
+      alias: String(item && item.alias || ''),
+      help: String(item && item.help || ''),
       parent: String(item && item.parent || '')
     }));
   const selectedFields = (classFields && Array.isArray(classFields) ? classFields : [])
@@ -36858,6 +37207,21 @@ async function buildAssistantMcpContext(authToken, body, runtimeConfig) {
     diagnostics.confirmedClassNames = confirmedClassNames;
     classNames = uniqueStrings(classNames.concat(candidates.map((item) => item.name), confirmedClassNames));
   }
+  if (classNames.length > config.mcp.maxClasses) {
+    addAssistantLimitDiagnostics(diagnostics.limits, [assistantLimitDiagnostic({
+      source: 'assistant',
+      tool: 'cmdbuild_class_fields',
+      limitName: 'maxClasses',
+      configuredLimit: config.mcp.maxClasses,
+      effectiveLimit: config.mcp.maxClasses,
+      requested: classNames.length,
+      limit: config.mcp.maxClasses,
+      returned: config.mcp.maxClasses,
+      limitHit: true,
+      reason: 'resolved-class-context'
+    })]);
+    classNames = classNames.slice(0, config.mcp.maxClasses);
+  }
   if (toolSet.has('cmdbuild_class_fields')) {
     handledTools.add('cmdbuild_class_fields');
     if (classNames.length) {
@@ -36998,9 +37362,11 @@ function assistantMessages(body, mcpContext, runtimeConfig) {
     objectFlow: 'objectFlow',
     diagramInterpretation: 'diagramSemantics',
     diagramSemantics: 'diagramSemantics',
+    diagramBindingIntent: 'diagramBindingIntent',
     diagramMapping: 'diagramPlacement',
     diagramPlacement: 'diagramPlacement',
-    diagramConnections: 'diagramConnections'
+    diagramConnections: 'diagramConnections',
+    diagramCritique: 'diagramCritique'
   }[String(body && body.assistantTask || '')];
   const taskSystemPrompt = taskPromptKey ? String(assistantConfig.prompt[taskPromptKey] || '').trim() : '';
   const system = [
@@ -37203,6 +37569,8 @@ function assistantExactDescriptionFiltersFromText(value) {
 function assistantClassTextScore(classItem, terms) {
   const name = normalizedAssistantLookupText(classItem && classItem.name);
   const description = normalizedAssistantLookupText(classItem && classItem.description);
+  const alias = normalizedAssistantLookupText(classItem && classItem.alias);
+  const help = normalizedAssistantLookupText(classItem && classItem.help);
   const parent = normalizedAssistantLookupText(classItem && classItem.parent);
   if (!name) return { score: 0, matchedTerms: [] };
   const transliteration = {
@@ -37240,6 +37608,17 @@ function assistantClassTextScore(classItem, terms) {
       score += 7;
       matched = true;
     }
+    if (alias && termVariants.includes(alias)) {
+      score += 20;
+      matched = true;
+    } else if (!shortTerm && alias && termVariants.some((value) => alias.includes(value))) {
+      score += 9;
+      matched = true;
+    }
+    if (!shortTerm && help && termVariants.some((value) => help.includes(value))) {
+      score += 5;
+      matched = true;
+    }
     if (!shortTerm && parent && termVariants.some((value) => parent === value || parent.includes(value))) {
       score += 3;
       matched = true;
@@ -37256,12 +37635,16 @@ function assistantCandidateClassesFromSummary(summary, terms, limit = 8) {
       const name = String(item && (item.name || item.code || item.className) || '').trim();
       if (!isCmdbuildIdentifierText(name)) return null;
       const description = String(item && (item.description || item._description_translation || '') || '').trim();
+      const alias = String(item && item.alias || '').trim();
+      const help = String(item && item.help || '').trim();
       const parent = String(item && item.parent || '').trim();
-      const scored = assistantClassTextScore({ name, description, parent }, terms);
+      const scored = assistantClassTextScore({ name, description, alias, help, parent }, terms);
       if (!scored.score) return null;
       return {
         name,
         description,
+        alias,
+        help,
         parent,
         score: scored.score,
         matchedTerms: scored.matchedTerms
@@ -37278,6 +37661,8 @@ function assistantExactClassCandidatesFromSummary(summary, mentions) {
     const matches = classes.filter((item) => assistantClassTextScore({
       name: item && item.name,
       description: item && item.description,
+      alias: item && item.alias,
+      help: item && item.help,
       parent: item && item.parent
     }, [mention]).score >= 20);
     return matches.length === 1 ? [String(matches[0] && matches[0].name || '').trim()] : [];
@@ -38819,10 +39204,9 @@ function assistantObjectFlowIntentPlanningText(intent) {
       `Выборка ${index + 1}`,
       `Позиция в редакторе: ${index + 1}`,
       `Название результата: ${block.name}`,
-      `Сущности и входные условия: ${block.entities}`,
       block.uses.length ? `Использует результаты блоков: ${block.uses.join(', ')}` : '',
-      `Алгоритм: ${block.algorithm}`,
-      `Ожидаемый результат: ${block.expectedResult}`
+      `Описание результата и алгоритма: ${block.description}`,
+      `Ожидаемый тип строк: ${block.resultKind === 'auto' ? 'определить из описания' : block.resultKind}`
     ].filter(Boolean).join('\n'))
   ].filter(Boolean).join('\n\n');
 }
@@ -38832,7 +39216,7 @@ function assistantObjectFlowSemanticMessages(intent, currentSpec, mcpContext, ru
   const system = [
     'Return exactly one JSON object: {"version":1,"blocks":[{"id":"...","name":"...","summary":"...","resolvedEntities":["..."],"relationPaths":["..."],"dependencies":["..."],"expectedResult":"...","resultContract":{"outputKind":"sourceCards|relationPairs|unresolved","outputClass":"...","pair":{"mode":"domain|match","fromBlockId":"...","fromClass":"...","withBlockId":"...","withClass":"...","domain":"...","direction":"source|destination","rules":[{"leftColumn":"...","rightColumn":"...","operator":"..."}]},"candidateFilter":null,"dependencyPaths":[{"comparisonBlockId":"...","sourceClass":"...","domain":"...","direction":"source|destination","targetClass":"..."}],"relationPredicates":[{"sourceClass":"...","relatedClass":"...","comparisonBlockId":"...","comparisonClass":"...","domain":"...","direction":"source|destination","comparisonFields":["..."],"relatedField":"...","operator":"..."}],"attributePredicates":[{"sourceClass":"...","comparisonBlockId":"...","comparisonClass":"...","sourceFields":["..."],"comparisonField":"...","operator":"..."}],"referencePathPredicates":[{"sourceClass":"...","comparisonBlockId":"...","comparisonClass":"...","sourcePath":["referenceAttribute","terminalAttribute"],"comparisonField":"...","operator":"..."}]},"warnings":[]}],"explanation":"...","warnings":[]}.',
     'Return no markdown, Object Flow, DSL, aliases, Spec JSON, D2 source, save, publish, or execution action.',
-    'Return every supplied block exactly once with the same id, name, dependency ids, and expected result. The order of blocks in the editor is visual only: a dependency may point to a block displayed later. Preserve all dependency ids and derive execution order from the dependency graph, not the visual order. resolvedEntities and relationPaths must contain only identifiers or paths confirmed by supplied MCP context. outputKind sourceCards means the expected result contains only outputClass cards. outputKind relationPairs requires pair and no outputClass: fromBlockId and withBlockId must be two different dependency ids explicitly selected for this block, and their classes must be copied from those dependency result contracts. For pair.mode=domain choose only one exact confirmed domain transition and leave rules empty. For pair.mode=match leave domain and direction empty and return explicit field rules. Never create a broad class selection as a missing endpoint. For sourceCards, dependencyPaths is the only representation of a direct CMDBuild traversal from a dependency result to outputClass: its comparisonBlockId must be a dependency, sourceClass is the class produced by that dependency, and targetClass equals outputClass. Do not use relationPredicates for such a traversal. Create a relationPredicates item only when retaining outputClass requires traversing a confirmed CMDBuild domain to relatedClass and comparing that related card with a different block result; every relationPredicate must contain non-empty comparisonFields, relatedField, and operator. Create an attributePredicates item when outputClass cards are compared directly with attributes of a different block result; attributePredicates never has domain or direction. Every predicate comparisonBlockId must exactly equal one of that block dependencies. If dependencies is empty, dependencyPaths, relationPredicates and attributePredicates must all be exactly []; a CMDBuild path from an input parameter or an anchor card belongs to the block selection and relationPaths, never to a contract predicate. A block with no dependencies must return sourceCards with all three arrays empty or unresolved with a warning. If a user-written domain does not connect the source and target classes, use the unique matching MCP path and add a warning; if no unique path exists, return unresolved. If the expected result granularity is ambiguous, use outputKind unresolved, leave outputClass and contract arrays empty, and add a warning. Use warnings instead of inventing identifiers.',
+    'Return every supplied block exactly once with the same id, name, dependency ids, and expected result. When a block declares resultKind sourceCards or relationPairs, use that exact outputKind or return unresolved with a specific warning; resultKind auto is inferred from the description. The order of blocks in the editor is visual only: a dependency may point to a block displayed later. Preserve all dependency ids and derive execution order from the dependency graph, not the visual order. resolvedEntities and relationPaths must contain only identifiers or paths confirmed by supplied MCP context. outputKind sourceCards means the expected result contains only outputClass cards. outputKind relationPairs requires pair and no outputClass: fromBlockId and withBlockId must be two different dependency ids explicitly selected for this block, and their classes must be copied from those dependency result contracts. For pair.mode=domain choose only one exact confirmed domain transition and leave rules empty. For pair.mode=match leave domain and direction empty and return explicit field rules. Never create a broad class selection as a missing endpoint. For sourceCards, dependencyPaths is the only representation of a direct CMDBuild traversal from a dependency result to outputClass: its comparisonBlockId must be a dependency, sourceClass is the class produced by that dependency, and targetClass equals outputClass. Do not use relationPredicates for such a traversal. Create a relationPredicates item only when retaining outputClass requires traversing a confirmed CMDBuild domain to relatedClass and comparing that related card with a different block result; every relationPredicate must contain non-empty comparisonFields, relatedField, and operator. Create an attributePredicates item when outputClass cards are compared directly with attributes of a different block result; attributePredicates never has domain or direction. Every predicate comparisonBlockId must exactly equal one of that block dependencies. If dependencies is empty, dependencyPaths, relationPredicates and attributePredicates must all be exactly []; a CMDBuild path from an input parameter or an anchor card belongs to the block selection and relationPaths, never to a contract predicate. A block with no dependencies must return sourceCards with all three arrays empty or unresolved with a warning. If a user-written domain does not connect the source and target classes, use the unique matching MCP path and add a warning; if no unique path exists, return unresolved. If the expected result granularity is ambiguous, use outputKind unresolved, leave outputClass and contract arrays empty, and add a warning. Use warnings instead of inventing identifiers.',
     'The expected result controls outputClass. When the expected result asks for class A cards, outputClass must be A; a helper class B used only for a relation hop or field comparison must not replace it. When retaining A requires traversing to B and comparing B with dependency result C, use relationPredicate with outputClass A, relatedClass B, and comparisonClass C. Do not encode that as dependencyPath C to B.',
     'An IPv4 condition that an address belongs to a network, CIDR, or range is compiled only by the deterministic Object Flow layer. In this semantic response keep the business dependency, output class and expected result, leave candidateFilter null, and do not validate IPv4 fields, reference paths, operators or predicates or return unresolved because of an IPv4 condition. A user-supplied dotted reference path is resolved later from MCP schema by the deterministic compiler. If a block retains cards from an earlier block and compares them with data reached from another selected result or from an explicit parameterized anchor selection, the deterministic layer builds a left-preserving candidateFilter; do not invent a domain from the retained class to the comparison class. Never convert an IPv4 comparison into dependencyPaths or make a network superclass the outputClass.'
   ].join('\n');
@@ -39882,7 +40266,7 @@ function assistantMcpFieldMatches(fields, value, options = {}) {
   return (fields || []).filter((field) => {
     if (!field || !field.name) return false;
     if (requireReference !== undefined && (String(field.type || '').toLowerCase() === 'reference') !== requireReference) return false;
-    return [field.name, field.description, field.code]
+    return [field.name, field.description, field.code, field.alias, field.help]
       .map((item) => normalizedAssistantLookupText(item))
       .some((candidate) => candidate && candidate === normalized);
   });
@@ -39896,7 +40280,7 @@ function assistantMcpPreferredFieldMatches(fields, value, options = {}) {
     field && field.name
     && (requireReference === undefined || (String(field.type || '').toLowerCase() === 'reference') === requireReference)
   ));
-  for (const key of ['name', 'description', 'code']) {
+  for (const key of ['name', 'description', 'code', 'alias', 'help']) {
     const matches = candidates.filter((field) => normalizedAssistantLookupText(field[key]) === normalized);
     if (matches.length) return matches;
   }
@@ -40582,6 +40966,18 @@ function normalizeAssistantObjectFlowSemanticPlan(value, intent, options = {}) {
         maxReferencePathDepth: options.maxReferencePathDepth,
         warnings: normalizationWarnings
       });
+      if (block.resultKind !== 'auto' && resultContract.outputKind !== 'unresolved' && resultContract.outputKind !== block.resultKind) {
+        throw assistantSemanticPlanError(
+          `Semantic plan block ${block.name} must use the row type selected by the user: ${block.resultKind}.`,
+          {
+            kind: 'semanticPlanResultKindMismatch',
+            blockId: block.id,
+            blockName: block.name,
+            expectedOutputKind: block.resultKind,
+            receivedOutputKind: resultContract.outputKind
+          }
+        );
+      }
       return {
         id: block.id,
         name: block.name,
@@ -42292,7 +42688,8 @@ function assistantOutputBindingMetadata(flow, intent, bindings) {
         alias: output.alias,
         label: direct.name,
         assistantBlockId: direct.id,
-        assistantBlockIds: [direct.id]
+        assistantBlockIds: [direct.id],
+        assistantStageRole: 'terminal'
       };
     }
     const stageOwners = owners(output.alias);
@@ -42309,7 +42706,8 @@ function assistantOutputBindingMetadata(flow, intent, bindings) {
       alias: output.alias,
       label: `${resolvedOwners.map((block) => block.name).join(' / ')}: ${stageLabels[output.kind] || 'Этап'} ${ordinal}`,
       assistantBlockId: ownerIds[0],
-      assistantBlockIds: ownerIds
+      assistantBlockIds: ownerIds,
+      assistantStageRole: 'helper'
     };
   }).filter(Boolean);
   return { metadata, errors };
@@ -45099,6 +45497,11 @@ function assistantDiagramTopologyRequirements(relationRules, roles, mappings = [
       label: String(stage.label || stage.name || stage.alias || stage.id || ''),
       className: String(stage.className || ''),
       kind: String(stage.kind || ''),
+      stageRole: String(stage.stageRole || 'helper'),
+      businessBlockIds: uniqueStrings(Array.isArray(stage.assistantBlockIds) ? stage.assistantBlockIds.map(String) : []),
+      outputKind: String(stage.outputKind || 'sourceCards'),
+      rowGrain: String(stage.rowGrain || 'card'),
+      mode: 'attributeEndpoints',
       stage,
       sourceField,
       targetField,
@@ -45118,6 +45521,11 @@ function assistantDiagramTopologyRequirements(relationRules, roles, mappings = [
       label: String(stage.label || stage.name || stage.alias || stage.id || ''),
       className: String(stage.className || ''),
       kind: String(stage.kind || ''),
+      stageRole: String(stage.stageRole || 'helper'),
+      businessBlockIds: uniqueStrings(Array.isArray(stage.assistantBlockIds) ? stage.assistantBlockIds.map(String) : []),
+      outputKind: String(stage.outputKind || 'sourceCards'),
+      rowGrain: String(stage.rowGrain || 'card'),
+      mode: 'relationCard',
       sourceClass: String(connection && connection.fromClass || ''),
       targetClass: String(connection && connection.withClass || ''),
       sourceField,
@@ -45133,6 +45541,11 @@ function assistantDiagramTopologyRequirements(relationRules, roles, mappings = [
       sourceStageId: String(stage.id || ''),
       label: String(stage.label || stage.name || stage.alias || stage.id || ''),
       className: String(stage.className || ''),
+      stageRole: String(stage.stageRole || 'helper'),
+      businessBlockIds: uniqueStrings(Array.isArray(stage.assistantBlockIds) ? stage.assistantBlockIds.map(String) : []),
+      outputKind: String(stage.outputKind || 'sourceCards'),
+      rowGrain: String(stage.rowGrain || 'card'),
+      mode: 'deterministicEndpoints',
       fields: columns,
       sourceClass: String(stage && stage.connection && stage.connection.fromClass || ''),
       targetClass: String(stage && stage.connection && stage.connection.withClass || ''),
@@ -45176,6 +45589,7 @@ function assistantDiagramTopologyRequirements(relationRules, roles, mappings = [
       d2ClassKeys: Array.isArray(rule.d2ClassKeys) ? rule.d2ClassKeys.map(String) : [],
       connectionNotes: truncateText(String(rule.d2Notes || ''), 8000),
       notes: truncateText(String(rule.d2Notes || ''), 8000),
+      directives: assistantDiagramNotesDirectives(rule.d2Notes || ''),
       exampleLabels: Array.isArray(rule.d2ExampleLabels) ? rule.d2ExampleLabels.map(String) : [String(rule.d2Label || '')].filter(Boolean),
       label: String(rule.d2Label || rule.d2ElementKey),
       directionPolicy: normalizeDiagramDirectionPolicy(rule.directionPolicy),
@@ -45245,6 +45659,16 @@ function assistantDiagramPlacementTargets(proposal, stages = [], catalog = null)
     const visualKind = diagramImportRoleVisualKind(role);
     const roleNotes = truncateText(String(role.notes || ''), 8000);
     const placementNotes = truncateText(String((elementByKey.get(String(item && item.templateElementKey || '')) || {}).notes || ''), 8000);
+    const roleDirectives = assistantDiagramNotesDirectives(roleNotes);
+    const placementDirectives = assistantDiagramNotesDirectives(placementNotes);
+    const directives = {
+      ...roleDirectives,
+      ...placementDirectives,
+      'required-condition': uniqueStrings([].concat(roleDirectives['required-condition'] || [], placementDirectives['required-condition'] || [])),
+      'required-membership': uniqueStrings([].concat(roleDirectives['required-membership'] || [], placementDirectives['required-membership'] || [])),
+      'endpoint-field': uniqueStrings([].concat(roleDirectives['endpoint-field'] || [], placementDirectives['endpoint-field'] || [])),
+      'endpoint-operator': uniqueStrings([].concat(roleDirectives['endpoint-operator'] || [], placementDirectives['endpoint-operator'] || []))
+    };
     const templateStatic = item && item.templateStatic === true || role && role.templateStatic === true;
     const materialization = assistantDiagramPlacementMaterialization(roleNotes, placementNotes, visualKind, templateStatic);
     return {
@@ -45259,6 +45683,7 @@ function assistantDiagramPlacementTargets(proposal, stages = [], catalog = null)
       roleNotes,
       placementNotes,
       notes: uniqueStrings([roleNotes, placementNotes]).join('\n\n'),
+      directives,
       materializationHint: materialization.hint,
       allowedMaterialization: materialization.allowed,
       materializationError: materialization.invalidHint ? {
@@ -45291,6 +45716,56 @@ function assistantDiagramPlacementTargets(proposal, stages = [], catalog = null)
   }));
 }
 
+function assistantDiagramDirectiveValues(directives, key) {
+  const value = directives && directives[key];
+  return uniqueStrings((Array.isArray(value) ? value : value ? [value] : [])
+    .map((item) => String(item || '').trim())
+    .filter(Boolean));
+}
+
+function assistantDiagramEndpointProfilesFromBindings(input, items) {
+  const mappedItems = Array.isArray(items) ? items : [];
+  const mappedItemIds = new Set(mappedItems.map((item) => String(item && item.structureItemId || '')).filter(Boolean));
+  const placementById = new Map((Array.isArray(input && input.placements) ? input.placements : [])
+    .map((placement) => [String(placement && placement.structureItemId || ''), placement])
+    .filter(([itemId]) => itemId));
+  const existing = diagramImportEndpointProfiles(
+    input && input.endpointProfiles !== undefined
+      ? input.endpointProfiles
+      : input && input.proposal && input.proposal.endpointProfiles
+  ).filter((profile) => mappedItemIds.has(String(profile && profile.structureItemId || '')));
+  const profilesByPlacementField = new Map(existing.map((profile) => [
+    `${String(profile.structureItemId || '')}\u0000${String(profile.field || '')}`,
+    profile
+  ]));
+  for (const item of mappedItems) {
+    const structureItemId = String(item && item.structureItemId || '');
+    const target = placementById.get(structureItemId) || {};
+    const directives = target.directives || {};
+    const fields = assistantDiagramDirectiveValues(directives, 'endpoint-field');
+    const operators = assistantDiagramDirectiveValues(directives, 'endpoint-operator')
+      .filter((operator) => DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(operator));
+    if (!fields.length || !operators.length) continue;
+    const mapping = item && item.mapping && typeof item.mapping === 'object' ? item.mapping : {};
+    const source = normalizeDiagramImportConditionCardSource(mapping && mapping.primary && mapping.primary.cardSource);
+    if (!source) continue;
+    for (const field of fields) {
+      profilesByPlacementField.set(`${structureItemId}\u0000${field}`, {
+        id: diagramImportStableId('assistant_endpoint_profile', `${structureItemId}:${source.className}:${field}`),
+        structureItemId,
+        roleId: String(item && item.roleId || target.roleId || ''),
+        label: '',
+        stageId: '',
+        field,
+        source,
+        valueKind: operators.some((operator) => /^ipv4/i.test(operator)) ? 'ipv4' : 'scalar',
+        operators
+      });
+    }
+  }
+  return diagramImportEndpointProfiles(Array.from(profilesByPlacementField.values()));
+}
+
 function assistantVersionedModel(kind, version, payload = {}) {
   const normalizedPayload = cloneJsonValueServer(payload, {});
   const modelHash = hashJson({ kind, version, payload: normalizedPayload });
@@ -45303,6 +45778,135 @@ function assistantRightExpressionKind(value) {
   if (/\$\{previous\.[^}]+\}/.test(expression)) return 'previous';
   if (/\$\{param\.[^}]+\}/.test(expression)) return 'parameter';
   return 'literal';
+}
+
+function assistantDiagramNotesDirectives(notes) {
+  const supported = new Set([
+    'binding-result',
+    'stage-policy',
+    'row-grain',
+    'membership',
+    'required-condition',
+    'required-membership',
+    'endpoint-mode',
+    'endpoint-field',
+    'endpoint-operator',
+    'source-field',
+    'source-operator',
+    'target-field',
+    'target-operator',
+    'exemplars'
+  ]);
+  const repeated = new Set([
+    'required-condition',
+    'required-membership',
+    'endpoint-field',
+    'endpoint-operator'
+  ]);
+  const directives = {};
+  for (const line of String(notes || '').split(/\r?\n/)) {
+    const match = /^\s*([a-z][a-z-]*)\s*:\s*(.*?)\s*$/i.exec(line);
+    if (!match) continue;
+    const key = String(match[1] || '').toLowerCase();
+    const value = String(match[2] || '').trim();
+    if (!supported.has(key) || !value) continue;
+    if (repeated.has(key)) {
+      if (!Array.isArray(directives[key])) directives[key] = [];
+      directives[key].push(value);
+    } else {
+      directives[key] = value;
+    }
+  }
+  return directives;
+}
+
+function assistantDiagramNotesHasNaturalLanguage(notes) {
+  const supported = new Set([
+    'binding-result', 'stage-policy', 'row-grain', 'membership', 'required-condition',
+    'required-membership', 'endpoint-mode', 'endpoint-field', 'endpoint-operator',
+    'source-field', 'source-operator', 'target-field', 'target-operator', 'exemplars'
+  ]);
+  return String(notes || '').split(/\r?\n/).some((line) => {
+    const text = String(line || '').trim();
+    if (!text || text === '|' || /^notes\s*:/i.test(text) || /^```/.test(text)) return false;
+    const directive = /^([a-z][a-z-]*)\s*:/i.exec(text);
+    return !directive || !supported.has(String(directive[1] || '').toLowerCase());
+  });
+}
+
+function assistantObjectFlowBusinessBlockManifest(spec, stages = []) {
+  const authoring = templateAuthoring(spec);
+  const intent = authoring && authoring.assistant && authoring.assistant.objectFlowIntent && typeof authoring.assistant.objectFlowIntent === 'object'
+    ? authoring.assistant.objectFlowIntent
+    : {};
+  const blocks = Array.isArray(intent.blocks) ? intent.blocks : [];
+  const stageList = Array.isArray(stages) ? stages : [];
+  const stagesByBlockId = new Map();
+  for (const stage of stageList) {
+    for (const blockId of Array.isArray(stage && stage.assistantBlockIds) ? stage.assistantBlockIds : []) {
+      const id = String(blockId || '').trim();
+      if (!id) continue;
+      const values = stagesByBlockId.get(id) || [];
+      values.push(stage);
+      stagesByBlockId.set(id, values);
+    }
+  }
+  return assistantVersionedModel('BusinessBlockManifest', ASSISTANT_BUSINESS_BLOCK_MANIFEST_VERSION, {
+    context: truncateText(String(intent.context || ''), 6000),
+    blocks: blocks.map((block, order) => {
+      const blockId = String(block && block.id || '').trim();
+      const ownedStages = stagesByBlockId.get(blockId) || [];
+      const terminalStages = ownedStages.filter((stage) => String(stage && stage.stageRole || '') === 'terminal');
+      const declaredTerminalStages = ownedStages.filter((stage) => String(stage && stage.declaredStageRole || '') === 'terminal');
+      const hasDeclaredRoles = ownedStages.some((stage) => ['terminal', 'helper'].includes(String(stage && stage.declaredStageRole || '')));
+      const terminalCandidates = hasDeclaredRoles ? declaredTerminalStages : terminalStages;
+      const terminal = terminalStages.length === 1 ? terminalStages[0] : null;
+      const outputKind = String(terminal && terminal.outputKind || '');
+      const terminalContract = terminal ? {
+        stageId: String(terminal.id || ''),
+        alias: String(terminal.alias || ''),
+        className: String(terminal.className || ''),
+        outputKind,
+        rowGrain: String(terminal.rowGrain || (outputKind === 'relationPairs' ? 'pair' : 'card')),
+        from: String(terminal.from || ''),
+        with: String(terminal.with || ''),
+        operation: String(terminal.operation || terminal.type || terminal.kind || ''),
+        domain: String(terminal.domain || ''),
+        direction: String(terminal.direction || ''),
+        rules: (Array.isArray(terminal.rules) ? terminal.rules : []).map(assistantDataSemanticRule),
+        lineageAliases: uniqueStrings(Array.isArray(terminal.lineageAliases) ? terminal.lineageAliases.map(String) : [])
+      } : null;
+      return {
+        id: blockId,
+        name: truncateText(String(block && block.name || blockId), 240),
+        order,
+        status: terminalStages.length === 1 ? 'ready' : terminalCandidates.length > 1 ? 'ambiguous' : 'missing',
+        uses: uniqueStrings(Array.isArray(block && block.uses) ? block.uses.map(String) : []),
+        description: truncateText(assistantObjectFlowBlockDescription(block), 12_000),
+        resultKind: normalizeAssistantObjectFlowResultKind(block && block.resultKind),
+        terminalAlias: String(terminal && terminal.alias || ''),
+        terminalStageId: String(terminal && terminal.id || ''),
+        terminalContractHash: terminalContract ? hashJson(terminalContract) : '',
+        terminalContract,
+        terminalCandidateStageIds: terminalCandidates.map((stage) => String(stage && stage.id || '')).filter(Boolean),
+        helperStageIds: ownedStages.filter((stage) => (
+          hasDeclaredRoles
+            ? String(stage && stage.declaredStageRole || '') === 'helper'
+            : String(stage && stage.stageRole || '') === 'helper'
+        )).map((stage) => String(stage && stage.id || '')).filter(Boolean),
+        outputKind,
+        primaryClass: String(terminal && terminal.className || ''),
+        rowGrain: String(terminal && terminal.rowGrain || (outputKind === 'relationPairs' ? 'pair' : 'card')),
+        terminalFields: uniqueStrings(Array.isArray(terminal && terminal.columns) ? terminal.columns.map(String) : []),
+        terminalCardSources: (Array.isArray(terminal && terminal.cardSources) ? terminal.cardSources : []).map((source) => ({
+          id: String(source && source.id || ''),
+          className: String(source && source.className || ''),
+          classColumn: String(source && source.classColumn || ''),
+          idColumn: String(source && source.idColumn || '')
+        }))
+      };
+    }).filter((block) => block.id)
+  });
 }
 
 function assistantDataSemanticRule(rule = {}) {
@@ -45340,6 +45944,9 @@ function assistantDataSemanticModel(stages = [], catalog = {}) {
         from: String(stage && stage.from || ''),
         with: String(stage && stage.with || ''),
         operation: String(stage && (stage.operation || stage.type) || ''),
+        stageRole: String(stage && stage.stageRole || 'helper'),
+        outputKind: String(stage && stage.outputKind || 'sourceCards'),
+        rowGrain: String(stage && stage.rowGrain || 'card'),
         domain: String(stage && stage.domain || ''),
         direction: String(stage && stage.direction || ''),
         targetClass: String(stage && stage.targetClass || ''),
@@ -45443,6 +46050,64 @@ function assistantD2BindingModel(items = [], relationRules = []) {
   });
 }
 
+function assistantD2BindingIntentModel(intent = {}) {
+  const source = intent && typeof intent === 'object' && !Array.isArray(intent) ? intent : {};
+  return assistantVersionedModel('D2BindingIntent', ASSISTANT_D2_BINDING_INTENT_VERSION, {
+    placements: (Array.isArray(source.placements) ? source.placements : []).map((item) => ({
+      structureItemId: String(item && item.structureItemId || ''),
+      materializationIntent: String(item && item.materializationIntent || ''),
+      businessBlockId: String(item && item.businessBlockId || ''),
+      stagePolicy: String(item && item.stagePolicy || 'terminal-only'),
+      membership: String(item && item.membership || ''),
+      requiredConditions: uniqueStrings(Array.isArray(item && item.requiredConditions) ? item.requiredConditions.map(String) : []),
+      requiredMembership: uniqueStrings(Array.isArray(item && item.requiredMembership) ? item.requiredMembership.map(String) : []),
+      endpointFields: uniqueStrings(Array.isArray(item && item.endpointFields) ? item.endpointFields.map(String) : []),
+      endpointOperators: uniqueStrings(Array.isArray(item && item.endpointOperators) ? item.endpointOperators.map(String) : [])
+    })).filter((item) => item.structureItemId),
+    connections: (Array.isArray(source.connections) ? source.connections : []).map((item) => ({
+      d2ClassKey: String(item && item.d2ClassKey || ''),
+      businessBlockId: String(item && item.businessBlockId || ''),
+      stagePolicy: String(item && item.stagePolicy || 'terminal-only'),
+      rowGrain: String(item && item.rowGrain || ''),
+      endpointMode: String(item && item.endpointMode || ''),
+      sourceField: String(item && item.sourceField || ''),
+      sourceOperator: String(item && item.sourceOperator || ''),
+      targetField: String(item && item.targetField || ''),
+      targetOperator: String(item && item.targetOperator || '')
+    })).filter((item) => item.d2ClassKey),
+    unresolved: cloneJsonValueServer(source.unresolved || [], [])
+  });
+}
+
+function assistantSemanticObligationModel(matrix = {}) {
+  const source = matrix && typeof matrix === 'object' && !Array.isArray(matrix) ? matrix : {};
+  const obligations = (Array.isArray(source.obligations) ? source.obligations : []).map((item) => ({
+    id: String(item && item.id || ''),
+    family: String(item && item.family || ''),
+    targetId: String(item && item.targetId || ''),
+    targetPhase: String(item && item.targetPhase || ''),
+    status: String(item && item.status || ''),
+    requirement: truncateText(String(item && item.requirement || ''), 1000),
+    evidence: truncateText(String(item && item.evidence || ''), 1000)
+  })).filter((item) => item.id);
+  return assistantVersionedModel('SemanticObligationMatrix', ASSISTANT_SEMANTIC_OBLIGATION_MODEL_VERSION, {
+    status: obligations.some((item) => item.status !== 'satisfied') ? 'incomplete' : 'satisfied',
+    obligations
+  });
+}
+
+function assistantD2CritiqueModel(critique = {}) {
+  const source = critique && typeof critique === 'object' && !Array.isArray(critique) ? critique : {};
+  return assistantVersionedModel('D2MappingCritique', ASSISTANT_D2_CRITIQUE_MODEL_VERSION, {
+    approved: source.approved === true,
+    violations: (Array.isArray(source.violations) ? source.violations : []).map((item) => ({
+      obligationId: String(item && item.obligationId || ''),
+      targetPhase: String(item && item.targetPhase || ''),
+      message: truncateText(String(item && item.message || ''), 1000)
+    })).filter((item) => item.obligationId)
+  });
+}
+
 function assistantCoverageModel(mapping = {}) {
   const source = mapping && typeof mapping === 'object' && !Array.isArray(mapping) ? mapping : {};
   return assistantVersionedModel('CoverageModel', ASSISTANT_COVERAGE_MODEL_VERSION, {
@@ -45472,6 +46137,818 @@ function assistantDiagramModelBundle(input = {}, draft = {}, mapping = null) {
   return bundle;
 }
 
+function assistantDiagramBindingIntentMessages(input, runtimeConfig) {
+  const assistantConfig = normalizeAssistantRuntimeConfig(runtimeConfig || defaultRuntimeConfig());
+  const contract = '{"placementBindings":[{"structureItemId":"<exact placement id>","materializationIntent":"structural|stage|parentCard","businessBlockId":"<exact block id, required only for stage>","membership":"|structural|same-parent-card|compare","requiredConditions":["<field> <operator> <literal or ${param.name}>"],"requiredMembership":["<child field> <operator> parent.<field>"],"endpointFields":["<exact field path>"],"endpointOperators":["<supported operator>"]}],"connectionBindings":[{"d2ClassKey":"<exact connection class>","businessBlockId":"<exact block id>","rowGrain":"card|pair","endpointMode":"attributeEndpoints|relationCard|deterministicEndpoints","sourceField":"<exact field>","sourceOperator":"<supported operator>","targetField":"<exact field>","targetOperator":"<supported operator>"}],"unresolved":[{"targetType":"placement|connection","targetId":"<exact id>","reason":"noCompatibleBlock|ambiguousBlock","message":"..."}],"explanation":"...","warnings":[]}';
+  const system = [
+    'You are a D2 diagram binding-intent assistant.',
+    `Return exactly one JSON object matching this contract: ${contract}`,
+    'Choose only user-facing business block ids. Never return Object Flow stage ids, aliases, runtime Spec, D2 source or extra fields. Exact fields and operators may be returned only when they are required by natural-language Notes and are present in the terminal contract or supplied data model.',
+    'Every dynamic placement must occur exactly once in placementBindings or unresolved. Every supplied connection class must occur exactly once in connectionBindings or unresolved.',
+    'materializationIntent must be one supplied allowedMaterialization value. structural and parentCard have no independent businessBlockId. stage requires one exact businessBlockId.',
+    'When a placement supplies fixedMaterializationIntent or requiredBusinessBlockId, copy that exact value. When a connection supplies requiredBusinessBlockId, copy that exact value. These values are deterministic constraints, not choices.',
+    'Exact binding-result in Placement or Connection Notes is authoritative. Otherwise use the template placement and connection prompts plus business block name, algorithm, expected result, primary class and row grain.',
+    'A named block means its terminal result. Helper stages are not visible in this phase. Do not infer a broad source block when a filtered business result exists.',
+    'Translate natural-language Notes into typed obligations. requiredConditions describe branch filters, requiredMembership describes child-to-parent membership, and endpoint fields/operators describe how connection endpoints are compared. Leave an optional obligation empty when Notes do not require it. Never invent an obligation from exemplar labels or D2 nesting alone.',
+    'Do not save, publish, execute or mutate the template.',
+    input.correction && Array.isArray(input.correction.invalidBindingIntent) && input.correction.invalidBindingIntent.length
+      ? 'The previous response was rejected. Return a complete replacement and correct exactly these validation errors: ' + JSON.stringify(input.correction.invalidBindingIntent)
+      : ''
+  ].filter(Boolean).join('\n');
+  const taskPrompt = String(assistantConfig.prompt.diagramBindingIntent || '').trim();
+  const user = JSON.stringify({
+    prompt: truncateText(String(input.prompt || ''), 6000),
+    models: {
+      businessBlockManifest: input.businessBlockManifest,
+      d2StructuralModel: input.d2StructuralModel,
+      d2SemanticModel: input.d2SemanticModel
+    },
+    placements: (Array.isArray(input.placements) ? input.placements : []).filter((placement) => placement && placement.templateStatic !== true).map((placement) => {
+      const allowedMaterialization = uniqueStrings(Array.isArray(placement.allowedMaterialization) ? placement.allowedMaterialization.map(String) : []);
+      const materializationHint = String(placement.materializationHint || '');
+      const fixedMaterializationIntent = materializationHint && allowedMaterialization.includes(materializationHint)
+        ? materializationHint
+        : allowedMaterialization.length === 1 ? allowedMaterialization[0] : '';
+      const requiredBusinessBlockId = assistantDiagramBindingResultBlockId(placement.directives || {}, input.businessBlockManifest);
+      return {
+        structureItemId: String(placement.structureItemId || ''),
+        roleId: String(placement.roleId || ''),
+        displayName: String(placement.displayName || ''),
+        parentStructureItemId: String(placement.parentStructureItemId || ''),
+        visualKind: String(placement.visualKind || ''),
+        allowedMaterialization,
+        ...(fixedMaterializationIntent ? { fixedMaterializationIntent } : {}),
+        ...(requiredBusinessBlockId && requiredBusinessBlockId !== '__invalid__' ? { requiredBusinessBlockId } : {}),
+        notes: truncateText(String(placement.notes || ''), 8000),
+        directives: cloneJsonValueServer(placement.directives || {}, {})
+      };
+    }),
+    connections: (Array.isArray(input.relationRules) ? input.relationRules : []).map((rule) => {
+      const directives = assistantDiagramNotesDirectives(rule && rule.d2Notes || '');
+      const requiredBusinessBlockId = assistantDiagramBindingResultBlockId(directives, input.businessBlockManifest);
+      return {
+        d2ClassKey: String(rule && (rule.d2ClassKey || rule.d2ElementKey) || ''),
+        ...(requiredBusinessBlockId && requiredBusinessBlockId !== '__invalid__' ? { requiredBusinessBlockId } : {}),
+        notes: truncateText(String(rule && rule.d2Notes || ''), 8000),
+        directives
+      };
+    }).filter((item) => item.d2ClassKey),
+    correction: input.correction && Array.isArray(input.correction.invalidBindingIntent)
+      ? { invalidBindingIntent: cloneJsonValueServer(input.correction.invalidBindingIntent, []) }
+      : null
+  });
+  return [
+    { role: 'system', content: system },
+    { role: 'system', content: assistantConfig.prompt.system },
+    ...(taskPrompt ? [{ role: 'system', content: taskPrompt }] : []),
+    { role: 'user', content: user }
+  ];
+}
+
+function assistantDiagramBindingResultBlockId(directives, manifest) {
+  const requested = String(directives && directives['binding-result'] || '').trim();
+  if (!requested) return '';
+  const blocks = Array.isArray(manifest && manifest.blocks) ? manifest.blocks : [];
+  const exact = blocks.filter((block) => String(block && block.id || '') === requested || String(block && block.name || '').trim() === requested);
+  return exact.length === 1 ? String(exact[0].id || '') : '__invalid__';
+}
+
+function assistantDiagramBindingIntentSeed(input) {
+  const manifest = input && input.businessBlockManifest || {};
+  const blocks = Array.isArray(manifest.blocks) ? manifest.blocks : [];
+  const blockById = new Map(blocks.map((block) => [String(block && block.id || ''), block]));
+  const placementBindings = [];
+  const connectionBindings = [];
+  const pendingPlacementIds = [];
+  const pendingConnectionKeys = [];
+  const placements = (Array.isArray(input && input.placements) ? input.placements : [])
+    .filter((placement) => placement && placement.templateStatic !== true);
+  for (const placement of placements) {
+    const structureItemId = String(placement.structureItemId || '');
+    const directives = placement.directives || {};
+    const allowed = uniqueStrings(Array.isArray(placement.allowedMaterialization) ? placement.allowedMaterialization.map(String) : []);
+    const notesBlockId = assistantDiagramBindingResultBlockId(directives, manifest);
+    const materializationHint = String(placement.materializationHint || '');
+    const materializationIntent = materializationHint && allowed.includes(materializationHint)
+      ? materializationHint
+      : allowed.length === 1
+        ? allowed[0]
+        : notesBlockId && notesBlockId !== '__invalid__' && allowed.includes('stage')
+          ? 'stage'
+          : '';
+    const block = blockById.get(notesBlockId) || null;
+    const stagePolicy = String(directives['stage-policy'] || 'terminal-only');
+    const needsNaturalLanguageContract = assistantDiagramNotesHasNaturalLanguage(placement && placement.notes);
+    const stageBindingReady = materializationIntent === 'stage'
+      && Boolean(block)
+      && (stagePolicy === 'helper-allowed' || Boolean(String(block && block.terminalStageId || '')));
+    const cardlessBindingReady = (materializationIntent === 'structural' || materializationIntent === 'parentCard')
+      && !notesBlockId;
+    const deterministicBindingReady = stageBindingReady || cardlessBindingReady;
+    if (structureItemId && deterministicBindingReady) {
+      placementBindings.push({
+        structureItemId,
+        materializationIntent,
+        ...(materializationIntent === 'stage' ? { businessBlockId: notesBlockId } : {})
+      });
+    }
+    if (structureItemId && (needsNaturalLanguageContract || !deterministicBindingReady)) pendingPlacementIds.push(structureItemId);
+  }
+  for (const rule of Array.isArray(input && input.relationRules) ? input.relationRules : []) {
+    const d2ClassKey = String(rule && (rule.d2ClassKey || rule.d2ElementKey) || '');
+    if (!d2ClassKey) continue;
+    const directives = assistantDiagramNotesDirectives(rule && rule.d2Notes || '');
+    const notesBlockId = assistantDiagramBindingResultBlockId(directives, manifest);
+    const block = blockById.get(notesBlockId) || null;
+    const stagePolicy = String(directives['stage-policy'] || 'terminal-only');
+    const deterministicBindingReady = notesBlockId && notesBlockId !== '__invalid__' && block
+      && (stagePolicy === 'helper-allowed' || Boolean(String(block.terminalStageId || '')));
+    if (deterministicBindingReady) {
+      connectionBindings.push({ d2ClassKey, businessBlockId: notesBlockId });
+    }
+    if (assistantDiagramNotesHasNaturalLanguage(rule && rule.d2Notes) || !deterministicBindingReady) pendingConnectionKeys.push(d2ClassKey);
+  }
+  return {
+    placementBindings,
+    connectionBindings,
+    pendingPlacementIds: uniqueStrings(pendingPlacementIds),
+    pendingConnectionKeys: uniqueStrings(pendingConnectionKeys)
+  };
+}
+
+function normalizeAssistantDiagramBindingIntentResponse(input, parsedObject) {
+  const response = cloneJsonValueServer(parsedObject && typeof parsedObject === 'object' && !Array.isArray(parsedObject) ? parsedObject : {}, {});
+  const manifest = input && input.businessBlockManifest || {};
+  const placementById = new Map((Array.isArray(input && input.placements) ? input.placements : [])
+    .filter((placement) => placement && placement.templateStatic !== true)
+    .map((placement) => [String(placement.structureItemId || ''), placement]));
+  const normalizedPlacements = [];
+  const placementByNormalizedId = new Map();
+  let duplicatePlacements = 0;
+  for (const raw of Array.isArray(response.placementBindings) ? response.placementBindings : []) {
+    const candidate = raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...raw } : raw;
+    const structureItemId = String(candidate && candidate.structureItemId || '');
+    const placement = placementById.get(structureItemId);
+    if (placement && candidate && typeof candidate === 'object') {
+      const allowed = uniqueStrings(Array.isArray(placement.allowedMaterialization) ? placement.allowedMaterialization.map(String) : []);
+      const hint = String(placement.materializationHint || '');
+      const fixedMaterialization = hint && allowed.includes(hint) ? hint : allowed.length === 1 ? allowed[0] : '';
+      const notesBlockId = assistantDiagramBindingResultBlockId(placement.directives || {}, manifest);
+      if (fixedMaterialization) candidate.materializationIntent = fixedMaterialization;
+      if (notesBlockId && notesBlockId !== '__invalid__' && (candidate.materializationIntent === 'stage' || !fixedMaterialization && allowed.includes('stage'))) {
+        candidate.materializationIntent = 'stage';
+        candidate.businessBlockId = notesBlockId;
+      }
+      if (candidate.materializationIntent && candidate.materializationIntent !== 'stage') delete candidate.businessBlockId;
+      if (candidate.materializationIntent === 'structural') {
+        candidate.membership = 'structural';
+        candidate.requiredConditions = [];
+        candidate.requiredMembership = [];
+        candidate.endpointFields = [];
+        candidate.endpointOperators = [];
+      }
+    }
+    const existing = placementByNormalizedId.get(structureItemId);
+    if (structureItemId && existing && stableJsonStringify(existing) === stableJsonStringify(candidate)) {
+      duplicatePlacements += 1;
+      continue;
+    }
+    if (structureItemId && !existing) placementByNormalizedId.set(structureItemId, candidate);
+    normalizedPlacements.push(candidate);
+  }
+  const connectionByKey = new Map((Array.isArray(input && input.relationRules) ? input.relationRules : []).map((rule) => {
+    const key = String(rule && (rule.d2ClassKey || rule.d2ElementKey) || '');
+    return [key, assistantDiagramNotesDirectives(rule && rule.d2Notes || '')];
+  }));
+  const normalizedConnections = (Array.isArray(response.connectionBindings) ? response.connectionBindings : []).map((raw) => {
+    const candidate = raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...raw } : raw;
+    const d2ClassKey = String(candidate && candidate.d2ClassKey || '');
+    const notesBlockId = assistantDiagramBindingResultBlockId(connectionByKey.get(d2ClassKey) || {}, manifest);
+    if (candidate && typeof candidate === 'object' && notesBlockId && notesBlockId !== '__invalid__') candidate.businessBlockId = notesBlockId;
+    return candidate;
+  });
+  response.placementBindings = normalizedPlacements;
+  response.connectionBindings = normalizedConnections;
+  response.warnings = uniqueStrings([].concat(
+    Array.isArray(response.warnings) ? response.warnings : [],
+    duplicatePlacements ? [`Removed ${duplicatePlacements} exact duplicate D2 placement binding(s) from the Assistant response.`] : []
+  ));
+  return response;
+}
+
+function assistantDiagramBindingIntentDraftFromResponse(input, parsedObject) {
+  const response = parsedObject && typeof parsedObject === 'object' && !Array.isArray(parsedObject) ? parsedObject : {};
+  const manifest = input.businessBlockManifest || {};
+  const blockById = new Map((Array.isArray(manifest.blocks) ? manifest.blocks : []).map((block) => [String(block && block.id || ''), block]));
+  const placements = (Array.isArray(input.placements) ? input.placements : []).filter((placement) => placement && placement.templateStatic !== true);
+  const placementById = new Map(placements.map((placement) => [String(placement.structureItemId || ''), placement]));
+  const connections = (Array.isArray(input.relationRules) ? input.relationRules : []).map((rule) => ({
+    d2ClassKey: String(rule && (rule.d2ClassKey || rule.d2ElementKey) || ''),
+    directives: assistantDiagramNotesDirectives(rule && rule.d2Notes || '')
+  })).filter((item) => item.d2ClassKey);
+  const connectionByKey = new Map(connections.map((item) => [item.d2ClassKey, item]));
+  const errors = [];
+  const warnings = Array.isArray(response.warnings) ? response.warnings.map(String).filter(Boolean) : [];
+  const seenPlacements = new Set();
+  const seenConnections = new Set();
+  const intentPlacements = [];
+  const intentConnections = [];
+  const unresolved = [];
+  for (const [index, candidate] of (Array.isArray(response.placementBindings) ? response.placementBindings : []).entries()) {
+    const structureItemId = String(candidate && candidate.structureItemId || '');
+    const target = placementById.get(structureItemId);
+    if (!target || seenPlacements.has(structureItemId)) {
+      errors.push({ path: `$.placementBindings[${index}].structureItemId`, message: `Unknown or duplicate D2 placement ${structureItemId || '(empty)'}.` });
+      continue;
+    }
+    seenPlacements.add(structureItemId);
+    const materializationIntent = String(candidate && candidate.materializationIntent || '');
+    const allowed = Array.isArray(target.allowedMaterialization) ? target.allowedMaterialization.map(String) : [];
+    if (!allowed.includes(materializationIntent)) {
+      errors.push({ path: `$.placementBindings[${index}].materializationIntent`, message: `D2 placement ${target.displayName || structureItemId} must use one allowed materialization: ${allowed.join(', ')}.` });
+      continue;
+    }
+    const businessBlockId = String(candidate && candidate.businessBlockId || '');
+    if (materializationIntent === 'stage' && !blockById.has(businessBlockId)) {
+      errors.push({ path: `$.placementBindings[${index}].businessBlockId`, message: `D2 placement ${target.displayName || structureItemId} requires one exact business block.` });
+      continue;
+    }
+    const selectedBlock = blockById.get(businessBlockId) || {};
+    const stagePolicy = String(target.directives && target.directives['stage-policy'] || 'terminal-only');
+    if (materializationIntent === 'stage' && stagePolicy !== 'helper-allowed' && !String(selectedBlock.terminalStageId || '')) {
+      errors.push({ path: `$.placementBindings[${index}].businessBlockId`, message: `D2 placement ${target.displayName || structureItemId} requires a business block with one materialized terminal result.` });
+      continue;
+    }
+    if (materializationIntent !== 'stage' && businessBlockId) {
+      errors.push({ path: `$.placementBindings[${index}].businessBlockId`, message: `D2 placement ${target.displayName || structureItemId} must not select a business block for ${materializationIntent}.` });
+      continue;
+    }
+    const notesBlockId = assistantDiagramBindingResultBlockId(target.directives, manifest);
+    if (notesBlockId === '__invalid__' || notesBlockId && notesBlockId !== businessBlockId) {
+      errors.push({ path: `$.placementBindings[${index}].businessBlockId`, message: `D2 placement ${target.displayName || structureItemId} must follow its exact binding-result Notes directive.` });
+      continue;
+    }
+    const directiveConditions = uniqueStrings(Array.isArray(target.directives && target.directives['required-condition']) ? target.directives['required-condition'].map(String) : []);
+    const directiveMembership = uniqueStrings(Array.isArray(target.directives && target.directives['required-membership']) ? target.directives['required-membership'].map(String) : []);
+    const requiredConditions = directiveConditions.length
+      ? directiveConditions
+      : uniqueStrings(Array.isArray(candidate && candidate.requiredConditions) ? candidate.requiredConditions.map(String) : []);
+    const requiredMembership = directiveMembership.length
+      ? directiveMembership
+      : uniqueStrings(Array.isArray(candidate && candidate.requiredMembership) ? candidate.requiredMembership.map(String) : []);
+    const invalidCondition = requiredConditions.find((value) => !assistantDiagramDirectiveParts(value, false));
+    const invalidMembership = requiredMembership.find((value) => !assistantDiagramDirectiveParts(value, true));
+    if (invalidCondition || invalidMembership) {
+      errors.push({ path: `$.placementBindings[${index}]`, message: `D2 placement ${target.displayName || structureItemId} returned an invalid typed condition: ${invalidCondition || invalidMembership}.` });
+      continue;
+    }
+    const directiveEndpointFields = assistantDiagramDirectiveValues(target.directives, 'endpoint-field');
+    const endpointFields = directiveEndpointFields.length
+      ? directiveEndpointFields
+      : uniqueStrings(Array.isArray(candidate && candidate.endpointFields) ? candidate.endpointFields.map(String) : []);
+    const directiveEndpointOperators = assistantDiagramDirectiveValues(target.directives, 'endpoint-operator');
+    const endpointOperators = directiveEndpointOperators.length
+      ? directiveEndpointOperators
+      : uniqueStrings(Array.isArray(candidate && candidate.endpointOperators) ? candidate.endpointOperators.map(String) : []);
+    const unsupportedEndpointOperator = endpointOperators.find((operator) => !DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(operator));
+    if (unsupportedEndpointOperator) {
+      errors.push({ path: `$.placementBindings[${index}].endpointOperator`, message: `D2 placement ${target.displayName || structureItemId} declares unsupported endpoint operator ${unsupportedEndpointOperator}.` });
+      continue;
+    }
+    const membership = String(target.directives && target.directives.membership || candidate && candidate.membership || '');
+    if (membership && !['structural', 'same-parent-card', 'compare'].includes(membership)) {
+      errors.push({ path: `$.placementBindings[${index}].membership`, message: `D2 placement ${target.displayName || structureItemId} returned unsupported membership ${membership}.` });
+      continue;
+    }
+    intentPlacements.push({
+      structureItemId,
+      materializationIntent,
+      businessBlockId,
+      stagePolicy,
+      membership,
+      requiredConditions,
+      requiredMembership,
+      endpointFields,
+      endpointOperators
+    });
+  }
+  for (const [index, candidate] of (Array.isArray(response.connectionBindings) ? response.connectionBindings : []).entries()) {
+    const d2ClassKey = String(candidate && candidate.d2ClassKey || '');
+    const target = connectionByKey.get(d2ClassKey);
+    const businessBlockId = String(candidate && candidate.businessBlockId || '');
+    if (!target || seenConnections.has(d2ClassKey)) {
+      errors.push({ path: `$.connectionBindings[${index}].d2ClassKey`, message: `Unknown or duplicate D2 connection class ${d2ClassKey || '(empty)'}.` });
+      continue;
+    }
+    seenConnections.add(d2ClassKey);
+    if (!blockById.has(businessBlockId)) {
+      errors.push({ path: `$.connectionBindings[${index}].businessBlockId`, message: `D2 connection class ${d2ClassKey} requires one exact business block.` });
+      continue;
+    }
+    const notesBlockId = assistantDiagramBindingResultBlockId(target.directives, manifest);
+    if (notesBlockId === '__invalid__' || notesBlockId && notesBlockId !== businessBlockId) {
+      errors.push({ path: `$.connectionBindings[${index}].businessBlockId`, message: `D2 connection class ${d2ClassKey} must follow its exact binding-result Notes directive.` });
+      continue;
+    }
+    const block = blockById.get(businessBlockId) || {};
+    const stagePolicy = String(target.directives && target.directives['stage-policy'] || 'terminal-only');
+    if (stagePolicy !== 'helper-allowed' && !String(block.terminalStageId || '')) {
+      errors.push({ path: `$.connectionBindings[${index}].businessBlockId`, message: `D2 connection class ${d2ClassKey} requires a business block with one materialized terminal result.` });
+      continue;
+    }
+    const sourceOperator = String(target.directives && target.directives['source-operator'] || candidate && candidate.sourceOperator || '');
+    const targetOperator = String(target.directives && target.directives['target-operator'] || candidate && candidate.targetOperator || '');
+    if (sourceOperator && !DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(sourceOperator)) {
+      errors.push({ path: `$.connectionBindings[${index}].sourceOperator`, message: `D2 connection class ${d2ClassKey} declares unsupported source operator ${sourceOperator}.` });
+      continue;
+    }
+    if (targetOperator && !DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(targetOperator)) {
+      errors.push({ path: `$.connectionBindings[${index}].targetOperator`, message: `D2 connection class ${d2ClassKey} declares unsupported target operator ${targetOperator}.` });
+      continue;
+    }
+    const endpointMode = String(target.directives && target.directives['endpoint-mode'] || candidate && candidate.endpointMode || '');
+    if (endpointMode && !['attributeEndpoints', 'relationCard', 'deterministicEndpoints', 'networkEndpoints'].includes(endpointMode)) {
+      errors.push({ path: `$.connectionBindings[${index}].endpointMode`, message: `D2 connection class ${d2ClassKey} returned unsupported endpoint mode ${endpointMode}.` });
+      continue;
+    }
+    intentConnections.push({
+      d2ClassKey,
+      businessBlockId,
+      stagePolicy,
+      rowGrain: String(target.directives && target.directives['row-grain'] || candidate && candidate.rowGrain || block.rowGrain || ''),
+      endpointMode,
+      sourceField: String(target.directives && target.directives['source-field'] || candidate && candidate.sourceField || ''),
+      sourceOperator,
+      targetField: String(target.directives && target.directives['target-field'] || candidate && candidate.targetField || ''),
+      targetOperator
+    });
+  }
+  for (const [index, item] of (Array.isArray(response.unresolved) ? response.unresolved : []).entries()) {
+    const targetType = String(item && item.targetType || '');
+    const targetId = String(item && item.targetId || '');
+    const valid = targetType === 'placement' ? placementById.has(targetId) : targetType === 'connection' ? connectionByKey.has(targetId) : false;
+    if (!valid) {
+      errors.push({ path: `$.unresolved[${index}]`, message: `Unknown unresolved D2 binding target ${targetType}:${targetId}.` });
+      continue;
+    }
+    const seen = targetType === 'placement' ? seenPlacements : seenConnections;
+    if (seen.has(targetId)) {
+      errors.push({ path: `$.unresolved[${index}].targetId`, message: `D2 binding target ${targetType}:${targetId} was returned more than once or both mapped and unresolved.` });
+      continue;
+    }
+    seen.add(targetId);
+    unresolved.push({ targetType, targetId, reason: String(item && item.reason || ''), message: truncateText(String(item && item.message || ''), 1000) });
+  }
+  for (const placement of placements) {
+    const id = String(placement.structureItemId || '');
+    if (!seenPlacements.has(id)) errors.push({ path: '$.placementBindings', message: `Assistant omitted D2 placement ${placement.displayName || id} from binding intent.` });
+  }
+  for (const connection of connections) {
+    if (!seenConnections.has(connection.d2ClassKey)) errors.push({ path: '$.connectionBindings', message: `Assistant omitted D2 connection class ${connection.d2ClassKey} from binding intent.` });
+  }
+  const intent = { placements: intentPlacements, connections: intentConnections, unresolved };
+  return {
+    success: errors.length === 0,
+    intent,
+    explanation: String(response.explanation || ''),
+    warnings: uniqueStrings(warnings),
+    errors,
+    diagnostics: { contract: 'typed-d2-binding-intent-v1', attempts: 1 }
+  };
+}
+
+async function createAssistantDiagramBindingIntentDraft(input, runtimeConfig) {
+  ensureAssistantRequestIntent({ prompt: String(input.placementPrompt || input.connectionsPrompt || input.prompt || '') });
+  const seed = assistantDiagramBindingIntentSeed(input);
+  const pendingPlacementIds = new Set(seed.pendingPlacementIds);
+  const pendingConnectionKeys = new Set(seed.pendingConnectionKeys);
+  if (!pendingPlacementIds.size && !pendingConnectionKeys.size) {
+    const deterministic = assistantDiagramBindingIntentDraftFromResponse(input, {
+      placementBindings: seed.placementBindings,
+      connectionBindings: seed.connectionBindings,
+      unresolved: [],
+      explanation: 'Binding intent was derived from deterministic D2 Notes directives.',
+      warnings: []
+    });
+    deterministic.diagnostics = {
+      ...(deterministic.diagnostics || {}),
+      attempts: 0,
+      source: 'd2-notes'
+    };
+    return deterministic;
+  }
+  ensureAssistantReady(runtimeConfig);
+  const requestInput = {
+    ...input,
+    placements: (Array.isArray(input.placements) ? input.placements : []).filter((placement) => (
+      pendingPlacementIds.has(String(placement && placement.structureItemId || ''))
+    )),
+    relationRules: (Array.isArray(input.relationRules) ? input.relationRules : []).filter((rule) => (
+      pendingConnectionKeys.has(String(rule && (rule.d2ClassKey || rule.d2ElementKey) || ''))
+    ))
+  };
+  const content = await callLiteLLM(assistantDiagramBindingIntentMessages(requestInput, runtimeConfig), runtimeConfig, {
+    signal: input.abortSignal,
+    operation: 'diagram_mapping',
+    phase: 'intent.initial',
+    attempt: 1
+  });
+  const response = normalizeAssistantDiagramBindingIntentResponse(input, parseAssistantJson(content));
+  const responsePlacementBindings = Array.isArray(response && response.placementBindings) ? response.placementBindings : [];
+  const responseConnectionBindings = Array.isArray(response && response.connectionBindings) ? response.connectionBindings : [];
+  const responseUnresolved = Array.isArray(response && response.unresolved) ? response.unresolved : [];
+  const ignoredResponseItems = responsePlacementBindings.filter((item) => !pendingPlacementIds.has(String(item && item.structureItemId || ''))).length
+    + responseConnectionBindings.filter((item) => !pendingConnectionKeys.has(String(item && item.d2ClassKey || ''))).length
+    + responseUnresolved.filter((item) => {
+      const targetType = String(item && item.targetType || '');
+      const targetId = String(item && item.targetId || '');
+      return targetType === 'placement'
+        ? !pendingPlacementIds.has(targetId)
+        : targetType === 'connection'
+          ? !pendingConnectionKeys.has(targetId)
+          : true;
+    }).length;
+  const responsePlacementById = new Map(responsePlacementBindings
+    .filter((item) => pendingPlacementIds.has(String(item && item.structureItemId || '')))
+    .map((item) => [String(item && item.structureItemId || ''), item]));
+  const responseConnectionByKey = new Map(responseConnectionBindings
+    .filter((item) => pendingConnectionKeys.has(String(item && item.d2ClassKey || '')))
+    .map((item) => [String(item && item.d2ClassKey || ''), item]));
+  const seededPlacementIds = new Set(seed.placementBindings.map((item) => String(item && item.structureItemId || '')));
+  const seededConnectionKeys = new Set(seed.connectionBindings.map((item) => String(item && item.d2ClassKey || '')));
+  const mergedPlacements = seed.placementBindings.map((base) => ({
+    ...base,
+    ...(responsePlacementById.get(String(base.structureItemId || '')) || {})
+  })).concat(responsePlacementBindings.filter((item) => (
+    pendingPlacementIds.has(String(item && item.structureItemId || '')) &&
+    !seededPlacementIds.has(String(item && item.structureItemId || ''))
+  )));
+  const mergedConnections = seed.connectionBindings.map((base) => ({
+    ...base,
+    ...(responseConnectionByKey.get(String(base.d2ClassKey || '')) || {})
+  })).concat(responseConnectionBindings.filter((item) => (
+    pendingConnectionKeys.has(String(item && item.d2ClassKey || '')) &&
+    !seededConnectionKeys.has(String(item && item.d2ClassKey || ''))
+  )));
+  const unresolvedWithNoDeterministicBinding = responseUnresolved.filter((item) => {
+    const targetType = String(item && item.targetType || '');
+    const targetId = String(item && item.targetId || '');
+    return targetType === 'placement'
+      ? pendingPlacementIds.has(targetId) && !seededPlacementIds.has(targetId)
+      : targetType === 'connection'
+        ? pendingConnectionKeys.has(targetId) && !seededConnectionKeys.has(targetId)
+        : false;
+  });
+  const ignoredUnresolved = responseUnresolved.length - unresolvedWithNoDeterministicBinding.length;
+  const merged = {
+    ...response,
+    placementBindings: mergedPlacements,
+    connectionBindings: mergedConnections,
+    unresolved: unresolvedWithNoDeterministicBinding,
+    warnings: uniqueStrings([].concat(
+      Array.isArray(response && response.warnings) ? response.warnings : [],
+      ignoredResponseItems ? [`Ignored ${ignoredResponseItems} Assistant binding item(s) outside the requested ambiguous targets.`] : [],
+      ignoredUnresolved ? [`Preserved ${ignoredUnresolved} deterministic D2 binding(s) that Assistant returned as unresolved.`] : []
+    ))
+  };
+  const draft = assistantDiagramBindingIntentDraftFromResponse(input, merged);
+  draft.diagnostics = {
+    ...(draft.diagnostics || {}),
+    deterministicPlacements: seed.placementBindings.length,
+    deterministicConnections: seed.connectionBindings.length,
+    requestedPlacements: pendingPlacementIds.size,
+    requestedConnections: pendingConnectionKeys.size
+  };
+  return draft;
+}
+
+function assistantDiagramCritiqueMessages(input, runtimeConfig, draft, obligationMatrix) {
+  const assistantConfig = normalizeAssistantRuntimeConfig(runtimeConfig || defaultRuntimeConfig());
+  const contract = '{"approved":true|false,"violations":[{"obligationId":"<exact obligation id>","targetPhase":"placements|connections","message":"..."}],"explanation":"...","warnings":[]}';
+  const system = [
+    'You are the semantic critic for a deterministic D2 mapping proposal.',
+    `Return exactly one JSON object matching this contract: ${contract}`,
+    'Use only exact obligation ids from SemanticObligationMatrix. Do not return mappings, stages, fields, paths, D2 source, runtime Spec or extra fields.',
+    'Reject broad helper/source stages used instead of an intended terminal business result, omitted required filters, lineage used as hierarchy membership, and connection helpers used instead of edge records.',
+    'approved=true is valid only with an empty violations array. Do not save, publish, execute or mutate the template.'
+  ].join('\n');
+  const taskPrompt = String(assistantConfig.prompt.diagramCritique || '').trim();
+  const user = JSON.stringify({
+    models: {
+      businessBlockManifest: input.businessBlockManifest,
+      d2BindingIntent: assistantD2BindingIntentModel(input.bindingIntent),
+      d2BindingModel: assistantD2BindingModel(draft.items, draft.relationRules),
+      semanticObligationMatrix: assistantSemanticObligationModel(obligationMatrix)
+    }
+  });
+  return [
+    { role: 'system', content: system },
+    { role: 'system', content: assistantConfig.prompt.system },
+    ...(taskPrompt ? [{ role: 'system', content: taskPrompt }] : []),
+    { role: 'user', content: user }
+  ];
+}
+
+function assistantDiagramCritiqueDraftFromResponse(parsedObject, obligationMatrix) {
+  const response = parsedObject && typeof parsedObject === 'object' && !Array.isArray(parsedObject) ? parsedObject : {};
+  const obligationById = new Map((Array.isArray(obligationMatrix && obligationMatrix.obligations) ? obligationMatrix.obligations : [])
+    .map((item) => [String(item && item.id || ''), item]));
+  const errors = [];
+  const seen = new Set();
+  const violations = [];
+  for (const [index, item] of (Array.isArray(response.violations) ? response.violations : []).entries()) {
+    const obligationId = String(item && item.obligationId || '');
+    const obligation = obligationById.get(obligationId);
+    const targetPhase = String(item && item.targetPhase || '');
+    if (!obligation || seen.has(obligationId)) {
+      errors.push({ path: `$.violations[${index}].obligationId`, message: `Unknown or duplicate semantic obligation ${obligationId || '(empty)'}.` });
+      continue;
+    }
+    if (!['placements', 'connections'].includes(targetPhase) || targetPhase !== String(obligation.targetPhase || '')) {
+      errors.push({ path: `$.violations[${index}].targetPhase`, message: `Semantic obligation ${obligationId} must target ${String(obligation.targetPhase || '')}.` });
+      continue;
+    }
+    seen.add(obligationId);
+    violations.push({ obligationId, targetPhase, message: truncateText(String(item && item.message || obligation.requirement || ''), 1000) });
+  }
+  const approved = response.approved === true;
+  if (approved && violations.length) errors.push({ path: '$.approved', message: 'Approved D2 critique must not contain violations.' });
+  if (!approved && !violations.length) errors.push({ path: '$.violations', message: 'Rejected D2 critique must identify at least one exact semantic obligation.' });
+  return {
+    success: errors.length === 0,
+    critique: { approved, violations },
+    explanation: String(response.explanation || ''),
+    warnings: Array.isArray(response.warnings) ? response.warnings.map(String).filter(Boolean) : [],
+    errors,
+    diagnostics: { contract: 'typed-d2-mapping-critique-v1', attempts: 1 }
+  };
+}
+
+async function createAssistantDiagramCritiqueDraft(input, runtimeConfig, draft, obligationMatrix) {
+  ensureAssistantReady(runtimeConfig);
+  const content = await callLiteLLM(assistantDiagramCritiqueMessages(input, runtimeConfig, draft, obligationMatrix), runtimeConfig, {
+    signal: input.abortSignal,
+    operation: 'diagram_mapping',
+    phase: 'critique.initial',
+    attempt: 1
+  });
+  return assistantDiagramCritiqueDraftFromResponse(parseAssistantJson(content), obligationMatrix);
+}
+
+function assistantDiagramTopologyWithBindingIntent(topology = [], bindingIntent = {}) {
+  const intentByClassKey = new Map((Array.isArray(bindingIntent && bindingIntent.connections) ? bindingIntent.connections : [])
+    .map((item) => [String(item && item.d2ClassKey || ''), item])
+    .filter(([key]) => key));
+  const candidateFamilies = [
+    ['networkEndpointStages', 'attributeEndpoints'],
+    ['relationCardStages', 'relationCard'],
+    ['deterministicEndpointStages', 'deterministicEndpoints']
+  ];
+  const unresolvedKeys = new Set((Array.isArray(bindingIntent && bindingIntent.unresolved) ? bindingIntent.unresolved : [])
+    .filter((item) => String(item && item.targetType || '') === 'connection')
+    .map((item) => String(item && item.targetId || ''))
+    .filter(Boolean));
+  return (Array.isArray(topology) ? topology : []).filter((requirement) => !unresolvedKeys.has(String(requirement && requirement.d2ClassKey || ''))).map((requirement) => {
+    const intent = intentByClassKey.get(String(requirement && requirement.d2ClassKey || '')) || null;
+    if (!intent) {
+      return {
+        ...requirement,
+        networkEndpointStages: [],
+        relationCardStages: [],
+        deterministicEndpointStages: []
+      };
+    }
+    const terminalRequired = String(intent.stagePolicy || 'terminal-only') !== 'helper-allowed';
+    const endpointMode = String(intent.endpointMode || '');
+    const filtered = { ...requirement, bindingIntent: cloneJsonValueServer(intent, {}) };
+    for (const [family, mode] of candidateFamilies) {
+      filtered[family] = (Array.isArray(requirement && requirement[family]) ? requirement[family] : []).filter((candidate) => {
+        const blockIds = Array.isArray(candidate && candidate.businessBlockIds) ? candidate.businessBlockIds.map(String) : [];
+        if (!blockIds.includes(String(intent.businessBlockId || ''))) return false;
+        if (terminalRequired && String(candidate && candidate.stageRole || '') !== 'terminal') return false;
+        if (endpointMode && endpointMode !== mode && !(endpointMode === 'networkEndpoints' && mode === 'attributeEndpoints')) return false;
+        if (intent.sourceField && String(candidate && candidate.sourceField || '') !== String(intent.sourceField)) return false;
+        if (intent.targetField && String(candidate && candidate.targetField || '') !== String(intent.targetField)) return false;
+        if (intent.rowGrain && candidate && candidate.rowGrain && String(candidate.rowGrain) !== String(intent.rowGrain)) return false;
+        return true;
+      });
+    }
+    return filtered;
+  });
+}
+
+function assistantDiagramDirectiveParts(value, membership = false) {
+  const text = String(value || '').trim();
+  const match = /^(.*?)\s+(equals|notEquals|contains|startsWith|endsWith|in|exists|notExists|matches|notMatches|isIpv4|isIpv4Network|ipv4InCidr|ipv4InRange|ipv4CidrOverlaps|ipv4CidrContains)\s*(.*?)$/i.exec(text);
+  if (!match) return null;
+  const right = String(match[3] || '').trim();
+  const normalizedRight = membership && right.startsWith('parent.') ? right.slice('parent.'.length) : right;
+  const parameter = !membership ? /^\$\{param\.([A-Za-z_][A-Za-z0-9_.-]*)\}$/.exec(normalizedRight) : null;
+  return {
+    leftColumn: String(match[1] || '').trim(),
+    operator: String(match[2] || ''),
+    rightColumn: membership ? normalizedRight : '',
+    rightValue: membership || parameter ? '' : normalizedRight,
+    rightKind: membership ? 'stage' : parameter ? 'param' : 'literal',
+    rightName: parameter ? String(parameter[1] || '') : ''
+  };
+}
+
+function assistantDiagramRuleFromDirective(value, membership = false, parentStageId = '', contextId = '') {
+  const parts = assistantDiagramDirectiveParts(value, membership);
+  if (!parts) return null;
+  return {
+    id: diagramImportStableId('assistant_typed_condition', `${contextId}:${membership ? 'membership' : 'condition'}:${value}`),
+    action: 'include',
+    negate: false,
+    origin: 'assistant',
+    operator: parts.operator,
+    caseSensitive: false,
+    left: { column: parts.leftColumn, regex: '' },
+    right: membership
+      ? { kind: 'stage', value: '', name: '', stageId: String(parentStageId || ''), column: parts.rightColumn, regex: '' }
+      : parts.rightKind === 'param'
+        ? { kind: 'param', value: '', name: parts.rightName, stageId: '', column: '', regex: '' }
+        : { kind: 'literal', value: parts.rightValue, name: '', stageId: '', column: '', regex: '' }
+  };
+}
+
+function assistantDiagramLiteralMatches(actual, expected) {
+  const normalized = (value) => {
+    const text = String(value ?? '').trim();
+    if (/^(true|false)$/i.test(text)) return text.toLowerCase();
+    return text.replace(/^(['"])(.*)\1$/, '$2');
+  };
+  return normalized(actual) === normalized(expected);
+}
+
+function assistantDiagramRuleSatisfiesDirective(rule, directive, membership = false) {
+  const parts = assistantDiagramDirectiveParts(directive, membership);
+  if (!parts || !rule || typeof rule !== 'object') return false;
+  if (String(rule.operator || rule.op || '') !== parts.operator) return false;
+  if (String(rule.left && rule.left.column || rule.leftColumn || '') !== parts.leftColumn) return false;
+  const right = rule.right && typeof rule.right === 'object' ? rule.right : {};
+  if (membership) {
+    return String(right.kind || '') === 'stage' && String(right.column || '') === parts.rightColumn;
+  }
+  if (parts.rightKind === 'param') {
+    return String(right.kind || '') === 'param' && String(right.name || '') === parts.rightName;
+  }
+  return String(right.kind || 'literal') === 'literal' && assistantDiagramLiteralMatches(right.value, parts.rightValue);
+}
+
+function assistantDiagramSemanticObligations(input, draft) {
+  const bindingIntent = input && input.bindingIntent || {};
+  const placements = Array.isArray(input && input.placements) ? input.placements : [];
+  const placementById = new Map(placements.map((item) => [String(item && item.structureItemId || ''), item]));
+  const itemById = new Map((Array.isArray(draft && draft.items) ? draft.items : [])
+    .map((item) => [String(item && item.structureItemId || ''), item]));
+  const stageById = new Map((Array.isArray(input && input.stages) ? input.stages : [])
+    .map((stage) => [String(stage && stage.id || ''), stage]));
+  const relationRuleByClass = new Map((Array.isArray(draft && draft.relationRules) ? draft.relationRules : [])
+    .map((rule) => [String(rule && rule.d2ClassKey || ''), rule]));
+  const endpointProfiles = diagramImportEndpointProfiles(draft && draft.endpointProfiles);
+  const obligations = [];
+  const add = (family, targetId, targetPhase, requirement, satisfied, evidence) => {
+    obligations.push({
+      id: diagramImportStableId('semantic_obligation', `${targetPhase}:${targetId}:${family}:${requirement}`),
+      family,
+      targetId,
+      targetPhase,
+      status: satisfied ? 'satisfied' : 'unsatisfied',
+      requirement,
+      evidence
+    });
+  };
+  for (const intent of Array.isArray(bindingIntent.placements) ? bindingIntent.placements : []) {
+    const targetId = String(intent && intent.structureItemId || '');
+    const target = placementById.get(targetId) || {};
+    const item = itemById.get(targetId) || null;
+    const mapping = item && item.mapping || {};
+    const materialization = String(mapping && mapping.materialization && mapping.materialization.kind || '');
+    add('placementMaterialization', targetId, 'placements', `materialization=${String(intent.materializationIntent || '')}`,
+      materialization === String(intent.materializationIntent || ''), `materialization=${materialization || '(missing)'}`);
+    if (String(intent.materializationIntent || '') === 'stage') {
+      const stageId = String(mapping && mapping.materialization && mapping.materialization.stageId || item && item.source && item.source.stageId || '');
+      const stage = stageById.get(stageId) || {};
+      const blockIds = Array.isArray(stage.assistantBlockIds) ? stage.assistantBlockIds.map(String) : [];
+      const terminalRequired = String(intent.stagePolicy || 'terminal-only') !== 'helper-allowed';
+      const satisfied = blockIds.includes(String(intent.businessBlockId || '')) && (!terminalRequired || String(stage.stageRole || '') === 'terminal');
+      add('placementBusinessResult', targetId, 'placements', `${terminalRequired ? 'terminal ' : ''}businessBlock=${String(intent.businessBlockId || '')}`,
+        satisfied, `stage=${stageId || '(missing)'}; role=${String(stage.stageRole || '(missing)')}; blocks=${blockIds.join(',')}`);
+    }
+    const conditionRules = diagramImportPlacementFilters(mapping.conditions).rules;
+    for (const directive of Array.isArray(intent.requiredConditions) ? intent.requiredConditions : []) {
+      add('placementCondition', targetId, 'placements', String(directive),
+        conditionRules.some((rule) => assistantDiagramRuleSatisfiesDirective(rule, directive, false)),
+        `rules=${conditionRules.length}; placement=${String(target.displayName || targetId)}`);
+    }
+    const hierarchyRules = diagramImportPlacementFilters(mapping.hierarchyConditions).rules;
+    const membership = String(intent.membership || '');
+    if (membership === 'same-parent-card') {
+      add('placementMembership', targetId, 'placements', 'same-parent-card', materialization === 'parentCard', `materialization=${materialization || '(missing)'}`);
+    } else if (membership === 'compare') {
+      add('placementMembership', targetId, 'placements', 'explicit parent-child comparison', hierarchyRules.length > 0, `hierarchyRules=${hierarchyRules.length}`);
+    } else if (membership === 'structural') {
+      add('placementMembership', targetId, 'placements', 'structural placement', materialization === 'structural', `materialization=${materialization || '(missing)'}`);
+    }
+    for (const directive of Array.isArray(intent.requiredMembership) ? intent.requiredMembership : []) {
+      add('placementMembershipRule', targetId, 'placements', String(directive),
+        hierarchyRules.some((rule) => assistantDiagramRuleSatisfiesDirective(rule, directive, true)),
+        `hierarchyRules=${hierarchyRules.length}`);
+    }
+    const placementProfiles = endpointProfiles.filter((profile) => String(profile && profile.structureItemId || '') === targetId);
+    for (const field of Array.isArray(intent.endpointFields) ? intent.endpointFields : []) {
+      for (const operator of Array.isArray(intent.endpointOperators) ? intent.endpointOperators : []) {
+        const satisfied = placementProfiles.some((profile) => (
+          String(profile && profile.field || '') === String(field) &&
+          Array.isArray(profile && profile.operators) && profile.operators.includes(String(operator))
+        ));
+        add('placementEndpointProfile', targetId, 'placements', `${String(field)} supports ${String(operator)}`,
+          satisfied, `profiles=${placementProfiles.map((profile) => `${String(profile.field || '')}:${(profile.operators || []).join(',')}`).join(';') || '(missing)'}`);
+      }
+    }
+  }
+  for (const intent of Array.isArray(bindingIntent.connections) ? bindingIntent.connections : []) {
+    const targetId = String(intent && intent.d2ClassKey || '');
+    const rule = relationRuleByClass.get(targetId) || null;
+    const stage = stageById.get(String(rule && rule.sourceStageId || '')) || {};
+    const blockIds = Array.isArray(stage.assistantBlockIds) ? stage.assistantBlockIds.map(String) : [];
+    const terminalRequired = String(intent.stagePolicy || 'terminal-only') !== 'helper-allowed';
+    add('connectionBusinessResult', targetId, 'connections', `${terminalRequired ? 'terminal ' : ''}businessBlock=${String(intent.businessBlockId || '')}`,
+      Boolean(rule) && blockIds.includes(String(intent.businessBlockId || '')) && (!terminalRequired || String(stage.stageRole || '') === 'terminal'),
+      `stage=${String(rule && rule.sourceStageId || '(missing)')}; role=${String(stage.stageRole || '(missing)')}`);
+    if (intent.endpointMode) add('connectionEndpointMode', targetId, 'connections', `mode=${String(intent.endpointMode)}`,
+      Boolean(rule) && [String(intent.endpointMode), String(intent.endpointMode) === 'networkEndpoints' ? 'attributeEndpoints' : ''].includes(String(rule.mode || '')),
+      `mode=${String(rule && rule.mode || '(missing)')}`);
+    if (intent.sourceField) add('connectionSourceField', targetId, 'connections', `sourceField=${String(intent.sourceField)}`,
+      Boolean(rule) && String(rule.sourceField || '') === String(intent.sourceField), `sourceField=${String(rule && rule.sourceField || '(missing)')}`);
+    if (intent.sourceOperator) add('connectionSourceOperator', targetId, 'connections', `sourceOperator=${String(intent.sourceOperator)}`,
+      Boolean(rule) && diagramImportConnectionRuleSideOperator(rule, 'source') === String(intent.sourceOperator), `sourceOperator=${String(rule && diagramImportConnectionRuleSideOperator(rule, 'source') || '(missing)')}`);
+    if (intent.targetField) add('connectionTargetField', targetId, 'connections', `targetField=${String(intent.targetField)}`,
+      Boolean(rule) && String(rule.targetField || '') === String(intent.targetField), `targetField=${String(rule && rule.targetField || '(missing)')}`);
+    if (intent.targetOperator) add('connectionTargetOperator', targetId, 'connections', `targetOperator=${String(intent.targetOperator)}`,
+      Boolean(rule) && diagramImportConnectionRuleSideOperator(rule, 'target') === String(intent.targetOperator), `targetOperator=${String(rule && diagramImportConnectionRuleSideOperator(rule, 'target') || '(missing)')}`);
+    if (intent.rowGrain) add('connectionRowGrain', targetId, 'connections', `rowGrain=${String(intent.rowGrain)}`,
+      Boolean(rule) && String(stage.rowGrain || '') === String(intent.rowGrain), `rowGrain=${String(stage.rowGrain || '(missing)')}`);
+  }
+  return { obligations };
+}
+
+function assistantDiagramSemanticObligationErrors(matrix) {
+  return (Array.isArray(matrix && matrix.obligations) ? matrix.obligations : [])
+    .filter((item) => String(item && item.status || '') !== 'satisfied')
+    .map((item) => ({
+      path: '$.semanticObligations',
+      code: 'diagram_semantic_obligation_failed',
+      obligationId: String(item.id || ''),
+      structureItemId: String(item.targetPhase || '') === 'placements' ? String(item.targetId || '') : '',
+      d2ElementKey: String(item.targetPhase || '') === 'connections' ? String(item.targetId || '') : '',
+      displayName: String(item.targetId || ''),
+      targetPhase: String(item.targetPhase || ''),
+      message: `Semantic obligation was not satisfied: ${String(item.requirement || item.id || '')}.`
+    }));
+}
+
+function assistantDiagramPlacementPromptTargets(input) {
+  const intentById = new Map((Array.isArray(input && input.bindingIntent && input.bindingIntent.placements) ? input.bindingIntent.placements : [])
+    .map((item) => [String(item && item.structureItemId || ''), item]));
+  const stages = Array.isArray(input && input.stages) ? input.stages : [];
+  const semanticStageById = new Map((Array.isArray(input && input.dataSemanticModel && input.dataSemanticModel.stages)
+    ? input.dataSemanticModel.stages
+    : []).map((stage) => [String(stage && stage.id || ''), stage]));
+  const unresolvedIds = new Set((Array.isArray(input && input.bindingIntent && input.bindingIntent.unresolved) ? input.bindingIntent.unresolved : [])
+    .filter((item) => String(item && item.targetType || '') === 'placement')
+    .map((item) => String(item && item.targetId || ''))
+    .filter(Boolean));
+  return (Array.isArray(input && input.placements) ? input.placements : [])
+    .filter((placement) => placement && placement.templateStatic !== true && !unresolvedIds.has(String(placement.structureItemId || '')))
+    .map((placement) => {
+      const intent = intentById.get(String(placement.structureItemId || '')) || null;
+      const terminalRequired = !intent || String(intent.stagePolicy || 'terminal-only') !== 'helper-allowed';
+      const allowedStages = String(intent && intent.materializationIntent || '') === 'stage'
+        ? stages.filter((stage) => (
+          (Array.isArray(stage && stage.assistantBlockIds) ? stage.assistantBlockIds.map(String) : []).includes(String(intent.businessBlockId || '')) &&
+          (!terminalRequired || String(stage && stage.stageRole || '') === 'terminal')
+        )).map((stage) => {
+          const semanticStage = semanticStageById.get(String(stage && stage.id || '')) || {};
+          return {
+          id: String(stage && stage.id || ''),
+          label: String(stage && stage.label || ''),
+          className: String(stage && stage.className || ''),
+          stageRole: String(stage && stage.stageRole || ''),
+          outputKind: String(stage && stage.outputKind || ''),
+          rowGrain: String(stage && stage.rowGrain || ''),
+          fields: uniqueStrings([].concat(
+            Array.isArray(stage && stage.columns) ? stage.columns.map(String) : [],
+            Array.isArray(semanticStage && semanticStage.readableFields) ? semanticStage.readableFields.map(String) : []
+          ))
+        }})
+        : [];
+      return { ...placement, bindingIntent: intent, allowedStages };
+    });
+}
+
 function assistantDiagramStageMessages(input, runtimeConfig) {
   const mapTask = input.kind === 'mapping';
   const mappingPhase = mapTask ? String(input.mappingPhase || 'roles') : '';
@@ -45482,11 +46959,7 @@ function assistantDiagramStageMessages(input, runtimeConfig) {
       ? 'diagramConnections'
       : 'diagramPlacement';
   const taskPrompt = String(assistantConfig.prompt[taskPromptKey] || '').trim();
-  const userTaskPrompt = String(!mapTask
-    ? input.semanticsPrompt || input.prompt
-    : mappingPhase === 'topology'
-      ? input.connectionsPrompt || input.prompt
-      : input.placementPrompt || input.prompt).trim();
+  const userTaskPrompt = String(input.prompt || '').trim();
   const roleModelTask = !mapTask && input.roleModelRevision === D2_IMPORT_SEMANTIC_MODEL_REVISION;
   if (roleModelTask) {
     const correction = input.correction && Array.isArray(input.correction.invalidRoleModel)
@@ -45602,13 +47075,15 @@ function assistantDiagramStageMessages(input, runtimeConfig) {
       dataSemanticModel: input.dataSemanticModel || assistantDataSemanticModel(input.stages),
       d2StructuralModel: input.d2StructuralModel || assistantD2StructuralModel(input.roles, input.placements, input.topology),
       d2SemanticModel: input.d2SemanticModel || assistantD2SemanticModel(input.roles),
+      ...(input.businessBlockManifest ? { businessBlockManifest: input.businessBlockManifest } : {}),
+      ...(input.bindingIntent ? { d2BindingIntent: assistantD2BindingIntentModel(input.bindingIntent) } : {}),
       ...(mappingPhase === 'topology' || Array.isArray(input.acceptedItems) && input.acceptedItems.length ? {
         d2BindingModel: input.d2BindingModel || assistantD2BindingModel(input.acceptedItems)
       } : {})
     },
     ...(!mapTask || mappingPhase === 'topology'
       ? { roles: input.modelRoles || input.roles }
-      : { placements: (input.placements || []).filter((placement) => placement && placement.templateStatic !== true) }),
+      : { placements: assistantDiagramPlacementPromptTargets(input) }),
     ...(correction ? { correction } : {}),
     ...(mapTask && mappingPhase === 'topology' ? { topology: input.topology || [] } : {})
   });
@@ -45752,6 +47227,8 @@ function assistantDiagramNormalizePlacementCandidates(input, candidates, warning
     ? input.placementContext
     : targets;
   const targetById = new Map(placementContext.map((target) => [String(target && target.structureItemId || ''), target]));
+  const intentByItemId = new Map((Array.isArray(input && input.bindingIntent && input.bindingIntent.placements) ? input.bindingIntent.placements : [])
+    .map((item) => [String(item && item.structureItemId || ''), item]));
   const targetsByMappingId = new Map();
   for (const target of placementContext) {
     const mappingId = String(target && target.currentMapping && target.currentMapping.id || '').trim();
@@ -45777,9 +47254,25 @@ function assistantDiagramNormalizePlacementCandidates(input, candidates, warning
       });
       continue;
     }
-    const normalizedCandidate = itemId === requestedItemId ? candidate : { ...candidate, structureItemId: itemId };
+    const normalizedCandidate = { ...(candidate && typeof candidate === 'object' && !Array.isArray(candidate) ? candidate : {}), structureItemId: itemId };
     if (itemId !== requestedItemId) {
       warnings.push(`Assistant placement id ${requestedItemId} was normalized to its unique current structure item ${itemId}.`);
+    }
+    const bindingIntent = intentByItemId.get(itemId) || null;
+    const fixedKind = String(bindingIntent && bindingIntent.materializationIntent || '');
+    if (fixedKind) {
+      normalizedCandidate.materialization = { kind: fixedKind, stageId: '' };
+      if (fixedKind === 'stage') {
+        const terminalRequired = String(bindingIntent.stagePolicy || 'terminal-only') !== 'helper-allowed';
+        const allowedStages = (Array.isArray(input && input.stages) ? input.stages : []).filter((stage) => (
+          (Array.isArray(stage && stage.assistantBlockIds) ? stage.assistantBlockIds.map(String) : []).includes(String(bindingIntent.businessBlockId || '')) &&
+          (!terminalRequired || String(stage && stage.stageRole || '') === 'terminal')
+        ));
+        if (allowedStages.length === 1) normalizedCandidate.stageId = String(allowedStages[0].id || '');
+      } else {
+        delete normalizedCandidate.stageId;
+        delete normalizedCandidate.source;
+      }
     }
     const entries = grouped.get(itemId) || [];
     entries.push({ candidate: normalizedCandidate, index });
@@ -45823,6 +47316,8 @@ function assistantDiagramPlacementDraftFromResponse(input, parsedObject) {
     .map((item) => [String(item && item.structureItemId || ''), item])
     .filter(([itemId]) => itemId));
   const stageById = new Map((input.stages || []).map((stage) => [String(stage && stage.id || ''), stage]));
+  const intentByItemId = new Map((Array.isArray(input.bindingIntent && input.bindingIntent.placements) ? input.bindingIntent.placements : [])
+    .map((item) => [String(item && item.structureItemId || ''), item]));
   const errors = [];
   const warnings = Array.isArray(response.warnings) ? response.warnings.map((item) => String(item || '')).filter(Boolean) : [];
   const staticTargets = targets.filter((target) => target && target.templateStatic === true);
@@ -45934,6 +47429,7 @@ function assistantDiagramPlacementDraftFromResponse(input, parsedObject) {
     const target = targetById.get(itemId);
     const allowed = new Set(Array.isArray(target.allowedMaterialization) ? target.allowedMaterialization.map(String) : []);
     const kind = assistantDiagramPlacementCandidateMaterializationKind(candidate);
+    const bindingIntent = intentByItemId.get(itemId) || null;
     if (!allowed.has(kind)) {
       errors.push({
         path: `$.mappings[${candidates.indexOf(candidate)}].materialization`,
@@ -45944,6 +47440,18 @@ function assistantDiagramPlacementDraftFromResponse(input, parsedObject) {
         allowedMaterialization: Array.from(allowed),
         receivedMaterialization: kind,
         message: `Для элемента «${String(target.displayName || 'элемент диаграммы')}» выбран недопустимый способ наполнения. Допустимо: ${Array.from(allowed).join(', ')}.`
+      });
+      continue;
+    }
+    if (bindingIntent && String(bindingIntent.materializationIntent || '') !== kind) {
+      errors.push({
+        path: `$.mappings[${candidates.indexOf(candidate)}].materialization`,
+        code: 'diagram_binding_intent_materialization_mismatch',
+        structureItemId: itemId,
+        displayName: String(target.displayName || itemId),
+        expectedMaterialization: String(bindingIntent.materializationIntent || ''),
+        receivedMaterialization: kind,
+        message: `D2 placement ${String(target.displayName || itemId)} does not follow its confirmed binding intent.`
       });
       continue;
     }
@@ -45958,6 +47466,23 @@ function assistantDiagramPlacementDraftFromResponse(input, parsedObject) {
         message: `Для элемента «${String(target.displayName || 'элемент диаграммы')}» Assistant выбрал отсутствующий результат Object Flow.`
       });
       continue;
+    }
+    if (kind === 'stage' && bindingIntent) {
+      const businessBlockId = String(bindingIntent.businessBlockId || '');
+      const stageBlocks = new Set(Array.isArray(stage && stage.assistantBlockIds) ? stage.assistantBlockIds.map(String) : []);
+      const terminalRequired = String(bindingIntent.stagePolicy || 'terminal-only') !== 'helper-allowed';
+      if (!businessBlockId || !stageBlocks.has(businessBlockId) || terminalRequired && String(stage && stage.stageRole || '') !== 'terminal') {
+        errors.push({
+          path: `$.mappings[${candidates.indexOf(candidate)}].stageId`,
+          code: 'diagram_binding_intent_stage_mismatch',
+          structureItemId: itemId,
+          displayName: String(target.displayName || itemId),
+          businessBlockId,
+          receivedStageId: String(stage && stage.id || ''),
+          message: `D2 placement ${String(target.displayName || itemId)} must use the confirmed ${terminalRequired ? 'terminal ' : ''}result of business block ${businessBlockId || '(empty)'}.`
+        });
+        continue;
+      }
     }
     if (kind === 'parentCard' && !stage) {
       errors.push({
@@ -46005,6 +47530,16 @@ function assistantDiagramPlacementDraftFromResponse(input, parsedObject) {
     const assistantConditions = assistantDiagramPlacementFiltersWithoutEmptyRules(candidate.conditions, warnings, String(target.displayName || itemId));
     const currentConditions = diagramImportPlacementFilters(current.conditions);
     const assistantHierarchyConditions = assistantDiagramPlacementFiltersWithoutEmptyRules(candidate.hierarchyConditions, warnings, String(target.displayName || itemId));
+    for (const directive of Array.isArray(bindingIntent && bindingIntent.requiredConditions) ? bindingIntent.requiredConditions : []) {
+      if (assistantConditions.rules.some((rule) => assistantDiagramRuleSatisfiesDirective(rule, directive, false))) continue;
+      const rule = assistantDiagramRuleFromDirective(directive, false, '', itemId);
+      if (rule) assistantConditions.rules.push(rule);
+    }
+    for (const directive of Array.isArray(bindingIntent && bindingIntent.requiredMembership) ? bindingIntent.requiredMembership : []) {
+      if (assistantHierarchyConditions.rules.some((rule) => assistantDiagramRuleSatisfiesDirective(rule, directive, true))) continue;
+      const rule = assistantDiagramRuleFromDirective(directive, true, String(parentStage && parentStage.id || ''), itemId);
+      if (rule) assistantHierarchyConditions.rules.push(rule);
+    }
     const hierarchyRuleCount = assistantHierarchyConditions.rules.length;
     if (kind !== 'stage') {
       assistantHierarchyConditions.rules = [];
@@ -46147,7 +47682,10 @@ function assistantDiagramPlacementCorrection(errors, placements = [], stages = [
     'diagram_placement_condition_invalid',
     'diagram_placement_materialization_invalid',
     'diagram_placement_primary_invalid',
-    'diagram_placement_execution_invalid'
+    'diagram_placement_execution_invalid',
+    'diagram_binding_intent_materialization_mismatch',
+    'diagram_binding_intent_stage_mismatch',
+    'diagram_semantic_obligation_failed'
   ]);
   const placementById = new Map((Array.isArray(placements) ? placements : [])
     .map((placement) => [String(placement && placement.structureItemId || ''), placement]));
@@ -46505,11 +48043,22 @@ function assistantDiagramStageDraftFromResponse(input, parsedObject) {
           else warnings.push(`Assistant normalized D2 relation class ${requestedConnectionKey} to its one connection contract.`);
         }
       }
-      const mode = String(candidate && candidate.mode || '').trim();
       if (!requirement) {
         errors.push({ path: `$.relationRules[${index}].d2ClassKey`, message: `Unknown or ambiguous D2 relation class ${requestedIdentifier || '(empty)'}.` });
         return;
       }
+      const offeredWithModes = [].concat(
+        (Array.isArray(requirement.networkEndpointStages) ? requirement.networkEndpointStages : []).map((item) => ({ ...item, mode: 'attributeEndpoints' })),
+        (Array.isArray(requirement.relationCardStages) ? requirement.relationCardStages : []).map((item) => ({ ...item, mode: 'relationCard' })),
+        (Array.isArray(requirement.deterministicEndpointStages) ? requirement.deterministicEndpointStages : []).map((item) => ({ ...item, mode: 'deterministicEndpoints' }))
+      );
+      const requestedCandidateId = String(candidate && candidate.candidateId || '').trim();
+      const requestedSourceStageId = String(candidate && candidate.sourceStageId || '').trim();
+      const exactOffered = input.bindingIntent && requestedCandidateId
+        ? offeredWithModes.find((item) => String(item && item.candidateId || '') === requestedCandidateId && (!requestedSourceStageId || String(item && item.sourceStageId || '') === requestedSourceStageId))
+        : null;
+      const selectedCandidate = exactOffered ? { ...candidate, ...exactOffered } : candidate;
+      const mode = String(selectedCandidate && selectedCandidate.mode || '').trim();
       if (!['relationCard', 'attributeEndpoints', 'networkEndpoints', 'deterministicEndpoints'].includes(mode)) {
         errors.push({ path: `$.relationRules[${index}].mode`, message: `Unsupported D2 connection mode ${mode || '(empty)'}.` });
         return;
@@ -46525,6 +48074,14 @@ function assistantDiagramStageDraftFromResponse(input, parsedObject) {
         return;
       }
       seenRelationRuleKeys.add(d2ElementKey);
+      const requirementDirectives = requirement && requirement.directives && typeof requirement.directives === 'object'
+        ? requirement.directives
+        : {};
+      const confirmedConnectionIntent = {
+        ...(requirement && requirement.bindingIntent && typeof requirement.bindingIntent === 'object' ? requirement.bindingIntent : {}),
+        sourceOperator: String(requirement && requirement.bindingIntent && requirement.bindingIntent.sourceOperator || requirementDirectives['source-operator'] || ''),
+        targetOperator: String(requirement && requirement.bindingIntent && requirement.bindingIntent.targetOperator || requirementDirectives['target-operator'] || '')
+      };
       const rule = {
         d2ElementKey,
         d2ClassKey: String(requirement.d2ClassKey || d2ElementKey),
@@ -46536,17 +48093,22 @@ function assistantDiagramStageDraftFromResponse(input, parsedObject) {
         directionPolicySuggestion: normalizeDiagramDirectionPolicy(requirement.directionPolicy) || normalizeDiagramDirectionPolicy(requirement.directionPolicySuggestion) || 'dataFields',
         mode,
         path: [],
-        candidateId: String(candidate && candidate.candidateId || '').trim(),
-        sourceStageId: String(candidate && candidate.sourceStageId || '').trim(),
-        sourceField: String(candidate && candidate.sourceField || '').trim(),
-        targetField: String(candidate && candidate.targetField || '').trim(),
-        sourceOperator: String(candidate && (candidate.sourceOperator || candidate.endpointOperator) || (mode === 'attributeEndpoints' || mode === 'networkEndpoints' ? 'ipv4InCidr' : '')).trim(),
-        targetOperator: String(candidate && (candidate.targetOperator || candidate.endpointOperator) || (mode === 'attributeEndpoints' || mode === 'networkEndpoints' ? 'ipv4InCidr' : '')).trim(),
-        labelTemplate: diagramImportRelationLabelTemplate(candidate)
+        candidateId: String(selectedCandidate && selectedCandidate.candidateId || '').trim(),
+        sourceStageId: String(selectedCandidate && selectedCandidate.sourceStageId || '').trim(),
+        sourceField: String(selectedCandidate && selectedCandidate.sourceField || '').trim(),
+        targetField: String(selectedCandidate && selectedCandidate.targetField || '').trim(),
+        sourceOperator: String(confirmedConnectionIntent.sourceOperator || selectedCandidate && (selectedCandidate.sourceOperator || selectedCandidate.endpointOperator) || (mode === 'attributeEndpoints' || mode === 'networkEndpoints' ? 'ipv4InCidr' : '')).trim(),
+        targetOperator: String(confirmedConnectionIntent.targetOperator || selectedCandidate && (selectedCandidate.targetOperator || selectedCandidate.endpointOperator) || (mode === 'attributeEndpoints' || mode === 'networkEndpoints' ? 'ipv4InCidr' : '')).trim(),
+        labelTemplate: diagramImportRelationLabelTemplate(selectedCandidate)
       };
       const stage = stageById.get(rule.sourceStageId);
       if (!stage || !rule.sourceField || !rule.targetField) {
         errors.push({ path: `$.relationRules[${index}]`, message: `D2 relation class ${String(requirement.d2ClassKey || d2ElementKey)} requires an existing connection stage and materialized source/target fields.` });
+        return;
+      }
+      if (['attributeEndpoints', 'networkEndpoints'].includes(mode) &&
+        (!DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(rule.sourceOperator) || !DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(rule.targetOperator))) {
+        errors.push({ path: `$.relationRules[${index}]`, message: `D2 relation class ${String(requirement.d2ClassKey || d2ElementKey)} requires supported deterministic source and target operators.` });
         return;
       }
       {
@@ -46697,7 +48259,7 @@ function assistantDiagramStageDraftFromResponse(input, parsedObject) {
   };
 }
 
-function assistantDiagramMappingCoverage(input, items, unresolved, relationRules = [], connectionUnresolved = []) {
+function assistantDiagramMappingCoverage(input, items, unresolved, relationRules = [], connectionUnresolved = [], endpointProfiles = []) {
   const placements = Array.isArray(input.placements) ? input.placements : [];
   const dynamicPlacements = placements.filter((target) => target && target.templateStatic !== true);
   const staticPlacements = placements.filter((target) => target && target.templateStatic === true);
@@ -46720,8 +48282,33 @@ function assistantDiagramMappingCoverage(input, items, unresolved, relationRules
   const mappedObjects = objectPlacements.filter((target) => mappedItemIds.has(String(target && target.structureItemId || '')));
   const mappedContainers = containerPlacements.filter((target) => mappedItemIds.has(String(target && target.structureItemId || '')));
   const topology = Array.isArray(input.topology) ? input.topology : [];
-  const acceptedConnectionKeys = new Set((Array.isArray(relationRules) ? relationRules : []).map((rule) => String(rule && rule.d2ElementKey || '')).filter(Boolean));
+  const normalizedProfiles = diagramImportEndpointProfiles(endpointProfiles);
+  const executableIssues = diagramImportTopologyUnresolved(input.validationRoles || input.roles || [], relationRules, normalizedProfiles);
+  const executableIssueClassKeys = new Set(executableIssues.map((item) => String(item && item.d2ClassKey || '')).filter(Boolean));
+  const executableIssueElementKeys = new Set(executableIssues.flatMap((item) => Array.isArray(item && item.d2ElementKeys)
+    ? item.d2ElementKeys.map(String)
+    : []).filter(Boolean));
+  const acceptedConnectionKeys = new Set((Array.isArray(relationRules) ? relationRules : [])
+    .filter((rule) => !executableIssueClassKeys.has(String(rule && rule.d2ClassKey || '')) && !executableIssueElementKeys.has(String(rule && rule.d2ElementKey || '')))
+    .map((rule) => String(rule && rule.d2ElementKey || '')).filter(Boolean));
   const explicitConnections = new Map((Array.isArray(connectionUnresolved) ? connectionUnresolved : []).map((item) => [String(item && item.connectionKey || ''), item]));
+  for (const requirement of topology) {
+    const connectionKey = String(requirement && requirement.d2ElementKey || '');
+    const classKey = String(requirement && requirement.d2ClassKey || '');
+    const issue = executableIssues.find((item) => (
+      String(item && item.d2ClassKey || '') === classKey ||
+      (Array.isArray(item && item.d2ElementKeys) ? item.d2ElementKeys.map(String) : []).includes(connectionKey)
+    ));
+    if (!issue || explicitConnections.has(connectionKey)) continue;
+    explicitConnections.set(connectionKey, {
+      connectionKey,
+      d2ClassKey: classKey,
+      displayName: String(requirement && (requirement.label || classKey || connectionKey) || ''),
+      code: 'connectionEndpointProfilesIncomplete',
+      message: `D2 relation class ${String(requirement && (classKey || requirement.label || connectionKey) || '')} is mapped, but its deterministic endpoint comparison rules are incomplete.`,
+      fields: Array.isArray(issue.fields) ? issue.fields.map(String) : []
+    });
+  }
   const unresolvedConnections = topology
     .filter((requirement) => !acceptedConnectionKeys.has(String(requirement && requirement.d2ElementKey || '')))
     .map((requirement) => ({
@@ -46796,11 +48383,26 @@ function assistantDiagramRoleModelCorrection(errors) {
 function normalizeAssistantDiagramMappingStage(value) {
   const stage = String(value || '').trim();
   if (!stage || stage === 'roles') return 'roles';
-  if (stage === 'topology') return 'topology';
+  if (stage === 'topology') return stage;
   const error = new Error('D2 mapping stage is invalid. Start mapping again.');
   error.statusCode = 400;
   error.code = 'assistant_diagram_mapping_stage_invalid';
   throw error;
+}
+
+function normalizeAssistantDiagramMappingPhase(value) {
+  const phase = String(value || '').trim();
+  if (!phase || phase === 'roles') return 'roles';
+  if (['intent', 'topology', 'critique'].includes(phase)) return phase;
+  const error = new Error('Saved D2 mapping phase is invalid. Start mapping again.');
+  error.statusCode = 409;
+  error.code = 'assistant_diagram_mapping_resume_stage_mismatch';
+  throw error;
+}
+
+function assistantDiagramPublicStageForPhase(value) {
+  const phase = normalizeAssistantDiagramMappingPhase(value);
+  return phase === 'intent' || phase === 'roles' ? 'roles' : 'topology';
 }
 
 function normalizeAssistantDiagramMappingResumeId(value) {
@@ -46819,8 +48421,9 @@ function assistantDiagramMappingCheckpointInputHash(input = {}) {
     templateCode: String(input.templateCode || ''),
     baseSpecHash: String(input.baseSpecHash || ''),
     prompt: String(input.prompt || ''),
-    placementPrompt: String(input.placementPrompt || ''),
-    connectionsPrompt: String(input.connectionsPrompt || ''),
+    businessBlockManifest: input.businessBlockManifest && typeof input.businessBlockManifest === 'object'
+      ? input.businessBlockManifest
+      : {},
     currentSpec: input.currentSpec && typeof input.currentSpec === 'object' ? input.currentSpec : {},
     proposal: diagramImportProposalSignaturePayload(input.proposal || {}),
     roles: Array.isArray(input.roles) ? input.roles : [],
@@ -46838,7 +48441,8 @@ function assistantDiagramModelHashes(input = {}) {
   return {
     dataSemanticModel: String(input.dataSemanticModel && input.dataSemanticModel.modelHash || ''),
     d2StructuralModel: String(input.d2StructuralModel && input.d2StructuralModel.modelHash || ''),
-    d2SemanticModel: String(input.d2SemanticModel && input.d2SemanticModel.modelHash || '')
+    d2SemanticModel: String(input.d2SemanticModel && input.d2SemanticModel.modelHash || ''),
+    businessBlockManifest: String(input.businessBlockManifest && input.businessBlockManifest.modelHash || '')
   };
 }
 
@@ -46854,6 +48458,7 @@ function assistantDiagramMappingCheckpointSummary(checkpoint, options = {}) {
   const retry = checkpoint && checkpoint.retry && typeof checkpoint.retry === 'object' ? checkpoint.retry : {};
   const correctionAttempt = Math.max(0, Number(retry.correctionAttempt || 0));
   const transientAttempt = Math.max(0, Number(retry.transientAttempt || 0));
+  const totalCorrectionCount = Math.max(correctionAttempt, Number(checkpoint && checkpoint.correctionCount || 0));
   return {
     resumeId: String(options.resumeId || ''),
     stage: String(options.stage || 'roles'),
@@ -46861,9 +48466,9 @@ function assistantDiagramMappingCheckpointSummary(checkpoint, options = {}) {
     rolesReused: Boolean(options.rolesReused),
     attempt: Math.max(1, correctionAttempt + transientAttempt + 1),
     transientAttempt,
-    correctionAttempt,
+    correctionAttempt: totalCorrectionCount,
     automaticRetriesRemaining: Math.max(0, ASSISTANT_DIAGRAM_MAPPING_STAGE_AUTO_RETRIES - transientAttempt),
-    correctionRetriesRemaining: Math.max(0, ASSISTANT_DIAGRAM_MAPPING_STAGE_CORRECTION_RETRIES - correctionAttempt),
+    correctionRetriesRemaining: Math.max(0, ASSISTANT_DIAGRAM_MAPPING_STAGE_CORRECTION_RETRIES - totalCorrectionCount),
     checkpointTtlSec: Math.max(1, Math.round(Number(options.ttlMs || 0) / 1000)),
     expiresAt: checkpoint && checkpoint.expiresAt || ''
   };
@@ -46896,12 +48501,17 @@ function assistantDiagramMappingCheckpointDraft(input, options = {}) {
   const now = new Date();
   const ttlMs = assistantDiagramMappingCheckpointTtlMs();
   return {
-    version: D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION,
+    version: ASSISTANT_DIAGRAM_MAPPING_CHECKPOINT_VERSION,
     inputHash: assistantDiagramMappingCheckpointInputHash(input),
     modelHashes: assistantDiagramModelHashes(input),
-    pendingStage: normalizeAssistantDiagramMappingStage(options.pendingStage),
+    pendingStage: normalizeAssistantDiagramMappingPhase(options.pendingStage),
+    bindingIntent: options.bindingIntent ? cloneJsonValueServer(options.bindingIntent, {}) : null,
     roleDraft: options.roleDraft ? cloneJsonValueServer(options.roleDraft, {}) : null,
     topology: cloneJsonValueServer(options.topology || [], []),
+    finalDraft: options.finalDraft ? cloneJsonValueServer(options.finalDraft, {}) : null,
+    obligationMatrix: options.obligationMatrix ? cloneJsonValueServer(options.obligationMatrix, {}) : null,
+    critique: options.critique ? cloneJsonValueServer(options.critique, {}) : null,
+    correctionCount: Math.max(0, Number(options.correctionCount || 0)),
     retry: options.retry && typeof options.retry === 'object' ? cloneJsonValueServer(options.retry, {}) : null,
     createdAt: String(options.createdAt || now.toISOString()),
     updatedAt: now.toISOString(),
@@ -46911,7 +48521,7 @@ function assistantDiagramMappingCheckpointDraft(input, options = {}) {
 
 function assistantDiagramMappingRetryState(stage, correctionAttempt, correction = {}, placementIds = [], transientAttempt = 0) {
   return {
-    stage: normalizeAssistantDiagramMappingStage(stage),
+    stage: normalizeAssistantDiagramMappingPhase(stage),
     correctionAttempt: Math.max(0, Number(correctionAttempt || 0)),
     transientAttempt: Math.max(0, Number(transientAttempt || 0)),
     correction: correction && typeof correction === 'object' ? cloneJsonValueServer(correction, {}) : {},
@@ -46932,7 +48542,7 @@ function assistantDiagramRoleRetryState(input, roleDraft, correctionAttempt = 0,
     const correction = assistantDiagramPlacementCorrection(roleDraft && roleDraft.errors, input.placements, input.stages);
     return correction ? assistantDiagramMappingRetryState('roles', correctionAttempt, correction, correction.retryPlacementIds, transientAttempt) : null;
   }
-  const mapping = roleDraft.mapping || assistantDiagramMappingCoverage(input, roleDraft.items, roleDraft.unresolved);
+  const mapping = roleDraft.mapping || assistantDiagramMappingCoverage(input, roleDraft.items, roleDraft.unresolved, [], [], roleDraft.endpointProfiles || []);
   const explicitlyUnresolved = new Set((Array.isArray(roleDraft.unresolved) ? roleDraft.unresolved : [])
     .map((item) => String(item && item.structureItemId || ''))
     .filter(Boolean));
@@ -47096,7 +48706,8 @@ function assistantDiagramFinalizeRoleDraft(input, roleDraft, previousRoleDraft =
       list.findIndex((candidate) => String(candidate && candidate.structureItemId || '') === itemId) === index;
   });
   let acceptedItems = items;
-  let mapping = assistantDiagramMappingCoverage(input, acceptedItems, unresolved);
+  let endpointProfiles = assistantDiagramEndpointProfilesFromBindings(input, acceptedItems);
+  let mapping = assistantDiagramMappingCoverage(input, acceptedItems, unresolved, [], [], endpointProfiles);
   let success = Boolean(roleDraft.success);
   let errors = Array.isArray(roleDraft.errors) ? roleDraft.errors : [];
   let executionValidation = { checked: false, errors: [], invalidItemIds: [] };
@@ -47105,7 +48716,8 @@ function assistantDiagramFinalizeRoleDraft(input, roleDraft, previousRoleDraft =
     if (executionValidation.errors.length) {
       const invalidItemIds = new Set(executionValidation.invalidItemIds);
       acceptedItems = acceptedItems.filter((item) => !invalidItemIds.has(String(item && item.structureItemId || '')));
-      mapping = assistantDiagramMappingCoverage(input, acceptedItems, unresolved);
+      endpointProfiles = assistantDiagramEndpointProfilesFromBindings(input, acceptedItems);
+      mapping = assistantDiagramMappingCoverage(input, acceptedItems, unresolved, [], [], endpointProfiles);
       success = false;
       errors = executionValidation.errors;
     }
@@ -47114,6 +48726,7 @@ function assistantDiagramFinalizeRoleDraft(input, roleDraft, previousRoleDraft =
     ...roleDraft,
     success,
     items: acceptedItems,
+    endpointProfiles,
     // Keep only the Assistant's explicit unresolved decisions here. Coverage
     // also reports synthetic omissions for the UI, but those must remain
     // retryable instead of being mistaken for an intentional decision.
@@ -47142,7 +48755,7 @@ async function loadAssistantDiagramMappingCheckpoint(input, options = {}) {
     error.code = 'assistant_diagram_mapping_resume_expired';
     throw error;
   }
-  if (Number(checkpoint.version || 0) !== D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION) {
+  if (Number(checkpoint.version || 0) !== ASSISTANT_DIAGRAM_MAPPING_CHECKPOINT_VERSION) {
     await cacheDelete('assistant-diagram-mapping', checkpointOptions.key, assistantDiagramMappingCheckpointCache);
     const error = new Error('Saved D2 object mapping uses an obsolete retry contract. Start mapping again.');
     error.statusCode = 409;
@@ -47155,9 +48768,22 @@ async function loadAssistantDiagramMappingCheckpoint(input, options = {}) {
     error.code = 'assistant_diagram_mapping_resume_mismatch';
     throw error;
   }
-  const pendingStage = normalizeAssistantDiagramMappingStage(checkpoint.pendingStage);
+  const pendingStage = normalizeAssistantDiagramMappingPhase(checkpoint.pendingStage);
+  const intentPipeline = Boolean(input && input.businessBlockManifest && Array.isArray(input.businessBlockManifest.blocks) && input.businessBlockManifest.blocks.length);
+  if (intentPipeline && pendingStage !== 'intent' && !checkpoint.bindingIntent) {
+    const error = new Error('Saved D2 mapping is missing the confirmed business binding intent. Start mapping again.');
+    error.statusCode = 409;
+    error.code = 'assistant_diagram_mapping_resume_incomplete';
+    throw error;
+  }
   if (pendingStage === 'topology' && (!checkpoint.roleDraft || !Array.isArray(checkpoint.topology))) {
     const error = new Error('Saved D2 object mapping is incomplete. Start mapping again.');
+    error.statusCode = 409;
+    error.code = 'assistant_diagram_mapping_resume_incomplete';
+    throw error;
+  }
+  if (pendingStage === 'critique' && (!checkpoint.finalDraft || !checkpoint.obligationMatrix)) {
+    const error = new Error('Saved D2 semantic validation is incomplete. Start mapping again.');
     error.statusCode = 409;
     error.code = 'assistant_diagram_mapping_resume_incomplete';
     throw error;
@@ -47202,7 +48828,8 @@ async function createAssistantDiagramStageDraft(input, runtimeConfig) {
     if (!firstDraft.success) return firstDraft;
     if (input.mappingPhase === 'topology') return firstDraft;
     firstDraft.items = assistantDiagramAttachRelatedNetworkStages(firstDraft.items, input.roles, input.stages);
-    const firstCoverage = assistantDiagramMappingCoverage(input, firstDraft.items, firstDraft.unresolved);
+    firstDraft.endpointProfiles = assistantDiagramEndpointProfilesFromBindings(input, firstDraft.items);
+    const firstCoverage = assistantDiagramMappingCoverage(input, firstDraft.items, firstDraft.unresolved, [], [], firstDraft.endpointProfiles);
     firstDraft.mapping = firstCoverage;
     firstDraft.diagnostics = { ...firstDraft.diagnostics, mappingStatus: firstCoverage.status };
     return firstDraft;
@@ -47214,7 +48841,7 @@ async function createAssistantDiagramMappingRolesDraft(input, runtimeConfig) {
   const roleInput = { ...input, mappingPhase: 'roles', topology: [] };
   const roleDraft = await createAssistantDiagramStageDraft(roleInput, runtimeConfig);
   if (!roleDraft.success) return { success: false, roleDraft, topology: [] };
-  const topology = assistantDiagramTopologyRequirements(
+  const rawTopology = assistantDiagramTopologyRequirements(
     input.relationRules,
     input.roles,
     roleDraft.items,
@@ -47222,6 +48849,9 @@ async function createAssistantDiagramMappingRolesDraft(input, runtimeConfig) {
     input.catalog,
     input.traversalDepth
   );
+  const topology = input.bindingIntent
+    ? assistantDiagramTopologyWithBindingIntent(rawTopology, input.bindingIntent)
+    : rawTopology;
   const endpointBindings = assistantDiagramEnsureNetworkEndpointBindings(
     roleDraft.items,
     input.roles,
@@ -47229,19 +48859,22 @@ async function createAssistantDiagramMappingRolesDraft(input, runtimeConfig) {
     topology
   );
   roleDraft.items = endpointBindings.items;
+  roleDraft.endpointProfiles = assistantDiagramEndpointProfilesFromBindings(input, roleDraft.items);
   roleDraft.warnings = uniqueStrings((roleDraft.warnings || []).concat(endpointBindings.warnings));
-  roleDraft.mapping = assistantDiagramMappingCoverage(input, roleDraft.items, roleDraft.unresolved);
+  roleDraft.mapping = assistantDiagramMappingCoverage(input, roleDraft.items, roleDraft.unresolved, [], [], roleDraft.endpointProfiles);
   return { success: true, roleDraft, topology };
 }
 
 function completeAssistantDiagramRoleMapping(input, roleDraft) {
   const topology = [];
-  const mapping = assistantDiagramMappingCoverage({ ...input, topology }, roleDraft.items, roleDraft.unresolved);
+  const endpointProfiles = assistantDiagramEndpointProfilesFromBindings(input, roleDraft.items);
+  const mapping = assistantDiagramMappingCoverage({ ...input, topology }, roleDraft.items, roleDraft.unresolved, [], [], endpointProfiles);
   const rolesAttempts = Number(roleDraft.diagnostics && roleDraft.diagnostics.attempts || 1);
   return {
     ...roleDraft,
     relationRules: [],
     connectionUnresolved: [],
+    endpointProfiles,
     mapping,
     diagnostics: {
       ...roleDraft.diagnostics,
@@ -47273,7 +48906,8 @@ async function createAssistantDiagramTopologyMappingDraft(input, runtimeConfig, 
       roleDraft.items,
       roleDraft.unresolved,
       topologyDraft.relationRules || [],
-      topologyDraft.connectionUnresolved || []
+      topologyDraft.connectionUnresolved || [],
+      roleDraft.endpointProfiles || []
     );
     return {
       ...roleDraft,
@@ -47300,7 +48934,8 @@ async function createAssistantDiagramTopologyMappingDraft(input, runtimeConfig, 
     roleDraft.items,
     roleDraft.unresolved,
     topologyDraft.relationRules || [],
-    topologyDraft.connectionUnresolved || []
+    topologyDraft.connectionUnresolved || [],
+    roleDraft.endpointProfiles || []
   );
   const rolesAttempts = Number(roleDraft.diagnostics && roleDraft.diagnostics.attempts || 1);
   const topologyAttempts = Number(topologyDraft.diagnostics && topologyDraft.diagnostics.attempts || 1);
@@ -47308,6 +48943,7 @@ async function createAssistantDiagramTopologyMappingDraft(input, runtimeConfig, 
     ...roleDraft,
     relationRules: topologyDraft.relationRules || [],
     connectionUnresolved: topologyDraft.connectionUnresolved || [],
+    endpointProfiles: roleDraft.endpointProfiles || [],
     mapping,
     warnings: uniqueStrings([...(roleDraft.warnings || []), ...(topologyDraft.warnings || [])]),
     explanation: topologyDraft.explanation || roleDraft.explanation,
@@ -48248,7 +49884,16 @@ function validateTemplateSpecForStorage(spec) {
 
 function validateD2ExecutionState(spec) {
   const errors = [];
-  const authoring = templateAuthoring(spec, { allowLegacy: false });
+  const authoringStatus = diagramAuthoringStatusForSpec(spec);
+  if (authoringStatus.status === 'unsupported' || authoringStatus.status === 'needsReanalysis') {
+    errors.push({
+      path: '$.result.diagrams',
+      code: authoringStatus.code || 'd2_authoring_current_contract_required',
+      message: authoringStatus.message
+    });
+    return errors;
+  }
+  const authoring = templateAuthoring(spec);
   const source = String(authoring && authoring.d2 && authoring.d2.source || '');
   const diagrams = spec && spec.result && Array.isArray(spec.result.diagrams) ? spec.result.diagrams : [];
   const importedDiagram = diagrams.find((diagram) => diagram && diagram.authoring && diagram.authoring.d2Import);
@@ -54354,7 +55999,8 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
   const includeDiagrams = options.includeDiagrams !== false;
   const d2Workflow = includeDiagrams ? await d2WorkflowStatusForSpec(spec) : { state: 'not-requested' };
   const partialDiagramPreview = includeDiagrams && options.allowPartialDiagramPreview === true && d2Workflow.state === 'pending';
-  const diagrams = includeDiagrams && (d2Workflow.state !== 'pending' || partialDiagramPreview)
+  const canBuildDiagrams = d2Workflow.state === 'applied' || partialDiagramPreview;
+  const diagrams = includeDiagrams && canBuildDiagrams
     ? buildResultDiagrams(spec, context, effectiveParams, limits)
     : [];
   if (includeDiagrams && !options.skipD2Render && diagrams.length) {
@@ -54386,7 +56032,9 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
       ...trace.flatMap((item) => Array.isArray(item.limitDiagnostics)
       ? assistantLimitWarningsFromDiagnostics(item.limitDiagnostics)
       : (item.warning ? [item.warning] : [])),
-      ...(includeDiagrams && d2Workflow.state === 'pending'
+      ...(includeDiagrams && d2Workflow.state === 'unsupported'
+        ? [d2Workflow.message || 'The saved D2 mapping uses an unsupported authoring contract. Diagram output is withheld until a current mapping is applied; table output remains available.']
+        : includeDiagrams && d2Workflow.state === 'pending'
         ? [partialDiagramPreview
           ? 'D2 mapping is incomplete. Preview contains only independently executable deterministic bindings; omitted roles and connections require mapping correction.'
           : 'D2 source was changed or imported but its deterministic mapping has not been applied. Diagram output is withheld until the D2 mapping is applied; table output remains available.']
@@ -55001,7 +56649,7 @@ async function handleBackend(req, res, requestUrl) {
     const startedAt = Date.now();
     try {
       const sourceSpec = cloneJsonValueServer(body.currentSpec || authoring.template && authoring.template.spec || {}, {});
-      const source = String(templateAuthoringD2(sourceSpec, { allowLegacy: false }).source || '');
+      const source = String(templateAuthoringD2(sourceSpec).source || '');
       const catalogRequestUrl = await configuredModelCatalogRequestUrl(authToken, root, new URL('http://127.0.0.1/model/catalog?includeAttributes=true'));
       const catalogResult = await buildModelCatalog(authToken, catalogRequestUrl);
       if (!catalogResult.success) {
@@ -55216,10 +56864,29 @@ async function handleBackend(req, res, requestUrl) {
     if (!requireJsonContentType(req, res)) return;
     const body = await readJsonObjectBody(req, res, 256 * 1024);
     if (!body) return;
-    const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
-    const planContext = await resolveAssistantObjectFlowPlanContext(authToken, res, root, body.templateCode);
+    let templateRef;
+    try {
+      templateRef = assistantRequestTemplateRef(body);
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { success: false, action: 'assistant-object-flow-semantic-plan', code: error.code || 'assistant_template_ref_invalid', message: error.message || String(error), errors: error.details || [] });
+      return;
+    }
+    const root = templateRef.root;
+    const authoringContext = templateRef.templateCode
+      ? await requireDiagramAuthoringContext(authToken, res, root, templateRef.templateCode, templateRef.baseSpecHash)
+      : await resolveAssistantObjectFlowPlanContext(authToken, res, root, '');
+    const planContext = authoringContext && {
+      ...authoringContext,
+      canApply: authoringContext.canApply !== undefined ? authoringContext.canApply : Boolean(authoringContext.template)
+    };
     if (!planContext) return;
-    const currentSpec = body.currentSpec || planContext.template && planContext.template.spec || {};
+    let currentSpec;
+    try {
+      currentSpec = resolveAssistantRequestSpec(body, planContext.template && planContext.template.spec || {});
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { success: false, code: error.code || 'assistant_editor_delta_invalid', message: error.message || String(error), errors: error.details || [] });
+      return;
+    }
     const currentSpecErrors = validateTemplateSpecForStorage(currentSpec);
     if (currentSpecErrors.length) {
       sendJson(res, 400, {
@@ -55239,21 +56906,21 @@ async function handleBackend(req, res, requestUrl) {
     const resumeId = normalizeAssistantSemanticPlanResumeId(body.resumeId) || crypto.randomUUID();
     const checkpointScope = executionThrottleScopeFromRequest(req, {
       action: 'assistant-object-flow-semantic-plan-checkpoint',
-      templateCode: body.templateCode
+      templateCode: templateRef.templateCode
     });
     const checkpoint = {
       root,
       resumeId,
       key: assistantSemanticPlanCheckpointKey({ root, scope: checkpointScope, resumeId })
     };
-    const slot = acquireExecutionSlot(req, res, { action: 'assistant-object-flow-semantic-plan', templateCode: body.templateCode });
+    const slot = acquireExecutionSlot(req, res, { action: 'assistant-object-flow-semantic-plan', templateCode: templateRef.templateCode });
     if (!slot) return;
     try {
       const plan = await createAssistantObjectFlowSemanticPlan({
         intent: body.intent,
         currentSpec,
-        templateCode: body.templateCode || '',
-        baseSpecHash: body.baseSpecHash || ''
+        templateCode: templateRef.templateCode,
+        baseSpecHash: templateRef.baseSpecHash
       }, { authToken, runtimeConfig, stage: semanticStage, checkpoint });
       if (semanticStage === 'context') {
         const contextLimits = collectAssistantLimitDiagnostics(plan.diagnostics || {}).filter((item) => item.limitHit);
@@ -55299,7 +56966,7 @@ async function handleBackend(req, res, requestUrl) {
         requestId: req.cmdpRequestId || '',
         authSource: backendLogUser,
         root,
-        templateCode: truncateText(String(body.templateCode || ''), 120),
+        templateCode: truncateText(templateRef.templateCode, 120),
         stage: semanticStage,
         retryable,
         resumeIdHash: retryable ? sha256Hex(resumeId).slice(0, 16) : '',
@@ -55332,10 +56999,29 @@ async function handleBackend(req, res, requestUrl) {
     if (!requireJsonContentType(req, res)) return;
     const body = await readJsonObjectBody(req, res, 256 * 1024);
     if (!body) return;
-    const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
-    const planContext = await resolveAssistantObjectFlowPlanContext(authToken, res, root, body.templateCode);
+    let templateRef;
+    try {
+      templateRef = assistantRequestTemplateRef(body);
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { success: false, action: 'assistant-object-flow-plan', code: error.code || 'assistant_template_ref_invalid', message: error.message || String(error), errors: error.details || [] });
+      return;
+    }
+    const root = templateRef.root;
+    const authoringContext = templateRef.templateCode
+      ? await requireDiagramAuthoringContext(authToken, res, root, templateRef.templateCode, templateRef.baseSpecHash)
+      : await resolveAssistantObjectFlowPlanContext(authToken, res, root, '');
+    const planContext = authoringContext && {
+      ...authoringContext,
+      canApply: authoringContext.canApply !== undefined ? authoringContext.canApply : Boolean(authoringContext.template)
+    };
     if (!planContext) return;
-    const currentSpec = body.currentSpec || planContext.template && planContext.template.spec || {};
+    let currentSpec;
+    try {
+      currentSpec = resolveAssistantRequestSpec(body, planContext.template && planContext.template.spec || {});
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { success: false, code: error.code || 'assistant_editor_delta_invalid', message: error.message || String(error), errors: error.details || [] });
+      return;
+    }
     const currentSpecErrors = validateTemplateSpecForStorage(currentSpec);
     if (currentSpecErrors.length) {
       sendJson(res, 400, {
@@ -55354,14 +57040,14 @@ async function handleBackend(req, res, requestUrl) {
     const resumeId = body.resumeId ? normalizeAssistantSemanticPlanResumeId(body.resumeId) : '';
     const checkpointScope = resumeId ? executionThrottleScopeFromRequest(req, {
       action: 'assistant-object-flow-semantic-plan-checkpoint',
-      templateCode: body.templateCode
+      templateCode: templateRef.templateCode
     }) : '';
     const checkpointOptions = resumeId ? {
       root,
       resumeId,
       key: assistantSemanticPlanCheckpointKey({ root, scope: checkpointScope, resumeId })
     } : null;
-    const slot = acquireExecutionSlot(req, res, { action: 'assistant-object-flow-plan', templateCode: body.templateCode });
+    const slot = acquireExecutionSlot(req, res, { action: 'assistant-object-flow-plan', templateCode: templateRef.templateCode });
     if (!slot) return;
     let checkpoint = null;
     try {
@@ -55369,8 +57055,8 @@ async function handleBackend(req, res, requestUrl) {
         intent: body.intent,
         semanticPlan: body.semanticPlan,
         currentSpec,
-        templateCode: body.templateCode || '',
-        baseSpecHash: body.baseSpecHash || ''
+        templateCode: templateRef.templateCode,
+        baseSpecHash: templateRef.baseSpecHash
       }, {
         checkpoint: checkpointOptions,
         ttlMs: assistantSemanticPlanCheckpointTtlMs(runtimeConfig)
@@ -55396,7 +57082,7 @@ async function handleBackend(req, res, requestUrl) {
           requestId: req.cmdpRequestId || '',
           authSource: backendLogUser,
           root,
-          templateCode: truncateText(String(body.templateCode || ''), 120),
+          templateCode: truncateText(templateRef.templateCode, 120),
           causes: Array.isArray(feedback && feedback.causes) ? feedback.causes.map((cause) => String(cause && cause.kind || '')).filter(Boolean) : [],
           errorPaths: Array.isArray(draft.errors) ? draft.errors.map((error) => String(error && error.path || '')).filter(Boolean).slice(0, 20) : [],
           normalizationKinds: Array.isArray(draft.diagnostics && draft.diagnostics.objectFlow && draft.diagnostics.objectFlow.normalizations)
@@ -55454,7 +57140,7 @@ async function handleBackend(req, res, requestUrl) {
         requestId: req.cmdpRequestId || '',
         authSource: backendLogUser,
         root,
-        templateCode: truncateText(String(body.templateCode || ''), 120),
+        templateCode: truncateText(templateRef.templateCode, 120),
         stage,
         retryable,
         mcpContextReused: Boolean(checkpoint),
@@ -55563,11 +57249,18 @@ async function handleBackend(req, res, requestUrl) {
     if (!requireJsonContentType(req, res)) return;
     const body = await readJsonObjectBody(req, res, D2_IMPORT_MAX_OUTPUT_BYTES + 512 * 1024);
     if (!body) return;
-    const root = body.root || requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
     const proposalInput = body.proposal;
-    const templateCode = String(body.templateCode || proposalInput && proposalInput.templateCode || '').trim();
+    let templateRef;
+    try {
+      templateRef = assistantRequestTemplateRef(body);
+    } catch (error) {
+      sendJson(res, error.statusCode || 400, { success: false, action: 'assistant-diagram-import', code: error.code || 'assistant_template_ref_invalid', message: error.message || String(error), errors: error.details || [] });
+      return;
+    }
+    const root = templateRef.root;
+    const templateCode = String(templateRef.templateCode || proposalInput && proposalInput.templateCode || '').trim();
     const requestedSpecHash = templateCode
-      ? String(body.baseSpecHash || hashJson(body.currentSpec || {})).trim()
+      ? String(templateRef.baseSpecHash || '').trim()
       : '';
     const authoring = await requireDiagramAuthoringContext(authToken, res, root, templateCode, requestedSpecHash);
     if (!authoring) return;
@@ -55593,7 +57286,7 @@ async function handleBackend(req, res, requestUrl) {
         templateError.statusCode = 409;
         throw templateError;
       }
-      const sourceSpec = cloneJsonValueServer(body.currentSpec || authoring.template && authoring.template.spec || {}, {});
+      const sourceSpec = resolveAssistantRequestSpec(body, authoring.template && authoring.template.spec || {});
       assertAssistantCurrentSpecValid(sourceSpec);
       assertDiagramImportProposalDeterministicSpec(proposalInput, sourceSpec, 'using Assistant');
       assertDiagramImportStoredSource(proposalInput, sourceSpec, 'using Assistant');
@@ -55663,12 +57356,13 @@ async function handleBackend(req, res, requestUrl) {
       const dataSemanticModel = assistantDataSemanticModel(stages, mappingCatalog || {});
       const d2StructuralModel = assistantD2StructuralModel(roles, placements, reviewProposal.relationRules);
       const d2SemanticModel = assistantD2SemanticModel(roles);
+      const businessBlockManifest = mapTask ? assistantObjectFlowBusinessBlockManifest(sourceSpec, stages) : null;
       if (!mapTask) {
         assistantInput = {
           kind: 'interpretation',
           roleModelRevision: D2_IMPORT_SEMANTIC_MODEL_REVISION,
           prompt: String(body.prompt || '').trim(),
-          semanticsPrompt: String(body.semanticsPrompt || body.prompt || '').trim(),
+          semanticsPrompt: String(body.prompt || '').trim(),
           abortSignal: abortContext.signal,
           roles,
           stages,
@@ -55700,16 +57394,18 @@ async function handleBackend(req, res, requestUrl) {
           validationRoles: reviewProposal.roles,
           structure: reviewProposal.structure,
           relationRules: reviewProposal.relationRules,
+          endpointProfiles: reviewProposal.endpointProfiles,
           structureTree: reviewProposal.structureTree,
           traversalDepth: Math.max(1, Math.min(5, Number(body.traversalDepth) || 1)),
           kind: 'mapping',
           roleModelRevision: D2_IMPORT_SEMANTIC_MODEL_REVISION,
           prompt: String(body.prompt || '').trim(),
-          placementPrompt: String(body.placementPrompt || body.prompt || '').trim(),
-          connectionsPrompt: String(body.connectionsPrompt || body.prompt || '').trim(),
+          placementPrompt: String(body.prompt || '').trim(),
+          connectionsPrompt: String(body.prompt || '').trim(),
           abortSignal: abortContext.signal,
           placements,
           stages,
+          businessBlockManifest,
           dataSemanticModel,
           d2StructuralModel,
           d2SemanticModel,
@@ -55775,7 +57471,8 @@ async function handleBackend(req, res, requestUrl) {
             retryDraft.items || [],
             retryDraft.unresolved || [],
             retryDraft.relationRules || [],
-            retryDraft.connectionUnresolved || []
+            retryDraft.connectionUnresolved || [],
+            retryDraft.endpointProfiles || []
           ));
           sendJson(res, 422, {
             success: false,
@@ -55790,6 +57487,7 @@ async function handleBackend(req, res, requestUrl) {
             partial: Boolean(partialMapping && Array.isArray(retryDraft && retryDraft.items) && retryDraft.items.length),
             mappings: retryDraft && retryDraft.items || [],
             relationRules: retryDraft && retryDraft.relationRules || [],
+            endpointProfiles: retryDraft && retryDraft.endpointProfiles || [],
             connectionUnresolved: retryDraft && retryDraft.connectionUnresolved || [],
             mapping: partialMapping || null,
             models: assistantDiagramModelBundle(mappingInput, retryDraft || {}, partialMapping || null),
@@ -55803,11 +57501,79 @@ async function handleBackend(req, res, requestUrl) {
             }
           });
         };
-        if (mappingStage === 'roles') {
-          const cached = await cacheGetJson('assistant-diagram-mapping', mappingCheckpointOptions.key, assistantDiagramMappingCheckpointCache);
-          if (cached.value) {
-            const loaded = await loadAssistantDiagramMappingCheckpoint(mappingInput, { checkpoint: mappingCheckpointOptions });
-            mappingCheckpoint = loaded.checkpoint;
+        const cachedMappingCheckpoint = await cacheGetJson('assistant-diagram-mapping', mappingCheckpointOptions.key, assistantDiagramMappingCheckpointCache);
+        if (cachedMappingCheckpoint.value) {
+          const loaded = await loadAssistantDiagramMappingCheckpoint(mappingInput, { checkpoint: mappingCheckpointOptions });
+          mappingCheckpoint = loaded.checkpoint;
+        }
+        const intentPipeline = Boolean(businessBlockManifest && Array.isArray(businessBlockManifest.blocks) && businessBlockManifest.blocks.length);
+        if (mappingStage === 'topology' && !mappingCheckpoint) {
+          const stageError = new Error('Saved D2 object mapping has expired. Start mapping again.');
+          stageError.statusCode = 409;
+          stageError.code = 'assistant_diagram_mapping_resume_expired';
+          throw stageError;
+        }
+        if (mappingStage === 'roles' && intentPipeline && (!mappingCheckpoint || String(mappingCheckpoint.pendingStage || '') === 'intent')) {
+          if (!mappingCheckpoint) {
+            mappingCheckpoint = assistantDiagramMappingCheckpointDraft(mappingInput, { pendingStage: 'intent' });
+            await persistMappingCheckpoint(mappingCheckpoint);
+          }
+          const intentRetry = mappingCheckpoint.retry && mappingCheckpoint.retry.stage === 'intent' ? mappingCheckpoint.retry : null;
+          const intentDraft = await createAssistantDiagramBindingIntentDraft(intentRetry ? {
+            ...mappingInput,
+            assistantStageAttempt: 'retry',
+            correction: intentRetry.correction || {}
+          } : mappingInput, runtimeConfig);
+          if (!intentDraft.success) {
+            const correctionAttempt = Math.max(0, Number(mappingCheckpoint.correctionCount || 0)) + 1;
+            if (correctionAttempt <= ASSISTANT_DIAGRAM_MAPPING_STAGE_CORRECTION_RETRIES) {
+              const retry = assistantDiagramMappingRetryState('intent', correctionAttempt, {
+                invalidBindingIntent: cloneJsonValueServer(intentDraft.errors || [], [])
+              });
+              mappingCheckpoint = assistantDiagramMappingCheckpointDraft(mappingInput, {
+                pendingStage: 'intent',
+                retry,
+                correctionCount: correctionAttempt,
+                createdAt: mappingCheckpoint.createdAt
+              });
+              await persistMappingCheckpoint(mappingCheckpoint);
+              draft = { ...intentDraft, items: [], bindingIntent: intentDraft.intent || null };
+              sendMappingRetry({
+                stage: 'roles',
+                draft,
+                retry,
+                rolesReused: false,
+                message: 'D2 business binding intent needs one resumable deterministic correction.'
+              });
+              return;
+            }
+            draft = { ...intentDraft, items: [], bindingIntent: intentDraft.intent || null };
+          } else {
+            mappingInput.bindingIntent = intentDraft.intent;
+            mappingCheckpoint = assistantDiagramMappingCheckpointDraft(mappingInput, {
+              pendingStage: 'roles',
+              bindingIntent: intentDraft.intent,
+              correctionCount: Number(mappingCheckpoint.correctionCount || 0),
+              createdAt: mappingCheckpoint.createdAt
+            });
+            await persistMappingCheckpoint(mappingCheckpoint);
+            const resume = mappingResume('roles', 'roles', false);
+            const intentResult = { ...intentDraft, items: [], bindingIntent: intentDraft.intent };
+            sendJson(res, 202, {
+              success: true,
+              action: 'assistant-diagram-import-map-selections-roles',
+              checkpoint: resume,
+              mapping: null,
+              models: assistantDiagramModelBundle(mappingInput, intentResult, null),
+              explanation: intentDraft.explanation || '',
+              warnings: intentDraft.warnings || [],
+              errors: [],
+              diagnostics: { ...(intentDraft.diagnostics || {}), phases: { intent: 'accepted', roles: 'pending' }, resume }
+            });
+            return;
+          }
+        } else if (mappingStage === 'roles') {
+          if (mappingCheckpoint) {
             if (String(mappingCheckpoint.pendingStage || '') !== 'roles') {
               const stageError = new Error('Saved D2 mapping is waiting for a different stage. Continue the current mapping request.');
               stageError.statusCode = 409;
@@ -55818,6 +57584,7 @@ async function handleBackend(req, res, requestUrl) {
             mappingCheckpoint = assistantDiagramMappingCheckpointDraft(mappingInput, { pendingStage: 'roles' });
             await persistMappingCheckpoint(mappingCheckpoint);
           }
+          if (mappingCheckpoint.bindingIntent) mappingInput.bindingIntent = cloneJsonValueServer(mappingCheckpoint.bindingIntent, {});
           const retry = mappingCheckpoint.retry && mappingCheckpoint.retry.stage === 'roles' ? mappingCheckpoint.retry : null;
           const retryPlacementIds = new Set(retry && Array.isArray(retry.placementIds) ? retry.placementIds.map(String) : []);
           const acceptedItems = retry && mappingCheckpoint.roleDraft && Array.isArray(mappingCheckpoint.roleDraft.items)
@@ -55851,7 +57618,7 @@ async function handleBackend(req, res, requestUrl) {
           const nextRoleRetry = assistantDiagramRoleRetryState(
             mappingInput,
             draft,
-            Number(retry && retry.correctionAttempt || 0) + 1,
+            Number(mappingCheckpoint.correctionCount || 0) + 1,
             Number(retry && retry.transientAttempt || 0)
           );
           if (nextRoleRetry && assistantDiagramCorrectionRetryAvailable(nextRoleRetry)) {
@@ -55889,8 +57656,10 @@ async function handleBackend(req, res, requestUrl) {
               : mappingCheckpoint.roleDraft;
             mappingCheckpoint = assistantDiagramMappingCheckpointDraft(mappingInput, {
               pendingStage: 'roles',
+              bindingIntent: mappingCheckpoint.bindingIntent,
               roleDraft: checkpointRoleDraft,
               retry: nextRoleRetry,
+              correctionCount: Number(nextRoleRetry.correctionAttempt || mappingCheckpoint.correctionCount || 0),
               createdAt: mappingCheckpoint.createdAt
             });
             await persistMappingCheckpoint(mappingCheckpoint);
@@ -55916,7 +57685,8 @@ async function handleBackend(req, res, requestUrl) {
               draft.items || [],
               draft.unresolved || [],
               draft.relationRules || [],
-              draft.connectionUnresolved || []
+              draft.connectionUnresolved || [],
+              draft.endpointProfiles || []
             ));
             sendJson(res, 422, {
               success: false,
@@ -55930,6 +57700,7 @@ async function handleBackend(req, res, requestUrl) {
               partial: Boolean(partialMapping && Array.isArray(draft && draft.items) && draft.items.length),
               mappings: draft && draft.items || [],
               relationRules: draft && draft.relationRules || [],
+              endpointProfiles: draft && draft.endpointProfiles || [],
               connectionUnresolved: draft && draft.connectionUnresolved || [],
               mapping: partialMapping || null,
               models: assistantDiagramModelBundle(mappingInput, draft || {}, partialMapping || null),
@@ -55938,7 +57709,7 @@ async function handleBackend(req, res, requestUrl) {
             });
             return;
           }
-          const topology = assistantDiagramTopologyRequirements(
+          const rawTopology = assistantDiagramTopologyRequirements(
             mappingInput.relationRules,
             mappingInput.roles,
             draft.items,
@@ -55946,6 +57717,9 @@ async function handleBackend(req, res, requestUrl) {
             mappingInput.catalog,
             mappingInput.traversalDepth
           );
+          const topology = mappingInput.bindingIntent
+            ? assistantDiagramTopologyWithBindingIntent(rawTopology, mappingInput.bindingIntent)
+            : rawTopology;
           if (topology.length) {
             const rolesAttempts = Number(draft.diagnostics && draft.diagnostics.attempts || 1);
             const mapping = assistantDiagramMappingCoverage(
@@ -55953,12 +57727,15 @@ async function handleBackend(req, res, requestUrl) {
               draft.items,
               draft.unresolved,
               [],
-              topology
+              topology,
+              draft.endpointProfiles || []
             );
             mappingCheckpoint = assistantDiagramMappingCheckpointDraft(mappingInput, {
               pendingStage: 'topology',
+              bindingIntent: mappingCheckpoint.bindingIntent,
               roleDraft: draft,
               topology,
+              correctionCount: mappingCheckpoint.correctionCount,
               createdAt: mappingCheckpoint.createdAt
             });
             const cacheBackend = await persistMappingCheckpoint(mappingCheckpoint);
@@ -55995,15 +57772,41 @@ async function handleBackend(req, res, requestUrl) {
             return;
           }
           draft = completeAssistantDiagramRoleMapping(mappingInput, draft);
-        } else {
-          const loaded = await loadAssistantDiagramMappingCheckpoint(mappingInput, { checkpoint: mappingCheckpointOptions });
-          mappingCheckpoint = loaded.checkpoint;
+          if (mappingInput.bindingIntent) {
+            const obligationMatrix = assistantDiagramSemanticObligations(mappingInput, draft);
+            mappingCheckpoint = assistantDiagramMappingCheckpointDraft(mappingInput, {
+              pendingStage: 'critique',
+              bindingIntent: mappingCheckpoint.bindingIntent,
+              roleDraft: draft,
+              topology: [],
+              finalDraft: draft,
+              obligationMatrix,
+              correctionCount: mappingCheckpoint.correctionCount,
+              createdAt: mappingCheckpoint.createdAt
+            });
+            await persistMappingCheckpoint(mappingCheckpoint);
+            const resume = mappingResume('roles', 'topology', false);
+            sendJson(res, 202, {
+              success: true,
+              action: 'assistant-diagram-import-map-selections-roles',
+              checkpoint: resume,
+              mapping: draft.mapping,
+              models: assistantDiagramModelBundle(mappingInput, { ...draft, obligationMatrix }, draft.mapping),
+              explanation: draft.explanation || '',
+              warnings: draft.warnings || [],
+              errors: [],
+              diagnostics: { ...(draft.diagnostics || {}), phases: { intent: 'accepted', roles: 'accepted', topology: 'not_required', critique: 'pending' }, resume }
+            });
+            return;
+          }
+        } else if (mappingStage === 'topology' && mappingCheckpoint && String(mappingCheckpoint.pendingStage || '') !== 'critique') {
           if (String(mappingCheckpoint.pendingStage || '') !== 'topology') {
             const stageError = new Error('Saved D2 mapping is waiting for object mapping. Start with the current mapping request.');
             stageError.statusCode = 409;
             stageError.code = 'assistant_diagram_mapping_resume_stage_mismatch';
             throw stageError;
           }
+          if (mappingCheckpoint.bindingIntent) mappingInput.bindingIntent = cloneJsonValueServer(mappingCheckpoint.bindingIntent, {});
           mappingRolesReused = true;
           const retry = mappingCheckpoint.retry && mappingCheckpoint.retry.stage === 'topology' ? mappingCheckpoint.retry : null;
           draft = await createAssistantDiagramTopologyMappingDraft(
@@ -56019,15 +57822,17 @@ async function handleBackend(req, res, requestUrl) {
           if (!draft.success) {
             const nextTopologyRetry = assistantDiagramTopologyRetryState(
               draft,
-              Number(retry && retry.correctionAttempt || 0) + 1,
+              Number(mappingCheckpoint.correctionCount || 0) + 1,
               Number(retry && retry.transientAttempt || 0)
             );
             if (nextTopologyRetry && assistantDiagramCorrectionRetryAvailable(nextTopologyRetry)) {
               mappingCheckpoint = assistantDiagramMappingCheckpointDraft(mappingInput, {
                 pendingStage: 'topology',
+                bindingIntent: mappingCheckpoint.bindingIntent,
                 roleDraft: mappingCheckpoint.roleDraft,
                 topology: mappingCheckpoint.topology,
                 retry: nextTopologyRetry,
+                correctionCount: Number(nextTopologyRetry.correctionAttempt || mappingCheckpoint.correctionCount || 0),
                 createdAt: mappingCheckpoint.createdAt
               });
               await persistMappingCheckpoint(mappingCheckpoint);
@@ -56037,6 +57842,141 @@ async function handleBackend(req, res, requestUrl) {
                 retry: nextTopologyRetry,
                 rolesReused: true,
                 message: 'D2 mapping of connections needs a resumable deterministic correction. Confirmed object mappings are preserved.'
+              });
+              return;
+            }
+          }
+          if (draft.success && mappingInput.bindingIntent) {
+            const obligationMatrix = assistantDiagramSemanticObligations(mappingInput, draft);
+            mappingCheckpoint = assistantDiagramMappingCheckpointDraft(mappingInput, {
+              pendingStage: 'critique',
+              bindingIntent: mappingCheckpoint.bindingIntent,
+              roleDraft: mappingCheckpoint.roleDraft,
+              topology: mappingCheckpoint.topology,
+              finalDraft: draft,
+              obligationMatrix,
+              correctionCount: mappingCheckpoint.correctionCount,
+              createdAt: mappingCheckpoint.createdAt
+            });
+            await persistMappingCheckpoint(mappingCheckpoint);
+            const resume = mappingResume('topology', 'topology', true);
+            sendJson(res, 202, {
+              success: true,
+              action: 'assistant-diagram-import-map-selections-roles',
+              checkpoint: resume,
+              mapping: draft.mapping,
+              models: assistantDiagramModelBundle(mappingInput, { ...draft, obligationMatrix }, draft.mapping),
+              explanation: draft.explanation || '',
+              warnings: draft.warnings || [],
+              errors: [],
+              diagnostics: { ...(draft.diagnostics || {}), phases: { intent: 'accepted', roles: 'accepted', topology: 'accepted', critique: 'pending' }, resume }
+            });
+            return;
+          }
+        } else if (mappingStage === 'topology' && mappingCheckpoint && String(mappingCheckpoint.pendingStage || '') === 'critique') {
+          if (String(mappingCheckpoint.pendingStage || '') !== 'critique') {
+            const stageError = new Error('Saved D2 mapping is waiting for a different stage. Continue the current mapping request.');
+            stageError.statusCode = 409;
+            stageError.code = 'assistant_diagram_mapping_resume_stage_mismatch';
+            throw stageError;
+          }
+          mappingInput.bindingIntent = cloneJsonValueServer(mappingCheckpoint.bindingIntent, {});
+          mappingRolesReused = true;
+          const finalDraft = cloneJsonValueServer(mappingCheckpoint.finalDraft, {});
+          const obligationMatrix = assistantDiagramSemanticObligations(mappingInput, finalDraft);
+          const deterministicErrors = assistantDiagramSemanticObligationErrors(obligationMatrix);
+          const critiqueDraft = deterministicErrors.length
+            ? await createAssistantDiagramCritiqueDraft(mappingInput, runtimeConfig, finalDraft, obligationMatrix)
+            : {
+                success: true,
+                critique: { approved: true, violations: [] },
+                explanation: 'All typed D2 semantic obligations passed deterministic validation.',
+                warnings: [],
+                errors: [],
+                diagnostics: { contract: 'typed-d2-mapping-critique-v1', attempts: 0, skipped: 'deterministic-obligations-complete' }
+              };
+          const obligationById = new Map((obligationMatrix.obligations || []).map((item) => [String(item && item.id || ''), item]));
+          const criticWarnings = critiqueDraft.success
+            ? (critiqueDraft.critique && critiqueDraft.critique.violations || []).filter((violation) => {
+                const obligation = obligationById.get(String(violation && violation.obligationId || '')) || {};
+                return String(obligation.status || '') === 'satisfied';
+              }).map((violation) => `Semantic critic questioned satisfied obligation ${String(violation.obligationId || '')}: ${String(violation.message || '')}`)
+            : [];
+          const criticErrors = critiqueDraft.success ? [] : (critiqueDraft.errors || []);
+          const semanticErrors = [];
+          const seenSemanticErrors = new Set();
+          for (const error of deterministicErrors.concat(criticErrors)) {
+            const key = `${String(error && error.obligationId || '')}:${String(error && error.targetPhase || '')}:${String(error && error.message || '')}`;
+            if (seenSemanticErrors.has(key)) continue;
+            seenSemanticErrors.add(key);
+            semanticErrors.push(error);
+          }
+          draft = {
+            ...finalDraft,
+            success: critiqueDraft.success && deterministicErrors.length === 0,
+            obligationMatrix,
+            critique: critiqueDraft.critique || { approved: false, violations: [] },
+            warnings: uniqueStrings([...(finalDraft.warnings || []), ...(critiqueDraft.warnings || []), ...criticWarnings]),
+            errors: semanticErrors,
+            diagnostics: {
+              ...(finalDraft.diagnostics || {}),
+              ...(critiqueDraft.diagnostics || {}),
+              phases: { intent: 'accepted', roles: 'accepted', topology: mappingCheckpoint.topology.length ? 'accepted' : 'not_required', critique: !critiqueDraft.success ? 'invalid' : criticWarnings.length ? 'advisory' : 'accepted' },
+              semanticObligations: { total: obligationMatrix.obligations.length, failed: deterministicErrors.length }
+            }
+          };
+          if (!draft.success && semanticErrors.length && Number(mappingCheckpoint.correctionCount || 0) < ASSISTANT_DIAGRAM_MAPPING_STAGE_CORRECTION_RETRIES) {
+            const correctionCount = Number(mappingCheckpoint.correctionCount || 0) + 1;
+            const placementErrors = semanticErrors.filter((error) => String(error && error.targetPhase || '') === 'placements' && error.structureItemId);
+            if (placementErrors.length) {
+              const correction = assistantDiagramPlacementCorrection(placementErrors, mappingInput.placements, mappingInput.stages);
+              if (correction) {
+                const retryIds = new Set(correction.retryPlacementIds.map(String));
+                const acceptedRoleDraft = {
+                  ...mappingCheckpoint.roleDraft,
+                  items: (mappingCheckpoint.roleDraft && mappingCheckpoint.roleDraft.items || []).filter((item) => !retryIds.has(String(item && item.structureItemId || '')))
+                };
+                const retry = assistantDiagramMappingRetryState('roles', correctionCount, correction, correction.retryPlacementIds);
+                mappingCheckpoint = assistantDiagramMappingCheckpointDraft(mappingInput, {
+                  pendingStage: 'roles',
+                  bindingIntent: mappingCheckpoint.bindingIntent,
+                  roleDraft: acceptedRoleDraft,
+                  retry,
+                  correctionCount,
+                  createdAt: mappingCheckpoint.createdAt
+                });
+                await persistMappingCheckpoint(mappingCheckpoint);
+                sendMappingRetry({
+                  stage: 'roles',
+                  draft,
+                  retry,
+                  rolesReused: true,
+                  message: 'Semantic validation found an incorrect object placement. Confirmed unrelated mappings are preserved for one targeted correction.'
+                });
+                return;
+              }
+            }
+            const connectionErrors = semanticErrors.filter((error) => String(error && error.targetPhase || '') === 'connections' && error.d2ElementKey);
+            if (connectionErrors.length) {
+              const retry = assistantDiagramMappingRetryState('topology', correctionCount, {
+                invalidTopology: connectionErrors.map((error) => ({ d2ElementKey: String(error.d2ElementKey || ''), message: String(error.message || '') }))
+              });
+              mappingCheckpoint = assistantDiagramMappingCheckpointDraft(mappingInput, {
+                pendingStage: 'topology',
+                bindingIntent: mappingCheckpoint.bindingIntent,
+                roleDraft: mappingCheckpoint.roleDraft,
+                topology: mappingCheckpoint.topology,
+                retry,
+                correctionCount,
+                createdAt: mappingCheckpoint.createdAt
+              });
+              await persistMappingCheckpoint(mappingCheckpoint);
+              sendMappingRetry({
+                stage: 'topology',
+                draft,
+                retry,
+                rolesReused: true,
+                message: 'Semantic validation found an incorrect connection mapping. Confirmed object mappings are preserved for one targeted correction.'
               });
               return;
             }
@@ -56052,7 +57992,8 @@ async function handleBackend(req, res, requestUrl) {
           draft.items || [],
           draft.unresolved || [],
           draft.relationRules || [],
-          draft.connectionUnresolved || []
+          draft.connectionUnresolved || [],
+          draft.endpointProfiles || []
         ));
         sendJson(res, 422, {
           success: false,
@@ -56067,6 +58008,7 @@ async function handleBackend(req, res, requestUrl) {
             partial: Boolean(partialMapping && Array.isArray(draft.items) && draft.items.length),
             mappings: draft.items || [],
             relationRules: draft.relationRules || [],
+            endpointProfiles: draft.endpointProfiles || [],
             connectionUnresolved: draft.connectionUnresolved || [],
             mapping: partialMapping || null,
             structureTree: reviewProposal.structureTree || { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] }
@@ -56080,7 +58022,7 @@ async function handleBackend(req, res, requestUrl) {
         return;
       }
       const resultItems = draft.items;
-      const mapping = mapTask ? (draft.mapping || assistantDiagramMappingCoverage({ roles, stages, topology: [] }, resultItems, draft.unresolved, draft.relationRules, draft.connectionUnresolved)) : null;
+      const mapping = mapTask ? (draft.mapping || assistantDiagramMappingCoverage(mappingInput || { roles, stages, topology: [] }, resultItems, draft.unresolved, draft.relationRules, draft.connectionUnresolved, draft.endpointProfiles || [])) : null;
       if (mapTask) {
         if (mappingCheckpointOptions && mappingCheckpoint) {
           await cacheDelete('assistant-diagram-mapping', mappingCheckpointOptions.key, assistantDiagramMappingCheckpointCache);
@@ -56110,6 +58052,7 @@ async function handleBackend(req, res, requestUrl) {
         ...(mapTask ? {
           mappings: resultItems,
           relationRules: draft.relationRules || [],
+          endpointProfiles: draft.endpointProfiles || [],
           connectionUnresolved: draft.connectionUnresolved || [],
           structureTree: mappingInput && mappingInput.structureTree || { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] }
         } : { decisions: resultItems }),
@@ -56138,10 +58081,10 @@ async function handleBackend(req, res, requestUrl) {
       if (abortContext.cancelled || res.destroyed || res.writableEnded) return;
       let retryable = mapTask && Boolean(mappingCheckpoint) && assistantDiagramMappingRetryable(error);
       if (retryable && mappingCheckpointOptions) {
-        const currentRetry = mappingCheckpoint.retry && mappingCheckpoint.retry.stage === mappingStage ? mappingCheckpoint.retry : null;
-        mappingCheckpoint.pendingStage = mappingStage;
+        const pendingPhase = normalizeAssistantDiagramMappingPhase(mappingCheckpoint.pendingStage);
+        const currentRetry = mappingCheckpoint.retry && mappingCheckpoint.retry.stage === pendingPhase ? mappingCheckpoint.retry : null;
         mappingCheckpoint.retry = assistantDiagramMappingRetryState(
-          mappingStage,
+          pendingPhase,
           Number(currentRetry && currentRetry.correctionAttempt || 0),
           currentRetry && currentRetry.correction || {},
           currentRetry && currentRetry.placementIds || [],
@@ -56168,7 +58111,7 @@ async function handleBackend(req, res, requestUrl) {
       const resume = retryable ? assistantDiagramMappingCheckpointSummary(mappingCheckpoint, {
         resumeId: mappingResumeId,
         stage: mappingStage,
-        nextStage: mappingStage,
+        nextStage: assistantDiagramPublicStageForPhase(mappingCheckpoint.pendingStage),
         rolesReused: mappingRolesReused,
         ttlMs: assistantDiagramMappingCheckpointTtlMs()
       }) : null;
@@ -56194,7 +58137,8 @@ async function handleBackend(req, res, requestUrl) {
         failureDraft && failureDraft.items || [],
         failureDraft && failureDraft.unresolved || [],
         failureRelationRules,
-        failureConnectionUnresolved
+        failureConnectionUnresolved,
+        failureDraft && failureDraft.endpointProfiles || []
       ) : null;
       sendJson(res, error.statusCode || 502, {
         success: false,
@@ -56209,6 +58153,7 @@ async function handleBackend(req, res, requestUrl) {
           partial: Boolean(failureDraft && Array.isArray(failureDraft.items) && failureDraft.items.length),
           mappings: failureDraft && failureDraft.items || [],
           relationRules: failureRelationRules,
+          endpointProfiles: failureDraft && failureDraft.endpointProfiles || [],
           connectionUnresolved: failureConnectionUnresolved,
           mapping: failureMapping,
           structureTree: mappingInput && mappingInput.structureTree || { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] }
@@ -56272,8 +58217,7 @@ async function handleBackend(req, res, requestUrl) {
       return;
     }
 
-    const draftD2Recompile = await recompileDiagramImportForCurrentInput(draft.spec);
-    if (draftD2Recompile.recompiled) draft.spec = draftD2Recompile.spec;
+    const draftD2Recompile = { recompiled: false };
     const template = {
       code: draft.code,
       description: draft.description,
@@ -56531,7 +58475,12 @@ async function handleBackend(req, res, requestUrl) {
       if (!requireJsonContentType(req, res)) return;
       const body = await readJsonBody(req, TEMPLATE_REQUEST_MAX_BYTES);
       const rawSpec = body.spec !== undefined ? body.spec : body.SpecJson;
-      const rawSpecErrors = validateTemplateSpecForStorage(safeJsonValue(rawSpec, rawSpec));
+      const rawTemplateSpec = safeJsonValue(rawSpec, rawSpec);
+      if (diagramAuthoringStatusForSpec(rawTemplateSpec).status === 'unsupported') {
+        sendJson(res, 409, d2AuthoringCurrentContractRequiredPayload(rawTemplateSpec));
+        return;
+      }
+      const rawSpecErrors = validateTemplateSpecForStorage(rawTemplateSpec);
       if (rawSpecErrors.length) {
         sendJson(res, 400, {
           success: false,
@@ -56543,6 +58492,10 @@ async function handleBackend(req, res, requestUrl) {
       const session = await getSessionData(authToken);
       const payload = normalizeTemplatePayload(body, null, session.data && session.data.username);
       const storedSpec = safeJsonValue(payload.SpecJson, null);
+      if (diagramAuthoringStatusForSpec(storedSpec).status === 'unsupported') {
+        sendJson(res, 409, d2AuthoringCurrentContractRequiredPayload(storedSpec));
+        return;
+      }
       const specErrors = validateTemplateSpecForStorage(storedSpec);
       if (specErrors.length) {
         sendJson(res, 400, {
@@ -56618,14 +58571,6 @@ async function handleBackend(req, res, requestUrl) {
         sendJson(res, 404, { success: false, message: `Unknown template route: ${requestUrl.pathname}` });
         return;
       }
-      if (templateAction === 'assistant-draft') {
-        sendJson(res, 410, {
-          success: false,
-          code: 'assistant_authoring_route_removed',
-          message: 'Assistant authoring is saved only with the template.'
-        });
-        return;
-      }
       if (templateAction === 'versions') {
         if (!methodAllowed(req, res, 'GET')) return;
         const versions = await listTemplateVersionCards(authToken, root, templateCode, requestUrl);
@@ -56686,9 +58631,9 @@ async function handleBackend(req, res, requestUrl) {
 
       const template = sanitizeTemplateCard(found.card);
       const includeDiagrams = templateOutputIncludesDiagrams(template.spec);
-      const recoverySaveRequirement = await templateD2RecoverySaveRequirement(found.card, template, { includeDiagrams });
-      if (recoverySaveRequirement) {
-        sendJson(res, 409, d2RecoverySaveRequiredPayload(template, templateAction, recoverySaveRequirement));
+      const diagramAuthoringStatus = diagramAuthoringStatusForSpec(template.spec);
+      if (includeDiagrams && (diagramAuthoringStatus.status === 'unsupported' || diagramAuthoringStatus.status === 'needsReanalysis')) {
+        sendJson(res, 409, d2AuthoringCurrentContractRequiredPayload(template.spec));
         return;
       }
       const errors = validateTemplateSpecForExecution(template.spec, { includeDiagrams });
@@ -56882,12 +58827,14 @@ async function handleBackend(req, res, requestUrl) {
         }
         const d2Workflow = await d2WorkflowStatusForSpec(template.spec);
         const outputMode = normalizeRuntimeOutputMode(resultPresentationFromSpec(template.spec).outputMode || 'both');
-        if (d2Workflow.state === 'pending' && outputMode !== 'tables') {
+        if ((d2Workflow.state === 'pending' || d2Workflow.state === 'unsupported') && outputMode !== 'tables') {
           sendJson(res, 422, {
             success: false,
             action: templateAction,
-            reason: 'publication_d2_mapping_pending',
-            message: 'D2 source is saved, but its deterministic mapping is not executable. Complete it in Diagram Assistant or Diagram Editor, save the template, and then publish. Table-only publication remains available.',
+            reason: d2Workflow.state === 'unsupported' ? 'd2_authoring_current_contract_required' : 'publication_d2_mapping_pending',
+            message: d2Workflow.state === 'unsupported'
+              ? d2Workflow.message
+              : 'D2 source is saved, but its deterministic mapping is not executable. Complete it in Diagram Assistant or Diagram Editor, save the template, and then publish. Table-only publication remains available.',
             d2Workflow
           });
           return;
@@ -57162,9 +59109,19 @@ async function handleBackend(req, res, requestUrl) {
         return;
       }
       const session = await getSessionData(authToken);
-      const storageOptions = { d2MappingOutcomes: [], objectFlowOutcomes: [] };
+      const storageOptions = { objectFlowOutcomes: [] };
       const rawSpec = body.spec !== undefined ? body.spec : body.SpecJson;
-      const rawSpecErrors = validateTemplateSpecForStorage(safeJsonValue(rawSpec, rawSpec));
+      const rawTemplateSpec = safeJsonValue(rawSpec, rawSpec);
+      if (diagramAuthoringStatusForSpec(rawTemplateSpec).status === 'unsupported') {
+        logWarn('template.authoring_unsupported', {
+          requestId: req.cmdpRequestId || '',
+          templateCode,
+          reasons: diagramAuthoringStatusForSpec(rawTemplateSpec).reasons
+        });
+        sendJson(res, 409, d2AuthoringCurrentContractRequiredPayload(rawTemplateSpec));
+        return;
+      }
+      const rawSpecErrors = validateTemplateSpecForStorage(rawTemplateSpec);
       if (rawSpecErrors.length) {
         sendJson(res, 400, {
           success: false,
@@ -57173,56 +59130,11 @@ async function handleBackend(req, res, requestUrl) {
         });
         return;
       }
-      if (diagramImportNeedsRecovery(rawSpec)) {
-        const rawAuthoringSource = String(templateAuthoringD2(safeJsonValue(rawSpec, {}), { allowLegacy: true }).source || '');
-        if (rawAuthoringSource.trim()) {
-          const identity = await d2SourceStructureIdentity(rawAuthoringSource);
-          if (identity.ok) {
-            storageOptions.d2SourceIdentities = [identity];
-          } else {
-            logWarn('template.d2_mapping_recovery_source_invalid', {
-              requestId: req.cmdpRequestId || '',
-              templateCode,
-              reason: String(identity.reason || 'invalid_source')
-            });
-          }
-        }
-        try {
-          const versions = await fetchTemplateVersionCards(authToken, found.schema.root);
-          if (versions.response.ok) {
-            storageOptions.recoveryVersions = versions.cards
-              .filter((card) => String(card && card.TemplateCode || '') === templateCode)
-              .map(sanitizeTemplateVersionCard);
-          } else {
-            logWarn('template.d2_mapping_recovery_history_unavailable', {
-              requestId: req.cmdpRequestId || '',
-              templateCode,
-              cmdbuildStatus: versions.response.statusCode
-            });
-          }
-        } catch (error) {
-          logWarn('template.d2_mapping_recovery_history_failed', {
-            requestId: req.cmdpRequestId || '',
-            templateCode,
-            error: error && error.message ? error.message : String(error)
-          });
-        }
-      }
       let payload = normalizeTemplatePayload(body, templateCode, session.data && session.data.username, storageOptions);
       let storedSpec = safeJsonValue(payload.SpecJson, null);
-      const d2Recompile = await recompileDiagramImportForCurrentInput(storedSpec);
-      if (d2Recompile.recompiled) {
-        storedSpec = d2Recompile.spec;
-        payload = { ...payload, SpecJson: JSON.stringify(storedSpec) };
-        recordD2MappingStorageOutcome(storageOptions, {
-          status: d2Recompile.partial ? 'current_input_partially_recompiled' : 'current_input_recompiled',
-          reasons: d2Recompile.partial ? ['partialMapping'] : []
-        });
-      } else if (d2Recompile.error) {
-        recordD2MappingStorageOutcome(storageOptions, {
-          status: 'current_input_recompile_preserved',
-          reasons: [String(d2Recompile.error && d2Recompile.error.code || 'recompileFailed')]
-        });
+      if (diagramAuthoringStatusForSpec(storedSpec).status === 'unsupported') {
+        sendJson(res, 409, d2AuthoringCurrentContractRequiredPayload(storedSpec));
+        return;
       }
       const specErrors = validateTemplateSpecForStorage(storedSpec);
       if (specErrors.length) {
@@ -57253,15 +59165,6 @@ async function handleBackend(req, res, requestUrl) {
           ]
         : null;
       const executionValidation = executionValidationForSpec(storedSpec);
-      const legacyHistoricalRecovery = storageOptions.d2MappingOutcomes.find((item) => item && item.verification === 'legacyHistoricalAttestation');
-      if (updated.ok && legacyHistoricalRecovery) {
-        logWarn('template.d2_mapping_legacy_historical_recovered', {
-          requestId: req.cmdpRequestId || '',
-          templateCode: payload.Code,
-          recoveredFromVersion: legacyHistoricalRecovery.recoveredFromVersion || null,
-          action: 'recompiled_and_resigned'
-        });
-      }
       logInfo(updated.ok ? 'template.updated' : 'template.update_failed', {
         requestId: req.cmdpRequestId || '',
         templateCode: payload.Code,
@@ -57273,9 +59176,7 @@ async function handleBackend(req, res, requestUrl) {
         staticSnapshotsInvalidated: cacheInvalidation && cacheInvalidation[1].invalidated || 0,
         cacheInvalidationComplete: cacheInvalidation ? cacheInvalidation.every((item) => item.complete) : false,
         objectFlowOutcomes: storageOptions.objectFlowOutcomes.map((item) => String(item && item.status || '')).filter(Boolean),
-        objectFlowOwnership: storageOptions.objectFlowOutcomes.map((item) => String(item && item.ownership || '')).filter(Boolean),
-        d2MappingOutcomes: storageOptions.d2MappingOutcomes.map((item) => String(item && item.status || '')).filter(Boolean),
-        d2MappingReasons: uniqueStrings(storageOptions.d2MappingOutcomes.flatMap((item) => Array.isArray(item && item.reasons) ? item.reasons.map(String) : []))
+        objectFlowOwnership: storageOptions.objectFlowOutcomes.map((item) => String(item && item.ownership || '')).filter(Boolean)
       });
       sendJson(res, updated.ok ? 200 : 502, {
         success: updated.ok,
@@ -57293,12 +59194,6 @@ async function handleBackend(req, res, requestUrl) {
           preservedLabels: Number(item && item.preservedLabels || 0),
           generatedLabels: Number(item && item.generatedLabels || 0),
           ownership: String(item && item.ownership || '')
-        })),
-        authoringRecovery: storageOptions.d2MappingOutcomes.map((item) => ({
-          status: String(item && item.status || ''),
-          recoveredFromVersion: item && item.recoveredFromVersion || null,
-          verification: String(item && item.verification || ''),
-          reasons: Array.isArray(item && item.reasons) ? item.reasons.map(String) : []
         })),
         cacheInvalidation: cacheInvalidation && {
           runtime: cacheInvalidation[0],
@@ -57673,17 +59568,31 @@ export {
   assistantDiagramPlacementExecutionValidation,
   assistantDiagramRecoverParentCardMappings,
   assistantDiagramPlacementTargets,
+  assistantDiagramEndpointProfilesFromBindings,
+  assistantObjectFlowBusinessBlockManifest,
   assistantDataSemanticModel,
   assistantD2StructuralModel,
   assistantD2SemanticModel,
+  assistantD2BindingIntentModel,
   assistantD2BindingModel,
+  assistantSemanticObligationModel,
+  assistantD2CritiqueModel,
   assistantCoverageModel,
   assistantDiagramModelBundle,
+  assistantDiagramBindingIntentSeed,
+  normalizeAssistantDiagramBindingIntentResponse,
+  assistantDiagramBindingIntentDraftFromResponse,
+  assistantDiagramMappingCoverage,
+  assistantDiagramTopologyWithBindingIntent,
+  assistantDiagramSemanticObligations,
   assistantDiagramResolveStageId,
   assistantDiagramStageDraftFromResponse,
   assistantDiagramTopologyRequirements,
   assistantObjectFlowDiagramStages,
   assistantDiagramSelectionMappings,
+  assistantDiagramNotesHasNaturalLanguage,
+  assistantEditorDeltaFromSpec,
+  applyAssistantEditorDelta,
   assembleDiagramClassRoleRows,
   assistantLimitWarningsFromDiagnostics,
   assistantLiteLlmTimeoutMs,
@@ -57708,6 +59617,7 @@ export {
   d2CacheContext,
   d2SourceForCompiler,
   d2WorkflowStatusForSpec,
+  diagramAuthoringStatusForSpec,
   decorateD2MarkdownFrames,
   diagramSvgExecutionContract,
   d2ImportConfigSummary,
@@ -57726,7 +59636,6 @@ export {
   diagramImportMappingInputRevision,
   diagramImportMappingInputRevisionStatus,
   diagramImportMappingValidationIsCurrent,
-  migrateDiagramImportToCurrentRevision,
   signDiagramImportMappingValidation,
   diagramImportCloneStructureBranch,
   diagramImportStructureTree,
@@ -57779,14 +59688,13 @@ export {
   renderD2SourceToSvg,
   applyDiagramImportProposal,
   applyPartialDiagramImportProposal,
-  diagramImportCurrentInputRecompileRequired,
-  recompileDiagramImportForCurrentInput,
   diagramImportRolesForStoredStructure,
   draftDiagramPreviewMappingPlan,
   draftDiagramPreviewRequiresPartialPlan,
   completeDiagramImportV3FromSpec,
   renderPrometheusMetrics,
   callLiteLLM,
+  boundedMcpText,
   ensureAssistantReady,
   mcpToolDefinitions,
   runtimeCacheKeyParts,

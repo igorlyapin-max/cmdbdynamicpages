@@ -317,8 +317,7 @@ Typed authoring endpoints under `/cmdbuild/custom-api` are:
     "version": 1,
     "assistant": {
       "objectFlowIntent": "...",
-      "diagramInterpretPrompt": "...",
-      "diagramMappingPrompt": "..."
+      "diagramIntentPrompt": "..."
     },
     "d2": { "source": "...", "sourceHash": "..." }
   }
@@ -329,7 +328,7 @@ Typed authoring endpoints under `/cmdbuild/custom-api` are:
 
 Хранилище допускает незавершённый D2 source/mapping и другие authoring-поля. Runtime, draft preview, extraction и publication выполняют строгую execution-валидацию и блокируются до готового D2 source/mapping. Legacy `assistantDraft` мигрируется только при обычном `Сохранить`; `/templates/<code>/assistant-draft` удалён и возвращает `410`. Generic `POST /assistant/template-draft` и mixed `POST /assistant/diagram-import/complete` удалены из публичного контракта; legacy aliases не поддержаны и не запланированы.
 
-Applied D2 mapping has a signed `mappingInputRevision`: canonical D2 `sourceHash`, hashes of both D2 prompts (`diagramInterpretPrompt` and `diagramMappingPrompt`), and the contract of only the Object Flow stages and fields referenced by that mapping. When all of those inputs and the signature match, the mapping remains usable after reload without Analyze, Interpret, Map, Apply, or an automatic LLM call. A change to the D2 source, either D2 prompt, or a referenced Object Flow stage contract preserves the mapping for inspection/editing but marks it `needsReview`; execution, preview, extraction, runtime, and publication fail closed until the author explicitly reviews and applies a replacement or corrects it in Diagram. Unrelated template changes and unreferenced Object Flow stages must not mark the mapping stale. Exact version-history recovery never restores a different mapping: it accepts the same source, prompts, referenced stage contract and mapping only. A historical `semanticModelRevision=8` / tree `3` valid marker from before a signing-secret rotation is only a migration attestation during normal Save; the backend re-parses, revalidates, recompiles and signs the current mapping before it becomes runtime-valid. It is not a runtime fallback or legacy compatibility. The full saved `specHash` remains the compare-and-swap guard for concurrent template updates.
+Applied D2 mapping has a signed `mappingInputRevision`: canonical D2 `sourceHash` and the contract of only the Object Flow stages and fields referenced by that mapping. Assistant prompts guide a future proposal but do not invalidate an already applied mapping. When the source, referenced stage contract, and signature match, the mapping remains usable after reload without Analyze, Interpret, Map, Apply, or an automatic LLM call. A change to the D2 source or a referenced Object Flow stage contract preserves the mapping for inspection/editing but marks it `needsReview`; execution, preview, extraction, runtime, and publication fail closed until the author explicitly reviews and applies a replacement or corrects it in Diagram. Unrelated template changes and unreferenced Object Flow stages must not mark the mapping stale. A mapping with a `semanticModelRevision` other than the current revision 15 is historical data only: it is never migrated or re-signed during read, Save, preview, extraction, runtime, or publication. The author must analyze the current D2 source and explicitly apply a new mapping. The full saved `specHash` remains the compare-and-swap guard for concurrent template updates.
 
 Assistant authoring calls use the configured LiteLLM-compatible `/v1/chat/completions` endpoint and may include bounded read-only CMDBuild model context through `POST /cmdbuild/custom-api/mcp` tools controlled by `Cst_QueryToolConfig.RuntimeConfigJson.assistant.mcp`. `assistant.mcp.timeoutMs` bounds the complete MCP-context collection phase and one individual LiteLLM attempt; its effective range is 1000-60000 ms. A context deadline returns partial context with an explicit warning instead of silently starting more MCP reads. D2 interpretation permits up to two LiteLLM attempts. D2 mapping is split into resumable `roles` and `topology` stages: every HTTP request performs exactly one LiteLLM call, then the browser may make one automatic retry using the same session-bound TTL checkpoint. A successful `roles` stage is preserved while `topology` is retried, so the connection retry never queries roles again. The browser budget covers one LiteLLM attempt plus transport grace and remains below the default nginx custom API timeout. Closing or aborting the browser request cancels the active LiteLLM attempt and releases the execution slot. The authoring-only `Cst_QueryToolConfig.RuntimeConfigJson.assistant.prompt.system` setting may add deployment-specific naming and relation semantics without hardcoding customer classes in the default contract. Runtime page rendering, runtime cache construction, static snapshot serving, and publication never call LLM or MCP. The assistant is disabled by default and is enabled by `Cst_QueryToolConfig.RuntimeConfigJson.assistant.llm.enabled`; the LiteLLM API key is supplied only through env or a secret file. `CMDP_ASSISTANT_ENABLED` is kept as a deprecated no-op for older deployment templates. `CMDP_ASSISTANT_TIMEOUT_MS` is unsupported. This section defines the approved API contract and does not claim runtime implementation verification.
 
@@ -345,11 +344,12 @@ Production Redis must require a password and should use `rediss://`. Do not stor
 
 ```text
 CMDBDYNAMIC_REDIS_URL=rediss://redis.example.local:6380/0
-CMDBDYNAMIC_REDIS_TLS_CA_FILE=
+CMDP_TLS_CA_FILE=
+CMDP_TLS_CA_FILE_HOST=
 CMDBDYNAMIC_REDIS_PASSWORD_FILE=/run/secrets/cmdbdynamicpages_redis_password
 ```
 
-`CMDBDYNAMIC_REDIS_TLS_CA_FILE` is optional and names a CA PEM already mounted in the backend container when system trust does not cover private Redis PKI. Plaintext `redis://` remains supported for local and existing deployments; in production it emits the `redis_plaintext_transport` runtime warning.
+Set `CMDP_TLS_CA_FILE_HOST` together with `CMDP_TLS_CA_FILE=/run/certs/cmdbdynamicpages-ca.pem` when CMDBuild, Redis, or LiteLLM needs a private-CA PEM bundle. Compose mounts the bundle read-only; Node uses it for HTTPS trust and Redis uses the same file. Plaintext `redis://` remains supported for local and existing deployments; in production it emits the `redis_plaintext_transport` runtime warning.
 
 `CMDBDYNAMIC_REDIS_PASSWORD` and URL form `redis://:password@host:6379/0` are also supported for non-production/dev use, but the file-based secret is preferred. Health/status responses mask Redis credentials before returning the URL.
 
@@ -758,6 +758,7 @@ CMDBuild 4.1 validates uploaded JS with strict markers:
 - [Roadmap and current task state](docs/roadmap.md)
 - [Audit remediation 2026-05-31](docs/audit-remediation-2026-05-31.md)
 - [Architecture decisions](docs/adr/0001-zero-runtime-dependencies.md)
+- [CMDBuild metadata guidance for Assistant (Russian)](docs/cmdbuild-assistant-metadata-guide.ru.md)
 - [Russian README](README.ru.md)
 - [Russian architecture plan](docs/architecture-plan.ru.md)
 - [Russian roadmap](docs/roadmap.ru.md)

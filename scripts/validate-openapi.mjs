@@ -11,6 +11,8 @@ const requiredPaths = [
   '/cmdbuild/custom-api/schema/parents',
   '/cmdbuild/custom-api/schema/preview',
   '/cmdbuild/custom-api/templates/{code}/run',
+  '/cmdbuild/custom-api/assistant/object-flow/semantic-plan',
+  '/cmdbuild/custom-api/assistant/object-flow/plan',
   '/cmdbuild/custom-api/draft/diagram-import/analyze',
   '/cmdbuild/custom-api/draft/diagram-import/apply',
   '/cmdbuild/custom-api/assistant/diagram-import/interpret',
@@ -64,13 +66,33 @@ const diagramAssistantSchemaContracts = [
   },
   {
     name: 'AssistantDiagramImportInterpretRequest',
-    properties: ['templateCode', 'baseSpecHash', 'currentSpec', 'proposal', 'prompt', 'semanticsPrompt', 'placementPrompt', 'connectionsPrompt', 'roles', 'relationRules', 'structureTree'],
-    required: ['templateCode', 'baseSpecHash', 'currentSpec', 'proposal', 'roles', 'structureTree', 'semanticsPrompt']
+    properties: ['templateRef', 'editorDelta', 'proposal', 'prompt', 'roles', 'relationRules', 'structureTree'],
+    required: ['templateRef', 'editorDelta', 'proposal', 'roles', 'structureTree', 'prompt']
   },
   {
     name: 'AssistantDiagramImportMapSelectionsRequest',
-    properties: ['templateCode', 'baseSpecHash', 'currentSpec', 'proposal', 'prompt', 'semanticsPrompt', 'placementPrompt', 'connectionsPrompt', 'roles', 'relationRules', 'structureTree', 'traversalDepth', 'stage', 'resumeId', 'stages'],
-    required: ['templateCode', 'baseSpecHash', 'currentSpec', 'proposal', 'roles', 'structureTree', 'placementPrompt', 'connectionsPrompt', 'traversalDepth', 'stage', 'resumeId']
+    properties: ['templateRef', 'editorDelta', 'proposal', 'prompt', 'roles', 'relationRules', 'structureTree', 'traversalDepth', 'stage', 'resumeId', 'stages'],
+    required: ['templateRef', 'editorDelta', 'proposal', 'roles', 'structureTree', 'prompt', 'traversalDepth', 'stage', 'resumeId']
+  },
+  {
+    name: 'AssistantTemplateRef',
+    properties: ['root', 'templateCode', 'baseSpecHash'],
+    required: ['root', 'templateCode', 'baseSpecHash']
+  },
+  {
+    name: 'AssistantEditorDelta',
+    properties: ['version', 'hash', 'spec'],
+    required: ['version', 'spec']
+  },
+  {
+    name: 'AssistantObjectFlowSemanticPlanRequest',
+    properties: ['templateRef', 'editorDelta', 'intent', 'stage', 'resumeId'],
+    required: ['templateRef', 'editorDelta', 'intent', 'stage', 'resumeId']
+  },
+  {
+    name: 'AssistantObjectFlowPlanRequest',
+    properties: ['templateRef', 'editorDelta', 'intent', 'semanticPlan', 'resumeId'],
+    required: ['templateRef', 'editorDelta', 'intent', 'semanticPlan', 'resumeId']
   },
   {
     name: 'AssistantDiagramModels',

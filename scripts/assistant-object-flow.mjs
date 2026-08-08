@@ -1397,7 +1397,7 @@ function visualSelection(selection) {
  * @param {ObjectFlow} flow
  * @returns {{objectGroup: Record<string, unknown>, objectMatching: Record<string, unknown>}}
  */
-function normalizeAssistantOutputManifest(value, outputs) {
+function normalizeAssistantOutputManifest(value, outputs, publishedAlias = '') {
   if (value === undefined || value === null) {
     if (outputs.some((output) => output.assistantManaged)) {
       throw contractError('Assistant-managed object-flow outputs require a persisted ownership manifest.', 'assistant_output_manifest_invalid', 422);
@@ -1430,6 +1430,19 @@ function normalizeAssistantOutputManifest(value, outputs) {
   const referencedBlockIds = new Set(outputs.flatMap((output) => output.assistantBlockIds || []));
   if (blocks.some((block) => !referencedBlockIds.has(block.id))) {
     throw contractError('Every Assistant ownership manifest block must resolve to a materialized result.', 'assistant_output_manifest_invalid', 422);
+  }
+  if (outputs.some((output) => !['terminal', 'helper'].includes(output.assistantStageRole))) {
+    throw contractError('Every Assistant-owned result must declare terminal or helper stage semantics.', 'assistant_output_manifest_invalid', 422);
+  }
+  for (const block of blocks) {
+    const terminalOutputs = outputs.filter((output) => output.assistantStageRole === 'terminal' && output.assistantBlockIds.includes(block.id));
+    if (terminalOutputs.length !== 1 || terminalOutputs[0].assistantBlockIds.length !== 1) {
+      throw contractError('Every Assistant ownership manifest block must own exactly one unshared terminal result.', 'assistant_output_manifest_invalid', 422);
+    }
+  }
+  const publishedOutput = outputs.find((output) => output.alias === text(publishedAlias));
+  if (publishedOutput && publishedOutput.assistantStageRole !== 'terminal') {
+    throw contractError('An Assistant helper result cannot be selected as the published result.', 'assistant_output_manifest_invalid', 422);
   }
   return {
     version: 1,
@@ -1552,13 +1565,18 @@ export function objectFlowResultOutputs(flow, outputMetadata = []) {
     const assistantBlockIds = uniqueStrings(Array.isArray(raw.assistantBlockIds)
       ? raw.assistantBlockIds.map((item) => text(item))
       : assistantBlockId ? [assistantBlockId] : []);
+    const assistantStageRole = text(raw.assistantStageRole);
     if (!alias || !materializedAliases.has(alias) || !label || metadataByAlias.has(alias)) {
       throw contractError('Object-flow output metadata must define one non-empty label for each known alias.', 'object_flow_output_metadata_invalid', 422);
+    }
+    if (assistantStageRole && !['terminal', 'helper'].includes(assistantStageRole)) {
+      throw contractError('Object-flow output metadata assistantStageRole must be terminal or helper.', 'object_flow_output_metadata_invalid', 422);
     }
     metadataByAlias.set(alias, {
       label,
       assistantBlockId: assistantBlockId || assistantBlockIds[0] || '',
-      assistantBlockIds
+      assistantBlockIds,
+      assistantStageRole
     });
   }
   if (metadataByAlias.size && (metadataByAlias.size !== materializedAliases.size
@@ -1602,7 +1620,8 @@ export function objectFlowResultOutputs(flow, outputMetadata = []) {
       ...(metadata ? {
         assistantManaged: true,
         ...(metadata.assistantBlockId ? { assistantBlockId: metadata.assistantBlockId } : {}),
-        ...(metadata.assistantBlockIds.length ? { assistantBlockIds: metadata.assistantBlockIds } : {})
+        ...(metadata.assistantBlockIds.length ? { assistantBlockIds: metadata.assistantBlockIds } : {}),
+        ...(metadata.assistantStageRole ? { assistantStageRole: metadata.assistantStageRole } : {})
       } : {})
     });
   }
@@ -1755,7 +1774,7 @@ export function compileObjectFlowToSpec(currentSpec, flow, options = {}) {
   }
 
   const outputs = objectFlowResultOutputs(executableFlow, options.outputMetadata || []);
-  const assistantOutputManifest = normalizeAssistantOutputManifest(options.assistantOutputManifest, outputs);
+  const assistantOutputManifest = normalizeAssistantOutputManifest(options.assistantOutputManifest, outputs, executableFlow.publishedAlias);
   const models = objectFlowVisualModels(executableFlow, outputs, assistantOutputManifest);
   const currentModels = Array.isArray(spec.visualModels) ? spec.visualModels : [];
   spec.visualModels = replaceObjectFlowVisualModels(currentModels, models.objectGroup, models.objectMatching);

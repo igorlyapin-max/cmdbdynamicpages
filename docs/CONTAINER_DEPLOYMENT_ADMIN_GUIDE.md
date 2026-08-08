@@ -16,7 +16,7 @@ Runtime host не должен выполнять `npm install`, `npm run build`
 ## Предварительные условия контура
 
 - Доступ к approved private registry и registry login для service account.
-- Если registry использует внутренний CA, установить CA/cert в trust store Docker host до pull image.
+- Если registry использует внутренний CA, установить CA/cert в trust store Docker host до pull image. Это отдельное требование от CA bundle внутри backend container.
 - DNS/proxy/firewall должны разрешать:
   - pull image из private registry;
   - browser access только к public `CMDP_PUBLIC_ORIGIN` через TLS reverse proxy;
@@ -45,7 +45,7 @@ cp .env.example .env
 - `CMDP_NGINX_PUBLIC_PROTO` - `http` или `https` из `CMDP_PUBLIC_ORIGIN`, который bundled nginx передает как `X-Forwarded-Proto`;
 - `CMDBUILD_ORIGIN` - URL CMDBuild upstream, доступный с backend host;
 - `CMDBDYNAMIC_REDIS_URL` - production Redis endpoint без plaintext password в URL, предпочтительно `rediss://redis.example.local:6380/0`;
-- `CMDBDYNAMIC_REDIS_TLS_CA_FILE` - optional путь к CA PEM, уже доступному внутри backend container, если private Redis PKI не доверен system trust. Оставить пустым для standard trusted chain;
+- `CMDP_TLS_CA_FILE_HOST` и `CMDP_TLS_CA_FILE` - optional private-CA PEM bundle для CMDBuild, Redis и LiteLLM. Первый указывает существующий readable host file, второй - его фиксированный путь внутри container `/run/certs/cmdbdynamicpages-ca.pem`. Задать оба значения или оставить оба пустыми, если system trust достаточен;
 - `CMDBDYNAMIC_REDIS_PASSWORD_FILE_HOST` - host path к secret file от PAM/platform;
 - `CMDBDYNAMICPAGES_CSRF_SECRET` - stable external secret из approved secret source;
 - `CMDP_NGINX_CUSTOM_API_READ_TIMEOUT` - timeout для `proxy_read_timeout` и `proxy_send_timeout` только в nginx location `/cmdbuild/custom-api/`; default `70s`. Он должен быть больше максимальной одной LiteLLM-попытки (`60000 ms`) и transport grace. D2 mapping повторяется отдельным checkpointed HTTP-запросом и не требует увеличения этого timeout;
@@ -63,7 +63,22 @@ cp .env.example .env
 
 `replace-me`, `registry.example.local`, `cmdbuild.example.local`, `redis.example.local`, `litellm.example.local` и `syslog.example.local` не являются рабочими значениями. Real `.env` файлы не коммитить.
 
-`redis://` для local и уже существующих deployment остается поддержанным. В production backend запускается, но пишет runtime warning `redis_plaintext_transport`; для нового production deployment использовать `rediss://` и при private CA предоставить `CMDBDYNAMIC_REDIS_TLS_CA_FILE` через approved read-only mount или image trust.
+`redis://` для local и уже существующих deployment остается поддержанным. В production backend запускается, но пишет runtime warning `redis_plaintext_transport`; для нового production deployment использовать `rediss://`. Если CMDBuild, Redis или LiteLLM использует private PKI, передать единый PEM bundle через read-only mount:
+
+```text
+CMDP_TLS_CA_FILE_HOST=/etc/cmdbdynamicpages/customer-ca-bundle.pem
+CMDP_TLS_CA_FILE=/run/certs/cmdbdynamicpages-ca.pem
+```
+
+Host file должен быть обычным файлом, читаемым Docker daemon и пользователем `node` в container, например mode `0444`. Compose передает его как `NODE_EXTRA_CA_CERTS` для HTTPS CMDBuild/LiteLLM и тем же bundle проверяет Redis TLS. При ротации заменить host file, проверить fingerprint, затем recreate backend container; restart старого container не перечитывает mount contract.
+
+Проверить private PKI до запуска, не используя `--insecure`:
+
+```bash
+CMDP_TLS_SMOKE_URL=https://cmdbuild.internal.example/cmdbuild/ \
+CMDP_TLS_CA_FILE_HOST=/etc/cmdbdynamicpages/customer-ca-bundle.pem \
+bash scripts/tls-ca-smoke.sh
+```
 
 В LiteLLM могут передаваться authoring literals, введённые в Assistant prompts, filters, D2 Notes, templates и mapping rules. Runtime rows, resolved parameter values, CMDBuild cards и raw D2 source автоматически не отправляются; они попадут в запрос только если пользователь явно включит их в authoring text.
 
@@ -72,6 +87,7 @@ cp .env.example .env
 ```bash
 test -f "$LITELLM_API_KEY_FILE_HOST" && test -r "$LITELLM_API_KEY_FILE_HOST"
 docker compose -f docker-compose.runtime.yml exec cmdbdynamicpages sh -c 'test -f /run/secrets/cmdbdynamicpages_litellm_api_key && test -r /run/secrets/cmdbdynamicpages_litellm_api_key'
+test -z "$CMDP_TLS_CA_FILE" || { test "$CMDP_TLS_CA_FILE" = /run/certs/cmdbdynamicpages-ca.pem && test -f "$CMDP_TLS_CA_FILE_HOST" && test -r "$CMDP_TLS_CA_FILE_HOST"; }
 ```
 
 `CMDP_PUBLIC_ORIGIN` и `CMDBUILD_ORIGIN` имеют разные роли. Например, browser работает с `https://custom.example.local`, а backend обращается к internal CMDBuild `https://vr2.internal.example`. Для этого public origin задать `CMDP_NGINX_PUBLIC_HOST=custom.example.local` и `CMDP_NGINX_PUBLIC_PROTO=https`; delivery validation требует совпадения с host/port и protocol `CMDP_PUBLIC_ORIGIN`. Internal upstream не должен быть доступен пользователям, попадать в browser URLs, redirect `Location`, `Origin`, `Referer` или CMDBuild cookie domain. Bundled nginx намеренно не передает в backend client-supplied `Host`, `X-Forwarded-Host` или `X-Forwarded-Proto`.

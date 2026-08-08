@@ -21,7 +21,8 @@ RUN test -n "${CMDBUILD_WAR_SHA256}" \
     && chmod 0755 cmdbuild.sh \
     && rm /tmp/cmdbuild.war
 
-RUN useradd --system --uid 10001 --create-home --home-dir /home/cmdbuild cmdbuild \
+RUN groupadd --system --gid 10001 cmdbuild \
+    && useradd --system --uid 10001 --gid cmdbuild --no-create-home --shell /usr/sbin/nologin cmdbuild \
     && chown -R cmdbuild:cmdbuild /usr/local/tomcat/conf /usr/local/tomcat/logs /usr/local/tomcat/temp /usr/local/tomcat/webapps /usr/local/tomcat/work /var/lib/cmdbuild42
 
 COPY entrypoint.sh /usr/local/bin/cmdbuild42-entrypoint

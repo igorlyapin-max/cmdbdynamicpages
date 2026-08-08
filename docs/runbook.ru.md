@@ -27,7 +27,8 @@ CMDP_PUBLIC_ORIGIN=https://custom.example.local
 CMDP_NGINX_PUBLIC_HOST=custom.example.local
 CMDP_NGINX_PUBLIC_PROTO=https
 CMDBDYNAMIC_REDIS_URL=rediss://redis.example.local:6380/0
-CMDBDYNAMIC_REDIS_TLS_CA_FILE=
+CMDP_TLS_CA_FILE=
+CMDP_TLS_CA_FILE_HOST=
 CMDBDYNAMICPAGES_CSRF_SECRET=<external stable secret>
 CMDBDYNAMIC_REDIS_REQUIRED=true
 CMDBDYNAMIC_REDIS_PASSWORD_FILE=/run/secrets/cmdbdynamicpages_redis_password
@@ -56,7 +57,7 @@ GET /cmdbuild/custom-api/logging/status
 
 `CMDBUILD_ORIGIN` - только внутренний upstream URL, доступный backend, например `https://vr2.internal.example`. Он может отличаться от `CMDP_PUBLIC_ORIGIN`, но не должен появляться в URL браузера, `Origin`, `Referer`, redirect `Location` или cookie domain.
 
-Для production Redis использовать `rediss://`. `CMDBDYNAMIC_REDIS_TLS_CA_FILE` optional и задает путь к CA PEM, уже смонтированному в backend container, если system trust не покрывает private Redis PKI. Plaintext `redis://` остается поддержанным для local и существующих deployment, но в production runtime сообщает `redis_plaintext_transport`.
+Для production Redis использовать `rediss://`. При private PKI CMDBuild, Redis или LiteLLM задать вместе `CMDP_TLS_CA_FILE_HOST` и `CMDP_TLS_CA_FILE=/run/certs/cmdbdynamicpages-ca.pem`: compose смонтирует один PEM bundle read-only, а Node использует его для HTTPS trust. Plaintext `redis://` остается поддержанным для local и существующих deployment, но в production runtime сообщает `redis_plaintext_transport`.
 
 Задать `CMDP_NGINX_PUBLIC_HOST` как `host[:port]` из `CMDP_PUBLIC_ORIGIN`, а `CMDP_NGINX_PUBLIC_PROTO` как его protocol. Bundled nginx передает только эти configured values, а не client-supplied `Host`, `X-Forwarded-Host` или `X-Forwarded-Proto`. Пользовательский ingress публикует только public hostname; прямой доступ пользователей к backend, bundled nginx и internal CMDBuild upstream закрывается firewall/ingress правилами. Browser JavaScript использует относительные `/cmdbuild/...` URLs и не обращается к `PROXY_PORT` или `CMDBUILD_ORIGIN` напрямую.
 

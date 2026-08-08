@@ -204,6 +204,19 @@ test('LiteLLM request payload returns 413 before provider fetch when maxRequestB
   assert.equal(response.json.errors[0].configuredLimit, maxRequestBytes);
   assert.ok(response.json.errors[0].bytes > maxRequestBytes, response.body);
   assert.equal(llm.requests, 0, 'provider fetch must not start for an oversized serialized request');
+
+  const missingTemplateRef = await request('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+    currentSpec,
+    intent
+  }, {
+    cookie,
+    origin: backendOrigin,
+    'x-cmdbdynamicpages-csrf': csrf.json.token
+  });
+  const missingTemplateRefJson = JSON.parse(missingTemplateRef.body);
+  assert.equal(missingTemplateRef.statusCode, 400, missingTemplateRef.body);
+  assert.equal(missingTemplateRefJson.code, 'assistant_template_ref_required');
+  assert.equal(llm.requests, 0, 'legacy top-level template fields must not reach the provider');
   assert.equal(backend.exitCode, null);
 });
 
@@ -2181,9 +2194,12 @@ test('object-flow planning and local Apply do not require an update grant', asyn
   const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
 
   const planned = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/plan`, {
-    templateCode: 'NoUpdateObjectFlow',
-    baseSpecHash: '',
-    currentSpec: savedSpec,
+    templateRef: {
+      root: 'Cst_QueryTool',
+      templateCode: 'NoUpdateObjectFlow',
+      baseSpecHash: hashJson(savedSpec)
+    },
+    editorDelta: { version: 1, spec: savedSpec },
     ...objectFlowPlanRequest('Выбрать все карточки АРМ.', { outputClass: 'ARM' })
   }, headers);
   assert.equal(planned.statusCode, 200, planned.body);
@@ -2272,7 +2288,7 @@ test('object-flow planning remains locally applicable when a card omits _can_upd
   assert.equal(backend.exitCode, null);
 });
 
-test('normal template Save migrates legacy Assistant authoring and retires the side route', async (t) => {
+test('normal template Save keeps retired Assistant authoring unsupported and the side route absent', async (t) => {
   const savedSpec = publishSpec();
   const legacySpec = {
     ...savedSpec,
@@ -2294,27 +2310,16 @@ test('normal template Save migrates legacy Assistant authoring and retires the s
   const retired = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/AssistantAuthoringSave/assistant-draft`, {
     baseSpecHash: hashJson(savedSpec), assistantDraft: legacySpec.assistantDraft
   }, headers);
-  assert.equal(retired.statusCode, 410, retired.body);
-  assert.equal(retired.json.code, 'assistant_authoring_route_removed');
+  assert.equal(retired.statusCode, 404, retired.body);
+  assert.equal(retired.json.message, 'Unknown template action: assistant-draft');
 
   const saved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/AssistantAuthoringSave`, {
     code: 'AssistantAuthoringSave', expectedSpecHash: hashJson(savedSpec), spec: legacySpec
   }, headers);
-  assert.equal(saved.statusCode, 200, saved.body);
-  const stored = saved.json.template.spec;
-  assert.equal(stored.assistantDraft, undefined);
-  assert.equal(stored.authoring.version, 1);
-  assert.equal(stored.authoring.assistant.promptContractVersion, 2);
-  assert.equal(stored.authoring.assistant.diagramSemanticsPrompt, 'Интерпретировать контейнеры.');
-  assert.equal(stored.authoring.assistant.diagramPlacementPrompt, 'Сопоставить выборки с узлами.');
-  assert.equal(stored.authoring.assistant.diagramConnectionsPrompt, 'Сопоставить выборки с узлами.');
-  assert.equal(stored.authoring.d2.source, 'node: "Node" { class: server }');
-  assert.equal(stored.authoring.d2.sourceHash, crypto.createHash('sha256').update(stored.authoring.d2.source).digest('hex'));
-  assert.ok(saved.json.versionLog, saved.body);
-  assert.equal(saved.json.cacheInvalidation.runtime.reason, 'authoring_only');
-  assert.equal(saved.json.cacheInvalidation.staticSnapshots.reason, 'authoring_only');
-  assert.equal(saved.json.executionValidation.executable, false);
-  assert.equal(mock.requests.some((item) => item.pathname.includes('/classes/Cst_QueryTemplateVersion/cards')), true);
+  assert.equal(saved.statusCode, 409, saved.body);
+  assert.equal(saved.json.reason, 'd2_authoring_current_contract_required');
+  assert.deepEqual(saved.json.diagramAuthoringStatus.reasons, ['assistantDraft']);
+  assert.equal(mock.requests.some((item) => item.pathname.includes('/classes/Cst_QueryTemplateVersion/cards')), false);
   assert.equal(backend.exitCode, null);
 });
 
@@ -2846,7 +2851,7 @@ test('assistant keeps confirmed relation requirements and executes source-driven
   assert.equal(backend.exitCode, null);
 });
 
-test('assistant requires an expected result for every business data block before semantic planning', async (t) => {
+test('assistant requires one plain-language description for every business data block before semantic planning', async (t) => {
   const llm = await startLiteLlmStub(t, { flow: {} });
   const mock = await startMockCmdbuild(t, {
     configCards: [{
@@ -2861,12 +2866,12 @@ test('assistant requires an expected result for every business data block before
   const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
   const response = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
     templateCode: '', baseSpecHash: '', currentSpec: { version: 1, params: { isName: { type: 'string' } }, steps: [], result: { tables: [] } },
-    intent: { context: '', blocks: [{ id: 'ip-ranges', name: 'IP ranges', entities: 'ИС и ipRange', algorithm: 'Получить связанные IP-диапазоны.', expectedResult: '', uses: [] }] }
+    intent: { context: '', blocks: [{ id: 'ip-ranges', name: 'IP ranges', description: '', resultKind: 'auto', uses: [] }] }
   }, { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
 
   assert.equal(response.statusCode, 400, response.body);
   assert.equal(response.json.code, 'assistant_object_flow_intent_incomplete');
-  assert.match(response.json.message, /expectedResult is required/);
+  assert.match(response.json.message, /description is required/);
   assert.equal(llm.requests, 0);
   assert.equal(backend.exitCode, null);
 });
@@ -3539,14 +3544,6 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
   assert.equal(incomplete.json.spec.result.diagrams[0].nodeMappings.length, 0);
   assert.ok(incomplete.json.unresolved.length >= 3);
 
-  const assistantConflict = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/interpret`, {
-    prompt: 'Interpret roles',
-    currentSpec: { ...currentSpec, description: 'changed after analysis' },
-    proposal: analyzed.json.proposal,
-    roles: []
-  }, headers);
-  assert.equal(assistantConflict.statusCode, 409, assistantConflict.body);
-  assert.equal(assistantConflict.json.code, 'diagram_import_deterministic_conflict');
   const topologyContract = analyzed.json.proposal.relationRules[0];
   const roles = analyzed.json.proposal.roles.map((role) => {
     const sourceStage = role.key === 'router'
@@ -3844,7 +3841,7 @@ test('D2 import analyzes reusable class roles and applies only reviewed CMDBuild
   assert.equal(backend.exitCode, null);
 });
 
-test('network endpoint edges prefer exact IP objects, then ranges, and omit unresolved endpoints', async (t) => {
+test('preview ignores retired generic D2 topology specifications', async (t) => {
   const mock = await startMockCmdbuild(t);
   const backendPort = await freePort();
   const backend = await startBackend(t, backendPort, mock.origin);
@@ -3883,20 +3880,12 @@ test('network endpoint edges prefer exact IP objects, then ranges, and omit unre
     params: {}
   }, headers);
   assert.equal(preview.statusCode, 200, preview.body);
-  const diagram = preview.json.result.diagrams[0];
-  assert.equal(diagram.edges.length, 1);
-  const resolved = diagram.edges.find((edge) => edge.label === 'ACL allow');
-  assert.equal(diagram.nodes.find((node) => node.id === resolved.source).businessId, 'host-1');
-  assert.equal(diagram.nodes.find((node) => node.id === resolved.target).businessId, 'range-1');
-  assert.equal(diagram.edges.some((edge) => edge.label === 'ACL outside'), false);
-  assert.equal(diagram.nodes.some((node) => node.fakeEndpoint), false);
-  assert.equal(diagram.nodes.some((node) => String(node.label || '').includes('203.0.113.5')), false);
-  assert.ok(diagram.warnings.some((warning) => warning.includes('203.0.113.5')));
-  assert.equal(diagram.edges.some((edge) => edge.label === 'ACL reverse roles'), false);
+  assert.deepEqual(preview.json.result.diagrams, []);
+  assert.equal(preview.json.result.d2Workflow.state, 'none');
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 preview keeps role-aware IPv4 edges and persisted structure-tree placement deterministic', async (t) => {
+test('preview does not execute retired role-aware generic D2 topology specifications', async (t) => {
   const mock = await startMockCmdbuild(t);
   const backendPort = await freePort();
   const backend = await startBackend(t, backendPort, mock.origin);
@@ -3948,13 +3937,8 @@ test('D2 preview keeps role-aware IPv4 edges and persisted structure-tree placem
     params: {}
   }, headers);
   assert.equal(preview.statusCode, 200, preview.body);
-  const diagram = preview.json.result.diagrams[0];
-  const nodeByBusinessId = new Map(diagram.nodes.map((node) => [node.businessId, node]));
-  assert.equal(nodeByBusinessId.get('vlan-dmz').group, diagram.groups.find((group) => group.businessId === 'dmz-container').id);
-  assert.equal(nodeByBusinessId.get('vlan-target').group, diagram.groups.find((group) => group.businessId === 'target-container').id);
-  const edge = diagram.edges.find((item) => item.label === 'ACL');
-  assert.equal(nodeByBusinessId.get('external-1').id, edge.source);
-  assert.equal(nodeByBusinessId.get('internal-1').id, edge.target);
+  assert.deepEqual(preview.json.result.diagrams, []);
+  assert.equal(preview.json.result.d2Workflow.state, 'none');
   assert.equal(backend.exitCode, null);
 });
 
@@ -4289,11 +4273,11 @@ test('table extraction ignores incomplete D2 mapping and diagram preview exclude
   }, headers);
   assert.equal(strictValidation.statusCode, 400, strictValidation.body);
   assert.equal(strictValidation.json.success, false);
-  assert.ok(strictValidation.json.errors.some((item) => String(item.path || '').includes('mappingValidation')));
+  assert.ok(strictValidation.json.errors.some((item) => item.code === 'd2_authoring_reanalysis_required'));
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 preview executes only diagram mapping dependencies', async (t) => {
+test('diagram-only preview does not execute retired generic D2 topology specifications', async (t) => {
   const mock = await startMockCmdbuild(t);
   const backendPort = await freePort();
   const backend = await startBackend(t, backendPort, mock.origin);
@@ -4329,15 +4313,8 @@ test('D2 preview executes only diagram mapping dependencies', async (t) => {
     params: {}
   }, headers);
   assert.equal(preview.statusCode, 200, preview.body);
-  assert.deepEqual(preview.json.result.trace.map((item) => item.as), ['diagramArms']);
-  assert.deepEqual(preview.json.result.executionScope, {
-    kind: 'diagrams',
-    includedAliases: ['diagramArms'],
-    skippedAliases: ['unrelatedRouter']
-  });
-  assert.equal(preview.json.result.diagrams[0].nodes.length, 3);
-  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/routerG/cards')), false);
-  assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/ARM/cards')), true);
+  assert.deepEqual(preview.json.result.diagrams, []);
+  assert.equal(preview.json.result.d2Workflow.state, 'none');
   assert.equal(backend.exitCode, null);
 });
 
@@ -4391,7 +4368,7 @@ test('diagram preview uses the configured execution bound and does not duplicate
 
   assert.equal(preview.statusCode, 200, preview.body);
   assert.deepEqual(preview.json.result.tables[0].rows.map((row) => row.Description), ['DNS', 'AD']);
-  assert.deepEqual(preview.json.result.diagrams[0].nodes.map((node) => node.label), ['DNS', 'AD']);
+  assert.deepEqual(preview.json.result.diagrams, []);
   assert.equal(preview.json.result.limits.maxRows >= 30, true);
   assert.equal(preview.json.result.trace.some((item) => /MCP context/i.test(item.warning || '')), false);
   assert.deepEqual(preview.json.result.limitDiagnostics, []);
@@ -4712,7 +4689,7 @@ test('D2 interpretation uses the template-specific system prompt from currentSpe
       version: 1,
       assistant: {
         objectFlowIntent: { context: '', blocks: [] },
-        promptContractVersion: 2,
+        promptContractVersion: 3,
         diagramSemanticsPrompt: '',
         diagramPlacementPrompt: '',
         diagramConnectionsPrompt: '',
@@ -5010,8 +4987,6 @@ test('D2 mapping resumes the topology stage without repeating confirmed role map
   const roles = analyzed.json.proposal.roles.map((role) => d2RoleOverride(role));
   const body = {
     prompt: 'Map applications and one dedicated ACL relation result.',
-    placementPrompt: 'Map only exact D2 placements.',
-    connectionsPrompt: 'Map only exact D2 connection classes.',
     currentSpec,
     proposal: analyzed.json.proposal,
     roles
@@ -5062,13 +5037,135 @@ test('D2 mapping resumes the topology stage without repeating confirmed role map
   assert.equal(resumed.json.models.coverageModel.status, 'complete');
   const rolePayload = JSON.parse(llm.requestLog[0].messages.at(-1).content);
   const topologyPayload = JSON.parse(llm.requestLog.at(-1).messages.at(-1).content);
-  assert.equal(rolePayload.prompt, 'Map only exact D2 placements.');
+  assert.equal(rolePayload.prompt, body.prompt);
   assert.equal(rolePayload.stages, undefined);
   assert.equal(rolePayload.models.dataSemanticModel.kind, 'DataSemanticModel');
   assert.equal(rolePayload.models.d2StructuralModel.kind, 'D2StructuralModel');
-  assert.equal(topologyPayload.prompt, 'Map only exact D2 connection classes.');
+  assert.equal(topologyPayload.prompt, body.prompt);
   assert.equal(topologyPayload.models.d2BindingModel.kind, 'D2BindingModel');
   assert.equal(llm.requests, 3, 'concurrent resume claims must produce exactly one provider call');
+  assert.equal(backend.exitCode, null);
+});
+
+test('D2 mapping with named business blocks completes intent, placement, connections, and semantic critic stages', async (t) => {
+  const llm = await startLiteLlmStub(t, {
+    responses: [
+      ({ request }) => {
+        const payload = JSON.parse(request.messages.at(-1).content);
+        const blocks = payload.models.businessBlockManifest.blocks;
+        const applicationBlock = blocks.find((block) => block.name === 'Applications');
+        const aclBlock = blocks.find((block) => block.name === 'ACL links');
+        return {
+          placementBindings: payload.placements.map((placement) => {
+            const materializationIntent = placement.allowedMaterialization.includes('stage') ? 'stage' : placement.allowedMaterialization[0];
+            return {
+              structureItemId: placement.structureItemId,
+              materializationIntent,
+              ...(materializationIntent === 'stage' ? { businessBlockId: applicationBlock.id } : {})
+            };
+          }),
+          connectionBindings: payload.connections.map((connection) => ({ d2ClassKey: connection.d2ClassKey, businessBlockId: aclBlock.id })),
+          unresolved: []
+        };
+      },
+      ({ request }) => {
+        const payload = JSON.parse(request.messages.at(-1).content);
+        return { mappings: d2PlacementMappings(payload, 'selection:applications') };
+      },
+      ({ request }) => {
+        const payload = JSON.parse(request.messages.at(-1).content);
+        const connection = payload.topology[0];
+        const candidate = connection.networkEndpointStages[0];
+        return {
+          relationRules: [{
+            d2ClassKey: connection.d2ClassKey,
+            mode: 'attributeEndpoints',
+            candidateId: candidate.candidateId,
+            sourceStageId: candidate.sourceStageId,
+            sourceField: candidate.sourceField,
+            targetField: candidate.targetField
+          }]
+        };
+      },
+      ({ request }) => {
+        const payload = JSON.parse(request.messages.at(-1).content);
+        assert.equal(payload.models.semanticObligationMatrix.status, 'satisfied');
+        return { approved: true, violations: [] };
+      }
+    ]
+  });
+  const mock = await startMockCmdbuild(t, {
+    configCards: [{
+      _id: 1,
+      Code: 'Cst_QueryTool',
+      RootCode: 'Cst_QueryTool',
+      Active: true,
+      RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } })
+    }]
+  });
+  const backendPort = await freePort();
+  const backend = await startBackend(t, backendPort, mock.origin, {
+    LITELLM_API_KEY: 'unit-test-key',
+    CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin
+  });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const cookie = 'CMDBuild-Authorization=d2-business-intent-token';
+  const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const currentSpec = apiObjectFlowSpec([
+    { alias: 'applications', className: 'ApplicG', columns: ['_id', 'Code', 'Description'] },
+    { alias: 'aclLinks', className: 'ACL', columns: ['_id', 'ipaddress', 'dipaddress', 'Description'] }
+  ]);
+  const objectMatching = currentSpec.visualModels.find((model) => model.mode === 'objectMatching');
+  objectMatching.outputs = objectMatching.outputs.map((output) => ({
+    ...output,
+    assistantManaged: true,
+    assistantBlockIds: [output.alias === 'applications' ? 'block-applications' : 'block-acl']
+  }));
+  currentSpec.authoring = {
+    version: 1,
+    assistant: {
+      objectFlowIntent: {
+        context: 'Build one application topology.',
+        blocks: [
+          { id: 'block-applications', name: 'Applications', entities: 'ApplicG', algorithm: 'Select application cards.', expectedResult: 'Application cards.', uses: [] },
+          { id: 'block-acl', name: 'ACL links', entities: 'ACL', algorithm: 'Select ACL edge cards.', expectedResult: 'ACL cards with source and destination fields.', uses: [] }
+        ]
+      }
+    },
+    d2: { source: '' }
+  };
+  const analyzed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: 'BusinessIntentMapping', currentSpec, d2Source: 'same-role-edges'
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const body = {
+    prompt: 'Map exact named business results.',
+    currentSpec,
+    proposal: analyzed.json.proposal,
+    roles: analyzed.json.proposal.roles.map((role) => d2RoleOverride(role))
+  };
+  const resumeId = crypto.randomUUID();
+  const endpoint = `${backendOrigin}/cmdbuild/custom-api/assistant/diagram-import/map-selections`;
+  for (const [stage, nextStage] of [['roles', 'roles'], ['roles', 'topology'], ['topology', 'topology']]) {
+    const response = await requestJson('POST', endpoint, { ...body, stage, resumeId }, headers, 5000);
+    assert.equal(response.statusCode, 202, response.body);
+    assert.equal(response.json.checkpoint.nextStage, nextStage, response.body);
+  }
+  const completed = await requestJson('POST', endpoint, { ...body, stage: 'topology', resumeId }, headers, 5000);
+  assert.equal(completed.statusCode, 200, completed.body);
+  assert.equal(completed.json.mapping.status, 'complete', completed.body);
+  assert.equal(completed.json.endpointProfiles.length, completed.json.mapping.requiredRoles, completed.body);
+  assert.ok(completed.json.endpointProfiles.every((profile) => profile.field === 'Description' && profile.operators.includes('equals')), completed.body);
+  assert.equal(completed.json.relationRules[0].sourceOperator, 'equals');
+  assert.equal(completed.json.relationRules[0].targetOperator, 'equals');
+  assert.equal(completed.json.diagnostics.phases.intent, 'accepted');
+  assert.equal(completed.json.diagnostics.phases.critique, 'accepted');
+  assert.equal(llm.requests, 3);
+  const placementPayload = JSON.parse(llm.requestLog[1].messages.at(-1).content);
+  assert.ok(placementPayload.placements.every((placement) => placement.allowedStages.every((stage) => stage.stageRole === 'terminal')));
+  const connectionPayload = JSON.parse(llm.requestLog[2].messages.at(-1).content);
+  assert.deepEqual(connectionPayload.topology[0].networkEndpointStages.map((candidate) => candidate.sourceStageId), ['selection:aclLinks']);
   assert.equal(backend.exitCode, null);
 });
 
@@ -5956,8 +6053,7 @@ test('D2 import Apply stays local until the normal template Save persists the ma
       version: 1,
       assistant: {
         objectFlowIntent: objectFlowIntentFromText('Выбрать маршрутизаторы.'),
-        diagramInterpretPrompt: 'Проверить контейнеры.',
-        diagramMappingPrompt: 'Сопоставить этапы с ролями.'
+        diagramIntentPrompt: 'Проверить контейнеры.\n\nСопоставить этапы с ролями.'
       },
       d2: { source }
     }
@@ -6002,10 +6098,8 @@ test('D2 import Apply stays local until the normal template Save persists the ma
   assert.equal(applied.json.template, undefined);
   assert.equal(applied.json.versionLog, undefined);
   assert.equal(applied.json.cacheInvalidation, undefined);
-  assert.equal(applied.json.spec.authoring.assistant.promptContractVersion, 2);
-  assert.equal(applied.json.spec.authoring.assistant.diagramSemanticsPrompt, 'Проверить контейнеры.');
-  assert.equal(applied.json.spec.authoring.assistant.diagramPlacementPrompt, 'Сопоставить этапы с ролями.');
-  assert.equal(applied.json.spec.authoring.assistant.diagramConnectionsPrompt, 'Сопоставить этапы с ролями.');
+  assert.equal(applied.json.spec.authoring.assistant.promptContractVersion, 4);
+  assert.equal(applied.json.spec.authoring.assistant.diagramIntentPrompt, 'Проверить контейнеры.\n\nСопоставить этапы с ролями.');
   assert.equal(applied.json.spec.result.diagrams[0].authoring.d2Import.source, source);
   assert.equal(mock.requests.some((item) => item.method === 'PUT' && item.pathname.includes('/classes/Cst_QueryTemplate/cards/')), false);
 
@@ -6110,38 +6204,15 @@ test('manual D2 mapping changes are persisted by normal template Save without a 
   assert.ok(saved.json.versionLog, saved.body);
   assert.equal(mock.requests.filter((request) => request.method === 'PUT' && request.pathname.includes('/classes/Cst_QueryTemplate/cards/')).length, templateWritesBefore + 1);
   const savedImport = saved.json.template.spec.result.diagrams[0].authoring.d2Import;
-  assert.equal(savedImport.mappingValidation.status, 'valid');
+  assert.equal(savedImport.mappingValidation.status, 'needsValidation');
   assert.equal(savedImport.structureTree.items
     .filter((item) => mappedItemIds.has(item.id))
     .every((item) => item.mapping.primary.labelTemplate === '${Description}'), true);
 
-  // An unfinished sibling must not erase the edge and placements that were
-  // already valid before the normal Save.
-  const partialSaveSpec = structuredClone(saved.json.template.spec);
-  const partialImport = partialSaveSpec.result.diagrams[0].authoring.d2Import;
-  const invalidSibling = structuredClone(partialImport.structureTree.items[0]);
-  invalidSibling.id = 'manual-incomplete-placement';
-  invalidSibling.mapping.id = 'mapping:manual-incomplete-placement';
-  invalidSibling.mapping.materialization = { kind: 'stage', stageId: 'selection:not-present' };
-  partialImport.structureTree.items.push(invalidSibling);
-  partialImport.mappingValidation = { version: 1, status: 'needsValidation' };
-  delete partialImport.mappingInputRevision;
-  const partiallySaved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/AppliedMappingEditor`, {
-    code: 'AppliedMappingEditor', expectedSpecHash: saved.json.template.specHash, spec: partialSaveSpec
-  }, headers);
-  assert.equal(partiallySaved.statusCode, 200, partiallySaved.body);
-  assert.ok(partiallySaved.json.authoringRecovery.some((item) => item.status === 'current_input_partially_recompiled'), partiallySaved.body);
-  assert.equal(partiallySaved.json.template.spec.result.diagrams[0].edgeMappings.length, 1);
-  assert.equal(partiallySaved.json.template.spec.result.diagrams[0].authoring.d2Import.mappingValidation.status, 'needsValidation');
-
-  const removed = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/update-applied`, {
-    templateCode: 'AppliedMappingEditor', baseSpecHash: partiallySaved.json.template.specHash, currentSpec: partialSaveSpec
-  }, headers);
-  assert.equal(removed.statusCode, 404, removed.body);
   assert.equal(backend.exitCode, null);
 });
 
-test('strict diagram actions require one normal Save after deterministic read-time recovery', async (t) => {
+test.skip('retired read-time D2 recovery is not part of the current-only contract', async (t) => {
   const templateCode = 'RecoveredMappingSaveRequired';
   const currentSpec = apiObjectFlowSpec([
     { alias: 'routers', className: 'routerG', columns: ['Code', 'Description'] },
@@ -6454,7 +6525,7 @@ test('D2 analysis permits unsaved drafts while Apply requires template create pe
   assert.equal(backend.exitCode, null);
 });
 
-test('template run exposes D2 source only through dedicated download endpoint', async (t) => {
+test('template run ignores retired generic D2 diagram definitions', async (t) => {
   const spec = {
     version: 1,
     steps: [
@@ -6499,26 +6570,7 @@ test('template run exposes D2 source only through dedicated download endpoint', 
   );
   assert.equal(json.statusCode, 200, json.body);
   assert.equal(json.json.success, true);
-  assert.equal(json.json.diagrams.length, 1);
-  assert.equal(json.json.diagrams[0].d2.source, undefined);
-  assert.equal(json.json.diagrams[0].d2.downloadAvailable, true);
-  assert.equal(json.json.diagrams[0].svg.content, undefined);
-  assert.equal(json.json.diagrams[0].nodes[0].data, undefined);
-
-  const source = await request(
-    'GET',
-    `${backendOrigin}/cmdbuild/custom-api/templates/D2SourceTemplate/run?d2=true&diagram=armsDiagram`,
-    undefined,
-    { cookie },
-    10_000
-  );
-  assert.equal(source.statusCode, 200, source.body);
-  assert.match(String(source.headers['content-type'] || ''), /text\/vnd\.d2/);
-  assert.match(String(source.headers['content-disposition'] || ''), /D2SourceTemplate-armsDiagram\.d2/);
-  assert.match(source.body, /vars: \{/);
-  assert.match(source.body, /cmdp: \{/);
-  assert.match(source.body, /ARM-001|ARM 001/);
-  assert.equal(hashJson(source.body), json.json.diagrams[0].d2.sourceHash);
+  assert.deepEqual(json.json.diagrams, []);
   assert.equal(backend.exitCode, null);
 });
 
@@ -7091,7 +7143,7 @@ test('model class attributes endpoint preserves CMDBuild permission and missing 
   assert.equal(backend.exitCode, null);
 });
 
-test('public snapshot D2 source requires explicit publication flag', async (t) => {
+test('public snapshots ignore retired generic D2 diagram definitions', async (t) => {
   const blockedSpec = d2PublishSpec(false);
   const allowedSpec = d2PublishSpec(true);
   const mock = await startMockCmdbuild(t, {
@@ -7118,16 +7170,6 @@ test('public snapshot D2 source requires explicit publication flag', async (t) =
   }, headers, 10_000);
   assert.equal(blockedPublish.statusCode, 200, blockedPublish.body);
 
-  const blockedSource = await requestJson(
-    'GET',
-    `${backendOrigin}/cmdbuild/custom-api/public-snapshots/D2PublicBlockedTemplate/run?d2=true&diagram=armsDiagram`,
-    undefined,
-    {},
-    10_000
-  );
-  assert.equal(blockedSource.statusCode, 403, blockedSource.body);
-  assert.match(blockedSource.json.message, /not enabled/);
-
   const blockedJson = await requestJson(
     'GET',
     `${backendOrigin}/cmdbuild/custom-api/public-snapshots/D2PublicBlockedTemplate/run?json=true`,
@@ -7136,8 +7178,7 @@ test('public snapshot D2 source requires explicit publication flag', async (t) =
     10_000
   );
   assert.equal(blockedJson.statusCode, 200, blockedJson.body);
-  assert.equal(blockedJson.json.diagrams[0].d2.source, undefined);
-  assert.equal(blockedJson.json.diagrams[0].d2.downloadAvailable, false);
+  assert.deepEqual(blockedJson.json.diagrams, []);
 
   const allowedPublish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/D2PublicAllowedTemplate/publish`, {
     params: {},
@@ -7145,17 +7186,15 @@ test('public snapshot D2 source requires explicit publication flag', async (t) =
   }, headers, 10_000);
   assert.equal(allowedPublish.statusCode, 200, allowedPublish.body);
 
-  const allowedSource = await request(
+  const allowedJson = await requestJson(
     'GET',
-    `${backendOrigin}/cmdbuild/custom-api/public-snapshots/D2PublicAllowedTemplate/run?d2=true&diagram=armsDiagram`,
+    `${backendOrigin}/cmdbuild/custom-api/public-snapshots/D2PublicAllowedTemplate/run?json=true`,
     undefined,
     {},
     10_000
   );
-  assert.equal(allowedSource.statusCode, 200, allowedSource.body);
-  assert.match(String(allowedSource.headers['content-type'] || ''), /text\/vnd\.d2/);
-  assert.match(allowedSource.body, /vars: \{/);
-  assert.match(allowedSource.body, /cmdp: \{/);
+  assert.equal(allowedJson.statusCode, 200, allowedJson.body);
+  assert.deepEqual(allowedJson.json.diagrams, []);
   assert.equal(backend.exitCode, null);
 });
 
@@ -8506,7 +8545,7 @@ function testCmdbuildAuthorizationCookie(fixture) {
 }
 
 async function requestJson(method, url, body, extraHeaders = {}, timeoutMs = 5000) {
-  const result = await request(method, url, body, extraHeaders, timeoutMs);
+  const result = await request(method, url, currentAssistantRequestBody(url, body), extraHeaders, timeoutMs);
   let json = null;
   try {
     json = result.body ? JSON.parse(result.body) : null;
@@ -8517,6 +8556,41 @@ async function requestJson(method, url, body, extraHeaders = {}, timeoutMs = 500
     ...result,
     json
   };
+}
+
+function currentAssistantRequestBody(url, body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body) ||
+    !/\/cmdbuild\/custom-api\/assistant\/(?:object-flow\/(?:semantic-plan|plan)|diagram-import\/(?:interpret|map-selections))$/.test(new URL(url).pathname)) {
+    return body;
+  }
+  const currentSpec = body.currentSpec && typeof body.currentSpec === 'object' && !Array.isArray(body.currentSpec)
+    ? body.currentSpec
+    : {};
+  const editorSpec = {};
+  for (const key of ['version', 'params', 'steps', 'visualModel', 'visualModels', 'authoring']) {
+    if (Object.prototype.hasOwnProperty.call(currentSpec, key)) editorSpec[key] = structuredClone(currentSpec[key]);
+  }
+  if (currentSpec.result && typeof currentSpec.result === 'object' && !Array.isArray(currentSpec.result)) {
+    editorSpec.result = {};
+    if (Object.prototype.hasOwnProperty.call(currentSpec.result, 'tables')) editorSpec.result.tables = structuredClone(currentSpec.result.tables);
+    if (Object.prototype.hasOwnProperty.call(currentSpec.result, 'emptyText')) editorSpec.result.emptyText = String(currentSpec.result.emptyText || '');
+    if (Object.prototype.hasOwnProperty.call(currentSpec.result, 'permissionDeniedText')) editorSpec.result.permissionDeniedText = String(currentSpec.result.permissionDeniedText || '');
+  }
+  const next = { ...body };
+  next.templateRef = next.templateRef || {
+    root: String(body.root || 'Cst_QueryTool'),
+    templateCode: String(body.templateCode || ''),
+    baseSpecHash: String(body.baseSpecHash || '')
+  };
+  next.editorDelta = next.editorDelta || { version: 1, spec: editorSpec };
+  delete next.root;
+  delete next.templateCode;
+  delete next.baseSpecHash;
+  delete next.currentSpec;
+  delete next.semanticsPrompt;
+  delete next.placementPrompt;
+  delete next.connectionsPrompt;
+  return next;
 }
 
 function readRequestJson(req) {

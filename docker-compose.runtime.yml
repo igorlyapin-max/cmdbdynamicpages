@@ -15,8 +15,9 @@ services:
       CMDBUILD_ORIGIN: ${CMDBUILD_ORIGIN}
       CMDBUILD_REQUEST_TIMEOUT_MS: ${CMDBUILD_REQUEST_TIMEOUT_MS:-10000}
       CMDP_DRAFT_PREVIEW_TIMEOUT_MS: ${CMDP_DRAFT_PREVIEW_TIMEOUT_MS:-60000}
+      CMDP_TLS_CA_FILE: ${CMDP_TLS_CA_FILE:-}
+      NODE_EXTRA_CA_CERTS: ${CMDP_TLS_CA_FILE:-}
       CMDBDYNAMIC_REDIS_URL: ${CMDBDYNAMIC_REDIS_URL}
-      CMDBDYNAMIC_REDIS_TLS_CA_FILE: ${CMDBDYNAMIC_REDIS_TLS_CA_FILE:-}
       CMDBDYNAMIC_REDIS_PASSWORD_FILE: ${CMDBDYNAMIC_REDIS_PASSWORD_FILE:-/run/secrets/cmdbdynamicpages_redis_password}
       CMDBDYNAMIC_REDIS_REQUIRED: ${CMDBDYNAMIC_REDIS_REQUIRED:-true}
       CMDBDYNAMIC_HEALTH_REDIS_REQUIRED: ${CMDBDYNAMIC_HEALTH_REDIS_REQUIRED:-true}
@@ -73,6 +74,10 @@ services:
       - type: bind
         source: ${LITELLM_API_KEY_FILE_HOST:-/dev/null}
         target: /run/secrets/cmdbdynamicpages_litellm_api_key
+        read_only: true
+      - type: bind
+        source: ${CMDP_TLS_CA_FILE_HOST:-/dev/null}
+        target: /run/certs/cmdbdynamicpages-ca.pem
         read_only: true
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:${PROXY_PORT:-8093}/health/live || exit 1"]

@@ -82,6 +82,10 @@ ENV NODE_ENV=production \
 
 WORKDIR /app
 
+# Runtime CA bundles are mounted read-only by the deployment compose profile.
+RUN mkdir -p /run/certs \
+  && chown node:node /run/certs
+
 LABEL org.opencontainers.image.title="cmdbdynamicpages" \
       org.opencontainers.image.source="${SOURCE_URL}"
 

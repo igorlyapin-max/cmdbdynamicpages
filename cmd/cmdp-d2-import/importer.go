@@ -68,6 +68,7 @@ type elements struct {
 type nodeElement struct {
 	ID        string            `json:"id"`
 	Label     string            `json:"label"`
+	Notes     string            `json:"notes,omitempty"`
 	Shape     string            `json:"shape,omitempty"`
 	ClassKeys []string          `json:"classKeys"`
 	Style     map[string]string `json:"style,omitempty"`
@@ -879,7 +880,7 @@ func normalizeElements(visits []graphVisit, semanticRoles semanticRoleIndex, sta
 			if isGroup(object) || hasSemanticRole(visit, object, semanticRoles) {
 				result.Groups = append(result.Groups, normalizeGroup(visit, object, semanticRoles, staticElements, notesByElement))
 			} else {
-				result.Nodes = append(result.Nodes, normalizeNode(visit, object))
+				result.Nodes = append(result.Nodes, normalizeNode(visit, object, notesByElement))
 			}
 			if hasElementParent(object) {
 				parentID := elementID(visit.board, object.Parent.AbsID())
@@ -903,11 +904,13 @@ func normalizeElements(visits []graphVisit, semanticRoles semanticRoleIndex, sta
 	return result
 }
 
-func normalizeNode(visit graphVisit, object *d2graph.Object) nodeElement {
+func normalizeNode(visit graphVisit, object *d2graph.Object, notesByElement map[string]string) nodeElement {
 	parent := elementParentID(visit, object)
+	id := elementID(visit.board, object.AbsID())
 	return nodeElement{
-		ID:        elementID(visit.board, object.AbsID()),
+		ID:        id,
 		Label:     objectLabel(object),
+		Notes:     strings.TrimSpace(notesByElement[id]),
 		Shape:     object.Shape.Value,
 		ClassKeys: copyClassKeys(object.Classes),
 		Style:     normalizeStyle(object.Style),

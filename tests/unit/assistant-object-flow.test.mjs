@@ -1119,11 +1119,11 @@ test('Assistant output metadata gives named blocks ownership of visible tables w
   const flow = validFlow();
   flow.publishedAlias = 'routerRoomVlans';
   const outputMetadata = [
-    { alias: 'routers', label: 'Маршрутизаторы', assistantBlockId: 'block-1' },
-    { alias: 'rooms', label: 'Помещения', assistantBlockId: 'block-2' },
-    { alias: 'vlans', label: 'VLAN текущей ИС', assistantBlockId: 'block-3' },
-    { alias: 'routerRooms', label: 'VLAN текущей ИС: Сопоставление 1', assistantBlockId: 'block-3', assistantBlockIds: ['block-3'] },
-    { alias: 'routerRoomVlans', label: 'Список VLAN', assistantBlockId: 'block-4' }
+    { alias: 'routers', label: 'Маршрутизаторы', assistantBlockId: 'block-1', assistantStageRole: 'terminal' },
+    { alias: 'rooms', label: 'Помещения', assistantBlockId: 'block-2', assistantStageRole: 'terminal' },
+    { alias: 'vlans', label: 'VLAN текущей ИС', assistantBlockId: 'block-3', assistantStageRole: 'terminal' },
+    { alias: 'routerRooms', label: 'VLAN текущей ИС: Сопоставление 1', assistantBlockId: 'block-3', assistantBlockIds: ['block-3'], assistantStageRole: 'helper' },
+    { alias: 'routerRoomVlans', label: 'Список VLAN', assistantBlockId: 'block-4', assistantStageRole: 'terminal' }
   ];
   const assistantOutputManifest = {
     version: 1,
@@ -1148,6 +1148,7 @@ test('Assistant output metadata gives named blocks ownership of visible tables w
     'Маршрутизаторы', 'Помещения', 'VLAN текущей ИС', 'VLAN текущей ИС: Сопоставление 1', 'Список VLAN'
   ]);
   assert.equal(outputs.every((output) => output.assistantManaged), true);
+  assert.deepEqual(outputs.map((output) => output.assistantStageRole), ['terminal', 'terminal', 'terminal', 'helper', 'terminal']);
   assert.deepEqual(outputs.map((output) => [output.alias, output.assistantBlockId, output.assistantBlockIds]), [
     ['routers', 'block-1', ['block-1']],
     ['rooms', 'block-2', ['block-2']],
@@ -1167,7 +1168,8 @@ test('Assistant output metadata requires a complete persisted ownership manifest
   const completeMetadata = objectFlowResultOutputs(flow).map((output, index) => ({
     alias: output.alias,
     label: `Result ${index + 1}`,
-    assistantBlockId: 'block-1'
+    assistantBlockId: 'block-1',
+    assistantStageRole: output.alias === flow.publishedAlias ? 'terminal' : 'helper'
   }));
   const currentSpec = { version: 1, steps: [], result: { tables: [] } };
 
@@ -1212,6 +1214,48 @@ test('Assistant output metadata requires a complete persisted ownership manifest
     () => compileObjectFlowToSpec(currentSpec, flow, {
       outputMetadata: completeMetadata,
       assistantOutputManifest: { version: 1, blocks: [{ id: 'block-1', name: 'Result' }] }
+    }),
+    { code: 'assistant_output_manifest_invalid' }
+  );
+  assert.throws(
+    () => compileObjectFlowToSpec(currentSpec, flow, {
+      outputMetadata: completeMetadata.map((metadata) => ({ ...metadata, assistantStageRole: 'helper' })),
+      assistantOutputManifest: { version: 1, blocks: [{ id: 'block-1', name: 'Result', order: 1 }] }
+    }),
+    { code: 'assistant_output_manifest_invalid' }
+  );
+  assert.throws(
+    () => compileObjectFlowToSpec(currentSpec, flow, {
+      outputMetadata: completeMetadata.map((metadata, index) => ({
+        ...metadata,
+        assistantStageRole: index >= completeMetadata.length - 2 ? 'terminal' : 'helper'
+      })),
+      assistantOutputManifest: { version: 1, blocks: [{ id: 'block-1', name: 'Result', order: 1 }] }
+    }),
+    { code: 'assistant_output_manifest_invalid' }
+  );
+  const sharedTerminalMetadata = completeMetadata.map((metadata) => metadata.assistantStageRole === 'terminal'
+    ? { ...metadata, assistantBlockId: 'block-1', assistantBlockIds: ['block-1', 'block-2'] }
+    : metadata);
+  assert.throws(
+    () => compileObjectFlowToSpec(currentSpec, flow, {
+      outputMetadata: sharedTerminalMetadata,
+      assistantOutputManifest: {
+        version: 1,
+        blocks: [
+          { id: 'block-1', name: 'Result 1', order: 1 },
+          { id: 'block-2', name: 'Result 2', order: 2 }
+        ]
+      }
+    }),
+    { code: 'assistant_output_manifest_invalid' }
+  );
+  const helperPublishedFlow = structuredClone(flow);
+  helperPublishedFlow.publishedAlias = 'routerRooms';
+  assert.throws(
+    () => compileObjectFlowToSpec(currentSpec, helperPublishedFlow, {
+      outputMetadata: completeMetadata,
+      assistantOutputManifest: { version: 1, blocks: [{ id: 'block-1', name: 'Result', order: 1 }] }
     }),
     { code: 'assistant_output_manifest_invalid' }
   );

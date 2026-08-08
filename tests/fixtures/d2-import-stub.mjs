@@ -83,12 +83,12 @@ process.stdin.on('end', () => {
     ]) : serverGroup ? [
       { key: 'server', definition: { style: { fill: '#FFFFFF' } }, usageCount: 2, sampleElementKeys: ['servers.first', 'servers.second'] }
     ] : multipleRelationClasses ? [
-      { key: 'application', notes: 'Dynamic Application objects.', definition: {}, usageCount: 2, sampleElementKeys: ['application_a', 'application_b'] },
-      { key: 'acl_intrasystem', notes: 'Dedicated ACL result for connections inside the target system.', definition: { style: { stroke: '#D97706' } }, usageCount: 1, sampleElementKeys: ['application_a_b_acl'] },
+      { key: 'application', notes: 'Dynamic Application objects.\nendpoint-field: Description\nendpoint-operator: equals', definition: {}, usageCount: 2, sampleElementKeys: ['application_a', 'application_b'] },
+      { key: 'acl_intrasystem', notes: 'Dedicated ACL result for connections inside the target system.\nsource-operator: equals\ntarget-operator: equals', definition: { style: { stroke: '#D97706' } }, usageCount: 1, sampleElementKeys: ['application_a_b_acl'] },
       { key: 'application_dependency', notes: 'Dedicated dependency result for application links.', definition: { style: { stroke: '#2563EB' } }, usageCount: 1, sampleElementKeys: ['application_a_b_dependency'] }
     ] : sameRoleEdges ? [
-      { key: 'application', notes: 'Dynamic Application objects.', definition: {}, usageCount: 2, sampleElementKeys: ['application_a', 'application_b'] },
-      { key: 'acl_intrasystem', notes: 'Dedicated ACL result for connections inside the target system.', definition: { style: { stroke: '#D97706' } }, usageCount: 2, sampleElementKeys: ['application_a_b_1', 'application_a_b_2'] }
+      { key: 'application', notes: 'Dynamic Application objects.\nendpoint-field: Description\nendpoint-operator: equals', definition: {}, usageCount: 2, sampleElementKeys: ['application_a', 'application_b'] },
+      { key: 'acl_intrasystem', notes: 'Dedicated ACL result for connections inside the target system.\nsource-operator: equals\ntarget-operator: equals', definition: { style: { stroke: '#D97706' } }, usageCount: 2, sampleElementKeys: ['application_a_b_1', 'application_a_b_2'] }
     ] : [
       { key: 'router', definition: {}, usageCount: 1, sampleElementKeys: ['router'] },
       { key: 'switch', definition: {}, usageCount: 1, sampleElementKeys: ['switch'] },

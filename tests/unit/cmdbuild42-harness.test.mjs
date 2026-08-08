@@ -25,7 +25,9 @@ test('CMDBuild 4.2 image accepts only a verified vendor WAR', () => {
   assert.match(dockerfile, /postgresql\.org\/media\/keys\/ACCC4CF8\.asc/);
   assert.match(dockerfile, /noble-pgdg/);
   assert.match(dockerfile, /postgresql-client-17/);
-  assert.match(dockerfile, /useradd --system --uid 10001/);
+  assert.match(dockerfile, /groupadd --system --gid 10001 cmdbuild/);
+  assert.match(dockerfile, /useradd --system --uid 10001 --gid cmdbuild --no-create-home --shell \/usr\/sbin\/nologin cmdbuild/);
+  assert.doesNotMatch(dockerfile, /\badduser\b|\baddgroup\b|--create-home/);
   assert.match(dockerfile, /USER cmdbuild/);
   assert.match(dockerfile, /jar xf \/tmp\/cmdbuild\.war/);
   assert.match(dockerfile, /chmod 0755 cmdbuild\.sh/);

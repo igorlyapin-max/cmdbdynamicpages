@@ -8,6 +8,7 @@ const requiredFiles = [
   'docker-compose.nginx.yml',
   'scripts/build-identity.mjs',
   'scripts/container-image.mjs',
+  'scripts/tls-ca-smoke.sh',
   'docs/CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md'
 ];
 
@@ -21,7 +22,8 @@ const requiredEnv = [
   'CMDP_NGINX_PUBLIC_PROTO',
   'CMDBUILD_ORIGIN',
   'CMDBDYNAMIC_REDIS_URL',
-  'CMDBDYNAMIC_REDIS_TLS_CA_FILE',
+  'CMDP_TLS_CA_FILE',
+  'CMDP_TLS_CA_FILE_HOST',
   'CMDBDYNAMIC_REDIS_PASSWORD_FILE',
   'CMDBDYNAMIC_REDIS_PASSWORD_FILE_HOST',
   'CMDBDYNAMIC_REDIS_REQUIRED',
@@ -157,6 +159,8 @@ requireEnvValue('CMDP_LOG_TARGET', 'stdout,syslog');
 requireEnvValue('CMDP_ASSISTANT_LLM_MAX_REQUEST_BYTES_ABSOLUTE', '2097152');
 requireEnvValue('CMDP_ASSISTANT_LLM_MAX_RESPONSE_BYTES_ABSOLUTE', '4194304');
 requireEnvValue('LITELLM_API_KEY_FILE_HOST', '');
+requireEnvValue('CMDP_TLS_CA_FILE', '');
+requireEnvValue('CMDP_TLS_CA_FILE_HOST', '');
 requireEnvValue('CMDBDYNAMIC_IMAGE', 'registry.example.local/gkm/cmdbdynamicpages:vXX.YY.ZZ.NN');
 validateNginxPublicOrigin();
 
@@ -175,11 +179,14 @@ requireText('docker-compose.runtime.yml', 'CMDP_SYSLOG_PORT', 'syslog port wirin
 requireText('docker-compose.runtime.yml', 'CMDP_SYSLOG_PROTOCOL', 'syslog protocol wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_SYSLOG_FACILITY', 'syslog facility wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_PUBLIC_ORIGIN: ${CMDP_PUBLIC_ORIGIN}', 'public origin wiring');
+requireText('docker-compose.runtime.yml', 'CMDP_TLS_CA_FILE: ${CMDP_TLS_CA_FILE:-}', 'private CA bundle wiring');
+requireText('docker-compose.runtime.yml', 'NODE_EXTRA_CA_CERTS: ${CMDP_TLS_CA_FILE:-}', 'Node private CA bundle wiring');
+requireText('docker-compose.runtime.yml', 'source: ${CMDP_TLS_CA_FILE_HOST:-/dev/null}', 'private CA host mount wiring');
+requireText('docker-compose.runtime.yml', 'target: /run/certs/cmdbdynamicpages-ca.pem', 'private CA container mount target');
 requireText('docker-compose.runtime.yml', 'CMDP_LITELLM_ALLOWED_BASE_URLS', 'LiteLLM base URL allowlist wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_ASSISTANT_LLM_MAX_REQUEST_BYTES_ABSOLUTE: ${CMDP_ASSISTANT_LLM_MAX_REQUEST_BYTES_ABSOLUTE:-2097152}', 'LiteLLM absolute request cap wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_ASSISTANT_LLM_MAX_RESPONSE_BYTES_ABSOLUTE: ${CMDP_ASSISTANT_LLM_MAX_RESPONSE_BYTES_ABSOLUTE:-4194304}', 'LiteLLM absolute response cap wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_EXECUTION_MAX_SELECTION_SCAN_ROWS_ABSOLUTE: ${CMDP_EXECUTION_MAX_SELECTION_SCAN_ROWS_ABSOLUTE:-50000}', 'absolute selection scan limit wiring');
-requireText('docker-compose.runtime.yml', 'CMDBDYNAMIC_REDIS_TLS_CA_FILE', 'Redis TLS CA wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_D2_RENDER_ENABLED', 'D2 render wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_D2_MAX_DIAGRAMS', 'D2 max diagrams wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_D2_CONCURRENCY', 'D2 render concurrency wiring');
@@ -196,6 +203,9 @@ rejectPattern('nginx/cmdbdynamicpages.conf', /proxy_set_header\s+(?:Host|X-Forwa
 rejectPattern('nginx/cmdbdynamicpages.conf', /proxy_set_header\s+X-Forwarded-Proto\s+\$scheme;/, 'request scheme forwarding');
 requireText('Dockerfile', 'HEALTHCHECK', 'Docker HEALTHCHECK');
 requireText('Dockerfile', 'USER node', 'non-root runtime user');
+requireText('Dockerfile', 'mkdir -p /run/certs', 'private CA mount parent directory');
+requireText('scripts/tls-ca-smoke.sh', 'curl --fail --silent --show-error --cacert', 'private CA TLS smoke without insecure mode');
+rejectPattern('scripts/tls-ca-smoke.sh', /--insecure|\s-k(?:\s|$)/, 'insecure private CA TLS smoke option');
 requireText('Dockerfile', 'PROXY_HOST=127.0.0.1', 'loopback proxy host default');
 requireText('Dockerfile', 'CMDP_LOG_TARGET=stdout,syslog', 'production stdout and syslog targets');
 requireText('Dockerfile', `path:'/health/live'`, 'Docker liveness healthcheck');
@@ -267,7 +277,8 @@ requireText('.dockerignore', '.tmp-*', 'local temporary artifact exclusion');
   'CMDP_SYSLOG_PROTOCOL',
   'CMDP_SYSLOG_FACILITY',
   'CMDP_PUBLIC_ORIGIN',
-  'CMDBDYNAMIC_REDIS_TLS_CA_FILE',
+  'CMDP_TLS_CA_FILE',
+  'CMDP_TLS_CA_FILE_HOST',
   'CMDP_NGINX_CUSTOM_API_READ_TIMEOUT',
   'CMDP_EXECUTION_MAX_SELECTION_SCAN_ROWS_ABSOLUTE',
   'CMDP_LITELLM_ALLOWED_BASE_URLS',
@@ -289,6 +300,19 @@ requireText('.dockerignore', '.tmp-*', 'local temporary artifact exclusion');
   'vXX.YY.ZZ.NN',
   '--require-clean'
 ].forEach((text) => requireText('docs/CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md', text));
+
+[
+  'Dockerfile',
+  'docker-compose.runtime.yml',
+  '.env.example',
+  'docs/CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md',
+  'docs/deployment-guide.md',
+  'docs/deployment-guide.ru.md',
+  'docs/runbook.md',
+  'docs/runbook.ru.md',
+  'README.md',
+  'README.ru.md'
+].forEach((file) => rejectPattern(file, /\bCMDBDYNAMIC_REDIS_TLS_CA_FILE\b/, 'retired Redis-only CA variable'));
 
 rejectPattern('.env.example', /v0\.1\.0-static-baseline/, 'legacy image tag example');
 rejectPattern('docs/CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md', /v0\.1\.0-static-baseline/, 'legacy image tag example');

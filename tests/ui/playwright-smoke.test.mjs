@@ -13,6 +13,7 @@ const runtimeTemplate = process.env.CMDBDYNAMIC_E2E_TEMPLATE || 'ProbeClassesByA
 const runtimeAttrType = process.env.CMDBDYNAMIC_E2E_ATTR_TYPE || 'reference';
 const runtimeCacheLayoutTemplate = process.env.CMDBDYNAMIC_E2E_CACHE_TEMPLATE || 'testtemplate';
 const runtimeDiagramTemplate = process.env.CMDBDYNAMIC_E2E_D2_TEMPLATE || 'testtemplate';
+const runtimeAssistantDiagramTemplate = process.env.CMDBDYNAMIC_E2E_D2_ASSISTANT_TEMPLATE || 'testtemplate3';
 const loginUsername = process.env.CMDBUILD_USERNAME || '';
 const loginPassword = process.env.CMDBUILD_PASSWORD || '';
 const loginRole = process.env.CMDBUILD_ROLE || '';
@@ -52,9 +53,13 @@ async function addAssistantBusinessBlock(page, values = {}) {
   const block = page.locator('[data-assistant-flow-block]').last();
   const index = (await page.locator('[data-assistant-flow-block]').count()) - 1;
   await block.locator(`#assistant-flow-${index}-name`).fill(values.name || `Result ${index + 1}`);
-  await block.locator(`#assistant-flow-${index}-entities`).fill(values.entities || 'CMDBuild objects');
-  await block.locator(`#assistant-flow-${index}-algorithm`).fill(values.algorithm || 'Select the requested objects.');
-  await block.locator(`#assistant-flow-${index}-expected-result`).fill(values.expectedResult || 'A deterministic result table.');
+  const description = values.description || [
+    values.entities || 'CMDBuild objects',
+    values.algorithm || 'Select the requested objects.',
+    values.expectedResult || 'A deterministic result table.'
+  ].filter(Boolean).join('\n\n');
+  await block.locator(`#assistant-flow-${index}-description`).fill(description);
+  if (values.resultKind) await block.locator(`#assistant-flow-${index}-result-kind`).selectOption(values.resultKind);
   return block;
 }
 
@@ -73,32 +78,27 @@ test('[required:designer-shell] Designer opens on the template list with fixed m
   });
 });
 
-test('[required:d2-recovery-save] Designer asks for a normal Save when a recovered D2 mapping is ready but not persisted', { skip: skipReason }, async () => {
+test('[required:d2-current-contract] Designer blocks a retired D2 mapping until the user explicitly resets it', { skip: skipReason }, async () => {
   await withPage(async (page) => {
-    let recoveredCode = '';
+    let templateCode = '';
     await page.route('**/cmdbuild/custom-api/templates?**', async (route) => {
       const response = await route.fetch();
       const payload = await response.json();
       const templates = Array.isArray(payload && payload.data) ? payload.data : [];
       if (templates.length) {
-        recoveredCode = String(templates[0].code || '');
+        templateCode = String(templates[0].code || '');
         templates[0] = {
           ...templates[0],
           spec: {
             ...(templates[0].spec || {}),
-            result: {
-              ...(templates[0].spec?.result || {}),
-              presentation: {
-                ...(templates[0].spec?.result?.presentation || {}),
-                outputMode: 'both'
+            authoring: {
+              ...(templates[0].spec?.authoring || {}),
+              d2: { source: 'node: Node' },
+              assistant: {
+                ...(templates[0].spec?.authoring?.assistant || {}),
+                diagramSemanticsPrompt: 'retired prompt'
               }
-            },
-            publish: { mode: 'staticSnapshot', paramsMode: 'exact', warningAccepted: true }
-          },
-          authoringRecovery: {
-            requiresSave: true,
-            executionReadyAfterSave: true,
-            statuses: ['reattested']
+            }
           }
         };
       }
@@ -106,29 +106,16 @@ test('[required:d2-recovery-save] Designer asks for a normal Save when a recover
     });
     await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
-    assert.ok(recoveredCode, 'The Designer fixture must expose at least one readable template.');
-    await page.locator(`[data-action="select-template"][data-code="${recoveredCode}"]`).click();
-
-    const notice = page.locator('[data-d2-recovery-save-required]');
-    await notice.waitFor({ state: 'visible', timeout: 10_000 });
-    const noticeBox = await notice.boundingBox();
-    assert.ok(noticeBox && noticeBox.width > 0 && noticeBox.height > 0, JSON.stringify(noticeBox));
-    assert.match(await notice.innerText(), /Save the recovered D2 mapping|Сохраните восстановленный D2 mapping/);
-    assert.equal(await notice.locator('button[data-action="save-template"]').isEnabled(), true);
-
-    await page.locator('a[data-designer-section="publication"]').click();
-    await page.waitForSelector('#cmdp-publication-editor', { timeout: 10_000 });
-    assert.equal(await page.locator('[data-d2-recovery-save-required]').isVisible(), true);
-    assert.equal(await page.locator('button[data-action="publish-snapshot"]').isDisabled(), true);
-    assert.equal(await page.locator('[data-d2-recovery-save-required] [data-action="open-assistant-d2"]').count(), 0);
-
-    await page.locator('a[data-designer-section="run"]').click();
-    await page.waitForSelector('#cmdp-run-params-editor', { timeout: 10_000 });
-    assert.equal(await page.locator('button[data-action="visualize-editor"]').isEnabled(), true);
-    assert.equal(await page.locator('button[data-action="force-refresh-editor"]').isDisabled(), true);
-    assert.equal(await page.locator('button[data-action="visualize-external"]').isDisabled(), true);
-    assert.equal(await page.locator('#cmdp-run-launch-url').getAttribute('aria-disabled'), 'true');
-    assert.equal(await page.locator('#cmdp-run-launch-url').getAttribute('href'), null);
+    assert.ok(templateCode, 'The Designer fixture must expose at least one readable template.');
+    await page.locator(`[data-action="select-template"][data-code="${templateCode}"]`).click();
+    await page.locator('a[data-designer-section="diagram-assistant"]').click();
+    await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 10_000 });
+    const reset = page.locator('button[data-action="diagram-import-reset-unsupported"]');
+    await reset.waitFor({ state: 'visible', timeout: 10_000 });
+    assert.match(await page.locator('#cmdp-diagram-assistant-editor').innerText(), /Требуется новое сопоставление D2/);
+    assert.equal(await page.locator('button[data-action="diagram-import-analyze"]').isDisabled(), true);
+    await reset.click();
+    assert.equal(await page.locator('button[data-action="diagram-import-analyze"]').isDisabled(), false);
   });
 });
 
@@ -345,9 +332,7 @@ test('New template does not retain Assistant authoring from the previous templat
 
     await page.locator('a[data-designer-section="diagram-assistant"]').click();
     await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 10_000 });
-    await page.locator('#cmdp-assistant-diagram-interpret-prompt').fill(`${sentinel}-semantics`);
-    await page.locator('#cmdp-assistant-diagram-mapping-prompt').fill(`${sentinel}-placement`);
-    await page.locator('#cmdp-assistant-diagram-connections-prompt').fill(`${sentinel}-connections`);
+    await page.locator('#cmdp-assistant-diagram-intent-prompt').fill(`${sentinel}-diagram-intent`);
 
     await page.locator('a[data-designer-section="templates"]').click();
     await page.waitForSelector('#cmdp-template-list', { timeout: 10_000 });
@@ -362,9 +347,7 @@ test('New template does not retain Assistant authoring from the previous templat
 
     await page.locator('a[data-designer-section="diagram-assistant"]').click();
     await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 10_000 });
-    assert.equal(await page.locator('#cmdp-assistant-diagram-interpret-prompt').inputValue(), '');
-    assert.equal(await page.locator('#cmdp-assistant-diagram-mapping-prompt').inputValue(), '');
-    assert.equal(await page.locator('#cmdp-assistant-diagram-connections-prompt').inputValue(), '');
+    assert.equal(await page.locator('#cmdp-assistant-diagram-intent-prompt').inputValue(), '');
     assert.equal((await page.locator('body').innerText()).includes(sentinel), false);
   });
 });
@@ -415,6 +398,119 @@ test('main Diagram editor is the only diagram authoring entry point', { skip: sk
   });
 });
 
+test('testtemplate3 Diagram Assistant completes mapping and renders the applied draft through the UI', {
+  skip: skipReason || !requireLiveDiagramUi
+    ? (skipReason || 'Set CMDBDYNAMIC_E2E_D2_REQUIRED=1 to run the live Assistant D2 regression.')
+    : false,
+  timeout: 360_000
+}, async () => {
+  await withPage(async (page) => {
+    const pageErrors = [];
+    const mappingStatuses = [];
+    const mappingFailures = [];
+    page.on('pageerror', (error) => pageErrors.push(error && error.message ? error.message : String(error)));
+    page.on('response', async (response) => {
+      if (response.url().includes('/cmdbuild/custom-api/assistant/diagram-import/map-selections')) {
+        mappingStatuses.push(response.status());
+        if (response.status() >= 400) {
+          let body = {};
+          try {
+            const payload = await response.json();
+            body = {
+              code: payload && payload.code,
+              message: payload && payload.message,
+              errors: Array.isArray(payload && payload.errors) ? payload.errors.slice(0, 20) : [],
+              details: Array.isArray(payload && payload.details) ? payload.details.slice(0, 20) : [],
+              resume: payload && payload.resume,
+              diagnostics: payload && payload.diagnostics && {
+                phases: payload.diagnostics.phases,
+                rootCause: payload.diagnostics.rootCause
+              }
+            };
+          } catch (error) {
+            body = { parseError: error && error.message ? error.message : String(error) };
+          }
+          mappingFailures.push({ status: response.status(), body });
+        }
+      }
+    });
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#cmdp-designer-menu', { timeout: 20_000 });
+    const templateButton = page.locator(`[data-action="select-template"][data-code="${runtimeAssistantDiagramTemplate}"]`);
+    await templateButton.waitFor({ state: 'visible', timeout: 20_000 });
+    await templateButton.click();
+    await page.locator('a[data-designer-section="diagram-assistant"]').click();
+    await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 20_000 });
+
+    const analyzeResponsePromise = page.waitForResponse((response) => (
+      response.url().includes('/cmdbuild/custom-api/draft/diagram-import/analyze') && response.request().method() === 'POST'
+    ), { timeout: 60_000 });
+    await page.locator('button[data-action="diagram-import-analyze"]').click();
+    const analyzeResponse = await analyzeResponsePromise;
+    assert.equal(analyzeResponse.status(), 200, await analyzeResponse.text());
+    await page.waitForFunction(() => !document.querySelector('button[data-action="assistant-diagram-interpret"]')?.disabled, null, { timeout: 30_000 });
+
+    const interpretResponsePromise = page.waitForResponse((response) => (
+      response.url().includes('/cmdbuild/custom-api/assistant/diagram-import/interpret') && response.request().method() === 'POST'
+    ), { timeout: 210_000 });
+    await page.locator('button[data-action="assistant-diagram-interpret"]').click();
+    const interpretResponse = await interpretResponsePromise;
+    assert.equal(interpretResponse.status(), 200, await interpretResponse.text());
+    await page.waitForFunction(() => !document.querySelector('button[data-action="assistant-diagram-map"]')?.disabled, null, { timeout: 30_000 });
+
+    const mappingResponsePromise = page.waitForResponse((response) => (
+      response.url().includes('/cmdbuild/custom-api/assistant/diagram-import/map-selections')
+        && response.request().method() === 'POST'
+        && response.status() === 200
+    ), { timeout: 300_000 });
+    await page.locator('button[data-action="assistant-diagram-map"]').click();
+    await page.waitForFunction(() => document.querySelector('button[data-action="assistant-diagram-map"]')?.disabled === true, null, { timeout: 10_000 });
+    const mappingOutcome = await Promise.race([
+      mappingResponsePromise.then((response) => ({ response })),
+      page.waitForFunction(() => document.querySelector('button[data-action="assistant-diagram-map"]')?.disabled === false, null, { timeout: 300_000 }).then(() => ({ response: null }))
+    ]);
+    const mappingResponse = mappingOutcome.response;
+    if (!mappingResponse) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.fail(`D2 mapping did not complete. Statuses: ${JSON.stringify(mappingStatuses)}. Failures: ${JSON.stringify(mappingFailures)}`);
+    }
+    const mappingBody = await mappingResponse.json();
+    assert.equal(mappingBody?.mapping?.status, 'complete', JSON.stringify(mappingBody));
+    assert.equal(mappingBody?.mapping?.mappedRoles, mappingBody?.mapping?.requiredRoles, JSON.stringify(mappingBody.mapping));
+    assert.equal(mappingBody?.mapping?.mappedConnections, mappingBody?.mapping?.requiredConnections, JSON.stringify(mappingBody.mapping));
+    assert.equal(Array.isArray(mappingBody?.mapping?.unresolved) ? mappingBody.mapping.unresolved.length : Number(mappingBody?.mapping?.unresolved || 0), 0);
+    assert.equal(mappingStatuses.includes(422), false, `UI mapping required a correction: ${JSON.stringify(mappingStatuses)}`);
+
+    const applyButton = page.locator('button[data-action="diagram-import-apply"]');
+    await applyButton.waitFor({ state: 'visible', timeout: 30_000 });
+    assert.equal(await applyButton.isEnabled(), true);
+    const applyResponsePromise = page.waitForResponse((response) => (
+      response.url().includes('/cmdbuild/custom-api/draft/diagram-import/apply') && response.request().method() === 'POST'
+    ), { timeout: 120_000 });
+    await applyButton.click();
+    const applyResponse = await applyResponsePromise;
+    const applyBody = await applyResponse.json();
+    assert.equal(applyResponse.status(), 200, JSON.stringify(applyBody));
+    assert.equal(applyBody.partial, false, JSON.stringify(applyBody));
+
+    await page.locator('a[data-designer-section="visualization"]').click();
+    await page.locator('#cmdp-visualization-editor').waitFor({ state: 'visible', timeout: 20_000 });
+    const previewResponsePromise = page.waitForResponse((response) => (
+      response.url().includes('/cmdbuild/custom-api/draft/preview') && response.request().method() === 'POST'
+    ), { timeout: 210_000 });
+    await page.locator('#cmdp-visualization-editor button[data-action="diagram-import-preview-current"]').click();
+    const previewResponse = await previewResponsePromise;
+    const previewBody = await previewResponse.json();
+    assert.equal(previewResponse.status(), 200, JSON.stringify(previewBody));
+    const diagrams = previewBody?.result?.diagrams || [];
+    assert.equal(diagrams.length, 1, JSON.stringify(previewBody?.result?.trace || []));
+    assert.equal(diagrams[0]?.svg?.rendered, true, JSON.stringify(diagrams[0]?.warnings || []));
+    assert.match(String(diagrams[0]?.svg?.content || ''), /^<svg[\s>]/i);
+    await page.locator('[data-diagram-import-runtime-preview] [data-d2-rendered-svg]').waitFor({ state: 'visible', timeout: 60_000 });
+    assert.deepEqual(pageErrors, []);
+  });
+});
+
 test('testtemplate preview keeps mapped server scopes, cards, and selected-result VLAN labels in declared branches', {
   skip: skipReason || !requireLiveDiagramUi
     ? (skipReason || 'Set CMDBDYNAMIC_E2E_D2_REQUIRED=1 to run the live testtemplate D2 regression.')
@@ -436,22 +532,33 @@ test('testtemplate preview keeps mapped server scopes, cards, and selected-resul
       : null;
     const loadedSource = String(loadedTemplate && loadedTemplate.spec && loadedTemplate.spec.authoring && loadedTemplate.spec.authoring.d2 && loadedTemplate.spec.authoring.d2.source || '');
     const loadedSourceHash = createHash('sha256').update(loadedSource).digest('hex');
-    assert.equal(loadedImport && loadedImport.semanticModelRevision, 14, `Template list must migrate the saved D2 authoring model before the editor selects it. ${JSON.stringify({
-      semanticModelRevision: loadedImport && loadedImport.semanticModelRevision,
-      structureTreeVersion: loadedImport && loadedImport.structureTree && loadedImport.structureTree.version,
-      mappingValidation: loadedImport && loadedImport.mappingValidation,
-      sourceHash: loadedImport && loadedImport.sourceHash,
-      loadedSourceHash,
-      authoringRecovery: loadedTemplate && loadedTemplate.authoringRecovery
-    })}`);
-    assert.equal(loadedImport && loadedImport.mappingValidation && loadedImport.mappingValidation.status, 'needsValidation', `A migrated partial D2 mapping must remain editable and previewable without requiring another Assistant analysis. ${JSON.stringify({
+    if (loadedImport && loadedImport.semanticModelRevision !== 15) {
+      assert.equal(loadedTemplate?.diagramAuthoringStatus?.status, 'needsReanalysis', JSON.stringify({
+        semanticModelRevision: loadedImport.semanticModelRevision,
+        structureTreeVersion: loadedImport.structureTree && loadedImport.structureTree.version,
+        mappingValidation: loadedImport.mappingValidation,
+        sourceHash: loadedImport.sourceHash,
+        loadedSourceHash,
+        diagramAuthoringStatus: loadedTemplate?.diagramAuthoringStatus
+      }));
+      const templateButton = page.locator(`[data-action="select-template"][data-code="${runtimeDiagramTemplate}"]`);
+      await templateButton.waitFor({ state: 'visible', timeout: 20_000 });
+      await templateButton.click();
+      await page.locator('a[data-designer-section="diagram-assistant"]').click();
+      const analyzeButton = page.locator('button[data-action="diagram-import-analyze"]');
+      await analyzeButton.waitFor({ state: 'visible', timeout: 20_000 });
+      assert.equal(await analyzeButton.isEnabled(), true, 'A historic D2 mapping must direct the user to current analysis instead of attempting migration.');
+      assert.deepEqual(pageErrors, []);
+      return;
+    }
+    assert.equal(loadedImport && loadedImport.mappingValidation && loadedImport.mappingValidation.status, 'needsValidation', `A current partial D2 mapping must remain editable and previewable. ${JSON.stringify({
       mappingValidation: loadedImport && loadedImport.mappingValidation,
       authoringRecovery: loadedTemplate && loadedTemplate.authoringRecovery
     })}`);
     assert.equal(
       (loadedTemplate && loadedTemplate.authoringRecovery && loadedTemplate.authoringRecovery.statuses || []).includes('migration_rebuild_failed'),
       false,
-      `Partial D2 migration must not be reported as a failed rebuild. ${JSON.stringify(loadedTemplate && loadedTemplate.authoringRecovery)}`
+      `Current partial D2 mapping must not be reported as a failed rebuild. ${JSON.stringify(loadedTemplate && loadedTemplate.authoringRecovery)}`
     );
     const loadedRuleClasses = (loadedImport && loadedImport.relationRules || []).map((rule) => String(rule && rule.d2ClassKey || rule && rule.d2Label || ''));
     assert.ok(loadedRuleClasses.includes('acl_external'), `Template list must expose the external ACL class contract instead of a sample D2 arrow label: ${JSON.stringify({ classes: loadedRuleClasses, sourceHash: loadedImport && loadedImport.sourceHash, loadedSourceHash, structureHash: loadedImport && loadedImport.structureHash, mappingContractHash: loadedImport && loadedImport.mappingContractHash, validation: loadedImport && loadedImport.mappingValidation, recovery: loadedTemplate && loadedTemplate.authoringRecovery })}`);
@@ -1944,11 +2051,11 @@ test('Assistant keeps prompts separate from deterministic Designer controls', { 
     assert.match(await page.locator('#cmdp-assistant-editor').innerText(), /Статус ассистента/);
     assert.doesNotMatch(await page.locator('#cmdp-assistant-editor').innerText(), /Provider|Base URL|Model|MCP context/);
     assert.equal(await page.locator('[data-object-selection], [data-matching-block], [data-matching-rule-row], [data-diagram-import-role-mapping]').count(), 0);
-    assert.equal(await page.locator('#cmdp-assistant-diagram-interpret-prompt, #cmdp-assistant-diagram-mapping-prompt, #cmdp-assistant-diagram-connections-prompt').count(), 0);
+    assert.equal(await page.locator('#cmdp-assistant-diagram-intent-prompt').count(), 0);
     assert.equal(await page.locator('button[data-action="assistant-diagram-map"]').count(), 0);
 
     await addAssistantBusinessBlock(page);
-    const flowPrompt = page.locator('#assistant-flow-0-algorithm');
+    const flowPrompt = page.locator('#assistant-flow-0-description');
     assert.equal(await flowPrompt.isVisible(), true);
     assert.equal(await page.locator('[data-assistant-flow-selection], [data-assistant-flow-match]').count(), 0);
     const promptWidth = await flowPrompt.evaluate((node) => {
@@ -1963,8 +2070,8 @@ test('Assistant keeps prompts separate from deterministic Designer controls', { 
     assert.equal((await page.locator('a[data-designer-section="diagram-assistant"]').innerText()).trim(), 'Ассистент диаграмм');
     assert.match(await page.locator('#cmdp-diagram-assistant-editor').innerText(), /Статус ассистента/);
     assert.equal(await page.locator('#cmdp-diagram-import-source').count(), 1);
-    assert.equal(await page.locator('#cmdp-assistant-diagram-interpret-prompt, #cmdp-assistant-diagram-mapping-prompt, #cmdp-assistant-diagram-connections-prompt').count(), 3);
-    assert.equal(await page.locator('#assistant-flow-0-algorithm').count(), 0);
+    assert.equal(await page.locator('#cmdp-assistant-diagram-intent-prompt').count(), 1);
+    assert.equal(await page.locator('#assistant-flow-0-description').count(), 0);
   });
 });
 
@@ -1978,9 +2085,7 @@ test('Assistant persists canonical authoring only through the explicit template 
         algorithm: 'Найти ИС по isName и получить связанные ipRange.',
         expectedResult: 'Таблица IP-диапазонов выбранной ИС.'
       },
-      semantics: 'Контейнеры являются визуальными группами, а узлы - экземплярами CMDB-классов.',
-      placement: 'Сопоставить выборки с D2-размещениями по семантике и доступным атрибутам.',
-      connections: 'Сопоставить D2-связи только с подтвержденными детерминированными результатами.'
+      diagramIntent: 'Контейнеры являются визуальными группами, узлы - экземплярами CMDB-классов. Сопоставить размещения и D2-связи только с подтвержденными именованными результатами.'
     };
     const objectFlowSystemOverride = 'Для этого шаблона сохраняй результаты под пользовательскими именами блоков.';
     const d2Source = 'server: "Server" { class: server }';
@@ -2011,9 +2116,7 @@ test('Assistant persists canonical authoring only through the explicit template 
     await page.locator('a[data-designer-section="diagram-assistant"]').click();
     await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 10_000 });
     await page.locator('#cmdp-diagram-import-source').fill(d2Source);
-    await page.locator('#cmdp-assistant-diagram-interpret-prompt').fill(prompts.semantics);
-    await page.locator('#cmdp-assistant-diagram-mapping-prompt').fill(prompts.placement);
-    await page.locator('#cmdp-assistant-diagram-connections-prompt').fill(prompts.connections);
+    await page.locator('#cmdp-assistant-diagram-intent-prompt').fill(prompts.diagramIntent);
     await page.waitForTimeout(700);
     assert.deepEqual(retiredAssistantDraftRequests, [], 'Assistant input must not use the retired assistant-draft endpoint.');
 
@@ -2025,14 +2128,18 @@ test('Assistant persists canonical authoring only through the explicit template 
     assert.equal(saveResponse.status(), 200, JSON.stringify(saveBody));
     const expectedObjectFlowIntent = {
       context: '',
-      blocks: [{ id: 'block-1', uses: [], ...prompts.objectFlow }]
+      blocks: [{
+        id: 'block-1',
+        name: prompts.objectFlow.name,
+        description: [prompts.objectFlow.entities, prompts.objectFlow.algorithm, prompts.objectFlow.expectedResult].join('\n\n'),
+        resultKind: 'auto',
+        uses: []
+      }]
     };
     const savedAssistant = saveRequest?.spec?.authoring?.assistant;
     assert.deepEqual(savedAssistant?.objectFlowIntent, expectedObjectFlowIntent);
-    assert.equal(savedAssistant?.promptContractVersion, 2);
-    assert.equal(savedAssistant?.diagramSemanticsPrompt, prompts.semantics);
-    assert.equal(savedAssistant?.diagramPlacementPrompt, prompts.placement);
-    assert.equal(savedAssistant?.diagramConnectionsPrompt, prompts.connections);
+    assert.equal(savedAssistant?.promptContractVersion, 4);
+    assert.equal(savedAssistant?.diagramIntentPrompt, prompts.diagramIntent);
     assert.equal(Object.hasOwn(savedAssistant || {}, 'diagramInterpretPrompt'), false);
     assert.equal(Object.hasOwn(savedAssistant || {}, 'diagramMappingPrompt'), false);
     assert.equal(savedAssistant?.systemPromptOverrides?.objectFlow, objectFlowSystemOverride);
@@ -2040,10 +2147,8 @@ test('Assistant persists canonical authoring only through the explicit template 
     const storedAuthoring = saveBody?.template?.spec?.authoring;
     assert.equal(storedAuthoring?.version, 1);
     assert.deepEqual(storedAuthoring?.assistant?.objectFlowIntent, expectedObjectFlowIntent);
-    assert.equal(storedAuthoring?.assistant?.promptContractVersion, 2);
-    assert.equal(storedAuthoring?.assistant?.diagramSemanticsPrompt, prompts.semantics);
-    assert.equal(storedAuthoring?.assistant?.diagramPlacementPrompt, prompts.placement);
-    assert.equal(storedAuthoring?.assistant?.diagramConnectionsPrompt, prompts.connections);
+    assert.equal(storedAuthoring?.assistant?.promptContractVersion, 4);
+    assert.equal(storedAuthoring?.assistant?.diagramIntentPrompt, prompts.diagramIntent);
     assert.equal(Object.hasOwn(storedAuthoring?.assistant || {}, 'diagramInterpretPrompt'), false);
     assert.equal(Object.hasOwn(storedAuthoring?.assistant || {}, 'diagramMappingPrompt'), false);
     assert.equal(storedAuthoring?.assistant?.systemPromptOverrides?.objectFlow, objectFlowSystemOverride);
@@ -2060,17 +2165,14 @@ test('Assistant persists canonical authoring only through the explicit template 
     await page.locator('a[data-designer-section="assistant"]').click();
     await page.waitForSelector('#cmdp-assistant-editor', { timeout: 10_000 });
     assert.equal(await page.locator('#assistant-flow-0-name').inputValue(), prompts.objectFlow.name);
-    assert.equal(await page.locator('#assistant-flow-0-entities').inputValue(), prompts.objectFlow.entities);
-    assert.equal(await page.locator('#assistant-flow-0-algorithm').inputValue(), prompts.objectFlow.algorithm);
-    assert.equal(await page.locator('#assistant-flow-0-expected-result').inputValue(), prompts.objectFlow.expectedResult);
+    assert.equal(await page.locator('#assistant-flow-0-description').inputValue(), expectedObjectFlowIntent.blocks[0].description);
+    assert.equal(await page.locator('#assistant-flow-0-result-kind').inputValue(), 'auto');
     assert.equal(await page.locator('[data-assistant-flow-block]').count(), 1);
     await page.locator('#cmdp-assistant-editor .assistant-template-system-prompts summary').click();
     assert.equal(await page.locator('#cmdp-template-assistant-system-prompt-objectFlow').inputValue(), objectFlowSystemOverride);
     await page.locator('a[data-designer-section="diagram-assistant"]').click();
     await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 10_000 });
-    assert.equal(await page.locator('#cmdp-assistant-diagram-interpret-prompt').inputValue(), prompts.semantics);
-    assert.equal(await page.locator('#cmdp-assistant-diagram-mapping-prompt').inputValue(), prompts.placement);
-    assert.equal(await page.locator('#cmdp-assistant-diagram-connections-prompt').inputValue(), prompts.connections);
+    assert.equal(await page.locator('#cmdp-assistant-diagram-intent-prompt').inputValue(), prompts.diagramIntent);
     assert.equal(await page.locator('#cmdp-diagram-import-source').inputValue(), d2Source);
 
     // A deterministic rebuild must preserve the complete canonical authoring
@@ -2090,10 +2192,8 @@ test('Assistant persists canonical authoring only through the explicit template 
     const rebuildSave = await rebuildSavePromise;
     const rebuildBody = await rebuildSave.json();
     assert.equal(rebuildSave.status(), 200, JSON.stringify(rebuildBody));
-    assert.equal(rebuildBody?.template?.spec?.authoring?.assistant?.promptContractVersion, 2);
-    assert.equal(rebuildBody?.template?.spec?.authoring?.assistant?.diagramSemanticsPrompt, prompts.semantics);
-    assert.equal(rebuildBody?.template?.spec?.authoring?.assistant?.diagramPlacementPrompt, prompts.placement);
-    assert.equal(rebuildBody?.template?.spec?.authoring?.assistant?.diagramConnectionsPrompt, prompts.connections);
+    assert.equal(rebuildBody?.template?.spec?.authoring?.assistant?.promptContractVersion, 4);
+    assert.equal(rebuildBody?.template?.spec?.authoring?.assistant?.diagramIntentPrompt, prompts.diagramIntent);
     assert.equal(rebuildBody?.template?.spec?.authoring?.d2?.source, d2Source);
 
     await page.reload({ waitUntil: 'domcontentloaded' });
@@ -2101,9 +2201,7 @@ test('Assistant persists canonical authoring only through the explicit template 
     await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
     await page.locator('a[data-designer-section="diagram-assistant"]').click();
     await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 10_000 });
-    assert.equal(await page.locator('#cmdp-assistant-diagram-interpret-prompt').inputValue(), prompts.semantics);
-    assert.equal(await page.locator('#cmdp-assistant-diagram-mapping-prompt').inputValue(), prompts.placement);
-    assert.equal(await page.locator('#cmdp-assistant-diagram-connections-prompt').inputValue(), prompts.connections);
+    assert.equal(await page.locator('#cmdp-assistant-diagram-intent-prompt').inputValue(), prompts.diagramIntent);
     assert.equal(await page.locator('#cmdp-diagram-import-source').inputValue(), d2Source);
 
     await page.locator('a[data-designer-section="templates"]').click();
@@ -2222,20 +2320,20 @@ test('Assistant keeps an Object Flow response after updating a saved template va
     await page.locator('button[data-action="assistant-flow-prepare"]').click();
     await semanticResponsePromise;
     assert.equal(
-      semanticRequestPayload?.currentSpec?.authoring?.assistant?.systemPromptOverrides?.objectFlowSemantic,
+      semanticRequestPayload?.editorDelta?.spec?.authoring?.assistant?.systemPromptOverrides?.objectFlowSemantic,
       unsavedSystemPromptOverride,
       'Object Flow must send the current unsaved template prompt override.'
     );
     await page.locator('button[data-action="assistant-flow-generate"]').click();
     await flowRequestSeenPromise;
-    await page.locator('#assistant-flow-0-algorithm').evaluate((node, value) => {
+    await page.locator('#assistant-flow-0-description').evaluate((node, value) => {
       node.value = value;
       node.dispatchEvent(new Event('input', { bubbles: true }));
     }, `${prompt}\n`);
     const refreshResponsePromise = page.waitForResponse((response) => response.url().includes('/cmdbuild/custom-api/templates?limit=1000') && response.request().method() === 'GET');
     await page.locator('button[data-action="refresh"]').click();
     await refreshResponsePromise;
-    await page.waitForFunction((value) => document.querySelector('#assistant-flow-0-algorithm')?.value === value, `${prompt}\n`, { timeout: 10_000 });
+    await page.waitForFunction((value) => document.querySelector('#assistant-flow-0-description')?.value === value, `${prompt}\n`, { timeout: 10_000 });
 
     releaseFlowResponse();
     await page.waitForFunction(() => {
@@ -2332,9 +2430,7 @@ test('Assistant renders a direct dependency path in the Semantic Plan', { skip: 
     await page.locator('button[data-action="assistant-flow-block-add"]').click();
     const secondBlock = page.locator('[data-assistant-flow-block]').last();
     await secondBlock.locator('#assistant-flow-1-name').fill('Результат 2');
-    await secondBlock.locator('#assistant-flow-1-entities').fill('VLAN, связанные с первым результатом.');
-    await secondBlock.locator('#assistant-flow-1-algorithm').fill('Выбрать VLAN, связанные с ipRange из первого результата.');
-    await secondBlock.locator('#assistant-flow-1-expected-result').fill('Список VLAN.');
+    await secondBlock.locator('#assistant-flow-1-description').fill('Выбрать VLAN, связанные с ipRange из первого результата. Результат: список VLAN.');
     await secondBlock.locator('[data-assistant-flow-field="uses"]').selectOption('block-1');
     await page.route('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*', async (route) => {
       await route.fulfill({
@@ -2730,7 +2826,7 @@ test('Assistant renders rejected Object Flow diagnostics without enabling Apply'
       });
     });
 
-    const prompt = page.locator('#assistant-flow-0-algorithm');
+    const prompt = page.locator('#assistant-flow-0-description');
     await page.locator('button[data-action="assistant-flow-prepare"]').click();
     await page.waitForSelector('[data-assistant-flow-semantic-plan]', { timeout: 10_000 });
     await page.locator('button[data-action="assistant-flow-generate"]').click();
@@ -3270,11 +3366,9 @@ test('Diagram Assistant applies valid D2 mappings partially and previews only co
         });
       });
 
-      await page.locator('#cmdp-assistant-diagram-interpret-prompt').fill('users и services - контейнеры; workstation и service - объекты.');
+      await page.locator('#cmdp-assistant-diagram-intent-prompt').fill('users и services - контейнеры; workstation и service - объекты. Сопоставь объекты с Workstations, связи без подтвержденного результата оставь незаполненными.');
       await page.locator('button[data-action="assistant-diagram-interpret"]').click();
       await page.locator('.notice').filter({ hasText: 'Assistant proposal prepared.' }).waitFor({ state: 'visible', timeout: 10_000 });
-      await page.locator('#cmdp-assistant-diagram-mapping-prompt').fill('Сопоставь объекты с Workstations.');
-      await page.locator('#cmdp-assistant-diagram-connections-prompt').fill('Связь оставь незаполненной.');
       const mappingResponsePromise = page.waitForResponse((response) => (
         response.url().includes('/assistant/diagram-import/map-selections') && response.status() === 200
       ));
@@ -3467,8 +3561,7 @@ test('Diagram Assistant continues a staged D2 mapping through bounded correction
     const analyzeResponsePromise = page.waitForResponse((response) => response.url().includes('/draft/diagram-import/analyze'));
     await page.locator('button[data-action="diagram-import-analyze"]').click();
     assert.equal((await analyzeResponsePromise).status(), 200);
-    await page.locator('#cmdp-assistant-diagram-mapping-prompt').fill('Сопоставь каждый объект с доступной выборкой.');
-    await page.locator('#cmdp-assistant-diagram-connections-prompt').fill('Сопоставь только подтвержденные связи.');
+    await page.locator('#cmdp-assistant-diagram-intent-prompt').fill('Сопоставь каждый объект с доступной именованной выборкой и используй только подтвержденные связи.');
 
     await page.route('**/cmdbuild/custom-api/assistant/diagram-import/map-selections?*', async (route) => {
       const request = route.request();
@@ -3713,8 +3806,7 @@ test('Designer analyzes and applies a reviewed D2 structure template', { skip: s
     await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 10_000 });
     assert.equal(await page.locator('[data-object-selection], [data-matching-block]').count(), 0);
     assert.equal(await page.locator('#cmdp-diagram-import-source').count(), 1);
-    assert.equal(await page.locator('#cmdp-assistant-diagram-mapping-prompt').count(), 1);
-    assert.equal(await page.locator('#cmdp-assistant-diagram-connections-prompt').count(), 1);
+    assert.equal(await page.locator('#cmdp-assistant-diagram-intent-prompt').count(), 1);
     assert.equal(await page.locator('button[data-action="assistant-diagram-map"]').isDisabled(), true);
     const d2Source = [
       'classes: { workstation: { shape: person } }',
@@ -3837,7 +3929,7 @@ test('Designer analyzes and applies a reviewed D2 structure template', { skip: s
       return Boolean(button && !button.disabled);
     }, null, { timeout: 10_000 });
 
-    await page.locator('#cmdp-assistant-diagram-interpret-prompt').fill('Интерпретируй workstation как объект, а users как статический контейнер. Не меняй role id.');
+    await page.locator('#cmdp-assistant-diagram-intent-prompt').fill('Интерпретируй workstation как объект, а users как статический контейнер. Сопоставь workstation с выборкой Workstations и не создавай связи без подтвержденного результата Object Flow. Не меняй role id.');
     await page.locator('button[data-action="assistant-diagram-interpret"]').click();
     await page.waitForTimeout(250);
     assert.equal(interpretationRouteCalls, 1, await page.locator('#cmdp-diagram-assistant-editor').innerText());
@@ -3845,8 +3937,6 @@ test('Designer analyzes and applies a reviewed D2 structure template', { skip: s
     assert.equal(await page.locator('#cmdp-diagram-assistant-editor').count(), 1);
     assert.equal(await page.locator('#cmdp-diagram-section-editor').count(), 0);
 
-    await page.locator('#cmdp-assistant-diagram-mapping-prompt').fill('Сопоставь workstation с выборкой Workstations, users оставь статическим. Используй только доступные stage id.');
-    await page.locator('#cmdp-assistant-diagram-connections-prompt').fill('Не создавай связи без подтвержденного результата Object Flow.');
     await page.locator('button[data-action="assistant-diagram-map"]').click();
     await page.locator('.notice').filter({ hasText: 'Mapping proposal prepared.' }).waitFor({ state: 'visible', timeout: 10_000 });
 
@@ -4056,7 +4146,7 @@ test('Designer analyzes and applies a reviewed D2 structure template', { skip: s
     const refreshAnalyzeBody = await refreshAnalyzeResponse.json();
     assert.equal(refreshAnalyzeResponse.status(), 200, `D2 reanalyze failed: ${JSON.stringify(refreshAnalyzeBody)}`);
     const changedSource = `${analyzedSource}\n# changed`;
-    await page.locator('#cmdp-assistant-diagram-interpret-prompt').fill('Повторно интерпретируй workstation как объект, а users как статический контейнер. Не меняй role id.');
+    await page.locator('#cmdp-assistant-diagram-intent-prompt').fill('Повторно интерпретируй workstation как объект, а users как статический контейнер. Используй только именованные детерминированные результаты. Не меняй role id.');
     const refreshedInterpretRequestPromise = page.waitForRequest((request) => request.url().includes('/assistant/diagram-import/interpret') && request.method() === 'POST');
     const refreshedInterpretResponsePromise = page.waitForResponse((response) => response.url().includes('/assistant/diagram-import/interpret') && response.request().method() === 'POST');
     await page.locator('button[data-action="assistant-diagram-interpret"]').click();
@@ -4067,14 +4157,14 @@ test('Designer analyzes and applies a reviewed D2 structure template', { skip: s
     const refreshedInterpretPayload = refreshedInterpretRequest.postDataJSON();
     assert.equal(refreshedInterpretPayload?.proposal?.sourceText, changedSource);
     assert.equal(
-      refreshedInterpretPayload?.currentSpec?.authoring?.d2?.source,
+      refreshedInterpretPayload?.editorDelta?.spec?.authoring?.d2?.source,
       changedSource,
       'Assistant request must use the analyzed proposal source without persisting it as the applied source.'
     );
     assert.equal(
-      refreshedInterpretPayload?.currentSpec?.result?.diagrams?.[0]?.authoring?.d2Import?.source,
-      analyzedSource,
-      'Assistant request must keep the already applied D2 mapping source unchanged.'
+      Object.hasOwn(refreshedInterpretPayload?.editorDelta?.spec?.result || {}, 'diagrams'),
+      false,
+      'Assistant editor delta must not transfer generated or applied diagrams.'
     );
     const refreshedRoles = refreshAnalyzeBody.proposal?.roles || [];
     const refreshedWorkstation = refreshedRoles.find((role) => role.key === 'workstation');
@@ -4264,9 +4354,7 @@ test('Assistant uses current in-browser D2 authoring without prompt autosave', {
   await withPage(async (page) => {
     const code = `D2AssistantRevisionUiSmoke${Date.now()}`;
     const prompts = {
-      semantics: 'Interpret workstation as a CMDB object and users as a static container.',
-      placement: 'Map workstation placements to exact Object Flow stages.',
-      connections: 'Map only connections backed by deterministic endpoint results.'
+      intent: 'Interpret workstation as a CMDB object and users as a static container. Map placements and connections only to exact named deterministic Object Flow results.'
     };
     await page.goto(`${nginxOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
@@ -4311,9 +4399,7 @@ test('Assistant uses current in-browser D2 authoring without prompt autosave', {
       });
     });
 
-    await page.locator('#cmdp-assistant-diagram-interpret-prompt').fill(prompts.semantics);
-    await page.locator('#cmdp-assistant-diagram-mapping-prompt').fill(prompts.placement);
-    await page.locator('#cmdp-assistant-diagram-connections-prompt').fill(prompts.connections);
+    await page.locator('#cmdp-assistant-diagram-intent-prompt').fill(prompts.intent);
     await page.waitForTimeout(700);
     assert.deepEqual(retiredAssistantDraftRequests, [], 'Editing a D2 Assistant prompt must not persist it automatically.');
     const interpretRequestPromise = page.waitForRequest((request) => request.url().includes('/assistant/diagram-import/interpret'));
@@ -4322,18 +4408,18 @@ test('Assistant uses current in-browser D2 authoring without prompt autosave', {
 
     const interpretRequest = await interpretRequestPromise;
     const interpretPayload = interpretRequest.postDataJSON();
-    assert.equal(interpretPayload?.templateCode, code);
-    assert.equal(interpretPayload?.baseSpecHash, initialBody.proposal?.baseSpecHash);
+    assert.equal(interpretPayload?.templateRef?.templateCode, code);
+    assert.equal(interpretPayload?.templateRef?.baseSpecHash, initialBody.proposal?.baseSpecHash);
     assert.equal(interpretPayload?.proposal?.baseSpecHash, initialBody.proposal?.baseSpecHash);
     assert.equal(interpretPayload?.proposal?.deterministicSpecHash, initialBody.proposal?.deterministicSpecHash);
-    assert.equal(interpretPayload?.semanticsPrompt, prompts.semantics);
-    assert.equal(interpretPayload?.placementPrompt, prompts.placement);
-    assert.equal(interpretPayload?.connectionsPrompt, prompts.connections);
-    const requestAssistant = interpretPayload?.currentSpec?.authoring?.assistant;
-    assert.equal(requestAssistant?.promptContractVersion, 2);
-    assert.equal(requestAssistant?.diagramSemanticsPrompt, prompts.semantics);
-    assert.equal(requestAssistant?.diagramPlacementPrompt, prompts.placement);
-    assert.equal(requestAssistant?.diagramConnectionsPrompt, prompts.connections);
+    assert.equal(interpretPayload?.prompt, prompts.intent);
+    assert.equal(Object.hasOwn(interpretPayload || {}, 'semanticsPrompt'), false);
+    assert.equal(Object.hasOwn(interpretPayload || {}, 'placementPrompt'), false);
+    assert.equal(Object.hasOwn(interpretPayload || {}, 'connectionsPrompt'), false);
+    assert.equal(Object.hasOwn(interpretPayload || {}, 'currentSpec'), false);
+    const requestAssistant = interpretPayload?.editorDelta?.spec?.authoring?.assistant;
+    assert.equal(requestAssistant?.promptContractVersion, 4);
+    assert.equal(requestAssistant?.diagramIntentPrompt, prompts.intent);
     assert.equal(Object.hasOwn(requestAssistant || {}, 'diagramInterpretPrompt'), false);
     assert.equal(Object.hasOwn(requestAssistant || {}, 'diagramMappingPrompt'), false);
     assert.equal(reanalysisRequests, 0, 'Changing a prompt must not trigger another D2 analysis.');

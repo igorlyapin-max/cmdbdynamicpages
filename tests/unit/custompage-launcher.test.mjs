@@ -148,11 +148,13 @@ function generatedDynamicPagesClientScript() {
     'DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT',
     'DEFAULT_ASSISTANT_OBJECT_FLOW_SEMANTIC_PROMPT',
     'DEFAULT_ASSISTANT_DIAGRAM_SEMANTICS_PROMPT',
+    'DEFAULT_ASSISTANT_DIAGRAM_BINDING_INTENT_PROMPT',
     'DEFAULT_ASSISTANT_DIAGRAM_PLACEMENT_PROMPT',
     'DEFAULT_ASSISTANT_DIAGRAM_CONNECTIONS_PROMPT',
+    'DEFAULT_ASSISTANT_DIAGRAM_CRITIQUE_PROMPT',
     factorySource
   );
-  return factory('empty result', 'permission denied', 3600, 10, 1, 5, 1, 2, 2, 'assistant system prompt', 'object flow prompt', 'semantic plan prompt', 'diagram semantics prompt', 'diagram placement prompt', 'diagram connections prompt')();
+  return factory('empty result', 'permission denied', 3600, 10, 1, 5, 1, 3, 3, 'assistant system prompt', 'object flow prompt', 'semantic plan prompt', 'diagram semantics prompt', 'diagram binding intent prompt', 'diagram placement prompt', 'diagram connections prompt', 'diagram critique prompt')();
 }
 
 test('generated Dynamic Pages client script parses as browser JavaScript', () => {
@@ -1080,7 +1082,7 @@ test('Assistant authoring is persisted only through canonical authoring on norma
   assert.match(authoringSource, /systemPromptOverrides: normalizeTemplateAssistantPromptOverridesClient\(assistant\.systemPromptOverrides\)/);
   assert.doesNotMatch(authoringSource, /legacyAssistantAuthoringClient/);
   assert.match(specWithPromptsSource, /next\.authoring = assistantAuthoringFromState\(next\)/);
-  assert.match(specWithPromptsSource, /delete next\.assistantDraft/);
+  assert.doesNotMatch(specWithPromptsSource, /assistantDraft/);
   assert.match(saveSource, /assistantSpecWithPrompts\(state\.selectedTemplate && state\.selectedTemplate\.spec \|\| defaultSpec\(\)\)/);
   assert.match(saveSource, /request\(path, \{ method: exists \? 'PUT' : 'POST'/);
 });
@@ -1160,7 +1162,9 @@ test('template Assistant prompt overrides are explicit, resettable, and kept out
   assert.match(inputSource, /state\.assistantTemplatePromptOverrides = promptOverrides/);
   assert.match(inputSource, /updateAssistantTemplatePromptLimit/);
   assert.match(proxySource, /function templateAssistantRuntimeConfig\(runtimeConfig, spec\)/);
-  assert.match(proxySource, /const currentSpec = body\.currentSpec \|\| planContext\.template && planContext\.template\.spec \|\| \{\};/);
+  assert.match(proxySource, /currentSpec = resolveAssistantRequestSpec\(body, planContext\.template && planContext\.template\.spec \|\| \{\}\)/);
+  assert.match(proxySource, /function assistantRequestTemplateRef\(body\)/);
+  assert.match(proxySource, /function applyAssistantEditorDelta\(baseSpec, value\)/);
   assert.match(proxySource, /templateAssistantRuntimeConfig\(\n\s*await getRuntimeConfig\(authToken, root\),\n\s*currentSpec/);
   assert.match(proxySource, /templateAssistantPromptOverrideValidationErrors/);
   assert.match(proxySource, /function prepareAssistantObjectFlowSemanticPlan\(retry\)[\s\S]*?var requestSpec = assistantSpecWithPrompts\(state\.selectedTemplate && state\.selectedTemplate\.spec \|\| defaultSpec\(\)\);/);
@@ -1202,23 +1206,14 @@ test('deterministic editor updates keep canonical Assistant and D2 authoring', (
 test('Assistant authoring has no autosave write endpoint and is excluded from flow staleness checks', () => {
   const flowSnapshotStart = proxySource.indexOf('function assistantTemplateRevisionSnapshot(template, spec, requestGeneration)');
   const applyDraftStart = proxySource.indexOf('function applyAssistantDraftToSpec(spec, intent, taskMode)');
-  const serverDraftStart = proxySource.indexOf("if (templateAction === 'assistant-draft')");
-  const serverVersionsStart = proxySource.indexOf("if (templateAction === 'versions')");
   assert.ok(flowSnapshotStart > -1);
   assert.ok(applyDraftStart > flowSnapshotStart);
-  assert.ok(serverDraftStart > -1);
-  assert.ok(serverVersionsStart > serverDraftStart);
 
   const flowSnapshotSource = proxySource.slice(flowSnapshotStart, applyDraftStart);
-  const serverDraftSource = proxySource.slice(serverDraftStart, serverVersionsStart);
   assert.match(flowSnapshotSource, /assistantSpecWithoutPromptDraft/);
-  assert.match(serverDraftSource, /assistant_authoring_route_removed/);
-  assert.match(serverDraftSource, /statusCode: 410|sendJson\(res, 410/);
   assert.doesNotMatch(proxySource, /function autosaveAssistantPrompts\(/);
   assert.doesNotMatch(proxySource, /function scheduleAssistantPromptAutosave\(/);
-  assert.doesNotMatch(serverDraftSource, /writeTemplateVersion/);
-  assert.doesNotMatch(serverDraftSource, /invalidateTemplateRuntimeCache/);
-  assert.doesNotMatch(serverDraftSource, /invalidateTemplateStaticSnapshots/);
+  assert.doesNotMatch(proxySource, /templateAction === 'assistant-draft'/);
 });
 
 test('typed assistant flow renders one in-progress proposal before deterministic apply', () => {
@@ -1344,7 +1339,7 @@ test('assistant status is compact and flow capture uses proposal state without d
   assert.doesNotMatch(captureSource, /captureObjectGroupDraftFromDom/);
   assert.doesNotMatch(captureSource, /readRelationExpansionFields/);
   assert.match(specWithPromptsSource, /next\.authoring = assistantAuthoringFromState\(next\)/);
-  assert.match(specWithPromptsSource, /delete next\.assistantDraft/);
+  assert.doesNotMatch(specWithPromptsSource, /assistantDraft/);
 });
 
 test('Assistant D2 authoring restores canonical source and saved checkpoint without an LLM request', () => {
@@ -1672,7 +1667,9 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   assert.match(assistantSource, /captureAssistantPromptsFromDom\(\)/);
   assert.match(assistantSource, /assistantSpecWithPrompts\(/);
   assert.match(assistantSource, /var currentSpec = assistantDiagramRequestSpec\(/);
-  assert.match(assistantSource, /currentSpec: currentSpec/);
+  assert.match(assistantSource, /templateRef: assistantTemplateRefClient\(\)/);
+  assert.match(assistantSource, /editorDelta: assistantEditorDeltaClient\(currentSpec\)/);
+  assert.doesNotMatch(assistantSource, /currentSpec:\s*currentSpec/);
   assert.match(assistantSource, /ensureDiagramImportProposalForCurrentRevision/);
   assert.match(applySource, /\/draft\/diagram-import\/apply/);
   assert.match(applySource, /var proposal = state\.diagramImportProposal/);
@@ -1831,8 +1828,10 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   assert.match(proxySource, /function diagramImportAnalysisCheckpointMatchesAppliedMapping\(mapping, checkpoint\)/);
   assert.match(proxySource, /function diagramImportCheckpointCanFollowCurrentMapping\(mapping, checkpoint, sourceHash\)/);
   assert.match(proxySource, /!provisionalBaseMatches && !checkpointMatchesAppliedMapping && !currentMappingMayRebaseCheckpoint && !executableMappingIsCurrent/);
-  assert.match(proxySource, /rebaseStoredD2AnalysisCheckpoint\(recompiled\)/);
-  assert.match(proxySource, /rebaseStoredD2AnalysisCheckpoint\(partial\.spec\)/);
+  assert.match(proxySource, /function diagramAuthoringReanalysisReasons\(spec\)/);
+  assert.match(proxySource, /diagramAuthoringStatusForSpec\(next\)\.status !== 'needsReanalysis'/);
+  assert.doesNotMatch(proxySource, /rebaseStoredD2AnalysisCheckpoint\(recompiled\)/);
+  assert.doesNotMatch(proxySource, /rebaseStoredD2AnalysisCheckpoint\(partial\.spec\)/);
   const assistantRequestSpecStart = proxySource.indexOf('function assistantDiagramRequestSpec(spec, proposal)');
   const assistantRequestSpecEnd = proxySource.indexOf('function markAssistantAuthoringChanged()', assistantRequestSpecStart);
   const assistantRequestSpecSource = proxySource.slice(assistantRequestSpecStart, assistantRequestSpecEnd);

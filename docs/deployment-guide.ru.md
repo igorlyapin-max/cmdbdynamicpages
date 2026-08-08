@@ -31,7 +31,8 @@ CMDP_NGINX_PUBLIC_HOST=cmdb.example.local
 CMDP_NGINX_PUBLIC_PROTO=https
 CMDBUILD_ORIGIN=http://127.0.0.1:8090
 CMDBDYNAMIC_REDIS_URL=rediss://redis.example.local:6380/0
-CMDBDYNAMIC_REDIS_TLS_CA_FILE=
+CMDP_TLS_CA_FILE=
+CMDP_TLS_CA_FILE_HOST=
 CMDBDYNAMIC_REDIS_PASSWORD_FILE=/run/secrets/cmdbdynamicpages_redis_password
 CMDBDYNAMIC_REDIS_REQUIRED=true
 CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=true
@@ -66,7 +67,7 @@ CMDBDYNAMIC_REDIS_URL=redis://:password@redis-host:6379/0
 docker compose -f docker-compose.nginx.yml up -d redis
 ```
 
-Production Redis должен быть защищен паролем и использовать `rediss://`. `CMDBDYNAMIC_REDIS_TLS_CA_FILE` optional: задавать путь к CA PEM, уже смонтированному в backend container, только если private Redis PKI не покрыт system trust. Предпочтительно передавать пароль через `CMDBDYNAMIC_REDIS_PASSWORD_FILE`; если используется строковая передача секрета, задавать `CMDBDYNAMIC_REDIS_PASSWORD` или password в `CMDBDYNAMIC_REDIS_URL` только через secret/env платформы. Plaintext `redis://` остается поддержанным для local и существующих deployment, но в production backend пишет runtime warning `redis_plaintext_transport`. Не хранить secrets или CA material в git или compose-файле репозитория.
+Production Redis должен быть защищен паролем и использовать `rediss://`. `CMDP_TLS_CA_FILE_HOST` и `CMDP_TLS_CA_FILE=/run/certs/cmdbdynamicpages-ca.pem` задают один read-only private-CA PEM bundle для Redis, CMDBuild и LiteLLM; задавать оба только когда system trust не покрывает internal PKI. Предпочтительно передавать пароль через `CMDBDYNAMIC_REDIS_PASSWORD_FILE`; если используется строковая передача секрета, задавать `CMDBDYNAMIC_REDIS_PASSWORD` или password в `CMDBDYNAMIC_REDIS_URL` только через secret/env платформы. Plaintext `redis://` остается поддержанным для local и существующих deployment, но в production backend пишет runtime warning `redis_plaintext_transport`. Не хранить secrets или CA material в git или compose-файле репозитория.
 
 LiteLLM Assistant опционален. Оставляйте `LITELLM_API_KEY_FILE_HOST` пустым, если Assistant не используется: compose смонтирует `/dev/null`. При включенном Assistant путь обязан существовать до `docker compose up` и быть читаемым обычным файлом, иначе Docker может создать каталог вместо secret file. Проверка без вывода ключа:
 

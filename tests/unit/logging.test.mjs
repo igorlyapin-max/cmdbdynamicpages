@@ -4,7 +4,7 @@ import dgram from 'node:dgram';
 import net from 'node:net';
 import tls from 'node:tls';
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -92,6 +92,42 @@ test('Redis URL configuration distinguishes TLS and plaintext transports', () =>
   assert.equal(redisTransportSecurity('redis://redis.example:6379/0').transport, 'plaintext');
   assert.equal(redisTransportSecurity('rediss://redis.example:6380/0').transport, 'tls');
   assert.throws(() => parseRedisUrl('https://redis.example:6380/0'), /redis:\/\/ or rediss:\/\//);
+});
+
+test('runtime configuration requires one readable shared CA bundle for Node and Redis TLS', () => {
+  const certificateDirectory = mkdtempSync(join(tmpdir(), 'cmdbdynamicpages-tls-config-'));
+  const certificatePath = join(certificateDirectory, 'customer-ca.pem');
+  writeFileSync(certificatePath, '-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n');
+  try {
+    const valid = validateRuntimeConfig({
+      nodeEnv: 'development',
+      redisEnabled: false,
+      tlsCaFile: certificatePath,
+      nodeExtraCaCerts: certificatePath
+    });
+    assert.equal(valid.ok, true);
+    assert.deepEqual(valid.tls, { configured: true, readable: true });
+
+    const mismatched = validateRuntimeConfig({
+      nodeEnv: 'development',
+      redisEnabled: false,
+      tlsCaFile: certificatePath,
+      nodeExtraCaCerts: ''
+    });
+    assert.equal(mismatched.ok, false);
+    assert.ok(mismatched.errors.some((item) => item.code === 'tls_ca_bundle_contract_invalid'));
+
+    const unreadable = validateRuntimeConfig({
+      nodeEnv: 'development',
+      redisEnabled: false,
+      tlsCaFile: join(certificateDirectory, 'missing.pem'),
+      nodeExtraCaCerts: join(certificateDirectory, 'missing.pem')
+    });
+    assert.equal(unreadable.ok, false);
+    assert.ok(unreadable.errors.some((item) => item.code === 'tls_ca_bundle_invalid'));
+  } finally {
+    rmSync(certificateDirectory, { recursive: true, force: true });
+  }
 });
 
 test('same-origin mutation checks use the configured public origin, not the upstream host', () => {
@@ -349,7 +385,8 @@ test('Redis TLS transport accepts a configured private CA', async (t) => {
         PROXY_PORT: String(proxyPort),
         CMDP_PUBLIC_ORIGIN: `http://127.0.0.1:${proxyPort}`,
         CMDBDYNAMIC_REDIS_URL: `rediss://127.0.0.1:${redisPort}/0`,
-        CMDBDYNAMIC_REDIS_TLS_CA_FILE: certificatePath,
+        CMDP_TLS_CA_FILE: certificatePath,
+        NODE_EXTRA_CA_CERTS: certificatePath,
         CMDBDYNAMIC_REDIS_REQUIRED: 'false',
         CMDP_D2_RENDER_ENABLED: 'false',
         CMDP_LOG_TARGET: 'stdout'
@@ -367,6 +404,79 @@ test('Redis TLS transport accepts a configured private CA', async (t) => {
       await new Promise((resolve) => backend.once('exit', resolve));
     }
     if (redisServer && redisServer.listening) await new Promise((resolve) => redisServer.close(resolve));
+    rmSync(certificateDirectory, { recursive: true, force: true });
+  }
+});
+
+test('CMDBuild HTTPS health probe trusts the configured shared CA bundle', async (t) => {
+  const certificateDirectory = mkdtempSync(join(tmpdir(), 'cmdbdynamicpages-cmdbuild-tls-'));
+  const keyPath = join(certificateDirectory, 'cmdbuild-key.pem');
+  const certificatePath = join(certificateDirectory, 'cmdbuild-cert.pem');
+  let cmdbuildServer = null;
+  let backend = null;
+  try {
+    try {
+      execFileSync('openssl', [
+        'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+        '-keyout', keyPath,
+        '-out', certificatePath,
+        '-subj', '/CN=127.0.0.1',
+        '-addext', 'subjectAltName=IP:127.0.0.1',
+        '-days', '1'
+      ], { stdio: 'ignore' });
+    } catch {
+      t.skip('OpenSSL is required to generate the temporary CMDBuild TLS certificate.');
+      return;
+    }
+    cmdbuildServer = tls.createServer({
+      key: readFileSync(keyPath),
+      cert: readFileSync(certificatePath)
+    }, (socket) => {
+      socket.once('data', () => {
+        socket.end('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{"success":true}');
+      });
+    });
+    try {
+      await listen(cmdbuildServer);
+    } catch (error) {
+      if (error && error.code === 'EPERM') {
+        t.skip('TCP sockets are not permitted by this execution sandbox.');
+        return;
+      }
+      throw error;
+    }
+    const cmdbuildPort = cmdbuildServer.address().port;
+    const proxyPort = await availablePort();
+    backend = spawn(process.execPath, ['scripts/dev-proxy-server.mjs'], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        NODE_ENV: 'development',
+        PROXY_HOST: '127.0.0.1',
+        PROXY_PORT: String(proxyPort),
+        CMDP_PUBLIC_ORIGIN: `http://127.0.0.1:${proxyPort}`,
+        CMDBUILD_ORIGIN: `https://127.0.0.1:${cmdbuildPort}`,
+        CMDP_TLS_CA_FILE: certificatePath,
+        NODE_EXTRA_CA_CERTS: certificatePath,
+        CMDBDYNAMIC_REDIS_ENABLED: 'false',
+        CMDP_D2_RENDER_ENABLED: 'false',
+        CMDP_D2_IMPORT_BINARY: join(process.cwd(), 'tests/fixtures/d2-import-stub.mjs'),
+        CMDP_LOG_TARGET: 'stdout'
+      },
+      stdio: ['ignore', 'ignore', 'ignore']
+    });
+    const status = await waitForJson(`http://127.0.0.1:${proxyPort}/health/ready`);
+    assert.ok([200, 503].includes(status.response.status), JSON.stringify(status.json));
+    const cmdbuild = status.json && status.json.checks && status.json.checks.cmdbuild;
+    assert.ok(cmdbuild, JSON.stringify(status.json));
+    assert.equal(cmdbuild.ok, true);
+    assert.equal(cmdbuild.status, 'ok');
+  } finally {
+    if (backend && backend.exitCode === null) {
+      backend.kill('SIGTERM');
+      await new Promise((resolve) => backend.once('exit', resolve));
+    }
+    if (cmdbuildServer && cmdbuildServer.listening) await new Promise((resolve) => cmdbuildServer.close(resolve));
     rmSync(certificateDirectory, { recursive: true, force: true });
   }
 });

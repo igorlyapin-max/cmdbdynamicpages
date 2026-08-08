@@ -31,7 +31,8 @@ CMDP_NGINX_PUBLIC_HOST=cmdb.example.local
 CMDP_NGINX_PUBLIC_PROTO=https
 CMDBUILD_ORIGIN=http://127.0.0.1:8090
 CMDBDYNAMIC_REDIS_URL=rediss://redis.example.local:6380/0
-CMDBDYNAMIC_REDIS_TLS_CA_FILE=
+CMDP_TLS_CA_FILE=
+CMDP_TLS_CA_FILE_HOST=
 CMDBDYNAMIC_REDIS_PASSWORD_FILE=/run/secrets/cmdbdynamicpages_redis_password
 CMDBDYNAMIC_REDIS_REQUIRED=true
 CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=true
@@ -66,7 +67,7 @@ For dev:
 docker compose -f docker-compose.nginx.yml up -d redis
 ```
 
-Production Redis must be password-protected and should use `rediss://`. `CMDBDYNAMIC_REDIS_TLS_CA_FILE` is optional: set it to a CA PEM path already mounted in the backend container only when private Redis PKI is not covered by system trust. Prefer `CMDBDYNAMIC_REDIS_PASSWORD_FILE`; if string delivery is used, set `CMDBDYNAMIC_REDIS_PASSWORD` or a password inside `CMDBDYNAMIC_REDIS_URL` only through platform secret/env. Plaintext `redis://` remains supported for local and existing deployments, but production emits the `redis_plaintext_transport` runtime warning. Do not store secrets or CA material in git or in the repository compose file.
+Production Redis must be password-protected and should use `rediss://`. `CMDP_TLS_CA_FILE_HOST` and `CMDP_TLS_CA_FILE=/run/certs/cmdbdynamicpages-ca.pem` configure one read-only private-CA PEM bundle for Redis, CMDBuild, and LiteLLM; set both only when system trust does not cover the internal PKI. Prefer `CMDBDYNAMIC_REDIS_PASSWORD_FILE`; if string delivery is used, set `CMDBDYNAMIC_REDIS_PASSWORD` or a password inside `CMDBDYNAMIC_REDIS_URL` only through platform secret/env. Plaintext `redis://` remains supported for local and existing deployments, but production emits the `redis_plaintext_transport` runtime warning. Do not store secrets or CA material in git or in the repository compose file.
 
 LiteLLM Assistant is optional. Leave `LITELLM_API_KEY_FILE_HOST` empty when Assistant is unused so compose mounts `/dev/null`. When enabled, the host path must exist before `docker compose up` and must be a readable regular file; otherwise Docker may create a directory in place of the secret file. Verify without printing the key:
 

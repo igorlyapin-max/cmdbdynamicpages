@@ -37,8 +37,8 @@ test('OpenAPI validator rejects Diagram Assistant field, status, and component d
   const mutations = [
     {
       name: 'request field',
-      expectedError: /semanticsPrompt/,
-      mutate: (value) => value.replace('\n        semanticsPrompt:\n', '\n        semanticsPromptDrift:\n')
+      expectedError: /templateRef/,
+      mutate: (value) => value.replace('\n        templateRef:\n          \$ref: "#\/components\/schemas\/AssistantTemplateRef"\n', '\n        templateRefDrift:\n          \$ref: "#\/components\/schemas\/AssistantTemplateRef"\n')
     },
     {
       name: 'response status',

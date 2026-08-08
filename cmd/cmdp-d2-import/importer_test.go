@@ -161,6 +161,31 @@ app: Application { class: application }
 	}
 }
 
+func TestImportD2PreservesNodeNotesAsPlacementGuidance(t *testing.T) {
+	input := []byte(`classes: {
+  application: { shape: rectangle }
+}
+apps: {
+  api: "Application" {
+    class: application
+    Notes: |md
+      binding-result: Applications for virtual servers
+      stage-policy: terminal-only
+    |
+  }
+}
+`)
+
+	result := importD2(input, 20)
+	if len(result.Source.Errors) != 0 {
+		t.Fatalf("unexpected source errors: %#v", result.Source.Errors)
+	}
+	api := findNodeByID(t, result.Elements.Nodes, "apps.api")
+	if got := api.Notes; got != "binding-result: Applications for virtual servers\nstage-policy: terminal-only" {
+		t.Fatalf("node notes = %q", got)
+	}
+}
+
 func TestImportD2PreservesStaticTemplateContainerAndNotes(t *testing.T) {
 	input := []byte(`vars: {
   data: {
