@@ -55,28 +55,28 @@ test('canonical image helper selects the standard runtime target by default', ()
   ]);
 });
 
-test('GKM image helper requires paired prepared bases and verified provenance', () => {
+test('canonical GKM image helper requires paired prepared bases and verified provenance', () => {
   assert.throws(
-    () => validateBuildTargetOptions({ target: 'gkm-runtime', requireClean: true, nodeBaseImage: 'registry.example/node:20' }),
+    () => validateBuildTargetOptions({ target: 'gkm-runtime-canonical', requireClean: true, nodeBaseImage: 'registry.example/node:20' }),
     /requires both --node-base-image and --go-base-image/
   );
   assert.throws(
-    () => validateBuildTargetOptions({ target: 'gkm-runtime', nodeBaseImage: 'registry.example/node:20', goBaseImage: 'registry.example/go:1.25' }),
+    () => validateBuildTargetOptions({ target: 'gkm-runtime-canonical', nodeBaseImage: 'registry.example/node:20', goBaseImage: 'registry.example/go:1.25' }),
     /requires --require-clean/
   );
   assert.deepEqual(validateBuildTargetOptions({
-    target: 'gkm-runtime',
+    target: 'gkm-runtime-canonical',
     requireClean: true,
     nodeBaseImage: 'registry.example/node:20-alpine-ca',
     goBaseImage: 'registry.example/go:1.25-alpine-ca'
   }), {
-    target: 'gkm-runtime',
+    target: 'gkm-runtime-canonical',
     nodeBaseImage: 'registry.example/node:20-alpine-ca',
     goBaseImage: 'registry.example/go:1.25-alpine-ca'
   });
   assert.deepEqual(canonicalDockerBuildArguments(cleanWorkspace, {
     tag: 'example:gkm',
-    target: 'gkm-runtime',
+    target: 'gkm-runtime-canonical',
     requireClean: true,
     nodeBaseImage: 'registry.example/node:20-alpine-ca',
     goBaseImage: 'registry.example/go:1.25-alpine-ca'
@@ -96,10 +96,18 @@ test('Dockerfile keeps manual default identity separate from canonical labels an
   const manualManifestStart = dockerfile.indexOf('FROM runtime-source AS runtime-source-manifest-manual');
   const canonicalManifestStart = dockerfile.indexOf('FROM runtime-source AS runtime-source-manifest-canonical');
   const canonicalRuntimeStart = dockerfile.indexOf('FROM runtime-base AS runtime-canonical');
+  const gkmManualManifestStart = dockerfile.indexOf('FROM gkm-runtime-source AS gkm-runtime-source-manifest-manual');
+  const gkmCanonicalManifestStart = dockerfile.indexOf('FROM gkm-runtime-source AS gkm-runtime-source-manifest-canonical');
+  const gkmCanonicalRuntimeStart = dockerfile.indexOf('FROM gkm-runtime-base AS gkm-runtime-canonical');
+  const gkmManualRuntimeStart = dockerfile.indexOf('FROM gkm-runtime-base AS gkm-runtime\n');
   const manualRuntimeStart = dockerfile.indexOf('FROM runtime-base AS runtime-manual');
   assert.ok(manualManifestStart > 0);
   assert.ok(canonicalManifestStart > manualManifestStart);
-  assert.ok(manualRuntimeStart > canonicalRuntimeStart);
+  assert.ok(gkmManualManifestStart > canonicalRuntimeStart);
+  assert.ok(gkmCanonicalManifestStart > gkmManualManifestStart);
+  assert.ok(gkmCanonicalRuntimeStart > gkmCanonicalManifestStart);
+  assert.ok(gkmManualRuntimeStart > gkmCanonicalRuntimeStart);
+  assert.ok(manualRuntimeStart > gkmManualRuntimeStart);
 
   const manualManifestStage = dockerfile.slice(manualManifestStart, canonicalManifestStart);
   const canonicalManifestStage = dockerfile.slice(canonicalManifestStart, dockerfile.indexOf('FROM node:', canonicalManifestStart));
@@ -115,6 +123,17 @@ test('Dockerfile keeps manual default identity separate from canonical labels an
   assert.doesNotMatch(manualRuntimeStage, /org\.opencontainers\.image\.revision/);
   assert.doesNotMatch(manualRuntimeStage, /io\.gkm\.cmdbdynamicpages\.runtime-source-manifest-sha256/);
   assert.match(manualRuntimeStage, /"revision":"unknown","dirty":null,"provenance":"unverified-local"/);
+
+  const gkmManualManifestStage = dockerfile.slice(gkmManualManifestStart, gkmCanonicalManifestStart);
+  const gkmCanonicalManifestStage = dockerfile.slice(gkmCanonicalManifestStart, dockerfile.indexOf('FROM ${GKM_NODE_BASE_IMAGE} AS gkm-runtime-base', gkmCanonicalManifestStart));
+  const gkmCanonicalRuntimeStage = dockerfile.slice(gkmCanonicalRuntimeStart, gkmManualRuntimeStart);
+  const gkmManualRuntimeStage = dockerfile.slice(gkmManualRuntimeStart, manualRuntimeStart);
+  assert.doesNotMatch(gkmManualManifestStage, /--expect-sha256/);
+  assert.match(gkmCanonicalManifestStage, /--expect-sha256 "\$RUNTIME_MANIFEST_SHA256"/);
+  assert.match(gkmCanonicalRuntimeStage, /org\.opencontainers\.image\.revision/);
+  assert.match(gkmManualRuntimeStage, /io\.gkm\.cmdbdynamicpages\.provenance="unverified-local"/);
+  assert.doesNotMatch(gkmManualRuntimeStage, /org\.opencontainers\.image\.revision/);
+  assert.match(gkmManualRuntimeStage, /"revision":"unknown","dirty":null,"provenance":"unverified-local"/);
 });
 
 test('strict verification requires both a clean checkout and image dirty=false', () => {

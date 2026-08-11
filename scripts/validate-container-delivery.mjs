@@ -9,7 +9,11 @@ const requiredFiles = [
   'scripts/build-identity.mjs',
   'scripts/container-entrypoint.sh',
   'scripts/container-image.mjs',
+  'scripts/build-gkm-base-images.sh',
+  'scripts/build-gkm-runtime.sh',
   'scripts/tls-ca-smoke.sh',
+  'deploy/gkm-base-images/Dockerfile.node',
+  'deploy/gkm-base-images/Dockerfile.go',
   'tests/fixtures/gkm-node-base.Dockerfile',
   'tests/fixtures/gkm-go-base.Dockerfile',
   'docs/CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md'
@@ -229,7 +233,9 @@ requireDigestPinnedReferences('Dockerfile', /^FROM\s+((?:node|golang):[^\s]+)(?:
 requireText('Dockerfile', 'AS runtime-source-manifest-manual', 'manual runtime source manifest build stage');
 requireText('Dockerfile', 'AS runtime-source-manifest-canonical', 'canonical runtime source manifest build stage');
 requireText('Dockerfile', 'AS runtime-canonical', 'canonical runtime image target');
-requireText('Dockerfile', 'AS gkm-runtime', 'prepared-base GKM runtime target');
+requireText('Dockerfile', 'AS gkm-runtime-source-manifest-manual', 'manual prepared-base runtime manifest target');
+requireText('Dockerfile', 'AS gkm-runtime-canonical', 'canonical prepared-base runtime target');
+requireText('Dockerfile', 'AS gkm-runtime', 'manual prepared-base GKM runtime target');
 requireText('Dockerfile', 'AS runtime-manual', 'default manual runtime image target');
 requireText('Dockerfile', 'ARG GKM_NODE_BASE_IMAGE=', 'prepared Node base pre-FROM argument');
 requireText('Dockerfile', 'ARG GKM_GO_BASE_IMAGE=', 'prepared Go base pre-FROM argument');
@@ -265,11 +271,21 @@ requireText('scripts/container-image.mjs', 'workspace.runtimeManifestText !== em
 requireText('scripts/container-image.mjs', 'a clean verification requires a clean Git checkout', 'strict clean checkout verification');
 requireText('scripts/container-image.mjs', 'a clean verification requires image dirty=false', 'strict image dirty verification');
 requireText('scripts/container-image.mjs', '`RUNTIME_MANIFEST_SHA256=${metadata.runtimeManifestSha256}`', 'runtime manifest Docker build argument');
-requireText('scripts/container-image.mjs', "const SUPPORTED_BUILD_TARGETS = new Set(['runtime-canonical', 'gkm-runtime']);", 'canonical and prepared Docker target selection');
-requireText('scripts/container-image.mjs', "'gkm-runtime'", 'prepared-base build target selection');
-requireText('scripts/container-image.mjs', 'gkm-runtime requires both --node-base-image and --go-base-image.', 'prepared-base argument validation');
+requireText('scripts/container-image.mjs', "const SUPPORTED_BUILD_TARGETS = new Set(['runtime-canonical', 'gkm-runtime-canonical']);", 'canonical and prepared Docker target selection');
+requireText('scripts/container-image.mjs', "'gkm-runtime-canonical'", 'canonical prepared-base build target selection');
+requireText('scripts/container-image.mjs', 'gkm-runtime-canonical requires both --node-base-image and --go-base-image.', 'canonical prepared-base argument validation');
 requireText('package.json', '"container:build": "node scripts/container-image.mjs build"', 'canonical container build command');
 requireText('package.json', '"container:verify": "node scripts/container-image.mjs verify"', 'container identity verification command');
+requireText('scripts/build-gkm-base-images.sh', 'docker build', 'Docker-only prepared-base bootstrap');
+rejectPattern('scripts/build-gkm-base-images.sh', /\b(?:npm\s+|node\s+scripts\/|go\s+(?:build|run|test))/m, 'host language tooling in prepared-base bootstrap');
+requireText('scripts/build-gkm-runtime.sh', 'docker build --target gkm-runtime', 'Docker-only prepared runtime build');
+rejectPattern('scripts/build-gkm-runtime.sh', /\b(?:npm\s+|node\s+scripts\/)/m, 'host language tooling in prepared runtime build');
+requireText('deploy/gkm-base-images/Dockerfile.node', 'USER node', 'prepared Node runtime user');
+requireText('deploy/gkm-base-images/Dockerfile.go', 'USER root', 'prepared Go builder user');
+requireText('deploy/gkm-base-images/Dockerfile.node', 'update-ca-certificates', 'prepared Node CA trust update');
+requireText('deploy/gkm-base-images/Dockerfile.go', 'update-ca-certificates', 'prepared Go CA trust update');
+requireText('deploy/gkm-base-images/Dockerfile.node', '/etc/apk/repositories', 'prepared Node Alpine mirror wiring');
+requireText('deploy/gkm-base-images/Dockerfile.go', '/etc/apk/repositories', 'prepared Go Alpine mirror wiring');
 rejectPattern('Dockerfile', /^COPY\s+\.\s+\.$/m, 'broad build-context copy');
 requireText('.dockerignore', '*.d2', 'local D2 template exclusion');
 requireText('.dockerignore', '.tmp-*', 'local temporary artifact exclusion');
@@ -313,8 +329,11 @@ requireText('.dockerignore', '.tmp-*', 'local temporary artifact exclusion');
   'vXX.YY.ZZ.NN',
   '--require-clean',
   '--target gkm-runtime',
+  'gkm-runtime-canonical',
   '--node-base-image',
-  '--go-base-image'
+  '--go-base-image',
+  'build-gkm-base-images.sh',
+  'build-gkm-runtime.sh'
 ].forEach((text) => requireText('docs/CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md', text));
 
 [
@@ -394,7 +413,8 @@ requireText('.github/workflows/ci.yml', 'verify-runtime --root /app --expect-pro
 requireText('.github/workflows/ci.yml', 'docker push', 'Docker image push gate');
 requireText('.github/workflows/ci.yml', 'gkm-node-base.Dockerfile', 'prepared Node base fixture gate');
 requireText('.github/workflows/ci.yml', 'gkm-go-base.Dockerfile', 'prepared Go base fixture gate');
-requireText('.github/workflows/ci.yml', '--target gkm-runtime', 'prepared GKM image build gate');
+requireText('.github/workflows/ci.yml', 'docker build --target gkm-runtime', 'manual prepared GKM image build gate');
+requireText('.github/workflows/ci.yml', '--target gkm-runtime-canonical', 'canonical prepared GKM image build gate');
 requireText('.github/workflows/ci.yml', 'needs:', 'Docker image dependency gate');
 requireText('.github/workflows/ci.yml', '- test', 'Docker image npm/UI dependency');
 requireText('.github/workflows/ci.yml', '- go_vulncheck', 'Docker image vulnerability dependency');
@@ -415,7 +435,8 @@ requireText('.gitlab-ci.yml', 'verify-runtime --root /app --expect-provenance un
 requireText('.gitlab-ci.yml', 'docker push', 'Docker image push gate');
 requireText('.gitlab-ci.yml', 'gkm-node-base.Dockerfile', 'prepared Node base fixture gate');
 requireText('.gitlab-ci.yml', 'gkm-go-base.Dockerfile', 'prepared Go base fixture gate');
-requireText('.gitlab-ci.yml', '--target gkm-runtime', 'prepared GKM image build gate');
+requireText('.gitlab-ci.yml', 'docker build --target gkm-runtime', 'manual prepared GKM image build gate');
+requireText('.gitlab-ci.yml', '--target gkm-runtime-canonical', 'canonical prepared GKM image build gate');
 requireText('.gitlab-ci.yml', 'dist/cmdbdynamicpages-custompage.zip', 'GitLab custom page artifact path');
 requirePattern('.gitlab-ci.yml', /npm_test:[\s\S]*?rules:[\s\S]*?CI_COMMIT_TAG[\s\S]*?script:/, 'npm test gate for tag pipelines');
 requirePattern('.gitlab-ci.yml', /ui_smoke_required:[\s\S]*?rules:[\s\S]*?CI_COMMIT_TAG[\s\S]*?script:/, 'browser gate for tag pipelines');

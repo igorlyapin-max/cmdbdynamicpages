@@ -15,7 +15,7 @@ const REVISION_PATTERN = /^[0-9a-f]{40}$/;
 const DEFAULT_CONTAINER = 'cmdbdynamicpages-backend';
 const DEFAULT_WORKSPACE_ROOT = fileURLToPath(new URL('../', import.meta.url));
 const RUNTIME_MANIFEST_LABEL = 'io.gkm.cmdbdynamicpages.runtime-source-manifest-sha256';
-const SUPPORTED_BUILD_TARGETS = new Set(['runtime-canonical', 'gkm-runtime']);
+const SUPPORTED_BUILD_TARGETS = new Set(['runtime-canonical', 'gkm-runtime-canonical']);
 
 const READ_IMAGE_FILES_SCRIPT = [
   "const crypto=require('node:crypto');",
@@ -77,13 +77,13 @@ function validateBuildTargetOptions(options = {}) {
   }
   const nodeBaseImage = String(options.nodeBaseImage || '').trim();
   const goBaseImage = String(options.goBaseImage || '').trim();
-  if (target === 'gkm-runtime') {
-    if (!options.requireClean) throw new Error('gkm-runtime requires --require-clean.');
+  if (target === 'gkm-runtime-canonical') {
+    if (!options.requireClean) throw new Error('gkm-runtime-canonical requires --require-clean.');
     if (!nodeBaseImage || !goBaseImage) {
-      throw new Error('gkm-runtime requires both --node-base-image and --go-base-image.');
+      throw new Error('gkm-runtime-canonical requires both --node-base-image and --go-base-image.');
     }
   } else if (nodeBaseImage || goBaseImage) {
-    throw new Error('--node-base-image and --go-base-image are supported only with --target gkm-runtime.');
+    throw new Error('--node-base-image and --go-base-image are supported only with --target gkm-runtime-canonical.');
   }
   return { target, nodeBaseImage, goBaseImage };
 }
@@ -135,7 +135,7 @@ function canonicalDockerBuildArguments(metadata, options = {}) {
     '--build-arg', `BUILD_PROVENANCE=${metadata.provenance}`,
     '--build-arg', `RUNTIME_MANIFEST_SHA256=${metadata.runtimeManifestSha256}`
   );
-  if (targetOptions.target === 'gkm-runtime') {
+  if (targetOptions.target === 'gkm-runtime-canonical') {
     args.push(
       '--build-arg', `GKM_NODE_BASE_IMAGE=${targetOptions.nodeBaseImage}`,
       '--build-arg', `GKM_GO_BASE_IMAGE=${targetOptions.goBaseImage}`
@@ -298,7 +298,7 @@ function usage() {
   return [
     'Usage:',
     '  node scripts/container-image.mjs build --tag <image> [--target runtime-canonical] [--no-cache] [--require-clean]',
-    '  node scripts/container-image.mjs build --target gkm-runtime --node-base-image <image> --go-base-image <image> --tag <image> --require-clean [--no-cache]',
+    '  node scripts/container-image.mjs build --target gkm-runtime-canonical --node-base-image <image> --go-base-image <image> --tag <image> --require-clean [--no-cache]',
     `  node scripts/container-image.mjs verify --image <image> [--container ${DEFAULT_CONTAINER}] [--require-clean]`
   ].join('\n');
 }

@@ -155,19 +155,48 @@ npm run container:verify -- --image cmdbdynamicpages:verified-local --require-cl
 
 ### Подготовленные GKM base images
 
-Для закрытого registry, внутреннего CA или package mirror используйте verified target `gkm-runtime` и передайте подготовленные заказчиком Node и Go images:
+Для закрытого registry, внутреннего CA или package mirror подготовьте два Alpine base image. Это отдельная операция заказчика, выполняемая до сборки приложения. Скрипт использует только `docker build`; на хосте не требуются `npm`, Node или Go.
 
 ```bash
-npm run container:build -- \
+scripts/build-gkm-base-images.sh \
+  --node-tag registry.gkm.local/gkm/node:20-alpine-ca \
+  --go-tag registry.gkm.local/gkm/golang:1.25.11-alpine-ca \
+  --ca-dir /secure/customer-ca \
+  --apk-repositories /secure/apk-repositories
+docker push registry.gkm.local/gkm/node:20-alpine-ca
+docker push registry.gkm.local/gkm/golang:1.25.11-alpine-ca
+```
+
+`--ca-dir` необязателен, но при его указании должен содержать хотя бы один PEM-encoded `.crt` или `.pem`; один файл содержит ровно один certificate, а цепочка передаётся отдельными файлами. `--apk-repositories` необязателен и должен содержать Alpine repositories. Перед pull/push private registry Docker daemon хоста должен доверять CA registry: trust внутри base image не заменяет этот prerequisite.
+
+После этого соберите сервис из checkout. Рекомендуемая явная команда:
+
+```bash
+docker build \
   --target gkm-runtime \
+  --build-arg GKM_NODE_BASE_IMAGE=registry.gkm.local/gkm/node:20-alpine-ca \
+  --build-arg GKM_GO_BASE_IMAGE=registry.gkm.local/gkm/golang:1.25.11-alpine-ca \
+  --tag registry.gkm.local/gkm/cmdbdynamicpages:local \
+  .
+```
+
+Эквивалентный удобный shell wrapper вызывает ту же команду Docker:
+
+```bash
+scripts/build-gkm-runtime.sh \
   --node-base-image registry.gkm.local/gkm/node:20-alpine-ca \
   --go-base-image registry.gkm.local/gkm/golang:1.25.11-alpine-ca \
-  --tag registry.gkm.local/gkm/cmdbdynamicpages:XX.YY.ZZ.NN \
-  --require-clean
-npm run container:verify -- \
-  --image registry.gkm.local/gkm/cmdbdynamicpages:XX.YY.ZZ.NN \
-  --require-clean
+  --tag registry.gkm.local/gkm/cmdbdynamicpages:local
 ```
+
+Проверьте embedded identity без Node/npm на хосте:
+
+```bash
+docker run --rm --entrypoint cat registry.gkm.local/gkm/cmdbdynamicpages:local \
+  /app/BUILD_INFO.json
+```
+
+В JSON должны быть `"provenance":"unverified-local"`, `"revision":"unknown"` и непустой `runtimeManifestSha256`. `gkm-runtime` не принимает release provenance arguments. Для проверяемого CI/release image используется отдельный target `gkm-runtime-canonical` через `scripts/container-image.mjs`; это не процедура ручной сборки заказчика.
 
 Prepared base images обязаны сохранять поддерживаемые OS family, package manager, CPU architecture, Node/Go ABI и пользователя `node`; они содержат CA trust store и конфигурацию package repository/mirror. Product Dockerfile не копирует customer CA, registry credentials или repository configuration, но после `FROM` устанавливает собственные утилиты, необходимые для загрузки D2 (`curl`, `tar`). Для этого проекта команды используют `apk`; миграция на другое семейство ОС требует отдельного изменения Dockerfile.
 

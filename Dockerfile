@@ -201,6 +201,12 @@ COPY scripts ./scripts
 COPY cmd/cmdp-d2-import ./cmd/cmdp-d2-import
 COPY go.mod go.sum package.json VERSION ./
 
+FROM gkm-runtime-source AS gkm-runtime-source-manifest-manual
+
+RUN node scripts/build-identity.mjs manifest \
+  --root /source \
+  --output /out/RUNTIME_SOURCE_MANIFEST.json
+
 FROM gkm-runtime-source AS gkm-runtime-source-manifest-canonical
 
 ARG RUNTIME_MANIFEST_SHA256
@@ -251,7 +257,7 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
 ENTRYPOINT ["sh", "scripts/container-entrypoint.sh"]
 CMD ["node", "scripts/dev-proxy-server.mjs"]
 
-FROM gkm-runtime-base AS gkm-runtime
+FROM gkm-runtime-base AS gkm-runtime-canonical
 
 ARG APP_VERSION
 ARG VCS_REF
@@ -289,6 +295,20 @@ RUN set -eu; \
   printf '{"version":"%s","revision":"%s","dirty":%s,"provenance":"%s","runtimeManifestSha256":"%s"}\n' \
     "$file_version" "$VCS_REF" "$dirty_json" "$BUILD_PROVENANCE" "$RUNTIME_MANIFEST_SHA256" > ./BUILD_INFO.json; \
   node scripts/build-identity.mjs verify-runtime --root /app --expect-provenance "$BUILD_PROVENANCE"
+
+USER node
+
+FROM gkm-runtime-base AS gkm-runtime
+
+LABEL io.gkm.cmdbdynamicpages.provenance="unverified-local"
+
+COPY --from=gkm-runtime-source-manifest-manual --chown=node:node /out/RUNTIME_SOURCE_MANIFEST.json ./RUNTIME_SOURCE_MANIFEST.json
+RUN set -eu; \
+  file_version="$(tr -d '\r\n' < ./VERSION)"; \
+  runtime_manifest_sha256="$(sha256sum ./RUNTIME_SOURCE_MANIFEST.json | cut -d ' ' -f 1)"; \
+  printf '{"version":"%s","revision":"unknown","dirty":null,"provenance":"unverified-local","runtimeManifestSha256":"%s"}\n' \
+    "$file_version" "$runtime_manifest_sha256" > ./BUILD_INFO.json; \
+  node scripts/build-identity.mjs verify-runtime --root /app --expect-provenance unverified-local
 
 USER node
 
