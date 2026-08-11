@@ -797,13 +797,13 @@ function validateRuntimeConfig(input = {}) {
   const errors = [];
   const warnings = [];
 
-  let tlsCaBundle = { configured: Boolean(tlsCaFile), readable: false };
-  if (tlsCaFile || nodeExtraCaCerts) {
-    if (!tlsCaFile || !nodeExtraCaCerts || tlsCaFile !== nodeExtraCaCerts) {
+  let tlsCaBundle = { configured: Boolean(tlsCaFile || nodeExtraCaCerts), readable: false };
+  if (tlsCaFile) {
+    if (!nodeExtraCaCerts || tlsCaFile !== nodeExtraCaCerts) {
       errors.push({
         code: 'tls_ca_bundle_contract_invalid',
         env: 'CMDP_TLS_CA_FILE,NODE_EXTRA_CA_CERTS',
-        message: 'Private CA configuration requires CMDP_TLS_CA_FILE and NODE_EXTRA_CA_CERTS to reference the same readable PEM file.'
+        message: 'CMDP_TLS_CA_FILE requires NODE_EXTRA_CA_CERTS to reference the same readable PEM file.'
       });
     } else {
       try {
@@ -817,6 +817,18 @@ function validateRuntimeConfig(input = {}) {
           message: error && error.message ? error.message : 'Private CA bundle is not readable.'
         });
       }
+    }
+  } else if (nodeExtraCaCerts) {
+    try {
+      if (!fs.statSync(nodeExtraCaCerts).isFile()) throw new Error('Node extra CA path is not a regular file.');
+      fs.accessSync(nodeExtraCaCerts, fs.constants.R_OK);
+      tlsCaBundle = { configured: true, readable: true };
+    } catch (error) {
+      errors.push({
+        code: 'node_extra_ca_certs_invalid',
+        env: 'NODE_EXTRA_CA_CERTS',
+        message: error && error.message ? error.message : 'Prepared-base Node CA bundle is not readable.'
+      });
     }
   }
 

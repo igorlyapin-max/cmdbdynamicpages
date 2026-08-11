@@ -153,6 +153,26 @@ npm run container:verify -- --image cmdbdynamicpages:verified-local --require-cl
 
 Прямой `docker build .` является только manual `unverified-local` path. Customer release принимается из approved registry по image digest и собирается только canonical helper/CI. `--no-cache` не меняет provenance. Node, Go и GitLab Docker base images также закреплены immutable SHA-256 digest; их обновление выполняется отдельным проверяемым изменением CI/Dockerfile.
 
+### Подготовленные GKM base images
+
+Для закрытого registry, внутреннего CA или package mirror используйте verified target `gkm-runtime` и передайте подготовленные заказчиком Node и Go images:
+
+```bash
+npm run container:build -- \
+  --target gkm-runtime \
+  --node-base-image registry.gkm.local/gkm/node:20-alpine-ca \
+  --go-base-image registry.gkm.local/gkm/golang:1.25.11-alpine-ca \
+  --tag registry.gkm.local/gkm/cmdbdynamicpages:XX.YY.ZZ.NN \
+  --require-clean
+npm run container:verify -- \
+  --image registry.gkm.local/gkm/cmdbdynamicpages:XX.YY.ZZ.NN \
+  --require-clean
+```
+
+Prepared base images обязаны сохранять поддерживаемые OS family, package manager, CPU architecture, Node/Go ABI и пользователя `node`; они содержат CA trust store и конфигурацию package repository/mirror. Product Dockerfile не копирует customer CA, registry credentials или repository configuration, но после `FROM` устанавливает собственные утилиты, необходимые для загрузки D2 (`curl`, `tar`). Для этого проекта команды используют `apk`; миграция на другое семейство ОС требует отдельного изменения Dockerfile.
+
+Build-time trust, registry daemon trust и runtime trust различны. Runtime mount `CMDP_TLS_CA_FILE` остаётся отдельным контрактом: entrypoint передаёт его в `NODE_EXTRA_CA_CERTS`. Если mount не задан, inherited `NODE_EXTRA_CA_CERTS` prepared Node base image не перезаписывается.
+
 ## Запуск и остановка
 
 ```bash

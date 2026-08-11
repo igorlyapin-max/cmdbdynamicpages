@@ -100,6 +100,12 @@ jobs:
           docker run --rm --entrypoint node "$manual_image" scripts/build-identity.mjs verify-runtime --root /app --expect-provenance unverified-local
           node scripts/container-image.mjs build --tag "$image:$tag" --require-clean
           node scripts/container-image.mjs verify --image "$image:$tag" --require-clean
+          gkm_node_image="cmdbdynamicpages-gkm-node:$tag"
+          gkm_go_image="cmdbdynamicpages-gkm-go:$tag"
+          docker build -f tests/fixtures/gkm-node-base.Dockerfile -t "$gkm_node_image" .
+          docker build -f tests/fixtures/gkm-go-base.Dockerfile -t "$gkm_go_image" .
+          node scripts/container-image.mjs build --target gkm-runtime --node-base-image "$gkm_node_image" --go-base-image "$gkm_go_image" --tag "$image:gkm-$tag" --require-clean
+          node scripts/container-image.mjs verify --image "$image:gkm-$tag" --require-clean
           echo "CMDBDYNAMIC_CI_IMAGE=$image:$tag" >> "$GITHUB_ENV"
 
       - name: Login to GHCR

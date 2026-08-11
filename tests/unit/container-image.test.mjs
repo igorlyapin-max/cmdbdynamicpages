@@ -7,7 +7,8 @@ import {
   canonicalDockerBuildArguments,
   compareRuntimeSourceManifests,
   requireCleanVerificationErrors,
-  parseOptions
+  parseOptions,
+  validateBuildTargetOptions
 } from '../../scripts/container-image.mjs';
 import {
   RUNTIME_SOURCE_MANIFEST_INCLUDES,
@@ -36,7 +37,7 @@ test('strict verified build rejects a dirty checkout', () => {
   );
 });
 
-test('canonical image helper always selects the runtime-canonical target', () => {
+test('canonical image helper selects the standard runtime target by default', () => {
   assert.deepEqual(canonicalDockerBuildArguments(cleanWorkspace, {
     tag: 'example:test',
     noCache: true
@@ -51,6 +52,39 @@ test('canonical image helper always selects the runtime-canonical target', () =>
     '--build-arg', `RUNTIME_MANIFEST_SHA256=${'c'.repeat(64)}`,
     '-t', 'example:test',
     '.'
+  ]);
+});
+
+test('GKM image helper requires paired prepared bases and verified provenance', () => {
+  assert.throws(
+    () => validateBuildTargetOptions({ target: 'gkm-runtime', requireClean: true, nodeBaseImage: 'registry.example/node:20' }),
+    /requires both --node-base-image and --go-base-image/
+  );
+  assert.throws(
+    () => validateBuildTargetOptions({ target: 'gkm-runtime', nodeBaseImage: 'registry.example/node:20', goBaseImage: 'registry.example/go:1.25' }),
+    /requires --require-clean/
+  );
+  assert.deepEqual(validateBuildTargetOptions({
+    target: 'gkm-runtime',
+    requireClean: true,
+    nodeBaseImage: 'registry.example/node:20-alpine-ca',
+    goBaseImage: 'registry.example/go:1.25-alpine-ca'
+  }), {
+    target: 'gkm-runtime',
+    nodeBaseImage: 'registry.example/node:20-alpine-ca',
+    goBaseImage: 'registry.example/go:1.25-alpine-ca'
+  });
+  assert.deepEqual(canonicalDockerBuildArguments(cleanWorkspace, {
+    tag: 'example:gkm',
+    target: 'gkm-runtime',
+    requireClean: true,
+    nodeBaseImage: 'registry.example/node:20-alpine-ca',
+    goBaseImage: 'registry.example/go:1.25-alpine-ca'
+  }).slice(-9), [
+    '--build-arg', `RUNTIME_MANIFEST_SHA256=${'c'.repeat(64)}`,
+    '--build-arg', 'GKM_NODE_BASE_IMAGE=registry.example/node:20-alpine-ca',
+    '--build-arg', 'GKM_GO_BASE_IMAGE=registry.example/go:1.25-alpine-ca',
+    '-t', 'example:gkm', '.'
   ]);
 });
 
@@ -136,6 +170,9 @@ test('container image CLI parses explicit verification options', () => {
     noCache: false,
     requireClean: true,
     container: 'backend',
+    target: 'runtime-canonical',
+    nodeBaseImage: '',
+    goBaseImage: '',
     image: 'example:test'
   });
 });

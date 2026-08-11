@@ -7,8 +7,11 @@ const requiredFiles = [
   'docker-compose.runtime.yml',
   'docker-compose.nginx.yml',
   'scripts/build-identity.mjs',
+  'scripts/container-entrypoint.sh',
   'scripts/container-image.mjs',
   'scripts/tls-ca-smoke.sh',
+  'tests/fixtures/gkm-node-base.Dockerfile',
+  'tests/fixtures/gkm-go-base.Dockerfile',
   'docs/CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md'
 ];
 
@@ -180,7 +183,7 @@ requireText('docker-compose.runtime.yml', 'CMDP_SYSLOG_PROTOCOL', 'syslog protoc
 requireText('docker-compose.runtime.yml', 'CMDP_SYSLOG_FACILITY', 'syslog facility wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_PUBLIC_ORIGIN: ${CMDP_PUBLIC_ORIGIN}', 'public origin wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_TLS_CA_FILE: ${CMDP_TLS_CA_FILE:-}', 'private CA bundle wiring');
-requireText('docker-compose.runtime.yml', 'NODE_EXTRA_CA_CERTS: ${CMDP_TLS_CA_FILE:-}', 'Node private CA bundle wiring');
+rejectPattern('docker-compose.runtime.yml', /^\s*NODE_EXTRA_CA_CERTS:/m, 'compose override of prepared-base Node CA trust');
 requireText('docker-compose.runtime.yml', 'source: ${CMDP_TLS_CA_FILE_HOST:-/dev/null}', 'private CA host mount wiring');
 requireText('docker-compose.runtime.yml', 'target: /run/certs/cmdbdynamicpages-ca.pem', 'private CA container mount target');
 requireText('docker-compose.runtime.yml', 'CMDP_LITELLM_ALLOWED_BASE_URLS', 'LiteLLM base URL allowlist wiring');
@@ -204,6 +207,7 @@ rejectPattern('nginx/cmdbdynamicpages.conf', /proxy_set_header\s+X-Forwarded-Pro
 requireText('Dockerfile', 'HEALTHCHECK', 'Docker HEALTHCHECK');
 requireText('Dockerfile', 'USER node', 'non-root runtime user');
 requireText('Dockerfile', 'mkdir -p /run/certs', 'private CA mount parent directory');
+requireText('Dockerfile', 'ENTRYPOINT ["sh", "scripts/container-entrypoint.sh"]', 'runtime CA handoff entrypoint');
 requireText('scripts/tls-ca-smoke.sh', 'curl --fail --silent --show-error --cacert', 'private CA TLS smoke without insecure mode');
 rejectPattern('scripts/tls-ca-smoke.sh', /--insecure|\s-k(?:\s|$)/, 'insecure private CA TLS smoke option');
 requireText('Dockerfile', 'PROXY_HOST=127.0.0.1', 'loopback proxy host default');
@@ -225,7 +229,14 @@ requireDigestPinnedReferences('Dockerfile', /^FROM\s+((?:node|golang):[^\s]+)(?:
 requireText('Dockerfile', 'AS runtime-source-manifest-manual', 'manual runtime source manifest build stage');
 requireText('Dockerfile', 'AS runtime-source-manifest-canonical', 'canonical runtime source manifest build stage');
 requireText('Dockerfile', 'AS runtime-canonical', 'canonical runtime image target');
+requireText('Dockerfile', 'AS gkm-runtime', 'prepared-base GKM runtime target');
 requireText('Dockerfile', 'AS runtime-manual', 'default manual runtime image target');
+requireText('Dockerfile', 'ARG GKM_NODE_BASE_IMAGE=', 'prepared Node base pre-FROM argument');
+requireText('Dockerfile', 'ARG GKM_GO_BASE_IMAGE=', 'prepared Go base pre-FROM argument');
+requireText('Dockerfile', 'FROM ${GKM_NODE_BASE_IMAGE} AS gkm-d2', 'prepared Node D2 stage');
+requireText('Dockerfile', 'FROM ${GKM_GO_BASE_IMAGE} AS gkm-d2-import-builder', 'prepared Go importer stage');
+requireText('Dockerfile', 'apk add --no-cache curl tar', 'product-specific D2 utility installation');
+rejectPattern('Dockerfile', /FROM \$\{GKM_NODE_BASE_IMAGE\} AS gkm-d2[\s\S]*?apk add --no-cache ca-certificates/, 'prepared-base CA package installation');
 requireText('Dockerfile', 'COPY src ./src', 'runtime manifest src source copy');
 requireText('Dockerfile', 'COPY scripts ./scripts', 'runtime manifest scripts source copy');
 requireText('Dockerfile', 'COPY cmd/cmdp-d2-import ./cmd/cmdp-d2-import', 'runtime manifest D2 importer source copy');
@@ -254,7 +265,9 @@ requireText('scripts/container-image.mjs', 'workspace.runtimeManifestText !== em
 requireText('scripts/container-image.mjs', 'a clean verification requires a clean Git checkout', 'strict clean checkout verification');
 requireText('scripts/container-image.mjs', 'a clean verification requires image dirty=false', 'strict image dirty verification');
 requireText('scripts/container-image.mjs', '`RUNTIME_MANIFEST_SHA256=${metadata.runtimeManifestSha256}`', 'runtime manifest Docker build argument');
-requireText('scripts/container-image.mjs', "'--target', 'runtime-canonical'", 'canonical Docker target selection');
+requireText('scripts/container-image.mjs', "const SUPPORTED_BUILD_TARGETS = new Set(['runtime-canonical', 'gkm-runtime']);", 'canonical and prepared Docker target selection');
+requireText('scripts/container-image.mjs', "'gkm-runtime'", 'prepared-base build target selection');
+requireText('scripts/container-image.mjs', 'gkm-runtime requires both --node-base-image and --go-base-image.', 'prepared-base argument validation');
 requireText('package.json', '"container:build": "node scripts/container-image.mjs build"', 'canonical container build command');
 requireText('package.json', '"container:verify": "node scripts/container-image.mjs verify"', 'container identity verification command');
 rejectPattern('Dockerfile', /^COPY\s+\.\s+\.$/m, 'broad build-context copy');
@@ -298,7 +311,10 @@ requireText('.dockerignore', '.tmp-*', 'local temporary artifact exclusion');
   'verify-runtime --root /app --expect-provenance unverified-local',
   'CMDBDYNAMIC_IMAGE=cmdbdynamicpages:manual',
   'vXX.YY.ZZ.NN',
-  '--require-clean'
+  '--require-clean',
+  '--target gkm-runtime',
+  '--node-base-image',
+  '--go-base-image'
 ].forEach((text) => requireText('docs/CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md', text));
 
 [
@@ -376,6 +392,9 @@ requireText('.github/workflows/ci.yml', 'node scripts/container-image.mjs verify
 requireText('.github/workflows/ci.yml', 'docker build -t "$manual_image" .', 'plain manual Docker image build gate');
 requireText('.github/workflows/ci.yml', 'verify-runtime --root /app --expect-provenance unverified-local', 'manual Docker image identity gate');
 requireText('.github/workflows/ci.yml', 'docker push', 'Docker image push gate');
+requireText('.github/workflows/ci.yml', 'gkm-node-base.Dockerfile', 'prepared Node base fixture gate');
+requireText('.github/workflows/ci.yml', 'gkm-go-base.Dockerfile', 'prepared Go base fixture gate');
+requireText('.github/workflows/ci.yml', '--target gkm-runtime', 'prepared GKM image build gate');
 requireText('.github/workflows/ci.yml', 'needs:', 'Docker image dependency gate');
 requireText('.github/workflows/ci.yml', '- test', 'Docker image npm/UI dependency');
 requireText('.github/workflows/ci.yml', '- go_vulncheck', 'Docker image vulnerability dependency');
@@ -394,6 +413,9 @@ requireText('.gitlab-ci.yml', 'node scripts/container-image.mjs verify --image "
 requireText('.gitlab-ci.yml', 'docker build -t "$MANUAL_IMAGE" .', 'plain GitLab manual Docker image build gate');
 requireText('.gitlab-ci.yml', 'verify-runtime --root /app --expect-provenance unverified-local', 'GitLab manual Docker image identity gate');
 requireText('.gitlab-ci.yml', 'docker push', 'Docker image push gate');
+requireText('.gitlab-ci.yml', 'gkm-node-base.Dockerfile', 'prepared Node base fixture gate');
+requireText('.gitlab-ci.yml', 'gkm-go-base.Dockerfile', 'prepared Go base fixture gate');
+requireText('.gitlab-ci.yml', '--target gkm-runtime', 'prepared GKM image build gate');
 requireText('.gitlab-ci.yml', 'dist/cmdbdynamicpages-custompage.zip', 'GitLab custom page artifact path');
 requirePattern('.gitlab-ci.yml', /npm_test:[\s\S]*?rules:[\s\S]*?CI_COMMIT_TAG[\s\S]*?script:/, 'npm test gate for tag pipelines');
 requirePattern('.gitlab-ci.yml', /ui_smoke_required:[\s\S]*?rules:[\s\S]*?CI_COMMIT_TAG[\s\S]*?script:/, 'browser gate for tag pipelines');

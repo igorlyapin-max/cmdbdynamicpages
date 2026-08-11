@@ -15,6 +15,7 @@ const REVISION_PATTERN = /^[0-9a-f]{40}$/;
 const DEFAULT_CONTAINER = 'cmdbdynamicpages-backend';
 const DEFAULT_WORKSPACE_ROOT = fileURLToPath(new URL('../', import.meta.url));
 const RUNTIME_MANIFEST_LABEL = 'io.gkm.cmdbdynamicpages.runtime-source-manifest-sha256';
+const SUPPORTED_BUILD_TARGETS = new Set(['runtime-canonical', 'gkm-runtime']);
 
 const READ_IMAGE_FILES_SCRIPT = [
   "const crypto=require('node:crypto');",
@@ -46,12 +47,19 @@ function command(commandName, args, options = {}) {
 }
 
 function parseOptions(args) {
-  const options = { noCache: false, requireClean: false, container: '' };
+  const options = {
+    noCache: false,
+    requireClean: false,
+    container: '',
+    target: 'runtime-canonical',
+    nodeBaseImage: '',
+    goBaseImage: ''
+  };
   for (let index = 0; index < args.length; index += 1) {
     const value = args[index];
     if (value === '--no-cache') options.noCache = true;
     else if (value === '--require-clean') options.requireClean = true;
-    else if (value === '--tag' || value === '--image' || value === '--container') {
+    else if (value === '--tag' || value === '--image' || value === '--container' || value === '--target' || value === '--node-base-image' || value === '--go-base-image') {
       const next = args[index + 1];
       if (!next || next.startsWith('--')) throw new Error(`${value} requires a value.`);
       options[value.slice(2)] = next;
@@ -60,6 +68,24 @@ function parseOptions(args) {
     else throw new Error(`Unknown option: ${value}`);
   }
   return options;
+}
+
+function validateBuildTargetOptions(options = {}) {
+  const target = String(options.target || 'runtime-canonical').trim();
+  if (!SUPPORTED_BUILD_TARGETS.has(target)) {
+    throw new Error(`Unsupported build target: ${target}.`);
+  }
+  const nodeBaseImage = String(options.nodeBaseImage || '').trim();
+  const goBaseImage = String(options.goBaseImage || '').trim();
+  if (target === 'gkm-runtime') {
+    if (!options.requireClean) throw new Error('gkm-runtime requires --require-clean.');
+    if (!nodeBaseImage || !goBaseImage) {
+      throw new Error('gkm-runtime requires both --node-base-image and --go-base-image.');
+    }
+  } else if (nodeBaseImage || goBaseImage) {
+    throw new Error('--node-base-image and --go-base-image are supported only with --target gkm-runtime.');
+  }
+  return { target, nodeBaseImage, goBaseImage };
 }
 
 function readWorkspaceMetadata(options = {}) {
@@ -98,18 +124,24 @@ function buildMetadataForOptions(workspace, options = {}) {
 }
 
 function canonicalDockerBuildArguments(metadata, options = {}) {
+  const targetOptions = validateBuildTargetOptions(options);
   const args = ['build'];
   if (options.noCache) args.push('--no-cache');
   args.push(
-    '--target', 'runtime-canonical',
+    '--target', targetOptions.target,
     '--build-arg', `APP_VERSION=${metadata.version}`,
     '--build-arg', `VCS_REF=${metadata.revision}`,
     '--build-arg', `SOURCE_DIRTY=${metadata.dirty}`,
     '--build-arg', `BUILD_PROVENANCE=${metadata.provenance}`,
-    '--build-arg', `RUNTIME_MANIFEST_SHA256=${metadata.runtimeManifestSha256}`,
-    '-t', options.tag,
-    '.'
+    '--build-arg', `RUNTIME_MANIFEST_SHA256=${metadata.runtimeManifestSha256}`
   );
+  if (targetOptions.target === 'gkm-runtime') {
+    args.push(
+      '--build-arg', `GKM_NODE_BASE_IMAGE=${targetOptions.nodeBaseImage}`,
+      '--build-arg', `GKM_GO_BASE_IMAGE=${targetOptions.goBaseImage}`
+    );
+  }
+  args.push('-t', options.tag, '.');
   return args;
 }
 
@@ -265,7 +297,8 @@ function buildImage(options) {
 function usage() {
   return [
     'Usage:',
-    '  node scripts/container-image.mjs build --tag <image> [--no-cache] [--require-clean]',
+    '  node scripts/container-image.mjs build --tag <image> [--target runtime-canonical] [--no-cache] [--require-clean]',
+    '  node scripts/container-image.mjs build --target gkm-runtime --node-base-image <image> --go-base-image <image> --tag <image> --require-clean [--no-cache]',
     `  node scripts/container-image.mjs verify --image <image> [--container ${DEFAULT_CONTAINER}] [--require-clean]`
   ].join('\n');
 }
@@ -307,5 +340,6 @@ export {
   compareRuntimeSourceManifests,
   parseOptions,
   readWorkspaceMetadata,
+  validateBuildTargetOptions,
   requireCleanVerificationErrors
 };

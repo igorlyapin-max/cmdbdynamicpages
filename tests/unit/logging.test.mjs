@@ -117,6 +117,16 @@ test('runtime configuration requires one readable shared CA bundle for Node and 
     assert.equal(mismatched.ok, false);
     assert.ok(mismatched.errors.some((item) => item.code === 'tls_ca_bundle_contract_invalid'));
 
+    const inheritedBaseTrust = validateRuntimeConfig({
+      nodeEnv: 'development',
+      redisEnabled: false,
+      tlsCaFile: '',
+      nodeExtraCaCerts: certificatePath,
+      logTargets: ['stdout']
+    });
+    assert.equal(inheritedBaseTrust.ok, true);
+    assert.deepEqual(inheritedBaseTrust.tls, { configured: true, readable: true });
+
     const unreadable = validateRuntimeConfig({
       nodeEnv: 'development',
       redisEnabled: false,

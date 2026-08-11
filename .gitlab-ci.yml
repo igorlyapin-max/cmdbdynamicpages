@@ -70,5 +70,11 @@ container_image:
     - docker run --rm --entrypoint node "$MANUAL_IMAGE" scripts/build-identity.mjs verify-runtime --root /app --expect-provenance unverified-local
     - node scripts/container-image.mjs build --tag "$CI_REGISTRY_IMAGE:$IMAGE_TAG" --require-clean
     - node scripts/container-image.mjs verify --image "$CI_REGISTRY_IMAGE:$IMAGE_TAG" --require-clean
+    - export GKM_NODE_BASE_IMAGE="cmdbdynamicpages-gkm-node:$IMAGE_TAG"
+    - export GKM_GO_BASE_IMAGE="cmdbdynamicpages-gkm-go:$IMAGE_TAG"
+    - docker build -f tests/fixtures/gkm-node-base.Dockerfile -t "$GKM_NODE_BASE_IMAGE" .
+    - docker build -f tests/fixtures/gkm-go-base.Dockerfile -t "$GKM_GO_BASE_IMAGE" .
+    - node scripts/container-image.mjs build --target gkm-runtime --node-base-image "$GKM_NODE_BASE_IMAGE" --go-base-image "$GKM_GO_BASE_IMAGE" --tag "$CI_REGISTRY_IMAGE:gkm-$IMAGE_TAG" --require-clean
+    - node scripts/container-image.mjs verify --image "$CI_REGISTRY_IMAGE:gkm-$IMAGE_TAG" --require-clean
     - docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
     - docker push "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
