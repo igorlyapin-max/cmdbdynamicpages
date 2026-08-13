@@ -74,12 +74,9 @@ jobs:
           node-version: '20'
 
       - name: Validate container delivery files
-        run: node scripts/validate-container-delivery.mjs
-
-      - name: Validate compose templates
         run: |
+          npm run container:check
           docker compose --env-file .env.example -f docker-compose.runtime.yml config >/dev/null
-          docker compose -f docker-compose.nginx.yml config >/dev/null
 
       - name: Validate nginx templates
         run: bash scripts/nginx-test.sh
@@ -102,14 +99,31 @@ jobs:
           node scripts/container-image.mjs verify --image "$image:$tag" --require-clean
           gkm_node_image="cmdbdynamicpages-gkm-node:$tag"
           gkm_go_image="cmdbdynamicpages-gkm-go:$tag"
-          docker build -f tests/fixtures/gkm-node-base.Dockerfile -t "$gkm_node_image" .
-          docker build -f tests/fixtures/gkm-go-base.Dockerfile -t "$gkm_go_image" .
+          docker build -f tests/fixtures/gkm-node-base.Dockerfile -t "$gkm_node_image-fixture" .
+          docker build -f tests/fixtures/gkm-go-base.Dockerfile -t "$gkm_go_image-fixture" .
+          gkm_fixture_dir="$(mktemp -d)"
+          trap 'rm -rf "$gkm_fixture_dir"' EXIT
+          mkdir -p "$gkm_fixture_dir/ca"
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$gkm_fixture_dir/fixture-key.pem" \
+            -out "$gkm_fixture_dir/ca/fixture-ca.crt" \
+            -days 1 -subj '/CN=cmdbdynamicpages-ci-fixture'
+          gkm_node_base="$(sed -n 's/^ARG GKM_NODE_BASE_IMAGE=//p' Dockerfile)"
+          test -n "$gkm_node_base"
+          docker run --rm "$gkm_node_base" cat /etc/apk/repositories > "$gkm_fixture_dir/apk-repositories"
+          scripts/build-gkm-base-images.sh \
+            --node-tag "$gkm_node_image" --go-tag "$gkm_go_image" \
+            --ca-dir "$gkm_fixture_dir/ca" \
+            --apk-repositories "$gkm_fixture_dir/apk-repositories"
+          docker run --rm --entrypoint sh "$gkm_node_image" -ec 'test -s /etc/apk/repositories && test -f /usr/local/share/ca-certificates/fixture-ca.crt'
+          docker run --rm --entrypoint sh "$gkm_go_image" -ec 'test -s /etc/apk/repositories && test -f /usr/local/share/ca-certificates/fixture-ca.crt'
           gkm_manual_image="$image:gkm-manual-$tag"
           docker build --target gkm-runtime --build-arg "GKM_NODE_BASE_IMAGE=$gkm_node_image" --build-arg "GKM_GO_BASE_IMAGE=$gkm_go_image" -t "$gkm_manual_image" .
           docker run --rm --entrypoint node "$gkm_manual_image" scripts/build-identity.mjs verify-runtime --root /app --expect-provenance unverified-local
           node scripts/container-image.mjs build --target gkm-runtime-canonical --node-base-image "$gkm_node_image" --go-base-image "$gkm_go_image" --tag "$image:gkm-$tag" --require-clean
           node scripts/container-image.mjs verify --image "$image:gkm-$tag" --require-clean
           echo "CMDBDYNAMIC_CI_IMAGE=$image:$tag" >> "$GITHUB_ENV"
+          echo "CMDBDYNAMIC_GKM_CI_IMAGE=$image:gkm-$tag" >> "$GITHUB_ENV"
 
       - name: Login to GHCR
         if: github.event_name == 'push'
@@ -117,4 +131,6 @@ jobs:
 
       - name: Push Docker image
         if: github.event_name == 'push'
-        run: docker push "$CMDBDYNAMIC_CI_IMAGE"
+        run: |
+          docker push "$CMDBDYNAMIC_CI_IMAGE"
+          docker push "$CMDBDYNAMIC_GKM_CI_IMAGE"

@@ -7,7 +7,7 @@
 - Backend image `cmdbdynamicpages`, tag должен совпадать с release tag формата `vXX.YY.ZZ.NN`.
 - Verified release image содержит root `VERSION`, Git revision, `RUNTIME_SOURCE_MANIFEST.json` и OCI labels. Manifest детерминированно покрывает `src/**`, `scripts/**`, `cmd/cmdp-d2-import/**`, `go.mod`, `go.sum`, `package.json` и `VERSION`; его `runtimeManifestSha256` записан в `BUILD_INFO.json` и label `io.gkm.cmdbdynamicpages.runtime-source-manifest-sha256`.
 - `/health/live` возвращает ту же build identity, manifest digest и SHA-256 фактически исполняемого Designer.
-- Image-only compose template: `docker-compose.runtime.yml`.
+- Image-only compose template: `docker-compose.runtime.yml`; optional direct syslog overlay: `docker-compose.syslog.yml`.
 - Safe env template: `.env.example`.
 - Custom page zip artifact: `dist/cmdbdynamicpages-custompage.zip`, собирается в CI/release через `npm run build:zip`.
 
@@ -23,12 +23,13 @@ Runtime host не должен выполнять `npm install`, `npm run build`
   - доступ backend к `CMDBUILD_ORIGIN`;
   - доступ backend к Redis;
   - optional доступ backend к LiteLLM endpoint, если включен Designer assistant;
-  - доступ backend к approved syslog collector.
+  - platform collector, agent или sidecar, который забирает stdout/stderr контейнера;
+  - доступ backend к syslog collector только при выборе optional direct syslog overlay.
 - Backend по умолчанию слушает только `127.0.0.1:8093`. Не открывать `PROXY_PORT` во внешнем firewall и не использовать его как public URL: browser входит через `CMDP_PUBLIC_ORIGIN`.
 - Redis должен быть production-grade и password-protected, если static snapshot или runtime cache входят в service contract.
 - Kafka для этого сервиса не требуется.
 - Секреты должны приходить из PAM, platform injection, Docker secrets, mounted secret file или другого approved secret source.
-- Production logging использует `CMDP_LOG_TARGET=stdout,syslog`: приложение пишет structured logs в `stdout`/`stderr` и отправляет их в approved syslog collector. Docker logging driver не является заменой этого delivery contract.
+- Production logging по умолчанию использует `CMDP_LOG_TARGET=stdout`: приложение пишет structured logs в `stdout`/`stderr`, а platform collector отвечает за их доставку. Базовый Compose не задаёт Docker logging driver, collector или syslog topology. Прямая доставка приложения в syslog включается только через `docker-compose.syslog.yml`.
 
 ## Подготовка env
 
@@ -58,8 +59,8 @@ cp .env.example .env
 - `Cst_QueryToolConfig.RuntimeConfigJson.assistant.mcp` - runtime-настройки read-only MCP tools для Designer Assistant; secrets здесь не хранить;
 - `CMDP_D2_RENDER_ENABLED`, `CMDP_D2_BINARY`, `CMDP_D2_TIMEOUT_MS`, `CMDP_D2_MAX_INPUT_BYTES`, `CMDP_D2_MAX_OUTPUT_BYTES`, `CMDP_D2_MAX_DIAGRAMS`, `CMDP_D2_CONCURRENCY`, `CMDP_D2_LAYOUT`, `CMDP_D2_LAYOUT_ALLOWLIST` - обязательный по умолчанию server-side D2 SVG render. В штатном image binary уже лежит в `/usr/local/bin/d2`; при `CMDP_D2_RENDER_ENABLED=true` `/health/ready` требует рабочий binary;
 - `CMDP_D2_IMPORT_BINARY`, `CMDP_D2_IMPORT_TIMEOUT_MS`, `CMDP_D2_IMPORT_MAX_INPUT_BYTES`, `CMDP_D2_IMPORT_MAX_OUTPUT_BYTES`, `CMDP_D2_IMPORT_MAX_ELEMENTS`, `CMDP_D2_IMPORT_PROPOSAL_TTL_MS`, `CMDP_D2_IMPORT_ASSISTANT_MAX_SPEC_BYTES`, `CMDP_D2_IMPORT_ASSISTANT_CHECKPOINT_MAX_BYTES`, `CMDP_TEMPLATE_REQUEST_MAX_BYTES` - bounded import self-contained `.d2` в Designer. Штатный image содержит `/usr/local/bin/cmdp-d2-import`; readiness проверяет parser helper отдельно. Proposal подписан, привязан к CMDBuild session/template version и по умолчанию действует 30 минут. Перед LiteLLM raw D2 source/structural IR и composite template удаляются, размер sanitized spec ограничен. `CMDP_D2_IMPORT_ASSISTANT_CHECKPOINT_MAX_BYTES` ограничивает и authoring checkpoint, и server-side resumable mapping checkpoint; превышение очищает mapping checkpoint и возвращает `413 assistant_diagram_mapping_checkpoint_too_large`. После reload checkpoints переаттестуются без LLM и не содержат runtime payload. Общий body limit Preview/Create/Update должен вмещать разрешённые source и normalized IR. Raw D2 source и CMDBuild payload не должны попадать в operational logs;
-- `CMDP_LOG_TARGET` - production contract `stdout,syslog`: structured logs остаются в stdout/stderr и дублируются в syslog;
-- `CMDP_SYSLOG_HOST`, `CMDP_SYSLOG_PORT`, `CMDP_SYSLOG_PROTOCOL`, `CMDP_SYSLOG_FACILITY` - обязательные параметры approved syslog collector.
+- `CMDP_LOG_TARGET` - по умолчанию `stdout`; structured logs всегда остаются в stdout/stderr;
+- `CMDP_SYSLOG_HOST`, `CMDP_SYSLOG_PORT`, `CMDP_SYSLOG_PROTOCOL`, `CMDP_SYSLOG_FACILITY` - параметры optional direct syslog overlay `docker-compose.syslog.yml`.
 
 `replace-me`, `registry.example.local`, `cmdbuild.example.local`, `redis.example.local`, `litellm.example.local` и `syslog.example.local` не являются рабочими значениями. Real `.env` файлы не коммитить.
 
@@ -98,6 +99,7 @@ test -z "$CMDP_TLS_CA_FILE" || { test "$CMDP_TLS_CA_FILE" = /run/certs/cmdbdynam
 
 ```bash
 docker compose --env-file .env.example -f docker-compose.runtime.yml config
+CMDP_SYSLOG_HOST=collector.example.local docker compose --env-file .env.example -f docker-compose.runtime.yml -f docker-compose.syslog.yml config
 docker compose -f docker-compose.nginx.yml config
 ```
 
@@ -167,6 +169,24 @@ docker push registry.gkm.local/gkm/node:20-alpine-ca
 docker push registry.gkm.local/gkm/golang:1.25.11-alpine-ca
 ```
 
+Без wrapper подготовка использует те же два `docker build`; context должен содержать только `customer-ca/` и `apk-repositories`, подготовленные из защищённых operator inputs:
+
+```bash
+GKM_CONTEXT="$(mktemp -d)"
+trap 'rm -rf "$GKM_CONTEXT"' EXIT
+mkdir -p "$GKM_CONTEXT/customer-ca"
+cp /secure/customer-ca/*.crt "$GKM_CONTEXT/customer-ca/"
+cp /secure/apk-repositories "$GKM_CONTEXT/apk-repositories"
+docker build -f deploy/gkm-base-images/Dockerfile.node \
+  --build-arg BASE_IMAGE=node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 \
+  --build-arg CUSTOM_CA_REQUIRED=true --build-arg APK_REPOSITORIES_REQUIRED=true \
+  --tag registry.gkm.local/gkm/node:20-alpine-ca "$GKM_CONTEXT"
+docker build -f deploy/gkm-base-images/Dockerfile.go \
+  --build-arg BASE_IMAGE=golang:1.25.11-alpine@sha256:523c3effe300580ed375e43f43b1c9b091b68e935a7c3a92bfcc4e7ed55b18c2 \
+  --build-arg CUSTOM_CA_REQUIRED=true --build-arg APK_REPOSITORIES_REQUIRED=true \
+  --tag registry.gkm.local/gkm/golang:1.25.11-alpine-ca "$GKM_CONTEXT"
+```
+
 `--ca-dir` необязателен, но при его указании должен содержать хотя бы один PEM-encoded `.crt` или `.pem`; один файл содержит ровно один certificate, а цепочка передаётся отдельными файлами. `--apk-repositories` необязателен и должен содержать Alpine repositories. Перед pull/push private registry Docker daemon хоста должен доверять CA registry: trust внутри base image не заменяет этот prerequisite.
 
 После этого соберите сервис из checkout. Рекомендуемая явная команда:
@@ -196,7 +216,7 @@ docker run --rm --entrypoint cat registry.gkm.local/gkm/cmdbdynamicpages:local \
   /app/BUILD_INFO.json
 ```
 
-В JSON должны быть `"provenance":"unverified-local"`, `"revision":"unknown"` и непустой `runtimeManifestSha256`. `gkm-runtime` не принимает release provenance arguments. Для проверяемого CI/release image используется отдельный target `gkm-runtime-canonical` через `scripts/container-image.mjs`; это не процедура ручной сборки заказчика.
+В JSON должны быть `"provenance":"unverified-local"`, `"revision":"unknown"` и непустой `runtimeManifestSha256`. `gkm-runtime` не принимает release provenance arguments. Для проверяемого CI/release image используется отдельный target `gkm-runtime-canonical` через `scripts/container-image.mjs`; CI публикует его как `registry/.../cmdbdynamicpages:gkm-<release-tag>` наряду с обычным verified `:<release-tag>`. Это не процедура ручной сборки заказчика.
 
 Prepared base images обязаны сохранять поддерживаемые OS family, package manager, CPU architecture, Node/Go ABI и пользователя `node`; они содержат CA trust store и конфигурацию package repository/mirror. Product Dockerfile не копирует customer CA, registry credentials или repository configuration, но после `FROM` устанавливает собственные утилиты, необходимые для загрузки D2 (`curl`, `tar`). Для этого проекта команды используют `apk`; миграция на другое семейство ОС требует отдельного изменения Dockerfile.
 
@@ -210,6 +230,16 @@ docker compose --env-file .env -f docker-compose.runtime.yml pull
 docker compose --env-file .env -f docker-compose.runtime.yml up -d --force-recreate
 docker compose --env-file .env -f docker-compose.runtime.yml ps
 ```
+
+Base startup emits structured logs to stdout/stderr; the platform collector, agent, or sidecar owns forwarding. `docker compose ... logs` proves only local container output, not the external route. Before production acceptance, send a unique probe and make the platform-owned collector query confirm that exact identifier:
+
+```bash
+bash scripts/verify-platform-log-route.sh \
+  https://custom.example.local/health/live -- \
+  sh -c 'platform-log-query --contains "$CMDP_LOG_PROBE_ID"'
+```
+
+The command after `--` is supplied by the customer platform and must exit `0` only when its collector, agent, or sidecar has received `CMDP_LOG_PROBE_ID`. The script does not store the command, credentials, or collector topology. For direct syslog, set `CMDP_SYSLOG_HOST` and add `-f docker-compose.syslog.yml` to every runtime Compose command. The overlay sets `CMDP_LOG_TARGET=stdout,syslog`; it is optional and does not configure a Docker logging driver.
 
 Остановка:
 
@@ -258,12 +288,8 @@ Production default:
 
 ```text
 CMDP_DIAGNOSTIC_MODE=off
-CMDP_LOG_TARGET=stdout,syslog
+CMDP_LOG_TARGET=stdout
 CMDP_LOG_FORMAT=json
-CMDP_SYSLOG_HOST=syslog.example.local
-CMDP_SYSLOG_PORT=514
-CMDP_SYSLOG_PROTOCOL=udp
-CMDP_SYSLOG_FACILITY=local0
 ```
 
 Для диагностики можно временно включить:
@@ -273,7 +299,7 @@ CMDP_DIAGNOSTIC_MODE=Basic
 CMDP_DIAGNOSTIC_MODE=Verbose
 ```
 
-`Verbose` включать только на время incident. Cookie, authorization headers, CSRF token, Redis password, raw runtime rows и raw CMDBuild payload не должны попадать в логи. `CMDP_SYSLOG_HOST`, `CMDP_SYSLOG_PORT`, `CMDP_SYSLOG_PROTOCOL` и `CMDP_SYSLOG_FACILITY` должны указывать на approved syslog collector; `stdout`/stderr остаются обязательным локальным output.
+`Verbose` включать только на время incident. Cookie, authorization headers, CSRF token, Redis password, raw runtime rows и raw CMDBuild payload не должны попадать в логи. `stdout`/stderr остаются обязательным output, а platform collector должен подтвердить их доставку. Для direct syslog задать `CMDP_SYSLOG_HOST` и запускать с `docker-compose.syslog.yml`; только этот overlay требует syslog endpoint.
 
 ## CMDBuild schema и custom page
 
@@ -302,10 +328,11 @@ CI для release должен:
 
 - запускать `npm run ci`;
 - строить Docker image;
-- проверять `docker compose --env-file .env.example -f docker-compose.runtime.yml config`;
+- проверять `docker compose --env-file .env.example -f docker-compose.runtime.yml config` и `CMDP_SYSLOG_HOST=collector.example.local docker compose --env-file .env.example -f docker-compose.runtime.yml -f docker-compose.syslog.yml config`;
 - проверять `docker compose -f docker-compose.nginx.yml config`;
 - запускать `bash scripts/nginx-test.sh` для проверки рендеринга nginx template;
 - публиковать image в approved registry для branch/tag release;
+- проверять platform collector probe для выбранного production contour либо selected direct-syslog profile;
 - прикладывать `dist/cmdbdynamicpages-custompage.zip` как release artifact.
 
 Если image push не выполнен, release нельзя считать готовым для GKM container handoff.

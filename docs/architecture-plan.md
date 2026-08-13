@@ -166,17 +166,17 @@ Runtime logging is structured and transport-neutral. The backend emits JSON even
 cmdbdynamicpages stdout -> Docker logging/Filebeat/Fluent Bit/Logstash -> Elasticsearch
 ```
 
-For VM/bare-metal or SIEM-oriented deployments the backend can send the same event payload to syslog:
+For VM/bare-metal or SIEM-oriented deployments the backend can send the same event payload to syslog through the explicit `docker-compose.syslog.yml` overlay:
 
 ```text
-CMDP_LOG_TARGET=syslog
+CMDP_LOG_TARGET=stdout,syslog
 CMDP_SYSLOG_HOST=<syslog-host>
 CMDP_SYSLOG_PORT=514
 CMDP_SYSLOG_PROTOCOL=udp|tcp
 CMDP_SYSLOG_FACILITY=local0
 ```
 
-`CMDP_LOG_TARGET=stdout,syslog` duplicates events to both transports. Direct Elasticsearch output is intentionally not implemented in the application to avoid coupling runtime availability to the observability backend. `/cmdbuild/custom-api/logging/status` reports the active logging configuration without secrets and is a diagnostics endpoint, not readiness.
+The base runtime always emits stdout/stderr and leaves collection to the platform. The optional syslog overlay duplicates events to both transports. Direct Elasticsearch output is intentionally not implemented in the application to avoid coupling runtime availability to the observability backend. `/cmdbuild/custom-api/logging/status` reports the active logging configuration without secrets and is a diagnostics endpoint, not readiness.
 
 Logged events cover HTTP request completion, Redis availability, CMDBuild upstream failures, CSRF/same-origin rejections, runtime cache hit/miss/refresh, static snapshot publish/hit/miss, and template create/update/delete. Headers and query parameters configured in `CMDP_LOG_REDACT_HEADERS` and `CMDP_LOG_REDACT_QUERY` are redacted; cookies, authorization headers, CSRF tokens, runtime table rows, and raw CMDBuild card payloads must not appear in operational logs.
 

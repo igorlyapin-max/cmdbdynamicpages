@@ -168,17 +168,17 @@ Runtime-логирование структурированное и не при
 cmdbdynamicpages stdout -> Docker logging/Filebeat/Fluent Bit/Logstash -> Elasticsearch
 ```
 
-Для VM/bare-metal или SIEM можно включить syslog:
+Для VM/bare-metal или SIEM можно включить syslog явным overlay `docker-compose.syslog.yml`:
 
 ```text
-CMDP_LOG_TARGET=syslog
+CMDP_LOG_TARGET=stdout,syslog
 CMDP_SYSLOG_HOST=<syslog-host>
 CMDP_SYSLOG_PORT=514
 CMDP_SYSLOG_PROTOCOL=udp|tcp
 CMDP_SYSLOG_FACILITY=local0
 ```
 
-`CMDP_LOG_TARGET=stdout,syslog` дублирует события в оба транспорта. Прямой output в Elasticsearch из приложения намеренно не реализуется, чтобы не связывать доступность runtime с observability backend. `/cmdbuild/custom-api/logging/status` показывает активную конфигурацию логирования без секретов и является диагностикой, а не readiness.
+Базовый runtime всегда пишет в stdout/stderr и передаёт доставку platform collector. Optional syslog overlay дублирует события в оба транспорта. Прямой output в Elasticsearch из приложения намеренно не реализуется, чтобы не связывать доступность runtime с observability backend. `/cmdbuild/custom-api/logging/status` показывает активную конфигурацию логирования без секретов и является диагностикой, а не readiness.
 
 В логи пишутся завершение HTTP-запросов, доступность Redis, ошибки CMDBuild upstream, CSRF/same-origin отказы, runtime cache hit/miss/refresh, static snapshot publish/hit/miss и create/update/delete шаблонов. Headers и query-параметры из `CMDP_LOG_REDACT_HEADERS` и `CMDP_LOG_REDACT_QUERY` маскируются; cookie, authorization headers, CSRF token, строки runtime-таблиц и raw payload карточек CMDBuild не должны попадать в операционные логи.
 

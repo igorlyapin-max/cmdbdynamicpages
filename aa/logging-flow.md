@@ -25,8 +25,8 @@ flowchart TB
 
 | Режим | Настройка | Назначение | Примечание ИБ |
 | --- | --- | --- | --- |
-| Local stdout | `CMDP_LOG_TARGET=stdout` | Локальная разработка без syslog collector | Не использовать как production delivery contract |
-| Production delivery | `CMDP_LOG_TARGET=stdout,syslog` | Docker/VM production, SIEM или существующий rsyslog/syslog-ng контур | `CMDP_SYSLOG_HOST` обязателен; UDP может терять сообщения, TCP предпочтительнее при строгих требованиях |
+| Stdout-first delivery | `CMDP_LOG_TARGET=stdout` | Local и production; platform collector, agent или sidecar забирает stdout/stderr | Base Compose не задаёт collector или Docker logging driver |
+| Optional direct syslog | `CMDP_LOG_TARGET=stdout,syslog` через `docker-compose.syslog.yml` | VM/SIEM или существующий rsyslog/syslog-ng контур | `CMDP_SYSLOG_HOST` обязателен; UDP может терять сообщения, TCP предпочтительнее при строгих требованиях |
 
 ## Состав событий
 
@@ -60,5 +60,7 @@ CMDP_LOG_REDACT_QUERY=password,passwd,pwd,token,secret,authorization,auth,csrf,x
 ## Диагностика
 
 `GET /cmdbuild/custom-api/logging/status` возвращает активный target, level, format и списки маскирования без секретов. Endpoint диагностический и не должен использоваться как readiness.
+
+Для stdout-first delivery acceptance требует external evidence: `scripts/verify-platform-log-route.sh <health-url> -- <platform collector query>`. Скрипт посылает уникальный `X-Request-ID`; platform query получает его через `CMDP_LOG_PROBE_ID` и завершается успешно только после подтверждения доставки.
 
 `CMDP_DIAGNOSTIC_MODE=off` по умолчанию. `Basic` пишет безопасные diagnostic events без sensitive payload. `Verbose` добавляет sanitized HTTP и CMDBuild upstream diagnostics без request/response bodies, runtime rows, cookies, tokens, Redis password и raw CMDBuild payload; включать только временно.

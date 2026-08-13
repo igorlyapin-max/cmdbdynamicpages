@@ -228,7 +228,7 @@ test('logging status is diagnostic and does not expose secret values', () => {
   assert.equal(status.assistant.apiKeyErrorCode, '');
   assert.ok(status.syslog === null || typeof status.syslog === 'object');
   assert.equal(status.elk.directOutput, false);
-  assert.match(status.elk.recommendedPipeline, /stdout\/syslog/);
+  assert.equal(status.elk.recommendedPipeline, 'stdout -> platform collector/agent/sidecar -> configured log backend');
 });
 
 test('runtime config validation fails closed for production CSRF secret', () => {
@@ -241,7 +241,18 @@ test('runtime config validation fails closed for production CSRF secret', () => 
   });
 
   assert.equal(invalid.ok, false);
-  assert.deepEqual(invalid.errors.map((item) => item.code), ['csrf_secret_required', 'syslog_log_target_required']);
+  assert.deepEqual(invalid.errors.map((item) => item.code), ['csrf_secret_required']);
+
+  const stdoutOnly = validateRuntimeConfig({
+    nodeEnv: 'production',
+    csrfSecret: 'externally-managed-secret',
+    logTargets: ['stdout'],
+    publicOrigin: 'https://custom.example',
+    diagnosticMode: 'off'
+  });
+
+  assert.equal(stdoutOnly.ok, true);
+  assert.deepEqual(stdoutOnly.errors, []);
 
   const placeholder = validateRuntimeConfig({
     nodeEnv: 'production',

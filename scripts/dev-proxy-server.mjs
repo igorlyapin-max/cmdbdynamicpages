@@ -764,7 +764,9 @@ function loggingStatus() {
     } : null,
     elk: {
       directOutput: false,
-      recommendedPipeline: 'stdout/syslog -> collector -> Elasticsearch'
+      recommendedPipeline: LOG_TARGETS.includes('syslog')
+        ? 'stdout -> platform collector/agent/sidecar; direct syslog -> configured collector'
+        : 'stdout -> platform collector/agent/sidecar -> configured log backend'
     },
     tls: {
       caBundleConfigured: Boolean(TLS_CA_FILE)
@@ -905,13 +907,6 @@ function validateRuntimeConfig(input = {}) {
       code: 'stdout_log_target_required',
       env: 'CMDP_LOG_TARGET',
       message: 'Structured logs must always include stdout/stderr.'
-    });
-  }
-  if (nodeEnv.toLowerCase() === 'production' && Array.isArray(logTargets) && !logTargets.includes('syslog')) {
-    errors.push({
-      code: 'syslog_log_target_required',
-      env: 'CMDP_LOG_TARGET',
-      message: 'Production startup requires CMDP_LOG_TARGET=stdout,syslog so structured logs are delivered to a configured syslog sink.'
     });
   }
   if (nodeEnv.toLowerCase() === 'production' && Array.isArray(logTargets) && logTargets.includes('syslog') && (!syslogHostIsConfigured(syslogHost) || !syslogPort)) {

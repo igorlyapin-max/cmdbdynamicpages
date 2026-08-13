@@ -50,7 +50,7 @@ services:
       CMDBDYNAMIC_EXECUTION_THROTTLE_RETRY_AFTER_SEC: ${CMDBDYNAMIC_EXECUTION_THROTTLE_RETRY_AFTER_SEC:-5}
       CMDP_LOG_LEVEL: ${CMDP_LOG_LEVEL:-info}
       CMDP_LOG_FORMAT: ${CMDP_LOG_FORMAT:-json}
-      CMDP_LOG_TARGET: ${CMDP_LOG_TARGET:-stdout,syslog}
+      CMDP_LOG_TARGET: ${CMDP_LOG_TARGET:-stdout}
       CMDP_DIAGNOSTIC_MODE: ${CMDP_DIAGNOSTIC_MODE:-off}
       CMDP_LOG_REDACT_HEADERS: ${CMDP_LOG_REDACT_HEADERS:-cookie,authorization,cmdbuild-authorization,x-csrf-token,x-cmdbdynamicpages-csrf,set-cookie}
       CMDP_LOG_REDACT_QUERY: ${CMDP_LOG_REDACT_QUERY:-password,passwd,pwd,token,secret,authorization,auth,csrf,x-cmdbdynamicpages-csrf}
@@ -61,10 +61,6 @@ services:
       CMDP_ASSISTANT_LLM_MAX_REQUEST_BYTES_ABSOLUTE: ${CMDP_ASSISTANT_LLM_MAX_REQUEST_BYTES_ABSOLUTE:-2097152}
       CMDP_ASSISTANT_LLM_MAX_RESPONSE_BYTES_ABSOLUTE: ${CMDP_ASSISTANT_LLM_MAX_RESPONSE_BYTES_ABSOLUTE:-4194304}
       LITELLM_API_KEY_FILE: ${LITELLM_API_KEY_FILE:-/run/secrets/cmdbdynamicpages_litellm_api_key}
-      CMDP_SYSLOG_HOST: ${CMDP_SYSLOG_HOST:?CMDP_SYSLOG_HOST must be set}
-      CMDP_SYSLOG_PORT: ${CMDP_SYSLOG_PORT:-514}
-      CMDP_SYSLOG_PROTOCOL: ${CMDP_SYSLOG_PROTOCOL:-udp}
-      CMDP_SYSLOG_FACILITY: ${CMDP_SYSLOG_FACILITY:-local0}
     volumes:
       - type: bind
         source: ${CMDBDYNAMIC_REDIS_PASSWORD_FILE_HOST:-./secrets/cmdbdynamicpages_redis_password}

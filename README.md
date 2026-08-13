@@ -361,6 +361,8 @@ CMDBuild/DynamicPages stays on `http://127.0.0.1:8093/`; nginx exposes only the 
 npm run nginx:dev
 ```
 
+`nginx:dev` is the only supported local launcher for this front: it validates and starts `docker-compose.nginx.yml`, which supplies all template variables. Do not replace it with a manual `docker run`; an omitted `CMDP_NGINX_PUBLIC_HOST` or `CMDP_NGINX_PUBLIC_PROTO` leaves an unresolved Nginx variable and causes a restart loop. The local port contract is fixed: diagnose a failure without changing `8088`, `8093`, `8090`, or `6379`.
+
 Open CMDBuild through nginx:
 
 ```text
@@ -482,28 +484,18 @@ CMDP_TEMPLATE_REQUEST_MAX_BYTES=5767168
 
 ## Logging
 
-The backend writes structured operational logs. Local development can use `stdout` only. The production Docker Compose contract is `stdout,syslog` with an approved syslog collector; the application does not write directly to Elasticsearch.
+The backend writes structured operational logs to stdout/stderr. A platform collector, agent, or sidecar owns forwarding; the base Docker Compose file does not choose a logging topology. The application does not write directly to Elasticsearch. `docker compose ... logs` is not evidence of external delivery: use `scripts/verify-platform-log-route.sh <health-url> -- <platform collector query>` for the selected deployment contour.
 
 ```text
 CMDP_LOG_LEVEL=info
 CMDP_LOG_FORMAT=json
-CMDP_LOG_TARGET=stdout,syslog
-CMDP_SYSLOG_HOST=syslog.example.local
-CMDP_SYSLOG_PORT=514
-CMDP_SYSLOG_PROTOCOL=udp
-CMDP_SYSLOG_FACILITY=local0
+CMDP_LOG_TARGET=stdout
 CMDP_DIAGNOSTIC_MODE=off
 CMDP_LOG_REDACT_HEADERS=cookie,authorization,cmdbuild-authorization,x-csrf-token,x-cmdbdynamicpages-csrf,set-cookie
 CMDP_LOG_REDACT_QUERY=password,passwd,pwd,token,secret,authorization,auth,csrf,x-cmdbdynamicpages-csrf
 ```
 
-For local development without a collector, use stdout only:
-
-```text
-CMDP_LOG_TARGET=stdout
-```
-
-`stdout` always remains enabled. Production must use `CMDP_LOG_TARGET=stdout,syslog` and replace the example collector with an approved syslog endpoint. Logged events include request completion, CSRF/same-origin rejection, Redis availability changes, CMDBuild upstream errors, runtime cache status, static snapshot publish/hit/miss, and template create/update/delete. Cookies, authorization headers, CSRF tokens and configured secret-like query parameters are redacted; runtime result rows and CMDBuild card payloads are not logged. `/metrics` exposes only aggregate counters/gauges and does not include cookies, tokens, user names, runtime rows or raw CMDBuild payloads.
+`stdout` always remains enabled in every environment. A platform collector, agent, or sidecar is responsible for forwarding it. To use direct syslog delivery, set `CMDP_SYSLOG_HOST` and start Compose with `-f docker-compose.syslog.yml`; the overlay sets `CMDP_LOG_TARGET=stdout,syslog`. Logged events include request completion, CSRF/same-origin rejection, Redis availability changes, CMDBuild upstream errors, runtime cache status, static snapshot publish/hit/miss, and template create/update/delete. Cookies, authorization headers, CSRF tokens and configured secret-like query parameters are redacted; runtime result rows and CMDBuild card payloads are not logged. `/metrics` exposes only aggregate counters/gauges and does not include cookies, tokens, user names, runtime rows or raw CMDBuild payloads.
 
 Diagnostic mode is off by default and can be enabled without code changes:
 

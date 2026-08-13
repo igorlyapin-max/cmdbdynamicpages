@@ -178,28 +178,18 @@ CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=true
 
 ## Логирование
 
-Backend пишет структурированные операционные логи. Для локальной разработки допустим только `stdout`. Production Docker Compose использует `stdout,syslog` с approved syslog collector; прямой output в Elasticsearch из приложения не используется.
+Backend пишет структурированные операционные логи в `stdout`/`stderr`. Их доставку выполняет platform collector, agent или sidecar; базовый Compose не задаёт topology логирования. Прямой output в Elasticsearch из приложения не используется. `docker compose ... logs` не доказывает внешнюю доставку: для выбранного deployment contour использовать `scripts/verify-platform-log-route.sh <health-url> -- <platform collector query>`.
 
 ```text
 CMDP_LOG_LEVEL=info
 CMDP_LOG_FORMAT=json
-CMDP_LOG_TARGET=stdout,syslog
-CMDP_SYSLOG_HOST=syslog.example.local
-CMDP_SYSLOG_PORT=514
-CMDP_SYSLOG_PROTOCOL=udp
-CMDP_SYSLOG_FACILITY=local0
+CMDP_LOG_TARGET=stdout
 CMDP_DIAGNOSTIC_MODE=off
 CMDP_LOG_REDACT_HEADERS=cookie,authorization,cmdbuild-authorization,x-csrf-token,x-cmdbdynamicpages-csrf,set-cookie
 CMDP_LOG_REDACT_QUERY=password,passwd,pwd,token,secret,authorization,auth,csrf,x-cmdbdynamicpages-csrf
 ```
 
-Для локальной разработки без collector используйте только stdout:
-
-```text
-CMDP_LOG_TARGET=stdout
-```
-
-`stdout` остается включенным всегда. Для production обязателен `CMDP_LOG_TARGET=stdout,syslog`; example collector нужно заменить на approved syslog endpoint. В логи попадают завершение HTTP-запросов, CSRF/same-origin отказы, изменение доступности Redis, ошибки CMDBuild upstream, runtime cache hit/miss/refresh, static snapshot publish/hit/miss и create/update/delete шаблонов. Cookie, authorization headers, CSRF token и secret-like query параметры маскируются. Runtime-строки результата и payload карточек CMDBuild в операционные логи не пишутся.
+`stdout` остается включенным всегда. Для прямой доставки в syslog задать `CMDP_SYSLOG_HOST` и запустить Compose с `-f docker-compose.syslog.yml`; overlay установит `CMDP_LOG_TARGET=stdout,syslog`. В логи попадают завершение HTTP-запросов, CSRF/same-origin отказы, изменение доступности Redis, ошибки CMDBuild upstream, runtime cache hit/miss/refresh, static snapshot publish/hit/miss и create/update/delete шаблонов. Cookie, authorization headers, CSRF token и secret-like query параметры маскируются. Runtime-строки результата и payload карточек CMDBuild в операционные логи не пишутся.
 
 Diagnostic mode выключен по умолчанию и включается без изменения кода:
 

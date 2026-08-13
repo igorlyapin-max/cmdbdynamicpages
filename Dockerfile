@@ -77,7 +77,7 @@ ARG SOURCE_URL
 ENV NODE_ENV=production \
     PROXY_HOST=127.0.0.1 \
     PROXY_PORT=8093 \
-    CMDP_LOG_TARGET=stdout,syslog \
+    CMDP_LOG_TARGET=stdout \
     CMDP_D2_RENDER_ENABLED=true \
     CMDP_D2_BINARY=/usr/local/bin/d2 \
     CMDP_D2_IMPORT_BINARY=/usr/local/bin/cmdp-d2-import
@@ -225,7 +225,7 @@ USER root
 ENV NODE_ENV=production \
     PROXY_HOST=127.0.0.1 \
     PROXY_PORT=8093 \
-    CMDP_LOG_TARGET=stdout,syslog \
+    CMDP_LOG_TARGET=stdout \
     CMDP_D2_RENDER_ENABLED=true \
     CMDP_D2_BINARY=/usr/local/bin/d2 \
     CMDP_D2_IMPORT_BINARY=/usr/local/bin/cmdp-d2-import

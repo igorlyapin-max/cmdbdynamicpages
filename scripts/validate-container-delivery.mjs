@@ -5,12 +5,14 @@ const requiredFiles = [
   'VERSION',
   'Dockerfile',
   'docker-compose.runtime.yml',
+  'docker-compose.syslog.yml',
   'docker-compose.nginx.yml',
   'scripts/build-identity.mjs',
   'scripts/container-entrypoint.sh',
   'scripts/container-image.mjs',
   'scripts/build-gkm-base-images.sh',
   'scripts/build-gkm-runtime.sh',
+  'scripts/verify-platform-log-route.sh',
   'scripts/tls-ca-smoke.sh',
   'deploy/gkm-base-images/Dockerfile.node',
   'deploy/gkm-base-images/Dockerfile.go',
@@ -55,10 +57,6 @@ const requiredEnv = [
   'CMDP_ASSISTANT_LLM_MAX_RESPONSE_BYTES_ABSOLUTE',
   'LITELLM_API_KEY_FILE_HOST',
   'CMDP_LOG_TARGET',
-  'CMDP_SYSLOG_HOST',
-  'CMDP_SYSLOG_PORT',
-  'CMDP_SYSLOG_PROTOCOL',
-  'CMDP_SYSLOG_FACILITY',
   'CMDP_DIAGNOSTIC_MODE'
 ];
 
@@ -162,7 +160,7 @@ requiredEnv.forEach((name) => {
 });
 requireEnvValue('PROXY_HOST', '127.0.0.1');
 requireEnvValue('CMDBDYNAMIC_REDIS_URL', 'rediss://redis.example.local:6380/0');
-requireEnvValue('CMDP_LOG_TARGET', 'stdout,syslog');
+requireEnvValue('CMDP_LOG_TARGET', 'stdout');
 requireEnvValue('CMDP_ASSISTANT_LLM_MAX_REQUEST_BYTES_ABSOLUTE', '2097152');
 requireEnvValue('CMDP_ASSISTANT_LLM_MAX_RESPONSE_BYTES_ABSOLUTE', '4194304');
 requireEnvValue('LITELLM_API_KEY_FILE_HOST', '');
@@ -180,11 +178,14 @@ requireText('docker-compose.runtime.yml', 'PROXY_HOST: ${PROXY_HOST:-127.0.0.1}'
 requireText('docker-compose.runtime.yml', '/health/live', 'container liveness healthcheck');
 requireText('docker-compose.runtime.yml', 'LITELLM_API_KEY_FILE', 'LiteLLM assistant secret file wiring');
 requireText('docker-compose.runtime.yml', 'source: ${LITELLM_API_KEY_FILE_HOST:-/dev/null}', 'LiteLLM empty-secret fallback');
-requireText('docker-compose.runtime.yml', 'CMDP_LOG_TARGET: ${CMDP_LOG_TARGET:-stdout,syslog}', 'production stdout and syslog target default');
-requireText('docker-compose.runtime.yml', 'CMDP_SYSLOG_HOST: ${CMDP_SYSLOG_HOST:?CMDP_SYSLOG_HOST must be set}', 'required syslog host wiring');
-requireText('docker-compose.runtime.yml', 'CMDP_SYSLOG_PORT', 'syslog port wiring');
-requireText('docker-compose.runtime.yml', 'CMDP_SYSLOG_PROTOCOL', 'syslog protocol wiring');
-requireText('docker-compose.runtime.yml', 'CMDP_SYSLOG_FACILITY', 'syslog facility wiring');
+requireText('docker-compose.runtime.yml', 'CMDP_LOG_TARGET: ${CMDP_LOG_TARGET:-stdout}', 'stdout-first log target default');
+rejectPattern('docker-compose.runtime.yml', /CMDP_SYSLOG_(?:HOST|PORT|PROTOCOL|FACILITY)/, 'direct syslog wiring in base Compose');
+requireText('docker-compose.syslog.yml', 'CMDP_LOG_TARGET: stdout,syslog', 'optional direct syslog target');
+requireText('docker-compose.syslog.yml', 'CMDP_SYSLOG_HOST: ${CMDP_SYSLOG_HOST:?CMDP_SYSLOG_HOST must be set for direct syslog logging}', 'optional syslog host requirement');
+requireText('docker-compose.syslog.yml', 'CMDP_SYSLOG_PORT', 'optional syslog port wiring');
+requireText('docker-compose.syslog.yml', 'CMDP_SYSLOG_PROTOCOL', 'optional syslog protocol wiring');
+requireText('docker-compose.syslog.yml', 'CMDP_SYSLOG_FACILITY', 'optional syslog facility wiring');
+rejectPattern('docker-compose.syslog.yml', /^\s*logging\s*:/m, 'Docker logging driver configuration');
 requireText('docker-compose.runtime.yml', 'CMDP_PUBLIC_ORIGIN: ${CMDP_PUBLIC_ORIGIN}', 'public origin wiring');
 requireText('docker-compose.runtime.yml', 'CMDP_TLS_CA_FILE: ${CMDP_TLS_CA_FILE:-}', 'private CA bundle wiring');
 rejectPattern('docker-compose.runtime.yml', /^\s*NODE_EXTRA_CA_CERTS:/m, 'compose override of prepared-base Node CA trust');
@@ -214,8 +215,11 @@ requireText('Dockerfile', 'mkdir -p /run/certs', 'private CA mount parent direct
 requireText('Dockerfile', 'ENTRYPOINT ["sh", "scripts/container-entrypoint.sh"]', 'runtime CA handoff entrypoint');
 requireText('scripts/tls-ca-smoke.sh', 'curl --fail --silent --show-error --cacert', 'private CA TLS smoke without insecure mode');
 rejectPattern('scripts/tls-ca-smoke.sh', /--insecure|\s-k(?:\s|$)/, 'insecure private CA TLS smoke option');
+requireText('scripts/verify-platform-log-route.sh', 'X-Request-ID', 'platform collector probe request identifier');
+requireText('scripts/verify-platform-log-route.sh', 'CMDP_LOG_PROBE_ID', 'platform collector probe environment contract');
+rejectPattern('scripts/verify-platform-log-route.sh', /--insecure|\s-k(?:\s|$)/, 'insecure platform collector probe option');
 requireText('Dockerfile', 'PROXY_HOST=127.0.0.1', 'loopback proxy host default');
-requireText('Dockerfile', 'CMDP_LOG_TARGET=stdout,syslog', 'production stdout and syslog targets');
+requireText('Dockerfile', 'CMDP_LOG_TARGET=stdout', 'stdout-first production log target');
 requireText('Dockerfile', `path:'/health/live'`, 'Docker liveness healthcheck');
 requireText('Dockerfile', 'd2-v${D2_VERSION}', 'pinned D2 binary download');
 requireText('Dockerfile', 'sha256sum -c -', 'D2 checksum validation');
@@ -300,6 +304,8 @@ requireText('.dockerignore', '.tmp-*', 'local temporary artifact exclusion');
   '/health/live',
   '/health/ready',
   '/metrics',
+  'CMDP_LOG_TARGET=stdout',
+  'docker-compose.syslog.yml',
   'CMDP_LOG_TARGET=stdout,syslog',
   'CMDP_SYSLOG_HOST',
   'CMDP_SYSLOG_PORT',
@@ -372,12 +378,14 @@ rejectPattern('.env.example', /^PROXY_HOST=0\.0\.0\.0$/m, 'public backend bind d
 ].forEach((rule) => requireText('.gitignore', rule, `local workspace ignore ${rule}`));
 
 [
-  ['docs/deployment-guide.md', 'CMDP_LOG_TARGET=stdout,syslog'],
+  ['docs/deployment-guide.md', 'CMDP_LOG_TARGET=stdout'],
+  ['docs/deployment-guide.md', 'docker-compose.syslog.yml'],
   ['docs/deployment-guide.md', 'CMDP_ASSISTANT_LLM_MAX_REQUEST_BYTES_ABSOLUTE=2097152'],
   ['docs/deployment-guide.md', 'CMDP_ASSISTANT_LLM_MAX_RESPONSE_BYTES_ABSOLUTE=4194304'],
   ['docs/deployment-guide.md', 'assistant.llm.maxRequestBytes'],
   ['docs/deployment-guide.md', 'Runtime rows'],
-  ['docs/deployment-guide.ru.md', 'CMDP_LOG_TARGET=stdout,syslog'],
+  ['docs/deployment-guide.ru.md', 'CMDP_LOG_TARGET=stdout'],
+  ['docs/deployment-guide.ru.md', 'docker-compose.syslog.yml'],
   ['docs/deployment-guide.ru.md', 'CMDP_ASSISTANT_LLM_MAX_REQUEST_BYTES_ABSOLUTE=2097152'],
   ['docs/deployment-guide.ru.md', 'CMDP_ASSISTANT_LLM_MAX_RESPONSE_BYTES_ABSOLUTE=4194304'],
   ['docs/deployment-guide.ru.md', 'assistant.llm.maxRequestBytes'],
@@ -415,6 +423,9 @@ requireText('.github/workflows/ci.yml', 'gkm-node-base.Dockerfile', 'prepared No
 requireText('.github/workflows/ci.yml', 'gkm-go-base.Dockerfile', 'prepared Go base fixture gate');
 requireText('.github/workflows/ci.yml', 'docker build --target gkm-runtime', 'manual prepared GKM image build gate');
 requireText('.github/workflows/ci.yml', '--target gkm-runtime-canonical', 'canonical prepared GKM image build gate');
+requireText('.github/workflows/ci.yml', 'npm run container:check', 'GitHub Compose base and syslog overlay gate');
+requireText('.github/workflows/ci.yml', 'scripts/build-gkm-base-images.sh', 'GitHub prepared-base bootstrap gate');
+requireText('.github/workflows/ci.yml', 'docker push "$CMDBDYNAMIC_GKM_CI_IMAGE"', 'GitHub canonical GKM image push gate');
 requireText('.github/workflows/ci.yml', 'needs:', 'Docker image dependency gate');
 requireText('.github/workflows/ci.yml', '- test', 'Docker image npm/UI dependency');
 requireText('.github/workflows/ci.yml', '- go_vulncheck', 'Docker image vulnerability dependency');
@@ -437,6 +448,9 @@ requireText('.gitlab-ci.yml', 'gkm-node-base.Dockerfile', 'prepared Node base fi
 requireText('.gitlab-ci.yml', 'gkm-go-base.Dockerfile', 'prepared Go base fixture gate');
 requireText('.gitlab-ci.yml', 'docker build --target gkm-runtime', 'manual prepared GKM image build gate');
 requireText('.gitlab-ci.yml', '--target gkm-runtime-canonical', 'canonical prepared GKM image build gate');
+requireText('.gitlab-ci.yml', 'npm run container:check', 'GitLab Compose base and syslog overlay gate');
+requireText('.gitlab-ci.yml', 'scripts/build-gkm-base-images.sh', 'GitLab prepared-base bootstrap gate');
+requireText('.gitlab-ci.yml', 'docker push "$CI_REGISTRY_IMAGE:gkm-$IMAGE_TAG"', 'GitLab canonical GKM image push gate');
 requireText('.gitlab-ci.yml', 'dist/cmdbdynamicpages-custompage.zip', 'GitLab custom page artifact path');
 requirePattern('.gitlab-ci.yml', /npm_test:[\s\S]*?rules:[\s\S]*?CI_COMMIT_TAG[\s\S]*?script:/, 'npm test gate for tag pipelines');
 requirePattern('.gitlab-ci.yml', /ui_smoke_required:[\s\S]*?rules:[\s\S]*?CI_COMMIT_TAG[\s\S]*?script:/, 'browser gate for tag pipelines');

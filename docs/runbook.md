@@ -32,10 +32,7 @@ CMDP_TLS_CA_FILE_HOST=
 CMDBDYNAMICPAGES_CSRF_SECRET=<external stable secret>
 CMDBDYNAMIC_REDIS_REQUIRED=true
 CMDBDYNAMIC_REDIS_PASSWORD_FILE=/run/secrets/cmdbdynamicpages_redis_password
-CMDP_LOG_TARGET=stdout,syslog
-CMDP_SYSLOG_HOST=<approved syslog collector>
-CMDP_SYSLOG_PORT=514
-CMDP_SYSLOG_PROTOCOL=udp
+CMDP_LOG_TARGET=stdout
 CMDP_DIAGNOSTIC_MODE=off
 ```
 
@@ -50,6 +47,15 @@ GET /cmdbuild/custom-api/logging/status
 ```
 
 Expected result: `/health/live` is `200`; `/health/ready` is `200` only when Redis and CMDBuild upstream are reachable; `/metrics` returns Prometheus text without cookies, tokens, user names, runtime rows, or raw CMDBuild payloads.
+
+`docker compose ... logs` proves local stdout only. Verify the platform-managed route with a platform-owned collector query that exits `0` only when it finds the emitted probe ID:
+
+```bash
+bash scripts/verify-platform-log-route.sh https://custom.example.local/health/live -- \
+  sh -c 'platform-log-query --contains "$CMDP_LOG_PROBE_ID"'
+```
+
+For direct syslog only, set `CMDP_SYSLOG_HOST` and start with `-f docker-compose.syslog.yml`; that overlay sets `CMDP_LOG_TARGET=stdout,syslog` and requires the syslog endpoint.
 
 ## Public Origin Behind Reverse Proxy
 
@@ -84,6 +90,17 @@ No destructive CMDBuild schema rollback is expected for ordinary runtime release
 ## Diagnostics
 
 Use `CMDP_DIAGNOSTIC_MODE=Basic` for safe incident diagnostics. Use `Verbose` only temporarily and only when sanitized request/upstream details are needed.
+
+### Local nginx restart loop
+
+The local ports are a contract: do not change `8088`, `8093`, `8090`, or `6379` to work around a failure. First inspect the rendered configuration and the container environment:
+
+```bash
+docker compose -f docker-compose.nginx.yml config --quiet
+docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' cmdbdynamicpages-nginx
+```
+
+The `/etc/nginx/templates/default.conf.template` requires `CMDP_NGINX_PUBLIC_HOST`, `CMDP_NGINX_PUBLIC_PROTO`, and `CMDP_NGINX_CUSTOM_API_READ_TIMEOUT`. `unknown "cmdp_nginx_public_host" variable` means nginx was not created through the supported Compose entrypoint or was created without its complete environment. Restore only nginx with `npm run nginx:dev`; it recreates that container with the same `network_mode: host` and port `8088`, without touching the backend, Redis, or CMDBuild. Then check `GET http://localhost:8088/health/live`, `GET http://localhost:8088/health/ready`, and `GET http://localhost:8088/cmdbuild/ui/`.
 
 Useful endpoints:
 

@@ -37,16 +37,20 @@ CMDBDYNAMIC_REDIS_PASSWORD_FILE=/run/secrets/cmdbdynamicpages_redis_password
 CMDBDYNAMIC_REDIS_REQUIRED=true
 CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=true
 CMDBDYNAMICPAGES_CSRF_SECRET=<stable external secret>
-CMDP_LOG_TARGET=stdout,syslog
+CMDP_LOG_TARGET=stdout
 CMDP_LOG_FORMAT=json
-CMDP_SYSLOG_HOST=syslog.example.local
-CMDP_SYSLOG_PORT=514
-CMDP_SYSLOG_PROTOCOL=udp
-CMDP_SYSLOG_FACILITY=local0
 CMDP_DIAGNOSTIC_MODE=off
 ```
 
-В репозитории есть backend `Dockerfile` для container deployment. Образ запускается от пользователя `node`, слушает `8093` и использует `/health/live` только как liveness container healthcheck. Для approved production collector задать `CMDP_SYSLOG_HOST`, `CMDP_SYSLOG_PORT`, `CMDP_SYSLOG_PROTOCOL` и `CMDP_SYSLOG_FACILITY`; `CMDP_LOG_TARGET=stdout,syslog` оставляет stdout/stderr локальным operational output.
+В репозитории есть backend `Dockerfile` для container deployment. Образ запускается от пользователя `node`, слушает `8093` и использует `/health/live` только как liveness container healthcheck. Structured logs всегда поступают в stdout/stderr; дальнейшую доставку выполняет platform collector, agent или sidecar. `docker compose ... logs` подтверждает только local output; внешний маршрут проверяется `scripts/verify-platform-log-route.sh` и platform-owned запросом к collector. Базовый Compose не задаёт Docker logging driver или topology syslog.
+
+Для прямой доставки приложением в syslog задать `CMDP_SYSLOG_HOST` и запустить явный overlay:
+
+```bash
+docker compose --env-file .env -f docker-compose.runtime.yml -f docker-compose.syslog.yml up -d
+```
+
+Overlay устанавливает `CMDP_LOG_TARGET=stdout,syslog` и требует `CMDP_SYSLOG_HOST`; порт, protocol и facility настраиваются через `CMDP_SYSLOG_PORT`, `CMDP_SYSLOG_PROTOCOL` и `CMDP_SYSLOG_FACILITY`.
 Production startup fail-closed, если не задан `CMDBDYNAMICPAGES_CSRF_SECRET` или `CMDP_PUBLIC_ORIGIN`. `CMDP_PUBLIC_ORIGIN` - публичный browser origin; `CMDBUILD_ORIGIN` - внутренний backend upstream и они могут различаться. `CMDP_NGINX_PUBLIC_HOST` и `CMDP_NGINX_PUBLIC_PROTO` должны совпадать с host[:port] и protocol `CMDP_PUBLIC_ORIGIN`; bundled nginx использует эти configured values, а не forwarding headers из запроса. `CMDP_DIAGNOSTIC_MODE=Verbose` включать только временно для incident diagnostics.
 Admin-facing container handoff описан отдельно: [CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md](CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md).
 

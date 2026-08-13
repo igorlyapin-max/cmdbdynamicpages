@@ -11,6 +11,7 @@ const runtimeTemplate = process.env.CMDBDYNAMIC_E2E_TEMPLATE || 'ProbeClassesByA
 const runtimeAttrType = process.env.CMDBDYNAMIC_E2E_ATTR_TYPE || 'reference';
 const cookieHeader = process.env.CMDBUILD_COOKIE_HEADER || readCookieJar(cookieJar);
 const nginxCompose = fs.readFileSync('docker-compose.nginx.yml', 'utf8');
+const nginxDevScript = fs.readFileSync('scripts/nginx-dev.sh', 'utf8');
 const nginxAvailable = await canReach(`${nginxOrigin}/health/live`);
 const skipWhenUnavailable = nginxAvailable ? false : `nginx same-origin front did not return healthy /health/live at ${nginxOrigin}`;
 
@@ -45,6 +46,17 @@ test('nginx compose pins public forwarding defaults and probes only nginx itself
   assert.match(nginxCompose, /nginx -t && test -s \/var\/run\/nginx\.pid && kill -0 \$\$\(cat \/var\/run\/nginx\.pid\)/);
   assert.doesNotMatch(nginxCompose, /\bwget\b/);
   assert.doesNotMatch(nginxCompose, /\/health\/live/);
+});
+
+test('nginx dev launcher uses Compose and preserves the fixed local port contract', () => {
+  assert.match(nginxDevScript, /docker compose -f docker-compose\.nginx\.yml config --quiet/);
+  assert.match(nginxDevScript, /docker container inspect "\$\{NAME\}"/);
+  assert.match(nginxDevScript, /EXISTING_PROJECT=.*com\.docker\.compose\.project/);
+  assert.match(nginxDevScript, /\[\[ -z "\$\{EXISTING_PROJECT\}" \|\| "\$\{EXISTING_PROJECT\}" == '<no value>' \]\]/);
+  assert.match(nginxDevScript, /docker rm --force "\$\{NAME\}"/);
+  assert.match(nginxDevScript, /belongs to Compose project/);
+  assert.match(nginxDevScript, /docker compose -f docker-compose\.nginx\.yml up -d --force-recreate --no-deps nginx/);
+  assert.doesNotMatch(nginxDevScript, /docker run/);
 });
 
 test('nginx health route reaches cmdbdynamicpages backend', { skip: skipWhenUnavailable }, async () => {

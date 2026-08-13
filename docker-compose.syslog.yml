@@ -1,0 +1,8 @@
+services:
+  cmdbdynamicpages:
+    environment:
+      CMDP_LOG_TARGET: stdout,syslog
+      CMDP_SYSLOG_HOST: ${CMDP_SYSLOG_HOST:?CMDP_SYSLOG_HOST must be set for direct syslog logging}
+      CMDP_SYSLOG_PORT: ${CMDP_SYSLOG_PORT:-514}
+      CMDP_SYSLOG_PROTOCOL: ${CMDP_SYSLOG_PROTOCOL:-udp}
+      CMDP_SYSLOG_FACILITY: ${CMDP_SYSLOG_FACILITY:-local0}
