@@ -91,13 +91,10 @@ test('[required:d2-current-contract] Designer blocks a retired D2 mapping until 
           ...templates[0],
           spec: {
             ...(templates[0].spec || {}),
+            assistantDraft: { diagramIntent: 'retired authoring contract' },
             authoring: {
               ...(templates[0].spec?.authoring || {}),
-              d2: { source: 'node: Node' },
-              assistant: {
-                ...(templates[0].spec?.authoring?.assistant || {}),
-                diagramSemanticsPrompt: 'retired prompt'
-              }
+              d2: { source: 'node: Node' }
             }
           }
         };
@@ -116,6 +113,7 @@ test('[required:d2-current-contract] Designer blocks a retired D2 mapping until 
     assert.equal(await page.locator('button[data-action="diagram-import-analyze"]').isDisabled(), true);
     await reset.click();
     assert.equal(await page.locator('button[data-action="diagram-import-analyze"]').isDisabled(), false);
+    assert.equal(await page.locator('#cmdp-diagram-import-source').inputValue(), 'node: Node');
   });
 });
 
@@ -2075,7 +2073,23 @@ test('Assistant keeps prompts separate from deterministic Designer controls', { 
   });
 });
 
-test('Assistant persists canonical authoring only through the explicit template Save', { skip: skipReason, timeout: 90_000 }, async () => {
+test('Assistant persists canonical authoring only through the explicit template Save', { skip: skipReason, timeout: 90_000 }, async (t) => {
+  const createdCodes = [];
+  t.after(async () => {
+    if (!createdCodes.length) return;
+    await withPage(async (cleanupPage) => {
+      await cleanupPage.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+      for (const fixtureCode of createdCodes) {
+        await cleanupPage.locator('a[data-designer-section="templates"]').click();
+        const deleteButton = cleanupPage.locator(`[data-action="delete-template"][data-code="${fixtureCode}"]`);
+        await deleteButton.waitFor({ timeout: 10_000 });
+        cleanupPage.once('dialog', (dialog) => dialog.accept());
+        const deleted = cleanupPage.waitForResponse((response) => new URL(response.url()).pathname === `/cmdbuild/custom-api/templates/${fixtureCode}` && response.request().method() === 'DELETE');
+        await deleteButton.click();
+        assert.equal((await deleted).status(), 200, `Cannot clean up owned fixture ${fixtureCode}`);
+      }
+    });
+  });
   await withPage(async (page) => {
     const code = `AssistantAuthoringSaveUiSmoke${Date.now()}`;
     const prompts = {
@@ -2089,6 +2103,14 @@ test('Assistant persists canonical authoring only through the explicit template 
     };
     const objectFlowSystemOverride = 'Для этого шаблона сохраняй результаты под пользовательскими именами блоков.';
     const d2Source = 'server: "Server" { class: server }';
+    const assertCanonicalDiagramPrompt = async (targetPage) => {
+      const field = targetPage.locator('#cmdp-assistant-diagram-intent-prompt');
+      await field.waitFor({ state: 'visible', timeout: 10_000 });
+      await field.scrollIntoViewIfNeeded();
+      assert.equal(await field.inputValue(), prompts.diagramIntent);
+      const box = await field.boundingBox();
+      assert.ok(box && box.width > 200 && box.height > 60, 'Canonical diagram prompt must remain visible and usable.');
+    };
     await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
     await page.locator('button[data-action="new-template"]').click();
@@ -2099,6 +2121,7 @@ test('Assistant persists canonical authoring only through the explicit template 
     await page.locator('button[data-action="save-template"]').click();
     const createResponse = await createResponsePromise;
     assert.equal(createResponse.status(), 201, await createResponse.text());
+    createdCodes.push(code);
 
     await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
     const retiredAssistantDraftRequests = [];
@@ -2112,11 +2135,17 @@ test('Assistant persists canonical authoring only through the explicit template 
     await addAssistantBusinessBlock(page, prompts.objectFlow);
     await page.locator('#cmdp-assistant-editor .assistant-template-system-prompts summary').click();
     await page.locator('[data-action="assistant-template-prompt-override"][data-template-assistant-prompt-key="objectFlow"]').click();
+    if (!await page.locator('#cmdp-template-assistant-system-prompt-objectFlow').isVisible()) {
+      await page.locator('#cmdp-assistant-editor .assistant-template-system-prompts summary').click();
+    }
     await page.locator('#cmdp-template-assistant-system-prompt-objectFlow').fill(objectFlowSystemOverride);
     await page.locator('a[data-designer-section="diagram-assistant"]').click();
     await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 10_000 });
     await page.locator('#cmdp-diagram-import-source').fill(d2Source);
     await page.locator('#cmdp-assistant-diagram-intent-prompt').fill(prompts.diagramIntent);
+    await page.locator('a[data-designer-section="assistant"]').click();
+    await page.locator('a[data-designer-section="diagram-assistant"]').click();
+    await assertCanonicalDiagramPrompt(page);
     await page.waitForTimeout(700);
     assert.deepEqual(retiredAssistantDraftRequests, [], 'Assistant input must not use the retired assistant-draft endpoint.');
 
@@ -2159,6 +2188,32 @@ test('Assistant persists canonical authoring only through the explicit template 
     assert.equal(saveBody?.cacheInvalidation?.staticSnapshots?.reason, 'authoring_only');
     assert.deepEqual(retiredAssistantDraftRequests, [], 'Explicit Save must use the normal template endpoint.');
 
+    await page.locator('a[data-designer-section="templates"]').click();
+    const otherCode = `ui_test_prompt_switch_${Date.now()}`;
+    await page.locator('button[data-action="new-template"]').click();
+    await page.locator('#cmdp-code').fill(otherCode);
+    await page.locator('#cmdp-description').fill('Isolated canonical prompt switch fixture');
+    const otherCreated = page.waitForResponse((response) => new URL(response.url()).pathname === '/cmdbuild/custom-api/templates' && response.request().method() === 'POST');
+    await page.locator('button[data-action="save-template"]').click();
+    assert.equal((await otherCreated).status(), 201);
+    createdCodes.push(otherCode);
+    await page.locator(`[data-action="select-template"][data-code="${otherCode}"]`).click();
+    assert.equal(await page.locator('#cmdp-template-context .code-inline').innerText(), otherCode);
+    await page.locator('a[data-designer-section="templates"]').click();
+    await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
+    await page.locator('a[data-designer-section="diagram-assistant"]').click();
+    await assertCanonicalDiagramPrompt(page);
+
+    await withPage(async (freshPage) => {
+      await freshPage.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+      await freshPage.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+      await freshPage.locator(`[data-action="select-template"][data-code="${code}"]`).click();
+      assert.equal(await freshPage.locator('#cmdp-template-context .code-inline').innerText(), code);
+      await freshPage.locator('a[data-designer-section="diagram-assistant"]').click();
+      await assertCanonicalDiagramPrompt(freshPage);
+      assert.equal(await freshPage.locator('#cmdp-diagram-import-source').inputValue(), d2Source);
+    });
+
     await page.reload({ waitUntil: 'domcontentloaded' });
     await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
     await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
@@ -2172,7 +2227,7 @@ test('Assistant persists canonical authoring only through the explicit template 
     assert.equal(await page.locator('#cmdp-template-assistant-system-prompt-objectFlow').inputValue(), objectFlowSystemOverride);
     await page.locator('a[data-designer-section="diagram-assistant"]').click();
     await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 10_000 });
-    assert.equal(await page.locator('#cmdp-assistant-diagram-intent-prompt').inputValue(), prompts.diagramIntent);
+    await assertCanonicalDiagramPrompt(page);
     assert.equal(await page.locator('#cmdp-diagram-import-source').inputValue(), d2Source);
 
     // A deterministic rebuild must preserve the complete canonical authoring
@@ -2201,17 +2256,9 @@ test('Assistant persists canonical authoring only through the explicit template 
     await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
     await page.locator('a[data-designer-section="diagram-assistant"]').click();
     await page.waitForSelector('#cmdp-diagram-assistant-editor', { timeout: 10_000 });
-    assert.equal(await page.locator('#cmdp-assistant-diagram-intent-prompt').inputValue(), prompts.diagramIntent);
+    await assertCanonicalDiagramPrompt(page);
     assert.equal(await page.locator('#cmdp-diagram-import-source').inputValue(), d2Source);
 
-    await page.locator('a[data-designer-section="templates"]').click();
-    const deleteButton = page.locator(`[data-action="delete-template"][data-code="${code}"]`);
-    await deleteButton.waitFor({ timeout: 10_000 });
-    page.once('dialog', (dialog) => dialog.accept());
-    const deleteResponsePromise = page.waitForResponse((response) => response.url().includes(`/cmdbuild/custom-api/templates/${code}`) && response.request().method() === 'DELETE');
-    await deleteButton.click();
-    const deleteResponse = await deleteResponsePromise;
-    assert.equal(deleteResponse.status(), 200, await deleteResponse.text());
   });
 });
 

@@ -3,6 +3,12 @@
 .omk/
 .kimi/
 .recovery/
+/AGENTS.md
+/.tmp-*
+/example.d2
+/example2.d2
+/example3.d2
+/docs/2026-08-03/
 node_modules/
 npm-debug.log*
 dist/*.zip

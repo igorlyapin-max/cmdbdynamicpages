@@ -5,7 +5,7 @@ import { once } from 'node:events';
 
 const REQUIRED_TEST_IDS = [
   'designer-shell',
-  'd2-recovery-save',
+  'd2-current-contract',
   'object-flow-recovery-extraction',
   'build-identity'
 ];

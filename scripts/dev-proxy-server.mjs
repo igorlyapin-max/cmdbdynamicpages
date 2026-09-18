@@ -59587,6 +59587,7 @@ export {
   assistantCoverageModel,
   assistantDiagramModelBundle,
   assistantDiagramBindingIntentSeed,
+  assistantDiagramBindingIntentMessages,
   normalizeAssistantDiagramBindingIntentResponse,
   assistantDiagramBindingIntentDraftFromResponse,
   assistantDiagramMappingCoverage,

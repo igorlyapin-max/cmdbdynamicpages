@@ -4,6 +4,10 @@
 .omk
 .agents
 .codex
+.recovery
+AGENTS.md
+secrets
+docs/2026-08-03
 node_modules
 npm-debug.log*
 dist

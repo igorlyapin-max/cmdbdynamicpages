@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-09-18 - v00.00.00.09
+
+### Added
+
+- Added bounded synthetic Assistant quality experiments, a production binding-stage replay tool, and focused regression tests.
+- Added an offline testtemplate4 prompt/Notes revision builder and documented the observed evaluation results and CMDBuild metadata guidance.
+- Extended browser coverage for explicit Assistant prompt saving and restoration across template switches and fresh contexts.
+
+### Fixed
+
+- Pointed the required browser gate at the existing current D2 contract scenario instead of its removed recovery predecessor; all four mandatory scenarios must still execute.
+- Updated that scenario to use unsupported authoring state rather than a discarded prompt field, and verified that explicit reset preserves the D2 source.
+
+### Known limitations
+
+- Full automatic diagram generation for testtemplate4 remains unverified as successful: all three recorded UI trials stopped at a server-to-VLAN hierarchy condition.
+- Three P2 review findings remain open: class Notes replacement can cross its intended section, a candidate compilation failure can leave other experiment workers running, and replay checks an occupied report path only after model calls.
+- Saved CMDBuild templates and private evaluation snapshots are not included in this Git release.
+
 ## 2026-07-09 - v0.1.0-static-baseline
 
 ### Added
