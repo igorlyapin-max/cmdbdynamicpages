@@ -1,30 +1,38 @@
-# Карта секретов
+# Карта секретов и доверенных материалов
 
-| ID | Поток/компонент | Секрет | Где хранится | Где используется | Ротация | Примечание |
-| --- | --- | --- | --- | --- | --- | --- |
-| SEC-001 | IF-004 Browser/Backend/CMDBuild | `CMDBuild-Authorization` cookie | Выдается CMDBuild, хранится в браузере как `HttpOnly` cookie | Backend извлекает на server side и пересылает в CMDBuild REST header | По политике CMDBuild sessions | Не логировать, не отдавать в JSON |
-| SEC-002 | Backend state-changing API | `CMDBDYNAMICPAGES_CSRF_SECRET` | Secret/env уровня деплоя | Генерация `X-CMDBDynamicPages-CSRF` | При деплое или по ИБ-процедуре; смена инвалидирует текущие CSRF токены | Не хранить в git |
-| SEC-003 | IF-005 Backend/Redis | Redis password | `CMDBDYNAMIC_REDIS_PASSWORD_FILE` предпочтительно; допускается env/URL для dev | Redis AUTH перед `PING/GET/SET/DEL` | По ИБ-процедуре, минимум при компрометации/смене контура | Production Redis обязан требовать пароль |
-| SEC-004 | IF-004 Backend/CMDBuild | CMDBuild technical data permissions | CMDBuild role/grants | Доступ к `Cst_QueryTool*` классам | Через CMDBuild admin process | Не отдельный секрет, но доступ влияет на права редактора |
+Источники: `scripts/dev-proxy-server.mjs` (`readSecretValue`, `readOptionalSecretValue`, `validateRuntimeConfig`, `ensureAssistantStatusReady`, HMAC-функции), `scripts/container-entrypoint.sh`, `docker-compose.runtime.yml`. Значения секретов, сертификаты, fingerprints и реальные адреса хранилищ не приводятся.
 
-## Правила хранения
+## Реестр
 
-- Секреты не коммитятся в git.
-- Для Redis production использовать file-mounted secret:
+IF3 означает доставку env и read-only mounted files в backend, не сетевой вызов secret manager. IF0 означает использование Redis credentials. Назначенные API-реестром OAPI2/OAPI100 связывают cookie с проверкой текущей сессии; OAPI200 связывает API key с LiteLLM-вызовом. Session header используется и другими аутентифицированными операциями [consumed CMDBuild API](openapi/cmdbuild-consumed.openapi.yaml); указанные два потока не ограничивают область действия сессии.
 
-```text
-CMDBDYNAMIC_REDIS_URL=redis://redis-host:6379/0
-CMDBDYNAMIC_REDIS_PASSWORD_FILE=/run/secrets/cmdbdynamicpages_redis_password
-```
+<!-- aa-table: secrets -->
+| Контур | Поток | Секрет | Применимость | Тип | Инициатор / хранение | Получатель / хранение | Периодичность | Обновление | Ответственный |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Требует согласования | OAPI2; OAPI100 | `CMDBuild-Authorization` | Пользовательская CMDBuild cookie-сессия для backend и пересылки в CMDBuild REST header | Session token | CMDBuild и browser cookie jar; место серверного хранения: Требует согласования | Backend извлекает cookie в память на запрос; CMDBuild получает header; локально HTTP `8088/8093` и upstream `8090`, целевой порт: Требует согласования | Требует согласования | Перевыпуск/отзыв CMDBuild-сессии; процедура и срок: Требует согласования | Требует согласования |
+| Требует согласования | IF3 | `CMDBDYNAMICPAGES_CSRF_SECRET` | Обязателен для production startup; CSRF и подписи D2 proposal/mapping | Секрет HMAC | Deployment env; исходное защищенное хранилище: Требует согласования | Env backend -> память процесса при старте; `_FILE` для этого параметра не реализован | Требует согласования | Обновить env и перезапустить/recreate backend; прежние CSRF и D2 signatures перестают соответствовать; восстановление D2 через повторную проверку, не обычный Save | Требует согласования |
+| Требует согласования | IF3; IF0 | Redis password | При Redis AUTH; production-политика обязательности пароля: Требует согласования | Пароль | Read-only file через `CMDBDYNAMIC_REDIS_PASSWORD_FILE_HOST`; исходное хранилище: Требует согласования | `CMDBDYNAMIC_REDIS_PASSWORD_FILE`, Compose target `/run/secrets/cmdbdynamicpages_redis_password`; память backend; Redis AUTH по RESP/RESP over TLS, default `6379` | Требует согласования | Согласованно сменить Redis credentials и mount/env backend, recreate, проверить H1/H2; порядок переключения/отзыва: Требует согласования | Требует согласования |
+| Требует согласования | IF3; OAPI200 | LiteLLM API key | Только вызовы включенного Assistant; не обязательная зависимость startup/readiness | API key | Read-only file через `LITELLM_API_KEY_FILE_HOST`; исходное хранилище: Требует согласования | `LITELLM_API_KEY_FILE`, Compose target `/run/secrets/cmdbdynamicpages_litellm_api_key`; память backend; передача LiteLLM по HTTP(S), порт из deployment URL: Требует согласования | Требует согласования | Заменить ключ у провайдера и в mount/env, recreate backend; проверить status и разрешенный Assistant-вызов без вывода ключа; отзыв: Требует согласования | Требует согласования |
+| Требует согласования | IF3 | CA bundle (`CMDP_TLS_CA_FILE`) | Опциональное дополнительное доверие HTTPS CMDBuild/LiteLLM и Redis TLS; это не секрет и не private key | Доверенный PEM-материал | Read-only file через `CMDP_TLS_CA_FILE_HOST`; источник доверия: Требует согласования | Compose target `/run/certs/cmdbdynamicpages-ca.pem`; entrypoint выставляет `NODE_EXTRA_CA_CERTS` из `CMDP_TLS_CA_FILE`; Redis TLS явно читает тот же bundle | Требует согласования | Заменить доверенный файл по согласованной процедуре и recreate backend; проверить TLS соединения; сроки и владелец PKI: Требует согласования | Требует согласования |
 
-- `CMDBDYNAMIC_REDIS_PASSWORD` и `redis://:password@host:6379/0` допустимы для локальной диагностики, но не рекомендуются как production storage.
-- Health/status responses маскируют Redis password в URL.
+## Приоритеты и ошибки конфигурации
 
-## Смена Redis password
+- CSRF: при обычном непроизводственном запуске без env секрет генерируется в памяти. Для `NODE_ENV=production` validator требует стабильный внешний непустой секрет и отвергает встроенный список placeholder-значений. Генерация случайного значения не делает production-конфигурацию допустимой.
+- Этот же секрет используется в `signDiagramImportProposal` и `signDiagramImportMappingValidation`. Его ротация влияет не только на CSRF. Нельзя обещать сохранение валидности старых D2 signatures или их автоматическое подтверждение через Save.
+- Redis: file имеет приоритет перед `CMDBDYNAMIC_REDIS_PASSWORD`; затем используется пароль из `CMDBDYNAMIC_REDIS_URL`, если полученное значение пусто. Заданный нечитаемый file вызывает ошибку при загрузке модуля: это **не** optional-secret path. Read-only mount защищает от записи приложением, но не задает ротацию или secret-store policy.
+- Runtime Compose задает Redis required для readiness/runtime, но не разворачивает Redis server, AUTH/ACL и не доказывает наличие его пароля. Локальный Redis в nginx Compose не настроен на AUTH; этот профиль не подтверждает production-защиту. Пароль нельзя включать в committed URL или команды диагностики.
+- LiteLLM: непустой `LITELLM_API_KEY` имеет приоритет над file; код также читает имена `CMDP_LITELLM_API_KEY` и `CMDP_LITELLM_API_KEY_FILE`. Compose передает основной file-параметр. Отсутствующий/пустой файл дает `missing`, ошибка чтения, кроме ENOENT, дает `invalid_file`, не исключение startup.
+- При пустом `LITELLM_API_KEY_FILE_HOST` Compose монтирует `/dev/null`: базовый backend может стартовать без ключа. Если задан путь к каталогу/нечитаемому файлу, приложение сообщает `assistant.secret_file_invalid` без ключа. Ошибка bind mount со стороны container engine остается отдельной deployment-ошибкой.
+- При вызове Assistant сначала проверяется enabled; выключенный дает `assistant_disabled` (503). При включенном Assistant invalid file дает `assistant_secret_file_invalid` (503), отсутствие ключа дает `assistant_not_configured` (503). Ни ключ, ни LiteLLM не проверяются в H2. Периодического перечитывания API key нет: обновление требует нового процесса.
 
-1. Создать новый password в secret store.
-2. Обновить Redis configuration/ACL.
-3. Обновить mounted secret или deployment env backend.
-4. Перезапустить backend.
-5. Проверить `GET /health/redis` и `GET /health/ready`.
-6. Удалить старый secret.
+## CA, cookie и граница ответственности
+
+Если `CMDP_TLS_CA_FILE` пуст, entrypoint сохраняет унаследованный `NODE_EXTRA_CA_CERTS` prepared base image. Если CA задан, оба параметра должны указывать на один читаемый обычный файл; validator проверяет этот контракт, а не фактическую работоспособность всей PKI. Redis `rediss://` дополнительно получает CA через `CMDP_TLS_CA_FILE`; это отличается от настройки только Node HTTPS trust.
+
+Отсутствующий CA mount допускается: runtime Compose подставляет `/dev/null`, но параметр `CMDP_TLS_CA_FILE` должен оставаться пустым, пока реальный bundle не предоставлен. Не задавать этот параметр на placeholder mount. Runtime trust, build-time trust и доверие registry daemon являются разными контрактами. Управление trust store платформы находится за границей приложения.
+
+Backend не выпускает CMDBuild session cookie и не добавляет `HttpOnly` автоматически: `rewriteProxySetCookieHeader` сохраняет остальные атрибуты и может настроить `SameSite`/`Secure`. Проверка `HttpOnly`, срока жизни и HTTPS-политики на стороне CMDBuild/deployment: Требует согласования. Токен не должен попадать в логи или документы; health endpoints сессию не используют.
+
+CMDBuild roles/grants являются разрешениями, а не отдельным секретом. Их владельцы и процедуры выдачи: Требует согласования. CSRF token в `X-CMDBDynamicPages-CSRF` является производным от session token и HMAC secret; отдельного постоянного secret store для него нет.
+
+Успешные H0/H1/H2 не доказывают ротацию, отзыв старых credentials или приемку Assistant. Требуется отдельная проверка применимого сценария. Источники хранения, контуры, ответственные, cadence и регламент ротации остаются **Требует согласования**; предположительные значения не подставляются в XLSX.

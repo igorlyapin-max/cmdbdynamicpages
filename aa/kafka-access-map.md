@@ -1,14 +1,9 @@
 # Карта доступов Kafka
 
-Kafka/RabbitMQ в текущей версии проекта не используются.
+Статус: неприменимо (not applicable).
 
-| Topic/Queue | Producer | Consumer | Система | Статус |
-| --- | --- | --- | --- | --- |
-| Н/П | Н/П | Н/П | Н/П | Асинхронный обмен отсутствует |
+В runtime проекта нет Kafka/RabbitMQ clients, topics, producers или consumers. Основание: `package.json`, `scripts/dev-proxy-server.mjs`, `docker-compose.runtime.yml`.
 
-При добавлении асинхронного обмена карта должна быть синхронизирована с:
+Выбор платформой Kafka как транспорта внешнего сборщика stdout не означает прямой Kafka-интеграции приложения. Такой транспорт согласуется платформой отдельно.
 
-- [information-model.md](information-model.md);
-- будущим `aa/asyncapi.yaml`;
-- [secrets-map.md](secrets-map.md);
-- [event-logging-map.md](event-logging-map.md).
+XLSX для Kafka не создаётся. При появлении прямого брокерного обмена требуются карта topics/ACL/контуров, XLSX и [AsyncAPI](asyncapi-applicability.md), согласованные с [информационной моделью](information-model.md).

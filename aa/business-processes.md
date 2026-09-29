@@ -1,161 +1,71 @@
-# Описание бизнес-процессов
+# Бизнес-процессы
 
-## BP-001. Подготовка шаблона динамической страницы
+Пользователь действует через браузер и Designer. Сохранённый алгоритм исполняется детерминированно; LLM — необязательный инструмент предложения конфигурации. HTTP-операции и flow IDs приведены в [реестре](information-model.md) и [OpenAPI](openapi.yaml).
 
-```mermaid
-flowchart TD
-  U[Редактор шаблонов] --> B[Веб-браузер]
-  B -->|GET Designer, 8093 или 8088| D[cmdbdynamicpages Designer]
-  D -->|GET catalog/templates, 8093| API[cmdbdynamicpages Backend]
-  API -->|REST, 8090| C[CMDBuild REST]
-  API -->|PING/GET/SET, 6379| R[Redis]
-  D -->|POST validate/preview, 8093| API
-  D -->|POST/PUT template, 8093| API
-  API -->|create/update cards, 8090| C
-  API -->|best-effort version card, 8090| C
-```
-
-Позитивный сценарий:
-
-1. Редактор открывает Designer.
-2. Designer загружает список шаблонов и каталог CMDBuild в рамках прав текущего пользователя.
-3. Редактор задает входные переменные, выборки, сопоставление, итоговые данные, визуализацию и cache policy.
-4. Preview выполняется через backend под текущей CMDBuild-сессией.
-5. При сохранении backend пишет `Cst_QueryTemplate` и best-effort версию в `Cst_QueryTemplateVersion`.
-
-Негативные сценарии:
-
-- нет CMDBuild session cookie: backend возвращает 401;
-- нет прав на технические классы: показывается permission denied text шаблона;
-- CMDBuild REST недоступен на `8090`: preview/save завершается ошибкой backend;
-- Redis недоступен: Designer продолжает работать, но readiness будет `503`, если Redis обязателен.
-
-Логирование:
-
-| Событие | Где фиксируется | Данные |
-| --- | --- | --- |
-| Загрузка launcher/custom page | `/cmdbuild/custom-api/client-log` | stage, href, timestamp |
-| Proxy request к CMDBuild UI | `/cmdbuild/custom-api/proxy-log` | method, path, referer, userAgent |
-| Preview шаблона | standard backend logs | requestId, template, user, status, rows |
-| Save/update шаблона | `Cst_QueryTemplateVersion` best-effort | template, version, changedBy |
-
-## BP-002. Запуск dynamic runtime страницы
+## Подготовка и проверка данных
 
 ```mermaid
 flowchart TD
-  V[Пользователь/iframe] --> B[Веб-браузер]
-  B -->|GET /cmdbuild/dynamicpages/ui/run/template, 8093 или 8088| UI[Runtime UI]
-  UI -->|GET /cmdbuild/custom-api/templates/template/run, 8093| API[Backend]
-  API -->|read template cards, 8090| C[CMDBuild REST]
-  API -->|GET/SET runtime cache, 6379| R[Redis]
-  API -->|business data REST, 8090| C
-  API --> UI
-  UI --> V
+  User[Редактор] --> Browser[Браузер / Designer]
+  Browser -->|IF5: UI assets, HTTP 8088 / HTTPS 443| Front[Проектный proxy / ingress]
+  Front -->|HTTP 8093: session, catalog, templates API| Backend[cmdbdynamicpages]
+  Backend -->|HTTP 8090 стенд / HTTPS 443 контур: REST запрос| CMDB[CMDBuild]
+  CMDB -->|HTTP 8090 / HTTPS 443: metadata, cards, permissions| Backend
+  Backend -->|HTTP 8093: данные и диагностика| Front
+  Front -->|HTTP 8088 / HTTPS 443: результаты| Browser
 ```
 
-Позитивный сценарий:
+1. Авторизация: backend проверяет текущую CMDBuild-сессию и права; операции изменения дополнительно требуют same-origin и CSRF. Это общий подпроцесс сохранения, публикации и запросов Assistant.
+2. Пользователь задаёт параметры и блоки данных вручную в редакторах или через Assistant. Каталог подтверждает классы, атрибуты и пути с учётом прав и настроенной глубины.
+3. Необязательный Assistant подготавливает семантический план, затем Object Flow. Каждый ответ проверяется детерминированно; неоднозначности показываются пользователю, предложения применяются явно.
+4. «Извлечение» выполняет выборки и сопоставления. Некорректное D2 mapping не блокирует проверку данных без диаграмм. «Итоговые данные» управляют представлением публикуемой таблицы.
+5. Сохранение записывает конфигурацию в технические CMDBuild-классы; запись истории версий — best effort. Результат сохранения и ошибка записи версии различаются в логах.
 
-1. Пользователь открывает runtime URL или iframe.
-2. Runtime UI вызывает read-only `GET run`.
-3. Backend загружает шаблон, проверяет cache policy и права.
-4. При cache hit возвращается готовый результат.
-5. При cache miss backend выполняет DSL через CMDBuild REST и кладет результат в Redis.
-6. Runtime UI отображает итоговую таблицу, sorting/filtering выполняются на клиенте.
+Отказы: 401 без сессии; 403 без прав/CSRF; 409 при конфликте ревизий; ошибки детерминированной валидации; ограничение строк/REST-вызовов/времени. Отклонённый ответ модели не применяется. Регистрация: HTTP completion, `assistant.object_flow.*`, `template.*`, `template.execution_failed`, см. [карту событий](event-logging-map.md).
 
-Негативные сценарии:
-
-- cookie CMDBuild не передан: dynamic runtime показывает сообщение о необходимости входа;
-- недостаточно прав на business data или technical classes: возвращается permission denied text;
-- Redis недоступен: при `CMDBDYNAMIC_HEALTH_REDIS_REQUIRED=true` readiness `503`, runtime может использовать memory fallback в dev;
-- превышены лимиты строк/REST calls/traversal depth: backend возвращает ошибку выполнения.
-
-Логирование:
-
-| Событие | Где фиксируется | Данные |
-| --- | --- | --- |
-| GET runtime iframe | access/proxy logs окружения | URL без cookie/token |
-| Direct `POST run` | standard backend logs | template, user, status, rows |
-| Runtime `GET run` | standard backend logs | read-only iframe режим |
-| Нет данных в правах пользователя | response JSON | HTTP 200, `success=true`, пустые `rows`, `emptyText` |
-| Нет прав на используемый класс/атрибут | response JSON + backend stderr/container logs | HTTP 403, `success=false`, `permissionDenied=true`, `permissionDeniedText`; частичный результат по другим выборкам не отдается |
-| Ошибка выполнения | response JSON + backend stderr/container logs | message/status; masked CMDBuild 404 может классифицироваться как generic execution error |
-
-## BP-003. Публикация static snapshot
+## D2: структура, данные и связи
 
 ```mermaid
-flowchart TD
-  E[Редактор] --> D[Designer]
-  D -->|POST publish, 8093| API[Backend]
-  API -->|execute template, 8090| C[CMDBuild REST]
-  API -->|SET snapshot, 6379| R[Redis]
-  V[Зритель] -->|GET public snapshot, 8093 или 8088| API
-  API -->|GET snapshot, 6379| R
+flowchart LR
+  U[Браузер / Designer] -->|HTTP 8088 / HTTPS 443: analyze, interpret, map, apply| API[cmdbdynamicpages через proxy]
+  API -->|IF1: stdin, локальный процесс| Import[cmdp-d2-import]
+  Import -->|IF1: IR / диагностика| API
+  API -->|OAPI200: HTTPS 443 / HTTP 4000, необязательно| LLM[LiteLLM]
+  LLM -->|OAPI200: JSON предложение, HTTPS 443 / HTTP 4000| API
+  API -->|IF2: stdin D2, локальный процесс| D2[D2 renderer]
+  D2 -->|IF2: SVG / ошибка| API
+  API -->|HTTP 8088 / HTTPS 443: предложение / preview| U
 ```
 
-Позитивный сценарий:
+1. Пользователь загружает D2. Анализатор извлекает роли, экземпляры, структуру и Notes без LLM.
+2. «Интерпретировать структуру» предлагает семантику объектов/контейнеров; «Предложить маппинг» сопоставляет с подтверждёнными результатами Object Flow. Notes и prompt задают предметную логику, но не обходят проверку.
+3. Пользователь явно применяет предложение либо редактирует mapping вручную: структуру, источники карточек, фильтры, подписи, иерархию и алгоритмы D2-связей.
+4. Preview использует текущую конфигурацию и данные. Частичный preview сопровождается диагностикой пропущенных элементов; демонстрационные объекты D2 не подменяют отсутствующие данные.
+5. Сохранение удерживает незавершённые правки. Публикация диаграммы требует исполнимого mapping; это не требование к отдельному извлечению или публикации таблицы.
 
-1. Редактор включает `staticSnapshot`, подтверждает предупреждение и публикует snapshot.
-2. Backend выполняет шаблон под сессией редактора.
-3. Результат сохраняется в Redis без TTL.
-4. Runtime отдает snapshot без проверки прав зрителя на исходные CMDBuild-объекты.
+Отказы: malformed D2, неподтверждённые ссылки, конфликт ревизий, timeout LiteLLM, неполный mapping и ошибка renderer. Для поддерживаемых staged Assistant-операций checkpoint/resume продолжает незавершённый этап. Регистрация: `assistant.diagram_mapping.*`, D2 import/render и HTTP completion. Prompts, карточки и ключи не включаются в операционные логи.
 
-Негативные сценарии:
-
-- предупреждение не принято: публикация запрещена;
-- snapshot отсутствует в Redis: Runtime выводит `Страница отсутствует для загрузки`;
-- Redis потерян без восстановления RDB: администратор/редактор должен опубликовать snapshot заново.
-
-## BP-004. Health/readiness мониторинг
+## Запуск и публикация
 
 ```mermaid
-flowchart TD
-  M[Мониторинг/балансировщик] -->|GET /health/live, 8093 или 8088| API[Backend]
-  M -->|GET /health/ready, 8093 или 8088| API
-  API -->|PING, 6379| R[Redis]
-  API -->|GET sessions/current, 8090| C[CMDBuild REST]
+flowchart LR
+  U[Пользователь / браузер] -->|HTTP 8088 / HTTPS 443: run или snapshot| API[cmdbdynamicpages через proxy]
+  API -->|IF0: RESP 6379, GET/SET| Cache[Redis]
+  Cache -->|IF0: RESP 6379, cached rows / snapshot| API
+  API -->|HTTP 8090 / HTTPS 443: REST чтение| CMDB[CMDBuild]
+  CMDB -->|HTTP 8090 / HTTPS 443: карточки| API
+  API -->|IF2: локально, только диаграммы| D2[D2 renderer]
+  D2 -->|IF2: SVG| API
+  API -->|HTTP 8088 / HTTPS 443: таблица / SVG| U
 ```
 
-Позитивный сценарий:
+- Динамический запуск проверяет сессию и права, использует cache policy; cache miss исполняет сохранённый алгоритм. LLM не вызывается.
+- Публикация static snapshot требует явного подтверждения: данные извлекаются под сессией издателя, snapshot доступен без повторной проверки прав зрителя на исходные объекты. Redis хранит snapshot без TTL.
+- Snapshot отсутствует/потерян: выдаётся состояние отсутствующей страницы, требуется повторная публикация. Ошибки доступа или выполнения не заменяются данными другого пользователя.
+- Регистрация: `runtime.cache_result`, `snapshot.*`, `template.executed`, `template.execution_failed`. Исходные строки и секреты не логируются.
 
-1. Liveness проверяет, что backend process отвечает.
-2. Readiness проверяет Redis и CMDBuild upstream.
-3. Redis-only health позволяет отдельно видеть состояние Redis.
+## Мониторинг и поддержка
 
-Негативные сценарии:
+Общий подпроцесс: `H0` liveness, `H1` Redis health, `H2` readiness, `M0` metrics. Readiness проверяет CMDBuild, Redis по политике обязательности, D2 renderer и importer; точные условия — [HealthCheck](healthcheck-map.md).
 
-- Redis недоступен: `/health/redis` и `/health/ready` возвращают `503`;
-- CMDBuild недоступен: `/health/ready` возвращает `503`;
-- backend process недоступен: liveness не получает ответ.
-
-## BP-005. Designer assistant draft
-
-```mermaid
-flowchart TD
-  UI[Designer] -->|POST assistant/template-draft| API[cmdbdynamicpages Backend]
-  API -->|validate current session/CSRF| C[CMDBuild session]
-  API -->|chat completions| L[LiteLLM]
-  API -->|validate returned DSL| UI
-```
-
-Позитивный сценарий:
-
-1. Пользователь в Designer нажимает `Assistant draft` и описывает нужную таблицу или диаграмму.
-2. Backend проверяет CMDBuild session cookie, same-origin headers и CSRF token.
-3. Если `CMDP_ASSISTANT_ENABLED=false`, endpoint возвращает controlled disabled response.
-4. Если assistant включен, backend отправляет краткий intent и текущий draft context в LiteLLM-compatible `/v1/chat/completions`.
-5. Ответ модели парсится как JSON и валидируется тем же DSL validator, что обычный шаблон.
-6. Designer применяет только валидный deterministic draft; runtime pages не вызывают LLM.
-
-Негативные сценарии:
-
-- нет CMDBuild session cookie или сессия истекла: endpoint отклоняется как обычный protected API;
-- нет CSRF/same-origin для POST: endpoint отклоняется как state-changing вызов;
-- LiteLLM key не настроен при включенном assistant: readiness/config validation показывает ошибку;
-- модель вернула невалидный DSL: ответ не применяется в Designer.
-
-Логирование:
-
-| Событие | Где фиксируется | Данные |
-| --- | --- | --- |
-| Assistant draft request | structured logger `assistant.template_draft.*` | requestId, username/session hash, model, status/error |
-| CSRF/same-origin отказ | backend logs | route, HTTP status; token не пишется |
+Операционные события идут в `L2` stdout/stderr. Дополнительный маршрут `L3` syslog или `L4` platform collector выбирается эксплуатацией. Диагностика `off` по умолчанию, `Basic` безопасна по составу полей, `Verbose` применяется временно с маскированием. Доставка проверяется отдельно от HTTP health. Для поддержки используются request ID, этап и безопасная причина; cookie, API key и бизнес-payload не копируются в обращения.

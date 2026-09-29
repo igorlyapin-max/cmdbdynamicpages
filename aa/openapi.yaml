@@ -3,15 +3,46 @@ info:
   title: cmdbdynamicpages API
   version: 0.1.0
   description: >
-    Backend-owned UI/API for CMDBuild dynamic pages. Dynamic endpoints run with
-    the current CMDBuild session cookie. Health endpoints are unauthenticated.
+    HTTP-контракт backend cmdbdynamicpages. Закрытые маршруты принимают только
+    cookie CMDBuild-Authorization, не Bearer/header/query token. Проверка
+    действительности сессии зависит от обработчика и описана у операции.
+    Публичные health, metrics, cache/status и public-snapshots не требуют cookie.
+    Операции с csrfHeader дополнительно требуют same-origin Origin либо Referer
+    (Origin имеет приоритет); ожидаемый origin задаётся CMDP_PUBLIC_ORIGIN,
+    иначе вычисляется из HTTP Host. Отсутствие обоих заголовков даёт 403.
+    Неподдержанный метод на маршрутах с methodAllowed даёт 405 и Allow;
+    необработанное исключение custom-api даёт 500, остановка сервиса даёт 503.
     Каноническое Assistant/D2 authoring хранится в `spec.authoring`; версию
     шаблона записывает только обычный template POST/PUT.
+x-source-evidence:
+  - scripts/dev-proxy-server.mjs: handleBackend, handleDynamicPagesUi, backendAuthFromRequest, requireStateChangingRequest
+  - scripts/dev-proxy-server.mjs: readinessPayload, d2RendererHealth, d2ImporterHealth
+x-contract-scope: >
+  Контракт выведен из исходного кода, а не из live-проверки инфраструктуры заказчика.
+  Порядок существующих paths сохранён; обычные HTTP operations нумеруются OAPI0
+  и далее. H/M/L имеют семантический приоритет; alias health сохраняет H того же
+  probe. Удалённые Assistant contracts не поддержаны и не запланированы.
+  Прозрачный proxy CMDBuild не является отдельным owned API. Используемое backend
+  подмножество внешних REST-вызовов описано в openapi/cmdbuild-consumed.openapi.yaml и
+  openapi/litellm-consumed.openapi.yaml.
 servers:
+  - url: "{protocol}://{host}:{port}"
+    description: >
+      Placeholder адреса поставки, не сеть заказчика. FQDN, TLS termination,
+      protocol и port для каждого контура требуют согласования; defaults
+      синтаксические, не подтверждение deployment.
+    variables:
+      protocol:
+        default: https
+        enum: [http, https]
+      host:
+        default: dynamicpages.example.invalid
+      port:
+        default: "443"
   - url: http://127.0.0.1:8093
-    description: Local dynamicpages backend
+    description: Только локальный development backend, HTTP/TCP 8093
   - url: http://localhost:8088
-    description: Local same-origin nginx front
+    description: Только локальный development nginx front, HTTP/TCP 8088
 tags:
   - name: health
   - name: diagnostics
@@ -35,13 +66,14 @@ security:
 paths:
   /health/live:
     get:
+      x-flow-id: H0
       tags: [health]
       security: []
-      summary: Liveness probe
-      description: Public operational probe. It exposes only backend process liveness and no CMDBuild data.
+      summary: Проверка жизнеспособности
+      description: Публичная эксплуатационная проверка. Показывает только жизнеспособность процесса backend, без данных CMDBuild.
       responses:
         "200":
-          description: Backend process is alive
+          description: Процесс backend работает
           headers:
             X-CMDP-Version:
               $ref: "#/components/headers/CmdpVersion"
@@ -57,13 +89,14 @@ paths:
                 $ref: "#/components/schemas/LiveHealth"
   /health/redis:
     get:
+      x-flow-id: H1
       tags: [health]
       security: []
-      summary: Strict Redis health probe
-      description: Public operational probe. It reports Redis availability without credentials or cached business data.
+      summary: Строгая проверка доступности Redis
+      description: Публичная эксплуатационная проверка. Показывает доступность Redis без учётных данных и кэшированных бизнес-данных.
       responses:
         "200":
-          description: Redis is available
+          description: Redis доступен
           headers:
             X-CMDP-Version:
               $ref: "#/components/headers/CmdpVersion"
@@ -78,7 +111,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/RedisHealth"
         "503":
-          description: Redis is unavailable or disabled
+          description: Redis недоступен либо выключен
           headers:
             X-CMDP-Version:
               $ref: "#/components/headers/CmdpVersion"
@@ -88,15 +121,28 @@ paths:
               $ref: "#/components/headers/CmdpProvenance"
             X-CMDP-Editor-SHA256:
               $ref: "#/components/headers/CmdpEditorSha256"
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/RedisHealth"
+                  - $ref: "#/components/schemas/HealthFailure"
   /health/ready:
     get:
+      x-flow-id: H2
       tags: [health]
       security: []
-      summary: Production readiness probe
-      description: Public operational probe. It exposes aggregate dependency readiness only.
+      summary: Проверка готовности к промышленной эксплуатации
+      description: >
+        Публичная проверка зависимостей. ready = cmdbuild.ok AND
+        (NOT HEALTH_REDIS_REQUIRED OR redis.ok) AND (NOT d2.required OR d2.ok)
+        AND (NOT d2Import.required OR d2Import.ok). Renderer обязателен при
+        CMDP_D2_RENDER_ENABLED; importer обязателен всегда. Оба проверяются локальными
+        процессами, не HTTP, с кэшем проверки 15 секунд. Проверка CMDBuild
+        без сессии подтверждает доступность HTTP, но не права пользователя.
       responses:
         "200":
-          description: Backend is ready
+          description: Backend готов к работе
           headers:
             X-CMDP-Version:
               $ref: "#/components/headers/CmdpVersion"
@@ -111,7 +157,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ReadyHealth"
         "503":
-          description: Backend is not ready
+          description: Backend не готов к работе
           headers:
             X-CMDP-Version:
               $ref: "#/components/headers/CmdpVersion"
@@ -121,15 +167,22 @@ paths:
               $ref: "#/components/headers/CmdpProvenance"
             X-CMDP-Editor-SHA256:
               $ref: "#/components/headers/CmdpEditorSha256"
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ReadyHealth"
+                  - $ref: "#/components/schemas/HealthFailure"
   /metrics:
     get:
+      x-flow-id: M0
       tags: [health]
       security: []
-      summary: Prometheus metrics
-      description: Returns aggregate operational counters and gauges only; cookies, tokens, user names, runtime rows, and raw CMDBuild payloads are not exposed.
+      summary: Метрики Prometheus
+      description: Возвращает только агрегированные эксплуатационные счётчики и текущие значения; cookie, токены, имена пользователей, строки результатов выполнения и исходные данные CMDBuild не раскрываются.
       responses:
         "200":
-          description: Prometheus text exposition
+          description: Текстовый формат экспорта Prometheus
           content:
             text/plain; version=0.0.4:
               schema:
@@ -139,120 +192,149 @@ paths:
                   # TYPE cmdp_health_ready gauge
                   cmdp_health_ready 1
         "500":
-          description: Metrics rendering failed
+          description: Ошибка формирования метрик
   /cmdbuild/custom-api/cache/status:
     get:
+      x-flow-id: OAPI0
       tags: [diagnostics]
       security: []
-      summary: Diagnostic cache status
-      description: Public operational diagnostic. Returns 200 even when Redis fallback to memory is active; do not use as strict readiness. Redis credentials and cached business data are never returned.
+      summary: Диагностическое состояние кэша
+      description: Публичная эксплуатационная диагностика. Возвращает 200 даже при переключении с Redis на кэш в памяти; не использовать как строгую проверку готовности. Учётные данные Redis и кэшированные бизнес-данные не возвращаются.
       responses:
         "200":
-          description: Cache diagnostic status
+          description: Диагностическое состояние кэша
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/CacheStatus"
   /cmdbuild/custom-api/logging/status:
     get:
+      x-flow-id: OAPI1
       tags: [diagnostics]
-      summary: Diagnostic logging configuration
-      description: Returns active log level, target and redaction settings without secrets. This is not readiness.
+      summary: Диагностическая конфигурация логирования
+      description: >
+        Возвращает конфигурацию логирования без секретов. Проверяет только наличие
+        cookie, без запроса sessions/current. Не является readiness.
       responses:
         "200":
-          description: Logging diagnostic status
+          description: Диагностическое состояние логирования
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/LoggingStatus"
         "401":
-          description: CMDBuild session cookie is missing or invalid
+          description: Cookie CMDBuild-Authorization отсутствует
   /cmdbuild/custom-api/session:
     get:
+      x-flow-id: OAPI2
       tags: [session]
-      summary: Current CMDBuild session
+      summary: Текущая сессия CMDBuild
       responses:
         "200":
-          description: Sanitized session
+          description: Отфильтрованная сессия и статус запроса в CMDBuild
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ApiResponse"
+                $ref: "#/components/schemas/SessionProbeResponse"
         "401":
-          description: CMDBuild session cookie is missing or invalid
+          description: Cookie CMDBuild-Authorization отсутствует
+        "502":
+          description: sessions/current вернул не-2xx, включая истёкшую сессию
   /cmdbuild/custom-api/model/catalog:
     get:
+      x-flow-id: OAPI3
       tags: [model]
-      summary: Current-user visible model catalog
+      summary: Каталог модели, доступный текущему пользователю
       responses:
         "200":
-          description: Classes, attributes, domains, lookups visible to current user
+          description: Классы, атрибуты, домены и справочники, доступные текущему пользователю
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ApiResponse"
   /cmdbuild/custom-api/model/classes:
     get:
+      x-flow-id: OAPI4
       tags: [model]
-      summary: Visible CMDBuild classes
+      summary: Доступные классы CMDBuild
       parameters:
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/Start"
       responses:
         "200":
-          description: Class list
+          description: Список классов
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ApiResponse"
   /cmdbuild/custom-api/model/classes/{className}:
     get:
+      x-flow-id: OAPI5
       tags: [model]
-      summary: One CMDBuild class metadata
+      summary: Метаданные одного класса CMDBuild
       parameters:
         - $ref: "#/components/parameters/ClassName"
       responses:
         "200":
-          description: Class metadata
+          description: Метаданные класса
         "403":
-          description: Access denied
+          description: Доступ запрещён
         "404":
-          description: Class not found
+          description: Класс не найден
   /cmdbuild/custom-api/model/classes/{className}/attributes:
     get:
+      x-flow-id: OAPI6
       tags: [model]
-      summary: Attributes visible for one class
+      summary: Доступные атрибуты одного класса
       parameters:
         - $ref: "#/components/parameters/ClassName"
       responses:
         "200":
-          description: Attribute list
+          description: Список атрибутов
   /cmdbuild/custom-api/model/domains:
     get:
+      x-flow-id: OAPI7
       tags: [model]
-      summary: Visible CMDBuild domains
+      summary: Доступные домены CMDBuild
       parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Start"
         - name: detailed
           in: query
           schema:
             type: boolean
+        - name: details
+          in: query
+          description: Дополнительно запросить метаданные отдельных доменов
+          schema:
+            type: boolean
+            default: false
+        - name: maxDetails
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 200
+            default: 50
       responses:
         "200":
-          description: Domain list
+          description: Список доменов
   /cmdbuild/custom-api/auth/permission-scope:
     get:
+      x-flow-id: OAPI8
       tags: [model]
-      summary: Permission-scope diagnostics
+      summary: Диагностика области действия разрешений
       responses:
         "200":
-          description: Diagnostic visible-model hashes and endpoint statuses
+          description: Диагностические хэши доступной модели и статусы endpoints
   /cmdbuild/custom-api/csrf:
     get:
+      x-flow-id: OAPI9
       tags: [session]
-      summary: Get custom API CSRF token
+      summary: Получить CSRF-токен custom API
       responses:
         "200":
-          description: CSRF token for non-GET calls
+          description: CSRF-токен для вызовов, отличных от GET
           content:
             application/json:
               schema:
@@ -264,8 +346,9 @@ paths:
                     type: string
   /cmdbuild/custom-api/schema:
     get:
+      x-flow-id: OAPI10
       tags: [schema]
-      summary: Technical schema readiness
+      summary: Готовность технической схемы
       parameters:
         - name: root
           in: query
@@ -279,18 +362,20 @@ paths:
             example: Class
       responses:
         "200":
-          description: Technical schema status
+          description: Состояние технической схемы
   /cmdbuild/custom-api/schema/parents:
     get:
+      x-flow-id: OAPI11
       tags: [schema]
-      summary: Candidate parent superclasses for technical schema
+      summary: Допустимые родительские суперклассы технической схемы
       responses:
         "200":
-          description: Parent class list
+          description: Список родительских классов
   /cmdbuild/custom-api/schema/preview:
     post:
+      x-flow-id: OAPI12
       tags: [schema]
-      summary: Preview non-destructive technical schema bootstrap
+      summary: Предварительный просмотр создания технической схемы без разрушительных изменений
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -302,13 +387,14 @@ paths:
               $ref: "#/components/schemas/SchemaBootstrapRequest"
       responses:
         "200":
-          description: Schema plan without CMDBuild changes
+          description: План схемы без изменений в CMDBuild
         "403":
-          description: CSRF check failed
+          description: Проверка CSRF не пройдена
   /cmdbuild/custom-api/schema/bootstrap:
     post:
+      x-flow-id: OAPI13
       tags: [schema]
-      summary: Create missing technical schema objects without destructive updates
+      summary: Создать отсутствующие объекты технической схемы без разрушительных изменений
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -320,19 +406,21 @@ paths:
               $ref: "#/components/schemas/SchemaBootstrapRequest"
       responses:
         "200":
-          description: Bootstrap completed
+          description: Первичное создание схемы завершено
         "403":
-          description: CSRF or admin privilege check failed
+          description: Проверка CSRF или административных привилегий не пройдена
   /cmdbuild/custom-api/config:
     get:
+      x-flow-id: OAPI14
       tags: [config]
-      summary: Runtime configuration
+      summary: Конфигурация выполнения
       responses:
         "200":
-          description: Config card data
+          description: Данные карточки конфигурации
     put:
+      x-flow-id: OAPI15
       tags: [config]
-      summary: Upsert runtime configuration
+      summary: Создать или обновить конфигурацию выполнения
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -344,11 +432,12 @@ paths:
               type: object
       responses:
         "200":
-          description: Config saved
+          description: Конфигурация сохранена
   /cmdbuild/custom-api/assistant/object-flow/plan:
     post:
+      x-flow-id: OAPI16
       tags: [assistant]
-      summary: Propose a complete deterministic object flow
+      summary: Предложить полный детерминированный Object Flow
       description: >
         LLM authoring-предложение полного потока Selection -> Match ->
         Selection. Ответ не меняет текущий spec и применяется явно через
@@ -365,37 +454,38 @@ paths:
               $ref: "#/components/schemas/AssistantObjectFlowPlanRequest"
       responses:
         "200":
-          description: Typed complete object-flow proposal
+          description: Типизированное предложение полного Object Flow
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantObjectFlowPlanResponse"
         "401":
-          description: CMDBuild session is invalid or expired
+          description: Сессия CMDBuild недействительна либо истекла
         "403":
           description: Не пройдена CSRF-проверка или шаблон недоступен для чтения
         "409":
-          description: Saved template changed before proposal generation
+          description: Сохранённый шаблон изменился до формирования предложения
         "422":
-          description: Assistant proposal failed deterministic object-flow validation
+          description: Предложение Assistant не прошло детерминированную проверку Object Flow
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantObjectFlowPlanResponse"
         "429":
-          description: Authoring execution throttle reached
+          description: Достигнут лимит выполнения операций редактирования
         "503":
-          description: Assistant is disabled or LiteLLM is not configured
+          description: Assistant выключен либо LiteLLM не настроен
   /cmdbuild/custom-api/assistant/object-flow/semantic-plan:
     post:
+      x-flow-id: OAPI17
       tags: [assistant]
-      summary: Prepare or resume the semantic plan for named Object Flow blocks
+      summary: Подготовить или продолжить семантический план именованных блоков Object Flow
       description: >
-        Two-stage authoring operation. Stage context stores a bounded,
-        session-scoped MCP checkpoint and returns HTTP 202. Stage plan resumes
-        that checkpoint and produces one semantic contract per named user
-        block. The browser sends a saved-template reference and a bounded
-        editor delta; it never transfers the complete currentSpec.
+        Двухэтапная операция редактирования. Этап context сохраняет ограниченную
+        контрольную точку MCP в области текущей сессии и возвращает HTTP 202.
+        Этап plan продолжает её и формирует по одному семантическому контракту
+        на именованный пользовательский блок. Браузер передаёт ссылку на
+        сохранённый шаблон и ограниченные изменения редактора, но не полный currentSpec.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -407,33 +497,34 @@ paths:
               $ref: "#/components/schemas/AssistantObjectFlowSemanticPlanRequest"
       responses:
         "200":
-          description: Semantic plan is ready
+          description: Семантический план готов
         "202":
-          description: Bounded context checkpoint is ready for the plan stage
+          description: Контрольная точка ограниченного контекста готова для этапа plan
         "400":
-          description: Request, template reference, or editor delta is invalid
+          description: Некорректный запрос, ссылка на шаблон либо изменения редактора
         "401":
-          description: CMDBuild session is invalid or expired
+          description: Сессия CMDBuild недействительна либо истекла
         "403":
-          description: CSRF check failed or the saved template is not readable
+          description: Проверка CSRF не пройдена либо сохранённый шаблон недоступен для чтения
         "409":
-          description: Saved template or checkpoint identity changed
+          description: Изменился сохранённый шаблон либо идентификационные данные контрольной точки
         "413":
-          description: Bounded context or checkpoint exceeds configured limits
+          description: Ограниченный контекст либо контрольная точка превышает настроенные лимиты
         "422":
-          description: Semantic plan failed deterministic validation
+          description: Семантический план не прошёл детерминированную проверку
         "429":
-          description: Authoring execution throttle reached
+          description: Достигнут лимит выполнения операций редактирования
         "502":
-          description: LiteLLM or MCP context preparation failed
+          description: Ошибка LiteLLM либо подготовки контекста MCP
         "503":
-          description: Assistant is disabled or LiteLLM is not configured
+          description: Assistant выключен либо LiteLLM не настроен
         "504":
-          description: Semantic-plan stage timed out and may be resumed
+          description: Превышен таймаут этапа семантического плана; выполнение можно продолжить
   /cmdbuild/custom-api/draft/object-flow/apply:
     post:
+      x-flow-id: OAPI18
       tags: [templates]
-      summary: Apply a reviewed object flow to the editor draft
+      summary: Применить проверенный Object Flow к черновику редактора
       description: >
         Детерминированно валидирует и компилирует проверенные selection/match
         stages в новый editor spec. Endpoint не вызывает LLM, не сохраняет и не
@@ -452,28 +543,29 @@ paths:
               $ref: "#/components/schemas/ObjectFlowApplyRequest"
       responses:
         "200":
-          description: Validated editor spec and mapping-source list
+          description: Проверенный spec редактора и список источников сопоставления
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ObjectFlowApplyResponse"
         "401":
-          description: CMDBuild session is invalid or expired
+          description: Сессия CMDBuild недействительна либо истекла
         "403":
           description: Не пройдена CSRF-проверка или шаблон недоступен для чтения
         "409":
-          description: Editor draft or saved template changed before apply
+          description: Черновик редактора либо сохранённый шаблон изменился до применения
         "422":
-          description: Reviewed flow failed deterministic validation or compilation
+          description: Проверяемый поток не прошёл детерминированную валидацию либо компиляцию
   /cmdbuild/custom-api/mcp:
     post:
+      x-flow-id: OAPI19
       tags: [mcp]
-      summary: Read-only CMDBuild MCP JSON-RPC endpoint
+      summary: Endpoint CMDBuild MCP JSON-RPC только для чтения
       description: >
-        Authoring-only Model Context Protocol adapter for the current CMDBuild
-        session. It exposes a narrow read-only tool allowlist controlled by
-        RuntimeConfigJson.assistant.mcp. Runtime template execution, endpoint
-        cache and static snapshots do not call this endpoint.
+        Адаптер Model Context Protocol для редактирования в текущей сессии
+        CMDBuild. Предоставляет узкий разрешённый набор инструментов только для
+        чтения, управляемый RuntimeConfigJson.assistant.mcp. Выполнение шаблонов,
+        кэш endpoints и статические снимки не вызывают этот endpoint.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -491,13 +583,13 @@ paths:
               $ref: "#/components/schemas/McpJsonRpcRequest"
             examples:
               toolsList:
-                summary: List allowed tools
+                summary: Перечислить разрешённые инструменты
                 value:
                   jsonrpc: "2.0"
                   id: 1
                   method: tools/list
               callModelSummary:
-                summary: Read visible CMDBuild model summary
+                summary: Прочитать сводку доступной модели CMDBuild
                 value:
                   jsonrpc: "2.0"
                   id: 2
@@ -509,33 +601,35 @@ paths:
                       maxDomains: 30
       responses:
         "200":
-          description: JSON-RPC result
+          description: Результат JSON-RPC
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/McpJsonRpcResponse"
         "400":
-          description: JSON-RPC protocol or tool error
+          description: Ошибка протокола JSON-RPC либо инструмента
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/McpJsonRpcResponse"
         "403":
-          description: CSRF or same-origin check failed
+          description: Проверка CSRF либо same-origin не пройдена
   /cmdbuild/custom-api/templates:
     get:
+      x-flow-id: OAPI20
       tags: [templates]
-      summary: List query templates
+      summary: Перечислить шаблоны запросов
       responses:
         "200":
-          description: Template list
+          description: Список шаблонов
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/TemplateListResponse"
     post:
+      x-flow-id: OAPI21
       tags: [templates]
-      summary: Create query template
+      summary: Создать шаблон запроса
       description: >
         Обычное глобальное `Сохранить` для нового шаблона. Требует create
         permission, сохраняет canonical `spec.authoring` вместе с executable
@@ -551,25 +645,27 @@ paths:
               $ref: "#/components/schemas/TemplatePayload"
       responses:
         "200":
-          description: Template created
+          description: Шаблон создан
   /cmdbuild/custom-api/templates/{code}:
     parameters:
       - $ref: "#/components/parameters/TemplateCode"
     get:
+      x-flow-id: OAPI22
       tags: [templates]
-      summary: Get one template
+      summary: Получить один шаблон
       responses:
         "200":
-          description: Template
+          description: Шаблон
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/TemplateResponse"
         "404":
-          description: Template not found
+          description: Шаблон не найден
     put:
+      x-flow-id: OAPI23
       tags: [templates]
-      summary: Update one template
+      summary: Обновить один шаблон
       description: >
         Обычное глобальное `Сохранить` для существующего шаблона. Требует update
         permission и является единственной update-операцией, записывающей версию
@@ -587,7 +683,7 @@ paths:
               $ref: "#/components/schemas/TemplatePayload"
       responses:
         "200":
-          description: Template updated
+          description: Шаблон обновлён
           content:
             application/json:
               schema:
@@ -595,47 +691,51 @@ paths:
         "403":
           description: Нет Template update permission или не пройдена CSRF-проверка
         "409":
-          description: Template changed since the caller loaded it
+          description: Шаблон изменился после его загрузки вызывающей стороной
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/TemplateVersionConflict"
     delete:
+      x-flow-id: OAPI24
       tags: [templates]
-      summary: Delete one template
+      summary: Удалить один шаблон
       security:
         - cmdbuildCookie: []
           csrfHeader: []
       responses:
         "200":
-          description: Template deleted
+          description: Шаблон удалён
   /cmdbuild/custom-api/templates/{code}/versions:
     parameters:
       - $ref: "#/components/parameters/TemplateCode"
     get:
+      x-flow-id: OAPI25
       tags: [templates]
-      summary: Template versions
+      summary: Версии шаблона
       responses:
         "200":
-          description: Version list
+          description: Список версий
   /cmdbuild/custom-api/templates/{code}/validate:
     parameters:
       - $ref: "#/components/parameters/TemplateCode"
     post:
+      x-flow-id: OAPI26
       tags: [templates]
-      summary: Validate saved template
+      summary: Проверить сохранённый шаблон
       security:
         - cmdbuildCookie: []
           csrfHeader: []
       responses:
         "200":
-          description: Validation result
+          description: Результат проверки
   /cmdbuild/custom-api/templates/{code}/preview:
     parameters:
       - $ref: "#/components/parameters/TemplateCode"
     post:
+      x-flow-id: OAPI27
       tags: [templates]
-      summary: Preview saved template
+      summary: Предварительный просмотр сохранённого шаблона
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -643,14 +743,15 @@ paths:
         $ref: "#/components/requestBodies/RunParams"
       responses:
         "200":
-          description: Preview result
+          description: Результат предварительного просмотра
   /cmdbuild/custom-api/templates/{code}/run:
     parameters:
       - $ref: "#/components/parameters/TemplateCode"
     get:
+      x-flow-id: OAPI28
       tags: [runtime]
-      summary: Read-only runtime execution
-      description: Used by Runtime UI/iframe; no CSRF required. Runtime execution is not stored in CMDBuild technical classes; events go through standard backend logging. Empty authorized results are returned as HTTP 200 with empty rows and `emptyText`. An explicit CMDBuild 401/403 on a class or attribute used by the template is returned as HTTP 403 with `permissionDenied=true`; the runtime does not return a partial multi-selection result in that case. If CMDBuild masks permission denial as 404, the current implementation may classify it as a generic execution error.
+      summary: Выполнение шаблона только для чтения
+      description: Используется Runtime UI/iframe; CSRF не требуется. Выполнение не сохраняется в технических классах CMDBuild; события проходят через стандартное логирование backend. Пустые результаты при разрешённом доступе возвращаются как HTTP 200 с пустыми строками и `emptyText`. Явный ответ CMDBuild 401/403 для класса или атрибута, используемого шаблоном, возвращается как HTTP 403 с `permissionDenied=true`; частичный результат нескольких выборок в этом случае не возвращается. Если CMDBuild маскирует отказ в доступе ответом 404, текущая реализация может классифицировать его как общую ошибку выполнения.
       parameters:
         - name: refresh
           in: query
@@ -664,27 +765,28 @@ paths:
             enum: ["1"]
         - name: json
           in: query
-          description: Reserved runtime output flag. When true/1/yes, returns the final runtime result as application/json instead of the normal API envelope used by the HTML runtime shell.
+          description: Зарезервированный флаг вывода результата выполнения. При true/1/yes возвращает конечный результат в формате application/json вместо обычной оболочки ответа API, используемой HTML-оболочкой выполнения.
           schema:
             type: string
             enum: ["true", "1", "yes"]
       responses:
         "200":
-          description: Runtime result
+          description: Результат выполнения
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/RuntimeJsonResult"
         "403":
-          description: Permission denied
+          description: Недостаточно прав доступа
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/RuntimePermissionDenied"
     post:
+      x-flow-id: OAPI29
       tags: [runtime]
-      summary: Direct runtime execution
-      description: Designer/API POST may request `forceRefresh` to rebuild the runtime cache without the user refresh cooldown. GET runtime does not accept forced refresh.
+      summary: Прямое выполнение шаблона
+      description: POST из Designer/API может передать `forceRefresh` для перестроения кэша выполнения без пользовательского интервала ожидания между обновлениями. GET выполнения не допускает принудительное обновление.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -698,13 +800,14 @@ paths:
         $ref: "#/components/requestBodies/RunParams"
       responses:
         "200":
-          description: Runtime result
+          description: Результат выполнения
   /cmdbuild/custom-api/templates/{code}/publish:
     parameters:
       - $ref: "#/components/parameters/TemplateCode"
     post:
+      x-flow-id: OAPI30
       tags: [runtime]
-      summary: Publish static snapshot to Redis
+      summary: Опубликовать статический снимок в Redis
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -712,26 +815,28 @@ paths:
         $ref: "#/components/requestBodies/RunParams"
       responses:
         "200":
-          description: Snapshot published
+          description: Снимок опубликован
   /cmdbuild/custom-api/public-snapshots/{code}/run:
     parameters:
       - $ref: "#/components/parameters/TemplateCode"
     get:
+      x-flow-id: OAPI31
       tags: [runtime]
       security: []
-      summary: Run public static snapshot
-      description: Public only for an explicitly published static snapshot. It reads the stored snapshot and never executes a CMDBuild query for the viewer.
+      summary: Получить публичный статический снимок
+      description: Публичный доступ разрешён только для явно опубликованного статического снимка. Читает сохранённый снимок и никогда не выполняет запрос CMDBuild от имени просматривающего пользователя.
       responses:
         "200":
-          description: Snapshot result or missing snapshot response
+          description: Результат снимка либо ответ об отсутствии снимка
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/RuntimeJsonResult"
   /cmdbuild/custom-api/draft/validate:
     post:
+      x-flow-id: OAPI32
       tags: [templates]
-      summary: Validate unsaved draft
+      summary: Проверить несохранённый черновик
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -743,17 +848,18 @@ paths:
               $ref: "#/components/schemas/DraftPayload"
       responses:
         "200":
-          description: Validation result
+          description: Результат проверки
   /cmdbuild/custom-api/draft/diagram-import/analyze:
     post:
+      x-flow-id: OAPI33
       tags: [assistant]
-      summary: Analyze a self-contained D2 structure template
+      summary: Проанализировать автономный шаблон структуры D2
       description: >
-        Read-only deterministic parser stage Assistant-owned D2 import workflow.
-        Требует валидную CMDBuild session и CSRF protection, возвращает structural
-        IR, rendered preview и signed review proposal, но не меняет и не
-        сохраняет шаблон. Обычное Save или publication проверяет write permission;
-        сам analysis его не требует.
+        Детерминированный этап разбора только для чтения в процессе импорта D2,
+        принадлежащем Assistant. Требует действительную сессию CMDBuild и защиту
+        CSRF, возвращает структурное IR, отрисованный предварительный просмотр
+        и подписанное предложение для проверки, но не меняет и не сохраняет
+        шаблон. Обычные Save и публикация проверяют права записи; сам анализ их не требует.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -765,67 +871,68 @@ paths:
               $ref: "#/components/schemas/DiagramImportAnalyzeRequest"
       responses:
         "200":
-          description: Structural IR and merge proposal
+          description: Структурное IR и предложение объединения
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagramImportAnalyzeResponse"
         "400":
-          description: Request body or D2 source is invalid
+          description: Некорректное тело запроса либо исходный код D2
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagramImportErrorResponse"
         "401":
-          description: CMDBuild session is invalid or expired
+          description: Сессия CMDBuild недействительна либо истекла
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagramImportErrorResponse"
         "403":
-          description: CSRF validation failed
+          description: Проверка CSRF не пройдена
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagramImportErrorResponse"
         "413":
-          description: Configured source, output, or element limit reached
+          description: Достигнут настроенный лимит исходного кода, вывода либо числа элементов
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagramImportErrorResponse"
         "415":
-          description: Request content type is not application/json
+          description: Тип содержимого запроса отличается от application/json
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagramImportErrorResponse"
         "422":
-          description: D2 parse, compile, or import validation failed
+          description: Ошибка разбора, компиляции D2 либо проверки импорта
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagramImportErrorResponse"
         "429":
-          description: D2 analysis execution throttle reached
+          description: Достигнут лимит выполнения анализа D2
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagramImportErrorResponse"
         "502":
-          description: D2 helper output or CMDBuild catalog is unavailable
+          description: Вывод вспомогательного процесса D2 либо каталог CMDBuild недоступен
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagramImportErrorResponse"
   /cmdbuild/custom-api/draft/diagram-import/apply:
     post:
+      x-flow-id: OAPI34
       tags: [templates]
-      summary: Apply reviewed D2 structure mappings to an editor draft
+      summary: Применить проверенные сопоставления структуры D2 к черновику редактора
       description: >
-        Diagram-owned deterministic apply stage. Принимает только явно
-        проверенные node/container роли, item-owned structureTree mappings и
-        connection rules, возвращает новый валидный local draft Spec JSON и не
+        Детерминированный этап применения, принадлежащий Diagram. Принимает только явно
+        проверенные роли node/container, сопоставления отдельных элементов structureTree и
+        правила связей, возвращает новый корректный локальный черновик Spec JSON и не
         вызывает LLM, не сохраняет и не публикует шаблон, не создаёт версию CMDB
         и не инвалидирует runtime/static cache. Нужны читаемый шаблон и
         совпадающая CAS revision из proposal, но не update permission.
@@ -840,19 +947,19 @@ paths:
               $ref: "#/components/schemas/DiagramImportApplyRequest"
       responses:
         "200":
-          description: Validated editor Spec JSON
+          description: Проверенный Spec JSON редактора
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagramImportApplyResponse"
         "400":
-          description: Request body or current D2 source is invalid
+          description: Некорректное тело запроса либо текущий исходный код D2
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagramImportErrorResponse"
         "401":
-          description: CMDBuild session is invalid or expired
+          description: Сессия CMDBuild недействительна либо истекла
           content:
             application/json:
               schema:
@@ -864,50 +971,51 @@ paths:
               schema:
                 $ref: "#/components/schemas/DiagramImportErrorResponse"
         "409":
-          description: Editor draft, saved template, source, or signed proposal changed after D2 analysis
+          description: Черновик редактора, сохранённый шаблон, исходный код либо подписанное предложение изменились после анализа D2
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagramImportErrorResponse"
         "413":
-          description: Request or normalized mapping exceeds a configured authoring limit
+          description: Запрос либо нормализованное сопоставление превышает настроенный лимит редактирования
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagramImportErrorResponse"
         "415":
-          description: Request content type is not application/json
+          description: Тип содержимого запроса отличается от application/json
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagramImportErrorResponse"
         "422":
-          description: Structure mappings or relation rules are unresolved, or the result spec is invalid
+          description: Не разрешены сопоставления структуры или правила связей либо итоговый spec некорректен
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagramImportErrorResponse"
         "429":
-          description: Authoring execution throttle reached
+          description: Достигнут лимит выполнения операций редактирования
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagramImportErrorResponse"
         "502":
-          description: CMDBuild catalog is unavailable for deterministic mapping validation
+          description: Каталог CMDBuild недоступен для детерминированной проверки сопоставлений
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiagramImportErrorResponse"
   /cmdbuild/custom-api/assistant/diagram-import/interpret:
     post:
+      x-flow-id: OAPI35
       tags: [assistant]
-      summary: Propose semantic interpretation of imported D2 roles
+      summary: Предложить семантическую интерпретацию импортированных ролей D2
       description: >
-        Authoring-only LLM proposal over a signed D2 import review context. Raw
-        D2 source, structural IR, and signed proposal internals are not forwarded
-        to the model. The response contains role semantics only and never changes
-        Diagram settings or the editor spec.
+        Предложение LLM только для редактирования на основе подписанного контекста
+        проверки импорта D2. Исходный код D2, структурное IR и внутренние поля
+        подписанного предложения не передаются модели. Ответ содержит только
+        семантику ролей и не меняет настройки Diagram либо spec редактора.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -919,19 +1027,19 @@ paths:
               $ref: "#/components/schemas/AssistantDiagramImportInterpretRequest"
       responses:
         "200":
-          description: Semantic role proposals
+          description: Предложения семантики ролей
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramImportInterpretResponse"
         "400":
-          description: Request body or Assistant input is invalid
+          description: Некорректное тело запроса либо входные данные Assistant
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "401":
-          description: CMDBuild session is invalid or expired
+          description: Сессия CMDBuild недействительна либо истекла
           content:
             application/json:
               schema:
@@ -943,65 +1051,66 @@ paths:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "409":
-          description: Saved template, source, or signed proposal changed after D2 analysis
+          description: Сохранённый шаблон, исходный код либо подписанное предложение изменились после анализа D2
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "413":
-          description: Request or sanitized Assistant context exceeds a configured limit
+          description: Запрос либо очищенный контекст Assistant превышает настроенный лимит
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "415":
-          description: Request content type is not application/json
+          description: Тип содержимого запроса отличается от application/json
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "422":
-          description: Assistant semantic proposal failed deterministic validation
+          description: Семантическое предложение Assistant не прошло детерминированную проверку
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "429":
-          description: Authoring execution throttle reached
+          description: Достигнут лимит выполнения операций редактирования
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "502":
-          description: LiteLLM or an upstream Assistant dependency failed
+          description: Ошибка LiteLLM либо внешней зависимости Assistant
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "503":
-          description: Assistant is disabled or LiteLLM is not configured
+          description: Assistant выключен либо LiteLLM не настроен
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "504":
-          description: Assistant request exceeded the configured stage timeout
+          description: Запрос Assistant превысил настроенный таймаут этапа
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
   /cmdbuild/custom-api/assistant/diagram-import/map-selections:
     post:
+      x-flow-id: OAPI36
       tags: [assistant]
-      summary: Propose staged D2 placement and topology mappings
+      summary: Предложить поэтапные сопоставления размещения и топологии D2
       description: >
-        Authoring-only LLM proposal. Stage roles maps each structureTree item to
-        structural, stage, or parentCard materialization. When connections need
-        mapping, HTTP 202 returns a checkpoint and stage topology resumes with
-        the same resumeId while preserving accepted placements. Eligible sources
-        are named terminal Object Flow results; helper stages are excluded unless
-        an explicit advanced contract allows one.
-        Returned mappings remain proposals until explicit deterministic Apply.
+        Предложение LLM только для редактирования. Этап roles сопоставляет каждый
+        элемент structureTree с материализацией structural, stage либо parentCard.
+        Если требуется сопоставление связей, HTTP 202 возвращает контрольную точку,
+        а этап topology продолжает работу с тем же resumeId, сохраняя принятые размещения.
+        Допустимые источники: именованные конечные результаты Object Flow;
+        вспомогательные этапы исключены, если явный расширенный контракт не разрешает их.
+        Возвращённые сопоставления остаются предложениями до явного детерминированного Apply.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -1013,25 +1122,25 @@ paths:
               $ref: "#/components/schemas/AssistantDiagramImportMapSelectionsRequest"
       responses:
         "200":
-          description: Completed placement and topology mapping proposal
+          description: Завершённое предложение сопоставлений размещения и топологии
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramImportMapSelectionsResponse"
         "202":
-          description: Placement mappings accepted and resumable topology stage is pending
+          description: Сопоставления размещения приняты; ожидается продолжение этапа topology
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramImportMapCheckpointResponse"
         "400":
-          description: Request body, stage, or resumeId is invalid
+          description: Некорректное тело запроса, stage либо resumeId
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "401":
-          description: CMDBuild session is invalid or expired
+          description: Сессия CMDBuild недействительна либо истекла
           content:
             application/json:
               schema:
@@ -1043,57 +1152,58 @@ paths:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "409":
-          description: Editor flow, source, proposal, checkpoint input, or requested resume stage changed
+          description: Изменились поток редактора, исходный код, предложение, входные данные контрольной точки либо запрошенный этап продолжения
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "413":
-          description: Request, sanitized model context, or resumable checkpoint exceeds a configured limit
+          description: Запрос, очищенный контекст модели либо контрольная точка продолжения превышает настроенный лимит
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "415":
-          description: Request content type is not application/json
+          description: Тип содержимого запроса отличается от application/json
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "422":
-          description: Assistant mapping proposal failed deterministic validation
+          description: Предложение сопоставлений Assistant не прошло детерминированную проверку
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "429":
-          description: Authoring execution throttle reached
+          description: Достигнут лимит выполнения операций редактирования
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "502":
-          description: CMDBuild catalog, LiteLLM, or another upstream dependency failed
+          description: Ошибка каталога CMDBuild, LiteLLM либо другой внешней зависимости
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "503":
-          description: Assistant is disabled or LiteLLM is not configured
+          description: Assistant выключен либо LiteLLM не настроен
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
         "504":
-          description: Current mapping stage exceeded its configured timeout and may be resumed
+          description: Текущий этап сопоставления превысил настроенный таймаут; выполнение можно продолжить
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AssistantDiagramErrorResponse"
   /cmdbuild/custom-api/draft/preview:
     post:
+      x-flow-id: OAPI37
       tags: [templates]
-      summary: Preview unsaved draft
+      summary: Предварительный просмотр несохранённого черновика
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -1105,24 +1215,530 @@ paths:
               $ref: "#/components/schemas/DraftPayload"
       responses:
         "200":
-          description: Preview result
+          description: Результат предварительного просмотра
+  /cmdbuild/custom-api/draft/diagram-import/restore:
+    post:
+      x-flow-id: OAPI38
+      tags: [templates]
+      summary: Восстановить анализ D2 и сохранённое предложение Assistant
+      description: >
+        Требует действующую CMDBuild-сессию. Для существующего шаблона проверяет
+        читаемую карточку и CAS baseSpecHash, но не _can_update; для нового
+        проверяет _can_create технического класса. При отсутствии baseSpecHash
+        использует hashJson(currentSpec || {}). D2 source берётся из
+        currentSpec.authoring.d2.source либо сохранённого spec, не из d2Source.
+        Проверяет source/structure/mapping/deterministic hashes checkpoint,
+        перечитывает доступный каталог и повторно подписывает proposal.
+        Ошибка optional assistantCheckpoint возвращается как warning в 200,
+        если детерминированный анализ восстановлен. LiteLLM не вызывается;
+        карточки и версии не сохраняются. Лимит тела равен
+        D2_IMPORT_MAX_INPUT_BYTES + 2 * D2_IMPORT_ASSISTANT_CHECKPOINT_MAX_BYTES + 512 KiB.
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DiagramImportRestoreRequest"
+      responses:
+        "200":
+          description: Анализ восстановлен; состояние остаётся локальным черновиком
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportRestoreResponse"
+        "400":
+          $ref: "#/components/responses/DiagramBadRequest"
+        "401":
+          $ref: "#/components/responses/SessionRequired"
+        "403":
+          $ref: "#/components/responses/DiagramForbidden"
+        "409":
+          $ref: "#/components/responses/DiagramConflict"
+        "413":
+          $ref: "#/components/responses/DiagramBodyTooLarge"
+        "415":
+          $ref: "#/components/responses/JsonRequired"
+        "422":
+          $ref: "#/components/responses/DiagramInvalid"
+        "429":
+          $ref: "#/components/responses/ExecutionLimited"
+        "502":
+          $ref: "#/components/responses/DiagramUpstreamFailed"
+  /cmdbuild/custom-api/draft/diagram-import/refresh:
+    post:
+      x-flow-id: OAPI39
+      tags: [templates]
+      summary: Обновить D2 source без изменения применённой структуры mapping
+      description: >
+        Проверки сессии и прав такие же, как у restore; baseSpecHash для
+        существующего шаблона обязателен, автоматического вычисления нет.
+        currentSpec должен содержать применённый d2Import версии 3 с
+        structureHash и mappingContractHash. Изменение структуры или mapping
+        contract даёт 409 и требует нового analyze/apply. При успехе возвращает
+        новый spec, не сохраняет CMDBuild-карточку и не вызывает LiteLLM.
+        Лимит тела D2_IMPORT_MAX_INPUT_BYTES + 512 KiB.
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DiagramImportRefreshRequest"
+      responses:
+        "200":
+          description: Source обновлён в возвращённом черновике
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiagramImportRefreshResponse"
+        "400":
+          $ref: "#/components/responses/DiagramBadRequest"
+        "401":
+          $ref: "#/components/responses/SessionRequired"
+        "403":
+          $ref: "#/components/responses/DiagramForbidden"
+        "409":
+          $ref: "#/components/responses/DiagramConflict"
+        "413":
+          $ref: "#/components/responses/DiagramBodyTooLarge"
+        "415":
+          $ref: "#/components/responses/JsonRequired"
+        "422":
+          $ref: "#/components/responses/DiagramInvalid"
+        "429":
+          $ref: "#/components/responses/ExecutionLimited"
+        "502":
+          $ref: "#/components/responses/DiagramUpstreamFailed"
+  /cmdbuild/custom-api/auth/capabilities:
+    get:
+      x-flow-id: OAPI40
+      tags: [session]
+      summary: Проверить доступность ролевых каталогов текущей сессии
+      description: >
+        Запрашивает sessions/current, roles?limit=100, users?limit=1,
+        groups?limit=1 и текущую роль. HTTP 200 определяется только успехом
+        sessions/current; недоступные каталоги дают false и upstream status
+        в probes, а не 403 всего ответа. Не является разрешением на запись.
+      responses:
+        "200":
+          description: Сессия прочитана, результаты независимых проверок доступны
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthCapabilitiesResponse"
+        "401":
+          $ref: "#/components/responses/CookieMissing"
+        "502":
+          description: sessions/current вернул не-2xx; тело сохраняет probes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthCapabilitiesResponse"
+  /cmdbuild/custom-api/client-log:
+    get:
+      x-flow-id: L0
+      tags: [diagnostics]
+      summary: Прочитать журнал клиента либо добавить событие через query
+      description: >
+        Проверяет только наличие cookie, без проверки sessions/current.
+        stage с непустым значением добавляет событие и возвращает весь bounded
+        in-memory журнал; без stage только читает. clear=1 очищает журнал перед
+        добавлением и требует same-origin Origin/Referer и CSRF. Для чтения и
+        добавления через stage эти проверки отсутствуют в текущем обработчике.
+        Журнал общий для процесса, не изолирован по пользователям и не заменяет
+        structured logging sink. В query нельзя передавать секреты или ПДн.
+      parameters:
+        - $ref: "#/components/parameters/LogClear"
+        - $ref: "#/components/parameters/ConditionalLogCsrf"
+        - name: stage
+          in: query
+          schema: { type: string }
+          description: Имя этапа; сохраняется не более 120 символов
+        - name: href
+          in: query
+          schema: { type: string }
+          description: Адрес, обрабатываемый sanitizeDiagnosticHref
+        - name: message
+          in: query
+          schema: { type: string }
+          description: Сообщение; сохраняется не более 500 символов
+      responses:
+        "200":
+          description: Текущие записи клиентского журнала
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ClientLogEntry"
+        "401":
+          $ref: "#/components/responses/CookieMissing"
+        "403":
+          description: Только при clear=1 отсутствует same-origin заголовок либо CSRF
+    post:
+      x-flow-id: L0
+      x-supported: false
+      tags: [diagnostics]
+      summary: POST записи клиентского журнала не поддержан runtime
+      description: >
+        Зафиксирован отрицательный контракт, не новый способ записи. С cookie
+        methodAllowed отвергает POST до чтения тела и CSRF; без cookie даёт 401.
+        Используемая реализацией запись идёт через GET с stage.
+      responses:
+        "401":
+          $ref: "#/components/responses/CookieMissing"
+        "405":
+          description: Метод POST отклонён, запись не создаётся
+          headers:
+            Allow:
+              schema: { type: string, enum: [GET] }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackendError"
+  /cmdbuild/custom-api/proxy-log:
+    get:
+      x-flow-id: L1
+      tags: [diagnostics]
+      summary: Прочитать либо очистить журнал proxy
+      description: >
+        Только наличие cookie, без sessions/current. Возвращает общий bounded
+        in-memory журнал proxy. clear=1 требует same-origin Origin/Referer и
+        CSRF; обычное чтение не требует этих заголовков.
+      parameters:
+        - $ref: "#/components/parameters/LogClear"
+        - $ref: "#/components/parameters/ConditionalLogCsrf"
+      responses:
+        "200":
+          description: Текущие записи proxy-журнала
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ProxyLogEntry"
+        "401":
+          $ref: "#/components/responses/CookieMissing"
+        "403":
+          description: Только при clear=1 отсутствует same-origin заголовок либо CSRF
+  /cmdbuild/custom-api/session-probe:
+    get:
+      x-flow-id: OAPI41
+      tags: [session]
+      summary: Диагностический alias текущей сессии
+      description: Тот же обработчик и преобразование upstream status, что у /session
+      responses:
+        "200":
+          description: Сессия прочитана
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionProbeResponse"
+        "401":
+          $ref: "#/components/responses/CookieMissing"
+        "502":
+          description: Неуспех sessions/current, включая upstream 401/403
+  /cmdbuild/custom-api/model/domains/{domainName}:
+    get:
+      x-flow-id: OAPI42
+      tags: [model]
+      summary: Прочитать метаданные одного домена
+      parameters:
+        - name: domainName
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Отфильтрованные метаданные домена
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, cmdbuildStatus, domain]
+                properties:
+                  success: { type: boolean }
+                  cmdbuildStatus: { type: integer }
+                  domain:
+                    type: object
+                    nullable: true
+                    additionalProperties: true
+        "401":
+          $ref: "#/components/responses/CookieMissing"
+        "404":
+          description: Некорректный route с пустым именем либо дополнительным slash
+        "502":
+          description: CMDBuild вернул не-2xx, в том числе upstream 403/404; domain=null
+  /cmdbuild/custom-api/classes-probe:
+    get:
+      x-flow-id: OAPI43
+      tags: [diagnostics]
+      summary: Проверить чтение первой доступной CMDBuild class
+      responses:
+        "200":
+          description: Результат запроса classes?limit=1; не проверка всех прав
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, receivedCmdbuildCookie, forwardedAs, cmdbuildStatus, firstClass]
+                properties:
+                  success: { type: boolean }
+                  receivedCmdbuildCookie: { type: boolean, enum: [true] }
+                  forwardedAs: { type: string, enum: [CMDBuild-Authorization header] }
+                  cmdbuildStatus: { type: integer }
+                  firstClass:
+                    type: object
+                    nullable: true
+                    properties:
+                      name: { type: string }
+                      description: { type: string }
+                      canRead: { type: boolean }
+                      canCreate: { type: boolean }
+        "401":
+          $ref: "#/components/responses/CookieMissing"
+        "502":
+          description: CMDBuild вернул не-2xx
+  /cmdbuild/custom-api/health/live:
+    get:
+      x-flow-id: H0
+      tags: [health]
+      security: []
+      summary: Alias /health/live под backend prefix
+      responses:
+        "200":
+          description: Процесс работает
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiveHealth"
+  /cmdbuild/custom-api/health/redis:
+    get:
+      x-flow-id: H1
+      tags: [health]
+      security: []
+      summary: Alias /health/redis под backend prefix
+      responses:
+        "200":
+          description: Redis доступен
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RedisHealth"
+        "503":
+          description: Redis недоступен либо выключен
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/RedisHealth"
+                  - $ref: "#/components/schemas/HealthFailure"
+  /cmdbuild/custom-api/health/ready:
+    get:
+      x-flow-id: H2
+      tags: [health]
+      security: []
+      summary: Alias /health/ready под backend prefix
+      responses:
+        "200":
+          description: Все обязательные зависимости готовы
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyHealth"
+        "503":
+          description: Обязательная зависимость недоступна
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ReadyHealth"
+                  - $ref: "#/components/schemas/HealthFailure"
+  /cmdbuild/dynamicpages/ui:
+    get:
+      x-flow-id: OAPI44
+      tags: [runtime]
+      summary: Перенаправить авторизованного пользователя в Designer
+      responses:
+        "302":
+          description: Сессия проверена через CMDBuild
+          headers:
+            Location:
+              schema: { type: string, enum: [/cmdbuild/dynamicpages/ui/designer] }
+        "401":
+          $ref: "#/components/responses/UiSessionRequired"
+  /cmdbuild/dynamicpages/ui/designer:
+    get:
+      x-flow-id: OAPI45
+      tags: [runtime]
+      summary: Открыть HTML оболочку Designer
+      parameters:
+        - $ref: "#/components/parameters/DesignerSection"
+      responses:
+        "200":
+          $ref: "#/components/responses/UiShell"
+        "401":
+          $ref: "#/components/responses/UiSessionRequired"
+  /cmdbuild/dynamicpages/ui/designer/{section}:
+    get:
+      x-flow-id: OAPI46
+      tags: [runtime]
+      summary: Открыть раздел Designer по path
+      description: section query (затем cmdpSection) имеет приоритет над path
+      parameters:
+        - name: section
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: "#/components/parameters/DesignerSection"
+      responses:
+        "200":
+          $ref: "#/components/responses/UiShell"
+        "401":
+          $ref: "#/components/responses/UiSessionRequired"
+  /cmdbuild/dynamicpages/ui/run/{code}:
+    get:
+      x-flow-id: OAPI47
+      tags: [runtime]
+      summary: Открыть runtime оболочку либо получить JSON результата
+      security:
+        - {}
+        - cmdbuildCookie: []
+      description: >
+        Без cookie HTML оболочка публична; её получение не означает доступность
+        данных. При json=true без cookie делегирует public-snapshots/{code}/run,
+        с валидной cookie делегирует templates/{code}/run. Невалидная переданная
+        cookie даёт 401, без fallback на публичный режим. JSON статусы определяет
+        целевой обработчик, query передаётся ему без изменений.
+      parameters:
+        - $ref: "#/components/parameters/TemplateCode"
+        - name: json
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: HTML оболочка либо JSON результат целевого run
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400":
+          description: Недопустимый template code или параметры run
+        "401":
+          $ref: "#/components/responses/UiSessionRequired"
+        "403":
+          description: JSON run запрещён правами или настройками публикации
+        "404":
+          description: Шаблон либо разрешённый публичный snapshot не найден
+        default:
+          description: Ошибка делегированного JSON run; см. соответствующий API-контракт
 components:
+  responses:
+    CookieMissing:
+      description: Cookie CMDBuild-Authorization отсутствует
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/BackendError"
+    SessionRequired:
+      description: Cookie отсутствует либо проверка сессии вернула upstream 400/401/403
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DiagramImportErrorResponse"
+    DiagramBadRequest:
+      description: Некорректный JSON/object, technical root, template code либо baseSpecHash
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DiagramImportErrorResponse"
+    DiagramForbidden:
+      description: Same-origin/CSRF отклонён либо нет _can_create для нового шаблона
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DiagramImportErrorResponse"
+    DiagramConflict:
+      description: Конфликт версии, checkpoint, source, structure либо mapping contract
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DiagramImportErrorResponse"
+    DiagramBodyTooLarge:
+      description: Превышен лимит байтов JSON-тела
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DiagramImportErrorResponse"
+    JsonRequired:
+      description: Content-Type должен начинаться с application/json
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DiagramImportErrorResponse"
+    DiagramInvalid:
+      description: Невалидный D2, ошибка importer либо детерминированной обработки
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DiagramImportErrorResponse"
+    ExecutionLimited:
+      description: Достигнут лимит выполнения для сессии либо процесса
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DiagramImportErrorResponse"
+    DiagramUpstreamFailed:
+      description: Недоступны проверка сессии, прав, карточки или нужного каталога CMDBuild
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DiagramImportErrorResponse"
+    UiShell:
+      description: HTML оболочка после проверки действующей сессии
+      content:
+        text/html:
+          schema: { type: string }
+    UiSessionRequired:
+      description: Cookie отсутствует либо CMDBuild не подтвердил сессию; ответ HTML
+      content:
+        text/html:
+          schema: { type: string }
   headers:
     CmdpVersion:
-      description: Application version embedded in the running image.
+      description: Версия приложения, встроенная в запущенный образ.
       schema:
         type: string
     CmdpRevision:
-      description: Full Git revision embedded in the running image, or unknown for an unverified local build.
+      description: Полная ревизия Git, встроенная в запущенный образ, либо unknown для непроверенной локальной сборки.
       schema:
         type: string
     CmdpProvenance:
-      description: Build provenance established by the canonical build path.
+      description: Происхождение сборки, подтверждённое канонической процедурой сборки.
       schema:
         type: string
         enum: [verified, unverified-local]
     CmdpEditorSha256:
-      description: SHA-256 of the editor backend source served by this process.
+      description: SHA-256 исходного кода backend редактора, обслуживаемого этим процессом.
       schema:
         type: string
         pattern: '^[0-9a-f]{64}$'
@@ -1136,6 +1752,22 @@ components:
       in: header
       name: X-CMDBDynamicPages-CSRF
   parameters:
+    LogClear:
+      name: clear
+      in: query
+      description: Только строка 1 включает очистку; тогда обязательны CSRF и same-origin
+      schema: { type: string }
+    ConditionalLogCsrf:
+      name: X-CMDBDynamicPages-CSRF
+      in: header
+      required: false
+      description: Обязателен при clear=1; токен выдаётся GET /cmdbuild/custom-api/csrf
+      schema: { type: string }
+    DesignerSection:
+      name: section
+      in: query
+      schema: { type: string }
+      description: Раздел Designer; после приведения к нижнему регистру допускает a-z, 0-9 и дефис
     TemplateCode:
       name: code
       in: path
@@ -1191,7 +1823,7 @@ components:
       additionalProperties: true
     RuntimeJsonResult:
       type: object
-      description: Runtime JSON output for `json=true`. A successful response can contain empty rows when no objects are visible under the current user's CMDBuild permissions.
+      description: JSON-вывод выполнения при `json=true`. Успешный ответ может содержать пустые строки, если права текущего пользователя CMDBuild не позволяют видеть ни одного объекта.
       properties:
         success:
           type: boolean
@@ -1327,7 +1959,7 @@ components:
         semanticPlan:
           type: object
           additionalProperties: true
-          description: Previously validated semantic plan for the same intent and checkpoint.
+          description: Ранее проверенный семантический план для того же намерения и контрольной точки.
         resumeId:
           type: string
           pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$"
@@ -1358,10 +1990,10 @@ components:
           minLength: 1
         templateCode:
           type: string
-          description: Empty only while authoring an unsaved local template draft.
+          description: Пустое значение допустимо только при редактировании несохранённого локального черновика шаблона.
         baseSpecHash:
           type: string
-          description: Empty only while authoring an unsaved local template draft; otherwise the saved template hash used for optimistic authoring CAS.
+          description: Пустое значение допустимо только при редактировании несохранённого локального черновика шаблона; иначе это хэш сохранённого шаблона для оптимистической проверки CAS при редактировании.
     AssistantEditorDelta:
       type: object
       additionalProperties: false
@@ -1376,7 +2008,7 @@ components:
         spec:
           type: object
           additionalProperties: false
-          description: Bounded unsaved editor fields layered over the referenced saved template.
+          description: Ограниченный набор несохранённых полей редактора, накладываемый на указанный сохранённый шаблон.
           properties:
             version:
               type: integer
@@ -1520,20 +2152,20 @@ components:
             $ref: "#/components/schemas/ObjectFlowSelectionStage"
         operations:
           type: array
-          description: Ordered match and set operations. Every source alias must be materialized by a selection or an earlier operation.
+          description: Упорядоченные операции match и set. Каждый alias источника должен быть материализован выборкой либо предшествующей операцией.
           items:
             $ref: "#/components/schemas/ObjectFlowOperation"
         publishedAlias:
           type: string
-          description: Optional materialized alias selected for the published result table.
+          description: Необязательный материализованный alias, выбранный для публикуемой таблицы результата.
         blocks:
           type: array
-          description: Compatibility projection of match operations returned by the server.
+          description: Проекция операций match для совместимости, возвращаемая сервером.
           items:
             $ref: "#/components/schemas/ObjectFlowMatchStage"
         setOperations:
           type: array
-          description: Compatibility projection of set operations returned by the server.
+          description: Проекция операций set для совместимости, возвращаемая сервером.
           items:
             $ref: "#/components/schemas/ObjectFlowSetOperation"
     ObjectFlowSourceRef:
@@ -1567,10 +2199,10 @@ components:
           type: string
         className:
           type: string
-          description: Permission-filtered CMDBuild catalog class selected by the author or proposal.
+          description: Класс из каталога CMDBuild с учётом прав доступа, выбранный автором либо предложением.
         from:
           type: string
-          description: Optional prior selection or match alias used by correlated filters.
+          description: Необязательный alias предшествующей выборки либо match, используемый коррелированными фильтрами.
         limit:
           type: integer
           minimum: 1
@@ -1617,13 +2249,13 @@ components:
           enum: [match]
         from:
           type: string
-          description: Selection or previous intermediate match alias.
+          description: Alias выборки либо предшествующей промежуточной операции match.
         with:
           type: string
-          description: Selection alias joined into this stage.
+          description: Alias выборки, присоединяемой на этом этапе.
         as:
           type: string
-          description: Stable output alias; this output is also a Diagram mapping source.
+          description: Стабильный alias результата; этот результат также является источником сопоставления Diagram.
         rightPrefix:
           type: string
         rules:
@@ -1731,7 +2363,7 @@ components:
               additionalProperties: true
     RuntimePermissionDenied:
       type: object
-      description: Returned when a class or attribute actually used by the runtime template is denied by CMDBuild as 401/403. The endpoint does not return partial data from other selections in this case.
+      description: Возвращается, когда CMDBuild запрещает доступ к классу или атрибуту, фактически используемому при выполнении шаблона, ответом 401/403. Endpoint в этом случае не возвращает частичные данные других выборок.
       properties:
         success:
           type: boolean
@@ -1768,11 +2400,11 @@ components:
           example: CMDB Dynamic Pages technical root
         parent:
           type: string
-          description: CMDBuild superclass under which the technical root class is created.
+          description: Суперкласс CMDBuild, под которым создаётся корневой технический класс.
           example: Class
         confirm:
           type: boolean
-          description: UI confirmation that bootstrap may create only missing classes/attributes and must not move/delete existing objects.
+          description: Подтверждение в UI, что первичное создание схемы может добавлять только отсутствующие классы и атрибуты, но не перемещать и не удалять существующие объекты.
     BuildIdentity:
       type: object
       required: [version, revision, dirty, provenance, editorSha256]
@@ -1840,7 +2472,7 @@ components:
           type: boolean
         url:
           type: string
-          description: Redis URL with credentials masked.
+          description: URL Redis с замаскированными учётными данными.
         keyPrefix:
           type: string
         lastCheckedAt:
@@ -1870,6 +2502,7 @@ components:
               type: boolean
             checks:
               type: object
+              required: [process, redis, cmdbuild, d2, d2Import]
               properties:
                 process:
                   type: object
@@ -1897,6 +2530,53 @@ components:
                       type: integer
                     error:
                       type: string
+                d2:
+                  $ref: "#/components/schemas/D2RendererHealth"
+                d2Import:
+                  $ref: "#/components/schemas/D2ImporterHealth"
+    HealthFailure:
+      allOf:
+        - $ref: "#/components/schemas/HealthBase"
+        - type: object
+          required: [status, ready, error]
+          description: Исключение health handler; checks может отсутствовать
+          properties:
+            status: { type: string, enum: [not_ready] }
+            ready: { type: boolean, enum: [false] }
+            error: { type: string }
+    D2RendererHealth:
+      type: object
+      required: [required, enabled, ok, status, binary]
+      description: >
+        Локальный вызов D2 binary с --version. Выключенный renderer возвращает
+        required=false, enabled=false, ok=true, status=disabled без version,
+        error, reason, latencyMs. Включённый renderer обязателен для readiness.
+      properties:
+        required: { type: boolean }
+        enabled: { type: boolean }
+        ok: { type: boolean }
+        status: { type: string, enum: [ok, unavailable, disabled] }
+        binary: { type: string }
+        version: { type: string }
+        error: { type: string }
+        reason: { type: string }
+        latencyMs: { type: number, minimum: 0 }
+    D2ImporterHealth:
+      type: object
+      required: [required, ok, status, binary, parser, error, reason, latencyMs]
+      description: >
+        Локальный запуск importer с минимальным D2. ok требует успешного процесса,
+        JSON IR version >= 4 и отсутствия source.errors. required всегда true,
+        независимо от включения renderer; это не сетевой endpoint.
+      properties:
+        required: { type: boolean, enum: [true] }
+        ok: { type: boolean }
+        status: { type: string, enum: [ok, unavailable] }
+        binary: { type: string }
+        parser: { type: string }
+        error: { type: string }
+        reason: { type: string }
+        latencyMs: { type: number, minimum: 0 }
     CacheStatus:
       type: object
       properties:
@@ -1993,17 +2673,17 @@ components:
         spec:
           type: object
           description: >
-            Template Spec JSON. Normal dynamic templates используют DSL
-            steps/result model; special CMDBuild model view templates задают
-            `kind=cmdbBuildView` и хранят renderer settings в `cmdbBuildView`.
-            Canonical Assistant и D2 authoring находится в `spec.authoring`:
-            version, assistant prompts, D2 source и source hash. Хранилище
-            принимает неполный authoring section; execution paths валидируют его
+            Spec JSON шаблона. Обычные динамические шаблоны используют модель
+            DSL steps/result; специальные шаблоны представления модели CMDBuild задают
+            `kind=cmdbBuildView` и хранят настройки рендерера в `cmdbBuildView`.
+            Каноническое состояние редактирования Assistant и D2 находится в `spec.authoring`:
+            версия, запросы Assistant, исходный код D2 и его хэш. Хранилище
+            принимает неполный раздел редактирования; пути выполнения проверяют его
             строго.
           additionalProperties: true
         expectedSpecHash:
           type: string
-          description: Optional optimistic update guard. If present on update, the backend returns 409 when the stored template spec hash differs.
+          description: Необязательная оптимистическая защита обновления. Если передана при обновлении, backend возвращает 409 при несовпадении хэша сохранённого spec шаблона.
           pattern: "^[a-f0-9]{64}$"
         paramsSchema:
           type: object
@@ -2030,7 +2710,7 @@ components:
           additionalProperties: true
         specHash:
           type: string
-          description: SHA-256 hash of the normalized template spec used by Designer as expectedSpecHash on update.
+          description: SHA-256 нормализованного spec шаблона, используемый Designer как expectedSpecHash при обновлении.
           pattern: "^[a-f0-9]{64}$"
         paramsSchema:
           type: object
@@ -2105,6 +2785,221 @@ components:
         params:
           type: object
           additionalProperties: true
+    BackendError:
+      type: object
+      required: [success, message]
+      properties:
+        success: { type: boolean, enum: [false] }
+        message: { type: string }
+        receivedCmdbuildCookie: { type: boolean }
+      additionalProperties: true
+    SanitizedSession:
+      type: object
+      nullable: true
+      properties:
+        userId:
+          description: Идентификатор CMDBuild либо null
+          oneOf:
+            - type: string
+            - type: integer
+              nullable: true
+        username: { type: string }
+        userDescription: { type: string }
+        language: { type: string }
+        locale: { type: string }
+        role: { type: string }
+        tenant:
+          description: Идентификатор текущего tenant в формате CMDBuild
+        availableTenants:
+          type: array
+          items: {}
+        availableRoles:
+          type: array
+          items: {}
+        multigroup: { type: boolean }
+        sessionType: { type: string }
+        rolePrivileges:
+          type: object
+          additionalProperties: { type: boolean }
+    SanitizedRole:
+      type: object
+      nullable: true
+      properties:
+        id:
+          description: Идентификатор роли в формате CMDBuild
+        name: { type: string }
+        description: { type: string }
+        type: { type: string, nullable: true }
+        active: { type: boolean, nullable: true }
+        canReadUsers: { type: boolean, nullable: true }
+        canModifyUsers: { type: boolean, nullable: true }
+        privileges:
+          type: object
+          additionalProperties: { type: boolean }
+    SessionProbeResponse:
+      type: object
+      required: [success, receivedCmdbuildCookie, forwardedAs, cmdbuildStatus, session]
+      properties:
+        success: { type: boolean }
+        receivedCmdbuildCookie: { type: boolean, enum: [true] }
+        forwardedAs: { type: string, enum: [CMDBuild-Authorization header] }
+        cmdbuildStatus: { type: integer }
+        session:
+          $ref: "#/components/schemas/SanitizedSession"
+    AuthCapabilitiesResponse:
+      type: object
+      required: [success, cmdbuildStatus, session, capabilities, roles, currentRole, probes]
+      properties:
+        success: { type: boolean }
+        cmdbuildStatus: { type: integer }
+        session:
+          $ref: "#/components/schemas/SanitizedSession"
+        capabilities:
+          type: object
+          required: [roleCatalogAvailable, userCatalogAvailable, groupsEndpointAvailable, currentRoleDetailsAvailable, editorPermissionStrategy, notes]
+          properties:
+            roleCatalogAvailable: { type: boolean }
+            userCatalogAvailable: { type: boolean }
+            groupsEndpointAvailable: { type: boolean }
+            currentRoleDetailsAvailable: { type: boolean }
+            editorPermissionStrategy: { type: string, enum: [cmdbuild-class-crud] }
+            notes:
+              type: array
+              items: { type: string }
+        roles:
+          type: array
+          items:
+            $ref: "#/components/schemas/SanitizedRole"
+        currentRole:
+          $ref: "#/components/schemas/SanitizedRole"
+        probes:
+          type: object
+          required: [rolesStatus, usersStatus, groupsStatus, currentRoleStatus]
+          properties:
+            rolesStatus: { type: integer }
+            usersStatus: { type: integer }
+            groupsStatus: { type: integer }
+            currentRoleStatus:
+              type: integer
+              description: 0, если session не содержит role и запрос не выполнялся
+    ClientLogEntry:
+      type: object
+      required: [time, stage, href, message]
+      properties:
+        time: { type: string, format: date-time }
+        stage: { type: string }
+        href: { type: string }
+        message: { type: string }
+    ProxyLogEntry:
+      type: object
+      required: [time, method, path, referer, userAgent]
+      properties:
+        time: { type: string, format: date-time }
+        method: { type: string }
+        path: { type: string }
+        referer: { type: string }
+        userAgent: { type: string }
+    DiagramImportRestoreRequest:
+      type: object
+      required: [analysisCheckpoint]
+      description: >
+        Пустой templateCode означает новый шаблон. currentSpec можно не передавать
+        при наличии читаемого сохранённого шаблона; source берётся из его authoring.
+        Для восстановления именно сохранённой revision клиент передаёт baseSpecHash.
+        Неизвестные поля обработчик не отклоняет.
+      properties:
+        root: { type: string }
+        templateCode: { type: string }
+        baseSpecHash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        currentSpec:
+          type: object
+          additionalProperties: true
+        analysisCheckpoint:
+          $ref: "#/components/schemas/D2AnalysisCheckpoint"
+        assistantCheckpoint:
+          $ref: "#/components/schemas/D2AssistantCheckpoint"
+    DiagramImportRefreshRequest:
+      type: object
+      required: [currentSpec, d2Source]
+      properties:
+        root: { type: string }
+        templateCode: { type: string }
+        baseSpecHash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+          description: Обязателен для существующего templateCode; иначе 409
+        currentSpec:
+          type: object
+          additionalProperties: true
+        d2Source:
+          type: string
+          description: Автономный D2 source без внешних imports
+    D2AnalysisCheckpoint:
+      type: object
+      required: [proposalId, deterministicSpecHash, source, structureTree]
+      description: >
+        Минимальная форма, принимаемая normalizeD2AnalysisCheckpoint. version
+        нормализуется в 1; roles и relationRules при отсутствии становятся [].
+        Размер ограничен D2_IMPORT_ASSISTANT_CHECKPOINT_MAX_BYTES после нормализации.
+      properties:
+        version: { type: integer }
+        proposalId: { type: string, minLength: 1 }
+        deterministicSpecHash: { type: string, pattern: "^[a-f0-9]{64}$" }
+        source:
+          type: object
+          required: [hash, structureHash, mappingContractHash]
+          properties:
+            hash: { type: string, pattern: "^[a-f0-9]{64}$" }
+            structureHash: { type: string, pattern: "^[a-f0-9]{64}$" }
+            mappingContractHash: { type: string, pattern: "^[a-f0-9]{64}$" }
+        roles:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramImportRoleOverride"
+        relationRules:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiagramImportRelationRule"
+        structureTree:
+          $ref: "#/components/schemas/DiagramImportStructureTree"
+    D2AssistantCheckpoint:
+      allOf:
+        - $ref: "#/components/schemas/D2AnalysisCheckpoint"
+        - type: object
+          description: >
+            Надстройка сохранённого Assistant, version нормализуется в 3.
+            Ошибки этой optional части не отменяют восстановление анализа.
+          properties:
+            interpretation: { type: object, additionalProperties: true }
+            mapping: { type: object, additionalProperties: true }
+    DiagramImportRestoreResponse:
+      type: object
+      required: [success, action, ir, proposal, diagnostics, restoreKind, interpretation, mapping, assistantRestoreWarning, preview, catalog]
+      properties:
+        success: { type: boolean, enum: [true] }
+        action: { type: string, enum: [diagram-import-restore] }
+        ir: { type: object, additionalProperties: true }
+        proposal:
+          $ref: "#/components/schemas/DiagramImportProposalEnvelope"
+        diagnostics:
+          $ref: "#/components/schemas/DiagramImportDiagnostics"
+        restoreKind: { type: string, enum: [analysis, assistant] }
+        interpretation: { type: object, additionalProperties: true }
+        mapping: { type: object, additionalProperties: true }
+        assistantRestoreWarning: { type: string }
+        preview: { type: object, additionalProperties: true }
+        catalog: { type: object, additionalProperties: true }
+    DiagramImportRefreshResponse:
+      type: object
+      required: [success, action, spec, specHash, d2Workflow]
+      properties:
+        success: { type: boolean, enum: [true] }
+        action: { type: string, enum: [diagram-import-refresh] }
+        spec: { type: object, additionalProperties: true }
+        specHash: { type: string, pattern: "^[a-f0-9]{64}$" }
+        d2Workflow: { type: object, additionalProperties: true }
     DiagramImportAnalyzeRequest:
       type: object
       additionalProperties: false
@@ -2118,13 +3013,13 @@ components:
         baseSpecHash:
           type: string
           pattern: "^[a-f0-9]{64}$"
-          description: Full saved Spec hash used as the Diagram authoring CAS identity.
+          description: Полный хэш сохранённого Spec, используемый как идентификатор CAS при редактировании Diagram.
         currentSpec:
           type: object
           additionalProperties: true
         d2Source:
           type: string
-          description: Current self-contained D2 source; external imports are not accepted.
+          description: Текущий автономный исходный код D2; внешние импорты не допускаются.
     DiagramImportApplyRequest:
       type: object
       additionalProperties: false
@@ -2142,7 +3037,7 @@ components:
           additionalProperties: true
         d2Source:
           type: string
-          description: Current D2 source checked against the signed proposal before local deterministic Apply.
+          description: Текущий исходный код D2, проверяемый на соответствие подписанному предложению перед локальным детерминированным Apply.
         proposal:
           $ref: "#/components/schemas/DiagramImportProposalEnvelope"
         roles:
@@ -2171,7 +3066,7 @@ components:
           enum: [diagram-import-analyze]
         ir:
           type: object
-          description: Normalized structural IR produced by the pinned D2 importer.
+          description: Нормализованное структурное IR, сформированное закреплённой версией D2 importer.
           additionalProperties: true
         proposal:
           $ref: "#/components/schemas/DiagramImportProposalEnvelope"
@@ -2179,11 +3074,11 @@ components:
           $ref: "#/components/schemas/DiagramImportDiagnostics"
         preview:
           type: object
-          description: Bounded D2 render status and sanitized SVG preview metadata.
+          description: Ограниченные данные о состоянии рендеринга D2 и очищенные метаданные предварительного просмотра SVG.
           additionalProperties: true
         catalog:
           type: object
-          description: Permission-filtered CMDBuild catalog used for deterministic validation.
+          description: Каталог CMDBuild с учётом прав доступа, используемый для детерминированной проверки.
           additionalProperties: true
     DiagramImportApplyResponse:
       type: object
@@ -2197,7 +3092,7 @@ components:
           enum: [diagram-import-apply]
         spec:
           type: object
-          description: Local editor draft. The endpoint does not save a template or create a CMDBuild version.
+          description: Локальный черновик редактора. Endpoint не сохраняет шаблон и не создаёт версию CMDBuild.
           additionalProperties: true
         specHash:
           type: string
@@ -2254,7 +3149,7 @@ components:
           type: boolean
         action:
           type: string
-          enum: [diagram-import-analyze, diagram-import-apply]
+          enum: [diagram-import-analyze, diagram-import-apply, diagram-import-restore, diagram-import-refresh]
         code:
           type: string
         reason:
@@ -2279,10 +3174,10 @@ components:
         prompt:
           type: string
           minLength: 1
-          description: One user-facing diagram intent; internal semantic, placement, and connection system stages remain separate.
+          description: Одно пользовательское намерение для диаграммы; внутренние системные этапы семантики, размещения и связей остаются раздельными.
         roles:
           type: array
-          description: Imported roles visible to semantic interpretation.
+          description: Импортированные роли, доступные для семантической интерпретации.
           items:
             $ref: "#/components/schemas/DiagramImportRoleOverride"
         relationRules:
@@ -2334,7 +3229,7 @@ components:
         prompt:
           type: string
           minLength: 1
-          description: One user-facing intent retained in the checkpoint identity.
+          description: Одно пользовательское намерение, сохраняемое в идентификационных данных контрольной точки.
         roles:
           type: array
           items:
@@ -2349,18 +3244,18 @@ components:
           type: integer
           minimum: 1
           maximum: 5
-          description: Permission-filtered CMDBuild catalog traversal depth used to build mapping candidates.
+          description: Глубина обхода каталога CMDBuild с учётом прав доступа, используемая для построения кандидатов сопоставления.
         stage:
           type: string
           enum: [roles, topology]
-          description: roles creates placement mappings; topology resumes the same checkpoint and preserves accepted roles.
+          description: Этап roles создаёт сопоставления размещения; topology продолжает ту же контрольную точку и сохраняет принятые роли.
         resumeId:
           type: string
           pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$"
-          description: Client-generated opaque checkpoint key reused unchanged for roles retries and the topology continuation.
+          description: Непрозрачный ключ контрольной точки, созданный клиентом и повторно используемый без изменений при повторах roles и продолжении topology.
         stages:
           type: array
-          description: Optional client summary; the backend derives authoritative terminal stages from the referenced template plus editor delta.
+          description: Необязательная сводка клиента; backend определяет канонические конечные этапы по указанному шаблону с учётом изменений редактора.
           items:
             $ref: "#/components/schemas/ObjectFlowSourceRef"
     AssistantDiagramImportMapSelectionsResponse:
@@ -2379,7 +3274,7 @@ components:
             $ref: "#/components/schemas/DiagramSelectionMapping"
         endpointProfiles:
           type: array
-          description: Deterministic placement comparison rules derived from explicit D2 Notes and preserved compatible editor mappings.
+          description: Детерминированные правила сравнения размещений, полученные из явных D2 Notes и сохранённых совместимых сопоставлений редактора.
           items:
             $ref: "#/components/schemas/DiagramImportEndpointProfile"
         relationRules:
@@ -2444,7 +3339,7 @@ components:
           additionalProperties: true
     DiagramImportProposalEnvelope:
       type: object
-      description: Signed immutable class-aware IR v3 proposal produced by deterministic D2 analysis. Unknown signed internals must be returned unchanged.
+      description: Подписанное неизменяемое предложение IR v3 с учётом классов, сформированное детерминированным анализом D2. Неизвестные подписанные внутренние поля должны возвращаться без изменений.
       required: [version, proposalId, templateCode, baseSpecHash, editorSpecHash, signature]
       additionalProperties: true
       properties:
@@ -2541,7 +3436,7 @@ components:
           type: string
         domain:
           type: string
-          description: CMDBuild domain identifier backing a reference attribute, when exposed by the catalog.
+          description: Идентификатор домена CMDBuild, лежащего в основе ссылочного атрибута, если он доступен в каталоге.
         targetClass:
           type: string
         direction:
@@ -2665,7 +3560,7 @@ components:
           enum: [structural, stage, parentCard]
         stageId:
           type: string
-          description: Required for stage and empty for structural or parentCard; parentCard inherits the nearest materialized ancestor.
+          description: Обязателен для stage и пуст для structural либо parentCard; parentCard наследует ближайшего материализованного предка.
     DiagramImportPrimaryMapping:
       type: object
       additionalProperties: true
@@ -2754,7 +3649,7 @@ components:
           type: string
         className:
           type: string
-      description: Empty for structural placements; otherwise identifies the validated Object Flow result used by the mapping.
+      description: Пуст для структурных размещений; в остальных случаях идентифицирует проверенный результат Object Flow, используемый сопоставлением.
     AssistantDiagramIssue:
       type: object
       additionalProperties: true
@@ -2888,7 +3783,7 @@ components:
           type: string
         rightExpression:
           type: string
-          description: Canonical authoring expression, including literal values, ${param.name}, or ${previous.field} references.
+          description: Каноническое выражение редактирования, включая литералы и ссылки ${param.name} либо ${previous.field}.
         expressionKind:
           type: string
           enum: [empty, literal, parameter, previous]
@@ -3166,7 +4061,7 @@ components:
     AssistantDiagramMappingResume:
       allOf:
         - $ref: "#/components/schemas/AssistantDiagramMappingCheckpoint"
-      description: Same opaque checkpoint summary returned on retryable 422/502/503/504 failures; resend resumeId with the indicated nextStage.
+      description: Та же сводка непрозрачной контрольной точки возвращается при допускающих повтор ошибках 422/502/503/504; повторно отправьте resumeId с указанным nextStage.
     AssistantDiagramCoverageCount:
       type: object
       additionalProperties: false

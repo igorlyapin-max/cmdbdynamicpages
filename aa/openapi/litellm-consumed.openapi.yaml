@@ -1,0 +1,142 @@
+openapi: 3.0.3
+info:
+  title: LiteLLM API, потребляемое подмножество cmdbdynamicpages
+  version: 0.1.0
+  description: >
+    Только фактический исходящий callLiteLLM, не полный vendor API. Backend
+    вызывает chat/completions с серверным Bearer API key, без пользовательской
+    CMDBuild cookie, CMDBuild-Authorization и CSRF. Origin выбирается из
+    deployment-owned allowlist, произвольный URL от клиента не допускается.
+    Модель и лимиты задаются runtime-конфигурацией. Streaming, tools, embeddings,
+    models listing и произвольные vendor endpoints этим caller не используются.
+    Новая legacy-совместимость не поддержана и не запланирована.
+x-source-evidence:
+  - scripts/dev-proxy-server.mjs: liteLLMBaseUrlStatus, litellmEndpoint, ensureAssistantReady
+  - scripts/dev-proxy-server.mjs: callLiteLLM, readBoundedLiteLlmResponse, assistantLiteLlmTimeoutMs
+servers:
+  - url: "{protocol}://{host}:{port}/{basePath}"
+    description: >
+      Placeholder для разрешённого LITELLM_BASE_URL. FQDN, protocol, port,
+      basePath и TLS требуют согласования для каждого контура. Defaults не
+      описывают действующую сеть заказчика; localhost и реальные адреса отсутствуют.
+    variables:
+      protocol:
+        default: https
+        enum: [http, https]
+      host:
+        default: litellm.example.invalid
+      port:
+        default: "443"
+      basePath:
+        default: v1
+        description: Префикс из разрешённого base URL; chat/completions добавляется к нему
+security:
+  - serverBearer: []
+paths:
+  /chat/completions:
+    post:
+      x-flow-id: OAPI200
+      summary: Получить текст типизированного authoring-предложения
+      description: >
+        Отправляет Accept и Content-Type application/json. Caller ограничивает
+        request/response bytes, ставит AbortController deadline и читает только
+        choices[0].message.content. Непустой content далее проходит JSON parsing
+        и детерминированную валидацию соответствующего authoring endpoint.
+        Успешный LLM HTTP ответ не означает сохранённый или валидный template.
+        При не-2xx статус upstream сохраняется с code=litellm_error; сообщение
+        извлекается из error.message либо message. Отсутствие content даёт
+        локальную ошибку 502 assistant_empty_response. Timeout даёт локальную
+        504 assistant_timeout; отмена клиента 499 assistant_request_cancelled,
+        при разорванном соединении HTTP ответ может не отправляться. Эти локальные
+        ошибки не являются ответами LiteLLM. API key отсутствует или Assistant
+        выключен: ensureAssistantReady прекращает обработку до HTTP вызова.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatCompletionRequest"
+      responses:
+        "2XX":
+          description: Нестриминговый JSON; клиент использует первый message.content
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionResponse"
+        default:
+          description: >
+            Любой не-2xx, включая отказы авторизации, rate limit и ошибки провайдера.
+            JSON тело может отсутствовать или быть непарсируемым: тогда используется
+            сообщение с HTTP status. Конкретные статусы требуют live-проверки vendor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderError"
+            text/plain:
+              schema: { type: string }
+components:
+  securitySchemes:
+    serverBearer:
+      type: http
+      scheme: bearer
+      description: >
+        Серверный LITELLM_API_KEY либо secret file; значение не передаётся в браузер
+        и не приводится в examples. Схема не утверждает формат JWT.
+  schemas:
+    ChatCompletionRequest:
+      type: object
+      additionalProperties: false
+      required: [model, messages, temperature, max_tokens]
+      properties:
+        model:
+          type: string
+          description: Разрешённый идентификатор модели из runtime-конфигурации
+        messages:
+          type: array
+          items:
+            type: object
+            required: [role, content]
+            properties:
+              role: { type: string, enum: [system, user] }
+              content:
+                type: string
+                description: Ограниченный prompt и контекст модели; примеры с реальными данными не публикуются
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: CMDP_ASSISTANT_TEMPERATURE, ограниченный caller
+        max_tokens:
+          type: integer
+          minimum: 256
+          maximum: 8192
+          description: CMDP_ASSISTANT_MAX_TOKENS, ограниченный caller
+    ChatCompletionResponse:
+      type: object
+      required: [choices]
+      properties:
+        choices:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [message]
+            properties:
+              message:
+                type: object
+                required: [content]
+                properties:
+                  content:
+                    type: string
+                    minLength: 1
+                    description: Текст для последующей типизированной валидации
+      additionalProperties: true
+    ProviderError:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message: { type: string }
+        message: { type: string }
+      additionalProperties: true

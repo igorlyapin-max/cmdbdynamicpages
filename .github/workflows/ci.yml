@@ -24,6 +24,12 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Install architecture artifact validators
+        run: |
+          python3 -m venv "$RUNNER_TEMP/cmdb-aa-venv"
+          "$RUNNER_TEMP/cmdb-aa-venv/bin/pip" install -r scripts/requirements-aa.txt
+          echo "$RUNNER_TEMP/cmdb-aa-venv/bin" >> "$GITHUB_PATH"
+
       - name: Run CI gate
         run: npm run ci
 

@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-09-29 - v00.00.00.10
+
+### Changed
+
+- Aligned architecture processes, deployment views, operational maps and the SVG overview with the current runtime and typed information-flow registry.
+- Updated owned OpenAPI and added the consumed CMDBuild and LiteLLM contracts; flow IDs are cross-checked against the information model.
+
+### Added
+
+- Added four canonical XLSX delivery maps for health checks, metrics, events and secret rotation, generated from the Markdown sources.
+- Added CI checks for artifact completeness, recursive links, typed flow IDs, OpenAPI and workbook contents, including protected template cells and negative regression cases.
+- Documented generation prerequisites and explicit non-applicability for Kafka, AsyncAPI and network file-access maps.
+
+### Known limitations
+
+- Runtime behavior and CMDBuild data are unchanged. The architecture maps record the existing stack logging outside Verbose and the still-required external log-delivery evidence as open acceptance blockers.
+- This source handoff does not attest a verified registry image or deployment to customer contours.
+
 ## 2026-09-18 - v00.00.00.09
 
 ### Added

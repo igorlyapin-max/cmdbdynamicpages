@@ -1,0 +1,813 @@
+openapi: 3.0.3
+info:
+  title: CMDBuild REST API, потребляемое подмножество cmdbdynamicpages
+  version: 0.1.0
+  description: >
+    Контракт фактически вызываемых backend и cmdb-build-view endpoints, а не
+    полная спецификация CMDBuild. Авторизация выполняется заголовком
+    CMDBuild-Authorization с текущей пользовательской сессией. Cookie и
+    X-CMDBDynamicPages-CSRF не пересылаются: same-origin/CSRF проверяет owned
+    API до вызова этой интеграции. Все вызовы используют Accept: application/json;
+    записи дополнительно Content-Type: application/json. x-request-id
+    передаётся при наличии request context. Клиент определяет успех по любому
+    2xx, читает JSON data/meta; не-2xx обрабатывается по конкретному caller.
+    Ответы 2XX здесь отражают именно условие клиента, а не обещание каждого
+    отдельного vendor status. Состав дополнительных полей, статусы конкретной
+    версии CMDBuild и deployment адрес требуют проверки на целевой установке.
+    Proxy UI, login браузера, POC и тестовые mocks не входят в этот runtime-контракт.
+x-source-evidence:
+  - scripts/dev-proxy-server.mjs: cmdbuildRequest, cmdbuildRequestOnce, checkCmdbuildUpstream
+  - scripts/dev-proxy-server.mjs: buildModelCatalog, buildPermissionScopeProbe, checkOrCreateTechnicalSchema
+  - scripts/dev-proxy-server.mjs: findConfigCard, findTemplateCard, writeTemplateVersion, executeTemplateSpec
+  - src/special-renderers/cmdb-build-view.mjs: loadTranslationMap, loadClassAttributes, loadDomains, loadLookupTables
+servers:
+  - url: "{protocol}://{host}:{port}/cmdbuild/services/rest/v3"
+    description: >
+      Placeholder для CMDBUILD_ORIGIN, не сеть заказчика. FQDN, protocol, port
+      и TLS для каждого контура требуют согласования. Defaults синтаксические;
+      адреса действующей установки и credentials намеренно отсутствуют.
+    variables:
+      protocol:
+        default: https
+        enum: [http, https]
+      host:
+        default: cmdbuild.example.invalid
+      port:
+        default: "443"
+security:
+  - cmdbuildSessionHeader: []
+tags:
+  - name: session
+  - name: model
+  - name: schema
+  - name: cards
+paths:
+  /sessions/current:
+    get:
+      x-flow-id: OAPI100
+      tags: [session]
+      summary: Прочитать текущую CMDBuild-сессию
+      description: >
+        Основной вызов использует session header. Отдельный checkCmdbuildUpstream
+        для owned H2 вызывает тот же путь без авторизации, игнорирует тело и
+        считает любой HTTP 200..499 признаком доступности upstream. Это не
+        проверка действительности сессии. requireValidBackendSession требует
+        2xx и data; upstream 400/401/403 превращает в owned 401, прочий неуспех
+        в 502. Owned /session и /auth/capabilities преобразуют любой не-2xx в 502.
+      security:
+        - cmdbuildSessionHeader: []
+        - {}
+      responses:
+        "2XX":
+          description: Сессия в data; для health probe тело не используется
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    $ref: "#/components/schemas/Session"
+        default:
+          description: >
+            Не-2xx. 400/401/403 значимы для проверки сессии; для health probe
+            также 3xx/4xx означает HTTP-доступность, 5xx означает недоступность.
+  /classes:
+    get:
+      x-flow-id: OAPI101
+      tags: [model]
+      summary: Прочитать доступные классы и признаки CRUD
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Start"
+        - $ref: "#/components/parameters/Detailed"
+      responses:
+        "2XX":
+          description: Каталог classes с метаданными и правами текущей сессии
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Class"
+                  meta:
+                    $ref: "#/components/schemas/ListMeta"
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+  /classes/:
+    post:
+      x-flow-id: OAPI102
+      tags: [schema]
+      summary: Создать отсутствующий технический класс при bootstrap
+      description: >
+        Завершающий slash сохранён по фактическому caller. Bootstrap не меняет
+        существующий класс. Помимо session header отправляет CMDBuild-View: admin;
+        owned обработчик предварительно проверяет admin_classes_modify.
+      parameters:
+        - $ref: "#/components/parameters/AdministrationView"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClassCreate"
+      responses:
+        "2XX":
+          $ref: "#/components/responses/ClassItem"
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+  /classes/{className}:
+    parameters:
+      - $ref: "#/components/parameters/ClassName"
+    get:
+      x-flow-id: OAPI103
+      tags: [model]
+      summary: Прочитать описание класса и проверить доступ к template class
+      responses:
+        "2XX":
+          $ref: "#/components/responses/ClassItem"
+        "404":
+          description: Класс отсутствует; schema preview/bootstrap использует этот статус
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+  /classes/{className}/attributes:
+    parameters:
+      - $ref: "#/components/parameters/ClassName"
+    get:
+      x-flow-id: OAPI104
+      tags: [model]
+      summary: Прочитать атрибуты класса
+      description: readCmdbuildClassAttributes и build-view отправляют scope=service и limit=1000
+      parameters:
+        - $ref: "#/components/parameters/ServiceScope"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "2XX":
+          $ref: "#/components/responses/AttributeList"
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+    post:
+      x-flow-id: OAPI105
+      tags: [schema]
+      summary: Создать отсутствующий технический атрибут
+      description: >
+        Только schema bootstrap, без изменения существующих атрибутов.
+        CMDBuild-View: admin обязателен в исходящем запросе этого caller.
+      parameters:
+        - $ref: "#/components/parameters/AdministrationView"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AttributeCreate"
+      responses:
+        "2XX":
+          $ref: "#/components/responses/AttributeItem"
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+  /classes/{className}/attributes/{attributeName}:
+    parameters:
+      - $ref: "#/components/parameters/ClassName"
+      - name: attributeName
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      x-flow-id: OAPI106
+      tags: [schema]
+      summary: Проверить существование и форму технического атрибута
+      responses:
+        "2XX":
+          $ref: "#/components/responses/AttributeItem"
+        "404":
+          description: Атрибут отсутствует, schema preview/bootstrap фиксирует missing
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+  /domains:
+    get:
+      x-flow-id: OAPI107
+      tags: [model]
+      summary: Прочитать доступные домены для каталога и обхода связей
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Start"
+        - $ref: "#/components/parameters/Detailed"
+      responses:
+        "2XX":
+          description: Каталог доменов
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Domain"
+                  meta:
+                    $ref: "#/components/schemas/ListMeta"
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+  /domains/{domainName}:
+    parameters:
+      - $ref: "#/components/parameters/DomainName"
+    get:
+      x-flow-id: OAPI108
+      tags: [model]
+      summary: Прочитать стороны, cardinality и metadata домена
+      responses:
+        "2XX":
+          description: Метаданные одного домена
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Domain"
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+  /lookup_types:
+    get:
+      x-flow-id: OAPI109
+      tags: [model]
+      summary: Прочитать используемые типы lookup
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "2XX":
+          $ref: "#/components/responses/LookupTypeList"
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+  /roles:
+    get:
+      x-flow-id: OAPI110
+      tags: [session]
+      summary: Проверить доступность каталога ролей
+      description: Backend передаёт limit=100; ошибка отдельного probe не делает сессию невалидной
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "2XX":
+          description: Роли текущего пользователя или администратора
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Role"
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+  /roles/{roleName}:
+    get:
+      x-flow-id: OAPI111
+      tags: [session]
+      summary: Прочитать текущую роль и её привилегии
+      parameters:
+        - name: roleName
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "2XX":
+          description: Поля роли, используемые sanitizeRole
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Role"
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+  /users:
+    get:
+      x-flow-id: OAPI112
+      tags: [session]
+      summary: Проверить доступность каталога пользователей
+      description: >
+        limit=1. auth/capabilities и permission-scope используют только HTTP
+        status. Пользовательские записи не требуются этому контракту.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "2XX":
+          description: Endpoint доступен с текущей сессией; содержимое data не используется
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+  /groups:
+    get:
+      x-flow-id: OAPI113
+      tags: [session]
+      summary: Проверить наличие и доступность endpoint groups
+      description: >
+        limit=1. Диагностический probe, существование endpoint не гарантируется
+        каждой версией CMDBuild. Не-2xx сохраняется в probes, не заменяется
+        выдуманным успешным списком групп.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "2XX":
+          description: Endpoint доступен с текущей сессией; содержимое data не используется
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+  /classes/{className}/cards:
+    parameters:
+      - $ref: "#/components/parameters/ClassName"
+    get:
+      x-flow-id: OAPI114
+      tags: [cards]
+      summary: Прочитать страницы бизнес-карточек или технические карточки
+      description: >
+        Выполнение шаблона читает бизнес-данные; config/template/version callers
+        читают свои технические классы. Выбор template Code и версии выполняется
+        локально после чтения, серверный filter этим caller не отправляется.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Start"
+        - name: attributes
+          in: query
+          description: Имена прямых атрибутов через запятую; необязательная проекция
+          schema: { type: string }
+      responses:
+        "2XX":
+          description: Карточки с динамическими атрибутами и meta пагинации
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Card"
+                  meta:
+                    $ref: "#/components/schemas/ListMeta"
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+    post:
+      x-flow-id: OAPI115
+      tags: [cards]
+      summary: Создать config, template либо template version карточку
+      description: >
+        Запись только в технические классы проекта. Привилегии берутся от
+        пользовательской сессии, service-account обход прав отсутствует.
+        Создание version выполняется после обычного сохранения template.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/ConfigWrite"
+                - $ref: "#/components/schemas/TemplateWrite"
+                - $ref: "#/components/schemas/VersionWrite"
+      responses:
+        "2XX":
+          $ref: "#/components/responses/CardItem"
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+  /classes/{className}/cards/{cardId}:
+    parameters:
+      - $ref: "#/components/parameters/ClassName"
+      - $ref: "#/components/parameters/CardId"
+    get:
+      x-flow-id: OAPI116
+      tags: [cards]
+      summary: Прочитать одну карточку при runtime traversal
+      responses:
+        "2XX":
+          $ref: "#/components/responses/CardItem"
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+    put:
+      x-flow-id: OAPI117
+      tags: [cards]
+      summary: Обновить техническую config либо template карточку
+      description: CAS и _can_update проверяет owned API; CMDBuild revision header не отправляется
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/ConfigWrite"
+                - $ref: "#/components/schemas/TemplateWrite"
+      responses:
+        "2XX":
+          $ref: "#/components/responses/CardItem"
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+    delete:
+      x-flow-id: OAPI118
+      tags: [cards]
+      summary: Удалить техническую template карточку
+      description: Без request body; backend использует HTTP status, а не обязательное JSON тело
+      responses:
+        "2XX":
+          description: Удаление принято; JSON тело может отсутствовать
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+  /classes/{className}/cards/{cardId}/relations:
+    parameters:
+      - $ref: "#/components/parameters/ClassName"
+      - $ref: "#/components/parameters/CardId"
+    get:
+      x-flow-id: OAPI119
+      tags: [cards]
+      summary: Прочитать связи карточки для ограниченного traversal
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "2XX":
+          description: Связи с идентификаторами class/card и домена
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Relation"
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+  /translations:
+    get:
+      x-flow-id: OAPI120
+      tags: [model]
+      summary: Прочитать переводы подписей для cmdb-build-view
+      description: scope=service, limit=100000; ошибка обрабатывается как отсутствие переводов
+      parameters:
+        - $ref: "#/components/parameters/ServiceScope"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "2XX":
+          description: Используемые поля code и value
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        code: { type: string }
+                        value: { type: string }
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+  /domains/{domainName}/attributes:
+    parameters:
+      - $ref: "#/components/parameters/DomainName"
+    get:
+      x-flow-id: OAPI121
+      tags: [model]
+      summary: Прочитать атрибуты домена для cmdb-build-view
+      description: scope=service, limit=1000; неуспех записывается в attributesError
+      parameters:
+        - $ref: "#/components/parameters/ServiceScope"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "2XX":
+          $ref: "#/components/responses/AttributeList"
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+  /lookup_types/{lookupName}/values:
+    get:
+      x-flow-id: OAPI122
+      tags: [model]
+      summary: Прочитать значения используемого lookup для cmdb-build-view
+      description: scope=service, limit=1000; неуспех записывается в valuesError
+      parameters:
+        - name: lookupName
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: "#/components/parameters/ServiceScope"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "2XX":
+          description: Значения lookup для построения иерархии
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        _id: {}
+                        id: {}
+                        code: { type: string }
+                        description: { type: string }
+                        _description_translation: { type: string }
+                        active: { type: boolean }
+                        parent:
+                          description: Идентификатор либо объект с _id/id, используемый lookupParentId
+                        parent_id:
+                          description: Альтернативный идентификатор родителя, читаемый lookupParentId
+        default:
+          $ref: "#/components/responses/UpstreamFailure"
+components:
+  securitySchemes:
+    cmdbuildSessionHeader:
+      type: apiKey
+      in: header
+      name: CMDBuild-Authorization
+      description: Значение текущей пользовательской сессии; никогда не публикуется в examples
+  parameters:
+    ClassName:
+      name: className
+      in: path
+      required: true
+      schema: { type: string }
+    DomainName:
+      name: domainName
+      in: path
+      required: true
+      schema: { type: string }
+    CardId:
+      name: cardId
+      in: path
+      required: true
+      schema: { type: string }
+      description: Идентификатор карточки, caller сериализует и URL-encode
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 0 }
+      description: Значение задаёт caller по лимитам каталога или выполнения; единого default нет
+    Start:
+      name: start
+      in: query
+      schema: { type: integer, minimum: 0 }
+    Detailed:
+      name: detailed
+      in: query
+      schema: { type: boolean }
+    ServiceScope:
+      name: scope
+      in: query
+      required: true
+      schema: { type: string, enum: [service] }
+    AdministrationView:
+      name: CMDBuild-View
+      in: header
+      required: true
+      schema: { type: string, enum: [admin] }
+  responses:
+    UpstreamFailure:
+      description: >
+        Ответ не-2xx. Тело не предполагается всегда JSON: caller сохраняет
+        statusCode, json (null при parse failure) и text; конкретный owned
+        обработчик решает, вернуть upstream status, 502 либо диагностический
+        probe. Сетевой timeout/ошибка соединения вообще не является HTTP ответом.
+    ClassItem:
+      description: Метаданные класса в data
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data:
+                $ref: "#/components/schemas/Class"
+    AttributeItem:
+      description: Метаданные атрибута в data
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data:
+                $ref: "#/components/schemas/Attribute"
+    AttributeList:
+      description: Список атрибутов в data
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Attribute"
+              meta:
+                $ref: "#/components/schemas/ListMeta"
+    LookupTypeList:
+      description: Список lookup types
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    _id: {}
+                    name: { type: string }
+                    description: { type: string }
+                    parent: { type: string }
+                    speciality: { type: string }
+    CardItem:
+      description: Карточка с динамическими атрибутами в data
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data:
+                $ref: "#/components/schemas/Card"
+  schemas:
+    ListMeta:
+      type: object
+      properties:
+        total: { type: integer }
+        start: { type: integer }
+        limit: { type: integer }
+      additionalProperties: true
+    Session:
+      type: object
+      description: Поля, читаемые getSessionData/sanitizeSession; остальные vendor-поля не фиксируются
+      properties:
+        userId: {}
+        username: { type: string }
+        userDescription: { type: string }
+        language: { type: string }
+        locale: { type: string }
+        role: { type: string }
+        tenant: {}
+        availableRoles: { type: array, items: {} }
+        availableTenants: { type: array, items: {} }
+        rolePrivileges:
+          type: object
+          properties:
+            admin_classes_modify: { type: boolean }
+          additionalProperties: { type: boolean }
+      additionalProperties: true
+    Role:
+      type: object
+      properties:
+        _id: {}
+        name: { type: string }
+        description: { type: string }
+        type: { type: string }
+        active: { type: boolean }
+        _can_users_read: { type: boolean }
+        _can_users_modify: { type: boolean }
+        _rp_admin_classes_modify: { type: boolean }
+        _rp_custompages_access: { type: boolean }
+      additionalProperties: true
+    Class:
+      type: object
+      properties:
+        _id: {}
+        name: { type: string }
+        description: { type: string }
+        _description_translation: { type: string }
+        parent: { type: string, nullable: true }
+        prototype: { type: boolean }
+        type: { type: string }
+        active: { type: boolean }
+        _can_read: { type: boolean }
+        _can_create: { type: boolean }
+        _can_update: { type: boolean }
+        _can_delete: { type: boolean }
+      additionalProperties: true
+    Attribute:
+      type: object
+      properties:
+        name: { type: string }
+        description: { type: string }
+        type: { type: string }
+        mode: { type: string }
+        active: { type: boolean }
+        mandatory: { type: boolean }
+        unique: { type: boolean }
+        targetClass: { type: string }
+        domain: { type: string }
+        lookupType: { type: string }
+        metadata: { type: object, additionalProperties: true }
+      additionalProperties: true
+    Domain:
+      type: object
+      properties:
+        name: { type: string }
+        description: { type: string }
+        source: { type: string }
+        destination: { type: string }
+        sources: { type: array, items: { type: string } }
+        destinations: { type: array, items: { type: string } }
+        cardinality: { type: string }
+        descriptionDirect: { type: string }
+        descriptionInverse: { type: string }
+        active: { type: boolean }
+      additionalProperties: true
+    Card:
+      type: object
+      properties:
+        _id: {}
+        _type: { type: string }
+        Code: { type: string }
+        Description: { type: string }
+        _can_update: { type: boolean }
+        _can_delete: { type: boolean }
+      additionalProperties: true
+    Relation:
+      type: object
+      description: Минимальные читаемые ключи связи; дополнительные поля остаются vendor-owned
+      properties:
+        _id: {}
+        _type: { type: string }
+        _sourceId: {}
+        _sourceType: { type: string }
+        _destinationId: {}
+        _destinationType: { type: string }
+      additionalProperties: true
+    ClassCreate:
+      type: object
+      required: [name, description, parent, prototype, type, active]
+      description: >
+        baseClassPayload дополнительно отправляет пустые defaultOrder/domainOrder,
+        formTriggers/contextMenuItems/widgets/attributeGroups/dmsCategories,
+        attachmentsInline=false, attachmentsInlineClosed=true, noteInline=false,
+        noteInlineClosed=false, multitenantMode=never, uiRouting_mode=default,
+        uiRouting_target=null, uiRouting_custom={}, barcodeSearchAttr=null,
+        barcodeSearchRegex=null. Это форма caller, не полный vendor create DTO.
+      properties:
+        name: { type: string }
+        description: { type: string }
+        parent: { type: string }
+        prototype: { type: boolean }
+        type: { type: string, enum: [standard] }
+        active: { type: boolean, enum: [true] }
+      additionalProperties: true
+    AttributeCreate:
+      type: object
+      required: [name, description, type, mode, active, mandatory, unique, showInGrid, showInReducedGrid, hidden, writable, index, metadata]
+      description: >
+        Для string caller также отправляет maxLength, password=false,
+        showPassword=always, textContentSecurity=plaintext и metadata.cm_length,
+        cm_multiline=false; для text cm_multiline=true и textContentSecurity.
+      properties:
+        name: { type: string }
+        description: { type: string }
+        type: { type: string }
+        mode: { type: string, enum: [write] }
+        active: { type: boolean, enum: [true] }
+        mandatory: { type: boolean }
+        unique: { type: boolean }
+        showInGrid: { type: boolean }
+        showInReducedGrid: { type: boolean, enum: [false] }
+        hidden: { type: boolean, enum: [false] }
+        writable: { type: boolean, enum: [true] }
+        index: { type: integer }
+        metadata: { type: object, additionalProperties: { type: string } }
+        maxLength: { type: integer }
+      additionalProperties: true
+    ConfigWrite:
+      type: object
+      required: [Code, Description, RootCode, Active, RuntimeConfigJson]
+      properties:
+        Code: { type: string }
+        Description: { type: string }
+        RootCode: { type: string }
+        Active: { type: boolean }
+        RuntimeConfigJson: { type: string, description: Сериализованный JSON конфигурации }
+    TemplateWrite:
+      type: object
+      required: [Code, Description, Active, SpecJson, ParamsSchemaJson, ResultSchemaJson, Owner, UpdatedAt]
+      properties:
+        Code: { type: string }
+        Description: { type: string }
+        Active: { type: boolean }
+        SpecJson: { type: string, description: Сериализованный нормализованный spec }
+        ParamsSchemaJson: { type: string }
+        ResultSchemaJson: { type: string }
+        Owner: { type: string }
+        UpdatedAt: { type: string, format: date-time }
+    VersionWrite:
+      type: object
+      required: [Code, Description, TemplateCode, Version, SpecJson, ChangedBy, ChangedAt, ChangeComment]
+      properties:
+        Code: { type: string }
+        Description: { type: string }
+        TemplateCode: { type: string }
+        Version: { type: integer, minimum: 1 }
+        SpecJson: { type: string }
+        ChangedBy: { type: string }
+        ChangedAt: { type: string, format: date-time }
+        ChangeComment: { type: string }
