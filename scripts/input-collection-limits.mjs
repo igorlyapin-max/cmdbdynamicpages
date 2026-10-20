@@ -122,10 +122,11 @@ const SCHEMAS = {
     related: ['mapping'], primary: 'mapping', mapping: 'mapping', mappings: ['mapping'], path: ['mapping'],
     conditions: 'condition', hierarchyConditions: 'condition',
     endpointProfiles: ['mapping', 'd2MaxElements'], endpointResolution: 'mapping',
-    labelFields: ['leaf'], dataProfile: 'dataProfile', d2Template: 'elements',
+    labelFields: ['leaf'], dataProfile: 'dataProfile', d2Template: 'elements', aggregation: 'aggregation',
     templateElementKeys: ['leaf']
   },
   dataProfile: { fields: ['leaf'] },
+  aggregation: { groupBy: ['leaf', 32] },
   diagram: {
     nodeMappings: ['mapping'], edgeMappings: ['mapping'], groupMappings: ['mapping'], hierarchyMappings: ['mapping'],
     structureTree: 'structureTree', templateGrammar: 'grammar', authoring: 'authoring'

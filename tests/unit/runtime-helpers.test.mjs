@@ -1295,7 +1295,7 @@ test('D2 renderer is enabled by default and SVG sanitizer strips unsafe content'
   assert.equal(config.maxDiagrams, 8);
   assert.equal(config.concurrency, 2);
   assert.deepEqual(config.layoutAllowlist, ['dagre', 'elk']);
-  assert.equal(d2CacheContext().d2.sourceBuilderVersion, 3);
+  assert.equal(d2CacheContext().d2.sourceBuilderVersion, 4);
   assert.equal(d2CacheContext().d2.markdownFrameRevision, 1);
 
   const sanitized = sanitizeD2Svg('<?xml version="1.0"?><svg onclick="alert(1)"><script>alert(1)</script><foreignObject><body>Bad</body></foreignObject><style>@import url(http://evil)</style><animate attributeName="x"></animate><image href="https://evil.local/a.png"></image><a href="javascript:alert(1)"><text>Bad</text></a><a href="ftp://evil.local/a"><text>FTP</text></a><a href="/cmdbuild/ui/#classes/Server/cards/1" style="fill:#111"><text>Good</text></a><text style="background:url(https://evil.local/a.png)">Styled</text></svg>');

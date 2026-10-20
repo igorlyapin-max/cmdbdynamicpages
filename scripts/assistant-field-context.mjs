@@ -85,7 +85,8 @@ export function buildAssistantFieldContext(stages, catalog = {}, options = {}) {
   for (const owners of attributeOwners.values()) if (owners.size === 1) traversable.add([...owners][0]);
   const discover = (root) => {
     if (cache.has(root)) return cache.get(root);
-    const fields = [], queue = [{ name: root, prefix: '', hops: [], visited: new Set([root]) }];
+    const fields = [], queue = [{ name: root, prefix: '', hops: [] }];
+    const queuedPaths = new Set([JSON.stringify([root, '', []])]);
     let discoveredBytes = 0;
     const shortestFields = new Map();
     let cursor = 0;
@@ -113,10 +114,14 @@ export function buildAssistantFieldContext(stages, catalog = {}, options = {}) {
       if (discoveredBytes > classBudget) break;
       if (state.hops.length >= depth) continue;
       const enqueue = (name, prefix, hop) => {
-        if (!classes.has(name) || state.visited.has(name)) return;
-        // Each queued state has a distinct semantic path; no first-card shortcut.
+        if (!classes.has(name)) return;
+        const hops = state.hops.concat(hop);
+        const pathKey = JSON.stringify([name, prefix, hops]);
+        if (queuedPaths.has(pathKey)) return;
+        // Revisited classes are distinct paths, bounded by depth and state caps.
         if (queue.length >= maxStates) { diagnostics.truncated = true; return; }
-        queue.push({ name, prefix, hops: state.hops.concat(hop), visited: new Set([...state.visited, name]) });
+        queuedPaths.add(pathKey);
+        queue.push({ name, prefix, hops });
       };
       for (const attribute of attributes(owner.name)) {
         const target = attribute.targetClass || attribute.targetType;

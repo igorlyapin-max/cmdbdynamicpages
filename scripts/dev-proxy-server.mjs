@@ -38,6 +38,9 @@ import { resolveDiagramEndpointScope, diagramObjectsWithinScope } from './diagra
 import { compileAssistantPlacementIntent, assistantPlacementHasStageAncestor } from './assistant-placement-compiler.mjs';
 import { createAssistantBindingHandles } from './assistant-binding-handles.mjs';
 import { assertInputCollections, normalizeInputCollectionLimits } from './input-collection-limits.mjs';
+import { aggregateDiagramEdges, normalizeEdgeAggregation, validateEdgeAggregation } from './diagram-edge-aggregation.mjs';
+import { runtimeRowIdentity, runtimeRowValue, runtimeSemanticKey, setRuntimeRowSemantics, setRuntimeRowValue,
+  inheritRuntimeRowSemantics, mergeRuntimeRowSemantics, deriveRuntimeRowSemantics } from './runtime-row-semantics.mjs';
 
 const APPLICATION_BUILD_IDENTITY = readApplicationBuildIdentity();
 const APPLICATION_BUILD = publicApplicationBuildIdentity(APPLICATION_BUILD_IDENTITY);
@@ -1943,7 +1946,7 @@ function d2CacheContext() {
   const config = d2RendererConfig();
   return {
     d2: {
-      sourceBuilderVersion: 3,
+      sourceBuilderVersion: 4,
       enabled: config.enabled,
       binary: config.binary,
       timeoutMs: config.timeoutMs,
@@ -2535,7 +2538,24 @@ function normalizeDiagramImportRelatedLabelValueMode(value) {
 function normalizeDiagramImportConditionOperator(value) {
   const operator = String(value || 'equals').trim();
   if (operator === 'notEquals') return 'equals';
-  return DIAGRAM_IMPORT_CONDITION_OPERATORS.has(operator) ? operator : 'equals';
+  return operator;
+}
+
+function diagramImportConditionOperatorErrors(filters, path, label) {
+  return filters.rules.flatMap((condition, index) => DIAGRAM_IMPORT_CONDITION_OPERATORS.has(condition.operator) ? [] : [{
+    path: `${path}.rules[${index}].operator`, code: 'diagram_condition_operator_unsupported',
+    message: `Для «${label || 'элемент диаграммы'}» условие «${condition.left.column} ${condition.operator} ${condition.right.column || condition.right.name || condition.right.value}» содержит неподдерживаемый оператор «${condition.operator}». Допустимы: ${[...DIAGRAM_IMPORT_CONDITION_OPERATORS].join(', ')}, notEquals.`
+  }]);
+}
+
+function assertDiagramImportConditionOperators(filters, label) {
+  const errors = diagramImportConditionOperatorErrors(filters, '$.conditions', label);
+  if (!errors.length) return;
+  const error = new Error(errors[0].message);
+  error.code = 'diagram_condition_operator_unsupported';
+  error.statusCode = 422;
+  error.details = errors;
+  throw error;
 }
 
 function normalizeDiagramImportConditionCardSource(value) {
@@ -4336,7 +4356,8 @@ function diagramImportConnectionRuleMappingSignature(rule) {
     diagramImportConnectionRuleSideOperator(source, 'target'),
     diagramImportRelationLabelTemplate(source),
     normalizeDiagramDirectionPolicy(source.directionPolicy),
-    String(source.endpointScopeStructureItemId || '')
+    String(source.endpointScopeStructureItemId || ''),
+    stableJsonStringify(source.aggregation === undefined ? null : source.aggregation)
   ].join('\u0000');
 }
 
@@ -4821,6 +4842,8 @@ function diagramImportMappingInputUsedFields(spec, imported, stages) {
     const stageId = String(rule && rule.sourceStageId || '');
     [rule && rule.sourceField, rule && rule.targetField, rule && rule.labelField]
       .concat(Array.isArray(rule && rule.fields) ? rule.fields : [])
+      .concat(diagramTemplateFieldNames(diagramImportRelationLabelTemplate(rule)))
+      .concat(rule && rule.aggregation && rule.aggregation.enabled === true && Array.isArray(rule.aggregation.groupBy) ? rule.aggregation.groupBy : [])
       .forEach((field) => add(stageId, field));
   }
   return fieldsByStageId;
@@ -5574,6 +5597,7 @@ function diagramImportCompileConditionEnrichment(from, stage, fields, treeItemId
 
 function diagramImportCompileMappingConditions(mapping, treeItemId, primaryAlias, stageById = new Map(), primaryStage = null) {
   const conditions = diagramImportPlacementFilters(mapping && mapping.conditions);
+  assertDiagramImportConditionOperators(conditions, primaryStage && primaryStage.label || mapping && mapping.label || 'элемент диаграммы');
   if (!primaryAlias || !conditions.rules.length) return { alias: primaryAlias, steps: [], stageCorrelations: [], inferredSources: [] };
 
   const steps = [];
@@ -5719,6 +5743,7 @@ function diagramImportCompileMappingConditions(mapping, treeItemId, primaryAlias
 // They must never change the membership of the child Object Flow result.
 function diagramImportCompileHierarchyCorrelations(mapping, treeItemId, primaryAlias, primaryStage = null, parentFieldColumns = new Map()) {
   const conditions = diagramImportPlacementFilters(mapping && mapping.hierarchyConditions);
+  assertDiagramImportConditionOperators(conditions, primaryStage && primaryStage.label || mapping && mapping.label || 'элемент диаграммы');
   if (!primaryAlias || !conditions.rules.length) return { alias: primaryAlias, steps: [], stageCorrelations: [], inferredSources: [] };
 
   const primaryEnrichment = diagramImportCompileConditionEnrichment(
@@ -6320,10 +6345,27 @@ function diagramImportCompileRelationRule(rule, roleById, compiledByItemId, stag
   const sourceField = String(matchEndpointSources && matchEndpointSources[0] && matchEndpointSources[0].idColumn || rule.sourceField);
   const targetField = String(matchEndpointSources && matchEndpointSources[1] && matchEndpointSources[1].idColumn || rule.targetField);
   if (!sourceField || !targetField) return [];
+  const aggregationFields = rule.aggregation && rule.aggregation.enabled === true && Array.isArray(rule.aggregation.groupBy)
+    ? rule.aggregation.groupBy : [];
+  const enrichment = diagramImportCompileConditionEnrichment(stage.alias, stage,
+    aggregationFields.map((field) => ({ path: field })), String(rule.id || rule.d2ClassKey || ''), 'aggregation');
+  // Aggregation enriches the existing row; it must never expand a collection
+  // path into additional business records or change the reviewed source result.
+  for (const step of enrichment.steps) {
+    step.purpose = 'd2EdgeAggregation';
+    const source = cardSources.find((candidate) => candidate.classColumn === step.classColumn && candidate.idColumn === step.idColumn);
+    step.columns = normalizePathColumnSpecs(step.columns).map((column) => ({
+      ...column,
+      as: column.path,
+      path: source ? diagramImportCardSourceRawField(source, column.path) : column.path,
+      multiMode: 'join',
+      correlationKey: ''
+    }));
+  }
   return [{
     rule: cloneJsonValueServer(rule, {}),
-    alias: stage.alias,
-    steps: [],
+    alias: enrichment.alias,
+    steps: enrichment.steps,
     rootIdField: sourceField,
     targetIdField: targetField,
     labelTemplate: diagramImportRelationLabelTemplate(rule)
@@ -6364,6 +6406,7 @@ function diagramImportRuntimeRelationMappings(compiledRules, roleById, templateG
       direction: normalizeDiagramDirectionPolicy(rule.directionPolicy) === 'undirected' ? '--' : '->',
       label: String(edgeBlueprint.label || rule.d2Label || ''),
       labelTemplate: compiled.labelTemplate,
+      ...(rule.aggregation !== undefined ? { aggregation: cloneJsonValueServer(rule.aggregation, {}) } : {}),
       labelFallbackDisabled: rule.kind !== 'hierarchy'
     };
     if (rule.kind === 'hierarchy') hierarchyMappings.push(mapping);
@@ -7123,6 +7166,28 @@ function validateDiagramImportV3Catalog(proposal, catalog, currentSpec = {}) {
       continue;
     }
     const available = new Set(Array.isArray(stage.columns) ? stage.columns.map(String) : []);
+    errors.push(...validateEdgeAggregation(rule.aggregation, {
+      path: `$.relationRules[${index}].aggregation`
+    }).map((error) => ({ ...error, code: 'diagram_edge_aggregation_invalid' })));
+    if (rule.aggregation && rule.aggregation.enabled === true && Array.isArray(rule.aggregation.groupBy)) {
+      rule.aggregation.groupBy.forEach((field, fieldIndex) => {
+        if (typeof field !== 'string' || !field.trim() || available.has(field)) return;
+        const fieldPath = `$.relationRules[${index}].aggregation.groupBy[${fieldIndex}]`;
+        const sources = diagramImportUniqueStageCardSources(stage.cardSources || [])
+          .filter((source) => diagramImportCardSourceField(source, diagramImportCardSourceRawField(source, field)) === field);
+        if (!sources.length && stage.className) sources.push(diagramImportCurrentStageCardSource(stage.className));
+        const initialErrors = errors.length;
+        let confirmed = 0;
+        for (const source of sources) {
+          const start = errors.length;
+          if (validateFieldPath(source.className, diagramImportCardSourceRawField(source, field), fieldPath)) confirmed += 1;
+          errors.splice(start);
+        }
+        errors.splice(initialErrors);
+        if (confirmed !== 1) errors.push({ path: fieldPath, code: 'diagram_edge_aggregation_field_invalid',
+          message: `Атрибут агрегации «${field}» не подтверждён однозначно для результата «${stage.label || stage.alias}». Выберите поле этого результата.` });
+      });
+    }
     const requiredFields = ['sourceField', 'targetField'];
     for (const field of uniqueStrings(requiredFields.concat(diagramTemplateFieldNames(diagramImportRelationLabelTemplate(rule))))) {
       const value = String(requiredFields.includes(field) ? rule[field] || '' : field).trim();
@@ -10467,6 +10532,33 @@ function dynamicPagesClientScript() {
       diagramImportEditorStructureTab: 'Structure',
       diagramImportEditorHierarchyTab: 'Hierarchy links',
       diagramImportEditorConnectionsTab: 'D2 connections',
+      diagramImportAggregation: 'Aggregation',
+      diagramImportAggregationEnabled: 'Aggregate connections',
+      diagramImportAggregationGroupBy: 'Group by',
+      diagramImportAggregationAdd: 'Add grouping field',
+      diagramImportAggregationUp: 'Move field up',
+      diagramImportAggregationDown: 'Move field down',
+      diagramImportAggregationRemove: 'Remove grouping field',
+      diagramImportAggregationLimit: 'Grouping fields: {count}/32',
+      diagramImportAggregationGroupError: 'Select a field in each row; at most 32 fields are allowed.',
+      diagramImportAggregationFormat: 'Label format',
+      diagramImportAggregationCompact: 'Compact',
+      diagramImportAggregationTree: 'Tree',
+      diagramImportAggregationDuplicates: 'Duplicate values',
+      diagramImportAggregationDistinct: 'Distinct',
+      diagramImportAggregationPreserve: 'Preserve',
+      diagramImportAggregationMax: 'Label characters',
+      diagramImportAggregationMaxError: 'Enter an integer from 64 to 20000.',
+      diagramImportAggregationDetails: 'Connection aggregation',
+      diagramImportAggregationInput: 'Input connections',
+      diagramImportAggregationOutput: 'Output connections',
+      diagramImportAggregationRecords: 'Unique records',
+      diagramImportAggregationTruncated: 'Truncated labels',
+      diagramImportAggregationMembers: 'Members',
+      diagramImportAggregationConnections: 'Connections',
+      diagramImportAggregationGroups: 'Groups',
+      diagramImportAggregationHidden: 'Hidden values',
+      diagramImportAggregationTruncatedNotice: 'The label is truncated; member data is available below.',
       diagramImportEditorTabsLabel: 'D2 mapping editor',
       diagramImportParentContainer: 'Parent container',
       diagramImportRootContainer: 'Root',
@@ -11680,6 +11772,33 @@ function dynamicPagesClientScript() {
       diagramImportEditorStructureTab: 'Структура',
       diagramImportEditorHierarchyTab: 'Связи иерархии',
       diagramImportEditorConnectionsTab: 'Связи D2',
+      diagramImportAggregation: 'Агрегация',
+      diagramImportAggregationEnabled: 'Объединять связи',
+      diagramImportAggregationGroupBy: 'Группировка по полям',
+      diagramImportAggregationAdd: 'Добавить поле группировки',
+      diagramImportAggregationUp: 'Переместить поле выше',
+      diagramImportAggregationDown: 'Переместить поле ниже',
+      diagramImportAggregationRemove: 'Удалить поле группировки',
+      diagramImportAggregationLimit: 'Полей группировки: {count}/32',
+      diagramImportAggregationGroupError: 'Выберите поле в каждой строке; допустимо не более 32 полей.',
+      diagramImportAggregationFormat: 'Формат подписи',
+      diagramImportAggregationCompact: 'Компактный',
+      diagramImportAggregationTree: 'Дерево',
+      diagramImportAggregationDuplicates: 'Повторяющиеся значения',
+      diagramImportAggregationDistinct: 'Без повторов',
+      diagramImportAggregationPreserve: 'Сохранять',
+      diagramImportAggregationMax: 'Символов в подписи',
+      diagramImportAggregationMaxError: 'Введите целое число от 64 до 20000.',
+      diagramImportAggregationDetails: 'Агрегация связей',
+      diagramImportAggregationInput: 'Входящие связи',
+      diagramImportAggregationOutput: 'Итоговые связи',
+      diagramImportAggregationRecords: 'Уникальные записи',
+      diagramImportAggregationTruncated: 'Сокращённые подписи',
+      diagramImportAggregationMembers: 'Участники',
+      diagramImportAggregationConnections: 'Соединения',
+      diagramImportAggregationGroups: 'Группы',
+      diagramImportAggregationHidden: 'Скрытые значения',
+      diagramImportAggregationTruncatedNotice: 'Подпись сокращена; данные участников доступны ниже.',
       diagramImportEditorTabsLabel: 'Редактор D2 mapping',
       diagramImportParentContainer: 'Родительский контейнер',
       diagramImportRootContainer: 'Корень',
@@ -21056,7 +21175,11 @@ function dynamicPagesClientScript() {
     if (start < 0) return null;
     var fragment = before.slice(start + 2);
     if (fragment.indexOf('}') >= 0 || fragment.indexOf(String.fromCharCode(10)) >= 0 || fragment.indexOf(String.fromCharCode(13)) >= 0) return null;
-    return { start: start, end: caret, fragment: fragment };
+    var closing = value.indexOf('}', caret);
+    var remainder = closing >= 0 ? value.slice(caret, closing) : '';
+    var end = closing >= 0 && remainder.indexOf('$' + '{') < 0 && remainder.indexOf(String.fromCharCode(10)) < 0 && remainder.indexOf(String.fromCharCode(13)) < 0
+      ? closing + 1 : caret;
+    return { start: start, end: end, fragment: fragment };
   }
 
   function diagramImportLabelAutocompleteHost(input) {
@@ -21169,7 +21292,7 @@ function dynamicPagesClientScript() {
       };
     }
     var candidate = active.candidates[Number(candidateIndex)];
-    var query = active.query || diagramImportLabelAutocompleteQuery(input);
+    var query = diagramImportLabelAutocompleteQuery(input);
     if (!candidate || !query) return;
     ensureDiagramImportRelatedLabelField(input, candidate);
     var value = String(input.value || '');
@@ -22581,6 +22704,189 @@ function dynamicPagesClientScript() {
       (unavailable ? '<p class="diagram-import-label-error" role="alert">' + escapeHtml(t('diagramImportEndpointScopeFix')) + '</p>' : '');
   }
 
+  function diagramImportAggregationConfigClient(value) {
+    var config = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    return {
+      enabled: config.enabled === true,
+      groupBy: Array.isArray(config.groupBy) ? config.groupBy.slice() : [],
+      format: config.format === undefined ? 'compact' : config.format,
+      duplicates: config.duplicates === undefined ? 'distinct' : config.duplicates,
+      maxLabelChars: config.maxLabelChars === undefined ? 2000 : config.maxLabelChars
+    };
+  }
+
+  function diagramImportAggregationErrorsClient(config) {
+    var errors = [];
+    if (config.groupBy.length > 32 || config.groupBy.some(function (field) { return !String(field || '').trim(); })) errors.push(t('diagramImportAggregationGroupError'));
+    if (!Number.isInteger(config.maxLabelChars) || config.maxLabelChars < 64 || config.maxLabelChars > 20000) errors.push(t('diagramImportAggregationMaxError'));
+    return errors;
+  }
+
+  function captureDiagramImportAggregationClient(row, existing) {
+    var enabled = row.querySelector('[data-diagram-import-aggregation-field="enabled"]');
+    if (!enabled) return existing;
+    if (!enabled.checked && existing === undefined) return undefined;
+    var value = function (name, fallback) {
+      var control = row.querySelector('[data-diagram-import-aggregation-field="' + name + '"]');
+      return control ? control.value : fallback;
+    };
+    var config = diagramImportAggregationConfigClient(existing);
+    var max = value('maxLabelChars', config.maxLabelChars);
+    return {
+      enabled: Boolean(enabled.checked),
+      groupBy: Array.prototype.map.call(row.querySelectorAll('[data-diagram-import-aggregation-field="groupBy"]'), function (control) { return String(control.value || ''); }),
+      format: String(value('format', config.format)),
+      duplicates: String(value('duplicates', config.duplicates)),
+      maxLabelChars: max === '' ? '' : Number(max)
+    };
+  }
+
+  function syncDiagramImportAggregationValidationClient(target) {
+    var row = target && target.closest('[data-diagram-import-rule-row]');
+    if (!row) return;
+    var config = captureDiagramImportAggregationClient(row, {});
+    var errors = diagramImportAggregationErrorsClient(config);
+    var notice = row.querySelector('[data-diagram-import-aggregation-errors]');
+    if (notice) {
+      notice.textContent = config.enabled ? errors.join(' ') : '';
+      notice.hidden = !config.enabled || !errors.length;
+    }
+    var max = row.querySelector('[data-diagram-import-aggregation-field="maxLabelChars"]');
+    if (max) max.setAttribute('aria-invalid', config.enabled && errors.indexOf(t('diagramImportAggregationMaxError')) >= 0 ? 'true' : 'false');
+  }
+
+  function renderDiagramImportAggregationClient(rule, spec) {
+    var config = diagramImportAggregationConfigClient(rule.aggregation);
+    var error = diagramImportAggregationErrorsClient(config);
+    var expanded = state.diagramImportAggregationExpanded || {};
+    var open = Object.prototype.hasOwnProperty.call(expanded, String(rule.id || '')) ? expanded[String(rule.id || '')] : config.enabled;
+    function icon(action, label, symbol, index, disabled) {
+      return '<button type="button" class="icon-button" data-diagram-import-aggregation-action="' + action + '" data-diagram-import-aggregation-index="' + index + '" title="' + escapeHtml(t(label)) + '" aria-label="' + escapeHtml(t(label)) + '" style="width:44px;height:44px;flex:none"' + (disabled ? ' disabled' : '') + '>' + symbol + '</button>';
+    }
+    function options(values, selected) {
+      return (values.some(function (entry) { return entry[0] === selected; }) ? '' : '<option selected value="' + escapeHtml(String(selected)) + '">' + escapeHtml(String(selected)) + '</option>') + values.map(function (entry) {
+        return '<option value="' + entry[0] + '"' + (entry[0] === selected ? ' selected' : '') + '>' + escapeHtml(t(entry[1])) + '</option>';
+      }).join('');
+    }
+    var rows = config.groupBy.map(function (field, index) {
+      return '<div data-diagram-import-aggregation-row style="display:flex;align-items:center;gap:4px;min-width:0"><div style="flex:1;min-width:0">' +
+        renderDiagramImportStageFields(spec || defaultSpec(), rule.sourceStageId || '', [field], 'data-diagram-import-aggregation-field="groupBy" aria-label="' + escapeHtml(t('diagramImportAggregationGroupBy') + ' ' + String(index + 1)) + '"') + '</div>' +
+        icon('up', 'diagramImportAggregationUp', '↑', index, index === 0) + icon('down', 'diagramImportAggregationDown', '↓', index, index === config.groupBy.length - 1) + icon('remove', 'diagramImportAggregationRemove', '×', index, false) + '</div>';
+    }).join('');
+    return '<details class="help-details" data-diagram-import-aggregation-details' + (open ? ' open' : '') + '><summary>' + escapeHtml(t('diagramImportAggregation')) + '</summary>' +
+      '<label class="checkbox-label"><input type="checkbox" data-diagram-import-aggregation-field="enabled"' + (config.enabled ? ' checked' : '') + '> ' + escapeHtml(t('diagramImportAggregationEnabled')) + '</label>' +
+      '<fieldset style="margin:0;padding:0;border:0;min-width:0"' + (config.enabled ? '' : ' disabled') + '><legend>' + escapeHtml(t('diagramImportAggregationGroupBy')) + '</legend>' + rows +
+      '<div class="toolbar">' + icon('add', 'diagramImportAggregationAdd', '+', config.groupBy.length, config.groupBy.length >= 32) + '<span class="muted">' + escapeHtml(t('diagramImportAggregationLimit', { count: config.groupBy.length })) + '</span></div>' +
+      '<div class="diagram-grid" style="grid-template-columns:repeat(auto-fit,minmax(min(180px,100%),1fr))"><label>' + escapeHtml(t('diagramImportAggregationFormat')) + '<select data-diagram-import-aggregation-field="format">' + options([['compact', 'diagramImportAggregationCompact'], ['tree', 'diagramImportAggregationTree']], config.format) + '</select></label>' +
+      '<label>' + escapeHtml(t('diagramImportAggregationDuplicates')) + '<select data-diagram-import-aggregation-field="duplicates">' + options([['distinct', 'diagramImportAggregationDistinct'], ['preserve', 'diagramImportAggregationPreserve']], config.duplicates) + '</select></label>' +
+      '<label>' + escapeHtml(t('diagramImportAggregationMax')) + '<input type="number" min="64" max="20000" step="1" required data-diagram-import-aggregation-field="maxLabelChars" value="' + escapeHtml(String(config.maxLabelChars)) + '"></label></div></fieldset>' +
+      '<p class="diagram-import-label-error" data-diagram-import-aggregation-errors role="alert"' + (config.enabled && error.length ? '' : ' hidden') + '>' + (config.enabled ? escapeHtml(error.join(' ')) : '') + '</p></details>';
+  }
+
+  function mutateDiagramImportAggregationClient(target) {
+    var row = target.closest('[data-diagram-import-rule-row]');
+    if (!row) return;
+    var proposal = captureDiagramImportProposalFromDom();
+    if (!proposal) return;
+    var rule = (proposal.relationRules || []).find(function (item) { return String(item.id || '') === String(row.getAttribute('data-diagram-import-rule-id') || ''); });
+    if (!rule) return;
+    var config = diagramImportAggregationConfigClient(rule.aggregation);
+    var action = target.getAttribute('data-diagram-import-aggregation-action');
+    var index = Number(target.getAttribute('data-diagram-import-aggregation-index'));
+    if (action === 'add') {
+      if (config.groupBy.length >= 32) return;
+      config.groupBy.push('');
+    } else if (Number.isInteger(index) && index >= 0 && index < config.groupBy.length) {
+      if (action === 'remove') config.groupBy.splice(index, 1);
+      else {
+        var next = index + (action === 'up' ? -1 : action === 'down' ? 1 : 0);
+        if (next === index || next < 0 || next >= config.groupBy.length) return;
+        var field = config.groupBy[index];
+        config.groupBy[index] = config.groupBy[next];
+        config.groupBy[next] = field;
+      }
+    } else return;
+    rule.aggregation = config;
+    storeDiagramImportEditorMutation(proposal);
+    renderDesigner();
+    var renderedRow = Array.prototype.find.call(document.querySelectorAll('[data-diagram-import-rule-row]'), function (item) {
+      return String(item.getAttribute('data-diagram-import-rule-id') || '') === String(rule.id || '');
+    });
+    if (!renderedRow) return;
+    var focusIndex = action === 'add' ? config.groupBy.length - 1 : Math.min(action === 'up' ? index - 1 : action === 'down' ? index + 1 : index, config.groupBy.length - 1);
+    var groupRow = renderedRow.querySelectorAll('[data-diagram-import-aggregation-row]')[focusIndex];
+    var focusTarget = groupRow && groupRow.querySelector('[data-diagram-import-aggregation-action="' + action + '"]:not(:disabled)');
+    if (!focusTarget && groupRow) focusTarget = groupRow.querySelector('[data-action="catalog-field-picker-toggle"]');
+    if (!focusTarget) focusTarget = renderedRow.querySelector('[data-diagram-import-aggregation-action="add"]');
+    if (focusTarget) focusTarget.focus();
+  }
+
+  function diagramImportAggregationLabelCandidatesClient(input, fragment) {
+    var row = input && input.closest('[data-diagram-import-rule-row]');
+    var stage = row && row.querySelector('[data-diagram-import-rule-field="sourceStageId"]');
+    var spec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
+    var needle = String(fragment || '').trim();
+    var parametersOnly = !needle || needle.indexOf('param.') === 0 || needle.indexOf('params.') === 0;
+    return diagramTemplateParameterTokenRows(spec).concat(!parametersOnly && stage && stage.value ? diagramImportStageFieldOptions(spec, String(stage.value), needle) : []).map(function (entry) {
+      return { displayToken: entry.value, canonicalToken: entry.value, label: entry.label || entry.value };
+    });
+  }
+
+  function ensureDiagramImportAggregationLabelAttributesClient(input, query, active) {
+    var needle = String(query.fragment || '').trim();
+    if (!needle || needle.indexOf('param.') === 0 || needle.indexOf('params.') === 0) return false;
+    var row = input.closest('[data-diagram-import-rule-row]');
+    var stageInput = row && row.querySelector('[data-diagram-import-rule-field="sourceStageId"]');
+    var stageId = String(stageInput && stageInput.value || '');
+    if (!stageId) return false;
+    var template = state.selectedTemplate;
+    var spec = template && template.spec || defaultSpec();
+    var stage = diagramImportStageById(spec, stageId) || {};
+    var source = diagramImportPrimaryCardSourceClient(stage, {}, null).source || diagramImportStageCardSourcesClient(stage)[0];
+    var className = String(source && source.className || '').trim();
+    var key = catalogAttributeLoadKey(className);
+    var failedAt = Number(state.catalogAttributeFailedAt[key] || 0);
+    if (!className || state.catalogAttributeLoaded[key] || (failedAt && Date.now() - failedAt < 5000)) return false;
+    var value = input.value;
+    ensureCatalogAttributesForClass(className).then(function () {
+      if (state.diagramImportLabelAutocomplete !== active || state.selectedTemplate !== template || (template && template.spec !== spec) || !document.contains(input) || input.value !== value || String(stageInput.value || '') !== stageId) return;
+      var current = diagramImportLabelAutocompleteQuery(input);
+      if (!current || current.start !== query.start || current.end !== query.end || current.fragment !== query.fragment) return;
+      renderDiagramImportAggregationLabelAutocompleteClient(input);
+    });
+    return true;
+  }
+
+  function renderDiagramImportAggregationLabelAutocompleteClient(input, direction) {
+    var query = diagramImportLabelAutocompleteQuery(input);
+    if (!query) { closeDiagramImportLabelAutocomplete(); return; }
+    var host = diagramImportLabelAutocompleteHost(input);
+    var list = host && host.querySelector('[data-diagram-import-label-autocomplete]');
+    if (!list) return;
+    var candidates = diagramImportAggregationLabelCandidatesClient(input, query.fragment);
+    var needle = query.fragment.toLowerCase();
+    var indexes = candidates.map(function (_candidate, index) { return index; }).filter(function (index) {
+      return (candidates[index].displayToken + ' ' + candidates[index].label).toLowerCase().indexOf(needle) >= 0;
+    }).slice(0, 12);
+    var previous = state.diagramImportLabelAutocomplete;
+    var position = previous && previous.input === input ? indexes.indexOf(previous.activeIndex) : 0;
+    if (position < 0) position = 0;
+    if (direction && indexes.length) position = (position + direction + indexes.length) % indexes.length;
+    var activeIndex = indexes.length ? indexes[position] : -1;
+    state.diagramImportLabelAutocomplete = { input: input, candidates: candidates, query: query, matchIndexes: indexes, activeIndex: activeIndex };
+    var loading = ensureDiagramImportAggregationLabelAttributesClient(input, query, state.diagramImportLabelAutocomplete);
+    var rowIndex = input.closest('[data-diagram-import-rule-row]').getAttribute('data-diagram-import-rule-row');
+    var optionId = function (index) { return 'cmdp-aggregation-label-' + rowIndex + '-' + index; };
+    list.innerHTML = indexes.length ? indexes.map(function (index) {
+      var candidate = candidates[index];
+      return '<button type="button" role="option" id="' + optionId(index) + '" data-diagram-import-aggregation-candidate="' + index + '" aria-selected="' + (index === activeIndex ? 'true' : 'false') + '"><span class="diagram-import-label-token">$' + '{' + escapeHtml(candidate.displayToken) + '}</span><span class="diagram-import-label-description">' + escapeHtml(candidate.label) + '</span></button>';
+    }).join('') : '<div class="diagram-import-label-description" role="status">' + escapeHtml(t(loading ? 'fieldPickerLoading' : 'diagramImportLabelAutocompleteEmpty')) + '</div>';
+    list.hidden = false;
+    input.setAttribute('aria-expanded', 'true');
+    if (activeIndex >= 0) input.setAttribute('aria-activedescendant', optionId(activeIndex));
+    else input.removeAttribute('aria-activedescendant');
+  }
+
   function renderDiagramImportRelationRules(proposal, spec) {
     var comparisonOperators = [
       ['equals', 'Равно'],
@@ -22637,7 +22943,7 @@ function dynamicPagesClientScript() {
             + renderDiagramImportEndpointScopeControl(proposal, scopeItems, rule.endpointScopeStructureItemId)
           : '') +
         '</div>' + profileHint + '</td>';
-      var labelTemplateField = '<td><label class="diagram-template-field">Подпись связи<input data-diagram-import-rule-field="labelTemplate" value="' + escapeHtml(labelTemplate) + '" placeholder="Например: TCP $' + '{protocol}: $' + '{Description}"></label><p class="muted">Текст и поля результата через $' + '{…}; пустое значение не выводит подпись.</p>' + renderDiagramImportRelationTemplateSuggestions(spec || defaultSpec(), rule.sourceStageId || '') + '</td>';
+      var labelTemplateField = '<td><div class="diagram-import-label-template" data-diagram-import-label-template-field><label class="diagram-template-field">Подпись связи<input data-diagram-import-rule-field="labelTemplate" data-diagram-import-aggregation-label-template value="' + escapeHtml(labelTemplate) + '" autocomplete="off" spellcheck="false" aria-autocomplete="list" aria-expanded="false" placeholder="Например: TCP $' + '{protocol}: $' + '{Description}"></label><div class="diagram-import-label-autocomplete" data-diagram-import-label-autocomplete role="listbox" hidden></div></div>' + renderDiagramImportAggregationClient(rule, spec) + '</td>';
       var legacyStage = rule.legacySuggestion && rule.legacySuggestion.sourceStageId
         ? (diagramImportStageById(spec || defaultSpec(), rule.legacySuggestion.sourceStageId) || {})
         : {};
@@ -24496,6 +24802,42 @@ function dynamicPagesClientScript() {
     return renderDiagramViewport('<div class="cmdp-d2-svg" data-d2-rendered-svg role="img" aria-label="' + escapeHtml(title || t('d2RenderedDiagram')) + '">' + content + '</div>', title);
   }
 
+  function renderDiagramAggregationDetailsClient(diagram) {
+    var diagnostics = diagram && diagram.execution && diagram.execution.aggregation;
+    var entries = Array.isArray(diagnostics) ? diagnostics : diagnostics && typeof diagnostics === 'object' ? [diagnostics] : [];
+    var edges = (Array.isArray(diagram && diagram.edges) ? diagram.edges : []).filter(function (edge) { return edge && edge.data && edge.data.aggregation; });
+    if (!entries.length && !edges.length) return '';
+    function count(value) { return escapeHtml(String(value == null ? 0 : value)); }
+    var rows = entries.map(function (entry) {
+      return '<tr><th scope="row">' + escapeHtml(String(entry.label || t('diagramImportAggregation'))) + '</th><td>' + count(entry.inputEdges) + '</td><td>' + count(entry.outputEdges) + '</td><td>' + count(entry.uniqueRecords) + '</td><td>' + count(entry.truncatedLabels) + '</td></tr>';
+    }).join('');
+    var labels = Object.create(null);
+    (Array.isArray(diagram.nodes) ? diagram.nodes : []).concat(Array.isArray(diagram.groups) ? diagram.groups : []).forEach(function (item) { if (item && item.id && item.label) labels[String(item.id)] = String(item.label); });
+    var members = edges.map(function (edge) {
+      var aggregation = edge.data.aggregation;
+      var caption = (labels[String(edge.source)] || t('noData')) + ' → ' + (labels[String(edge.target)] || t('noData'));
+      var fields = (Array.isArray(aggregation.members) ? aggregation.members : []).map(function (member) {
+        if (!member || typeof member !== 'object') return '';
+        var safeFields = member.data && member.data.fields;
+        var values = safeFields && typeof safeFields === 'object' && !Array.isArray(safeFields) ? Object.keys(safeFields).map(function (name) {
+          var value = safeFields[name];
+          var text = value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, 'display')
+            ? String(value.display == null ? '' : value.display)
+            : value && typeof value === 'object' ? JSON.stringify(value) : String(value == null ? '' : value);
+          return '<tr><th scope="row" style="overflow-wrap:anywhere">' + escapeHtml(name) + '</th><td style="white-space:pre-wrap;overflow-wrap:anywhere">' + escapeHtml(text) + '</td></tr>';
+        }).join('') : '';
+        var sourceLabel = member.data && member.data.sourceRef && member.data.sourceRef.description;
+        return '<li style="overflow-wrap:anywhere"><span style="white-space:pre-wrap">' + escapeHtml(String(sourceLabel || member.label || t('noData'))) + '</span>' + (values ? '<table class="compact"><tbody>' + values + '</tbody></table>' : '') + '</li>';
+      }).join('');
+      return '<details class="help-details" data-diagram-import-aggregation-edge><summary style="overflow-wrap:anywhere">' + escapeHtml(caption) + ' · ' + escapeHtml(t('diagramImportAggregationMembers')) + ': ' + count(aggregation.memberCount) + '</summary>' +
+        '<p class="muted">' + escapeHtml(t('diagramImportAggregationConnections')) + ': ' + count(aggregation.connectionCount) + '; ' + escapeHtml(t('diagramImportAggregationGroups')) + ': ' + count(Array.isArray(aggregation.groups) ? aggregation.groups.length : aggregation.groups) + '; ' + escapeHtml(t('diagramImportAggregationHidden')) + ': ' + count(aggregation.hiddenValues) + '</p>' +
+        (aggregation.labelTruncated ? '<p role="status">' + escapeHtml(t('diagramImportAggregationTruncatedNotice')) + '</p>' : '') +
+        '<ul style="padding-inline-start:20px">' + fields + '</ul></details>';
+    }).join('');
+    return '<details class="help-details" data-diagram-import-aggregation-diagnostics><summary>' + escapeHtml(t('diagramImportAggregationDetails')) + '</summary>' +
+      (rows ? '<div class="table-wrap"><table class="compact"><thead><tr><th>' + escapeHtml(t('diagramImportAggregation')) + '</th><th>' + escapeHtml(t('diagramImportAggregationInput')) + '</th><th>' + escapeHtml(t('diagramImportAggregationOutput')) + '</th><th>' + escapeHtml(t('diagramImportAggregationRecords')) + '</th><th>' + escapeHtml(t('diagramImportAggregationTruncated')) + '</th></tr></thead><tbody>' + rows + '</tbody></table></div>' : '') + members + '</details>';
+  }
+
   function renderResultDiagram(diagram, toolbarHtml, d2DownloadHref) {
     var nodes = Array.isArray(diagram.nodes) ? diagram.nodes.filter(function (node) { return node && node.id; }) : [];
     var edges = Array.isArray(diagram.edges) ? diagram.edges.filter(function (edge) { return edge && edge.source && edge.target; }) : [];
@@ -24504,17 +24846,18 @@ function dynamicPagesClientScript() {
     var d2Svg = renderD2SvgContent(diagram, title);
     var d2Notice = renderD2UnavailableNotice(diagram);
     var svgContract = renderDiagramSvgContract(diagram);
+    var aggregationDetails = renderDiagramAggregationDetailsClient(diagram);
     if (!nodes.length) {
       return '<div class="result-table-wrap" data-result-diagram><div class="result-table-header"><div class="result-table-title"><h3>' +
         escapeHtml(title) + '</h3></div>' + toolbar +
-        '</div>' + (d2Svg || d2Notice + '<div class="notice">' + escapeHtml(diagram.emptyText || DEFAULT_EMPTY_RESULT_TEXT) + '</div>') + svgContract + '</div>';
+        '</div>' + (d2Svg || d2Notice + '<div class="notice">' + escapeHtml(diagram.emptyText || DEFAULT_EMPTY_RESULT_TEXT) + '</div>') + svgContract + aggregationDetails + '</div>';
     }
     if (d2Svg) {
       var renderedWarnings = Array.isArray(diagram.warnings) && diagram.warnings.length
         ? '<div class="notice">' + escapeHtml(diagram.warnings.join(' ')) + '</div>'
         : '';
       return '<div class="result-table-wrap" data-result-diagram><div class="result-table-header"><div class="result-table-title"><h3>' +
-        escapeHtml(title) + '</h3></div>' + toolbar + '</div>' + d2Svg + svgContract + renderedWarnings + '</div>';
+        escapeHtml(title) + '</h3></div>' + toolbar + '</div>' + d2Svg + svgContract + renderedWarnings + aggregationDetails + '</div>';
     }
     var diagramGroups = Array.isArray(diagram.groups) ? diagram.groups.filter(function (group) { return group && group.id; }) : [];
     var groupLabels = {};
@@ -24579,7 +24922,7 @@ function dynamicPagesClientScript() {
       groupHtml + edgeHtml + nodeHtml + '</svg>';
     return '<div class="result-table-wrap" data-result-diagram><div class="result-table-header"><div class="result-table-title"><h3>' +
       escapeHtml(title) + '</h3></div>' + toolbar +
-      '</div>' + d2Notice + renderDiagramViewport(fallbackSvg, title) + svgContract + warnings + '</div>';
+      '</div>' + d2Notice + renderDiagramViewport(fallbackSvg, title) + svgContract + warnings + aggregationDetails + '</div>';
   }
 
   function renderRuntimeNotice(text, cacheHtml, type) {
@@ -27757,8 +28100,10 @@ function dynamicPagesClientScript() {
         delete existingWithoutLegacyLabelField.parentRoleId;
         delete existingWithoutLegacyLabelField.childRoleId;
         var labelTemplateControl = field('labelTemplate');
+        var aggregation = captureDiagramImportAggregationClient(row, existing.aggregation);
         return {
           ...existingWithoutLegacyLabelField,
+          ...(aggregation === undefined ? {} : { aggregation: aggregation }),
           id: existing.id || 'relation_rule_' + String(index + 1),
           enabled: true,
           kind: String(field('kind') && field('kind').value || 'connection'),
@@ -31690,11 +32035,17 @@ function dynamicPagesClientScript() {
       markImportedDiagramChanged();
       ensureTrailingDiagramMappingRow(event.target);
     }
-    if (event.target && event.target.matches && event.target.matches('[data-diagram-import-role-model-field], [data-diagram-import-placement-field], [data-diagram-import-condition-field], [data-diagram-import-related-field], [data-diagram-import-hierarchy-field], [data-diagram-import-rule-field], [data-diagram-relation-policy-card], [data-diagram-element-field]') && isAppliedDiagramImportEditorTarget(event.target)) {
+    if (event.target && event.target.matches && event.target.matches('[data-diagram-import-aggregation-label-template]')) {
+      renderDiagramImportAggregationLabelAutocompleteClient(event.target);
+    }
+    if (event.target && event.target.matches && event.target.matches('[data-diagram-import-aggregation-field]')) {
+      syncDiagramImportAggregationValidationClient(event.target);
+    }
+    if (event.target && event.target.matches && event.target.matches('[data-diagram-import-role-model-field], [data-diagram-import-placement-field], [data-diagram-import-condition-field], [data-diagram-import-related-field], [data-diagram-import-hierarchy-field], [data-diagram-import-rule-field], [data-diagram-import-aggregation-field], [data-diagram-relation-policy-card], [data-diagram-element-field]') && isAppliedDiagramImportEditorTarget(event.target)) {
       var appliedProposal = appliedDiagramImportEditorModel(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
       if (appliedProposal && diagramImportEditorIsApplied(appliedProposal)) markAppliedDiagramImportEditorDirty(appliedProposal);
     }
-    if (event.target && event.target.matches && event.target.matches('[data-diagram-import-role-model-field], [data-diagram-import-placement-field], [data-diagram-import-condition-field], [data-diagram-import-related-field], [data-diagram-import-hierarchy-field], [data-diagram-import-rule-field], [data-diagram-relation-policy-card], [data-diagram-element-field]')) {
+    if (event.target && event.target.matches && event.target.matches('[data-diagram-import-role-model-field], [data-diagram-import-placement-field], [data-diagram-import-condition-field], [data-diagram-import-related-field], [data-diagram-import-hierarchy-field], [data-diagram-import-rule-field], [data-diagram-import-aggregation-field], [data-diagram-relation-policy-card], [data-diagram-element-field]')) {
       markImportedDiagramChanged();
     }
     if (event.target && event.target.id === 'cmdp-diagram-import-source') {
@@ -31722,6 +32073,59 @@ function dynamicPagesClientScript() {
       if (mappingButton) mappingButton.disabled = state.diagramImportStale || !state.diagramImportProposal;
       var applyButton = document.querySelector('[data-action="diagram-import-apply"]');
       if (applyButton) applyButton.disabled = !state.diagramImportProposal || diagramImportProposalHasReviewBlocker(state.diagramImportProposal);
+    }
+  });
+
+  document.addEventListener('click', function (event) {
+    if (event.target && event.target.matches && event.target.matches('[data-diagram-import-aggregation-label-template]')) renderDiagramImportAggregationLabelAutocompleteClient(event.target);
+    var target = event.target && event.target.closest ? event.target.closest('[data-diagram-import-aggregation-action], [data-diagram-import-aggregation-candidate]') : null;
+    if (!target) return;
+    if (target.hasAttribute('data-diagram-import-aggregation-action')) mutateDiagramImportAggregationClient(target);
+    else {
+      var active = state.diagramImportLabelAutocomplete;
+      if (active) selectDiagramImportLabelAutocompleteCandidate(active.input, target.getAttribute('data-diagram-import-aggregation-candidate'));
+    }
+  });
+
+  document.addEventListener('pointerdown', function (event) {
+    if (event.target && event.target.closest && event.target.closest('[data-diagram-import-aggregation-candidate]')) event.preventDefault();
+  });
+
+  document.addEventListener('toggle', function (event) {
+    var details = event.target;
+    if (!details || !details.matches || !details.matches('[data-diagram-import-aggregation-details]')) return;
+    var row = details.closest('[data-diagram-import-rule-row]');
+    if (!row) return;
+    if (!state.diagramImportAggregationExpanded) state.diagramImportAggregationExpanded = {};
+    state.diagramImportAggregationExpanded[String(row.getAttribute('data-diagram-import-rule-id') || '')] = details.open;
+  }, true);
+
+  document.addEventListener('focusin', function (event) {
+    if (event.target && event.target.matches && event.target.matches('[data-diagram-import-aggregation-label-template]')) renderDiagramImportAggregationLabelAutocompleteClient(event.target);
+  });
+
+  document.addEventListener('focusout', function (event) {
+    if (!event.target || !event.target.matches || !event.target.matches('[data-diagram-import-aggregation-label-template]')) return;
+    var host = diagramImportLabelAutocompleteHost(event.target);
+    if (!host || !host.contains(event.relatedTarget)) closeDiagramImportLabelAutocomplete();
+  });
+
+  document.addEventListener('keyup', function (event) {
+    if (event.target && event.target.matches && event.target.matches('[data-diagram-import-aggregation-label-template]') && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].indexOf(event.key) >= 0) renderDiagramImportAggregationLabelAutocompleteClient(event.target);
+  });
+
+  document.addEventListener('keydown', function (event) {
+    var input = event.target;
+    if (!input || !input.matches || !input.matches('[data-diagram-import-aggregation-label-template]')) return;
+    if (event.key === 'Escape') { closeDiagramImportLabelAutocomplete(); return; }
+    var active = state.diagramImportLabelAutocomplete;
+    if (!active || active.input !== input || !active.matchIndexes.length) return;
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      renderDiagramImportAggregationLabelAutocompleteClient(input, event.key === 'ArrowDown' ? 1 : -1);
+    } else if (event.key === 'Enter' || event.key === 'Tab') {
+      event.preventDefault();
+      selectDiagramImportLabelAutocompleteCandidate(input, active.activeIndex);
     }
   });
 
@@ -31801,22 +32205,21 @@ function dynamicPagesClientScript() {
     if (target.matches && target.matches('[data-diagram-import-rule-field="sourceStageId"]')) {
       var connectionProposal = captureDiagramImportProposalFromDom();
       if (connectionProposal) storeDiagramImportEditorMutation(connectionProposal);
-      var connectionStage = diagramImportStageById(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(), String(target.value || '')) || {};
-      Promise.all(diagramImportStageDirectClassNames(connectionStage).map(ensureCatalogAttributesForClass)).then(function () {
-        renderDesigner();
-      });
+      renderDesigner();
       return;
     }
-    if (target.matches && target.matches('[data-diagram-import-placement-field], [data-diagram-import-condition-field], [data-diagram-import-related-field], [data-diagram-import-hierarchy-field], [data-diagram-import-rule-field], [data-diagram-import-endpoint-profile-field], [data-diagram-structure-field], [data-diagram-relation-policy-card]')) {
+    if (target.matches && target.matches('[data-diagram-import-placement-field], [data-diagram-import-condition-field], [data-diagram-import-related-field], [data-diagram-import-hierarchy-field], [data-diagram-import-rule-field], [data-diagram-import-aggregation-field], [data-diagram-import-endpoint-profile-field], [data-diagram-structure-field], [data-diagram-relation-policy-card]')) {
       var changedProposal = captureDiagramImportProposalFromDom();
       if (changedProposal) storeDiagramImportEditorMutation(changedProposal);
+      if (target.matches('[data-diagram-import-aggregation-field="maxLabelChars"]')) {
+        syncDiagramImportAggregationValidationClient(target);
+        return;
+      }
       if (target.matches('[data-diagram-import-endpoint-profile-field="label"]')) {
         return;
       }
-      if (target.matches('[data-diagram-import-label-template]')) {
-        // A blur-triggered change can occur between a toolbar button's mousedown
-        // and mouseup. Keep the button in the DOM until its click is delivered.
-        window.setTimeout(renderDesigner, 0);
+      if (target.matches('[data-diagram-import-label-template], [data-diagram-import-aggregation-label-template]')) {
+        // Capture label edits without replacing the focused input or toolbar.
         return;
       }
       renderDesigner();
@@ -34977,6 +35380,7 @@ function addResultDiagramDependencies(add, diagram, addInvalidReference = () => 
   };
   const addMappingExtraDependencies = (source, mapping, fallbackLabel = '') => {
     for (const field of diagramTemplateFieldNames(diagramMappingLabelTemplate(mapping))) addMappingFieldDependency(source, mapping, field);
+    for (const field of mapping && mapping.aggregation && mapping.aggregation.enabled === true && Array.isArray(mapping.aggregation.groupBy) ? mapping.aggregation.groupBy : []) addMappingFieldDependency(source, mapping, field);
     for (const field of diagramMappingLabelFields(mapping, fallbackLabel)) addMappingFieldDependency(source, mapping, field);
     for (const field of normalizeDiagramDataProfile(mapping).fields) addMappingFieldDependency(source, mapping, field);
     for (const field of diagramCompositeTemplateFieldNames(mapping)) addMappingFieldDependency(source, mapping, field);
@@ -35733,6 +36137,7 @@ function sendRuntimeD2Source(res, payload, options = {}) {
 function stripSensitiveDiagramArtifacts(result, options = {}) {
   const includeSvgContent = options.includeSvgContent !== false;
   const includeD2Source = options.includeD2Source === true;
+  const includeAggregationDetails = options.includeAggregationDetails === true;
   const d2DownloadAllowed = options.d2DownloadAllowed !== false;
   const next = cloneJsonValueServer(result || { tables: [] }, { tables: [] });
   if (!Array.isArray(next.diagrams)) return next;
@@ -35743,7 +36148,9 @@ function stripSensitiveDiagramArtifacts(result, options = {}) {
       if (!Array.isArray(diagram[collectionName])) return;
       diagram[collectionName].forEach((item) => {
         if (item && typeof item === 'object' && !Array.isArray(item)) {
+          const aggregation = collectionName === 'edges' && includeAggregationDetails && item.data && item.data.aggregation;
           delete item.data;
+          if (aggregation) item.data = { aggregation: cloneJsonValueServer(aggregation, {}) };
           delete item.d2Template;
         }
       });
@@ -35874,6 +36281,11 @@ function runtimeResultContentHash(result) {
       target: String(edge && edge.target || ''),
       label: String(edge && edge.label || ''),
       kind: String(edge && edge.kind || ''),
+      ...(edge && edge.data && edge.data.aggregation ? { aggregation: {
+        memberCount: edge.data.aggregation.memberCount,
+        connectionCount: edge.data.aggregation.connectionCount,
+        labelTruncated: Boolean(edge.data.aggregation.labelTruncated)
+      } } : {}),
       d2Id: String(edge && edge.d2Id || '')
     })) : [],
     groups: Array.isArray(diagram && diagram.groups) ? diagram.groups.map((group) => ({
@@ -36031,6 +36443,11 @@ function runtimeJsonDiagrams(result, options = {}) {
       label: String(edge && edge.label || ''),
       mappingType: String(edge && edge.mappingType || ''),
       kind: String(edge && edge.kind || ''),
+      ...(edge && edge.data && edge.data.aggregation ? { aggregation: {
+        memberCount: edge.data.aggregation.memberCount,
+        connectionCount: edge.data.aggregation.connectionCount,
+        labelTruncated: Boolean(edge.data.aggregation.labelTruncated)
+      } } : {}),
       direction: String(edge && edge.direction || ''),
       d2Id: String(edge && edge.d2Id || ''),
       sourceD2Id: String(edge && edge.sourceD2Id || ''),
@@ -46141,6 +46558,7 @@ function assistantD2StructuralModel(roles = [], placements = [], connections = [
       d2ClassKey: String(connection && (connection.d2ClassKey || connection.d2ElementKey) || ''),
       connectionNotes: truncateText(String(connection && (connection.connectionNotes || connection.notes || connection.d2Notes) || ''), 8000),
       directionPolicy: String(connection && connection.directionPolicy || ''),
+      ...(connection && connection.aggregation !== undefined ? { aggregation: cloneJsonValueServer(connection.aggregation, {}) } : {}),
       supportedModes: uniqueStrings(Array.isArray(connection && connection.supportedModes) ? connection.supportedModes.map(String) : []),
       exampleLabels: uniqueStrings(Array.isArray(connection && connection.exampleLabels) ? connection.exampleLabels.map(String) : [])
     })).filter((connection) => connection.d2ElementKey)
@@ -46186,6 +46604,7 @@ function assistantD2BindingModel(items = [], relationRules = []) {
       sourceOperator: diagramImportConnectionRuleSideOperator(rule, 'source'),
       targetOperator: diagramImportConnectionRuleSideOperator(rule, 'target'),
       labelTemplate: diagramImportRelationLabelTemplate(rule),
+      ...(rule && rule.aggregation !== undefined ? { aggregation: cloneJsonValueServer(rule.aggregation, {}) } : {}),
       endpointScopeStructureItemId: String(rule && rule.endpointScopeStructureItemId || '')
     })).filter((rule) => rule.d2ElementKey)
   });
@@ -46623,6 +47042,15 @@ function assistantDiagramBindingIntentDraftFromResponse(input, parsedObject) {
       errors.push({ path: `$.placementBindings[${index}]`, message: `D2 placement ${target.displayName || structureItemId} returned an invalid typed condition: ${invalidCondition || invalidMembership}.` });
       continue;
     }
+    const unsupportedCondition = requiredConditions.concat(requiredMembership).find((value) => {
+      const parts = assistantDiagramDirectiveParts(value);
+      return parts && !DIAGRAM_IMPORT_CONDITION_OPERATORS.has(normalizeDiagramImportConditionOperator(parts.operator));
+    });
+    if (unsupportedCondition) {
+      errors.push({ path: `$.placementBindings[${index}]`, code: 'diagram_condition_operator_unsupported',
+        message: `Для «${target.displayName || structureItemId}» (результат «${selectedBlock.name || selectedBlock.label || businessBlockId}») условие «${unsupportedCondition}» содержит неподдерживаемый оператор. Допустимы: ${[...DIAGRAM_IMPORT_CONDITION_OPERATORS].join(', ')}, notEquals.` });
+      continue;
+    }
     const directiveEndpointFields = assistantDiagramDirectiveValues(target.directives, 'endpoint-field');
     const endpointFields = directiveEndpointFields.length
       ? directiveEndpointFields
@@ -46929,7 +47357,7 @@ function assistantDiagramTopologyWithBindingIntent(topology = [], bindingIntent 
 
 function assistantDiagramDirectiveParts(value, membership = false) {
   const text = String(value || '').trim();
-  const match = /^(.*?)\s+(equals|notEquals|contains|startsWith|endsWith|in|exists|notExists|matches|notMatches|isIpv4|isIpv4Network|ipv4InCidr|ipv4InRange|ipv4CidrOverlaps|ipv4CidrContains)\s*(.*?)$/i.exec(text);
+  const match = /^(.*?)\s+(equals|notEquals|contains|regexMatch|startsWith|endsWith|in|exists|notExists|matches|notMatches|isIpv4|isIpv4Network|ipv4InCidr|ipv4InRange|ipv4CidrOverlaps|ipv4CidrContains)\s*(.*?)$/i.exec(text);
   if (!match) return null;
   const right = String(match[3] || '').trim();
   const normalizedRight = membership && right.startsWith('parent.') ? right.slice('parent.'.length) : right;
@@ -46977,6 +47405,7 @@ function assistantDiagramRuleSatisfiesDirective(rule, directive, membership = fa
   if (!parts || !rule || typeof rule !== 'object') return false;
   const expected = diagramImportPlacementFilters({ rules: [assistantDiagramRuleFromDirective(directive, membership)] }).rules[0];
   const actual = diagramImportPlacementFilters({ rules: [rule] }).rules[0];
+  if (!DIAGRAM_IMPORT_CONDITION_OPERATORS.has(expected.operator) || !DIAGRAM_IMPORT_CONDITION_OPERATORS.has(actual.operator)) return false;
   if (actual.action !== 'include' || actual.negate !== expected.negate || actual.operator !== expected.operator) return false;
   if (actual.left.column !== parts.leftColumn || actual.left.regex || actual.right.regex) return false;
   const right = actual.right;
@@ -47302,7 +47731,7 @@ function assistantDiagramStageMessages(input, runtimeConfig) {
   const correction = mappingCorrection || topologyCorrection;
   const contract = mapTask
     ? mappingPhase === 'topology'
-      ? '{"relationRules":[{"d2ClassKey":"<exact offered D2 connection class>","mode":"deterministicEndpoints|relationCard|attributeEndpoints","candidateId":"<exact offered connection candidate id>","sourceStageId":"<exact dedicated deterministic result id>","sourceField":"<exact offered endpoint field>","targetField":"<exact offered endpoint field>","sourceOperator":"<supported operator for source side when attributeEndpoints>","targetOperator":"<supported operator for target side when attributeEndpoints>","labelTemplate":"<optional offered label template>"}],"explanation":"...","warnings":[]}'
+      ? '{"relationRules":[{"d2ClassKey":"<exact offered D2 connection class>","mode":"deterministicEndpoints|relationCard|attributeEndpoints","candidateId":"<exact offered connection candidate id>","sourceStageId":"<exact dedicated deterministic result id>","sourceField":"<exact offered endpoint field>","targetField":"<exact offered endpoint field>","sourceOperator":"<supported operator for source side when attributeEndpoints>","targetOperator":"<supported operator for target side when attributeEndpoints>","labelTemplate":"<optional offered label template>","aggregation":{"enabled":true,"groupBy":["<offered field>"],"format":"compact|tree","duplicates":"distinct|preserve","maxLabelChars":2000}}],"explanation":"...","warnings":[]}'
       : '{"mappings":[{"structureItemId":"<exact D2 placement id>","materialization":"structural|stage|parentCard","stageId":"<exact stage id for stage materialization>","conditions":{"ruleJoin":"any|all","rules":[{"action":"include|exclude","operator":"<supported operator>","left":{"column":"<offered field>"},"right":{"kind":"literal|param|stage","value":"<literal>","name":"<report parameter>","stageId":"<exact stage id>","column":"<offered field>"}}]},"hierarchyConditions":{"ruleJoin":"any|all","rules":[{"action":"include|exclude","operator":"<supported operator>","left":{"column":"<offered child field>"},"right":{"kind":"stage","stageId":"<nearest materialized parent stage id>","column":"<offered parent field>"}}]},"confidence":"high|medium|low","reason":"..."}],"unresolved":[{"structureItemId":"<exact D2 placement id>","reason":"noCompatibleStage|ambiguousStage|needsStaticDecision","message":"..."}],"explanation":"...","warnings":[]}'
     : '';
   const system = [
@@ -47320,7 +47749,8 @@ function assistantDiagramStageMessages(input, runtimeConfig) {
       : topologyCorrection
         ? 'The previous connection mapping was rejected. Return a complete replacement relationRules array using only the supplied topology candidates and correct every listed edge. Do not return role mappings or placement rules.'
         : '',
-    'Do not save, publish, execute, or mutate the template.'
+    'Do not save, publish, execute, or mutate the template.',
+    'Connection aggregation is optional. Omit aggregation unless Notes or the user explicitly request it. Preserve supplied aggregation unchanged. It groups already matched visual endpoints, never replaces the endpoint algorithm or Object Flow. groupBy is an ordered list of exact fields of the selected result (maximum 32); no network-specific defaults. labelTemplate renders one leaf value. format is compact or tree, duplicates is distinct or preserve, maxLabelChars is an integer 64..20000 (default 2000). Aggregation never changes direction, styles, placement identity or source data.'
   ].filter(Boolean).join('\n');
   const user = JSON.stringify({
     prompt: truncateText(userTaskPrompt, 4000),
@@ -47916,6 +48346,14 @@ function assistantDiagramPlacementDraftFromResponse(input, parsedObject) {
     if (assistantHierarchyConditions.rules.length !== hierarchyRuleCount) {
       warnings.push(`Assistant hierarchy rules for ${String(target.displayName || itemId)} were reduced to the exact materialized parent contract.`);
     }
+    const operatorErrors = diagramImportConditionOperatorErrors(assistantConditions, `$.mappings[${candidates.indexOf(candidate)}].conditions`,
+      `${target.displayName || 'элемент диаграммы'}: ${stage && stage.label || ''}`)
+      .concat(diagramImportConditionOperatorErrors(assistantHierarchyConditions, `$.mappings[${candidates.indexOf(candidate)}].hierarchyConditions`,
+        `${target.displayName || 'элемент диаграммы'}: ${stage && stage.label || ''}`));
+    if (operatorErrors.length) {
+      errors.push(...operatorErrors);
+      continue;
+    }
     items.push({
       structureItemId: itemId,
       roleId: String(target.roleId || ''),
@@ -48455,7 +48893,9 @@ function assistantDiagramStageDraftFromResponse(input, parsedObject) {
         targetField: String(selectedCandidate && selectedCandidate.targetField || '').trim(),
         sourceOperator: String(confirmedConnectionIntent.sourceOperator || selectedCandidate && (selectedCandidate.sourceOperator || selectedCandidate.endpointOperator) || (mode === 'attributeEndpoints' || mode === 'networkEndpoints' ? 'ipv4InCidr' : '')).trim(),
         targetOperator: String(confirmedConnectionIntent.targetOperator || selectedCandidate && (selectedCandidate.targetOperator || selectedCandidate.endpointOperator) || (mode === 'attributeEndpoints' || mode === 'networkEndpoints' ? 'ipv4InCidr' : '')).trim(),
-        labelTemplate: diagramImportRelationLabelTemplate(selectedCandidate)
+        labelTemplate: diagramImportRelationLabelTemplate(selectedCandidate),
+        ...(requirement.aggregation !== undefined || candidate && candidate.aggregation !== undefined
+          ? { aggregation: cloneJsonValueServer(requirement.aggregation !== undefined ? requirement.aggregation : candidate.aggregation, {}) } : {})
       };
       const scope = resolveDiagramEndpointScope(String(requirementDirectives['endpoint-scope'] || ''), input.structureTree, input.roles);
       if (scope.error) {
@@ -48468,6 +48908,16 @@ function assistantDiagramStageDraftFromResponse(input, parsedObject) {
         errors.push({ path: `$.relationRules[${index}]`, message: `D2 relation class ${String(requirement.d2ClassKey || d2ElementKey)} requires an existing connection stage and materialized source/target fields.` });
         return;
       }
+      const aggregationErrors = validateEdgeAggregation(rule.aggregation, {
+        path: `$.relationRules[${index}].aggregation`,
+        ...(requirement.aggregation === undefined && rule.aggregation && rule.aggregation.enabled === true
+          ? { availableFields: new Set(stage.columns || []) } : {})
+      });
+      if (aggregationErrors.length) {
+        errors.push(...aggregationErrors.map((error) => ({ ...error, code: 'diagram_edge_aggregation_invalid' })));
+        return;
+      }
+      if (rule.aggregation !== undefined) rule.aggregation = normalizeEdgeAggregation(rule.aggregation);
       if (['attributeEndpoints', 'networkEndpoints'].includes(mode) &&
         (!DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(rule.sourceOperator) || !DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(rule.targetOperator))) {
         errors.push({ path: `$.relationRules[${index}]`, message: `D2 relation class ${String(requirement.d2ClassKey || d2ElementKey)} requires supported deterministic source and target operators.` });
@@ -50146,6 +50596,8 @@ function validateTemplateSpec(spec) {
           if (mapping.labelTemplate !== undefined && typeof mapping.labelTemplate !== 'string') {
             errors.push({ path: `${mappingPath}.labelTemplate`, message: 'Result diagram mapping labelTemplate must be a string.' });
           }
+          if (mappingKey === 'edgeMappings') errors.push(...validateEdgeAggregation(mapping.aggregation, { path: `${mappingPath}.aggregation` })
+            .map((error) => ({ ...error, code: 'diagram_edge_aggregation_invalid' })));
           if (mapping.labelFields !== undefined && !Array.isArray(mapping.labelFields) && typeof mapping.labelFields !== 'string') {
             errors.push({ path: `${mappingPath}.labelFields`, message: 'Result diagram mapping labelFields must be an array or comma-separated string.' });
           }
@@ -51002,6 +51454,9 @@ function diagramMappingStructuredFields(kind, mapping) {
     ].forEach(add);
   }
   diagramTemplateFieldNames(diagramMappingLabelTemplate(mapping)).forEach(add);
+  if (kind === 'edge' && mapping && mapping.aggregation && mapping.aggregation.enabled === true) {
+    (Array.isArray(mapping.aggregation.groupBy) ? mapping.aggregation.groupBy : []).forEach(add);
+  }
   return uniqueStrings(result);
 }
 
@@ -51444,13 +51899,65 @@ function assignDiagramD2Paths(nodes, groups, warnings = []) {
   }
 }
 
-function buildTopologyDiagram(diagram, context, params, limits) {
+function prepareDiagramEdgeAggregation(edges, context, options = {}) {
+  const checked = new Map();
+  const invalidByKey = new Map();
+  const recordIdsByKey = new Map();
+  const warnings = [];
+  const diagnostics = [];
+  const result = edges.map((edge) => {
+    const mapping = edge && edge.runtimeMapping || {};
+    if (mapping.aggregation === undefined) return edge;
+    const key = `${String(mapping.id || edge.runtimeSourceName || '')}\u0000${stableJsonStringify(mapping.aggregation)}`;
+    if (!checked.has(key)) {
+      const source = context[String(edge.runtimeSourceName || diagramMappingSourceName(mapping))] || {};
+      const available = new Set((Array.isArray(source.columns) ? source.columns : [])
+        .map((field) => typeof field === 'string' ? field : String(field && (field.as || field.name || field.path) || '')).filter(Boolean));
+      for (const row of Array.isArray(source.rows) ? source.rows : []) {
+        for (const field of Object.keys(row || {})) available.add(field);
+      }
+      const errors = validateEdgeAggregation(mapping.aggregation, {
+        path: '$.aggregation',
+        ...(mapping.aggregation && mapping.aggregation.enabled === true && available.size ? { availableFields: available } : {})
+      });
+      checked.set(key, errors);
+      if (errors.length) {
+        const label = String(mapping.importRole && (mapping.importRole.edgeClassKey || mapping.importRole.label) || 'Связь');
+        if (options.allowPartialAggregation !== true) {
+          const error = new Error(`Агрегация «${label}» не выполнена: ${errors.map((item) => item.message).join(' ')}`);
+          error.code = 'diagram_edge_aggregation_invalid';
+          error.statusCode = 422;
+          error.details = errors;
+          throw error;
+        }
+        warnings.push(`Агрегация «${label}» не выполнена: ${errors.map((item) => item.message).join(' ')} Показаны отдельные подтверждённые связи.`);
+        const diagnostic = { label, status: 'invalid', inputEdges: 0, outputEdges: 0, uniqueRecords: 0, truncatedLabels: 0 };
+        diagnostics.push(diagnostic);
+        invalidByKey.set(key, diagnostic);
+        recordIdsByKey.set(key, new Set());
+      }
+    }
+    if (!checked.get(key).length) return edge;
+    const diagnostic = invalidByKey.get(key);
+    diagnostic.inputEdges += 1;
+    diagnostic.outputEdges += 1;
+    const row = edge.runtimeRow || {};
+    recordIdsByKey.get(key).add(stableJsonStringify([row.Class || '', row._id || row.Id || row.id || edge.id]));
+    diagnostic.uniqueRecords = recordIdsByKey.get(key).size;
+    const { aggregation, ...withoutAggregation } = mapping;
+    return { ...edge, runtimeMapping: withoutAggregation };
+  });
+  return { edges: result, warnings, diagnostics };
+}
+
+function buildTopologyDiagram(diagram, context, params, limits, options = {}) {
   const name = String(diagram.name || diagram.as || 'diagram').trim();
   const titleTemplate = String(diagram.title || diagram.label || name);
   const maxNodes = normalizeDiagramLimit(diagram.maxNodes || diagram.limit && diagram.limit.maxNodes || diagram.limits && diagram.limits.maxNodes, Math.min(limits.maxRows || 500, 300), ABSOLUTE_EXECUTION_LIMITS.maxRows);
   const maxEdges = normalizeDiagramLimit(diagram.maxEdges || diagram.limit && diagram.limit.maxEdges || diagram.limits && diagram.limits.maxEdges, Math.min((limits.maxRows || 500) * 2, 800), ABSOLUTE_EXECUTION_LIMITS.maxRows * 2);
   const maxGroups = normalizeDiagramLimit(diagram.maxGroups || diagram.limit && diagram.limit.maxGroups || diagram.limits && diagram.limits.maxGroups, Math.min(maxNodes, 100), ABSOLUTE_EXECUTION_LIMITS.maxRows);
   const warnings = [];
+  let edgeInputLimitReached = false;
   const unplaced = [];
   const unplacedRuntimeIds = new Set();
   const executionBindings = [];
@@ -51958,8 +52465,7 @@ function buildTopologyDiagram(diagram, context, params, limits) {
     const kind = (row && edgeTypeField ? diagramRowDisplayValue(row, edgeTypeField, ['Type', 'Kind', 'Relation', 'Domain']) : '') || diagramConstantValue(mapping, ['kind', 'edgeKind']) || mappingType;
     const direction = row && directionField ? diagramRowDisplayValue(row, directionField, ['Direction', 'direction']) : diagramConstantValue(mapping, ['direction']);
     const label = diagramLabelForRow(row, mapping, labelField, labelValue || diagramConstantValue(mapping, ['label']), params, warnings, `edge mapping ${mapping && mapping.id || sourceName}`);
-    const rowIdentity = displayCardValue(row && (row._id || row.Id || row.id || row.RelationId || row.Code)).trim()
-      || `row:${sha256Hex(JSON.stringify(row && typeof row === 'object' ? row : {})).slice(0, 16)}`;
+    const rowIdentity = runtimeRowIdentity(row);
     const relationIdentity = String(edgeImportRole.edgeClassKey || mapping && mapping.id || sourceName || 'edge').trim();
     let emittedPairs = 0;
     let duplicatePairs = 0;
@@ -52000,7 +52506,7 @@ function buildTopologyDiagram(diagram, context, params, limits) {
       runtimeSourceBusinessId: String(sourceNode && sourceNode.businessId || sourceBusinessId || ''),
       runtimeTargetBusinessId: String(targetNode && targetNode.businessId || targetBusinessId || ''),
       runtimeMapping: cloneJsonValueServer(mapping && typeof mapping === 'object' ? mapping : {}, {}),
-      runtimeRow: row && typeof row === 'object' ? cloneJsonValueServer(row, {}) : null,
+      runtimeRow: row && typeof row === 'object' ? inheritRuntimeRowSemantics(cloneJsonValueServer(row, {}), row) : null,
       runtimeSourceName: String(sourceName || '')
       };
       edge.styleHints = edge.importRole.styleHints && typeof edge.importRole.styleHints === 'object' && !Array.isArray(edge.importRole.styleHints)
@@ -52011,6 +52517,7 @@ function buildTopologyDiagram(diagram, context, params, limits) {
       if (direction) edge.direction = direction;
       edgeIdentityKeys.add(edgeIdentity);
       edges.push(edge);
+      if (edges.length >= maxEdges) edgeInputLimitReached = true;
       emittedPairs += 1;
     }
     return { emittedPairs, duplicatePairs, reason: emittedPairs || duplicatePairs ? '' : 'limit' };
@@ -52850,6 +53357,21 @@ function buildTopologyDiagram(diagram, context, params, limits) {
       throw error;
     }
   }
+  const aggregationPlan = prepareDiagramEdgeAggregation(edges, context, options);
+  const aggregationResult = aggregateDiagramEdges(aggregationPlan.edges, {
+    readField: (row, field) => runtimeRowValue(row, field, rowValueByField),
+    displayValue: (value, row, field) => normalizedLookupResultValue(row || {}, field, String(field || '').replace(/^Source_/, '')),
+    hash: (text) => sha256Hex(text)
+  });
+  edges.splice(0, edges.length, ...aggregationResult.edges);
+  warnings.push(...aggregationPlan.warnings);
+  warnings.push(...aggregationResult.warnings);
+  if (aggregationResult.diagnostics.some((item) => item.truncatedLabels > 0)) {
+    logWarn('diagram.edge_aggregation.label_limit', {
+      groups: aggregationResult.diagnostics.reduce((count, item) => count + item.outputEdges, 0),
+      truncatedLabels: aggregationResult.diagnostics.reduce((count, item) => count + item.truncatedLabels, 0)
+    });
+  }
   const groups = Array.from(groupMap.values());
   for (const group of groups) {
     delete group.endpointRow;
@@ -52891,7 +53413,7 @@ function buildTopologyDiagram(diagram, context, params, limits) {
       d2Path: String(runtime && (runtime.d2Path || runtime.d2Id) || '')
     };
   });
-  const truncated = expandedShapeLimitHit || expandedShapeCount >= maxNodes || edges.length >= maxEdges || groupMap.size >= maxGroups;
+  const truncated = expandedShapeLimitHit || expandedShapeCount >= maxNodes || edgeInputLimitReached || edges.length >= maxEdges || groupMap.size >= maxGroups;
   if (truncated) warnings.push('Diagram was truncated by execution limits.');
   if (unplaced.length) warnings.push(`D2 structure tree placement is incomplete: ${unplaced.length} object(s) were not rendered in their configured branch.`);
   const result = {
@@ -52912,6 +53434,7 @@ function buildTopologyDiagram(diagram, context, params, limits) {
     execution: {
       version: 2,
       bindings: executionBindings,
+      aggregation: aggregationPlan.diagnostics.concat(aggregationResult.diagnostics),
       connections: connectionDiagnostics.map((diagnostic) => ({
         relation: cloneJsonValueServer(diagnostic.relation, {}),
         source: cloneJsonValueServer(diagnostic.source, {}),
@@ -52938,9 +53461,9 @@ function buildTopologyDiagram(diagram, context, params, limits) {
   return result;
 }
 
-function buildResultDiagrams(spec, context, params, limits) {
+function buildResultDiagrams(spec, context, params, limits, options = {}) {
   const diagrams = Array.isArray(spec && spec.result && spec.result.diagrams) ? spec.result.diagrams : [];
-  return diagrams.map((diagram) => buildTopologyDiagram(diagram || {}, context, params, limits));
+  return diagrams.map((diagram) => buildTopologyDiagram(diagram || {}, context, params, limits, options));
 }
 
 function draftDiagramPreviewValidationOmissionMessage(errors, stages) {
@@ -53105,6 +53628,14 @@ function draftDiagramPreviewMappingPlan(spec) {
     for (const rule of relationRules) {
       if (!diagramImportRelationRuleIsEnabled(rule)) continue;
       const label = String(rule && (rule.d2Label || rule.d2ClassKey || rule.d2ElementKey || rule.id) || '');
+      const aggregationErrors = validateEdgeAggregation(rule.aggregation, {
+        path: '$.aggregation'
+      });
+      if (aggregationErrors.length) {
+        omissions.push({ diagramIndex, kind: 'aggregation', label,
+          message: `Агрегация «${label}» не выполнена: ${aggregationErrors.map((error) => error.message).join(' ')}` });
+        delete rule.aggregation;
+      }
       if (!normalizeDiagramDirectionPolicy(rule && rule.directionPolicy)) {
         omissions.push({
           diagramIndex,
@@ -53140,7 +53671,7 @@ function draftDiagramPreviewMappingPlan(spec) {
       const key = [
         String(rule.d2ClassKey || rule.d2ElementKey || rule.id || ''),
         String(rule.mode || ''), compiled.alias, compiled.rootIdField, compiled.targetIdField,
-        compiled.labelTemplate
+        compiled.labelTemplate, stableJsonStringify(rule.aggregation === undefined ? null : rule.aggregation)
       ].join(':');
       if (relationRuleKeys.has(key)) continue;
       relationRuleKeys.add(key);
@@ -53236,7 +53767,7 @@ async function buildDraftDiagramDiagnosticPreview(spec, error, options = {}) {
   };
   if (workflow.state !== 'applied' && !allowPartial) return diagnostic;
   try {
-    diagnostic.diagrams = buildResultDiagrams(spec, snapshot.context, snapshot.effectiveParams || {}, snapshot.limits || {});
+    diagnostic.diagrams = buildResultDiagrams(spec, snapshot.context, snapshot.effectiveParams || {}, snapshot.limits || {}, { allowPartialAggregation: allowPartial });
     // Do not extend a timed-out request with another renderer invocation. The
     // client still shows the already analysed template preview in this case.
     if (diagnostic.diagrams.length && diagnostic.reason !== 'draft_preview_timeout') {
@@ -53915,11 +54446,11 @@ function resolveSelectionDriverRows(step, context, limits) {
     throw new Error(`selectCards source not found: ${step.from}`);
   }
   const rows = Array.isArray(source.rows) ? source.rows.slice(0, limits.maxRows) : [];
-  return rows.map((row, index) => ({
+  return rows.map((row, index) => inheritRuntimeRowSemantics({
     ...(row && typeof row === 'object' ? row : {}),
     __index: index,
     __source: step.from
-  }));
+  }, row));
 }
 
 function resolveSelectionClassName(step, params, driverRow) {
@@ -54049,7 +54580,7 @@ function normalizePathColumnSpecs(value) {
 
 function pathValueEntries(values, lineage = '') {
   return (Array.isArray(values) ? values : [values])
-    .map((value) => ({ value: displayCardValue(value), lineage }))
+    .map((value) => ({ value: displayCardValue(value), rawValue: value, lineage }))
     .filter((entry) => entry.value !== '');
 }
 
@@ -54111,7 +54642,8 @@ async function resolveCardPathValueEntries(cmdbuildExecRequest, pathCache, class
   if (text === 'Class') return pathValueEntries([className], lineage);
   if (card && Object.prototype.hasOwnProperty.call(card, text)) {
     const values = cardAttributeDisplayValues(card, text);
-    return values.length ? pathValueEntries(values, lineage) : [{ value: '', lineage }];
+    return values.length ? pathValueEntries(values, lineage).map((entry) => ({ ...entry, rawValue: card[text] }))
+      : [{ value: '', rawValue: card[text], lineage }];
   }
   return [];
 }
@@ -54131,10 +54663,12 @@ async function resolveRowPathColumnValues(cmdbuildExecRequest, pathCache, row, c
 
 async function resolveRowPathColumnValueEntries(cmdbuildExecRequest, pathCache, row, className, card, column) {
   if (Object.prototype.hasOwnProperty.call(row, column.path)) {
-    return pathValueEntries(Array.isArray(row[column.path]) ? row[column.path] : [row[column.path]]);
+    return pathValueEntries(Array.isArray(row[column.path]) ? row[column.path] : [row[column.path]])
+      .map((entry) => ({ ...entry, rawValue: runtimeRowValue(row, column.path) }));
   }
   if (Object.prototype.hasOwnProperty.call(row, column.as) && row[column.as] !== undefined && row[column.as] !== null && row[column.as] !== '') {
-    return pathValueEntries(Array.isArray(row[column.as]) ? row[column.as] : [row[column.as]]);
+    return pathValueEntries(Array.isArray(row[column.as]) ? row[column.as] : [row[column.as]])
+      .map((entry) => ({ ...entry, rawValue: runtimeRowValue(row, column.as) }));
   }
   if (column.path === 'Class') return pathValueEntries([className || row.Class || '']);
   if (column.path === '_id') return pathValueEntries([(card && card._id !== undefined ? card._id : row._id) || '']);
@@ -54160,6 +54694,7 @@ async function resolveRowPathColumnCandidateEntries(cmdbuildExecRequest, pathCac
     if (!related.card) continue;
     const entries = await resolveRowPathColumnValueEntries(cmdbuildExecRequest, pathCache, row, className, related.card, {
       ...column,
+      path: diagramImportCardSourceRawField(candidate, column.path),
       sourceCandidates: []
     });
     if (entries.length) resolved.push({ candidate, entries });
@@ -54202,11 +54737,22 @@ async function materializeRowPathColumns(cmdbuildExecRequest, pathCache, row, cl
       const info = await readRelatedCard(cmdbuildExecRequest, pathCache.cards, className, row._id);
       fullCard = info.card || null;
     }
-    const values = await resolveRowPathColumnValues(cmdbuildExecRequest, pathCache, row, className, fullCard, column);
+    const entries = await resolveRowPathColumnValueEntries(cmdbuildExecRequest, pathCache, row, className, fullCard, column);
+    const values = uniqueDisplayValues(entries.map((entry) => entry.value));
     row[column.as] = values.length ? values.join(column.separator) : '';
+    setRuntimeRowValue(row, column.as, runtimePathEntriesValue(entries));
     addColumnOnce(outputColumns, column.as);
   }
   return row;
+}
+
+function runtimePathEntriesValue(entries) {
+  const values = new Map();
+  for (const entry of entries) {
+    const value = Object.hasOwn(entry, 'rawValue') ? entry.rawValue : entry.value;
+    values.set(runtimeSemanticKey(value), value);
+  }
+  return values.size === 1 ? values.values().next().value : values.size ? [...values.values()] : undefined;
 }
 
 function normalizeSelectionExpected(value, caseSensitive) {
@@ -54447,7 +54993,13 @@ function buildSelectionResultRow(className, card, driverRow, columns, step) {
     }
   }
 
-  return row;
+  const rawFields = new Map(Object.keys(row).map((field) => [field, Object.hasOwn(card || {}, field) ? card[field] : row[field]]));
+  if (includeSource) for (const field of Object.keys(driverRow)) {
+    if (!field.startsWith('__')) rawFields.set(`${sourcePrefix}${field}`, runtimeRowValue(driverRow, field));
+  }
+  const cardIdentity = card && card._id !== undefined && card._id !== null
+    ? ['card', className, card._id] : ['anonymous-card', className, runtimeRowIdentity(card)];
+  return setRuntimeRowSemantics(row, includeSource ? ['pair', cardIdentity, runtimeRowIdentity(driverRow)] : cardIdentity, rawFields);
 }
 
 function cardListPath(className, limit, fields, start = 0) {
@@ -54672,11 +55224,11 @@ function resolveRelationDriverRows(step, context, limits) {
     throw new Error(`expandRelations source not found: ${step.from}`);
   }
   const rows = Array.isArray(source.rows) ? source.rows.slice(0, limits.maxRows) : [];
-  return rows.map((row, index) => ({
+  return rows.map((row, index) => inheritRuntimeRowSemantics({
     ...(row && typeof row === 'object' ? row : {}),
     __index: index,
     __source: step.from
-  }));
+  }, row));
 }
 
 function resolveRelationSourceClass(step, params, row) {
@@ -54873,6 +55425,13 @@ async function buildRelationResultRow(cmdbuildExecRequest, pathCache, driverRow,
     row[key] = cardAttributeDisplayValue(relatedCard, key);
     addColumnOnce(columns, key);
   }
+  const rawFields = new Map(Object.keys(row).map((field) => [field, Object.hasOwn(relatedCard, field) ? relatedCard[field] : row[field]]));
+  rawFields.set('SourceCode', runtimeRowValue(driverRow, 'Code'));
+  rawFields.set('SourceDescription', runtimeRowValue(driverRow, 'Description'));
+  if (includeSource) for (const field of Object.keys(driverRow || {})) {
+    if (!field.startsWith('__') && !['Class', '_id', 'Code', 'Description'].includes(field)) rawFields.set(`${sourcePrefix}${field}`, runtimeRowValue(driverRow, field));
+  }
+  setRuntimeRowSemantics(row, ['relation', runtimeRowIdentity(driverRow), ['card', relatedClass, relatedId], domain, relation._id ?? null], rawFields);
   const requestedPaths = requestedColumns.filter((column) => String(column || '').includes('.') || String(column || '').includes('{'));
   if (requestedPaths.length) await materializeRowPathColumns(cmdbuildExecRequest, pathCache, row, relatedClass, relatedCard, requestedPaths, columns);
 
@@ -54990,7 +55549,7 @@ async function executeEnrichRows(cmdbuildExecRequest, step, params, context, lim
   let truncated = Boolean(source.truncated) || (Array.isArray(source.rows) && source.rows.length > sourceRows.length);
 
   for (const sourceRow of sourceRows) {
-    const row = { ...(sourceRow && typeof sourceRow === 'object' ? sourceRow : {}) };
+    const row = inheritRuntimeRowSemantics({ ...(sourceRow && typeof sourceRow === 'object' ? sourceRow : {}) }, sourceRow);
     const className = String(row[classColumn] || row.RelatedClass || '').trim();
     const id = row[idColumn] !== undefined && row[idColumn] !== null && row[idColumn] !== ''
       ? row[idColumn]
@@ -55015,26 +55574,31 @@ async function executeEnrichRows(cmdbuildExecRequest, step, params, context, lim
           for (const entry of entries) {
             const lineage = String(entry && entry.lineage || '');
             if (!lineage) continue;
-            const current = entriesByLineage.get(lineage) || {};
-            current[candidate.as] = entry.value;
+            const current = entriesByLineage.get(lineage) || { values: {}, raw: {} };
+            current.values[candidate.as] = entry.value;
+            current.raw[candidate.as] = Object.hasOwn(entry, 'rawValue') ? entry.rawValue : entry.value;
             entriesByLineage.set(lineage, current);
           }
         }
-        const correlatedRows = Array.from(entriesByLineage.values()).map((values) => {
+        const correlatedRows = Array.from(entriesByLineage.entries()).map(([lineage, entry]) => {
           const next = {};
           correlatedColumns.forEach((candidate) => {
-            next[candidate.as] = values[candidate.as] === undefined ? '' : values[candidate.as];
+            next[candidate.as] = entry.values[candidate.as] === undefined ? '' : entry.values[candidate.as];
           });
-          return next;
+          return setRuntimeRowSemantics(next, ['correlation', column.correlationKey, lineage], entry.raw);
         });
         const effectiveRows = correlatedRows.length
           ? correlatedRows
           : [Object.fromEntries(correlatedColumns.map((candidate) => [candidate.as, '']))];
-        variants = variants.flatMap((variant) => effectiveRows.map((values) => ({ ...variant, ...values })));
+        variants = variants.flatMap((variant) => effectiveRows.map((values) => deriveRuntimeRowSemantics(
+          { ...variant, ...values }, variant, ['correlation', column.correlationKey, runtimeRowIdentity(values)],
+          Object.fromEntries(Object.keys(values).map((field) => [field, runtimeRowValue(values, field)]))
+        )));
         continue;
       }
       addColumnOnce(columns, column.as);
-      const values = await resolveEnrichColumnValues(cmdbuildExecRequest, pathCache, row, className, card, column, sourceResolution);
+      const entries = await resolveEnrichColumnValueEntries(cmdbuildExecRequest, pathCache, row, className, card, column, sourceResolution);
+      const values = uniqueDisplayValues(entries.map((entry) => entry.value));
       if (!values.length && column.emptyRow === false) {
         variants = [];
         break;
@@ -55044,19 +55608,21 @@ async function executeEnrichRows(cmdbuildExecRequest, step, params, context, lim
         const expanded = [];
         for (const variant of variants) {
           for (const value of effectiveValues) {
-            expanded.push({
+            const matchingEntries = entries.filter((entry) => displayCardValue(entry.value) === value);
+            expanded.push(deriveRuntimeRowSemantics({
               ...variant,
               [column.as]: value
-            });
+            }, variant, ['enrich', column.path, matchingEntries.map((entry) => entry.lineage).sort(), value],
+            { [column.as]: runtimePathEntriesValue(matchingEntries) }));
           }
         }
         variants = expanded;
       } else {
         const joined = effectiveValues.join(column.separator);
-        variants = variants.map((variant) => ({
+        variants = variants.map((variant) => inheritRuntimeRowSemantics({
           ...variant,
           [column.as]: joined
-        }));
+        }, variant, { [column.as]: runtimePathEntriesValue(entries) }));
       }
     }
     for (const variant of variants) {
@@ -55171,7 +55737,7 @@ function mergeJoinRows(leftRow, rightRow, leftColumns, keyPairs, rightMapping) {
   for (const item of rightMapping) {
     row[item.target] = rightRow && rightRow[item.source] !== undefined ? rightRow[item.source] : null;
   }
-  return row;
+  return mergeRuntimeRowSemantics(row, leftRow, rightRow, leftColumns, rightMapping);
 }
 
 function executeJoinRows(step, context, limits) {
@@ -55269,7 +55835,7 @@ function setOperationColumns(left, right) {
 function projectSetOperationRow(row, columns) {
   const projected = {};
   for (const column of columns) projected[column] = row && row[column] !== undefined ? row[column] : null;
-  return projected;
+  return inheritRuntimeRowSemantics(projected, row);
 }
 
 function executeUnionRows(step, context, limits) {
@@ -55521,7 +56087,7 @@ function mergeMatchRows(leftRow, rightRow, leftColumns, rightMapping) {
   for (const item of rightMapping) {
     row[item.target] = rightRow && rightRow[item.source] !== undefined ? rightRow[item.source] : null;
   }
-  return row;
+  return mergeRuntimeRowSemantics(row, leftRow, rightRow, leftColumns, rightMapping);
 }
 
 function executeMatchRows(step, params, context, limits) {
@@ -55587,7 +56153,7 @@ function executeSemiJoinRows(step, params, context, limits) {
       return included && !excludeRules.some((rule) => matchRowsRuleMatches(leftRow, rightRow, rule, params, step.caseSensitive));
     });
     if (!matches) continue;
-    rows.push({ ...leftRow });
+    rows.push(inheritRuntimeRowSemantics({ ...leftRow }, leftRow));
     if (rows.length >= limits.maxRows) {
       return { columns: inferColumns(left), rows, truncated: true };
     }
@@ -55722,6 +56288,13 @@ function buildComposeRow(columns, leftRow, rightRow, params) {
   const row = {};
   for (const column of columns) {
     row[column.name] = getComposeColumnValue(column, leftRow, rightRow, params);
+  }
+  if (rightRow) mergeRuntimeRowSemantics(row, leftRow, rightRow, [], []);
+  else inheritRuntimeRowSemantics(row, leftRow);
+  for (const column of columns) {
+    if (!column.valueParam && !column.hasValue && !column.template) {
+      setRuntimeRowValue(row, column.name, runtimeRowValue(column.source === 'right' ? rightRow : leftRow, column.column));
+    }
   }
   return row;
 }
@@ -56410,7 +56983,7 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
   const partialDiagramPreview = includeDiagrams && options.allowPartialDiagramPreview === true && d2Workflow.state === 'pending';
   const canBuildDiagrams = d2Workflow.state === 'applied' || partialDiagramPreview;
   const diagrams = includeDiagrams && canBuildDiagrams
-    ? buildResultDiagrams(spec, context, effectiveParams, limits)
+    ? buildResultDiagrams(spec, context, effectiveParams, limits, { allowPartialAggregation: partialDiagramPreview })
     : [];
   if (includeDiagrams && !options.skipD2Render && diagrams.length) {
     await renderD2ArtifactsForDiagrams(diagrams);
@@ -58813,6 +59386,7 @@ async function handleBackend(req, res, requestUrl) {
         result: stripSensitiveDiagramArtifacts(result, {
           includeSvgContent: true,
           includeD2Source: true,
+          includeAggregationDetails: true,
           d2DownloadAllowed: true
         })
       });
@@ -58828,6 +59402,7 @@ async function handleBackend(req, res, requestUrl) {
           diagrams: stripSensitiveDiagramArtifacts({ diagrams: diagnosticPreview.diagrams }, {
             includeSvgContent: true,
             includeD2Source: true,
+            includeAggregationDetails: true,
             d2DownloadAllowed: true
           }).diagrams
         }
@@ -60083,6 +60658,14 @@ export {
   embedDiagramSvgMetadata,
   executionValidationForSpec,
   executeFilterRows,
+  executeSelectCards,
+  executeMatchRows,
+  executeEnrichRows,
+  executeJoinRows,
+  executeUnionRows,
+  executeDifferenceRows,
+  diagramImportCompileRelationRule,
+  diagramImportRuntimeRelationMappings,
   executionThrottleScopeKey,
   expectedSpecHashFromBody,
   extractAssistantDraftSpec,

@@ -40,6 +40,7 @@ x-input-collection-limits:
     absolute: 50000
   business-blocks: 32
   block-uses: 31
+  edge-aggregation-group-by: 32
 servers:
   - url: "{protocol}://{host}:{port}"
     description: >
@@ -3647,6 +3648,56 @@ components:
         direction:
           type: string
           enum: [direct, inverse, both]
+    DiagramEdgeAggregation:
+      type: object
+      additionalProperties: false
+      description: >
+        Необязательная агрегация бизнес-связей после разрешения конечных объектов
+        и проверки структуры D2. Отсутствие объекта или enabled=false сохраняет
+        отдельные связи. Листья используют существующий labelTemplate правила;
+        отдельный шаблон подписи агрегации не поддерживается. Иерархические связи
+        и статические фрагменты D2 не агрегируются.
+      properties:
+        enabled:
+          type: boolean
+          default: false
+          description: Включает агрегацию только для данного правила связи.
+        groupBy:
+          type: array
+          default: []
+          maxItems: 32
+          x-input-collection-policy: edge-aggregation-group-by
+          description: >
+            Упорядоченные поля выбранного источника, задающие уровни подписи.
+            По умолчанию уровней нет. Фиксированный предел безопасности 32;
+            превышение отклоняется, массив не обрезается. Общий настраиваемый
+            предел коллекций не повышает этот предел.
+          items:
+            type: string
+            minLength: 1
+            pattern: "\\S"
+        format:
+          type: string
+          enum: [compact, tree]
+          default: compact
+          description: compact выводит вложенные группы компактно; tree выводит уровни отдельными строками.
+        duplicates:
+          type: string
+          enum: [distinct, preserve]
+          default: distinct
+          description: >
+            distinct выводит одинаковый текст листа один раз внутри группы;
+            preserve сохраняет повторяющийся текст разных исходных записей.
+            Повторное обнаружение одной записи через несколько endpoint matches
+            не создаёт дополнительную бизнес-запись.
+        maxLabelChars:
+          type: integer
+          minimum: 64
+          maximum: 20000
+          default: 2000
+          description: >
+            Предел длины видимой подписи. Скрытые целые значения отмечаются
+            в подписи и остаются в структурированных деталях связи.
     DiagramImportRelationRule:
       type: object
       additionalProperties: true
@@ -3683,6 +3734,8 @@ components:
             Empty selects the entire diagram. This is not a participant-pair list.
         labelTemplate:
           type: string
+        aggregation:
+          $ref: "#/components/schemas/DiagramEdgeAggregation"
         directionPolicy:
           type: string
         parentRoleId:
@@ -4267,6 +4320,8 @@ components:
           type: string
         directionPolicy:
           type: string
+        aggregation:
+          $ref: "#/components/schemas/DiagramEdgeAggregation"
         supportedModes:
           type: array
           items:
@@ -4383,6 +4438,8 @@ components:
           type: string
         labelTemplate:
           type: string
+        aggregation:
+          $ref: "#/components/schemas/DiagramEdgeAggregation"
         endpointScopeStructureItemId:
           type: string
           description: Точное размещение контейнера, ограничивающее оба конца связи; пустая строка означает всю диаграмму.

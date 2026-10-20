@@ -8748,3 +8748,152 @@ function stopChild(child) {
     child.kill('SIGTERM');
   });
 }
+
+async function edgeAggregationApiFixture(t, aggregation = { enabled: true, groupBy: ['Category'], format: 'compact', duplicates: 'distinct', maxLabelChars: 2000 }) {
+  const code = 'EdgeAggregation';
+  const columns = ['Source', 'Target', 'Category', 'Value'];
+  const cards = Array.from({ length: 100 }, (_, index) => ({
+    _id: index + 1, Code: `connection-${index + 1}`, Source: 'a', Target: 'b',
+    Category: index % 2 ? 'B' : 'A', Value: index + 1, PrivatePayload: 'not-selected'
+  }));
+  const currentSpec = apiObjectFlowSpec([
+    { alias: 'sources', className: 'SourceObject', columns: ['Code', 'Description'] },
+    { alias: 'targets', className: 'TargetObject', columns: ['Code', 'Description'] },
+    { alias: 'links', className: 'Connection', columns }
+  ]);
+  const mock = await startMockCmdbuild(t, {
+    templates: [templateCard(code, currentSpec)],
+    classes: ['SourceObject', 'TargetObject', 'Connection', 'Cst_QueryToolConfig', 'Cst_QueryTemplate'].map((name, index) => ({ _id: index + 1, name, active: true })),
+    attributesByClass: { Connection: columns.map((name) => ({ name, type: name === 'Value' ? 'integer' : 'string', active: true, _can_read: true })) },
+    cardsByClass: {
+      SourceObject: [{ _id: 'a', Code: 'a', Description: 'Source object' }],
+      TargetObject: [{ _id: 'b', Code: 'b', Description: 'Target object' }], Connection: cards
+    }
+  });
+  const port = await freePort();
+  const backend = await startBackend(t, port, mock.origin, { CMDP_D2_BINARY: `${process.cwd()}/tests/fixtures/d2-render-stub.mjs` });
+  const origin = `http://127.0.0.1:${port}`;
+  const cookie = testCmdbuildAuthorizationCookie('edge-aggregation-api');
+  const csrf = await requestJson('GET', `${origin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  assert.equal(csrf.statusCode, 200, csrf.body);
+  const headers = { cookie, origin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const d2Source = 'router: Router\nswitch: Switch\nrouter -> switch: Connection';
+  const analyzed = await requestJson('POST', `${origin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: code, baseSpecHash: hashJson(currentSpec), currentSpec, d2Source
+  }, headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const proposal = analyzed.json.proposal;
+  const roles = proposal.roles.map((role) => d2RoleOverride(role, {
+    materialization: { kind: 'stage', stageId: role.key === 'router' ? 'selection:sources' : 'selection:targets' },
+    primary: { className: role.key === 'router' ? 'SourceObject' : 'TargetObject', idAttribute: '_id', labelTemplate: '${Description}', structuredFields: [], filters: [] },
+    related: []
+  }));
+  const applyBody = {
+    templateCode: code, baseSpecHash: hashJson(currentSpec),
+    currentSpec: { ...currentSpec, authoring: { version: 1, d2: { source: d2Source } } },
+    d2Source, proposal, roles, structureTree: d2StructureTreeWithMaterialization(proposal, roles),
+    relationRules: [{
+      ...proposal.relationRules[0], id: 'generic-connections', kind: 'connection', mode: 'deterministicEndpoints', directionPolicy: 'dataFields',
+      parentRoleId: roles.find((role) => role.mapping.primary.className === 'SourceObject').id,
+      childRoleId: roles.find((role) => role.mapping.primary.className === 'TargetObject').id,
+      sourceStageId: 'selection:links', sourceField: 'Source', targetField: 'Target', labelTemplate: '${Value}', aggregation
+    }]
+  };
+  const applied = await requestJson('POST', `${origin}/cmdbuild/custom-api/draft/diagram-import/apply`, applyBody, headers);
+  assert.equal(applied.statusCode, 200, applied.body);
+  return { origin, headers, backend, mock, code, cards, currentSpec, applyBody, spec: applied.json.spec };
+}
+
+test('edge aggregation HTTP draft preview merges 100 distinct mock records and is deterministic', async (t) => {
+  const fixture = await edgeAggregationApiFixture(t);
+  const { origin, headers, spec, code, cards, mock, backend, currentSpec } = fixture;
+  const preview = () => requestJson('POST', `${origin}/cmdbuild/custom-api/draft/preview?maxRows=200&maxRestCalls=100`, {
+    template: { code, spec }, params: {}
+  }, headers);
+  const first = await preview();
+  assert.equal(first.statusCode, 200, first.body);
+  assert.equal(first.json.success, true);
+  assert.equal(first.json.result.diagrams.length, 1);
+  const diagram = first.json.result.diagrams[0];
+  assert.equal(diagram.edges.length, 1);
+  const aggregated = diagram.edges[0];
+  assert.equal(aggregated.data.aggregation.memberCount, 100);
+  assert.equal(aggregated.data.aggregation.members.length, 100);
+  assert.deepEqual(Object.keys(aggregated.data), ['aggregation']);
+  assert.equal(diagram.svg.rendered, true);
+  const block = /<metadata id="cmdp-diagram-data" type="application\/json">([\s\S]*?)<\/metadata>/.exec(diagram.svg.content);
+  assert.ok(block, 'HTTP SVG contains structured connection details');
+  const metadata = JSON.parse(block[1].replace(/&(amp|lt|gt);/g, (_entity, name) => ({ amp: '&', lt: '<', gt: '>' })[name]));
+  const data = metadata.objects[aggregated.d2Id];
+  assert.deepEqual(aggregated.data.aggregation, data.aggregation);
+  assert.equal(data.aggregation.memberCount, 100);
+  assert.equal(data.aggregation.connectionCount, 100);
+  assert.equal(data.aggregation.members.length, 100);
+  assert.equal(new Set(data.aggregation.members.map((member) => member.id)).size, 100);
+  assert.match(aggregated.label, /^A \[/);
+  assert.match(aggregated.label, /\nB \[/);
+  assert.equal(diagram.execution.aggregation[0].inputEdges, 100);
+  assert.equal(diagram.execution.aggregation[0].outputEdges, 1);
+  assert.doesNotMatch(JSON.stringify(data), /PrivatePayload|not-selected|runtimeRow/);
+  assert.ok(mock.requests.some((request) => request.pathname.endsWith('/classes/Connection/cards')));
+  cards.reverse();
+  const second = await preview();
+  assert.equal(second.statusCode, 200, second.body);
+  assert.deepEqual(second.json.result.diagrams[0].edges, diagram.edges);
+  assert.equal(second.json.result.diagrams[0].d2.source, diagram.d2.source);
+  const saved = await requestJson('PUT', `${origin}/cmdbuild/custom-api/templates/${code}`, {
+    code, expectedSpecHash: hashJson(currentSpec), spec
+  }, headers);
+  assert.equal(saved.statusCode, 200, saved.body);
+  const run = await requestJson('GET', `${origin}/cmdbuild/custom-api/templates/${code}/run?json=true&noCache=1`, undefined, { cookie: headers.cookie });
+  assert.equal(run.statusCode, 200, run.body);
+  assert.equal(run.json.diagrams.length, 1);
+  assert.equal(run.json.diagrams[0].edges.length, 1);
+  assert.equal(run.json.diagrams[0].edges[0].aggregation.memberCount, 100);
+  assert.equal(run.json.diagrams[0].edges[0].data, undefined);
+  assert.doesNotMatch(JSON.stringify(run.json), /"members"|"sourceRef"|runtimeRow/);
+  assert.equal(backend.exitCode, null);
+});
+
+test('edge aggregation normal template Save and GET preserve disabled configuration', async (t) => {
+  const aggregation = { enabled: false, groupBy: ['Category'], format: 'tree', duplicates: 'preserve', maxLabelChars: 128 };
+  const { origin, headers, code, spec, currentSpec, mock, backend } = await edgeAggregationApiFixture(t, aggregation);
+  const saved = await requestJson('PUT', `${origin}/cmdbuild/custom-api/templates/${code}`, {
+    code, expectedSpecHash: hashJson(currentSpec), spec
+  }, headers);
+  assert.equal(saved.statusCode, 200, saved.body);
+  assert.deepEqual(saved.json.template.spec.result.diagrams[0].authoring.d2Import.relationRules[0].aggregation, aggregation);
+  const listed = await requestJson('GET', `${origin}/cmdbuild/custom-api/templates?root=Cst_QueryTool`, undefined, { cookie: headers.cookie });
+  assert.equal(listed.statusCode, 200, listed.body);
+  const reloaded = listed.json.data.find((template) => template.code === code);
+  assert.ok(reloaded, listed.body);
+  assert.deepEqual(reloaded.spec.result.diagrams[0].authoring.d2Import.relationRules[0].aggregation, aggregation);
+  assert.deepEqual(reloaded.spec.result.diagrams[0].edgeMappings[0].aggregation, aggregation);
+  assert.ok(mock.requests.some((request) => request.method === 'PUT' && request.pathname.endsWith(`/classes/Cst_QueryTemplate/cards/${code}`)));
+  assert.equal(backend.exitCode, null);
+});
+
+test('edge aggregation strict Apply rejects invalid settings with 422 while table extraction stays usable', async (t) => {
+  const { origin, headers, code, spec, applyBody, mock, backend } = await edgeAggregationApiFixture(t);
+  const invalid = { enabled: true, groupBy: ['Category'], format: 'invalid' };
+  const rules = applyBody.relationRules.map((rule) => ({ ...rule, aggregation: invalid }));
+  const rejected = await requestJson('POST', `${origin}/cmdbuild/custom-api/draft/diagram-import/apply`, { ...applyBody, relationRules: rules }, headers);
+  assert.equal(rejected.statusCode, 422, rejected.body);
+  assert.equal(rejected.json.success, false);
+  assert.ok(rejected.json.errors.some((error) => error.path.endsWith('.aggregation.format')), rejected.body);
+  const draft = structuredClone(spec);
+  draft.result.diagrams[0].authoring.d2Import.relationRules[0].aggregation = invalid;
+  draft.result.diagrams[0].edgeMappings[0].aggregation = invalid;
+  const extraction = await requestJson('POST', `${origin}/cmdbuild/custom-api/draft/preview?maxRows=200&includeDiagrams=false`, {
+    template: { code, spec: draft }, params: {}
+  }, headers);
+  assert.equal(extraction.statusCode, 200, extraction.body);
+  assert.equal(extraction.json.success, true);
+  assert.deepEqual(extraction.json.result.diagrams, []);
+  const table = extraction.json.result.tables.find((item) => item.name === 'links');
+  assert.ok(table, extraction.body);
+  assert.equal(table.rows.length, 100);
+  assert.deepEqual([...new Set(table.rows.map((row) => row.Category))].sort(), ['A', 'B']);
+  assert.equal(mock.requests.some((request) => request.method === 'PUT'), false);
+  assert.equal(backend.exitCode, null);
+});

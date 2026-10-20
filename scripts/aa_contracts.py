@@ -137,7 +137,11 @@ def runtime_input_limits(module: Path | None = None) -> dict:
         if not 0 < default <= absolute:
             raise ValueError(f"invalid runtime limits: {key}")
         limits[policy] = {"configuration": configuration, "default": default, "absolute": absolute}
-    for policy, kind, field in (("business-blocks", "intent", "blocks"), ("block-uses", "intentBlock", "uses")):
+    for policy, kind, field in (
+        ("business-blocks", "intent", "blocks"),
+        ("block-uses", "intentBlock", "uses"),
+        ("edge-aggregation-group-by", "aggregation", "groupBy"),
+    ):
         match = re.search(rf"\b{kind}:\s*\{{\s*{field}:\s*\['[A-Za-z]+',\s*([0-9]+)\]", source)
         if not match:
             raise ValueError(f"missing runtime literal contract: {policy}")
@@ -187,9 +191,11 @@ def validate_input_contracts(document: dict, limits: dict | None = None) -> int:
                 raise ValueError(f"{location}: opaque spec missing x-input-collection-policy: full-spec")
         if schema.get("type") != "array" or policy == "output-data":
             continue
-        if policy not in (None, "collection", "d2", "business-blocks", "block-uses"):
+        if policy not in (None, "collection", "d2", "business-blocks", "block-uses", "edge-aggregation-group-by"):
             raise ValueError(f"{location}: unknown input collection policy: {policy}")
-        bound = limits[policy] if policy in ("business-blocks", "block-uses") else limits[policy or "collection"]["absolute"]
+        if policy == "edge-aggregation-group-by" and location != "#/components/schemas/DiagramEdgeAggregation/properties/groupBy":
+            raise ValueError(f"{location}: edge-aggregation-group-by policy is only allowed on DiagramEdgeAggregation.groupBy")
+        bound = limits[policy] if policy in ("business-blocks", "block-uses", "edge-aggregation-group-by") else limits[policy or "collection"]["absolute"]
         maximum = schema.get("maxItems")
         if type(maximum) is not int or maximum != bound:
             raise ValueError(f"{location}: maxItems must equal runtime absolute limit {bound}")

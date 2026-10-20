@@ -31,6 +31,112 @@ const referenceCatalog = { classes: [
   { name: 'Unrelated', attributes: [{ name: 'unrelatedField', type: 'string' }] }
 ], domains: [{ name: 'unrelated', source: 'Asset', destination: 'Unrelated', cardinality: '1:N' }] };
 
+const selfReferenceCatalog = { classes: [{ name: 'Person', attributes: [
+  { name: 'Description', type: 'string' },
+  { name: 'manager', type: 'reference', targetClass: 'Person' },
+  { name: 'deputy', type: 'foreignkey', targetType: 'Person' }
+] }] };
+const peopleStage = { id: 'people', className: 'Person' };
+
+test('explicit self-reference paths remain distinct at default and configured depth 1', () => {
+  const queries = ['manager.Description', 'deputy.Description'];
+  for (const options of [{}, { depth: 1 }]) {
+    const result = buildAssistantFieldContext([peopleStage], selfReferenceCatalog, { ...options, queries });
+    for (const path of queries) {
+      const field = result.stages[0].fields.find((item) => item.path === path);
+      assert.ok(field, path);
+      assert.equal(field.className, 'Person');
+      assert.equal(field.evidence, 'readableCatalog');
+      assert.equal(field.cardinality, 'one');
+      assert.equal(field.hops.length, 1);
+      assert.equal(field.hops[0].name, path.split('.')[0]);
+      assert.equal(field.hops[0].sourceClass, 'Person');
+      assert.equal(field.hops[0].targetClass, 'Person');
+    }
+    assert.equal(new Set(result.fieldCatalog.map((field) => field.id)).size, result.fieldCatalog.length);
+    assert.equal(result.diagnostics.scannedStates, 3);
+    assert.equal(result.diagnostics.truncated, false);
+  }
+});
+
+test('repeated self-reference chains respect depth 2 and preserve each semantic path', () => {
+  const queries = ['manager.manager.Description', 'manager.deputy.Description', 'deputy.manager.Description'];
+  for (const depth of [0, 1]) {
+    const shallow = buildAssistantFieldContext([peopleStage], selfReferenceCatalog, { depth, queries });
+    assert.equal(shallow.stages[0].fields.some((field) => queries.includes(field.path)), false);
+    assert.equal(shallow.diagnostics.truncated, false);
+  }
+  const result = buildAssistantFieldContext([peopleStage], selfReferenceCatalog, { depth: 2, queries });
+  for (const path of queries) {
+    const field = result.stages[0].fields.find((item) => item.path === path);
+    assert.ok(field, path);
+    assert.deepEqual(field.hops.map((hop) => hop.name), path.split('.').slice(0, -1));
+    assert.ok(field.hops.every((hop) => hop.sourceClass === 'Person' && hop.targetClass === 'Person'));
+  }
+  assert.ok(result.stages[0].fields.every((field) => field.hops.length <= 2));
+  assert.equal(result.diagnostics.scannedStates, 7);
+  assert.equal(result.diagnostics.truncated, false);
+});
+
+test('domain paths can return to a previously visited class and terminate at configured depth', () => {
+  const cycleCatalog = { classes: [
+    { name: 'CycleA', attributes: [{ name: 'Description', type: 'string' }] },
+    { name: 'CycleB', attributes: [{ name: 'Description', type: 'string' }] }
+  ], domains: [{ name: 'links', source: 'CycleA', destination: 'CycleB', cardinality: '1:N' }] };
+  for (const depth of [2, 5]) {
+    const path = Array.from({ length: depth }, (_, i) => `{links:Cycle${i % 2 ? 'A' : 'B'}}`).join('.') + '.Description';
+    const result = buildAssistantFieldContext([{ id: 'cycle', className: 'CycleA' }], cycleCatalog, { depth, queries: [path] });
+    const field = result.stages[0].fields.find((item) => item.path === path);
+    assert.ok(field, path);
+    assert.equal(field.hops.length, depth);
+    assert.deepEqual(field.hops.map((hop) => hop.direction), Array.from({ length: depth }, (_, i) => i % 2 ? 'inverse' : 'direct'));
+    assert.equal(field.cardinality, 'many');
+    assert.ok(result.stages[0].fields.every((item) => item.hops.length <= depth));
+    assert.equal(result.diagnostics.scannedStates, depth + 1);
+    assert.equal(result.diagnostics.truncated, false);
+  }
+});
+
+test('self-reference discovery retains shortest-field relevance for non-path queries', () => {
+  const result = buildAssistantFieldContext([peopleStage], selfReferenceCatalog, { depth: 2, queries: ['manager'] });
+  assert.deepEqual(result.stages[0].fields.map((field) => field.path), ['Description', 'manager']);
+  assert.equal(result.diagnostics.truncated, false);
+});
+
+test('repeated self-reference states obey configured caps with visible deterministic truncation', () => {
+  const options = { depth: 2, queries: ['manager.manager.Description'] };
+  for (const maxStates of [1, 2, 3, 6]) {
+    const boundedOptions = { ...options, maxStates };
+    const result = buildAssistantFieldContext([peopleStage], selfReferenceCatalog, boundedOptions);
+    assert.equal(result.diagnostics.maxStates, maxStates);
+    assert.equal(result.diagnostics.scannedStates, maxStates);
+    assert.equal(result.diagnostics.truncated, true);
+    assert.equal(assistantFieldContextWarnings({ fieldContextDiagnostics: result.diagnostics }).length, 1);
+    assert.deepEqual(result, buildAssistantFieldContext([peopleStage], selfReferenceCatalog, boundedOptions));
+  }
+  const full = buildAssistantFieldContext([peopleStage], selfReferenceCatalog, { ...options, maxStates: 7 });
+  assert.equal(full.diagnostics.scannedStates, 7);
+  assert.equal(full.diagnostics.truncated, false);
+  assert.ok(full.stages[0].fields.some((field) => field.path === options.queries[0]));
+});
+
+test('repeated self-reference fields obey exact and undersized byte budgets', () => {
+  const options = { depth: 2, queries: ['manager.manager.Description'] };
+  const full = buildAssistantFieldContext([peopleStage], selfReferenceCatalog, options);
+  const exact = buildAssistantFieldContext([peopleStage], selfReferenceCatalog, { ...options, maxBytes: full.diagnostics.bytes });
+  assert.deepEqual(exact.fieldCatalog, full.fieldCatalog);
+  assert.equal(exact.diagnostics.truncated, false);
+  for (const maxBytes of [1, full.diagnostics.bytes - 1]) {
+    const boundedOptions = { ...options, maxBytes };
+    const result = buildAssistantFieldContext([peopleStage], selfReferenceCatalog, boundedOptions);
+    assert.equal(result.diagnostics.maxBytes, maxBytes);
+    assert.ok(result.diagnostics.bytes <= maxBytes);
+    assert.equal(result.diagnostics.truncated, true);
+    assert.equal(assistantFieldContextWarnings({ fieldContextDiagnostics: result.diagnostics }).length, 1);
+    assert.deepEqual(result, buildAssistantFieldContext([peopleStage], selfReferenceCatalog, boundedOptions));
+  }
+});
+
 for (const terminal of ['Description', 'Code', 'Name']) {
   test(`explicit reference path to generic ${terminal} is available at default and configured depth 1`, () => {
     const path = `owner.${terminal}`;
