@@ -9,6 +9,7 @@ import tls from 'node:tls';
 import { spawn } from 'node:child_process';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { URL, pathToFileURL } from 'node:url';
+import { assistantCardSources, assistantSelectedCardSource, assistantMergeBindingIntent } from './assistant-card-source.mjs';
 import {
   CMDB_BUILD_VIEW_KIND,
   DEFAULT_CMDB_BUILD_VIEW_CODE,
@@ -31,6 +32,12 @@ import {
   publicApplicationBuildIdentity,
   readApplicationBuildIdentity
 } from './build-identity.mjs';
+import { buildAssistantFieldContext, compactAssistantDataModel, compactAssistantBusinessManifest, assistantFieldContextWarnings } from './assistant-field-context.mjs';
+import { buildAssistantRequirementLedger } from './assistant-requirements.mjs';
+import { resolveDiagramEndpointScope, diagramObjectsWithinScope } from './diagram-endpoint-scope.mjs';
+import { compileAssistantPlacementIntent, assistantPlacementHasStageAncestor } from './assistant-placement-compiler.mjs';
+import { createAssistantBindingHandles } from './assistant-binding-handles.mjs';
+import { assertInputCollections, normalizeInputCollectionLimits } from './input-collection-limits.mjs';
 
 const APPLICATION_BUILD_IDENTITY = readApplicationBuildIdentity();
 const APPLICATION_BUILD = publicApplicationBuildIdentity(APPLICATION_BUILD_IDENTITY);
@@ -145,7 +152,12 @@ const D2_IMPORT_BINARY = String(process.env.CMDP_D2_IMPORT_BINARY || '/usr/local
 const D2_IMPORT_TIMEOUT_MS = Math.max(500, Number(process.env.CMDP_D2_IMPORT_TIMEOUT_MS || 5000) || 5000);
 const D2_IMPORT_MAX_INPUT_BYTES = Math.max(1024, Number(process.env.CMDP_D2_IMPORT_MAX_INPUT_BYTES || 1024 * 1024) || 1024 * 1024);
 const D2_IMPORT_MAX_OUTPUT_BYTES = Math.max(1024, Number(process.env.CMDP_D2_IMPORT_MAX_OUTPUT_BYTES || 4 * 1024 * 1024) || 4 * 1024 * 1024);
-const D2_IMPORT_MAX_ELEMENTS = Math.max(1, Number(process.env.CMDP_D2_IMPORT_MAX_ELEMENTS || 5000) || 5000);
+const INPUT_COLLECTION_LIMITS = normalizeInputCollectionLimits({
+  maxCollectionItems: process.env.CMDP_INPUT_MAX_COLLECTION_ITEMS,
+  maxTotalItems: process.env.CMDP_INPUT_MAX_TOTAL_ITEMS,
+  d2MaxElements: process.env.CMDP_D2_IMPORT_MAX_ELEMENTS
+});
+const D2_IMPORT_MAX_ELEMENTS = INPUT_COLLECTION_LIMITS.effective.d2MaxElements;
 const D2_IMPORT_PROPOSAL_TTL_MS = Math.max(60_000, Number(process.env.CMDP_D2_IMPORT_PROPOSAL_TTL_MS || 30 * 60 * 1000) || 30 * 60 * 1000);
 const D2_IMPORT_ASSISTANT_MAX_SPEC_BYTES = Math.max(1024, Number(process.env.CMDP_D2_IMPORT_ASSISTANT_MAX_SPEC_BYTES || 256 * 1024) || 256 * 1024);
 const D2_IMPORT_ASSISTANT_CHECKPOINT_MAX_BYTES = Math.max(16 * 1024, Math.min(
@@ -154,15 +166,15 @@ const D2_IMPORT_ASSISTANT_CHECKPOINT_MAX_BYTES = Math.max(16 * 1024, Math.min(
 ));
 const D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION = 1;
 const D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION = 3;
-const ASSISTANT_DIAGRAM_MAPPING_CHECKPOINT_VERSION = 2;
+const ASSISTANT_DIAGRAM_MAPPING_CHECKPOINT_VERSION = 3;
 const ASSISTANT_PROMPT_CONTRACT_VERSION = 4;
 const ASSISTANT_EDITOR_DELTA_VERSION = 1;
-const ASSISTANT_DATA_SEMANTIC_MODEL_VERSION = 3;
+const ASSISTANT_DATA_SEMANTIC_MODEL_VERSION = 4;
 const ASSISTANT_D2_STRUCTURAL_MODEL_VERSION = 1;
 const ASSISTANT_D2_SEMANTIC_MODEL_VERSION = 1;
-const ASSISTANT_D2_BINDING_MODEL_VERSION = 1;
-const ASSISTANT_BUSINESS_BLOCK_MANIFEST_VERSION = 2;
-const ASSISTANT_D2_BINDING_INTENT_VERSION = 1;
+const ASSISTANT_D2_BINDING_MODEL_VERSION = 2;
+const ASSISTANT_BUSINESS_BLOCK_MANIFEST_VERSION = 3;
+const ASSISTANT_D2_BINDING_INTENT_VERSION = 2;
 const ASSISTANT_SEMANTIC_OBLIGATION_MODEL_VERSION = 1;
 const ASSISTANT_D2_CRITIQUE_MODEL_VERSION = 1;
 const ASSISTANT_COVERAGE_MODEL_VERSION = 2;
@@ -254,8 +266,10 @@ const DEFAULT_ASSISTANT_DIAGRAM_SEMANTICS_PROMPT = [
   'Не выбирай CMDB classes, attributes, aliases, object-flow stages, relation paths или mapping. Не добавляй и не удаляй элементы диаграммы. Верни только typed semantic decisions для supplied exact role ids.'
 ].join('\n\n');
 const DEFAULT_ASSISTANT_DIAGRAM_BINDING_INTENT_PROMPT = [
-  'Сопоставь смысл каждого exact D2 placement и connection class только с именованным пользовательским бизнес-блоком из BusinessBlockManifest. На этом этапе запрещено выбирать stageId, поля, operators или connection mode.',
+  'Сопоставь каждый D2 placement и тип связи с именованным бизнес-блоком из BusinessBlockManifest. StageId и aliases не выбираются. Точные поля, операторы и endpointMode разрешены только для обязательств из Notes, подтвержденных terminal contract или DataSemanticModel.fieldCatalog.',
   'Для placement сначала выбери materializationIntent из allowedMaterialization. structural не имеет источника данных; parentCard наследует карточку ближайшего materialized parent; только stage требует businessBlockId.',
+  'Stage выбирает cardSourceId только из terminalCardSources своего блока. Сторона отображения и стороны проверки родителя независимы. При нескольких источниках без явного основания верни unresolved. Узел использует собственный structureItemId, не parentStructureItemId.',
+  'Membership=structural означает размещение в рамке без сравнения карточек: это допустимо и для stage, если выше нет материализованной карточки. Независимый stage внутри материализованного родителя требует compare с полными requiredMembership. Same-parent-card относится только к parentCard.',
   'Именованный бизнес-блок означает его terminal result. Helper stages являются техническими промежуточными результатами и не выбираются, если Notes явно не содержат stage-policy: helper-allowed.',
   'Для connection class выбери один businessBlockId, строка которого действительно является карточкой или записью требуемой связи. Вспомогательный relation/path stage не является результатом связи.',
   'Exact Placement Notes и Connection Notes имеют приоритет над шаблонным prompt; Role Notes задают только повторно используемый visual contract. Переведи естественный текст Notes в typed obligations: обязательные условия строк, принадлежность родителю, row grain, endpoint mode, поля и операторы. Machine directives endpoint-field, endpoint-operator, source-operator и target-operator являются advanced authoritative overrides и применяются backend детерминированно. Не считай Notes исполненными только потому, что выбран похожий business block. При противоречии или неоднозначности верни unresolved, не подбирай ближайшее название.',
@@ -925,6 +939,11 @@ function validateRuntimeConfig(input = {}) {
     });
   }
 
+  for (const [name, limit] of Object.entries(INPUT_COLLECTION_LIMITS.meta)) {
+    if (!limit.clampedBy) continue;
+    warnings.push({ code: 'input_collection_limit_adjusted', setting: name, ...limit });
+  }
+
   return {
     ok: errors.length === 0,
     nodeEnv,
@@ -943,6 +962,7 @@ function validateRuntimeConfig(input = {}) {
     applicationVersion: APPLICATION_VERSION,
     build: APPLICATION_BUILD,
     d2: d2RendererConfigSummary(),
+    inputCollections: INPUT_COLLECTION_LIMITS,
     errors,
     warnings
   };
@@ -961,6 +981,7 @@ function runtimeConfigLogSummary(validation = validateRuntimeConfig()) {
     tls: validation.tls || { configured: Boolean(TLS_CA_FILE), readable: false },
     redis: validation.redis || redisTransportSecurity(),
     d2: validation.d2 || d2RendererConfigSummary(),
+    inputCollections: validation.inputCollections || INPUT_COLLECTION_LIMITS,
     errors: validation.errors.map((item) => item.code),
     warnings: validation.warnings.map((item) => item.code)
   };
@@ -1195,7 +1216,7 @@ function assistantEditorDeltaFromSpec(spec) {
 }
 
 function applyAssistantEditorDelta(baseSpec, value) {
-  const base = cloneJsonValueServer(baseSpec, {});
+  const baseSource = baseSpec && typeof baseSpec === 'object' && !Array.isArray(baseSpec) ? baseSpec : {};
   const delta = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
   if (!delta || Number(delta.version || 0) !== ASSISTANT_EDITOR_DELTA_VERSION || !delta.spec || typeof delta.spec !== 'object' || Array.isArray(delta.spec)) {
     const error = new Error(`editorDelta must use Assistant editor delta version ${ASSISTANT_EDITOR_DELTA_VERSION}.`);
@@ -1211,12 +1232,18 @@ function applyAssistantEditorDelta(baseSpec, value) {
     error.details = unknown.map((key) => ({ path: `$.editorDelta.spec.${key}`, message: 'Field is not part of the bounded Assistant editor contract.' }));
     throw error;
   }
+  const effectiveInput = { ...baseSource, ...delta.spec };
+  if (Object.prototype.hasOwnProperty.call(delta.spec, 'result')) {
+    effectiveInput.result = { ...baseSource.result, ...delta.spec.result };
+  }
+  assertInputCollections(effectiveInput, INPUT_COLLECTION_LIMITS, { rootKind: 'spec' });
   if (delta.hash && (!isSpecHash(delta.hash) || String(delta.hash).toLowerCase() !== hashJson(delta.spec))) {
     const error = new Error('editorDelta hash does not match its content.');
     error.statusCode = 400;
     error.code = 'assistant_editor_delta_hash_mismatch';
     throw error;
   }
+  const base = cloneJsonValueServer(baseSource, {});
   for (const key of ASSISTANT_EDITOR_DELTA_SPEC_KEYS) {
     if (!Object.prototype.hasOwnProperty.call(delta.spec, key)) continue;
     if (key === 'result') {
@@ -1363,6 +1390,7 @@ function normalizeTemplateAssistantPromptOverrides(value) {
 
 function normalizeD2AnalysisCheckpoint(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  assertInputCollections(value, INPUT_COLLECTION_LIMITS, { rootKind: 'checkpoint' });
   const source = value.source && typeof value.source === 'object' && !Array.isArray(value.source) ? value.source : {};
   const roles = Array.isArray(value.roles) ? value.roles : [];
   const relationRules = Array.isArray(value.relationRules) ? value.relationRules : [];
@@ -1378,12 +1406,12 @@ function normalizeD2AnalysisCheckpoint(value) {
       structureHash: truncateText(String(source.structureHash || ''), 128),
       mappingContractHash: truncateText(String(source.mappingContractHash || ''), 128)
     },
-    roles: roles.slice(0, D2_IMPORT_MAX_ELEMENTS).map((role) => ({
+    roles: roles.map((role) => ({
       id: truncateText(String(role && role.id || ''), 256),
       visualKind: normalizeDiagramImportVisualKind(role && role.visualKind, ''),
       labelTemplate: truncateText(String(role && role.labelTemplate || ''), 12_000)
     })).filter((role) => role.id),
-    relationRules: cloneJsonValueServer(relationRules.slice(0, D2_IMPORT_MAX_ELEMENTS), []),
+    relationRules: cloneJsonValueServer(relationRules, []),
     structureTree: cloneJsonValueServer(structureTree, { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] })
   };
   if (Number(checkpoint.structureTree.version || 0) !== D2_IMPORT_STRUCTURE_TREE_VERSION || !Array.isArray(checkpoint.structureTree.items)) {
@@ -1420,17 +1448,17 @@ function normalizeD2AssistantCheckpoint(value) {
     proposalId: analysis.proposalId,
     deterministicSpecHash: analysis.deterministicSpecHash,
     source: analysis.source,
-    roles: roles.slice(0, D2_IMPORT_MAX_ELEMENTS).map((role) => ({
+    roles: roles.map((role) => ({
       id: truncateText(String(role && role.id || ''), 256),
       visualKind: normalizeDiagramImportVisualKind(role && role.visualKind, ''),
       labelTemplate: truncateText(String(role && role.labelTemplate || ''), 12_000)
     })).filter((role) => role.id),
-    relationRules: cloneJsonValueServer(relationRules.slice(0, D2_IMPORT_MAX_ELEMENTS), []),
+    relationRules: cloneJsonValueServer(relationRules, []),
     structureTree: cloneJsonValueServer(structureTree, { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] }),
     interpretation: {
       explanation: truncateText(String(interpretation.explanation || ''), 12_000),
       warnings: uniqueStrings(Array.isArray(interpretation.warnings) ? interpretation.warnings.map(String) : []).slice(0, 200),
-      decisions: (Array.isArray(interpretation.decisions) ? interpretation.decisions : []).slice(0, D2_IMPORT_MAX_ELEMENTS).map((decision) => ({
+      decisions: (Array.isArray(interpretation.decisions) ? interpretation.decisions : []).map((decision) => ({
         roleId: truncateText(String(decision && decision.roleId || ''), 256),
         visualKind: normalizeDiagramImportVisualKind(decision && decision.visualKind, ''),
         labelTemplate: truncateText(String(decision && decision.labelTemplate || ''), 12_000),
@@ -2884,7 +2912,11 @@ function diagramImportDirectRelationParentCorrelation(mapping, sourceStage, pare
     cardSource: primaryCardSource
   };
   const hierarchyConditions = diagramImportPlacementFilters(source.hierarchyConditions);
-  const hasManualRule = hierarchyConditions.rules.some((condition) => condition && condition.origin !== 'assistant');
+  const hasManualRule = hierarchyConditions.rules.some((condition) => condition && (condition.origin !== 'assistant' ||
+    String(condition.id || '').startsWith('assistant_typed_condition_') ||
+    (sourceStage.columns || []).includes(condition.left && condition.left.column) &&
+      (parentStage.columns || []).includes(condition.right && condition.right.column) &&
+      String(condition.right && condition.right.stageId || '') === String(parentStage.id || '')));
   if (hasManualRule) {
     return { mapping: { ...source, primary }, changed: true, correlationChanged: false };
   }
@@ -3053,9 +3085,10 @@ function diagramImportStructureTree(value, structure, roles) {
     : Array.isArray(source.items)
       ? source.items
       : [];
+  assertInputCollections({ items: rawItems }, INPUT_COLLECTION_LIMITS, { rootKind: 'structureTree' });
   const roleById = new Map((Array.isArray(roles) ? roles : []).map((role) => [String(role && role.id || ''), role]));
   const contextByKey = structure ? diagramImportStructureTreeContextByKey(structure, roles) : new Map();
-  const normalized = rawItems.slice(0, D2_IMPORT_MAX_ELEMENTS).map((item, index) => {
+  const normalized = rawItems.map((item, index) => {
     const roleId = String(item && item.roleId || '').trim();
     const role = roleById.get(roleId) || {};
     const requestedElementKey = String(item && item.templateElementKey || '').trim();
@@ -3102,7 +3135,9 @@ function diagramImportStructureTree(value, structure, roles) {
         // A nested node mapped to the same deterministic rows as its nearest
         // materialized container inherits that card. Keeping it as an own
         // stage creates duplicate rows and requires an artificial correlation.
-        if (parentStageId === stageId) {
+        const childSource = normalizeDiagramImportConditionCardSource(mapping.primary && mapping.primary.cardSource);
+        const parentSource = normalizeDiagramImportConditionCardSource(parentMapping.primary && parentMapping.primary.cardSource);
+        if (parentStageId === stageId && diagramImportConditionSourceKey(childSource) === diagramImportConditionSourceKey(parentSource)) {
           item.mapping = {
             ...mapping,
             materialization: { kind: 'parentCard', stageId: '' }
@@ -3112,6 +3147,12 @@ function diagramImportStructureTree(value, structure, roles) {
       }
       parentId = String(parent.parentId || '');
     }
+  }
+  for (const item of normalized) {
+    if (String(item.mapping && item.mapping.materialization && item.mapping.materialization.kind || '') !== 'parentCard') continue;
+    const ancestor = diagramImportNearestMaterializedAncestor({ items: normalized }, roles, item);
+    const inheritedSource = normalizeDiagramImportConditionCardSource(ancestor && ancestor.mapping && ancestor.mapping.primary && ancestor.mapping.primary.cardSource);
+    if (inheritedSource) item.mapping.primary = { ...item.mapping.primary, className: inheritedSource.className, cardSource: inheritedSource };
   }
   return {
     version: D2_IMPORT_STRUCTURE_TREE_VERSION,
@@ -3515,6 +3556,12 @@ function diagramImportStructureTreeErrors(tree, roles, currentSpec = {}, structu
       continue;
     }
     const available = new Set((stage.columns || []).map(String));
+    const primarySource = materializationKind === 'parentCard'
+      ? diagramImportPrimaryCardSource(stage, ancestor && ancestor.mapping && ancestor.mapping.primary || {}).source
+      : diagramImportPrimaryCardSource(stage, mapping.primary || {}).source;
+    if (!primarySource) {
+      errors.push({ path: `$.structureTree.items[${index}].mapping.primary.cardSource`, message: 'Select one exact retained primary card source; multiple card sources require an explicit choice.' });
+    }
     for (const field of uniqueStrings(['_id']
       .concat(mapping.primary && mapping.primary.structuredFields || [])
       .concat(diagramImportPrimaryTemplateFieldNames(mapping.primary && mapping.primary.labelTemplate || '')))
@@ -3524,7 +3571,8 @@ function diagramImportStructureTreeErrors(tree, roles, currentSpec = {}, structu
       }
     }
     if (materializationKind === 'stage' && ancestor && ancestor.stageId) {
-      if (String(ancestor.stageId) === stageId) {
+      const ancestorSource = diagramImportPrimaryCardSource(stages.get(String(ancestor.stageId)), ancestor.mapping && ancestor.mapping.primary || {}).source;
+      if (String(ancestor.stageId) === stageId && diagramImportConditionSourceKey(primarySource) === diagramImportConditionSourceKey(ancestorSource)) {
         errors.push({ path: `$.structureTree.items[${index}].mapping.materialization.kind`, message: 'Use parentCard instead of selecting the same Object Flow result as the materialized parent.' });
       } else if (
         !diagramImportStageDirectlyDependsOn(stage, stages.get(String(ancestor.stageId || ''))) &&
@@ -3768,7 +3816,8 @@ function migrateDiagramImportToCurrentRevision(spec, value, options = {}) {
     relationRules: diagramImportBindRelationRulesToStructureItems(
       diagramImportTopologyRules(roles, structure, imported.relationRules || [], classes, imported.endpointProfiles),
       imported.structureTree,
-      imported.endpointProfiles
+      imported.endpointProfiles,
+      roles
     ),
     templateGrammar: diagramImportTemplateGrammar(roles, structure, classes)
   });
@@ -3845,7 +3894,8 @@ function migrateDiagramImportToCurrentRevision(spec, value, options = {}) {
     relationRules: diagramImportBindRelationRulesToStructureItems(
       diagramImportTopologyRules(roles, structure, imported.relationRules || [], classes, imported.endpointProfiles),
       structureTree,
-      imported.endpointProfiles
+      imported.endpointProfiles,
+      roles
     ),
     structureTree,
     templateGrammar: diagramImportTemplateGrammar(roles, structure, classes)
@@ -4285,16 +4335,24 @@ function diagramImportConnectionRuleMappingSignature(rule) {
     diagramImportConnectionRuleSideOperator(source, 'source'),
     diagramImportConnectionRuleSideOperator(source, 'target'),
     diagramImportRelationLabelTemplate(source),
-    normalizeDiagramDirectionPolicy(source.directionPolicy)
+    normalizeDiagramDirectionPolicy(source.directionPolicy),
+    String(source.endpointScopeStructureItemId || '')
   ].join('\u0000');
 }
 
-function diagramImportBindRelationRulesToStructureItems(relationRules, structureTree, endpointProfiles = []) {
-  // Kept as a compatibility entry point for the import pipeline. Connection
-  // semantics are deliberately not bound to template element pairs or a
-  // manually selected subset of structure placements.
+function diagramImportBindRelationRulesToStructureItems(relationRules, structureTree, endpointProfiles = [], roles = []) {
   return (Array.isArray(relationRules) ? relationRules : [])
-    .map((rule) => diagramImportConnectionRuleWithProfileIds(rule, endpointProfiles));
+    .map((rule) => {
+      const normalized = diagramImportConnectionRuleWithProfileIds(rule, endpointProfiles);
+      const requested = Object.prototype.hasOwnProperty.call(normalized, 'endpointScopeStructureItemId')
+        ? String(normalized.endpointScopeStructureItemId || '')
+        : String(assistantDiagramNotesDirectives(normalized.d2Notes || '')['endpoint-scope'] || '');
+      const scope = resolveDiagramEndpointScope(requested, structureTree, roles);
+      const { endpointScopeError, ...clean } = normalized;
+      return { ...clean,
+        ...(requested ? { endpointScopeStructureItemId: scope.structureItemId || requested } : {}),
+        ...(scope.error ? { endpointScopeError: scope.error } : {}) };
+    });
 }
 
 function diagramImportTopologyRules(roles, structure, explicitRules = [], classes = [], endpointProfiles = []) {
@@ -4590,7 +4648,7 @@ function createDiagramImportProposal(currentSpec, ir, options = {}) {
       ir.elements,
       roles
     );
-  const relationRules = diagramImportBindRelationRulesToStructureItems(rawRelationRules, structureTree, endpointProfiles);
+  const relationRules = diagramImportBindRelationRulesToStructureItems(rawRelationRules, structureTree, endpointProfiles, roles);
   const templateGrammar = diagramImportTemplateGrammar(roles, ir.elements, ir.classes);
   const catalog = options.catalog && typeof options.catalog === 'object' ? options.catalog : null;
   const warnings = [];
@@ -5108,7 +5166,8 @@ function diagramImportV3WithOverrides(proposal, roleOverrides = [], relationRule
   next.relationRules = diagramImportBindRelationRulesToStructureItems(
     diagramImportTopologyRules(next.roles, next.structure, next.relationRules, next.classes, next.endpointProfiles),
     next.structureTree,
-    next.endpointProfiles
+    next.endpointProfiles,
+    next.roles
   );
   next.templateGrammar = diagramImportTemplateGrammar(next.roles, next.structure, next.classes);
   next.unresolved = diagramImportV3Unresolved(next.roles, next.relationRules, next.structureTree, currentSpec, next.structure, next.endpointProfiles);
@@ -5711,6 +5770,7 @@ function diagramImportCompileRoleMapping(role, mapping, treeItemId = '', stageBy
   const sourceStage = stageById.get(String(source.stageId || '')) || null;
   const sourceClassName = String(source.className || sourceStage && sourceStage.className || '').trim();
   const primaryProjection = diagramImportPrimaryCardSource(sourceStage, primary);
+  if (sourceStage && !primaryProjection.source) throw new Error('D2 compilation requires one exact retained primary card source.');
   const primaryCardSource = primaryProjection.source;
   const primaryClassName = String(primaryCardSource && primaryCardSource.className || sourceClassName).trim();
   const primaryAlias = String(source.alias || '').trim() || (sourceClassName ? diagramImportManagedAlias('d2_primary', `${role.id}:${treeItemId || 'mapping'}`) : '');
@@ -6329,6 +6389,7 @@ function diagramImportRuntimeRelationMappings(compiledRules, roleById, templateG
           targetField: compiled.targetIdField,
           directionPolicy: normalizeDiagramDirectionPolicy(rule.directionPolicy),
           profileScope: 'allCompatiblePlacements',
+          ...(rule.endpointScopeStructureItemId ? { scopeStructureItemId: String(rule.endpointScopeStructureItemId) } : {}),
           unmatchedPolicy: 'omit'
         }
       });
@@ -6489,50 +6550,8 @@ function diagramImportCurrentStageCardSource(className, label = '') {
 }
 
 function diagramImportPrimaryCardSource(stage, primary = {}, parentStage = null) {
-  const available = diagramImportUniqueStageCardSources(Array.isArray(stage && stage.cardSources) ? stage.cardSources : [])
-    .map((source) => normalizeDiagramImportConditionCardSource(source))
-    .filter(Boolean);
-  const explicit = normalizeDiagramImportConditionCardSource(primary && primary.cardSource);
-  const sourceKey = (source) => source ? [source.className, source.classColumn, source.idColumn].join('\u0000') : '';
-  const hasSource = (candidate) => available.some((source) => sourceKey(source) === sourceKey(candidate));
-  if (explicit && hasSource(explicit)) return { source: explicit, inferred: false, ambiguous: false };
-
-  const parentClass = String(parentStage && parentStage.className || '').trim();
-  const configuredClass = String(primary && primary.className || '').trim();
-  const stageClass = String(stage && stage.className || '').trim();
-  const distinctFromParent = parentClass
-    ? available.filter((source) => String(source.className || '') !== parentClass)
-    : [];
-  const distinctClasses = uniqueStrings(distinctFromParent.map((source) => source.className));
-  // A match result retains the direct relation source and may also retain
-  // deeper lineage cards. When the current card is the materialized parent,
-  // only the direct relation source is the deterministic child projection;
-  // deeper provenance must never compete with it.
-  const directRelationSource = available.find((source) => source.id === 'relation-source' && String(source.className || '') !== parentClass);
-  if (parentClass && stageClass === parentClass && directRelationSource) {
-    return { source: directRelationSource, inferred: true, ambiguous: false };
-  }
-  // A relation result without a direct source can still be repaired when it
-  // retains exactly one card class distinct from the parent branch.
-  if (parentClass && stageClass === parentClass && distinctClasses.length === 1) {
-    const candidates = distinctFromParent.filter((source) => source.className === distinctClasses[0]);
-    if (candidates.length === 1) return { source: candidates[0], inferred: true, ambiguous: false };
-    return { source: null, inferred: false, ambiguous: true };
-  }
-
-  if (available.length === 1) return { source: available[0], inferred: true, ambiguous: false };
-  const current = available.find((source) => source.id === 'current');
-  if (current) return { source: current, inferred: true, ambiguous: false };
-  // Before primary.cardSource existed, mappings persisted only className.
-  // That value was an implementation detail of an inferred source, not an
-  // author decision. It must not replace the actual Object Flow result after
-  // reload. Use it only when the stage has no current card to select.
-  if (configuredClass) {
-    const candidates = available.filter((source) => source.className === configuredClass);
-    if (candidates.length === 1) return { source: candidates[0], inferred: true, ambiguous: false };
-    if (candidates.length > 1) return { source: null, inferred: false, ambiguous: true };
-  }
-  return { source: null, inferred: false, ambiguous: available.length > 1 };
+  const selected = assistantSelectedCardSource(stage || {}, '', primary && primary.cardSource || null);
+  return { ...selected, source: normalizeDiagramImportConditionCardSource(selected.source) };
 }
 
 function diagramImportCardSourceField(source, field) {
@@ -7077,6 +7096,15 @@ function validateDiagramImportV3Catalog(proposal, catalog, currentSpec = {}) {
   }
   for (const [index, rule] of (proposal.relationRules || []).entries()) {
     if (!diagramImportRelationRuleIsEnabled(rule)) continue;
+    const scopeRequest = Object.prototype.hasOwnProperty.call(rule, 'endpointScopeStructureItemId')
+      ? String(rule.endpointScopeStructureItemId || '')
+      : String(assistantDiagramNotesDirectives(rule.d2Notes || '')['endpoint-scope'] || '');
+    const scope = resolveDiagramEndpointScope(scopeRequest, proposal.structureTree, proposal.roles);
+    if (scope.error || scopeRequest && !['networkEndpoints', 'attributeEndpoints'].includes(String(rule.mode || ''))) {
+      errors.push({ path: `$.relationRules[${index}].endpointScopeStructureItemId`,
+        code: scope.error?.code || 'diagram_endpoint_scope_mode_unsupported',
+        message: scope.error?.message || 'Container endpoint scope requires an attribute comparison connection.' });
+    }
     errors.push(...diagramImportLabelTemplateSyntaxErrors(
       diagramImportRelationLabelTemplate(rule),
       `$.relationRules[${index}].labelTemplate`
@@ -9513,6 +9541,10 @@ function securityHeaders(extra = {}) {
 }
 
 function sendJson(res, statusCode, payload, extraHeaders = {}) {
+  if (payload && payload.code === 'input_collection_limit') {
+    payload = inputCollectionLimitPayload({ details: Array.isArray(payload.errors) ? payload.errors[0] : payload.errors });
+    statusCode = 413;
+  }
   const body = JSON.stringify(payload, null, 2);
   res.writeHead(statusCode, securityHeaders({
     'content-type': 'application/json; charset=utf-8',
@@ -10303,6 +10335,10 @@ function dynamicPagesClientScript() {
       diagramImportUnresolvedHelp: 'Resolve the listed fields before applying D2 mapping. Assistant can apply a complete proposal; use Diagram Editor only to correct it manually.',
       diagramImportUnresolvedMappingTitle: 'Data mappings required: {count}',
       diagramImportDirectionPolicyTitle: 'Undirected connection confirmation required: {count}',
+      diagramImportEndpointScope: 'Both endpoints inside container',
+      diagramImportEndpointScopeAll: 'Entire diagram',
+      diagramImportEndpointScopeMissing: 'The selected container is no longer available',
+      diagramImportEndpointScopeFix: 'Select an available container or explicitly allow the entire diagram.',
       diagramImportDirectionPolicyHelp: 'D2 template arrow is used by default. Select Undirected in Diagram Editor only when the connection must not have a direction.',
       diagramImportDirectionPolicyContractHelp: 'Add the following D2 contract to the source and analyze it again. It applies to every connection with the listed D2 class.',
       d2WorkflowPendingTitle: 'D2 mapping is not ready for publication',
@@ -10918,6 +10954,7 @@ function dynamicPagesClientScript() {
       runtimeRefresh: 'Refresh',
       runtimeRefreshing: 'Refreshing...',
       requestFailed: 'Request failed.',
+      inputCollectionLimit: 'Too many authoring elements at {path}: {count}, limit {limit}. Reduce the collection or ask the operator to adjust the limit. Your edits have not been discarded.',
       httpStatus: 'HTTP {status}',
       invalidJson: '{id} must contain valid JSON.',
       fieldRequired: '{label} is required.',
@@ -11511,6 +11548,10 @@ function dynamicPagesClientScript() {
       diagramImportUnresolvedHelp: 'Заполните указанные поля перед применением сопоставления D2. Assistant применяет полностью готовое предложение; «Редактор диаграмм» нужен только для ручной корректировки.',
       diagramImportUnresolvedMappingTitle: 'Требуется сопоставление данных: {count}',
       diagramImportDirectionPolicyTitle: 'Требуется подтверждение связи без направления: {count}',
+      diagramImportEndpointScope: 'Оба конца внутри контейнера',
+      diagramImportEndpointScopeAll: 'Вся диаграмма',
+      diagramImportEndpointScopeMissing: 'Выбранный контейнер больше недоступен',
+      diagramImportEndpointScopeFix: 'Выберите доступный контейнер или явно разрешите всю диаграмму.',
       diagramImportDirectionPolicyHelp: 'По умолчанию используется стрелка D2 template. Отметьте «Без направления» в редакторе диаграмм только для связи без направления.',
       diagramImportDirectionPolicyContractHelp: 'Добавьте следующий D2 contract в исходник и повторите анализ. Он применяется ко всем связям с указанным D2 class.',
       d2WorkflowPendingTitle: 'Сопоставление D2 не готово к публикации',
@@ -12126,6 +12167,7 @@ function dynamicPagesClientScript() {
       runtimeRefresh: 'Обновить',
       runtimeRefreshing: 'Обновляется...',
       requestFailed: 'Запрос не выполнен.',
+      inputCollectionLimit: 'Слишком много элементов настройки в {path}: {count}, допустимо {limit}. Уменьшите список или попросите администратора изменить лимит. Введённые изменения не сброшены.',
       httpStatus: 'HTTP {status}',
       invalidJson: '{id} должен содержать корректный JSON.',
       fieldRequired: '{label} обязательно.',
@@ -12819,6 +12861,11 @@ function dynamicPagesClientScript() {
 
   function errorText(result) {
     if (!result) return t('requestFailed');
+    if (result.json && result.json.code === 'input_collection_limit') {
+      var detail = result.json.errors && result.json.errors[0] || {};
+      return t('inputCollectionLimit', { path: detail.path || '$', count: detail.actualCount, limit: detail.limit }) +
+        (result.json.requestId ? ' Request ID: ' + result.json.requestId : '');
+    }
     if (result.json && (result.json.rootCause || result.json.schema && result.json.schema.rootCause)) {
       return schemaBootstrapRootCauseText(result.json.rootCause || result.json.schema.rootCause);
     }
@@ -21545,8 +21592,11 @@ function dynamicPagesClientScript() {
         var sourceStage = sourceInfo.stage;
         var condition = diagramImportPlacementFiltersClient(mapping.conditions || {});
         var ancestor = diagramImportNearestMaterializedAncestorClient(proposal, item);
-        if (materializationKind === 'stage' && ancestor && String(ancestor.stageId || '') === String(sourceInfo.stageId || '')) issues[id] = 'Выберите «Использовать карточку родителя» вместо повторного выбора того же результата.';
-        else if (materializationKind === 'stage' && ancestor && !condition.rules.some(function (rule) { return rule && rule.right && rule.right.kind === 'stage' && String(rule.right.stageId || '') === String(ancestor.stageId || ''); })) {
+        var parentPrimary = ancestor && ancestor.mapping && ancestor.mapping.primary || {};
+        var samePrimary = !ancestor || diagramImportConditionSourceKeyClient(mapping.primary && mapping.primary.cardSource) === diagramImportConditionSourceKeyClient(parentPrimary.cardSource);
+        var membershipRules = condition.rules.concat(diagramImportPlacementFiltersClient(mapping.hierarchyConditions || {}).rules);
+        if (materializationKind === 'stage' && ancestor && samePrimary && String(ancestor.stageId || '') === String(sourceInfo.stageId || '')) issues[id] = 'Выберите «Использовать карточку родителя» вместо повторного выбора того же результата.';
+        else if (materializationKind === 'stage' && ancestor && !membershipRules.some(function (rule) { return rule && rule.right && rule.right.kind === 'stage' && String(rule.right.stageId || '') === String(ancestor.stageId || ''); })) {
           var candidates = diagramImportParentCorrelationCandidatesClient(proposal, item, spec || defaultSpec());
           issues[id] = candidates.length === 1
             ? 'Добавьте рекомендованное сопоставление с результатом родительской ветви.'
@@ -22009,33 +22059,13 @@ function dynamicPagesClientScript() {
     var available = diagramImportStageCardSourcesClient(stage).map(normalizeDiagramImportConditionCardSourceClient).filter(Boolean);
     var explicit = normalizeDiagramImportConditionCardSourceClient(primary && primary.cardSource);
     var sourceKey = function (source) {
-      return source ? [source.className, source.classColumn, source.idColumn].join('\\u0000') : '';
+      return source ? [source.id, source.className, source.classColumn, source.idColumn].join('\\u0000') : '';
     };
     if (explicit && available.some(function (source) { return sourceKey(source) === sourceKey(explicit); })) {
       return { source: explicit, inferred: false, ambiguous: false };
     }
-    var parentClass = String(parentStage && parentStage.className || '').trim();
-    var configuredClass = String(primary && primary.className || '').trim();
-    var stageClass = String(stage && stage.className || '').trim();
-    var distinct = parentClass ? available.filter(function (source) { return String(source.className || '') !== parentClass; }) : [];
-    var distinctClasses = uniqueList(distinct.map(function (source) { return source.className; }));
-    var directRelationSource = available.find(function (source) { return source.id === 'relation-source' && String(source.className || '') !== parentClass; });
-    if (parentClass && stageClass === parentClass && directRelationSource) {
-      return { source: directRelationSource, inferred: true, ambiguous: false };
-    }
-    if (parentClass && stageClass === parentClass && distinctClasses.length === 1) {
-      var inferred = distinct.filter(function (source) { return source.className === distinctClasses[0]; });
-      if (inferred.length === 1) return { source: inferred[0], inferred: true, ambiguous: false };
-      return { source: null, inferred: false, ambiguous: true };
-    }
+    if (primary && primary.cardSource) return { source: null, inferred: false, ambiguous: false, invalid: true };
     if (available.length === 1) return { source: available[0], inferred: true, ambiguous: false };
-    var current = available.find(function (source) { return source.id === 'current'; });
-    if (current) return { source: current, inferred: true, ambiguous: false };
-    if (configuredClass) {
-      var matches = available.filter(function (source) { return source.className === configuredClass; });
-      if (matches.length === 1) return { source: matches[0], inferred: true, ambiguous: false };
-      if (matches.length > 1) return { source: null, inferred: false, ambiguous: true };
-    }
     return { source: null, inferred: false, ambiguous: available.length > 1 };
   }
 
@@ -22071,7 +22101,8 @@ function dynamicPagesClientScript() {
   function renderDiagramImportPrimaryCardSourceControl(stage, primary, parentStage) {
     var projection = diagramImportPrimaryCardSourceClient(stage, primary || {}, parentStage || null);
     var source = projection.source || null;
-    if (!source) return '';
+    if (!source) return '<label>Карточка результата для повторения<select data-diagram-import-placement-field="primary.cardSource">' +
+      renderDiagramImportPrimaryCardSourceOptions(stage, null, true) + '</select></label>';
     var sourceLabel = String(source.label || source.className || 'Карточка результата');
     var identityField = diagramImportCardSourceFieldClient(source, '_id');
     var labelField = diagramImportCardSourceFieldClient(source, 'Description');
@@ -22537,6 +22568,19 @@ function dynamicPagesClientScript() {
       '</div>' + labelSourceHint + renderDiagramImportNodeDataFields(role, spec || defaultSpec(), stage, primary, 'data-diagram-import-placement-field="primary.structuredFields"') + renderDiagramImportPlacementConditions(role, item, mapping, spec || defaultSpec(), sourceInfo.stageId, proposal) + renderDiagramImportRelatedDataForItem(proposal, spec || defaultSpec(), item, role, mapping) + '</details>';
   }
 
+  function renderDiagramImportEndpointScopeControl(proposal, scopeItems, selected) {
+    var requested = String(selected || '');
+    var unavailable = requested && !scopeItems.some(function (item) { return String(item.id) === requested; });
+    var options = '<option value=""' + (!requested ? ' selected' : '') + '>' + escapeHtml(t('diagramImportEndpointScopeAll')) + '</option>';
+    if (unavailable) options += '<option value="' + escapeHtml(requested) + '" selected>' + escapeHtml(t('diagramImportEndpointScopeMissing')) + '</option>';
+    options += scopeItems.map(function (item) {
+      var role = diagramImportStructureTreeRoleClient(proposal, item);
+      return '<option value="' + escapeHtml(item.id) + '"' + (requested === String(item.id) ? ' selected' : '') + '>' + escapeHtml(item.templateElementKey || role.label || role.key) + '</option>';
+    }).join('');
+    return '<label>' + escapeHtml(t('diagramImportEndpointScope')) + '<select data-diagram-import-rule-field="endpointScopeStructureItemId"' + (unavailable ? ' aria-invalid="true"' : '') + '>' + options + '</select></label>' +
+      (unavailable ? '<p class="diagram-import-label-error" role="alert">' + escapeHtml(t('diagramImportEndpointScopeFix')) + '</p>' : '');
+  }
+
   function renderDiagramImportRelationRules(proposal, spec) {
     var comparisonOperators = [
       ['equals', 'Равно'],
@@ -22554,6 +22598,9 @@ function dynamicPagesClientScript() {
     }
     var roles = proposal.roles || [];
     var allRules = Array.isArray(proposal.relationRules) ? proposal.relationRules : [];
+    var scopeItems = (diagramImportStructureTreeClient(proposal).items || []).filter(function (item) {
+      return diagramImportRoleVisualKindClient(diagramImportStructureTreeRoleClient(proposal, item)) === 'container';
+    });
     var activeRules = allRules.filter(function (rule) { return !rule || rule.enabled !== false; });
     var rows = activeRules.map(function (rule, index) {
       var mode = ['relationCard', 'attributeEndpoints', 'networkEndpoints', 'deterministicEndpoints'].includes(String(rule.mode || ''))
@@ -22587,6 +22634,7 @@ function dynamicPagesClientScript() {
         (attributeEndpoints
           ? '<label>Метод сравнения источника<select data-diagram-import-rule-field="sourceOperator">' + comparisonOperatorOptions(rule.sourceOperator || rule.endpointOperator || 'ipv4InCidr') + '</select></label>' +
             '<label>Метод сравнения назначения<select data-diagram-import-rule-field="targetOperator">' + comparisonOperatorOptions(rule.targetOperator || rule.endpointOperator || 'ipv4InCidr') + '</select></label>'
+            + renderDiagramImportEndpointScopeControl(proposal, scopeItems, rule.endpointScopeStructureItemId)
           : '') +
         '</div>' + profileHint + '</td>';
       var labelTemplateField = '<td><label class="diagram-template-field">Подпись связи<input data-diagram-import-rule-field="labelTemplate" value="' + escapeHtml(labelTemplate) + '" placeholder="Например: TCP $' + '{protocol}: $' + '{Description}"></label><p class="muted">Текст и поля результата через $' + '{…}; пустое значение не выводит подпись.</p>' + renderDiagramImportRelationTemplateSuggestions(spec || defaultSpec(), rule.sourceStageId || '') + '</td>';
@@ -27722,6 +27770,8 @@ function dynamicPagesClientScript() {
           sourceStageId: selectedField('sourceStageId'),
           sourceField: selectedField('sourceField'),
           targetField: selectedField('targetField'),
+          endpointScopeStructureItemId: field('endpointScopeStructureItemId')
+            ? selectedField('endpointScopeStructureItemId') : String(existing.endpointScopeStructureItemId || ''),
           // Comparison rules are owned by individual structure placements.
           // Runtime evaluates every rule whose allowed methods include the
           // selected side operator; no participant pair is persisted here.
@@ -29682,7 +29732,8 @@ function dynamicPagesClientScript() {
         roles: diagramImportBindingOverrides(proposal),
         relationRules: cloneJsonValue(proposal.relationRules || [], []),
         structureTree: cloneJsonValue(diagramImportStructureTreeClient(proposal), { version: D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] }),
-        traversalDepth: Math.max(1, Math.min(5, Number(state.maxTraversalDepth) || 1))
+        traversalDepth: Math.max(1, Math.min(5, Number(state.maxTraversalDepth) || 1)),
+        maxCatalogPathCandidates: Number(state.maxCatalogPathCandidates) || 5000
       };
       if (kind === 'map') body.stages = assistantFlowStageSummaries(assistantFlowModel(currentSpec), currentSpec);
       var assistantRequest;
@@ -31884,6 +31935,26 @@ function dynamicPagesClientScript() {
 `;
 }
 
+function isCollectionLimitedAuthoringRequest(req) {
+  if (!['POST', 'PUT', 'PATCH'].includes(req.method)) return false;
+  const pathname = new URL(req.url || '/', 'http://local').pathname;
+  return pathname.startsWith(`${BACKEND_PREFIX}/draft/`) ||
+    pathname.startsWith(`${BACKEND_PREFIX}/assistant/object-flow/`) ||
+    pathname.startsWith(`${BACKEND_PREFIX}/assistant/diagram-import/`) ||
+    new RegExp(`^${BACKEND_PREFIX}/templates(?:/[^/]+)?/?$`).test(pathname);
+}
+
+function inputCollectionLimitPayload(error) {
+  return {
+    success: false,
+    code: 'input_collection_limit',
+    message: 'Authoring input exceeds a structural collection limit. Reduce the collection or ask the operator to adjust its configured limit.',
+    requestId: currentRequestId(),
+    errors: [error.details],
+    limits: INPUT_COLLECTION_LIMITS
+  };
+}
+
 function readJsonBody(req, maxBytes = 64 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -31906,12 +31977,26 @@ function readJsonBody(req, maxBytes = 64 * 1024) {
         resolve({});
         return;
       }
+      let body;
       try {
-        resolve(JSON.parse(text));
+        body = JSON.parse(text);
       } catch {
         const error = new Error('Request body must be valid JSON.');
         error.code = 'invalid_json_body';
         error.statusCode = 400;
+        reject(error);
+        return;
+      }
+      try {
+        if (isCollectionLimitedAuthoringRequest(req)) assertInputCollections(body, INPUT_COLLECTION_LIMITS);
+        resolve(body);
+      } catch (error) {
+        if (error.code === 'input_collection_limit') {
+          logWarn('security.input_collection_limit', {
+            requestId: currentRequestId(), method: req.method, path: sanitizeReqUrl(req),
+            collection: error.details, limits: INPUT_COLLECTION_LIMITS
+          });
+        }
         reject(error);
       }
     });
@@ -31932,6 +32017,10 @@ async function readJsonObjectBody(req, res, maxBytes = 64 * 1024) {
     }
     return body;
   } catch (error) {
+    if (error.code === 'input_collection_limit') {
+      sendJson(res, 413, inputCollectionLimitPayload(error));
+      return null;
+    }
     sendJson(res, error.statusCode || 400, {
       success: false,
       code: error.code || 'invalid_json_body',
@@ -32490,6 +32579,8 @@ function sanitizeDomain(item) {
     active: item.active === undefined ? null : Boolean(item.active),
     descriptionDirect: item._descriptionDirect_translation || item.descriptionDirect || '',
     descriptionInverse: item._descriptionInverse_translation || item.descriptionInverse || '',
+    disabledSourceDescendants: diagramImportCatalogStrings(item.disabledSourceDescendants || []),
+    disabledDestinationDescendants: diagramImportCatalogStrings(item.disabledDestinationDescendants || []),
     isMasterDetail: item.isMasterDetail === undefined ? null : Boolean(item.isMasterDetail),
     permissions: pickBooleans(item, [
       '_can_create',
@@ -32506,6 +32597,7 @@ function sanitizeAttribute(item) {
     name: item.name,
     description: item._description_translation || item.description || '',
     type: item.type || null,
+    ...(item.help ? { help: String(item.help) } : {}),
     active: item.active === undefined ? null : Boolean(item.active),
     inherited: item.inherited === undefined ? null : Boolean(item.inherited),
     mandatory: item.mandatory === undefined ? null : Boolean(item.mandatory),
@@ -33810,7 +33902,8 @@ function normalizeStoredDiagramImport(spec, diagram, options = {}) {
       relationRules: diagramImportBindRelationRulesToStructureItems(
         diagramImportTopologyRules(roles, original.structure, original.relationRules, original.classes, original.endpointProfiles),
         original.structureTree,
-        original.endpointProfiles
+        original.endpointProfiles,
+        roles
       )
     };
     recordD2MappingStorageOutcome(options, { status: 'topology_normalized' });
@@ -34137,6 +34230,7 @@ function normalizeStoredObjectFlowPresentation(spec, options = {}) {
 }
 
 function normalizeTemplateSpecForStorage(spec, code = '', options = {}) {
+  assertInputCollections(spec, INPUT_COLLECTION_LIMITS, { rootKind: 'spec' });
   const parsed = safeJsonValue(spec, spec);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return spec;
 
@@ -34327,6 +34421,7 @@ function normalizeTemplatePayload(body, fallbackCode, username, options = {}) {
 }
 
 function normalizeAssistantObjectFlowIntent(value, options = {}) {
+  assertInputCollections(value, INPUT_COLLECTION_LIMITS, { rootKind: 'intent' });
   const source = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
   if (!source) {
     const error = new Error('assistantObjectFlowIntent must be an object.');
@@ -34422,6 +34517,7 @@ function normalizeAssistantObjectFlowIntent(value, options = {}) {
 }
 
 function normalizeDraftTemplateBody(body) {
+  assertInputCollections(body, INPUT_COLLECTION_LIMITS);
   const container = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
   const source = container.template && typeof container.template === 'object' && !Array.isArray(container.template)
     ? container.template
@@ -45732,6 +45828,8 @@ function assistantDiagramDirectiveValues(directives, key) {
 
 function assistantDiagramEndpointProfilesFromBindings(input, items) {
   const mappedItems = Array.isArray(items) ? items : [];
+  const intentById = new Map((Array.isArray(input && input.bindingIntent && input.bindingIntent.placements) ? input.bindingIntent.placements : [])
+    .map((item) => [String(item && item.structureItemId || ''), item]));
   const mappedItemIds = new Set(mappedItems.map((item) => String(item && item.structureItemId || '')).filter(Boolean));
   const placementById = new Map((Array.isArray(input && input.placements) ? input.placements : [])
     .map((placement) => [String(placement && placement.structureItemId || ''), placement])
@@ -45749,8 +45847,11 @@ function assistantDiagramEndpointProfilesFromBindings(input, items) {
     const structureItemId = String(item && item.structureItemId || '');
     const target = placementById.get(structureItemId) || {};
     const directives = target.directives || {};
-    const fields = assistantDiagramDirectiveValues(directives, 'endpoint-field');
-    const operators = assistantDiagramDirectiveValues(directives, 'endpoint-operator')
+    const intent = intentById.get(structureItemId) || {};
+    const directiveFields = assistantDiagramDirectiveValues(directives, 'endpoint-field');
+    const directiveOperators = assistantDiagramDirectiveValues(directives, 'endpoint-operator');
+    const fields = directiveFields.length ? directiveFields : uniqueStrings(intent.endpointFields || []);
+    const operators = (directiveOperators.length ? directiveOperators : uniqueStrings(intent.endpointOperators || []))
       .filter((operator) => DIAGRAM_IMPORT_COMPARISON_OPERATORS.has(operator));
     if (!fields.length || !operators.length) continue;
     const mapping = item && item.mapping && typeof item.mapping === 'object' ? item.mapping : {};
@@ -45758,7 +45859,7 @@ function assistantDiagramEndpointProfilesFromBindings(input, items) {
     if (!source) continue;
     for (const field of fields) {
       profilesByPlacementField.set(`${structureItemId}\u0000${field}`, {
-        id: diagramImportStableId('assistant_endpoint_profile', `${structureItemId}:${source.className}:${field}`),
+        id: diagramImportStableId('assistant_endpoint_profile', `${structureItemId}:${source.id}:${source.classColumn}:${source.idColumn}:${field}`),
         structureItemId,
         roleId: String(item && item.roleId || target.roleId || ''),
         label: '',
@@ -45790,6 +45891,11 @@ function assistantRightExpressionKind(value) {
 function assistantDiagramNotesDirectives(notes) {
   const supported = new Set([
     'binding-result',
+    'label-template',
+    'endpoint-scope',
+    'card-source',
+    'membership-card-source',
+    'parent-membership-card-source',
     'stage-policy',
     'row-grain',
     'membership',
@@ -45829,6 +45935,8 @@ function assistantDiagramNotesDirectives(notes) {
 
 function assistantDiagramNotesHasNaturalLanguage(notes) {
   const supported = new Set([
+    'materialization', 'label-template', 'endpoint-scope',
+    'card-source', 'membership-card-source', 'parent-membership-card-source',
     'binding-result', 'stage-policy', 'row-grain', 'membership', 'required-condition',
     'required-membership', 'endpoint-mode', 'endpoint-field', 'endpoint-operator',
     'source-field', 'source-operator', 'target-field', 'target-operator', 'exemplars'
@@ -45841,13 +45949,14 @@ function assistantDiagramNotesHasNaturalLanguage(notes) {
   });
 }
 
-function assistantObjectFlowBusinessBlockManifest(spec, stages = []) {
+function assistantObjectFlowBusinessBlockManifest(spec, stages = [], dataSemanticModel = null) {
   const authoring = templateAuthoring(spec);
   const intent = authoring && authoring.assistant && authoring.assistant.objectFlowIntent && typeof authoring.assistant.objectFlowIntent === 'object'
     ? authoring.assistant.objectFlowIntent
     : {};
   const blocks = Array.isArray(intent.blocks) ? intent.blocks : [];
   const stageList = Array.isArray(stages) ? stages : [];
+  const semanticByStage = new Map((dataSemanticModel && dataSemanticModel.stages || []).map((stage) => [stage.id, stage]));
   const stagesByBlockId = new Map();
   for (const stage of stageList) {
     for (const blockId of Array.isArray(stage && stage.assistantBlockIds) ? stage.assistantBlockIds : []) {
@@ -45904,7 +46013,11 @@ function assistantObjectFlowBusinessBlockManifest(spec, stages = []) {
         outputKind,
         primaryClass: String(terminal && terminal.className || ''),
         rowGrain: String(terminal && terminal.rowGrain || (outputKind === 'relationPairs' ? 'pair' : 'card')),
-        terminalFields: uniqueStrings(Array.isArray(terminal && terminal.columns) ? terminal.columns.map(String) : []),
+        terminalFields: uniqueStrings([
+          ...(Array.isArray(terminal && terminal.columns) ? terminal.columns.map(String) : []),
+          ...(semanticByStage.get(terminal && terminal.id)?.readableFields || [])
+        ]),
+        typedFields: semanticByStage.get(terminal && terminal.id)?.typedFields || [],
         terminalCardSources: (Array.isArray(terminal && terminal.cardSources) ? terminal.cardSources : []).map((source) => ({
           id: String(source && source.id || ''),
           className: String(source && source.className || ''),
@@ -45931,17 +46044,28 @@ function assistantDataSemanticRule(rule = {}) {
   };
 }
 
-function assistantDataSemanticModel(stages = [], catalog = {}) {
+function assistantDataSemanticModel(stages = [], catalog = {}, options = {}) {
   const catalogClasses = new Map((Array.isArray(catalog && catalog.classes) ? catalog.classes : [])
     .map((item) => [String(item && item.name || ''), item]));
+  const fieldContext = buildAssistantFieldContext(
+    stages.slice().sort((left, right) => Number(right.stageRole === 'terminal') - Number(left.stageRole === 'terminal')),
+    catalog,
+    options
+  );
+  const fieldsByStage = new Map(fieldContext.stages.map((stage) => [stage.id, stage]));
   return assistantVersionedModel('DataSemanticModel', ASSISTANT_DATA_SEMANTIC_MODEL_VERSION, {
+    fieldContextDiagnostics: fieldContext.diagnostics,
+    fieldCatalog: fieldContext.fieldCatalog,
     stages: (Array.isArray(stages) ? stages : []).map((stage) => {
       const className = String(stage && stage.className || '');
       const columns = uniqueStrings(Array.isArray(stage && stage.columns) ? stage.columns.map(String) : []);
       const classItem = catalogClasses.get(className) || {};
       const readableFields = uniqueStrings(columns.concat(
-        (Array.isArray(classItem.attributes) ? classItem.attributes : []).map((attribute) => String(attribute && attribute.name || ''))
-      )).slice(0, 160);
+        (Array.isArray(classItem.attributes) ? classItem.attributes : [])
+          .filter((attribute) => attribute.active !== false && attribute.permissions?._can_read !== false)
+          .map((attribute) => String(attribute && attribute.name || '')),
+        fieldsByStage.get(stage.id)?.readableFields || []
+      ));
       return {
         id: String(stage && stage.id || ''),
         label: String(stage && (stage.label || stage.name || stage.alias || stage.id) || ''),
@@ -45959,6 +46083,7 @@ function assistantDataSemanticModel(stages = [], catalog = {}) {
         targetClass: String(stage && stage.targetClass || ''),
         columns,
         readableFields,
+        typedFields: (fieldsByStage.get(stage.id)?.fields || []).map(({ id, path, rootClass, cardSourceId }) => ({ id, path, rootClass, cardSourceId })),
         rules: (Array.isArray(stage && stage.rules) ? stage.rules : []).map(assistantDataSemanticRule),
         assistantBlockIds: uniqueStrings(Array.isArray(stage && stage.assistantBlockIds) ? stage.assistantBlockIds.map(String) : []),
         lineageAliases: uniqueStrings(Array.isArray(stage && stage.lineageAliases) ? stage.lineageAliases.map(String) : []),
@@ -46046,13 +46171,22 @@ function assistantD2BindingModel(items = [], relationRules = []) {
       materialization: String(item && item.mapping && item.mapping.materialization && item.mapping.materialization.kind || ''),
       stageId: String(item && item.source && item.source.stageId || item && item.mapping && item.mapping.materialization && item.mapping.materialization.stageId || ''),
       className: String(item && item.source && item.source.className || ''),
+      cardSourceId: String(item && item.mapping && item.mapping.primary && item.mapping.primary.cardSource && item.mapping.primary.cardSource.id || ''),
+      labelTemplate: String(item && item.mapping && item.mapping.primary && item.mapping.primary.labelTemplate || ''),
+      conditions: cloneJsonValueServer(item && item.mapping && item.mapping.conditions || {}, {}),
       hierarchyConditions: cloneJsonValueServer(item && item.mapping && item.mapping.hierarchyConditions || {}, {})
     })).filter((item) => item.structureItemId),
     connections: (Array.isArray(relationRules) ? relationRules : []).map((rule) => ({
       d2ElementKey: String(rule && rule.d2ElementKey || ''),
       d2ClassKey: String(rule && rule.d2ClassKey || ''),
       sourceStageId: String(rule && rule.sourceStageId || ''),
-      mode: String(rule && rule.mode || '')
+      mode: String(rule && rule.mode || ''),
+      sourceField: String(rule && rule.sourceField || ''),
+      targetField: String(rule && rule.targetField || ''),
+      sourceOperator: diagramImportConnectionRuleSideOperator(rule, 'source'),
+      targetOperator: diagramImportConnectionRuleSideOperator(rule, 'target'),
+      labelTemplate: diagramImportRelationLabelTemplate(rule),
+      endpointScopeStructureItemId: String(rule && rule.endpointScopeStructureItemId || '')
     })).filter((rule) => rule.d2ElementKey)
   });
 }
@@ -46064,6 +46198,9 @@ function assistantD2BindingIntentModel(intent = {}) {
       structureItemId: String(item && item.structureItemId || ''),
       materializationIntent: String(item && item.materializationIntent || ''),
       businessBlockId: String(item && item.businessBlockId || ''),
+      cardSourceId: String(item && item.cardSourceId || ''),
+      membershipCardSourceId: String(item && item.membershipCardSourceId || ''),
+      parentMembershipCardSourceId: String(item && item.parentMembershipCardSourceId || ''),
       stagePolicy: String(item && item.stagePolicy || 'terminal-only'),
       membership: String(item && item.membership || ''),
       requiredConditions: uniqueStrings(Array.isArray(item && item.requiredConditions) ? item.requiredConditions.map(String) : []),
@@ -46140,20 +46277,42 @@ function assistantDiagramModelBundle(input = {}, draft = {}, mapping = null) {
   if (input.kind === 'mapping') {
     bundle.d2BindingModel = assistantD2BindingModel(items, draft.relationRules);
     bundle.coverageModel = assistantCoverageModel(mapping || draft.mapping || {});
+    const ledger = input.requirementLedger || buildAssistantRequirementLedger(input);
+    const obligations = draft.obligationMatrix?.obligations || [];
+    bundle.requirementLedger = ledger;
+    bundle.requirementCoverage = {
+      scope: 'source-target-accountability-only',
+      semanticProof: false,
+      entries: ledger.requirements.map((requirement) => {
+        const failed = obligations.filter((obligation) => obligation.targetId === requirement.targetId && obligation.status !== 'satisfied');
+        const conflict = ledger.warnings.some((warning) => warning.requirementIds.includes(requirement.id));
+        const resolved = requirement.targetType === 'placement'
+          ? items.some((item) => item.structureItemId === requirement.targetId)
+          : requirement.targetType === 'connection'
+            ? (draft.relationRules || []).some((rule) => rule.d2ClassKey === requirement.targetId)
+            : input.businessBlockManifest?.blocks.some((block) => block.id === requirement.targetId && block.status === 'ready');
+        return { id: requirement.id, status: conflict ? 'conflict' : resolved && !failed.length ? 'compiled' : 'unresolved',
+          ...(resolved && !failed.length && !conflict ? { evidenceRefs: [{ family: requirement.targetType, ref: requirement.targetId }] } : {}) };
+      })
+    };
   }
   return bundle;
 }
 
 function assistantDiagramBindingIntentMessages(input, runtimeConfig) {
   const assistantConfig = normalizeAssistantRuntimeConfig(runtimeConfig || defaultRuntimeConfig());
-  const contract = '{"placementBindings":[{"structureItemId":"<exact placement id>","materializationIntent":"structural|stage|parentCard","businessBlockId":"<exact block id, required only for stage>","membership":"|structural|same-parent-card|compare","requiredConditions":["<field> <operator> <literal or ${param.name}>"],"requiredMembership":["<child field> <operator> parent.<field>"],"endpointFields":["<exact field path>"],"endpointOperators":["<supported operator>"]}],"connectionBindings":[{"d2ClassKey":"<exact connection class>","businessBlockId":"<exact block id>","rowGrain":"card|pair","endpointMode":"attributeEndpoints|relationCard|deterministicEndpoints","sourceField":"<exact field>","sourceOperator":"<supported operator>","targetField":"<exact field>","targetOperator":"<supported operator>"}],"unresolved":[{"targetType":"placement|connection","targetId":"<exact id>","reason":"noCompatibleBlock|ambiguousBlock","message":"..."}],"explanation":"...","warnings":[]}';
+  const contract = '{"placementBindings":[{"structureItemId":"<exact placement id>","materializationIntent":"structural|stage|parentCard","businessBlockId":"<exact block id, required only for stage>","cardSourceId":"<exact terminalCardSources id, stage only>","membershipCardSourceId":"<optional exact retained child source id for requiredMembership>","parentMembershipCardSourceId":"<optional exact retained parent source id for requiredMembership>","membership":"|structural|same-parent-card|compare","requiredConditions":["<field> <operator> <literal or ${param.name}>"],"requiredMembership":["<child field> <operator> parent.<field>"],"endpointFields":["<exact field path>"],"endpointOperators":["<supported operator>"]}],"connectionBindings":[{"d2ClassKey":"<exact connection class>","businessBlockId":"<exact block id>","rowGrain":"card|pair","endpointMode":"attributeEndpoints|relationCard|deterministicEndpoints","sourceField":"<exact field>","sourceOperator":"<supported operator>","targetField":"<exact field>","targetOperator":"<supported operator>"}],"unresolved":[{"targetType":"placement|connection","targetId":"<exact id>","reason":"noCompatibleBlock|ambiguousBlock","message":"..."}],"explanation":"...","warnings":[]}';
   const system = [
     'You are a D2 diagram binding-intent assistant.',
     `Return exactly one JSON object matching this contract: ${contract}`,
     'Choose only user-facing business block ids. Never return Object Flow stage ids, aliases, runtime Spec, D2 source or extra fields. Exact fields and operators may be returned only when they are required by natural-language Notes and are present in the terminal contract or supplied data model.',
     'Every dynamic placement must occur exactly once in placementBindings or unresolved. Every supplied connection class must occur exactly once in connectionBindings or unresolved.',
+    'Structure references use request-local typed handles. Copy each placement own structureItemId, never its parentStructureItemId. For example a structural container_1 has no business block or card source; its stage child node_1 owns its own block and source. Never merge a frame and its child into one binding.',
     'materializationIntent must be one supplied allowedMaterialization value. structural and parentCard have no independent businessBlockId. stage requires one exact businessBlockId.',
+    'For stage, select cardSourceId from that block terminalCardSources by exact id. It selects the displayed card identity, class, label and endpoints. Multiple card sources require an explicit choice justified by Notes or unresolved; never guess current from a class name, label, hierarchy or lineage. A single card source is a deterministic default. structural and parentCard must not select cardSourceId; parentCard inherits the displayed parent card. Parent membership may compare a different retained side of the row: preserve its exact fields independently of the displayed card.',
+    'For requiredMembership, optional membershipCardSourceId and parentMembershipCardSourceId independently select the exact retained child and parent card sources. These are not the displayed card selection. Use raw class attribute paths with these source ids. Without these ids, exact materialized row fields such as _id, Class or Source_range retain their row meaning and must not be reprojected through the displayed card. Omit membership source ids when using prefixed materialized row columns. Never infer parent membership from the displayed class or lineage. Non-stage placements have no membership source ids.',
     'When a placement supplies fixedMaterializationIntent or requiredBusinessBlockId, copy that exact value. When a connection supplies requiredBusinessBlockId, copy that exact value. These values are deterministic constraints, not choices.',
+    'Exact card-source, membership-card-source and parent-membership-card-source Notes directives are authoritative source ids for cardSourceId, membershipCardSourceId and parentMembershipCardSourceId respectively. Placement Notes override Role Notes. Copy exact retained ids only; an invalid id is unresolved, never a class-name lookup.',
     'Exact binding-result in Placement or Connection Notes is authoritative. Otherwise use the template placement and connection prompts plus business block name, algorithm, expected result, primary class and row grain.',
     'A named block means its terminal result. Helper stages are not visible in this phase. Do not infer a broad source block when a filtered business result exists.',
     'Translate natural-language Notes into typed obligations. requiredConditions describe branch filters, requiredMembership describes child-to-parent membership, and endpoint fields/operators describe how connection endpoints are compared. Leave an optional obligation empty when Notes do not require it. Never invent an obligation from exemplar labels or D2 nesting alone.',
@@ -46163,10 +46322,12 @@ function assistantDiagramBindingIntentMessages(input, runtimeConfig) {
       : ''
   ].filter(Boolean).join('\n');
   const taskPrompt = String(assistantConfig.prompt.diagramBindingIntent || '').trim();
-  const user = JSON.stringify({
+  const handles = createAssistantBindingHandles(input.placements || []);
+  const user = JSON.stringify(handles.encode({
     prompt: truncateText(String(input.prompt || ''), 6000),
     models: {
-      businessBlockManifest: input.businessBlockManifest,
+      businessBlockManifest: compactAssistantBusinessManifest(input.businessBlockManifest),
+      dataSemanticModel: compactAssistantDataModel(input.dataSemanticModel, { terminalOnly: Boolean(input.businessBlockManifest?.blocks?.length) }),
       d2StructuralModel: input.d2StructuralModel,
       d2SemanticModel: input.d2SemanticModel
     },
@@ -46203,7 +46364,7 @@ function assistantDiagramBindingIntentMessages(input, runtimeConfig) {
     correction: input.correction && Array.isArray(input.correction.invalidBindingIntent)
       ? { invalidBindingIntent: cloneJsonValueServer(input.correction.invalidBindingIntent, []) }
       : null
-  });
+  }));
   return [
     { role: 'system', content: system },
     { role: 'system', content: assistantConfig.prompt.system },
@@ -46244,19 +46405,29 @@ function assistantDiagramBindingIntentSeed(input) {
           ? 'stage'
           : '';
     const block = blockById.get(notesBlockId) || null;
+    const cardSourceId = String(directives['card-source'] || '');
+    const membershipCardSourceId = String(directives['membership-card-source'] || '');
+    const parentMembershipCardSourceId = String(directives['parent-membership-card-source'] || '');
+    const selectedCard = assistantSelectedCardSource(block || {}, cardSourceId);
     const stagePolicy = String(directives['stage-policy'] || 'terminal-only');
     const needsNaturalLanguageContract = assistantDiagramNotesHasNaturalLanguage(placement && placement.notes);
     const stageBindingReady = materializationIntent === 'stage'
       && Boolean(block)
+      && Boolean(selectedCard.source)
+      && (!membershipCardSourceId || Boolean(assistantSelectedCardSource(block || {}, membershipCardSourceId).source))
       && (stagePolicy === 'helper-allowed' || Boolean(String(block && block.terminalStageId || '')));
     const cardlessBindingReady = (materializationIntent === 'structural' || materializationIntent === 'parentCard')
-      && !notesBlockId;
+      && !notesBlockId && !cardSourceId && !membershipCardSourceId && !parentMembershipCardSourceId;
     const deterministicBindingReady = stageBindingReady || cardlessBindingReady;
     if (structureItemId && deterministicBindingReady) {
       placementBindings.push({
         structureItemId,
         materializationIntent,
-        ...(materializationIntent === 'stage' ? { businessBlockId: notesBlockId } : {})
+        ...(materializationIntent === 'stage' ? {
+          businessBlockId: notesBlockId, cardSourceId: String(selectedCard.source.id),
+          ...(membershipCardSourceId ? { membershipCardSourceId } : {}),
+          ...(parentMembershipCardSourceId ? { parentMembershipCardSourceId } : {})
+        } : {})
       });
     }
     if (structureItemId && (needsNaturalLanguageContract || !deterministicBindingReady)) pendingPlacementIds.push(structureItemId);
@@ -46307,6 +46478,17 @@ function normalizeAssistantDiagramBindingIntentResponse(input, parsedObject) {
         candidate.businessBlockId = notesBlockId;
       }
       if (candidate.materializationIntent && candidate.materializationIntent !== 'stage') delete candidate.businessBlockId;
+      for (const [directive, key] of [['card-source', 'cardSourceId'], ['membership-card-source', 'membershipCardSourceId'], ['parent-membership-card-source', 'parentMembershipCardSourceId']]) {
+        if (placement.directives && placement.directives[directive]) candidate[key] = String(placement.directives[directive]);
+      }
+      if (candidate.materializationIntent === 'stage' && !candidate.cardSourceId) {
+        const block = (Array.isArray(manifest.blocks) ? manifest.blocks : []).find((item) => String(item && item.id || '') === String(candidate.businessBlockId || ''));
+        const selected = assistantSelectedCardSource(block || {});
+        if (selected.source) candidate.cardSourceId = String(selected.source.id);
+      }
+      if (placement.directives?.membership) candidate.membership = String(placement.directives.membership);
+      else if (candidate.materializationIntent === 'stage' && placement.directives?.['required-membership']?.length) candidate.membership = 'compare';
+      else if (candidate.materializationIntent === 'parentCard') candidate.membership = 'same-parent-card';
       if (candidate.materializationIntent === 'structural') {
         candidate.membership = 'structural';
         candidate.requiredConditions = [];
@@ -46334,6 +46516,13 @@ function normalizeAssistantDiagramBindingIntentResponse(input, parsedObject) {
     if (candidate && typeof candidate === 'object' && notesBlockId && notesBlockId !== '__invalid__') candidate.businessBlockId = notesBlockId;
     return candidate;
   });
+  const kinds = new Map(normalizedPlacements.map((item) => [item.structureItemId, item.materializationIntent]));
+  for (const candidate of normalizedPlacements) {
+    const target = placementById.get(candidate.structureItemId);
+    if (candidate.materializationIntent === 'stage' && !target?.directives?.membership &&
+      !target?.directives?.['required-membership']?.length && !candidate.requiredMembership?.length &&
+      assistantPlacementHasStageAncestor(candidate.structureItemId, input.placements, kinds) === false) candidate.membership = 'structural';
+  }
   response.placementBindings = normalizedPlacements;
   response.connectionBindings = normalizedConnections;
   response.warnings = uniqueStrings([].concat(
@@ -46355,7 +46544,8 @@ function assistantDiagramBindingIntentDraftFromResponse(input, parsedObject) {
   })).filter((item) => item.d2ClassKey);
   const connectionByKey = new Map(connections.map((item) => [item.d2ClassKey, item]));
   const errors = [];
-  const warnings = Array.isArray(response.warnings) ? response.warnings.map(String).filter(Boolean) : [];
+  const warnings = (Array.isArray(response.warnings) ? response.warnings.map(String).filter(Boolean) : [])
+    .concat(assistantFieldContextWarnings(input.dataSemanticModel));
   const seenPlacements = new Set();
   const seenConnections = new Set();
   const intentPlacements = [];
@@ -46381,6 +46571,30 @@ function assistantDiagramBindingIntentDraftFromResponse(input, parsedObject) {
       continue;
     }
     const selectedBlock = blockById.get(businessBlockId) || {};
+    let sourceDirectiveMismatch = false;
+    for (const [directive, key] of [['card-source', 'cardSourceId'], ['membership-card-source', 'membershipCardSourceId'], ['parent-membership-card-source', 'parentMembershipCardSourceId']]) {
+      const required = String(target.directives && target.directives[directive] || '');
+      if (required && candidate && candidate[key] && String(candidate[key]) !== required) {
+        errors.push({ path: `$.placementBindings[${index}].${key}`, message: `D2 placement ${target.displayName || structureItemId} must follow its exact ${directive} Notes directive.` });
+        sourceDirectiveMismatch = true;
+      }
+    }
+    if (sourceDirectiveMismatch) continue;
+    const cardSourceId = String(target.directives && target.directives['card-source'] || candidate && candidate.cardSourceId || '');
+    const selectedCard = materializationIntent === 'stage'
+      ? assistantSelectedCardSource(selectedBlock, cardSourceId)
+      : null;
+    if ((selectedCard && !selectedCard.source) || (materializationIntent !== 'stage' && cardSourceId)) {
+      errors.push({ path: `$.placementBindings[${index}].cardSourceId`, code: 'diagram_card_source_required', message: `D2 placement ${target.displayName || structureItemId} must select one exact terminal card source for stage materialization only.` });
+      continue;
+    }
+    const membershipCardSourceId = String(target.directives && target.directives['membership-card-source'] || candidate && candidate.membershipCardSourceId || '');
+    const parentMembershipCardSourceId = String(target.directives && target.directives['parent-membership-card-source'] || candidate && candidate.parentMembershipCardSourceId || '');
+    if ((membershipCardSourceId && !assistantSelectedCardSource(selectedBlock, membershipCardSourceId).source) ||
+      (materializationIntent !== 'stage' && (membershipCardSourceId || parentMembershipCardSourceId))) {
+      errors.push({ path: `$.placementBindings[${index}].membershipCardSourceId`, message: 'Parent membership requires exact retained card source ids on a stage placement.' });
+      continue;
+    }
     const stagePolicy = String(target.directives && target.directives['stage-policy'] || 'terminal-only');
     if (materializationIntent === 'stage' && stagePolicy !== 'helper-allowed' && !String(selectedBlock.terminalStageId || '')) {
       errors.push({ path: `$.placementBindings[${index}].businessBlockId`, message: `D2 placement ${target.displayName || structureItemId} requires a business block with one materialized terminal result.` });
@@ -46427,10 +46641,20 @@ function assistantDiagramBindingIntentDraftFromResponse(input, parsedObject) {
       errors.push({ path: `$.placementBindings[${index}].membership`, message: `D2 placement ${target.displayName || structureItemId} returned unsupported membership ${membership}.` });
       continue;
     }
+    const allowedMembership = materializationIntent === 'parentCard' ? ['same-parent-card']
+      : materializationIntent === 'structural' ? ['structural'] : ['structural', 'compare'];
+    if (membership && (!allowedMembership.includes(membership) || requiredMembership.length && membership !== 'compare')) {
+      errors.push({ path: `$.placementBindings[${index}].membership`, code: 'diagram_binding_membership_mismatch',
+        message: `D2 placement ${target.displayName || structureItemId} uses ${materializationIntent}; membership ${membership} is incompatible with its materialization or required comparisons.` });
+      continue;
+    }
     intentPlacements.push({
       structureItemId,
       materializationIntent,
       businessBlockId,
+      cardSourceId: String(selectedCard && selectedCard.source && selectedCard.source.id || ''),
+      membershipCardSourceId,
+      parentMembershipCardSourceId,
       stagePolicy,
       membership,
       requiredConditions,
@@ -46458,6 +46682,12 @@ function assistantDiagramBindingIntentDraftFromResponse(input, parsedObject) {
       continue;
     }
     const block = blockById.get(businessBlockId) || {};
+    const rowGrain = String(target.directives && target.directives['row-grain'] || candidate && candidate.rowGrain || block.rowGrain || '');
+    if (block.rowGrain && rowGrain !== block.rowGrain) {
+      errors.push({ path: `$.connectionBindings[${index}].rowGrain`, code: 'diagram_binding_row_grain_mismatch',
+        message: `Connection ${d2ClassKey} must preserve rowGrain=${String(block.rowGrain)} from business result ${String(block.name || businessBlockId)}; received ${rowGrain || '(empty)'}.` });
+      continue;
+    }
     const stagePolicy = String(target.directives && target.directives['stage-policy'] || 'terminal-only');
     if (stagePolicy !== 'helper-allowed' && !String(block.terminalStageId || '')) {
       errors.push({ path: `$.connectionBindings[${index}].businessBlockId`, message: `D2 connection class ${d2ClassKey} requires a business block with one materialized terminal result.` });
@@ -46482,7 +46712,7 @@ function assistantDiagramBindingIntentDraftFromResponse(input, parsedObject) {
       d2ClassKey,
       businessBlockId,
       stagePolicy,
-      rowGrain: String(target.directives && target.directives['row-grain'] || candidate && candidate.rowGrain || block.rowGrain || ''),
+      rowGrain,
       endpointMode,
       sourceField: String(target.directives && target.directives['source-field'] || candidate && candidate.sourceField || ''),
       sourceOperator,
@@ -46520,7 +46750,7 @@ function assistantDiagramBindingIntentDraftFromResponse(input, parsedObject) {
     explanation: String(response.explanation || ''),
     warnings: uniqueStrings(warnings),
     errors,
-    diagnostics: { contract: 'typed-d2-binding-intent-v1', attempts: 1 }
+    diagnostics: { contract: 'typed-d2-binding-intent-v2', attempts: 1 }
   };
 }
 
@@ -46560,62 +46790,14 @@ async function createAssistantDiagramBindingIntentDraft(input, runtimeConfig) {
     phase: 'intent.initial',
     attempt: 1
   });
-  const response = normalizeAssistantDiagramBindingIntentResponse(input, parseAssistantJson(content));
-  const responsePlacementBindings = Array.isArray(response && response.placementBindings) ? response.placementBindings : [];
-  const responseConnectionBindings = Array.isArray(response && response.connectionBindings) ? response.connectionBindings : [];
-  const responseUnresolved = Array.isArray(response && response.unresolved) ? response.unresolved : [];
-  const ignoredResponseItems = responsePlacementBindings.filter((item) => !pendingPlacementIds.has(String(item && item.structureItemId || ''))).length
-    + responseConnectionBindings.filter((item) => !pendingConnectionKeys.has(String(item && item.d2ClassKey || ''))).length
-    + responseUnresolved.filter((item) => {
-      const targetType = String(item && item.targetType || '');
-      const targetId = String(item && item.targetId || '');
-      return targetType === 'placement'
-        ? !pendingPlacementIds.has(targetId)
-        : targetType === 'connection'
-          ? !pendingConnectionKeys.has(targetId)
-          : true;
-    }).length;
-  const responsePlacementById = new Map(responsePlacementBindings
-    .filter((item) => pendingPlacementIds.has(String(item && item.structureItemId || '')))
-    .map((item) => [String(item && item.structureItemId || ''), item]));
-  const responseConnectionByKey = new Map(responseConnectionBindings
-    .filter((item) => pendingConnectionKeys.has(String(item && item.d2ClassKey || '')))
-    .map((item) => [String(item && item.d2ClassKey || ''), item]));
-  const seededPlacementIds = new Set(seed.placementBindings.map((item) => String(item && item.structureItemId || '')));
-  const seededConnectionKeys = new Set(seed.connectionBindings.map((item) => String(item && item.d2ClassKey || '')));
-  const mergedPlacements = seed.placementBindings.map((base) => ({
-    ...base,
-    ...(responsePlacementById.get(String(base.structureItemId || '')) || {})
-  })).concat(responsePlacementBindings.filter((item) => (
-    pendingPlacementIds.has(String(item && item.structureItemId || '')) &&
-    !seededPlacementIds.has(String(item && item.structureItemId || ''))
-  )));
-  const mergedConnections = seed.connectionBindings.map((base) => ({
-    ...base,
-    ...(responseConnectionByKey.get(String(base.d2ClassKey || '')) || {})
-  })).concat(responseConnectionBindings.filter((item) => (
-    pendingConnectionKeys.has(String(item && item.d2ClassKey || '')) &&
-    !seededConnectionKeys.has(String(item && item.d2ClassKey || ''))
-  )));
-  const unresolvedWithNoDeterministicBinding = responseUnresolved.filter((item) => {
-    const targetType = String(item && item.targetType || '');
-    const targetId = String(item && item.targetId || '');
-    return targetType === 'placement'
-      ? pendingPlacementIds.has(targetId) && !seededPlacementIds.has(targetId)
-      : targetType === 'connection'
-        ? pendingConnectionKeys.has(targetId) && !seededConnectionKeys.has(targetId)
-        : false;
-  });
-  const ignoredUnresolved = responseUnresolved.length - unresolvedWithNoDeterministicBinding.length;
+  const decoded = createAssistantBindingHandles(requestInput.placements).decode(parseAssistantJson(content));
+  const response = normalizeAssistantDiagramBindingIntentResponse(input, decoded);
+  const mergedResponse = assistantMergeBindingIntent(seed, response);
   const merged = {
-    ...response,
-    placementBindings: mergedPlacements,
-    connectionBindings: mergedConnections,
-    unresolved: unresolvedWithNoDeterministicBinding,
+    ...mergedResponse,
     warnings: uniqueStrings([].concat(
       Array.isArray(response && response.warnings) ? response.warnings : [],
-      ignoredResponseItems ? [`Ignored ${ignoredResponseItems} Assistant binding item(s) outside the requested ambiguous targets.`] : [],
-      ignoredUnresolved ? [`Preserved ${ignoredUnresolved} deterministic D2 binding(s) that Assistant returned as unresolved.`] : []
+      mergedResponse.ignoredResponseItems ? [`Ignored ${mergedResponse.ignoredResponseItems} Assistant binding item(s) outside the requested ambiguous targets.`] : []
     ))
   };
   const draft = assistantDiagramBindingIntentDraftFromResponse(input, merged);
@@ -46645,6 +46827,7 @@ function assistantDiagramCritiqueMessages(input, runtimeConfig, draft, obligatio
       businessBlockManifest: input.businessBlockManifest,
       d2BindingIntent: assistantD2BindingIntentModel(input.bindingIntent),
       d2BindingModel: assistantD2BindingModel(draft.items, draft.relationRules),
+      requirementLedger: input.requirementLedger || buildAssistantRequirementLedger(input),
       semanticObligationMatrix: assistantSemanticObligationModel(obligationMatrix)
     }
   });
@@ -46792,9 +46975,11 @@ function assistantDiagramLiteralMatches(actual, expected) {
 function assistantDiagramRuleSatisfiesDirective(rule, directive, membership = false) {
   const parts = assistantDiagramDirectiveParts(directive, membership);
   if (!parts || !rule || typeof rule !== 'object') return false;
-  if (String(rule.operator || rule.op || '') !== parts.operator) return false;
-  if (String(rule.left && rule.left.column || rule.leftColumn || '') !== parts.leftColumn) return false;
-  const right = rule.right && typeof rule.right === 'object' ? rule.right : {};
+  const expected = diagramImportPlacementFilters({ rules: [assistantDiagramRuleFromDirective(directive, membership)] }).rules[0];
+  const actual = diagramImportPlacementFilters({ rules: [rule] }).rules[0];
+  if (actual.action !== 'include' || actual.negate !== expected.negate || actual.operator !== expected.operator) return false;
+  if (actual.left.column !== parts.leftColumn || actual.left.regex || actual.right.regex) return false;
+  const right = actual.right;
   if (membership) {
     return String(right.kind || '') === 'stage' && String(right.column || '') === parts.rightColumn;
   }
@@ -46807,11 +46992,37 @@ function assistantDiagramRuleSatisfiesDirective(rule, directive, membership = fa
 function assistantDiagramSemanticObligations(input, draft) {
   const bindingIntent = input && input.bindingIntent || {};
   const placements = Array.isArray(input && input.placements) ? input.placements : [];
-  const placementById = new Map(placements.map((item) => [String(item && item.structureItemId || ''), item]));
-  const itemById = new Map((Array.isArray(draft && draft.items) ? draft.items : [])
+  const placementById = new Map([...(input && input.placementContext || []), ...placements]
+    .map((item) => [String(item && item.structureItemId || ''), item]));
+  const itemById = new Map([...(input && input.acceptedItems || []), ...(Array.isArray(draft && draft.items) ? draft.items : [])]
     .map((item) => [String(item && item.structureItemId || ''), item]));
   const stageById = new Map((Array.isArray(input && input.stages) ? input.stages : [])
     .map((stage) => [String(stage && stage.id || ''), stage]));
+  const semanticStageById = new Map((input && input.dataSemanticModel && input.dataSemanticModel.stages || [])
+    .map((stage) => [String(stage && stage.id || ''), stage]));
+  const nearestDataParent = (itemId, visited = new Set()) => {
+    const parentId = String(placementById.get(itemId)?.parentStructureItemId || '');
+    if (!parentId || visited.has(parentId)) return null;
+    const parent = itemById.get(parentId);
+    const kind = parent?.mapping?.materialization?.kind;
+    if (kind === 'stage') return parent;
+    return nearestDataParent(parentId, new Set(visited).add(parentId));
+  };
+  const sourceMatches = (actual, stage, field, sourceId = '', preferred = null) => {
+    const expected = sourceId ? assistantSelectedCardSource(stage || {}, sourceId).source
+      : assistantDiagramTypedFieldSource(stage, semanticStageById.get(String(stage && stage.id || '')), field, preferred) || preferred;
+    const normalized = normalizeDiagramImportConditionCardSource(actual);
+    if (actual || sourceId) {
+      return Boolean(normalized && expected) && String(normalized.id) === String(expected.id) &&
+        diagramImportConditionSourceKey(normalized) === diagramImportConditionSourceKey(expected);
+    }
+    return (stage && stage.columns || []).map(String).includes(String(field)) ||
+      assistantCardSources(stage || {}).length === 1 && Boolean(expected);
+  };
+  const isRequiredRule = (filters, predicate) => {
+    const includes = filters.rules.filter((rule) => rule.action === 'include');
+    return (filters.ruleJoin === 'all' || includes.length === 1) && includes.some(predicate);
+  };
   const relationRuleByClass = new Map((Array.isArray(draft && draft.relationRules) ? draft.relationRules : [])
     .map((rule) => [String(rule && rule.d2ClassKey || ''), rule]));
   const endpointProfiles = diagramImportEndpointProfiles(draft && draft.endpointProfiles);
@@ -46843,32 +47054,59 @@ function assistantDiagramSemanticObligations(input, draft) {
       const satisfied = blockIds.includes(String(intent.businessBlockId || '')) && (!terminalRequired || String(stage.stageRole || '') === 'terminal');
       add('placementBusinessResult', targetId, 'placements', `${terminalRequired ? 'terminal ' : ''}businessBlock=${String(intent.businessBlockId || '')}`,
         satisfied, `stage=${stageId || '(missing)'}; role=${String(stage.stageRole || '(missing)')}; blocks=${blockIds.join(',')}`);
+      const expectedSource = assistantSelectedCardSource(stage, intent.cardSourceId).source;
+      const actualSource = normalizeDiagramImportConditionCardSource(mapping.primary && mapping.primary.cardSource);
+      add('placementCardSource', targetId, 'placements', `cardSourceId=${String(intent.cardSourceId || expectedSource && expectedSource.id || '')}`,
+        Boolean(expectedSource && actualSource) && String(expectedSource.id) === String(actualSource.id) &&
+          diagramImportConditionSourceKey(expectedSource) === diagramImportConditionSourceKey(actualSource),
+        `cardSourceId=${String(actualSource && actualSource.id || '(missing)')}`);
     }
-    const conditionRules = diagramImportPlacementFilters(mapping.conditions).rules;
+    const stageId = materialization === 'parentCard'
+      ? String(nearestDataParent(targetId)?.mapping?.materialization?.stageId || '')
+      : String(mapping.materialization && mapping.materialization.stageId || '');
+    const stage = stageById.get(stageId);
+    const parent = nearestDataParent(targetId);
+    const parentStageId = String(parent?.mapping?.materialization?.stageId || '');
+    const parentStage = stageById.get(parentStageId);
+    const conditionFilters = diagramImportPlacementFilters(mapping.conditions);
+    const conditionRules = conditionFilters.rules;
     for (const directive of Array.isArray(intent.requiredConditions) ? intent.requiredConditions : []) {
       add('placementCondition', targetId, 'placements', String(directive),
-        conditionRules.some((rule) => assistantDiagramRuleSatisfiesDirective(rule, directive, false)),
-        `rules=${conditionRules.length}; placement=${String(target.displayName || targetId)}`);
+        isRequiredRule(conditionFilters, (rule) => assistantDiagramRuleSatisfiesDirective(rule, directive, false) &&
+          sourceMatches(rule.left.source, stage, rule.left.column, '', mapping.primary && mapping.primary.cardSource)),
+        `ruleJoin=${conditionFilters.ruleJoin}; rules=${conditionRules.length}; placement=${String(target.displayName || targetId)}`);
     }
-    const hierarchyRules = diagramImportPlacementFilters(mapping.hierarchyConditions).rules;
+    const hierarchyFilters = diagramImportPlacementFilters(mapping.hierarchyConditions);
+    const hierarchyRules = hierarchyFilters.rules;
+    const matchesParent = (rule) => Boolean(parentStage) && rule.right.kind === 'stage' &&
+      rule.right.stageId === parentStageId &&
+      sourceMatches(rule.left.source, stage, rule.left.column, String(intent.membershipCardSourceId || ''), mapping.primary && mapping.primary.cardSource) &&
+      sourceMatches(rule.right.source, parentStage, rule.right.column, String(intent.parentMembershipCardSourceId || ''), parent?.mapping?.primary?.cardSource);
     const membership = String(intent.membership || '');
     if (membership === 'same-parent-card') {
       add('placementMembership', targetId, 'placements', 'same-parent-card', materialization === 'parentCard', `materialization=${materialization || '(missing)'}`);
     } else if (membership === 'compare') {
-      add('placementMembership', targetId, 'placements', 'explicit parent-child comparison', hierarchyRules.length > 0, `hierarchyRules=${hierarchyRules.length}`);
+      add('placementMembership', targetId, 'placements', 'explicit parent-child comparison',
+        materialization === 'stage' && hierarchyRules.some((rule) => rule.action === 'include' && matchesParent(rule)),
+        `hierarchyRules=${hierarchyRules.length}`);
     } else if (membership === 'structural') {
-      add('placementMembership', targetId, 'placements', 'structural placement', materialization === 'structural', `materialization=${materialization || '(missing)'}`);
+      const kinds = new Map([...itemById.values()].map((item) => [item.structureItemId, item.mapping?.materialization?.kind]));
+      const layoutOnlyParent = assistantPlacementHasStageAncestor(targetId, [...placementById.values()], kinds) === false;
+      add('placementMembership', targetId, 'placements', 'structural placement', materialization === 'structural' || materialization === 'stage' && layoutOnlyParent, `materialization=${materialization || '(missing)'}`);
     }
     for (const directive of Array.isArray(intent.requiredMembership) ? intent.requiredMembership : []) {
       add('placementMembershipRule', targetId, 'placements', String(directive),
-        hierarchyRules.some((rule) => assistantDiagramRuleSatisfiesDirective(rule, directive, true)),
-        `hierarchyRules=${hierarchyRules.length}`);
+        materialization === 'stage' && isRequiredRule(hierarchyFilters, (rule) =>
+          assistantDiagramRuleSatisfiesDirective(rule, directive, true) && matchesParent(rule)),
+        `ruleJoin=${hierarchyFilters.ruleJoin}; hierarchyRules=${hierarchyRules.length}; parentStage=${parentStageId || '(missing)'}`);
     }
     const placementProfiles = endpointProfiles.filter((profile) => String(profile && profile.structureItemId || '') === targetId);
     for (const field of Array.isArray(intent.endpointFields) ? intent.endpointFields : []) {
       for (const operator of Array.isArray(intent.endpointOperators) ? intent.endpointOperators : []) {
         const satisfied = placementProfiles.some((profile) => (
           String(profile && profile.field || '') === String(field) &&
+          Boolean(profile.source && mapping.primary && mapping.primary.cardSource) &&
+          diagramImportConditionSourceKey(profile.source) === diagramImportConditionSourceKey(mapping.primary.cardSource) &&
           Array.isArray(profile && profile.operators) && profile.operators.includes(String(operator))
         ));
         add('placementEndpointProfile', targetId, 'placements', `${String(field)} supports ${String(operator)}`,
@@ -46898,6 +47136,14 @@ function assistantDiagramSemanticObligations(input, draft) {
       Boolean(rule) && diagramImportConnectionRuleSideOperator(rule, 'target') === String(intent.targetOperator), `targetOperator=${String(rule && diagramImportConnectionRuleSideOperator(rule, 'target') || '(missing)')}`);
     if (intent.rowGrain) add('connectionRowGrain', targetId, 'connections', `rowGrain=${String(intent.rowGrain)}`,
       Boolean(rule) && String(stage.rowGrain || '') === String(intent.rowGrain), `rowGrain=${String(stage.rowGrain || '(missing)')}`);
+    const declared = (input.relationRules || []).find((item) => String(item.d2ClassKey || item.d2ElementKey || '') === targetId);
+    const scopeRequest = assistantDiagramNotesDirectives(declared?.d2Notes || '')['endpoint-scope'];
+    if (scopeRequest) {
+      const scope = resolveDiagramEndpointScope(scopeRequest, input.structureTree, input.roles);
+      add('connectionEndpointScope', targetId, 'connections', String(scopeRequest),
+        !scope.error && Boolean(rule) && String(rule.endpointScopeStructureItemId || '') === scope.structureItemId,
+        `scope=${String(rule && rule.endpointScopeStructureItemId || '(missing)')}`);
+    }
   }
   return { obligations };
 }
@@ -47079,10 +47325,10 @@ function assistantDiagramStageMessages(input, runtimeConfig) {
   const user = JSON.stringify({
     prompt: truncateText(userTaskPrompt, 4000),
     models: {
-      dataSemanticModel: input.dataSemanticModel || assistantDataSemanticModel(input.stages),
+      dataSemanticModel: compactAssistantDataModel(input.dataSemanticModel || assistantDataSemanticModel(input.stages)),
       d2StructuralModel: input.d2StructuralModel || assistantD2StructuralModel(input.roles, input.placements, input.topology),
       d2SemanticModel: input.d2SemanticModel || assistantD2SemanticModel(input.roles),
-      ...(input.businessBlockManifest ? { businessBlockManifest: input.businessBlockManifest } : {}),
+      ...(input.businessBlockManifest ? { businessBlockManifest: compactAssistantBusinessManifest(input.businessBlockManifest) } : {}),
       ...(input.bindingIntent ? { d2BindingIntent: assistantD2BindingIntentModel(input.bindingIntent) } : {}),
       ...(mappingPhase === 'topology' || Array.isArray(input.acceptedItems) && input.acceptedItems.length ? {
         d2BindingModel: input.d2BindingModel || assistantD2BindingModel(input.acceptedItems)
@@ -47197,6 +47443,7 @@ function assistantDiagramPlacementCandidateSignature(candidate, stages = []) {
   return JSON.stringify({
     kind,
     stageId,
+    cardSourceId: String(candidate && candidate.cardSourceId || ''),
     labelTemplate: String(candidate && candidate.labelTemplate || ''),
     conditions: diagramImportPlacementFilters(candidate && candidate.conditions),
     hierarchyConditions: diagramImportPlacementFilters(candidate && candidate.hierarchyConditions)
@@ -47226,6 +47473,15 @@ function assistantDiagramPlacementFiltersWithoutEmptyRules(value, warnings = [],
     warnings.push(`Assistant omitted ${removed} empty D2 placement rule(s)${context ? ` for ${context}` : ''}; empty rules are not executable.`);
   }
   return { ...filters, rules: retained };
+}
+
+function assistantDiagramTypedFieldSource(stage, semanticStage, field, preferredSource = null) {
+  if ((stage && stage.columns || []).map(String).includes(String(field || ''))) return null;
+  const fields = (Array.isArray(semanticStage && semanticStage.typedFields) ? semanticStage.typedFields : [])
+    .filter((item) => String(item && item.path || '') === String(field || ''));
+  const preferred = fields.filter((item) => preferredSource && String(item.cardSourceId || '') === String(preferredSource.id || ''));
+  const ids = uniqueStrings((preferred.length ? preferred : fields).map((item) => String(item.cardSourceId || '')));
+  return ids.length === 1 ? normalizeDiagramImportConditionCardSource(assistantSelectedCardSource(stage || {}, ids[0]).source) : null;
 }
 
 function assistantDiagramNormalizePlacementCandidates(input, candidates, warnings, errors) {
@@ -47270,6 +47526,7 @@ function assistantDiagramNormalizePlacementCandidates(input, candidates, warning
     if (fixedKind) {
       normalizedCandidate.materialization = { kind: fixedKind, stageId: '' };
       if (fixedKind === 'stage') {
+        normalizedCandidate.cardSourceId = String(bindingIntent.cardSourceId || '');
         const terminalRequired = String(bindingIntent.stagePolicy || 'terminal-only') !== 'helper-allowed';
         const allowedStages = (Array.isArray(input && input.stages) ? input.stages : []).filter((stage) => (
           (Array.isArray(stage && stage.assistantBlockIds) ? stage.assistantBlockIds.map(String) : []).includes(String(bindingIntent.businessBlockId || '')) &&
@@ -47277,6 +47534,7 @@ function assistantDiagramNormalizePlacementCandidates(input, candidates, warning
         ));
         if (allowedStages.length === 1) normalizedCandidate.stageId = String(allowedStages[0].id || '');
       } else {
+        delete normalizedCandidate.cardSourceId;
         delete normalizedCandidate.stageId;
         delete normalizedCandidate.source;
       }
@@ -47323,10 +47581,13 @@ function assistantDiagramPlacementDraftFromResponse(input, parsedObject) {
     .map((item) => [String(item && item.structureItemId || ''), item])
     .filter(([itemId]) => itemId));
   const stageById = new Map((input.stages || []).map((stage) => [String(stage && stage.id || ''), stage]));
+  const semanticStageById = new Map((input.dataSemanticModel && input.dataSemanticModel.stages || [])
+    .map((stage) => [String(stage && stage.id || ''), stage]));
   const intentByItemId = new Map((Array.isArray(input.bindingIntent && input.bindingIntent.placements) ? input.bindingIntent.placements : [])
     .map((item) => [String(item && item.structureItemId || ''), item]));
   const errors = [];
-  const warnings = Array.isArray(response.warnings) ? response.warnings.map((item) => String(item || '')).filter(Boolean) : [];
+  const warnings = (Array.isArray(response.warnings) ? response.warnings.map((item) => String(item || '')).filter(Boolean) : [])
+    .concat(assistantFieldContextWarnings(input.dataSemanticModel));
   const staticTargets = targets.filter((target) => target && target.templateStatic === true);
   const staticTargetIds = new Set(staticTargets.map((target) => String(target.structureItemId || '')).filter(Boolean));
   const assistantCandidates = (Array.isArray(response.mappings) ? response.mappings : [])
@@ -47416,7 +47677,7 @@ function assistantDiagramPlacementDraftFromResponse(input, parsedObject) {
     const kind = assistantDiagramPlacementCandidateMaterializationKind(candidate);
     if (kind === 'stage') return assistantDiagramResolveStageId(candidate.stageId || candidate.source && candidate.source.stageId, input.stages);
     if (kind !== 'parentCard') return '';
-    return resolvedStageIdForItem(String(target.parentStructureItemId || ''), new Set(visited).add(itemId));
+    return String(nearestResolvedAncestorForItem(itemId, new Set(visited).add(itemId))?.stageId || '');
   };
   const nearestResolvedAncestorForItem = (itemId, visited = new Set()) => {
     const target = targetById.get(String(itemId || ''));
@@ -47430,6 +47691,25 @@ function assistantDiagramPlacementDraftFromResponse(input, parsedObject) {
       return { itemId: parentId, stageId, target: targetById.get(parentId) || null, accepted };
     }
     return nearestResolvedAncestorForItem(parentId, new Set(visited).add(parentId));
+  };
+  const resolvedCardSourceForItem = (itemId, visited = new Set()) => {
+    if (visited.has(itemId)) return { source: null };
+    const accepted = acceptedItemById.get(itemId);
+    const target = targetById.get(itemId) || {};
+    const candidate = candidateByItemId.get(itemId);
+    const kind = accepted
+      ? String(accepted.mapping && accepted.mapping.materialization && accepted.mapping.materialization.kind || '')
+      : assistantDiagramPlacementCandidateMaterializationKind(candidate);
+    if (kind === 'parentCard') {
+      const ancestor = nearestResolvedAncestorForItem(itemId);
+      return ancestor ? resolvedCardSourceForItem(ancestor.itemId, new Set(visited).add(itemId)) : { source: null };
+    }
+    const stage = stageById.get(resolvedStageIdForItem(itemId));
+    if (!stage || kind !== 'stage') return { source: null };
+    const intent = intentByItemId.get(itemId);
+    const sourceId = String(intent && intent.cardSourceId || candidate && candidate.cardSourceId || '');
+    const primary = accepted && accepted.mapping && accepted.mapping.primary || target.currentMapping && target.currentMapping.primary || {};
+    return sourceId ? assistantSelectedCardSource(stage, sourceId) : diagramImportPrimaryCardSource(stage, primary);
   };
   const items = [];
   for (const [itemId, candidate] of candidateByItemId.entries()) {
@@ -47502,7 +47782,13 @@ function assistantDiagramPlacementDraftFromResponse(input, parsedObject) {
       });
       continue;
     }
-    if (stage && !(stage.columns || []).map(String).includes('_id')) {
+    const primaryProjection = resolvedCardSourceForItem(itemId);
+    if (stage && !primaryProjection.source) {
+      errors.push({ path: '$.mappings', code: 'diagram_card_source_required', structureItemId: itemId,
+        message: `D2 placement ${String(target.displayName || itemId)} requires an exact retained card source; multiple sources cannot be inferred.` });
+      continue;
+    }
+    if (stage && !(stage.columns || []).map(String).includes(String(primaryProjection.source.idColumn))) {
       errors.push({
         path: `$.mappings[${candidates.indexOf(candidate)}].stageId`,
         code: 'diagram_stage_card_identity_missing',
@@ -47515,45 +47801,108 @@ function assistantDiagramPlacementDraftFromResponse(input, parsedObject) {
     const current = target.currentMapping && typeof target.currentMapping === 'object' ? target.currentMapping : {};
     const ancestor = nearestResolvedAncestorForItem(itemId);
     const parentStage = stageById.get(String(ancestor && ancestor.stageId || '')) || null;
-    const ancestorPrimary = ancestor && ancestor.accepted && ancestor.accepted.mapping && ancestor.accepted.mapping.primary ||
-      ancestor && ancestor.target && ancestor.target.currentMapping && ancestor.target.currentMapping.primary || {};
-    const primaryProjection = !stage
-      ? { source: null }
-      : kind === 'parentCard' && parentStage
-        ? diagramImportPrimaryCardSource(parentStage, ancestorPrimary, null)
-        : diagramImportPrimaryCardSource(stage, current.primary || {}, parentStage || null);
+    const membershipSourceId = String(bindingIntent && bindingIntent.membershipCardSourceId || '');
+    const parentMembershipSourceId = String(bindingIntent && bindingIntent.parentMembershipCardSourceId || '');
+    const membershipSource = membershipSourceId ? assistantSelectedCardSource(stage || {}, membershipSourceId).source : null;
+    const parentMembershipSource = parentMembershipSourceId ? assistantSelectedCardSource(parentStage || {}, parentMembershipSourceId).source : null;
+    if ((membershipSourceId && !membershipSource) || (parentMembershipSourceId && !parentMembershipSource)) {
+      errors.push({ path: '$.mappings', code: 'diagram_membership_card_source_invalid', structureItemId: itemId,
+        message: `D2 placement ${String(target.displayName || itemId)} must use exact retained sources for both parent membership sides.` });
+      continue;
+    }
     const primary = {
       ...(current.primary || {}),
       className: String(primaryProjection.source && primaryProjection.source.className || stage && stage.className || current.primary && current.primary.className || ''),
       idAttribute: '_id',
-      labelTemplate: Object.prototype.hasOwnProperty.call(candidate, 'labelTemplate')
+      labelTemplate: Object.prototype.hasOwnProperty.call(target.directives || {}, 'label-template')
+        ? String(target.directives['label-template'])
+        : Object.prototype.hasOwnProperty.call(candidate, 'labelTemplate')
         ? String(candidate.labelTemplate ?? '')
         : diagramImportPrimaryLabelTemplate(current.primary),
       structuredFields: uniqueStrings(current.primary && current.primary.structuredFields || [])
     };
     if (primaryProjection.source) primary.cardSource = primaryProjection.source;
     else delete primary.cardSource;
-    const source = stage ? { stageId: String(stage.id || ''), alias: String(stage.alias || ''), kind: String(stage.kind || ''), className: String(stage.className || '') } : {};
-    const assistantConditions = assistantDiagramPlacementFiltersWithoutEmptyRules(candidate.conditions, warnings, String(target.displayName || itemId));
-    const currentConditions = diagramImportPlacementFilters(current.conditions);
-    const assistantHierarchyConditions = assistantDiagramPlacementFiltersWithoutEmptyRules(candidate.hierarchyConditions, warnings, String(target.displayName || itemId));
-    for (const directive of Array.isArray(bindingIntent && bindingIntent.requiredConditions) ? bindingIntent.requiredConditions : []) {
-      if (assistantConditions.rules.some((rule) => assistantDiagramRuleSatisfiesDirective(rule, directive, false))) continue;
-      const rule = assistantDiagramRuleFromDirective(directive, false, '', itemId);
-      if (rule) assistantConditions.rules.push(rule);
-    }
-    for (const directive of Array.isArray(bindingIntent && bindingIntent.requiredMembership) ? bindingIntent.requiredMembership : []) {
-      if (assistantHierarchyConditions.rules.some((rule) => assistantDiagramRuleSatisfiesDirective(rule, directive, true))) continue;
-      const rule = assistantDiagramRuleFromDirective(directive, true, String(parentStage && parentStage.id || ''), itemId);
-      if (rule) assistantHierarchyConditions.rules.push(rule);
-    }
+    const source = stage ? { stageId: String(stage.id || ''), alias: String(stage.alias || ''), kind: String(stage.kind || ''), className: String(primaryProjection.source.className || '') } : {};
+    const currentFilters = (value) => {
+      const filters = diagramImportPlacementFilters(value);
+      filters.rules = filters.rules.map((rule, index) => {
+        const existing = value && value.rules && value.rules[index];
+        return existing && Object.prototype.hasOwnProperty.call(existing, 'origin') ? { ...rule, origin: existing.origin } : rule;
+      });
+      return filters;
+    };
+    let assistantConditions = assistantDiagramPlacementFiltersWithoutEmptyRules(candidate.conditions, warnings, String(target.displayName || itemId));
+    const currentConditions = currentFilters(current.conditions);
+    let assistantHierarchyConditions = assistantDiagramPlacementFiltersWithoutEmptyRules(candidate.hierarchyConditions, warnings, String(target.displayName || itemId));
+    const currentHierarchyConditions = currentFilters(current.hierarchyConditions);
+    const requiredConditions = Array.isArray(bindingIntent && bindingIntent.requiredConditions) ? bindingIntent.requiredConditions : [];
+    const requiredMembership = Array.isArray(bindingIntent && bindingIntent.requiredMembership) ? bindingIntent.requiredMembership : [];
+    const ruleKey = ({ id, origin, ...rule }) => stableJsonStringify(rule);
+    const hasMultipleIncludesOr = (filters) => filters.ruleJoin === 'any' && filters.rules.filter((rule) => rule.action === 'include').length > 1;
+    const mergeFilters = (proposed, existing, directives, family) => {
+      const keys = new Set(existing.rules.map(ruleKey));
+      const added = proposed.rules.filter((rule) => !keys.has(ruleKey(rule)));
+      // Flat DSL v1 cannot express required AND (authored OR).
+      if ((directives.length || existing.rules.length && added.length) &&
+        (hasMultipleIncludesOr(proposed) || hasMultipleIncludesOr(existing))) {
+        errors.push({ path: `$.mappings[${candidates.indexOf(candidate)}].${family}`,
+          code: 'diagram_mandatory_condition_conflict', structureItemId: itemId,
+          displayName: String(target.displayName || itemId),
+          message: `Элемент «${String(target.displayName || itemId)}»: ${family === 'conditions' ? 'фильтры элемента' : 'условия принадлежности'} содержат ручную группу OR (ИЛИ). DSL v1 не выражает вложенное сочетание AND/OR: обязательные условия И (ручные условия ИЛИ). Ручные правки сохранены. Уточните условия перед применением.` });
+        return null;
+      }
+      const ids = new Set(existing.rules.map((rule) => rule.id));
+      const rules = existing.rules.concat(added.map((rule) => ids.has(rule.id)
+        ? { ...rule, id: diagramImportStableId('assistant_condition', `${itemId}:${family}:${ruleKey(rule)}`) }
+        : rule));
+      return {
+        ruleJoin: directives.length || existing.rules.length && added.length ? 'all'
+          : existing.rules.length ? existing.ruleJoin : proposed.ruleJoin,
+        rules
+      };
+    };
+    assistantConditions = mergeFilters(assistantConditions, currentConditions, requiredConditions, 'conditions');
+    assistantHierarchyConditions = mergeFilters(assistantHierarchyConditions, currentHierarchyConditions, requiredMembership, 'hierarchyConditions');
+    if (!assistantConditions || !assistantHierarchyConditions) continue;
+    const typedRule = (rule, membership = false) => {
+      const leftSource = membership && membershipSource || rule.left && rule.left.source || assistantDiagramTypedFieldSource(stage, semanticStageById.get(stageId), rule.left && rule.left.column, primaryProjection.source);
+      const rightStage = stageById.get(String(rule.right && rule.right.stageId || ''));
+      const rightSource = membership && parentMembershipSource || rule.right && rule.right.source || assistantDiagramTypedFieldSource(rightStage, semanticStageById.get(String(rightStage && rightStage.id || '')), rule.right && rule.right.column,
+        ancestor && resolvedCardSourceForItem(ancestor.itemId).source);
+      return { ...rule, origin: 'assistant', left: { ...rule.left, ...(leftSource ? { source: leftSource } : {}) }, right: { ...rule.right, ...(rightSource ? { source: rightSource } : {}) } };
+    };
+    const sourceMatches = (actual, expected) => Boolean(actual && expected) && String(actual.id) === String(expected.id) &&
+      diagramImportConditionSourceKey(actual) === diagramImportConditionSourceKey(expected);
+    const appendRequired = (filters, directives, membership = false) => {
+      for (const directive of directives) {
+        if (filters.rules.some((rule) => assistantDiagramRuleSatisfiesDirective(rule, directive, membership) &&
+          (!membership || String(rule.right.stageId || '') === String(parentStage && parentStage.id || '') &&
+            (!membershipSourceId || sourceMatches(rule.left.source, membershipSource)) &&
+            (!parentMembershipSourceId || sourceMatches(rule.right.source, parentMembershipSource))))) continue;
+        const rule = assistantDiagramRuleFromDirective(directive, membership, String(parentStage && parentStage.id || ''), itemId);
+        if (rule) filters.rules.push(typedRule(diagramImportPlacementFilters({ rules: [rule] }).rules[0], membership));
+      }
+    };
+    // Current/manual rules retain their operands, sources and provenance.
+    assistantConditions.rules = assistantConditions.rules.map((rule) => currentConditions.rules.includes(rule) ? rule : typedRule(rule));
+    assistantHierarchyConditions.rules = assistantHierarchyConditions.rules.map((rule) => currentHierarchyConditions.rules.includes(rule) ? rule : typedRule(rule, true));
+    appendRequired(assistantConditions, requiredConditions);
+    appendRequired(assistantHierarchyConditions, requiredMembership, true);
     const hierarchyRuleCount = assistantHierarchyConditions.rules.length;
     if (kind !== 'stage') {
+      if (currentHierarchyConditions.rules.length) {
+        errors.push({ path: `$.mappings[${candidates.indexOf(candidate)}].hierarchyConditions`,
+          code: 'diagram_hierarchy_condition_invalid', structureItemId: itemId,
+          message: `Элемент «${String(target.displayName || itemId)}»: смена способа наполнения не может удалить текущие условия принадлежности. Ручные правки сохранены. Уточните условия перед применением.` });
+        continue;
+      }
       assistantHierarchyConditions.rules = [];
     } else {
-      const childFields = new Set(Array.isArray(stage && stage.columns) ? stage.columns.map(String) : []);
-      const parentFields = new Set(Array.isArray(parentStage && parentStage.columns) ? parentStage.columns.map(String) : []);
+      const childFields = new Set([...(stage && stage.columns || []), ...(semanticStageById.get(stageId)?.typedFields || []).map((field) => field.path)].map(String));
+      const parentFields = new Set([...(parentStage && parentStage.columns || []), ...(semanticStageById.get(String(parentStage && parentStage.id || ''))?.typedFields || []).map((field) => field.path)].map(String));
       assistantHierarchyConditions.rules = assistantHierarchyConditions.rules.filter((rule) => {
+        if (currentHierarchyConditions.rules.includes(rule)) return true;
         const right = rule && rule.right || {};
         return Boolean(
           parentStage &&
@@ -47567,8 +47916,6 @@ function assistantDiagramPlacementDraftFromResponse(input, parsedObject) {
     if (assistantHierarchyConditions.rules.length !== hierarchyRuleCount) {
       warnings.push(`Assistant hierarchy rules for ${String(target.displayName || itemId)} were reduced to the exact materialized parent contract.`);
     }
-    assistantConditions.rules = assistantConditions.rules.map((rule) => ({ ...rule, origin: 'assistant' }));
-    assistantHierarchyConditions.rules = assistantHierarchyConditions.rules.map((rule) => ({ ...rule, origin: 'assistant' }));
     items.push({
       structureItemId: itemId,
       roleId: String(target.roleId || ''),
@@ -47579,7 +47926,7 @@ function assistantDiagramPlacementDraftFromResponse(input, parsedObject) {
         roleId: String(target.roleId || ''),
         materialization: { kind, stageId: kind === 'stage' ? String(stage.id || '') : '' },
         primary,
-        conditions: assistantConditions.rules.length ? assistantConditions : currentConditions,
+        conditions: assistantConditions,
         hierarchyConditions: assistantHierarchyConditions,
         related: Array.isArray(current.related) ? current.related : []
       },
@@ -47622,7 +47969,9 @@ function assistantDiagramPlacementDraftFromResponse(input, parsedObject) {
       idAttribute: '_id'
     };
     if (!primaryProjection.source) delete mapping.primary.cardSource;
-    const directRelationRepair = diagramImportDirectRelationParentCorrelation(
+    const bindingIntent = intentByItemId.get(String(item.structureItemId || '')) || {};
+    const currentHierarchyRules = targetById.get(String(item.structureItemId || ''))?.currentMapping?.hierarchyConditions?.rules || [];
+    const directRelationRepair = (bindingIntent.requiredMembership || []).length || currentHierarchyRules.length ? { changed: false } : diagramImportDirectRelationParentCorrelation(
       mapping,
       childStage,
       parentStage,
@@ -48108,6 +48457,12 @@ function assistantDiagramStageDraftFromResponse(input, parsedObject) {
         targetOperator: String(confirmedConnectionIntent.targetOperator || selectedCandidate && (selectedCandidate.targetOperator || selectedCandidate.endpointOperator) || (mode === 'attributeEndpoints' || mode === 'networkEndpoints' ? 'ipv4InCidr' : '')).trim(),
         labelTemplate: diagramImportRelationLabelTemplate(selectedCandidate)
       };
+      const scope = resolveDiagramEndpointScope(String(requirementDirectives['endpoint-scope'] || ''), input.structureTree, input.roles);
+      if (scope.error) {
+        errors.push({ path: `$.relationRules[${index}].endpointScopeStructureItemId`, ...scope.error });
+        return;
+      }
+      if (scope.structureItemId) rule.endpointScopeStructureItemId = scope.structureItemId;
       const stage = stageById.get(rule.sourceStageId);
       if (!stage || !rule.sourceField || !rule.targetField) {
         errors.push({ path: `$.relationRules[${index}]`, message: `D2 relation class ${String(requirement.d2ClassKey || d2ElementKey)} requires an existing connection stage and materialized source/target fields.` });
@@ -48424,6 +48779,7 @@ function normalizeAssistantDiagramMappingResumeId(value) {
 
 function assistantDiagramMappingCheckpointInputHash(input = {}) {
   return hashJson({
+    bindingIntentVersion: ASSISTANT_D2_BINDING_INTENT_VERSION,
     root: String(input.root || DEFAULT_TECHNICAL_ROOT),
     templateCode: String(input.templateCode || ''),
     baseSpecHash: String(input.baseSpecHash || ''),
@@ -48588,13 +48944,21 @@ function assistantDiagramPlacementExecutionValidation(input, items = []) {
   const semanticStageById = new Map((Array.isArray(input && input.dataSemanticModel && input.dataSemanticModel.stages)
     ? input.dataSemanticModel.stages
     : []).map((stage) => [String(stage && stage.id || ''), stage]));
-  const offeredFields = (stageId) => {
+  const offeredFields = (stageId, fieldSource = null) => {
     const stage = stageById.get(String(stageId || '')) || {};
     const semanticStage = semanticStageById.get(String(stageId || '')) || {};
+    const source = normalizeDiagramImportConditionCardSource(fieldSource);
+    const retained = source ? assistantCardSources(stage).find((candidate) => ['className', 'classColumn', 'idColumn'].every((key) => String(candidate[key] || '') === String(source[key] || ''))) : null;
+    if (source && !retained) return new Set();
+    const typed = (Array.isArray(semanticStage.typedFields) ? semanticStage.typedFields : [])
+      .filter((field) => source
+        ? String(field.cardSourceId || '') === String(retained.id || '') && String(field.rootClass || '') === String(source.className || '')
+        : assistantCardSources(stage).some((candidate) => candidate.classColumn === 'Class' && candidate.idColumn === '_id' && String(candidate.id || '') === String(field.cardSourceId || '')))
+      .map((field) => String(field.path || ''));
     return new Set(uniqueStrings([].concat(
-      Array.isArray(stage.columns) ? stage.columns.map(String) : [],
-      Array.isArray(semanticStage.columns) ? semanticStage.columns.map(String) : [],
-      Array.isArray(semanticStage.readableFields) ? semanticStage.readableFields.map(String) : []
+      !source || source.classColumn === 'Class' && source.idColumn === '_id' ? (stage.columns || []).map(String) : ['Class', '_id'],
+      typed,
+      !source || source.classColumn === 'Class' && source.idColumn === '_id' ? (semanticStage.readableFields || []).map(String) : []
     )));
   };
   const assistantFieldErrors = [];
@@ -48608,19 +48972,18 @@ function assistantDiagramPlacementExecutionValidation(input, items = []) {
       : materializationKind === 'parentCard'
         ? String(ancestor && ancestor.stageId || '')
         : '';
-    const sourceFields = offeredFields(stageId);
     const validateRules = (filters, family) => {
       for (const [ruleIndex, rule] of diagramImportPlacementFilters(filters).rules.entries()) {
         if (rule && rule.origin !== 'assistant') continue;
         const basePath = `$.structureTree.items[${itemIndex}].mapping.${family}.rules[${ruleIndex}]`;
         const leftColumn = String(rule && rule.left && rule.left.column || '');
-        if (leftColumn && !sourceFields.has(leftColumn)) {
+        if (leftColumn && !offeredFields(stageId, rule.left && rule.left.source).has(leftColumn)) {
           assistantFieldErrors.push({ path: `${basePath}.left.column`, message: `Assistant field ${leftColumn} was not offered by Object Flow result ${stageId || '(empty)'}.` });
         }
         if (rule && rule.right && rule.right.kind === 'stage') {
           const rightStageId = String(rule.right.stageId || '');
           const rightColumn = String(rule.right.column || '');
-          if (rightColumn && !offeredFields(rightStageId).has(rightColumn)) {
+          if (rightColumn && !offeredFields(rightStageId, rule.right && rule.right.source).has(rightColumn)) {
             assistantFieldErrors.push({ path: `${basePath}.right.column`, message: `Assistant comparison field ${rightColumn} was not offered by Object Flow result ${rightStageId || '(empty)'}.` });
           }
         }
@@ -48846,7 +49209,11 @@ async function createAssistantDiagramStageDraft(input, runtimeConfig) {
 
 async function createAssistantDiagramMappingRolesDraft(input, runtimeConfig) {
   const roleInput = { ...input, mappingPhase: 'roles', topology: [] };
-  const roleDraft = await createAssistantDiagramStageDraft(roleInput, runtimeConfig);
+  const compiledIntent = compileAssistantPlacementIntent(roleInput);
+  const roleDraft = compiledIntent
+    ? assistantDiagramPlacementDraftFromResponse(roleInput, compiledIntent)
+    : await createAssistantDiagramStageDraft(roleInput, runtimeConfig);
+  if (compiledIntent) roleDraft.diagnostics = { ...roleDraft.diagnostics, attempts: 0, source: 'confirmed-binding-intent' };
   if (!roleDraft.success) return { success: false, roleDraft, topology: [] };
   const rawTopology = assistantDiagramTopologyRequirements(
     input.relationRules,
@@ -49192,6 +49559,10 @@ function validateDiagramD2Template(template, path) {
 }
 
 function validateTemplateSpec(spec) {
+  try { assertInputCollections(spec, INPUT_COLLECTION_LIMITS, { rootKind: 'spec' }); } catch (error) {
+    if (error.code !== 'input_collection_limit') throw error;
+    return [{ ...error.details, code: error.code, message: error.message }];
+  }
   const errors = [];
   if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
     return [{ path: '$', message: 'Template spec must be an object.' }];
@@ -49841,6 +50212,10 @@ function validateTemplateSpec(spec) {
 }
 
 function validateTemplateSpecForStorage(spec) {
+  try { assertInputCollections(spec, INPUT_COLLECTION_LIMITS, { rootKind: 'spec' }); } catch (error) {
+    if (error.code !== 'input_collection_limit') throw error;
+    return [{ ...error.details, code: error.code, message: error.message }];
+  }
   const errors = [];
   if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
     return [{ path: '$', message: 'Template spec must be an object.' }];
@@ -51968,6 +52343,30 @@ function buildTopologyDiagram(diagram, context, params, limits) {
         ? { parents: correlated, resolution: 'parentCorrelation' }
         : { parents: [], resolution: 'unresolved' };
     }
+    if (String(importRole && importRole.materialization || '') === 'parentCard') {
+      const cardClass = String(importRole.primaryCardSourceClassName || rowValueByField(row || {}, 'Class') || '').trim();
+      // A parentCard inherits the displayed card, not its relation provenance.
+      // Follow each frame's runtime parent to preserve distinct occurrences.
+      const inherited = parentGroups.filter((parent) => {
+        let anchor = parent;
+        const visited = new Set();
+        while (anchor) {
+          if (visited.has(anchor.id)) return false;
+          visited.add(anchor.id);
+          const anchorRole = anchor.importRole || {};
+          const anchorItem = treeById.get(String(anchorRole.structureItemId || ''));
+          const materialization = String(anchorItem && anchorItem.mapping && anchorItem.mapping.materialization && anchorItem.mapping.materialization.kind || anchorRole.materialization || '');
+          if (materialization !== 'structural') break;
+          anchor = groupMap.get(String(anchor.parent || ''));
+        }
+        if (!anchor) return false;
+        const anchorClass = String(anchor.importRole && anchor.importRole.primaryCardSourceClassName || rowValueByField(anchor.endpointRow || {}, 'Class') || '').trim();
+        return Boolean(cardClass && cardClass === anchorClass && String(anchor.businessId || '') === String(businessId || ''));
+      });
+      return inherited.length
+        ? { parents: inherited, resolution: 'parentCorrelation' }
+        : { parents: [], resolution: 'unresolved' };
+    }
     const sourceMatches = [];
     for (const key of sourceParentKeys(row)) {
       sourceMatches.push(...parentGroups.filter((group) => String(group.businessId || '') === key));
@@ -52301,7 +52700,10 @@ function buildTopologyDiagram(diagram, context, params, limits) {
       warnings.push(`Skipped D2 attribute connection ${String(edgeRole.edgeClassKey || mapping.id || '')}: its source comparison, target comparison, or direction is not configured.`);
       continue;
     }
-    const runtimeObjects = () => Array.from(nodeMap.values()).concat(Array.from(groupMap.values()));
+    const scopedObjects = diagramObjectsWithinScope(
+      Array.from(nodeMap.values()).concat(Array.from(groupMap.values())), String(resolution.scopeStructureItemId || '')
+    );
+    const runtimeObjects = () => scopedObjects;
     // A relation row is compared to every materialized object/container rule
     // whose selected method accepts the corresponding relation endpoint.
     // Connection classes do not own manual source/target participant lists.
@@ -52609,7 +53011,7 @@ function draftDiagramPreviewMappingPlan(spec) {
     // The saved relation rule is anchored to D2 element keys. Bind it against
     // the same repaired structure tree that will be compiled below so preview
     // cannot silently drop a valid manually configured endpoint profile.
-    const relationRules = diagramImportBindRelationRulesToStructureItems(rawRelationRules, normalizedTree, imported && imported.endpointProfiles);
+    const relationRules = diagramImportBindRelationRulesToStructureItems(rawRelationRules, normalizedTree, imported && imported.endpointProfiles, roles);
     repairs.push(...repairPlan.repairs.map((repair) => ({ diagramIndex, ...repair })));
     const validationErrors = diagramImportStructureTreeErrors(previewTree, roles, previewSpec, structure);
     const invalidIndexes = new Set();
@@ -56498,7 +56900,8 @@ async function handleBackend(req, res, requestUrl) {
         cmdbuildStatus: found.response.statusCode,
         root: found.schema.root,
         className: found.schema.classNames.config,
-        config: sanitizeConfigCard(found.card, found.schema.root)
+        config: sanitizeConfigCard(found.card, found.schema.root),
+        inputCollectionLimits: INPUT_COLLECTION_LIMITS
       });
       return;
     }
@@ -57360,10 +57763,24 @@ async function handleBackend(req, res, requestUrl) {
         materializationError.details = materializationErrors;
         throw materializationError;
       }
-      const dataSemanticModel = assistantDataSemanticModel(stages, mappingCatalog || {});
+      const dataSemanticModel = assistantDataSemanticModel(stages, mappingCatalog || {}, {
+        depth: Math.max(1, Math.min(runtimeConfig.executionLimits?.maxTraversalDepthMax || 5, Number(body.traversalDepth) || 1)),
+        maxBytes: normalizeAssistantRuntimeConfig(runtimeConfig).mcp.maxContextBytes,
+        maxStates: Number(body.maxCatalogPathCandidates) || 5000,
+        queries: [String(body.prompt || ''), ...roles.map((role) => role.notes),
+          ...placements.map((placement) => placement.notes)]
+      });
       const d2StructuralModel = assistantD2StructuralModel(roles, placements, reviewProposal.relationRules);
       const d2SemanticModel = assistantD2SemanticModel(roles);
-      const businessBlockManifest = mapTask ? assistantObjectFlowBusinessBlockManifest(sourceSpec, stages) : null;
+      const businessBlockManifest = mapTask ? assistantObjectFlowBusinessBlockManifest(sourceSpec, stages, dataSemanticModel) : null;
+      const requirementLedger = mapTask ? buildAssistantRequirementLedger({ businessBlockManifest, placements, relationRules: reviewProposal.relationRules }) : null;
+      if (requirementLedger?.warnings.length) {
+        const error = new Error('Notes contain conflicting directives for the same diagram placement or connection. Correct the listed source requirements.');
+        error.code = 'assistant_requirement_directive_conflict';
+        error.statusCode = 422;
+        error.details = requirementLedger.warnings;
+        throw error;
+      }
       if (!mapTask) {
         assistantInput = {
           kind: 'interpretation',
@@ -57413,6 +57830,7 @@ async function handleBackend(req, res, requestUrl) {
           placements,
           stages,
           businessBlockManifest,
+          requirementLedger,
           dataSemanticModel,
           d2StructuralModel,
           d2SemanticModel,
@@ -58216,6 +58634,10 @@ async function handleBackend(req, res, requestUrl) {
     try {
       draft = normalizeDraftTemplateBody(await readJsonBody(req, TEMPLATE_REQUEST_MAX_BYTES));
     } catch (error) {
+      if (error.code === 'input_collection_limit') {
+        sendJson(res, 413, inputCollectionLimitPayload(error));
+        return;
+      }
       sendJson(res, error.statusCode || 400, {
         success: false,
         action: draftAction,
@@ -59077,6 +59499,7 @@ async function handleBackend(req, res, requestUrl) {
     if (req.method === 'PUT') {
       if (!requireStateChangingRequest(req, res, authToken)) return;
       if (!requireJsonContentType(req, res)) return;
+      const body = await readJsonBody(req, TEMPLATE_REQUEST_MAX_BYTES);
       const found = await findTemplateCard(authToken, root, templateCode);
       if (!found.response.ok) {
         if (sendTechnicalSchemaAccessDeniedIfNeeded(res, {
@@ -59101,7 +59524,6 @@ async function handleBackend(req, res, requestUrl) {
       }
       if (!await requireTemplateUpdatePermission(authToken, res, found.schema, found.card, templateCode)) return;
 
-      const body = await readJsonBody(req, TEMPLATE_REQUEST_MAX_BYTES);
       const expectedSpecHash = expectedSpecHashFromBody(body);
       const currentTemplate = sanitizeTemplateCard(found.card);
       if (expectedSpecHash && currentTemplate && currentTemplate.specHash !== expectedSpecHash) {
@@ -59441,6 +59863,19 @@ function installGracefulShutdown(serverInstance) {
   process.once('SIGINT', () => shutdown('SIGINT'));
 }
 
+function handleDynamicUiFailure(req, res, requestUrl, error) {
+  const requestId = req.cmdpRequestId || '';
+  const errorType = ['Error', 'TypeError', 'ReferenceError', 'RangeError', 'SyntaxError', 'URIError', 'EvalError', 'AggregateError']
+    .includes(error && error.name) ? error.name : 'Error';
+  const fields = { requestId, path: requestUrl.pathname, code: 'dynamic_ui_render_failed', errorType };
+  logError('dynamic_ui.render_failed', fields);
+  // Exception text and stack may contain credentials, URLs or business values.
+  // Verbose keeps safe failure metadata, never arbitrary exception strings.
+  logDiagnosticVerbose('dynamic_ui.render_failed', { ...fields, hasStack: Boolean(error && typeof error.stack === 'string') });
+  const details = `Unexpected dynamic UI error. Check backend logs with request id ${requestId || 'unavailable'}.`;
+  sendHtml(res, 500, `<!doctype html><html><head><meta charset="utf-8"><title>CMDB Dynamic Pages</title></head><body style="font-family:Arial,sans-serif;padding:24px"><h1>CMDB Dynamic Pages error</h1><pre>${htmlEscape(details)}</pre></body></html>`);
+}
+
 const server = http.createServer((req, res) => {
   const requestUrl = new URL(req.url || '/', `http://${req.headers.host || `${LISTEN_HOST}:${LISTEN_PORT}`}`);
   attachHttpRequestLogging(req, res, requestUrl);
@@ -59476,21 +59911,16 @@ const server = http.createServer((req, res) => {
   }
   if (requestUrl.pathname === DYNAMIC_UI_PREFIX || requestUrl.pathname.startsWith(`${DYNAMIC_UI_PREFIX}/`)) {
     handleDynamicPagesUi(req, res, requestUrl).catch((error) => {
-      const requestId = req.cmdpRequestId || '';
-      logError('dynamic_ui.render_failed', {
-        requestId,
-        path: requestUrl.pathname,
-        message: error && error.message ? error.message : String(error),
-        stack: error && error.stack ? error.stack : ''
-      });
-      const details = error && error.stack ? error.stack : (error && error.message ? error.message : String(error));
-      const publicDetails = diagnosticModeAllows('Verbose') ? details : `Unexpected dynamic UI error. Check backend logs with request id ${requestId || 'unavailable'}.`;
-      sendHtml(res, 500, `<!doctype html><html><head><meta charset="utf-8"><title>CMDB Dynamic Pages</title></head><body style="font-family:Arial,sans-serif;padding:24px"><h1>CMDB Dynamic Pages error</h1><pre>${htmlEscape(publicDetails)}</pre></body></html>`);
+      handleDynamicUiFailure(req, res, requestUrl, error);
     });
     return;
   }
   if (requestUrl.pathname.startsWith(`${BACKEND_PREFIX}/`)) {
     handleBackend(req, res, requestUrl).catch((error) => {
+      if (error.code === 'input_collection_limit') {
+        sendJson(res, 413, inputCollectionLimitPayload(error));
+        return;
+      }
       sendJson(res, 500, {
         success: false,
         message: error && error.message ? error.message : String(error)
@@ -59662,6 +60092,7 @@ export {
   isJsonContentType,
   ipv4ValueMatches,
   diagnosticModeAllows,
+  handleDynamicUiFailure,
   loggingStatus,
   normalizeDiagnosticMode,
   normalizeAssistantDraftSpec,

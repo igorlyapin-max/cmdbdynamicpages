@@ -65,7 +65,7 @@ CMDP_LOG_REDACT_QUERY=password,passwd,pwd,token,secret,authorization,auth,csrf,x
 
 `sanitizeRequestPath` маскирует query по именам; `sanitizeUrlForLog` убирает URL userinfo/fragment и обрабатывает query; `sanitizeHeaders` маскирует перечисленные headers и обрабатывает referer. Это не универсальное распознавание секретов или персональных данных. Config override заменяет списки: обязательные чувствительные имена нельзя терять.
 
-Полные строки результата/HTTP bodies не добавляются перечисленными diagnostic handlers. При этом в operational events встречаются username, templateCode, свободные exception messages, а client stage/message только ограничиваются по длине. `dynamic_ui.render_failed` пишет stack вне режима Verbose. Поэтому утверждение «все логи полностью очищены» неверно: **P0 blocker runtime-готовности** для этой диагностической ветки остается открытым. Исправление кода и его тесты не входят в текущую AA-remediation.
+Полные строки результата/HTTP bodies не добавляются перечисленными diagnostic handlers. При этом в других operational events встречаются username, templateCode, свободные exception messages, а client stage/message только ограничиваются по длине: универсальная очистка всех событий не заявляется. `dynamic_ui.render_failed` теперь исключает raw message/stack во всех режимах и возвращает в UI только requestId. Verbose добавляет безопасную категорию и признак наличия stack, без его содержимого; focused regression проверяет отсутствие контрольных секретов в HTML и structured logs.
 
 ## Приемка внешней доставки
 

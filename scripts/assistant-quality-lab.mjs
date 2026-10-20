@@ -274,7 +274,7 @@ function contextBound(messages) {
   return messages.reduce((count, message) => count + Buffer.byteLength(message.content, 'utf8') + 64, 0);
 }
 
-function checkpointStore(outputDir, resume, manifest, fingerprint, onEvent) {
+export function checkpointStore(outputDir, resume, manifest, fingerprint, onEvent) {
   const records = [];
   let journal;
   if (outputDir) {
@@ -348,7 +348,11 @@ function reportFor(config, plan, records, results) {
       outputTokens: sum.outputTokens + (record.usage?.outputTokens || 0),
     }), { inputTokens: 0, outputTokens: 0 });
     return { variant, split, total: subset.length, exact: count('exact'), falseAcceptance: count('falseAcceptance'), unresolved: count('unresolved'),
-      failures, evaluated, exactRate: evaluated ? count('exact') / evaluated : null,
+      failures, evaluated, exactRate: subset.length ? count('exact') / subset.length : null,
+      exactPerEvaluated: evaluated ? count('exact') / evaluated : null,
+      endToEndExactRate: subset.length ? count('exact') / subset.length : null,
+      transportCompleted: subset.filter((result) => result.transportCompleted).length,
+      contractValid: subset.filter((result) => result.contractValid).length,
       modelCalls: measuredCalls.length, measuredUsage,
       callLatencyMs: { p50: percentile(0.5), p95: percentile(0.95), sum: durations.reduce((sum, ms) => sum + ms, 0) },
       available: subset.filter((result) => result.knowledgeAvailability === 'available').length,
@@ -359,8 +363,11 @@ function reportFor(config, plan, records, results) {
   }));
   return {
     fingerprint: config.fingerprint, scope: SCOPE, mode: config.mode,
-    warning: 'A-E are abstract stage simulations, not full production pipeline A/B evaluations. Offline results test harness mechanics, not model quality.',
+    warning: 'A-E are historical abstract stage simulations, not full production pipeline A/B evaluations. Offline results test harness mechanics, not model quality.',
+    primaryMetric: 'exact/total (including failures)', diagnosticMetric: 'exact/evaluated',
     manifest: config.manifest, plan, results, metrics: groups,
+    productionComparison: { module: 'scripts/assistant-quality-comparison.mjs', scope: 'production-pipeline-comparison',
+      status: 'separate-plan-and-snapshot-evaluator', historicalResultsReusableAsProduction: false },
     providerModels: [...new Set(finished.map((record) => record.providerModel).filter(Boolean))].sort(),
     budget: { calls: started.length, reservedTokens: started.reduce((sum, record) => sum + record.reservedTokens, 0),
       measuredUsage: usage, usageComplete, costUsd: config.mode === 'live' && config.price && usageComplete
@@ -412,6 +419,8 @@ export async function runExperiment(options = {}) {
     let usage = null;
     let providerModel = null;
     let outcome;
+    let transportCompleted = false;
+    let contractValid = false;
     const started = performance.now();
     try {
       const response = await Promise.race([
@@ -423,6 +432,7 @@ export async function runExperiment(options = {}) {
           timer = setTimeout(() => { controller.abort(); reject(fail('timeout')); }, limits.timeoutMs);
         }),
       ]);
+      transportCompleted = true;
       check(plain(response), 'invalid_contract');
       if (response.providerModel !== undefined) {
         check(typeof response.providerModel === 'string' && safeName.test(response.providerModel), 'invalid_provider_model');
@@ -436,6 +446,7 @@ export async function runExperiment(options = {}) {
       check(typeof response.content === 'string', 'invalid_json');
       check(Buffer.byteLength(response.content, 'utf8') <= limits.maxResponseBytes, 'response_limit');
       const value = validateStageResponse(response.content, stage, item.input);
+      contractValid = true;
       const counterexample = variant === 'E' && stage === 'binding' && value.status === 'accepted'
         ? publicCounterexample(item.input, value.candidateId) : null;
       outcome = counterexample ? { ok: false, code: 'counterexample', feedback: counterexample } : { ok: true, value };
@@ -445,7 +456,7 @@ export async function runExperiment(options = {}) {
       outcome = { ok: false, code, terminal: ['timeout', 'model_mismatch', 'token_limit'].includes(code) };
     } finally { clearTimeout(timer); }
     const record = { type: 'call_finished', key, variant, stage, attempt, requestHash, usage, providerModel,
-      durationMs: Math.round(performance.now() - started), ...outcome };
+      durationMs: Math.round(performance.now() - started), transportCompleted, contractValid, ...outcome };
     // Only validated IDs, public counterexamples and fixed error codes reach artifacts.
     checkpoint.append(record);
     return record;
@@ -481,6 +492,8 @@ export async function runExperiment(options = {}) {
       const result = {
         caseId: item.id, split: item.split, variant, repeat,
         status: failed ? 'failed' : value.status, code: response.code || (modelUnresolved ? 'model_unresolved' : null),
+        transportCompleted: binding.transportCompleted === true && (response === binding || variant === 'E' || response.transportCompleted === true),
+        contractValid: binding.contractValid === true && (response === binding || variant === 'E' || response.contractValid === true),
         repairs: binding.repairs + (response === binding ? 0 : response.repairs),
         bindingExact: Boolean(binding.ok && binding.value.candidateId === item.oracle.candidateId),
         evaluation: { ...evaluateResult(item.oracle.result, value), failed, unresolved: modelUnresolved, correctAbstention: false },

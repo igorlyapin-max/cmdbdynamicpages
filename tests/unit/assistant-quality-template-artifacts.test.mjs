@@ -225,7 +225,7 @@ test('overrides survive backend normalization and touch only the five diagram ph
   assert.match(binding, /dataFields является directionPolicy в D2 source, а не endpointMode/);
   assert.match(binding, /sourceField и targetField выбираются по явному предметному смыслу в Notes/);
   assert.match(binding, /Используй equals, не знак =/);
-  assert.match(binding, /нет ключа выбора стороны пары/);
+  assert.match(binding, /cardSourceId выбирает отображаемую карточку/);
   assert.match(overrides.diagramConnections, /В этом ответе нет отдельного поля unresolved/);
   assert.match(overrides.diagramCritique, /approved=false без violations не принимается/);
 });
@@ -332,7 +332,7 @@ test('binding seed fixes exact blocks without inventing role-wide blocks or acce
     const block = input.businessBlockManifest.blocks.find((item) => item.name === name);
     const structureItemId = input.placements[index].structureItemId;
     assert.deepEqual(seed.placementBindings.find((item) => item.structureItemId === structureItemId), {
-      structureItemId, materializationIntent: 'stage', businessBlockId: block.id,
+      structureItemId, materializationIntent: 'stage', businessBlockId: block.id, cardSourceId: 'current',
     });
     assert.equal(payload.placements[index].requiredBusinessBlockId, block.id);
   }
@@ -354,7 +354,7 @@ test('documented binding keys and enum vocabulary agree with the actual backend 
   const backend = readFileSync(new URL('../../scripts/dev-proxy-server.mjs', import.meta.url), 'utf8');
   const contractText = backend.match(/function assistantDiagramBindingIntentMessages\([^]*?const contract = '([^\n]+)';/)[1];
   const contract = JSON.parse(contractText);
-  assert.deepEqual(Object.keys(contract.placementBindings[0]), ['structureItemId', 'materializationIntent', 'businessBlockId', 'membership', 'requiredConditions', 'requiredMembership', 'endpointFields', 'endpointOperators']);
+  assert.deepEqual(Object.keys(contract.placementBindings[0]), ['structureItemId', 'materializationIntent', 'businessBlockId', 'cardSourceId', 'membershipCardSourceId', 'parentMembershipCardSourceId', 'membership', 'requiredConditions', 'requiredMembership', 'endpointFields', 'endpointOperators']);
   assert.deepEqual(Object.keys(contract.connectionBindings[0]), ['d2ClassKey', 'businessBlockId', 'rowGrain', 'endpointMode', 'sourceField', 'sourceOperator', 'targetField', 'targetOperator']);
   assert.equal(contract.connectionBindings[0].endpointMode, 'attributeEndpoints|relationCard|deterministicEndpoints');
   const prompt = buildTesttemplate4Artifacts(fixture()).authoring.assistant.systemPromptOverrides.diagramBindingIntent;

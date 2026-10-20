@@ -25,6 +25,21 @@ x-contract-scope: >
   Прозрачный proxy CMDBuild не является отдельным owned API. Используемое backend
   подмножество внешних REST-вызовов описано в openapi/cmdbuild-consumed.openapi.yaml и
   openapi/litellm-consumed.openapi.yaml.
+x-input-collection-limits:
+  collection:
+    configuration: CMDP_INPUT_MAX_COLLECTION_ITEMS
+    default: 5000
+    absolute: 50000
+  total:
+    configuration: CMDP_INPUT_MAX_TOTAL_ITEMS
+    default: 50000
+    absolute: 500000
+  d2:
+    configuration: CMDP_D2_IMPORT_MAX_ELEMENTS
+    default: 5000
+    absolute: 50000
+  business-blocks: 32
+  block-uses: 31
 servers:
   - url: "{protocol}://{host}:{port}"
     description: >
@@ -465,6 +480,8 @@ paths:
           description: Не пройдена CSRF-проверка или шаблон недоступен для чтения
         "409":
           description: Сохранённый шаблон изменился до формирования предложения
+        "413":
+          $ref: "#/components/responses/InputCollectionLimit"
         "422":
           description: Предложение Assistant не прошло детерминированную проверку Object Flow
           content:
@@ -510,6 +527,12 @@ paths:
           description: Изменился сохранённый шаблон либо идентификационные данные контрольной точки
         "413":
           description: Ограниченный контекст либо контрольная точка превышает настроенные лимиты
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/BackendError"
+                  - $ref: "#/components/schemas/InputCollectionLimitError"
         "422":
           description: Семантический план не прошёл детерминированную проверку
         "429":
@@ -554,6 +577,8 @@ paths:
           description: Не пройдена CSRF-проверка или шаблон недоступен для чтения
         "409":
           description: Черновик редактора либо сохранённый шаблон изменился до применения
+        "413":
+          $ref: "#/components/responses/InputCollectionLimit"
         "422":
           description: Проверяемый поток не прошёл детерминированную валидацию либо компиляцию
   /cmdbuild/custom-api/mcp:
@@ -646,6 +671,8 @@ paths:
       responses:
         "200":
           description: Шаблон создан
+        "413":
+          $ref: "#/components/responses/InputCollectionLimit"
   /cmdbuild/custom-api/templates/{code}:
     parameters:
       - $ref: "#/components/parameters/TemplateCode"
@@ -696,6 +723,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TemplateVersionConflict"
+        "413":
+          $ref: "#/components/responses/InputCollectionLimit"
     delete:
       x-flow-id: OAPI24
       tags: [templates]
@@ -849,6 +878,8 @@ paths:
       responses:
         "200":
           description: Результат проверки
+        "413":
+          $ref: "#/components/responses/InputCollectionLimit"
   /cmdbuild/custom-api/draft/diagram-import/analyze:
     post:
       x-flow-id: OAPI33
@@ -899,7 +930,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/DiagramImportErrorResponse"
+                anyOf:
+                  - $ref: "#/components/schemas/DiagramImportErrorResponse"
+                  - $ref: "#/components/schemas/InputCollectionLimitError"
         "415":
           description: Тип содержимого запроса отличается от application/json
           content:
@@ -981,7 +1014,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/DiagramImportErrorResponse"
+                anyOf:
+                  - $ref: "#/components/schemas/DiagramImportErrorResponse"
+                  - $ref: "#/components/schemas/InputCollectionLimitError"
         "415":
           description: Тип содержимого запроса отличается от application/json
           content:
@@ -1061,7 +1096,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
+                anyOf:
+                  - $ref: "#/components/schemas/AssistantDiagramErrorResponse"
+                  - $ref: "#/components/schemas/InputCollectionLimitError"
         "415":
           description: Тип содержимого запроса отличается от application/json
           content:
@@ -1162,7 +1199,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/AssistantDiagramErrorResponse"
+                anyOf:
+                  - $ref: "#/components/schemas/AssistantDiagramErrorResponse"
+                  - $ref: "#/components/schemas/InputCollectionLimitError"
         "415":
           description: Тип содержимого запроса отличается от application/json
           content:
@@ -1216,6 +1255,8 @@ paths:
       responses:
         "200":
           description: Результат предварительного просмотра
+        "413":
+          $ref: "#/components/responses/InputCollectionLimit"
   /cmdbuild/custom-api/draft/diagram-import/restore:
     post:
       x-flow-id: OAPI38
@@ -1681,11 +1722,22 @@ components:
           schema:
             $ref: "#/components/schemas/DiagramImportErrorResponse"
     DiagramBodyTooLarge:
-      description: Превышен лимит байтов JSON-тела
+      description: Превышен лимит байтов JSON-тела либо ранний лимит структурных входных коллекций
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/DiagramImportErrorResponse"
+            anyOf:
+              - $ref: "#/components/schemas/DiagramImportErrorResponse"
+              - $ref: "#/components/schemas/InputCollectionLimitError"
+    InputCollectionLimit:
+      description: >
+        HTTP 413 до нормализации, upstream-вызовов и сохранения: превышен
+        настроенный лимит структурной коллекции либо суммарного числа элементов.
+        Вход не обрезается. message и path не содержат значения входных данных.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/InputCollectionLimitError"
     JsonRequired:
       description: Content-Type должен начинаться с application/json
       content:
@@ -2013,16 +2065,20 @@ components:
             version:
               type: integer
             params:
-              type: array
-              items: {}
+              type: object
+              additionalProperties: true
             steps:
               type: array
+              maxItems: 50000
+              description: Структурная коллекция; CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
               items: {}
             visualModel:
               type: object
               additionalProperties: true
             visualModels:
               type: array
+              maxItems: 50000
+              description: Структурная коллекция; CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
               items: {}
             result:
               type: object
@@ -2030,6 +2086,8 @@ components:
               properties:
                 tables:
                   type: array
+                  maxItems: 50000
+                  description: Определения таблиц, не строки результата; CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
                   items: {}
                 emptyText:
                   type: string
@@ -2047,10 +2105,13 @@ components:
           type: string
         blocks:
           type: array
+          maxItems: 32
+          x-input-collection-policy: business-blocks
+          description: Не более 32 бизнес-блоков; также действует настроенный суммарный бюджет входа.
           items:
             type: object
             additionalProperties: false
-            required: [id, name, description, resultKind, dependsOn]
+            required: [id, name, description, resultKind, uses]
             properties:
               id:
                 type: string
@@ -2061,8 +2122,11 @@ components:
               resultKind:
                 type: string
                 enum: [auto, sourceCards, relationPairs]
-              dependsOn:
+              uses:
                 type: array
+                maxItems: 31
+                x-input-collection-policy: block-uses
+                description: Не более 31 зависимости на другие блоки; также действует настроенный суммарный бюджет входа.
                 items:
                   type: string
     AssistantObjectFlowPlanResponse:
@@ -2116,6 +2180,7 @@ components:
           type: string
         currentSpec:
           type: object
+          x-input-collection-policy: full-spec
           additionalProperties: true
         flow:
           $ref: "#/components/schemas/ObjectFlowProposal"
@@ -2148,11 +2213,14 @@ components:
         selections:
           type: array
           minItems: 1
+          maxItems: 50000
+          description: CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000; также учитывается суммарный бюджет входа.
           items:
             $ref: "#/components/schemas/ObjectFlowSelectionStage"
         operations:
           type: array
-          description: Упорядоченные операции match и set. Каждый alias источника должен быть материализован выборкой либо предшествующей операцией.
+          maxItems: 50000
+          description: Упорядоченные операции match и set. Каждый alias источника должен быть материализован выборкой либо предшествующей операцией. CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
           items:
             $ref: "#/components/schemas/ObjectFlowOperation"
         publishedAlias:
@@ -2160,12 +2228,14 @@ components:
           description: Необязательный материализованный alias, выбранный для публикуемой таблицы результата.
         blocks:
           type: array
-          description: Проекция операций match для совместимости, возвращаемая сервером.
+          maxItems: 50000
+          description: Проекция операций match для совместимости, возвращаемая сервером; при возврате во входе действует CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
           items:
             $ref: "#/components/schemas/ObjectFlowMatchStage"
         setOperations:
           type: array
-          description: Проекция операций set для совместимости, возвращаемая сервером.
+          maxItems: 50000
+          description: Проекция операций set для совместимости, возвращаемая сервером; при возврате во входе действует CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
           items:
             $ref: "#/components/schemas/ObjectFlowSetOperation"
     ObjectFlowSourceRef:
@@ -2184,6 +2254,8 @@ components:
           type: string
         columns:
           type: array
+          maxItems: 50000
+          description: CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
           items:
             type: string
     ObjectFlowSelectionStage:
@@ -2208,10 +2280,14 @@ components:
           minimum: 1
         columns:
           type: array
+          maxItems: 50000
+          description: CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
           items:
             type: string
         rules:
           type: array
+          maxItems: 50000
+          description: CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
           items:
             $ref: "#/components/schemas/ObjectFlowSelectionRule"
     ObjectFlowSelectionRule:
@@ -2261,12 +2337,14 @@ components:
         rules:
           type: array
           minItems: 1
+          maxItems: 50000
+          description: CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
           items:
             $ref: "#/components/schemas/ObjectFlowMatchRule"
     ObjectFlowSetOperation:
       type: object
       additionalProperties: false
-      required: [id, type, from, with, as, on, distinct, caseSensitive]
+      required: [id, type, from, with, as, "on", distinct, caseSensitive]
       properties:
         id:
           type: string
@@ -2279,9 +2357,11 @@ components:
           type: string
         as:
           type: string
-        on:
+        "on":
           type: array
           minItems: 1
+          maxItems: 50000
+          description: CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
           items:
             type: object
             additionalProperties: false
@@ -2672,6 +2752,7 @@ components:
           type: boolean
         spec:
           type: object
+          x-input-collection-policy: full-spec
           description: >
             Spec JSON шаблона. Обычные динамические шаблоны используют модель
             DSL steps/result; специальные шаблоны представления модели CMDBuild задают
@@ -2781,6 +2862,7 @@ components:
       properties:
         spec:
           type: object
+          x-input-collection-policy: full-spec
           additionalProperties: true
         params:
           type: object
@@ -2793,6 +2875,90 @@ components:
         message: { type: string }
         receivedCmdbuildCookie: { type: boolean }
       additionalProperties: true
+    InputCollectionLimitError:
+      type: object
+      additionalProperties: false
+      required: [success, code, message, errors, limits]
+      description: >
+        Ранний HTTP 413 без обрезания входа. Возвращаются только безопасное
+        сообщение, schema-owned путь с индексами, счётчики и операторские лимиты;
+        значения payload, cookies, prompt и секреты не возвращаются.
+      properties:
+        success:
+          type: boolean
+          enum: [false]
+        code:
+          type: string
+          enum: [input_collection_limit]
+        message:
+          type: string
+          description: Фиксированное безопасное сообщение без значений входных данных.
+        requestId:
+          type: string
+          description: Необязательный идентификатор корреляции structured logs.
+        errors:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [path, actualCount, limit]
+            properties:
+              path:
+                type: string
+                description: Путь из известных полей схемы и индексов, а не произвольных ключей или значений payload.
+              actualCount:
+                type: integer
+                minimum: 1
+                description: Исходная длина коллекции либо накопленный суммарный счётчик до нормализации и deduplication.
+              limit:
+                type: integer
+                minimum: 1
+                maximum: 500000
+                description: Нарушенный эффективный лимит коллекции, D2, бизнес-блоков/uses либо суммарного бюджета.
+        limits:
+          type: object
+          required: [effective, meta]
+          properties:
+            effective:
+              type: object
+              required: [maxCollectionItems, maxTotalItems, d2MaxElements]
+              properties:
+                maxCollectionItems: { type: integer, minimum: 1, maximum: 50000 }
+                maxTotalItems: { type: integer, minimum: 1, maximum: 500000 }
+                d2MaxElements: { type: integer, minimum: 1, maximum: 50000 }
+            meta:
+              type: object
+              required: [maxCollectionItems, maxTotalItems, d2MaxElements]
+              properties:
+                maxCollectionItems:
+                  allOf:
+                    - $ref: "#/components/schemas/InputCollectionLimitMetadata"
+                    - type: object
+                      properties:
+                        absolute: { type: integer, enum: [50000] }
+                maxTotalItems:
+                  allOf:
+                    - $ref: "#/components/schemas/InputCollectionLimitMetadata"
+                    - type: object
+                      properties:
+                        absolute: { type: integer, enum: [500000] }
+                d2MaxElements:
+                  allOf:
+                    - $ref: "#/components/schemas/InputCollectionLimitMetadata"
+                    - type: object
+                      properties:
+                        absolute: { type: integer, enum: [50000] }
+    InputCollectionLimitMetadata:
+      type: object
+      required: [requested, effective, absolute, clampedBy]
+      properties:
+        requested: { type: number, nullable: true }
+        effective: { type: integer, minimum: 1 }
+        absolute: { type: integer, minimum: 1 }
+        clampedBy:
+          type: string
+          nullable: true
+          enum: [default, absolute, null]
     SanitizedSession:
       type: object
       nullable: true
@@ -2915,6 +3081,7 @@ components:
           pattern: "^[a-f0-9]{64}$"
         currentSpec:
           type: object
+          x-input-collection-policy: full-spec
           additionalProperties: true
         analysisCheckpoint:
           $ref: "#/components/schemas/D2AnalysisCheckpoint"
@@ -2932,6 +3099,7 @@ components:
           description: Обязателен для существующего templateCode; иначе 409
         currentSpec:
           type: object
+          x-input-collection-policy: full-spec
           additionalProperties: true
         d2Source:
           type: string
@@ -2956,10 +3124,16 @@ components:
             mappingContractHash: { type: string, pattern: "^[a-f0-9]{64}$" }
         roles:
           type: array
+          maxItems: 50000
+          x-input-collection-policy: d2
+          description: CMDP_D2_IMPORT_MAX_ELEMENTS по умолчанию 5000, абсолютный предел 50000; также действуют общие входные лимиты.
           items:
             $ref: "#/components/schemas/DiagramImportRoleOverride"
         relationRules:
           type: array
+          maxItems: 50000
+          x-input-collection-policy: d2
+          description: CMDP_D2_IMPORT_MAX_ELEMENTS по умолчанию 5000, абсолютный предел 50000; также действуют общие входные лимиты.
           items:
             $ref: "#/components/schemas/DiagramImportRelationRule"
         structureTree:
@@ -3016,6 +3190,7 @@ components:
           description: Полный хэш сохранённого Spec, используемый как идентификатор CAS при редактировании Diagram.
         currentSpec:
           type: object
+          x-input-collection-policy: full-spec
           additionalProperties: true
         d2Source:
           type: string
@@ -3034,6 +3209,7 @@ components:
           pattern: "^[a-f0-9]{64}$"
         currentSpec:
           type: object
+          x-input-collection-policy: full-spec
           additionalProperties: true
         d2Source:
           type: string
@@ -3042,16 +3218,25 @@ components:
           $ref: "#/components/schemas/DiagramImportProposalEnvelope"
         roles:
           type: array
+          maxItems: 50000
+          x-input-collection-policy: d2
+          description: CMDP_D2_IMPORT_MAX_ELEMENTS по умолчанию 5000, абсолютный предел 50000; также действуют общие входные лимиты.
           items:
             $ref: "#/components/schemas/DiagramImportRoleOverride"
         relationRules:
           type: array
+          maxItems: 50000
+          x-input-collection-policy: d2
+          description: CMDP_D2_IMPORT_MAX_ELEMENTS по умолчанию 5000, абсолютный предел 50000; также действуют общие входные лимиты.
           items:
             $ref: "#/components/schemas/DiagramImportRelationRule"
         structureTree:
           $ref: "#/components/schemas/DiagramImportStructureTree"
         endpointProfiles:
           type: array
+          maxItems: 50000
+          x-input-collection-policy: d2
+          description: CMDP_D2_IMPORT_MAX_ELEMENTS по умолчанию 5000, абсолютный предел 50000; также действует суммарный бюджет входа.
           items:
             $ref: "#/components/schemas/DiagramImportEndpointProfile"
     DiagramImportAnalyzeResponse:
@@ -3177,11 +3362,16 @@ components:
           description: Одно пользовательское намерение для диаграммы; внутренние системные этапы семантики, размещения и связей остаются раздельными.
         roles:
           type: array
-          description: Импортированные роли, доступные для семантической интерпретации.
+          maxItems: 50000
+          x-input-collection-policy: d2
+          description: Импортированные роли, доступные для семантической интерпретации. CMDP_D2_IMPORT_MAX_ELEMENTS по умолчанию 5000, абсолютный предел 50000; также действуют общие входные лимиты.
           items:
             $ref: "#/components/schemas/DiagramImportRoleOverride"
         relationRules:
           type: array
+          maxItems: 50000
+          x-input-collection-policy: d2
+          description: CMDP_D2_IMPORT_MAX_ELEMENTS по умолчанию 5000, абсолютный предел 50000; также действуют общие входные лимиты.
           items:
             $ref: "#/components/schemas/DiagramImportRelationRule"
         structureTree:
@@ -3232,10 +3422,16 @@ components:
           description: Одно пользовательское намерение, сохраняемое в идентификационных данных контрольной точки.
         roles:
           type: array
+          maxItems: 50000
+          x-input-collection-policy: d2
+          description: CMDP_D2_IMPORT_MAX_ELEMENTS по умолчанию 5000, абсолютный предел 50000; также действуют общие входные лимиты.
           items:
             $ref: "#/components/schemas/DiagramImportRoleOverride"
         relationRules:
           type: array
+          maxItems: 50000
+          x-input-collection-policy: d2
+          description: CMDP_D2_IMPORT_MAX_ELEMENTS по умолчанию 5000, абсолютный предел 50000; также действуют общие входные лимиты.
           items:
             $ref: "#/components/schemas/DiagramImportRelationRule"
         structureTree:
@@ -3255,7 +3451,8 @@ components:
           description: Непрозрачный ключ контрольной точки, созданный клиентом и повторно используемый без изменений при повторах roles и продолжении topology.
         stages:
           type: array
-          description: Необязательная сводка клиента; backend определяет канонические конечные этапы по указанному шаблону с учётом изменений редактора.
+          maxItems: 50000
+          description: Необязательная сводка клиента; backend определяет канонические конечные этапы по указанному шаблону с учётом изменений редактора. CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
           items:
             $ref: "#/components/schemas/ObjectFlowSourceRef"
     AssistantDiagramImportMapSelectionsResponse:
@@ -3363,16 +3560,24 @@ components:
           type: string
         roles:
           type: array
+          maxItems: 50000
+          x-input-collection-policy: d2
+          description: При возврате подписанного предложения во входе действует CMDP_D2_IMPORT_MAX_ELEMENTS по умолчанию 5000, абсолютный предел 50000; также действуют общие входные лимиты.
           items:
             $ref: "#/components/schemas/DiagramImportRoleOverride"
         relationRules:
           type: array
+          maxItems: 50000
+          x-input-collection-policy: d2
+          description: При возврате подписанного предложения во входе действует CMDP_D2_IMPORT_MAX_ELEMENTS по умолчанию 5000, абсолютный предел 50000; также действуют общие входные лимиты.
           items:
             $ref: "#/components/schemas/DiagramImportRelationRule"
         structureTree:
           $ref: "#/components/schemas/DiagramImportStructureTree"
         unresolved:
           type: array
+          x-input-collection-policy: output-data
+          description: Диагностика подписанного предложения, не структурная входная коллекция; guard не ограничивает этот вывод.
           items:
             $ref: "#/components/schemas/AssistantDiagramIssue"
     DiagramImportSemanticProposal:
@@ -3470,6 +3675,12 @@ components:
           type: string
         targetOperator:
           type: string
+        endpointScopeStructureItemId:
+          type: string
+          description: >
+            Optional exact container placement. For attributeEndpoints both
+            matched endpoints must be descendants of this structure item.
+            Empty selects the entire diagram. This is not a participant-pair list.
         labelTemplate:
           type: string
         directionPolicy:
@@ -3481,6 +3692,8 @@ components:
         path:
           type: array
           minItems: 1
+          maxItems: 50000
+          description: CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
           items:
             $ref: "#/components/schemas/DiagramImportRelationHop"
     DiagramImportEndpointProfile:
@@ -3503,6 +3716,9 @@ components:
           enum: [5]
         items:
           type: array
+          maxItems: 50000
+          x-input-collection-policy: d2
+          description: CMDP_D2_IMPORT_MAX_ELEMENTS по умолчанию 5000, абсолютный предел 50000; также действуют общие входные лимиты.
           items:
             $ref: "#/components/schemas/DiagramImportStructureItem"
     DiagramImportStructureItem:
@@ -3520,6 +3736,8 @@ components:
           type: string
         templateElementKeys:
           type: array
+          maxItems: 50000
+          description: CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
           items:
             type: string
         parentId:
@@ -3547,6 +3765,8 @@ components:
           $ref: "#/components/schemas/DiagramImportFilterSet"
         related:
           type: array
+          maxItems: 50000
+          description: CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
           items:
             type: object
             additionalProperties: true
@@ -3573,10 +3793,14 @@ components:
           type: string
         structuredFields:
           type: array
+          maxItems: 50000
+          description: CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
           items:
             type: string
         filters:
           type: array
+          maxItems: 50000
+          description: CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
           items:
             type: object
             additionalProperties: true
@@ -3593,6 +3817,8 @@ components:
           enum: [any, all]
         rules:
           type: array
+          maxItems: 50000
+          description: CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000, абсолютный предел 50000.
           items:
             $ref: "#/components/schemas/DiagramImportFilterRule"
     DiagramImportFilterRule:
@@ -3685,28 +3911,39 @@ components:
           $ref: "#/components/schemas/AssistantD2BindingModel"
         coverageModel:
           $ref: "#/components/schemas/AssistantCoverageModel"
+        requirementLedger:
+          $ref: "#/components/schemas/AssistantRequirementLedger"
+        requirementCoverage:
+          $ref: "#/components/schemas/AssistantRequirementCoverage"
     AssistantDataSemanticModel:
       type: object
       additionalProperties: false
-      required: [kind, version, modelHash, stages]
+      required: [kind, version, modelHash, fieldCatalog, fieldContextDiagnostics, stages]
       properties:
         kind:
           type: string
           enum: [DataSemanticModel]
         version:
           type: integer
-          enum: [3]
+          enum: [4]
         modelHash:
           type: string
           pattern: "^[a-f0-9]{64}$"
+        fieldCatalog:
+          type: array
+          description: Типизированные определения доступных полей; stages[].typedFields ссылаются на них по id.
+          items:
+            $ref: "#/components/schemas/AssistantFieldDefinition"
+        fieldContextDiagnostics:
+          $ref: "#/components/schemas/AssistantFieldContextDiagnostics"
         stages:
           type: array
           items:
             $ref: "#/components/schemas/AssistantDataSemanticStage"
     AssistantDataSemanticStage:
       type: object
-      additionalProperties: true
-      required: [id, label, alias, kind, className, columns, readableFields, rules]
+      additionalProperties: false
+      required: [id, label, alias, kind, className, from, with, operation, stageRole, outputKind, rowGrain, domain, direction, targetClass, columns, readableFields, typedFields, rules, assistantBlockIds, lineageAliases, lineageLabels, relationSource, connection, cardSources]
       properties:
         id:
           type: string
@@ -3724,6 +3961,13 @@ components:
           type: string
         operation:
           type: string
+        stageRole:
+          type: string
+          enum: [terminal, helper]
+        outputKind:
+          type: string
+        rowGrain:
+          type: string
         domain:
           type: string
         direction:
@@ -3738,6 +3982,10 @@ components:
           type: array
           items:
             type: string
+        typedFields:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantTypedFieldRef"
         rules:
           type: array
           items:
@@ -3757,16 +4005,151 @@ components:
         relationSource:
           type: object
           nullable: true
-          additionalProperties: true
+          additionalProperties: false
+          required: [className, domain, direction, structuredFields]
+          properties:
+            className:
+              type: string
+            domain:
+              type: string
+            direction:
+              type: string
+            structuredFields:
+              type: array
+              items:
+                type: string
         connection:
           type: object
           nullable: true
-          additionalProperties: true
+          additionalProperties: false
+          required: [fromClass, withClass, sourceField, targetField]
+          properties:
+            fromClass:
+              type: string
+            withClass:
+              type: string
+            sourceField:
+              type: string
+            targetField:
+              type: string
         cardSources:
           type: array
           items:
-            type: object
-            additionalProperties: true
+            $ref: "#/components/schemas/AssistantDataCardSource"
+    AssistantDataCardSource:
+      type: object
+      additionalProperties: false
+      required: [id, label, className, classColumn, idColumn]
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        className:
+          type: string
+        classColumn:
+          type: string
+        idColumn:
+          type: string
+    AssistantTypedFieldRef:
+      type: object
+      additionalProperties: false
+      required: [id, path, rootClass, cardSourceId]
+      properties:
+        id:
+          type: string
+          pattern: "^field_[a-f0-9]{20}$"
+        path:
+          type: string
+        rootClass:
+          type: string
+        cardSourceId:
+          type: string
+    AssistantFieldDefinition:
+      type: object
+      additionalProperties: false
+      required: [id, path, rootClass, className, attribute, description, type, cardinality, hops, evidence]
+      properties:
+        id:
+          type: string
+          pattern: "^field_[a-f0-9]{20}$"
+        path:
+          type: string
+        rootClass:
+          type: string
+        className:
+          type: string
+        attribute:
+          type: string
+        description:
+          type: string
+        type:
+          type: string
+        help:
+          type: string
+        cardinality:
+          type: string
+          enum: [one, many]
+        hops:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantFieldHop"
+        evidence:
+          type: string
+          enum: [readableCatalog]
+    AssistantFieldHop:
+      type: object
+      additionalProperties: false
+      required: [kind, name, sourceClass, targetClass, direction]
+      properties:
+        kind:
+          type: string
+          enum: [reference, domain]
+        name:
+          type: string
+        sourceClass:
+          type: string
+        targetClass:
+          type: string
+        direction:
+          type: string
+        domain:
+          type: string
+        cardinality:
+          type: string
+    AssistantFieldContextDiagnostics:
+      type: object
+      additionalProperties: false
+      required: [depth, maxBytes, maxStates, scannedStates, returnedFields, bytes, truncated, missingClasses, perClassByteBudget]
+      properties:
+        depth:
+          type: integer
+          minimum: 0
+          maximum: 5
+        maxBytes:
+          type: integer
+          minimum: 1
+        maxStates:
+          type: integer
+          minimum: 1
+        scannedStates:
+          type: integer
+          minimum: 0
+        returnedFields:
+          type: integer
+          minimum: 0
+        bytes:
+          type: integer
+          minimum: 0
+        truncated:
+          type: boolean
+        missingClasses:
+          type: array
+          items:
+            type: string
+        perClassByteBudget:
+          type: integer
+          minimum: 1
     AssistantDataSemanticRule:
       type: object
       additionalProperties: false
@@ -3935,7 +4318,7 @@ components:
           enum: [D2BindingModel]
         version:
           type: integer
-          enum: [1]
+          enum: [2]
         modelHash:
           type: string
           pattern: "^[a-f0-9]{64}$"
@@ -3950,7 +4333,7 @@ components:
     AssistantD2BindingPlacement:
       type: object
       additionalProperties: false
-      required: [structureItemId, roleId, materialization, stageId, className, hierarchyConditions]
+      required: [structureItemId, roleId, materialization, stageId, className, cardSourceId, labelTemplate, conditions, hierarchyConditions]
       properties:
         structureItemId:
           type: string
@@ -3963,13 +4346,24 @@ components:
           type: string
         className:
           type: string
+        cardSourceId:
+          type: string
+        labelTemplate:
+          type: string
+        conditions:
+          $ref: "#/components/schemas/AssistantBindingConditions"
         hierarchyConditions:
-          type: object
-          additionalProperties: true
+          $ref: "#/components/schemas/AssistantBindingConditions"
+    AssistantBindingConditions:
+      description: Нормализованные условия сопоставления либо пустой объект, когда условия не заданы.
+      anyOf:
+        - type: object
+          additionalProperties: false
+        - $ref: "#/components/schemas/DiagramImportFilterSet"
     AssistantD2BindingConnection:
       type: object
       additionalProperties: false
-      required: [d2ElementKey, d2ClassKey, sourceStageId, mode]
+      required: [d2ElementKey, d2ClassKey, sourceStageId, mode, sourceField, targetField, sourceOperator, targetOperator, labelTemplate, endpointScopeStructureItemId]
       properties:
         d2ElementKey:
           type: string
@@ -3978,6 +4372,139 @@ components:
         sourceStageId:
           type: string
         mode:
+          type: string
+        sourceField:
+          type: string
+        targetField:
+          type: string
+        sourceOperator:
+          type: string
+        targetOperator:
+          type: string
+        labelTemplate:
+          type: string
+        endpointScopeStructureItemId:
+          type: string
+          description: Точное размещение контейнера, ограничивающее оба конца связи; пустая строка означает всю диаграмму.
+    AssistantRequirementLedger:
+      type: object
+      additionalProperties: false
+      required: [version, hash, requirements, warnings]
+      description: Реестр исходных требований; содержит приватный исходный текст, не предназначенный для логирования целиком.
+      properties:
+        version:
+          type: integer
+          enum: [1]
+        hash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        requirements:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantRequirement"
+        warnings:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantRequirementWarning"
+    AssistantRequirement:
+      type: object
+      additionalProperties: false
+      required: [id, targetType, targetId, sourceKind, sourceText, start, end, kind]
+      properties:
+        id:
+          type: string
+          pattern: "^req_[a-f0-9]{64}$"
+        targetType:
+          type: string
+          enum: [businessBlock, placement, connection]
+        targetId:
+          type: string
+        sourceKind:
+          type: string
+          enum: [description, notes, d2Notes]
+        sourceText:
+          type: string
+        start:
+          type: integer
+          minimum: 0
+          description: Начальное смещение UTF-16 в исходном поле.
+        end:
+          type: integer
+          minimum: 0
+          description: Конечное смещение UTF-16, не включаемое в диапазон.
+        kind:
+          type: string
+          enum: [directive, paragraph]
+        directiveType:
+          type: string
+        directiveValue:
+          type: string
+        overriddenBy:
+          type: array
+          items:
+            type: string
+            pattern: "^req_[a-f0-9]{64}$"
+    AssistantRequirementWarning:
+      type: object
+      additionalProperties: false
+      required: [code, targetType, targetId, directiveType, requirementIds]
+      properties:
+        code:
+          type: string
+          enum: [assistant_requirement_directive_conflict]
+        targetType:
+          type: string
+          enum: [businessBlock, placement, connection]
+        targetId:
+          type: string
+        directiveType:
+          type: string
+        requirementIds:
+          type: array
+          items:
+            type: string
+            pattern: "^req_[a-f0-9]{64}$"
+    AssistantRequirementCoverage:
+      type: object
+      additionalProperties: false
+      required: [scope, semanticProof, entries]
+      description: Учёт исходных требований по целям, не доказательство семантической полноты сопоставления.
+      properties:
+        scope:
+          type: string
+          enum: [source-target-accountability-only]
+        semanticProof:
+          type: boolean
+          enum: [false]
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssistantRequirementCoverageEntry"
+    AssistantRequirementCoverageEntry:
+      type: object
+      additionalProperties: false
+      required: [id, status]
+      properties:
+        id:
+          type: string
+          pattern: "^req_[a-f0-9]{64}$"
+        status:
+          type: string
+          enum: [compiled, unresolved, conflict]
+        evidenceRefs:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/AssistantRequirementEvidenceRef"
+    AssistantRequirementEvidenceRef:
+      type: object
+      additionalProperties: false
+      required: [family, ref]
+      properties:
+        family:
+          type: string
+          enum: [businessBlock, placement, connection]
+        ref:
           type: string
     AssistantCoverageModel:
       type: object

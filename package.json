@@ -17,7 +17,7 @@
     "test:aa": "node scripts/validate-aa-links.mjs && python3 -B scripts/aa_contracts.py && python3 -B scripts/aa_workbooks.py validate && python3 -B -m unittest discover -s tests/aa -p 'test_*.py'",
     "test:unit": "node --test tests/unit/*.test.mjs",
     "test:api": "node --test tests/api/contract.test.mjs",
-    "test:api:self-contained": "node --test tests/api/assistant-deterministic-preview.test.mjs",
+    "test:api:self-contained": "node --test tests/api/assistant-deterministic-preview.test.mjs tests/api/input-collection-limits.test.mjs",
     "test:ui": "node --test tests/ui/*.test.mjs",
     "test:ui:required": "node scripts/run-required-ui-smoke.mjs",
     "test:nginx": "bash scripts/nginx-test.sh && node --test tests/api/nginx-iframe.test.mjs",

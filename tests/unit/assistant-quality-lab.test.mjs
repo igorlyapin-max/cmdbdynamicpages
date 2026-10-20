@@ -376,7 +376,8 @@ test('quality classification: transport errors on either stage are failures, nev
       assert.deepEqual({
         total: metric.total, failures: metric.failures, evaluated: metric.evaluated, unresolved: metric.unresolved,
         correctAbstention: metric.correctAbstention, falseAcceptance: metric.falseAcceptance, exactRate: metric.exactRate,
-      }, { total: 3, failures: 3, evaluated: 0, unresolved: 0, correctAbstention: 0, falseAcceptance: 0, exactRate: null });
+      }, { total: 3, failures: 3, evaluated: 0, unresolved: 0, correctAbstention: 0, falseAcceptance: 0, exactRate: 0 });
+      assert.equal(metric.exactPerEvaluated, null);
       for (const result of report.results) {
         assert.equal(result.status, 'failed');
         assert.equal(result.code, 'provider_error');
@@ -448,7 +449,7 @@ test('quality classification: mixed failures, valid unresolved and accepted gues
   }, { total: 3, failures: 1, unresolved: 1, correctAbstention: 1, falseAcceptance: 1 });
 });
 
-test('quality classification: exact rate excludes failed jobs but reports their denominator', async () => {
+test('quality classification: primary exact rate includes failures; diagnostic exact/evaluated is separate', async () => {
   const report = await runExperiment(options({ repeats: 3, complete: async (request) => {
     if (request.metadata.repeat === 0) throw new Error('transport failed');
     return fixtureComplete(request);
@@ -457,5 +458,27 @@ test('quality classification: exact rate excludes failed jobs but reports their 
   assert.deepEqual({
     total: metric.total, failures: metric.failures, evaluated: metric.evaluated,
     exact: metric.exact, exactRate: metric.exactRate, unresolved: metric.unresolved,
-  }, { total: 3, failures: 1, evaluated: 2, exact: 2, exactRate: 1, unresolved: 0 });
+  }, { total: 3, failures: 1, evaluated: 2, exact: 2, exactRate: 2 / 3, unresolved: 0 });
+  assert.equal(metric.exactPerEvaluated, 1);
+  assert.equal(metric.endToEndExactRate, 2 / 3);
+  assert.equal(metric.transportCompleted, 2);
+  assert.equal(metric.contractValid, 2);
+  assert.equal(report.primaryMetric, 'exact/total (including failures)');
+});
+
+test('historical simulations remain separate from the production five-arm comparison', async () => {
+  const report = await runExperiment({ mode: 'dry-run' });
+  assert.equal(report.scope, 'abstract-stage-simulation');
+  assert.equal(report.productionComparison.historicalResultsReusableAsProduction, false);
+  assert.match(VARIANTS.D, /business result/);
+  assert.match(VARIANTS.E, /Fixed decision/);
+});
+
+test('completed transport is not valid contract or semantic correctness', async () => {
+  const report = await runExperiment(options({ complete: async () => ({ content: '{' }), limits: { maxRepairs: 0 } }));
+  assert.equal(report.results[0].transportCompleted, true);
+  assert.equal(report.results[0].contractValid, false);
+  assert.equal(report.results[0].evaluation.exact, false);
+  assert.equal(report.metrics[0].transportCompleted, 1);
+  assert.equal(report.metrics[0].contractValid, 0);
 });

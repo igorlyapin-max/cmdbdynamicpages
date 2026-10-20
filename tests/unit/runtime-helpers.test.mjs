@@ -60,6 +60,7 @@ import {
   d2ImportConfigSummary,
   diagramImportDeterministicSpecHash,
   diagramImportImplicitConditionSources,
+  diagramImportPrimaryCardSource,
   diagramImportInferImplicitConditionSource,
   diagramImportDirectRelationParentCorrelation,
   diagramImportBindRelationRulesToStructureItems,
@@ -265,6 +266,16 @@ test('Assistant editor delta excludes generated diagrams and preserves saved out
   assert.deepEqual(merged.result.diagrams, [{ name: 'saved-diagram' }]);
   assert.deepEqual(merged.result.cache, { enabled: true });
   assert.deepEqual(merged.publish, { mode: 'tableAndDiagram' });
+});
+
+test('Assistant rejects the combined retained-base and delta collection budget before cloning', () => {
+  const saved = { version: 1, result: { diagrams: [{ nodeMappings: Array.from({ length: 5000 }, () => ({
+    primary: { structuredFields: Array(8).fill('Description') }
+  })) }] } };
+  const delta = { version: 1, spec: { steps: Array.from({ length: 5000 }, () => ({ columns: ['Description', 'Name'] })) } };
+  const before = JSON.stringify(saved);
+  assert.throws(() => applyAssistantEditorDelta(saved, delta), (error) => error.code === 'input_collection_limit' && error.statusCode === 413);
+  assert.equal(JSON.stringify(saved), before);
 });
 
 test('template Assistant prompt overrides reject over-limit input without truncating it', () => {
@@ -1821,7 +1832,7 @@ test('D2 retained relation provenance materializes the related child and correla
     cardSources: [{ id: 'current', className: 'phServer', classColumn: 'Class', idColumn: '_id', label: 'Сервер' }]
   };
   const repaired = diagramImportDirectRelationParentCorrelation({
-    primary: { className: 'vServer' },
+    primary: { className: 'ApplicG', cardSource: sourceStage.cardSources[1] },
     hierarchyConditions: {
       ruleJoin: 'any',
       rules: [{
@@ -1844,7 +1855,7 @@ test('D2 retained relation provenance materializes the related child and correla
   assert.equal(repaired.mapping.hierarchyConditions.rules[0].right.column, '_id');
 });
 
-test('D2 legacy primary class cannot override the current Object Flow result without an explicit card source', () => {
+test('D2 primary class alone cannot select a multi-card source and an explicit current choice is preserved', () => {
   const stage = {
     id: 'relation:vlans',
     className: 'vlan',
@@ -1853,11 +1864,12 @@ test('D2 legacy primary class cannot override the current Object Flow result wit
       { id: 'relation-source', className: 'ipRange', classColumn: 'SourceClass', idColumn: 'SourceId', label: 'Network' }
     ]
   };
+  assert.equal(diagramImportPrimaryCardSource(stage, { className: 'ipRange' }).source, null);
   const compiled = diagramImportCompileRoleMapping({
     id: 'vlan-role', key: 'vlan', label: 'VLAN', kind: 'd2Class', visualKind: 'node', elementKeys: ['vlan']
   }, {
     materialization: { kind: 'stage', stageId: stage.id },
-    primary: { className: 'ipRange', idAttribute: '_id', labelTemplate: '${Description}' }
+    primary: { className: 'ipRange', cardSource: stage.cardSources[0], idAttribute: '_id', labelTemplate: '${Description}' }
   }, 'vlan-placement', new Map([[stage.id, stage]]), {
     stageId: stage.id, alias: 'vlans', baseAlias: 'vlans', className: stage.className, label: 'VLANs'
   });
@@ -3869,10 +3881,10 @@ test('D2 Assistant resolves parentCard and nested match cards through the neares
   };
   const draft = assistantDiagramPlacementDraftFromResponse({ kind: 'mapping', placements, stages }, {
     mappings: [
-      { structureItemId: 'scope', materialization: 'stage', stageId: 'relation:servers' },
+      { structureItemId: 'scope', materialization: 'stage', stageId: 'relation:servers', cardSourceId: 'current' },
       { structureItemId: 'server', materialization: 'parentCard', hierarchyConditions: invalidHierarchy },
       { structureItemId: 'applications-group', materialization: 'structural' },
-      { structureItemId: 'application-mapping', materialization: 'stage', stageId: 'match:applications', hierarchyConditions: invalidHierarchy }
+      { structureItemId: 'application-mapping', materialization: 'stage', stageId: 'match:applications', cardSourceId: 'relation-source', hierarchyConditions: invalidHierarchy }
     ],
     unresolved: [{
       structureItemId: 'application', reason: 'ambiguousStage',
@@ -4373,6 +4385,7 @@ test('D2 placement filters resolve a deep path from a retained source card', () 
   const proposal = createDiagramImportProposal(currentSpec, fixture.ir, { sourceText: fixture.source });
   const roles = Object.fromEntries(proposal.roles.map((role) => [role.key, role]));
   let tree = structureTreeWithStage(proposal.structureTree, roles['scope-vlan'].id, 'relation:servers');
+  const displayedSource = assistantObjectFlowDiagramStages(currentSpec).find((stage) => stage.id === 'relation:servers').cardSources.find((source) => source.id === 'current');
   tree.items = tree.items.map((item) => {
     if (String(item.roleId) === String(roles.vlan.id)) {
       return { ...item, mapping: { ...(item.mapping || {}), materialization: { kind: 'parentCard', stageId: '' } } };
@@ -4382,6 +4395,7 @@ test('D2 placement filters resolve a deep path from a retained source card', () 
       ...item,
       mapping: {
         ...(item.mapping || {}),
+        primary: { ...(item.mapping && item.mapping.primary || {}), cardSource: displayedSource, className: displayedSource.className },
         conditions: {
           ruleJoin: 'all',
           rules: [{
@@ -7144,7 +7158,7 @@ test('DataSemanticModel preserves canonical rightExpression values and expressio
   }]);
 
   assert.equal(model.kind, 'DataSemanticModel');
-  assert.equal(model.version, 3);
+  assert.equal(model.version, 4);
   assert.deepEqual(model.stages[0].rules.map((rule) => ({
     rightExpression: rule.rightExpression,
     expressionKind: rule.expressionKind
@@ -7183,7 +7197,7 @@ test('D2 Assistant exchanges versioned semantic, structural, binding, and covera
   assert.deepEqual([data.kind, structure.kind, semantics.kind, binding.kind, coverage.kind], [
     'DataSemanticModel', 'D2StructuralModel', 'D2SemanticModel', 'D2BindingModel', 'CoverageModel'
   ]);
-  assert.deepEqual([data.version, structure.version, semantics.version, binding.version, coverage.version], [3, 1, 1, 1, 2]);
+  assert.deepEqual([data.version, structure.version, semantics.version, binding.version, coverage.version], [4, 1, 1, 2, 2]);
   assert.ok([data, structure, semantics, binding, coverage].every((model) => /^[a-f0-9]{64}$/.test(model.modelHash)));
   assert.equal(structure.roles[0].roleNotes, 'One system card.');
   assert.equal(structure.placements[0].placementNotes, 'Place in the systems branch.');
@@ -7251,7 +7265,7 @@ test('D2 business intent exposes only terminal block results and deterministic o
   assert.deepEqual(deterministicSeed.pendingPlacementIds, []);
   assert.deepEqual(deterministicSeed.pendingConnectionKeys, []);
   assert.deepEqual(deterministicSeed.placementBindings, [{
-    structureItemId: 'placement-external', materializationIntent: 'stage', businessBlockId: 'block-external'
+    structureItemId: 'placement-external', materializationIntent: 'stage', businessBlockId: 'block-external', cardSourceId: 'current'
   }]);
   assert.deepEqual(deterministicSeed.connectionBindings, [{
     d2ClassKey: 'acl_external', businessBlockId: 'block-acl'
@@ -7331,7 +7345,7 @@ test('D2 business intent exposes only terminal block results and deterministic o
   assert.equal(assistantD2CritiqueModel({ approved: true, violations: [] }).approved, true);
 });
 
-test('BusinessBlockManifest v2 never selects one of several terminal results implicitly', () => {
+test('BusinessBlockManifest v3 never selects one of several terminal results implicitly', () => {
   const manifest = assistantObjectFlowBusinessBlockManifest({
     authoring: {
       version: 1,
@@ -7356,7 +7370,7 @@ test('BusinessBlockManifest v2 never selects one of several terminal results imp
     outputKind: 'sourceCards', assistantBlockIds: ['block-systems']
   }]);
 
-  assert.equal(manifest.version, 2);
+  assert.equal(manifest.version, 3);
   assert.equal(manifest.blocks[0].status, 'ambiguous');
   assert.equal(manifest.blocks[0].terminalStageId, '');
   assert.equal(manifest.blocks[0].terminalAlias, '');
@@ -7529,7 +7543,7 @@ test('binding-intent seed keeps deterministic Notes bindings while requesting na
     relationRules: []
   });
   assert.deepEqual(seed.placementBindings, [{
-    structureItemId: 'scope-vlan', materializationIntent: 'stage', businessBlockId: 'block-vlan'
+    structureItemId: 'scope-vlan', materializationIntent: 'stage', businessBlockId: 'block-vlan', cardSourceId: 'current'
   }]);
   assert.deepEqual(seed.pendingPlacementIds, ['scope-vlan']);
 });

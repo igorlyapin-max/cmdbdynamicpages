@@ -5070,10 +5070,6 @@ test('D2 mapping with named business blocks completes intent, placement, connect
       },
       ({ request }) => {
         const payload = JSON.parse(request.messages.at(-1).content);
-        return { mappings: d2PlacementMappings(payload, 'selection:applications') };
-      },
-      ({ request }) => {
-        const payload = JSON.parse(request.messages.at(-1).content);
         const connection = payload.topology[0];
         const candidate = connection.networkEndpointStages[0];
         return {
@@ -5151,6 +5147,7 @@ test('D2 mapping with named business blocks completes intent, placement, connect
     const response = await requestJson('POST', endpoint, { ...body, stage, resumeId }, headers, 5000);
     assert.equal(response.statusCode, 202, response.body);
     assert.equal(response.json.checkpoint.nextStage, nextStage, response.body);
+    if (stage === 'roles' && nextStage === 'topology') assert.equal(response.json.diagnostics.source, 'confirmed-binding-intent');
   }
   const completed = await requestJson('POST', endpoint, { ...body, stage: 'topology', resumeId }, headers, 5000);
   assert.equal(completed.statusCode, 200, completed.body);
@@ -5161,10 +5158,8 @@ test('D2 mapping with named business blocks completes intent, placement, connect
   assert.equal(completed.json.relationRules[0].targetOperator, 'equals');
   assert.equal(completed.json.diagnostics.phases.intent, 'accepted');
   assert.equal(completed.json.diagnostics.phases.critique, 'accepted');
-  assert.equal(llm.requests, 3);
-  const placementPayload = JSON.parse(llm.requestLog[1].messages.at(-1).content);
-  assert.ok(placementPayload.placements.every((placement) => placement.allowedStages.every((stage) => stage.stageRole === 'terminal')));
-  const connectionPayload = JSON.parse(llm.requestLog[2].messages.at(-1).content);
+  assert.equal(llm.requests, 2, 'the confirmed intent must compile without another model placement decision');
+  const connectionPayload = JSON.parse(llm.requestLog[1].messages.at(-1).content);
   assert.deepEqual(connectionPayload.topology[0].networkEndpointStages.map((candidate) => candidate.sourceStageId), ['selection:aclLinks']);
   assert.equal(backend.exitCode, null);
 });
