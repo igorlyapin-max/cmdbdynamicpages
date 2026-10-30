@@ -95,6 +95,326 @@ test -z "$CMDP_TLS_CA_FILE" || { test "$CMDP_TLS_CA_FILE" = /run/certs/cmdbdynam
 
 Для опубликованных static snapshots raw `.d2` source не отдается публичному endpoint по умолчанию. Если заказчик разрешает скачивание `.d2`, включайте `publish.publicD2Source=true` в шаблоне осознанно: source может содержать structured diagram metadata и бизнес-данные, уже зафиксированные в snapshot.
 
+<a id="llm-connection-setup"></a>
+
+## Цепочка настроек BFF -> LiteLLM -> провайдер модели
+
+LiteLLM и серверы моделей являются внешними сервисами:
+`docker-compose.runtime.yml` этого проекта их не разворачивает. При работе
+Assistant наш backend/BFF обращается к LiteLLM; провайдер выбирается шлюзом.
+
+```text
+Backend/BFF -- ключ шлюза --> LiteLLM -- ключ upstream, если нужен --> vLLM
+                                      |---------------------------> OpenAI
+                                      |---------------------------> OpenAI-compatible API
+                                      `---------------------------> Ollama
+```
+
+OpenAI - провайдер моделей. OpenAI-compatible API - сервер с совместимым
+контрактом запросов. OpenAPI - формат описания API, а не отдельный провайдер.
+
+| Где настраивать | Что задать | Для чего |
+| --- | --- | --- |
+| Сервер модели / кабинет провайдера | Доступную модель, endpoint, правила доступа и upstream key, если он нужен. | Провайдер должен обслуживать выбранную модель до настройки маршрута в LiteLLM. |
+| `config.yaml` и secret/env процесса LiteLLM | `model_name`, `litellm_params.model`, `api_base`, upstream `api_key`, настройки авторизации шлюза. | LiteLLM выбирает адаптер, адрес и учетные данные провайдера. |
+| Deployment `.env` и secret mount нашего backend | `LITELLM_BASE_URL`, `CMDP_LITELLM_ALLOWED_BASE_URLS`, `LITELLM_MODEL`, `LITELLM_API_KEY_FILE_HOST`. | BFF знает адрес шлюза, имя его маршрута и ключ доступа к шлюзу, а не к провайдеру. |
+| Designer -> «Runtime-настройки» для технического корня | `assistant.llm.enabled`, `assistant.llm.baseUrl`, `assistant.llm.model`. | Включает Assistant и выбирает фактический URL/модель для этого корня; сохраненные значения могут отличаться от deployment defaults. |
+
+Ключ шлюза проверяется LiteLLM, upstream key - провайдером или proxy перед ним.
+Это разные учетные данные; они не являются CMDBuild session token или CSRF
+secret. Не передавайте ключ провайдера в secret file BFF вместо ключа LiteLLM.
+
+### 1. Подготовить провайдер и выбрать один маршрут LiteLLM
+
+Ниже четыре **альтернативных полных примера** `config.yaml`. Выберите один и
+замените все `REPLACE_*` и условные адреса. Не объединяйте эти блоки с одинаковым
+`model_name` в один config: несколько deployments под одним именем могут стать
+пулом маршрутизации, а не выбором одного провайдера. Для намеренного использования
+нескольких моделей задайте разные `model_name` и выберите нужное имя в BFF.
+
+Во всех примерах `assistant-model` - стабильное имя маршрута шлюза. Префиксы
+`hosted_vllm/`, `openai/` и `ollama_chat/` выбирают адаптер LiteLLM; реальное имя
+модели находится после префикса и задается только в LiteLLM.
+
+#### Вариант A. Внутренняя vLLM
+
+Сначала запустите vLLM с нужной моделью и chat template, проверьте served model
+name и доступ LiteLLM к серверу. Пример без авторизации upstream:
+
+```yaml
+model_list:
+  - model_name: assistant-model
+    litellm_params:
+      model: hosted_vllm/REPLACE_WITH_VLLM_SERVED_MODEL_NAME
+      api_base: http://vllm.internal.example:8000
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+```
+
+- Суффикс после `hosted_vllm/` должен совпадать с именем, которое обслуживает
+  vLLM, например заданным через `--served-model-name`. Это не обязательно имя
+  каталога с весами модели.
+- `api_base` должен быть доступен из процесса/контейнера LiteLLM. Пример использует
+  корневой адрес сервера vLLM; не добавляйте к нему `/chat/completions`.
+
+Если vLLM запущена с `--api-key` / `VLLM_API_KEY` или proxy требует Bearer token,
+добавьте в `litellm_params`:
+
+```yaml
+api_key: os.environ/VLLM_API_KEY
+```
+
+Здесь `VLLM_API_KEY` - переменная окружения процесса LiteLLM с ключом его upstream.
+Если upstream не проверяет ключ, поле `api_key` можно опустить. Пустая строка и
+буквальная строка `EMPTY` не являются действительными ключами для защищенного
+upstream.
+
+#### Вариант B. Официальный OpenAI
+
+Сначала выберите доступную вашей учетной записи chat-модель и получите API key
+провайдера. Передайте его **процессу LiteLLM** через secret/env `OPENAI_API_KEY`:
+
+```yaml
+model_list:
+  - model_name: assistant-model
+    litellm_params:
+      model: openai/REPLACE_WITH_OPENAI_MODEL_NAME
+      api_base: https://api.openai.com/v1
+      api_key: os.environ/OPENAI_API_KEY
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+```
+
+Адрес явно указывает официальный OpenAI API. Это не адрес LiteLLM и не значение
+`LITELLM_BASE_URL` нашего backend. Использование внешнего провайдера должно быть
+разрешено политикой контура: authoring text, описанный выше, может уйти за его
+пределы. Наличие подписки на пользовательский чат не заменяет доступ к API.
+
+#### Вариант C. Произвольный OpenAI-совместимый API
+
+Сначала получите у оператора сервера API base, идентификатор chat-модели и ключ.
+Сервер должен поддерживать OpenAI-совместимый Chat Completions API, а не только
+предоставлять OpenAPI/Swagger-описание произвольного REST API.
+
+```yaml
+model_list:
+  - model_name: assistant-model
+    litellm_params:
+      model: openai/REPLACE_WITH_UPSTREAM_MODEL_NAME
+      api_base: https://model-api.internal.example/v1
+      api_key: os.environ/COMPATIBLE_API_KEY
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+```
+
+`COMPATIBLE_API_KEY` задается в окружении LiteLLM, не BFF. Префикс `openai/` в
+этом варианте задает формат протокола, но не отправляет запрос в OpenAI: адрес
+определяет `api_base`. В примере сервер использует `/v1`; если upstream имеет
+другой API prefix, укажите его реальный base URL. Не добавляйте конечный путь
+`/chat/completions`. Возможность работы без upstream key зависит от сервера и
+версии адаптера; при отсутствии проверки ключа согласуйте это с оператором,
+не подставляйте в этот параметр административный ключ LiteLLM.
+
+#### Вариант D. Локальный сервер Ollama
+
+Модель с нужным `name:tag` должна уже находиться на сервере Ollama и быть доступна
+LiteLLM. Ее предварительная загрузка выполняется оператором Ollama в рамках
+разрешенной политики загрузки моделей; наш backend модели не скачивает.
+
+```yaml
+model_list:
+  - model_name: assistant-model
+    litellm_params:
+      model: ollama_chat/REPLACE_WITH_OLLAMA_MODEL_AND_TAG
+      api_base: http://ollama.internal.example:11434
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+```
+
+Адаптер `ollama_chat/` обращается к native `/api/chat`, поэтому `api_base` здесь
+содержит корень Ollama **без `/v1` и без `/api/chat`**. Локальный API Ollama обычно
+не требует API key. Пример не относится к Ollama Cloud или защищающему сервер
+proxy: для них требуется отдельно настроенная авторизация. Доступность модели
+не гарантирует ее способность выполнять требуемые Assistant инструкции и
+возвращать корректный структурированный результат.
+
+#### Общие настройки шлюза и ключей
+
+Передайте `LITELLM_MASTER_KEY` в окружение LiteLLM через approved secret mechanism.
+Используйте случайный секрет с префиксом `sk-`, а не placeholder. В YAML выше
+находится только ссылка на переменную окружения; реальные ключи не коммитить.
+Ссылка `os.environ/NAME` читает env именно процесса LiteLLM: файл ключа нашего BFF
+не становится автоматически переменной окружения шлюза.
+
+Загрузите этот config в ваш экземпляр LiteLLM; при CLI-запуске он выбирается через
+`litellm --config /etc/litellm/config.yaml`.
+
+PostgreSQL не требуется для простого статического маршрута модели с master key.
+Для управления virtual keys в LiteLLM нужны PostgreSQL (`DATABASE_URL`) и master
+key. В этом режиме выдайте backend отдельный virtual key с доступом к
+`assistant-model`; административный master key оставьте оператору шлюза. При
+минимальной конфигурации без virtual keys клиентский ключ должен совпадать с
+master key, но это предоставляет клиенту административный секрет шлюза.
+
+Контракты провайдера и управления ключами описаны в официальной документации:
+[vLLM provider](https://docs.litellm.ai/docs/providers/vllm),
+[OpenAI provider](https://docs.litellm.ai/docs/providers/openai),
+[OpenAI-compatible endpoints](https://docs.litellm.ai/docs/providers/openai_compatible),
+[Ollama provider](https://docs.litellm.ai/docs/providers/ollama),
+[Ollama authentication](https://docs.ollama.com/api/authentication),
+[Virtual Keys](https://docs.litellm.ai/docs/proxy/virtual_keys),
+[Proxy quickstart](https://docs.litellm.ai/docs/proxy/docker_quick_start).
+
+### 2. Настроить backend DynamicPages
+
+Пример значений в deployment `.env` нашего backend:
+
+```dotenv
+LITELLM_BASE_URL=https://litellm.internal.example/v1
+CMDP_LITELLM_ALLOWED_BASE_URLS=https://litellm.internal.example/v1
+LITELLM_MODEL=assistant-model
+LITELLM_API_KEY_FILE=/run/secrets/cmdbdynamicpages_litellm_api_key
+LITELLM_API_KEY_FILE_HOST=/etc/cmdbdynamicpages/secrets/litellm_api_key
+```
+
+Все адреса, имя модели и host path в примере условные. URL LiteLLM должен быть
+доступен именно из backend, а endpoint выбранного провайдера - из LiteLLM.
+`localhost` внутри разных контейнеров не означает один и тот же сервис.
+Топология сети определяется развертыванием, а не этими примерами.
+
+В существующем обычном файле `LITELLM_API_KEY_FILE_HOST` разместите только ключ
+доступа backend к LiteLLM, без `Bearer`, кавычек и YAML. Он должен быть непустым и
+читаемым пользователем `node` в контейнере. Compose монтирует его read-only в
+фиксированный путь `/run/secrets/cmdbdynamicpages_litellm_api_key`; оставьте
+`LITELLM_API_KEY_FILE` равным этому пути. Не создавайте каталог вместо файла.
+Проверка mount без вывода ключа приведена выше в разделе подготовки env.
+
+Текущий backend требует непустой ключ LiteLLM и передает его как
+`Authorization: Bearer ...`. Отсутствие авторизации в vLLM или локальной Ollama
+это требование не отменяет. Ключ задается через secret file или deployment env `LITELLM_API_KEY`,
+не через `RuntimeConfigJson` или пользовательский prompt. Для штатного Compose
+используйте показанный secret-file вариант.
+
+`LITELLM_MODEL` должен совпадать с `model_list[].model_name`, то есть
+`assistant-model`, а не с `hosted_vllm/...`, `openai/...` или `ollama_chat/...`.
+`LITELLM_BASE_URL` содержит API prefix `/v1`; backend сам добавляет
+`chat/completions`. Выбранный в Runtime-настройках
+URL также должен входить в `CMDP_LITELLM_ALLOWED_BASE_URLS`; после изменения
+deployment значений проверьте уже сохраненные значения URL и модели в интерфейсе.
+
+Цепочка имен для любого варианта:
+
+```text
+BFF: LITELLM_MODEL / assistant.llm.model = assistant-model
+  -> LiteLLM: model_list[].model_name = assistant-model
+    -> LiteLLM: litellm_params.model = <адаптер>/<реальная-модель>
+      -> провайдер обслуживает <реальную-модель>
+```
+
+Сохраненные непустые `assistant.llm.baseUrl` и `assistant.llm.model` выбираются
+для текущего технического корня вместо deployment defaults. Изменение `.env` не
+перезаписывает эти настройки. После пересоздания backend перезагрузите Designer
+и явно проверьте/обновите оба поля. При сохранении пустого поля UI подставляет и
+сохраняет текущий default; это не динамическая привязка к будущим изменениям env.
+Даже при работе с Ollama BFF использует
+`https://litellm.internal.example/v1`, а не native URL Ollama. При замене upstream
+за неизменным alias в LiteLLM настройки BFF менять не требуется.
+
+Для private CA используйте существующие `CMDP_TLS_CA_FILE_HOST` и
+`CMDP_TLS_CA_FILE=/run/certs/cmdbdynamicpages-ca.pem`, описанные выше. Этот bundle
+обеспечивает доверие нашего backend к LiteLLM, но не настраивает автоматически
+доверие отдельного процесса LiteLLM к провайдеру. Для обоих переходов отдельно
+проверьте доверие CA, имя в сертификате и сетевую доступность. Не отключайте TLS
+verification. Для vLLM/Ollama без авторизации ограничьте доступ доверенными
+клиентами; production-транспорт должен соответствовать политике контура.
+
+После изменения env или файла ключа пересоздайте только backend:
+
+```bash
+docker compose --env-file .env -f docker-compose.runtime.yml up -d --no-deps --force-recreate cmdbdynamicpages
+```
+
+### 3. Включить Assistant в Designer
+
+В «Runtime-настройки» для нужного технического корня откройте LLM-настройки:
+
+1. Включите «Включить генерацию черновиков LLM для этого технического корня»
+   (`assistant.llm.enabled=true`).
+2. Проверьте «Базовый URL LiteLLM» и «Модель LiteLLM» по примеру выше.
+3. Сохраните runtime-настройки. Для этих изменений перезапуск не нужен.
+
+`CMDP_ASSISTANT_ENABLED` является deprecated/no-op: изменение этой env-переменной
+не включает Assistant. По умолчанию LLM выключен. Таймауты и лимиты имеют
+значения по умолчанию; для первоначального подключения менять их не требуется.
+Если модель отвечает медленно, используйте документированный
+`assistant.mcp.timeoutMs` и согласованные proxy timeout, а не неподдерживаемый
+`CMDP_ASSISTANT_TIMEOUT_MS`.
+
+### 4. Проверить всю цепочку и диагностировать ошибки
+
+Порядок действий оператора: подготовить доступную модель у выбранного провайдера,
+загрузить один из конфигов в LiteLLM, подготовить env и secret mount BFF,
+пересоздать backend при изменении deployment settings, затем включить и сохранить
+LLM в Runtime-настройках. Никакие примеры выше не включают LLM автоматически.
+
+После настройки оператор может выполнить следующий запрос с синтетическим
+текстом из backend container. Команда читает ключ из mounted file и выводит
+только HTTP status и факт наличия ответа, без ключа и текста ответа. Она вызывает
+модель, поэтому подчиняется лимитам и учету запросов шлюза. Проверяются deployment
+URL и модель; отдельно проверьте их совпадение с сохраненными Runtime-настройками.
+Не включайте shell tracing (`set -x`), `curl -v` или вывод секретных файлов.
+
+```bash
+docker compose --env-file .env -f docker-compose.runtime.yml exec -T cmdbdynamicpages node --input-type=module <<'NODE'
+import fs from 'node:fs';
+const key = fs.readFileSync(process.env.LITELLM_API_KEY_FILE, 'utf8').trim();
+if (!key) throw new Error('LiteLLM key file is empty');
+const base = process.env.LITELLM_BASE_URL.replace(/\/+$/, '') + '/';
+const response = await fetch(new URL('chat/completions', base), {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+  body: JSON.stringify({
+    model: process.env.LITELLM_MODEL,
+    messages: [{ role: 'user', content: 'Reply only OK.' }],
+    max_tokens: 16,
+    stream: false
+  }),
+  signal: AbortSignal.timeout(60000)
+});
+const result = await response.json().catch(() => null);
+const replyPresent = Boolean(result?.choices?.[0]?.message?.content);
+console.log(JSON.stringify({ status: response.status, replyPresent }));
+if (!response.ok || !replyPresent) process.exitCode = 1;
+NODE
+```
+
+HTTP 200 и `replyPresent=true` подтверждают базовый маршрут к модели, но не
+качество генерации или готовность всех Assistant/MCP-настроек. Затем в Designer
+выполните одно осознанное тестовое действие Assistant с несекретным описанием и
+проверьте предложение; применять его к рабочему шаблону для проверки связи не нужно.
+
+| Сообщение или симптом | Что проверить |
+| --- | --- |
+| `Template assistant is disabled` | `assistant.llm.enabled` для выбранного технического корня и сохранение runtime-настроек. |
+| `LiteLLM API key is not configured.` | Непустой файл ключа, mount, права чтения и пересоздание backend после изменения секрета. |
+| `LiteLLM API key secret file is invalid.` | На host и в контейнере находится обычный читаемый файл, а не каталог. |
+| `LiteLLM base URL is not allowed by server configuration.` | Совпадение effective URL с server-side allowlist; не расширяйте список произвольными адресами. |
+| HTTP 401/403 | На каком переходе отказ: ключ BFF и доступ к alias в LiteLLM либо upstream key и права у провайдера/proxy. Ключи двух переходов различаются. |
+| Неизвестная модель, HTTP 400/404 | Effective модель BFF совпадает с `model_name`; суффикс после адаптера совпадает с реальной моделью провайдера; у OpenAI есть API-доступ, а нужный tag Ollama подготовлен. HTTP 404 может означать неверный URL/prefix, а не имя модели. |
+| DNS error, connection refused, timeout/504 | Доступность endpoint из вызывающего контейнера, сеть/firewall, состояние модели и согласованные timeout. |
+| TLS certificate error | CA bundle и имя в сертификате на соответствующем переходе; не отключайте проверку TLS и не используйте `--insecure`. |
+| HTTP 200, но Assistant отклоняет ответ | Возможность модели возвращать требуемый JSON/структуру, контекст, лимит генерации и диагностику конкретного этапа; успешный транспорт не подтверждает корректность предложения. |
+| Smoke-запрос получил HTTP 200, но `replyPresent=false` | Проверить формат ответа и бюджет генерации: `max_tokens: 16` в коротком smoke может не хватить reasoning-модели. Это не равнозначно сетевой ошибке; адаптировать тестовый бюджет под модель, не ослабляя проверку результата Assistant. |
+| После изменения `.env` используется прежняя модель/URL | Проверить сохраненные `assistant.llm.model` / `assistant.llm.baseUrl` нужного технического корня и факт пересоздания backend после изменения env. |
+
+Для сопоставления с логами используйте Request ID нашего backend и отдельные
+логи LiteLLM/провайдера. Не публикуйте cookie CMDBuild, API keys, Authorization headers
+или полные payload в заявках и operational logs.
+
 ## Проверка compose template
 
 ```bash
