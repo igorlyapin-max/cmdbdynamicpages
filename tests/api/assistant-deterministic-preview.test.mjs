@@ -985,8 +985,11 @@ test('Object Flow uses a template prompt override from currentSpec and falls bac
   assert.equal(backend.exitCode, null);
 });
 
-test('LiteLLM timeout follows the configured MCP timeout', async (t) => {
-  const llm = await startLiteLlmStub(t, { flow: {}, delayMs: 1200 });
+for (const [phase, responseOptions] of [
+  ['headers', { flow: {}, delayMs: 1200 }],
+  ['body', { streamResponse: { contentBytes: 4, chunkBytes: 1, delayMs: 400 } }]
+]) test(`LiteLLM timeout follows the configured MCP timeout during ${phase}`, async (t) => {
+  const llm = await startLiteLlmStub(t, responseOptions);
   const mock = await startMockCmdbuild(t, {
     configCards: [{
       _id: 1,
@@ -1004,7 +1007,8 @@ test('LiteLLM timeout follows the configured MCP timeout', async (t) => {
   const backendPort = await freePort();
   const backend = await startBackend(t, backendPort, mock.origin, {
     LITELLM_API_KEY: 'unit-test-key',
-    CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin
+    CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin,
+    CMDP_LOG_LEVEL: 'info'
   });
   const backendOrigin = `http://127.0.0.1:${backendPort}`;
   const cookie = 'CMDBuild-Authorization=litellm-timeout-token';
@@ -1026,8 +1030,93 @@ test('LiteLLM timeout follows the configured MCP timeout', async (t) => {
   assert.equal(response.statusCode, 504, response.body);
   assert.equal(response.json.code, 'assistant_timeout');
   assert.match(response.json.message, /timed out after 1000ms/);
+  assert.match(response.json.message, /assistant\.mcp\.timeoutMs/);
+  assert.equal(response.json.diagnostics.limits[0].settingPath, 'assistant.mcp.timeoutMs');
+  assert.equal(response.json.diagnostics.limits[0].effectiveLimit, 1000);
+  assert.equal(response.json.diagnostics.limits[0].stage, 'semanticPlan');
+  assert.equal(response.json.diagnostics.limits[0].timeout, true);
+  assert.ok(response.json.diagnostics.limits[0].elapsedMs >= 850);
+  assert.match(response.json.feedback.action, /Тайм-аут MCP/);
+  assert.match(backend.testOutput, /assistant\.litellm\.timeout/);
+  assert.match(backend.testOutput, /"timeoutMs":1000/);
+  assert.doesNotMatch(backend.testOutput, /unit-test-key|litellm-timeout-token/);
   assert.ok(Date.now() - startedAt >= 850, 'LiteLLM request was cancelled before the configured timeout');
   assert.equal(backend.exitCode, null);
+});
+
+test('semantic plan directly resolves an explicit class beyond the bounded catalog and sends its fields to LiteLLM', async (t) => {
+  const className = 'Technical_Network';
+  const llm = await startLiteLlmStub(t, { responses: [{ version: 1, blocks: [{
+    id: 'block-1', name: 'Networks', summary: 'Networks', dependencies: [],
+    resultContract: { outputKind: 'sourceCards', outputClass: className }, warnings: []
+  }], warnings: [] }] });
+  const mock = await startMockCmdbuild(t, {
+    classes: [{ name: 'OtherClass', description: className, _description_translation: 'Other localized' }, { name: className, description: 'Networks' }, { name: 'Oversized_Asset', description: 'Large metadata' }],
+    attributesByClass: {
+      [className]: [{ name: 'NetworkValue', type: 'string', _can_read: true }],
+      Oversized_Asset: [{ name: 'ImportantField', description: 'x'.repeat(40 * 1024), type: 'string', _can_read: true }]
+    },
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true,
+      RuntimeConfigJson: JSON.stringify({ assistant: {
+        llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' },
+        mcp: { maxClasses: 1, timeoutMs: 10000, maxContextBytes: 32768 }
+      } }) }]
+  });
+  const backendPort = await freePort();
+  await startBackend(t, backendPort, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const origin = `http://127.0.0.1:${backendPort}`;
+  const cookie = testCmdbuildAuthorizationCookie('explicit-class-lookup');
+  const csrf = await requestJson('GET', `${origin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const response = await requestJson('POST', `${origin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+    templateCode: '', baseSpecHash: '', currentSpec: { version: 1, steps: [], result: { tables: [] } },
+    intent: objectFlowIntentFromText(`Выбрать все карточки класса ${className}.`, {
+      name: 'Networks', entities: `класс ${className}`, expectedResult: `Список карточек класса ${className}.`
+    })
+  }, { cookie, origin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json.semanticPlan.blocks[0].resultContract.outputClass, className);
+  assert.ok(mock.requests.some((item) => item.pathname === `/cmdbuild/services/rest/v3/classes/${className}`));
+  assert.ok(mock.requests.some((item) => item.pathname === `/cmdbuild/services/rest/v3/classes/${className}/attributes`));
+  assert.ok(llm.lastRequest.messages.some((item) => item.content.includes('NetworkValue')));
+  assert.equal(response.json.diagnostics.mcp.classLookups[0].status, 'found');
+  assert.equal(response.json.diagnostics.mcp.semanticContext.complete, true);
+  const incomplete = await requestJson('POST', `${origin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+    templateCode: '', baseSpecHash: '', currentSpec: { version: 1, steps: [], result: { tables: [] } },
+    intent: objectFlowIntentFromText(`Выбрать карточки класса "OtherClass and ${className}".`, {
+      name: 'Both networks', entities: `класс "OtherClass and ${className}"`, expectedResult: 'Карточки обоих классов.'
+    })
+  }, { cookie, origin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
+  assert.equal(incomplete.statusCode, 422, incomplete.body);
+  assert.equal(incomplete.json.errors[0].kind, 'semanticPlanContextIncomplete');
+  assert.equal(incomplete.json.errors[0].reason, 'maxClasses');
+  assert.equal(incomplete.json.errors[0].requiredCount, 2);
+  assert.equal(incomplete.json.feedback.code, 'semanticPlanContextIncomplete');
+  assert.equal(incomplete.json.feedback.params.settingPath, 'assistant.mcp.maxClasses');
+  assert.equal(llm.requests, 1, 'required context overflow must stop before LiteLLM');
+  const tooLarge = await requestJson('POST', `${origin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+    templateCode: '', baseSpecHash: '', currentSpec: { version: 1, steps: [], result: { tables: [] } },
+    intent: objectFlowIntentFromText('Выбрать все карточки класса Oversized_Asset.', {
+      name: 'Large metadata', entities: 'класс Oversized_Asset', expectedResult: 'Карточки класса Oversized_Asset.'
+    })
+  }, { cookie, origin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
+  assert.equal(tooLarge.statusCode, 422, tooLarge.body);
+  assert.equal(tooLarge.json.errors[0].reason, 'maxContextBytes');
+  assert.equal(tooLarge.json.feedback.params.settingPath, 'assistant.mcp.maxContextBytes');
+  assert.equal(llm.requests, 1, 'required byte overflow must stop before LiteLLM');
+  const rejected = await requestJson('POST', `${origin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+    templateCode: '', baseSpecHash: '', currentSpec: { version: 1, steps: [], result: { tables: [] } },
+    intent: objectFlowIntentFromText('Выбрать все карточки класса Missing_Network.', {
+      name: 'Networks', entities: 'класс Missing_Network', expectedResult: 'Список карточек класса Missing_Network.'
+    })
+  }, { cookie, origin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
+  assert.equal(rejected.statusCode, 422, rejected.body);
+  assert.equal(rejected.json.errors[0].reason, 'descriptionUnverified');
+  assert.equal(rejected.json.errors[0].lookup.statusCode, 404);
+  assert.equal(rejected.json.errors[0].lookup.status, 'nameNotFound');
+  assert.ok(rejected.json.diagnostics.mcp.classCatalog);
+  assert.ok(rejected.json.diagnostics.mcp.limits.some((item) => item.limitName === 'maxClasses' && item.limitHit));
+  assert.doesNotMatch(rejected.json.feedback.causes[0].message, /class Code/);
+  assert.equal(llm.requests, 1, 'unverified class is rejected before invoking LiteLLM');
 });
 
 test('D2 mapping timeout identifies the deterministic mapping phase', async (t) => {
@@ -1204,6 +1293,9 @@ test('semantic-plan retry resumes the LLM stage from a saved MCP context after a
   assert.equal(firstPlan.json.retryable, true);
   assert.equal(firstPlan.json.resume.resumeId, body.resumeId);
   assert.equal(firstPlan.json.resume.stage, 'mcpContextReady');
+  assert.match(firstPlan.json.feedback.action, /MCP-контекст сохранен/);
+  assert.equal(firstPlan.json.diagnostics.limits[0].effectiveLimit, 1000);
+  assert.ok(firstPlan.json.diagnostics.mcp);
 
   const retriedPlan = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, { ...body, stage: 'plan' }, headers, 5000);
   assert.equal(retriedPlan.statusCode, 200, retriedPlan.body);
@@ -7995,7 +8087,8 @@ async function startMockCmdbuild(t, options = {}) {
     }
     if (requestUrl.pathname === '/cmdbuild/services/rest/v3/classes') {
       sendJson(res, 200, {
-        data: classFixtures
+        data: paginate(requestUrl, classFixtures),
+        meta: { total: classFixtures.length }
       });
       return;
     }
@@ -8521,6 +8614,7 @@ async function startBackend(t, port, cmdbuildOrigin, envOverrides = {}) {
     stdio: ['ignore', 'pipe', 'pipe']
   });
   let output = '';
+  Object.defineProperty(child, 'testOutput', { get: () => output });
   child.stdout.on('data', (chunk) => {
     output += chunk.toString('utf8');
   });

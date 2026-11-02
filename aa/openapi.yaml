@@ -536,6 +536,10 @@ paths:
                   - $ref: "#/components/schemas/InputCollectionLimitError"
         "422":
           description: Семантический план не прошёл детерминированную проверку
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantSemanticPlanErrorResponse"
         "429":
           description: Достигнут лимит выполнения операций редактирования
         "502":
@@ -544,6 +548,10 @@ paths:
           description: Assistant выключен либо LiteLLM не настроен
         "504":
           description: Превышен таймаут этапа семантического плана; выполнение можно продолжить
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssistantSemanticPlanErrorResponse"
   /cmdbuild/custom-api/draft/object-flow/apply:
     post:
       x-flow-id: OAPI18
@@ -4707,6 +4715,51 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/AssistantDiagramIssue"
+    AssistantSemanticPlanErrorResponse:
+      type: object
+      additionalProperties: true
+      required: [success, code, message, errors, diagnostics, retryable]
+      properties:
+        success:
+          type: boolean
+          enum: [false]
+        code:
+          type: string
+        message:
+          type: string
+        errors:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        diagnostics:
+          type: object
+          additionalProperties: true
+          description: >
+            Диагностика доступности и полноты MCP-каталога, адресных проверок классов
+            и сработавших ограничений. Для локального таймаута limits содержит
+            settingPath, rawConfigured, effectiveLimit, elapsedMs и stage.
+            Пустые или неизвестные сведения не доказывают полноту каталога.
+        feedback:
+          type: object
+          nullable: true
+          additionalProperties: true
+          properties:
+            code:
+              type: string
+              description: Стабильный код локализуемой диагностики, включая semanticPlanContextIncomplete.
+            params:
+              type: object
+              additionalProperties: true
+              description: >
+                Параметры сообщения: пользовательский блок, основание привязки,
+                причина, settingPath, requiredCount и effectiveLimit.
+        retryable:
+          type: boolean
+        resume:
+          type: object
+          nullable: true
+          additionalProperties: true
     AssistantDiagramErrorResponse:
       type: object
       additionalProperties: true

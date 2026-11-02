@@ -2644,6 +2644,81 @@ test('Assistant explains a predicate erroneously added to an independent Semanti
   });
 });
 
+for (const language of ['ru', 'en']) {
+  test(`Assistant localizes structured limit and class feedback in ${language} without saving`, { skip: skipReason }, async () => {
+    await withPage(async (page) => {
+      const writes = [];
+      await page.route('**/cmdbuild/custom-api/**', async (route) => {
+        if (!['GET', 'HEAD'].includes(route.request().method())) {
+          writes.push(route.request().url());
+          await route.abort('blockedbyclient');
+          return;
+        }
+        await route.fallback();
+      });
+      let feedback;
+      let retryable = false;
+      await page.route('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*', async (route) => {
+        const body = route.request().postDataJSON();
+        await route.fulfill({ status: retryable ? 504 : 422, json: {
+          success: false, code: retryable ? 'assistant_timeout' : 'assistant_semantic_plan_invalid',
+          retryable, feedback,
+          ...(retryable ? { resume: { resumeId: body.resumeId, stage: 'mcpContextReady' } } : { errors: [] })
+        } });
+      });
+      await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+      await page.waitForSelector('#cmdp-designer-menu', { timeout: 10_000 });
+      await page.locator('#cmdp-language').selectOption(language);
+      await page.locator('button[data-action="new-template"]').click();
+      await page.locator('a[data-designer-section="assistant"]').click();
+      await addAssistantBusinessBlock(page, { name: 'Network result', description: 'Select Network.' });
+      const rejected = page.locator('[data-assistant-flow-rejected]');
+      const checkFeedback = async (expected) => {
+        await page.locator('button[data-action="assistant-flow-prepare"]').click();
+        await rejected.waitFor({ state: 'visible', timeout: 10_000 });
+        await page.waitForFunction(() => document.querySelector('#cmdp-assistant-object-flow')?.getAttribute('aria-busy') === 'false');
+        const text = await rejected.innerText();
+        assert.match(text, expected);
+        assert.doesNotMatch(text, /SERVER HUMAN TEXT/);
+        assert.doesNotMatch(await page.locator('.notice').first().innerText(), /SERVER HUMAN TEXT/);
+        const box = await rejected.boundingBox();
+        assert.ok(box && box.width > 0 && box.height > 0);
+        assert.equal(await page.locator('button[data-action="assistant-flow-generate"]').isDisabled(), true);
+        assert.equal(await page.locator('button[data-action="assistant-flow-apply"]').isDisabled(), true);
+        return text;
+      };
+      for (const reason of ['maxClasses', 'maxContextBytes', 'timeout', 'missingFields', 'missingMetadata']) {
+        const settingPath = reason === 'timeout' ? 'assistant.mcp.timeoutMs' : ['maxClasses', 'maxContextBytes'].includes(reason) ? `assistant.mcp.${reason}` : '';
+        feedback = { code: 'semanticPlanContextIncomplete', params: {
+          blockName: 'Network result', classNames: ['Network', 'CustomClass'], reason, settingPath, requiredCount: 23, effectiveLimit: 10
+        }, summary: 'SERVER HUMAN TEXT', action: 'SERVER HUMAN TEXT' };
+        const text = await checkFeedback(language === 'en' ? /metadata.*incomplete/ : /метаданные.*неполны/);
+        for (const value of ['Network result', 'Network, CustomClass', '23', '10', settingPath].filter(Boolean)) assert.ok(text.includes(value), text);
+        if (language === 'en') assert.doesNotMatch(text, /[А-Яа-яЁё]/);
+      }
+      for (const reason of ['permission', 'timeout', 'maxClasses', 'maxContextBytes', 'toolNotAllowed', 'incomplete', 'descriptionUnverified', 'nameNotFound', 'absent']) {
+        feedback = { code: 'semanticPlanClassUnavailable', params: {
+          blockName: 'Network result', className: 'CustomClass', reason, fetched: 50, visible: 45,
+          settingPath: reason === 'timeout' ? 'assistant.mcp.timeoutMs' : ['maxClasses', 'maxContextBytes'].includes(reason) ? `assistant.mcp.${reason}` : ''
+        }, summary: 'SERVER HUMAN TEXT', action: 'SERVER HUMAN TEXT' };
+        const text = await checkFeedback(/CustomClass/);
+        assert.ok(text.includes('Network result'));
+        if (reason === 'absent') assert.match(text, language === 'en' ? /complete visible catalog/ : /полном доступном каталоге/);
+        else assert.doesNotMatch(text, language === 'en' ? /Correct the class name/ : /Исправьте имя класса/);
+        if (language === 'en') assert.doesNotMatch(text, /[А-Яа-яЁё]/);
+      }
+      retryable = true;
+      feedback = { code: 'assistant_timeout', params: { effectiveLimit: 10000, settingPath: 'assistant.mcp.timeoutMs', stage: 'semanticPlan' }, summary: 'SERVER HUMAN TEXT', action: 'SERVER HUMAN TEXT' };
+      const text = await checkFeedback(/assistant\.mcp\.timeoutMs = 10000/);
+      assert.match(text, language === 'en' ? /MCP context was saved; retry will reuse it/ : /MCP-контекст сохранен/);
+      assert.match(text, language === 'en' ? /Semantic plan is paused/ : /Семантический план приостановлен/);
+      if (language === 'en') assert.doesNotMatch(text, /[А-Яа-яЁё]/);
+      assert.equal(await page.locator('button[data-action="assistant-flow-prepare-retry"]').isVisible(), true);
+      assert.deepEqual(writes, []);
+    });
+  });
+}
+
 test('Assistant retries a timed-out semantic plan from the saved MCP stage', { skip: skipReason }, async () => {
   await withPage(async (page) => {
     await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
@@ -4932,6 +5007,37 @@ test('Runtime subtable sorting stays local to each rendered group', { skip: skip
     groups.forEach((group) => {
       assert.deepEqual(group, sortedValues(group, 'desc'));
     });
+  });
+});
+
+test('Assistant timeout preserves the triggering setting and checkpoint feedback', { skip: skipReason, timeout: 60_000 }, async () => {
+  await withPage(async (page) => {
+    await page.route('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*', async (route) => {
+      const body = route.request().postDataJSON();
+      if (body.stage === 'context') {
+        await route.fulfill({ status: 202, json: { success: true, checkpoint: { resumeId: body.resumeId, stage: 'mcpContextReady' } } });
+        return;
+      }
+      await route.fulfill({ status: 504, json: {
+        success: false, code: 'assistant_timeout', retryable: true,
+        resume: { resumeId: body.resumeId, stage: 'mcpContextReady' },
+        diagnostics: { limits: [{ settingPath: 'assistant.mcp.timeoutMs', effectiveLimit: 10000, timeout: true }] },
+        feedback: {
+          summary: 'Ожидание ответа LiteLLM прервано: сработал лимит 10000 мс.',
+          action: 'Измените «Тайм-аут MCP, мс» в Runtime-настройках (assistant.mcp.timeoutMs). MCP-контекст сохранен.',
+          causes: [{ kind: 'assistant_timeout', message: 'Достигнут assistant.mcp.timeoutMs = 10000 мс.' }]
+        }
+      } });
+    });
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.locator('button[data-action="new-template"]').click();
+    await page.locator('a[data-designer-section="assistant"]').click();
+    await addAssistantBusinessBlock(page, { name: 'Networks', description: 'Выбрать все карточки класса ipRange.' });
+    await page.locator('button[data-action="assistant-flow-prepare"]').click();
+    await page.waitForFunction(() => document.body.textContent.includes('MCP-контекст сохранен.'));
+    assert.match(await page.locator('#cmdp-assistant-editor').innerText(), /assistant\.mcp\.timeoutMs/);
+    assert.match(await page.locator('#cmdp-assistant-editor').innerText(), /10000 мс/);
+    assert.ok(await page.locator('button[data-action="assistant-flow-prepare-retry"]').isVisible());
   });
 });
 

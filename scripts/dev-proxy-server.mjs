@@ -232,7 +232,7 @@ const DEFAULT_ASSISTANT_LLM_MAX_REQUEST_BYTES = Math.min(512 * 1024, ASSISTANT_L
 const DEFAULT_ASSISTANT_LLM_MAX_RESPONSE_BYTES = Math.min(1024 * 1024, ASSISTANT_LLM_MAX_RESPONSE_BYTES_ABSOLUTE);
 const DEFAULT_ASSISTANT_SYSTEM_PROMPT = [
   'Этот prompt задаёт только семантику CMDBuild. Он не задаёт синтаксис DSL, типы шагов, JSON-контракт или порядок операций: их определяет специализированный prompt текущей задачи.',
-  'Пользователь может называть CMDBuild классы, атрибуты, lookup значения и связи по Name, Description, Code, Alias или терминам из Help. При неоднозначности используй permission-filtered MCP context и предпочитай точное совпадение Name, затем Description, затем Code. Alias и Help являются дополнительными семантическими доказательствами, но не заменяют подтвержденный CMDBuild identifier. Частичное совпадение допустимо только как явно отмеченный fallback при отсутствии точного совпадения в доступном context.',
+  'Класс CMDBuild определяется техническим именем metadata.name или точным исходным либо переведенным Description. Code является атрибутом карточки, а не именем класса. Для классов предпочитай точное name, затем точное Description; частичные совпадения предлагай только для уточнения, не подставляй автоматически. Атрибуты, lookup значения и связи подтверждай по их собственным метаданным. Alias и Help помогают понять задачу, но не заменяют подтвержденный identifier.',
   'Не отождествляй название класса с названием атрибута. Перед выбором поля проверь его тип и принадлежность выбранному классу в MCP context.',
   'Пользовательские формулировки могут ссылаться на атрибуты напрямую, на связи через domains, на reference-поля и на lookup-поля. Для lookup, reference и domain пользователь обычно оперирует отображаемым значением или Description связанного объекта, а не внутренним id. Не сравнивай такие поля как raw id, если модель предоставляет человекочитаемое значение.',
   'Связи между объектами могут быть 1:N, N:1 и N:N. Анализируй все подходящие related cards и подтвержденные paths в пределах видимых настроенных лимитов. Учитывай domain суперклассов и разрешённые типы объектов на другой стороне связи.',
@@ -245,7 +245,7 @@ const DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT = [
   'Контракт результата семантического плана обязателен. Если outputKind равен sourceCards, publishedAlias обязан содержать только карточки outputClass. Фраза «Список <основного класса>» означает sourceCards: другой результат может быть только условием отбора, либо через existsRelated по подтвержденному domain, либо через source-driven сравнение атрибутов; он не становится отдельными строками или столбцами результата. Если пользователь явно просит пары или поля связанных объектов, используй relationPairs с двумя явно выбранными endpoint-блоками. Не подставляй широкий класс вместо отсутствующего endpoint-блока.',
   'Для union/difference/intersect используй явные ключи on. Для CMDB-карточек используй Class + _id; не сравнивай label или Description как идентичность карточки. publishedAlias указывает один materialized alias для таблицы, а узлы и рёбра диаграммы остаются отдельными mapping sources.',
   'Если CMDBuild-выборку необходимо сузить значением из уже выбранной строки, это оформляется явно в самой выборке: from и rule.valueColumn. Не добавляй из match неявные фильтры, deduplication или source dependency. Не выполняй широкое сканирование, если пользователь запросил точную связанную карточку или значение.',
-  'Проверяй Code и Description по permission-filtered MCP context. Не выдумывай class, attribute, domain, alias или relation identifier. Для «связанных объектов», domain и relation используй только подтвержденную operation relation; endpoint domain может быть суперклассом, если target class указан среди разрешенных потомков. Никогда не заменяй domain relation выдуманным reference-атрибутом или match. Lookup, reference и domain сравнивай по отображаемому значению или Description, если это поддерживается моделью, а не по raw id.',
+  'Проверяй техническое имя класса metadata.name и исходный либо переведенный Description по permission-filtered MCP context; карточный Code не является именем класса. Не выдумывай class, attribute, domain, alias или relation identifier. Для «связанных объектов», domain и relation используй только подтвержденную operation relation; endpoint domain может быть суперклассом, если target class указан среди разрешенных потомков. Никогда не заменяй domain relation выдуманным reference-атрибутом или match. Lookup, reference и domain сравнивай по отображаемому значению или Description, если это поддерживается моделью, а не по raw id.',
   'Связи 1:N, N:1 и N:N требуют анализа всех доступных связанных карточек и всех hops. Не выбирай первую попавшуюся связь. При неоднозначности верни warning и оставь только подтверждённый deterministic path.',
   'Не используй неограниченные отрицательные выборки как «всё, что не относится к ИС». Для динамической группы или выборки нужен положительный ограниченный критерий: class, attribute, lookup/reference value или явный relation path.',
   'Ты возвращаешь только typed ObjectFlowProposal, не Spec JSON, не D2 source, не runtime результат и не действие сохранения, публикации или выполнения.'
@@ -10114,6 +10114,36 @@ function dynamicPagesClientScript() {
       assistantRetrySemanticPlan: 'Retry saved LLM stage',
       assistantRetryFlowPlan: 'Retry flow generation',
       assistantSemanticPlanPaused: 'Semantic plan is paused.',
+      assistantFeedbackTimeoutSummary: 'Waiting for LiteLLM stopped at the local limit of {effectiveLimit} ms.',
+      assistantFeedbackTimeoutCause: '{settingPath} = {effectiveLimit} ms at stage {stage}. This is a local waiting limit, not a confirmed LiteLLM failure.',
+      assistantFeedbackTimeoutAction: 'Change MCP timeout in Runtime settings ({settingPath}) and retry.',
+      assistantFeedbackCheckpoint: 'MCP context was saved; retry will reuse it.',
+      assistantFeedbackClassSummary: 'Semantic plan is not ready: class “{className}” in “{blockName}” could not be verified.',
+      assistantFeedbackClassCause: 'Class verification: {reasonText}. Classes read: {fetched}; visible: {visible}. This does not confirm that the class is absent.',
+      assistantFeedbackClassAbsent: 'Class “{className}” in “{blockName}” was not found in the complete visible catalog.',
+      assistantFeedbackClassAbsentAction: 'Correct the class name in this block. No nearest-match substitution is made.',
+      assistantFeedbackClassDescription: 'Description could not be verified in the incomplete catalog. This does not confirm that the class is absent.',
+      assistantFeedbackSettingEvidence: 'Reached setting: {settingPath} = {effectiveLimit}.',
+      assistantFeedbackClassDescriptionAction: 'Provide the technical class name or complete Description verification before changing the block description.',
+      assistantFeedbackClassNameNotFound: 'Technical class name “{className}” was not found. Description matching is not confirmed; this does not prove absence.',
+      assistantFeedbackClassAmbiguous: 'Class “{className}” in “{blockName}” is ambiguous. Candidates: {candidates}.',
+      assistantFeedbackClassAmbiguousAction: 'Specify the technical name of the intended class.',
+      assistantFeedbackClassMismatch: 'Block “{blockName}” must use class “{expectedClassName}”, but Assistant returned “{actualClassName}”.',
+      assistantFeedbackClassMismatchAction: 'Prepare the plan again. The confirmed class binding is required; the draft is unchanged.',
+      assistantFeedbackContextSummary: 'Semantic plan is not ready: metadata for “{blockName}” is incomplete.',
+      assistantFeedbackContextCause: '{reasonText}. Classes: {classNames}. Required classes: {requiredCount}; effective setting value: {effectiveLimit}. Setting: {settingPath}.',
+      assistantFeedbackLimitAction: 'Check Runtime setting {settingPath}, adjust the reached limit and retry.',
+      assistantFeedbackMetadataAction: 'Check CMDBuild metadata access and allowed MCP tools, then retry. Do not change the block description before verification completes.',
+      assistantFeedbackPermissionAction: 'Check access to the class and its attributes for the current CMDBuild user and role.',
+      assistantFeedbackReason_permission: 'CMDBuild denied metadata access',
+      assistantFeedbackReason_timeout: 'metadata verification exceeded the time budget',
+      assistantFeedbackReason_maxClasses: 'the class count limit was reached',
+      assistantFeedbackReason_maxContextBytes: 'the context size limit was reached',
+      assistantFeedbackReason_maxReferencePathDepth: 'the reference path depth limit was reached',
+      assistantFeedbackReason_missingFields: 'required class fields are missing',
+      assistantFeedbackReason_missingMetadata: 'required class metadata is missing',
+      assistantFeedbackReason_toolNotAllowed: 'the required MCP tool is not allowed',
+      assistantFeedbackReason_incomplete: 'metadata verification is incomplete',
       assistantSemanticPlanRetryReady: 'CMDB context was saved. Retry will continue from the LLM stage.',
       assistantSemanticPlanRetryUnknown: 'The request was interrupted. Retry will reuse saved CMDB context when it is available.',
       assistantFlowPlanPaused: 'Flow generation is paused.',
@@ -10234,7 +10264,7 @@ function dynamicPagesClientScript() {
       assistantMcpMaxContextBytes: 'MCP context limit, bytes',
       assistantMcpMaxContextBytesHelp: 'Maximum CMDBuild model context passed to Assistant.',
       assistantMcpTimeoutMs: 'MCP timeout, ms',
-      assistantMcpTimeoutMsHelp: 'Maximum wait time for one MCP request.',
+      assistantMcpTimeoutMsHelp: 'Time budget for MCP context collection and maximum wait for each LiteLLM request, including its response body.',
       assistantMcpMaxClasses: 'MCP class limit',
       assistantMcpMaxClassesHelp: 'Maximum visible CMDBuild classes read for assistant context.',
       assistantMcpMaxDomains: 'MCP domain limit',
@@ -11354,6 +11384,36 @@ function dynamicPagesClientScript() {
       assistantRetrySemanticPlan: 'Повторить сохраненный этап LLM',
       assistantRetryFlowPlan: 'Повторить формирование потока',
       assistantSemanticPlanPaused: 'Семантический план приостановлен.',
+      assistantFeedbackTimeoutSummary: 'Ожидание ответа LiteLLM прервано: локальный лимит {effectiveLimit} мс.',
+      assistantFeedbackTimeoutCause: '{settingPath} = {effectiveLimit} мс на этапе {stage}. Это локальный лимит ожидания, а не подтвержденная ошибка LiteLLM.',
+      assistantFeedbackTimeoutAction: 'Измените тайм-аут MCP в Runtime-настройках ({settingPath}) и повторите запрос.',
+      assistantFeedbackCheckpoint: 'MCP-контекст сохранен; продолжение использует его повторно.',
+      assistantFeedbackClassSummary: 'Семантический план не подготовлен: для «{blockName}» не удалось проверить класс «{className}».',
+      assistantFeedbackClassCause: 'Проверка класса: {reasonText}. Прочитано классов: {fetched}, доступно: {visible}. Это не подтверждает отсутствие класса.',
+      assistantFeedbackClassAbsent: 'Класс «{className}» в «{blockName}» не найден в полном доступном каталоге.',
+      assistantFeedbackClassAbsentAction: 'Исправьте имя класса в этом блоке. Подмена ближайшим совпадением не выполняется.',
+      assistantFeedbackClassDescription: 'Description не проверен в неполном каталоге. Это не подтверждает отсутствие класса.',
+      assistantFeedbackSettingEvidence: 'Сработавшая настройка: {settingPath} = {effectiveLimit}.',
+      assistantFeedbackClassDescriptionAction: 'Укажите техническое имя класса или завершите проверку Description до изменения описания блока.',
+      assistantFeedbackClassNameNotFound: 'Техническое имя класса «{className}» не найдено. Соответствие Description не подтверждено; отсутствие класса не доказано.',
+      assistantFeedbackClassAmbiguous: 'Класс «{className}» в «{blockName}» неоднозначен. Кандидаты: {candidates}.',
+      assistantFeedbackClassAmbiguousAction: 'Укажите техническое имя нужного класса.',
+      assistantFeedbackClassMismatch: 'Блок «{blockName}» должен использовать класс «{expectedClassName}», но Assistant вернул «{actualClassName}».',
+      assistantFeedbackClassMismatchAction: 'Подготовьте план повторно. Подтвержденное соответствие класса обязательно; черновик не изменен.',
+      assistantFeedbackContextSummary: 'Семантический план не подготовлен: метаданные для «{blockName}» неполны.',
+      assistantFeedbackContextCause: '{reasonText}. Классы: {classNames}. Обязательных классов: {requiredCount}; действующее значение настройки: {effectiveLimit}. Настройка: {settingPath}.',
+      assistantFeedbackLimitAction: 'Проверьте Runtime-настройку {settingPath}, измените сработавший лимит и повторите запрос.',
+      assistantFeedbackMetadataAction: 'Проверьте доступ к метаданным CMDBuild и разрешенные инструменты MCP; повторите запрос. Не меняйте описание блока до завершения проверки.',
+      assistantFeedbackPermissionAction: 'Проверьте доступ к классу и его атрибутам под текущим пользователем и ролью CMDBuild.',
+      assistantFeedbackReason_permission: 'CMDBuild запретил чтение метаданных',
+      assistantFeedbackReason_timeout: 'проверка метаданных превысила временной бюджет',
+      assistantFeedbackReason_maxClasses: 'достигнут лимит количества классов',
+      assistantFeedbackReason_maxContextBytes: 'достигнут лимит размера контекста',
+      assistantFeedbackReason_maxReferencePathDepth: 'достигнут лимит глубины reference-пути',
+      assistantFeedbackReason_missingFields: 'отсутствуют обязательные поля класса',
+      assistantFeedbackReason_missingMetadata: 'отсутствуют обязательные метаданные класса',
+      assistantFeedbackReason_toolNotAllowed: 'не разрешен необходимый инструмент MCP',
+      assistantFeedbackReason_incomplete: 'проверка метаданных не завершена',
       assistantSemanticPlanRetryReady: 'Контекст CMDB сохранен. Повтор продолжит работу с этапа LLM.',
       assistantSemanticPlanRetryUnknown: 'Запрос был прерван. Повтор использует сохраненный CMDB context, когда он доступен.',
       assistantFlowPlanPaused: 'Формирование потока приостановлено.',
@@ -11474,7 +11534,7 @@ function dynamicPagesClientScript() {
       assistantMcpMaxContextBytes: 'Лимит контекста MCP, байт',
       assistantMcpMaxContextBytesHelp: 'Максимальный объем контекста модели CMDBuild, передаваемый Ассистенту.',
       assistantMcpTimeoutMs: 'Тайм-аут MCP, мс',
-      assistantMcpTimeoutMsHelp: 'Максимальное время ожидания одного обращения к MCP.',
+      assistantMcpTimeoutMsHelp: 'Бюджет сбора MCP-контекста и максимальное ожидание каждого запроса LiteLLM, включая получение тела ответа.',
       assistantMcpMaxClasses: 'Лимит классов MCP',
       assistantMcpMaxClassesHelp: 'Максимум видимых классов CMDBuild, читаемых для контекста Ассистента.',
       assistantMcpMaxDomains: 'Лимит доменов MCP',
@@ -14356,6 +14416,11 @@ function dynamicPagesClientScript() {
 
   function renderNotice(message) {
     if (!message || !message.text) return '';
+    var flowFeedback = state.assistantFlowFeedback;
+    if (flowFeedback && (message.text === flowFeedback.summary || message.text === flowFeedback.action)) {
+      var localized = localizeAssistantSemanticPlanFeedback(flowFeedback);
+      message = Object.assign({}, message, { text: message.text === flowFeedback.summary ? localized.summary : localized.action });
+    }
     var error = message.type === 'error';
     return '<div class="notice ' + escapeHtml(message.type || '') + '"' + (error ? ' role="alert" aria-live="assertive"' : ' aria-live="polite"') + '>' + escapeHtml(message.text) + '</div>';
   }
@@ -17877,7 +17942,7 @@ function dynamicPagesClientScript() {
       + (proposal.selections || []).map(function (selection) { return '<li>' + escapeHtml(selection.name + ': ' + selection.className) + '</li>'; }).join('')
       + (proposal.operations || []).map(function (operation) { return '<li>' + escapeHtml(operation.type + ': ' + (operation.domain || operation.from || '')) + '</li>'; }).join('')
       + '</ul></div>' : '';
-    var feedback = state.assistantFlowFeedback && typeof state.assistantFlowFeedback === 'object' ? state.assistantFlowFeedback : null;
+    var feedback = localizeAssistantSemanticPlanFeedback(state.assistantFlowFeedback);
     var semanticPlanRetryAvailable = Boolean(state.assistantFlowResume && state.assistantFlowResume.retryable && state.assistantFlowResume.retryStage !== 'flowDraft');
     var flowPlanRetryAvailable = Boolean(state.assistantFlowResume && state.assistantFlowResume.retryable && state.assistantFlowResume.retryStage === 'flowDraft');
     var retryAvailable = semanticPlanRetryAvailable || flowPlanRetryAvailable;
@@ -29721,15 +29786,53 @@ function dynamicPagesClientScript() {
       && resume.specFingerprint === assistantRequestSpecFingerprint(spec));
   }
 
-  function setAssistantSemanticPlanRetryState(resume, diagnostics, checkpointConfirmed) {
+  function localizeAssistantSemanticPlanFeedback(feedback) {
+    if (!feedback || typeof feedback !== 'object') return null;
+    var code = feedback.code;
+    if (['assistant_timeout', 'semanticPlanContextIncomplete', 'semanticPlanClassUnavailable', 'semanticPlanClassAmbiguous', 'semanticPlanOutputClassMismatch'].indexOf(code) < 0) return feedback;
+    var params = Object.assign({ blockName: '', className: '', fetched: 0, visible: 0, requiredCount: '', effectiveLimit: '', settingPath: '', stage: '' }, feedback.params || {});
+    params.classNames = Array.isArray(params.classNames) ? params.classNames.join(', ') : String(params.classNames || '');
+    params.candidates = Array.isArray(params.candidates) ? params.candidates.join(', ') : String(params.candidates || '');
+    var reason = ['permission', 'timeout', 'maxClasses', 'maxContextBytes', 'maxReferencePathDepth', 'missingFields', 'missingMetadata', 'toolNotAllowed'].indexOf(params.reason) >= 0 ? params.reason : 'incomplete';
+    params.reasonText = t('assistantFeedbackReason_' + reason);
+    var summary = 'assistantFeedbackClassSummary';
+    var cause = 'assistantFeedbackClassCause';
+    var action = reason === 'permission' ? 'assistantFeedbackPermissionAction' : params.settingPath ? 'assistantFeedbackLimitAction' : 'assistantFeedbackMetadataAction';
+    if (code === 'assistant_timeout') {
+      summary = 'assistantFeedbackTimeoutSummary'; cause = 'assistantFeedbackTimeoutCause'; action = 'assistantFeedbackTimeoutAction';
+    } else if (code === 'semanticPlanContextIncomplete') {
+      summary = 'assistantFeedbackContextSummary'; cause = 'assistantFeedbackContextCause';
+    } else if (code === 'semanticPlanClassAmbiguous') {
+      summary = cause = 'assistantFeedbackClassAmbiguous'; action = 'assistantFeedbackClassAmbiguousAction';
+    } else if (code === 'semanticPlanOutputClassMismatch') {
+      summary = cause = 'assistantFeedbackClassMismatch'; action = 'assistantFeedbackClassMismatchAction';
+    } else if (params.reason === 'absent') {
+      summary = cause = 'assistantFeedbackClassAbsent'; action = 'assistantFeedbackClassAbsentAction';
+    } else if (params.reason === 'descriptionUnverified' || params.reason === 'nameNotFound') {
+      cause = params.reason === 'nameNotFound' ? 'assistantFeedbackClassNameNotFound' : 'assistantFeedbackClassDescription';
+      action = params.settingPath ? 'assistantFeedbackLimitAction' : 'assistantFeedbackClassDescriptionAction';
+    }
+    return Object.assign({}, feedback, {
+      summary: t(summary, params),
+      causes: [{ kind: code, message: t(cause, params) + (code === 'semanticPlanClassUnavailable' && params.settingPath && params.effectiveLimit !== '' && params.effectiveLimit != null ? ' ' + t('assistantFeedbackSettingEvidence', params) : '') }],
+      action: t(action, params) + (params.checkpointRetained ? ' ' + t('assistantFeedbackCheckpoint') : '')
+    });
+  }
+
+  function setAssistantSemanticPlanRetryState(resume, diagnostics, checkpointConfirmed, feedback) {
     state.assistantFlowResume = Object.assign({}, resume || {}, { retryable: true, retryStage: 'semanticPlan', checkpointConfirmed: Boolean(checkpointConfirmed) });
     state.assistantFlowRejected = null;
     state.assistantFlowErrors = [];
     state.assistantFlowDiagnostics = diagnostics && typeof diagnostics === 'object' ? diagnostics : {};
-    state.assistantFlowFeedback = {
+    state.assistantFlowFeedback = feedback && typeof feedback === 'object' ? feedback : {
       summary: t('assistantSemanticPlanPaused'),
       action: checkpointConfirmed ? t('assistantSemanticPlanRetryReady') : t('assistantSemanticPlanRetryUnknown')
     };
+    if (state.assistantFlowFeedback.code === 'assistant_timeout') {
+      state.assistantFlowFeedback = Object.assign({}, state.assistantFlowFeedback, {
+        params: Object.assign({}, state.assistantFlowFeedback.params || {}, { checkpointRetained: Boolean(checkpointConfirmed) })
+      });
+    }
     state.assistantFlowErrorStage = 'semanticPlan';
     state.message = { type: 'error', text: state.assistantFlowFeedback.action };
   }
@@ -29828,7 +29931,7 @@ function dynamicPagesClientScript() {
         }
         if (!result.ok && result.json && result.json.retryable) {
           resume = Object.assign({}, resume, result.json.resume || {}, { checkpointConfirmed: Boolean(result.json.resume) });
-          setAssistantSemanticPlanRetryState(resume, result.json.diagnostics, Boolean(result.json.resume));
+          setAssistantSemanticPlanRetryState(resume, result.json.diagnostics, Boolean(result.json.resume), result.json.feedback);
           return;
         }
         if (!result.ok && result.json && result.json.code === 'assistant_semantic_plan_invalid') {
@@ -36981,15 +37084,14 @@ function responseTotalCount(response) {
   const meta = json.meta && typeof json.meta === 'object' && !Array.isArray(json.meta) ? json.meta : {};
   const values = [
     json.total,
-    json.count,
-    json.size,
+    json.totalCount,
+    json.total_count,
     meta.total,
-    meta.count,
-    meta.size,
     meta.totalCount,
     meta.total_count
   ];
-  const found = values.find((value) => Number.isFinite(Number(value)) && Number(value) >= 0);
+  const found = values.find((value) => (typeof value === 'number' || typeof value === 'string' && value.trim() !== '')
+    && Number.isSafeInteger(Number(value)) && Number(value) >= 0);
   return found === undefined ? null : Number(found);
 }
 
@@ -37005,8 +37107,8 @@ function assistantLimitDiagnostic(input = {}) {
     clamped ||
     input.truncated ||
     input.timeout ||
-    limit > 0 && returned >= limit ||
-    total !== null && Number.isFinite(total) && total > returned
+    input.complete !== true && limit > 0 && returned >= limit ||
+    input.complete !== true && total !== null && Number.isFinite(total) && total > returned
   );
   return {
     source: input.source || 'assistant',
@@ -37025,6 +37127,7 @@ function assistantLimitDiagnostic(input = {}) {
     clampedBy: input.clampedBy || '',
     truncated: Boolean(input.truncated),
     timeout: Boolean(input.timeout),
+    ...(typeof input.complete === 'boolean' ? { complete: input.complete } : {}),
     reason: input.reason || ''
   };
 }
@@ -37278,21 +37381,67 @@ function classNamesFromTemplateSpec(spec) {
   return uniqueStrings(values);
 }
 
-async function mcpReadModelSummary(authToken, args, config) {
+async function mcpReadModelSummary(authToken, args, config, options = {}) {
   const mcp = config && config.mcp ? config.mcp : normalizeAssistantRuntimeConfig(defaultRuntimeConfig()).mcp;
   const requestedClasses = Number(args && args.maxClasses || mcp.maxClasses);
   const requestedDomains = Number(args && args.maxDomains || mcp.maxDomains);
   const maxClasses = toPositiveInt(requestedClasses, mcp.maxClasses, mcp.maxClasses);
   const maxDomains = toPositiveInt(requestedDomains, mcp.maxDomains, mcp.maxDomains);
-  const classes = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes?limit=${maxClasses}&detailed=true`, authToken);
-  const domains = await cmdbuildRequest(`/cmdbuild/services/rest/v3/domains?limit=${maxDomains}`, authToken);
-  if (!classes.ok) throw new Error(`CMDBuild classes request failed with status ${classes.statusCode}.`);
-  if (!domains.ok) throw new Error(`CMDBuild domains request failed with status ${domains.statusCode}.`);
-  const classItems = responseDataArray(classes).slice(0, maxClasses);
+  const deadlineAt = options.deadlineAt || Date.now() + mcpTimeoutMs(config);
+  const requestOptions = { deadlineAt, deadlineTimeoutMs: mcpTimeoutMs(config) };
+  const classItems = [];
+  const seen = new Set();
+  let total = null;
+  let complete = false;
+  let reason = 'maxClasses';
+  let pages = 0;
+  let fetched = 0;
+  while (fetched < maxClasses) {
+    if (Date.now() >= deadlineAt) { reason = 'timeout'; break; }
+    try {
+      const response = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes?limit=${maxClasses - fetched}&start=${fetched}&detailed=true`, authToken, requestOptions);
+      if (!response.ok) {
+        reason = [401, 403].includes(response.statusCode) ? 'permission' : 'requestFailed';
+        break;
+      }
+      pages += 1;
+      if (!Array.isArray(response.json?.data)) { reason = 'incomplete'; break; }
+      total = responseTotalCount(response) ?? total;
+      const page = responseDataArray(response).slice(0, maxClasses - fetched);
+      if (!page.length) {
+        complete = total === null || classItems.length >= total;
+        reason = complete ? '' : 'incomplete';
+        break;
+      }
+      fetched += page.length;
+      const newItems = page.filter((item) => {
+        if (!item || !isCmdbuildIdentifierText(item.name) || seen.has(item.name)) return false;
+        seen.add(item.name);
+        return true;
+      });
+      classItems.push(...newItems);
+      if (!newItems.length) { reason = 'incomplete'; break; }
+      if (total !== null && classItems.length >= total) { complete = true; reason = ''; break; }
+    } catch (error) {
+      reason = Date.now() >= deadlineAt || /timeout/i.test(String(error && (error.code || error.message))) ? 'timeout' : 'requestFailed';
+      break;
+    }
+  }
+  let domains;
+  try {
+    domains = Date.now() < deadlineAt
+      ? await cmdbuildRequest(`/cmdbuild/services/rest/v3/domains?limit=${maxDomains}`, authToken, requestOptions)
+      : null;
+  } catch { domains = null; }
+  const visibleClasses = classItems.filter(assistantClassMetadataReadable).map(assistantClassMetadataSummary);
   const domainItems = responseDataArray(domains).slice(0, maxDomains);
   return {
+    classCatalog: {
+      fetched, visible: visibleClasses.length, total, pages, complete, reason,
+      denied: classItems.filter((item) => item && !assistantClassMetadataReadable(item)).length
+    },
     limits: [
-      assistantLimitDiagnostic({
+      { ...assistantLimitDiagnostic({
         source: 'mcp',
         tool: 'cmdbuild_model_summary',
         limitName: 'maxClasses',
@@ -37303,8 +37452,11 @@ async function mcpReadModelSummary(authToken, args, config) {
         limit: maxClasses,
         absoluteCap: ASSISTANT_MCP_MAX_CLASSES_ABSOLUTE,
         returned: classItems.length,
-        total: responseTotalCount(classes)
-      }),
+        total,
+        limitHit: !complete,
+        timeout: reason === 'timeout',
+        reason
+      }), complete, limitHit: reason === 'maxClasses' },
       assistantLimitDiagnostic({
         source: 'mcp',
         tool: 'cmdbuild_model_summary',
@@ -37316,17 +37468,12 @@ async function mcpReadModelSummary(authToken, args, config) {
         limit: maxDomains,
         absoluteCap: ASSISTANT_MCP_MAX_DOMAINS_ABSOLUTE,
         returned: domainItems.length,
-        total: responseTotalCount(domains)
+        total: responseTotalCount(domains),
+        limitHit: !domains || !domains.ok,
+        reason: !domains || !domains.ok ? 'domains-unavailable' : ''
       })
     ],
-    classes: classItems.filter((item) => item && item._can_read !== false).map((item) => ({
-      name: item.name || '',
-      description: item._description_translation || item.description || '',
-      alias: item.alias || '',
-      help: item._help_translation || item.help || '',
-      parent: item.parent || '',
-      canRead: item._can_read !== false
-    })),
+    classes: visibleClasses,
     domains: domainItems.map((item) => ({
       name: item.name || '',
       description: item._description_translation || item.description || '',
@@ -37566,6 +37713,8 @@ function assistantObjectFlowMcpPayload(results, diagnostics) {
     .map((item) => ({
       name: String(item && item.name || ''),
       description: String(item && item.description || ''),
+      originalDescription: String(item && item.originalDescription || ''),
+      translatedDescription: String(item && item.translatedDescription || ''),
       alias: String(item && item.alias || ''),
       help: String(item && item.help || ''),
       parent: String(item && item.parent || '')
@@ -37671,7 +37820,10 @@ async function buildAssistantMcpContext(authToken, body, runtimeConfig) {
       throw error;
     }
     try {
-      return await withMcpTimeout(callMcpTool(authToken, name, args, config), config, name, remaining);
+      const operation = name === 'cmdbuild_model_summary'
+        ? mcpReadModelSummary(authToken, args, config, { deadlineAt: contextDeadlineAt })
+        : callMcpTool(authToken, name, args, config);
+      return await withMcpTimeout(operation, config, name, remaining);
     } catch (error) {
       // This call always receives the remaining shared context budget, so its
       // timeout means the collection deadline was reached even at a timer edge.
@@ -37725,7 +37877,7 @@ async function buildAssistantMcpContext(authToken, body, runtimeConfig) {
       matchedTerms: item.matchedTerms
     }));
     diagnostics.confirmedClassNames = confirmedClassNames;
-    classNames = uniqueStrings(classNames.concat(candidates.map((item) => item.name), confirmedClassNames));
+    classNames = uniqueStrings(classNames.concat(confirmedClassNames, candidates.map((item) => item.name)));
   }
   if (classNames.length > config.mcp.maxClasses) {
     addAssistantLimitDiagnostics(diagnostics.limits, [assistantLimitDiagnostic({
@@ -38086,6 +38238,38 @@ function assistantExactDescriptionFiltersFromText(value) {
   return filters.slice(0, 20);
 }
 
+function assistantClassMetadataReadable(item) {
+  return Boolean(item && isCmdbuildIdentifierText(item.name) && item._can_read !== false
+    && item.canRead !== false && item.permissions?._can_read !== false);
+}
+
+function assistantClassMetadataSummary(item) {
+  return {
+    name: item.name,
+    description: item._description_translation || item.description || '',
+    originalDescription: item.description || '',
+    translatedDescription: item._description_translation || '',
+    alias: item.alias || '',
+    help: item._help_translation || item.help || '',
+    parent: item.parent || '',
+    canRead: true
+  };
+}
+
+function assistantClassExactScore(item, mention) {
+  const term = normalizedAssistantLookupText(mention);
+  if (!term || !assistantClassMetadataReadable(item)) return 0;
+  if (normalizedAssistantLookupText(item.name) === term) return 2;
+  return [item.description, item.originalDescription, item.translatedDescription, item._description_translation]
+    .some((description) => description && normalizedAssistantLookupText(description) === term) ? 1 : 0;
+}
+
+function assistantExactClassMatches(classes, mention) {
+  const scored = (classes || []).map((item) => ({ item, score: assistantClassExactScore(item, mention) }));
+  const best = Math.max(0, ...scored.map((entry) => entry.score));
+  return best ? scored.filter((entry) => entry.score === best).map((entry) => entry.item) : [];
+}
+
 function assistantClassTextScore(classItem, terms) {
   const name = normalizedAssistantLookupText(classItem && classItem.name);
   const description = normalizedAssistantLookupText(classItem && classItem.description);
@@ -38145,20 +38329,21 @@ function assistantClassTextScore(classItem, terms) {
     }
     if (matched && !matchedTerms.includes(term)) matchedTerms.push(term);
   }
-  return { score, matchedTerms };
+  const exactScore = Math.max(0, ...(terms || []).map((term) => assistantClassExactScore(classItem, term)));
+  return { score: score + (exactScore === 2 ? 1000000 : exactScore === 1 ? 100000 : 0), matchedTerms };
 }
 
 function assistantCandidateClassesFromSummary(summary, terms, limit = 8) {
   const classes = Array.isArray(summary && summary.classes) ? summary.classes : [];
   return classes
     .map((item) => {
-      const name = String(item && (item.name || item.code || item.className) || '').trim();
-      if (!isCmdbuildIdentifierText(name)) return null;
+      const name = String(item && item.name || '').trim();
+      if (!assistantClassMetadataReadable(item)) return null;
       const description = String(item && (item.description || item._description_translation || '') || '').trim();
       const alias = String(item && item.alias || '').trim();
       const help = String(item && item.help || '').trim();
       const parent = String(item && item.parent || '').trim();
-      const scored = assistantClassTextScore({ name, description, alias, help, parent }, terms);
+      const scored = assistantClassTextScore({ ...item, name, description, alias, help, parent }, terms);
       if (!scored.score) return null;
       return {
         name,
@@ -38178,13 +38363,7 @@ function assistantCandidateClassesFromSummary(summary, terms, limit = 8) {
 function assistantExactClassCandidatesFromSummary(summary, mentions) {
   const classes = Array.isArray(summary && summary.classes) ? summary.classes : [];
   return uniqueStrings((mentions || []).flatMap((mention) => {
-    const matches = classes.filter((item) => assistantClassTextScore({
-      name: item && item.name,
-      description: item && item.description,
-      alias: item && item.alias,
-      help: item && item.help,
-      parent: item && item.parent
-    }, [mention]).score >= 20);
+    const matches = assistantExactClassMatches(classes, mention);
     return matches.length === 1 ? [String(matches[0] && matches[0].name || '').trim()] : [];
   }).filter(Boolean));
 }
@@ -39281,6 +39460,7 @@ async function callLiteLLM(messages, runtimeConfig, options = {}) {
     ? options.signal
     : null;
   const metadata = assistantCallMetadata(options);
+  const startedAt = Date.now();
   let cancelledByCaller = Boolean(externalSignal && externalSignal.aborted);
   let timedOut = false;
   const abortFromCaller = () => {
@@ -39380,15 +39560,28 @@ async function callLiteLLM(messages, runtimeConfig, options = {}) {
       logWarn('assistant.litellm.timeout', {
         requestId: currentRequestId(),
         timeoutMs,
+        settingPath: 'assistant.mcp.timeoutMs',
+        configuredLimit: assistantConfig.mcp.timeoutMs,
+        elapsedMs: Date.now() - startedAt,
         model: truncateText(status.model || '', 160),
         baseUrlSource: status.baseUrlSource || '',
         phase: metadata.assistantPhase,
         attempt: metadata.assistantAttempt,
         operation: metadata.assistantOperation
       });
-      const timeoutError = new Error(`LiteLLM request timed out after ${timeoutMs}ms.`);
+      const elapsedMs = Date.now() - startedAt;
+      const limit = assistantLimitDiagnostic({
+        ...(assistantConfig.mcp.limitConfig && assistantConfig.mcp.limitConfig.timeoutMs || {}),
+        source: 'assistant', tool: 'LiteLLM', limitName: 'timeoutMs',
+        configuredLimit: assistantConfig.mcp.timeoutMs, effectiveLimit: timeoutMs,
+        limit: timeoutMs, timeout: true,
+        reason: 'assistant.mcp.timeoutMs'
+      });
+      const timeoutError = new Error(`LiteLLM request timed out after ${timeoutMs}ms. Limit: assistant.mcp.timeoutMs (configured ${limit.rawConfigured}ms, effective ${timeoutMs}ms). Change MCP timeout in Runtime settings and retry.`);
       timeoutError.statusCode = 504;
       timeoutError.code = 'assistant_timeout';
+      timeoutError.diagnostics = { limits: [{ ...limit, settingPath: 'assistant.mcp.timeoutMs', elapsedMs, stage: metadata.assistantPhase || 'llmResponse' }] };
+      timeoutError.timeoutMs = timeoutMs;
       Object.assign(timeoutError, metadata);
       throw timeoutError;
     }
@@ -40300,7 +40493,35 @@ function assistantSemanticPredicateClassError(block, index, predicateType, field
 }
 
 function assistantSemanticPlanValidationFeedback(error) {
+  if (error && error.code === 'assistant_timeout') {
+    const limit = (error.diagnostics && error.diagnostics.limits || []).find((item) => item.timeout);
+    const timeoutMs = limit && limit.effectiveLimit || error.timeoutMs;
+    return {
+      code: 'assistant_timeout',
+      params: { effectiveLimit: timeoutMs, settingPath: 'assistant.mcp.timeoutMs', stage: limit && limit.stage || 'llmResponse', checkpointRetained: Boolean(error.semanticPlanResume) },
+      summary: `Ожидание ответа LiteLLM прервано: сработал лимит ${timeoutMs} мс.`,
+      causes: [{ kind: 'assistant_timeout', message: `Достигнут assistant.mcp.timeoutMs = ${timeoutMs} мс на этапе «${limit && limit.stage || 'llmResponse'}». Это локальный лимит ожидания, а не подтвержденная ошибка LiteLLM.` }],
+      action: `Измените «Тайм-аут MCP, мс» в Runtime-настройках (assistant.mcp.timeoutMs) и повторите запрос.${error.semanticPlanResume ? ' MCP-контекст сохранен; продолжение использует его повторно.' : ''}`,
+      affectedStages: [], confirmedRelations: []
+    };
+  }
   const details = Array.isArray(error && error.details) ? error.details : [];
+  const contextIssue = details.find((item) => item && item.kind === 'semanticPlanContextIncomplete');
+  if (contextIssue) {
+    const params = {
+      blockName: String(contextIssue.blockName || contextIssue.blockId || ''),
+      blockId: String(contextIssue.blockId || ''), reason: String(contextIssue.reason || 'missingMetadata'),
+      settingPath: String(contextIssue.settingPath || ''), requiredCount: contextIssue.requiredCount,
+      effectiveLimit: contextIssue.effectiveLimit, classNames: Array.isArray(contextIssue.classNames) ? contextIssue.classNames : []
+    };
+    return {
+      code: 'semanticPlanContextIncomplete', params,
+      summary: `Семантический план не подготовлен: метаданные для «${params.blockName}» неполны.`,
+      causes: [{ kind: 'semanticPlanContextIncomplete', message: `${params.reason}: ${params.classNames.join(', ')}. ${params.settingPath}; требуется ${params.requiredCount ?? ''}, лимит ${params.effectiveLimit ?? ''}.` }],
+      action: params.settingPath ? `Проверьте Runtime-настройку ${params.settingPath} и повторите запрос.` : 'Проверьте доступ к метаданным CMDBuild и повторите запрос.',
+      affectedStages: [{ label: params.blockName, alias: params.blockId }], confirmedRelations: []
+    };
+  }
   const classBindingIssue = details.find((item) => item && ['semanticPlanClassUnavailable', 'semanticPlanClassAmbiguous', 'semanticPlanOutputClassMismatch'].includes(item.kind));
   const missingIpv4PredicateIssue = details.find((item) => item && item.kind === 'semanticPlanMissingIpv4Predicate');
   const unexpectedPredicateIssue = details.find((item) => item && item.kind === 'semanticPlanUnexpectedPredicateWithoutDependency');
@@ -40339,7 +40560,7 @@ function assistantSemanticPlanValidationFeedback(error) {
       action = 'Проверьте, что в этом блоке явно указаны опорный класс, условие по входному параметру и целевой класс данных сравнения. Связь должна однозначно подтверждаться MCP catalog.';
       cause = `Не найден единственный путь от параметризованной опорной выборки к данным сравнения.${anchors ? ` Проверено: ${anchors}.` : ''}`;
     } else if (candidateFilterIssue.kind === 'deterministicCandidateComparisonPathUnresolved') {
-      action = 'Укажите точный Code или Description связанных классов и нужного поля сравнения. При нескольких путях укажите domain явно.';
+      action = 'Укажите техническое имя (name) или точное Description связанных классов и нужного поля сравнения. При нескольких путях укажите domain явно.';
       cause = 'MCP schema не дала единственный подтвержденный путь к полю сравнения.';
     } else if (candidateFilterIssue.kind === 'deterministicCandidateSourceAmbiguous') {
       action = 'В «Использует результаты блоков» оставьте один результат-кандидат того же класса, который должен быть отфильтрован.';
@@ -40392,14 +40613,33 @@ function assistantSemanticPlanValidationFeedback(error) {
   if (classBindingIssue) {
     const blockName = String(classBindingIssue.blockName || 'блок данных');
     const className = String(classBindingIssue.className || classBindingIssue.mention || '');
+    const reason = String(classBindingIssue.reason || '');
+    const catalog = classBindingIssue.catalogCompleteness || {};
+    const localizable = {
+      code: classBindingIssue.kind,
+      params: {
+        blockName: String(classBindingIssue.blockName || classBindingIssue.blockId || ''),
+        blockId: String(classBindingIssue.blockId || ''), className, reason: reason || 'incomplete',
+        fetched: catalog.fetched || 0, visible: catalog.visible || 0,
+        requiredCount: classBindingIssue.requiredCount, effectiveLimit: classBindingIssue.effectiveLimit,
+        settingPath: String(classBindingIssue.settingPath || (['maxClasses', 'maxContextBytes'].includes(reason) ? `assistant.mcp.${reason}` : reason === 'timeout' ? 'assistant.mcp.timeoutMs' : catalog.reason === 'maxClasses' ? 'assistant.mcp.maxClasses' : '')),
+        candidates: (classBindingIssue.candidates || []).map((candidate) => candidate.name).filter(Boolean),
+        expectedClassName: String(classBindingIssue.expectedClassName || ''), actualClassName: String(classBindingIssue.actualClassName || '')
+      }
+    };
+    const limits = collectAssistantLimitDiagnostics(error && error.diagnostics || {}).filter((item) => item.limitHit);
+    const reachedSetting = limits.find((item) => localizable.params.settingPath === `assistant.mcp.${item.limitName}`);
+    if (localizable.params.effectiveLimit == null && reachedSetting) localizable.params.effectiveLimit = reachedSetting.effectiveLimit;
+    const reached = limits.map((item) => `${item.tool}: ${item.limitName}=${item.effectiveLimit || item.limit}${item.returned === undefined ? '' : `, получено ${item.returned}`}`).join('; ');
     const limitText = classBindingIssue.classContextLimited
-      ? ' Достигнут лимит каталога классов: увеличьте настраиваемый лимит MCP или сузьте контекст, затем повторите запрос.'
-      : ' Уточните существующий Code или точное Description класса в описании блока.';
+      ? ` Полнота каталога не подтверждена.${reached ? ` Сработали ограничения: ${reached}.` : ''}`
+      : ' Уточните техническое имя (name) или точное Description класса в описании блока.';
     if (classBindingIssue.kind === 'semanticPlanClassAmbiguous') {
       const candidates = Array.isArray(classBindingIssue.candidates) ? classBindingIssue.candidates : [];
       return {
+        ...localizable,
         summary: `Семантический план не подготовлен: класс «${className}» в «${blockName}» неоднозначен.`,
-        action: `Укажите CMDBuild Code нужного класса.${limitText}`,
+        action: `Укажите техническое имя (name) нужного класса.${limitText}`,
         causes: [{
           kind: 'semanticPlanClassAmbiguous',
           message: `Термин «${className}» соответствует нескольким видимым классам: ${candidates.map((candidate) => candidate.name).filter(Boolean).join(', ') || 'нет единственного кандидата'}.`
@@ -40410,22 +40650,42 @@ function assistantSemanticPlanValidationFeedback(error) {
     }
     if (classBindingIssue.kind === 'semanticPlanOutputClassMismatch') {
       return {
+        ...localizable,
         summary: `Семантический план не подготовлен: «${blockName}» выбрал не тот класс результата.`,
         action: 'Сформируйте план повторно. Подтвержденное соответствие класса передано Assistant как обязательное; draft не изменен.',
         causes: [{
           kind: 'semanticPlanOutputClassMismatch',
-          message: `Термин «${className}» однозначно соответствует CMDBuild Code «${String(classBindingIssue.expectedClassName || '')}», но Assistant вернул «${String(classBindingIssue.actualClassName || '')}».`
+          message: `Термин «${className}» однозначно соответствует техническому имени класса «${String(classBindingIssue.expectedClassName || '')}», но Assistant вернул «${String(classBindingIssue.actualClassName || '')}».`
         }],
         affectedStages: [{ label: blockName, alias: String(classBindingIssue.blockId || '') }],
         confirmedRelations: []
       };
     }
+    if (reason && reason !== 'absent') {
+      const timeout = reason === 'timeout';
+      const denied = reason === 'permission';
+      const detail = denied ? 'CMDBuild не разрешил чтение метаданных запрошенного класса в текущей сессии.'
+        : timeout ? 'Проверка класса не завершена в пределах временного бюджета assistant.mcp.timeoutMs.'
+          : `Проверка метаданных не завершена: ${reason}.${classBindingIssue.lookup && classBindingIssue.lookup.statusCode ? ` CMDBuild HTTP ${classBindingIssue.lookup.statusCode}.` : ''}`;
+      return {
+        ...localizable,
+        summary: `Семантический план не подготовлен: для «${blockName}» не удалось проверить класс «${className}».`,
+        causes: [{ kind: classBindingIssue.kind, message: `${detail}${limitText} Прочитано классов: ${catalog.fetched || 0}, доступно: ${catalog.visible || 0}. Это не подтверждает отсутствие класса.` }],
+        action: denied ? 'Проверьте доступ к классу и его атрибутам под текущим пользователем и ролью CMDBuild.'
+          : timeout ? 'Измените «Тайм-аут MCP, мс» в Runtime-настройках (assistant.mcp.timeoutMs) и повторите подготовку плана.'
+            : ['maxClasses', 'maxContextBytes'].includes(reason) || catalog.reason === 'maxClasses'
+              ? `Проверьте Runtime-настройки MCP: assistant.mcp.${['maxClasses', 'maxContextBytes'].includes(reason) ? reason : 'maxClasses'}. Измените сработавшее ограничение и повторите запрос.`
+              : 'Проверьте доступность CMDBuild и разрешенные инструменты MCP в Runtime-настройках; повторите подготовку плана. Описание блока менять не требуется, пока проверка метаданных не завершена.',
+        affectedStages: [{ label: blockName, alias: String(classBindingIssue.blockId || '') }], confirmedRelations: []
+      };
+    }
     return {
+      ...localizable,
       summary: `Семантический план не подготовлен: для «${blockName}» не подтвержден класс «${className}».`,
       action: `Исправьте класс в описании блока.${limitText} Assistant не подменяет класс ближайшим совпадением.`,
       causes: [{
         kind: 'semanticPlanClassUnavailable',
-        message: `Термин «${className}» в ${String(classBindingIssue.field || 'контракте результата')} не соответствует ни одному доступному CMDBuild class Code или Description.`
+        message: `Для термина «${className}» в ${String(classBindingIssue.field || 'контракте результата')} не подтверждено техническое имя (name) или точное Description класса в доступном MCP-контексте.`
       }],
       affectedStages: [{ label: blockName, alias: String(classBindingIssue.blockId || '') }],
       confirmedRelations: []
@@ -41569,6 +41829,214 @@ function assistantSemanticPlanRetryable(error) {
   return statusCode === 504 || code === 'assistant_timeout' || code === 'litellm_error' && [502, 503, 504].includes(statusCode);
 }
 
+async function assistantResolveExplicitClassMetadata(intent, mcpContext, authToken, config, deadlineAt) {
+  const results = mcpContext.results || (mcpContext.results = []);
+  let summary = results.find((item) => item?.tool === 'cmdbuild_model_summary' && item.ok && item.result)?.result;
+  const diagnostics = mcpContext.diagnostics || (mcpContext.diagnostics = {});
+  diagnostics.classLookups = [];
+  const text = (intent.blocks || []).map((block) => [block.entities, block.algorithm, block.expectedResult, block.description].filter(Boolean).join('\n')).join('\n');
+  const mentions = assistantClassMentionsFromText(text).flatMap((mention) => [mention, ...assistantClassMentionAlternatives(mention)]);
+  const rawMentions = Array.from(text.matchAll(/класс(?:а|ов|ы|е|ом|у)?\s+(?:"([^"]+)"|'([^']+)'|«([^»]+)»|([A-Za-z][A-Za-z0-9_ -]*))/giu))
+    .flatMap((match) => String(match[1] || match[2] || match[3] || match[4] || '').split(/\s+(?:и|and)\s+/iu));
+  const identifiers = uniqueStrings(rawMentions.map((mention) => assistantTrimClassMentionText(mention))
+    .filter((mention) => isCmdbuildIdentifierText(mention) && mentions.includes(normalizedAssistantLookupText(mention))));
+  const verified = [];
+  for (const className of identifiers) {
+    const knownMatches = assistantExactClassMatches(summary?.classes || [], className);
+    // A partial catalog's description cannot rule out a technical name outside the page.
+    if (knownMatches.some((item) => assistantClassExactScore(item, className) === 2)
+      || summary?.classCatalog?.complete === true && knownMatches.length) continue;
+    const lookup = { className, status: 'incomplete', statusCode: null, reason: '' };
+    diagnostics.classLookups.push(lookup);
+    if (!config.mcp.enabled || !config.mcp.allowedTools.includes('cmdbuild_model_summary') || !config.mcp.allowedTools.includes('cmdbuild_class_fields')) {
+      lookup.reason = 'toolNotAllowed';
+      continue;
+    }
+    if (diagnostics.classLookups.length > config.mcp.maxClasses) { lookup.reason = 'maxClasses'; continue; }
+    if (Date.now() >= deadlineAt) { lookup.status = 'timeout'; lookup.reason = 'timeout'; continue; }
+    const requestOptions = { deadlineAt, deadlineTimeoutMs: mcpTimeoutMs(config) };
+    try {
+      const response = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}`, authToken, requestOptions);
+      lookup.statusCode = response.statusCode;
+      if (!response.ok) {
+        lookup.status = response.statusCode === 404 ? 'nameNotFound' : [401, 403].includes(response.statusCode) ? 'permission' : 'incomplete';
+        lookup.reason = lookup.status;
+        continue;
+      }
+      const metadata = response.json?.data;
+      if (!metadata || normalizedAssistantLookupText(metadata.name) !== normalizedAssistantLookupText(className)) {
+        lookup.reason = 'invalidMetadata';
+        continue;
+      }
+      if (!assistantClassMetadataReadable(metadata)) { lookup.status = 'permission'; lookup.reason = 'permission'; continue; }
+      const fields = await cmdbuildRequest(cmdbuildClassAttributesPath(metadata.name), authToken, requestOptions);
+      if (!fields.ok) {
+        lookup.statusCode = fields.statusCode;
+        lookup.status = [401, 403].includes(fields.statusCode) ? 'permission' : 'incomplete';
+        lookup.reason = lookup.status === 'permission' ? 'permission' : 'fieldsUnavailable';
+        continue;
+      }
+      if (!Array.isArray(fields.json?.data)) { lookup.reason = 'fieldsUnavailable'; continue; }
+      if (!summary) {
+        summary = { classes: [], domains: [], classCatalog: { fetched: 0, visible: 0, total: null, pages: 0, complete: false, reason: 'incomplete' } };
+        results.push({ tool: 'cmdbuild_model_summary', ok: true, result: summary });
+      }
+      summary.classes.push(assistantClassMetadataSummary(metadata));
+      let fieldEntry = results.find((item) => item?.tool === 'cmdbuild_class_fields' && Array.isArray(item.result));
+      if (!fieldEntry) { fieldEntry = { tool: 'cmdbuild_class_fields', ok: true, result: [] }; results.push(fieldEntry); }
+      fieldEntry.ok = true;
+      fieldEntry.result = fieldEntry.result.filter((item) => item.className !== metadata.name);
+      fieldEntry.result.push({ className: metadata.name, attributes: sanitizeVisibleClassAttributes(responseDataArray(fields)
+        .filter((attribute) => attribute && attribute._can_read !== false && attribute.permissions?._can_read !== false)) });
+      verified.push(metadata.name);
+      lookup.status = 'found';
+    } catch (error) {
+      lookup.status = Date.now() >= deadlineAt || /timeout/i.test(String(error && (error.code || error.message))) ? 'timeout' : 'incomplete';
+      lookup.reason = lookup.status;
+    }
+  }
+  diagnostics.classCatalog = summary?.classCatalog || { fetched: 0, visible: 0, total: null, pages: 0, complete: false, reason: 'incomplete' };
+  diagnostics.contextClassNames = uniqueStrings(verified.concat(diagnostics.contextClassNames || []));
+}
+
+async function assistantFinalizeSemanticContext(intent, mcpContext, bindings, runtimeConfig, options = {}) {
+  const config = normalizeAssistantRuntimeConfig(runtimeConfig);
+  const deadlineAt = options.deadlineAt || Date.now() + config.mcp.timeoutMs;
+  const diagnostics = mcpContext.diagnostics || (mcpContext.diagnostics = {});
+  const required = new Map();
+  const addRequired = (className, binding) => {
+    if (!isCmdbuildIdentifierText(className)) return;
+    if (!required.has(className)) required.set(className, []);
+    if (binding && !required.get(className).some((item) => item.blockId === binding.blockId)) required.get(className).push(binding);
+  };
+  bindings.forEach((binding) => addRequired(binding.className, binding));
+  if (!required.size) return;
+  const results = mcpContext.results || [];
+  const summary = assistantMcpResult(results, 'cmdbuild_model_summary');
+  let fieldsEntry = results.find((item) => item.tool === 'cmdbuild_class_fields' && Array.isArray(item.result));
+  if (!fieldsEntry) {
+    fieldsEntry = { tool: 'cmdbuild_class_fields', ok: true, result: [] };
+    results.push(fieldsEntry);
+  }
+  const fail = (reason, classNames, settingPath = '', effectiveLimit = null) => {
+    if (reason === 'timeout') addAssistantLimitDiagnostics(diagnostics.limits || (diagnostics.limits = []), [assistantLimitDiagnostic({
+      source: 'assistant', tool: 'semanticPlanContext', limitName: 'timeoutMs',
+      limit: config.mcp.timeoutMs, timeout: true, reason: 'required-class-context'
+    })]);
+    diagnostics.requiredClassNames = [...required.keys()];
+    diagnostics.semanticContext = { complete: false, reason, requiredCount: required.size, effectiveLimit, settingPath };
+    const affected = classNames.flatMap((name) => required.get(name) || []);
+    const blocks = affected.length ? affected : bindings;
+    const details = uniqueStrings(blocks.map((binding) => JSON.stringify({
+      kind: 'semanticPlanContextIncomplete', blockId: binding.blockId, blockName: binding.blockName,
+      reason, classNames, requiredCount: required.size, effectiveLimit, settingPath
+    }))).map((value) => JSON.parse(value));
+    const error = assistantSemanticPlanError('Required CMDBuild metadata does not fit the confirmed semantic context.', details);
+    error.diagnostics = { mcp: diagnostics };
+    throw error;
+  };
+  const checkCount = () => {
+    if (required.size <= config.mcp.maxClasses) return;
+    addAssistantLimitDiagnostics(diagnostics.limits || (diagnostics.limits = []), [assistantLimitDiagnostic({
+      source: 'assistant', tool: 'semanticPlanContext', limitName: 'maxClasses',
+      limit: config.mcp.maxClasses, requested: required.size, returned: required.size, limitHit: true,
+      reason: 'required-class-context'
+    })]);
+    fail('maxClasses', [...required.keys()], 'assistant.mcp.maxClasses', config.mcp.maxClasses);
+  };
+  const ensureClass = async (className) => {
+    checkCount();
+    let metadata = summary && summary.classes.find((item) => item.name === className);
+    let fields = fieldsEntry.result.find((item) => item.className === className && !item.error && Array.isArray(item.attributes));
+    if (metadata && fields) return fields.attributes;
+    const reason = metadata ? 'missingFields' : 'missingMetadata';
+    if (options.allowReads === false) fail(reason, [className]);
+    if (!config.mcp.enabled || !config.mcp.allowedTools.includes('cmdbuild_model_summary') || !config.mcp.allowedTools.includes('cmdbuild_class_fields')) fail('toolNotAllowed', [className]);
+    if (Date.now() >= deadlineAt) fail('timeout', [className], 'assistant.mcp.timeoutMs', config.mcp.timeoutMs);
+    const requestOptions = { deadlineAt, deadlineTimeoutMs: config.mcp.timeoutMs };
+    try {
+      if (!metadata) {
+        const response = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}`, options.authToken || '', requestOptions);
+        if (!response.ok) fail([401, 403].includes(response.statusCode) ? 'permission' : 'missingMetadata', [className]);
+        if (!response.json?.data || response.json.data.name !== className) fail('missingMetadata', [className]);
+        if (!assistantClassMetadataReadable(response.json.data)) fail('permission', [className]);
+        metadata = assistantClassMetadataSummary(response.json.data);
+        summary.classes.push(metadata);
+      }
+      if (!fields) {
+        const response = await cmdbuildRequest(cmdbuildClassAttributesPath(className), options.authToken || '', requestOptions);
+        if (!response.ok || !Array.isArray(response.json?.data)) fail([401, 403].includes(response.statusCode) ? 'permission' : 'missingFields', [className]);
+        fields = { className, attributes: sanitizeVisibleClassAttributes(responseDataArray(response)
+          .filter((item) => item && item._can_read !== false && item.permissions?._can_read !== false)) };
+        fieldsEntry.result = fieldsEntry.result.filter((item) => item.className !== className).concat(fields);
+        fieldsEntry.ok = true;
+      }
+    } catch (error) {
+      if (error.code === 'assistant_semantic_plan_invalid') throw error;
+      if (Date.now() >= deadlineAt || /timeout/i.test(String(error.code || error.message))) fail('timeout', [className], 'assistant.mcp.timeoutMs', config.mcp.timeoutMs);
+      fail(reason, [className]);
+    }
+    return fields.attributes;
+  };
+  // Only explicit reference paths and confirmed paths between required roots
+  // are mandatory; unrelated search candidates must not consume their budget.
+  for (const binding of bindings) {
+    const block = (intent.blocks || []).find((item) => item.id === binding.blockId);
+    for (const hint of assistantReferencePathHintsFromBlock(block)) {
+      const maxDepth = config.semanticPlan && config.semanticPlan.maxReferencePathDepth;
+      let className = binding.className;
+      let referenceDepth = 0;
+      for (const segment of hint.slice(0, -1)) {
+        const fields = await ensureClass(className);
+        const matches = assistantMcpPreferredFieldMatches(fields, segment, { requireReference: true });
+        if (matches.length !== 1) break;
+        referenceDepth += 1;
+        if (maxDepth && referenceDepth > maxDepth) fail('maxReferencePathDepth', [binding.className], 'assistant.semanticPlan.maxReferencePathDepth', maxDepth);
+        className = assistantReferenceTargetClass(matches[0]);
+        if (!isCmdbuildIdentifierText(className)) break;
+        addRequired(className, binding);
+      }
+    }
+  }
+  (diagnostics.relationPaths || []).forEach((path) => {
+    if (required.has(path.sourceRoot || path.sourceClass) && required.has(path.targetRoot || path.targetClass)) {
+      const owners = [...(required.get(path.sourceRoot || path.sourceClass) || []), ...(required.get(path.targetRoot || path.targetClass) || [])];
+      owners.forEach((owner) => { addRequired(path.sourceClass, owner); addRequired(path.targetClass, owner); });
+    }
+  });
+  checkCount();
+  for (const className of required.keys()) await ensureClass(className);
+  diagnostics.requiredClassNames = [...required.keys()];
+  const optional = (diagnostics.contextClassNames || []).filter((name) => !required.has(name));
+  let selected = [...required.keys(), ...optional].slice(0, config.mcp.maxClasses);
+  let bounded;
+  while (true) {
+    diagnostics.contextClassNames = selected;
+    bounded = boundedMcpText(assistantObjectFlowMcpPayload(results, diagnostics), config.mcp.maxContextBytes);
+    if (!bounded.truncated || selected.length === required.size) break;
+    selected = selected.slice(0, -1);
+  }
+  if (bounded.truncated) {
+    addAssistantLimitDiagnostics(diagnostics.limits || (diagnostics.limits = []), [assistantLimitDiagnostic({
+      source: 'assistant', tool: 'semanticPlanContext', limitName: 'maxContextBytes',
+      limit: config.mcp.maxContextBytes, requested: bounded.bytes, returned: bounded.returnedBytes,
+      truncated: true, reason: 'required-class-context'
+    })]);
+    fail('maxContextBytes', [...required.keys()], 'assistant.mcp.maxContextBytes', config.mcp.maxContextBytes);
+  }
+  for (const className of required.keys()) {
+    if (!bounded.value.classes.some((item) => item.name === className)) fail('missingMetadata', [className]);
+    if (!bounded.value.classFields.some((item) => item.className === className && Array.isArray(item.attributes))) fail('missingFields', [className]);
+  }
+  diagnostics.excludedOptionalClassNames = optional.filter((name) => !selected.includes(name));
+  diagnostics.semanticContext = {
+    complete: true, requiredCount: required.size, selectedCount: selected.length,
+    excludedOptionalCount: diagnostics.excludedOptionalClassNames.length, serializedBytes: bounded.returnedBytes
+  };
+  mcpContext.text = bounded.text;
+  mcpContext.truncated = false;
+}
+
 async function prepareAssistantObjectFlowSemanticPlanContext(input, options = {}) {
   const runtimeConfig = options.runtimeConfig || defaultRuntimeConfig();
   const intent = normalizeAssistantObjectFlowIntent(input.intent, { requireComplete: true });
@@ -41598,15 +42066,21 @@ async function prepareAssistantObjectFlowSemanticPlanContext(input, options = {}
   }
 
   if (!checkpoint || !checkpoint.mcpContext) {
+    const config = normalizeAssistantRuntimeConfig(runtimeConfig);
+    const contextDeadlineAt = Date.now() + mcpTimeoutMs(config);
     const mcpContext = await buildAssistantMcpContext(options.authToken || '', {
       prompt: planningText,
       currentSpec: contextSpec,
       mcpContextScope: 'objectFlow'
     }, runtimeConfig);
+    await assistantResolveExplicitClassMetadata(intent, mcpContext, options.authToken || '', config, contextDeadlineAt);
     const classBindingResult = assistantSemanticClassBindings(intent, mcpContext);
     if (classBindingResult.errors.length) {
-      throw assistantSemanticPlanError('Semantic plan references a CMDBuild class that is unavailable or ambiguous in the MCP model context.', classBindingResult.errors);
+      const error = assistantSemanticPlanError('Semantic plan references a CMDBuild class that is unavailable or ambiguous in the MCP model context.', classBindingResult.errors);
+      error.diagnostics = { mcp: mcpContext.diagnostics || {} };
+      throw error;
     }
+    await assistantFinalizeSemanticContext(intent, mcpContext, classBindingResult.bindings, runtimeConfig, { authToken: options.authToken || '', deadlineAt: contextDeadlineAt });
     const now = new Date();
     checkpoint = {
       version: ASSISTANT_SEMANTIC_PLAN_CHECKPOINT_VERSION,
@@ -41630,8 +42104,11 @@ async function prepareAssistantObjectFlowSemanticPlanContext(input, options = {}
 
   const classBindingResult = assistantSemanticClassBindings(intent, checkpoint.mcpContext);
   if (classBindingResult.errors.length) {
-    throw assistantSemanticPlanError('Semantic plan references a CMDBuild class that is unavailable or ambiguous in the MCP model context.', classBindingResult.errors);
+    const error = assistantSemanticPlanError('Semantic plan references a CMDBuild class that is unavailable or ambiguous in the MCP model context.', classBindingResult.errors);
+    error.diagnostics = { mcp: checkpoint.mcpContext.diagnostics || {} };
+    throw error;
   }
+  await assistantFinalizeSemanticContext(intent, checkpoint.mcpContext, classBindingResult.bindings, runtimeConfig, { allowReads: false });
   return {
     intent,
     contextSpec,
@@ -41674,7 +42151,7 @@ async function createAssistantObjectFlowSemanticPlan(input, options = {}) {
     };
   }
   try {
-    const parsed = parseAssistantJson(await callLiteLLM(assistantObjectFlowSemanticMessages(prepared.intent, input.currentSpec || {}, prepared.checkpoint.mcpContext, runtimeConfig, prepared.classBindingResult.bindings), runtimeConfig));
+    const parsed = parseAssistantJson(await callLiteLLM(assistantObjectFlowSemanticMessages(prepared.intent, input.currentSpec || {}, prepared.checkpoint.mcpContext, runtimeConfig, prepared.classBindingResult.bindings), runtimeConfig, { operation: 'semantic-plan', phase: 'semanticPlan' }));
     const semanticPlan = normalizeAssistantObjectFlowSemanticPlan(parsed, prepared.intent, {
       mcpContext: prepared.checkpoint.mcpContext,
       maxReferencePathDepth: normalizeAssistantRuntimeConfig(runtimeConfig).semanticPlan.maxReferencePathDepth
@@ -41715,6 +42192,7 @@ async function createAssistantObjectFlowSemanticPlan(input, options = {}) {
     return { stage: 'completed', semanticPlan, explanation: semanticPlan.explanation, warnings, diagnostics, resume: completedResume };
   } catch (error) {
     if (resume) error.semanticPlanResume = resume;
+    error.diagnostics = { ...diagnostics, ...(error.diagnostics || {}) };
     throw error;
   }
 }
@@ -44264,11 +44742,13 @@ function assistantClassMentionAlternatives(mention) {
 
 function assistantSemanticClassBindings(intent, mcpContext) {
   const classes = assistantMcpSummaryClasses(mcpContext);
-  if (!classes.length) return { bindings: [], errors: [] };
+  const summary = (mcpContext?.results || []).find((item) => item?.tool === 'cmdbuild_model_summary' && item.ok && item.result)?.result;
+  const catalogCompleteness = summary?.classCatalog || mcpContext?.diagnostics?.classCatalog
+    || { fetched: classes.length, visible: classes.length, total: null, pages: 0, complete: false, reason: 'incomplete' };
   const limits = Array.isArray(mcpContext && mcpContext.diagnostics && mcpContext.diagnostics.limits)
     ? mcpContext.diagnostics.limits
     : [];
-  const classContextLimited = limits.some((limit) => limit
+  const classContextLimited = !catalogCompleteness.complete || limits.some((limit) => limit
     && limit.tool === 'cmdbuild_model_summary'
     && limit.limitName === 'maxClasses'
     && limit.limitHit);
@@ -44286,11 +44766,15 @@ function assistantSemanticClassBindings(intent, mcpContext) {
     const resolvedMentions = new Set();
     const unresolved = [];
     mentions.forEach((mention) => {
-      const matchesFor = (candidate) => classes.filter((item) => assistantClassTextScore({
-        name: item && item.name,
-        description: item && item.description,
-        parent: item && item.parent
-      }, [candidate]).score >= 20);
+      const lookupFor = (candidate) => (mcpContext?.diagnostics?.classLookups || [])
+        .find((lookup) => normalizedAssistantLookupText(lookup.className) === normalizedAssistantLookupText(candidate));
+      const matchesFor = (candidate) => {
+        const lookup = lookupFor(candidate);
+        if (lookup && !['found', 'nameNotFound'].includes(lookup.status)) return [];
+        const matches = assistantExactClassMatches(classes, candidate);
+        return matches.filter((item) => assistantClassExactScore(item, candidate) === 2
+          || catalogCompleteness.complete === true && !classContextLimited);
+      };
       const bind = (candidate, originalMention = candidate) => {
         const matches = matchesFor(candidate);
         if (matches.length !== 1) return false;
@@ -44300,6 +44784,8 @@ function assistantSemanticClassBindings(intent, mcpContext) {
           mention: candidate,
           className: String(matches[0] && matches[0].name || ''),
           description: String(matches[0] && matches[0].description || ''),
+          matchSource: assistantClassExactScore(matches[0], candidate) === 2 ? 'name' : 'description',
+          evidenceSource: lookupFor(candidate)?.status === 'found' ? 'sameSessionLookup' : 'classCatalog',
           expectedOutput: outputMentions.has(candidate) || outputMentions.has(originalMention)
         });
         resolvedMentions.add(candidate);
@@ -44307,12 +44793,24 @@ function assistantSemanticClassBindings(intent, mcpContext) {
       };
       if (bind(mention)) return;
       const alternatives = assistantClassMentionAlternatives(mention);
-      if (alternatives.length && alternatives.some((candidate) => bind(candidate, mention))) return;
+      if (alternatives.length) {
+        const resolved = alternatives.map((candidate) => bind(candidate, mention));
+        if (resolved.every(Boolean)) return;
+      }
       const matches = matchesFor(mention);
       if (!matches.length && alternatives.length) {
         const matchedAlternatives = alternatives.filter((candidate) => bind(candidate, mention));
-        if (matchedAlternatives.length) return;
+        if (matchedAlternatives.length === alternatives.length) return;
       }
+      const lookup = lookupFor(mention) || null;
+      const descriptionUnverified = classContextLimited && (lookup?.status === 'nameNotFound'
+        || assistantExactClassMatches(classes, mention).some((item) => assistantClassExactScore(item, mention) === 1));
+      const reason = matches.length ? 'ambiguous'
+        : lookup && lookup.status !== 'nameNotFound' ? lookup.reason || lookup.status
+          : descriptionUnverified ? 'descriptionUnverified'
+          : catalogCompleteness.denied > 0 || catalogCompleteness.reason === 'permission' ? 'permission'
+            : catalogCompleteness.reason === 'timeout' || limits.some((limit) => limit?.timeout) ? 'timeout'
+              : catalogCompleteness.complete ? 'absent' : 'incomplete';
       unresolved.push({
         kind: matches.length ? 'semanticPlanClassAmbiguous' : 'semanticPlanClassUnavailable',
         blockId: String(block && block.id || ''),
@@ -44321,6 +44819,10 @@ function assistantSemanticClassBindings(intent, mcpContext) {
         field: 'intent.classMention',
         className: mention,
         classContextLimited,
+        reason,
+        status: matches.length ? 'ambiguous' : reason === 'absent' ? 'notFound' : reason,
+        catalogCompleteness,
+        lookup,
         candidates: matches.map((item) => ({ name: String(item && item.name || ''), description: String(item && item.description || '') }))
       });
     });
@@ -57952,6 +58454,7 @@ async function handleBackend(req, res, requestUrl) {
         templateCode: truncateText(templateRef.templateCode, 120),
         stage: semanticStage,
         retryable,
+        limits: collectAssistantLimitDiagnostics(error.diagnostics || {}).filter((item) => item.limitHit || item.timeout || item.truncated),
         resumeIdHash: retryable ? sha256Hex(resumeId).slice(0, 16) : '',
         causes: Array.isArray(feedback && feedback.causes) ? feedback.causes.map((cause) => String(cause && cause.kind || '')).filter(Boolean) : [],
         errorKinds: Array.isArray(error.details) ? error.details.map((detail) => String(detail && detail.kind || '')).filter(Boolean) : [],
@@ -57967,6 +58470,7 @@ async function handleBackend(req, res, requestUrl) {
         message: error.message || String(error),
         errors: error.details || [],
         feedback,
+        diagnostics: error.diagnostics || {},
         retryable,
         resume: retryable ? error.semanticPlanResume : null
       });
@@ -59158,6 +59662,7 @@ async function handleBackend(req, res, requestUrl) {
         } : {}),
         models: assistantDiagramModelBundle(assistantInput || mappingInput || {}, failureDraft, failureMapping),
         diagnostics: {
+          ...(error.diagnostics || {}),
           stage: mappingStage,
           phase: String(error && error.assistantPhase || ''),
           attempt: Number(error && error.assistantAttempt || 1),
