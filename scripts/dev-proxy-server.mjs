@@ -39,6 +39,7 @@ import { compileAssistantPlacementIntent, assistantPlacementHasStageAncestor } f
 import { createAssistantBindingHandles } from './assistant-binding-handles.mjs';
 import { assertInputCollections, normalizeInputCollectionLimits } from './input-collection-limits.mjs';
 import { aggregateDiagramEdges, normalizeEdgeAggregation, validateEdgeAggregation } from './diagram-edge-aggregation.mjs';
+import { createUiRequestDiagnostics } from './ui-request-diagnostics.mjs';
 import { runtimeRowIdentity, runtimeRowValue, runtimeSemanticKey, setRuntimeRowSemantics, setRuntimeRowValue,
   inheritRuntimeRowSemantics, mergeRuntimeRowSemantics, deriveRuntimeRowSemantics } from './runtime-row-semantics.mjs';
 
@@ -9798,6 +9799,7 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     .diagram-element-workbench{display:grid;grid-template-columns:minmax(220px,.42fr) minmax(0,1fr);gap:10px}.diagram-element-tree{display:grid;gap:4px;align-content:start;border:1px solid var(--line);background:#fff;padding:6px;max-height:520px;overflow:auto}.diagram-element-tree-root{display:flex;align-items:center;gap:4px;min-height:30px;border:1px dashed #9aa9b9;background:#f8fafc;padding:5px 6px;font-size:12px;font-weight:700;color:#52667a}.diagram-element-tree-root>span{flex:1 1 auto}.diagram-element-tree-root.diagram-element-tree-drop{border-color:#236c91;background:#e6f4f1}.diagram-element-tree-row{display:flex;gap:4px;align-items:center;width:100%;border:1px solid transparent;background:#fff;padding:3px;text-align:left}.diagram-element-tree-row:hover{background:#f2faf8}.diagram-element-tree-row.selected{border-color:#236c91;background:#e6f4f1}.diagram-element-tree-row.complete{border-left:3px solid #2f855a}.diagram-element-tree-row.partial{border-left:3px solid #d69e2e}.diagram-element-tree-row.pending{border-left:3px solid #a0aec0}.diagram-element-tree-row.group{font-weight:700}.diagram-element-tree-select{display:flex;align-items:center;gap:6px;min-width:0;flex:1 1 auto;border:0;background:transparent;padding:2px 3px;text-align:left}.diagram-element-tree-select:hover{background:transparent}.diagram-element-tree-actions{display:flex;align-items:center;gap:3px;flex:0 0 auto}.diagram-element-tree-actions .icon-button{width:26px;height:26px;min-width:26px;padding:0;line-height:1}.diagram-structure-delete-button{min-height:26px;padding:3px 6px;border-color:#e9b7b0;background:#fff7f5;color:var(--danger);font-size:11px}.diagram-structure-add-menu{display:grid;gap:4px;margin:0 0 4px 28px;border:1px solid #9fb3c8;background:#f8fafc;padding:6px}.diagram-structure-add-menu strong{font-size:12px;color:#334e68}.diagram-structure-add-menu-options{display:flex;gap:4px;flex-wrap:wrap}.diagram-structure-add-menu-options button{font-size:12px}.diagram-structure-add-menu-empty{margin:0;color:var(--muted);font-size:12px}.diagram-element-drag-handle{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;flex:0 0 24px;border:0;background:transparent;color:#64748b;cursor:grab;font-size:16px;line-height:1;user-select:none}.diagram-element-drag-handle:active{cursor:grabbing}.diagram-element-drag-handle:focus-visible{outline:2px solid #236c91;outline-offset:1px}.diagram-element-tree-status{width:9px;height:9px;border-radius:50%;flex:0 0 auto;background:#a0aec0}.diagram-element-tree-row.complete .diagram-element-tree-status{background:#2f855a}.diagram-element-tree-row.partial .diagram-element-tree-status{background:#d69e2e}.diagram-element-tree-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.diagram-element-tree-indent{display:inline-block;width:14px}.diagram-element-tree-drop{outline:2px solid #236c91;outline-offset:-2px;background:#e6f4f1!important}.diagram-element-tree-notice{margin:0;color:#07575b;font-size:12px;font-weight:700}@media(max-width:900px){.diagram-element-workbench{grid-template-columns:1fr}.layout{grid-template-columns:1fr}main{padding:10px}header{height:auto;align-items:flex-start;gap:8px;flex-direction:column;padding:10px}.header-side{justify-content:flex-start}.designer-actionbar{align-items:flex-start}.designer-actionbar-actions{justify-content:flex-start}.designer-actionbar-context{flex-basis:100%}}
     .diagram-element-tree-branch{display:grid;gap:2px;position:relative}.diagram-element-tree-branch.nested{margin-left:15px;padding-left:12px;border-left:1px solid #c7d2de}.diagram-element-tree-node{display:grid;gap:2px;position:relative}.diagram-element-tree-branch.nested>.diagram-element-tree-node::before{content:"";position:absolute;left:-13px;top:16px;width:13px;border-top:1px solid #c7d2de}.diagram-element-tree-toggle{width:24px;height:24px;min-width:24px;padding:0;border:0;background:transparent;color:#52667a;font-weight:700;line-height:1}.diagram-element-tree-toggle:hover{background:#e6f4f1;color:#0f4c5c}.diagram-element-tree-hidden-count{color:var(--muted);font-size:11px;font-weight:400;white-space:nowrap}
     .code-inline{overflow-wrap:anywhere;word-break:break-word;white-space:normal}.diagram-element-inspector{display:grid;grid-template-columns:minmax(0,1fr);gap:10px;min-width:0;align-content:start}.diagram-element-inspector>*,.diagram-element-inspector .diagram-editor-block>*,.diagram-element-inspector .help-details,.diagram-element-inspector .diagram-grid{min-width:0}.diagram-element-inspector .diagram-grid{grid-template-columns:repeat(auto-fit,minmax(min(180px,100%),1fr))}.diagram-element-inspector .table-wrap{width:100%;min-width:0;overflow-x:auto}@media(min-width:901px){.diagram-element-workbench{grid-template-columns:minmax(240px,280px) minmax(0,1fr);align-items:start}.diagram-element-tree{min-width:0}}
+    .ui-error-diagnostics{width:100%;min-width:0;margin-top:8px;border:1px solid var(--line);border-radius:4px;padding:8px;background:#fff}.ui-error-diagnostics>summary{cursor:pointer;overflow-wrap:anywhere}.ui-error-diagnostics .toolbar{margin:8px 0;min-height:32px;gap:8px}.ui-error-diagnostics .icon-button{width:32px;height:32px;padding:0}.ui-error-diagnostics pre{max-width:100%;max-height:480px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}.ui-error-diagnostics [data-diagnostic-copy-status]{color:var(--muted);font-size:12px}@media(max-width:640px){.ui-error-diagnostics .icon-button{width:44px;height:44px}.ui-error-diagnostics>summary .muted{display:block}}
   </style>
 </head>
 <body${mode === 'runtime' ? ' class="runtime-page"' : ''}>
@@ -9814,6 +9816,7 @@ function dynamicPagesClientScript() {
 (function () {
   'use strict';
   var boot = window.CMDP_BOOT || {};
+  var uiRequestDiagnostics = (${createUiRequestDiagnostics.toString()})();
   var apiPrefix = boot.apiPrefix || '/cmdbuild/custom-api';
   var app = document.getElementById('app');
   var DEFAULT_EMPTY_RESULT_TEXT = ${JSON.stringify(DEFAULT_EMPTY_RESULT_TEXT)};
@@ -11076,6 +11079,16 @@ function dynamicPagesClientScript() {
       runtimeRefresh: 'Refresh',
       runtimeRefreshing: 'Refreshing...',
       requestFailed: 'Request failed.',
+      technicalDiagnostics: 'Technical diagnostics',
+      diagnosticNoHttpResponse: 'No HTTP response',
+      copyDiagnostics: 'Copy diagnostics',
+      diagnosticsCopied: 'Diagnostics copied.',
+      diagnosticsCopyUnavailable: 'Clipboard is unavailable. The diagnostic text is selected.',
+      diagnosticOperationInterrupted: 'The operation did not finish. Technical diagnostics contain the original failure.',
+      diagnosticUnexpectedResponse: 'The server returned an unexpected response format.',
+      diagnosticClientTimeout: 'The browser request exceeded its waiting limit ({timeoutMs} ms). Backend completion is not confirmed.',
+      diagnosticNetworkFailure: 'The browser could not receive a server response.',
+      diagnosticCancelled: 'The browser request was cancelled. Backend completion is not confirmed.',
       inputCollectionLimit: 'Too many authoring elements at {path}: {count}, limit {limit}. Reduce the collection or ask the operator to adjust the limit. Your edits have not been discarded.',
       httpStatus: 'HTTP {status}',
       invalidJson: '{id} must contain valid JSON.',
@@ -12346,6 +12359,16 @@ function dynamicPagesClientScript() {
       runtimeRefresh: 'Обновить',
       runtimeRefreshing: 'Обновляется...',
       requestFailed: 'Запрос не выполнен.',
+      technicalDiagnostics: 'Техническая диагностика',
+      diagnosticNoHttpResponse: 'Нет HTTP-ответа',
+      copyDiagnostics: 'Копировать диагностику',
+      diagnosticsCopied: 'Диагностика скопирована.',
+      diagnosticsCopyUnavailable: 'Буфер обмена недоступен. Текст диагностики выделен.',
+      diagnosticOperationInterrupted: 'Операция не завершена. Исходная причина сохранена в технической диагностике.',
+      diagnosticUnexpectedResponse: 'Сервер вернул ответ в неожиданном формате.',
+      diagnosticClientTimeout: 'Превышен лимит ожидания браузера ({timeoutMs} мс). Завершение backend не подтверждено.',
+      diagnosticNetworkFailure: 'Браузер не смог получить ответ сервера.',
+      diagnosticCancelled: 'Запрос браузера отменён. Завершение backend не подтверждено.',
       inputCollectionLimit: 'Слишком много элементов настройки в {path}: {count}, допустимо {limit}. Уменьшите список или попросите администратора изменить лимит. Введённые изменения не сброшены.',
       httpStatus: 'HTTP {status}',
       invalidJson: '{id} должен содержать корректный JSON.',
@@ -12426,6 +12449,8 @@ function dynamicPagesClientScript() {
     maxTraversalDepth: Math.max(1, Math.min(5, Number(readStorageValue('cmdbdynamicpages.maxTraversalDepth') || 2))),
     maxCatalogPathCandidates: Math.max(100, Math.min(50000, Number(readStorageValue('cmdbdynamicpages.maxCatalogPathCandidates') || 5000))),
     designerSection: normalizeDesignerSection(boot.designerSection || readDesignerSectionFromLocation()),
+    uiDiagnosticGeneration: 0,
+    uiDiagnosticRevision: 0,
     templates: [],
     templateVersions: [],
     selectedTemplate: null,
@@ -12454,6 +12479,7 @@ function dynamicPagesClientScript() {
       assistantFlowRejected: null,
       assistantFlowErrors: [],
       assistantFlowDiagnostics: {},
+      assistantFlowRequestDiagnostic: null,
       assistantFlowFeedback: null,
       assistantFlowErrorStage: '',
       assistantFlowResume: null,
@@ -12845,7 +12871,7 @@ function dynamicPagesClientScript() {
     if (failedAt && Date.now() - failedAt < 5000) return Promise.resolve(false);
     state.catalogAttributeLoads[key] = request(apiPrefix + '/model/classes/' + encodeURIComponent(name) + '/attributes').then(function (result) {
       if (!result.ok || !result.json || !Array.isArray(result.json.data)) {
-        throw new Error(errorText(result));
+        throw createRequestError(result);
       }
       delete state.catalogAttributeFailedAt[key];
       return mergeCatalogClassAttributes(name, result.json.data);
@@ -13022,6 +13048,8 @@ function dynamicPagesClientScript() {
         status: response.status,
         json: json,
         body: body,
+        contentType: response.headers && response.headers.get ? response.headers.get('Content-Type') || '' : '',
+        serverRequestId: response.headers && response.headers.get ? response.headers.get('x-request-id') || '' : '',
         retryAfter: response.headers && response.headers.get ? response.headers.get('Retry-After') || '' : '',
         requestId: response.headers && response.headers.get
           ? response.headers.get('x-request-id') || String(requestContext && requestContext.requestId || '')
@@ -13048,7 +13076,7 @@ function dynamicPagesClientScript() {
     if (result.json && (result.json.rootCause || result.json.schema && result.json.schema.rootCause)) {
       return schemaBootstrapRootCauseText(result.json.rootCause || result.json.schema.rootCause);
     }
-    if (result.json && result.json.errors) {
+    if (result.json && Array.isArray(result.json.errors) && result.json.errors.length) {
       var catalog = result.json.errors.filter(function (item) { return item && item.family === 'catalog'; });
       if (catalog.length) {
         return (result.json.message || 'D2 mapping is not valid for the current CMDBuild catalog.') + ' ' + catalog.slice(0, 3).map(function (item) {
@@ -13107,6 +13135,7 @@ function dynamicPagesClientScript() {
     error.path = path;
     error.timeoutMs = timeoutMs;
     error.requestId = requestId;
+    error.diagnostic = uiRequestDiagnostics.exception(error, Object.assign({}, context, { path: path }));
     return error;
   }
 
@@ -13117,39 +13146,69 @@ function dynamicPagesClientScript() {
   }
 
   function fetchWithinDeadline(path, fetchOptions, deadlineAt, requestContext) {
-    var controller = window.AbortController ? new AbortController() : null;
+    var controller = window.AbortController ? new window.AbortController() : null;
     var options = Object.assign({}, fetchOptions);
+    var callerSignal = options.signal;
     if (controller) options.signal = controller.signal;
     var timeoutMs = remainingRequestDeadlineMs(deadlineAt, path, requestContext);
     var timedOut = false;
     var timeoutId = null;
+    var cancelHandler = null;
+    var cancelled = new Promise(function (_, reject) {
+      if (!callerSignal) return;
+      cancelHandler = function () {
+        var error = new Error('Request cancelled: ' + path);
+        error.name = 'AbortError';
+        error.code = 'request_cancelled';
+        reject(error);
+        if (controller) controller.abort();
+      };
+      if (callerSignal.aborted) cancelHandler();
+      else callerSignal.addEventListener('abort', cancelHandler, { once: true });
+    });
     var timeout = new Promise(function (_, reject) {
       timeoutId = window.setTimeout(function () {
         timedOut = true;
-        if (controller) controller.abort();
         reject(requestTimeoutError(path, requestContext));
+        if (controller) controller.abort();
       }, timeoutMs);
     });
-    return Promise.race([fetch(path, options), timeout]).finally(function () {
+    var operation = Promise.resolve().then(function () {
+      if (callerSignal && callerSignal.aborted) throw Object.assign(new Error('Request cancelled: ' + path), { name: 'AbortError', code: 'request_cancelled' });
+      return fetch(path, options);
+    }).then(function (response) {
+      return parseResponse(response, requestContext);
+    });
+    return Promise.race([operation, timeout, cancelled]).finally(function () {
       window.clearTimeout(timeoutId);
+      if (callerSignal && cancelHandler) callerSignal.removeEventListener('abort', cancelHandler);
     }).catch(function (error) {
-      if (timedOut || error && error.name === 'AbortError') throw requestTimeoutError(path, requestContext);
+      if (timedOut && (!error || error.code !== 'request_timeout')) throw requestTimeoutError(path, requestContext);
+      if (!error.diagnostic) error.diagnostic = uiRequestDiagnostics.exception(error, requestContext);
       throw error;
     });
   }
 
-  function getCsrfToken(deadlineAt, requestContext) {
+  function getCsrfToken(deadlineAt, requestContext, signal) {
     if (csrfToken) return Promise.resolve(csrfToken);
-    return fetchWithinDeadline(apiPrefix + '/csrf', {
-      method: 'GET',
-      credentials: 'include',
-      headers: Object.assign({ Accept: 'application/json' }, requestContext && requestContext.requestId ? { 'X-Request-ID': requestContext.requestId } : {})
-    }, deadlineAt, requestContext).then(function (response) {
-      return parseResponse(response, requestContext);
+    var context = Object.assign({}, requestContext, { path: apiPrefix + '/csrf', method: 'GET', attempt: 1 });
+    return Promise.resolve().then(function () {
+      return fetchWithinDeadline(context.path, {
+        method: 'GET',
+        signal: signal,
+        credentials: 'include',
+        headers: Object.assign({ Accept: 'application/json' }, requestContext && requestContext.requestId ? { 'X-Request-ID': requestContext.requestId } : {})
+      }, deadlineAt, context);
     }).then(function (result) {
-      if (!result.ok || !result.json || !result.json.token) throw new Error(errorText(result));
+      if (!result.ok || !result.json || !result.json.token) {
+        result.diagnostic = uiRequestDiagnostics.response(result, context);
+        throw createRequestError(result);
+      }
       csrfToken = result.json.token;
       return csrfToken;
+    }).catch(function (error) {
+      if (!error.diagnostic) error.diagnostic = uiRequestDiagnostics.exception(error, context);
+      throw error;
     });
   }
 
@@ -13157,36 +13216,69 @@ function dynamicPagesClientScript() {
     options = options || {};
     var method = (options.method || 'GET').toUpperCase();
     var timeoutMs = Math.max(1000, Number(options.timeoutMs || 15000));
-    var deadlineAt = Date.now() + timeoutMs;
+    var startedAt = Date.now();
+    var deadlineAt = startedAt + timeoutMs;
     var requestContext = {
+      path: path,
+      method: method,
       requestId: String(options.requestId || clientRequestId()).trim(),
-      timeoutMs: timeoutMs
+      startedAt: startedAt,
+      timeoutMs: timeoutMs,
+      attempt: 1,
+      owner: options.owner || uiRequestOwner(),
+      action: options.action,
+      phase: options.phase,
+      blockName: options.blockName
     };
+    requestContext.action = options.action || requestContext.owner.action || requestContext.owner.section;
     var maxRetries = method === 'GET' ? Math.max(0, Math.min(3, Number(options.maxRetries === undefined ? 2 : options.maxRetries) || 0)) : 0;
     var fetchOptions = {
       method: method,
+      signal: options.signal,
       credentials: 'include',
       headers: { Accept: 'application/json', 'X-Request-ID': requestContext.requestId }
     };
     if (options.body !== undefined) {
       fetchOptions.headers['Content-Type'] = 'application/json';
-      fetchOptions.body = JSON.stringify(options.body);
+      try { fetchOptions.body = JSON.stringify(options.body); }
+      catch (error) {
+        error.diagnostic = uiRequestDiagnostics.exception(error, requestContext);
+        return Promise.reject(error);
+      }
     }
     var execute = function (attempt) {
-      return fetchWithinDeadline(path, fetchOptions, deadlineAt, requestContext).then(function (response) {
-        return parseResponse(response, requestContext);
+      requestContext.attempt = attempt + 1;
+      return Promise.resolve().then(function () {
+        return fetchWithinDeadline(path, fetchOptions, deadlineAt, requestContext);
       }).then(function (result) {
         if (attempt < maxRetries && [429, 502, 503, 504].indexOf(result.status) !== -1) {
           var retryDelay = Math.min(requestRetryDelayMs(result, attempt), remainingRequestDeadlineMs(deadlineAt, path, requestContext));
-          return new Promise(function (resolve) {
-            window.setTimeout(resolve, retryDelay);
+          return new Promise(function (resolve, reject) {
+            var signal = options.signal;
+            var cancel = function () {
+              window.clearTimeout(timer);
+              if (signal) signal.removeEventListener('abort', cancel);
+              reject(Object.assign(new Error('Request cancelled: ' + path), { name: 'AbortError', code: 'request_cancelled' }));
+            };
+            var timer = window.setTimeout(function () {
+              if (signal) signal.removeEventListener('abort', cancel);
+              resolve();
+            }, retryDelay);
+            if (signal) {
+              if (signal.aborted) cancel();
+              else signal.addEventListener('abort', cancel, { once: true });
+            }
           }).then(function () { return execute(attempt + 1); });
         }
+        result.diagnostic = uiRequestDiagnostics.response(result, requestContext);
         return result;
+      }).catch(function (error) {
+        if (!error.diagnostic) error.diagnostic = uiRequestDiagnostics.exception(error, requestContext);
+        throw error;
       });
     };
     if (method === 'GET') return execute(0);
-    return getCsrfToken(deadlineAt, requestContext).then(function (token) {
+    return getCsrfToken(deadlineAt, requestContext, options.signal).then(function (token) {
       fetchOptions.headers['X-CMDBDynamicPages-CSRF'] = token;
       return execute(0);
     });
@@ -13262,12 +13354,15 @@ function dynamicPagesClientScript() {
     return backendTimeout + grace;
   }
 
-  function requestDraftPreview(path, template, params, requestId) {
+  function requestDraftPreview(path, template, params, requestId, owner) {
     return request(path, {
       method: 'POST',
       timeoutMs: draftPreviewRequestTimeoutMs(),
       requestId: requestId,
+      owner: owner,
       body: { template: template, params: params }
+    }).then(function (result) {
+      return validateUiResponse(result, 'preview');
     });
   }
 
@@ -13475,7 +13570,7 @@ function dynamicPagesClientScript() {
       if (hasField('cmdp-params') || document.querySelectorAll('[data-run-param-field]').length) state.runParams = readRunParams();
       return true;
     } catch (error) {
-      state.message = { type: 'error', text: error.message || String(error) };
+      setUiError(error);
       renderDesigner();
       return false;
     }
@@ -13602,6 +13697,7 @@ function dynamicPagesClientScript() {
     state.assistantFlowRejected = null;
     state.assistantFlowErrors = [];
     state.assistantFlowDiagnostics = {};
+    state.assistantFlowRequestDiagnostic = null;
     state.assistantFlowFeedback = null;
     state.assistantFlowErrorStage = '';
     if (!options.preserveResume) state.assistantFlowResume = null;
@@ -14414,6 +14510,126 @@ function dynamicPagesClientScript() {
     state.lastDraftPreviewOk = false;
   }
 
+  function invalidateUiDiagnosticRevision(event) {
+    if (boot.mode === 'runtime' || !event.target || event.target.id === 'cmdp-language') return;
+    if (event.target.closest && event.target.closest('[data-ui-error-diagnostics]')) return;
+    if (event.target.matches && event.target.matches('[data-catalog-field-picker-search], [data-diagram-import-condition-picker-search], [data-compact-multi-select-search]')) return;
+    state.uiDiagnosticRevision = Number(state.uiDiagnosticRevision || 0) + 1;
+  }
+  document.addEventListener('input', invalidateUiDiagnosticRevision);
+  document.addEventListener('change', invalidateUiDiagnosticRevision);
+
+  function runUiOperation(action, callback) {
+    state.uiDiagnosticGeneration = Number(state.uiDiagnosticGeneration || 0) + 1;
+    state.uiDiagnosticAction = action;
+    return callback();
+  }
+
+  function runUiMutation(callback) {
+    state.uiDiagnosticRevision = Number(state.uiDiagnosticRevision || 0) + 1;
+    return callback();
+  }
+
+  function uiRequestOwner() {
+    return {
+      templateCode: String(state.selectedTemplate && state.selectedTemplate.code || ''),
+      section: String(state.designerSection || ''),
+      generation: Number(state.uiDiagnosticGeneration || 0),
+      revision: Number(state.uiDiagnosticRevision || 0),
+      action: String(state.uiDiagnosticAction || state.designerSection || '')
+    };
+  }
+
+  function uiDiagnosticIsCurrent(diagnostic) {
+    if (!diagnostic || boot.mode === 'runtime') return false;
+    var owner = diagnostic.owner;
+    if (!owner) return true;
+    var current = uiRequestOwner();
+    return owner.templateCode === current.templateCode && (owner.displaySection || owner.section) === current.section
+      && Number(owner.generation || 0) === current.generation
+      && Number(owner.revision || 0) === current.revision;
+  }
+
+  function validateUiResponse(result, kind) {
+    if (!result || !result.ok) return result;
+    var json = result.json;
+    var isObject = function (value) { return Boolean(value && typeof value === 'object' && !Array.isArray(value)); };
+    var valid = isObject(json) && json.success === true;
+    if (valid && kind === 'save') valid = isObject(json.template) && isObject(json.template.spec);
+    if (valid && kind === 'preview') valid = isObject(json.result) && Array.isArray(json.result.tables)
+      && (json.result.diagrams === undefined || Array.isArray(json.result.diagrams));
+    if (!valid) throw createRequestError(result, true);
+    return result;
+  }
+
+  function createRequestError(result, invalidEnvelope) {
+    var invalidResponse = Boolean(invalidEnvelope || result && result.ok && !(result.json && result.json.code));
+    var message = invalidResponse ? t('diagnosticUnexpectedResponse') : errorText(result);
+    var error = new Error(uiRequestDiagnostics.sanitize({ message: message }).message);
+    error.code = invalidEnvelope ? 'invalid_response' : result && result.json && result.json.code || (invalidResponse ? 'invalid_response' : 'request_failed');
+    error.diagnostic = result && result.diagnostic || null;
+    error.statusCode = result && result.status;
+    if (invalidResponse && error.diagnostic) error.diagnostic = Object.assign({}, error.diagnostic, { code: error.code, message: error.message });
+    return error;
+  }
+
+  function uiErrorMessage(error, text) {
+    var diagnostic = error && error.diagnostic;
+    var code = diagnostic && diagnostic.code || error && error.code || '';
+    var message = code === 'request_timeout' ? t('diagnosticClientTimeout', { timeoutMs: diagnostic && diagnostic.clientTimeoutMs || error.timeoutMs || '' })
+      : code === 'network_error' ? t('diagnosticNetworkFailure')
+        : code === 'request_cancelled' ? t('diagnosticCancelled')
+          : code === 'http_error' && diagnostic ? t('httpStatus', { status: diagnostic.status })
+            : text || error && error.message || String(error || '');
+    return { type: 'error', text: uiRequestDiagnostics.sanitize({ message: message }).message, diagnostic: diagnostic || null };
+  }
+
+  function setUiError(error, text) {
+    if (error && error.diagnostic && !uiDiagnosticIsCurrent(error.diagnostic)) return;
+    state.message = uiErrorMessage(error, text);
+  }
+
+  function routeUiRequestDiagnostic(result, section) {
+    if (!result || !result.diagnostic || !uiDiagnosticIsCurrent(result.diagnostic)) return;
+    result.diagnostic.owner.displaySection = section;
+  }
+
+  function renderRequestErrorNotice(result, text) {
+    var message = uiErrorMessage(createRequestError(result), text);
+    if (state.message && state.message.diagnostic === message.diagnostic) message.diagnostic = null;
+    return renderNotice(message);
+  }
+
+  function renderUiErrorDiagnostics(diagnostic) {
+    if (!uiDiagnosticIsCurrent(diagnostic)) return '';
+    var safe = uiRequestDiagnostics.sanitize(userFacingAssistantDiagnostics(diagnostic, (state.selectedTemplate && state.selectedTemplate.spec) || defaultSpec()));
+    var report = uiRequestDiagnostics.serialize(safe);
+    var status = safe.status ? 'HTTP ' + safe.status : t('diagnosticNoHttpResponse');
+    var requestId = safe.serverRequestId || safe.clientRequestId || '';
+    return '<details class="help-details ui-error-diagnostics" data-ui-error-diagnostics><summary>'
+      + escapeHtml(t('technicalDiagnostics')) + ' <span class="muted">' + escapeHtml(status + (requestId ? ' · ' + requestId : '')) + '</span></summary>'
+      + '<div class="toolbar"><button type="button" class="icon-button" data-action="copy-error-diagnostics" title="' + escapeHtml(t('copyDiagnostics')) + '" aria-label="' + escapeHtml(t('copyDiagnostics')) + '">⧉</button><span data-diagnostic-copy-status role="status" aria-live="polite"></span></div>'
+      + '<pre data-ui-diagnostic-report tabindex="0">' + escapeHtml(report) + '</pre></details>';
+  }
+
+  function copyUiErrorDiagnostics(button) {
+    var detail = button.closest('[data-ui-error-diagnostics]');
+    var report = detail && detail.querySelector('[data-ui-diagnostic-report]');
+    var status = detail && detail.querySelector('[data-diagnostic-copy-status]');
+    if (!report || !status) return;
+    Promise.resolve().then(function () {
+      if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error('clipboard_unavailable');
+      return navigator.clipboard.writeText(report.textContent);
+    }).then(function () { status.textContent = t('diagnosticsCopied'); }).catch(function () {
+      status.textContent = t('diagnosticsCopyUnavailable');
+      var selection = window.getSelection();
+      var range = document.createRange();
+      range.selectNodeContents(report);
+      if (selection) { selection.removeAllRanges(); selection.addRange(range); }
+      report.focus();
+    });
+  }
+
   function renderNotice(message) {
     if (!message || !message.text) return '';
     var flowFeedback = state.assistantFlowFeedback;
@@ -14422,7 +14638,8 @@ function dynamicPagesClientScript() {
       message = Object.assign({}, message, { text: message.text === flowFeedback.summary ? localized.summary : localized.action });
     }
     var error = message.type === 'error';
-    return '<div class="notice ' + escapeHtml(message.type || '') + '"' + (error ? ' role="alert" aria-live="assertive"' : ' aria-live="polite"') + '>' + escapeHtml(message.text) + '</div>';
+    return '<div class="notice ' + escapeHtml(message.type || '') + '"' + (error ? ' role="alert" aria-live="assertive"' : ' aria-live="polite"') + '>' + escapeHtml(message.text) + '</div>'
+      + (message.diagnosticOwner === 'assistantFlow' ? '' : renderUiErrorDiagnostics(message.diagnostic));
   }
 
   function renderKpi(label, value) {
@@ -17804,7 +18021,7 @@ function dynamicPagesClientScript() {
     var json = result.json || {};
     var displaySpec = json.spec && typeof json.spec === 'object' ? json.spec : ((state.selectedTemplate && state.selectedTemplate.spec) || defaultSpec());
     var html = busy;
-    if (!result.ok) html += renderNotice({ type: 'error', text: errorText(result) });
+    if (!result.ok) html += renderRequestErrorNotice(result);
     if (Array.isArray(json.warnings) && json.warnings.length) {
       html += '<h3>' + t('assistantWarnings') + '</h3><ul class="steps">' + json.warnings.map(function (item) { return '<li>' + escapeHtml(userFacingResultText(item, displaySpec)) + '</li>'; }).join('') + '</ul>';
     }
@@ -17946,7 +18163,11 @@ function dynamicPagesClientScript() {
     var semanticPlanRetryAvailable = Boolean(state.assistantFlowResume && state.assistantFlowResume.retryable && state.assistantFlowResume.retryStage !== 'flowDraft');
     var flowPlanRetryAvailable = Boolean(state.assistantFlowResume && state.assistantFlowResume.retryable && state.assistantFlowResume.retryStage === 'flowDraft');
     var retryAvailable = semanticPlanRetryAvailable || flowPlanRetryAvailable;
-    var technical = state.assistantFlowErrors.length ? '<details class="help-details"><summary>' + escapeHtml(t('assistantFlowTechnicalDetails')) + '</summary><pre>' + escapeHtml(pretty(userFacingAssistantDiagnostics({ errors: state.assistantFlowErrors, diagnostics: state.assistantFlowDiagnostics, rejectedFlow: state.assistantFlowRejected }, (state.selectedTemplate && state.selectedTemplate.spec) || defaultSpec()))) + '</pre></details>' : '';
+    var requestDiagnostic = state.assistantFlowRequestDiagnostic;
+    if (!requestDiagnostic && state.assistantFlowErrors.length) requestDiagnostic = uiRequestDiagnostics.response({
+      ok: false, json: { code: 'validation_error', errors: state.assistantFlowErrors, diagnostics: state.assistantFlowDiagnostics }
+    }, { owner: uiRequestOwner(), action: 'assistant.validation', phase: state.assistantFlowErrorStage, method: 'POST' });
+    var technical = renderUiErrorDiagnostics(requestDiagnostic);
     var errorHeading = flowPlanRetryAvailable ? t('assistantFlowPlanPaused') : retryAvailable ? t('assistantSemanticPlanPaused') : state.assistantFlowErrorStage === 'semanticPlan' ? t('assistantSemanticPlanRejected') : t('assistantFlowRejected');
     var errors = state.assistantFlowErrors.length || feedback ? '<div class="assistant-draft-preview notice warning" data-assistant-flow-rejected><h4>' + escapeHtml(errorHeading) + '</h4>'
       + (feedback && feedback.summary ? '<p>' + escapeHtml(feedback.summary) + '</p>' : '')
@@ -19710,7 +19931,7 @@ function dynamicPagesClientScript() {
   function renderExtractionPreview(spec) {
     var result = state.extractionPreview;
     if (!result) return '';
-    if (!result.ok) return '<div class="notice error">' + escapeHtml(errorText(result)) + '</div>';
+    if (!result.ok) return renderRequestErrorNotice(result);
     var tables = result.json && result.json.result && Array.isArray(result.json.result.tables) ? result.json.result.tables : [];
     if (!tables.length || !tables.some(function (table) { return table && Array.isArray(table.rows) && table.rows.length; })) {
       return '<div class="notice">' + t('extractionNoRows') + '</div>';
@@ -22546,7 +22767,7 @@ function dynamicPagesClientScript() {
       return Promise.resolve(false);
     }
     return request(apiPrefix + '/model/catalog?includeAttributes=true&root=' + encodeURIComponent(state.root || 'Cst_QueryTool')).then(function (result) {
-      if (!result.ok || !result.json || !result.json.catalog) throw new Error(errorText(result));
+      if (!result.ok || !result.json || !result.json.catalog) throw createRequestError(result);
       return writeCatalogCache(result.json.catalog).then(function (record) {
         applyCatalogCache(record);
         warnCatalogDomainEndpointsIncomplete();
@@ -24533,7 +24754,7 @@ function dynamicPagesClientScript() {
     var trace = result.json && result.json.result ? (result.json.result.trace || []) : [];
     var warnings = resultBody && Array.isArray(resultBody.warnings) ? resultBody.warnings : [];
     if (!result.ok) {
-      var errorHtml = '<section class="section" id="cmdp-result-section">' + renderNotice({ type: 'error', text: errorText(result) });
+      var errorHtml = '<section class="section" id="cmdp-result-section">' + renderRequestErrorNotice(result);
       if (trace.length) errorHtml += renderExecutionTrace(trace);
       return errorHtml + '</section>';
     }
@@ -25354,7 +25575,7 @@ function dynamicPagesClientScript() {
       });
       var redirectedToTemplates = ensureTemplateListOnNewDesignerSession();
       var failed = results.find(function (item) { return !item.ok; });
-      if (failed) state.message = { type: 'error', text: errorText(failed) };
+      if (failed) setUiError(createRequestError(failed));
       else if (!redirectedToTemplates || !state.message) state.message = null;
       return loadCatalogCache().then(function () {
         clientLog('load-designer-catalog', 'loaded');
@@ -27082,7 +27303,7 @@ function dynamicPagesClientScript() {
       state.message = { type: 'ok', text: t('paramsApplied') };
       renderDesigner();
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
     }
   }
@@ -27096,7 +27317,7 @@ function dynamicPagesClientScript() {
       state.message = { type: 'ok', text: t('examplesFilled') };
       renderDesigner();
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
     }
   }
@@ -27151,7 +27372,7 @@ function dynamicPagesClientScript() {
       state.message = { type: 'ok', text: t('extractionApplied') };
       renderDesigner();
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
     }
   }
@@ -27169,12 +27390,13 @@ function dynamicPagesClientScript() {
       state.message = { type: 'ok', text: t('extractionPreviewReady') };
       renderDesigner();
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
     }
   }
 
   function extractByTemplate() {
+    var owner = uiRequestOwner();
     var payload;
     var params;
     try {
@@ -27184,22 +27406,26 @@ function dynamicPagesClientScript() {
       state.extractionSource = preferredExtractionResultName(payload.spec, specTables, readValue('cmdp-extraction-source') || state.extractionSource || '');
       payload.spec = ensureExtractionPreviewTable(payload.spec, state.extractionSource);
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
       return;
     }
     state.extractionPreview = null;
-    requestDraftPreview(authoringPreviewPath({ includeDiagrams: false, extractionSource: state.extractionSource }), payload, params).then(function (result) {
+    requestDraftPreview(authoringPreviewPath({ includeDiagrams: false, extractionSource: state.extractionSource }), payload, params, undefined, owner).then(function (result) {
+      if (!uiDiagnosticIsCurrent(result.diagnostic)) return;
       state.extractionPreview = result;
       var sourceWarning = extractionSelectedSourceEmptyWarning(result, state.extractionSource, payload.spec);
       state.message = {
         type: result.ok ? (sourceWarning ? 'warning' : 'ok') : 'error',
-        text: result.ok ? (sourceWarning || t('extractionCompleted')) : draftPreviewResultErrorText(result)
+        text: result.ok ? (sourceWarning || t('extractionCompleted')) : draftPreviewResultErrorText(result),
+        diagnostic: result.ok ? null : result.diagnostic
       };
       renderDesigner();
     }).catch(function (error) {
+      if (!uiDiagnosticIsCurrent(error.diagnostic || { owner: owner })) return;
       state.extractionPreview = null;
-      state.message = { type: 'error', text: draftPreviewErrorText(error) };
+      state.lastDraftPreviewOk = false;
+      setUiError(error, draftPreviewErrorText(error));
       renderDesigner();
     });
   }
@@ -27217,7 +27443,7 @@ function dynamicPagesClientScript() {
       state.message = { type: 'ok', text: t('selectionApplied') };
       renderDesigner();
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
     }
   }
@@ -27236,7 +27462,7 @@ function dynamicPagesClientScript() {
       state.message = { type: 'ok', text: t('visualizationApplied') };
       renderDesigner();
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
     }
   }
@@ -27251,7 +27477,7 @@ function dynamicPagesClientScript() {
       state.message = { type: 'ok', text: t('publicationApplied') };
       renderDesigner();
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
     }
   }
@@ -27294,7 +27520,7 @@ function dynamicPagesClientScript() {
       state.message = { type: 'ok', text: t('cmdbBuildViewApplied') };
       renderDesigner();
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
     }
   }
@@ -27309,7 +27535,7 @@ function dynamicPagesClientScript() {
       state.message = { type: 'ok', text: t('cacheApplied') };
       renderDesigner();
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
     }
   }
@@ -27325,7 +27551,7 @@ function dynamicPagesClientScript() {
       state.message = { type: 'ok', text: t('viewComposerApplied') };
       renderDesigner();
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
     }
   }
@@ -27347,7 +27573,7 @@ function dynamicPagesClientScript() {
       state.message = { type: 'ok', text: t('objectGroupApplied') };
       renderDesigner();
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
     }
   }
@@ -27370,7 +27596,7 @@ function dynamicPagesClientScript() {
       state.message = { type: 'ok', text: t('relationApplied') };
       renderDesigner();
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
     }
   }
@@ -29010,7 +29236,7 @@ function dynamicPagesClientScript() {
       state.diagramImportPreviewSource = '';
       state.diagramImportPreviewError = message;
       state.diagramImportStale = false;
-      state.message = { type: 'error', text: message };
+      setUiError(error, message);
       clientLog('diagram-import-render-error', String(error && error.name || 'Error').slice(0, 80));
       try {
         app.innerHTML = '<section class="section"><div class="notice error" role="alert" aria-live="assertive">' + escapeHtml(message) + '</div><div class="toolbar"><button type="button" data-action="refresh">' + escapeHtml(t('refresh')) + '</button></div></section>';
@@ -29076,7 +29302,7 @@ function dynamicPagesClientScript() {
     }).then(function (result) {
       var revisionError = diagramImportRequestRevisionError(requestRevision, null);
       if (revisionError) throw revisionError;
-      if (!result.ok || !result.json || !result.json.proposal) throw new Error(errorText(result));
+      if (!result.ok || !result.json || !result.json.proposal) throw createRequestError(result);
       state.diagramImportSignedProposal = cloneJsonValue(result.json.proposal, null);
       state.diagramImportProposal = cloneJsonValue(result.json.proposal, null);
       // The restore endpoint re-analyzes the D2 source and therefore owns the
@@ -29116,7 +29342,7 @@ function dynamicPagesClientScript() {
     }).catch(function (error) {
       var message = String(error && error.message || error || t('requestFailed')).slice(0, 500);
       state.diagramImportPreviewError = message;
-      state.message = { type: 'error', text: message };
+      setUiError(error, message);
       if (options.propagateErrors) throw error;
     }).finally(function () {
       state.diagramImportBusy = false;
@@ -29154,7 +29380,7 @@ function dynamicPagesClientScript() {
     }).then(function (result) {
       var revisionError = diagramImportRequestRevisionError(requestRevision, null);
       if (revisionError) throw revisionError;
-      if (!result.ok || !result.json || !result.json.proposal) throw new Error(errorText(result));
+      if (!result.ok || !result.json || !result.json.proposal) throw createRequestError(result);
       state.diagramImportSignedProposal = cloneJsonValue(result.json.proposal, null);
       state.diagramImportProposal = cloneJsonValue(result.json.proposal, null);
       applyDiagramImportAuthoringOverrides(state.diagramImportProposal);
@@ -29303,12 +29529,13 @@ function dynamicPagesClientScript() {
     }
   }
 
-  function queueDiagramImportRuntimePreview(snapshot) {
+  function queueDiagramImportRuntimePreview(snapshot, owner) {
     state.diagramImportRuntimePreviewQueued = {
       mode: snapshot.mode,
       template: cloneJsonValue(snapshot.template, {}),
       params: cloneJsonValue(snapshot.params, {}),
-      revision: snapshot.revision
+      revision: snapshot.revision,
+      owner: Object.assign({}, owner)
     };
   }
 
@@ -29320,6 +29547,8 @@ function dynamicPagesClientScript() {
 
   function runDiagramImportRuntimePreview(options) {
     options = options || {};
+    var owner = options.owner || uiRequestOwner();
+    if (options.owner && !uiDiagnosticIsCurrent({ owner: owner })) return Promise.resolve();
     var selected = state.selectedTemplate || {};
     var previewTemplateCode = String(selected.code || '');
     var snapshot;
@@ -29328,7 +29557,7 @@ function dynamicPagesClientScript() {
     } catch (error) {
       state.lastDraftPreviewOk = false;
       state.diagramImportAppliedPendingPreview = false;
-      state.message = { type: 'error', text: error.message || String(error) };
+      setUiError(error);
       renderDesigner();
       return Promise.resolve();
     }
@@ -29343,7 +29572,7 @@ function dynamicPagesClientScript() {
       return Promise.resolve();
     }
     if (state.diagramImportRuntimePreviewBusy) {
-      queueDiagramImportRuntimePreview(snapshot);
+      queueDiagramImportRuntimePreview(snapshot, owner);
       return Promise.resolve();
     }
     var params = snapshot.params;
@@ -29367,8 +29596,9 @@ function dynamicPagesClientScript() {
     renderDesigner();
     // Extraction and Diagram use one RuntimeConfigJson bound. D2
     // maxNodes/maxEdges remain independent visual bounds.
-    return requestDraftPreview(authoringPreviewPath({ executionScope: 'diagrams' }), template, params, requestId).then(function (result) {
+    return requestDraftPreview(authoringPreviewPath({ executionScope: 'diagrams' }), template, params, requestId, owner).then(function (result) {
       if (state.diagramImportRuntimePreviewRequestId !== requestId) return;
+      if (!uiDiagnosticIsCurrent(result.diagnostic)) return;
       if (String((state.selectedTemplate || {}).code || '') !== previewTemplateCode || currentDiagramImportRuntimePreviewRevision(mode) !== previewRevision) {
         state.diagramImportRuntimePreviewError = t('diagramImportPreviewSuperseded');
         if (!preserveAppliedPreviewState) {
@@ -29394,19 +29624,21 @@ function dynamicPagesClientScript() {
       state.diagramImportAppliedPendingPreview = !state.lastDraftPreviewOk;
       state.message = {
         type: state.lastDraftPreviewOk ? 'ok' : details.diagrams.length ? 'warning' : 'error',
-        text: state.lastDraftPreviewOk ? t('diagramImportAppliedPreview') : details.message || draftPreviewResultErrorText(result)
+        text: state.lastDraftPreviewOk ? t('diagramImportAppliedPreview') : details.message || draftPreviewResultErrorText(result),
+        diagnostic: result.ok ? null : result.diagnostic
       };
     }).catch(function (error) {
       if (state.diagramImportRuntimePreviewRequestId !== requestId) return;
+      if (!uiDiagnosticIsCurrent(error.diagnostic || { owner: owner })) return;
       state.diagramImportRuntimePreviewError = draftPreviewErrorText(error);
       if (preserveAppliedPreviewState) {
         state.diagramImportAppliedPendingPreview = priorAppliedPendingPreview;
-        state.lastDraftPreviewOk = priorLastDraftPreviewOk;
+        state.lastDraftPreviewOk = error.code === 'invalid_response' ? false : priorLastDraftPreviewOk;
       } else {
         state.lastDraftPreviewOk = false;
         state.diagramImportAppliedPendingPreview = true;
       }
-      state.message = { type: 'error', text: state.diagramImportRuntimePreviewError };
+      setUiError(error, state.diagramImportRuntimePreviewError);
     }).finally(function () {
       if (state.diagramImportRuntimePreviewRequestId !== requestId) return;
       state.diagramImportRuntimePreviewBusy = false;
@@ -29415,7 +29647,7 @@ function dynamicPagesClientScript() {
       renderDesigner();
       var queued = state.diagramImportRuntimePreviewQueued;
       state.diagramImportRuntimePreviewQueued = null;
-      if (queued) return runDiagramImportRuntimePreview({ requestSnapshot: queued });
+      if (queued && uiDiagnosticIsCurrent({ owner: queued.owner })) return runDiagramImportRuntimePreview({ requestSnapshot: queued, owner: queued.owner });
     });
   }
 
@@ -29494,7 +29726,7 @@ function dynamicPagesClientScript() {
     }).then(function (result) {
       var revisionError = diagramImportRequestRevisionError(requestRevision, state.diagramImportSignedProposal);
       if (revisionError) throw revisionError;
-      if (!result.ok || !result.json || !result.json.spec) throw new Error(errorText(result));
+      if (!result.ok || !result.json || !result.json.spec) throw createRequestError(result);
       state.diagramImportProposal = null;
       state.diagramImportSignedProposal = null;
       state.diagramImportAnalysisCheckpoint = null;
@@ -29516,7 +29748,7 @@ function dynamicPagesClientScript() {
       state.diagramImportBusy = false;
       renderDesigner();
     }).catch(function (error) {
-      state.message = { type: 'error', text: error.message || String(error) };
+      setUiError(error);
     }).finally(function () {
       state.diagramImportBusy = false;
       renderDesigner();
@@ -29547,7 +29779,7 @@ function dynamicPagesClientScript() {
         d2Source: source
       }
     }).then(function (result) {
-      if (!result.ok || !result.json || !result.json.spec) throw new Error(errorText(result));
+      if (!result.ok || !result.json || !result.json.spec) throw createRequestError(result);
       state.diagramImportAppliedEditor = null;
       state.diagramImportAppliedEditorDirty = false;
       updateSelectedFromEditor(result.json.spec);
@@ -29560,7 +29792,7 @@ function dynamicPagesClientScript() {
       state.diagramImportAppliedPendingPreview = true;
       state.message = { type: 'ok', text: t('changesReadyToSave') };
     }).catch(function (error) {
-      state.message = { type: 'error', text: error.message || String(error) };
+      setUiError(error);
     }).finally(function () {
       state.diagramImportBusy = false;
       renderDesigner();
@@ -29572,7 +29804,7 @@ function dynamicPagesClientScript() {
       updateSelectedFromEditor(applyVisualizationToSpec(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(), false));
       renderDesigner();
     } catch (error) {
-      state.message = { type: 'error', text: error.message || String(error) };
+      setUiError(error);
       renderDesigner();
     }
   }
@@ -29676,18 +29908,22 @@ function dynamicPagesClientScript() {
     updateSelectedFromEditor(assistantSpecWithPrompts(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec()));
     var payload;
     try { payload = readEditorPayload(); } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
       return;
     }
+    var owner = uiRequestOwner();
     var exists = Boolean(state.selectedTemplate && state.selectedTemplate.id);
     var path = exists ? apiPrefix + '/templates/' + encodeURIComponent(state.selectedTemplate.code) : apiPrefix + '/templates';
     var wasCreating = state.designerSection === 'template';
     state.savingTemplate = true;
-    state.message = { type: 'ok', text: t('savingTemplate') };
+    var savingMessage = { type: 'ok', text: t('savingTemplate') };
+    state.message = savingMessage;
     renderDesigner();
-    request(path, { method: exists ? 'PUT' : 'POST', body: payload }).then(function (result) {
-      if (!result.ok) throw new Error(errorText(result));
+    request(path, { method: exists ? 'PUT' : 'POST', body: payload, owner: owner }).then(function (result) {
+      if (!uiDiagnosticIsCurrent(result.diagnostic)) return;
+      validateUiResponse(result, 'save');
+      if (!result.ok) throw createRequestError(result);
       state.selectedTemplate = result.json.template;
       var executionValidation = result.json.executionValidation || {};
       var saveMessage = result.json.cacheInvalidation && result.json.cacheInvalidation.complete === false
@@ -29708,15 +29944,22 @@ function dynamicPagesClientScript() {
         if (window.history && window.history.pushState) window.history.pushState({ designerSection: 'templates' }, '', designerSectionUrl('templates'));
       }
       return loadDesigner({ preserveAssistantState: false }).then(function () {
+        if (!uiDiagnosticIsCurrent(result.diagnostic)) return;
         state.message = saveMessage;
         renderDesigner();
       });
     }).catch(function (error) {
-      state.message = { type: 'error', text: error.message };
+      if (!uiDiagnosticIsCurrent(error.diagnostic || { owner: owner })) return;
+      state.lastDraftPreviewOk = false;
+      setUiError(error);
       renderDesigner();
     }).finally(function () {
       state.savingTemplate = false;
       syncImportedDiagramSaveGate();
+      if (state.message === savingMessage && !uiDiagnosticIsCurrent({ owner: owner })) {
+        state.message = null;
+        renderDesigner();
+      }
     });
   }
 
@@ -29819,13 +30062,18 @@ function dynamicPagesClientScript() {
     });
   }
 
-  function setAssistantSemanticPlanRetryState(resume, diagnostics, checkpointConfirmed, feedback) {
+  function setAssistantSemanticPlanRetryState(resume, diagnostics, checkpointConfirmed, feedback, requestDiagnostic) {
+    if (requestDiagnostic && !uiDiagnosticIsCurrent(requestDiagnostic)) return;
     state.assistantFlowResume = Object.assign({}, resume || {}, { retryable: true, retryStage: 'semanticPlan', checkpointConfirmed: Boolean(checkpointConfirmed) });
     state.assistantFlowRejected = null;
     state.assistantFlowErrors = [];
     state.assistantFlowDiagnostics = diagnostics && typeof diagnostics === 'object' ? diagnostics : {};
+    state.assistantFlowRequestDiagnostic = requestDiagnostic ? uiRequestDiagnostics.sanitize(Object.assign({}, requestDiagnostic, {
+      checkpoint: { confirmed: Boolean(checkpointConfirmed), stage: resume && resume.stage || '', expiresAt: resume && resume.expiresAt }
+    })) : null;
     state.assistantFlowFeedback = feedback && typeof feedback === 'object' ? feedback : {
-      summary: t('assistantSemanticPlanPaused'),
+      summary: requestDiagnostic ? t('diagnosticOperationInterrupted') : t('assistantSemanticPlanPaused'),
+      causes: requestDiagnostic ? [{ kind: requestDiagnostic.code || 'request_failed', message: uiErrorMessage({ diagnostic: requestDiagnostic, message: requestDiagnostic.message }).text }] : [],
       action: checkpointConfirmed ? t('assistantSemanticPlanRetryReady') : t('assistantSemanticPlanRetryUnknown')
     };
     if (state.assistantFlowFeedback.code === 'assistant_timeout') {
@@ -29834,20 +30082,22 @@ function dynamicPagesClientScript() {
       });
     }
     state.assistantFlowErrorStage = 'semanticPlan';
-    state.message = { type: 'error', text: state.assistantFlowFeedback.action };
+    state.message = { type: 'error', text: state.assistantFlowFeedback.action, diagnostic: requestDiagnostic || null, diagnosticOwner: 'assistantFlow' };
   }
 
-  function setAssistantObjectFlowPlanRetryState(resume, diagnostics, transport) {
+  function setAssistantObjectFlowPlanRetryState(resume, diagnostics, transport, requestDiagnostic) {
+    if (requestDiagnostic && !uiDiagnosticIsCurrent(requestDiagnostic)) return;
     state.assistantFlowResume = Object.assign({}, resume || {}, { retryable: true, retryStage: 'flowDraft', checkpointConfirmed: true });
     state.assistantFlowRejected = null;
     state.assistantFlowErrors = [];
     state.assistantFlowDiagnostics = diagnostics && typeof diagnostics === 'object' ? diagnostics : {};
+    state.assistantFlowRequestDiagnostic = requestDiagnostic || null;
     state.assistantFlowFeedback = {
       summary: t('assistantFlowPlanPaused'),
       action: transport === 'gateway' ? t('assistantFlowPlanRetryGateway') : t('assistantFlowPlanRetryReady')
     };
     state.assistantFlowErrorStage = 'flowDraft';
-    state.message = { type: 'error', text: state.assistantFlowFeedback.action };
+    state.message = { type: 'error', text: state.assistantFlowFeedback.action, diagnostic: requestDiagnostic || null, diagnosticOwner: 'assistantFlow' };
   }
 
   function assistantFlowOwnershipFeedback(errors) {
@@ -29883,6 +30133,7 @@ function dynamicPagesClientScript() {
 
   function prepareAssistantObjectFlowSemanticPlan(retry) {
     if (state.assistantFlowBusy) return;
+    var operationOwner = uiRequestOwner();
     captureAssistantPromptsFromDom();
     var requestSpec = assistantSpecWithPrompts(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
     var intent = cloneJsonValue(state.assistantObjectFlowIntent, { context: '', blocks: [] });
@@ -29914,6 +30165,8 @@ function dynamicPagesClientScript() {
     function requestSemanticPlanStage(stage) {
       return request(apiPrefix + '/assistant/object-flow/semantic-plan?root=' + encodeURIComponent(state.root || 'Cst_QueryTool'), {
         method: 'POST', timeoutMs: assistantRequestTimeoutMs(1),
+        action: 'assistant.semanticPlan', phase: stage,
+        owner: operationOwner,
         body: {
           stage: stage,
           resumeId: resume.resumeId,
@@ -29931,7 +30184,7 @@ function dynamicPagesClientScript() {
         }
         if (!result.ok && result.json && result.json.retryable) {
           resume = Object.assign({}, resume, result.json.resume || {}, { checkpointConfirmed: Boolean(result.json.resume) });
-          setAssistantSemanticPlanRetryState(resume, result.json.diagnostics, Boolean(result.json.resume), result.json.feedback);
+          setAssistantSemanticPlanRetryState(resume, result.json.diagnostics, Boolean(result.json.resume || resume.checkpointConfirmed), result.json.feedback, result.diagnostic);
           return;
         }
         if (!result.ok && result.json && result.json.code === 'assistant_semantic_plan_invalid') {
@@ -29939,12 +30192,13 @@ function dynamicPagesClientScript() {
           state.assistantFlowRejected = null;
           state.assistantFlowErrors = Array.isArray(result.json.errors) ? result.json.errors : [];
           state.assistantFlowDiagnostics = result.json.diagnostics && typeof result.json.diagnostics === 'object' ? result.json.diagnostics : {};
+          state.assistantFlowRequestDiagnostic = result.diagnostic || null;
           state.assistantFlowFeedback = result.json.feedback && typeof result.json.feedback === 'object' ? result.json.feedback : null;
           state.assistantFlowErrorStage = 'semanticPlan';
-          state.message = { type: 'error', text: state.assistantFlowFeedback && state.assistantFlowFeedback.summary || errorText(result) };
+          state.message = { type: 'error', text: state.assistantFlowFeedback && state.assistantFlowFeedback.summary || errorText(result), diagnostic: result.diagnostic, diagnosticOwner: 'assistantFlow' };
           return;
         }
-        if (!result.ok || !result.json || !result.json.semanticPlan) throw new Error(errorText(result));
+        if (!result.ok || !result.json || !result.json.semanticPlan) throw createRequestError(result);
         var staleError = assistantTemplateRevisionError(requestRevision);
         if (staleError) throw staleError;
         resume = Object.assign({}, resume, result.json.resume || {}, { checkpointConfirmed: true, retryable: false, retryStage: '' });
@@ -29957,11 +30211,16 @@ function dynamicPagesClientScript() {
     }
 
     requestSemanticPlanStage(previousResume ? 'plan' : 'context').catch(function (error) {
-      if (!assistantTemplateRevisionMismatch(requestRevision)) {
-        setAssistantSemanticPlanRetryState(resume, {}, Boolean(resume && resume.checkpointConfirmed));
+      if (/^assistant_semantic_plan_resume_/.test(String(error && error.code || ''))) {
+        state.assistantFlowResume = null;
+        setUiError(error);
         return;
       }
-      state.message = { type: 'error', text: error.message || String(error) };
+      if (!assistantTemplateRevisionMismatch(requestRevision)) {
+        setAssistantSemanticPlanRetryState(resume, {}, Boolean(resume && resume.checkpointConfirmed), null, error.diagnostic);
+        return;
+      }
+      setUiError(error);
     }).finally(function () {
       if (Number(state.assistantFlowRequestGeneration || 0) === requestGeneration) state.assistantFlowBusy = false;
       renderDesigner();
@@ -29969,6 +30228,7 @@ function dynamicPagesClientScript() {
   }
 
   function generateAssistantObjectFlow(retry) {
+    var operationOwner = uiRequestOwner();
     if (state.assistantFlowBusy || !state.assistantFlowSemanticPlan) return;
     captureAssistantPromptsFromDom();
     var requestSpec = assistantSpecWithPrompts(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
@@ -30001,6 +30261,8 @@ function dynamicPagesClientScript() {
     renderDesigner();
     request(apiPrefix + '/assistant/object-flow/plan?root=' + encodeURIComponent(state.root || 'Cst_QueryTool'), {
       method: 'POST', timeoutMs: assistantRequestTimeoutMs(1),
+      action: 'assistant.objectFlow', phase: 'flowDraft',
+      owner: operationOwner,
       body: {
         resumeId: resume.resumeId,
         intent: state.assistantObjectFlowIntent,
@@ -30012,23 +30274,24 @@ function dynamicPagesClientScript() {
       var mismatch = assistantTemplateRevisionMismatch(requestRevision);
       if (mismatch === 'request') throw assistantTemplateRevisionError(requestRevision);
       if (!result.ok && result.json && result.json.retryable) {
-        setAssistantObjectFlowPlanRetryState(Object.assign({}, resume, result.json.resume || {}), result.json.diagnostics, 'backend');
+        setAssistantObjectFlowPlanRetryState(Object.assign({}, resume, result.json.resume || {}), result.json.diagnostics, 'backend', result.diagnostic);
         return;
       }
       if (!result.ok && result.status === 504) {
-        setAssistantObjectFlowPlanRetryState(resume, {}, 'gateway');
+        setAssistantObjectFlowPlanRetryState(resume, {}, 'gateway', result.diagnostic);
         return;
       }
       if (!result.ok && result.json && result.json.code === 'assistant_object_flow_invalid') {
         state.assistantFlowRejected = result.json.rejectedFlow && typeof result.json.rejectedFlow === 'object' ? cloneJsonValue(result.json.rejectedFlow, { version: 1, selections: [], operations: [] }) : null;
         state.assistantFlowErrors = Array.isArray(result.json.errors) ? result.json.errors : [];
         state.assistantFlowDiagnostics = result.json.diagnostics && result.json.diagnostics.objectFlow || {};
+        state.assistantFlowRequestDiagnostic = result.diagnostic || null;
         state.assistantFlowFeedback = result.json.feedback && typeof result.json.feedback === 'object' ? result.json.feedback : null;
         state.assistantFlowWarnings = Array.isArray(result.json.warnings) ? result.json.warnings.map(String).filter(Boolean) : [];
-        state.message = { type: 'error', text: state.assistantFlowFeedback && state.assistantFlowFeedback.summary || t('assistantFlowRejected') };
+        state.message = { type: 'error', text: state.assistantFlowFeedback && state.assistantFlowFeedback.summary || t('assistantFlowRejected'), diagnostic: result.diagnostic, diagnosticOwner: 'assistantFlow' };
         return;
       }
-      if (!result.ok || !result.json || !result.json.flow) throw new Error(errorText(result));
+      if (!result.ok || !result.json || !result.json.flow) throw createRequestError(result);
       var staleError = assistantTemplateRevisionError(requestRevision);
       if (staleError) throw staleError;
       state.assistantFlowProposal = cloneJsonValue(result.json.flow, { version: 1, selections: [], blocks: [] });
@@ -30050,11 +30313,11 @@ function dynamicPagesClientScript() {
         ? { type: 'error', text: t('assistantFlowOwnershipIncomplete') }
         : { type: 'ok', text: assistantCompletionText(result.json, t('assistantFlowReady')) };
     }).catch(function (error) {
-      if (resume && /^Request timeout:/.test(String(error && error.message || ''))) {
-        setAssistantObjectFlowPlanRetryState(resume, {}, 'gateway');
+      if (resume && error && error.code === 'request_timeout') {
+        setAssistantObjectFlowPlanRetryState(resume, {}, 'gateway', error.diagnostic);
         return;
       }
-      state.message = { type: 'error', text: error.message || String(error) };
+      setUiError(error);
     }).finally(function () {
       if (Number(state.assistantFlowRequestGeneration || 0) === requestGeneration) state.assistantFlowBusy = false;
       renderDesigner();
@@ -30074,7 +30337,7 @@ function dynamicPagesClientScript() {
     }
     var flow;
     try { flow = captureAssistantObjectFlow(); } catch (error) {
-      state.message = { type: 'error', text: error.message || String(error) };
+      setUiError(error);
       renderDesigner();
       return;
     }
@@ -30114,7 +30377,7 @@ function dynamicPagesClientScript() {
         || stableClientJsonStringify(state.assistantFlowOutputBindings) !== requestOutputBindingsFingerprint) {
         throw assistantTemplateRevisionError(Object.assign({}, requestRevision, { requestGeneration: -1 }));
       }
-      if (!result.ok || !result.json || !result.json.spec) throw new Error(errorText(result));
+      if (!result.ok || !result.json || !result.json.spec) throw createRequestError(result);
       var staleError = assistantTemplateRevisionError(requestRevision);
       if (staleError) throw staleError;
       updateSelectedFromEditor(result.json.spec);
@@ -30136,7 +30399,7 @@ function dynamicPagesClientScript() {
       state.message = { type: 'ok', text: t('changesReadyToSave') };
       });
     }).catch(function (error) {
-      state.message = { type: 'error', text: error.message || String(error) };
+      setUiError(error);
     }).finally(function () {
       if (Number(state.assistantFlowRequestGeneration || 0) === requestGeneration) state.assistantFlowBusy = false;
       renderDesigner();
@@ -30144,6 +30407,7 @@ function dynamicPagesClientScript() {
   }
 
   function assistantDiagramRequest(kind) {
+    var operationOwner = uiRequestOwner();
     if (state.assistantDiagramInterpretBusy || state.assistantDiagramMappingBusy) return;
     if (!captureVisibleDesignerState()) return;
     captureAssistantPromptsFromDom();
@@ -30201,15 +30465,18 @@ function dynamicPagesClientScript() {
           renderDesigner();
           return request(apiPrefix + '/assistant/diagram-import/map-selections?root=' + encodeURIComponent(state.root || 'Cst_QueryTool'), {
             method: 'POST',
-          timeoutMs: assistantDiagramMappingStageTimeoutMs(stage),
-          body: Object.assign({}, body, { stage: stage, resumeId: mappingResumeId })
+            timeoutMs: assistantDiagramMappingStageTimeoutMs(stage),
+            action: 'assistant.diagramMapping', phase: stage,
+            owner: operationOwner,
+            body: Object.assign({}, body, { stage: stage, resumeId: mappingResumeId })
           }).then(function (result) {
             var revisionError = diagramImportRequestRevisionError(requestRevision, state.diagramImportProposal);
             if (revisionError) throw revisionError;
             if (!result.ok || !result.json) {
               var mappingErrorText = errorText(result);
               if (result.requestId) mappingErrorText += ' Request ID: ' + String(result.requestId) + '.';
-              var mappingError = new Error(mappingErrorText);
+              var mappingError = createRequestError(result);
+              mappingError.message = uiRequestDiagnostics.sanitize({ message: mappingErrorText }).message;
               mappingError.mappingRetryable = Boolean(result.json && result.json.retryable);
               mappingError.mappingRetryKind = String(result.json && result.json.retryKind || 'transient');
               mappingError.mappingStage = stage;
@@ -30251,13 +30518,14 @@ function dynamicPagesClientScript() {
         assistantRequest = requestMappingStage(mappingStage, assistantDiagramMappingStageRetryBudget(mappingStage), '');
       } else {
         assistantRequest = request(apiPrefix + '/assistant/diagram-import/interpret?root=' + encodeURIComponent(state.root || 'Cst_QueryTool'), {
-          method: 'POST', timeoutMs: assistantRequestTimeoutMs(attemptCount), body: body
+          method: 'POST', timeoutMs: assistantRequestTimeoutMs(attemptCount), body: body,
+          action: 'assistant.diagramInterpretation', phase: 'interpret', owner: operationOwner
         });
       }
       return assistantRequest.then(function (result) {
       var revisionError = diagramImportRequestRevisionError(requestRevision, state.diagramImportProposal);
       if (revisionError) throw revisionError;
-      if (!result.ok || !result.json) throw new Error(errorText(result));
+      if (!result.ok || !result.json) throw createRequestError(result);
       if (kind === 'interpret') {
         state.assistantDiagramInterpretResult = result.json;
         if (Array.isArray(result.json.warnings) && result.json.warnings.length) {
@@ -30354,7 +30622,7 @@ function dynamicPagesClientScript() {
           proposal: state.diagramImportProposal
         };
       }
-      state.message = { type: 'error', text: error.message || String(error) };
+      setUiError(error);
     }).finally(function () {
       state.assistantDiagramInterpretBusy = false;
       state.assistantDiagramMappingBusy = false;
@@ -30575,10 +30843,10 @@ function dynamicPagesClientScript() {
         clearDraftExecutionState();
         state.message = { type: 'ok', text: t('assistantDraftGeneratedApplied') };
       } else {
-        state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t('assistantDraftGenerated') : errorText(result) };
+        if (result.ok) state.message = { type: 'ok', text: t('assistantDraftGenerated') }; else setUiError(createRequestError(result));
       }
     }).catch(function (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
     }).finally(function () {
       state.assistantGenerating = false;
       state.assistantGeneratingStartedAt = 0;
@@ -30608,6 +30876,7 @@ function dynamicPagesClientScript() {
   }
 
   function runDraftAction(action) {
+    var owner = uiRequestOwner();
     var code = readTemplateCode();
     if (!code) {
       state.message = { type: 'error', text: t('templateCodeRequired') };
@@ -30620,25 +30889,30 @@ function dynamicPagesClientScript() {
       payload = readEditorPayload();
       params = readRunParams();
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
       return;
     }
     request(apiPrefix + '/draft/' + action + '?maxRows=' + authoringPreviewMaxRows(), {
       method: 'POST',
+      owner: owner,
       body: { template: payload, params: params }
     }).then(function (result) {
+      if (!uiDiagnosticIsCurrent(result.diagnostic)) return;
+      validateUiResponse(result, action === 'preview' ? 'preview' : 'validate');
       result.downloadMode = 'draft';
       state.result = result;
       state.lastDraftPreviewOk = action === 'preview' && result.ok;
       if (state.lastDraftPreviewOk) state.diagramImportAppliedPendingPreview = false;
-      state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t(action === 'validate' ? 'draftValidateCompleted' : 'draftPreviewCompleted') : errorText(result) };
+      if (result.ok) state.message = { type: 'ok', text: t(action === 'validate' ? 'draftValidateCompleted' : 'draftPreviewCompleted') }; else setUiError(createRequestError(result));
+      routeUiRequestDiagnostic(result, 'run');
       state.designerSection = 'run';
       if (window.history && window.history.pushState) window.history.pushState({ designerSection: 'run' }, '', designerSectionUrl('run'));
       renderDesigner();
     }).catch(function (error) {
+      if (!uiDiagnosticIsCurrent(error.diagnostic || { owner: owner })) return;
       state.lastDraftPreviewOk = false;
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
     });
   }
@@ -30678,10 +30952,10 @@ function dynamicPagesClientScript() {
       state.schema = result.json ? result.json.schema : null;
       state.schemaPlan = state.schema;
       state.schemaClassDrafts = schemaClassDraftsFromPlan(state.schemaPlan);
-      state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t('schemaBootstrapDone') : errorText(result) };
+      if (result.ok) state.message = { type: 'ok', text: t('schemaBootstrapDone') }; else setUiError(createRequestError(result));
       renderDesigner();
     }).catch(function (error) {
-      state.message = { type: 'error', text: error.message || String(error) };
+      setUiError(error);
       renderDesigner();
     });
   }
@@ -30702,10 +30976,10 @@ function dynamicPagesClientScript() {
       state.schemaPlan = result.json ? result.json.schema : null;
       state.schema = state.schemaPlan || state.schema;
       state.schemaClassDrafts = schemaClassDraftsFromPlan(state.schemaPlan);
-      state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t('schemaPreviewReady') : errorText(result) };
+      if (result.ok) state.message = { type: 'ok', text: t('schemaPreviewReady') }; else setUiError(createRequestError(result));
       renderDesigner();
     }).catch(function (error) {
-      state.message = { type: 'error', text: error.message || String(error) };
+      setUiError(error);
       renderDesigner();
     });
   }
@@ -30801,7 +31075,10 @@ function dynamicPagesClientScript() {
       body: { active: true, runtimeConfig: runtimeConfig }
     }).then(function (result) {
       state.config = result.json ? result.json.config : null;
-      state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t('configSaved') : errorText(result) };
+      if (result.ok) state.message = { type: 'ok', text: t('configSaved') }; else setUiError(createRequestError(result));
+      renderDesigner();
+    }).catch(function (error) {
+      setUiError(error);
       renderDesigner();
     });
   }
@@ -30813,7 +31090,7 @@ function dynamicPagesClientScript() {
     try {
       runtimeConfig = applyRuntimeConfigFields(runtimeConfig);
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
       return;
     }
@@ -30827,7 +31104,7 @@ function dynamicPagesClientScript() {
     try {
       runtimeConfig = applyRuntimeConfigFields(runtimeConfig);
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
       return;
     }
@@ -30845,7 +31122,7 @@ function dynamicPagesClientScript() {
     renderDesigner();
     request(apiPrefix + '/model/catalog?includeAttributes=true&root=' + encodeURIComponent(state.root || 'Cst_QueryTool')).then(function (result) {
       if (!result.ok || !result.json || !result.json.catalog) {
-        throw new Error(errorText(result));
+        throw createRequestError(result);
       }
       return writeCatalogCache(result.json.catalog).then(function (record) {
         applyCatalogCache(record);
@@ -30860,7 +31137,7 @@ function dynamicPagesClientScript() {
         updatedAt: state.catalogStatus && state.catalogStatus.updatedAt,
         error: error.message || String(error)
       };
-      state.message = { type: 'error', text: t('catalogError') + ': ' + (error.message || String(error)) };
+      setUiError(error, t('catalogError') + ': ' + (error.message || String(error)));
       renderDesigner();
     });
   }
@@ -30953,13 +31230,13 @@ function dynamicPagesClientScript() {
       state.selectedClass = name;
       if (!classResult.ok) {
         state.classAttributes = [];
-        state.message = { type: 'error', text: errorText(classResult) };
+        setUiError(createRequestError(classResult));
         renderDesigner();
         return null;
       }
       return request(apiPrefix + '/model/classes/' + encodeURIComponent(name) + '/attributes').then(function (attrResult) {
         state.classAttributes = attrResult.ok && attrResult.json && attrResult.json.data ? attrResult.json.data : [];
-        state.message = attrResult.ok ? { type: 'ok', text: t('classFound') } : { type: 'error', text: errorText(attrResult) };
+        if (attrResult.ok) state.message = { type: 'ok', text: t('classFound') }; else setUiError(createRequestError(attrResult));
         renderDesigner();
         return attrResult;
       });
@@ -30967,7 +31244,7 @@ function dynamicPagesClientScript() {
       state.classCheckResult = { ok: false, status: 0, json: null };
       state.checkedClass = null;
       state.classAttributes = [];
-      state.message = { type: 'error', text: error.message || String(error) };
+      setUiError(error);
       renderDesigner();
     });
   }
@@ -30987,7 +31264,7 @@ function dynamicPagesClientScript() {
       specData = readSpecWithParamEditor();
       spec = specData.spec;
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
       return;
     }
@@ -30995,7 +31272,7 @@ function dynamicPagesClientScript() {
       paramsSchema = readCurrentParamsSchema((state.selectedTemplate && state.selectedTemplate.paramsSchema) || {});
       resultSchema = readCurrentResultSchema((state.selectedTemplate && state.selectedTemplate.resultSchema) || {});
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
       return;
     }
@@ -31217,7 +31494,7 @@ function dynamicPagesClientScript() {
     if (!templateCode) return;
     if (!window.confirm(t('deleteTemplateConfirm', { code: templateCode }))) return;
     request(apiPrefix + '/templates/' + encodeURIComponent(templateCode), { method: 'DELETE' }).then(function (result) {
-      if (!result.ok) throw new Error(errorText(result));
+      if (!result.ok) throw createRequestError(result);
       if (state.selectedTemplate && state.selectedTemplate.code === templateCode) {
         state.selectedTemplate = null;
         state.templateVersions = [];
@@ -31230,7 +31507,7 @@ function dynamicPagesClientScript() {
       if (window.history && window.history.pushState) window.history.pushState({ designerSection: 'templates' }, '', designerSectionUrl('templates'));
       return loadDesigner();
     }).catch(function (error) {
-      state.message = { type: 'error', text: error.message || String(error) };
+      setUiError(error);
       renderDesigner();
     });
   }
@@ -31257,13 +31534,14 @@ function dynamicPagesClientScript() {
   }
 
   function visualizeInEditor() {
+    var owner = uiRequestOwner();
     var payload;
     var params;
     try {
       payload = readEditorPayload();
       params = readRunParams();
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
       return;
     }
@@ -31277,7 +31555,8 @@ function dynamicPagesClientScript() {
     // The Run view must describe this deterministic request, never a stale
     // Assistant response that happened in another Designer section.
     state.message = null;
-    requestDraftPreview(previewPath, payload, params).then(function (result) {
+    requestDraftPreview(previewPath, payload, params, undefined, owner).then(function (result) {
+      if (!uiDiagnosticIsCurrent(result.diagnostic)) return;
       result.downloadMode = 'draft';
       state.result = result;
       var partialDiagram = Boolean(result.ok && result.json && result.json.result && result.json.result.diagramPreview && result.json.result.diagramPreview.partial);
@@ -31285,14 +31564,17 @@ function dynamicPagesClientScript() {
       if (result.ok && !partialDiagram) state.diagramImportAppliedPendingPreview = false;
       state.message = {
         type: result.ok ? (partialDiagram ? 'warning' : 'ok') : 'error',
-        text: result.ok ? (partialDiagram ? t('diagramImportRuntimePreviewMappingPartial') : t('visualizationRunCompleted')) : draftPreviewResultErrorText(result)
+        text: result.ok ? (partialDiagram ? t('diagramImportRuntimePreviewMappingPartial') : t('visualizationRunCompleted')) : draftPreviewResultErrorText(result),
+        diagnostic: result.ok ? null : result.diagnostic
       };
+      routeUiRequestDiagnostic(result, 'run');
       state.designerSection = 'run';
       if (window.history && window.history.pushState) window.history.pushState({ designerSection: 'run' }, '', designerSectionUrl('run'));
       renderDesigner();
     }).catch(function (error) {
+      if (!uiDiagnosticIsCurrent(error.diagnostic || { owner: owner })) return;
       state.lastDraftPreviewOk = false;
-      state.message = { type: 'error', text: draftPreviewErrorText(error) };
+      setUiError(error, draftPreviewErrorText(error));
       renderDesigner();
     });
   }
@@ -31320,7 +31602,7 @@ function dynamicPagesClientScript() {
     try {
       params = readRunParams();
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
       return;
     }
@@ -31329,11 +31611,12 @@ function dynamicPagesClientScript() {
       body: { params: params, refresh: true, forceRefresh: true }
     }).then(function (result) {
       state.result = result;
-      state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t('forceRefreshRunCompleted') : errorText(result) };
+      if (result.ok) state.message = { type: 'ok', text: t('forceRefreshRunCompleted') }; else setUiError(createRequestError(result));
+      routeUiRequestDiagnostic(result, 'run');
       state.designerSection = 'run';
       renderDesigner();
     }).catch(function (error) {
-      state.message = { type: 'error', text: error.message || String(error) };
+      setUiError(error);
       renderDesigner();
     });
   }
@@ -31352,14 +31635,14 @@ function dynamicPagesClientScript() {
       payload.spec = applyPublicationToSpec(payload.spec, true);
       params = readRunParams();
     } catch (error) {
-      state.message = { type: 'error', text: error.message };
+      setUiError(error);
       renderDesigner();
       return;
     }
     var exists = Boolean(state.selectedTemplate && state.selectedTemplate.id);
     var savePath = exists ? apiPrefix + '/templates/' + encodeURIComponent(state.selectedTemplate.code) : apiPrefix + '/templates';
     request(savePath, { method: exists ? 'PUT' : 'POST', body: payload }).then(function (saveResult) {
-      if (!saveResult.ok) throw new Error(errorText(saveResult));
+      if (!saveResult.ok) throw createRequestError(saveResult);
       var savedTemplate = saveResult.json && saveResult.json.template ? saveResult.json.template : {};
       state.selectedTemplate = savedTemplate;
       var executionValidation = saveResult.json && saveResult.json.executionValidation || {};
@@ -31379,10 +31662,10 @@ function dynamicPagesClientScript() {
       });
     }).then(function (result) {
       state.result = result;
-      state.message = { type: result.ok ? 'ok' : 'error', text: result.ok ? t('snapshotPublished') : errorText(result) };
+      if (result.ok) state.message = { type: 'ok', text: t('snapshotPublished') }; else setUiError(createRequestError(result));
       renderDesigner();
     }).catch(function (error) {
-      state.message = { type: 'error', text: error.message || String(error) };
+      setUiError(error);
       renderDesigner();
     });
   }
@@ -31562,6 +31845,7 @@ function dynamicPagesClientScript() {
     event.preventDefault();
     if (target.disabled || target.getAttribute('aria-disabled') === 'true') return;
     var action = target.getAttribute('data-action');
+    if (action === 'copy-error-diagnostics') { copyUiErrorDiagnostics(target); return; }
     if (action === 'diagram-import-label-token-select') {
       selectDiagramImportLabelAutocompleteTarget(target);
       return;
@@ -31608,32 +31892,32 @@ function dynamicPagesClientScript() {
       return;
     }
     if (action === 'diagram-import-add-hierarchy-condition' || action === 'diagram-import-remove-hierarchy-condition') {
-      mutateDiagramImportV3(action, target);
+      runUiMutation(function () { mutateDiagramImportV3(action, target); });
       return;
     }
     if (action === 'runtime-refresh') {
       if (target.getAttribute('data-disabled') === 'true') return;
       loadRuntime(true);
     }
-    if (action === 'download-draft-d2') downloadDraftD2Source(target);
+    if (action === 'download-draft-d2') runUiOperation(action, function () { downloadDraftD2Source(target); });
     if (action === 'diagram-zoom-out') adjustDiagramViewportScale(target, -DIAGRAM_VIEWPORT_SCALE_STEP);
     if (action === 'diagram-zoom-reset') adjustDiagramViewportScale(target, 'reset');
     if (action === 'diagram-zoom-in') adjustDiagramViewportScale(target, DIAGRAM_VIEWPORT_SCALE_STEP);
-    if (action === 'refresh') refreshDesigner();
-    if (action === 'new-template') newTemplate();
-    if (action === 'new-cmdb-build-view') newCmdbBuildViewTemplate();
-    if (action === 'save-template') saveTemplate();
-    if (action === 'validate-template') runDraftAction('validate');
-    if (action === 'preview-template') runDraftAction('preview');
-    if (action === 'assistant-generate') generateAssistantDraft();
-    if (action === 'assistant-apply-draft') applyAssistantDraft();
-    if (action === 'assistant-flow-prepare') prepareAssistantObjectFlowSemanticPlan();
-    if (action === 'assistant-flow-prepare-retry') prepareAssistantObjectFlowSemanticPlan(true);
-    if (action === 'assistant-flow-generate') generateAssistantObjectFlow();
-    if (action === 'assistant-flow-generate-retry') generateAssistantObjectFlow(true);
-    if (action === 'assistant-flow-apply') applyAssistantObjectFlow();
-    if (action === 'assistant-flow-block-add') addAssistantObjectFlowBlock();
-    if (action === 'assistant-flow-block-remove') removeAssistantObjectFlowBlock(target.getAttribute('data-block-index'));
+    if (action === 'refresh') runUiOperation(action, function () { refreshDesigner(); });
+    if (action === 'new-template') runUiMutation(function () { newTemplate(); });
+    if (action === 'new-cmdb-build-view') runUiMutation(function () { newCmdbBuildViewTemplate(); });
+    if (action === 'save-template') runUiOperation(action, function () { saveTemplate(); });
+    if (action === 'validate-template') runUiOperation(action, function () { runDraftAction('validate'); });
+    if (action === 'preview-template') runUiOperation(action, function () { runDraftAction('preview'); });
+    if (action === 'assistant-generate') runUiOperation(action, function () { generateAssistantDraft(); });
+    if (action === 'assistant-apply-draft') runUiMutation(function () { applyAssistantDraft(); });
+    if (action === 'assistant-flow-prepare') runUiOperation(action, function () { prepareAssistantObjectFlowSemanticPlan(); });
+    if (action === 'assistant-flow-prepare-retry') runUiOperation(action, function () { prepareAssistantObjectFlowSemanticPlan(true); });
+    if (action === 'assistant-flow-generate') runUiOperation(action, function () { generateAssistantObjectFlow(); });
+    if (action === 'assistant-flow-generate-retry') runUiOperation(action, function () { generateAssistantObjectFlow(true); });
+    if (action === 'assistant-flow-apply') runUiOperation(action, function () { applyAssistantObjectFlow(); });
+    if (action === 'assistant-flow-block-add') runUiMutation(function () { addAssistantObjectFlowBlock(); });
+    if (action === 'assistant-flow-block-remove') runUiMutation(function () { removeAssistantObjectFlowBlock(target.getAttribute('data-block-index')); });
     if (action === 'assistant-template-prompt-override') {
       updateTemplateAssistantPromptOverride(String(target.getAttribute('data-template-assistant-prompt-key') || ''), 'override');
       return;
@@ -31642,61 +31926,61 @@ function dynamicPagesClientScript() {
       updateTemplateAssistantPromptOverride(String(target.getAttribute('data-template-assistant-prompt-key') || ''), 'reset');
       return;
     }
-    if (action === 'assistant-diagram-interpret') assistantDiagramRequest('interpret');
-    if (action === 'assistant-diagram-map') assistantDiagramRequest('map');
+    if (action === 'assistant-diagram-interpret') runUiOperation(action, function () { assistantDiagramRequest('interpret'); });
+    if (action === 'assistant-diagram-map') runUiOperation(action, function () { assistantDiagramRequest('map'); });
     if (action === 'open-assistant-d2') setDesignerSection('diagram-assistant');
     if (action === 'open-diagram-editor') setDesignerSection('diagram');
     if (action === 'open-visualization') setDesignerSection('visualization');
-    if (action === 'visualize-editor') visualizeInEditor();
-    if (action === 'force-refresh-editor') forceRefreshInEditor();
+    if (action === 'visualize-editor') runUiOperation(action, function () { visualizeInEditor(); });
+    if (action === 'force-refresh-editor') runUiOperation(action, function () { forceRefreshInEditor(); });
     if (action === 'visualize-external') visualizeExternal();
-    if (action === 'select-template') selectTemplate(target.getAttribute('data-code'));
-    if (action === 'delete-template') deleteTemplate(target.getAttribute('data-code'));
+    if (action === 'select-template') runUiOperation(action, function () { selectTemplate(target.getAttribute('data-code')); });
+    if (action === 'delete-template') runUiOperation(action, function () { deleteTemplate(target.getAttribute('data-code')); });
     if (action === 'object-selection-expand') expandObjectGroupSelection(target.getAttribute('data-object-selection-id'));
-    if (action === 'apply-object-group') applyObjectGroupEditor();
-    if (action === 'add-object-scope-row') addObjectGroupScopeRuleRow(target);
-    if (action === 'add-object-selection') addObjectSelection();
-    if (action === 'remove-object-selection') removeObjectSelection(target.getAttribute('data-object-selection-index'));
-    if (action === 'clear-object-scope-row') clearObjectGroupScopeRuleRow(target);
-    if (action === 'apply-relation-expansion') applyRelationExpansionEditor();
+    if (action === 'apply-object-group') runUiMutation(function () { applyObjectGroupEditor(); });
+    if (action === 'add-object-scope-row') runUiMutation(function () { addObjectGroupScopeRuleRow(target); });
+    if (action === 'add-object-selection') runUiMutation(function () { addObjectSelection(); });
+    if (action === 'remove-object-selection') runUiMutation(function () { removeObjectSelection(target.getAttribute('data-object-selection-index')); });
+    if (action === 'clear-object-scope-row') runUiMutation(function () { clearObjectGroupScopeRuleRow(target); });
+    if (action === 'apply-relation-expansion') runUiMutation(function () { applyRelationExpansionEditor(); });
     if (action === 'relation-operation-expand') expandRelationOperation(target.getAttribute('data-relation-operation-id'));
-    if (action === 'add-matching-block') addMatchingBlock();
-    if (action === 'add-relation-operation') addRelationOperation();
-    if (action === 'append-relation-path') appendRelationPath();
-    if (action === 'add-exists-related-operation') addExistsRelatedOperation();
-    if (action === 'add-matching-rule-row') addMatchingRuleRow(target);
-    if (action === 'add-exists-related-rule-row') addExistsRelatedRuleRow(target);
-    if (action === 'clear-matching-rule-row') clearMatchingRuleRow(target);
-    if (action === 'clear-matching-block') clearMatchingBlock(target);
-    if (action === 'clear-relation-operation') clearRelationOperation(target);
-    if (action === 'clear-exists-related-operation') clearExistsRelatedOperation(target);
-    if (action === 'add-set-operation') addSetOperation();
-    if (action === 'clear-set-operation') clearSetOperation(target);
-    if (action === 'add-set-operation-key') addSetOperationKey(target);
-    if (action === 'clear-set-operation-key') clearSetOperationKey(target);
-    if (action === 'apply-cmdb-build-view') applyCmdbBuildViewEditor();
-    if (action === 'add-param-row') addParamRow();
-    if (action === 'apply-params') applyParamsEditor();
-    if (action === 'fill-param-examples') fillParamExamples();
-    if (action === 'clear-param-row') clearParamRow(target);
-    if (action === 'extract-template') extractByTemplate();
-    if (action === 'apply-extraction') applyExtractionEditor();
-    if (action === 'preview-extraction') previewExtraction();
-    if (action === 'add-selection-filter-row') addSelectionFilterRow();
-    if (action === 'clear-selection-filter-row') clearSelectionFilterRow(target);
-    if (action === 'apply-selection') applyDataSelectionEditor();
-    if (action === 'add-view-column-row') addViewComposerColumnRow();
-    if (action === 'clear-view-column-row') clearViewComposerColumnRow(target);
-    if (action === 'add-diagram-mapping-row') addDiagramMappingRow(target);
-    if (action === 'clear-diagram-mapping-row') clearDiagramMappingRow(target);
+    if (action === 'add-matching-block') runUiMutation(function () { addMatchingBlock(); });
+    if (action === 'add-relation-operation') runUiMutation(function () { addRelationOperation(); });
+    if (action === 'append-relation-path') runUiMutation(function () { appendRelationPath(); });
+    if (action === 'add-exists-related-operation') runUiMutation(function () { addExistsRelatedOperation(); });
+    if (action === 'add-matching-rule-row') runUiMutation(function () { addMatchingRuleRow(target); });
+    if (action === 'add-exists-related-rule-row') runUiMutation(function () { addExistsRelatedRuleRow(target); });
+    if (action === 'clear-matching-rule-row') runUiMutation(function () { clearMatchingRuleRow(target); });
+    if (action === 'clear-matching-block') runUiMutation(function () { clearMatchingBlock(target); });
+    if (action === 'clear-relation-operation') runUiMutation(function () { clearRelationOperation(target); });
+    if (action === 'clear-exists-related-operation') runUiMutation(function () { clearExistsRelatedOperation(target); });
+    if (action === 'add-set-operation') runUiMutation(function () { addSetOperation(); });
+    if (action === 'clear-set-operation') runUiMutation(function () { clearSetOperation(target); });
+    if (action === 'add-set-operation-key') runUiMutation(function () { addSetOperationKey(target); });
+    if (action === 'clear-set-operation-key') runUiMutation(function () { clearSetOperationKey(target); });
+    if (action === 'apply-cmdb-build-view') runUiMutation(function () { applyCmdbBuildViewEditor(); });
+    if (action === 'add-param-row') runUiMutation(function () { addParamRow(); });
+    if (action === 'apply-params') runUiMutation(function () { applyParamsEditor(); });
+    if (action === 'fill-param-examples') runUiMutation(function () { fillParamExamples(); });
+    if (action === 'clear-param-row') runUiMutation(function () { clearParamRow(target); });
+    if (action === 'extract-template') runUiOperation(action, function () { extractByTemplate(); });
+    if (action === 'apply-extraction') runUiMutation(function () { applyExtractionEditor(); });
+    if (action === 'preview-extraction') runUiMutation(function () { previewExtraction(); });
+    if (action === 'add-selection-filter-row') runUiMutation(function () { addSelectionFilterRow(); });
+    if (action === 'clear-selection-filter-row') runUiMutation(function () { clearSelectionFilterRow(target); });
+    if (action === 'apply-selection') runUiMutation(function () { applyDataSelectionEditor(); });
+    if (action === 'add-view-column-row') runUiMutation(function () { addViewComposerColumnRow(); });
+    if (action === 'clear-view-column-row') runUiMutation(function () { clearViewComposerColumnRow(target); });
+    if (action === 'add-diagram-mapping-row') runUiMutation(function () { addDiagramMappingRow(target); });
+    if (action === 'clear-diagram-mapping-row') runUiMutation(function () { clearDiagramMappingRow(target); });
     if (action === 'insert-diagram-template-token') insertDiagramTemplateToken(target);
-    if (action === 'diagram-import-analyze') analyzeDiagramImport();
-    if (action === 'diagram-import-reset-unsupported') clearUnsupportedDiagramAuthoring();
+    if (action === 'diagram-import-analyze') runUiOperation(action, function () { analyzeDiagramImport(); });
+    if (action === 'diagram-import-reset-unsupported') runUiMutation(function () { clearUnsupportedDiagramAuthoring(); });
     if (action === 'diagram-import-select-element') selectDiagramImportElement(target.getAttribute('data-diagram-element-key') || '');
-    if (action === 'diagram-import-apply') applyDiagramImport();
-    if (action === 'diagram-import-refresh-source') refreshAppliedDiagramImportSource();
-    if (action === 'diagram-import-preview-current') previewCurrentDiagramImport();
-    if (action === 'diagram-import-preview-retry') retryDiagramImportRuntimePreview();
+    if (action === 'diagram-import-apply') runUiOperation(action, function () { applyDiagramImport(); });
+    if (action === 'diagram-import-refresh-source') runUiOperation(action, function () { refreshAppliedDiagramImportSource(); });
+    if (action === 'diagram-import-preview-current') runUiOperation(action, function () { previewCurrentDiagramImport(); });
+    if (action === 'diagram-import-preview-retry') runUiOperation(action, function () { retryDiagramImportRuntimePreview(); });
     if (action === 'diagram-structure-toggle') {
       toggleDiagramImportStructureTreeBranch(target.getAttribute('data-diagram-structure-item-id') || '');
       return;
@@ -31711,28 +31995,29 @@ function dynamicPagesClientScript() {
         : t('diagramImportStructureDeleteItemConfirm');
       if (!window.confirm(removeConfirmation)) return;
     }
-    if (['diagram-import-add-related-data', 'diagram-import-remove-related-data', 'diagram-import-add-related-condition', 'diagram-import-remove-related-condition', 'diagram-import-add-data-field', 'diagram-import-remove-data-field', 'diagram-import-add-condition', 'diagram-import-add-parent-correlation', 'diagram-import-remove-condition', 'diagram-import-enable-rule', 'diagram-import-disable-rule', 'diagram-import-confirm-rule-contract', 'diagram-import-add-endpoint-profile', 'diagram-import-remove-endpoint-profile', 'diagram-structure-add-root', 'diagram-structure-add-child', 'diagram-structure-add-role', 'diagram-structure-cancel-add', 'diagram-structure-duplicate', 'diagram-structure-remove'].indexOf(action) >= 0) mutateDiagramImportV3(action, target);
-    if (action === 'apply-view-composer') applyViewComposerEditor();
-    if (action === 'add-visual-row-group') addVisualizationRowGroup(target);
-    if (action === 'clear-visual-row-group') clearVisualizationRowGroup(target);
-    if (action === 'apply-visualization') applyVisualizationEditor();
-    if (action === 'apply-publication') applyPublicationEditor();
-    if (action === 'apply-cache') applyCacheEditor();
-    if (action === 'publish-snapshot') publishSnapshot();
-    if (action === 'draft-validate') runDraftAction('validate');
-    if (action === 'draft-preview') runDraftAction('preview');
-    if (action === 'save-after-test') saveAfterTest();
-    if (action === 'check-class') checkClassByName(readValue('cmdp-class-check'));
-    if (action === 'apply-class-fallback') applyClassFallback();
-    if (action === 'select-class') checkClassByName(target.getAttribute('data-class'));
-    if (action === 'load-version') loadVersion(target.getAttribute('data-version'));
-    if (action === 'schema-preview') previewSchema();
-    if (action === 'bootstrap-schema') bootstrapSchema();
-    if (action === 'save-config') saveConfig();
-    if (action === 'save-general-settings') saveGeneralSettings();
-    if (action === 'apply-builder') applyBuilder();
-    if (action === 'sync-catalog') syncCatalog();
-    if (action === 'open-run') openRun(target.getAttribute('data-code') || readValue('cmdp-code'));
+    if (['diagram-import-add-related-data', 'diagram-import-remove-related-data', 'diagram-import-add-related-condition', 'diagram-import-remove-related-condition', 'diagram-import-add-data-field', 'diagram-import-remove-data-field', 'diagram-import-add-condition', 'diagram-import-add-parent-correlation', 'diagram-import-remove-condition', 'diagram-import-enable-rule', 'diagram-import-disable-rule', 'diagram-import-confirm-rule-contract', 'diagram-import-add-endpoint-profile', 'diagram-import-remove-endpoint-profile', 'diagram-structure-add-role', 'diagram-structure-duplicate', 'diagram-structure-remove'].indexOf(action) >= 0) runUiMutation(function () { mutateDiagramImportV3(action, target); });
+    if (['diagram-structure-add-root', 'diagram-structure-add-child', 'diagram-structure-cancel-add'].indexOf(action) >= 0) mutateDiagramImportV3(action, target);
+    if (action === 'apply-view-composer') runUiMutation(function () { applyViewComposerEditor(); });
+    if (action === 'add-visual-row-group') runUiMutation(function () { addVisualizationRowGroup(target); });
+    if (action === 'clear-visual-row-group') runUiMutation(function () { clearVisualizationRowGroup(target); });
+    if (action === 'apply-visualization') runUiMutation(function () { applyVisualizationEditor(); });
+    if (action === 'apply-publication') runUiMutation(function () { applyPublicationEditor(); });
+    if (action === 'apply-cache') runUiMutation(function () { applyCacheEditor(); });
+    if (action === 'publish-snapshot') runUiOperation(action, function () { publishSnapshot(); });
+    if (action === 'draft-validate') runUiOperation(action, function () { runDraftAction('validate'); });
+    if (action === 'draft-preview') runUiOperation(action, function () { runDraftAction('preview'); });
+    if (action === 'save-after-test') runUiOperation(action, function () { saveAfterTest(); });
+    if (action === 'check-class') runUiOperation(action, function () { checkClassByName(readValue('cmdp-class-check')); });
+    if (action === 'apply-class-fallback') runUiMutation(function () { applyClassFallback(); });
+    if (action === 'select-class') runUiOperation(action, function () { checkClassByName(target.getAttribute('data-class')); });
+    if (action === 'load-version') runUiOperation(action, function () { loadVersion(target.getAttribute('data-version')); });
+    if (action === 'schema-preview') runUiOperation(action, function () { previewSchema(); });
+    if (action === 'bootstrap-schema') runUiOperation(action, function () { bootstrapSchema(); });
+    if (action === 'save-config') runUiOperation(action, function () { saveConfig(); });
+    if (action === 'save-general-settings') runUiOperation(action, function () { saveGeneralSettings(); });
+    if (action === 'apply-builder') runUiMutation(function () { applyBuilder(); });
+    if (action === 'sync-catalog') runUiOperation(action, function () { syncCatalog(); });
+    if (action === 'open-run') runUiOperation(action, function () { openRun(target.getAttribute('data-code') || readValue('cmdp-code')); });
   });
 
   function clearAssistantObjectFlowDragState() {
@@ -31834,6 +32119,7 @@ function dynamicPagesClientScript() {
       proposal.structureTree = tree;
       diagramImportStructureTreeExpandAncestorsClient(tree, draggedId, false);
       state.diagramImportStructureNotice = '';
+      state.uiDiagnosticRevision = Number(state.uiDiagnosticRevision || 0) + 1;
       refreshDiagramImportSemanticState(proposal);
       storeDiagramImportEditorMutation(proposal);
       renderDesigner();
@@ -31850,7 +32136,7 @@ function dynamicPagesClientScript() {
     var intent = normalizeAssistantObjectFlowIntentClient(state.assistantObjectFlowIntent);
     var from = intent.blocks.findIndex(function (item) { return item.id === sourceId; });
     var to = intent.blocks.findIndex(function (item) { return item.id === targetId; });
-    if (from >= 0 && to >= 0) moveAssistantObjectFlowBlockTo(from, to);
+    if (from >= 0 && to >= 0) runUiMutation(function () { moveAssistantObjectFlowBlockTo(from, to); });
   });
 
   document.addEventListener('dragend', function () {
@@ -37725,7 +38011,9 @@ function assistantObjectFlowMcpPayload(results, diagnostics) {
       className: String(item && item.className || ''),
       attributes: Array.isArray(item && item.attributes) ? item.attributes : []
     }));
-  const relationPathDomains = new Set((Array.isArray(diagnostics && diagnostics.relationPaths) ? diagnostics.relationPaths : [])
+  const relationPaths = (Array.isArray(diagnostics && diagnostics.relationPaths) ? diagnostics.relationPaths : [])
+    .filter((path) => selectedClassNames.includes(path.sourceClass) && selectedClassNames.includes(path.targetClass));
+  const relationPathDomains = new Set(relationPaths
     .map((item) => String(item && item.domain || ''))
     .filter(Boolean));
   (Array.isArray(diagnostics && diagnostics.requestedContextDomainNames) ? diagnostics.requestedContextDomainNames : []).forEach((name) => relationPathDomains.add(String(name || '')));
@@ -37737,7 +38025,7 @@ function assistantObjectFlowMcpPayload(results, diagnostics) {
     classes: selectedClasses,
     classFields: selectedFields,
     relationHints: { domains: selectedDomains },
-    relationPaths: Array.isArray(diagnostics && diagnostics.relationPaths) ? diagnostics.relationPaths : []
+    relationPaths
   };
 }
 
@@ -41897,6 +42185,10 @@ async function assistantResolveExplicitClassMetadata(intent, mcpContext, authTok
   }
   diagnostics.classCatalog = summary?.classCatalog || { fetched: 0, visible: 0, total: null, pages: 0, complete: false, reason: 'incomplete' };
   diagnostics.contextClassNames = uniqueStrings(verified.concat(diagnostics.contextClassNames || []));
+  if (verified.length) {
+    diagnostics.relationPaths = assistantMcpRelationPathHints(results, diagnostics.contextClassNames);
+    diagnostics.contextDomainNames = uniqueStrings(diagnostics.relationPaths.map((path) => path.domain));
+  }
 }
 
 async function assistantFinalizeSemanticContext(intent, mcpContext, bindings, runtimeConfig, options = {}) {
@@ -41998,7 +42290,11 @@ async function assistantFinalizeSemanticContext(intent, mcpContext, bindings, ru
       }
     }
   }
-  (diagnostics.relationPaths || []).forEach((path) => {
+  const relationPaths = Array.from(new Map([
+    ...assistantMcpRelationPathHints(results, uniqueStrings([...required.keys(), ...(diagnostics.contextClassNames || [])])),
+    ...(diagnostics.relationPaths || [])
+  ].map((path) => [[path.domain, path.direction, path.sourceClass, path.targetClass].join(':'), path])).values());
+  relationPaths.forEach((path) => {
     if (required.has(path.sourceRoot || path.sourceClass) && required.has(path.targetRoot || path.targetClass)) {
       const owners = [...(required.get(path.sourceRoot || path.sourceClass) || []), ...(required.get(path.targetRoot || path.targetClass) || [])];
       owners.forEach((owner) => { addRequired(path.sourceClass, owner); addRequired(path.targetClass, owner); });
@@ -42012,7 +42308,10 @@ async function assistantFinalizeSemanticContext(intent, mcpContext, bindings, ru
   let bounded;
   while (true) {
     diagnostics.contextClassNames = selected;
-    bounded = boundedMcpText(assistantObjectFlowMcpPayload(results, diagnostics), config.mcp.maxContextBytes);
+    const payload = assistantObjectFlowMcpPayload(results, { ...diagnostics, relationPaths });
+    diagnostics.relationPaths = payload.relationPaths;
+    diagnostics.contextDomainNames = uniqueStrings(payload.relationHints.domains.map((domain) => domain.name));
+    bounded = boundedMcpText(payload, config.mcp.maxContextBytes);
     if (!bounded.truncated || selected.length === required.size) break;
     selected = selected.slice(0, -1);
   }
@@ -42028,7 +42327,9 @@ async function assistantFinalizeSemanticContext(intent, mcpContext, bindings, ru
     if (!bounded.value.classes.some((item) => item.name === className)) fail('missingMetadata', [className]);
     if (!bounded.value.classFields.some((item) => item.className === className && Array.isArray(item.attributes))) fail('missingFields', [className]);
   }
-  diagnostics.excludedOptionalClassNames = optional.filter((name) => !selected.includes(name));
+  diagnostics.excludedOptionalClassNames = uniqueStrings([
+    ...(diagnostics.excludedOptionalClassNames || []), ...optional
+  ]).filter((name) => !selected.includes(name));
   diagnostics.semanticContext = {
     complete: true, requiredCount: required.size, selectedCount: selected.length,
     excludedOptionalCount: diagnostics.excludedOptionalClassNames.length, serializedBytes: bounded.returnedBytes

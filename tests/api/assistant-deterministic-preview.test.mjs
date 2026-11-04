@@ -1044,6 +1044,95 @@ for (const [phase, responseOptions] of [
   assert.equal(backend.exitCode, null);
 });
 
+test('semantic plan addressed related classes share confirmed prompt and validator paths', async (t) => {
+  const intent = objectFlowIntentFromText('', { blocks: ['Asset', 'Network'].map((className, index) => ({
+    id: `b${index}`, name: className, entities: `класс "${className}"`,
+    algorithm: `Выбрать карточки класса "${className}".`, expectedResult: `Карточки класса "${className}".`,
+    uses: index ? ['b0'] : []
+  })) });
+  const plan = { version: 1, blocks: intent.blocks.map((block, index) => ({
+    id: block.id, name: block.name, summary: block.name, dependencies: block.uses,
+    resultContract: { outputKind: 'sourceCards', outputClass: block.name, dependencyPaths: index ? [{
+      comparisonBlockId: 'b0', sourceClass: 'Asset', targetClass: 'Network', domain: 'AssetNetwork', direction: 'source'
+    }] : [] }, warnings: []
+  })), warnings: [] };
+  const llm = await startLiteLlmStub(t, { responses: [plan] });
+  const mock = await startMockCmdbuild(t, {
+    classes: ['Other', 'Padding', 'Asset', 'Network'].map((name) => ({ name })),
+    domains: [{ name: 'AssetNetwork', source: 'Asset', destination: 'Network', active: true }],
+    attributesByClass: { Asset: [{ name: 'AssetValue', type: 'string' }], Network: [{ name: 'NetworkValue', type: 'string' }] },
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true,
+      RuntimeConfigJson: JSON.stringify({ assistant: {
+        llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' },
+        mcp: { maxClasses: 2, timeoutMs: 10000, maxContextBytes: 32768 }
+      } }) }]
+  });
+  const port = await freePort();
+  await startBackend(t, port, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const origin = `http://127.0.0.1:${port}`;
+  const cookie = testCmdbuildAuthorizationCookie('addressed-related-classes');
+  const csrf = await requestJson('GET', `${origin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const response = await requestJson('POST', `${origin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+    templateCode: '', baseSpecHash: '', currentSpec: { version: 1, steps: [], result: { tables: [] } }, intent
+  }, { cookie, origin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json.semanticPlan.blocks[1].resultContract.dependencyPaths[0].domain, 'AssetNetwork');
+  assert.equal(response.json.diagnostics.mcp.classLookups.filter((item) => item.status === 'found').length, 2);
+  const promptContext = JSON.parse(llm.lastRequest.messages.find((item) => item.role === 'user').content).mcpContext;
+  const payload = JSON.parse(promptContext.data);
+  assert.ok(promptContext.data.includes('AssetValue') && promptContext.data.includes('NetworkValue'));
+  assert.deepEqual(payload.relationPaths, response.json.diagnostics.mcp.relationPaths);
+  assert.equal(payload.relationHints.domains[0].name, 'AssetNetwork');
+  assert.equal(llm.requests, 1);
+});
+
+test('semantic plan evicts dense optional graph but rejects genuine required byte overflow before LiteLLM', async (t) => {
+  const optional = Array.from({ length: 20 }, (_, index) => `Optional${index}`);
+  const llm = await startLiteLlmStub(t, { responses: [{ version: 1, blocks: [{
+    id: 'block-1', name: 'Assets', summary: 'Assets', dependencies: [],
+    resultContract: { outputKind: 'sourceCards', outputClass: 'Asset' }, warnings: []
+  }], warnings: [] }] });
+  const mock = await startMockCmdbuild(t, {
+    classes: ['Asset', ...optional, 'Oversized'].map((name) => ({ name, description: 'Candidate' })),
+    domains: [{ name: 'OptionalLinks', sources: optional, destinations: optional, active: true }],
+    attributesByClass: { Asset: [{ name: 'RequiredValue', type: 'string' }],
+      Oversized: [{ name: 'HeavyRequiredValue', description: 'x'.repeat(40 * 1024), type: 'string' }] },
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true,
+      RuntimeConfigJson: JSON.stringify({ assistant: {
+        llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' },
+        mcp: { maxClasses: 30, maxCandidateClasses: 30, timeoutMs: 10000, maxContextBytes: 32768 }
+      } }) }]
+  });
+  const port = await freePort();
+  await startBackend(t, port, mock.origin, { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin });
+  const origin = `http://127.0.0.1:${port}`;
+  const cookie = testCmdbuildAuthorizationCookie('dense-optional-graph');
+  const csrf = await requestJson('GET', `${origin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  const submit = (className) => requestJson('POST', `${origin}/cmdbuild/custom-api/assistant/object-flow/semantic-plan`, {
+    templateCode: '', baseSpecHash: '', currentSpec: { version: 1, steps: [], result: { tables: [] } },
+    intent: objectFlowIntentFromText(`Выбрать карточки класса "${className}". Candidate.`, {
+      context: optional.join(' '),
+      name: 'Assets', entities: `класс "${className}"`, expectedResult: `Карточки класса "${className}".`
+    })
+  }, { cookie, origin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
+  const response = await submit('Asset');
+  assert.equal(response.statusCode, 200, response.body);
+  const diagnostics = response.json.diagnostics.mcp;
+  assert.equal(diagnostics.semanticContext.complete, true);
+  assert.ok(diagnostics.semanticContext.serializedBytes <= 32768);
+  assert.ok(diagnostics.excludedOptionalClassNames.length > 0, JSON.stringify(diagnostics));
+  const selected = new Set(diagnostics.contextClassNames);
+  assert.ok(diagnostics.relationPaths.every((path) => selected.has(path.sourceClass) && selected.has(path.targetClass)));
+  const payload = JSON.parse(JSON.parse(llm.lastRequest.messages.find((item) => item.role === 'user').content).mcpContext.data);
+  assert.deepEqual(payload.relationPaths, diagnostics.relationPaths);
+  assert.deepEqual(payload.relationHints.domains.map((item) => item.name), diagnostics.contextDomainNames);
+  assert.ok(llm.lastRequest.messages.some((item) => item.content.includes('RequiredValue')));
+  const overflow = await submit('Oversized');
+  assert.equal(overflow.statusCode, 422, overflow.body);
+  assert.equal(overflow.json.errors[0].reason, 'maxContextBytes');
+  assert.equal(llm.requests, 1, 'genuine required overflow must stop before LiteLLM');
+});
+
 test('semantic plan directly resolves an explicit class beyond the bounded catalog and sends its fields to LiteLLM', async (t) => {
   const className = 'Technical_Network';
   const llm = await startLiteLlmStub(t, { responses: [{ version: 1, blocks: [{

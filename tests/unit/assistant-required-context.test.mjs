@@ -21,7 +21,9 @@ function harness(overrides = {}) {
     'assistantReferencePathHintsFromBlock', 'assistantReferencePathSegments',
     'assistantMcpPreferredFieldMatches', 'assistantReferenceTargetClass', 'normalizedAssistantLookupText',
     'cmdbuildClassAttributesPath', 'responseDataArray', 'sanitizeVisibleClassAttributes', 'sanitizeAttribute',
-    'assistantClassMetadataReadable', 'assistantClassMetadataSummary'
+    'assistantClassMetadataReadable', 'assistantClassMetadataSummary',
+    'assistantMcpRelationPathHints', 'assistantRelationClassHelpers',
+    'assistantRelationEndpointClasses', 'assistantRelationPathCandidates'
   ]) {
     const match = new RegExp(`^(?:async )?function ${name}\\(`, 'm').exec(source);
     assert.ok(match, name);
@@ -84,6 +86,36 @@ test('optional byte-heavy context can be removed without clipping required field
   assert.equal(JSON.parse(mcp.text).complete, true);
   assert.ok(mcp.text.includes('ExistingField'));
   assert.ok(!mcp.text.includes('Extra'));
+});
+
+test('dense optional graph eviction prunes paths and domains in the prompt and validator together', async () => {
+  const names = ['Existing', 'Target', 'Middle', ...Array.from({ length: 20 }, (_, i) => `Optional${i}`)];
+  const mcp = context(names);
+  const requiredPath = { sourceRoot: 'Existing', targetRoot: 'Target', sourceClass: 'Existing', targetClass: 'Middle', domain: 'RequiredLink', direction: 'source' };
+  mcp.diagnostics.relationPaths = [requiredPath, ...names.slice(3).flatMap((sourceClass) => names.slice(3)
+    .filter((targetClass) => sourceClass !== targetClass)
+    .map((targetClass) => ({ sourceClass, targetClass, domain: 'OptionalLinks', direction: 'source' })))];
+  mcp.results.push({ tool: 'cmdbuild_relation_hints', ok: true, result: { domains: [
+    { name: 'RequiredLink', source: 'Existing', destination: 'Middle' },
+    { name: 'OptionalLinks', sources: names.slice(3), destinations: names.slice(3) }
+  ] } });
+  await harness().assistantFinalizeSemanticContext(intent, mcp, bindings(['Existing', 'Target']), config(30, 2200), { allowReads: false });
+  const payload = JSON.parse(mcp.text);
+  assert.equal(payload.complete, true);
+  assert.ok(Buffer.byteLength(mcp.text) <= 2200);
+  assert.equal(mcp.diagnostics.requiredClassNames.join(','), 'Existing,Target,Middle');
+  assert.ok(mcp.diagnostics.excludedOptionalClassNames.length > 0);
+  assert.deepEqual(payload.relationPaths, JSON.parse(JSON.stringify(mcp.diagnostics.relationPaths)));
+  assert.ok(payload.relationPaths.some((path) => path.domain === 'RequiredLink'));
+  assert.ok(payload.classFields.some((item) => item.className === 'Middle'));
+  const selected = new Set(payload.classes.map((item) => item.name));
+  assert.ok(payload.relationPaths.every((path) => selected.has(path.sourceClass) && selected.has(path.targetClass)));
+  assert.deepEqual(payload.relationHints.domains.map((item) => item.name), Array.from(mcp.diagnostics.contextDomainNames));
+  assert.equal(payload.relationHints.domains.some((item) => item.name === 'OptionalLinks'), false);
+
+  mcp.results[1].result.find((item) => item.className === 'Middle').attributes.push({ name: 'RequiredHeavyField', description: 'x'.repeat(10000) });
+  await assert.rejects(harness().assistantFinalizeSemanticContext(intent, mcp, bindings(['Existing', 'Target']), config(30, 2200), { allowReads: false }),
+    (error) => error.details[0].reason === 'maxContextBytes' && error.diagnostics.mcp.semanticContext.complete === false);
 });
 
 test('cached contexts require readable metadata and fields for every accepted binding', async () => {

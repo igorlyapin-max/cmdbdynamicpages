@@ -14,7 +14,11 @@ const functionNames = [
   'assistantResolveExplicitClassMetadata', 'assistantMcpResult', 'assistantObjectFlowMcpPayload',
   'cmdbuildClassAttributesPath', 'sanitizeVisibleClassAttributes', 'sanitizeAttribute',
   'boundedMcpText', 'compactMcpValue', 'mcpResultEnvelope', 'mcpTimeoutMs',
-  'prepareAssistantObjectFlowSemanticPlanContext', 'assistantSemanticPlanError'
+  'prepareAssistantObjectFlowSemanticPlanContext', 'assistantSemanticPlanError',
+  'assistantMcpRelationPathHints', 'assistantRelationClassHelpers',
+  'assistantRelationEndpointClasses', 'assistantRelationPathCandidates',
+  'assistantSemanticDependencyPathCandidates', 'assistantPreferredSemanticDependencyPathCandidates',
+  'assistantSemanticDependencyPathError', 'normalizeAssistantDependencyPath'
 ];
 
 // Test private functions without adding runtime exports to the shared server.
@@ -27,6 +31,8 @@ function harness(overrides = {}) {
     truncateText: (value, length) => String(value).slice(0, length),
     pickBooleans: (item, keys) => Object.fromEntries(keys.filter((key) => typeof item[key] === 'boolean').map((key) => [key, item[key]])),
     ASSISTANT_MCP_MAX_CLASSES_ABSOLUTE: 10000,
+    ASSISTANT_CMDBUILD_CLASS_IDENTIFIER_PATTERN: /^[A-Za-z][A-Za-z0-9_]*$/,
+    ASSISTANT_CMDBUILD_IDENTIFIER_PATTERN: /^[A-Za-z_][A-Za-z0-9_]*$/,
     ASSISTANT_MCP_MAX_DOMAINS_ABSOLUTE: 10000,
     DEFAULT_ASSISTANT_MCP_MAX_CONTEXT_BYTES: 100000,
     ASSISTANT_SEMANTIC_PLAN_CHECKPOINT_VERSION: 1,
@@ -196,6 +202,26 @@ test('same-session metadata lookup provides verified metadata and readable field
   assert.equal(metadata.translatedDescription, 'Translated');
   assert.deepEqual(fields.attributes.map((item) => item.name), ['Title']);
   assert.equal(h.assistantSemanticClassBindings(intent('NewAsset'), ctx).bindings[0].className, 'NewAsset');
+});
+
+test('addressed related classes rebuild the same confirmed graph for prompt and dependency validation', async () => {
+  const h = harness({ cmdbuildRequest: async (path) => path.includes('/attributes?')
+    ? response([{ name: 'Name' }]) : response({ name: decodeURIComponent(path.split('/').at(-1)) }) });
+  const ctx = context([{ name: 'Other' }], { complete: false, reason: 'maxClasses' });
+  ctx.results.push({ tool: 'cmdbuild_relation_hints', ok: true, result: {
+    domains: [{ name: 'AssetNetwork', source: 'Asset', destination: 'Network' }]
+  } });
+  const input = { blocks: ['Asset', 'Network'].map((name, i) => ({ id: `b${i}`, entities: `класс "${name}"` })) };
+  await h.assistantResolveExplicitClassMetadata(input, ctx, 'session', config(), Date.now() + 5000);
+  assert.equal(ctx.diagnostics.classLookups.filter((item) => item.status === 'found').length, 2);
+  assert.equal(ctx.diagnostics.relationPaths.length, 2);
+  const payload = h.assistantObjectFlowMcpPayload(ctx.results, ctx.diagnostics);
+  assert.equal(payload.relationHints.domains[0].name, 'AssetNetwork');
+  assert.deepEqual(JSON.parse(JSON.stringify(payload.relationPaths)), JSON.parse(JSON.stringify(ctx.diagnostics.relationPaths)));
+  const path = h.normalizeAssistantDependencyPath({ comparisonBlockId: 'b0', sourceClass: 'Asset',
+    targetClass: 'Network', domain: 'AssetNetwork', direction: 'source'
+  }, { id: 'b1', name: 'Network', uses: ['b0'] }, 'Network', 0, { mcpContext: ctx });
+  assert.equal(path.domain, 'AssetNetwork');
 });
 
 test('exact English descriptions in complete catalogs and invalid identifiers never trigger direct lookup', async () => {

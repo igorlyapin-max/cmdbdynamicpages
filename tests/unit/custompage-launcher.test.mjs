@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics.mjs';
 
 const launcherSource = fs.readFileSync('src/CmdbDynamicPages.js', 'utf8');
 const proxySource = fs.readFileSync('scripts/dev-proxy-server.mjs', 'utf8');
@@ -98,7 +99,8 @@ test('Assistant browser deadline follows the configured MCP timeout with backend
   assert.match(previewHelperSource, /boot\.draftPreviewTimeoutMs/);
   assert.match(previewHelperSource, /boot\.draftPreviewUiGraceMs/);
   assert.match(previewHelperSource, /backendTimeout \+ grace/);
-  assert.match(previewHelperSource, /function requestDraftPreview\(path, template, params, requestId\)/);
+  assert.match(previewHelperSource, /function requestDraftPreview\(path, template, params, requestId, owner\)/);
+  assert.match(previewHelperSource, /validateUiResponse\(result, 'preview'\)/);
   assert.match(previewHelperSource, /timeoutMs: draftPreviewRequestTimeoutMs\(\)/);
   assert.match(previewHelperSource, /function draftPreviewErrorText\(error\)/);
   assert.match(previewHelperSource, /function draftPreviewResultErrorText\(result\)/);
@@ -135,6 +137,7 @@ function generatedDynamicPagesClientScript() {
     .slice(start, end)
     .replace('function dynamicPagesClientScript()', 'return function dynamicPagesClientScript()');
   const factory = new Function(
+    'createUiRequestDiagnostics',
     'DEFAULT_EMPTY_RESULT_TEXT',
     'DEFAULT_PERMISSION_DENIED_TEXT',
     'DEFAULT_TEMPLATE_CACHE_TTL_SEC',
@@ -154,7 +157,7 @@ function generatedDynamicPagesClientScript() {
     'DEFAULT_ASSISTANT_DIAGRAM_CRITIQUE_PROMPT',
     factorySource
   );
-  return factory('empty result', 'permission denied', 3600, 10, 1, 5, 1, 3, 3, 'assistant system prompt', 'object flow prompt', 'semantic plan prompt', 'diagram semantics prompt', 'diagram binding intent prompt', 'diagram placement prompt', 'diagram connections prompt', 'diagram critique prompt')();
+  return factory(createUiRequestDiagnostics, 'empty result', 'permission denied', 3600, 10, 1, 5, 1, 3, 3, 'assistant system prompt', 'object flow prompt', 'semantic plan prompt', 'diagram semantics prompt', 'diagram binding intent prompt', 'diagram placement prompt', 'diagram connections prompt', 'diagram critique prompt')();
 }
 
 test('generated Dynamic Pages client script parses as browser JavaScript', () => {
@@ -284,6 +287,9 @@ test('D2 runtime preview revisions include the full request and execute the late
   let nextRequestId = 0;
   const runtimePreview = new Function(
     'state',
+    'uiRequestOwner',
+    'uiDiagnosticIsCurrent',
+    'setUiError',
     'diagramImportRuntimePreviewRequestSnapshot',
     'templateAuthoringClient',
     't',
@@ -302,12 +308,16 @@ test('D2 runtime preview revisions include the full request and execute the late
     `${clientScript.slice(previewStart, previewEnd)}\nreturn { runDiagramImportRuntimePreview };`
   )(
     state,
+    () => ({ templateCode: 'testtemplate', section: 'visualization', generation: 1, revision: 0 }),
+    () => true,
+    (error) => { throw error; },
     () => { throw new Error('A supplied request snapshot is required for this test.'); },
     (spec) => spec.authoring,
     (key) => key,
     () => {},
-    (snapshot) => {
+    (snapshot, owner) => {
       state.diagramImportRuntimePreviewQueued = {
+        owner,
         mode: snapshot.mode,
         template: structuredClone(snapshot.template),
         params: structuredClone(snapshot.params),
@@ -1584,8 +1594,8 @@ test('diagram editor renders repeatable mapping tables with source-dependent fie
   assert.match(rowUiSource, /function ensureTrailingDiagramMappingRow\(target\)/);
   assert.match(rowUiSource, /data-diagram-mapping-detail/);
   assert.match(rowUiSource, /function refreshDiagramMappingEditorAfterSourceChange\(\)/);
-  assert.match(proxySource, /if \(action === 'add-diagram-mapping-row'\) addDiagramMappingRow\(target\)/);
-  assert.match(proxySource, /if \(action === 'clear-diagram-mapping-row'\) clearDiagramMappingRow\(target\)/);
+  assert.match(proxySource, /if \(action === 'add-diagram-mapping-row'\) runUiMutation\(function \(\) \{ addDiagramMappingRow\(target\); \}\)/);
+  assert.match(proxySource, /if \(action === 'clear-diagram-mapping-row'\) runUiMutation\(function \(\) \{ clearDiagramMappingRow\(target\); \}\)/);
   assert.match(proxySource, /if \(action === 'insert-diagram-template-token'\) insertDiagramTemplateToken\(target\)/);
   assert.match(proxySource, /\[data-diagram-mapping-field="from"\]/);
   assert.match(proxySource, /function diagramImportStructureTreeIssuesClient\(proposal, spec\)/);
@@ -1712,7 +1722,7 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   assert.match(runtimePreviewSource, /state\.lastDraftPreviewOk = result\.ok && details\.ready && !details\.partial/);
   assert.match(runtimePreviewSource, /state\.diagramImportAppliedPendingPreview = !state\.lastDraftPreviewOk/);
   assert.match(runtimePreviewSource, /state\.diagramImportRuntimePreviewBusy = true/);
-  assert.match(runtimePreviewSource, /requestDraftPreview\(authoringPreviewPath\(\{ executionScope: 'diagrams' \}\), template, params, requestId\)/);
+  assert.match(runtimePreviewSource, /requestDraftPreview\(authoringPreviewPath\(\{ executionScope: 'diagrams' \}\), template, params, requestId, owner\)/);
   assert.match(runtimePreviewSource, /Extraction and Diagram use one RuntimeConfigJson bound/);
   assert.match(runtimePreviewSource, /previewTemplateCode/);
   assert.match(runtimePreviewSource, /diagramImportRuntimePreviewRequestSnapshot\(options\)/);
@@ -1733,9 +1743,9 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   assert.match(retryPreviewSource, /diagramImportPreviewUsesCurrentDraft\(spec\) \? 'intermediate' : 'applied'/);
   assert.match(retryPreviewSource, /currentDiagramImportRuntimePreviewRevision\(mode\) === String\(snapshot\.revision \|\| ''\)/);
   assert.match(proxySource, /state\.diagramImportRuntimePreviewSnapshot = snapshot/);
-  assert.match(proxySource, /if \(action === 'diagram-import-preview-retry'\) retryDiagramImportRuntimePreview\(\)/);
-  assert.match(runtimePreviewSource, /queueDiagramImportRuntimePreview\(snapshot\)/);
-  assert.match(runtimePreviewSource, /runDiagramImportRuntimePreview\(\{ requestSnapshot: queued \}\)/);
+  assert.match(proxySource, /if \(action === 'diagram-import-preview-retry'\) runUiOperation\(action, function \(\) \{ retryDiagramImportRuntimePreview\(\); \}\)/);
+  assert.match(runtimePreviewSource, /queueDiagramImportRuntimePreview\(snapshot, owner\)/);
+  assert.match(runtimePreviewSource, /runDiagramImportRuntimePreview\(\{ requestSnapshot: queued, owner: queued.owner \}\)/);
   assert.match(proxySource, /diagramImportRuntimePreviewQueued: null/);
   assert.match(proxySource, /path: 'draft\/preview\?maxRows=' \+ authoringPreviewMaxRows\(\) \+ '&executionScope=diagrams'/);
   assert.match(proxySource, /params: params/);

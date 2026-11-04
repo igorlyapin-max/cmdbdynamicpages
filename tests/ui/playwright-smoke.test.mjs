@@ -2644,6 +2644,280 @@ test('Assistant explains a predicate erroneously added to an independent Semanti
   });
 });
 
+let designerContractFixturePayload = null;
+async function openDesignerContractFixture(page, section = 'extraction') {
+  let code = '';
+  const unexpectedWrites = [];
+  await page.route('**/cmdbuild/custom-api/**', async (route) => {
+    if (!['GET', 'HEAD'].includes(route.request().method())) {
+      unexpectedWrites.push(route.request().url());
+      return route.abort('blockedbyclient');
+    }
+    return route.fallback();
+  });
+  // Every write is intercepted below or blocked above; no CSRF-bearing request reaches CMDBuild.
+  await page.route('**/cmdbuild/custom-api/csrf', (route) => route.fulfill({ json: { success: true, token: 'ui-contract-fixture' } }));
+  await page.route('**/cmdbuild/custom-api/templates?**', async (route) => {
+    if (!designerContractFixturePayload) {
+      const response = await route.fetch();
+      assert.equal(response.status(), 200, 'Readable template metadata is required for the UI fixture.');
+      designerContractFixturePayload = await response.json();
+    }
+    const payload = structuredClone(designerContractFixturePayload);
+    for (const template of payload.data) {
+      template.spec = { version: 1, params: {}, steps: [{ type: 'selectCards', className: 'IS', as: 'systems', limit: 10 }], result: { tables: [{ name: 'systems', columns: ['Description'] }] } };
+      template.paramsSchema = {};
+      template.resultSchema = {};
+    }
+    code = payload.data[0].code;
+    await route.fulfill({ json: payload });
+  });
+  await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('#cmdp-designer-menu');
+  await page.locator('#cmdp-language').selectOption('ru');
+  await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
+  await page.locator(`a[data-designer-section="${section}"]`).click();
+  return { code, unexpectedWrites };
+}
+
+for (const operation of ['save', 'extraction', 'preview']) {
+  for (const format of ['html', 'empty', 'invalid_json', 'incomplete_json']) {
+    test(`Designer response contracts reject ${format} in ${operation} without losing edits`, { skip: skipReason }, async () => {
+      await withPage(async (page) => {
+        const fixture = await openDesignerContractFixture(page, operation === 'preview' ? 'assistant' : 'extraction');
+        const requestId = `invalid-${operation}-${format}`;
+        const body = format === 'html' ? '<h1>Unexpected gateway page</h1>' : format === 'empty' ? ''
+          : format === 'invalid_json' ? '{invalid' : JSON.stringify({ success: true, template: {}, result: { tables: 'not-an-array' } });
+        const fulfill = (route) => route.fulfill({ status: 200, contentType: format === 'html' ? 'text/html' : 'application/json', headers: { 'x-request-id': requestId }, body });
+        if (operation === 'save') {
+          await page.route('**/cmdbuild/custom-api/templates/*', (route) => route.request().method() === 'PUT' ? fulfill(route) : route.fallback());
+        } else {
+          await page.route('**/cmdbuild/custom-api/draft/preview?*', fulfill);
+        }
+        const action = operation === 'save' ? 'save-template' : operation === 'extraction' ? 'extract-template' : 'draft-preview';
+        await page.locator(`[data-action="${action}"]`).first().click();
+        const details = page.locator('[data-ui-error-diagnostics]');
+        await details.waitFor();
+        assert.equal(await details.count(), 1);
+        assert.match(await details.locator('summary').innerText(), new RegExp(`HTTP 200.*${requestId}`));
+        await details.locator('summary').click();
+        const report = JSON.parse(await details.locator('[data-ui-diagnostic-report]').innerText());
+        assert.equal(report.code, 'invalid_response');
+        assert.equal(report.status, 200);
+        assert.equal(report.responseFormat, format === 'incomplete_json' ? 'json' : format);
+        assert.doesNotMatch(await page.locator('.notice').first().innerText(), /Cannot read|завершен|завершено|сохранен/i);
+        await page.locator('a[data-designer-section="object-group"]').click();
+        await page.locator('#cmdp-object-group-editor').waitFor();
+        assert.match(await page.locator('#cmdp-object-group-editor').innerText(), /systems|ИС|IS/);
+        assert.deepEqual(fixture.unexpectedWrites, []);
+      });
+    });
+  }
+}
+
+for (const editInputs of [false, true]) {
+  test(`Designer delayed save ${editInputs ? 'ignores a response after editing inputs' : 'reports 502 after opening a dependency dropdown'}`, { skip: skipReason }, async () => {
+    await withPage(async (page) => {
+      const fixture = await openDesignerContractFixture(page, 'assistant');
+      await addAssistantBusinessBlock(page, { name: 'First', description: 'Select IS.' });
+      await page.locator('[data-action="assistant-flow-block-add"]').click();
+      await addAssistantBusinessBlock(page, { name: 'Second', description: 'Select IS.' });
+      let release;
+      const held = new Promise((resolve) => { release = resolve; });
+      await page.route('**/cmdbuild/custom-api/templates/*', async (route) => {
+        if (route.request().method() !== 'PUT') return route.fallback();
+        await held;
+        await route.fulfill({ status: 502, headers: { 'x-request-id': 'held-save-502' }, json: { success: false, code: 'save_failed', message: 'Save unavailable' } });
+      });
+      const pending = page.waitForRequest((request) => request.method() === 'PUT' && request.url().includes('/templates/'));
+      await page.locator('[data-action="save-template"]').first().click();
+      await pending;
+      const picker = page.locator('[data-compact-multi-select-kind="assistantDependencies"]').last();
+      await picker.locator('[data-action="compact-multi-select-toggle"]').click();
+      if (editInputs) await picker.locator('input[type="checkbox"]').first().check();
+      const response = page.waitForResponse((value) => value.request().method() === 'PUT' && value.url().includes('/templates/'));
+      release();
+      await response;
+      await page.waitForFunction(() => {
+        const save = document.querySelector('[data-action="save-template"]');
+        return save && !save.disabled;
+      });
+      if (editInputs) {
+        assert.equal(await page.locator('[data-ui-error-diagnostics]').count(), 0);
+        assert.doesNotMatch((await page.locator('.notice').allTextContents()).join('\n'), /held-save-502|Сохранение\.\.\./);
+        assert.equal(await page.locator('[data-compact-multi-select-kind="assistantDependencies"] select option:checked').count(), 1);
+      } else {
+        const details = page.locator('[data-ui-error-diagnostics]');
+        await details.waitFor();
+        assert.match(await details.locator('summary').innerText(), /HTTP 502.*held-save-502/);
+      }
+      assert.deepEqual(fixture.unexpectedWrites, []);
+    });
+  });
+}
+
+test('Designer ignores an extraction response after switching templates', { skip: skipReason }, async () => {
+  await withPage(async (page) => {
+    const fixture = await openDesignerContractFixture(page);
+    let release;
+    const held = new Promise((resolve) => { release = resolve; });
+    await page.route('**/cmdbuild/custom-api/draft/preview?*', async (route) => {
+      await held;
+      await route.fulfill({ status: 200, json: { success: true, result: { tables: [{ name: 'systems', columns: ['Description'], rows: [{ Description: 'STALE_REVIEW_RESULT' }] }] } } });
+    });
+    const pending = page.waitForRequest((request) => request.url().includes('/draft/preview'));
+    await page.locator('[data-action="extract-template"]').click();
+    await pending;
+    await page.locator('a[data-designer-section="templates"]').click();
+    const otherCode = await page.locator('[data-action="select-template"]').evaluateAll((nodes, selected) => nodes.find((node) => node.getAttribute('data-code') !== selected)?.getAttribute('data-code'), fixture.code);
+    assert.ok(otherCode, 'The live stand needs two readable templates for the ownership scenario.');
+    await page.locator(`[data-action="select-template"][data-code="${otherCode}"]`).click();
+    const response = page.waitForResponse((value) => value.url().includes('/draft/preview'));
+    release();
+    await response;
+    await page.locator('a[data-designer-section="extraction"]').click();
+    assert.doesNotMatch(await page.locator('#cmdp-extraction-editor').innerText(), /STALE_REVIEW_RESULT/);
+    assert.deepEqual(fixture.unexpectedWrites, []);
+  });
+});
+
+test('Designer technical diagnostics cover extraction and saving without changing template data', { skip: skipReason }, async () => {
+  await withPage(async (page) => {
+    const fixture = await openDesignerContractFixture(page);
+    let saves = 0;
+    await page.route('**/cmdbuild/custom-api/draft/preview?*', (route) => route.fulfill({ status: 502,
+      headers: { 'x-request-id': 'extraction-502' }, json: { success: false, code: 'preview_failed', message: 'Preview unavailable' }
+    }));
+    await page.route('**/cmdbuild/custom-api/templates/*', async (route) => {
+      if (route.request().method() !== 'PUT') return route.fallback();
+      saves += 1;
+      await route.fulfill({ status: 502, headers: { 'x-request-id': 'save-502' }, json: { success: false, code: 'save_failed', message: 'Save unavailable' } });
+    });
+    await page.locator('button[data-action="extract-template"]').click();
+    let details = page.locator('[data-ui-error-diagnostics]');
+    await details.waitFor();
+    assert.equal(await details.count(), 1);
+    assert.match(await details.locator('summary').innerText(), /HTTP 502.*extraction-502/);
+    await page.locator('button[data-action="save-template"]').first().click();
+    await page.waitForFunction(() => /save-502/.test(document.querySelector('[data-ui-error-diagnostics] summary')?.textContent || ''));
+    details = page.locator('[data-ui-error-diagnostics]');
+    assert.equal(await details.count(), 1);
+    await details.locator('summary').click();
+    const report = JSON.parse(await details.locator('[data-ui-diagnostic-report]').innerText());
+    assert.equal(report.code, 'save_failed');
+    assert.equal(report.method, 'PUT');
+    assert.equal(report.action, 'save-template');
+    assert.equal(saves, 1);
+    assert.deepEqual(fixture.unexpectedWrites, []);
+  });
+});
+
+for (const language of ['ru', 'en']) {
+  for (const format of ['json', 'html', 'invalid_json', 'network']) {
+    test(`Designer technical diagnostics ${language} ${format} preserve the actual failure without saving`, { skip: skipReason }, async () => {
+      await withPage(async (page) => {
+        const writes = [];
+        await page.route('**/cmdbuild/custom-api/**', async (route) => {
+          if (!['GET', 'HEAD'].includes(route.request().method())) {
+            writes.push(route.request().url());
+            await route.abort('blockedbyclient');
+            return;
+          }
+          await route.fallback();
+        });
+        await page.route('**/cmdbuild/custom-api/csrf', (route) => route.fulfill({ json: { success: true, token: 'ui-contract-fixture' } }));
+        let clientRequestId = '';
+        await page.route('**/cmdbuild/custom-api/assistant/object-flow/semantic-plan?*', async (route) => {
+          const body = route.request().postDataJSON();
+          if (body.stage === 'context') {
+            await route.fulfill({ status: 202, json: { success: true, checkpoint: {
+              resumeId: body.resumeId, stage: 'mcpContextReady', expiresAt: '2030-01-01T00:00:00.000Z'
+            } } });
+            return;
+          }
+          clientRequestId = route.request().headers()['x-request-id'];
+          if (format === 'network') {
+            await route.abort('connectionfailed');
+            return;
+          }
+          const headers = { 'x-request-id': 'diagnostic-server-502' };
+          if (format === 'json') {
+            await route.fulfill({ status: 502, headers, json: {
+              success: false, code: 'upstream_failure', message: 'Gateway unavailable. Authorization: Bearer SECRET_FIXTURE',
+              diagnostics: { limit: { settingPath: 'assistant.mcp.timeoutMs', effectiveLimit: 10000 }, token: 'SECRET_FIXTURE' }
+            } });
+          } else {
+            await route.fulfill({ status: format === 'html' ? 502 : 200, headers,
+              contentType: format === 'html' ? 'text/html' : 'application/json',
+              body: format === 'html'
+                ? '<h1>502 Bad Gateway</h1><script>window.injectedDiagnostic=true</script><img src="invalid" onerror="window.injectedDiagnostic=true">'
+                : '{invalid json'
+            });
+          }
+        });
+        await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+        await page.waitForSelector('#cmdp-designer-menu');
+        await page.locator('#cmdp-language').selectOption(language);
+        await page.locator('button[data-action="new-template"]').click();
+        await page.locator('a[data-designer-section="assistant"]').click();
+        await addAssistantBusinessBlock(page, { name: 'Networks', description: 'Select all Network cards.' });
+        await page.locator('button[data-action="assistant-flow-prepare"]').click();
+        const details = page.locator('[data-ui-error-diagnostics]');
+        await details.waitFor({ timeout: 15000 });
+        assert.equal(await details.count(), 1);
+        assert.equal(await details.getAttribute('open'), null);
+        const summary = await details.locator('summary').innerText();
+        if (format !== 'network') {
+          assert.match(summary, new RegExp(`HTTP ${format === 'invalid_json' ? 200 : 502}`));
+          assert.match(summary, /diagnostic-server-502/);
+        }
+        await details.locator('summary').click();
+        const reportText = await details.locator('[data-ui-diagnostic-report]').innerText();
+        const report = JSON.parse(reportText);
+        assert.equal(report.method, 'POST');
+        assert.equal(report.path, '/cmdbuild/custom-api/assistant/object-flow/semantic-plan');
+        assert.equal(report.action, 'assistant.semanticPlan');
+        assert.equal(report.phase, 'plan');
+        assert.equal(report.checkpoint.confirmed, true);
+        assert.equal(report.checkpoint.stage, 'mcpContextReady');
+        assert.ok(report.durationMs >= 0);
+        assert.ok(clientRequestId);
+        assert.equal(report.clientRequestId, clientRequestId);
+        assert.equal(report.code, format === 'json' ? 'upstream_failure' : format === 'network' ? 'network_error' : format === 'invalid_json' ? 'invalid_response' : 'http_error');
+        assert.doesNotMatch(reportText, /SECRET_FIXTURE|Bearer|injectedDiagnostic/);
+        assert.equal(await page.evaluate(() => Boolean(window.injectedDiagnostic)), false);
+        assert.equal(await details.locator('script,img').count(), 0);
+        if (language === 'ru' && format === 'html') {
+          await details.screenshot({ path: '/tmp/cmdp-ui-error-diagnostics.png' });
+          const viewport = page.viewportSize();
+          const bounds = await details.boundingBox();
+          assert.ok(bounds && bounds.width > 300 && bounds.x + bounds.width <= viewport.width + 1);
+          await page.setViewportSize({ width: 390, height: 844 });
+          const mobileBounds = await details.boundingBox();
+          assert.ok(mobileBounds && mobileBounds.width > 200 && mobileBounds.x + mobileBounds.width <= 391);
+          assert.equal(await details.locator('pre').evaluate((node) => node.scrollWidth <= node.clientWidth + 1), true);
+          await details.screenshot({ path: '/tmp/cmdp-ui-error-diagnostics-mobile.png' });
+          await page.setViewportSize(viewport);
+        }
+        await page.evaluate(() => {
+          window.copiedDiagnostic = '';
+          Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async (text) => { window.copiedDiagnostic = text; } } });
+        });
+        await details.locator('[data-action="copy-error-diagnostics"]').click();
+        await page.waitForFunction(() => Boolean(window.copiedDiagnostic));
+        assert.equal(await page.evaluate(() => window.copiedDiagnostic), reportText);
+        await page.evaluate(() => Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async () => { throw new Error('denied'); } } }));
+        await details.locator('[data-action="copy-error-diagnostics"]').click();
+        await page.waitForFunction(() => /unavailable|недоступ/i.test(document.querySelector('[data-diagnostic-copy-status]')?.textContent || ''));
+        assert.equal(await details.locator('[data-ui-diagnostic-report]').innerText(), reportText);
+        await page.locator('a[data-designer-section="templates"]').click();
+        assert.equal(await page.locator('[data-ui-error-diagnostics]').count(), 0);
+        assert.deepEqual(writes, []);
+      });
+    });
+  }
+}
+
 for (const language of ['ru', 'en']) {
   test(`Assistant localizes structured limit and class feedback in ${language} without saving`, { skip: skipReason }, async () => {
     await withPage(async (page) => {
