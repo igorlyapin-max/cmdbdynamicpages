@@ -91,6 +91,94 @@ GET https://custom.example.local/cmdbuild/custom-api/logging/status
 
 Для безопасной диагностики используйте `CMDP_DIAGNOSTIC_MODE=Basic`. `Verbose` включайте только временно, когда нужны sanitized request/upstream details.
 
+### Assistant Capture
+
+Assistant capture независим от `CMDP_DIAGNOSTIC_MODE`: default `Off`, `Basic` для
+metadata, `Verbose` также для bounded redacted request/response тел. Capture в Redis
+действует **для всех пользователей выбранного технического root**. Даже после
+redaction traces/exports считать чувствительными; не публиковать raw exports.
+
+В Designer откройте **Настройки выполнения → Диагностика Assistant**. Выберите
+«Подробная» и нажмите «Применить режим», подтвердите захват. После воспроизведения
+раскройте «Запросы и ответы Assistant» под результатом либо найдите запись по Request ID
+в настройках. Тела загружаются только при раскрытии этапа; доступны копирование и JSON export.
+Каждый HTTP-этап имеет собственную трассировку: возобновляемая операция может отдельно
+сохранить MCP-контекст и LLM-генерацию. Уже прочитанный фрагмент оборванного ответа
+сохраняется с признаком неполноты; запись диагностики не меняет исходную ошибку.
+
+Запись асинхронна: `diagnostics.assistantTrace.storageStatus` имеет значение `pending`, `stored`,
+`discarded` (отказ lifecycle/quota) или `unavailable` (отказ storage/control).
+Ссылка не подтверждает сохранение. При раскрытии UI повторяет чтение известной
+`pending` ссылки максимум 5 секунд; произвольные отсутствующие traces не опрашиваются.
+
+1. Использовать admin-сессию с `admin_classes_modify` и чтением конфигурации root.
+2. Прочитать `GET /cmdbuild/custom-api/assistant/diagnostics/status?root=<Root>`.
+   Включить `POST .../diagnostics/capture?root=<Root>` с JSON
+   `{"mode":"Verbose","durationSec":900,"confirmed":true}` через обычный same-origin CSRF flow.
+   Для metadata-only использовать `Basic`; `DELETE .../diagnostics/capture` выключает capture.
+3. Воспроизвести одну целевую Assistant-операцию. Прочитать `GET .../diagnostics/traces`
+   с `root` и опционально `requestId`, `templateCode`, `limit`. Trace:
+   `GET .../diagnostics/traces/<id>` (metadata без тел); span: `GET .../diagnostics/traces/<id>/spans/<spanId>`;
+   JSON export: `GET .../diagnostics/traces/<id>/export`. Передавать `root` во всех запросах.
+4. Сопоставить effective `max_tokens`, `finish_reason`, detailed token usage и provider
+   response. Verbose сохраняет текст invalid JSON после redaction; ошибка parsing
+   не означает отсутствие текста. Сначала проверить markers truncation/omission.
+5. Остановить capture. `DELETE .../diagnostics/traces?root=<Root>` удаляет retained
+   traces и через storage epoch инвалидирует pending/in-flight записи.
+   Все mutations требуют CSRF. Остановка не очищает traces, разрешает завершиться
+   уже принятым Redis traces, но запрещает новый admission. Очистка не останавливает capture.
+
+Все endpoints admin-only, ответы `Cache-Control: no-store`. Redaction выполняется
+до записи Redis. Тела не идут в stdout/stderr или внешние log sinks; операционные
+metadata идут в основной structured logging pipeline. Отказ Redis не должен менять
+результат Assistant; in-memory storage fallback не предусмотрен.
+Capture control опрашивается из Redis в фоне каждую 1 секунду; memory cache содержит
+только control metadata, не fallback хранения payload. Отсутствующий/недоступный
+control или control старше 2 секунд отключает tracing с warning без ожидания Redis
+на пути Assistant. Begin/update атомарны; update использует `XX`, исходный expiry
+и проверку epoch. Истёкшие, вытесненные и очищенные traces не восстанавливаются.
+Redaction покрывает credentials и в malformed JSON; старую историю нельзя считать безопасной.
+
+Сохранённая policy `assistant.diagnostics`: `captureDurationSec=900` (max `3600`),
+`retentionSec=86400` (max `604800`), `maxBodyBytes=8388608`, `maxTraceBytes=33554432`,
+`maxStoredBytes=268435456`. Byte quotas ограничивают тело, trace и общий объём retained
+traces root. Старые traces могут вытесняться; oversized детали могут опускаться.
+Capture истекает автоматически. Restart backend и сохранение policy не включают
+capture и не продлевают deadline или retention существующих traces. RuntimeConfig не хранит активный режим.
+Deployment ceilings перечислены в [admin guide](CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md#budget-генерации-и-временный-capture).
+Capture byte quotas не увеличивают LLM request/response byte limits.
+
+`assistant.llm.maxTokens` default `16384`; каждый Assistant LiteLLM request передаёт
+effective значение как `max_tokens`, ограниченное deployment ceiling
+`CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE=131072`. После изменения env пересоздать backend.
+
+`GET`/`PUT /cmdbuild/custom-api/config` сохраняют запрошенные RAW значения
+`assistant.llm.maxTokens` и числовой policy `assistant.diagnostics`; выполнение
+использует effective caps. Ответ содержит `diagnostics.limits` (`requested`,
+`effectiveLimit`, `clampedBy`), `warnings` и `effectiveAssistantDiagnostics`.
+Некорректные числа, включая числовые строки, ноль, отрицательные, дробные и unsafe
+integers, возвращают HTTP `422`, код `runtime_config_invalid`, до записи CMDBuild.
+Исправьте запрос; не подменяйте сохранённый RAW effective ceiling ради скрытия warning.
+
+#### Security Rollout
+
+Пользователь одобрил удаление **всей существующей диагностической истории** всех
+roots, но только внутри diagnostics namespace этого проекта. Остановить все старые
+backend writers, выполнить проверенный offline purge CLI от ответственного за
+rollout, проверить отсутствие старых diagnostic keys, затем запустить новый backend.
+До завершения purge backend не запускать. Новый публичный purge endpoint не
+планируется; root-scoped clear API не заменяет rollout purge. Не использовать
+`FLUSHDB`/`FLUSHALL` и не удалять посторонние project keys.
+Порты front/backend остаются `8088`/`8093`; templates, prompts и business data не
+меняются. Legacy для диагностической истории не поддержана. Точные offline команды:
+[Security Purge](CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md#assistant-diagnostics-security-purge).
+Helper импортируется без запуска HTTP, сохраняет epoch keys и удаляет старую/новую
+историю всех roots, включая orphan keys и active capture control. До запуска повторить
+purge при остановленных writers и получить `deletedKeys: 0`.
+Root выполнит это при финальном rollout; в рамках docs-задачи purge не выполнялся.
+При `finish_reason=length` не поднимать лимиты автоматически: проверить model/provider
+context/output limits, timeout, response byte budget и стоимость до решения оператора.
+
 ### Локальный nginx restart-loop
 
 Порты стенда являются контрактом: не менять `8088`, `8093`, `8090` или `6379` для обхода ошибки. Сначала проверить вычисленную конфигурацию и environment контейнера:

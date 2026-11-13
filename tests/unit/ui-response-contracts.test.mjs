@@ -6,6 +6,7 @@ import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics
 
 const source = fs.readFileSync(new URL('../../scripts/dev-proxy-server.mjs', import.meta.url), 'utf8');
 const functions = ['parseResponse', 'validateUiResponse', 'createRequestError', 'requestDraftPreview',
+  'runtimeSettingsScope', 'runtimeSettingsScopeIsCurrent',
   'draftPreviewRequestTimeoutMs', 'saveTemplate', 'extractByTemplate', 'runDraftAction',
   'visualizeInEditor', 'queueDiagramImportRuntimePreview', 'runDiagramImportRuntimePreview'];
 const helpers = functions.map((name) => {
@@ -21,9 +22,11 @@ async function harness(body, { status = 200, current = true, mode = 'applied' } 
   const calls = [];
   const errors = [];
   let loads = 0;
-  const state = { selectedTemplate: edited, designerSection: 'assistant', lastDraftPreviewOk: true };
+  const state = { root: 'A', session: {}, templates: [], uiDiagnosticRevision: owner.revision,
+    selectedTemplate: edited, designerSection: 'assistant', lastDraftPreviewOk: true };
   const sandbox = vm.createContext({
     state, boot: {}, apiPrefix: '/api', window: { history: {} },
+    document: { getElementById: () => null },
     cloneJsonValue: (value) => structuredClone(value),
     uiRequestDiagnostics: createUiRequestDiagnostics(),
     uiRequestOwner: () => ({ ...owner }),
@@ -139,13 +142,15 @@ for (const consumer of ['extractByTemplate', 'runDraftAction', 'visualizeInEdito
   }
 }
 
-test('actual saveTemplate accepts complete envelope and reloads saved template', async () => {
+test('actual saveTemplate accepts canonical ACK without reloading over the editor', async () => {
   const template = { id: 1, code: 'sample', spec: { saved: true } };
   const h = await harness(JSON.stringify({ success: true, template, executionValidation: { executable: true } }));
   await invoke(h, 'saveTemplate');
   assert.equal(h.errors.length, 0);
   assert.deepEqual(JSON.parse(JSON.stringify(h.state.selectedTemplate)), template);
-  assert.equal(h.loads, 1);
+  assert.equal(h.loads, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.state.templates)), [template]);
+  assert.equal(h.state.templateDirty, false);
   assert.equal(h.state.message.type, 'ok');
 });
 
@@ -175,7 +180,7 @@ for (const capture of ['captureVisibleDesignerState', 'updateSelectedFromEditor'
     assert.equal(h.state.selectedTemplate.id, 2);
     assert.equal(h.state.selectedTemplate.spec.saved, true);
     assert.equal(h.state.designerSection, 'templates');
-    assert.equal(h.loads, 1);
+    assert.equal(h.loads, 0);
     assert.equal(h.errors.length, 0);
   });
 }
@@ -189,19 +194,20 @@ test('actual saveTemplate still reports synchronous payload errors normally', as
   assert.equal(h.calls.length, 0);
 });
 
-test('actual saveTemplate does not overwrite newer message after delayed reload', async () => {
+test('actual saveTemplate does not overwrite newer message after delayed ACK', async () => {
   let current = true;
   const h = await harness('{"success":true,"template":{"spec":{}}}', { current: () => current });
   let resolve;
-  h.sandbox.loadDesigner = () => new Promise((done) => { resolve = done; });
-  await invoke(h, 'saveTemplate');
+  h.sandbox.request = () => new Promise((done) => { resolve = done; });
+  const operation = invoke(h, 'saveTemplate');
   assert.equal(typeof resolve, 'function');
   current = false;
   const newer = { marker: 'newer operation' };
   h.state.message = newer;
-  resolve();
-  for (let i = 0; i < 30; i += 1) await Promise.resolve();
+  resolve(h.response);
+  await operation;
   assert.equal(h.state.message, newer);
+  assert.equal(h.loads, 0);
 });
 
 test('actual intermediate diagram preview invalid response clears success gate but preserves visible SVG', async () => {
@@ -277,7 +283,7 @@ test('actual diagram preview rejects explicit stale replay owner before state mu
 });
 
 for (const newerMessage of [false, true]) {
-  test('actual saveTemplate after input revision changes ' + (newerMessage ? 'preserves newer message' : 'clears only its obsolete loading message'), async () => {
+  test('actual saveTemplate after input revision changes ' + (newerMessage ? 'preserves newer message' : 'reports unsaved newer edits'), async () => {
     const h = await harness('{"success":true,"template":{"code":"sample","spec":{"saved":true}}}');
     h.state.uiDiagnosticRevision = h.owner.revision;
     h.sandbox.uiRequestOwner = () => ({ ...h.owner, revision: h.state.uiDiagnosticRevision });
@@ -293,7 +299,9 @@ for (const newerMessage of [false, true]) {
     if (newerMessage) h.state.message = newer;
     resolve(h.response);
     await operation;
-    assert.equal(h.state.message, newerMessage ? newer : null);
+    if (newerMessage) assert.equal(h.state.message, newer);
+    else assert.deepEqual({ ...h.state.message }, { type: 'warning', text: 'savedPreviousRevision' });
+    assert.equal(h.state.templateDirty, true);
     assert.equal(h.state.selectedTemplate, h.edited);
     assert.equal(h.state.selectedTemplate.spec.editedAfterRequest, true);
     assert.equal(h.state.savingTemplate, false);

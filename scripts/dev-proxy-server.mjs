@@ -40,6 +40,9 @@ import { createAssistantBindingHandles } from './assistant-binding-handles.mjs';
 import { assertInputCollections, normalizeInputCollectionLimits } from './input-collection-limits.mjs';
 import { aggregateDiagramEdges, normalizeEdgeAggregation, validateEdgeAggregation } from './diagram-edge-aggregation.mjs';
 import { createUiRequestDiagnostics } from './ui-request-diagnostics.mjs';
+import { createAssistantDiagnosticsUi } from './assistant-diagnostics-ui.mjs';
+import { DEFAULT_ASSISTANT_DIAGNOSTICS, normalizeAssistantDiagnosticsPolicy, redactAssistantDiagnosticValue, createAssistantDiagnosticsStore, createAssistantCaptureController } from './assistant-diagnostics.mjs';
+import { purgeAssistantDiagnostics } from './assistant-diagnostics-maintenance.mjs';
 import { runtimeRowIdentity, runtimeRowValue, runtimeSemanticKey, setRuntimeRowSemantics, setRuntimeRowValue,
   inheritRuntimeRowSemantics, mergeRuntimeRowSemantics, deriveRuntimeRowSemantics } from './runtime-row-semantics.mjs';
 
@@ -225,7 +228,15 @@ const ASSISTANT_DIAGRAM_MAPPING_STAGE_AUTO_RETRIES = 1;
 // A transient timeout and a deterministic correction are independent recovery
 // paths. A completed timeout retry must not consume a deterministic correction.
 const ASSISTANT_DIAGRAM_MAPPING_STAGE_CORRECTION_RETRIES = 2;
-const ASSISTANT_MAX_TOKENS = Math.max(256, Math.min(8192, Number(process.env.CMDP_ASSISTANT_MAX_TOKENS || 2400) || 2400));
+const configuredAssistantTokenCap = Number(process.env.CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE);
+const ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE = Number.isSafeInteger(configuredAssistantTokenCap) && configuredAssistantTokenCap > 0 ? configuredAssistantTokenCap : 131072;
+const ASSISTANT_DIAGNOSTICS_CAPS = Object.freeze(Object.fromEntries(Object.entries({
+  ...DEFAULT_ASSISTANT_DIAGNOSTICS, captureDurationSec: 3600, retentionSec: 604800
+}).map(([key, fallback]) => {
+  const envKey = `CMDP_ASSISTANT_DIAGNOSTICS_${key.replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase()}_ABSOLUTE`;
+  const value = Number(process.env[envKey]);
+  return [key, Number.isSafeInteger(value) && value > 0 ? value : fallback];
+})));
 const ASSISTANT_TEMPERATURE = Math.max(0, Math.min(1, Number(process.env.CMDP_ASSISTANT_TEMPERATURE || 0.1) || 0.1));
 const ASSISTANT_LLM_MAX_REQUEST_BYTES_ABSOLUTE = Math.max(64 * 1024, Number(process.env.CMDP_ASSISTANT_LLM_MAX_REQUEST_BYTES_ABSOLUTE || 2 * 1024 * 1024) || 2 * 1024 * 1024);
 const ASSISTANT_LLM_MAX_RESPONSE_BYTES_ABSOLUTE = Math.max(64 * 1024, Number(process.env.CMDP_ASSISTANT_LLM_MAX_RESPONSE_BYTES_ABSOLUTE || 4 * 1024 * 1024) || 4 * 1024 * 1024);
@@ -334,6 +345,14 @@ const assistantSemanticPlanCheckpointCache = new Map();
 const assistantDiagramMappingCheckpointCache = new Map();
 const assistantDiagramMappingClaimCache = new Map();
 const requestContext = new AsyncLocalStorage();
+const assistantTraceContext = new AsyncLocalStorage();
+const assistantDiagnosticsStore = createAssistantDiagnosticsStore({
+  redisCommand: (parts) => redisCommand(parts, { isolatedDiagnostics: true }), keyPrefix: REDIS_KEY_PREFIX,
+  onEvent: ({ event, ...fields }) => logInfo(event, fields) });
+const assistantCaptureController = createAssistantCaptureController({ store: assistantDiagnosticsStore,
+  onWarning: () => logWarn('assistant.diagnostics.control_unavailable', {}) });
+const assistantTraceQueueBytes = new Map();
+let assistantTraceQueueTotalBytes = 0;
 const cmdbuildHttpAgent = new http.Agent({
   keepAlive: true,
   maxSockets: CMDBUILD_AGENT_MAX_SOCKETS,
@@ -8848,7 +8867,7 @@ async function redisCommand(parts, options = {}) {
     throw new Error('Redis is disabled.');
   }
   const now = Date.now();
-  if (!options.force && redisState.disabledUntil && redisState.disabledUntil > now) {
+  if (!options.force && !options.isolatedDiagnostics && redisState.disabledUntil && redisState.disabledUntil > now) {
     incMetric('cmdp_redis_errors_total', { reason: 'temporarily_unavailable' });
     throw new Error(redisState.lastError || 'Redis is temporarily unavailable.');
   }
@@ -8870,6 +8889,7 @@ async function redisCommand(parts, options = {}) {
   if (config.password) commands.push(['AUTH', config.password]);
   if (config.db) commands.push(['SELECT', config.db]);
   commands.push(parts);
+  const commandTimeoutMs = options.isolatedDiagnostics ? 5000 : REDIS_TIMEOUT_MS;
   return await new Promise((resolve, reject) => {
     let settled = false;
     let buffer = Buffer.alloc(0);
@@ -8878,14 +8898,19 @@ async function redisCommand(parts, options = {}) {
       : net.createConnection({ host: config.host, port: config.port });
     const timer = setTimeout(() => {
       socket.destroy();
-      finish(new Error(`Redis command timed out after ${REDIS_TIMEOUT_MS}ms.`));
-    }, REDIS_TIMEOUT_MS);
+      finish(new Error(`Redis command timed out after ${commandTimeoutMs}ms.`));
+    }, commandTimeoutMs);
     function finish(error, value) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       socket.destroy();
       if (error) {
+        if (options.isolatedDiagnostics) {
+          incMetric('cmdp_redis_errors_total', { reason: 'assistant_diagnostics' });
+          reject(error);
+          return;
+        }
         incMetric('cmdp_redis_errors_total', { reason: 'command_failed' });
         const previousAvailable = redisState.available;
         const previousError = redisState.lastError;
@@ -8903,6 +8928,7 @@ async function redisCommand(parts, options = {}) {
         }
         reject(error);
       } else {
+        if (options.isolatedDiagnostics) { resolve(value); return; }
         const wasUnavailable = redisState.available === false;
         redisState.available = true;
         redisState.lastError = '';
@@ -9607,6 +9633,20 @@ function securityHeaders(extra = {}) {
 }
 
 function sendJson(res, statusCode, payload, extraHeaders = {}) {
+  const capture = assistantTraceContext.getStore();
+  if (capture && payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    if (capture.trace) {
+      finishAssistantSpan(capture.bffSpan, { response: payload, statusCode }, capture);
+      capture.trace.statusCode = statusCode;
+      capture.trace.status = statusCode >= 400 ? 'error' : 'completed';
+      capture.trace.finishedAt = new Date().toISOString();
+      queueAssistantTraceSave(capture);
+    }
+    if (capture.trace || capture.warning) payload = { ...payload, diagnostics: { ...payload.diagnostics,
+      assistantTrace: { traceId: capture.trace?.id || null, requestId: capture.requestId,
+        storageStatus: capture.storageStatus || 'unavailable',
+        status: capture.warning ? 'unavailable' : capture.trace.status, ...(capture.warning ? { warning: capture.warning } : {}) } } };
+  }
   if (payload && payload.code === 'input_collection_limit') {
     payload = inputCollectionLimitPayload({ details: Array.isArray(payload.errors) ? payload.errors[0] : payload.errors });
     statusCode = 413;
@@ -9708,9 +9748,11 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
       timeoutMs: ASSISTANT_MCP_TIMEOUT_MS_ABSOLUTE
     },
     assistantLlmCaps: {
+      maxTokens: ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE,
       maxRequestBytes: ASSISTANT_LLM_MAX_REQUEST_BYTES_ABSOLUTE,
       maxResponseBytes: ASSISTANT_LLM_MAX_RESPONSE_BYTES_ABSOLUTE
     },
+    assistantDiagnosticsCaps: ASSISTANT_DIAGNOSTICS_CAPS,
     assistantTimeoutGraceMs: ASSISTANT_UI_TIMEOUT_GRACE_MS,
     assistantDiagramMaxAttempts: {
       interpret: ASSISTANT_DIAGRAM_INTERPRET_MAX_ATTEMPTS,
@@ -10171,6 +10213,7 @@ function dynamicPagesClientScript() {
       assistantTemplatePromptResetOverride: 'Use global',
       assistantTemplatePromptLimit: '{count} / {max} characters',
       savingTemplate: 'Saving template...',
+      savedPreviousRevision: 'The previous revision was saved; there are unsaved changes.',
       diagramImportSaveBusy: 'Wait for the Diagram Assistant operation to finish before saving the template.',
       changesReadyToSave: 'Changes are ready. Save the template to persist them.',
       savedNotExecutable: 'Template was saved, but execution remains unavailable until the deterministic configuration is complete.',
@@ -10249,6 +10292,18 @@ function dynamicPagesClientScript() {
       assistantLlmMaxRequestBytesHelp: 'Maximum serialized request sent to LiteLLM. The server rejects a larger request before network access.',
       assistantLlmMaxResponseBytes: 'LiteLLM response limit, bytes',
       assistantLlmMaxResponseBytesHelp: 'Maximum LiteLLM response read by the server. Reading stops as soon as this limit is exceeded.',
+      assistantLlmMaxTokens: 'Maximum response tokens',
+      assistantLlmMaxTokensHelp: 'Generation budget sent as max_tokens. The model may have a smaller limit. This is not the input context size or a guarantee of valid JSON. Increasing it does not change the timeout.',
+      assistantDebugDuration: 'Capture window, seconds',
+      assistantDebugDurationHelp: 'Temporary capture for all users in the current scope. The window is not extended by restart, page refresh, or Save.',
+      assistantDebugRetention: 'Retention, seconds',
+      assistantDebugRetentionHelp: 'Redis record lifetime. Default 86400 seconds (24 hours). Stored prompts and schema remain sensitive after redaction.',
+      assistantDebugBody: 'Maximum body size, bytes',
+      assistantDebugBodyHelp: 'Capture budget for each request or response body. Omitted bytes are reported explicitly.',
+      assistantDebugTrace: 'Maximum trace size, bytes',
+      assistantDebugTraceHelp: 'Capture budget for one complete Assistant request and its nested calls.',
+      assistantDebugStorage: 'Scope storage budget, bytes',
+      assistantDebugStorageHelp: 'Total Redis budget for this scope. Oldest records are removed when it fills; eviction is reported.',
       assistantLlmDeploymentHelp: 'API key is deployment-managed through env or secret file and is never stored in RuntimeConfigJson. All authoring literals entered in Assistant prompts, filters, D2 Notes, templates and mapping rules may be sent to LiteLLM. Runtime result rows, resolved parameter values, CMDBuild card data and raw D2 source are not sent unless the user includes them in authoring text.',
       assistantPromptSettings: 'Global system prompts',
       assistantSystemPrompt: 'Additional system prompt',
@@ -11451,6 +11506,7 @@ function dynamicPagesClientScript() {
       assistantTemplatePromptResetOverride: 'Вернуть общий',
       assistantTemplatePromptLimit: '{count} / {max} символов',
       savingTemplate: 'Шаблон сохраняется...',
+      savedPreviousRevision: 'Сохранена предыдущая редакция; есть несохранённые изменения.',
       diagramImportSaveBusy: 'Дождитесь завершения операции Ассистента диаграмм перед сохранением шаблона.',
       changesReadyToSave: 'Изменения готовы. Нажмите «Сохранить», чтобы записать их в шаблон.',
       savedNotExecutable: 'Шаблон сохранен, но выполнение недоступно, пока детерминированная конфигурация не завершена.',
@@ -11529,6 +11585,18 @@ function dynamicPagesClientScript() {
       assistantLlmMaxRequestBytesHelp: 'Максимальный размер сериализованного запроса к LiteLLM. Запрос большего размера отклоняется до сетевого обращения.',
       assistantLlmMaxResponseBytes: 'Лимит ответа LiteLLM, байт',
       assistantLlmMaxResponseBytesHelp: 'Максимальный размер ответа LiteLLM, читаемый сервером. Чтение прекращается сразу после превышения лимита.',
+      assistantLlmMaxTokens: 'Максимум токенов ответа',
+      assistantLlmMaxTokensHelp: 'Бюджет генерации, передаваемый как max_tokens. Модель может иметь меньший предел. Это не размер входного контекста и не гарантия корректного JSON. Увеличение не меняет тайм-аут.',
+      assistantDebugDuration: 'Окно захвата, секунд',
+      assistantDebugDurationHelp: 'Временный захват для всех пользователей текущего контура. Перезапуск, обновление страницы и сохранение настроек не продлевают окно.',
+      assistantDebugRetention: 'Срок хранения, секунд',
+      assistantDebugRetentionHelp: 'Время жизни записей в Redis. По умолчанию 86400 секунд (24 часа). Промты и схема остаются чувствительными после маскирования.',
+      assistantDebugBody: 'Максимум на одно тело, байт',
+      assistantDebugBodyHelp: 'Бюджет захвата каждого запроса или ответа. Пропущенные байты обозначаются явно.',
+      assistantDebugTrace: 'Максимум на трассировку, байт',
+      assistantDebugTraceHelp: 'Бюджет одного запроса Assistant со всеми вложенными обращениями.',
+      assistantDebugStorage: 'Бюджет хранилища контура, байт',
+      assistantDebugStorageHelp: 'Общий бюджет Redis для контура. При заполнении удаляются старейшие записи; удаление отражается в состоянии диагностики.',
       assistantLlmDeploymentHelp: 'Ключ API задается через переменную окружения или файл секрета и не хранится в RuntimeConfigJson. В LiteLLM могут передаваться все авторские литералы из промптов, фильтров, D2 Notes, шаблонов и правил сопоставления. Строки результатов выполнения, вычисленные значения параметров, карточки CMDBuild и исходный текст D2 не передаются, если пользователь сам не включил их в авторский текст.',
       assistantPromptSettings: 'Глобальные системные промпты',
       assistantSystemPrompt: 'Дополнительный системный промпт',
@@ -12493,6 +12561,7 @@ function dynamicPagesClientScript() {
     assistantFlowDragSourceId: '',
     assistantAuthoringDirty: false,
     savingTemplate: false,
+    templateDirty: false,
     assistantTemplatePromptOverrides: {},
     assistantDiagramIntentPrompt: '',
     assistantDiagramInterpretBusy: false,
@@ -12550,12 +12619,111 @@ function dynamicPagesClientScript() {
     builderKind: 'classes',
     runParams: {},
     message: null,
+    assistantLastTraceDiagnostic: null,
     result: null,
     runtimeRefreshInProgress: false,
     runtimeCountdownTimer: null,
     technicalSchemaAccessDenied: false,
     accessDeniedText: DEFAULT_PERMISSION_DENIED_TEXT
   };
+
+  var assistantDiagnosticsUi = (${createAssistantDiagnosticsUi.toString()})({
+    getState: function () { return state; },
+    escapeHtml: escapeHtml,
+    apiPrefix: apiPrefix,
+    request: request,
+    createRequestError: createRequestError,
+    safeError: function (error) { return uiErrorMessage(error).text; },
+    capturePolicy: captureRuntimeSettings,
+    savePolicy: function (root, snapshot) {
+      return persistRuntimeConfig(root, snapshot.runtimeConfig, snapshot).then(function (result) {
+        return result.json.effectiveAssistantDiagnostics;
+      });
+    }
+  });
+  document.addEventListener('input', function (event) { assistantDiagnosticsUi.handleInput(event); captureRuntimeSettingsInput(event); });
+  document.addEventListener('change', function (event) { assistantDiagnosticsUi.handleInput(event); captureRuntimeSettingsInput(event); });
+  document.addEventListener('toggle', function (event) { assistantDiagnosticsUi.handleToggle(event); }, true);
+
+  var designerRoot = state.root;
+  Object.defineProperty(state, 'root', {
+    get: function () { return designerRoot; },
+    set: function (value) {
+      if (value !== designerRoot) {
+        state.rootSelectionGeneration = Number(state.rootSelectionGeneration || 0) + 1;
+        state.runtimeSettingsDraft = null;
+        state.runtimeConfigWarning = '';
+        state.savingTemplate = false;
+        state.templateEditorInstance = Number(state.templateEditorInstance || 0) + 1;
+      }
+      designerRoot = value;
+    }
+  });
+  var runtimeSettingsReadDraft = null;
+  var designerSession = state.session;
+  Object.defineProperty(state, 'session', {
+    get: function () { return designerSession; },
+    set: function (value) {
+      if (value !== designerSession) {
+        state.sessionInstance = Number(state.sessionInstance || 0) + 1;
+        state.runtimeSettingsDraft = null;
+        state.savingTemplate = false;
+      }
+      designerSession = value;
+    }
+  });
+
+  function runtimeSettingsScope() {
+    return { root: String(state.root || 'Cst_QueryTool'), selection: Number(state.rootSelectionGeneration || 0), session: state.session };
+  }
+
+  function runtimeSettingsScopeIsCurrent(scope) {
+    return scope.root === String(state.root || 'Cst_QueryTool') && scope.selection === Number(state.rootSelectionGeneration || 0) && scope.session === state.session;
+  }
+
+  function runtimeSettingsDraft() {
+    if (!state.runtimeSettingsDraft || !runtimeSettingsScopeIsCurrent(state.runtimeSettingsDraft.scope)) {
+      state.runtimeSettingsDraft = { scope: runtimeSettingsScope(), revision: 0, fields: {} };
+    }
+    return state.runtimeSettingsDraft;
+  }
+
+  function captureRuntimeSettingsInput(event) {
+    var field = event.target;
+    if (!field || !field.id || !field.closest || !field.closest('#cmdp-runtime-settings, #cmdp-general-settings')) return;
+    if (field.runtimeSettingsOwner && !runtimeSettingsScopeIsCurrent(field.runtimeSettingsOwner)) return;
+    var draft = runtimeSettingsDraft();
+    draft.fields[field.id] = { value: field.value, checked: Boolean(field.checked), type: field.type };
+    draft.revision += 1;
+  }
+
+  function captureRuntimeSettingsFields() {
+    Array.prototype.forEach.call(document.querySelectorAll('#cmdp-runtime-settings input, #cmdp-runtime-settings textarea, #cmdp-runtime-settings select, #cmdp-general-settings input, #cmdp-general-settings textarea, #cmdp-general-settings select'), function (field) {
+      if (!field.id) return;
+      var draft = runtimeSettingsDraft();
+      var previous = draft.fields[field.id];
+      if (!previous || previous.value !== field.value || previous.checked !== Boolean(field.checked)) captureRuntimeSettingsInput({ target: field });
+    });
+  }
+
+  function restoreRuntimeSettingsFields() {
+    var draft = runtimeSettingsDraft();
+    Array.prototype.forEach.call(document.querySelectorAll('#cmdp-runtime-settings input, #cmdp-runtime-settings textarea, #cmdp-runtime-settings select, #cmdp-general-settings input, #cmdp-general-settings textarea, #cmdp-general-settings select'), function (field) { field.runtimeSettingsOwner = draft.scope; });
+    Array.prototype.forEach.call(document.querySelectorAll('#cmdp-runtime-settings input[type="number"], #cmdp-general-settings input[type="number"]'), function (field) {
+      field.type = 'text'; field.inputMode = 'numeric';
+    });
+    Object.keys(draft.fields).forEach(function (id) {
+      var field = document.getElementById(id);
+      if (field) { field.value = draft.fields[id].value; field.checked = draft.fields[id].checked; }
+    });
+  }
+
+  function captureRuntimeSettings(root) {
+    captureRuntimeSettingsFields();
+    var draft = runtimeSettingsDraft();
+    if (root !== draft.scope.root) throw new Error('Runtime settings scope changed');
+    return { runtimeConfig: applyRuntimeConfigFields(state.config && state.config.runtimeConfig || defaultRuntimeConfig()), revision: draft.revision, scope: draft.scope };
+  }
 
   function normalizeDesignerSection(value) {
     var section = String(value || '').trim().toLowerCase();
@@ -13271,6 +13439,7 @@ function dynamicPagesClientScript() {
           }).then(function () { return execute(attempt + 1); });
         }
         result.diagnostic = uiRequestDiagnostics.response(result, requestContext);
+        if (result.diagnostic.assistantTrace && uiDiagnosticIsCurrent(result.diagnostic)) state.assistantLastTraceDiagnostic = result.diagnostic;
         return result;
       }).catch(function (error) {
         if (!error.diagnostic) error.diagnostic = uiRequestDiagnostics.exception(error, requestContext);
@@ -13415,11 +13584,13 @@ function dynamicPagesClientScript() {
   }
 
   function readValue(id) {
+    if (runtimeSettingsReadDraft && runtimeSettingsReadDraft.fields[id]) return runtimeSettingsReadDraft.fields[id].value;
     var field = document.getElementById(id);
     return field ? field.value : '';
   }
 
   function readChecked(id) {
+    if (runtimeSettingsReadDraft && runtimeSettingsReadDraft.fields[id]) return runtimeSettingsReadDraft.fields[id].checked;
     var field = document.getElementById(id);
     return field ? Boolean(field.checked) : false;
   }
@@ -13431,6 +13602,7 @@ function dynamicPagesClientScript() {
   }
 
   function hasField(id) {
+    if (runtimeSettingsReadDraft && runtimeSettingsReadDraft.fields[id]) return true;
     return Boolean(document.getElementById(id));
   }
 
@@ -13514,6 +13686,7 @@ function dynamicPagesClientScript() {
   }
 
   function captureVisibleDesignerState() {
+    captureRuntimeSettingsFields();
     var selected = state.selectedTemplate || emptyTemplate();
     try {
       if (hasField('cmdp-code') || hasField('cmdp-description') || hasField('cmdp-active') || hasField('cmdp-template-kind') || hasField('cmdp-spec') || hasField('cmdp-params-schema') || hasField('cmdp-result-schema')) {
@@ -14201,9 +14374,11 @@ function dynamicPagesClientScript() {
           enabled: Boolean(boot.assistant && boot.assistant.enabled),
           baseUrl: boot.assistant && boot.assistant.baseUrl || '',
           model: boot.assistant && boot.assistant.model || '',
+          maxTokens: 16384,
           maxRequestBytes: 524288,
           maxResponseBytes: 1048576
         },
+        diagnostics: { captureDurationSec: 900, retentionSec: 86400, maxBodyBytes: 8388608, maxTraceBytes: 33554432, maxStoredBytes: 268435456 },
         mcp: {
           enabled: true,
           allowedTools: allMcpToolNames(),
@@ -14259,6 +14434,7 @@ function dynamicPagesClientScript() {
       runtimeCache: Object.assign({}, defaults.runtimeCache, source.runtimeCache || {}),
       assistant: Object.assign({}, defaultAssistant, sourceAssistant, {
         llm: Object.assign({}, defaultAssistant.llm, sourceAssistant.llm || {}),
+        diagnostics: Object.assign({}, defaultAssistant.diagnostics, sourceAssistant.diagnostics || {}),
         mcp: Object.assign({}, defaultAssistant.mcp, sourceAssistant.mcp || {}),
         semanticPlan: Object.assign({}, defaultAssistant.semanticPlan, sourceAssistant.semanticPlan || {}),
         prompt: normalizeAssistantPromptContractClient(sourcePrompt, defaultAssistant.prompt)
@@ -14410,6 +14586,8 @@ function dynamicPagesClientScript() {
   }
 
   function hydrateDesignerStateFromTemplate(options) {
+    state.templateEditorInstance = Number(state.templateEditorInstance || 0) + 1;
+    state.savingTemplate = false;
     options = options || {};
     var selected = state.selectedTemplate;
     var spec = selected && selected.spec ? selected.spec : defaultSpec();
@@ -14532,6 +14710,10 @@ function dynamicPagesClientScript() {
 
   function uiRequestOwner() {
     return {
+      root: String(state.root || ''),
+      rootSelectionGeneration: Number(state.rootSelectionGeneration || 0),
+      editorInstance: Number(state.templateEditorInstance || 0),
+      sessionInstance: Number(state.sessionInstance || 0),
       templateCode: String(state.selectedTemplate && state.selectedTemplate.code || ''),
       section: String(state.designerSection || ''),
       generation: Number(state.uiDiagnosticGeneration || 0),
@@ -14545,7 +14727,11 @@ function dynamicPagesClientScript() {
     var owner = diagnostic.owner;
     if (!owner) return true;
     var current = uiRequestOwner();
-    return owner.templateCode === current.templateCode && (owner.displaySection || owner.section) === current.section
+    return (owner.root === undefined || owner.root === current.root)
+      && Number(owner.rootSelectionGeneration || 0) === current.rootSelectionGeneration
+      && Number(owner.editorInstance || 0) === current.editorInstance
+      && Number(owner.sessionInstance || 0) === current.sessionInstance
+      && owner.templateCode === current.templateCode && (owner.displaySection || owner.section) === current.section
       && Number(owner.generation || 0) === current.generation
       && Number(owner.revision || 0) === current.revision;
   }
@@ -14609,7 +14795,8 @@ function dynamicPagesClientScript() {
     return '<details class="help-details ui-error-diagnostics" data-ui-error-diagnostics><summary>'
       + escapeHtml(t('technicalDiagnostics')) + ' <span class="muted">' + escapeHtml(status + (requestId ? ' · ' + requestId : '')) + '</span></summary>'
       + '<div class="toolbar"><button type="button" class="icon-button" data-action="copy-error-diagnostics" title="' + escapeHtml(t('copyDiagnostics')) + '" aria-label="' + escapeHtml(t('copyDiagnostics')) + '">⧉</button><span data-diagnostic-copy-status role="status" aria-live="polite"></span></div>'
-      + '<pre data-ui-diagnostic-report tabindex="0">' + escapeHtml(report) + '</pre></details>';
+      + '<pre data-ui-diagnostic-report tabindex="0">' + escapeHtml(report) + '</pre></details>'
+      + assistantDiagnosticsUi.renderReference(safe.assistantTrace);
   }
 
   function copyUiErrorDiagnostics(button) {
@@ -14639,7 +14826,7 @@ function dynamicPagesClientScript() {
     }
     var error = message.type === 'error';
     return '<div class="notice ' + escapeHtml(message.type || '') + '"' + (error ? ' role="alert" aria-live="assertive"' : ' aria-live="polite"') + '>' + escapeHtml(message.text) + '</div>'
-      + (message.diagnosticOwner === 'assistantFlow' ? '' : renderUiErrorDiagnostics(message.diagnostic));
+      + (message.diagnosticOwner === 'assistantFlow' ? '' : renderUiErrorDiagnostics(message.diagnostic || state.assistantLastTraceDiagnostic));
   }
 
   function renderKpi(label, value) {
@@ -18430,6 +18617,18 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
+  function renderAssistantDiagnosticsPolicyFields(assistant) {
+    if (!state.session || !state.session.rolePrivileges || !state.session.rolePrivileges.admin_classes_modify) return '';
+    var policy = assistant.diagnostics || defaultRuntimeConfig().assistant.diagnostics;
+    var caps = boot.assistantDiagnosticsCaps || {};
+    return assistantDiagnosticsUi.render() + '<div class="visual-grid">' + [
+      ['duration', 'assistantDebugDuration', 'captureDurationSec'], ['retention', 'assistantDebugRetention', 'retentionSec'],
+      ['body', 'assistantDebugBody', 'maxBodyBytes'], ['trace', 'assistantDebugTrace', 'maxTraceBytes'], ['storage', 'assistantDebugStorage', 'maxStoredBytes']
+    ].map(function (field) {
+      return renderNumberSetting('cmdp-assistant-debug-' + field[0], field[1], field[1] + 'Help', policy[field[2]], { min: 1, max: caps[field[2]] });
+    }).join('') + '</div>';
+  }
+
   function renderAssistantSettingsFields(assistant) {
     assistant = assistant || defaultRuntimeConfig().assistant;
     var llm = assistant.llm || {};
@@ -18452,9 +18651,11 @@ function dynamicPagesClientScript() {
       '<div class="visual-grid">',
       '<label>' + t('assistantLlmBaseUrl') + '<input id="cmdp-assistant-llm-base-url" value="' + escapeHtml(llm.baseUrl || '') + '"></label>',
       '<label>' + t('assistantLlmModel') + '<input id="cmdp-assistant-llm-model" value="' + escapeHtml(llm.model || '') + '"></label>',
+      renderNumberSetting('cmdp-assistant-llm-max-tokens', 'assistantLlmMaxTokens', 'assistantLlmMaxTokensHelp', llm.maxTokens || 16384, { min: 1, max: boot.assistantLlmCaps && boot.assistantLlmCaps.maxTokens || 131072 }),
       renderNumberSetting('cmdp-assistant-llm-max-request-bytes', 'assistantLlmMaxRequestBytes', 'assistantLlmMaxRequestBytesHelp', llm.maxRequestBytes || 524288, { min: 65536, max: boot.assistantLlmCaps && boot.assistantLlmCaps.maxRequestBytes || 2097152 }),
       renderNumberSetting('cmdp-assistant-llm-max-response-bytes', 'assistantLlmMaxResponseBytes', 'assistantLlmMaxResponseBytesHelp', llm.maxResponseBytes || 1048576, { min: 65536, max: boot.assistantLlmCaps && boot.assistantLlmCaps.maxResponseBytes || 4194304 }),
       '</div>',
+      renderAssistantDiagnosticsPolicyFields(assistant),
       '<h3>' + t('assistantPromptSettings') + '</h3>',
       '<label>' + t('assistantSystemPrompt') + '<textarea id="cmdp-assistant-system-prompt" rows="10" style="width:100%">' + escapeHtml(systemPrompt) + '</textarea><span class="muted">' + escapeHtml(t('assistantSystemPromptHelp')) + '</span></label>',
       '<label>' + t('assistantObjectFlowSemanticSystemPrompt') + '<textarea id="cmdp-assistant-object-flow-semantic-system-prompt" rows="8" style="width:100%">' + escapeHtml(objectFlowSemanticPrompt) + '</textarea></label>',
@@ -18491,6 +18692,7 @@ function dynamicPagesClientScript() {
     return [
       '<section class="section" id="cmdp-runtime-settings"><h2>' + t('runtimeSettings') + '</h2>',
       '<span class="pill ' + (config.exists ? 'ok' : '') + '">' + (config.exists ? t('configCard') : t('defaultConfig')) + '</span>',
+      (state.runtimeConfigWarning ? '<p class="notice warning" role="status">' + escapeHtml(state.runtimeConfigWarning) + '</p>' : ''),
       '<div class="form">',
       '<h3>' + t('runtimeCacheSettings') + '</h3>',
       renderRuntimeCacheFields(runtimeCache),
@@ -18564,7 +18766,7 @@ function dynamicPagesClientScript() {
       '<option value="dsl"' + (kind === 'dsl' ? ' selected' : '') + '>' + t('templateKindDsl') + '</option>',
       '<option value="' + CMDB_BUILD_VIEW_KIND + '"' + (kind === CMDB_BUILD_VIEW_KIND ? ' selected' : '') + '>' + t('templateKindCmdbBuildView') + '</option>',
       '</select><span class="muted">' + escapeHtml(t('templateKindHelp')) + '</span></label>',
-      '<label>' + t('code') + '<input id="cmdp-code" value="' + escapeHtml(selected.code || '') + '"' + (selected.id ? ' readonly' : '') + '></label>',
+      '<label>' + t('code') + '<input id="cmdp-code" value="' + escapeHtml(selected.code || '') + '"' + (selected.id || state.savingTemplate ? ' readonly' : '') + '></label>',
       '<label>' + t('description') + '<input id="cmdp-description" value="' + escapeHtml(selected.description || '') + '"></label>',
       selected && selected.protected ? '<span class="pill">' + escapeHtml(t('protectedTemplate')) + '</span>' : '',
       protectedHelp,
@@ -19078,7 +19280,8 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
-  function renderDesigner() {
+  function renderDesigner(skipRuntimeCapture) {
+    if (skipRuntimeCapture !== true) captureRuntimeSettingsFields();
     updateChrome();
     if (state.technicalSchemaAccessDenied) {
       app.innerHTML = renderAccessDenied(state.accessDeniedText);
@@ -19116,6 +19319,7 @@ function dynamicPagesClientScript() {
       renderDesignerSection(selected, config, templateRows),
       '</div>'
     ].join('');
+    restoreRuntimeSettingsFields();
     var structureViewportSnapshot = state.diagramImportStructureViewportRestoreSnapshot || state.diagramImportStructureViewport;
     hydrateVisualizationRowGroupOptions(app);
     applyObjectPathFilter(app);
@@ -25552,6 +25756,7 @@ function dynamicPagesClientScript() {
       if (!state.schemaDescriptionDraft && state.schema && state.schema.rootDescription) state.schemaDescriptionDraft = state.schema.rootDescription;
       if (!state.schemaParentDraft && state.schema && state.schema.rootParent) state.schemaParentDraft = state.schema.rootParent;
       state.config = results[3].json ? results[3].json.config : null;
+      state.runtimeConfigWarning = runtimeConfigWarnings(results[3].json);
       state.templates = results[4].json && results[4].json.data ? results[4].json.data : [];
       var accessDenied = [results[3], results[4]].find(resultIsPermissionDenied);
       if (accessDenied) {
@@ -29914,17 +30119,39 @@ function dynamicPagesClientScript() {
     }
     var owner = uiRequestOwner();
     var exists = Boolean(state.selectedTemplate && state.selectedTemplate.id);
-    var path = exists ? apiPrefix + '/templates/' + encodeURIComponent(state.selectedTemplate.code) : apiPrefix + '/templates';
+    var saveScope = runtimeSettingsScope();
+    var editorInstance = Number(state.templateEditorInstance || 0);
+    var saveToken = {};
+    state.templateSaveToken = saveToken;
+    function sameEditor() {
+      return runtimeSettingsScopeIsCurrent(saveScope) && Number(state.templateEditorInstance || 0) === editorInstance && state.templateSaveToken === saveToken;
+    }
+    var path = (exists ? apiPrefix + '/templates/' + encodeURIComponent(state.selectedTemplate.code) : apiPrefix + '/templates') + '?root=' + encodeURIComponent(saveScope.root);
     var wasCreating = state.designerSection === 'template';
     state.savingTemplate = true;
     var savingMessage = { type: 'ok', text: t('savingTemplate') };
     state.message = savingMessage;
     renderDesigner();
     request(path, { method: exists ? 'PUT' : 'POST', body: payload, owner: owner }).then(function (result) {
-      if (!uiDiagnosticIsCurrent(result.diagnostic)) return;
+      if (!sameEditor()) return;
       validateUiResponse(result, 'save');
       if (!result.ok) throw createRequestError(result);
+      var unchanged = Number(state.uiDiagnosticRevision || 0) === owner.revision;
+      if (!unchanged || !uiDiagnosticIsCurrent({ owner: owner })) {
+        captureVisibleDesignerState();
+        ['id', 'code', 'specHash', 'version', 'updatedAt'].forEach(function (key) {
+          if (Object.prototype.hasOwnProperty.call(result.json.template, key)) state.selectedTemplate[key] = result.json.template[key];
+        });
+        if (!unchanged) {
+          state.templateDirty = true;
+          if (state.message === savingMessage) state.message = { type: 'warning', text: t('savedPreviousRevision') };
+        }
+        state.savingTemplate = false;
+        renderDesigner();
+        return;
+      }
       state.selectedTemplate = result.json.template;
+      state.templateDirty = false;
       var executionValidation = result.json.executionValidation || {};
       var saveMessage = result.json.cacheInvalidation && result.json.cacheInvalidation.complete === false
         ? { type: 'error', text: t('diagramImportCacheInvalidationPartial') }
@@ -29943,19 +30170,20 @@ function dynamicPagesClientScript() {
         state.designerSection = 'templates';
         if (window.history && window.history.pushState) window.history.pushState({ designerSection: 'templates' }, '', designerSectionUrl('templates'));
       }
-      return loadDesigner({ preserveAssistantState: false }).then(function () {
-        if (!uiDiagnosticIsCurrent(result.diagnostic)) return;
-        state.message = saveMessage;
-        renderDesigner();
-      });
+      state.templates = state.templates.filter(function (item) { return item.code !== result.json.template.code; }).concat([result.json.template]);
+      state.savingTemplate = false;
+      renderDesigner();
     }).catch(function (error) {
-      if (!uiDiagnosticIsCurrent(error.diagnostic || { owner: owner })) return;
+      if (!sameEditor() || !uiDiagnosticIsCurrent(error.diagnostic || { owner: owner })) return;
       state.lastDraftPreviewOk = false;
       setUiError(error);
       renderDesigner();
     }).finally(function () {
+      if (!sameEditor()) return;
       state.savingTemplate = false;
       syncImportedDiagramSaveGate();
+      var codeField = document.getElementById('cmdp-code');
+      if (codeField) codeField.readOnly = Boolean(state.selectedTemplate && state.selectedTemplate.id);
       if (state.message === savingMessage && !uiDiagnosticIsCurrent({ owner: owner })) {
         state.message = null;
         renderDesigner();
@@ -31027,6 +31255,13 @@ function dynamicPagesClientScript() {
       next.assistant.llm.model = readValue('cmdp-assistant-llm-model') || defaultRuntimeConfig().assistant.llm.model;
       next.assistant.llm.maxRequestBytes = readPositiveIntField('cmdp-assistant-llm-max-request-bytes', t('assistantLlmMaxRequestBytes'), next.assistant.llm.maxRequestBytes);
       next.assistant.llm.maxResponseBytes = readPositiveIntField('cmdp-assistant-llm-max-response-bytes', t('assistantLlmMaxResponseBytes'), next.assistant.llm.maxResponseBytes);
+      next.assistant.llm.maxTokens = readPositiveIntField('cmdp-assistant-llm-max-tokens', t('assistantLlmMaxTokens'), next.assistant.llm.maxTokens);
+    }
+    if (hasField('cmdp-assistant-debug-duration')) {
+      next.assistant.diagnostics = next.assistant.diagnostics || defaultRuntimeConfig().assistant.diagnostics;
+      [['duration', 'captureDurationSec', 'assistantDebugDuration'], ['retention', 'retentionSec', 'assistantDebugRetention'], ['body', 'maxBodyBytes', 'assistantDebugBody'], ['trace', 'maxTraceBytes', 'assistantDebugTrace'], ['storage', 'maxStoredBytes', 'assistantDebugStorage']].forEach(function (field) {
+        next.assistant.diagnostics[field[1]] = readPositiveIntField('cmdp-assistant-debug-' + field[0], t(field[2]), next.assistant.diagnostics[field[1]]);
+      });
     }
     if (hasField('cmdp-assistant-system-prompt')) {
       next.assistant.prompt = next.assistant.prompt || {};
@@ -31063,23 +31298,41 @@ function dynamicPagesClientScript() {
   }
 
   function applyRuntimeConfigFields(runtimeConfig) {
-    var next = applyRuntimeCacheFields(runtimeConfig);
-    next = applyRuntimeExecutionLimitFields(next);
-    next = applyAssistantConfigFields(next);
-    return next;
+    runtimeSettingsReadDraft = runtimeSettingsDraft();
+    try {
+      var next = applyRuntimeCacheFields(runtimeConfig);
+      next = applyRuntimeExecutionLimitFields(next);
+      next = applyAssistantConfigFields(next);
+      return next;
+    } finally { runtimeSettingsReadDraft = null; }
   }
 
-  function persistRuntimeConfig(root, runtimeConfig) {
-    request(apiPrefix + '/config?root=' + encodeURIComponent(root), {
+  function runtimeConfigWarnings(json) {
+    var limits = json && json.diagnostics && Array.isArray(json.diagnostics.limits) ? json.diagnostics.limits : [];
+    return (json && Array.isArray(json.warnings) ? json.warnings.map(String) : []).concat(limits.filter(function (limit) { return limit.clamped; }).map(function (limit) {
+      return String(limit.settingPath) + ': requested=' + String(limit.requested) + ', effective=' + String(limit.effectiveLimit) + ', cap=' + String(limit.absoluteCap);
+    })).join(' ');
+  }
+
+  function persistRuntimeConfig(root, runtimeConfig, snapshot) {
+    snapshot = snapshot || { scope: runtimeSettingsScope(), revision: runtimeSettingsDraft().revision };
+    var owner = uiRequestOwner();
+    return request(apiPrefix + '/config?root=' + encodeURIComponent(root), {
       method: 'PUT',
-      body: { active: true, runtimeConfig: runtimeConfig }
+      body: { active: true, runtimeConfig: runtimeConfig }, owner: owner
     }).then(function (result) {
-      state.config = result.json ? result.json.config : null;
-      if (result.ok) state.message = { type: 'ok', text: t('configSaved') }; else setUiError(createRequestError(result));
-      renderDesigner();
+      if (!result.ok || !result.json || result.json.success !== true) throw createRequestError(result);
+      if (!runtimeSettingsScopeIsCurrent(snapshot.scope)) return result;
+      state.config = result.json.config;
+      var warning = runtimeConfigWarnings(result.json);
+      state.runtimeConfigWarning = warning;
+      if (!warning && runtimeSettingsDraft().revision === snapshot.revision) state.runtimeSettingsDraft = null;
+      if (uiDiagnosticIsCurrent({ owner: owner })) state.message = { type: warning ? 'warning' : 'ok', text: warning || t('configSaved') };
+      renderDesigner(true);
+      return result;
     }).catch(function (error) {
-      setUiError(error);
-      renderDesigner();
+      if (runtimeSettingsScopeIsCurrent(snapshot.scope) && uiDiagnosticIsCurrent({ owner: owner })) { setUiError(error); renderDesigner(); }
+      throw error;
     });
   }
 
@@ -31094,7 +31347,7 @@ function dynamicPagesClientScript() {
       renderDesigner();
       return;
     }
-    persistRuntimeConfig(root, runtimeConfig);
+    persistRuntimeConfig(root, runtimeConfig).catch(function () {});
   }
 
   function saveGeneralSettings() {
@@ -31108,7 +31361,7 @@ function dynamicPagesClientScript() {
       renderDesigner();
       return;
     }
-    persistRuntimeConfig(root, runtimeConfig);
+    persistRuntimeConfig(root, runtimeConfig).catch(function () {});
   }
 
   function refreshDesigner() {
@@ -31353,6 +31606,8 @@ function dynamicPagesClientScript() {
   }
 
   function applyBuilder() {
+    state.templateEditorInstance = Number(state.templateEditorInstance || 0) + 1;
+    state.savingTemplate = false;
     var kind = readValue('cmdp-builder-kind') || 'classes';
     var built = buildBuilderTemplate(kind, {
       attrType: readValue('cmdp-builder-attr-type') || 'reference',
@@ -31845,6 +32100,7 @@ function dynamicPagesClientScript() {
     event.preventDefault();
     if (target.disabled || target.getAttribute('aria-disabled') === 'true') return;
     var action = target.getAttribute('data-action');
+    if (assistantDiagnosticsUi.handleAction(target)) { event.preventDefault(); return; }
     if (action === 'copy-error-diagnostics') { copyUiErrorDiagnostics(target); return; }
     if (action === 'diagram-import-label-token-select') {
       selectDiagramImportLabelAutocompleteTarget(target);
@@ -32748,6 +33004,7 @@ function inputCollectionLimitPayload(error) {
 }
 
 function readJsonBody(req, maxBytes = 64 * 1024) {
+  const assistantCapture = assistantTraceContext.getStore();
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
@@ -32781,6 +33038,8 @@ function readJsonBody(req, maxBytes = 64 * 1024) {
       }
       try {
         if (isCollectionLimitedAuthoringRequest(req)) assertInputCollections(body, INPUT_COLLECTION_LIMITS);
+        const capture = assistantCapture;
+        if (capture) initializeAssistantTrace(capture, body);
         resolve(body);
       } catch (error) {
         if (error.code === 'input_collection_limit') {
@@ -33778,6 +34037,24 @@ function buildListPath(basePath, requestUrl, defaults = {}) {
 }
 
 async function cmdbuildRequest(path, authToken, options = {}) {
+  const capture = assistantTraceContext.getStore();
+  const modelPath = new URL(path, CMDBUILD_ORIGIN).pathname;
+  const traceModel = capture?.mcpDepth > 0 && !/\/(cards|sessions)(\/|$)/.test(modelPath) && /\/rest\/v3\/(classes|domains|lookups)(\/|$)/.test(modelPath);
+  if (traceModel) {
+    const span = startAssistantSpan('cmdbuild', 'CMDB model REST', { method: options.method || 'GET', path: sanitizeRequestPath(new URL(path, CMDBUILD_ORIGIN)) });
+    try {
+      const result = await cmdbuildRequestUntraced(path, authToken, options);
+      finishAssistantSpan(span, { response: result.json, statusCode: result.statusCode });
+      return result;
+    } catch (error) {
+      finishAssistantSpan(span, { metadata: { errorCode: error.code || 'cmdbuild_error' } });
+      throw error;
+    }
+  }
+  return cmdbuildRequestUntraced(path, authToken, options);
+}
+
+async function cmdbuildRequestUntraced(path, authToken, options = {}) {
   const method = String(options.method || 'GET').toUpperCase();
   const retryable = cmdbuildRequestCanRetry(method, options.retry);
   const maxAttempts = retryable ? CMDBUILD_RETRY_MAX_ATTEMPTS : 1;
@@ -35415,6 +35692,7 @@ function defaultRuntimeConfig() {
         enabled: false,
         baseUrl: LITELLM_BASE_URL,
         model: LITELLM_MODEL,
+        maxTokens: 16384,
         maxRequestBytes: DEFAULT_ASSISTANT_LLM_MAX_REQUEST_BYTES,
         maxResponseBytes: DEFAULT_ASSISTANT_LLM_MAX_RESPONSE_BYTES
       },
@@ -35428,6 +35706,7 @@ function defaultRuntimeConfig() {
         maxRelationDomains: 100,
         maxCandidateClasses: DEFAULT_ASSISTANT_MCP_MAX_CANDIDATE_CLASSES
       },
+      diagnostics: { ...DEFAULT_ASSISTANT_DIAGNOSTICS },
       semanticPlan: {
         checkpointTtlSec: DEFAULT_ASSISTANT_SEMANTIC_PLAN_CHECKPOINT_TTL_SEC,
         maxReferencePathDepth: DEFAULT_ASSISTANT_REFERENCE_PATH_MAX_DEPTH
@@ -35594,6 +35873,38 @@ function normalizeTemplateCacheConfig(spec, runtimeCacheConfig) {
   };
 }
 
+function assistantConfigurationLimitDiagnostics(runtimeConfig = {}) {
+  const source = runtimeConfig.assistant || {};
+  const tokens = assistantLimitConfigValue('maxTokens', source.llm?.maxTokens, 16384, ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE,
+    { clampedBy: 'CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE', tool: 'assistant.llm' });
+  const details = [{ ...tokens.detail, settingPath: 'assistant.llm.maxTokens' }];
+  const policy = normalizeAssistantDiagnosticsPolicy(source.diagnostics, ASSISTANT_DIAGNOSTICS_CAPS);
+  for (const [key, fallback] of Object.entries(DEFAULT_ASSISTANT_DIAGNOSTICS)) {
+    const envKey = `CMDP_ASSISTANT_DIAGNOSTICS_${key.replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase()}_ABSOLUTE`;
+    const item = assistantLimitConfigValue(key, source.diagnostics?.[key], fallback, ASSISTANT_DIAGNOSTICS_CAPS[key],
+      { clampedBy: envKey, tool: 'assistant.diagnostics' }).detail;
+    if (policy[key] < item.effectiveLimit) item.clampedBy = key === 'maxBodyBytes' ? 'assistant.diagnostics.maxTraceBytes' : 'assistant.diagnostics.maxStoredBytes';
+    details.push({ ...item, settingPath: `assistant.diagnostics.${key}`, effectiveLimit: policy[key], configuredLimit: policy[key],
+      limit: policy[key], clamped: item.requested !== policy[key] });
+  }
+  return details.filter((item) => item.clamped).map((item) => ({ ...item, limitHit: true }));
+}
+
+function validateAssistantConfigurationNumbers(runtimeConfig = {}) {
+  const assistant = runtimeConfig?.assistant || {};
+  const fields = [['assistant.llm.maxTokens', assistant.llm?.maxTokens],
+    ...Object.keys(DEFAULT_ASSISTANT_DIAGNOSTICS).map((key) => [`assistant.diagnostics.${key}`, assistant.diagnostics?.[key]])];
+  return fields.filter(([, value]) => value !== undefined && (!Number.isSafeInteger(value) || value < 1))
+    .map(([path]) => ({ path: `$.runtimeConfig.${path}`, settingPath: path, reason: 'positiveIntegerRequired', min: 1,
+      message: 'The setting must be a positive safe integer.' }));
+}
+
+function assistantConfigResponseDiagnostics(runtimeConfig) {
+  const limits = assistantConfigurationLimitDiagnostics(runtimeConfig);
+  return { diagnostics: { limits }, warnings: limits.map((item) => `${item.settingPath}: requested ${item.requested}; effective ${item.effectiveLimit}; ${item.clampedBy}.`),
+    effectiveAssistantDiagnostics: normalizeAssistantDiagnosticsPolicy(runtimeConfig?.assistant?.diagnostics, ASSISTANT_DIAGNOSTICS_CAPS) };
+}
+
 function mergeRuntimeConfigDefaults(runtimeConfig) {
   const defaults = defaultRuntimeConfig();
   const source = runtimeConfig && typeof runtimeConfig === 'object' && !Array.isArray(runtimeConfig) ? runtimeConfig : {};
@@ -35609,6 +35920,7 @@ function mergeRuntimeConfigDefaults(runtimeConfig) {
     }),
     assistant: Object.assign({}, defaults.assistant, sourceAssistant, {
       llm: Object.assign({}, defaults.assistant.llm, sourceAssistant.llm || {}),
+      diagnostics: Object.fromEntries(Object.entries(defaults.assistant.diagnostics).map(([key, fallback]) => [key, sourceAssistant.diagnostics?.[key] ?? fallback])),
       mcp: Object.assign({}, defaults.assistant.mcp, sourceAssistant.mcp || {}),
       semanticPlan: Object.assign({}, defaults.assistant.semanticPlan, sourceAssistant.semanticPlan || {}),
       prompt: normalizeAssistantPromptContract(sourcePrompt, defaults.assistant.prompt)
@@ -36912,6 +37224,7 @@ function assistantStatus(runtimeConfig) {
     baseUrlSource: baseUrlStatus.source,
     allowedBaseUrls: LITELLM_ALLOWED_BASE_URLS,
     model: llm.model || LITELLM_MODEL,
+    maxTokens: llm.maxTokens,
     maxRequestBytes: llm.maxRequestBytes,
     maxResponseBytes: llm.maxResponseBytes,
     limitConfig: llm.limitConfig || {},
@@ -37044,7 +37357,13 @@ function parseAssistantJson(value) {
   try {
     return JSON.parse(text);
   } catch (error) {
-    return parseFirstJsonValue(text);
+    try { return parseFirstJsonValue(text); }
+    catch (parseError) {
+      const capture = assistantTraceContext.getStore();
+      const span = capture?.trace?.spans?.findLast((item) => item.kind === 'litellm');
+      finishAssistantSpan(span, { metadata: { parseError: assistantParseErrorMetadata(error) } });
+      throw parseError;
+    }
   }
 }
 
@@ -37191,6 +37510,8 @@ function normalizeAssistantRuntimeConfig(runtimeConfig) {
   const prompt = normalizeAssistantPromptContract(assistant.prompt, defaultRuntimeConfig().assistant.prompt);
   const systemPrompt = prompt.system;
   const llm = assistant.llm && typeof assistant.llm === 'object' && !Array.isArray(assistant.llm) ? assistant.llm : {};
+  const maxTokensConfig = assistantLimitConfigValue('maxTokens', rawLlm.maxTokens, 16384,
+    ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE, { clampedBy: 'CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE', tool: 'assistant.llm' });
   const maxRequestBytesConfig = assistantLimitConfigValue(
     'maxRequestBytes',
     Object.prototype.hasOwnProperty.call(rawLlm, 'maxRequestBytes') ? llm.maxRequestBytes : undefined,
@@ -37279,13 +37600,15 @@ function normalizeAssistantRuntimeConfig(runtimeConfig) {
   return {
     llm: {
       ...llm,
+      maxTokens: maxTokensConfig.value,
       maxRequestBytes: maxRequestBytesConfig.value,
       maxResponseBytes: maxResponseBytesConfig.value,
       limitConfig: {
+        maxTokens: maxTokensConfig.detail,
         maxRequestBytes: maxRequestBytesConfig.detail,
         maxResponseBytes: maxResponseBytesConfig.detail
       },
-      limitClamps: [maxRequestBytesConfig.detail, maxResponseBytesConfig.detail].filter((item) => item.clamped)
+      limitClamps: [maxTokensConfig.detail, maxRequestBytesConfig.detail, maxResponseBytesConfig.detail].filter((item) => item.clamped)
     },
     mcp: {
       enabled: mcp.enabled !== false,
@@ -37869,6 +38192,20 @@ async function mcpReadRelationHints(authToken, args, config) {
 }
 
 async function callMcpTool(authToken, name, args, config) {
+  const capture = assistantTraceContext.getStore();
+  const span = startAssistantSpan('mcp', name);
+  if (capture) capture.mcpDepth = (capture.mcpDepth || 0) + 1;
+  try {
+    const result = await callMcpToolUntraced(authToken, name, args, config);
+    finishAssistantSpan(span, { request: args, response: result });
+    return result;
+  } catch (error) {
+    finishAssistantSpan(span, { request: args, metadata: { errorCode: error.code || 'mcp_error' } });
+    throw error;
+  } finally { if (capture) capture.mcpDepth -= 1; }
+}
+
+async function callMcpToolUntraced(authToken, name, args, config) {
   const configured = config && config.mcp && Array.isArray(config.mcp.allowedTools) ? config.mcp.allowedTools : allMcpToolNames();
   const allowed = new Set(configured);
   if (!allowed.has(name)) {
@@ -39695,7 +40032,7 @@ function assistantLlmLimitError(code, message, statusCode, bytes, configuredLimi
   return error;
 }
 
-async function readBoundedLiteLlmResponse(response, maxBytes) {
+async function readBoundedLiteLlmResponse(response, maxBytes, onPartial) {
   const declaredLength = Number(response && response.headers && response.headers.get('content-length') || 0);
   if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
     throw assistantLlmLimitError(
@@ -39719,16 +40056,25 @@ async function readBoundedLiteLlmResponse(response, maxBytes) {
   }
   const chunks = [];
   let total = 0;
-  while (true) {
-    const next = await reader.read();
-    if (next.done) break;
-    const chunk = Buffer.from(next.value || []);
-    total += chunk.length;
-    if (total > maxBytes) {
-      await reader.cancel().catch(() => {});
-      throw assistantLlmLimitError('litellm_response_too_large', `LiteLLM response exceeds configured maxResponseBytes=${maxBytes}.`, 502, total, maxBytes, ASSISTANT_LLM_MAX_RESPONSE_BYTES_ABSOLUTE);
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      const chunk = Buffer.from(next.value || []);
+      total += chunk.length;
+      if (total > maxBytes) {
+        chunks.push(chunk.subarray(0, Math.max(0, maxBytes - (total - chunk.length))));
+        await reader.cancel().catch(() => {});
+        throw assistantLlmLimitError('litellm_response_too_large', `LiteLLM response exceeds configured maxResponseBytes=${maxBytes}.`, 502, total, maxBytes, ASSISTANT_LLM_MAX_RESPONSE_BYTES_ABSOLUTE);
+      }
+      chunks.push(chunk);
     }
-    chunks.push(chunk);
+  } catch (error) {
+    if (typeof onPartial === 'function') {
+      try { onPartial(Buffer.concat(chunks).toString('utf8'), { partial: true, readBytes: total }); }
+      catch { /* Capture must preserve the original transport or size error. */ }
+    }
+    throw error;
   }
   return Buffer.concat(chunks, total).toString('utf8');
 }
@@ -39749,6 +40095,8 @@ async function callLiteLLM(messages, runtimeConfig, options = {}) {
     : null;
   const metadata = assistantCallMetadata(options);
   const startedAt = Date.now();
+  const diagnosticSpan = startAssistantSpan('litellm', options.operation || 'chat/completions', { method: 'POST', path: 'chat/completions' });
+  if (diagnosticSpan) diagnosticSpan.metadata = { limits: assistantConfig.llm.limitConfig, ...metadata };
   let cancelledByCaller = Boolean(externalSignal && externalSignal.aborted);
   let timedOut = false;
   const abortFromCaller = () => {
@@ -39766,9 +40114,10 @@ async function callLiteLLM(messages, runtimeConfig, options = {}) {
       model: status.model,
       messages,
       temperature: ASSISTANT_TEMPERATURE,
-      max_tokens: ASSISTANT_MAX_TOKENS
+      max_tokens: assistantConfig.llm.maxTokens
     });
     const requestBytes = Buffer.byteLength(requestBody, 'utf8');
+    finishAssistantSpan(diagnosticSpan, { request: JSON.parse(requestBody), metadata: { requestBytes } });
     if (requestBytes > assistantConfig.llm.maxRequestBytes) {
       logWarn('assistant.litellm.request_too_large', {
         requestId: currentRequestId(),
@@ -39797,13 +40146,22 @@ async function callLiteLLM(messages, runtimeConfig, options = {}) {
       body: requestBody,
       signal: controller.signal
     });
-    const text = await readBoundedLiteLlmResponse(response, assistantConfig.llm.maxResponseBytes);
+    finishAssistantSpan(diagnosticSpan, { statusCode: response.status, metadata: { contentType: response.headers.get('content-type') } });
+    const text = await readBoundedLiteLlmResponse(response, assistantConfig.llm.maxResponseBytes, (partial, metadata) => {
+      finishAssistantSpan(diagnosticSpan, { response: partial, metadata });
+      const capture = assistantTraceContext.getStore();
+      if (capture?.trace) capture.trace.capture.truncated = true;
+    });
     let json = null;
     try {
       json = text ? JSON.parse(text) : null;
-    } catch {
+    } catch (error) {
+      finishAssistantSpan(diagnosticSpan, { metadata: { parseError: assistantParseErrorMetadata(error) } });
       json = null;
     }
+    finishAssistantSpan(diagnosticSpan, { response: { raw: text, content: json?.choices?.[0]?.message?.content }, statusCode: response.status,
+      metadata: { contentType: response.headers.get('content-type'), responseBytes: Buffer.byteLength(text),
+        providerId: json?.id, finish_reason: json?.choices?.[0]?.finish_reason, usage: json?.usage } });
     if (!response.ok) {
       const error = new Error(json && (json.error && json.error.message || json.message) || `LiteLLM request failed with status ${response.status}.`);
       error.statusCode = response.status;
@@ -39821,6 +40179,7 @@ async function callLiteLLM(messages, runtimeConfig, options = {}) {
     }
     return content;
   } catch (error) {
+    finishAssistantSpan(diagnosticSpan, { metadata: { errorCode: error.code || error.name || 'litellm_error', details: error.details } });
     if (error && error.code === 'litellm_response_too_large') {
       logWarn('assistant.litellm.response_too_large', {
         requestId: currentRequestId(),
@@ -57844,7 +58203,237 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
   };
 }
 
+function assistantParseErrorMetadata(error) {
+  const message = String(error?.message || 'Invalid JSON');
+  const position = /position\s+(\d+)/i.exec(message);
+  return { reason: error?.name || 'SyntaxError', position: position ? Number(position[1]) : null,
+    ...(assistantTraceContext.getStore()?.trace?.mode === 'Verbose' ? { message: message.slice(0, 2048) } : {}) };
+}
+
+function assistantTraceWarning(capture, reason = 'storageUnavailable') {
+  capture.warning = reason === 'pendingTraceBytes'
+    ? `Assistant capture skipped: pendingTraceBytes exceeds maxStoredBytes=${capture.policy.maxStoredBytes} or deployment cap=${ASSISTANT_DIAGNOSTICS_CAPS.maxStoredBytes}.`
+    : 'Assistant diagnostic trace storage is unavailable.';
+  capture.storageStatus = 'unavailable';
+  logWarn('assistant.diagnostics.unavailable', { requestId: capture.requestId, reason });
+}
+
+async function purgeAssistantDiagnosticHistory(options) {
+  return purgeAssistantDiagnostics((parts) => redisCommand(parts, { isolatedDiagnostics: true }), REDIS_KEY_PREFIX, options);
+}
+
+function releaseAssistantTraceReservation(capture) {
+  const size = capture.reservedBytes || 0;
+  if (!size) return;
+  assistantTraceQueueTotalBytes = Math.max(0, assistantTraceQueueTotalBytes - size);
+  const rootSize = Math.max(0, (assistantTraceQueueBytes.get(capture.root) || 0) - size);
+  if (rootSize) assistantTraceQueueBytes.set(capture.root, rootSize); else assistantTraceQueueBytes.delete(capture.root);
+  capture.reservedBytes = 0;
+}
+
+function queueAssistantTraceSave(capture) {
+  if (!capture.trace || capture.warning || capture.discarded) return capture.queue;
+  const extra = Math.max(0, capture.bytes + 2048 - (capture.reservedBytes || 0));
+  const rootBytes = (assistantTraceQueueBytes.get(capture.root) || 0) + extra;
+  if (rootBytes > capture.policy.maxStoredBytes || assistantTraceQueueTotalBytes + extra > ASSISTANT_DIAGNOSTICS_CAPS.maxStoredBytes) {
+    capture.trace.capture.truncated = true;
+    capture.trace.capture.reason = 'pendingTraceBytes';
+    assistantTraceWarning(capture, 'pendingTraceBytes');
+    if (!capture.saving) releaseAssistantTraceReservation(capture);
+    return capture.queue;
+  }
+  assistantTraceQueueBytes.set(capture.root, rootBytes);
+  assistantTraceQueueTotalBytes += extra;
+  capture.reservedBytes = (capture.reservedBytes || 0) + extra;
+  capture.pending = true;
+  if (capture.saving) return capture.queue;
+  capture.saving = true;
+  capture.queue = capture.queue.then(async () => {
+    while (capture.pending && !capture.warning) {
+      // Coalesce model-read bursts; the store redacts and snapshots synchronously before its Redis write.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      capture.pending = false;
+      try {
+        const method = capture.registered ? 'save' : 'begin';
+        const result = await assistantDiagnosticsStore[method](capture.root, capture.trace, { ...capture.policy, secretValues: capture.secrets });
+        if (!result.stored) {
+          capture.storageStatus = 'discarded';
+          capture.discarded = true;
+          capture.pending = false;
+          break;
+        }
+        capture.registered = true;
+        capture.storageStatus = 'stored';
+      } catch { assistantTraceWarning(capture); }
+    }
+  }).catch(() => { assistantTraceWarning(capture); }).finally(() => {
+    capture.saving = false;
+    if (capture.closed || capture.warning || capture.discarded) releaseAssistantTraceReservation(capture);
+  });
+  return capture.queue;
+}
+
+function initializeAssistantTrace(capture, body = {}) {
+  if (capture.initialized) return;
+  capture.initialized = true;
+  if (!REDIS_ENABLED) return;
+  const root = body.templateRef?.root || body.root || capture.root;
+  try {
+    capture.root = buildTechnicalSchema(root).root;
+    const status = assistantCaptureController.snapshot(capture.root);
+    if (!status) { assistantTraceWarning(capture); return; }
+    if (!['Basic', 'Verbose'].includes(status.mode)) return;
+    capture.policy = normalizeAssistantDiagnosticsPolicy(status.policy, ASSISTANT_DIAGNOSTICS_CAPS);
+    const startedAt = new Date().toISOString();
+    capture.storageStatus = 'pending';
+    capture.trace = { id: crypto.randomUUID(), requestId: capture.requestId,
+      captureGeneration: status.captureGeneration, storageEpoch: status.storageEpoch,
+      expiresAt: new Date(Date.parse(startedAt) + capture.policy.retentionSec * 1000).toISOString(),
+      templateCode: String(body.templateRef?.templateCode || body.templateCode || ''), action: capture.action,
+      mode: status.mode, startedAt, finishedAt: null, status: 'in_progress', statusCode: null,
+      spans: [], capture: { activeUntil: status.activeUntil, policy: capture.policy } };
+    const span = startAssistantSpan('bff', capture.action, { method: 'POST', path: capture.action }, capture);
+    capture.bffSpan = span;
+    finishAssistantSpan(span, { request: body }, capture);
+    queueAssistantTraceSave(capture);
+  } catch { assistantTraceWarning(capture); }
+}
+
+function startAssistantSpan(kind, name, fields = {}, capture = assistantTraceContext.getStore()) {
+  if (!capture?.trace || capture.warning || capture.closed || capture.discarded) return null;
+  // The trace budget bounds span count as well as bodies, including Basic capture.
+  if (capture.bytes + 512 > capture.policy.maxTraceBytes) {
+    capture.trace.capture.truncated = true;
+    return null;
+  }
+  capture.bytes += 512;
+  const span = { id: crypto.randomUUID(), kind, name, ...fields, metadata: {}, durationMs: 0 };
+  capture.trace.spans.push(span);
+  Object.defineProperty(span, 'startedMs', { value: Date.now() });
+  return span;
+}
+
+function finishAssistantSpan(span, { request, response, metadata = {}, statusCode } = {}, capture = assistantTraceContext.getStore()) {
+  if (!span || !capture?.trace || capture.closed || capture.discarded) return;
+  try {
+    span.durationMs = Date.now() - span.startedMs;
+    if (statusCode !== undefined) span.statusCode = statusCode;
+    span.metadata = redactAssistantDiagnosticValue({ ...span.metadata, ...metadata }, {
+      secretValues: capture.secrets, maxBytes: Math.min(16384, capture.policy.maxBodyBytes)
+    }).value;
+    capture.bytes += Buffer.byteLength(JSON.stringify(span.metadata));
+    if (capture.trace.mode === 'Verbose') for (const [key, value] of Object.entries({ request, response })) {
+      if (value === undefined) continue;
+      const remaining = Math.max(1, Math.min(capture.policy.maxBodyBytes, capture.policy.maxTraceBytes - capture.bytes));
+      span[key] = redactAssistantDiagnosticValue(value, { secretValues: capture.secrets, maxBytes: remaining });
+      capture.bytes += span[key].storedBytes;
+    }
+    queueAssistantTraceSave(capture);
+  } catch { assistantTraceWarning(capture); }
+}
+
+function assistantTraceMetadata(trace) {
+  const { spans, ...metadata } = trace;
+  return { ...metadata, spans: (spans || []).map(({ request: _request, response: _response, ...summary }) => summary) };
+}
+
+async function handleAssistantDiagnostics(req, res, url) {
+  const authToken = backendAuthFromRequest(req, url).token;
+  if (!authToken) return sendJson(res, 401, { success: false, message: 'CMDBuild session is required.' });
+  const session = await requireValidBackendSession(authToken, res);
+  if (!session) return;
+  if (!session.data.rolePrivileges?.admin_classes_modify) return sendJson(res, 403, { success: false, message: 'Assistant diagnostics access denied.' });
+  let schema;
+  try { schema = buildTechnicalSchema(url.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT); }
+  catch { return sendJson(res, 400, { success: false, message: 'Invalid diagnostic root.' }); }
+  const classAccess = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(schema.classNames.config)}`, authToken);
+  if (!classAccess.ok || classAccess.json?.data?._can_read !== true) return sendJson(res, [401, 403, 404].includes(classAccess.statusCode) || classAccess.ok ? 403 : 502,
+    { success: false, message: 'Assistant diagnostics access denied.' });
+  if (!['GET', 'POST', 'DELETE'].includes(req.method)) return methodAllowed(req, res, ['GET', 'POST', 'DELETE']);
+  if (req.method !== 'GET' && !requireStateChangingRequest(req, res, authToken)) return;
+  const route = url.pathname.slice(`${BACKEND_PREFIX}/assistant/diagnostics/`.length);
+  try {
+    const runtime = await getRuntimeConfig(authToken, schema.root);
+    const policy = normalizeAssistantDiagnosticsPolicy(runtime.assistant?.diagnostics, ASSISTANT_DIAGNOSTICS_CAPS);
+    if (route === 'status') {
+      if (!methodAllowed(req, res, 'GET')) return;
+      const status = await assistantDiagnosticsStore.status(schema.root);
+      assistantCaptureController.apply(schema.root, status);
+      return sendJson(res, 200, { success: true, status: { ...status, available: true, policy, caps: ASSISTANT_DIAGNOSTICS_CAPS } });
+    }
+    if (route === 'capture') {
+      if (!methodAllowed(req, res, ['POST', 'DELETE'])) return;
+      if (req.method === 'DELETE') {
+        const status = await assistantDiagnosticsStore.stop(schema.root);
+        assistantCaptureController.apply(schema.root, status);
+        return sendJson(res, 200, { success: true, status });
+      }
+      if (!requireJsonContentType(req, res)) return;
+      const body = await readJsonObjectBody(req, res, 4096);
+      if (!body) return;
+      if (body.confirmed !== true || !['Basic', 'Verbose'].includes(body.mode) ||
+        (body.durationSec !== undefined && (!Number.isSafeInteger(body.durationSec) || body.durationSec < 1))) {
+        return sendJson(res, 400, { success: false, message: 'Confirmed Basic or Verbose capture and positive durationSec are required.' });
+      }
+      const status = await assistantDiagnosticsStore.activate(schema.root, { ...body, policy, actor: sha256Hex(authToken).slice(0, 16) });
+      assistantCaptureController.apply(schema.root, status);
+      return sendJson(res, 200, { success: true, status });
+    }
+    if (route === 'traces') {
+      if (!methodAllowed(req, res, ['GET', 'DELETE'])) return;
+      if (req.method === 'DELETE') {
+        await assistantDiagnosticsStore.clear(schema.root);
+        assistantCaptureController.apply(schema.root, await assistantDiagnosticsStore.status(schema.root));
+        return sendJson(res, 200, { success: true });
+      }
+      const limit = url.searchParams.get('limit') || '20';
+      if (!/^\d{1,3}$/.test(limit) || Number(limit) < 1 || Number(limit) > 100 ||
+        ['requestId', 'templateCode'].some((key) => (url.searchParams.get(key) || '').length > 256)) {
+        return sendJson(res, 400, { success: false, message: 'Invalid diagnostic filters.' });
+      }
+      return sendJson(res, 200, { success: true, traces: await assistantDiagnosticsStore.list(schema.root, {
+        requestId: url.searchParams.get('requestId') || '', templateCode: url.searchParams.get('templateCode') || '', limit: Number(limit)
+      }) });
+    }
+    const match = /^traces\/([a-f0-9-]{36})(?:\/(export)|\/spans\/([a-f0-9-]{36}))?$/i.exec(route);
+    if (!match) return sendJson(res, 400, { success: false, message: 'Invalid diagnostic route or id.' });
+    if (!methodAllowed(req, res, 'GET')) return;
+    const trace = await assistantDiagnosticsStore.get(schema.root, match[1]);
+    if (!trace) return sendJson(res, 404, { success: false, message: 'Diagnostic trace not found.' });
+    if (match[2]) return sendJson(res, 200, { success: true, trace }, { 'content-disposition': `attachment; filename="assistant-trace-${match[1]}.json"` });
+    if (match[3]) {
+      const span = trace.spans?.find((item) => item.id === match[3]);
+      return sendJson(res, span ? 200 : 404, span ? { success: true, span } : { success: false, message: 'Diagnostic span not found.' });
+    }
+    return sendJson(res, 200, { success: true, trace: assistantTraceMetadata(trace) });
+  } catch {
+    return sendJson(res, 503, { success: false, code: 'assistant_diagnostics_unavailable', message: 'Assistant diagnostics storage is unavailable.', status: { available: false } });
+  }
+}
+
 async function handleBackend(req, res, requestUrl) {
+  if (requestUrl.pathname.startsWith(`${BACKEND_PREFIX}/assistant/diagnostics/`)) {
+    return handleAssistantDiagnostics(req, res, requestUrl);
+  }
+  if (requestUrl.pathname.startsWith(`${BACKEND_PREFIX}/assistant/`) && !assistantTraceContext.getStore()) {
+    const capture = { requestId: req.cmdpRequestId || currentRequestId() || crypto.randomUUID(),
+      root: requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT,
+      action: requestUrl.pathname.slice(BACKEND_PREFIX.length),
+      authToken: backendAuthFromRequest(req, requestUrl).token,
+      secrets: [LITELLM_API_KEY, backendAuthFromRequest(req, requestUrl).token].filter(Boolean),
+      queue: Promise.resolve(), pending: null, saving: false, bytes: 0 };
+    return assistantTraceContext.run(capture, async () => {
+      try { return await handleBackendRequest(req, res, requestUrl); }
+      finally {
+        capture.closed = true;
+        if (!capture.saving) releaseAssistantTraceReservation(capture);
+      }
+    });
+  }
+  return handleBackendRequest(req, res, requestUrl);
+}
+
+async function handleBackendRequest(req, res, requestUrl) {
   const auth = backendAuthFromRequest(req, requestUrl);
   const authToken = auth.token;
   const authSource = auth.source;
@@ -58271,12 +58860,14 @@ async function handleBackend(req, res, requestUrl) {
         root: found.schema.root,
         className: found.schema.classNames.config
       })) return;
+      const config = sanitizeConfigCard(found.card, found.schema.root);
       sendJson(res, found.response.ok ? 200 : 502, {
         success: found.response.ok,
         cmdbuildStatus: found.response.statusCode,
         root: found.schema.root,
         className: found.schema.classNames.config,
-        config: sanitizeConfigCard(found.card, found.schema.root),
+        config,
+        ...assistantConfigResponseDiagnostics(config.runtimeConfig),
         inputCollectionLimits: INPUT_COLLECTION_LIMITS
       });
       return;
@@ -58285,7 +58876,11 @@ async function handleBackend(req, res, requestUrl) {
     if (req.method === 'PUT') {
       if (!requireStateChangingRequest(req, res, authToken)) return;
       if (!requireJsonContentType(req, res)) return;
-      const body = await readJsonBody(req);
+      const body = await readJsonObjectBody(req, res);
+      if (!body) return;
+      const numericErrors = validateAssistantConfigurationNumbers(body.runtimeConfig ?? safeJsonValue(body.RuntimeConfigJson, {}));
+      if (numericErrors.length) return sendJson(res, 422, { success: false, code: 'runtime_config_invalid',
+        message: 'Assistant settings contain invalid numeric values.', errors: numericErrors });
       const found = await findConfigCard(authToken, root);
       if (!found.response.ok) {
         if (sendTechnicalSchemaAccessDeniedIfNeeded(res, {
@@ -58312,12 +58907,18 @@ async function handleBackend(req, res, requestUrl) {
           method: 'POST',
           body: payload
         });
+      const config = sanitizeConfigCard(saved.json && saved.json.data, found.schema.root);
+      const configDiagnostics = assistantConfigResponseDiagnostics(config.runtimeConfig);
+      if (saved.ok && configDiagnostics.diagnostics.limits.length) logLimitDiagnostics('runtime.config.limit_clamped', {
+        requestId: req.cmdpRequestId || '', authSource: backendLogUser, root: found.schema.root
+      }, configDiagnostics.diagnostics.limits);
       sendJson(res, saved.ok ? 200 : 502, {
         success: saved.ok,
         cmdbuildStatus: saved.statusCode,
         root: found.schema.root,
         className: found.schema.classNames.config,
-        config: sanitizeConfigCard(saved.json && saved.json.data, found.schema.root)
+        config,
+        ...configDiagnostics
       });
       return;
     }
@@ -61202,6 +61803,7 @@ function installGracefulShutdown(serverInstance) {
   const shutdown = (signal) => {
     if (shutdownStarted) return;
     shutdownStarted = true;
+    assistantCaptureController.stop();
     shuttingDown = true;
     logWarn('app.shutdown_started', {
       signal,
@@ -61345,6 +61947,7 @@ if (isMainModule) {
     });
   }
   logDiagnosticBasic('app.config_valid', runtimeConfigLogSummary(runtimeConfig));
+  if (REDIS_ENABLED) assistantCaptureController.start();
   installGracefulShutdown(server);
   server.listen(LISTEN_PORT, LISTEN_HOST, () => {
     logInfo('app.started', {
@@ -61364,6 +61967,13 @@ if (isMainModule) {
 }
 
 export {
+  purgeAssistantDiagnosticHistory,
+  assistantConfigurationLimitDiagnostics,
+  validateAssistantConfigurationNumbers,
+  ASSISTANT_DIAGNOSTICS_CAPS,
+  ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE,
+  mergeRuntimeConfigDefaults,
+  normalizeConfigPayload,
   APPLICATION_BUILD,
   APPLICATION_VERSION,
   DEFAULT_TEMPLATE_CACHE_TTL_SEC,
@@ -61522,6 +62132,7 @@ export {
   completeDiagramImportV3FromSpec,
   renderPrometheusMetrics,
   callLiteLLM,
+  readBoundedLiteLlmResponse,
   boundedMcpText,
   ensureAssistantReady,
   mcpToolDefinitions,

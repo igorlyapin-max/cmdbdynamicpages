@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics.mjs';
+import { createAssistantDiagnosticsUi } from '../../scripts/assistant-diagnostics-ui.mjs';
 
 const launcherSource = fs.readFileSync('src/CmdbDynamicPages.js', 'utf8');
 const proxySource = fs.readFileSync('scripts/dev-proxy-server.mjs', 'utf8');
@@ -138,6 +139,7 @@ function generatedDynamicPagesClientScript() {
     .replace('function dynamicPagesClientScript()', 'return function dynamicPagesClientScript()');
   const factory = new Function(
     'createUiRequestDiagnostics',
+    'createAssistantDiagnosticsUi',
     'DEFAULT_EMPTY_RESULT_TEXT',
     'DEFAULT_PERMISSION_DENIED_TEXT',
     'DEFAULT_TEMPLATE_CACHE_TTL_SEC',
@@ -157,7 +159,7 @@ function generatedDynamicPagesClientScript() {
     'DEFAULT_ASSISTANT_DIAGRAM_CRITIQUE_PROMPT',
     factorySource
   );
-  return factory(createUiRequestDiagnostics, 'empty result', 'permission denied', 3600, 10, 1, 5, 1, 3, 3, 'assistant system prompt', 'object flow prompt', 'semantic plan prompt', 'diagram semantics prompt', 'diagram binding intent prompt', 'diagram placement prompt', 'diagram connections prompt', 'diagram critique prompt')();
+  return factory(createUiRequestDiagnostics, createAssistantDiagnosticsUi, 'empty result', 'permission denied', 3600, 10, 1, 5, 1, 3, 3, 'assistant system prompt', 'object flow prompt', 'semantic plan prompt', 'diagram semantics prompt', 'diagram binding intent prompt', 'diagram placement prompt', 'diagram connections prompt', 'diagram critique prompt')();
 }
 
 test('generated Dynamic Pages client script parses as browser JavaScript', () => {
@@ -1147,7 +1149,7 @@ test('template Assistant prompt overrides are explicit, resettable, and kept out
   const taskModeStart = proxySource.indexOf('function renderAssistantTaskMode(value)', renderStart);
   const updateStart = proxySource.indexOf('function updateTemplateAssistantPromptOverride(key, mode)');
   const promptChangedStart = proxySource.indexOf('function markDiagramImportPromptChanged(kind)', updateStart);
-  const inputStart = proxySource.indexOf("document.addEventListener('input', function (event)");
+  const inputStart = proxySource.indexOf("document.addEventListener('input', function (event)", promptChangedStart);
   const end = proxySource.indexOf("document.addEventListener('change', function (event)", inputStart);
   assert.ok(renderStart > -1);
   assert.ok(taskModeStart > renderStart);
@@ -1287,7 +1289,7 @@ test('typed assistant flow renders one in-progress proposal before deterministic
   assert.match(generateSource, /state\.assistantFlowBusy = false/);
 });
 
-test('normal Save reloads canonical authoring and restores a saved D2 Assistant checkpoint without LLM', () => {
+test('normal Save accepts canonical ACK without reloading; opening a template restores its D2 checkpoint without LLM', () => {
   const hydrateStart = proxySource.indexOf('function hydrateDesignerStateFromTemplate(options)');
   const noticeStart = proxySource.indexOf('function renderNotice(message)', hydrateStart);
   const loadStart = proxySource.indexOf('function loadDesigner(options)');
@@ -1309,7 +1311,10 @@ test('normal Save reloads canonical authoring and restores a saved D2 Assistant 
   assert.match(loadSource, /var selectedBeforeReload = state\.selectedTemplate/);
   assert.match(loadSource, /selectedBeforeReload\.specHash/);
   assert.match(loadSource, /preserveAssistantState: preserveAssistantState/);
-  assert.match(saveSource, /loadDesigner\(\{ preserveAssistantState: false \}\)/);
+  assert.match(saveSource, /state\.selectedTemplate = result\.json\.template/);
+  assert.match(saveSource, /state\.templates = state\.templates\.filter/);
+  assert.match(saveSource, /runtimeSettingsScopeIsCurrent\(saveScope\)/);
+  assert.doesNotMatch(saveSource, /loadDesigner\(/);
   assert.doesNotMatch(hydrateSource, /analyzeDiagramImport\(/);
   assert.match(proxySource, /function restoreDiagramImportAssistantCheckpoint\(\)/);
   assert.match(loadSource, /restoreDiagramImportAssistantCheckpoint\(\)/);
@@ -1428,7 +1433,7 @@ test('designer blocks template-bound menu sections until a template is selected'
 
 test('designer action bar exposes the global template Save in every selected-template section', () => {
   const actionBarStart = proxySource.indexOf('function renderDesignerActionBar(selected)');
-  const actionBarEnd = proxySource.indexOf('function renderDesigner()', actionBarStart);
+  const actionBarEnd = proxySource.indexOf('function renderDesigner(', actionBarStart);
   assert.ok(actionBarStart > -1);
   assert.ok(actionBarEnd > actionBarStart);
 
@@ -2475,7 +2480,7 @@ test('deep catalog fields are query-first, cached, and locally refreshed in the 
   const pickerStart = proxySource.indexOf('function renderCatalogFieldPicker(fieldAttribute, selectedName, initialOptions, context)');
   const refreshStart = proxySource.indexOf('function refreshMatchingBlockAfterSourceChange(node)');
   const refreshEnd = proxySource.indexOf('function clearObjectGroupScopeRuleRow(button)', refreshStart);
-  const changeHandlerStart = proxySource.indexOf("document.addEventListener('change', function (event) {");
+  const changeHandlerStart = proxySource.indexOf("document.addEventListener('change', function (event) {", refreshEnd);
   const popstateStart = proxySource.indexOf("window.addEventListener('popstate'", changeHandlerStart);
   const diagramStageStart = proxySource.indexOf('function diagramImportStageFieldOptions(spec, stageId, searchQuery, selectedSource)');
   const diagramStageEnd = proxySource.indexOf('function renderDiagramImportStageFields(', diagramStageStart);

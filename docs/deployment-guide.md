@@ -147,6 +147,23 @@ The check is non-destructive: it creates only missing classes and attributes. A 
 
 For a deliberately read-only role use `CMDBDYNAMIC_EXPECT_READONLY=1`; this mode does not call bootstrap and checks the schema without modifying it.
 
+### Assistant Token Budget And Capture Policy
+
+Set `Cst_QueryToolConfig.RuntimeConfigJson.assistant.llm.maxTokens` per root
+(default `16384`). Every Assistant LiteLLM request sends the effective value as
+`max_tokens`, bounded by deployment env `CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE`
+(default `131072`), passed through runtime Compose. Env changes require backend recreation.
+Provider context/output limits, byte budgets and timeout still apply.
+The old `CMDP_ASSISTANT_MAX_TOKENS` configuration is not supported.
+
+`assistant.diagnostics` stores policy only: `captureDurationSec=900` (max `3600`),
+`retentionSec=86400` (max `604800`), `maxBodyBytes=8388608`, `maxTraceBytes=33554432`,
+`maxStoredBytes=268435456`. Actual `Off|Basic|Verbose` capture defaults to `Off` and
+is activated temporarily through admin API in Redis per root for all its users.
+Policy saves and restarts never enable or renew capture. Protect Redis and exports;
+redaction precedes writes and bodies never go to stdout. This does not replace the
+required operational log sink. See [Assistant capture](runbook.md#assistant-capture).
+
 ## 6. CMDBuild permissions
 
 Template editors need read/create/update on the technical classes:

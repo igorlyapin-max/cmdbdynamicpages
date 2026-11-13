@@ -47,21 +47,21 @@ export function createUiRequestDiagnostics() {
     'sourceClass', 'comparisonClass', 'relatedClass', 'targetClass', 'outputClass', 'terminalClass',
     'sourceRoot', 'targetRoot', 'domain', 'direction', 'predicateType', 'invalidField',
     'path', 'field', 'fieldName', 'sourceField', 'comparisonField', 'relatedField',
-    'operator', 'expectedOperator', 'type', 'expectedType', 'actualType',
+    'operator', 'expectedOperator', 'type', 'expectedType', 'actualType', 'clampedBy', 'source', 'tool',
     'alias', 'as', 'from', 'with', 'expectedAlias', 'publishedAlias', 'sourceAlias', 'targetAlias', 'comparisonAlias'
   ];
   const numberFields = [
     'limit', 'effectiveLimit', 'configuredLimit', 'rawConfigured', 'requiredCount', 'actualCount', 'count', 'fetched', 'visible',
     'timeoutMs', 'durationMs', 'elapsedMs', 'maxBytes', 'actualBytes', 'restCalls', 'status', 'statusCode',
     'predicateIndex', 'index', 'min', 'max', 'maximum', 'configured', 'observed',
-    'maxLength', 'actualLength', 'maxItems', 'actualItems', 'maxDepth', 'depth'
+    'maxLength', 'actualLength', 'maxItems', 'actualItems', 'maxDepth', 'depth', 'requested', 'absoluteCap'
   ];
   const identifierArrays = [
     'classNames', 'sourceFields', 'comparisonFields', 'availableDependencyIds',
     'supportedOperators', 'allowedOperators', 'supportedTypes', 'supported', 'aliases', 'availableAliases',
     'sourceEndpoint', 'targetEndpoint'
   ];
-  const booleanFields = ['timeout', 'truncated', 'limitHit', 'exceeded', 'retryable', 'classContextLimited'];
+  const booleanFields = ['timeout', 'truncated', 'limitHit', 'exceeded', 'retryable', 'classContextLimited', 'clamped'];
   function fields(input, depth = 0) {
     const source = object(input);
     const result = {};
@@ -119,6 +119,10 @@ export function createUiRequestDiagnostics() {
       diagnostics: fields(source.diagnostics),
       checkpoint: checkpoint(source.checkpoint), retryable: source.retryable === true,
       owner: {
+        ...(typeof owner.root === 'string' ? { root: text(owner.root, 128) } : {}),
+        ...(Number.isSafeInteger(owner.rootSelectionGeneration) ? { rootSelectionGeneration: owner.rootSelectionGeneration } : {}),
+        ...(Number.isSafeInteger(owner.editorInstance) ? { editorInstance: owner.editorInstance } : {}),
+        ...(Number.isSafeInteger(owner.sessionInstance) ? { sessionInstance: owner.sessionInstance } : {}),
         templateCode: text(owner.templateCode, 128), section: text(owner.section, 128),
         ...(owner.displaySection ? { displaySection: text(owner.displaySection, 128) } : {}),
         generation: Number.isSafeInteger(owner.generation) ? owner.generation : null,
@@ -126,6 +130,13 @@ export function createUiRequestDiagnostics() {
       },
       truncated: source.truncated === true
     };
+    const trace = object(source.assistantTrace);
+    if (typeof trace.traceId === 'string' || typeof trace.warning === 'string') {
+      result.assistantTrace = {};
+      for (const key of ['traceId', 'requestId', 'status', 'storageStatus', 'warning']) {
+        if (typeof trace[key] === 'string') result.assistantTrace[key] = text(trace[key], key === 'warning' ? 512 : 128);
+      }
+    }
     if (typeof source.responseExcerpt === 'string' && bytes(source.responseExcerpt) > excerptLimit) result.truncated = true;
     return result;
   }
@@ -168,6 +179,7 @@ export function createUiRequestDiagnostics() {
       message: data.message || error.message || (typeof data.error === 'string' ? data.error : '') || (source.ok ? '' : 'Request failed'),
       responseFormat: format,
       errors: data.errors, diagnostics: data.diagnostics,
+      assistantTrace: object(data.diagnostics).assistantTrace,
       checkpoint: { confirmed, stage: resume.stage, expiresAt: resume.expiresAt },
       retryable: typeof data.retryable === 'boolean' ? data.retryable : [408, 429, 502, 503, 504].includes(source.status)
     };

@@ -128,6 +128,23 @@ Bootstrap создает только недостающие классы и а�
 
 Администратор bootstrap должен иметь права CMDBuild на изменение модели классов: создание классов под выбранным parent superclass, создание атрибутов, чтение metadata classes/attributes и проверку существующей схемы. После bootstrap эту роль не нужно выдавать обычным редакторам шаблонов.
 
+### Assistant Token Budget And Capture Policy
+
+Per-root budget: `Cst_QueryToolConfig.RuntimeConfigJson.assistant.llm.maxTokens`
+(default `16384`). Каждый Assistant LiteLLM request передаёт effective значение как
+`max_tokens`, ограниченное deployment env `CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE`
+(default `131072`), поставляемым в runtime Compose. Изменение env требует пересоздания
+backend. Provider context/output limits, byte budgets и timeout действуют независимо.
+Старый `CMDP_ASSISTANT_MAX_TOKENS` не поддержан.
+
+`assistant.diagnostics` хранит только policy: `captureDurationSec=900` (max `3600`),
+`retentionSec=86400` (max `604800`), `maxBodyBytes=8388608`, `maxTraceBytes=33554432`,
+`maxStoredBytes=268435456`. Фактический capture `Off|Basic|Verbose` default `Off`,
+временно включается admin API в Redis per root для всех его пользователей.
+Сохранение policy и restart не включают и не продлевают capture. Защитить Redis и
+exports; redaction до записи, тела не идут в stdout. Это не замена обязательного
+operational log sink. См. [Assistant capture](runbook.ru.md#assistant-capture).
+
 ## 6. Права CMDBuild
 
 Редакторам шаблонов нужны права чтения/создания/изменения на технические классы:

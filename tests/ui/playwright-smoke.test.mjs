@@ -2002,6 +2002,128 @@ test('Runtime settings expose a configurable Assistant reference-path depth', { 
   });
 });
 
+test('Assistant diagnostics UI configures tokens and lazily opens redacted request bodies', { skip: skipReason }, async () => {
+  await withPage(async (page) => {
+    let spanRequests = 0;
+    let savedConfig;
+    let capture;
+    const activeUntil = new Date(Date.now() + 900000).toISOString();
+    const traceId = '11111111-1111-4111-8111-111111111111';
+    await page.route('**/cmdbuild/custom-api/config?*', async (route) => {
+      if (route.request().method() !== 'PUT') return route.continue();
+      savedConfig = route.request().postDataJSON().runtimeConfig;
+      await route.fulfill({ json: { success: true, config: { exists: true, runtimeConfig: savedConfig }, effectiveAssistantDiagnostics: savedConfig.assistant.diagnostics } });
+    });
+    await page.route('**/cmdbuild/custom-api/assistant/diagnostics/**', async (route) => {
+      const url = new URL(route.request().url());
+      let response;
+      if (url.pathname.endsWith('/status')) response = { status: { mode: 'Off' } };
+      else if (url.pathname.endsWith('/capture')) { capture = route.request().postDataJSON(); response = { status: { mode: capture.mode, activeUntil } }; }
+      else if (url.pathname.endsWith('/spans/llm')) { spanRequests++; response = { span: { id: 'llm', request: { max_tokens: 32768, messages: ['prompt'] }, response: { content: '{invalid', finish_reason: 'length', api_key: '[REDACTED]' } } }; }
+      else if (url.pathname.endsWith('/traces/' + traceId)) response = { trace: { id: traceId, requestId: 'ui-diagnostic-request', status: 'error', mode: 'Verbose', spans: [{ id: 'llm', kind: 'llm', name: 'LiteLLM' }] } };
+      else response = { traces: [{ id: traceId, requestId: 'ui-diagnostic-request', templateCode: 'example', action: 'semantic-plan', statusCode: 502 }] };
+      await route.fulfill({ json: { success: true, ...response } });
+    });
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer/settings`, { waitUntil: 'domcontentloaded' });
+    await page.locator('#cmdp-assistant-debug-panel').waitFor({ timeout: 10000 });
+    await page.locator('#cmdp-language').selectOption('ru');
+    const tokens = page.locator('#cmdp-assistant-llm-max-tokens');
+    assert.equal(await tokens.getAttribute('max'), '131072');
+    await tokens.fill('32768');
+    await page.locator('#cmdp-assistant-debug-mode').selectOption('Verbose');
+    page.once('dialog', (dialog) => dialog.accept());
+    await page.locator('[data-action="assistant-debug-apply"]').click();
+    await page.waitForFunction(() => document.querySelector('#cmdp-assistant-debug-panel')?.textContent.includes('Действует до'));
+    assert.equal(savedConfig.assistant.llm.maxTokens, 32768);
+    assert.equal(capture.mode, 'Verbose');
+    assert.equal(capture.confirmed, true);
+    await page.locator('[data-action="assistant-debug-search"]').click();
+    await page.locator('[data-action="assistant-debug-open"]').first().click();
+    const span = page.locator('[data-assistant-debug-span="llm"]');
+    await span.waitFor();
+    assert.equal(spanRequests, 0);
+    await span.locator('summary').click();
+    await page.waitForFunction(() => document.querySelector('[data-debug-span-body]')?.textContent.includes('finish_reason'));
+    assert.equal(spanRequests, 1);
+    assert.match(await span.locator('[data-debug-span-body]').innerText(), /32768|REDACTED/);
+    for (const width of [1280, 390]) {
+      await page.setViewportSize({ width, height: 900 });
+      const geometry = await span.boundingBox();
+      assert.ok(geometry && geometry.width > 100 && geometry.x >= 0 && geometry.x + geometry.width <= width + 1, JSON.stringify({ width, geometry }));
+    }
+  });
+});
+
+test('Live Assistant trace can be captured and inspected through the deployed UI', {
+  skip: skipReason || (process.env.CMDP_DIAGNOSTICS_LIVE_UI_TEST !== '1' ? 'Explicit live Assistant capture opt-in required.' : false), timeout: 120000
+}, async () => {
+  await withPage(async (page) => {
+    let originalConfig;
+    let csrf;
+    const api = async (suffix, method = 'GET', body) => {
+      const response = await page.request.fetch(proxyOrigin + '/cmdbuild/custom-api/' + suffix, {
+        method, headers: { origin: proxyOrigin, ...(csrf ? { 'x-cmdbdynamicpages-csrf': csrf } : {}) },
+        ...(body ? { data: body } : {})
+      });
+      assert.equal(response.ok(), true, `${method} ${suffix}: ${response.status()}`);
+      return response.json();
+    };
+    try {
+      await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer/settings`, { waitUntil: 'domcontentloaded' });
+      await page.locator('#cmdp-assistant-debug-mode').waitFor();
+      await page.locator('#cmdp-language').selectOption('ru');
+      originalConfig = (await api('config?root=Cst_QueryTool')).config;
+      assert.equal(originalConfig.runtimeConfig.assistant.llm.enabled, true);
+      csrf = (await api('csrf')).token;
+      const baseline = await api('assistant/diagnostics/status?root=Cst_QueryTool');
+      assert.equal(baseline.status.mode, 'Off', 'Do not replace an existing operator capture window.');
+      await page.locator('#cmdp-assistant-debug-mode').selectOption('Verbose');
+      page.once('dialog', (dialog) => dialog.accept());
+      await page.locator('[data-action="assistant-debug-apply"]').click();
+      await page.waitForFunction(() => document.querySelector('[data-action="assistant-debug-apply"]')?.disabled === false);
+      assert.equal((await api('assistant/diagnostics/status?root=Cst_QueryTool')).status.mode, 'Verbose', await page.locator('#cmdp-assistant-debug-panel').innerText());
+      await page.locator('a[data-designer-section="templates"]').click();
+      await page.locator('button[data-action="new-template"]').click();
+      await page.locator('a[data-designer-section="assistant"]').click();
+      await addAssistantBusinessBlock(page, { name: 'Diagnostic schema probe', description: 'Выбрать все карточки класса IS. Ожидаемый результат: список карточек IS без фильтров.' });
+      const contextResponsePromise = page.waitForResponse((response) => response.url().includes('/assistant/object-flow/semantic-plan') && response.status() === 202, { timeout: 75000 });
+      const responsePromise = page.waitForResponse((response) => response.url().includes('/assistant/object-flow/semantic-plan') && response.status() !== 202, { timeout: 75000 });
+      await page.locator('[data-action="assistant-flow-prepare"]').click();
+      const response = await responsePromise;
+      const result = await response.json();
+      const traceId = result.diagnostics?.assistantTrace?.traceId;
+      assert.ok(traceId, `Missing trace reference: HTTP ${response.status()} ${result.code || ''}`);
+      const snapshotDeadline = Date.now() + 10000;
+      while ((await api(`assistant/diagnostics/traces/${traceId}?root=Cst_QueryTool`)).trace?.status === 'in_progress') {
+        assert.ok(Date.now() < snapshotDeadline, 'Final trace snapshot was not persisted.');
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      const reference = page.locator('[data-assistant-debug-reference]').first();
+      await reference.locator('summary').first().click();
+      const llm = reference.locator('[data-assistant-debug-span]').filter({ hasText: 'litellm' });
+      await llm.locator('summary').first().waitFor({ timeout: 10000 });
+      await llm.locator('summary').first().click();
+      await page.waitForFunction(() => Array.from(document.querySelectorAll('[data-debug-span-body]')).some((el) => el.textContent.includes('finish_reason')), { timeout: 10000 });
+      const trace = (await api(`assistant/diagnostics/traces/${traceId}/export?root=Cst_QueryTool`)).trace;
+      assert.ok(trace.spans.some((span) => span.kind === 'litellm' && span.metadata.finish_reason), JSON.stringify({ status: response.status(), code: result.code, traceStatus: trace.status, llm: trace.spans.filter((span) => span.kind === 'litellm').map((span) => ({ status: span.statusCode, metadata: span.metadata })) }));
+      const contextResponse = await (await contextResponsePromise).json();
+      const contextTrace = (await api(`assistant/diagnostics/traces/${contextResponse.diagnostics.assistantTrace.traceId}/export?root=Cst_QueryTool`)).trace;
+      assert.ok(contextTrace.spans.some((span) => span.kind === 'mcp'));
+      const artifact = new URL('../../.omk/runs/assistant-diagnostics-ui/', import.meta.url);
+      fs.mkdirSync(artifact, { recursive: true });
+      await llm.scrollIntoViewIfNeeded();
+      await page.screenshot({ path: new URL('trace-desktop.png', artifact).pathname });
+      await page.setViewportSize({ width: 390, height: 844 });
+      await llm.scrollIntoViewIfNeeded();
+      await page.screenshot({ path: new URL('trace-mobile.png', artifact).pathname });
+      console.log(JSON.stringify({ liveAssistantDiagnostic: true, status: response.status(), code: result.code || 'success', spans: trace.spans.length, llmFinishReason: trace.spans.find((span) => span.kind === 'litellm')?.metadata.finish_reason }));
+    } finally {
+      try { if (csrf) await api('assistant/diagnostics/capture?root=Cst_QueryTool', 'DELETE'); }
+      finally { if (originalConfig && csrf) await api('config?root=Cst_QueryTool', 'PUT', { active: originalConfig.active !== false, runtimeConfig: originalConfig.runtimeConfig }); }
+    }
+  });
+});
+
 test('Object Group collapsed summaries stay aligned and show the user name', { skip: skipReason }, async () => {
   await withPage(async (page) => {
     await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });

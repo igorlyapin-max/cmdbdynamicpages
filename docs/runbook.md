@@ -91,6 +91,94 @@ No destructive CMDBuild schema rollback is expected for ordinary runtime release
 
 Use `CMDP_DIAGNOSTIC_MODE=Basic` for safe incident diagnostics. Use `Verbose` only temporarily and only when sanitized request/upstream details are needed.
 
+### Assistant Capture
+
+Assistant capture is independent of `CMDP_DIAGNOSTIC_MODE`: `Off` by default,
+`Basic` for metadata, `Verbose` for bounded redacted request/response bodies too.
+Redis-backed capture applies to **all users of the selected technical root**.
+Treat traces/exports as sensitive even after redaction; do not publish raw exports.
+
+In Designer, open **Runtime settings → Assistant diagnostics**, select Verbose,
+apply the mode and confirm capture. After reproducing the issue, expand Assistant
+requests and responses below the result, or search by Request ID in settings.
+Bodies load only when a span opens; copy and JSON export are available. Each HTTP
+stage has its own trace: resumable operations can record MCP context and LLM generation
+separately. An interrupted response retains its already-read prefix with a partial
+marker; diagnostic storage does not replace the original error.
+
+Trace writes are asynchronous: `diagnostics.assistantTrace.storageStatus` is `pending`, `stored`,
+`discarded` (lifecycle/quota rejection), or `unavailable` (storage/control failure).
+A reference is not proof of persistence. On expansion, UI retries a known `pending`
+reference for at most 5 seconds; it does not poll arbitrary missing traces.
+
+1. Use an admin session with `admin_classes_modify` and read access to the root's configuration.
+2. Read `GET /cmdbuild/custom-api/assistant/diagnostics/status?root=<Root>`.
+   Activate `POST .../diagnostics/capture?root=<Root>` with JSON
+   `{"mode":"Verbose","durationSec":900,"confirmed":true}` and normal same-origin CSRF protection.
+   Use `Basic` for metadata-only capture; `DELETE .../diagnostics/capture` stops capture.
+3. Reproduce one intended Assistant operation. Read `GET .../diagnostics/traces`
+   with `root` and optional `requestId`, `templateCode`, `limit`. Read a trace via
+   `GET .../diagnostics/traces/<id>` (metadata only, no bodies), a span via
+   `GET .../diagnostics/traces/<id>/spans/<spanId>`, or JSON via
+   `GET .../diagnostics/traces/<id>/export`. Pass `root` on every request.
+4. Compare effective `max_tokens`, `finish_reason`, detailed token usage and provider
+   response. Verbose retains invalid JSON text after redaction; a parse failure
+   does not mean no text was returned. Check truncation/omission markers first.
+5. Stop capture explicitly; `DELETE .../diagnostics/traces?root=<Root>` clears retained
+   traces and invalidates pending/in-flight trace writes through a storage epoch.
+   All mutations require CSRF. Stop does not clear traces and permits already
+   Redis-admitted traces to finish; it rejects new admission. Clear does not stop capture.
+
+All endpoints are admin-only with `Cache-Control: no-store`. Redaction happens before
+Redis writes. Bodies never go to stdout/stderr or external log sinks; operational
+metadata uses the main structured logging pipeline. Redis failure must not change
+the underlying Assistant result; no in-memory storage fallback is provided.
+Capture control is polled from Redis in the background every 1 second; memory caches
+control metadata only, not a payload storage fallback. Missing/unavailable control
+or control older than 2 seconds skips tracing with a warning, without waiting for
+Redis on the Assistant path. Trace begin/update are atomic; updates use `XX` with
+the original expiry and epoch checks. Expired, evicted or cleared traces cannot be resurrected.
+Redaction covers credentials in malformed JSON too; do not rely on old history being safe.
+
+Saved `assistant.diagnostics` policy: `captureDurationSec=900` (max `3600`),
+`retentionSec=86400` (max `604800`), `maxBodyBytes=8388608`, `maxTraceBytes=33554432`,
+`maxStoredBytes=268435456`. Byte quotas bound each body, each trace and total retained
+trace storage per root. Old traces may be evicted; oversized detail may be omitted.
+Capture expires automatically. Backend restart and policy saves do not enable capture
+or extend its deadline or existing trace retention. RuntimeConfig stores no active mode.
+Diagnostics deployment ceilings are listed in the [admin guide](CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md#budget-генерации-и-временный-capture).
+Capture byte quotas do not increase the LLM request/response byte limits.
+
+`assistant.llm.maxTokens` defaults to `16384`; every Assistant LiteLLM request sends
+its effective value as `max_tokens`, bounded by deployment ceiling
+`CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE=131072`. Recreate the backend after env changes.
+
+`GET`/`PUT /cmdbuild/custom-api/config` preserve requested RAW `assistant.llm.maxTokens`
+and numeric `assistant.diagnostics` policy values; execution uses effective caps.
+Responses expose `diagnostics.limits` (`requested`, `effectiveLimit`, `clampedBy`),
+`warnings`, and `effectiveAssistantDiagnostics`. Invalid numbers (including numeric
+strings, zero, negative, fractional or unsafe integers) return HTTP `422`, code
+`runtime_config_invalid`, before any CMDBuild write. Correct the request; do not
+replace the saved RAW value with an effective ceiling to hide a warning.
+
+#### Security Rollout
+
+The user approved deleting **all existing diagnostic history**, across roots but
+only inside this project's diagnostics namespace. Stop all old backend writers,
+run the reviewed offline purge CLI supplied by the rollout owner, verify that old
+diagnostic keys are gone, then start the new backend. Do not start it before purge
+completes. No public purge endpoint is planned; the root-scoped clear API is not
+a replacement. Never use `FLUSHDB`/`FLUSHALL` or delete unrelated project keys.
+Keep front/backend ports `8088`/`8093`; templates, prompts and business data are
+unchanged. Legacy diagnostic history is not supported. Use the exact offline
+commands in [Security Purge](CONTAINER_DEPLOYMENT_ADMIN_GUIDE.md#assistant-diagnostics-security-purge).
+The helper imports without starting HTTP, preserves epoch keys and covers old/new
+history across all roots, including orphan keys and active capture control.
+Before startup, repeat purge with writers still stopped and require `deletedKeys: 0`.
+Root executes this during final rollout; purge has not been performed by this docs task.
+Do not raise limits automatically on `finish_reason=length`: inspect model/provider
+context/output limits, timeouts, response byte budget and cost before an operator change.
+
 ### Local nginx restart loop
 
 The local ports are a contract: do not change `8088`, `8093`, `8090`, or `6379` to work around a failure. First inspect the rendered configuration and the container environment:

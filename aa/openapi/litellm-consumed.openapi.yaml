@@ -40,7 +40,10 @@ paths:
       description: >
         Отправляет Accept и Content-Type application/json. Caller ограничивает
         request/response bytes, ставит AbortController deadline и читает только
-        choices[0].message.content. Непустой content далее проходит JSON parsing
+        choices[0].message.content для генерации. Временный Assistant capture
+        дополнительно сохраняет bounded redacted outer response, content,
+        finish_reason и detailed usage; invalid JSON не заменяется пустым объектом.
+        Непустой content далее проходит JSON parsing
         и детерминированную валидацию соответствующего authoring endpoint.
         Успешный LLM HTTP ответ не означает сохранённый или валидный template.
         При не-2xx статус upstream сохраняется с code=litellm_error; сообщение
@@ -108,9 +111,13 @@ components:
           description: CMDP_ASSISTANT_TEMPERATURE, ограниченный caller
         max_tokens:
           type: integer
-          minimum: 256
-          maximum: 8192
-          description: CMDP_ASSISTANT_MAX_TOKENS, ограниченный caller
+          minimum: 1
+          default: 16384
+          description: >
+            Effective assistant.llm.maxTokens из RuntimeConfig выбранного root;
+            ограничен CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE (default 131072).
+            Deployment ceiling может быть изменён оператором, поэтому не задан
+            статический maximum. Применяется ко всем Assistant стадиям.
     ChatCompletionResponse:
       type: object
       required: [choices]
@@ -122,6 +129,10 @@ components:
             type: object
             required: [message]
             properties:
+              finish_reason:
+                type: string
+                nullable: true
+                description: Причина завершения provider, включая length; значения не ограничены локальным enum
               message:
                 type: object
                 required: [content]
@@ -130,6 +141,19 @@ components:
                     type: string
                     minLength: 1
                     description: Текст для последующей типизированной валидации
+        id:
+          type: string
+          description: Идентификатор ответа provider, если присутствует
+        usage:
+          type: object
+          description: Token usage с provider-specific details, включая reasoning/cached tokens при наличии
+          properties:
+            prompt_tokens: { type: integer }
+            completion_tokens: { type: integer }
+            total_tokens: { type: integer }
+            prompt_tokens_details: { type: object, additionalProperties: true }
+            completion_tokens_details: { type: object, additionalProperties: true }
+          additionalProperties: true
       additionalProperties: true
     ProviderError:
       type: object

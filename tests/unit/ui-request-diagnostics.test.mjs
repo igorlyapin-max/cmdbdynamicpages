@@ -13,6 +13,20 @@ const context = {
 };
 const result = (json, extra = {}) => ({ status: 502, ok: false, json, body: '', contentType: 'application/json', requestId: 'server-456', ...extra });
 
+test('clamp diagnostics and scoped owner survive projection without arbitrary payload', () => {
+  const limit = { settingPath: 'assistant.llm.maxTokens', requested: 99999, rawConfigured: 99999, effectiveLimit: 8192,
+    configuredLimit: 8192, absoluteCap: 8192, clamped: true, clampedBy: 'TOKEN_CAP', source: 'config', tool: 'assistant.llm', rawBody: 'private' };
+  const diagnostic = api.response(result({ diagnostics: { limits: [limit], assistantTrace: { traceId: 'trace', storageStatus: 'pending' } } }),
+    { ...context, owner: { ...context.owner, root: 'A', rootSelectionGeneration: 2, editorInstance: 3, sessionInstance: 4 } });
+  assert.deepEqual(diagnostic.diagnostics.limits[0], Object.fromEntries(Object.entries(limit).filter(([key]) => key !== 'rawBody')));
+  assert.equal(diagnostic.owner.root, 'A');
+  assert.equal(diagnostic.owner.rootSelectionGeneration, 2);
+  assert.equal(diagnostic.owner.editorInstance, 3);
+  assert.equal(diagnostic.owner.sessionInstance, 4);
+  assert.equal(diagnostic.assistantTrace.storageStatus, 'pending');
+  assert.doesNotMatch(api.serialize(diagnostic), /private/);
+});
+
 test('diagnostic ownership rejects stale template, section, revision, generation and runtime', () => {
   const source = fs.readFileSync(new URL('../../scripts/dev-proxy-server.mjs', import.meta.url), 'utf8');
   const state = { selectedTemplate: { code: 'sample' }, designerSection: 'assistant', uiDiagnosticGeneration: 2, uiDiagnosticRevision: 4 };
@@ -38,6 +52,19 @@ test('a client fallback request ID is not presented as a server confirmation', (
   const diagnostic = api.response(result({}, { requestId: 'client-123', serverRequestId: '' }), context);
   assert.equal(diagnostic.serverRequestId, '');
   assert.equal(diagnostic.clientRequestId, 'client-123');
+});
+
+test('Assistant trace references survive safe reports without admitting captured bodies', () => {
+  const diagnostic = api.response(result({ diagnostics: { assistantTrace: {
+    traceId: 'trace-123', requestId: 'request-456', status: 'running',
+    warning: 'Record is incomplete', request: { prompt: 'private-prompt' }, response: 'private-response'
+  } } }), context);
+  assert.deepEqual(diagnostic.assistantTrace, {
+    traceId: 'trace-123', requestId: 'request-456', status: 'running', warning: 'Record is incomplete'
+  });
+  assert.deepEqual(api.sanitize(diagnostic), diagnostic);
+  assert.deepEqual(JSON.parse(api.serialize(diagnostic)).assistantTrace, diagnostic.assistantTrace);
+  assert.doesNotMatch(api.serialize(diagnostic), /private-prompt|private-response/);
 });
 
 test('JSON 502 preserves approved error and limit metadata, not arbitrary payload', () => {

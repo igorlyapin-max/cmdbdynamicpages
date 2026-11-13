@@ -430,13 +430,25 @@ paths:
       x-flow-id: OAPI14
       tags: [config]
       summary: Конфигурация выполнения
+      description: >
+        Возвращает запрошенные RAW assistant.llm.maxTokens и числовую policy
+        assistant.diagnostics без подмены effective caps. diagnostics.limits и
+        warnings объясняют clamp; effectiveAssistantDiagnostics содержит effective policy.
       responses:
         "200":
           description: Данные карточки конфигурации
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuntimeConfigResponse"
     put:
       x-flow-id: OAPI15
       tags: [config]
       summary: Создать или обновить конфигурацию выполнения
+      description: >
+        Сохраняет запрошенные RAW assistant.llm.maxTokens и числовую policy
+        assistant.diagnostics; caps применяются при выполнении. Некорректные
+        числовые значения отклоняются до CMDBuild write. Не включает capture.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -449,6 +461,16 @@ paths:
       responses:
         "200":
           description: Конфигурация сохранена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuntimeConfigResponse"
+        "422":
+          description: Некорректные числовые Assistant settings; CMDBuild write не выполнялся
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuntimeConfigInvalidResponse"
   /cmdbuild/custom-api/assistant/object-flow/plan:
     post:
       x-flow-id: OAPI16
@@ -1698,8 +1720,267 @@ paths:
           description: Шаблон либо разрешённый публичный snapshot не найден
         default:
           description: Ошибка делегированного JSON run; см. соответствующий API-контракт
+  /cmdbuild/custom-api/assistant/diagnostics/status:
+    get:
+      x-flow-id: OAPI48
+      tags: [assistant, diagnostics]
+      summary: Прочитать временный режим capture выбранного root
+      description: >
+        Все diagnostics операции требуют валидную CMDBuild cookie,
+        admin_classes_modify и _can_read конфигурационного класса root.
+        Ответы, включая ошибки, Cache-Control no-store. Режим по умолчанию Off;
+        Basic сохраняет metadata, Verbose также bounded redacted тела.
+        Capture общий для всех пользователей root, хранится в Redis отдельно от
+        RuntimeConfig. Restart и сохранение policy не продлевают capture/retention.
+      parameters:
+        - $ref: "#/components/parameters/AssistantDiagnosticsRoot"
+      responses:
+        "200":
+          $ref: "#/components/responses/AssistantDiagnosticsStatus"
+        default:
+          $ref: "#/components/responses/AssistantDiagnosticsError"
+  /cmdbuild/custom-api/assistant/diagnostics/capture:
+    parameters:
+      - $ref: "#/components/parameters/AssistantDiagnosticsRoot"
+      - $ref: "#/components/parameters/AssistantDiagnosticsCsrf"
+    post:
+      x-flow-id: OAPI49
+      tags: [assistant, diagnostics]
+      summary: Временно включить Basic или Verbose capture для root
+      description: >
+        Admin-only и чтение root config; same-origin Origin/Referer и CSRF.
+        JSON body до 4096 bytes; confirmed=true подтверждает root-wide capture.
+        durationSec ограничен сохранённым captureDurationSec и максимумом 3600.
+        Policy не принимается из body; используется RuntimeConfig и deployment caps.
+        Redaction до Redis; тела не идут в stdout или external log sinks.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode, confirmed]
+              properties:
+                mode: { type: string, enum: [Basic, Verbose] }
+                confirmed: { type: boolean, enum: [true] }
+                durationSec:
+                  type: integer
+                  minimum: 1
+                  description: По умолчанию effective captureDurationSec policy; большее значение clamp, не новый постоянный режим
+      responses:
+        "200":
+          $ref: "#/components/responses/AssistantDiagnosticsStatus"
+        default:
+          $ref: "#/components/responses/AssistantDiagnosticsError"
+    delete:
+      x-flow-id: OAPI50
+      tags: [assistant, diagnostics]
+      summary: Остановить capture без удаления traces
+      description: >
+        Admin-only и чтение root config; same-origin Origin/Referer и CSRF.
+        Возвращает mode Off. Запрещает новый admission; уже принятые Redis traces
+        могут завершить запись без продления исходного expiry. Не очищает историю.
+      responses:
+        "200":
+          $ref: "#/components/responses/AssistantDiagnosticsStatus"
+        default:
+          $ref: "#/components/responses/AssistantDiagnosticsError"
+  /cmdbuild/custom-api/assistant/diagnostics/traces:
+    parameters:
+      - $ref: "#/components/parameters/AssistantDiagnosticsRoot"
+    get:
+      x-flow-id: OAPI51
+      tags: [assistant, diagnostics]
+      summary: Прочитать summaries traces выбранного root без тел
+      description: Admin-only и чтение root config. Новые traces первыми; quota/TTL могут удалить старые traces.
+      parameters:
+        - name: requestId
+          in: query
+          schema: { type: string, maxLength: 256 }
+        - name: templateCode
+          in: query
+          schema: { type: string, maxLength: 256 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200":
+          description: Bounded summaries без request/response bodies; no-store
+          headers:
+            Cache-Control:
+              schema: { type: string, enum: [no-store] }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, traces]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  traces:
+                    type: array
+                    maxItems: 100
+                    items:
+                      $ref: "#/components/schemas/AssistantDiagnosticTraceSummary"
+        default:
+          $ref: "#/components/responses/AssistantDiagnosticsError"
+    delete:
+      x-flow-id: OAPI52
+      tags: [assistant, diagnostics]
+      summary: Очистить retained traces root без остановки capture
+      description: >
+        Admin-only и чтение root config; same-origin Origin/Referer и CSRF.
+        Атомарное увеличение storage epoch инвалидирует pending/in-flight traces;
+        последующая запись не восстанавливает очищенную историю. Capture не останавливается.
+        Это root-scoped clear, не offline security purge всех roots проекта.
+      parameters:
+        - $ref: "#/components/parameters/AssistantDiagnosticsCsrf"
+      responses:
+        "200":
+          description: Traces удалены; no-store
+          headers:
+            Cache-Control:
+              schema: { type: string, enum: [no-store] }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success]
+                properties:
+                  success: { type: boolean, enum: [true] }
+        default:
+          $ref: "#/components/responses/AssistantDiagnosticsError"
+  /cmdbuild/custom-api/assistant/diagnostics/traces/{id}:
+    parameters:
+      - $ref: "#/components/parameters/AssistantDiagnosticsRoot"
+      - $ref: "#/components/parameters/AssistantDiagnosticTraceId"
+    get:
+      x-flow-id: OAPI53
+      tags: [assistant, diagnostics]
+      summary: Прочитать metadata trace и spans без тел
+      description: >
+        Admin-only и чтение root config. request/response исключены из каждого span;
+        для тел нужен отдельный span GET или export. Асинхронная запись может ещё
+        не быть доступна: UI повторяет чтение только известного pending reference
+        максимум 5 секунд. 404 также возможен после истечения, eviction или clear
+        и сам по себе не доказывает pending.
+      responses:
+        "200":
+          $ref: "#/components/responses/AssistantDiagnosticTrace"
+        default:
+          $ref: "#/components/responses/AssistantDiagnosticsError"
+  /cmdbuild/custom-api/assistant/diagnostics/traces/{id}/spans/{spanId}:
+    parameters:
+      - $ref: "#/components/parameters/AssistantDiagnosticsRoot"
+      - $ref: "#/components/parameters/AssistantDiagnosticTraceId"
+      - name: spanId
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-fA-F0-9-]{36}$' }
+    get:
+      x-flow-id: OAPI54
+      tags: [assistant, diagnostics]
+      summary: Прочитать отдельный redacted span с доступными телами
+      description: Admin-only и чтение root config. Basic не содержит тел; Verbose может содержать bounded invalid JSON в response.value.
+      responses:
+        "200":
+          description: Redacted span; no-store
+          headers:
+            Cache-Control:
+              schema: { type: string, enum: [no-store] }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, span]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  span:
+                    $ref: "#/components/schemas/AssistantDiagnosticSpan"
+        default:
+          $ref: "#/components/responses/AssistantDiagnosticsError"
+  /cmdbuild/custom-api/assistant/diagnostics/traces/{id}/export:
+    parameters:
+      - $ref: "#/components/parameters/AssistantDiagnosticsRoot"
+      - $ref: "#/components/parameters/AssistantDiagnosticTraceId"
+    get:
+      x-flow-id: OAPI55
+      tags: [assistant, diagnostics]
+      summary: Скачать redacted JSON trace с доступными телами
+      description: >
+        Admin-only и чтение root config. Envelope success/trace, не bare trace.
+        Content-Disposition attachment с именем assistant-trace-<id>.json;
+        no-store. Redaction не делает export публичными данными.
+      responses:
+        "200":
+          $ref: "#/components/responses/AssistantDiagnosticTrace"
+        default:
+          $ref: "#/components/responses/AssistantDiagnosticsError"
 components:
   responses:
+    AssistantDiagnosticsStatus:
+      description: Состояние capture; available/caps добавляются только status GET; no-store
+      headers:
+        Cache-Control:
+          schema: { type: string, enum: [no-store] }
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [success, status]
+            properties:
+              success: { type: boolean, enum: [true] }
+              status:
+                type: object
+                required: [mode, activeUntil, policy]
+                properties:
+                  mode: { type: string, enum: [Off, Basic, Verbose] }
+                  activeUntil: { type: string, format: date-time, nullable: true }
+                  available: { type: boolean }
+                  policy:
+                    $ref: "#/components/schemas/AssistantDiagnosticsPolicy"
+                  caps:
+                    $ref: "#/components/schemas/AssistantDiagnosticsPolicyCaps"
+    AssistantDiagnosticTrace:
+      description: Trace envelope; metadata GET без тел, export с телами при Verbose; no-store
+      headers:
+        Cache-Control:
+          schema: { type: string, enum: [no-store] }
+        Content-Disposition:
+          description: Только export возвращает attachment filename
+          schema: { type: string }
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [success, trace]
+            properties:
+              success: { type: boolean, enum: [true] }
+              trace:
+                $ref: "#/components/schemas/AssistantDiagnosticTrace"
+    AssistantDiagnosticsError:
+      description: >
+        400 invalid root/filters/ID/JSON/confirmation; 401 нет валидной сессии;
+        403 нет admin_classes_modify/root config read или CSRF/same-origin;
+        404 trace/span не найден или истёк; 405 неподдержанный метод;
+        413 capture body больше 4096 bytes; 415 нужен application/json;
+        502 ошибка upstream проверки config access; 503 diagnostics unavailable.
+        Ошибки также no-store. Redis не заменяется in-memory storage.
+      headers:
+        Cache-Control:
+          schema: { type: string, enum: [no-store] }
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [success]
+            properties:
+              success: { type: boolean, enum: [false] }
+              code: { type: string, description: При отказе storage assistant_diagnostics_unavailable }
+              message: { type: string }
+              status:
+                type: object
+                properties:
+                  available: { type: boolean, enum: [false] }
     CookieMissing:
       description: Cookie CMDBuild-Authorization отсутствует
       content:
@@ -1813,6 +2094,22 @@ components:
       in: header
       name: X-CMDBDynamicPages-CSRF
   parameters:
+    AssistantDiagnosticsRoot:
+      name: root
+      in: query
+      description: Технический root; всегда передавать явно для предотвращения диагностики другого root
+      schema: { type: string, default: Cst_QueryTool }
+    AssistantDiagnosticsCsrf:
+      name: X-CMDBDynamicPages-CSRF
+      in: header
+      required: true
+      description: Токен из GET /cmdbuild/custom-api/csrf; также нужен same-origin Origin или Referer
+      schema: { type: string }
+    AssistantDiagnosticTraceId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[a-fA-F0-9-]{36}$' }
     LogClear:
       name: clear
       in: query
@@ -1876,11 +2173,216 @@ components:
               bypassRefreshCooldown:
                 type: boolean
   schemas:
+    RuntimeConfigResponse:
+      type: object
+      required: [success, config, diagnostics, warnings, effectiveAssistantDiagnostics]
+      properties:
+        success: { type: boolean, enum: [true] }
+        root: { type: string }
+        className: { type: string }
+        cmdbuildStatus: { type: integer }
+        config:
+          type: object
+          description: Карточка конфигурации; runtimeConfig содержит requested RAW числа, не effective caps
+          properties:
+            runtimeConfig:
+              type: object
+              properties:
+                assistant:
+                  type: object
+                  properties:
+                    llm:
+                      type: object
+                      properties:
+                        maxTokens: { type: integer, minimum: 1, maximum: 9007199254740991, default: 16384 }
+                      additionalProperties: true
+                    diagnostics:
+                      $ref: "#/components/schemas/AssistantDiagnosticsPolicy"
+                  additionalProperties: true
+              additionalProperties: true
+          additionalProperties: true
+        diagnostics:
+          type: object
+          required: [limits]
+          properties:
+            limits:
+              type: array
+              description: Только clamped settings; пустой массив при отсутствии clamp
+              items:
+                $ref: "#/components/schemas/RuntimeConfigLimitDetail"
+        warnings:
+          type: array
+          items: { type: string }
+        effectiveAssistantDiagnostics:
+          $ref: "#/components/schemas/AssistantDiagnosticsPolicy"
+      additionalProperties: true
+    RuntimeConfigLimitDetail:
+      type: object
+      required: [settingPath, requested, effectiveLimit, clampedBy]
+      properties:
+        settingPath: { type: string, example: assistant.llm.maxTokens }
+        requested: { type: integer, minimum: 1 }
+        effectiveLimit: { type: integer, minimum: 1 }
+        clampedBy:
+          type: string
+          description: Deployment ceiling env или связанное ограничение policy
+          example: CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE
+        clamped: { type: boolean }
+        limitHit: { type: boolean }
+      additionalProperties: true
+    RuntimeConfigInvalidResponse:
+      type: object
+      required: [success, code, message, errors]
+      properties:
+        success: { type: boolean, enum: [false] }
+        code: { type: string, enum: [runtime_config_invalid] }
+        message: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              path: { type: string }
+              settingPath: { type: string }
+              reason: { type: string, enum: [positiveIntegerRequired] }
+              min: { type: integer, enum: [1] }
+              message: { type: string }
+      description: >
+        maxTokens и diagnostics policy требуют positive safe integer JSON numbers.
+        Строки, null, boolean, ноль, отрицательные, дробные и unsafe integers недопустимы.
+        Валидные числа выше deployment caps сохраняются RAW с warnings, не дают 422.
+    AssistantDiagnosticReference:
+      type: object
+      description: >
+        Необязательный diagnostics.assistantTrace в ответе Assistant, не гарантия persistence.
+        Запись асинхронна; pending означает известную запись в очереди,
+        stored подтверждает запись Redis, discarded означает lifecycle/quota rejection,
+        unavailable означает storage/control failure. Ошибка диагностики не меняет
+        основной результат Assistant. Capture control читается фоновым Redis poll
+        каждую 1 s; недоступный/старше 2 s control пропускает tracing с warning
+        без ожидания Redis на пути Assistant. Memory хранит control cache, не payload fallback.
+      properties:
+        traceId: { type: string, nullable: true }
+        requestId: { type: string }
+        storageStatus: { type: string, enum: [pending, stored, discarded, unavailable] }
+        warning: { type: string }
+      additionalProperties: true
+    AssistantDiagnosticsPolicy:
+      type: object
+      description: >
+        Сохранённая requested RAW assistant.diagnostics policy или effective policy
+        в effectiveAssistantDiagnostics/status; не активный режим.
+        Effective значения clamp по deployment ceilings; maxBodyBytes не больше
+        maxTraceBytes, maxTraceBytes не больше maxStoredBytes.
+        Effective captureDurationSec/retentionSec дополнительно ограничены 3600/604800.
+        Валидные RAW значения выше caps сохраняются без clamp.
+      required: [captureDurationSec, retentionSec, maxBodyBytes, maxTraceBytes, maxStoredBytes]
+      properties:
+        captureDurationSec: { type: integer, minimum: 1, maximum: 9007199254740991, default: 900 }
+        retentionSec: { type: integer, minimum: 1, maximum: 9007199254740991, default: 86400 }
+        maxBodyBytes: { type: integer, minimum: 1, default: 8388608 }
+        maxTraceBytes: { type: integer, minimum: 1, default: 33554432 }
+        maxStoredBytes: { type: integer, minimum: 1, default: 268435456 }
+    AssistantDiagnosticsPolicyCaps:
+      type: object
+      description: >
+        Deployment ceilings CMDP_ASSISTANT_DIAGNOSTICS_<SNAKE_CASE_FIELD>_ABSOLUTE.
+        Это ceilings, не defaults сохранённой policy и не активация capture.
+      properties:
+        captureDurationSec: { type: integer, default: 3600 }
+        retentionSec: { type: integer, default: 604800 }
+        maxBodyBytes: { type: integer, default: 8388608 }
+        maxTraceBytes: { type: integer, default: 33554432 }
+        maxStoredBytes: { type: integer, default: 268435456 }
+    AssistantDiagnosticTraceSummary:
+      type: object
+      required: [id, traceId]
+      properties:
+        id: { type: string }
+        traceId: { type: string }
+        requestId: { type: string }
+        templateCode: { type: string }
+        action: { type: string }
+        mode: { type: string, enum: [Basic, Verbose] }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: string, format: date-time, nullable: true }
+        statusCode: { type: integer, nullable: true }
+        status: { type: string }
+    AssistantDiagnosticTrace:
+      allOf:
+        - $ref: "#/components/schemas/AssistantDiagnosticTraceSummary"
+        - type: object
+          properties:
+            spans:
+              type: array
+              description: Metadata GET исключает request/response; span GET и export возвращают доступные bounded тела
+              items:
+                $ref: "#/components/schemas/AssistantDiagnosticSpan"
+            capture:
+              type: object
+              properties:
+                activeUntil: { type: string, format: date-time, nullable: true }
+                policy:
+                  $ref: "#/components/schemas/AssistantDiagnosticsPolicy"
+                truncated: { type: boolean }
+                reason: { type: string }
+              additionalProperties: true
+            diagnostics:
+              type: object
+              properties:
+                actualBytes: { type: integer }
+                redacted: { type: boolean }
+                truncated: { type: boolean }
+                omitted: { type: boolean }
+                reason: { type: string }
+              additionalProperties: true
+          additionalProperties: true
+    AssistantDiagnosticSpan:
+      type: object
+      properties:
+        id: { type: string }
+        kind: { type: string, description: Граница bff, mcp, cmdbuild или litellm }
+        name: { type: string }
+        method: { type: string }
+        path: { type: string }
+        durationMs: { type: number }
+        statusCode: { type: integer }
+        metadata:
+          type: object
+          description: >
+            Bounded redacted metadata границы: effective limits, finish_reason,
+            detailed usage, provider ID, content type/byte counts, parse error
+            reason/position при наличии. Нет требования наличия provider-specific
+            полей у всех spans; raw bodies здесь не публикуются.
+          additionalProperties: true
+        request:
+          $ref: "#/components/schemas/AssistantDiagnosticBody"
+        response:
+          $ref: "#/components/schemas/AssistantDiagnosticBody"
+      additionalProperties: true
+    AssistantDiagnosticBody:
+      type: object
+      description: Только Verbose; redaction до Redis и до clipping. Проверять truncated до интерпретации value.
+      required: [value, actualBytes, storedBytes, truncated, redacted]
+      properties:
+        value:
+          description: Redacted JSON object/array/scalar или исходный invalid JSON text; oversized структура может быть заменена marker
+          nullable: true
+        actualBytes: { type: integer, minimum: 0 }
+        storedBytes: { type: integer, minimum: 0 }
+        truncated: { type: boolean }
+        redacted: { type: boolean }
     ApiResponse:
       type: object
       properties:
         success:
           type: boolean
+        diagnostics:
+          type: object
+          properties:
+            assistantTrace:
+              $ref: "#/components/schemas/AssistantDiagnosticReference"
+          additionalProperties: true
       additionalProperties: true
     RuntimeJsonResult:
       type: object

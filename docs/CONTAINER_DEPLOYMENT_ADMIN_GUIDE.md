@@ -356,6 +356,118 @@ MCP-контекста и отдельно timeout одной LiteLLM-попыт
 контекст сопровождается предупреждением. `CMDP_ASSISTANT_TIMEOUT_MS` не поддерживается.
 Не увеличивайте timeout или лимиты каталога автоматически при ошибке.
 
+#### Budget генерации и временный capture
+
+`assistant.llm.maxTokens` выбранного root имеет default `16384`. Effective budget
+передаётся как `max_tokens` во всех Assistant LiteLLM calls, с deployment ceiling
+`CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE=131072` в `.env.example` и runtime Compose.
+После изменения env пересоздать backend. `CMDP_ASSISTANT_MAX_TOKENS` не поддержан.
+Context/output limits модели, byte budgets и timeout действуют независимо; больший
+budget не гарантирует завершение и может увеличить стоимость.
+
+`assistant.diagnostics` сохраняет policy, не активный режим: `captureDurationSec=900`
+(max `3600`), `retentionSec=86400` (max `604800`), `maxBodyBytes=8388608`,
+`maxTraceBytes=33554432`, `maxStoredBytes=268435456`. Deployment ceilings поставляются
+через env и runtime Compose:
+
+| Policy | Env ceiling | Default ceiling |
+| --- | --- | --- |
+| `captureDurationSec` | `CMDP_ASSISTANT_DIAGNOSTICS_CAPTURE_DURATION_SEC_ABSOLUTE` | `3600` |
+| `retentionSec` | `CMDP_ASSISTANT_DIAGNOSTICS_RETENTION_SEC_ABSOLUTE` | `604800` |
+| `maxBodyBytes` | `CMDP_ASSISTANT_DIAGNOSTICS_MAX_BODY_BYTES_ABSOLUTE` | `8388608` |
+| `maxTraceBytes` | `CMDP_ASSISTANT_DIAGNOSTICS_MAX_TRACE_BYTES_ABSOLUTE` | `33554432` |
+| `maxStoredBytes` | `CMDP_ASSISTANT_DIAGNOSTICS_MAX_STORED_BYTES_ABSOLUTE` | `268435456` |
+
+Byte ceilings могут быть изменены deployment-конфигурацией; capture/retention
+дополнительно имеют hard maxima `3600`/`604800` секунд. Effective policy нормализуется:
+`maxBodyBytes <= maxTraceBytes <= maxStoredBytes`. Capture budgets не увеличивают
+`assistant.llm.maxRequestBytes`/`maxResponseBytes` и не снимают upstream limits.
+
+Config API (`GET`/`PUT`, существующие OAPI14/OAPI15) сохраняет запрошенные RAW
+`assistant.llm.maxTokens` и числа `assistant.diagnostics`, не заменяя их caps.
+Ответы содержат `diagnostics.limits` с `requested`, `effectiveLimit`, `clampedBy`,
+массив `warnings` и effective policy в `effectiveAssistantDiagnostics`.
+Выполнение ограничено effective caps, включая порядок byte quotas.
+Некорректные значения (не positive safe integer JSON number) отклоняются HTTP
+`422 runtime_config_invalid` до CMDBuild write; исправлять нужно входной запрос.
+
+Capture `Off|Basic|Verbose`
+default `Off` хранится отдельно в Redis per root и действует для всех его пользователей.
+`Basic` сохраняет metadata, `Verbose` также bounded redacted тела, включая invalid JSON;
+`finish_reason` и detailed token usage помогают диагностировать output budget.
+Тела не идут в stdout; обычные structured logs и operational sink остаются обязательными.
+
+Для diagnostics API нужны `admin_classes_modify` плюс чтение конфигурации root;
+mutations дополнительно требуют same-origin CSRF. Все ответы `no-store`; redaction
+до Redis. Restart и сохранение policy не продлевают TTL capture/существующих traces.
+Отказ Redis не должен ломать Assistant. Capture не включается через
+`CMDP_DIAGNOSTIC_MODE`. API и очистка: [Assistant Capture](runbook.ru.md#assistant-capture),
+контракт: [OpenAPI](../aa/openapi.yaml).
+
+Control metadata обновляются background Redis poll каждые 1 s. При отсутствии,
+отказе или давности control более 2 s tracing пропускается с warning без задержки
+Assistant. В memory кешируется только control; trace data хранятся только в Redis,
+payload fallback отсутствует. Асинхронная запись возвращает ссылку
+`diagnostics.assistantTrace.storageStatus=pending|stored|discarded|unavailable`; UI читает её
+лениво и повторяет известный `pending` максимум 5 s.
+Begin/update атомарны: update через `XX` сохраняет исходный expiry и проверяет epoch,
+не воскрешая expired/evicted/cleared traces. Clear (OAPI52) инвалидирует также
+pending/in-flight записи; stop (OAPI50) разрешает завершить уже принятые Redis traces.
+
+**Security rollout, обязательный порядок:** пользователь явно одобрил purge всей
+существующей диагностической истории всех roots, только в diagnostics namespace
+проекта. Redaction credentials теперь покрывает malformed JSON; старую историю
+не переносить. Остановить все старые backend writers, выполнить reviewed offline
+purge CLI и проверить удаление старых diagnostic keys, затем запустить новый backend.
+Команды приведены ниже. Public purge endpoint не планируется; root clear API не заменяет
+offline purge. `FLUSHDB`/`FLUSHALL` запрещены; прочие project keys, templates, prompts
+и business data не менять. Front/backend остаются на `8088`/`8093`.
+Legacy для старой диагностической истории не поддержана. Default `Off`, capture
+15 минут и retention 24 часа не меняются. Документация не подтверждает выполнение purge.
+
+#### Assistant Diagnostics Security Purge
+
+Выполняет root при финальном rollout, не в рамках docs-задачи. Подставить новый
+image с helper и runtime env этого стенда; Redis URL и key prefix должны указывать
+на тот же project namespace, где работали старые writers. Все writers этого
+namespace, включая другие replicas и локальные backend процессы, должны быть
+остановлены до purge и оставаться остановленными до окончания проверки.
+Флаги `confirmed`/`writersStopped` подтверждают действия оператора, а не останавливают writers.
+При любой ошибке не переходить к следующему шагу и не запускать backend.
+
+1. Задать image/env, остановить backend и выполнить offline purge новым image:
+
+```bash
+export CMDBDYNAMIC_IMAGE='<newimage>'
+RUNTIME_ENV='<runtime.env>'
+docker compose --env-file "$RUNTIME_ENV" -f docker-compose.runtime.yml stop cmdbdynamicpages
+docker compose --env-file "$RUNTIME_ENV" -f docker-compose.runtime.yml run --rm --no-deps cmdbdynamicpages node --input-type=module -e 'import { purgeAssistantDiagnosticHistory } from "./scripts/dev-proxy-server.mjs"; console.log(JSON.stringify(await purgeAssistantDiagnosticHistory({confirmed:true,writersStopped:true})));'
+```
+
+2. Повторить ту же purge-команду при остановленных writers:
+
+```bash
+docker compose --env-file "$RUNTIME_ENV" -f docker-compose.runtime.yml run --rm --no-deps cmdbdynamicpages node --input-type=module -e 'import { purgeAssistantDiagnosticHistory } from "./scripts/dev-proxy-server.mjs"; console.log(JSON.stringify(await purgeAssistantDiagnosticHistory({confirmed:true,writersStopped:true})));'
+```
+
+Требовать успешное завершение и `deletedKeys: 0` во втором JSON-результате.
+Сохранённые `:epoch` keys ожидаемы и не означают оставшуюся историю. Ненулевой
+повторный результат требует диагностики writers/namespace; backend не запускать.
+
+3. Только после успешной проверки пересоздать backend:
+
+```bash
+docker compose --env-file "$RUNTIME_ENV" -f docker-compose.runtime.yml up -d --no-deps --force-recreate cmdbdynamicpages
+```
+
+`purgeAssistantDiagnosticHistory` импортируется без запуска HTTP server. Helper
+использует `SCAN` только по `sha256(keyPrefix).slice(0,16) + ':assistant-diagnostics:*'`,
+пропускает `:epoch` и выполняет `UNLINK` порциями по 200 keys, без `FLUSH`.
+Удаляются старые и новые diagnostic records всех roots проекта, включая orphan
+keys и active capture control. Epoch сохраняются, чтобы старые записи не воскресали.
+Новый публичный endpoint и legacy history migration не нужны. Bundled nginx не
+перезапускается; fixed ports `8088`/`8093` сохраняются.
+
 ### 4. Проверить всю цепочку и диагностировать ошибки
 
 Локальный `504` из-за deadline/abort backend и upstream `504`, полученный от
