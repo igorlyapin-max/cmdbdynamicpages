@@ -25,7 +25,7 @@ function clientScript() {
   assert.ok(script.includes(startup));
   // Suppress only startup I/O; retain the real renderers, event handlers and request pipeline.
   return script.replace(startup, `window.remediation = { state, assistantDiagnosticsUi, renderDesigner,
-    captureVisibleDesignerState, captureRuntimeSettings, runtimeSettingsDraft, defaultRuntimeConfig };
+    captureVisibleDesignerState, captureRuntimeSettings, runtimeSettingsDraft, defaultRuntimeConfig, defaultSpec };
     setupLanguageSelector();`);
 }
 
@@ -48,7 +48,7 @@ async function withClient(viewport, scenario) {
       });
       const response = new Promise((resolve) => { reply = resolve; });
       expected.push({ method, pathname, receive, response, timer });
-      return { received, respond: reply };
+      return { received, respond: (json, status = 200) => reply({ json, status }), fail: () => reply({ abort: true }) };
     };
     await context.route('**/*', async (route) => {
       const request = route.request();
@@ -63,7 +63,8 @@ async function withClient(viewport, scenario) {
         const item = expected.splice(index, 1)[0];
         clearTimeout(item.timer);
         item.receive(call);
-        return route.fulfill({ json: await item.response });
+        const response = await item.response;
+        return response.abort ? route.abort('failed') : route.fulfill(response);
       }
       if (url.origin === 'http://remediation.test' && call.method === 'GET') {
         if (url.pathname === '/cmdbuild/custom-api/csrf') return route.fulfill({ json: { success: true, token: 'mock-csrf' } });
@@ -98,12 +99,150 @@ async function assertVisible(locator, viewport) {
   assert.ok(box && box.width > 100 && box.height > 0 && box.x >= 0 && box.x + box.width <= viewport.width, 'usable visible geometry');
 }
 
+async function openSemanticPlan(page, language = 'ru') {
+  await page.locator('#cmdp-language').selectOption(language);
+  await page.evaluate(() => {
+    const ui = window.remediation;
+    ui.state.selectedTemplate = { code: 'retry-test', spec: ui.defaultSpec() };
+    ui.state.assistantObjectFlowIntent = { context: 'Devices', blocks: [
+      { id: 'devices', name: 'Devices', description: 'Devices', resultKind: 'cards', uses: [] }
+    ] };
+    ui.state.designerSection = 'assistant';
+    ui.renderDesigner();
+  });
+}
+
+const semanticPath = '/cmdbuild/custom-api/assistant/object-flow/semantic-plan';
+
+for (const viewport of [{ width: 1280, height: 900 }, { width: 390, height: 844 }]) {
+  for (const language of ['ru', 'en']) {
+    test(`invalid JSON permits only manual checkpoint retry in ${language} at ${viewport.width}px`, async () => {
+      await withClient(viewport, async ({ page, expectRequest, writes }) => {
+        await openSemanticPlan(page, language);
+        const context = expectRequest('POST', semanticPath);
+        await page.locator('[data-action="assistant-flow-prepare"]').click();
+        const initial = await context.received;
+        const checkpoint = { resumeId: initial.body.resumeId, stage: 'mcpContextReady', expiresAt: new Date(Date.now() + 60000).toISOString() };
+        const plan = expectRequest('POST', semanticPath);
+        context.respond({ success: true, checkpoint });
+        assert.equal((await plan.received).body.stage, 'plan');
+        plan.respond({ success: false, code: 'assistant_invalid_json', retryable: true, resume: checkpoint }, 502);
+        const retry = page.locator('[data-action="assistant-flow-prepare-retry"]');
+        await retry.waitFor();
+        await assertVisible(retry, viewport);
+        const rejected = page.locator('[data-assistant-flow-rejected]');
+        await assertVisible(rejected, viewport);
+        assert.match(await rejected.innerText(), language === 'ru' ? /Модель вернула текст вместо JSON-плана; результат не применен/ : /model returned text instead of a JSON plan; not applied/);
+        assert.equal(await page.locator('[data-action="assistant-flow-apply"]').isDisabled(), true);
+        await page.waitForTimeout(100);
+        assert.equal(writes.filter((call) => call.path === semanticPath).length, 2, 'no automatic retry');
+        const manual = expectRequest('POST', semanticPath);
+        await retry.click();
+        const resumed = await manual.received;
+        assert.equal(resumed.body.stage, 'plan');
+        assert.equal(resumed.body.resumeId, initial.body.resumeId);
+        assert.equal(resumed.root, initial.root);
+        manual.respond({ success: false, code: 'assistant_invalid_json', retryable: false, resume: checkpoint }, 502);
+        await page.waitForFunction(() => !window.remediation.state.assistantFlowBusy);
+        assert.equal(await retry.count(), 0, 'server denial wins even with saved checkpoint');
+        assert.equal(await page.evaluate(() => window.remediation.state.assistantFlowResume), null);
+        assert.equal(await page.evaluate(() => window.remediation.state.assistantFlowSemanticPlan), null);
+        await page.screenshot({ path: `/tmp/assistant-retry-${language}-${viewport.width}.png`, fullPage: true });
+      });
+    });
+  }
+}
+
+for (const mode of ['missing', 'wrong-id', 'expired', 'wrong-stage', 'string-true', 'no-flag', 'auth', 'network']) {
+  test(`semantic retry rejects ${mode} server contract`, async () => {
+    await withClient({ width: 1280, height: 900 }, async ({ page, expectRequest, writes }) => {
+      await openSemanticPlan(page);
+      const pending = expectRequest('POST', semanticPath);
+      await page.locator('[data-action="assistant-flow-prepare"]').click();
+      const initial = await pending.received;
+      const resume = { resumeId: mode === 'wrong-id' ? 'other' : initial.body.resumeId,
+        stage: mode === 'wrong-stage' ? 'completed' : 'mcpContextReady',
+        expiresAt: new Date(Date.now() + (mode === 'expired' ? -60000 : 60000)).toISOString() };
+      if (mode === 'network') pending.fail();
+      else pending.respond({ success: false, code: mode === 'auth' ? 'permission_denied' : 'assistant_invalid_json',
+        ...(mode === 'no-flag' ? {} : { retryable: mode === 'string-true' ? 'true' : mode !== 'auth' }),
+        resume: mode === 'missing' ? null : resume }, mode === 'auth' ? 403 : 502);
+      await page.waitForFunction(() => !window.remediation.state.assistantFlowBusy);
+      assert.equal(await page.locator('[data-action="assistant-flow-prepare-retry"]').count(), 0);
+      assert.equal(await page.evaluate(() => window.remediation.state.assistantFlowResume), null);
+      assert.equal(writes.filter((call) => call.path === semanticPath).length, 1);
+    });
+  });
+}
+
+for (const language of ['ru', 'en']) {
+  for (const [code, retryable, summary] of [
+    ['assistant_empty_response', true, { ru: 'Модель вернула пустой ответ; результат не применен.', en: 'The model returned an empty response; not applied.' }],
+    ['assistant_output_truncated', false, { ru: 'Ответ модели обрезан; результат не применен.', en: 'The model response was truncated; not applied.' }],
+    ['assistant_response_format_unsupported', false, { ru: 'Провайдер не поддерживает выбранный формат ответа; результат не применен.', en: 'The provider does not support the selected response format; not applied.' }]
+  ]) {
+    test(`${code} localized in ${language}, retryable=${retryable}`, async () => {
+      await withClient({ width: 1280, height: 900 }, async ({ page, expectRequest }) => {
+        await openSemanticPlan(page, language);
+        const pending = expectRequest('POST', semanticPath);
+        await page.locator('[data-action="assistant-flow-prepare"]').click();
+        const initial = await pending.received;
+        pending.respond({ success: false, code, retryable, resume: {
+          resumeId: initial.body.resumeId, stage: 'mcpContextReady', expiresAt: new Date(Date.now() + 60000).toISOString()
+        } }, 502);
+        await page.waitForFunction(() => !window.remediation.state.assistantFlowBusy);
+        const rejected = page.locator('[data-assistant-flow-rejected]');
+        await assertVisible(rejected, { width: 1280 });
+        assert.ok((await rejected.innerText()).includes(summary[language]));
+        if (code === 'assistant_response_format_unsupported') assert.match(await rejected.innerText(), /assistant\.llm\.responseFormat/);
+        if (code === 'assistant_output_truncated') {
+          assert.match(await rejected.innerText(), /assistant\.llm\.maxTokens/);
+          assert.match(await rejected.innerText(), language === 'ru' ? /автоматически не увеличиваются/ : /not increased automatically/);
+        }
+        assert.equal(await page.locator('[data-action="assistant-flow-prepare-retry"]').count(), Number(retryable));
+        assert.match(await rejected.locator('h4').innerText(), retryable
+          ? language === 'ru' ? /приостановлен/ : /paused/
+          : language === 'ru' ? /отклонен/ : /rejected/);
+      });
+    });
+  }
+}
+
+for (const ownership of ['generation', 'root', 'session']) {
+  test(`semantic response cannot replace ${ownership} ownership`, async () => {
+    await withClient({ width: 1280, height: 900 }, async ({ page, expectRequest }) => {
+      await openSemanticPlan(page);
+      const pending = expectRequest('POST', semanticPath);
+      await page.locator('[data-action="assistant-flow-prepare"]').click();
+      const initial = await pending.received;
+      await page.evaluate((ownership) => {
+        const state = window.remediation.state;
+        if (ownership === 'generation') state.assistantFlowRequestGeneration++;
+        if (ownership === 'root') { const root = state.root; state.root = 'Other_QueryTool'; state.root = root; }
+        if (ownership === 'session') state.sessionInstance++;
+        state.assistantFlowResume = null;
+        state.assistantFlowBusy = true;
+        state.assistantFlowFeedback = { summary: 'Current owner feedback' };
+      }, ownership);
+      const ack = page.waitForResponse((response) => new URL(response.url()).pathname === semanticPath);
+      pending.respond({ success: false, code: 'assistant_invalid_json', retryable: true,
+        resume: { resumeId: initial.body.resumeId, stage: 'mcpContextReady', expiresAt: new Date(Date.now() + 60000).toISOString() } }, 502);
+      await ack;
+      await page.waitForTimeout(100);
+      assert.equal(await page.evaluate(() => window.remediation.state.assistantFlowFeedback.summary), 'Current owner feedback');
+      assert.equal(await page.evaluate(() => window.remediation.state.assistantFlowResume), null);
+      assert.equal(await page.evaluate(() => window.remediation.state.assistantFlowBusy), true, 'stale finally preserves current owner busy state');
+    });
+  });
+}
+
 for (const viewport of [{ width: 1280, height: 900 }, { width: 390, height: 844 }]) {
   test(`embedded client raw settings and trace filters survive rerender at ${viewport.width}px`, async () => {
     await withClient(viewport, async ({ page, expectRequest, writes }) => {
       await page.locator('#cmdp-assistant-llm-max-tokens').fill('not-a-number');
       await page.locator('#cmdp-assistant-system-prompt').fill('unsaved prompt\nsecond line');
       await page.locator('#cmdp-assistant-llm-model').fill('unsaved-model');
+      await page.locator('#cmdp-assistant-llm-response-format').selectOption('prompt');
       await page.locator('#cmdp-assistant-mcp-enabled').check();
       await page.locator('#cmdp-language').selectOption('en');
       await page.locator('[data-designer-section="about"]').click();
@@ -112,6 +251,10 @@ for (const viewport of [{ width: 1280, height: 900 }, { width: 390, height: 844 
       assert.equal(await page.locator('#cmdp-assistant-llm-max-tokens').inputValue(), 'not-a-number');
       assert.equal(await page.locator('#cmdp-assistant-system-prompt').inputValue(), 'unsaved prompt\nsecond line');
       assert.equal(await page.locator('#cmdp-assistant-llm-model').inputValue(), 'unsaved-model');
+      assert.equal(await page.locator('#cmdp-assistant-llm-response-format').inputValue(), 'prompt');
+      await page.locator('#cmdp-assistant-llm-max-tokens').fill('16384');
+      assert.equal(await page.evaluate(() => window.remediation.captureRuntimeSettings('Cst_QueryTool').runtimeConfig.assistant.llm.responseFormat), 'prompt');
+      await page.locator('#cmdp-assistant-llm-max-tokens').fill('not-a-number');
       assert.equal(await page.locator('#cmdp-assistant-mcp-enabled').isChecked(), true);
       await assertVisible(page.locator('#cmdp-assistant-llm-model'), viewport);
       assert.equal(await page.evaluate(() => { try { window.remediation.captureRuntimeSettings('Cst_QueryTool'); return false; } catch { return true; } }), true);

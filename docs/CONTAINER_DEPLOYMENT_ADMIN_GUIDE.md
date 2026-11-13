@@ -358,6 +358,14 @@ MCP-контекста и отдельно timeout одной LiteLLM-попыт
 
 #### Budget генерации и временный capture
 
+В Runtime settings настройка `assistant.llm.responseFormat`: `json_object`
+(по умолчанию, явный `response_format` в запросе) или `prompt` (только инструкция
+вернуть JSON для провайдера без поддержки параметра). Переключение выполняет
+оператор; скрытого fallback и автоматического повтора нет. JSON-режим не заменяет
+проверку схемы и детерминированную валидацию. При ошибке формата не увеличивайте
+`maxTokens` или timeout без доказательства достижения соответствующего лимита.
+Проверка передачи задачи и контекста: [runbook](runbook.ru.md#формат-ответа-и-потеря-задачи-моделью).
+
 `assistant.llm.maxTokens` выбранного root имеет default `16384`. Effective budget
 передаётся как `max_tokens` во всех Assistant LiteLLM calls, с deployment ceiling
 `CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE=131072` в `.env.example` и runtime Compose.

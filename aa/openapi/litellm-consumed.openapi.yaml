@@ -118,6 +118,16 @@ components:
             ограничен CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE (default 131072).
             Deployment ceiling может быть изменён оператором, поэтому не задан
             статический maximum. Применяется ко всем Assistant стадиям.
+        response_format:
+          type: object
+          additionalProperties: false
+          required: [type]
+          properties:
+            type: { type: string, enum: [json_object] }
+          description: >
+            Передаётся при assistant.llm.responseFormat=json_object (default).
+            В режиме prompt отсутствует. Неподдерживаемый формат не вызывает
+            автоматического переключения или повторного запроса.
     ChatCompletionResponse:
       type: object
       required: [choices]

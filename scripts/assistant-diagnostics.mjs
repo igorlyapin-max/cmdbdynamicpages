@@ -123,6 +123,19 @@ export function redactAssistantDiagnosticValue(value, { secretValues = [], maxBy
       const headerDescriptor = typeof item.name === 'string' && sensitiveKey.test(compactKey(item.name));
       for (const [key, entry] of Object.entries(item)) {
         const safeKey = cleanString(key);
+        // This credential-shaped setting contains numeric evidence, not free-form metadata.
+        if (key === 'maxTokens' && path.at(-1) === 'limits' && (path.length === 1 || path.at(-2) === 'metadata') &&
+            entry && typeof entry === 'object' && !Array.isArray(entry)) {
+          const detail = Object.create(null);
+          for (const field of ['rawConfigured', 'configuredLimit', 'effectiveLimit', 'requested', 'limit', 'absoluteCap']) {
+            if (Object.hasOwn(entry, field) && typeof entry[field] === 'number' && Number.isFinite(entry[field])) detail[field] = entry[field];
+          }
+          if (typeof entry.clamped === 'boolean') detail.clamped = entry.clamped;
+          if (entry.clampedBy === '' || entry.clampedBy === 'CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE') detail.clampedBy = entry.clampedBy;
+          output[safeKey] = detail;
+          redacted ||= Object.keys(detail).length !== Object.keys(entry).length;
+          continue;
+        }
         const numericUsage = typeof entry === 'number' && Number.isFinite(entry) && usageTokenKey.test(compactKey(key)) &&
           (usageContext.test(path.at(-1) ?? '') || (/^max(?:completion)?tokens$/i.test(compactKey(key)) &&
             (path.length === 0 || /^(?:request|parameters|metadata|generation|generationSettings)$/i.test(path.at(-1)))));

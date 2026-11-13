@@ -2091,6 +2091,8 @@ test('Live Assistant trace can be captured and inspected through the deployed UI
       await page.locator('[data-action="assistant-flow-prepare"]').click();
       const response = await responsePromise;
       const result = await response.json();
+      assert.equal(response.status(), 200, `Semantic plan must complete, not just emit a trace: ${result.code || ''}`);
+      assert.ok(result.semanticPlan?.blocks?.length > 0);
       const traceId = result.diagnostics?.assistantTrace?.traceId;
       assert.ok(traceId, `Missing trace reference: HTTP ${response.status()} ${result.code || ''}`);
       const snapshotDeadline = Date.now() + 10000;
@@ -2105,6 +2107,13 @@ test('Live Assistant trace can be captured and inspected through the deployed UI
       await llm.locator('summary').first().click();
       await page.waitForFunction(() => Array.from(document.querySelectorAll('[data-debug-span-body]')).some((el) => el.textContent.includes('finish_reason')), { timeout: 10000 });
       const trace = (await api(`assistant/diagnostics/traces/${traceId}/export?root=Cst_QueryTool`)).trace;
+      const llmTrace = trace.spans.find((span) => span.kind === 'litellm');
+      assert.equal(llmTrace.metadata.responseFormat, 'json_object');
+      assert.equal(typeof llmTrace.metadata.limits.maxTokens.requested, 'number');
+      assert.equal(llmTrace.request.value.response_format.type, 'json_object');
+      const taskMessages = llmTrace.request.value.messages.filter((message) => message.role === 'user');
+      assert.ok(JSON.parse(taskMessages.at(-1).content).intent.blocks.length > 0);
+      assert.equal(typeof JSON.parse(taskMessages.at(-2).content).mcpContext.data, 'object');
       assert.ok(trace.spans.some((span) => span.kind === 'litellm' && span.metadata.finish_reason), JSON.stringify({ status: response.status(), code: result.code, traceStatus: trace.status, llm: trace.spans.filter((span) => span.kind === 'litellm').map((span) => ({ status: span.statusCode, metadata: span.metadata })) }));
       const contextResponse = await (await contextResponsePromise).json();
       const contextTrace = (await api(`assistant/diagnostics/traces/${contextResponse.diagnostics.assistantTrace.traceId}/export?root=Cst_QueryTool`)).trace;

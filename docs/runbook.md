@@ -161,6 +161,29 @@ strings, zero, negative, fractional or unsafe integers) return HTTP `422`, code
 `runtime_config_invalid`, before any CMDBuild write. Correct the request; do not
 replace the saved RAW value with an effective ceiling to hide a warning.
 
+#### Response Format And Lost Task Instructions
+
+Runtime setting `assistant.llm.responseFormat` accepts `json_object` (default,
+sends `response_format: {"type":"json_object"}`) or `prompt` (JSON instructions
+without that parameter). The operator selects `prompt` when the provider lacks
+JSON mode. There is no automatic downgrade. Both modes retain deterministic
+proposal validation before any explicit apply action.
+
+- `assistant_invalid_json`: text or malformed JSON from the provider; a manual
+  retry can reuse the valid MCP checkpoint, without an automatic provider retry.
+- `assistant_empty_response`: no assistant content was returned.
+- `assistant_output_truncated`: `finish_reason=length`; the proposal is rejected.
+- `assistant_response_format_unsupported`: explicit provider rejection; fix the
+  format setting or provider configuration instead of increasing timeouts.
+
+Compare provider HTTP status, BFF status and `finish_reason` in the trace. If a
+catalog summary replaces the task, inspect the LiteLLM-to-model request for all
+system messages, the final task, the effective context window, chat template and
+input truncation policy. Compare short and full tasks on the same route. A token
+count near 16K alone does not prove truncation. The BFF trace proves what was sent
+to LiteLLM, not what the model received. Keep Verbose temporary and redact traces
+before sharing them.
+
 #### Security Rollout
 
 The user approved deleting **all existing diagnostic history**, across roots but

@@ -13,6 +13,19 @@ const context = {
 };
 const result = (json, extra = {}) => ({ status: 502, ok: false, json, body: '', contentType: 'application/json', requestId: 'server-456', ...extra });
 
+test('provider status and context preparation evidence remain visible without raw payloads', () => {
+  const diagnostic = api.response(result({ diagnostics: {
+    llm: { upstreamStatus: 200, responseFormat: 'json_object', finish_reason: 'stop', maxTokens: 16384,
+      usage: { prompt_tokens: 321, completion_tokens: 12, total_tokens: 333 }, raw: 'hidden-raw' },
+    mcp: { contextAssembly: { beforeBytes: 10000, afterBytes: 2000, beforeClasses: 20, afterClasses: 2, raw: 'hidden-catalog' } }
+  } }), context);
+  assert.equal(diagnostic.diagnostics.llm.upstreamStatus, 200);
+  assert.equal(diagnostic.diagnostics.llm.maxTokens, 16384);
+  assert.equal(diagnostic.diagnostics.llm.usage.total_tokens, 333);
+  assert.equal(diagnostic.diagnostics.mcp.contextAssembly.afterBytes, 2000);
+  assert.doesNotMatch(api.serialize(diagnostic), /hidden-/);
+});
+
 test('clamp diagnostics and scoped owner survive projection without arbitrary payload', () => {
   const limit = { settingPath: 'assistant.llm.maxTokens', requested: 99999, rawConfigured: 99999, effectiveLimit: 8192,
     configuredLimit: 8192, absoluteCap: 8192, clamped: true, clampedBy: 'TOKEN_CAP', source: 'config', tool: 'assistant.llm', rawBody: 'private' };

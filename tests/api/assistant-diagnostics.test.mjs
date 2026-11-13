@@ -114,8 +114,10 @@ async function fixture(t, options = {}) {
     for await (const chunk of req) body += chunk;
     outgoing.push(JSON.parse(body));
     if (options.llmDelay) await options.llmDelay();
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ id: 'provider-test-id', choices: [{ message: { content: options.content || '{invalid provider JSON diagnostic-test-key admin-test-session' }, finish_reason: 'length' }], usage: { total_tokens: 42 } }));
+    res.writeHead(options.llmStatus || 200, { 'content-type': 'application/json' });
+    if (options.rawResponse !== undefined) return res.end(options.rawResponse);
+    const completion = typeof options.completion === 'function' ? options.completion(outgoing.length) : options.completion;
+    res.end(JSON.stringify(completion || { id: 'provider-test-id', choices: [{ message: { content: options.content ?? '{invalid provider JSON diagnostic-test-key admin-test-session' }, finish_reason: options.finishReason || 'stop' }], usage: { total_tokens: 42 } }));
   });
   const llmPort = await listen(t, llm);
   const runtime = { assistant: { llm: { enabled: true, model: 'test-model', baseUrl: `http://127.0.0.1:${llmPort}`, maxTokens: 4567 }, mcp: { enabled: true } } };
@@ -235,8 +237,11 @@ test('capture stores safe ingress, metadata excludes bodies, full spans/export r
   {
     assert.equal(f.outgoing[0].max_tokens, 4567);
     const llm = exported.json.trace.spans.find((item) => item.kind === 'litellm');
-    assert.equal(llm.metadata.finish_reason, 'length');
+    assert.equal(llm.metadata.finish_reason, 'stop');
     assert.equal(llm.metadata.usage.total_tokens, 42);
+    assert.equal(llm.metadata.limits.maxTokens.requested, 4567);
+    assert.equal(llm.metadata.limits.maxTokens.effectiveLimit, 4567);
+    assert.equal(llm.metadata.responseFormat, 'json_object');
     assert.ok(llm.metadata.parseError);
     assert.equal(llm.metadata.parseError.reason, 'SyntaxError');
     assert.ok(llm.metadata.parseError.message);
@@ -286,6 +291,7 @@ test('Basic capture applies to another user, excludes bodies and stops without d
   assert.equal(trace.mode, 'Basic');
   assert.ok(trace.spans.some((span) => span.kind === 'litellm'));
   for (const span of trace.spans) { assert.equal(span.request, undefined); assert.equal(span.response, undefined); }
+  assert.equal(trace.spans.find((span) => span.kind === 'litellm').metadata.limits.maxTokens.requested, 4567);
   await f.request('/assistant/diagnostics/capture', { method: 'DELETE' });
   assert.equal((await f.request('/assistant/diagnostics/status')).json.status.mode, 'Off');
   assert.equal((await f.request('/assistant/diagnostics/traces')).json.traces.length, 1);
@@ -295,6 +301,73 @@ const semanticProbe = () => ({
   templateRef: { root: 'Cst_QueryTool', templateCode: '', baseSpecHash: '' },
   intent: { blocks: [{ id: 'block-1', name: 'Assets', description: 'Select all cards of class Asset.', uses: [] }] },
   editorDelta: { version: 1, spec: { version: 1, steps: [], result: { tables: [] } } }
+});
+
+test('JSON response format is explicit; instruction-only mode is saved and never selected implicitly', async (t) => {
+  const f = await fixture(t);
+  await f.request('/assistant/object-flow/semantic-plan', { method: 'POST', body: semanticProbe() });
+  assert.deepEqual(f.outgoing[0].response_format, { type: 'json_object' });
+  assert.equal(f.outgoing.length, 1);
+  assert.equal((await f.request('/config', { method: 'PUT', body: { runtimeConfig: { assistant: { ...f.runtime.assistant,
+    llm: { ...f.runtime.assistant.llm, responseFormat: 'prompt' } } } } })).status, 200);
+  assert.equal((await f.request('/config')).json.config.runtimeConfig.assistant.llm.responseFormat, 'prompt');
+  await f.request('/assistant/object-flow/semantic-plan', { method: 'POST', body: semanticProbe() });
+  assert.equal(f.outgoing.length, 2);
+  assert.equal(f.outgoing[1].response_format, undefined);
+  const before = f.configWrites.length;
+  assert.equal((await f.request('/config', { method: 'PUT', body: { runtimeConfig: { assistant: { llm: { responseFormat: 'auto' } } } } })).status, 422);
+  assert.equal(f.configWrites.length, before);
+});
+
+test('unsupported JSON format has a distinct error and exactly one provider request', async (t) => {
+  const f = await fixture(t, { llmStatus: 400, completion: { error: { param: 'response_format', message: 'response_format json_object is not supported' } } });
+  const response = await f.request('/assistant/object-flow/semantic-plan', { method: 'POST', body: semanticProbe() });
+  assert.equal(response.status, 502);
+  assert.equal(response.json.code, 'assistant_response_format_unsupported');
+  assert.equal(response.json.retryable, false);
+  assert.equal(response.json.diagnostics.llm.upstreamStatus, 400);
+  assert.equal(f.outgoing.length, 1);
+});
+
+test('text, empty content and token-limited output remain distinct failures without automatic retries', async (t) => {
+  for (const [options, code] of [
+    [{ content: '# Catalog summary' }, 'assistant_invalid_json'],
+    [{ rawResponse: '{invalid response envelope' }, 'assistant_invalid_json'],
+    [{ content: '' }, 'assistant_empty_response'],
+    [{ content: '{"version":1}', finishReason: 'length' }, 'assistant_output_truncated']
+  ]) {
+    await t.test(code, async (t) => {
+      const f = await fixture(t, options);
+      const response = await f.request('/assistant/object-flow/semantic-plan', { method: 'POST', body: semanticProbe() });
+      assert.equal(response.status, 502);
+      assert.equal(response.json.code, code);
+      assert.equal(response.json.diagnostics.llm.upstreamStatus, 200);
+      assert.equal(response.json.semanticPlan, undefined);
+      assert.equal(f.outgoing.length, 1);
+    });
+  }
+});
+
+test('manual invalid-JSON retry reuses the confirmed MCP checkpoint and completes a valid plan', async (t) => {
+  const valid = { version: 1, blocks: [{ id: 'block-1', name: 'Assets', summary: 'Select Asset cards', resolvedEntities: ['Asset'],
+    relationPaths: [], dependencies: [], expectedResult: 'Select all cards of class Asset.', resultContract: { outputKind: 'sourceCards', outputClass: 'Asset',
+      dependencyPaths: [], relationPredicates: [], attributePredicates: [], referencePathPredicates: [] }, warnings: [] }], warnings: [], explanation: 'Asset cards' };
+  const f = await fixture(t, { completion: (attempt) => ({ choices: [{ finish_reason: 'stop', message: { content: attempt === 1 ? '# Not a plan' : JSON.stringify(valid) } }] }) });
+  const body = semanticProbe();
+  const context = await f.request('/assistant/object-flow/semantic-plan', { method: 'POST', body: { ...body, stage: 'context' } });
+  assert.equal(context.status, 202, JSON.stringify(context.json));
+  const resumeId = context.json.checkpoint.resumeId;
+  assert.ok(resumeId);
+  const failed = await f.request('/assistant/object-flow/semantic-plan', { method: 'POST', body: { ...body, stage: 'plan', resumeId } });
+  assert.equal(failed.json.code, 'assistant_invalid_json');
+  assert.equal(failed.json.retryable, true);
+  assert.equal(failed.json.resume.resumeId, resumeId);
+  assert.equal(f.outgoing.length, 1);
+  const retried = await f.request('/assistant/object-flow/semantic-plan', { method: 'POST', body: { ...body, stage: 'plan', resumeId } });
+  assert.equal(retried.status, 200, JSON.stringify(retried.json));
+  assert.equal(retried.json.semanticPlan.blocks[0].resultContract.outputClass, 'Asset');
+  assert.equal(retried.json.diagnostics.resume.mcpContextReused, true);
+  assert.equal(f.outgoing.length, 2);
 });
 
 async function waitUntil(check, message) {

@@ -118,12 +118,16 @@ for (const language of ['ru', 'en']) {
 
 test('semantic retry keeps translated fallback and uses confirmed checkpoint state', () => {
   const state = { language: 'en' };
-  const retry = new Function('state', 'I18N', clientFunction('t') + '\n' + clientFunction('setAssistantSemanticPlanRetryState') + '\nreturn setAssistantSemanticPlanRetryState;')(state, dictionaries);
-  retry({}, {}, true);
+  const retry = new Function('state', 'I18N', clientFunction('t') + '\n' + clientFunction('localizeAssistantSemanticPlanFeedback') + '\n' + clientFunction('setAssistantSemanticPlanRetryState') + '\nreturn setAssistantSemanticPlanRetryState;')(state, dictionaries);
+  retry({ resumeId: 'confirmed' }, {}, true, null, null, true);
   assert.equal(state.assistantFlowFeedback.summary, 'Semantic plan is paused.');
   assert.match(state.assistantFlowFeedback.action, /CMDB context was saved/);
   const feedback = { code: 'assistant_timeout', params: { effectiveLimit: 10000, settingPath: 'assistant.mcp.timeoutMs', checkpointRetained: true } };
   retry({}, {}, false, feedback);
   assert.equal(state.assistantFlowFeedback.params.checkpointRetained, false);
   assert.equal(feedback.params.checkpointRetained, true);
+  assert.equal(state.assistantFlowResume, null);
+  retry({ resumeId: 'confirmed' }, {}, true, null, null, false);
+  assert.equal(state.assistantFlowFeedback.summary, 'Semantic plan was rejected.');
+  assert.equal(state.assistantFlowResume, null);
 });

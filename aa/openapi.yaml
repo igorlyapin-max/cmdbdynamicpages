@@ -2195,6 +2195,11 @@ components:
                       type: object
                       properties:
                         maxTokens: { type: integer, minimum: 1, maximum: 9007199254740991, default: 16384 }
+                        responseFormat:
+                          type: string
+                          enum: [json_object, prompt]
+                          default: json_object
+                          description: json_object передаёт response_format провайдеру; prompt оставляет только инструкцию. Автоматического переключения нет.
                       additionalProperties: true
                     diagnostics:
                       $ref: "#/components/schemas/AssistantDiagnosticsPolicy"

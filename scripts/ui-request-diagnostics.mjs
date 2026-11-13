@@ -48,13 +48,15 @@ export function createUiRequestDiagnostics() {
     'sourceRoot', 'targetRoot', 'domain', 'direction', 'predicateType', 'invalidField',
     'path', 'field', 'fieldName', 'sourceField', 'comparisonField', 'relatedField',
     'operator', 'expectedOperator', 'type', 'expectedType', 'actualType', 'clampedBy', 'source', 'tool',
-    'alias', 'as', 'from', 'with', 'expectedAlias', 'publishedAlias', 'sourceAlias', 'targetAlias', 'comparisonAlias'
+    'alias', 'as', 'from', 'with', 'expectedAlias', 'publishedAlias', 'sourceAlias', 'targetAlias', 'comparisonAlias',
+    'responseFormat', 'finish_reason'
   ];
   const numberFields = [
     'limit', 'effectiveLimit', 'configuredLimit', 'rawConfigured', 'requiredCount', 'actualCount', 'count', 'fetched', 'visible',
     'timeoutMs', 'durationMs', 'elapsedMs', 'maxBytes', 'actualBytes', 'restCalls', 'status', 'statusCode',
     'predicateIndex', 'index', 'min', 'max', 'maximum', 'configured', 'observed',
-    'maxLength', 'actualLength', 'maxItems', 'actualItems', 'maxDepth', 'depth', 'requested', 'absoluteCap'
+    'maxLength', 'actualLength', 'maxItems', 'actualItems', 'maxDepth', 'depth', 'requested', 'absoluteCap',
+    'upstreamStatus', 'maxTokens', 'prompt_tokens', 'completion_tokens', 'total_tokens', 'beforeBytes', 'afterBytes', 'beforeClasses', 'afterClasses'
   ];
   const identifierArrays = [
     'classNames', 'sourceFields', 'comparisonFields', 'availableDependencyIds',
@@ -75,7 +77,7 @@ export function createUiRequestDiagnostics() {
       for (const key of ['limits', 'errors', 'details', 'causes']) {
         if (Array.isArray(source[key])) result[key] = source[key].slice(0, 16).map((item) => fields(item, depth + 1));
       }
-      for (const key of ['limit', 'catalogCompleteness', 'mcp', 'objectFlow', 'semanticContext', 'rootCause']) {
+      for (const key of ['limit', 'catalogCompleteness', 'mcp', 'objectFlow', 'semanticContext', 'rootCause', 'llm', 'usage', 'contextAssembly']) {
         if (source[key] && typeof source[key] === 'object') result[key] = fields(source[key], depth + 1);
       }
       // Schema/reference paths can be identifier lists or bounded relation hops.

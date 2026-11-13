@@ -41,6 +41,48 @@ test('shared credential predicate masks numeric and descriptor credentials; usag
   assert.equal(result.redacted, true);
 });
 
+test('maxTokens setting evidence preserves only known finite numeric details at metadata.limits', () => {
+  const detail = { rawConfigured: 65536, configuredLimit: 32768, effectiveLimit: 32768,
+    requested: 65536, limit: 32768, absoluteCap: 32768,
+    source: 'credential-source', tool: 'credential-tool', clampedBy: 'credential-reason',
+    password: 'credential-password', arbitrary: 123, credentialKey: 'credential-value' };
+  for (const input of [{ metadata: { limits: { maxTokens: detail } } },
+    JSON.stringify({ metadata: { limits: { maxTokens: detail } } })]) {
+    const result = redactAssistantDiagnosticValue(input);
+    const safe = typeof result.value === 'string' ? JSON.parse(result.value) : result.value;
+    assert.deepEqual({ ...safe.metadata.limits.maxTokens }, { rawConfigured: 65536, configuredLimit: 32768,
+      effectiveLimit: 32768, requested: 65536, limit: 32768, absoluteCap: 32768 });
+    assert.doesNotMatch(JSON.stringify(result.value), /credential|password|arbitrary/);
+    assert.equal(result.redacted, true);
+  }
+  for (const entry of ['credential-text', { rawConfigured: 'credential-text', limit: Infinity, requested: NaN,
+    effectiveLimit: { password: 'credential-text' }, absoluteCap: ['credential-text'] }]) {
+    const safe = redactAssistantDiagnosticValue({ metadata: { limits: { maxTokens: entry } } }).value;
+    assert.doesNotMatch(JSON.stringify(safe), /credential-text/);
+  }
+  assert.equal(redactAssistantDiagnosticValue({ other: { limits: { maxTokens: detail } } }).value.other.limits.maxTokens, '[REDACTED]');
+  assert.equal(redactAssistantDiagnosticValue({ 'metadata.limits': { maxTokens: detail } }).value['metadata.limits'].maxTokens, '[REDACTED]');
+  assert.equal(redactAssistantDiagnosticValue({ metadata: { limits: { maxTokens: 123 } } }).value.metadata.limits.maxTokens, '[REDACTED]');
+  for (const clampedBy of ['', 'CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE']) {
+    const result = redactAssistantDiagnosticValue({ metadata: { limits: { maxTokens: { requested: 65536,
+      effectiveLimit: 32768, absoluteCap: 32768, clamped: true, clampedBy } } } });
+    assert.deepEqual({ ...result.value.metadata.limits.maxTokens }, { requested: 65536,
+      effectiveLimit: 32768, absoluteCap: 32768, clamped: true, clampedBy });
+  }
+  const rejected = redactAssistantDiagnosticValue({ metadata: { limits: { maxTokens: {
+    clamped: 'credential-bool', clampedBy: 'CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE credential-text'
+  } } } });
+  assert.deepEqual({ ...rejected.value.metadata.limits.maxTokens }, {});
+  assert.equal(rejected.redacted, true);
+  const metadata = { limits: { maxTokens: { requested: 65536, effectiveLimit: 32768, absoluteCap: 32768,
+    clamped: true, clampedBy: 'CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE', password: 'credential-text' } } };
+  const capturedMetadata = redactAssistantDiagnosticValue(metadata).value;
+  const exported = redactAssistantDiagnosticValue({ spans: [{ metadata: capturedMetadata }] }).value;
+  assert.deepEqual({ ...exported.spans[0].metadata.limits.maxTokens }, { requested: 65536, effectiveLimit: 32768,
+    absoluteCap: 32768, clamped: true, clampedBy: 'CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE' });
+  assert.doesNotMatch(JSON.stringify(exported), /credential-text|password/);
+});
+
 test('malformed fields: escaped keys/values, unclosed strings, headers and numeric secrets redact before clipping', () => {
   const fixtures = [
     '{"sessionId":"credential-one", broken',

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   ASSISTANT_DIAGNOSTICS_CAPS, ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE,
   assistantConfigurationLimitDiagnostics, validateAssistantConfigurationNumbers,
-  defaultRuntimeConfig, mergeRuntimeConfigDefaults, normalizeAssistantRuntimeConfig, normalizeConfigPayload
+  defaultRuntimeConfig, mergeRuntimeConfigDefaults, normalizeAssistantRuntimeConfig, normalizeConfigPayload, validateAssistantResponseFormat
 } from '../../scripts/dev-proxy-server.mjs';
 
 test('generation token default, minimum and configured cap use the shared limit diagnostic', () => {
@@ -18,6 +18,22 @@ test('generation token default, minimum and configured cap use the shared limit 
   assert.equal(config.llm.maxTokens, ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE);
   assert.equal(config.llm.limitConfig.maxTokens.requested, 999999);
   assert.equal(config.llm.limitConfig.maxTokens.clampedBy, 'CMDP_ASSISTANT_LLM_MAX_TOKENS_ABSOLUTE');
+});
+
+test('response format defaults to JSON and preserves explicitly configured instruction-only mode', () => {
+  assert.equal(defaultRuntimeConfig().assistant.llm.responseFormat, 'json_object');
+  assert.equal(normalizeAssistantRuntimeConfig({}).llm.responseFormat, 'json_object');
+  for (const responseFormat of ['json_object', 'prompt']) {
+    const runtimeConfig = { assistant: { llm: { responseFormat } } };
+    assert.deepEqual(validateAssistantResponseFormat(runtimeConfig), []);
+    assert.equal(normalizeAssistantRuntimeConfig(runtimeConfig).llm.responseFormat, responseFormat);
+    const payload = normalizeConfigPayload({ runtimeConfig }, 'Cst_QueryTool');
+    const saved = typeof payload.RuntimeConfigJson === 'string' ? JSON.parse(payload.RuntimeConfigJson) : payload.RuntimeConfigJson;
+    assert.equal(saved.assistant.llm.responseFormat, responseFormat);
+  }
+  for (const responseFormat of ['auto', '', null, 1, {}]) {
+    assert.equal(validateAssistantResponseFormat({ assistant: { llm: { responseFormat } } }).length, 1);
+  }
 });
 
 test('config save/read preserves requested budgets and reports their effective limits, not capture state', () => {

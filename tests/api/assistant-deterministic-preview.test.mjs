@@ -1078,9 +1078,18 @@ test('semantic plan addressed related classes share confirmed prompt and validat
   assert.equal(response.statusCode, 200, response.body);
   assert.equal(response.json.semanticPlan.blocks[1].resultContract.dependencyPaths[0].domain, 'AssetNetwork');
   assert.equal(response.json.diagnostics.mcp.classLookups.filter((item) => item.status === 'found').length, 2);
-  const promptContext = JSON.parse(llm.lastRequest.messages.find((item) => item.role === 'user').content).mcpContext;
-  const payload = JSON.parse(promptContext.data);
-  assert.ok(promptContext.data.includes('AssetValue') && promptContext.data.includes('NetworkValue'));
+  const userMessages = llm.lastRequest.messages.filter((item) => item.role === 'user');
+  assert.equal(userMessages.length, 2);
+  const promptContext = JSON.parse(userMessages[0].content).mcpContext;
+  const task = JSON.parse(userMessages[1].content);
+  const payload = promptContext.data;
+  assert.equal(typeof payload, 'object');
+  assert.ok(payload.classFields.some((item) => item.attributes.some((attribute) => attribute.name === 'AssetValue')));
+  assert.ok(payload.classFields.some((item) => item.attributes.some((attribute) => attribute.name === 'NetworkValue')));
+  assert.deepEqual(task.intent.blocks.map((block) => block.id), intent.blocks.map((block) => block.id));
+  assert.match(task.instruction, /Perform the supplied intent.*JSON semantic-plan contract/);
+  assert.equal('mcpContext' in task, false);
+  assert.deepEqual(promptContext.contextAssembly, response.json.diagnostics.mcp.contextAssembly);
   assert.deepEqual(payload.relationPaths, response.json.diagnostics.mcp.relationPaths);
   assert.equal(payload.relationHints.domains[0].name, 'AssetNetwork');
   assert.equal(llm.requests, 1);
@@ -1123,7 +1132,11 @@ test('semantic plan evicts dense optional graph but rejects genuine required byt
   assert.ok(diagnostics.excludedOptionalClassNames.length > 0, JSON.stringify(diagnostics));
   const selected = new Set(diagnostics.contextClassNames);
   assert.ok(diagnostics.relationPaths.every((path) => selected.has(path.sourceClass) && selected.has(path.targetClass)));
-  const payload = JSON.parse(JSON.parse(llm.lastRequest.messages.find((item) => item.role === 'user').content).mcpContext.data);
+  const reference = JSON.parse(llm.lastRequest.messages.at(-2).content).mcpContext;
+  const payload = reference.data;
+  assert.equal(typeof payload, 'object');
+  assert.match(JSON.parse(llm.lastRequest.messages.at(-1).content).instruction, /Perform the supplied intent/);
+  assert.deepEqual(reference.contextAssembly, diagnostics.contextAssembly);
   assert.deepEqual(payload.relationPaths, diagnostics.relationPaths);
   assert.deepEqual(payload.relationHints.domains.map((item) => item.name), diagnostics.contextDomainNames);
   assert.ok(llm.lastRequest.messages.some((item) => item.content.includes('RequiredValue')));
@@ -2851,6 +2864,19 @@ test('assistant validates an inherited IS to ipRange to vlan relation chain and 
   const previewTable = preview.json.result.tables.find((item) => item.name === 'vlan');
   assert.deepEqual(previewTable.rows.map((row) => [row.SourceCode, row.RelatedClass, row.Code, row.network]), [['RANGE-001', 'vlan', 'VLAN-001', '10.44.0.0/24']]);
 
+  const plannedSpec = compileObjectFlowToSpec({
+    version: 1, params: { isName: { type: 'string', required: true } }, steps: [], result: { tables: [] }
+  }, planned.json.flow);
+  const plannedPreview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=20&maxClasses=20&maxRestCalls=50`, {
+    template: { code: 'PlannedIsIpRangeVlanPreview', spec: plannedSpec }, params: { isName: 'Target IS' }
+  }, headers);
+  assert.equal(plannedPreview.statusCode, 200, plannedPreview.body);
+  const plannedTable = plannedPreview.json.result.tables.find((item) => item.name === planned.json.flow.publishedAlias);
+  assert.ok(plannedTable, plannedPreview.body);
+  assert.deepEqual(plannedTable.rows.map((row) => [row.SourceId, row.RelatedId, row.RelatedClass, row.Code, row.network]), [
+    ['201', '301', 'vlan', 'VLAN-001', '10.44.0.0/24']
+  ]);
+
   const runtime = await requestJson('GET', `${backendOrigin}/cmdbuild/dynamicpages/ui/run/IsIpRangeVlanRuntime?isName=Target%20IS&json=true`, undefined, { cookie });
   assert.equal(runtime.statusCode, 200, runtime.body);
   const runtimeTable = runtime.json.tables.find((item) => item.name === 'vlan');
@@ -3004,7 +3030,7 @@ test('assistant keeps confirmed relation requirements and executes source-driven
   assert.equal(planned.statusCode, 200, planned.body);
   assert.equal(planned.json.success, true);
   assert.equal(planned.json.flow.publishedAlias, 'acls');
-  assert.equal(planned.json.diagnostics.objectFlow.fallback, null);
+  assert.equal(planned.json.diagnostics.objectFlow.fallback, null, planned.body);
   assert.deepEqual(planned.json.diagnostics.objectFlow.relationRequirements, {
     kind: 'relationRequirements',
     chains: [

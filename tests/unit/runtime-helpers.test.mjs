@@ -8671,7 +8671,7 @@ test('assistant JSON parser reports controlled error when content has no JSON dr
     (error) => {
       assert.equal(error.code, 'assistant_invalid_json');
       assert.equal(error.statusCode, 502);
-      assert.equal(error.message, 'Assistant response did not contain parseable JSON.');
+      assert.match(error.message, /text instead of a JSON plan, or malformed JSON/);
       return true;
     }
   );
