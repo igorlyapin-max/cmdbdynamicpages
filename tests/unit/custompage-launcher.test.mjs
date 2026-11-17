@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics.mjs';
 import { createAssistantDiagnosticsUi } from '../../scripts/assistant-diagnostics-ui.mjs';
+import { resolveTemplateParameters } from '../../scripts/template-parameters.mjs';
 
 const launcherSource = fs.readFileSync('src/CmdbDynamicPages.js', 'utf8');
 const proxySource = fs.readFileSync('scripts/dev-proxy-server.mjs', 'utf8');
@@ -140,6 +141,7 @@ function generatedDynamicPagesClientScript() {
   const factory = new Function(
     'createUiRequestDiagnostics',
     'createAssistantDiagnosticsUi',
+    'resolveTemplateParameters',
     'DEFAULT_EMPTY_RESULT_TEXT',
     'DEFAULT_PERMISSION_DENIED_TEXT',
     'DEFAULT_TEMPLATE_CACHE_TTL_SEC',
@@ -159,7 +161,14 @@ function generatedDynamicPagesClientScript() {
     'DEFAULT_ASSISTANT_DIAGRAM_CRITIQUE_PROMPT',
     factorySource
   );
-  return factory(createUiRequestDiagnostics, createAssistantDiagnosticsUi, 'empty result', 'permission denied', 3600, 10, 1, 5, 1, 3, 3, 'assistant system prompt', 'object flow prompt', 'semantic plan prompt', 'diagram semantics prompt', 'diagram binding intent prompt', 'diagram placement prompt', 'diagram connections prompt', 'diagram critique prompt')();
+  const versions = ['D2_IMPORT_SEMANTIC_MODEL_REVISION', 'D2_IMPORT_ENDPOINT_PROFILE_VERSION',
+    'D2_IMPORT_STRUCTURE_TREE_VERSION', 'D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION',
+    'D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION', 'ASSISTANT_PROMPT_CONTRACT_VERSION'].map((name) => {
+    const match = proxySource.match(new RegExp('^const ' + name + ' = ([0-9]+);', 'm'));
+    assert.ok(match, name);
+    return Number(match[1]);
+  });
+  return factory(createUiRequestDiagnostics, createAssistantDiagnosticsUi, resolveTemplateParameters, 'empty result', 'permission denied', 3600, ...versions, 'assistant system prompt', 'object flow prompt', 'semantic plan prompt', 'diagram semantics prompt', 'diagram binding intent prompt', 'diagram placement prompt', 'diagram connections prompt', 'diagram critique prompt')();
 }
 
 test('generated Dynamic Pages client script parses as browser JavaScript', () => {
@@ -1112,7 +1121,9 @@ test('Assistant Save persists an analyzed D2 source without replacing the applie
   assert.match(authoringSource, /var analyzedSource = state\.diagramImportProposal/);
   assert.match(authoringSource, /sourceText.*state\.diagramImportSource/);
   assert.match(authoringSource, /var d2Source = analyzedSource \|\| \(hasAppliedImport/);
-  assert.match(saveSource, /var activeDiagramEditor = state\.designerSection === 'diagram'/);
+  assert.match(saveSource, /var inDiagramEditor = state\.designerSection === 'diagram'/);
+  assert.match(saveSource, /state\.diagramImportAppliedEditorDirty && state\.diagramImportAppliedEditor/);
+  assert.match(saveSource, /state\.diagramImportAppliedEditor\.editorMode === 'applied'/);
   assert.doesNotMatch(saveSource, /var activeDiagramEditor = activeDiagramImportEditorModel/);
 });
 
@@ -1874,7 +1885,7 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   assert.ok(saveFunctionStart > -1);
   assert.ok(saveFunctionEnd > saveFunctionStart);
   assert.match(saveFunctionSource, /diagramImportSaveBusy/);
-  assert.match(saveFunctionSource, /var activeDiagramEditor = state\.designerSection === 'diagram'/);
+  assert.match(saveFunctionSource, /var inDiagramEditor = state\.designerSection === 'diagram'/);
   assert.match(saveFunctionSource, /\? activeDiagramImportEditorModel\(/);
   assert.match(saveFunctionSource, /captureDiagramImportProposalFromDom\(\) \|\| activeDiagramEditor/);
   assert.doesNotMatch(saveFunctionSource, /state\.diagramImportAppliedEditorDirty \? captureDiagramImportProposalFromDom\(\) : null/);

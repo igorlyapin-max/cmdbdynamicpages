@@ -43,6 +43,9 @@ import { createUiRequestDiagnostics } from './ui-request-diagnostics.mjs';
 import { createAssistantDiagnosticsUi } from './assistant-diagnostics-ui.mjs';
 import { DEFAULT_ASSISTANT_DIAGNOSTICS, normalizeAssistantDiagnosticsPolicy, redactAssistantDiagnosticValue, createAssistantDiagnosticsStore, createAssistantCaptureController } from './assistant-diagnostics.mjs';
 import { purgeAssistantDiagnostics } from './assistant-diagnostics-maintenance.mjs';
+import { createTemplateTransferPackage, readTemplateTransferPackage, templateTransferDependencies,
+  templateTransferEnvironmentReferences, applyTemplateTransferOverrides } from './template-transfer.mjs';
+import { resolveTemplateParameters } from './template-parameters.mjs';
 import { runtimeRowIdentity, runtimeRowValue, runtimeSemanticKey, setRuntimeRowSemantics, setRuntimeRowValue,
   inheritRuntimeRowSemantics, mergeRuntimeRowSemantics, deriveRuntimeRowSemantics } from './runtime-row-semantics.mjs';
 
@@ -7787,10 +7790,10 @@ function appliedDiagramImportProposalError(message, code, details = []) {
 
 // Rebuild a server-owned editable model from an already accepted D2 mapping.
 // The browser can submit mapping overrides, but never a replacement source or grammar.
-async function appliedDiagramImportProposalFromSpec(currentSpec) {
+async function appliedDiagramImportProposalFromSpec(currentSpec, diagramId = '') {
   const sourceSpec = cloneJsonValueServer(currentSpec, {});
   const diagrams = Array.isArray(sourceSpec && sourceSpec.result && sourceSpec.result.diagrams) ? sourceSpec.result.diagrams : [];
-  const diagram = diagrams.find((item) => item && item.authoring && item.authoring.d2Import && item.authoring.d2Import.version === 3);
+  const diagram = diagrams.find((item) => item && (!diagramId || item.id === diagramId) && item.authoring && item.authoring.d2Import && item.authoring.d2Import.version === 3);
   const imported = diagram && diagram.authoring && diagram.authoring.d2Import;
   if (!imported) {
     throw appliedDiagramImportProposalError('The current draft has no applied D2 mapping. Analyze and apply the D2 source first.', 'diagram_import_mapping_missing');
@@ -9771,6 +9774,7 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
       topology: ASSISTANT_DIAGRAM_MAPPING_STAGE_CORRECTION_RETRIES
     },
     draftPreviewTimeoutMs: DRAFT_PREVIEW_TIMEOUT_MS,
+    templateTransferMaxBytes: TEMPLATE_REQUEST_MAX_BYTES,
     draftPreviewUiGraceMs: DRAFT_PREVIEW_UI_GRACE_MS
   });
   const headerHtml = mode === 'runtime' ? '' : `
@@ -9807,6 +9811,7 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     .lamp.ok{background:var(--ok)}.lamp.warn{background:#d99a21}.lamp.error{background:var(--danger)}.lamp.loading{background:#3b82f6}
     .layout{display:grid;grid-template-columns:minmax(280px,1fr) minmax(460px,2fr);gap:14px}.panel{background:var(--panel);border:1px solid var(--line);padding:12px}
     .section{background:var(--panel);border:1px solid var(--line);padding:12px;margin-bottom:12px}.section-title-row{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin:10px 0 6px}.section-title-row h3,.section-title-row h4{margin:0}.about-version{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:4px 10px;margin:0 0 10px}.about-version dt{color:var(--muted)}.about-version dd{margin:0;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+    #cmdp-template-transfer{min-width:0}#cmdp-template-transfer label{display:grid;gap:4px;min-width:0}#cmdp-template-transfer input,#cmdp-template-transfer select,#cmdp-template-transfer textarea{max-width:100%;min-width:0;box-sizing:border-box}#cmdp-template-transfer .checkbox{display:flex}#cmdp-template-transfer pre,#cmdp-template-transfer li{white-space:pre-wrap;overflow-wrap:anywhere}#cmdp-template-transfer .row{flex-wrap:wrap;margin-top:8px}#cmdp-template-transfer button{white-space:normal;max-width:100%}@media(max-width:600px){#cmdp-template-transfer .settings-grid{grid-template-columns:minmax(0,1fr)}#cmdp-template-transfer button,#cmdp-template-transfer input,#cmdp-template-transfer select{min-height:44px}}
     .object-selection{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}.object-selection-summary{padding-top:6px}.object-selection-summary-button{display:grid;width:100%;grid-template-columns:16px minmax(92px,auto) minmax(0,1fr) auto;align-items:center;gap:8px;padding:7px 8px;text-align:left}.object-selection-summary-marker{color:var(--muted);font-weight:700;text-align:center}.object-selection-summary-kind{font-size:12px;color:#334e68;white-space:nowrap}.object-selection-summary-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700}.object-selection-summary-meta{color:var(--muted);font-size:12px;white-space:nowrap}
     .matching-block{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
     .matching-rule-list{display:grid;gap:10px;margin-top:8px}
@@ -9864,6 +9869,7 @@ function dynamicPagesClientScript() {
   var DEFAULT_EMPTY_RESULT_TEXT = ${JSON.stringify(DEFAULT_EMPTY_RESULT_TEXT)};
   var DEFAULT_PERMISSION_DENIED_TEXT = ${JSON.stringify(DEFAULT_PERMISSION_DENIED_TEXT)};
   var DEFAULT_TEMPLATE_CACHE_TTL_SEC = ${JSON.stringify(DEFAULT_TEMPLATE_CACHE_TTL_SEC)};
+  var resolveTemplateParameters = (${resolveTemplateParameters.toString()});
   var D2_IMPORT_SEMANTIC_MODEL_REVISION = ${JSON.stringify(D2_IMPORT_SEMANTIC_MODEL_REVISION)};
   var D2_IMPORT_ENDPOINT_PROFILE_VERSION = ${JSON.stringify(D2_IMPORT_ENDPOINT_PROFILE_VERSION)};
   var D2_IMPORT_STRUCTURE_TREE_VERSION = ${JSON.stringify(D2_IMPORT_STRUCTURE_TREE_VERSION)};
@@ -10020,6 +10026,37 @@ function dynamicPagesClientScript() {
       active: 'Active',
       editingTemplate: 'Modifying',
       creatingTemplate: 'Creating a new template',
+      transferTitle: 'Template export / import',
+      transferExport: 'Export current definition',
+      transferFile: 'Import .cmdp-template.json',
+      transferMode: 'Import mode',
+      transferNew: 'New template',
+      transferReplace: 'Replace existing definition',
+      transferTarget: 'Existing target',
+      transferCode: 'Target code (optional)',
+      transferDescription: 'Description (optional)',
+      transferPrepare: 'Prepare import',
+      transferStage: 'Stage prepared definition',
+      transferCancel: 'Cancel import',
+      transferReady: 'Ready for review',
+      transferAttention: 'Import needs attention',
+      transferBusy: 'Preparing…',
+      transferNotSaved: 'Imported, not saved.',
+      transferConfirm: 'Replace the whole editor definition, including unsaved changes? Nothing will be saved until Save.',
+      transferAck: 'I reviewed this environment reference',
+      transferEffective: 'Effective value',
+      transferShadowed: 'Shadowed by {path}',
+      transferParameter: 'Parameter: {name}',
+      transferValue: 'Override value (JSON)',
+      transferPath: 'Override path (JSON path)',
+      transferOverrides: 'Additional overrides (JSON array of {path,value})',
+      transferInvalid: 'Invalid template transfer response or input.',
+      transferFileRequired: 'Select a .cmdp-template.json file.',
+      transferFileTooLarge: 'Template file exceeds the configured limit of {limit} bytes.',
+      transferTargetRequired: 'Select an existing target with a current definition hash.',
+      transferReviewRequired: 'Resolve blocking issues, prepare again after edits, and acknowledge all required references.',
+      transferExported: 'Current definition exported.',
+      transferIncomplete: 'Execution is not ready. The definition can be staged and saved as incomplete.',
       templateCreateHelp: 'Set the template code and description, then save it. Query logic is configured in the constructor sections.',
       templateKind: 'Template type',
       templateKindDsl: 'Dynamic data template',
@@ -11324,6 +11361,37 @@ function dynamicPagesClientScript() {
       active: 'Активен',
       editingTemplate: 'Модифицируем',
       creatingTemplate: 'Создаем новый шаблон',
+      transferTitle: 'Экспорт / импорт шаблона',
+      transferExport: 'Экспорт текущего определения',
+      transferFile: 'Импорт .cmdp-template.json',
+      transferMode: 'Режим импорта',
+      transferNew: 'Новый шаблон',
+      transferReplace: 'Заменить существующее определение',
+      transferTarget: 'Существующий шаблон',
+      transferCode: 'Код назначения (необязательно)',
+      transferDescription: 'Описание (необязательно)',
+      transferPrepare: 'Подготовить импорт',
+      transferStage: 'Применить подготовленное определение',
+      transferCancel: 'Отменить импорт',
+      transferReady: 'Готово к проверке',
+      transferAttention: 'Импорт требует внимания',
+      transferBusy: 'Подготовка…',
+      transferNotSaved: 'Импортировано, не сохранено.',
+      transferConfirm: 'Заменить всё определение в редакторе, включая несохранённые изменения? Запись произойдёт только по команде «Сохранить».',
+      transferAck: 'Ссылка на окружение проверена',
+      transferEffective: 'Действующее значение',
+      transferShadowed: 'Перекрыто значением из {path}',
+      transferParameter: 'Параметр: {name}',
+      transferValue: 'Значение замены (JSON)',
+      transferPath: 'Путь замены (JSON path)',
+      transferOverrides: 'Дополнительные замены (JSON-массив {path,value})',
+      transferInvalid: 'Некорректный ответ или входные данные переноса шаблона.',
+      transferFileRequired: 'Выберите файл .cmdp-template.json.',
+      transferFileTooLarge: 'Файл шаблона превышает настроенный лимит {limit} байт.',
+      transferTargetRequired: 'Выберите существующий шаблон с актуальным хешем определения.',
+      transferReviewRequired: 'Устраните блокирующие проблемы, повторите подготовку после правок и подтвердите обязательные ссылки.',
+      transferExported: 'Текущее определение экспортировано.',
+      transferIncomplete: 'Определение пока не готово к выполнению. Его можно применить и сохранить незавершённым.',
       templateCreateHelp: 'Укажите код и описание шаблона, затем сохраните. Логика запроса настраивается в разделах конструктора.',
       templateKind: 'Тип шаблона',
       templateKindDsl: 'Динамический шаблон данных',
@@ -14147,12 +14215,18 @@ function dynamicPagesClientScript() {
     // Prompt overrides change the model input. Keep saved deterministic
     // mapping intact, but never allow an earlier Assistant proposal to apply.
     invalidateAssistantObjectFlowRequests();
+    state.assistantFlowBusy = false;
     resetAssistantObjectFlowProposal();
     state.assistantDiagramInterpretResult = null;
     state.assistantDiagramMappingResult = null;
     state.assistantDiagramMappingResume = null;
     var flowApplyButton = document.querySelector('button[data-action="assistant-flow-apply"]');
     if (flowApplyButton) flowApplyButton.disabled = true;
+    var flowPrepareButton = document.querySelector('button[data-action="assistant-flow-prepare"]');
+    if (flowPrepareButton) {
+      flowPrepareButton.disabled = false;
+      flowPrepareButton.textContent = t('assistantPrepareSemanticPlan');
+    }
   }
 
   function updateTemplateAssistantPromptOverride(key, mode) {
@@ -14512,21 +14586,19 @@ function dynamicPagesClientScript() {
   }
 
   function getParamDefaultValue(spec, name, fallback) {
+    var resolved = resolveTemplateParameters(spec).values;
+    if (Object.prototype.hasOwnProperty.call(resolved, name)) return resolved[name];
     var params = spec && spec.params && typeof spec.params === 'object' && !Array.isArray(spec.params) ? spec.params : {};
     var definition = params[name];
     if (definition && typeof definition === 'object' && !Array.isArray(definition)) {
-      if (definition.default !== undefined) return definition.default;
-      if (definition.defaultValue !== undefined) return definition.defaultValue;
       if (definition.example !== undefined) return definition.example;
     }
-    var defaults = spec && spec.defaults && typeof spec.defaults === 'object' && !Array.isArray(spec.defaults) ? spec.defaults : {};
-    if (defaults[name] !== undefined) return defaults[name];
     return fallback;
   }
 
-  function getRunParamsFromSpec(spec) {
+  function getRunParamsFromSpec(spec, explicitParams) {
     var params = spec && spec.params && typeof spec.params === 'object' && !Array.isArray(spec.params) ? spec.params : {};
-    var result = {};
+    var result = Object.assign({}, resolveTemplateParameters(spec, explicitParams || {}).values);
     var builder = inferBuilderStateFromSpec(spec);
     var inferred = {
       attrType: builder.attrType,
@@ -14537,13 +14609,10 @@ function dynamicPagesClientScript() {
       depth: builder.depth
     };
     Object.keys(params).forEach(function (name) {
+      if (Object.prototype.hasOwnProperty.call(result, name)) return;
       var value = getParamDefaultValue(spec, name, undefined);
       if (value === undefined && inferred[name] !== undefined && inferred[name] !== '') value = inferred[name];
       if (value !== undefined) result[name] = value;
-    });
-    var defaults = spec && spec.defaults && typeof spec.defaults === 'object' && !Array.isArray(spec.defaults) ? spec.defaults : {};
-    Object.keys(defaults).forEach(function (name) {
-      if (result[name] === undefined) result[name] = defaults[name];
     });
     return result;
   }
@@ -18795,8 +18864,264 @@ function dynamicPagesClientScript() {
       selected && selected.protected ? '<span class="pill">' + escapeHtml(t('protectedTemplate')) + '</span>' : '',
       protectedHelp,
       '</div>',
-      '</section>'
+      '</section>',
+      renderTemplateTransfer()
     ].join('');
+  }
+
+  function templateTransferOwner() {
+    return {
+      scope: runtimeSettingsScope(), session: Number(state.sessionInstance || 0),
+      editor: Number(state.templateEditorInstance || 0),
+      id: String(state.selectedTemplate && state.selectedTemplate.id || ''),
+      hash: String(state.selectedTemplate && state.selectedTemplate.specHash || ''),
+      code: String(state.selectedTemplate && state.selectedTemplate.code || '')
+    };
+  }
+
+  function templateTransferOwnerIsCurrent(owner) {
+    var current = templateTransferOwner();
+    return Boolean(owner && runtimeSettingsScopeIsCurrent(owner.scope) && owner.session === current.session &&
+      owner.editor === current.editor && owner.id === current.id && owner.code === current.code && owner.hash === current.hash);
+  }
+
+  function templateTransferDraft() {
+    if (!state.templateTransfer || !templateTransferOwnerIsCurrent(state.templateTransfer.owner)) {
+      state.templateTransfer = {
+        owner: templateTransferOwner(), mode: 'new', targetCode: '', description: '',
+        existingTarget: state.selectedTemplate && state.selectedTemplate.id ? state.selectedTemplate.code : '',
+        overrides: '[]', review: [], prepared: null, package: null, fileName: '', busy: false, message: ''
+      };
+    }
+    return state.templateTransfer;
+  }
+
+  function renderTemplateTransfer() {
+    var draft = templateTransferDraft();
+    var prepared = draft.prepared;
+    var checks = prepared && prepared.checks;
+    var options = (state.templates || []).map(function (item) {
+      return '<option value="' + escapeHtml(item.code) + '"' + (draft.existingTarget === item.code ? ' selected' : '') + '>' + escapeHtml(item.code) + '</option>';
+    }).join('');
+    var review = draft.review.map(function (item, index) {
+      return '<div class="settings-block" data-transfer-reference="' + index + '"><strong>' + escapeHtml(item.kind || '') + '</strong>' +
+        (item.parameterName ? '<div>' + escapeHtml(t('transferParameter', { name: item.parameterName })) + '</div>' : '') +
+        (item.effective === true ? '<div>' + escapeHtml(t('transferEffective')) + '</div>' : '') +
+        (item.effective === false && item.shadowedBy ? '<div>' + escapeHtml(t('transferShadowed', { path: item.shadowedBy })) + '</div>' : '') +
+        '<label>' + t('transferPath') + '<input data-transfer-review-path="' + index + '" value="' + escapeHtml(item.path) + '"></label>' +
+        '<label>' + t('transferValue') + '<input data-transfer-review-value="' + index + '" value="' + escapeHtml(item.input) + '"></label>' +
+        (item.requiresConfirmation ? '<label class="checkbox"><input type="checkbox" data-transfer-ack="' + index + '"' + (item.ack ? ' checked' : '') + '> ' + t('transferAck') + '</label>' : '') + '</div>';
+    }).join('');
+    var issues = checks ? checks.issues.map(function (issue) {
+      return '<li>' + escapeHtml([issue.path, issue.code, issue.message].filter(Boolean).join(' - ')) + '</li>';
+    }).join('') : '';
+    return [
+      '<section class="section" id="cmdp-template-transfer" aria-labelledby="cmdp-transfer-title">',
+      '<h2 id="cmdp-transfer-title">' + t('transferTitle') + '</h2>',
+      '<div class="row"><button type="button" data-action="template-transfer-export"' + (state.savingTemplate ? ' disabled' : '') + '>' + t('transferExport') + '</button></div>',
+      '<div class="settings-grid">',
+      '<label>' + t('transferFile') + '<input id="cmdp-transfer-file" type="file" accept=".cmdp-template.json,application/json"><span>' + escapeHtml(draft.fileName) + '</span></label>',
+      '<label>' + t('transferMode') + '<select id="cmdp-transfer-mode"><option value="new"' + (draft.mode === 'new' ? ' selected' : '') + '>' + t('transferNew') + '</option><option value="replace"' + (draft.mode === 'replace' ? ' selected' : '') + '>' + t('transferReplace') + '</option></select></label>',
+      draft.mode === 'replace' ? '<label>' + t('transferTarget') + '<select id="cmdp-transfer-target"><option value=""></option>' + options + '</select></label>' : '<label>' + t('transferCode') + '<input id="cmdp-transfer-code" value="' + escapeHtml(draft.targetCode) + '"></label>',
+      '<label>' + t('transferDescription') + '<input id="cmdp-transfer-description" value="' + escapeHtml(draft.description) + '"></label>',
+      '</div>',
+      '<label>' + t('transferOverrides') + '<textarea id="cmdp-transfer-overrides" rows="3">' + escapeHtml(draft.overrides) + '</textarea></label>',
+      checks ? '<div role="status"><strong>' + t(checks.status === 'ready' ? 'transferReady' : 'transferAttention') + '</strong><ul>' + issues + '</ul><pre>' + escapeHtml(pretty({ summary: checks.summary, changes: prepared.changes })) + '</pre></div>' : '',
+      checks && checks.executionReady === false ? '<div class="notice warning">' + t('transferIncomplete') + '</div>' : '',
+      review,
+      '<div class="row"><button type="button" data-action="template-transfer-prepare"' + (draft.busy || !draft.package || state.savingTemplate ? ' disabled' : '') + '>' + t(draft.busy ? 'transferBusy' : 'transferPrepare') + '</button>',
+      '<button type="button" data-action="template-transfer-stage"' + (!prepared || draft.busy || state.savingTemplate ? ' disabled' : '') + '>' + t('transferStage') + '</button>',
+      '<button type="button" data-action="template-transfer-cancel">' + t('transferCancel') + '</button></div>',
+      '<div role="status" aria-live="polite">' + escapeHtml(draft.message || '') + '</div></section>'
+    ].join('');
+  }
+
+  function refreshTemplateTransfer() {
+    var panel = document.getElementById('cmdp-template-transfer');
+    if (panel) panel.outerHTML = renderTemplateTransfer();
+  }
+
+  function templateTransferError(draft, error) {
+    if (state.templateTransfer !== draft || !templateTransferOwnerIsCurrent(draft.owner)) return;
+    draft.busy = false;
+    draft.message = error.message || String(error);
+    refreshTemplateTransfer();
+  }
+
+  function readTemplateTransferFile(file) {
+    var draft = templateTransferDraft();
+    var token = {};
+    draft.token = token;
+    draft.prepared = null;
+    draft.package = null;
+    draft.fileName = '';
+    draft.review = [];
+    draft.busy = false;
+    draft.message = '';
+    if (!file || !file.name.endsWith('.cmdp-template.json')) {
+      templateTransferError(draft, new Error(t('transferFileRequired')));
+      return Promise.resolve();
+    }
+    var maxBytes = Number(boot.templateTransferMaxBytes);
+    if (maxBytes > 0 && file.size > maxBytes) {
+      templateTransferError(draft, new Error(t('transferFileTooLarge', { limit: maxBytes })));
+      return Promise.resolve();
+    }
+    return file.text().then(function (text) {
+      if (state.templateTransfer !== draft || draft.token !== token || !templateTransferOwnerIsCurrent(draft.owner)) return;
+      var value = JSON.parse(text);
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(t('transferInvalid'));
+      draft.package = value;
+      draft.fileName = file.name;
+      refreshTemplateTransfer();
+    }).catch(function (error) {
+      if (draft.token === token) templateTransferError(draft, error);
+    });
+  }
+
+  function prepareTemplateTransfer() {
+    var draft = templateTransferDraft();
+    if (draft.busy || state.savingTemplate) return Promise.resolve();
+    var body;
+    try {
+      if (!draft.package) throw new Error(t('transferFileRequired'));
+      var overrides = JSON.parse(draft.overrides);
+      if (!Array.isArray(overrides) || overrides.some(function (item) { return !item || typeof item.path !== 'string' || !Object.prototype.hasOwnProperty.call(item, 'value'); })) throw new Error(t('transferInvalid'));
+      overrides = overrides.concat(draft.review.filter(function (item) {
+        return item.input !== JSON.stringify(item.value) || item.path !== item.originalPath;
+      }).map(function (item) { return { path: item.path, value: JSON.parse(item.input) }; }));
+      overrides = Array.from(new Map(overrides.map(function (item) { return [item.path, item]; })).values());
+      body = { package: draft.package, mode: draft.mode, overrides: overrides };
+      if (draft.description.trim()) body.description = draft.description;
+      if (draft.mode === 'replace') {
+        var target = (state.templates || []).find(function (item) { return item.code === draft.existingTarget; });
+        if (state.selectedTemplate && state.selectedTemplate.id && state.selectedTemplate.code === draft.existingTarget) target = state.selectedTemplate;
+        if (!target || !target.id || !target.specHash) throw new Error(t('transferTargetRequired'));
+        body.targetCode = target.code;
+        body.baseSpecHash = target.specHash;
+        draft.target = cloneJsonValue(target, {});
+      } else if (draft.targetCode.trim()) body.targetCode = draft.targetCode.trim();
+    } catch (error) {
+      templateTransferError(draft, error);
+      return Promise.resolve();
+    }
+    var token = {};
+    draft.token = token;
+    draft.prepared = null;
+    draft.busy = true;
+    draft.message = '';
+    refreshTemplateTransfer();
+    return request(apiPrefix + '/template-transfer/prepare?root=' + encodeURIComponent(draft.owner.scope.root), { method: 'POST', body: body, owner: uiRequestOwner() }).then(function (result) {
+      if (state.templateTransfer !== draft || draft.token !== token || !templateTransferOwnerIsCurrent(draft.owner)) return;
+      if (!result.ok || !result.json || result.json.success !== true) throw createRequestError(result);
+      var value = result.json;
+      if (!value.template || !value.template.code || !value.template.spec || !value.checks ||
+          ['ready', 'needsAttention'].indexOf(value.checks.status) < 0 || !Array.isArray(value.checks.issues) || !Array.isArray(value.checks.environmentReferences)) throw new Error(t('transferInvalid'));
+      if (body.mode === 'replace' && value.template.code !== body.targetCode) throw new Error(t('transferInvalid'));
+      draft.prepared = value;
+      draft.overrides = JSON.stringify(body.overrides, null, 2);
+      draft.review = value.checks.environmentReferences.map(function (item) {
+        return { path: item.path, originalPath: item.path, value: item.value, input: JSON.stringify(item.value), kind: item.kind,
+          parameterName: item.parameterName, effective: item.effective, shadowedBy: item.shadowedBy,
+          requiresConfirmation: item.requiresConfirmation, ack: false };
+      });
+      draft.busy = false;
+      refreshTemplateTransfer();
+    }).catch(function (error) {
+      if (draft.token === token) templateTransferError(draft, error);
+    });
+  }
+
+  function stageTemplateTransfer() {
+    var draft = templateTransferDraft();
+    var prepared = draft.prepared;
+    if (!prepared || draft.busy || state.savingTemplate) return;
+    if (prepared.checks.issues.some(function (issue) { return issue.blocking === true; }) || draft.review.some(function (item) { return item.requiresConfirmation && !item.ack; })) {
+      templateTransferError(draft, new Error(t('transferReviewRequired')));
+      return;
+    }
+    if (!window.confirm(t('transferConfirm'))) return;
+    if (!templateTransferOwnerIsCurrent(draft.owner)) return;
+    var imported = cloneJsonValue(prepared.template, {});
+    var next = draft.mode === 'replace' ? Object.assign({}, draft.target) : { code: imported.code, active: false };
+    ['description', 'spec', 'paramsSchema', 'resultSchema'].forEach(function (key) { next[key] = imported[key]; });
+    state.selectedTemplate = next;
+    state.objectGroupDraft = null;
+    state.relationDraft = null;
+    state.viewComposerDraft = null;
+    state.paramRowsDraft = null;
+    state.result = null;
+    state.extractionPreview = null;
+    state.templateVersions = draft.mode === 'replace' && draft.owner.code === next.code ? state.templateVersions : [];
+    hydrateDesignerStateFromTemplate({ replaceRunParams: true });
+    state.templateDirty = true;
+    state.lastDraftPreviewOk = false;
+    state.templateTransfer = null;
+    state.message = { type: 'warning', text: t('transferNotSaved') };
+    state.designerSection = 'template';
+    renderDesigner();
+    templateTransferDraft().message = t('transferNotSaved');
+    refreshTemplateTransfer();
+  }
+
+  function exportTemplateTransfer() {
+    if (state.savingTemplate) return Promise.resolve();
+    var snapshot;
+    try { snapshot = captureTemplateEditorSnapshot(); } catch (error) {
+      setUiError(error);
+      renderDesigner();
+      return Promise.resolve();
+    }
+    if (!snapshot) return Promise.resolve();
+    var draft = templateTransferDraft();
+    var token = {};
+    draft.exportToken = token;
+    var body = { template: snapshot.payload };
+    if (state.selectedTemplate && state.selectedTemplate.id) body.templateRef = assistantTemplateRefClient();
+    return request(apiPrefix + '/template-transfer/export?root=' + encodeURIComponent(draft.owner.scope.root), { method: 'POST', body: body, owner: uiRequestOwner() }).then(function (result) {
+      if (state.templateTransfer !== draft || draft.exportToken !== token || !templateTransferOwnerIsCurrent(draft.owner)) return;
+      if (!result.ok || !result.json || result.json.success !== true) throw createRequestError(result);
+      if (!result.json.package || typeof result.json.fileName !== 'string') throw new Error(t('transferInvalid'));
+      var url = URL.createObjectURL(new Blob([JSON.stringify(result.json.package, null, 2)], { type: 'application/json' }));
+      var link = document.createElement('a');
+      link.href = url;
+      link.download = result.json.fileName;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+      draft.message = t('transferExported');
+      refreshTemplateTransfer();
+    }).catch(function (error) {
+      if (draft.exportToken === token) templateTransferError(draft, error);
+    });
+  }
+
+  function handleTemplateTransferChange(event) {
+    var target = event.target;
+    if (!target || !target.closest || !target.closest('#cmdp-template-transfer')) return;
+    if (target.id === 'cmdp-transfer-file') { readTemplateTransferFile(target.files && target.files[0]); return; }
+    var draft = templateTransferDraft();
+    if (target.hasAttribute('data-transfer-ack')) {
+      draft.review[Number(target.getAttribute('data-transfer-ack'))].ack = target.checked;
+      return;
+    }
+    var fields = { 'cmdp-transfer-mode': 'mode', 'cmdp-transfer-target': 'existingTarget', 'cmdp-transfer-code': 'targetCode', 'cmdp-transfer-description': 'description', 'cmdp-transfer-overrides': 'overrides' };
+    if (fields[target.id]) draft[fields[target.id]] = target.value;
+    else if (target.hasAttribute('data-transfer-review-path')) draft.review[Number(target.getAttribute('data-transfer-review-path'))].path = target.value;
+    else if (target.hasAttribute('data-transfer-review-value')) draft.review[Number(target.getAttribute('data-transfer-review-value'))].input = target.value;
+    else return;
+    draft.prepared = null;
+    draft.token = null;
+    draft.busy = false;
+    draft.message = '';
+    if (target.id === 'cmdp-transfer-mode' || target.id === 'cmdp-transfer-target') { draft.review = []; refreshTemplateTransfer(); }
+    else {
+      var stage = document.querySelector('[data-action="template-transfer-stage"]');
+      if (stage) stage.disabled = true;
+      var prepare = document.querySelector('[data-action="template-transfer-prepare"]');
+      if (prepare) prepare.disabled = !draft.package || state.savingTemplate;
+    }
   }
 
   function cmdbBuildViewModelForSpec(spec) {
@@ -19104,7 +19429,7 @@ function dynamicPagesClientScript() {
     if (section === 'settings') return renderRuntimeSettings(config);
     if (section === 'diagnostics') return renderDiagnostics();
     if (section === 'about') return renderAbout();
-    return renderTemplateList(templateRows);
+    return renderTemplateList(templateRows) + renderTemplateTransfer();
   }
 
   function designerSectionTitle(section) {
@@ -30117,16 +30442,31 @@ function dynamicPagesClientScript() {
       renderDesigner();
       return;
     }
-    if (!captureVisibleDesignerState()) return;
+    var snapshot;
+    try { snapshot = captureTemplateEditorSnapshot(); } catch (error) {
+      setUiError(error);
+      renderDesigner();
+      return;
+    }
+    if (!snapshot) return;
+    var savedDiagramEditorState = snapshot.savedDiagramEditorState;
+    var payload = snapshot.payload;
+    saveTemplateSnapshot(payload, savedDiagramEditorState);
+  }
+
+  function captureTemplateEditorSnapshot() {
+    if (!captureVisibleDesignerState()) return null;
     var savedDiagramEditorState = false;
     // The deterministic Diagram editor saves both Assistant-proposed and
     // manually edited mappings. Normal template Save recompiles the current
     // editor state; no Assistant action is required for manual corrections.
-    var activeDiagramEditor = state.designerSection === 'diagram'
+    var inDiagramEditor = state.designerSection === 'diagram';
+    var activeDiagramEditor = inDiagramEditor
       ? activeDiagramImportEditorModel(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec())
-      : null;
+      : state.diagramImportAppliedEditorDirty && state.diagramImportAppliedEditor && state.diagramImportAppliedEditor.editorMode === 'applied'
+        ? state.diagramImportAppliedEditor : null;
     var diagramEditor = activeDiagramEditor && activeDiagramEditor.version === 3
-      ? (captureDiagramImportProposalFromDom() || activeDiagramEditor)
+      ? (inDiagramEditor ? captureDiagramImportProposalFromDom() || activeDiagramEditor : activeDiagramEditor)
       : null;
     if (diagramEditor && diagramEditor.version === 3) {
       updateSelectedFromEditor(diagramImportSpecWithSavedEditor(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec(), diagramEditor));
@@ -30135,12 +30475,10 @@ function dynamicPagesClientScript() {
     }
     captureAssistantPromptsFromDom();
     updateSelectedFromEditor(assistantSpecWithPrompts(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec()));
-    var payload;
-    try { payload = readEditorPayload(); } catch (error) {
-      setUiError(error);
-      renderDesigner();
-      return;
-    }
+    return { payload: readEditorPayload(), savedDiagramEditorState: savedDiagramEditorState };
+  }
+
+  function saveTemplateSnapshot(payload, savedDiagramEditorState) {
     var owner = uiRequestOwner();
     var exists = Boolean(state.selectedTemplate && state.selectedTemplate.id);
     var saveScope = runtimeSettingsScope();
@@ -30495,8 +30833,13 @@ function dynamicPagesClientScript() {
       }
       setUiError(error);
     }).finally(function () {
-      if (!uiDiagnosticIsCurrent({ owner: operationOwner }) || Number(state.assistantFlowRequestGeneration || 0) !== requestGeneration) return;
+      var currentOwner = uiRequestOwner();
+      if (Number(state.assistantFlowRequestGeneration || 0) !== requestGeneration ||
+          ['root', 'rootSelectionGeneration', 'editorInstance', 'sessionInstance', 'templateCode'].some(function (key) {
+            return operationOwner[key] !== currentOwner[key];
+          })) return;
       state.assistantFlowBusy = false;
+      if (!uiDiagnosticIsCurrent({ owner: operationOwner }) && !captureVisibleDesignerState()) return;
       renderDesigner();
     });
   }
@@ -32210,6 +32553,10 @@ function dynamicPagesClientScript() {
     if (action === 'new-template') runUiMutation(function () { newTemplate(); });
     if (action === 'new-cmdb-build-view') runUiMutation(function () { newCmdbBuildViewTemplate(); });
     if (action === 'save-template') runUiOperation(action, function () { saveTemplate(); });
+    if (action === 'template-transfer-export') runUiOperation(action, function () { exportTemplateTransfer(); });
+    if (action === 'template-transfer-prepare') runUiOperation(action, function () { prepareTemplateTransfer(); });
+    if (action === 'template-transfer-stage') runUiMutation(function () { stageTemplateTransfer(); });
+    if (action === 'template-transfer-cancel') { state.templateTransfer = null; refreshTemplateTransfer(); }
     if (action === 'validate-template') runUiOperation(action, function () { runDraftAction('validate'); });
     if (action === 'preview-template') runUiOperation(action, function () { runDraftAction('preview'); });
     if (action === 'assistant-generate') runUiOperation(action, function () { generateAssistantDraft(); });
@@ -33022,6 +33369,9 @@ function dynamicPagesClientScript() {
     renderDesigner();
   });
 
+  document.addEventListener('input', handleTemplateTransferChange);
+  document.addEventListener('change', handleTemplateTransferChange);
+
   updateChrome();
   setupLanguageSelector();
   if (boot.mode === 'runtime') loadRuntime();
@@ -33034,6 +33384,7 @@ function isCollectionLimitedAuthoringRequest(req) {
   if (!['POST', 'PUT', 'PATCH'].includes(req.method)) return false;
   const pathname = new URL(req.url || '/', 'http://local').pathname;
   return pathname.startsWith(`${BACKEND_PREFIX}/draft/`) ||
+    pathname.startsWith(`${BACKEND_PREFIX}/template-transfer/`) ||
     pathname.startsWith(`${BACKEND_PREFIX}/assistant/object-flow/`) ||
     pathname.startsWith(`${BACKEND_PREFIX}/assistant/diagram-import/`) ||
     new RegExp(`^${BACKEND_PREFIX}/templates(?:/[^/]+)?/?$`).test(pathname);
@@ -51216,45 +51567,37 @@ async function listTemplateCards(authToken, root, requestUrl) {
 async function findTemplateCard(authToken, root, code) {
   const schema = buildTechnicalSchema(root);
   const templateCode = validateCmdbuildIdentifier(code, 'template code');
-  const cards = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(schema.classNames.template)}/cards?limit=1000`, authToken);
-  const data = Array.isArray(cards.json && cards.json.data) ? cards.json.data : [];
-  return {
-    schema,
-    response: cards,
-    card: data.find((item) => item.Code === templateCode) || null
-  };
+  const filter = JSON.stringify({ attribute: { simple: { attribute: 'Code', operator: 'equal', value: [templateCode] } } });
+  const seen = new Set();
+  let start = 0;
+  let card = null;
+  while (true) {
+    const query = new URLSearchParams({ limit: '1000', filter });
+    if (start) query.set('start', String(start));
+    const response = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(schema.classNames.template)}/cards?${query}`, authToken);
+    if (!response.ok) return { schema, response, card: null };
+    const data = responseDataArray(response);
+    for (const item of data) if (item.Code === templateCode && (!card || String(item._id) !== String(card._id))) {
+      if (card) {
+        const error = new Error('Template Code is not unique in the target root.');
+        error.statusCode = 409; error.code = 'template_code_ambiguous'; throw error;
+      }
+      card = item;
+    }
+    const total = Number(response.json?.meta?.total ?? response.json?.meta?.count);
+    if (data.length < 1000 || Number.isFinite(total) && start + data.length >= total) return { schema, response, card };
+    const pageKey = hashJson(data.map((item) => item._id));
+    if (seen.has(pageKey)) {
+      const error = new Error('Template lookup could not confirm a complete result.');
+      error.statusCode = 502; error.code = 'template_lookup_incomplete'; throw error;
+    }
+    seen.add(pageKey);
+    start += data.length;
+  }
 }
 
 function applyTemplateParamDefaults(spec, params) {
-  const effective = {};
-  const assignDefaults = (source) => {
-    if (!source || typeof source !== 'object' || Array.isArray(source)) return;
-    for (const [key, value] of Object.entries(source)) {
-      if (value !== undefined && value !== null && effective[key] === undefined) {
-        effective[key] = value;
-      }
-    }
-  };
-  assignDefaults(spec && spec.defaults);
-  assignDefaults(spec && spec.paramDefaults);
-  if (spec && spec.classNameFallback && effective.className === undefined) {
-    effective.className = spec.classNameFallback;
-  }
-  if (spec && spec.params && typeof spec.params === 'object' && !Array.isArray(spec.params)) {
-    for (const [key, definition] of Object.entries(spec.params)) {
-      if (effective[key] !== undefined || !definition || typeof definition !== 'object') continue;
-      if (definition.default !== undefined) effective[key] = definition.default;
-      else if (definition.defaultValue !== undefined) effective[key] = definition.defaultValue;
-    }
-  }
-  if (params && typeof params === 'object' && !Array.isArray(params)) {
-    for (const [key, value] of Object.entries(params)) {
-      if (value === undefined || value === null) continue;
-      if (value === '' && effective[key] !== undefined) continue;
-      effective[key] = value;
-    }
-  }
-  return effective;
+  return resolveTemplateParameters(spec, params).values;
 }
 
 function templateParamHasDefault(definition) {
@@ -58618,6 +58961,500 @@ async function handleBackend(req, res, requestUrl) {
   return handleBackendRequest(req, res, requestUrl);
 }
 
+function templateTransferIssue(path, code, message, severity = 'error') {
+  return { path, code, message, severity, blocking: false };
+}
+
+function templateTransferSelections(spec) {
+  const models = (Array.isArray(spec.visualModels) ? spec.visualModels : []).map((model, index) => ({ model, path: `$.spec.visualModels[${index}]` }));
+  if (spec.visualModel) models.push({ model: spec.visualModel, path: '$.spec.visualModel' });
+  return models.flatMap(({ model, path }) => (Array.isArray(model.selections) ? model.selections : []).map((selection, index) => ({ selection, path: `${path}.selections[${index}]` })));
+}
+
+function templateTransferSelectionRules(spec) {
+  return templateTransferSelections(spec).flatMap(({ selection, path }) => {
+    const rulesKey = Array.isArray(selection.rules) ? 'rules' : 'scopeRules';
+    return (selection[rulesKey] || []).map((rule, index) => {
+      const valueKey = Object.hasOwn(rule, 'rightExpression') ? 'rightExpression' : 'value';
+      return { selection, rule, valueKey, path: `${path}.${rulesKey}[${index}].${valueKey}`, fieldPath: `${path}.${rulesKey}[${index}].path`, semanticKey: `${selection.id || selection.alias}:${index}:${rule.path}` };
+    });
+  });
+}
+
+function templateTransferReferenceType(definition) {
+  if (!definition || typeof definition !== 'object') return null;
+  const type = String(definition.referenceType || definition.type || '').toLowerCase();
+  if (type === 'lookup' && definition.lookupType) return { kind: 'lookup', lookupType: definition.lookupType };
+  if (['reference', 'card'].includes(type) && (definition.targetClass || definition.targetType || definition.className)) {
+    return { kind: 'card', className: definition.targetClass || definition.targetType || definition.className };
+  }
+  return null;
+}
+
+// Resolve row provenance using metadata only. No selection or relation rows are fetched.
+async function validateTemplateTransferRawSteps(spec, parameters, { field, readClass, readDomain, catalog, issues, filterReference }) {
+  const aliases = new Map();
+  const unverified = (path, message) => issues.push(templateTransferIssue(path, 'template_transfer_dependency_unverified', message));
+  const copy = (source) => ({ className: source?.className || '', columns: new Map(source?.columns || []) });
+  const column = async (source, name, path) => {
+    const origin = source?.columns.get(name) || (source?.className ? { className: source.className, path: name } : null);
+    if (!origin) { unverified(path, `Cannot statically resolve row field ${name}.`); return null; }
+    return origin.literal ? origin : { ...origin, attribute: await field(origin.className, origin.path, path) };
+  };
+  const filters = async (source, values, path, alias) => {
+    for (const [index, filter] of (Array.isArray(values) ? values : []).entries()) {
+      const name = filter.path || filter.attribute || filter.column || filter.field;
+      const origin = await column(source, name, `${path}[${index}]`);
+      if (origin && !origin.literal) {
+        filterReference(origin.attribute, filter, `${path}[${index}]`, alias);
+      }
+    }
+  };
+  const cardSource = async (className, path) => {
+    const source = { className, columns: new Map() };
+    if (!className || !/^[A-Za-z][A-Za-z0-9_]*$/.test(String(className))) {
+      source.className = '';
+      unverified(path, 'The card class cannot be resolved from effective parameters or static alias provenance.');
+      return source;
+    }
+    const cls = await readClass(className);
+    if (!cls) issues.push(templateTransferIssue(path, 'template_transfer_class_unavailable', `CMDBuild class ${className} is not readable in the target contour.`));
+    for (const name of ['Class', '_id', 'Code', 'Description', ...(cls?.attributes || []).map((attr) => attr.name)]) {
+      source.columns.set(name, { className, path: name, ...(name === 'Class' ? { constant: className } : {}) });
+    }
+    return source;
+  };
+  const relationSource = async (step, left, path) => {
+    const className = readStepOrParam(step, parameters.values, 'targetClass', 'targetClassParam');
+    const source = await cardSource(className, path);
+    const domainName = readStepOrParam(step, parameters.values, 'domain', 'domainParam');
+    const domain = typeof domainName === 'string' ? await readDomain(domainName) : null;
+    const sourceClass = left?.columns.get(step.sourceClassColumn || step.classColumn || 'Class')?.constant || left?.className;
+    const direction = step.direction || 'both';
+    const parents = diagramImportCatalogClassParents(catalog());
+    const allows = (side, from, to) => domain && diagramImportCatalogDomainEndpointAllows(domain, side, from, parents)
+      && diagramImportCatalogDomainEndpointAllows(domain, side === 'source' ? 'destination' : 'source', to, parents);
+    if (!sourceClass || !className) unverified(path, 'Relation endpoint classes are not statically known.');
+    else if (!['source', 'destination', 'both'].includes(direction) || !(direction !== 'destination' && allows('source', sourceClass, className) || direction !== 'source' && allows('destination', sourceClass, className))) {
+      issues.push(templateTransferIssue(path, 'template_transfer_domain_endpoints', 'The domain does not confirm the requested raw DSL traversal.'));
+    }
+    for (const name of ['SourceClass', 'SourceId', 'SourceCode', 'SourceDescription', 'Domain', 'RelationId', 'RelationDirection', 'RelationSourceSide', 'RelatedClass', 'RelatedId', 'RelatedReadStatus']) {
+      source.columns.set(name, { literal: true, ...(name === 'SourceClass' ? { constant: sourceClass } : {}) });
+    }
+    return source;
+  };
+  for (const [index, step] of (Array.isArray(spec.steps) ? spec.steps : []).entries()) {
+    const path = `$.spec.steps[${index}]`;
+    const left = aliases.get(step.from);
+    const right = aliases.get(step.with);
+    let source = copy(left);
+    if (step.type === 'selectCards' || step.type === 'expandRelations') {
+      const className = step.type === 'selectCards'
+        ? step.className !== undefined && step.className !== '' ? step.className
+          : step.classNameParam ? parameters.values[step.classNameParam]
+            : step.classColumn ? left?.columns.get(step.classColumn)?.constant : ''
+        : readStepOrParam(step, parameters.values, 'targetClass', 'targetClassParam');
+      source = step.type === 'expandRelations' ? await relationSource(step, left, path) : await cardSource(className, path);
+      if (left) for (const [name, origin] of left.columns) source.columns.set(`Source_${name}`, origin);
+      await filters(source, step.filters || step.where, `${path}.${step.filters ? 'filters' : 'where'}`, step.as);
+      for (const projection of normalizePathColumnSpecs(step.columns || step.cardColumns || step.outputColumns)) {
+        const origin = await column(source, projection.path, `${path}.columns`);
+        if (origin) source.columns.set(projection.as, origin);
+      }
+    } else if (step.type === 'filterRows') {
+      await filters(left, step.filters || step.where, `${path}.${step.filters ? 'filters' : 'where'}`, step.as);
+    } else if (['matchRows', 'semiJoinRows', 'existsRelatedRows', 'joinRows', 'intersectRows', 'differenceRows'].includes(step.type)) {
+      const matching = ['matchRows', 'semiJoinRows', 'existsRelatedRows'].includes(step.type);
+      const pairs = matching ? (step.rules || step.where || []).map((rule) => {
+        const normalized = normalizeMatchRowsRule(rule);
+        return { left: normalized.leftColumn, right: normalized.rightColumn };
+      }) : normalizeRowOperationKeys(step);
+      const related = step.type === 'existsRelatedRows' ? await relationSource(step, left, path) : null;
+      for (const pair of pairs) {
+        await column(related ? right : left, pair.left, `${path}.${matching ? 'rules' : 'on'}`);
+        await column(related || right, pair.right, `${path}.${matching ? 'rules' : 'on'}`);
+      }
+      if (related) for (const projection of normalizePathColumnSpecs(step.columns)) await column(related, projection.path, `${path}.columns`);
+      if (['matchRows', 'joinRows'].includes(step.type) && left && right) {
+        const mapping = step.type === 'matchRows'
+          ? buildMatchRowsColumnMapping([...left.columns.keys()], [...right.columns.keys()], step)
+          : buildRightColumnMapping([...left.columns.keys()], [...right.columns.keys()], pairs, step);
+        for (const item of mapping.mapping) source.columns.set(item.target, right.columns.get(item.source));
+      }
+    } else if (step.type === 'composeRows' || step.type === 'compose') {
+      source = { className: '', columns: new Map() };
+      for (const projection of normalizeComposeColumns(step)) {
+        const origin = projection.hasValue || projection.valueParam || projection.template
+          ? { literal: true, ...(projection.hasValue ? { constant: projection.value } : projection.valueParam ? { constant: parameters.values[projection.valueParam] } : {}) }
+          : await column(projection.source === 'right' ? right : left, projection.column, `${path}.columns`);
+        if (origin) source.columns.set(projection.name, origin);
+      }
+    } else if (step.type === 'enrichRows') {
+      for (const projection of normalizePathColumnSpecs(step.columns || step.fields)) {
+        const origin = await column(left, projection.path, `${path}.columns`);
+        if (origin) source.columns.set(projection.as, origin);
+      }
+    } else if (step.type === 'unionRows') {
+      if (!left || !right || left.className !== right.className) source.className = '';
+      for (const [name, origin] of right?.columns || []) {
+        if (stableJsonStringify(source.columns.get(name)) !== stableJsonStringify(origin)) source.columns.delete(name);
+      }
+    } else if (['extractVariables', 'extract'].includes(step.type)) {
+      source = { className: '', columns: new Map() };
+      unverified(path, 'Extracted row fields have no statically verified schema provenance.');
+    } else {
+      unverified(path, `Static transfer dependency analysis is unavailable for ${step.type}.`);
+    }
+    aliases.set(step.as, source);
+  }
+  for (const [index, table] of (spec.result?.tables || []).entries()) {
+    for (const name of table.columns || []) await column(aliases.get(table.name), name, `$.spec.result.tables[${index}].columns`);
+  }
+}
+
+function setTemplateTransferReference(spec, path, value) {
+  const pending = [{ value: spec, path: '$.spec' }];
+  while (pending.length) {
+    const current = pending.pop();
+    if (!current.value || typeof current.value !== 'object') continue;
+    for (const key of Object.keys(current.value)) {
+      const location = Array.isArray(current.value) ? `${current.path}[${key}]`
+        : /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) ? `${current.path}.${key}` : `${current.path}[${JSON.stringify(key)}]`;
+      if (location === path) { current.value[key] = value; return; }
+      pending.push({ value: current.value[key], path: location });
+    }
+  }
+  throw Object.assign(new Error('Unknown transfer reference path.'), { statusCode: 400 });
+}
+
+// Catalog reads use destination credentials and execution budgets, never Assistant/LLM settings.
+async function validateTemplateTransferTarget(authToken, root, spec, budget = { calls: 0 }) {
+  const issues = [];
+  const runtime = await getRuntimeConfig(authToken, root);
+  const limits = normalizeExecutionLimitConfig(runtime);
+  const classes = new Map();
+  const domains = new Map();
+  const request = async (path) => {
+    if (budget.calls >= limits.maxRestCallsDefault) {
+      const error = new Error(`Transfer validation reached maxRestCallsDefault=${limits.maxRestCallsDefault}.`);
+      error.code = 'template_transfer_catalog_limit';
+      throw error;
+    }
+    budget.calls++;
+    return cmdbuildRequest(path, authToken);
+  };
+  const readClass = async (name) => {
+    if (!name || classes.has(name)) return classes.get(name);
+    if (classes.size >= limits.maxClassesDefault) throw Object.assign(new Error(`Transfer validation reached maxClassesDefault=${limits.maxClassesDefault}.`), { code: 'template_transfer_catalog_limit' });
+    classes.set(name, null);
+    const response = await request(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(name)}`);
+    const raw = response.ok && response.json && response.json.data;
+    if (!raw || raw.active === false || raw._can_read === false || raw.name !== name) return null;
+    const attrs = await request(cmdbuildClassAttributesPath(name));
+    if (!attrs.ok) return null;
+    const value = { ...sanitizeClass(raw), attributes: sanitizeVisibleClassAttributes(responseDataArray(attrs)) };
+    classes.set(name, value);
+    if (value.parent) await readClass(value.parent);
+    return value;
+  };
+  const readDomain = async (name) => {
+    if (!name || domains.has(name)) return domains.get(name);
+    if (domains.size >= limits.maxDomainsDefault) throw Object.assign(new Error(`Transfer validation reached maxDomainsDefault=${limits.maxDomainsDefault}.`), { code: 'template_transfer_catalog_limit' });
+    domains.set(name, null);
+    const response = await request(`/cmdbuild/services/rest/v3/domains/${encodeURIComponent(name)}`);
+    const raw = response.ok && response.json && response.json.data;
+    if (!raw || raw.active === false || raw._can_read === false || raw.name !== name) return null;
+    const value = sanitizeDomain(raw);
+    domains.set(name, value);
+    return value;
+  };
+  const catalog = () => ({ classes: [...classes.values()].filter(Boolean), domains: [...domains.values()].filter(Boolean) });
+  const field = async (className, path, location) => {
+    let owner = className;
+    let rest = String(path || '');
+    let depth = 0;
+    while (rest && owner) {
+      if (depth > limits.maxTraversalDepthMax) throw Object.assign(new Error(`Transfer field ${path} reached maxTraversalDepthMax=${limits.maxTraversalDepthMax}.`), { code: 'template_transfer_catalog_limit' });
+      const cls = await readClass(owner);
+      if (!cls) break;
+      if (rest.startsWith('{')) {
+        const match = /^\{([^:}]+):([^}]+)\}\.(.+)$/.exec(rest);
+        if (!match) break;
+        const domain = await readDomain(match[1]);
+        await readClass(match[2]);
+        if (!domain || !diagramImportCatalogDomainRelatedClasses(domain, owner, catalog()).includes(match[2])) break;
+        owner = match[2]; rest = match[3]; depth++; continue;
+      }
+      if (['_id', 'Id', 'Class', 'Code', 'Description'].includes(rest)) return { name: rest, type: 'string' };
+      const dot = rest.indexOf('.');
+      const name = dot < 0 ? rest : rest.slice(0, dot);
+      const attr = cls.attributes.find((item) => item.name === name);
+      if (!attr) break;
+      if (dot < 0) return attr;
+      if (!diagramImportCatalogReferenceAttribute(attr)) break;
+      owner = attr.targetClass || attr.targetType;
+      rest = rest.slice(dot + 1); depth++;
+    }
+    issues.push(templateTransferIssue(location, 'template_transfer_field_unavailable', `CMDBuild field ${className}.${path} is not readable or its reference/domain path is invalid.`));
+    return null;
+  };
+  const manifest = templateTransferDependencies(spec);
+  const references = templateTransferEnvironmentReferences(spec);
+  const parameters = resolveTemplateParameters(spec);
+  const parameterTypes = new Map();
+  const selectionAliases = new Set(templateTransferSelections(spec).map(({ selection }) => selection.alias));
+  const rememberParameterType = (name, type) => {
+    if (!type) return;
+    if (!parameterTypes.has(name)) parameterTypes.set(name, new Map());
+    parameterTypes.get(name).set(stableJsonStringify(type), type);
+  };
+  for (const [name, definition] of Object.entries(spec.params || {})) rememberParameterType(name, templateTransferReferenceType(definition));
+  const filterReference = (attr, filter, path, alias) => {
+    const type = templateTransferReferenceType(attr);
+    if (!type) return;
+    const key = Object.hasOwn(filter, 'valueExpression') ? 'valueExpression' : Object.hasOwn(filter, 'rightExpression') ? 'rightExpression' : 'value';
+    const value = filter[key];
+    const parameter = typeof value === 'string' && /^\$\{param\.([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(value);
+    if (parameter || filter.valueParam) rememberParameterType(parameter ? parameter[1] : filter.valueParam, type);
+    else if (!selectionAliases.has(alias) && /^[1-9][0-9]*$/.test(String(value))) references.push({ ...type, path: `${path}.${key}`, value });
+  };
+  const addParameterReferences = () => {
+    for (const candidate of parameters.candidates) {
+      const types = parameterTypes.get(candidate.parameterName);
+      const type = types?.size === 1 ? types.values().next().value
+        : typeof candidate.value === 'string' && /^https?:\/\//i.test(candidate.value) ? { kind: 'url' } : null;
+      if (types?.size > 1) {
+        if (candidate.effective && !issues.some((issue) => issue.path === candidate.path && issue.code === 'template_transfer_dependency_unverified')) issues.push(templateTransferIssue(candidate.path, 'template_transfer_dependency_unverified', `Parameter ${candidate.parameterName} has ambiguous reference targets.`));
+        continue;
+      }
+      if (type) references.push({ ...type, ...candidate });
+    }
+  };
+  try {
+    for (const dep of manifest.classes) if (dep.name && !await readClass(dep.name)) issues.push(templateTransferIssue(dep.path, 'template_transfer_class_unavailable', `CMDBuild class ${dep.name} is not readable in the target contour.`));
+    for (const dep of manifest.domains) if (dep.name && !await readDomain(dep.name)) issues.push(templateTransferIssue(dep.path, 'template_transfer_domain_unavailable', `CMDBuild domain ${dep.name} is not readable in the target contour.`));
+    for (const dep of manifest.directFields) if (!dep.path.startsWith('$.spec.steps[')) await field(dep.className, dep.field, dep.path);
+    await validateTemplateTransferRawSteps(spec, parameters, { field, readClass, readDomain, catalog, issues, filterReference });
+    const flow = objectFlowFromSpecServer(spec);
+    const stages = assistantObjectFlowDiagramStages(spec, flow);
+    for (const stage of stages) {
+      const cardSources = (stage.cardSources || []).slice().sort((left, right) => String(right.classColumn).length - String(left.classColumn).length);
+      for (const column of stage.columns || []) {
+        const source = cardSources.find((item) => {
+          const raw = diagramImportCardSourceRawField(item, column);
+          return diagramImportCardSourceField(item, raw) === column;
+        });
+        const raw = source && diagramImportCardSourceRawField(source, column);
+        // Runtime relation metadata and CMDBuild display metadata are not schema attributes.
+        if (!source || raw.startsWith('_') || !resultRowColumnContext({ Class: source.className }, raw, raw).className) continue;
+        const stepIndex = (spec.steps || []).findIndex((item) => item.as === stage.alias);
+        await field(source.className, raw, stepIndex < 0 ? '$.spec' : `$.spec.steps[${stepIndex}]`);
+      }
+    }
+    const aliases = new Map((flow.selections || []).map((item) => [item.alias, item.className]));
+    for (const { selection, rule, valueKey, path, fieldPath } of templateTransferSelectionRules(spec)) {
+        if (!rule.path) continue;
+        const attr = await field(selection.className, rule.path, fieldPath);
+        const value = rule[valueKey];
+        filterReference(attr, rule, path.slice(0, path.lastIndexOf('.')), selection.alias);
+        if (attr && ['reference', 'lookup'].includes(attr.type) && value !== '' && value !== undefined && /^[1-9][0-9]*$/.test(String(value))) {
+          references.push({ path, value, kind: attr.type === 'lookup' ? 'lookup' : 'card', className: attr.targetClass || attr.targetType || '', lookupType: attr.lookupType || '' });
+        }
+    }
+    for (const [index, operation] of (flow.operations || []).entries()) {
+      const source = aliases.get(operation.from);
+      const target = operation.targetClass || operation.className;
+      if (source && target && operation.domain) {
+        const domain = await readDomain(operation.domain);
+        const parents = diagramImportCatalogClassParents(catalog());
+        const direction = operation.direction;
+        const sourceSide = direction === 'source' ? 'source' : 'destination';
+        const targetSide = direction === 'source' ? 'destination' : 'source';
+        const endpoints = domain && diagramImportCatalogDomainEndpointAllows(domain, sourceSide, source, parents) && diagramImportCatalogDomainEndpointAllows(domain, targetSide, target, parents);
+        const reversed = direction === 'both' && domain && diagramImportCatalogDomainEndpointAllows(domain, targetSide, source, parents) && diagramImportCatalogDomainEndpointAllows(domain, sourceSide, target, parents);
+        if (!domain || !['source', 'destination', 'both'].includes(direction) || (!endpoints && !reversed)) {
+          issues.push(templateTransferIssue(`$.spec.objectFlow.operations[${index}]`, 'template_transfer_domain_endpoints', `Domain ${operation.domain} does not confirm the requested ${source} -> ${target} traversal/direction.`));
+        }
+      }
+      if (operation.alias && (target || source)) aliases.set(operation.alias, target || source);
+    }
+    addParameterReferences();
+    const checked = new Set();
+    for (const ref of [...new Map(references.map((item) => [item.path, item])).values()]) {
+      if (ref.effective === false) continue;
+      if (ref.kind !== 'url' && !/^[1-9][0-9]*$/.test(String(ref.value))) {
+        if (ref.value !== null && ref.value !== '') issues.push(templateTransferIssue(ref.path, 'template_transfer_reference_invalid', 'The effective reference must be a positive card or lookup ID.'));
+        continue;
+      }
+      const key = `${ref.kind}:${ref.className || ref.lookupType}:${ref.value}`;
+      if (checked.has(key)) continue;
+      checked.add(key);
+      if (ref.kind === 'card' && ref.className) {
+        const response = await request(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(ref.className)}/cards/${encodeURIComponent(ref.value)}`);
+        if (!response.ok || !response.json?.data || response.json.data._can_read === false) issues.push(templateTransferIssue(ref.path, 'template_transfer_card_unavailable', `Card ${ref.className}/${ref.value} is not readable in the target contour.`));
+      } else if (ref.kind === 'lookup' && ref.lookupType) {
+        const response = await request(`/cmdbuild/services/rest/v3/lookup_types/${encodeURIComponent(ref.lookupType)}/values/${encodeURIComponent(ref.value)}`);
+        if (!response.ok || !response.json?.data) issues.push(templateTransferIssue(ref.path, 'template_transfer_lookup_unavailable', `Lookup ${ref.lookupType}/${ref.value} is not readable in the target contour.`));
+      }
+    }
+  } catch (error) {
+    issues.push(templateTransferIssue('$.spec', error.code || 'template_transfer_catalog_failed', error.message));
+  }
+  // Metadata-declared candidates remain visible even when a catalog budget was exhausted.
+  addParameterReferences();
+  return { issues, catalog: catalog(), environmentReferences: [...new Map(references.map((ref) => [ref.path, { ...ref, requiresConfirmation: ref.effective !== false && ref.value !== null && ref.value !== '' }])).values()], limits, calls: budget.calls };
+}
+
+async function prepareTemplateTransferD2(spec, validation) {
+  let next = cloneJsonValueServer(spec, {});
+  const originalAuthoring = cloneJsonValueServer(next.authoring, null);
+  const diagrams = next.result && next.result.diagrams || [];
+  const compiledSteps = new Map();
+  for (const [index, diagram] of diagrams.entries()) {
+    const imported = diagram && diagram.authoring && diagram.authoring.d2Import;
+    if (!imported) continue;
+    imported.mappingValidation = { version: 1, status: 'needsValidation' };
+    try {
+      if (validation.issues.some((issue) => issue.severity === 'error')) continue;
+      const proposal = await appliedDiagramImportProposalFromSpec(next, diagram.id);
+      proposal.proposalId = crypto.randomUUID();
+      const errors = validateDiagramImportV3Catalog(proposal, validation.catalog, next);
+      if (errors.length) {
+        validation.issues.push(...errors.map((item) => templateTransferIssue(`$.spec.result.diagrams[${index}]${String(item.path || '$').slice(1)}`, 'template_transfer_d2_catalog', item.message)));
+        continue;
+      }
+      next = applyDiagramImportProposal(next, proposal, [], proposal.relationRules, proposal.structureTree, proposal.endpointProfiles);
+      for (const step of next.steps || []) {
+        if (step.managedBy !== 'd2ImportV3') continue;
+        const previous = compiledSteps.get(step.as);
+        if (previous && stableJsonStringify(previous) !== stableJsonStringify(step)) {
+          throw Object.assign(new Error(`D2 diagrams compile incompatible definitions for alias ${step.as}.`), { code: 'template_transfer_d2_alias_conflict' });
+        }
+        compiledSteps.set(step.as, step);
+      }
+    } catch (error) {
+      validation.issues.push(templateTransferIssue(`$.spec.result.diagrams[${index}].authoring.d2Import`, error.code || 'template_transfer_d2_invalid', error.message));
+    }
+  }
+  if (validation.issues.some((issue) => issue.severity === 'error')) {
+    next = cloneJsonValueServer(spec, {});
+    for (const diagram of next.result && next.result.diagrams || []) {
+      if (diagram.authoring && diagram.authoring.d2Import) diagram.authoring.d2Import.mappingValidation = { version: 1, status: 'needsValidation' };
+    }
+  } else if (compiledSteps.size) {
+    next.steps = (next.steps || []).filter((step) => step.managedBy !== 'd2ImportV3').concat([...compiledSteps.values()]);
+  }
+  // A different unsaved source must not be overwritten by the last applied mapping.
+  if (originalAuthoring) {
+    const source = originalAuthoring.d2 && originalAuthoring.d2.source;
+    const applied = next.result && (next.result.diagrams || []).find((item) => item.authoring && item.authoring.d2Import && item.authoring.d2Import.source === source);
+    if (!applied) next.authoring = originalAuthoring;
+    else if (originalAuthoring.assistant) next.authoring.assistant = originalAuthoring.assistant;
+    if (source && !applied) {
+      validation.issues.push(templateTransferIssue('$.spec.authoring.d2', 'template_transfer_d2_source_pending', 'The current D2 source differs from its applied mapping. Analyze the source in Diagram Editor.', 'warning'));
+    }
+    const checkpoints = originalAuthoring.d2 || {};
+    if (source && (checkpoints.analysisCheckpoint || checkpoints.assistantCheckpoint)) {
+      try {
+        const identity = await d2SourceStructureIdentity(source);
+        if (!identity.ok) throw new Error(identity.error || 'D2 source is invalid.');
+        const wrapper = {
+          proposalId: crypto.randomUUID(), deterministicSpecHash: diagramImportDeterministicSpecHash(next),
+          source: { hash: identity.sourceHash, structureHash: identity.structureHash, mappingContractHash: identity.mappingContractHash }
+        };
+        next.authoring.d2 = { ...next.authoring.d2, source };
+        for (const name of ['analysisCheckpoint', 'assistantCheckpoint']) {
+          if (!checkpoints[name]) continue;
+          const normalize = name === 'analysisCheckpoint' ? normalizeD2AnalysisCheckpoint : normalizeD2AssistantCheckpoint;
+          const restored = normalize({ ...checkpoints[name], ...wrapper });
+          if (!restored) throw new Error(`The imported ${name} is not supported by the current editor.`);
+          next.authoring.d2[name] = restored;
+        }
+      } catch (error) {
+        validation.issues.push(templateTransferIssue('$.spec.authoring.d2', 'template_transfer_d2_checkpoint_invalid', error.message));
+      }
+    }
+  }
+  return next;
+}
+
+async function handleTemplateTransfer(req, res, requestUrl, authToken) {
+  if (!methodAllowed(req, res, 'POST') || !requireStateChangingRequest(req, res, authToken) || !requireJsonContentType(req, res)) return;
+  const body = await readJsonBody(req, TEMPLATE_REQUEST_MAX_BYTES);
+  const root = requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
+  const session = await requireValidBackendSession(authToken, res);
+  if (!session) return;
+  if (requestUrl.pathname.endsWith('/export')) {
+    const raw = body.template;
+    const errors = validateTemplateSpecForStorage(raw && raw.spec);
+    if (errors.length) { sendJson(res, 400, { success: false, code: 'template_transfer_invalid', message: 'Template spec validation failed.', errors }); return; }
+    const schema = buildTechnicalSchema(root);
+    const access = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(schema.classNames.template)}`, authToken);
+    if (!access.ok || access.json?.data?._can_read === false) { sendJson(res, access.ok ? 403 : 502, { success: false, message: 'Template read permission could not be verified.' }); return; }
+    const pkg = createTemplateTransferPackage(raw, { producerVersion: APPLICATION_VERSION });
+    logInfo('template.transfer.exported', { requestId: req.cmdpRequestId || '', templateCode: pkg.template.code, checksum: pkg.checksum });
+    sendJson(res, 200, { success: true, package: pkg, fileName: `${pkg.template.code.replace(/[^A-Za-z0-9_.-]/g, '_') || 'template'}.cmdp-template.json` });
+    return;
+  }
+  if (!['new', 'replace'].includes(body.mode)) { sendJson(res, 400, { success: false, code: 'template_transfer_mode_invalid', message: 'Choose new or replace import mode.' }); return; }
+  let portable = readTemplateTransferPackage(body.package);
+  let code;
+  try { code = validateCmdbuildIdentifier(String(body.targetCode || portable.code || '').trim(), 'template code'); }
+  catch (error) { error.statusCode = 400; throw error; }
+  const target = await findTemplateCard(authToken, root, code);
+  if (!target.response.ok) { sendJson(res, 502, { success: false, message: 'Target template lookup failed.', cmdbuildStatus: target.response.statusCode }); return; }
+  if (body.mode === 'new' && target.card) { sendJson(res, 409, { success: false, code: 'template_transfer_code_collision', message: `Template already exists: ${code}` }); return; }
+  if (body.mode === 'replace' && !target.card) { sendJson(res, 404, { success: false, message: `Template not found: ${code}` }); return; }
+  const existing = target.card ? sanitizeTemplateCard(target.card) : null;
+  if (existing && existing.protected) { sendJson(res, 403, { success: false, message: 'Protected templates cannot be replaced by import.' }); return; }
+  if (existing && (!isSpecHash(body.baseSpecHash) || body.baseSpecHash !== existing.specHash)) { sendJson(res, 409, { success: false, code: 'template_spec_conflict', message: 'The target template changed. Reload it before preparing replacement.' }); return; }
+  if (existing ? !await requireTemplateUpdatePermission(authToken, res, target.schema, target.card, code) : !await requireTemplateClassPermission(authToken, res, target.schema, '_can_create')) return;
+  // Resolve schema-typed literals before accepting overrides; arbitrary JSON paths are never writable.
+  const budget = { calls: 0 };
+  const validation = await validateTemplateTransferTarget(authToken, root, portable.spec, budget);
+  if (body.overrides !== undefined && (!Array.isArray(body.overrides) || body.overrides.some((item) => !item || typeof item.path !== 'string' || !Object.hasOwn(item, 'value')))) throw Object.assign(new Error('Invalid transfer reference overrides.'), { statusCode: 400 });
+  const overrides = body.overrides || [];
+  const shadowedOverrides = [];
+  if (overrides.length) {
+    const known = new Map(validation.environmentReferences.map((ref) => [ref.path, ref]));
+    if (new Set(overrides.map((item) => item.path)).size !== overrides.length || overrides.some((item) => !known.has(item.path))) throw Object.assign(new Error('Unknown or duplicate transfer reference override.'), { statusCode: 400 });
+    const rules = templateTransferSelectionRules(portable.spec);
+    const ruleReplacements = new Map();
+    for (const override of overrides) {
+      const reference = known.get(override.path);
+      const valid = reference.kind === 'url' ? typeof override.value === 'string' && /^https?:\/\//i.test(override.value)
+        : (Number.isSafeInteger(override.value) && override.value > 0) || typeof override.value === 'string' && /^[1-9][0-9]*$/.test(override.value);
+      if (!valid) throw Object.assign(new Error('Invalid typed card/lookup/URL override.'), { statusCode: 400 });
+      if (reference.effective === false) shadowedOverrides.push(templateTransferIssue(override.path, 'template_transfer_override_shadowed', `Override does not reach runtime; the effective value comes from ${reference.shadowedBy || 'another parameter source'}.`));
+      const item = rules.find((item) => item.path === override.path);
+      if (!item) { setTemplateTransferReference(portable.spec, override.path, override.value); continue; }
+      const previous = ruleReplacements.get(item.semanticKey);
+      if (previous !== undefined && String(previous) !== String(override.value)) throw Object.assign(new Error('Conflicting replacements for the same selection rule.'), { statusCode: 400 });
+      ruleReplacements.set(item.semanticKey, override.value);
+    }
+    if (ruleReplacements.size) {
+      for (const item of rules) if (ruleReplacements.has(item.semanticKey)) item.rule[item.valueKey] = String(ruleReplacements.get(item.semanticKey));
+      // Recompile execution steps, but retain all authored table labels, ownership and visual metadata.
+      portable.spec.steps = compileObjectFlowToSpec(portable.spec, objectFlowFromSpecServer(portable.spec)).steps;
+    }
+    Object.assign(validation, await validateTemplateTransferTarget(authToken, root, portable.spec, budget));
+  }
+  validation.issues.push(...shadowedOverrides);
+  {
+    const spec = await prepareTemplateTransferD2(portable.spec, validation);
+    const storageErrors = validateTemplateSpecForStorage(spec);
+    if (storageErrors.length) { sendJson(res, 400, { success: false, code: 'template_transfer_invalid', message: 'Imported template is invalid.', errors: storageErrors }); return; }
+    const execution = executionValidationForSpec(spec);
+    validation.issues.push(...execution.errors.map((item) => templateTransferIssue(item.path, 'template_transfer_execution_incomplete', item.message, 'warning')));
+    const template = { ...portable, code, description: body.description === undefined ? portable.description : String(body.description), active: existing ? existing.active : false, owner: existing ? existing.owner : session.data.username, updatedAt: existing ? existing.updatedAt : null, ...(existing ? { id: existing.id, specHash: existing.specHash } : {}), spec };
+    const executionReady = execution.executable && !validation.issues.some((item) => item.severity === 'error');
+    const checks = { status: validation.issues.length || validation.environmentReferences.length ? 'needsAttention' : 'ready', executionReady, issues: validation.issues, environmentReferences: validation.environmentReferences, summary: { restCalls: validation.calls, limits: validation.limits } };
+    const changes = { mode: body.mode, sourceCode: portable.code, targetCode: code, replacedSections: ['spec', 'paramsSchema', 'resultSchema', 'description'], previousSpecHash: existing ? existing.specHash : null, importedSpecHash: hashJson(spec) };
+    logInfo('template.transfer.prepared', { requestId: req.cmdpRequestId || '', templateCode: code, mode: body.mode, status: checks.status, executionReady, issueCount: checks.issues.length });
+    sendJson(res, 200, { success: true, template, checks, changes });
+  }
+}
+
 async function handleBackendRequest(req, res, requestUrl) {
   const auth = backendAuthFromRequest(req, requestUrl);
   const authToken = auth.token;
@@ -58663,6 +59500,17 @@ async function handleBackendRequest(req, res, requestUrl) {
       receivedCmdbuildCookie: false,
       message: 'CMDBuild-Authorization cookie was not sent to backend route.'
     });
+    return;
+  }
+
+  if ([`${BACKEND_PREFIX}/template-transfer/export`, `${BACKEND_PREFIX}/template-transfer/prepare`].includes(requestUrl.pathname)) {
+    const slot = acquireExecutionSlot(req, res, { action: 'template-transfer' });
+    if (!slot) return;
+    try { await handleTemplateTransfer(req, res, requestUrl, authToken); }
+    catch (error) {
+      logWarn('template.transfer.rejected', { requestId: req.cmdpRequestId || '', code: error.code || 'template_transfer_invalid' });
+      sendJson(res, error.statusCode || (error.code === 'template_transfer_invalid' ? 400 : 502), { success: false, code: error.code || 'template_transfer_invalid', message: error.message });
+    } finally { slot.release(); }
     return;
   }
 
@@ -61728,6 +62576,7 @@ async function handleBackendRequest(req, res, requestUrl) {
         return;
       }
       let payload = normalizeTemplatePayload(body, templateCode, session.data && session.data.username, storageOptions);
+      if (body.owner === undefined && body.Owner === undefined && found.card.Owner !== undefined) payload.Owner = found.card.Owner;
       let storedSpec = safeJsonValue(payload.SpecJson, null);
       if (diagramAuthoringStatusForSpec(storedSpec).status === 'unsupported') {
         sendJson(res, 409, d2AuthoringCurrentContractRequiredPayload(storedSpec));

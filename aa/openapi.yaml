@@ -1915,6 +1915,113 @@ paths:
           $ref: "#/components/responses/AssistantDiagnosticTrace"
         default:
           $ref: "#/components/responses/AssistantDiagnosticsError"
+  /cmdbuild/custom-api/template-transfer/export:
+    post:
+      x-flow-id: OAPI56
+      tags: [templates]
+      summary: Экспортировать текущее несохранённое определение шаблона
+      description: >
+        Перенос только между окружениями с одинаковой моделью CMDBuild.
+        Принимает полный снимок текущего редактора, собранный как Save,
+        включая Diagram, D2 source, Assistant prompts и схемы. Не записывает
+        шаблон, версию, кэш или публикацию; LLM не вызывается. templateRef
+        необязателен и не является доказательством доверия к source.
+        Ограничение тела TEMPLATE_REQUEST_MAX_BYTES (CMDP_TEMPLATE_REQUEST_MAX_BYTES)
+        совпадает с обычным Save.
+        Runtime config, identity, history, snapshots и secrets не переносятся.
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      parameters:
+        - $ref: "#/components/parameters/TemplateTransferRoot"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplateTransferExportRequest"
+      responses:
+        "200":
+          description: JSON envelope; браузер скачивает package как JSON Blob с fileName
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateTransferExportResponse"
+        "400":
+          description: Некорректный JSON, root, template или Spec
+        "401":
+          description: Нет действительной CMDBuild session
+        "403":
+          description: Недостаточно прав либо CSRF/same-origin не пройдены
+        "413":
+          $ref: "#/components/responses/InputCollectionLimit"
+        "415":
+          description: Требуется application/json
+        "502":
+          description: Ошибка CMDBuild upstream
+  /cmdbuild/custom-api/template-transfer/prepare:
+    post:
+      x-flow-id: OAPI57
+      tags: [templates]
+      summary: Подготовить импорт без записи в CMDBuild
+      description: >
+        Проверяет format/version/checksum/security и модель назначения,
+        применяет только явные overrides. ID/URL не remap автоматически.
+        При new проверяет право создания и отсутствие Code; новый черновик
+        неактивен и не наследует identity источника. При replace обязательны
+        существующий targetCode и baseSpecHash; identity, Code, activity,
+        ownership и history назначения сохраняются. baseSpecHash проверяется
+        при prepare и сохраняется как expectedSpecHash для последующего Save.
+        Только обычный Save записывает шаблон и версию. UI подтверждает замену
+        всего editor definition и каждую requiresConfirmation ссылку перед
+        staging. needsAttention не запрещает staging и Save незавершённого
+        определения; executionReady не подразумевается. Неподписанное/неполное
+        D2 mapping остаётся редактируемым; исполнение требует строгой проверки.
+        Нет LLM, автоматического Save/publish и миграции модели.
+        Ограничение тела TEMPLATE_REQUEST_MAX_BYTES (CMDP_TEMPLATE_REQUEST_MAX_BYTES)
+        совпадает с Save.
+        Структурные лимиты применяет HTTP input pipeline, не pure transfer module:
+        CMDP_INPUT_MAX_COLLECTION_ITEMS default 5000 / absolute 50000,
+        CMDP_INPUT_MAX_TOTAL_ITEMS default 50000 / absolute 500000.
+        Target checks используют runtime executionLimits назначения:
+        maxClassesDefault=100, maxDomainsDefault=100, maxRestCallsDefault=250,
+        maxTraversalDepthMax=5 по умолчанию. Фактические бюджеты возвращаются
+        в checks.summary.limits; достижение бюджета даёт issue для review,
+        а не автоматическое расширение поиска или вызов LLM.
+      security:
+        - cmdbuildCookie: []
+          csrfHeader: []
+      parameters:
+        - $ref: "#/components/parameters/TemplateTransferRoot"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplateTransferPrepareRequest"
+      responses:
+        "200":
+          description: Подготовленный локальный черновик и проблемы для review; записи нет
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateTransferPrepareResponse"
+        "400":
+          description: Некорректные JSON, format/version/checksum/security, Spec или overrides; template не возвращается
+        "401":
+          description: Нет действительной CMDBuild session
+        "403":
+          description: Недостаточно create/update/read permissions либо CSRF/same-origin не пройдены
+        "404":
+          description: Шаблон назначения replace не найден
+        "409":
+          description: Code нового шаблона занят либо baseline baseSpecHash устарел
+        "413":
+          $ref: "#/components/responses/InputCollectionLimit"
+        "415":
+          description: Требуется application/json
+        "502":
+          description: Ошибка CMDBuild upstream
 components:
   responses:
     AssistantDiagnosticsStatus:
@@ -2094,6 +2201,11 @@ components:
       in: header
       name: X-CMDBDynamicPages-CSRF
   parameters:
+    TemplateTransferRoot:
+      name: root
+      in: query
+      description: Технический root назначения; UI передаёт явно и привязывает async response к root/session/template
+      schema: { type: string, default: Cst_QueryTool }
     AssistantDiagnosticsRoot:
       name: root
       in: query
@@ -2173,6 +2285,169 @@ components:
               bypassRefreshCooldown:
                 type: boolean
   schemas:
+    TemplateTransferExportRequest:
+      type: object
+      required: [template]
+      properties:
+        template:
+          $ref: "#/components/schemas/TemplatePayload"
+        templateRef:
+          $ref: "#/components/schemas/AssistantTemplateRef"
+    TemplateTransferDefinition:
+      type: object
+      additionalProperties: false
+      required: [code, description, spec, paramsSchema, resultSchema]
+      description: >
+        Переносимое определение без id, activity, owner, history и runtime config.
+        Содержит canonical authoring, но не доверенные подписи/сроки checkpoint.
+      properties:
+        code: { type: string }
+        description: { type: string }
+        spec:
+          type: object
+          x-input-collection-policy: full-spec
+          required: [version]
+          properties:
+            version: { type: integer, enum: [1] }
+          additionalProperties: true
+        paramsSchema: { type: object, additionalProperties: true }
+        resultSchema: { type: object, additionalProperties: true }
+    TemplateTransferPackage:
+      type: object
+      additionalProperties: false
+      required: [format, formatVersion, producerVersion, template, dependencies, checksum]
+      description: >
+        Единый .cmdp-template.json. checksum проверяет целостность canonical JSON,
+        но не является подписью доверия источнику или каталогу назначения.
+        Старые версии формата не поддержаны. Загружать неизменённым;
+        адаптацию передавать отдельно в prepare.overrides.
+        maxItems описывает абсолютный предел HTTP input pipeline;
+        pure transfer module сам не задаёт глобальные collection caps.
+      properties:
+        format: { type: string, enum: [cmdbdynamicpages.template] }
+        formatVersion: { type: integer, enum: [1] }
+        producerVersion: { type: string, minLength: 1, maxLength: 128 }
+        template:
+          $ref: "#/components/schemas/TemplateTransferDefinition"
+        dependencies:
+          type: object
+          required: [classes, directFields, domains, environmentReferences, inspection]
+          properties:
+            classes: { type: array, maxItems: 50000, description: 'CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000; абсолютный предел 50000.', items: { type: object, additionalProperties: true } }
+            directFields: { type: array, maxItems: 50000, description: 'CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000; абсолютный предел 50000.', items: { type: object, additionalProperties: true } }
+            domains: { type: array, maxItems: 50000, description: 'CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000; абсолютный предел 50000.', items: { type: object, additionalProperties: true } }
+            environmentReferences:
+              type: array
+              maxItems: 50000
+              description: CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000; абсолютный предел 50000.
+              items:
+                $ref: "#/components/schemas/TemplateTransferReference"
+            inspection: { type: array, maxItems: 50000, description: 'CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000; абсолютный предел 50000.', items: { type: object, additionalProperties: true } }
+        checksum: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+    TemplateTransferReference:
+      type: object
+      required: [path, value, kind]
+      properties:
+        path: { type: string, description: JSON path от $.spec }
+        value:
+          description: JSON-значение ID карточки/справочника или URL; сохраняет исходный JSON type
+          nullable: true
+        kind: { type: string, enum: [card, lookup, url] }
+        requiresConfirmation:
+          type: boolean
+          description: Подтверждение выполняется явно в UI после последнего prepare, не записывается сервером
+        className: { type: string }
+        lookupType: { type: string }
+        parameterName:
+          type: string
+          description: Только checks при prepare; имя параметра, которому принадлежит физическое default-значение
+        effective:
+          type: boolean
+          description: Только checks при prepare; используется ли это значение при запуске без явного параметра
+        shadowedBy:
+          type: string
+          description: Только checks при prepare; JSON path действующего значения, затеняющего этот default; пустая строка для действующего значения
+      additionalProperties: true
+    TemplateTransferOverride:
+      type: object
+      additionalProperties: false
+      required: [path, value]
+      properties:
+        path: { type: string, description: Явный путь environment reference от $.spec, возвращённый проверкой }
+        value:
+          description: Явное JSON-значение замены; без автоматического ID mapping
+          nullable: true
+    TemplateTransferPrepareRequest:
+      type: object
+      required: [package, mode]
+      properties:
+        package:
+          $ref: "#/components/schemas/TemplateTransferPackage"
+        mode: { type: string, enum: [new, replace] }
+        targetCode:
+          type: string
+          description: Для new необязательный код назначения; для replace обязательный существующий Code
+        baseSpecHash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+          description: Обязателен для replace; хеш сохранённого spec назначения, затем expectedSpecHash при Save
+        description:
+          type: string
+          description: Необязательное описание; при отсутствии используется trimmed описание источника
+        overrides:
+          type: array
+          maxItems: 50000
+          description: CMDP_INPUT_MAX_COLLECTION_ITEMS по умолчанию 5000; абсолютный предел 50000.
+          default: []
+          items:
+            $ref: "#/components/schemas/TemplateTransferOverride"
+    TemplateTransferExportResponse:
+      type: object
+      required: [success, package, fileName]
+      properties:
+        success: { type: boolean, enum: [true] }
+        package:
+          $ref: "#/components/schemas/TemplateTransferPackage"
+        fileName: { type: string, description: Имя скачиваемого .cmdp-template.json }
+    TemplateTransferIssue:
+      type: object
+      required: [path, code, message, severity, blocking]
+      properties:
+        path: { type: string }
+        code:
+          type: string
+          description: >
+            Включает template_transfer_override_shadowed для замены затенённого
+            default и template_transfer_dependency_unverified для активной DSL
+            зависимости без подтверждённого происхождения. Оба возвращаются
+            с severity=error и checks.executionReady=false; draft остаётся редактируемым.
+        message: { type: string }
+        severity: { type: string, enum: [warning, error] }
+        blocking: { type: boolean, enum: [false], description: Catalog/mapping issues не блокируют загрузку и редактирование }
+      additionalProperties: true
+    TemplateTransferPrepareResponse:
+      type: object
+      required: [success, template, checks, changes]
+      properties:
+        success: { type: boolean, enum: [true] }
+        template:
+          $ref: "#/components/schemas/TemplateCard"
+        checks:
+          type: object
+          required: [status, issues, environmentReferences, summary, executionReady]
+          properties:
+            status: { type: string, enum: [ready, needsAttention] }
+            issues:
+              type: array
+              items:
+                $ref: "#/components/schemas/TemplateTransferIssue"
+            environmentReferences:
+              type: array
+              items:
+                $ref: "#/components/schemas/TemplateTransferReference"
+            summary: { type: object, additionalProperties: true }
+            executionReady: { type: boolean, description: false не запрещает staging или Save незавершённого определения }
+        changes: { type: object, additionalProperties: true }
     RuntimeConfigResponse:
       type: object
       required: [success, config, diagnostics, warnings, effectiveAssistantDiagnostics]

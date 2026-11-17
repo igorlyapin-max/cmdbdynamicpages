@@ -36,7 +36,7 @@ function harness() {
   vm.runInContext(source.slice(start, source.indexOf('  function runtimeSettingsScope()', start)), context);
   load(context, ['runtimeSettingsScope', 'runtimeSettingsScopeIsCurrent', 'runtimeSettingsDraft', 'captureRuntimeSettingsInput',
     'captureRuntimeSettingsFields', 'restoreRuntimeSettingsFields', 'readValue', 'readChecked', 'hasField', 'readPositiveIntField',
-    'uiRequestOwner', 'uiDiagnosticIsCurrent', 'saveTemplate', 'runtimeConfigWarnings', 'persistRuntimeConfig']);
+    'uiRequestOwner', 'uiDiagnosticIsCurrent', 'captureTemplateEditorSnapshot', 'saveTemplateSnapshot', 'saveTemplate', 'runtimeConfigWarnings', 'persistRuntimeConfig']);
   return { fields, state, calls, context };
 }
 

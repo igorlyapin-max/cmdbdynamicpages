@@ -245,6 +245,18 @@ http://127.0.0.1:8093/metrics
 
 ## 9. Production notes
 
+### Template transfer acceptance
+
+- Serve backend and embedded editor from the same updated build. Transfer uses the existing same-origin JSON/CSRF request pipeline and CMDBuild session; it needs no separate service, port, LLM key, or database migration.
+- Export/prepare share Save's `TEMPLATE_REQUEST_MAX_BYTES` body budget, configured by `CMDP_TEMPLATE_REQUEST_MAX_BYTES`, and the existing structural collection limits. Preserve the corresponding reverse-proxy body limit; oversized inputs return HTTP 413.
+- HTTP structural budgets are `CMDP_INPUT_MAX_COLLECTION_ITEMS` (default 5000, absolute 50000) and `CMDP_INPUT_MAX_TOTAL_ITEMS` (default 50000, absolute 500000), not global caps enforced by the pure transfer module. Target catalog checks use destination runtime `executionLimits`: defaults `maxClassesDefault=100`, `maxDomainsDefault=100`, `maxRestCallsDefault=250`, `maxTraversalDepthMax=5`. Review the effective `checks.summary.limits` and any budget-exhaustion issue; the backend does not expand those budgets or invoke LLM.
+- Target environments must have the same CMDBuild model and appropriate template permissions: source read for export, create for new, and target update/read for replacement. Model differences are review findings, not automatic schema migration.
+- Verify export of an unsaved description, schemas, Diagram edit, D2 source and Assistant prompt. Download must not create/update a template or version.
+- Check Diagram -> list -> export, all four default sources, and an override of a shadowed ID: unconfirmed active dependencies must not get `executionReady:true`. For DSL without visual models, verify the terminal field of a nested reference/domain path. Editing an Assistant prompt during a request must not leave preparation disabled after the request finishes.
+- Import the file with new/replace, review issues and explicit ID/URL overrides, acknowledge required references, cancel once, then confirm staging. CMDBuild must remain unchanged until ordinary Save. A saved new template is inactive; replace preserves target identity/activity/history and rejects a stale baseline hash.
+- A `needsAttention` package with incomplete/unsigned mapping remains editable and saveable as incomplete. Verify that execution readiness is not implied and no LLM or publish request occurs during transfer.
+- Focused browser regression: `node tests/ui/template-transfer.test.mjs` (Playwright and system Chrome, or `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`). This uses mocked API responses; a real deployment still needs the authenticated end-to-end checks above. User workflow and request examples: [README](../README.md#export--import); [OpenAPI](../aa/openapi.yaml).
+
 - Do not enable a generic REST proxy.
 - Do not log `cookie`, `authorization`, `CMDBuild-Authorization`, CSRF tokens, or Redis password.
 - Keep `CMDP_DIAGNOSTIC_MODE=off` by default; use `Basic` or temporary `Verbose` diagnostics only through deployment configuration.

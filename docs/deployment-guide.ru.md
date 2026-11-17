@@ -233,6 +233,18 @@ http://127.0.0.1:8093/metrics
 
 ## 9. Production notes
 
+### Приёмка переноса шаблонов
+
+- Backend и встроенный редактор должны обслуживаться одной обновлённой сборкой. Используются существующие same-origin JSON/CSRF pipeline и CMDBuild session; отдельные сервис, порт, LLM key и миграция БД не нужны.
+- Export/prepare используют общий с Save лимит тела `TEMPLATE_REQUEST_MAX_BYTES`, настраиваемый через `CMDP_TEMPLATE_REQUEST_MAX_BYTES`, и существующие structural collection limits. Согласуйте лимит reverse proxy; превышение возвращает HTTP 413.
+- Структурные бюджеты HTTP: `CMDP_INPUT_MAX_COLLECTION_ITEMS` (default 5000, absolute 50000) и `CMDP_INPUT_MAX_TOTAL_ITEMS` (default 50000, absolute 500000). Это не глобальные caps pure transfer module. Проверки каталога используют `executionLimits` назначения: по умолчанию `maxClassesDefault=100`, `maxDomainsDefault=100`, `maxRestCallsDefault=250`, `maxTraversalDepthMax=5`. Проверьте фактические `checks.summary.limits` и проблемы достижения бюджета: backend не расширяет поиск автоматически и не вызывает LLM.
+- Окружения должны иметь одинаковую модель CMDBuild и права на шаблоны: чтение источника для экспорта, создание для нового, чтение/изменение назначения для замены. Различия модели показываются как проблемы проверки, автоматической миграции схемы нет.
+- Проверьте экспорт несохранённых описания, схем, правок Diagram, D2 source и запросов Assistant. Скачивание не должно создавать/обновлять шаблон или версию.
+- Отдельно проверьте Diagram → список → экспорт, приоритет всех четырёх источников defaults и замену затенённого ID: неподтверждённая активная зависимость не должна получить `executionReady:true`. Для DSL без visual models проверьте конечное поле вложенного reference/domain path. Изменение prompt во время запроса Assistant не должно оставлять кнопку подготовки заблокированной после завершения запроса.
+- Импортируйте файл в режимах new/replace, проверьте проблемы и явные ID/URL overrides, подтвердите обязательные ссылки, сначала отмените применение, затем подтвердите staging. До обычного Save CMDBuild не меняется. Новый сохранённый шаблон неактивен; замена сохраняет identity/активность/историю назначения и отклоняет устаревший baseline hash.
+- Пакет `needsAttention` с неполным/неподписанным сопоставлением остаётся доступен для редактирования и сохранения незавершённым. Готовность выполнения не должна подразумеваться; перенос не вызывает LLM и не публикует.
+- Браузерная регрессия: `node tests/ui/template-transfer.test.mjs` (Playwright и системный Chrome либо `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`). API в тесте замокирован; для поставленного контура отдельно выполните описанный выше сценарий с реальной авторизацией. Порядок действий и API: [README](../README.ru.md#экспорт--импорт), [OpenAPI](../aa/openapi.yaml).
+
 - Не включать generic REST proxy.
 - Не логировать `cookie`, `authorization`, `CMDBuild-Authorization`, CSRF tokens и Redis password.
 - Держать `CMDP_DIAGNOSTIC_MODE=off` по умолчанию; `Basic` или временный `Verbose` включать только через deployment configuration.

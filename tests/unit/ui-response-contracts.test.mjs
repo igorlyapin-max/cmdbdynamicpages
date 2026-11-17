@@ -6,7 +6,7 @@ import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics
 
 const source = fs.readFileSync(new URL('../../scripts/dev-proxy-server.mjs', import.meta.url), 'utf8');
 const functions = ['parseResponse', 'validateUiResponse', 'createRequestError', 'requestDraftPreview',
-  'runtimeSettingsScope', 'runtimeSettingsScopeIsCurrent',
+  'runtimeSettingsScope', 'runtimeSettingsScopeIsCurrent', 'captureTemplateEditorSnapshot', 'saveTemplateSnapshot',
   'draftPreviewRequestTimeoutMs', 'saveTemplate', 'extractByTemplate', 'runDraftAction',
   'visualizeInEditor', 'queueDiagramImportRuntimePreview', 'runDiagramImportRuntimePreview'];
 const helpers = functions.map((name) => {

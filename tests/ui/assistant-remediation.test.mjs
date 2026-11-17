@@ -4,6 +4,17 @@ import fs from 'node:fs';
 import { chromium } from 'playwright';
 import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics.mjs';
 import { createAssistantDiagnosticsUi } from '../../scripts/assistant-diagnostics-ui.mjs';
+import { resolveTemplateParameters } from '../../scripts/template-parameters.mjs';
+
+function clientVersionConstants(source) {
+  return Object.fromEntries(['D2_IMPORT_SEMANTIC_MODEL_REVISION', 'D2_IMPORT_ENDPOINT_PROFILE_VERSION',
+    'D2_IMPORT_STRUCTURE_TREE_VERSION', 'D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION',
+    'D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION', 'ASSISTANT_PROMPT_CONTRACT_VERSION'].map((name) => {
+    const match = source.match(new RegExp('^const ' + name + ' = ([0-9]+);', 'm'));
+    assert.ok(match, name);
+    return [name, Number(match[1])];
+  }));
+}
 
 function clientScript() {
   const source = fs.readFileSync(new URL('../../scripts/dev-proxy-server.mjs', import.meta.url), 'utf8');
@@ -11,10 +22,9 @@ function clientScript() {
   const end = source.indexOf('\nfunction isCollectionLimitedAuthoringRequest', start);
   assert.ok(start >= 0 && end > start, 'generated client boundaries must exist');
   const constants = {
-    createUiRequestDiagnostics, createAssistantDiagnosticsUi,
+    createUiRequestDiagnostics, createAssistantDiagnosticsUi, resolveTemplateParameters,
     DEFAULT_EMPTY_RESULT_TEXT: 'empty', DEFAULT_PERMISSION_DENIED_TEXT: 'denied', DEFAULT_TEMPLATE_CACHE_TTL_SEC: 3600,
-    D2_IMPORT_SEMANTIC_MODEL_REVISION: 10, D2_IMPORT_ENDPOINT_PROFILE_VERSION: 1, D2_IMPORT_STRUCTURE_TREE_VERSION: 5,
-    D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION: 1, D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION: 3, ASSISTANT_PROMPT_CONTRACT_VERSION: 3,
+    ...clientVersionConstants(source),
     DEFAULT_ASSISTANT_SYSTEM_PROMPT: 'system', DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT: 'flow', DEFAULT_ASSISTANT_OBJECT_FLOW_SEMANTIC_PROMPT: 'semantic',
     DEFAULT_ASSISTANT_DIAGRAM_SEMANTICS_PROMPT: 'diagram', DEFAULT_ASSISTANT_DIAGRAM_BINDING_INTENT_PROMPT: 'binding',
     DEFAULT_ASSISTANT_DIAGRAM_PLACEMENT_PROMPT: 'placement', DEFAULT_ASSISTANT_DIAGRAM_CONNECTIONS_PROMPT: 'connections', DEFAULT_ASSISTANT_DIAGRAM_CRITIQUE_PROMPT: 'critique'
@@ -25,7 +35,8 @@ function clientScript() {
   assert.ok(script.includes(startup));
   // Suppress only startup I/O; retain the real renderers, event handlers and request pipeline.
   return script.replace(startup, `window.remediation = { state, assistantDiagnosticsUi, renderDesigner,
-    captureVisibleDesignerState, captureRuntimeSettings, runtimeSettingsDraft, defaultRuntimeConfig, defaultSpec };
+    captureVisibleDesignerState, captureRuntimeSettings, runtimeSettingsDraft, defaultRuntimeConfig, defaultSpec,
+    hydrateDesignerStateFromTemplate, getRunParamsFromSpec };
     setupLanguageSelector();`);
 }
 
@@ -235,6 +246,143 @@ for (const ownership of ['generation', 'root', 'session']) {
     });
   });
 }
+
+test('semantic request cleanup releases its own busy state after edits or navigation without replacing newer diagnostics', async () => {
+  for (const change of ['prompt', 'section']) {
+    await withClient({ width: 1280, height: 900 }, async ({ page, expectRequest }) => {
+      await openSemanticPlan(page, 'en');
+      await page.locator('.assistant-template-system-prompts summary').click();
+      await page.locator('[data-action="assistant-template-prompt-override"][data-template-assistant-prompt-key="objectFlowSemantic"]').click();
+      const pending = expectRequest('POST', semanticPath);
+      await page.locator('[data-action="assistant-flow-prepare"]').click();
+      const initial = await pending.received;
+      if (change === 'prompt') {
+        await page.locator('.assistant-template-system-prompts summary').click();
+        const prompt = page.locator('#cmdp-template-assistant-system-prompt-objectFlowSemantic');
+        await assertVisible(prompt, { width: 1280 });
+        await prompt.fill('New unsaved semantic prompt');
+      } else {
+        await page.locator('[data-designer-section="params"]').click();
+      }
+      await page.evaluate(() => { window.remediation.state.message = { type: 'warning', text: 'Newer local status' }; });
+      const response = page.waitForResponse((response) => new URL(response.url()).pathname === semanticPath);
+      pending.respond({ success: false, code: 'assistant_invalid_json', retryable: true, resume: {
+        resumeId: initial.body.resumeId, stage: 'mcpContextReady', expiresAt: new Date(Date.now() + 60000).toISOString()
+      } }, 502);
+      await response;
+      await page.waitForFunction(() => !window.remediation.state.assistantFlowBusy);
+      assert.equal(await page.evaluate(() => window.remediation.state.message.text), 'Newer local status');
+      assert.equal(await page.evaluate(() => window.remediation.state.assistantFlowSemanticPlan), null);
+      if (change === 'section') await page.locator('[data-designer-section="assistant"]').click();
+      assert.equal(await page.locator('[data-action="assistant-flow-prepare"]').isDisabled(), false);
+      if (change === 'prompt') {
+        await page.locator('.assistant-template-system-prompts summary').click();
+        assert.equal(await page.locator('#cmdp-template-assistant-system-prompt-objectFlowSemantic').inputValue(), 'New unsaved semantic prompt');
+      }
+    });
+  }
+});
+
+test('full client transfer preserves staged Save/export artifacts, defaults and pending D2 checkpoints outside Diagram', async () => {
+  const versions = clientVersionConstants(fs.readFileSync(new URL('../../scripts/dev-proxy-server.mjs', import.meta.url), 'utf8'));
+  for (const mode of ['new', 'replace']) {
+    await withClient({ width: 1280, height: 1000 }, async ({ page, expectRequest, writes }) => {
+      await page.locator('#cmdp-language').selectOption('en');
+      const checkpoint = { version: versions.D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION, proposalId: 'pending-proposal',
+        deterministicSpecHash: 'pending-spec', source: { hash: 'pending-source', structureHash: 'structure', mappingContractHash: 'mapping' },
+        roles: [{ id: 'role-container', visualKind: 'container', labelTemplate: 'Pending proposal label' }],
+        relationRules: [], structureTree: { version: versions.D2_IMPORT_STRUCTURE_TREE_VERSION, items: [] } };
+      const imported = {
+        code: mode === 'replace' ? 'existing' : 'imported', description: 'Imported definition', active: true,
+        paramsSchema: { type: 'object', properties: { card: { type: 'integer' } } }, resultSchema: { type: 'object', additionalProperties: true },
+        spec: { version: 1, defaults: { card: 84 }, paramDefaults: { fallback: 22 },
+          params: { card: { type: 'integer', default: 41, example: 99 }, fallback: { type: 'integer', defaultValue: 11 }, exampleOnly: { type: 'string', example: 'example fallback' } },
+          steps: [{ type: 'selectCards', as: 'assets', className: 'Asset', limit: 20, filters: [] }],
+          objectFlow: { version: 1, selections: [{ id: 'asset-selection', alias: 'assets', className: 'Asset', rules: [] }], operations: [] },
+          cache: { enabled: true, ttlSec: 456 }, publish: { mode: 'dynamicUser', paramsMode: 'exact' },
+          result: { tables: [{ name: 'assets', title: 'Preserved table' }], diagrams: [
+            { id: 'topology', name: 'topology', title: 'Saved diagram', type: 'topology', authoring: { d2Import: {
+              version: 3, semanticModelRevision: versions.D2_IMPORT_SEMANTIC_MODEL_REVISION,
+              endpointProfileVersion: versions.D2_IMPORT_ENDPOINT_PROFILE_VERSION,
+              diagramId: 'topology', source: 'group: { class: container }', sourceHash: 'applied-source', structureHash: 'structure', mappingContractHash: 'mapping',
+              structure: { nodes: [], groups: [{ key: 'group', classKeys: ['container'] }], edges: [] }, classes: [{ key: 'container' }],
+              roles: [{ id: 'role-container', kind: 'class', key: 'container', visualKind: 'container', visualKindOptions: ['container'], labelTemplate: 'Saved label' }],
+              structureTree: { version: versions.D2_IMPORT_STRUCTURE_TREE_VERSION, items: [{ id: 'group', roleId: 'role-container', d2Key: 'group', parentId: '', mapping: { materialization: { kind: 'structural' }, primary: { labelTemplate: 'Saved label' } } }] },
+              relationRules: [], endpointProfiles: [], mappingValidation: { version: 1, status: 'needsValidation' }
+            } } },
+            { id: 'second', name: 'second', type: 'topology', title: 'Do not replace this diagram', nodes: [] }
+          ] },
+          authoring: { version: 1, assistant: { promptContractVersion: versions.ASSISTANT_PROMPT_CONTRACT_VERSION,
+            objectFlowIntent: { context: 'Imported context', blocks: [{ id: 'assets', name: 'Assets', description: 'Asset cards', resultKind: 'sourceCards', uses: [] }] },
+            diagramIntentPrompt: 'Imported diagram prompt', systemPromptOverrides: { objectFlow: 'Imported flow policy' } },
+            d2: { source: 'group: { class: container }', analysisCheckpoint: checkpoint, assistantCheckpoint: null } }
+        }
+      };
+      await page.evaluate(() => {
+        const ui = window.remediation;
+        ui.state.selectedTemplate = { id: 7, code: 'existing', description: 'Existing definition', active: true, specHash: 'original-hash', owner: 'local-owner', spec: ui.defaultSpec(), paramsSchema: {}, resultSchema: {} };
+        ui.state.templates = [structuredClone(ui.state.selectedTemplate)];
+        ui.hydrateDesignerStateFromTemplate({ replaceRunParams: true });
+        ui.state.designerSection = 'template'; ui.renderDesigner();
+      });
+      const prepare = expectRequest('POST', '/cmdbuild/custom-api/template-transfer/prepare');
+      await page.locator('#cmdp-transfer-file').setInputFiles({ name: 'current.cmdp-template.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify({ template: imported })) });
+      if (mode === 'replace') await page.locator('#cmdp-transfer-mode').selectOption('replace');
+      await page.locator('[data-action="template-transfer-prepare"]').click();
+      await prepare.received;
+      prepare.respond({ success: true, template: imported, changes: { mode }, checks: { status: 'ready', issues: [], environmentReferences: [], executionReady: false } });
+      await page.locator('[data-action="template-transfer-stage"]:enabled').waitFor();
+      page.once('dialog', (dialog) => dialog.accept());
+      await page.locator('[data-action="template-transfer-stage"]').click();
+      const staged = await page.evaluate(() => structuredClone(window.remediation.state.selectedTemplate));
+      assert.deepEqual(staged.spec, imported.spec);
+      assert.deepEqual(staged.paramsSchema, imported.paramsSchema);
+      assert.deepEqual(staged.resultSchema, imported.resultSchema);
+      assert.deepEqual(await page.evaluate(() => window.remediation.state.runParams), { card: 84, fallback: 22, exampleOnly: 'example fallback' });
+      assert.equal(await page.evaluate(() => window.remediation.getRunParamsFromSpec(window.remediation.state.selectedTemplate.spec, { card: 105 }).card), 105);
+      const expectedPayload = { code: imported.code, description: imported.description, active: mode === 'replace', spec: imported.spec,
+        paramsSchema: imported.paramsSchema, resultSchema: imported.resultSchema, ...(mode === 'replace' ? { expectedSpecHash: 'original-hash' } : {}) };
+      const exported = expectRequest('POST', '/cmdbuild/custom-api/template-transfer/export');
+      await page.locator('[data-action="template-transfer-export"]').click();
+      const exportCall = await exported.received;
+      assert.deepEqual(exportCall.body.template, expectedPayload, 'entire staged artifact reaches export');
+      exported.respond({ success: false, message: 'Mock download not needed' }, 400);
+      await page.waitForFunction(() => window.remediation.state.templateTransfer.message === 'Mock download not needed');
+
+      await page.locator('[data-designer-section="diagram"]').click();
+      await page.locator('[data-action="diagram-structure-select"][data-diagram-structure-item-id="group"]').click();
+      const label = page.locator('[data-diagram-import-placement-field="primary.labelTemplate"]');
+      await assertVisible(label, { width: 1280 });
+      await label.fill('Unsaved current label');
+      await page.locator('[data-designer-section="templates"]').click();
+      await page.evaluate(({ checkpoint, source }) => {
+        window.remediation.state.diagramImportProposal = {
+          ...structuredClone(checkpoint), version: 3, sourceText: source,
+          template: {}, structure: { nodes: [], groups: [], edges: [] }, classes: [], endpointProfiles: []
+        };
+      }, { checkpoint, source: imported.spec.authoring.d2.source });
+      const dirtyExport = expectRequest('POST', '/cmdbuild/custom-api/template-transfer/export');
+      await page.locator('[data-action="template-transfer-export"]').click();
+      const dirtyCall = await dirtyExport.received;
+      const dirtySpec = dirtyCall.body.template.spec;
+      assert.equal(dirtySpec.result.diagrams[0].authoring.d2Import.structureTree.items[0].mapping.primary.labelTemplate, 'Unsaved current label');
+      assert.deepEqual(dirtySpec.result.diagrams[1], imported.spec.result.diagrams[1]);
+      assert.deepEqual(dirtySpec.authoring.d2.analysisCheckpoint, checkpoint, 'pending checkpoint is preserved, never promoted to result.diagrams');
+      for (const key of ['params', 'defaults', 'paramDefaults', 'steps', 'objectFlow', 'cache', 'publish']) assert.deepEqual(dirtySpec[key], imported.spec[key], key);
+      assert.deepEqual(dirtySpec.authoring.assistant, imported.spec.authoring.assistant);
+      dirtyExport.respond({ success: false, message: 'Mock download complete' }, 400);
+      await page.waitForFunction(() => window.remediation.state.templateTransfer.message === 'Mock download complete');
+      const savePath = '/cmdbuild/custom-api/templates' + (mode === 'replace' ? '/existing' : '');
+      const save = expectRequest(mode === 'replace' ? 'PUT' : 'POST', savePath);
+      await page.locator('[data-action="save-template"]').click();
+      const saved = await save.received;
+      assert.deepEqual(saved.body, dirtyCall.body.template, 'Save and export use the same entire current artifact');
+      save.respond({ success: true, template: { ...saved.body, id: 7, specHash: 'saved-hash' }, executionValidation: { executable: false } });
+      await page.waitForFunction(() => !window.remediation.state.savingTemplate);
+      assert.equal(writes.filter((call) => call.path.startsWith('/cmdbuild/custom-api/templates')).length, 1, 'only explicit Save persists');
+    });
+  }
+});
 
 for (const viewport of [{ width: 1280, height: 900 }, { width: 390, height: 844 }]) {
   test(`embedded client raw settings and trace filters survive rerender at ${viewport.width}px`, async () => {

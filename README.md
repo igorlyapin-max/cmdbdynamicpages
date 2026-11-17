@@ -556,6 +556,36 @@ Runtime executor defaults/caps are stored in `Cst_QueryToolConfig.RuntimeConfigJ
 
 A template is a CMDBuild card in `Cst_QueryTemplate`.
 
+### Export / Import
+
+In **Template**, or below the template list without selecting a template, use **Template export / import** (`#cmdp-template-transfer`). Transfer is intended for environments with the **same CMDBuild model**. It does not migrate classes, domains, attributes, lookup types, credentials, runtime settings, history, or published snapshots.
+
+1. **Export current definition** downloads `<code>.cmdp-template.json`. It captures current unsaved editor values using the same snapshot as Save, including schemas, Diagram edits, D2 source, and Assistant prompts. It does not save or create a version.
+2. Select the JSON file and choose **New template** or **Replace existing definition**. Optionally set a target code for a new template and a description. For replacement, select an existing target; its saved `specHash` is sent as `baseSpecHash`.
+3. **Prepare import** validates the package and inspects the target model without writing to CMDBuild. Review every issue and environment reference. Card IDs, lookup IDs, and URLs are not remapped automatically. Use the explicit JSON path and JSON value fields, or the additional `{path,value}` override array, then prepare again. Acknowledge every reference marked for confirmation after the last preparation.
+4. **Stage prepared definition** asks for confirmation before replacing the whole editor definition, including unsaved edits. Cancel leaves the editor unchanged. The status is **Imported, not saved**; only the ordinary **Save** writes the template/version. A new template starts inactive and does not inherit the source identity. Replacement keeps the target identity, code, activity, ownership, and history and uses its original hash for Save's compare-and-swap check (`expectedSpecHash`). A conflict requires preparing against the current target again.
+
+`needsAttention` and `executionReady:false` do not prevent loading and editing a structurally valid package. Catalog warnings or an unsigned/incomplete D2 mapping may be saved as incomplete; execution, preview, extraction, or publication still require their normal validation. Transfer never invokes LLM, auto-saves, or publishes. Format/version/checksum/security errors reject the package instead of staging it. Old formats are not supported.
+
+Parameter checks use runtime precedence: `defaults`, then `paramDefaults`, then `params.<name>.default` and `defaultValue`. Explicit run parameters override defaults under the existing runtime rules. Parameter entries in `checks.environmentReferences` include `parameterName`, `effective`, and `shadowedBy`: active references require acknowledgement, while shadowed values remain visible. Overrides change only the specified physical path. Changing a shadowed default returns `template_transfer_override_shadowed` and `executionReady:false` instead of rewriting other values; change the reported effective path and prepare again.
+
+Executable DSL `steps` are checked even without visual models, including reference/domain paths, attributes, and column provenance. An active dependency that cannot be confirmed produces `template_transfer_dependency_unverified` or a path-specific catalog issue: the draft remains editable, but is not reported as execution-ready. Extended analysis occurs during prepare and does not change format-1 packages. The shared Save/export snapshot retains unsaved D2 edits after navigating from Diagram to the template list.
+
+API (authenticated CMDBuild session, JSON, same-origin and CSRF required):
+
+```text
+POST /cmdbuild/custom-api/template-transfer/export?root=<targetRoot>
+  {template: <current editor payload>, templateRef?: {root, templateCode, baseSpecHash}}
+  -> {success:true, package, fileName}
+POST /cmdbuild/custom-api/template-transfer/prepare?root=<targetRoot>
+  {package, mode:"new"|"replace", targetCode?, description?, baseSpecHash?, overrides:[{path,value}]}
+  -> {success:true, template, checks:{status, issues, environmentReferences, summary, executionReady}, changes}
+```
+
+`baseSpecHash` and an existing `targetCode` are required for replacement. Overrides use the returned reference paths rooted at `$.spec`; they are explicit edits, not discovery or automatic ID mapping. Keep the downloaded file unchanged and submit overrides separately so checksum validation remains meaningful. See [OpenAPI](aa/openapi.yaml) for the wire schema.
+
+Transfer shares Save's request-byte budget (`CMDP_TEMPLATE_REQUEST_MAX_BYTES`) and HTTP structural limits. Target checks use destination `executionLimits` (defaults: `maxClassesDefault=100`, `maxDomainsDefault=100`, `maxRestCallsDefault=250`, `maxTraversalDepthMax=5`); effective values appear in `checks.summary.limits`. These are backend request/check budgets, not global limits inside the pure package module.
+
 Important fields:
 
 ```text

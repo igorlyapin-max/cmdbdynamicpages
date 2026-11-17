@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import net from 'node:net';
 import { URL } from 'node:url';
-import { compileObjectFlowToSpec } from '../../scripts/assistant-object-flow.mjs';
+import { compileObjectFlowToSpec, objectFlowStageSummaries } from '../../scripts/assistant-object-flow.mjs';
 import {
   diagramImportMappingInputRevisionStatus,
   diagramImportMappingValidationIsCurrent,
@@ -8102,6 +8102,741 @@ test('semantic planning compiles a confirmed multi-hop reference path back to th
   assert.equal(backend.exitCode, null);
 });
 
+function transferAuthoringTemplate(code = 'PortableSource', className = 'ARM') {
+  const spec = apiObjectFlowSpec([{ alias: 'portableAssets', className, columns: ['Code', 'Description'] }]);
+  spec.authoring = {
+    version: 1,
+    assistant: {
+      promptContractVersion: 4,
+      objectFlowIntent: { context: 'Keep business context id/token verbatim.', blocks: [{
+        id: 'portable-business-block', name: 'Portable named business result',
+        description: 'Keep the current unsaved authoring prompt.', uses: [], resultKind: 'sourceCards'
+      }] },
+      diagramIntentPrompt: 'Keep this reviewed diagram prompt.',
+      systemPromptOverrides: { diagramSemantics: 'Keep the author-selected semantic instructions.' }
+    },
+    d2: { source: '' }
+  };
+  return { code, description: 'Unsaved portable definition', spec, paramsSchema: null, resultSchema: null };
+}
+
+async function transferApiFixture(t, mockOptions = {}, envOverrides = {}) {
+  const mock = await startMockCmdbuild(t, mockOptions);
+  const port = await freePort();
+  const backend = await startBackend(t, port, mock.origin, envOverrides);
+  const origin = `http://127.0.0.1:${port}`;
+  const cookie = testCmdbuildAuthorizationCookie('template-transfer-api');
+  const csrf = await requestJson('GET', `${origin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+  assert.equal(csrf.statusCode, 200, csrf.body);
+  const headers = { cookie, origin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  return { mock, backend, origin, headers,
+    post: (action, body) => requestJson('POST', `${origin}/cmdbuild/custom-api/template-transfer/${action}`, body, headers, 15000) };
+}
+
+function assertTransferReadOnly(mock) {
+  assert.deepEqual(mock.requests.filter((item) => !['GET', 'HEAD'].includes(item.method)), [],
+    'export/prepare must not mutate CMDBuild cards, schema, runtime config or version history');
+}
+
+test('template transfer export uses current unsaved authoring without writes or source identity', async (t) => {
+  const template = transferAuthoringTemplate();
+  const stored = templateCard(template.code, { version: 1, steps: [], result: { tables: [] } });
+  const fixture = await transferApiFixture(t, { templates: [stored] });
+  const before = structuredClone(stored);
+  const result = await fixture.post('export', { template: { ...template, id: 'source-id', active: true, owner: 'source-owner' } });
+  assert.equal(result.statusCode, 200, result.body);
+  assert.match(result.json.fileName, /\.cmdp-template\.json$/);
+  assert.equal(result.json.package.format, 'cmdbdynamicpages.template');
+  assert.equal(result.json.package.formatVersion, 1);
+  assert.deepEqual(result.json.package.template.spec, template.spec);
+  assert.equal(result.json.package.template.paramsSchema, null);
+  assert.equal(result.json.package.template.resultSchema, null);
+  assert.ok(result.json.package.dependencies.directFields.some((item) => item.className === 'ARM' && item.field === 'Code' && /^\$\.spec\.visualModels\[\d+\]\.selections\[0\]\.columns/.test(item.path)), result.body);
+  for (const key of ['id', 'active', 'owner', 'updatedAt', 'specHash', 'history', 'runtimeConfig']) {
+    assert.equal(Object.hasOwn(result.json.package.template, key), false, key);
+  }
+  assert.deepEqual(stored, before);
+  assertTransferReadOnly(fixture.mock);
+  assert.equal(fixture.backend.exitCode, null);
+});
+
+test('template transfer prepare new is inactive and preserves IDs, names and prompts without writes', async (t) => {
+  const fixture = await transferApiFixture(t);
+  const source = transferAuthoringTemplate();
+  const exported = await fixture.post('export', { template: source });
+  assert.equal(exported.statusCode, 200, exported.body);
+  const prepared = await fixture.post('prepare', {
+    package: exported.json.package, mode: 'new', targetCode: 'PortableNew', description: 'Target description', overrides: []
+  });
+  assert.equal(prepared.statusCode, 200, prepared.body);
+  assert.equal(prepared.json.template.code, 'PortableNew');
+  assert.equal(prepared.json.template.description, 'Target description');
+  assert.equal(prepared.json.template.active, false);
+  assert.ok(!prepared.json.template.id);
+  assert.deepEqual(prepared.json.template.spec.visualModel, source.spec.visualModel);
+  assert.deepEqual(prepared.json.template.spec.visualModels, source.spec.visualModels);
+  assert.deepEqual(prepared.json.template.spec.authoring.assistant, source.spec.authoring.assistant);
+  assert.deepEqual(prepared.json.template.spec.steps, source.spec.steps);
+  assert.ok(['ready', 'needsAttention'].includes(prepared.json.checks.status));
+  assert.equal(typeof prepared.json.checks.executionReady, 'boolean');
+  assert.ok(Array.isArray(prepared.json.checks.environmentReferences));
+  assert.ok(Object.hasOwn(prepared.json, 'changes'));
+  assertTransferReadOnly(fixture.mock);
+});
+
+test('template transfer replace keeps target identity/activity/hash and rejects stale hash or new collision', async (t) => {
+  const targetSpec = apiObjectFlowSpec([{ alias: 'targetRouters', className: 'routerG', columns: ['Code'] }]);
+  const target = { ...templateCard('PortableTarget', targetSpec), _id: 791, Active: true, Owner: 'target-owner' };
+  const before = structuredClone(target);
+  const fixture = await transferApiFixture(t, { templates: [target] });
+  const exported = await fixture.post('export', { template: transferAuthoringTemplate() });
+  assert.equal(exported.statusCode, 200, exported.body);
+  const body = { package: exported.json.package, mode: 'replace', targetCode: target.Code, baseSpecHash: hashJson(targetSpec), overrides: [] };
+  const prepared = await fixture.post('prepare', body);
+  assert.equal(prepared.statusCode, 200, prepared.body);
+  assert.equal(prepared.json.template.id, target._id);
+  assert.equal(prepared.json.template.code, target.Code);
+  assert.equal(prepared.json.template.active, target.Active);
+  assert.equal(prepared.json.template.owner, target.Owner);
+  assert.equal(prepared.json.template.updatedAt, target.UpdatedAt);
+  assert.equal(prepared.json.template.specHash, hashJson(targetSpec));
+  assert.deepEqual(prepared.json.template.spec.steps, exported.json.package.template.spec.steps);
+  const stale = await fixture.post('prepare', { ...body, baseSpecHash: '0'.repeat(64) });
+  assert.equal(stale.statusCode, 409, stale.body);
+  const collision = await fixture.post('prepare', { ...body, mode: 'new' });
+  assert.equal(collision.statusCode, 409, collision.body);
+  assert.deepEqual(target, before);
+  assertTransferReadOnly(fixture.mock);
+});
+
+test('template transfer replace ordinary Save without owner preserves target identity/activity and appends history', async (t) => {
+  for (const active of [false, true]) {
+    const targetCode = active ? 'OwnedActiveTarget' : 'OwnedInactiveTarget';
+    const targetSpec = apiObjectFlowSpec([{ alias: 'existingRouters', className: 'routerG', columns: ['Code'] }]);
+    const targetCard = { ...templateCard(targetCode, targetSpec), _id: active ? 8202 : 8201,
+      Active: active, Owner: 'original-target-owner' };
+    const oldVersion = { _id: 'old-history-entry', Code: `VER_${targetCode}_3`, Description: 'Existing history',
+      TemplateCode: targetCode, Version: 3, SpecJson: JSON.stringify(targetSpec), ChangedBy: 'original-author',
+      ChangedAt: '2026-07-01T00:00:00.000Z', ChangeComment: 'Existing version must remain unchanged.' };
+    const versions = [structuredClone(oldVersion)];
+    const fixture = await transferApiFixture(t, { templates: [targetCard], versionCards: versions });
+    const exported = await fixture.post('export', { template: transferAuthoringTemplate('DifferentSourceOwner') });
+    assert.equal(exported.statusCode, 200, exported.body);
+    const prepared = await fixture.post('prepare', {
+      package: exported.json.package, mode: 'replace', targetCode, baseSpecHash: hashJson(targetSpec), overrides: []
+    });
+    assert.equal(prepared.statusCode, 200, prepared.body);
+    assert.equal(prepared.json.template.specHash, hashJson(targetSpec));
+    assert.equal(prepared.json.template.owner, targetCard.Owner);
+    assert.equal(prepared.json.template.active, active);
+    assertTransferReadOnly(fixture.mock);
+    assert.deepEqual(versions, [oldVersion], 'prepare must not append history');
+    const draft = prepared.json.template;
+    const saveBody = { code: draft.code, description: draft.description, active: draft.active, spec: draft.spec,
+      paramsSchema: draft.paramsSchema, resultSchema: draft.resultSchema,
+      expectedSpecHash: draft.specHash, changeComment: 'Ordinary Save after transfer replacement.' };
+    assert.equal(Object.hasOwn(saveBody, 'owner'), false);
+    assert.equal(Object.hasOwn(saveBody, 'Owner'), false);
+    const saved = await requestJson('PUT', `${fixture.origin}/cmdbuild/custom-api/templates/${targetCode}`, saveBody, fixture.headers);
+    assert.equal(saved.statusCode, 200, saved.body);
+    assert.equal(saved.json.versionLog.success, true, saved.body);
+    const read = await requestJson('GET', `${fixture.origin}/cmdbuild/custom-api/templates/${targetCode}`, undefined, { cookie: fixture.headers.cookie });
+    assert.equal(read.statusCode, 200, read.body);
+    for (const result of [saved.json.template, read.json.template]) {
+      assert.equal(result.id, targetCard._id);
+      assert.equal(result.code, targetCode);
+      assert.equal(result.owner, 'original-target-owner');
+      assert.equal(result.active, active);
+      assert.equal(result.specHash, hashJson(result.spec));
+      assert.notEqual(result.specHash, hashJson(targetSpec));
+      assert.deepEqual(result.spec.steps, draft.spec.steps);
+      assert.deepEqual(result.spec.authoring.assistant, draft.spec.authoring.assistant);
+    }
+    const history = await requestJson('GET', `${fixture.origin}/cmdbuild/custom-api/templates/${targetCode}/versions`, undefined, { cookie: fixture.headers.cookie });
+    assert.equal(history.statusCode, 200, history.body);
+    assert.equal(history.json.meta.total, 2);
+    assert.deepEqual(history.json.data.map((item) => item.version), [4, 3]);
+    assert.equal(history.json.data[0].templateCode, targetCode);
+    assert.equal(history.json.data[0].changedBy, 'preview-user', 'history records the actor without replacing template ownership');
+    assert.equal(history.json.data[0].changeComment, saveBody.changeComment);
+    assert.deepEqual(history.json.data[0].spec, read.json.template.spec);
+    assert.deepEqual(versions[0], oldVersion);
+    assert.equal(versions.length, 2);
+    assert.equal(fixture.mock.requests.filter((item) => item.method === 'PUT' && item.pathname.endsWith(`/classes/Cst_QueryTemplate/cards/${targetCard._id}`)).length, 1);
+    assert.equal(fixture.mock.requests.filter((item) => item.method === 'POST' && item.pathname.endsWith('/classes/Cst_QueryTemplateVersion/cards')).length, 1);
+  }
+});
+
+test('template transfer missing target class remains editable needsAttention with nonblocking issues', async (t) => {
+  const fixture = await transferApiFixture(t);
+  const source = transferAuthoringTemplate('MissingSource', 'MissingPortableClass');
+  const exported = await fixture.post('export', { template: source });
+  assert.equal(exported.statusCode, 200, exported.body);
+  const prepared = await fixture.post('prepare', { package: exported.json.package, mode: 'new', targetCode: 'MissingTarget', overrides: [] });
+  assert.equal(prepared.statusCode, 200, prepared.body);
+  assert.equal(prepared.json.checks.status, 'needsAttention');
+  assert.equal(prepared.json.checks.executionReady, false);
+  assert.deepEqual(prepared.json.template.spec.steps, source.spec.steps);
+  const issue = prepared.json.checks.issues.find((item) => /class/i.test(item.code) && /MissingPortableClass/.test(item.message));
+  assert.ok(issue, prepared.body);
+  assert.equal(typeof issue.path, 'string');
+  assert.equal(typeof issue.severity, 'string');
+  assert.equal(issue.blocking, false);
+  assertTransferReadOnly(fixture.mock);
+});
+
+test('template transfer rejects corrupted checksum and requires auth and CSRF on both endpoints', async (t) => {
+  const fixture = await transferApiFixture(t);
+  const template = transferAuthoringTemplate();
+  const exported = await fixture.post('export', { template });
+  assert.equal(exported.statusCode, 200, exported.body);
+  const pkg = structuredClone(exported.json.package);
+  pkg.template.spec.authoring.assistant.diagramIntentPrompt += ' tampered';
+  const corrupted = await fixture.post('prepare', { package: pkg, mode: 'new', targetCode: 'TamperedTarget', overrides: [] });
+  assert.ok([400, 422].includes(corrupted.statusCode), corrupted.body);
+  assert.equal(corrupted.json.success, false);
+  for (const [action, body] of [
+    ['export', { template }],
+    ['prepare', { package: exported.json.package, mode: 'new', targetCode: 'ProtectedTarget', overrides: [] }]
+  ]) {
+    const url = `${fixture.origin}/cmdbuild/custom-api/template-transfer/${action}`;
+    const anonymous = await requestJson('POST', url, body, { origin: fixture.origin });
+    assert.equal(anonymous.statusCode, 401, anonymous.body);
+    const noCsrf = await requestJson('POST', url, body, { cookie: fixture.headers.cookie, origin: fixture.origin });
+    assert.equal(noCsrf.statusCode, 403, noCsrf.body);
+    const wrongCsrf = await requestJson('POST', url, body, { ...fixture.headers, 'x-cmdbdynamicpages-csrf': 'invalid-csrf' });
+    assert.equal(wrongCsrf.statusCode, 403, wrongCsrf.body);
+  }
+  assertTransferReadOnly(fixture.mock);
+});
+
+test('template transfer reattests signed D2 across backend secrets without LLM or mapping changes', async (t) => {
+  const llm = await startLiteLlmStub(t, { flow: { version: 1, selections: [], operations: [], publishedAlias: '' } });
+  const runtime = { assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } };
+  const mockOptions = { configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify(runtime) }] };
+  const env = { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin };
+  const source = await transferApiFixture(t, mockOptions, { ...env, CMDBDYNAMICPAGES_CSRF_SECRET: 'transfer-source-test-secret' });
+  const target = await transferApiFixture(t, mockOptions, { ...env, CMDBDYNAMICPAGES_CSRF_SECRET: 'transfer-target-test-secret' });
+  const currentSpec = apiObjectFlowSpec([
+    { alias: 'routers', className: 'routerG', columns: ['Code', 'Description'] },
+    { alias: 'arms', className: 'ARM', columns: ['Code', 'Description'] }
+  ], [{ id: 'match:portableNetwork', from: 'routers', with: 'arms', as: 'portableNetwork', rightPrefix: 'Selection 2.',
+    rules: [{ action: 'include', negate: false, operator: 'equals', leftColumn: 'Code', leftRegex: '', rightColumn: 'Code', rightRegex: '' }] }]);
+  const d2Source = 'router: Router\nswitch: Switch\nrouter -> switch: Connection';
+  currentSpec.authoring = structuredClone(transferAuthoringTemplate().spec.authoring);
+  currentSpec.authoring.d2.source = d2Source;
+  const analyzed = await requestJson('POST', `${source.origin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: '', baseSpecHash: '', currentSpec, d2Source
+  }, source.headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const proposal = analyzed.json.proposal;
+  assert.ok(proposal.signature, analyzed.body);
+  const roles = proposal.roles.map((role) => d2RoleOverride(role, {
+    materialization: { kind: 'stage', stageId: role.key === 'router' ? 'selection:routers' : 'selection:arms' },
+    primary: { className: role.key === 'router' ? 'routerG' : 'ARM', idAttribute: '_id', labelTemplate: '${Code}', structuredFields: ['Code'], filters: [] }, related: []
+  }));
+  const applied = await requestJson('POST', `${source.origin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
+    templateCode: '', baseSpecHash: '', currentSpec, d2Source, proposal, roles,
+    structureTree: d2StructureTreeWithMaterialization(proposal, roles),
+    relationRules: [{ ...proposal.relationRules[0], id: 'portable-reviewed-connection', kind: 'connection', mode: 'deterministicEndpoints', directionPolicy: 'dataFields',
+      parentRoleId: roles.find((role) => role.mapping.primary.className === 'routerG').id,
+      childRoleId: roles.find((role) => role.mapping.primary.className === 'ARM').id,
+      sourceStageId: 'match:portableNetwork', sourceField: 'Code', targetField: 'Selection 2.Code', labelField: '' }]
+  }, source.headers);
+  assert.equal(applied.statusCode, 200, applied.body);
+  const sourceImported = applied.json.spec.result.diagrams[0].authoring.d2Import;
+  assert.ok(sourceImported.mappingValidation.signature, applied.body);
+  const exported = await source.post('export', { template: { ...transferAuthoringTemplate(), spec: applied.json.spec } });
+  assert.equal(exported.statusCode, 200, exported.body);
+  const portableImported = exported.json.package.template.spec.result.diagrams[0].authoring.d2Import;
+  for (const key of ['mappingValidation', 'proposalId', 'importedAt']) assert.equal(Object.hasOwn(portableImported, key), false, key);
+  for (const key of ['sourceHash', 'structureHash', 'mappingContractHash', 'roles', 'structureTree', 'relationRules']) {
+    assert.deepEqual(portableImported[key], sourceImported[key], key);
+  }
+  const prepared = await target.post('prepare', { package: exported.json.package, mode: 'new', targetCode: 'ReattestedTarget', overrides: [] });
+  assert.equal(prepared.statusCode, 200, prepared.body);
+  const targetImported = prepared.json.template.spec.result.diagrams[0].authoring.d2Import;
+  assert.equal(prepared.json.checks.executionReady, true, prepared.body);
+  assert.equal(targetImported.mappingValidation.status, 'valid', prepared.body);
+  assert.match(targetImported.mappingValidation.signature, /^[a-f0-9]{64}$/);
+  assert.notEqual(targetImported.mappingValidation.signature, sourceImported.mappingValidation.signature);
+  for (const key of ['roles', 'structureTree', 'relationRules', 'sourceHash', 'structureHash', 'mappingContractHash']) {
+    assert.deepEqual(targetImported[key], sourceImported[key], key);
+  }
+  assert.deepEqual(prepared.json.template.spec.authoring.assistant, applied.json.spec.authoring.assistant);
+  assert.equal(llm.requests, 0, 'portable reviewed D2 compile/reattest must not call LLM');
+  assertTransferReadOnly(source.mock);
+  assertTransferReadOnly(target.mock);
+  assert.equal(source.backend.exitCode, null);
+  assert.equal(target.backend.exitCode, null);
+});
+
+test('template transfer rehydrates unapplied reviewed checkpoints and Save/read retains their payload without LLM', async (t) => {
+  const llm = await startLiteLlmStub(t, { flow: { version: 1, selections: [], operations: [], publishedAlias: '' } });
+  const configCards = [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true,
+    RuntimeConfigJson: JSON.stringify({ assistant: { llm: { enabled: true, baseUrl: llm.origin, model: 'unit-test-model' } } }) }];
+  const env = { LITELLM_API_KEY: 'unit-test-key', CMDP_LITELLM_ALLOWED_BASE_URLS: llm.origin };
+  const source = await transferApiFixture(t, { configCards }, { ...env, CMDBDYNAMICPAGES_CSRF_SECRET: 'unapplied-source-test-secret' });
+  const template = transferAuthoringTemplate('UnappliedSource');
+  const d2Source = 'router: Router\nswitch: Switch\nrouter -> switch: Connection';
+  template.spec.authoring.d2.source = d2Source;
+  const analyzed = await requestJson('POST', `${source.origin}/cmdbuild/custom-api/draft/diagram-import/analyze`, {
+    templateCode: '', baseSpecHash: '', currentSpec: template.spec, d2Source
+  }, source.headers);
+  assert.equal(analyzed.statusCode, 200, analyzed.body);
+  const proposal = analyzed.json.proposal;
+  const reviewedRoles = proposal.roles.map((role) => ({ id: role.id, visualKind: role.visualKind, labelTemplate: 'Reviewed ${Code}' }));
+  const rolesWithMappings = proposal.roles.map((role) => d2RoleOverride(role, {
+    materialization: { kind: 'stage', stageId: 'selection:portableAssets' },
+    primary: { className: 'ARM', idAttribute: '_id', labelTemplate: '${Code}', structuredFields: ['Code'], filters: [] }, related: []
+  }));
+  const analysisCheckpoint = {
+    version: 1, proposalId: proposal.proposalId, deterministicSpecHash: proposal.deterministicSpecHash,
+    source: { hash: proposal.source.hash, structureHash: proposal.source.structureHash, mappingContractHash: proposal.source.mappingContractHash },
+    roles: reviewedRoles, relationRules: proposal.relationRules,
+    structureTree: d2StructureTreeWithMaterialization(proposal, rolesWithMappings)
+  };
+  const assistantCheckpoint = {
+    ...structuredClone(analysisCheckpoint),
+    interpretation: { explanation: 'Reviewed interpretation, not yet applied.', warnings: ['Keep this review warning.'],
+      decisions: reviewedRoles.map((role) => ({ ...role, roleId: role.id, reason: 'Reviewed by author.' })) },
+    mapping: { explanation: 'Reviewed mapping, not yet applied.', warnings: [],
+      result: { mapping: { status: 'partial', mappedRoles: reviewedRoles.length, requiredRoles: reviewedRoles.length }, partial: true } }
+  };
+  template.spec.authoring.d2.analysisCheckpoint = analysisCheckpoint;
+  template.spec.authoring.d2.assistantCheckpoint = assistantCheckpoint;
+  assert.equal(template.spec.result.diagrams?.length || 0, 0, 'checkpoint fixture must remain unapplied');
+  const exported = await source.post('export', { template });
+  assert.equal(exported.statusCode, 200, exported.body);
+  for (const name of ['analysisCheckpoint', 'assistantCheckpoint']) {
+    const checkpoint = exported.json.package.template.spec.authoring.d2[name];
+    for (const key of ['proposalId', 'deterministicSpecHash', 'source']) assert.equal(Object.hasOwn(checkpoint, key), false, `${name}.${key}`);
+  }
+  const targetSpec = apiObjectFlowSpec([{ alias: 'targetAssets', className: 'ARM', columns: ['Code'] }]);
+  const targetCode = 'UnappliedReviewedTarget';
+  const target = await transferApiFixture(t, { configCards, templates: [templateCard(targetCode, targetSpec)] },
+    { ...env, CMDBDYNAMICPAGES_CSRF_SECRET: 'unapplied-target-test-secret' });
+  const prepared = await target.post('prepare', {
+    package: exported.json.package, mode: 'replace', targetCode, baseSpecHash: hashJson(targetSpec), overrides: []
+  });
+  assert.equal(prepared.statusCode, 200, prepared.body);
+  assert.equal(prepared.json.checks.status, 'needsAttention');
+  assert.equal(prepared.json.checks.executionReady, false);
+  assert.equal(prepared.json.checks.issues.some((issue) => issue.code === 'template_transfer_d2_checkpoint_invalid'), false, prepared.body);
+  const preparedD2 = prepared.json.template.spec.authoring.d2;
+  for (const name of ['analysisCheckpoint', 'assistantCheckpoint']) {
+    const checkpoint = preparedD2[name];
+    assert.match(checkpoint.proposalId, /^[a-f0-9-]{36}$/);
+    assert.notEqual(checkpoint.proposalId, proposal.proposalId);
+    assert.match(checkpoint.deterministicSpecHash, /^[a-f0-9]{64}$/);
+    assert.deepEqual(checkpoint.source, analysisCheckpoint.source);
+    for (const key of ['roles', 'structureTree', 'relationRules']) assert.deepEqual(checkpoint[key], analysisCheckpoint[key], `${name}.${key}`);
+  }
+  assert.deepEqual(preparedD2.assistantCheckpoint.mapping, assistantCheckpoint.mapping);
+  assert.equal(preparedD2.assistantCheckpoint.interpretation.explanation, assistantCheckpoint.interpretation.explanation);
+  assertTransferReadOnly(source.mock);
+  assertTransferReadOnly(target.mock);
+  const saved = await requestJson('PUT', `${target.origin}/cmdbuild/custom-api/templates/${targetCode}`, {
+    code: targetCode, expectedSpecHash: hashJson(targetSpec), spec: prepared.json.template.spec
+  }, target.headers);
+  assert.equal(saved.statusCode, 200, saved.body);
+  const read = await requestJson('GET', `${target.origin}/cmdbuild/custom-api/templates/${targetCode}`, undefined, { cookie: target.headers.cookie });
+  assert.equal(read.statusCode, 200, read.body);
+  const persistedD2 = { ...preparedD2, sourceHash: crypto.createHash('sha256').update(d2Source).digest('hex') };
+  assert.deepEqual(saved.json.template.spec.authoring.d2, persistedD2);
+  assert.deepEqual(read.json.template.spec.authoring.d2, persistedD2);
+  const restored = await requestJson('POST', `${target.origin}/cmdbuild/custom-api/draft/diagram-import/restore`, {
+    templateCode: targetCode, baseSpecHash: read.json.template.specHash, currentSpec: read.json.template.spec,
+    analysisCheckpoint: preparedD2.analysisCheckpoint, assistantCheckpoint: preparedD2.assistantCheckpoint
+  }, target.headers);
+  assert.equal(restored.statusCode, 200, restored.body);
+  assert.equal(restored.json.restoreKind, 'assistant');
+  assert.ok(restored.json.proposal.signature);
+  assert.equal(restored.json.interpretation.explanation, assistantCheckpoint.interpretation.explanation);
+  assert.deepEqual(restored.json.mapping.result, assistantCheckpoint.mapping.result);
+  assert.equal(llm.requests, 0);
+  assert.equal(target.mock.requests.filter((item) => item.method === 'PUT' && item.pathname.includes('/classes/Cst_QueryTemplate/cards/')).length, 1);
+});
+
+test('template transfer overrides catalog-typed card and lookup values at actual visualModels and mirror paths', async (t) => {
+  const template = transferAuthoringTemplate('TypedReferenceSource');
+  template.spec = compileObjectFlowToSpec(template.spec, { version: 1, selections: [{
+    id: 'selection:typedAssets', name: 'Typed assets', alias: 'typedAssets', className: 'ARM', limit: 100, columns: ['Code'],
+    rules: [{ action: 'include', path: 'Location', op: 'equals', value: '901' }, { action: 'include', path: 'Status', op: 'equals', value: '7' }]
+  }], operations: [] });
+  template.spec.visualModel = structuredClone(template.spec.visualModels.find((model) => model.mode === 'objectMatching'));
+  const fixture = await transferApiFixture(t, {
+    attributesByClass: { ARM: [
+      { name: 'Location', type: 'reference', targetClass: 'Location', active: true, _can_read: true },
+      { name: 'Status', type: 'lookup', lookupType: 'AssetStatus', active: true, _can_read: true }
+    ] },
+    cardsByClass: { Location: [{ _id: 902, Code: 'target-location', _can_read: true }] },
+    lookupValuesByType: { AssetStatus: [{ _id: 8, code: 'target-status', active: true }] }
+  });
+  const exported = await fixture.post('export', { template });
+  assert.equal(exported.statusCode, 200, exported.body);
+  const body = { package: exported.json.package, mode: 'new', targetCode: 'TypedReferenceTarget', overrides: [] };
+  const originalPackage = structuredClone(body.package);
+  const initial = await fixture.post('prepare', body);
+  assert.equal(initial.statusCode, 200, initial.body);
+  assert.equal(initial.json.checks.status, 'needsAttention');
+  const refs = initial.json.checks.environmentReferences.filter((ref) => ['card', 'lookup'].includes(ref.kind));
+  assert.equal(refs.length, 6, initial.body);
+  assert.equal(refs.filter((ref) => ref.kind === 'card').length, 3);
+  assert.equal(refs.filter((ref) => ref.kind === 'lookup').length, 3);
+  assert.ok(refs.some((ref) => /^\$\.spec\.visualModels\[\d+\]\.selections\[0\]\.rules\[0\]\.rightExpression$/.test(ref.path)));
+  assert.ok(refs.some((ref) => ref.path === '$.spec.visualModel.selections[0].rules[1].rightExpression'));
+  assert.ok(refs.some((ref) => /^\$\.spec\.visualModels\[\d+\]\.selections\[0\]\.scopeRules\[1\]\.rightExpression$/.test(ref.path)));
+  assert.ok(refs.every((ref) => ref.requiresConfirmation === true));
+  assert.ok(initial.json.checks.issues.some((issue) => issue.code === 'template_transfer_card_unavailable'));
+  assert.ok(initial.json.checks.issues.some((issue) => issue.code === 'template_transfer_lookup_unavailable'));
+  const overrides = refs.map((ref) => ({ path: ref.path, value: ref.kind === 'card' ? '902' : '8' }));
+  const prepared = await fixture.post('prepare', { ...body, overrides });
+  assert.equal(prepared.statusCode, 200, prepared.body);
+  assert.equal(prepared.json.checks.executionReady, true, prepared.body);
+  assert.equal(prepared.json.checks.issues.some((issue) => /_(card|lookup)_unavailable$/.test(issue.code)), false, prepared.body);
+  assert.deepEqual(prepared.json.checks.environmentReferences.filter((ref) => ['card', 'lookup'].includes(ref.kind)).map(({ path, value }) => ({ path, value })), overrides);
+  const matching = prepared.json.template.spec.visualModels.find((model) => model.mode === 'objectMatching');
+  assert.deepEqual(matching.selections[0].rules.map((rule) => rule.rightExpression), ['902', '8']);
+  assert.deepEqual(prepared.json.template.spec.visualModel.selections[0].rules.map((rule) => rule.rightExpression), ['902', '8']);
+  assert.deepEqual(prepared.json.template.spec.visualModels.find((model) => model.mode === 'objectGroup').selections[0].scopeRules.map((rule) => rule.rightExpression), ['902', '8']);
+  assert.deepEqual(prepared.json.template.spec.steps.find((step) => step.as === 'typedAssets').filters.map((filter) => filter.valueExpression), ['902', '8']);
+  assert.equal(matching.selections[0].id, 'selection:typedAssets');
+  assert.deepEqual(prepared.json.template.spec.authoring.assistant, template.spec.authoring.assistant);
+  assert.deepEqual(body.package, originalPackage);
+  assert.ok(fixture.mock.requests.some((item) => item.pathname.endsWith('/classes/Location/cards/902')));
+  assert.ok(fixture.mock.requests.some((item) => item.pathname.endsWith('/lookup_types/AssetStatus/values/8')));
+  const invalidPath = await fixture.post('prepare', { ...body, overrides: [{ path: '$.spec.visualModel.selections[0].id', value: '902' }] });
+  assert.equal(invalidPath.statusCode, 400, invalidPath.body);
+  assertTransferReadOnly(fixture.mock);
+});
+
+test('template transfer checks match-only fields absent from displayed direct-selection columns', async (t) => {
+  const fixture = await transferApiFixture(t);
+  for (const missingSide of ['left', 'right']) {
+    const template = transferAuthoringTemplate(`ImplicitMatch${missingSide}`);
+    template.spec = apiObjectFlowSpec([
+      { alias: 'assets', className: 'ARM', columns: ['Code'] },
+      { alias: 'routers', className: 'routerG', columns: ['Code'] }
+    ], [{
+      id: 'match:implicitField', from: 'assets', with: 'routers', as: 'matchedAssets', rightPrefix: 'Router.',
+      rules: [{ action: 'include', negate: false, operator: 'equals',
+        leftColumn: missingSide === 'left' ? 'MissingAttribute' : 'Code', leftRegex: '',
+        rightColumn: missingSide === 'right' ? 'MissingAttribute' : 'Code', rightRegex: '' }]
+    }]);
+    const matching = template.spec.visualModels.find((model) => model.mode === 'objectMatching');
+    assert.deepEqual(matching.selections.map((selection) => selection.columns), [['Code'], ['Code']],
+      'the unavailable attribute is used only by matching, never an explicit displayed column');
+    const sourceAlias = missingSide === 'left' ? 'assets' : 'routers';
+    assert.equal((template.spec.steps.find((step) => step.as === sourceAlias).columns || []).some((column) => column.path === 'MissingAttribute'), false,
+      'direct card attributes are implicitly materialized, not explicit technical step projections');
+    const exported = await fixture.post('export', { template });
+    assert.equal(exported.statusCode, 200, exported.body);
+    const prepared = await fixture.post('prepare', {
+      package: exported.json.package, mode: 'new', targetCode: `ImplicitMatchTarget${missingSide}`, overrides: []
+    });
+    assert.equal(prepared.statusCode, 200, prepared.body);
+    assert.equal(prepared.json.checks.status, 'needsAttention', prepared.body);
+    assert.equal(prepared.json.checks.executionReady, false, prepared.body);
+    const className = missingSide === 'left' ? 'ARM' : 'routerG';
+    const issue = prepared.json.checks.issues.find((item) => item.code === 'template_transfer_field_unavailable'
+      && item.message.includes(`${className}.MissingAttribute`));
+    assert.ok(issue, prepared.body);
+    assert.match(issue.path, /^\$\.spec\./);
+    assert.equal(issue.severity, 'error');
+    assert.equal(issue.blocking, false);
+    assert.deepEqual(prepared.json.template.spec.steps, template.spec.steps);
+    assert.deepEqual(prepared.json.template.spec.visualModels, template.spec.visualModels);
+  }
+  assertTransferReadOnly(fixture.mock);
+});
+
+test('template transfer accepts generated relation metadata and source display columns without schema attributes', async (t) => {
+  const fixture = await transferApiFixture(t, {
+    attributesByClass: { routerG: [], ARM: [] },
+    domains: [{ _id: 'RouterArm', name: 'RouterArm', source: 'routerG', sources: ['routerG'],
+      destination: 'ARM', destinations: ['ARM'], disabledSourceDescendants: [], disabledDestinationDescendants: [], cardinality: 'N:N' }]
+  });
+  const template = transferAuthoringTemplate('RelationMetadataSource');
+  template.spec = apiObjectFlowSpec([
+    { alias: 'routers', className: 'routerG', columns: ['Code', '_Name', '_isExt'] }
+  ], [{ id: 'relation:relatedAssets', type: 'relation', from: 'routers', as: 'relatedAssets',
+    domain: 'RouterArm', direction: 'source', targetClass: 'ARM', columns: ['Code', '_Name', '_isExt'] }]);
+  const matching = template.spec.visualModels.find((model) => model.mode === 'objectMatching');
+  const stages = objectFlowStageSummaries(matching);
+  const source = stages.find((stage) => stage.id === 'selection:routers');
+  const related = stages.find((stage) => stage.id === 'relation:relatedAssets');
+  for (const column of ['_Name', '_isExt']) assert.ok(source.columns.includes(column), column);
+  for (const column of ['Domain', 'RelationId', 'RelationDirection', 'RelationSourceSide', 'RelatedClass', 'RelatedId']) {
+    assert.ok(related.columns.includes(column), `relation stage must generate ${column}`);
+    assert.equal(matching.operations[0].columns.includes(column), false, `${column} is runtime metadata, not an authored schema field`);
+  }
+  const exported = await fixture.post('export', { template });
+  assert.equal(exported.statusCode, 200, exported.body);
+  const prepared = await fixture.post('prepare', {
+    package: exported.json.package, mode: 'new', targetCode: 'RelationMetadataTarget', overrides: []
+  });
+  assert.equal(prepared.statusCode, 200, prepared.body);
+  assert.equal(prepared.json.checks.status, 'ready', prepared.body);
+  assert.equal(prepared.json.checks.executionReady, true, prepared.body);
+  assert.deepEqual(prepared.json.checks.issues, []);
+  assert.deepEqual(prepared.json.template.spec.steps, template.spec.steps);
+  assert.deepEqual(prepared.json.template.spec.visualModels, template.spec.visualModels);
+  for (const className of ['routerG', 'ARM']) {
+    assert.ok(fixture.mock.requests.some((item) => item.pathname.endsWith(`/classes/${className}/attributes`)), `catalog attributes were checked for ${className}`);
+  }
+  assert.ok(fixture.mock.requests.some((item) => item.pathname.endsWith('/domains/RouterArm')));
+  for (const displayField of ['_Name', '_isExt']) {
+    const filtered = structuredClone(template);
+    for (const model of filtered.spec.visualModels) {
+      const selection = model.selections?.[0];
+      if (selection) (selection.rules || selection.scopeRules)[0].path = displayField;
+    }
+    const filteredExport = await fixture.post('export', { template: filtered });
+    assert.equal(filteredExport.statusCode, 200, filteredExport.body);
+    const filteredPrepare = await fixture.post('prepare', {
+      package: filteredExport.json.package, mode: 'new', targetCode: `StrictDisplayRule${displayField}`, overrides: []
+    });
+    assert.equal(filteredPrepare.statusCode, 200, filteredPrepare.body);
+    assert.equal(filteredPrepare.json.checks.status, 'needsAttention');
+    assert.equal(filteredPrepare.json.checks.executionReady, false);
+    assert.ok(filteredPrepare.json.checks.issues.some((issue) => issue.code === 'template_transfer_field_unavailable'
+      && issue.message.includes(`routerG.${displayField}`)), filteredPrepare.body);
+  }
+  assertTransferReadOnly(fixture.mock);
+});
+
+test('template transfer denies create and update before target model or catalog checks', async (t) => {
+  const targetSpec = apiObjectFlowSpec([{ alias: 'existingAssets', className: 'ARM', columns: ['Code'] }]);
+  const targetCode = 'PermissionDeniedTarget';
+  for (const mode of ['new', 'replace-card', 'replace-class']) {
+    const templates = mode === 'new' ? [] : [templateCard(targetCode, targetSpec,
+      mode === 'replace-card' ? { canUpdate: false } : { includeCanUpdate: false })];
+    const fixture = await transferApiFixture(t, {
+      templates, templateClassCanCreate: false, templateClassCanUpdate: false
+    });
+    const exported = await fixture.post('export', { template: transferAuthoringTemplate('DeniedSource', 'MissingDeniedClass') });
+    assert.equal(exported.statusCode, 200, exported.body);
+    const before = fixture.mock.requests.length;
+    const denied = await fixture.post('prepare', {
+      package: exported.json.package, mode: mode === 'new' ? 'new' : 'replace', targetCode,
+      ...(mode === 'new' ? {} : { baseSpecHash: hashJson(targetSpec) }), overrides: []
+    });
+    assert.equal(denied.statusCode, 403, denied.body);
+    assert.equal(denied.json.reason, mode === 'new' ? 'template_create_forbidden' : 'template_update_forbidden');
+    assert.equal(denied.json.template, undefined);
+    assert.equal(denied.json.checks, undefined);
+    const reads = fixture.mock.requests.slice(before);
+    assert.ok(reads.length > 0);
+    assert.ok(reads.every((item) => /^\/cmdbuild\/services\/rest\/v3\/(sessions\/current|classes\/Cst_QueryTemplate(?:\/cards)?)$/.test(item.pathname)),
+      `permission denial must precede runtime/model/catalog reads: ${JSON.stringify(reads)}`);
+    assertTransferReadOnly(fixture.mock);
+  }
+});
+
+test('template transfer finds replacement and code collision beyond 1000 target cards', async (t) => {
+  const targetSpec = apiObjectFlowSpec([{ alias: 'lateTarget', className: 'ARM', columns: ['Code'] }]);
+  const templates = Array.from({ length: 1005 }, (_, index) => templateCard(`EarlierTemplate${index}`, targetSpec));
+  const targetCode = 'TemplateAfterFirstThousand';
+  templates.push({ ...templateCard(targetCode, targetSpec), Active: false, _id: 6001 });
+  for (const templateCodeFilter of [false, true]) {
+    const fixture = await transferApiFixture(t, { templates, templateCodeFilter });
+    const exported = await fixture.post('export', { template: transferAuthoringTemplate() });
+    assert.equal(exported.statusCode, 200, exported.body);
+    const body = { package: exported.json.package, targetCode, overrides: [] };
+    const collision = await fixture.post('prepare', { ...body, mode: 'new' });
+    assert.equal(collision.statusCode, 409, collision.body);
+    assert.equal(collision.json.code, 'template_transfer_code_collision');
+    const replacement = await fixture.post('prepare', { ...body, mode: 'replace', baseSpecHash: hashJson(targetSpec) });
+    assert.equal(replacement.statusCode, 200, replacement.body);
+    assert.equal(replacement.json.template.id, 6001);
+    assert.equal(replacement.json.template.active, false);
+    assert.equal(replacement.json.template.specHash, hashJson(targetSpec));
+    const lookups = fixture.mock.requests.filter((item) => item.pathname.endsWith('/classes/Cst_QueryTemplate/cards'));
+    assert.equal(lookups.some((item) => new URLSearchParams(item.search).get('start') === '1000'), !templateCodeFilter);
+    assert.ok(lookups.every((item) => {
+      const filter = JSON.parse(new URLSearchParams(item.search).get('filter'));
+      return filter.attribute.simple.attribute === 'Code' && filter.attribute.simple.value[0] === targetCode;
+    }));
+    assertTransferReadOnly(fixture.mock);
+  }
+});
+
+function transferRawSpec(extra = {}) {
+  return { version: 1, steps: [{ type: 'selectCards', as: 'assets', className: 'ARM',
+    filters: [], columns: ['Code'], limit: 100 }], result: { tables: [{ name: 'assets', columns: ['Code'] }] }, ...extra };
+}
+
+function transferReferenceCatalog(extra = {}) {
+  return { classes: ['ARM', 'routerG', 'Location', 'Cst_QueryToolConfig', 'Cst_QueryTemplate'].map((name) => ({ name, active: true })),
+    cardsByClass: { Location: [901, 902, 903, 904, 905].map((_id) => ({ _id, Code: `site-${_id}`, _can_read: true })) }, ...extra };
+}
+
+async function prepareRawTransfer(fixture, spec, code, overrides = []) {
+  const exported = await fixture.post('export', { template: { code, description: '', spec, paramsSchema: null, resultSchema: null } });
+  assert.equal(exported.statusCode, 200, exported.body);
+  assert.equal(exported.json.package.formatVersion, 1);
+  return fixture.post('prepare', { package: exported.json.package, mode: 'new', targetCode: code, overrides });
+}
+
+test('template transfer parameter reference matrix checks only effective physical defaults and preserves shadowed candidates', async (t) => {
+  const fixture = await transferApiFixture(t, transferReferenceCatalog());
+  for (const [index, effectivePath] of ['$.spec.defaults.site', '$.spec.paramDefaults.site', '$.spec.params.site.default', '$.spec.params.site.defaultValue'].entries()) {
+    const spec = transferRawSpec({ params: { site: { type: 'string', default: '903', defaultValue: '904' } } });
+    if (index < 1) spec.defaults = { site: '901' };
+    if (index < 2) spec.paramDefaults = { site: '902' };
+    if (index > 2) delete spec.params.site.default;
+    spec.steps[0].filters = [{ path: 'Location', op: 'equals', valueExpression: '${param.site}' }];
+    const from = fixture.mock.requests.length;
+    const prepared = await prepareRawTransfer(fixture, spec, `DefaultMatrix${index}`);
+    assert.equal(prepared.statusCode, 200, prepared.body);
+    assert.equal(prepared.json.checks.executionReady, true, prepared.body);
+    const refs = prepared.json.checks.environmentReferences.filter((ref) => ref.parameterName === 'site');
+    assert.equal(refs.length, 4 - index, prepared.body);
+    assert.equal(refs.filter((ref) => ref.effective).length, 1, prepared.body);
+    assert.equal(refs.find((ref) => ref.effective).path, effectivePath);
+    for (const ref of refs) {
+      assert.equal(ref.requiresConfirmation, ref.effective);
+      assert.equal(ref.shadowedBy, ref.effective ? '' : effectivePath);
+    }
+    assert.deepEqual(fixture.mock.requests.slice(from).filter((request) => /\/classes\/Location\/cards\//.test(request.pathname)).map((request) => request.pathname.split('/').pop()), [String(901 + index)]);
+    const changed = await prepareRawTransfer(fixture, spec, `ChangedDefault${index}`, [{ path: effectivePath, value: '905' }]);
+    assert.equal(changed.json.checks.executionReady, true, changed.body);
+    assert.equal(changed.json.checks.environmentReferences.find((ref) => ref.effective && ref.parameterName === 'site').value, '905');
+    assert.deepEqual(changed.json.checks.environmentReferences.filter((ref) => ref.parameterName === 'site' && !ref.effective).map(({ path, value }) => ({ path, value })), refs.filter((ref) => !ref.effective).map(({ path, value }) => ({ path, value })));
+  }
+  assertTransferReadOnly(fixture.mock);
+});
+
+test('template transfer shadowed override changes only its physical path and is not execution ready', async (t) => {
+  const fixture = await transferApiFixture(t, transferReferenceCatalog());
+  const spec = transferRawSpec({ defaults: { site: '901' }, paramDefaults: { site: '902' },
+    params: { site: { type: 'string', referenceType: 'card', targetClass: 'Location', default: '903', defaultValue: '904' } } });
+  spec.steps[0].filters = [{ path: 'Location', op: 'equals', valueExpression: '${param.site}' }];
+  const prepared = await prepareRawTransfer(fixture, spec, 'ShadowedOverride', [{ path: '$.spec.params.site.defaultValue', value: '905' }]);
+  assert.equal(prepared.statusCode, 200, prepared.body);
+  assert.equal(prepared.json.checks.status, 'needsAttention');
+  assert.equal(prepared.json.checks.executionReady, false);
+  assert.ok(prepared.json.checks.issues.some((issue) => issue.code === 'template_transfer_override_shadowed' && issue.severity === 'error' && issue.path === '$.spec.params.site.defaultValue'));
+  const next = prepared.json.template.spec;
+  assert.deepEqual(next.defaults, spec.defaults);
+  assert.deepEqual(next.paramDefaults, spec.paramDefaults);
+  assert.deepEqual(next.params.site, { ...spec.params.site, defaultValue: '905' });
+  assert.equal(prepared.json.checks.environmentReferences.find((ref) => ref.effective && ref.parameterName === 'site').value, '901');
+  assertTransferReadOnly(fixture.mock);
+});
+
+test('template transfer metadata defaultValue lookup and raw literal card references are checked and overridable', async (t) => {
+  const fixture = await transferApiFixture(t, transferReferenceCatalog({ lookupValuesByType: { Status: [{ _id: 8, code: 'active', active: true }] } }));
+  const spec = transferRawSpec({ params: { state: { type: 'string', referenceType: 'lookup', lookupType: 'Status', defaultValue: '7' } } });
+  spec.steps[0].filters = [{ path: 'Location', op: 'equals', valueExpression: '999' }];
+  const initial = await prepareRawTransfer(fixture, spec, 'LookupDefaultValue');
+  assert.equal(initial.statusCode, 200, initial.body);
+  assert.equal(initial.json.checks.executionReady, false);
+  for (const code of ['template_transfer_card_unavailable', 'template_transfer_lookup_unavailable']) assert.ok(initial.json.checks.issues.some((issue) => issue.code === code), initial.body);
+  const prepared = await prepareRawTransfer(fixture, spec, 'LookupDefaultFixed', [
+    { path: '$.spec.params.state.defaultValue', value: '8' }, { path: '$.spec.steps[0].filters[0].valueExpression', value: '902' }
+  ]);
+  assert.equal(prepared.statusCode, 200, prepared.body);
+  assert.equal(prepared.json.checks.executionReady, true, prepared.body);
+  assert.equal(prepared.json.template.spec.params.state.defaultValue, '8');
+  assert.equal(prepared.json.template.spec.steps[0].filters[0].valueExpression, '902');
+  assertTransferReadOnly(fixture.mock);
+});
+
+test('template transfer raw DSL resolves reference and domain paths and rejects missing terminal fields', async (t) => {
+  const fixture = await transferApiFixture(t, transferReferenceCatalog({ domains: [{ name: 'AssetLocation', source: 'ARM', sources: ['ARM'], destination: 'Location', destinations: ['Location'], cardinality: 'N:1' }] }));
+  for (const [index, path] of ['Location.Code', '{AssetLocation:Location}.Code', 'Location.NoSuchField', '{AssetLocation:Location}.NoSuchField'].entries()) {
+    const spec = transferRawSpec();
+    spec.steps[0].filters = [{ path, op: 'equals', valueExpression: 'site' }];
+    const prepared = await prepareRawTransfer(fixture, spec, `RawPath${index}`);
+    assert.equal(prepared.statusCode, 200, prepared.body);
+    assert.equal(prepared.json.checks.executionReady, index < 2, prepared.body);
+    assert.equal(prepared.json.checks.status, index < 2 ? 'ready' : 'needsAttention', prepared.body);
+    if (index >= 2) assert.ok(prepared.json.checks.issues.some((issue) => issue.code === 'template_transfer_field_unavailable' && issue.path.startsWith('$.spec.steps[0]')), prepared.body);
+  }
+  assert.equal(fixture.mock.requests.some((request) => /\/classes\/(ARM|Location)\/cards/.test(request.pathname)), false, 'schema path validation never runs card queries');
+  assertTransferReadOnly(fixture.mock);
+});
+
+test('template transfer raw DSL tracks projections and join right-side provenance', async (t) => {
+  const fixture = await transferApiFixture(t, transferReferenceCatalog());
+  for (const missing of [false, true]) {
+    const spec = transferRawSpec({ steps: [
+      { type: 'selectCards', as: 'assets', className: 'ARM', columns: [{ path: 'Location.Code', as: 'site' }], filters: [], limit: 100 },
+      { type: 'selectCards', as: 'routers', className: 'routerG', columns: [{ path: 'Location.Code', as: 'site' }], filters: [], limit: 100 },
+      { type: 'joinRows', as: 'joined', from: 'assets', with: 'routers', on: [{ left: 'site', right: missing ? 'NoSuchField' : 'site' }], includeRightKeys: true, rightPrefix: 'R_' },
+      { type: 'composeRows', as: 'projected', from: 'joined', columns: [{ name: 'locationCode', column: 'R_site' }] },
+      { type: 'filterRows', as: 'filtered', from: 'projected', filters: [{ column: 'locationCode', op: 'equals', value: 'site' }] }
+    ], result: { tables: [{ name: 'filtered', columns: ['locationCode'] }] } });
+    const prepared = await prepareRawTransfer(fixture, spec, `RawJoin${missing}`);
+    assert.equal(prepared.statusCode, 200, prepared.body);
+    assert.equal(prepared.json.checks.executionReady, !missing, prepared.body);
+    if (missing) assert.ok(prepared.json.checks.issues.some((issue) => issue.code === 'template_transfer_field_unavailable' && issue.message.includes('routerG.NoSuchField')), prepared.body);
+  }
+  assertTransferReadOnly(fixture.mock);
+});
+
+test('template transfer raw DSL uses effective dynamic class parameters and fails closed for unverified classes', async (t) => {
+  const fixture = await transferApiFixture(t, transferReferenceCatalog());
+  for (const resolved of [false, true]) {
+    const spec = transferRawSpec({ params: { target: { type: 'string', required: true } } });
+    delete spec.steps[0].className;
+    spec.steps[0].classNameParam = 'target';
+    if (resolved) spec.paramDefaults = { target: 'ARM' };
+    const prepared = await prepareRawTransfer(fixture, spec, `DynamicClass${resolved}`);
+    assert.equal(prepared.statusCode, 200, prepared.body);
+    assert.equal(prepared.json.checks.executionReady, resolved, prepared.body);
+    if (!resolved) {
+      assert.equal(prepared.json.checks.status, 'needsAttention');
+      assert.ok(prepared.json.checks.issues.some((issue) => issue.code === 'template_transfer_dependency_unverified' && issue.severity === 'error'), prepared.body);
+    }
+  }
+  assertTransferReadOnly(fixture.mock);
+});
+
+test('template transfer raw managed DSL validates relation metadata, exists-related comparison sides and D2 enrich projections', async (t) => {
+  const fixture = await transferApiFixture(t, transferReferenceCatalog({
+    attributesByClass: { routerG: [{ name: 'ComparisonCode', type: 'string', active: true, _can_read: true }] },
+    domains: [{ name: 'AssetLocation', source: 'ARM', sources: ['ARM'], destination: 'Location', destinations: ['Location'], cardinality: 'N:1' }]
+  }));
+  for (const missing of [false, true]) {
+    const spec = transferRawSpec({ steps: [
+      { type: 'selectCards', as: 'assets', className: 'ARM', columns: ['Code'], filters: [], purpose: 'objectGroup' },
+      { type: 'selectCards', as: 'comparison', className: 'routerG', columns: ['ComparisonCode'], filters: [], purpose: 'objectGroup' },
+      { type: 'existsRelatedRows', as: 'scoped', from: 'assets', with: 'comparison', domain: 'AssetLocation', targetClass: 'Location', direction: 'source',
+        rules: [{ left: { column: 'ComparisonCode' }, right: { column: missing ? 'NoSuchField' : 'Code' }, operator: 'equals' }], purpose: 'objectMatching' },
+      { type: 'expandRelations', as: 'related', from: 'scoped', domain: 'AssetLocation', targetClass: 'Location', direction: 'source', columns: ['Code'], purpose: 'objectMatching' },
+      { type: 'matchRows', as: 'matched', from: 'related', with: 'comparison', rightPrefix: 'Endpoint_', rules: [{ leftColumn: 'RelatedId', rightColumn: '_id' }], purpose: 'objectMatching' },
+      { type: 'enrichRows', as: 'd2_condition', from: 'matched', classColumn: 'Class', idColumn: '_id', columns: [{ path: '_id', as: '__d2_condition_parent' }], managedBy: 'd2ImportV3', purpose: 'd2PlacementFilter' }
+    ], result: { tables: [{ name: 'd2_condition', columns: ['SourceDescription', 'RelatedId', 'Endpoint_ComparisonCode', '__d2_condition_parent'] }] } });
+    const prepared = await prepareRawTransfer(fixture, spec, `ManagedRaw${missing}`);
+    assert.equal(prepared.statusCode, 200, prepared.body);
+    assert.equal(prepared.json.checks.executionReady, !missing, prepared.body);
+    if (!missing) assert.deepEqual(prepared.json.checks.issues, [], prepared.body);
+    else assert.ok(prepared.json.checks.issues.some((issue) => issue.code === 'template_transfer_field_unavailable' && issue.message.includes('Location.NoSuchField')), prepared.body);
+  }
+  assertTransferReadOnly(fixture.mock);
+});
+
+test('template transfer catalog limits cannot turn partially checked raw dependencies ready', async (t) => {
+  for (const executionLimits of [{ maxRestCallsDefault: 1 }, { maxClassesDefault: 1 }, { maxTraversalDepthMax: 1 }]) {
+    const fixture = await transferApiFixture(t, transferReferenceCatalog({
+      attributesByClass: { Location: [{ name: 'Parent', type: 'reference', targetClass: 'Location', active: true, _can_read: true }] },
+      configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true, RuntimeConfigJson: JSON.stringify({ executionLimits }) }]
+    }));
+    const spec = transferRawSpec();
+    spec.steps[0].columns = ['Location.Parent.Parent.Code'];
+    const prepared = await prepareRawTransfer(fixture, spec, `Budget${Object.keys(executionLimits)[0]}`);
+    assert.equal(prepared.statusCode, 200, prepared.body);
+    assert.equal(prepared.json.checks.executionReady, false, prepared.body);
+    assert.equal(prepared.json.checks.status, 'needsAttention');
+    assert.ok(prepared.json.checks.issues.some((issue) => issue.code === 'template_transfer_catalog_limit' && issue.severity === 'error'), prepared.body);
+    assert.ok(prepared.json.checks.summary.restCalls <= prepared.json.checks.summary.limits.maxRestCallsDefault);
+    assertTransferReadOnly(fixture.mock);
+  }
+});
+
 async function startMockCmdbuild(t, options = {}) {
   const requests = [];
   const templateCards = Array.isArray(options.templates) ? options.templates : [];
@@ -8296,6 +9031,15 @@ async function startMockCmdbuild(t, options = {}) {
       else sendJson(res, 404, { message: `Domain not found: ${name}` });
       return;
     }
+    const lookupValueMatch = requestUrl.pathname.match(/^\/cmdbuild\/services\/rest\/v3\/lookup_types\/([^/]+)\/values\/([^/]+)$/);
+    if (lookupValueMatch && req.method === 'GET') {
+      const lookupType = decodeURIComponent(lookupValueMatch[1]);
+      const lookupId = decodeURIComponent(lookupValueMatch[2]);
+      const value = (options.lookupValuesByType?.[lookupType] || []).find((item) => String(item._id) === lookupId);
+      if (value) sendJson(res, 200, { data: value });
+      else sendJson(res, 404, { message: `Lookup value not found: ${lookupType}/${lookupId}` });
+      return;
+    }
     if (requestUrl.pathname === '/cmdbuild/services/rest/v3/lookup_types') {
       sendJson(res, 200, { data: [] });
       return;
@@ -8305,7 +9049,28 @@ async function startMockCmdbuild(t, options = {}) {
       return;
     }
     if (requestUrl.pathname === '/cmdbuild/services/rest/v3/classes/Cst_QueryTemplate/cards') {
-      sendJson(res, 200, { data: paginate(requestUrl, templateCards) });
+      let rows = templateCards;
+      if (options.templateCodeFilter && requestUrl.searchParams.has('filter')) {
+        const filter = JSON.parse(requestUrl.searchParams.get('filter'));
+        const simple = filter.attribute?.simple;
+        if (simple?.attribute !== 'Code' || simple.operator !== 'equal' || !Array.isArray(simple.value)) {
+          sendJson(res, 400, { message: 'Unsupported mock template filter.' });
+          return;
+        }
+        rows = rows.filter((card) => simple.value.includes(card.Code));
+      }
+      sendJson(res, 200, { data: paginate(requestUrl, rows), meta: { total: rows.length } });
+      return;
+    }
+    if (Array.isArray(options.versionCards) && requestUrl.pathname === '/cmdbuild/services/rest/v3/classes/Cst_QueryTemplateVersion/cards') {
+      if (req.method === 'GET') {
+        sendJson(res, 200, { data: paginate(requestUrl, options.versionCards), meta: { total: options.versionCards.length } });
+      } else if (req.method === 'POST') {
+        const payload = await readRequestJson(req);
+        const created = { ...payload, _id: `mock-version-${options.versionCards.length + 1}` };
+        options.versionCards.push(created);
+        sendJson(res, 200, { data: created });
+      } else sendJson(res, 405, { message: 'Unsupported mock version method.' });
       return;
     }
     const templateCardMatch = requestUrl.pathname.match(/^\/cmdbuild\/services\/rest\/v3\/classes\/Cst_QueryTemplate\/cards\/([^/]+)$/);
