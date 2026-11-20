@@ -7,7 +7,7 @@ import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics
 const source = fs.readFileSync(new URL('../../scripts/dev-proxy-server.mjs', import.meta.url), 'utf8');
 const functions = ['parseResponse', 'validateUiResponse', 'createRequestError', 'requestDraftPreview',
   'runtimeSettingsScope', 'runtimeSettingsScopeIsCurrent', 'captureTemplateEditorSnapshot', 'saveTemplateSnapshot',
-  'draftPreviewRequestTimeoutMs', 'saveTemplate', 'extractByTemplate', 'runDraftAction',
+  'draftPreviewRequestTimeoutMs', 'saveTemplate', 'extractByTemplate', 'extractionIsRunning', 'extractionMatchesDraft', 'extractionCaptureDetails', 'runDraftAction',
   'visualizeInEditor', 'queueDiagramImportRuntimePreview', 'runDiagramImportRuntimePreview'];
 const helpers = functions.map((name) => {
   const start = source.indexOf('  function ' + name + '(');
@@ -46,7 +46,8 @@ async function harness(body, { status = 200, current = true, mode = 'applied' } 
     readRunParams: () => ({}), readTemplateCode: () => 'sample', readValue: () => '',
     diagramImportExecutionValidationHasMappingBlocker: () => false,
     loadDesigner() { loads += 1; return Promise.resolve(); },
-    preferredExtractionResultName: () => 'items',
+    assistantFlowApplyPending: () => false, selectedExtractionSource: () => 'items',
+    stableClientJsonStringify: JSON.stringify,
     ensureExtractionPreviewTable: (spec) => spec,
     extractionSelectedSourceEmptyWarning: () => '',
     authoringPreviewPath: () => '/api/draft/preview', authoringPreviewMaxRows: () => 10,
@@ -73,7 +74,7 @@ async function harness(body, { status = 200, current = true, mode = 'applied' } 
 
 async function invoke(h, name, ...args) {
   await h.sandbox[name](...args);
-  // Save and extraction intentionally do not return their request promise.
+  // Some consumers do not return their request promise.
   for (let i = 0; i < 30; i += 1) await Promise.resolve();
 }
 
@@ -95,7 +96,7 @@ const invalidPreview = [
     .map((result) => ['invalid result ' + JSON.stringify(result), JSON.stringify({ success: true, result })])
 ];
 
-function assertInvalid(h) {
+function assertInvalid(h, consumer) {
   assert.equal(h.errors.length, 1);
   const error = h.errors[0];
   assert.equal(error.code, 'invalid_response');
@@ -107,7 +108,12 @@ function assertInvalid(h) {
   assert.equal(h.state.lastDraftPreviewOk, false);
   assert.equal(h.state.selectedTemplate, h.edited);
   assert.equal(h.state.selectedTemplate.spec.edited, true);
-  assert.equal(h.state.message.type, 'error');
+  if (consumer === 'extractByTemplate') {
+    assert.equal(h.state.message, null);
+    assert.equal(h.state.extractionPreview.diagnostic.code, 'invalid_response');
+    assert.equal(h.state.extractionPreview.ok, false);
+    assert.equal(h.state.extractionOperation, null);
+  } else assert.equal(h.state.message.type, 'error');
   assert.deepEqual(h.calls[0].options.owner, h.owner);
 }
 
@@ -126,7 +132,7 @@ for (const consumer of ['extractByTemplate', 'runDraftAction', 'visualizeInEdito
     test('actual ' + consumer + ' rejects ' + label, async () => {
       const h = await harness(body);
       await invoke(h, consumer, ...(consumer === 'runDraftAction' ? ['preview'] : []));
-      assertInvalid(h);
+      assertInvalid(h, consumer);
     });
   }
   for (const result of [{ tables: [] }, { tables: [], diagrams: [] }]) {
@@ -134,7 +140,11 @@ for (const consumer of ['extractByTemplate', 'runDraftAction', 'visualizeInEdito
       const h = await harness(JSON.stringify({ success: true, result }));
       await invoke(h, consumer, ...(consumer === 'runDraftAction' ? ['preview'] : []));
       assert.equal(h.errors.length, 0);
-      assert.equal(h.state.message.type, 'ok');
+      if (consumer === 'extractByTemplate') {
+        assert.equal(h.state.message, null);
+        assert.equal(h.state.extractionPreview.ok, true);
+        assert.equal(h.state.extractionOperation, null);
+      } else assert.equal(h.state.message.type, 'ok');
       assert.equal(h.state.lastDraftPreviewOk, true);
       assert.equal(h.state.selectedTemplate, h.edited);
       assert.deepEqual(h.calls[0].options.owner, h.owner);
@@ -316,6 +326,23 @@ test('HTTP error keeps backend code and original diagnostic', async () => {
   assert.equal(h.errors[0].code, 'backend_error');
   assert.equal(h.errors[0].diagnostic, h.response.diagnostic);
 });
+
+for (const revision of ['local spec', 'saved base']) {
+  test('actual extraction drops a response for the same source after changing ' + revision, async () => {
+    const h = await harness('{"success":true,"result":{"tables":[{"name":"items","rows":[{}]}]}}');
+    let resolve;
+    h.sandbox.request = () => new Promise((done) => { resolve = done; });
+    const pending = h.sandbox.extractByTemplate();
+    assert.equal(h.sandbox.extractionIsRunning(), true);
+    if (revision === 'local spec') h.state.selectedTemplate.spec.edited = false;
+    else h.state.selectedTemplate.specHash = 'new-saved-hash';
+    assert.equal(h.sandbox.extractionIsRunning(), false);
+    resolve(h.response);
+    await pending;
+    assert.equal(h.state.extractionPreview, null);
+    assert.equal(h.state.extractionOperation, null);
+  });
+}
 
 for (const consumer of ['saveTemplate', 'extractByTemplate', 'runDraftAction', 'visualizeInEditor', 'runDiagramImportRuntimePreview']) {
   test('actual ' + consumer + ' cannot clear newer data when invalid response arrives late', async () => {

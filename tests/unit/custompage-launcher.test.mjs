@@ -1253,7 +1253,7 @@ test('typed assistant flow renders one in-progress proposal before deterministic
   const generateSource = proxySource.slice(generateStart, applyStart);
 
   assert.match(proxySource, /assistantGeneratingTitle/);
-  assert.match(renderSource, /assistantGenerateBusy/);
+  assert.match(renderSource, /data-assistant-flow-apply-status/);
   assert.match(renderSource, /state\.assistantFlowBusy/);
   assert.match(renderSource, /cmdp-assistant-object-flow-intent/);
   assert.match(renderSource, /assistant-flow-prepare/);
@@ -1268,7 +1268,7 @@ test('typed assistant flow renders one in-progress proposal before deterministic
   assert.doesNotMatch(renderSource, /assistant-flow-block-down/);
   assert.match(renderSource, /assistant-flow-generate/);
   assert.match(renderSource, /assistantFlowProposal/);
-  assert.match(renderSource, /assistantFlowCanApply/);
+  assert.match(renderSource, /assistantFlowApplyStatus\(\)/);
   assert.match(renderSource, /assistantFlowSemanticPlan/);
   assert.match(renderSource, /data-assistant-flow-semantic-plan/);
   assert.doesNotMatch(renderSource, /assistant-flow-generate-selection/);
@@ -1294,17 +1294,19 @@ test('typed assistant flow renders one in-progress proposal before deterministic
   assert.match(generateSource, /assistantTemplateRevisionSnapshot\(state\.selectedTemplate, requestSpec, requestGeneration\)/);
   assert.match(generateSource, /mismatch === 'request'/);
   assert.match(generateSource, /assistantTemplateRevisionError\(requestRevision\)/);
-  assert.match(generateSource, /state\.assistantFlowRequestGeneration \|\| 0\) === requestGeneration/);
+  assert.match(generateSource, /finishAssistantFlowOperation\(requestGeneration, operationOwner\)/);
+  const finishSource = proxySource.slice(proxySource.indexOf('function finishAssistantFlowOperation('), generateStart);
+  assert.match(finishSource, /state\.assistantFlowRequestGeneration \|\| 0\) !== requestGeneration/);
   assert.doesNotMatch(proxySource.slice(proxySource.indexOf('function assistantTemplateRevisionSnapshot'), proxySource.indexOf('function applyAssistantDraftToSpec')), /assistantObjectFlowPrompt|hasPrompt|specHash/);
   assert.doesNotMatch(generateSource, /state\.selectedTemplate !== requestTemplate/);
-  assert.match(generateSource, /state\.assistantFlowBusy = false/);
+  assert.match(finishSource, /state\.assistantFlowBusy = false/);
 });
 
 test('normal Save accepts canonical ACK without reloading; opening a template restores its D2 checkpoint without LLM', () => {
   const hydrateStart = proxySource.indexOf('function hydrateDesignerStateFromTemplate(options)');
   const noticeStart = proxySource.indexOf('function renderNotice(message)', hydrateStart);
   const loadStart = proxySource.indexOf('function loadDesigner(options)');
-  const fetchVersionsStart = proxySource.indexOf('function fetchVersions(code)', loadStart);
+  const fetchVersionsStart = proxySource.indexOf('function fetchVersions(', loadStart);
   const saveStart = proxySource.indexOf('function saveTemplate()');
   const assistantStart = proxySource.indexOf('function openAssistantSection()', saveStart);
   assert.ok(hydrateStart > -1);
@@ -1409,7 +1411,7 @@ test('designer blocks template-bound menu sections until a template is selected'
   const renderSectionSource = proxySource.slice(renderSectionStart, titleStart);
   const clickSource = proxySource.slice(clickStart, actionStart);
   const loadDesignerStart = proxySource.indexOf('function loadDesigner(options)');
-  const fetchVersionsStart = proxySource.indexOf('function fetchVersions(code)');
+  const fetchVersionsStart = proxySource.indexOf('function fetchVersions(', loadDesignerStart);
   assert.ok(loadDesignerStart > -1);
   assert.ok(fetchVersionsStart > loadDesignerStart);
   const loadDesignerSource = proxySource.slice(loadDesignerStart, fetchVersionsStart);
@@ -2033,7 +2035,8 @@ test('Assistant applies data flow locally; normal Save remains the only persiste
   assert.match(proxySource, /assistantApplyFlow: 'Применить цепочку'/);
   assert.match(applySource, /captureAssistantPromptsFromDom\(\)/);
   assert.match(applySource, /result\.json\.spec/);
-  assert.match(applySource, /changesReadyToSave/);
+  assert.match(applySource, /state\.assistantFlowApplied = true/);
+  assert.match(applySource, /state\.templateDirty = true/);
   assert.match(routeSource, /template_save_required/);
   assert.match(routeSource, /persisted: false/);
   assert.doesNotMatch(routeSource, /writeTemplateVersion/);
@@ -2379,10 +2382,9 @@ test('object group final alias drives extraction defaults and diagnostics', () =
   assert.match(warningSource, /populatedTable\.rows\.length/);
   assert.match(warningSource, /userFacingResultLabel\(selected, spec\)/);
   assert.match(warningSource, /userFacingResultLabel\(populatedTable\.name, spec\)/);
-  assert.match(extractSource, /var sourceWarning = extractionSelectedSourceEmptyWarning\(result, state\.extractionSource, payload\.spec\)/);
-  assert.doesNotMatch(extractSource, /extractionSelectedSourceEmptyWarning\(result, state\.extractionSource, spec\)/);
-  assert.match(extractSource, /type: result\.ok \? \(sourceWarning \? 'warning' : 'ok'\) : 'error'/);
-  assert.match(extractSource, /sourceWarning \|\| t\('extractionCompleted'\)/);
+  assert.match(extractSource, /selectedExtractionSource\(payload\.spec\)/);
+  assert.match(extractSource, /state\.extractionOperation = operation/);
+  assert.match(extractSource, /includeDiagrams: false, extractionSource: source/);
 });
 
 test('Assistant extraction warns on incomplete provenance and keeps safe labels available', () => {
@@ -2422,7 +2424,7 @@ test('Assistant extraction warns on incomplete provenance and keeps safe labels 
   assert.match(renderSource, /data-object-flow-recovery/);
   assert.match(renderSource, /assistantManifest\.warning/);
   assert.doesNotMatch(renderSource, /assistantFlowOutputManifestInvalid/);
-  assert.match(renderSource, /renderExtractionResultOptions\(state\.extractionSource, spec, optionTables\)/);
+  assert.match(renderSource, /renderExtractionResultOptions\(source, spec, specTables, resultOptions\)/);
   assert.match(renderSource, /extractionResultSourceHelp/);
   assert.doesNotMatch(extractionSource, /assistantManifest\.assistantManaged|assistantManifest\.error/);
 });

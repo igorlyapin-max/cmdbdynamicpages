@@ -8130,7 +8130,14 @@ async function transferApiFixture(t, mockOptions = {}, envOverrides = {}) {
   assert.equal(csrf.statusCode, 200, csrf.body);
   const headers = { cookie, origin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
   return { mock, backend, origin, headers,
+    put: (code, body) => requestJson('PUT', `${origin}/cmdbuild/custom-api/templates/${code}`, body, headers, 15000),
+    create: (body) => requestJson('POST', `${origin}/cmdbuild/custom-api/templates`, body, headers, 15000),
     post: (action, body) => requestJson('POST', `${origin}/cmdbuild/custom-api/template-transfer/${action}`, body, headers, 15000) };
+}
+
+function transferReplacementSaveBody(prepared) {
+  const { template: { code, description, spec, paramsSchema, resultSchema }, changes: { targetId, targetRevision } } = prepared.json;
+  return { code, description, spec, paramsSchema, resultSchema, transferReplace: { targetId, revision: targetRevision } };
 }
 
 function assertTransferReadOnly(mock) {
@@ -8200,16 +8207,19 @@ test('template transfer replace keeps target identity/activity/hash and rejects 
   assert.equal(prepared.json.template.owner, target.Owner);
   assert.equal(prepared.json.template.updatedAt, target.UpdatedAt);
   assert.equal(prepared.json.template.specHash, hashJson(targetSpec));
+  assert.equal(prepared.json.changes.targetId, target._id);
+  assert.match(prepared.json.changes.targetRevision, /^sha256:[a-f0-9]{64}$/);
   assert.deepEqual(prepared.json.template.spec.steps, exported.json.package.template.spec.steps);
   const stale = await fixture.post('prepare', { ...body, baseSpecHash: '0'.repeat(64) });
   assert.equal(stale.statusCode, 409, stale.body);
+  assert.equal(stale.json.code, 'template_spec_conflict');
   const collision = await fixture.post('prepare', { ...body, mode: 'new' });
   assert.equal(collision.statusCode, 409, collision.body);
   assert.deepEqual(target, before);
   assertTransferReadOnly(fixture.mock);
 });
 
-test('template transfer replace ordinary Save without owner preserves target identity/activity and appends history', async (t) => {
+test('template transfer replace sends a partial PUT without metadata and appends history', async (t) => {
   for (const active of [false, true]) {
     const targetCode = active ? 'OwnedActiveTarget' : 'OwnedInactiveTarget';
     const targetSpec = apiObjectFlowSpec([{ alias: 'existingRouters', className: 'routerG', columns: ['Code'] }]);
@@ -8219,7 +8229,8 @@ test('template transfer replace ordinary Save without owner preserves target ide
       TemplateCode: targetCode, Version: 3, SpecJson: JSON.stringify(targetSpec), ChangedBy: 'original-author',
       ChangedAt: '2026-07-01T00:00:00.000Z', ChangeComment: 'Existing version must remain unchanged.' };
     const versions = [structuredClone(oldVersion)];
-    const fixture = await transferApiFixture(t, { templates: [targetCard], versionCards: versions });
+    const templatePutPatches = [];
+    const fixture = await transferApiFixture(t, { templates: [targetCard], versionCards: versions, templatePutPatches });
     const exported = await fixture.post('export', { template: transferAuthoringTemplate('DifferentSourceOwner') });
     assert.equal(exported.statusCode, 200, exported.body);
     const prepared = await fixture.post('prepare', {
@@ -8232,13 +8243,11 @@ test('template transfer replace ordinary Save without owner preserves target ide
     assertTransferReadOnly(fixture.mock);
     assert.deepEqual(versions, [oldVersion], 'prepare must not append history');
     const draft = prepared.json.template;
-    const saveBody = { code: draft.code, description: draft.description, active: draft.active, spec: draft.spec,
-      paramsSchema: draft.paramsSchema, resultSchema: draft.resultSchema,
-      expectedSpecHash: draft.specHash, changeComment: 'Ordinary Save after transfer replacement.' };
-    assert.equal(Object.hasOwn(saveBody, 'owner'), false);
-    assert.equal(Object.hasOwn(saveBody, 'Owner'), false);
-    const saved = await requestJson('PUT', `${fixture.origin}/cmdbuild/custom-api/templates/${targetCode}`, saveBody, fixture.headers);
+    const saveBody = { ...transferReplacementSaveBody(prepared), active: !active, Owner: 'must-not-write',
+      changeComment: 'Save after transfer replacement.' };
+    const saved = await fixture.put(targetCode, saveBody);
     assert.equal(saved.statusCode, 200, saved.body);
+    assert.deepEqual(Object.keys(templatePutPatches[0]).sort(), ['Description', 'ParamsSchemaJson', 'ResultSchemaJson', 'SpecJson', 'UpdatedAt']);
     assert.equal(saved.json.versionLog.success, true, saved.body);
     const read = await requestJson('GET', `${fixture.origin}/cmdbuild/custom-api/templates/${targetCode}`, undefined, { cookie: fixture.headers.cookie });
     assert.equal(read.statusCode, 200, read.body);
@@ -8265,6 +8274,72 @@ test('template transfer replace ordinary Save without owner preserves target ide
     assert.equal(fixture.mock.requests.filter((item) => item.method === 'PUT' && item.pathname.endsWith(`/classes/Cst_QueryTemplate/cards/${targetCard._id}`)).length, 1);
     assert.equal(fixture.mock.requests.filter((item) => item.method === 'POST' && item.pathname.endsWith('/classes/Cst_QueryTemplateVersion/cards')).length, 1);
   }
+});
+
+test('template transfer replace rejects stale metadata, wrong identity, malformed mode and revoked update permission without a write', async (t) => {
+  const targetSpec = transferRawSpec();
+  const card = { ...templateCard('RevisionTarget', targetSpec), _id: 4300, Active: true, Owner: 'original' };
+  const cards = [card];
+  const fixture = await transferApiFixture(t, { templates: cards, versionCards: [] });
+  const pkg = (await fixture.post('export', { template: transferAuthoringTemplate() })).json.package;
+  const prepare = { package: pkg, mode: 'replace', targetCode: card.Code, baseSpecHash: hashJson(targetSpec) };
+  const prepared = await fixture.post('prepare', prepare);
+  assert.equal(prepared.statusCode, 200, prepared.body);
+  const body = transferReplacementSaveBody(prepared);
+  for (const patch of [{ Description: 'renamed' }, { Active: false }, { Owner: 'other' },
+    { ParamsSchemaJson: '{"changed":true}' }, { ResultSchemaJson: '{"changed":true}' }, { UpdatedAt: 'later' }, { _id: 4301 }]) {
+    cards[0] = { ...card, ...patch };
+    const changed = await fixture.put(card.Code, body);
+    assert.equal(changed.statusCode, 409, changed.body);
+    assert.equal(changed.json.code, 'template_transfer_revision_conflict');
+  }
+  cards[0] = { ...card, _can_update: false };
+  const denied = await fixture.put(card.Code, body);
+  assert.equal(denied.statusCode, 403, denied.body);
+  cards[0] = card;
+  const invalid = await fixture.put(card.Code, { ...body, transferReplace: null });
+  assert.equal(invalid.statusCode, 400, invalid.body);
+  assert.equal(invalid.json.code, 'template_transfer_replace_invalid');
+  const incomplete = await fixture.put(card.Code, { ...body, spec: { version: 1, steps: [], result: { tables: [] } } });
+  assert.equal(incomplete.statusCode, 422, incomplete.body);
+  assert.equal(incomplete.json.code, 'template_transfer_incomplete');
+  cards.length = 0;
+  assert.equal((await fixture.put(card.Code, body)).statusCode, 409);
+  assertTransferReadOnly(fixture.mock);
+});
+
+test('template transfer replace reruns list checks on final save and rechecks target after catalog reads', async (t) => {
+  const targetSpec = transferRawSpec();
+  const card = { ...templateCard('FinalValidationTarget', targetSpec), _id: 4302, Active: false };
+  const cards = [card];
+  let changeDuringValidation = false;
+  const fixture = await transferApiFixture(t, transferReferenceCatalog({
+    templates: cards, versionCards: [],
+    delayByPath(url) {
+      if (changeDuringValidation && url.pathname.endsWith('/classes/Location/cards/901')) {
+        cards[0] = { ...card, Owner: 'changed-while-validating' };
+      }
+      return 0;
+    }
+  }));
+  const spec = transferRawSpec();
+  spec.steps[0].filters = [{ attribute: 'Location', op: 'in', values: [901, 902] }];
+  const exported = await fixture.post('export', { template: { ...transferAuthoringTemplate(), spec } });
+  const prepared = await fixture.post('prepare', { package: exported.json.package, mode: 'replace', targetCode: card.Code, baseSpecHash: hashJson(targetSpec) });
+  assert.equal(prepared.statusCode, 200, prepared.body);
+  assert.equal(prepared.json.checks.executionReady, true, prepared.body);
+  const body = transferReplacementSaveBody(prepared);
+  const edited = structuredClone(body);
+  edited.spec.steps[0].filters[0].values[1] = 999;
+  const rejected = await fixture.put(card.Code, edited);
+  assert.equal(rejected.statusCode, 422, rejected.body);
+  assert.equal(rejected.json.code, 'template_transfer_incomplete');
+  assert.ok(rejected.json.issues.some((issue) => issue.path === '$.spec.steps[0].filters[0].values[1]' && issue.code === 'template_transfer_card_unavailable'));
+  changeDuringValidation = true;
+  const changed = await fixture.put(card.Code, body);
+  assert.equal(changed.statusCode, 409, changed.body);
+  assert.equal(changed.json.code, 'template_transfer_revision_conflict');
+  assertTransferReadOnly(fixture.mock);
 });
 
 test('template transfer missing target class remains editable needsAttention with nonblocking issues', async (t) => {
@@ -8412,12 +8487,11 @@ test('template transfer rehydrates unapplied reviewed checkpoints and Save/read 
     const checkpoint = exported.json.package.template.spec.authoring.d2[name];
     for (const key of ['proposalId', 'deterministicSpecHash', 'source']) assert.equal(Object.hasOwn(checkpoint, key), false, `${name}.${key}`);
   }
-  const targetSpec = apiObjectFlowSpec([{ alias: 'targetAssets', className: 'ARM', columns: ['Code'] }]);
   const targetCode = 'UnappliedReviewedTarget';
-  const target = await transferApiFixture(t, { configCards, templates: [templateCard(targetCode, targetSpec)] },
+  const target = await transferApiFixture(t, { configCards, persistNewTemplates: true, versionCards: [] },
     { ...env, CMDBDYNAMICPAGES_CSRF_SECRET: 'unapplied-target-test-secret' });
   const prepared = await target.post('prepare', {
-    package: exported.json.package, mode: 'replace', targetCode, baseSpecHash: hashJson(targetSpec), overrides: []
+    package: exported.json.package, mode: 'new', targetCode, overrides: []
   });
   assert.equal(prepared.statusCode, 200, prepared.body);
   assert.equal(prepared.json.checks.status, 'needsAttention');
@@ -8436,10 +8510,9 @@ test('template transfer rehydrates unapplied reviewed checkpoints and Save/read 
   assert.equal(preparedD2.assistantCheckpoint.interpretation.explanation, assistantCheckpoint.interpretation.explanation);
   assertTransferReadOnly(source.mock);
   assertTransferReadOnly(target.mock);
-  const saved = await requestJson('PUT', `${target.origin}/cmdbuild/custom-api/templates/${targetCode}`, {
-    code: targetCode, expectedSpecHash: hashJson(targetSpec), spec: prepared.json.template.spec
-  }, target.headers);
-  assert.equal(saved.statusCode, 200, saved.body);
+  const saved = await target.create(prepared.json.template);
+  assert.equal(saved.statusCode, 201, saved.body);
+  assert.equal(saved.json.template.active, false, saved.body);
   const read = await requestJson('GET', `${target.origin}/cmdbuild/custom-api/templates/${targetCode}`, undefined, { cookie: target.headers.cookie });
   assert.equal(read.statusCode, 200, read.body);
   const persistedD2 = { ...preparedD2, sourceHash: crypto.createHash('sha256').update(d2Source).digest('hex') };
@@ -8455,7 +8528,7 @@ test('template transfer rehydrates unapplied reviewed checkpoints and Save/read 
   assert.equal(restored.json.interpretation.explanation, assistantCheckpoint.interpretation.explanation);
   assert.deepEqual(restored.json.mapping.result, assistantCheckpoint.mapping.result);
   assert.equal(llm.requests, 0);
-  assert.equal(target.mock.requests.filter((item) => item.method === 'PUT' && item.pathname.includes('/classes/Cst_QueryTemplate/cards/')).length, 1);
+  assert.equal(target.mock.requests.filter((item) => item.method === 'POST' && item.pathname.endsWith('/classes/Cst_QueryTemplate/cards')).length, 1);
 });
 
 test('template transfer overrides catalog-typed card and lookup values at actual visualModels and mirror paths', async (t) => {
@@ -8741,6 +8814,49 @@ test('template transfer metadata defaultValue lookup and raw literal card refere
   assert.equal(prepared.json.checks.executionReady, true, prepared.body);
   assert.equal(prepared.json.template.spec.params.state.defaultValue, '8');
   assert.equal(prepared.json.template.spec.steps[0].filters[0].valueExpression, '902');
+  assertTransferReadOnly(fixture.mock);
+});
+
+test('template transfer checks each values and valuesParam index using runtime precedence; overrides change only that index', async (t) => {
+  const fixture = await transferApiFixture(t, transferReferenceCatalog({
+    attributesByClass: { ARM: [
+      { name: 'Location', type: 'reference', targetClass: 'Location', active: true, _can_read: true },
+      { name: 'Status', type: 'lookup', lookupType: 'Status', active: true, _can_read: true }
+    ] },
+    lookupValuesByType: { Status: [{ _id: 8, code: 'active', active: true }, { _id: 9, code: 'next', active: true }] }
+  }));
+  const spec = transferRawSpec({
+    defaults: { statuses: [8, 777] },
+    paramDefaults: { statuses: [778, 779] },
+    params: { statuses: { type: 'string', default: [780, 781] }, winner: { type: 'string', default: 903 } }
+  });
+  spec.steps[0].filters = [
+    { attribute: 'Location', op: 'in', values: [901, 998] },
+    { attribute: 'Status', op: 'in', valuesParam: 'statuses', value: 980, values: [981] },
+    { attribute: 'Location', op: 'in', valueParam: 'winner', valuesParam: 'ignored', values: [982] }
+  ];
+  const prepared = await prepareRawTransfer(fixture, spec, 'ListReferences');
+  assert.equal(prepared.json.checks.executionReady, false, prepared.body);
+  const refs = prepared.json.checks.environmentReferences;
+  assert.ok(refs.some((ref) => ref.path === '$.spec.defaults.statuses[0]' && ref.effective && ref.requiresConfirmation));
+  assert.ok(refs.some((ref) => ref.path === '$.spec.paramDefaults.statuses[1]' && !ref.effective && ref.shadowedBy === '$.spec.defaults.statuses'));
+  assert.ok(refs.some((ref) => ref.path === '$.spec.steps[0].filters[0].values[0]' && ref.value === 901 && ref.requiresConfirmation));
+  for (const [path, code] of [
+    ['$.spec.steps[0].filters[0].values[1]', 'template_transfer_card_unavailable'],
+    ['$.spec.defaults.statuses[1]', 'template_transfer_lookup_unavailable']
+  ]) assert.ok(prepared.json.checks.issues.some((item) => item.path === path && item.code === code), prepared.body);
+  const fixed = await prepareRawTransfer(fixture, spec, 'ListReferencesFixed', [
+    { path: '$.spec.steps[0].filters[0].values[1]', value: 902 },
+    { path: '$.spec.defaults.statuses[1]', value: 9 }
+  ]);
+  assert.equal(fixed.json.checks.executionReady, true, fixed.body);
+  assert.deepEqual(fixed.json.template.spec.steps[0].filters[0].values, [901, 902]);
+  assert.deepEqual(fixed.json.template.spec.defaults.statuses, [8, 9]);
+  assert.deepEqual(fixed.json.template.spec.paramDefaults.statuses, [778, 779]);
+  const requests = fixture.mock.requests.map((req) => req.pathname);
+  for (const path of ['/classes/Location/cards/901', '/classes/Location/cards/902', '/classes/Location/cards/903',
+    '/lookup_types/Status/values/8', '/lookup_types/Status/values/9']) assert.ok(requests.some((req) => req.endsWith(path)), path);
+  assert.ok(!requests.some((req) => /\/(778|779|780|781|980|981|982)$/.test(req)));
   assertTransferReadOnly(fixture.mock);
 });
 
@@ -9049,6 +9165,12 @@ async function startMockCmdbuild(t, options = {}) {
       return;
     }
     if (requestUrl.pathname === '/cmdbuild/services/rest/v3/classes/Cst_QueryTemplate/cards') {
+      if (req.method === 'POST' && options.persistNewTemplates) {
+        const card = { ...await readRequestJson(req), _id: templateCards.length + 1 };
+        templateCards.push(card);
+        sendJson(res, 200, { data: card });
+        return;
+      }
       let rows = templateCards;
       if (options.templateCodeFilter && requestUrl.searchParams.has('filter')) {
         const filter = JSON.parse(requestUrl.searchParams.get('filter'));
@@ -9085,6 +9207,7 @@ async function startMockCmdbuild(t, options = {}) {
           sendJson(res, 400, { message: 'Invalid request JSON.' });
           return;
         }
+        options.templatePutPatches?.push(patch);
         templateCards[index] = { ...templateCards[index], ...patch };
         sendJson(res, 200, { data: templateCards[index] });
         return;

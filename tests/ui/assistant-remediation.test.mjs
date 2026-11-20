@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { chromium } from 'playwright';
+import { compileObjectFlowToSpec } from '../../scripts/assistant-object-flow.mjs';
 import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics.mjs';
 import { createAssistantDiagnosticsUi } from '../../scripts/assistant-diagnostics-ui.mjs';
 import { resolveTemplateParameters } from '../../scripts/template-parameters.mjs';
@@ -67,7 +68,7 @@ async function withClient(viewport, scenario) {
       if (url.origin === 'http://remediation.test' && request.isNavigationRequest() && url.pathname === '/') {
         return route.fulfill({ contentType: 'text/html', body: '<!doctype html><html><head><style>*{box-sizing:border-box}body{font:14px sans-serif;margin:12px}input,textarea,select{max-width:100%}label{display:block}section{max-width:100%}.visual-grid{display:grid;gap:8px}pre{overflow-wrap:anywhere}table{font-size:12px}</style></head><body><select id="cmdp-language"><option value="ru">RU</option><option value="en">EN</option></select><div id="app"></div></body></html>' });
       }
-      const call = { method: request.method(), path: url.pathname, root: url.searchParams.get('root'), body: request.postDataJSON() };
+      const call = { method: request.method(), path: url.pathname, root: url.searchParams.get('root'), query: url.searchParams, body: request.postDataJSON() };
       if (call.method !== 'GET') writes.push(call);
       const index = expected.findIndex((item) => item.method === call.method && item.pathname === url.pathname);
       if (url.origin === 'http://remediation.test' && index >= 0) {
@@ -124,6 +125,412 @@ async function openSemanticPlan(page, language = 'ru') {
 }
 
 const semanticPath = '/cmdbuild/custom-api/assistant/object-flow/semantic-plan';
+const flowPath = '/cmdbuild/custom-api/assistant/object-flow/plan';
+const applyPath = '/cmdbuild/custom-api/draft/object-flow/apply';
+const extractionPath = '/cmdbuild/custom-api/draft/preview';
+const widgetRoot = 'Widget_QueryTool';
+const widgetTemplate = { id: 7, code: 'widget-extraction', active: true, specHash: 'saved-widget-spec' };
+const widgetBlock = { id: 'widgets', name: 'Карточки Widget', description: 'Все карточки класса Widget без фильтров', resultKind: 'sourceCards', uses: [] };
+const widgetIntent = { context: 'Показать все карточки Widget', blocks: [widgetBlock] };
+const widgetFlow = {
+  version: 1,
+  selections: [{ id: 'selection:widgets', name: widgetBlock.name, alias: 'widgets', className: 'Widget',
+    from: '', limit: 100, columns: ['Code', 'Description'],
+    // Production uses this match-all sentinel when no user filter was specified.
+    rules: [{ action: 'include', path: 'Code', negate: false, op: 'matches', rightExpression: '.*' }] }],
+  operations: [], blocks: [], setOperations: [], publishedAlias: 'widgets'
+};
+const widgetRows = [
+  { _id: 41, Code: 'W-001', Description: 'Первый виджет' },
+  { _id: 42, Code: 'W-002', Description: 'Второй виджет' }
+];
+const archiveBlock = { ...widgetBlock, id: 'archive', name: 'Архивные карточки Widget' };
+const archiveSelection = { ...widgetFlow.selections[0], id: 'selection:archive', alias: 'archive', name: archiveBlock.name };
+const archiveFlow = { ...widgetFlow, selections: [archiveSelection], publishedAlias: 'archive' };
+const combinedWidgetFlow = { ...widgetFlow, selections: [archiveSelection, ...widgetFlow.selections] };
+
+async function openWidgetTemplate(page, section, spec, proposal) {
+  await page.locator('#cmdp-language').selectOption('ru');
+  await page.evaluate(({ template, intent, root, section, spec, proposal }) => {
+    const ui = window.remediation;
+    ui.state.root = root;
+    ui.state.selectedTemplate = { ...template, spec: spec || { ...ui.defaultSpec(), params: {}, steps: [], result: { tables: [] } } };
+    ui.state.templates = [structuredClone(ui.state.selectedTemplate)];
+    ui.hydrateDesignerStateFromTemplate({ replaceRunParams: true });
+    ui.state.assistantObjectFlowIntent = intent;
+    if (proposal) {
+      ui.state.assistantFlowProposal = proposal;
+      ui.state.assistantFlowCanApply = true;
+      ui.state.assistantFlowOutputBindings = intent.blocks.map((block) => ({ blockId: block.id, alias: block.id }));
+    }
+    ui.state.designerSection = section;
+    ui.renderDesigner();
+  }, { template: widgetTemplate, intent: proposal?.selections.length === 2 ? { ...widgetIntent, blocks: [archiveBlock, widgetBlock] } : widgetIntent,
+    root: widgetRoot, section, spec, proposal });
+}
+
+function draftWithArchive() {
+  return compileObjectFlowToSpec({ version: 1, params: {}, steps: [], result: { tables: [] } }, archiveFlow);
+}
+
+function compileAppliedFlow(call) {
+  const { currentSpec, flow, assistantOutputBindings, assistantObjectFlowIntent } = call.body;
+  const blocks = assistantObjectFlowIntent.blocks.map(({ id, name }, index) => ({ id, name, order: index + 1 }));
+  return compileObjectFlowToSpec(currentSpec, flow, {
+    outputMetadata: assistantOutputBindings.map(({ alias, blockId }) => ({ alias,
+      label: blocks.find((block) => block.id === blockId).name, assistantBlockId: blockId, assistantStageRole: 'terminal' })),
+    assistantOutputManifest: { version: 1, blocks }
+  });
+}
+
+function draftWithBothSources() {
+  return compileAppliedFlow({ body: {
+    currentSpec: { version: 1, params: {}, steps: [], result: { tables: [] } }, flow: combinedWidgetFlow,
+    assistantObjectFlowIntent: { ...widgetIntent, blocks: [archiveBlock, widgetBlock] },
+    assistantOutputBindings: [{ blockId: 'archive', alias: 'archive' }, { blockId: 'widgets', alias: 'widgets' }]
+  } });
+}
+
+async function prepareWidgetFlow(page, expectRequest) {
+  const semanticPlan = { version: 1, blocks: [{ ...widgetBlock, dependencies: [],
+    resultContract: { outputKind: 'sourceCards', outputClass: 'Widget', dependencyPaths: [], relationPredicates: [], attributePredicates: [] }
+  }] };
+  const context = expectRequest('POST', semanticPath);
+  await page.locator('[data-action="assistant-flow-prepare"]').click();
+  const initial = await context.received;
+  assert.equal(initial.root, widgetRoot);
+  assert.equal(initial.body.stage, 'context');
+  const plan = expectRequest('POST', semanticPath);
+  context.respond({ success: true, checkpoint: { resumeId: initial.body.resumeId,
+    stage: 'mcpContextReady', expiresAt: new Date(Date.now() + 60000).toISOString() } });
+  const semantic = await plan.received;
+  assert.equal(semantic.body.stage, 'plan');
+  assert.equal(semantic.body.resumeId, initial.body.resumeId);
+  plan.respond({ success: true, semanticPlan });
+  const generate = expectRequest('POST', flowPath);
+  await page.getByRole('button', { name: 'Сформировать поток данных', exact: true }).click();
+  const generated = await generate.received;
+  assert.equal(generated.root, widgetRoot);
+  assert.equal(generated.body.resumeId, initial.body.resumeId);
+  assert.deepEqual(generated.body.semanticPlan, semanticPlan);
+  const outputBindings = [{ blockId: widgetBlock.id, alias: 'widgets' }];
+  generate.respond({ success: true, flow: widgetFlow, canApply: true, outputBindings });
+  return outputBindings;
+}
+
+function widgetExtractionResult(rows, limitDiagnostics = []) {
+  return { success: true, action: 'preview', result: {
+    tables: [{ name: 'widgets', columns: ['_id', 'Code', 'Description'], rows }],
+    diagrams: [], trace: [{ index: 0, type: 'selectCards', as: 'widgets', status: 'ok', rows: rows.length, restCalls: 1, elapsedMs: 17 }],
+    limitDiagnostics
+  }, diagnostics: { assistantTrace: { traceId: 'fixture-widget-trace', mode: 'Basic' } } };
+}
+
+function assertWidgetExtractionRequest(call, compiledSpec) {
+  assert.equal(call.root, widgetRoot);
+  assert.equal(call.query.get('includeDiagrams'), 'false');
+  assert.equal(call.query.get('extractionSource'), 'widgets');
+  assert.equal(call.query.get('maxRows'), '100');
+  assert.equal(call.body.template.code, widgetTemplate.code);
+  assert.equal(call.body.template.expectedSpecHash, widgetTemplate.specHash);
+  assert.deepEqual(call.body.template.spec.steps, compiledSpec.steps, 'extraction uses the applied local spec, not the saved spec');
+  assert.equal(compiledSpec.steps[0].className, 'Widget');
+  assert.deepEqual(compiledSpec.steps[0].filters, [
+    { scope: 'include', path: 'Code', negate: false, op: 'matches', regexExpression: '.*' }
+  ], 'no user-defined filters');
+  assert.ok(call.body.template.spec.result.tables.some((table) => table.name === 'widgets'));
+  assert.deepEqual(call.body.params, {});
+}
+
+for (const viewport of [{ width: 1280, height: 900 }, { width: 390, height: 844 }]) {
+  test(`Assistant Apply and Extraction show draft-only Widget results at ${viewport.width}px`, async () => {
+    await withClient(viewport, async ({ page, expectRequest, writes }) => {
+      const saved = draftWithArchive();
+      await openWidgetTemplate(page, 'extraction', saved);
+      const source = page.locator('#cmdp-extraction-source');
+      const extractButton = page.locator('[data-action="extract-template"]');
+      assert.equal(await source.inputValue(), 'archive');
+      assert.equal(await extractButton.isEnabled(), true, 'old draft would otherwise be executable');
+      await page.locator('[data-designer-section="assistant"]').click();
+      const applyStatus = page.locator('[data-assistant-flow-apply-status]');
+      const applyButton = page.getByRole('button', { name: 'Применить цепочку', exact: true });
+      const initialReason = applyStatus.filter({ hasText: 'Сначала сформируйте поток данных.' });
+      await initialReason.waitFor();
+      await assertVisible(initialReason, viewport);
+      assert.equal(await applyButton.isDisabled(), true);
+      assert.equal(await applyButton.getAttribute('aria-describedby'), await initialReason.getAttribute('id'));
+      assert.deepEqual(writes, []);
+
+      const outputBindings = await prepareWidgetFlow(page, expectRequest);
+      const apply = expectRequest('POST', applyPath);
+      await applyButton.click();
+      const applied = await apply.received;
+      assert.equal(await applyButton.isDisabled(), true);
+      await assertVisible(applyStatus, viewport);
+      assert.match(await applyStatus.innerText(), /Применяем цепочку/);
+      assert.doesNotMatch(await applyStatus.innerText(), /Цепочка применена|Изменения готовы/);
+      assert.equal(applied.body.root, widgetRoot);
+      assert.equal(applied.body.templateCode, widgetTemplate.code);
+      assert.equal(applied.body.baseSpecHash, widgetTemplate.specHash);
+      assert.deepEqual(applied.body.assistantOutputBindings, outputBindings);
+      assert.deepEqual(applied.body.assistantObjectFlowIntent, widgetIntent);
+      assert.deepEqual(applied.body.currentSpec.steps, saved.steps);
+      assert.deepEqual(applied.body.flow, widgetFlow);
+      const compiled = compileAppliedFlow(applied);
+      await page.locator('[data-designer-section="extraction"]').click();
+      const editor = page.locator('#cmdp-extraction-editor');
+      const status = (state) => editor.locator(`[data-extraction-status][data-extraction-state="${state}"]`);
+      const table = editor.locator('table');
+      await status('apply-pending').filter({ hasText: 'Применяем цепочку' }).waitFor();
+      await assertVisible(status('apply-pending'), viewport);
+      assert.equal(await source.inputValue(), 'archive');
+      assert.equal(await extractButton.isDisabled(), true);
+      await extractButton.dispatchEvent('click');
+      assert.equal(writes.filter((call) => call.path === extractionPath).length, 0, 'pending Apply cannot extract the old draft');
+
+      apply.respond({ success: true, action: 'object-flow-apply', spec: compiled, specHash: 'unsaved-widget-spec' });
+      await status('not-started').filter({ hasText: 'Данные ещё не извлечены.' }).waitFor();
+      await assertVisible(status('not-started'), viewport);
+      assert.equal(await table.count(), 0);
+      assert.equal(await source.inputValue(), 'widgets');
+      assert.deepEqual(await source.locator('option').evaluateAll((options) => options.map((option) => option.value)), ['widgets']);
+      assert.deepEqual(await source.locator('option:checked').allTextContents(), [widgetBlock.name]);
+      assert.equal(await extractButton.isEnabled(), true);
+      const unsaved = page.locator('[data-authoring-unsaved]');
+      await assertVisible(unsaved, viewport);
+      await page.locator('[data-designer-section="assistant"]').click();
+      const appliedStatus = applyStatus.filter({ hasText: 'Цепочка применена к черновику. Данные ещё не извлечены.' });
+      await assertVisible(appliedStatus, viewport);
+      assert.equal(await applyButton.isDisabled(), true);
+      await page.locator('[data-designer-section="extraction"]').click();
+
+      const extract = expectRequest('POST', extractionPath);
+      await extractButton.click();
+      assertWidgetExtractionRequest(await extract.received, compiled);
+      await status('running').filter({ hasText: `Извлекаем данные: ${widgetBlock.name}` }).waitFor();
+      await assertVisible(status('running'), viewport);
+      assert.equal(await extractButton.isDisabled(), true, 'in-flight extraction cannot be repeated');
+      const extractBox = await extractButton.boundingBox();
+      assert.ok(extractBox);
+      await page.mouse.click(extractBox.x + extractBox.width / 2, extractBox.y + extractBox.height / 2);
+      assert.equal(await page.getByText(/Изменения готовы/).count(), 0, 'running status replaces the old Apply notice');
+      assert.equal(await table.count(), 0);
+      await assertVisible(unsaved, viewport);
+      extract.respond(widgetExtractionResult(widgetRows));
+      await status('rows').filter({ hasText: 'получено строк: 2' }).waitFor();
+      await assertVisible(status('rows'), viewport);
+      assert.equal(await extractButton.isDisabled(), false);
+      assert.equal(await table.locator('tbody tr').count(), 2);
+      for (const [index, card] of widgetRows.entries()) {
+        const row = table.locator('tbody tr').nth(index);
+        await assertVisible(row, viewport);
+        assert.deepEqual(await row.getByRole('cell').allTextContents(), [String(card._id), card.Code, card.Description]);
+      }
+
+      let extractionCount = 1;
+      if (viewport.width === 1280) {
+        const technical = editor.locator('[data-ui-error-diagnostics]');
+        await technical.locator('summary').click();
+        const report = technical.locator('[data-ui-diagnostic-report]');
+        await assertVisible(report, viewport);
+        const captured = JSON.parse(await report.innerText());
+        assert.equal(captured.assistantTrace.mode, 'Basic');
+        assert.equal(captured.diagnostics.className, 'Widget');
+        assert.equal(captured.diagnostics.filterCount, 1, 'trace counts the compiled match-all rule');
+        assert.equal(captured.diagnostics.steps[0].rows, 2);
+        assert.equal(captured.diagnostics.steps[0].restCalls, 1);
+        assert.equal(captured.diagnostics.steps[0].elapsedMs, 17);
+        assert.doesNotMatch(await report.innerText(), /W-001|W-002|Первый виджет|Второй виджет/);
+
+        const missing = widgetExtractionResult([]);
+        missing.result.tables = [{ name: 'unselected', columns: ['Description'], rows: [{ Description: 'Wrong source' }] }];
+        const limit = { source: 'template-execution', limitHit: true, limitName: 'maxRows', configuredLimit: 1,
+          returned: 1, truncated: true, reason: 'selection-row-limit' };
+        for (const [state, expectedText, response, httpStatus, rowCount] of [
+          ['empty', 'получено строк: 0', widgetExtractionResult([]), 200, 0],
+          ['missing-result', 'Ответ не содержит выбранный результат', missing, 200, 0],
+          ['limited', 'Результат ограничен.', widgetExtractionResult(widgetRows.slice(0, 1), [limit]), 200, 1],
+          ['error', 'Не удалось извлечь данные', { success: false, code: 'fixture_extraction_failed', message: 'Нет доступа к Widget.' }, 422, 0]
+        ]) {
+          const next = expectRequest('POST', extractionPath);
+          await extractButton.click();
+          assertWidgetExtractionRequest(await next.received, compiled);
+          extractionCount++;
+          await status('running').waitFor();
+          assert.equal(await table.count(), 0, 'a new run clears stale rows before the response');
+          next.respond(response, httpStatus);
+          await status(state).filter({ hasText: expectedText }).waitFor();
+          await assertVisible(status(state), viewport);
+          assert.equal(await extractButton.isDisabled(), false);
+          assert.equal(await table.locator('tbody tr').filter({ hasText: /W-00[12]/ }).count(), rowCount);
+          assert.equal(await editor.getByText('Wrong source', { exact: true }).count(), 0, 'never show a fallback table for a missing source');
+          assert.equal(await page.getByText(/Изменения готовы/).count(), 0);
+          if (state === 'limited') {
+            await technical.locator('summary').click();
+            assert.deepEqual(JSON.parse(await report.innerText()).diagnostics.limits, [limit]);
+          }
+        }
+      }
+      assert.deepEqual(writes.map((call) => [call.method, call.path]), [
+        ['POST', semanticPath], ['POST', semanticPath], ['POST', flowPath], ['POST', applyPath],
+        ...Array.from({ length: extractionCount }, () => ['POST', extractionPath])
+      ], 'no persistence, implicit extraction, duplicate extraction or extra Assistant calls');
+    });
+  });
+}
+
+test('Extraction explains why it cannot run with no executable source', async () => {
+  const viewport = { width: 1280, height: 900 };
+  await withClient(viewport, async ({ page, writes }) => {
+    await openWidgetTemplate(page, 'extraction');
+    const reason = page.locator('[data-extraction-status][data-extraction-state="no-source"]')
+      .filter({ hasText: 'Нет выбранного исполняемого результата.' });
+    await reason.waitFor();
+    await assertVisible(reason, viewport);
+    assert.equal(await page.locator('[data-action="extract-template"]').isDisabled(), true);
+    assert.deepEqual(writes, []);
+  });
+});
+
+test('Apply keeps a still-executable non-default Extraction source but clears old rows', async () => {
+  const viewport = { width: 1280, height: 900 };
+  await withClient(viewport, async ({ page, expectRequest }) => {
+    await openWidgetTemplate(page, 'extraction', draftWithBothSources(), combinedWidgetFlow);
+    const source = page.locator('#cmdp-extraction-source');
+    assert.equal(await source.inputValue(), 'archive');
+    await source.selectOption('widgets');
+    const extract = expectRequest('POST', extractionPath);
+    await page.locator('[data-action="extract-template"]').click();
+    assert.equal((await extract.received).query.get('extractionSource'), 'widgets');
+    extract.respond(widgetExtractionResult(widgetRows));
+    await page.getByRole('cell', { name: 'W-001' }).waitFor();
+    await page.locator('[data-designer-section="assistant"]').click();
+    const apply = expectRequest('POST', applyPath);
+    await page.locator('[data-action="assistant-flow-apply"]').click();
+    const applied = await apply.received;
+    await page.locator('[data-designer-section="extraction"]').click();
+    assert.equal(await page.getByRole('cell', { name: 'W-001' }).count(), 0);
+    apply.respond({ success: true, spec: compileAppliedFlow(applied) });
+    const status = page.locator('[data-extraction-state="not-started"]');
+    await status.waitFor();
+    await assertVisible(status, viewport);
+    assert.equal(await source.inputValue(), 'widgets');
+    assert.equal(await page.getByRole('cell', { name: 'W-001' }).count(), 0);
+  });
+});
+
+test('Apply error stays visible after navigating to Extraction and does not replace the draft', async () => {
+  const viewport = { width: 1280, height: 900 };
+  await withClient(viewport, async ({ page, expectRequest, writes }) => {
+    const saved = draftWithArchive();
+    await openWidgetTemplate(page, 'assistant', saved, widgetFlow);
+    const apply = expectRequest('POST', applyPath);
+    const applyButton = page.locator('[data-action="assistant-flow-apply"]');
+    await applyButton.click();
+    await apply.received;
+    await page.locator('[data-designer-section="extraction"]').click();
+    apply.respond({ success: false, code: 'object_flow_invalid', message: 'Поток данных не прошёл проверку.' }, 422);
+    const error = page.locator('[data-authoring-operation-message]').filter({ hasText: 'Поток данных не прошёл проверку.' });
+    await error.waitFor();
+    await assertVisible(error, viewport);
+    await page.locator('[data-ui-error-diagnostics] summary').click();
+    assert.equal(JSON.parse(await page.locator('[data-ui-diagnostic-report]').innerText()).code, 'object_flow_invalid');
+    assert.equal(await page.locator('#cmdp-extraction-source').inputValue(), 'archive');
+    assert.equal(await page.locator('[data-action="extract-template"]').isEnabled(), true);
+    assert.equal(await page.locator('[data-authoring-unsaved]').count(), 0);
+    await page.locator('[data-designer-section="assistant"]').click();
+    await assertVisible(error, viewport);
+    assert.equal(await applyButton.isEnabled(), true);
+    assert.deepEqual(writes.map((call) => call.path), [applyPath]);
+  });
+});
+
+test('Extraction source A → B drops shown rows and ignores the late A response', async () => {
+  const viewport = { width: 1280, height: 900 };
+  await withClient(viewport, async ({ page, expectRequest, writes }) => {
+    await openWidgetTemplate(page, 'extraction', draftWithBothSources());
+    const source = page.locator('#cmdp-extraction-source');
+    const extract = page.locator('[data-action="extract-template"]');
+    const table = page.locator('#cmdp-extraction-editor table');
+    async function start(alias) {
+      const request = expectRequest('POST', extractionPath);
+      await extract.click();
+      assert.equal((await request.received).query.get('extractionSource'), alias);
+      return request;
+    }
+    const first = await start('archive');
+    const bothTables = widgetExtractionResult([{ Code: 'Wrong B from A' }]);
+    bothTables.result.tables.unshift({ name: 'archive', columns: ['Code', 'Description'], rows: [{ Code: 'Only A', Description: 'Архивная карточка Widget' }] });
+    first.respond(bothTables);
+    const aRow = table.getByRole('row').filter({ hasText: 'Only A' });
+    await aRow.waitFor();
+    await assertVisible(aRow, viewport);
+
+    await source.selectOption('widgets');
+    await page.locator('[data-extraction-state="not-started"]').waitFor();
+    assert.equal(await table.count(), 0, 'B never renders the B table piggybacked on completed A');
+    await source.selectOption('archive');
+    assert.equal(await table.count(), 0, 'returning to A does not restore discarded rows');
+    const lateA = await start('archive');
+    assert.equal(await source.isEnabled(), true);
+    await source.selectOption('widgets');
+    assert.equal(await extract.isEnabled(), true);
+    const currentB = await start('widgets');
+    const ack = page.waitForResponse((response) => new URL(response.url()).pathname === extractionPath);
+    lateA.respond(bothTables);
+    await (await ack).finished();
+    await page.waitForTimeout(100);
+    assert.equal(await page.locator('[data-extraction-state="running"]').count(), 1, 'stale A must not clear the B operation');
+    assert.equal(await table.count(), 0);
+    currentB.respond(widgetExtractionResult(widgetRows));
+    const bRow = table.getByRole('row').filter({ hasText: 'W-001' });
+    await bRow.waitFor();
+    await assertVisible(bRow, viewport);
+    assert.equal(await table.getByText('Wrong B from A').count(), 0);
+    assert.deepEqual(writes.map((call) => call.query.get('extractionSource')), ['archive', 'archive', 'widgets']);
+  });
+});
+
+for (const change of ['root', 'session', 'editor', 'template', 'base revision', 'input revision', 'spec', 'action', 'generation', 'proposal', 'intent', 'bindings']) {
+  test(`Apply ignores stale ${change} ownership after section navigation`, async () => {
+    const viewport = { width: 1280, height: 900 };
+    await withClient(viewport, async ({ page, expectRequest }) => {
+      const saved = draftWithArchive();
+      await openWidgetTemplate(page, 'assistant', saved, widgetFlow);
+      const apply = expectRequest('POST', applyPath);
+      await page.locator('[data-action="assistant-flow-apply"]').click();
+      const sent = await apply.received;
+      await page.locator('[data-designer-section="extraction"]').click();
+      await page.locator('[data-extraction-state="apply-pending"]').waitFor();
+      await page.evaluate((change) => {
+        const { state, renderDesigner } = window.remediation;
+        if (change === 'root') { const root = state.root; state.root = 'Other_QueryTool'; state.root = root; }
+        if (change === 'session') state.session = { ...state.session };
+        if (change === 'editor') state.templateEditorInstance++;
+        if (change === 'template') state.selectedTemplate.id++;
+        if (change === 'base revision') state.selectedTemplate.specHash = 'new-saved-hash';
+        if (change === 'input revision') state.uiDiagnosticRevision++;
+        if (change === 'spec') state.selectedTemplate.spec.steps[0].limit = 35;
+        if (change === 'action') state.uiDiagnosticAction = 'save-template';
+        if (change === 'generation') state.uiDiagnosticGeneration++;
+        if (change === 'proposal') state.assistantFlowProposal.publishedAlias = 'another';
+        if (change === 'intent') state.assistantObjectFlowIntent.context = 'Different intent';
+        if (change === 'bindings') state.assistantFlowOutputBindings[0].alias = 'another';
+        state.message = { type: 'ok', text: 'Текущее состояние редактора' };
+        renderDesigner();
+      }, change);
+      assert.equal(await page.locator('[data-action="extract-template"]').isEnabled(), true, 'stale Apply must not block current draft');
+      apply.respond({ success: true, spec: compileAppliedFlow(sent) });
+      await page.waitForFunction(() => window.remediation.state.assistantFlowApplyOperation === null);
+      const source = page.locator('#cmdp-extraction-source');
+      assert.equal(await source.inputValue(), 'archive');
+      assert.equal(await page.locator('[data-authoring-unsaved]').count(), 0);
+      await assertVisible(page.getByText('Текущее состояние редактора', { exact: true }), viewport);
+      assert.deepEqual(await page.evaluate(() => window.remediation.state.selectedTemplate.spec.steps),
+        change === 'spec' ? [{ ...saved.steps[0], limit: 35 }] : saved.steps);
+    });
+  });
+}
 
 for (const viewport of [{ width: 1280, height: 900 }, { width: 390, height: 844 }]) {
   for (const language of ['ru', 'en']) {
@@ -330,7 +737,11 @@ test('full client transfer preserves staged Save/export artifacts, defaults and 
       if (mode === 'replace') await page.locator('#cmdp-transfer-mode').selectOption('replace');
       await page.locator('[data-action="template-transfer-prepare"]').click();
       await prepare.received;
-      prepare.respond({ success: true, template: imported, changes: { mode }, checks: { status: 'ready', issues: [], environmentReferences: [], executionReady: false } });
+      const replacement = { targetId: 7, revision: 'sha256:' + 'a'.repeat(64) };
+      prepare.respond({ success: true,
+        template: mode === 'replace' ? { ...imported, id: 7, specHash: 'original-hash' } : imported,
+        changes: { mode, ...(mode === 'replace' ? { targetId: replacement.targetId, targetRevision: replacement.revision } : {}) },
+        checks: { status: 'needsAttention', issues: [], environmentReferences: [], executionReady: false } });
       await page.locator('[data-action="template-transfer-stage"]:enabled').waitFor();
       page.once('dialog', (dialog) => dialog.accept());
       await page.locator('[data-action="template-transfer-stage"]').click();
@@ -376,9 +787,25 @@ test('full client transfer preserves staged Save/export artifacts, defaults and 
       const save = expectRequest(mode === 'replace' ? 'PUT' : 'POST', savePath);
       await page.locator('[data-action="save-template"]').click();
       const saved = await save.received;
-      assert.deepEqual(saved.body, dirtyCall.body.template, 'Save and export use the same entire current artifact');
-      save.respond({ success: true, template: { ...saved.body, id: 7, specHash: 'saved-hash' }, executionValidation: { executable: false } });
+      if (mode === 'replace') {
+        const { active, expectedSpecHash, ...portableFields } = dirtyCall.body.template;
+        assert.deepEqual(saved.body, { ...portableFields, transferReplace: replacement }, 'Replace saves the same artifact without overwriting target activity');
+        save.respond({ success: false, code: 'template_transfer_incomplete', issues: [
+          { path: '$.spec.result.diagrams[0]', code: 'template_transfer_execution_incomplete', severity: 'error', message: 'Invalid mapping' }
+        ] }, 422);
+      } else {
+        assert.deepEqual(saved.body, dirtyCall.body.template, 'Save and export use the same entire current artifact');
+        save.respond({ success: true, template: { ...saved.body, id: 7, specHash: 'saved-hash' }, executionValidation: { executable: false } });
+      }
       await page.waitForFunction(() => !window.remediation.state.savingTemplate);
+      if (mode === 'replace') {
+        const rejected = await page.evaluate(() => window.remediation.state);
+        assert.equal(rejected.templateDirty, true);
+        assert.deepEqual(rejected.stagedTemplateTransfer.replacement, replacement);
+        assert.equal(rejected.selectedTemplate.specHash, 'original-hash');
+        assert.equal(rejected.selectedTemplate.spec.result.diagrams[0].authoring.d2Import.structureTree.items[0].mapping.primary.labelTemplate,
+          'Unsaved current label');
+      }
       assert.equal(writes.filter((call) => call.path.startsWith('/cmdbuild/custom-api/templates')).length, 1, 'only explicit Save persists');
     });
   }

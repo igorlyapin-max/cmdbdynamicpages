@@ -9,7 +9,9 @@ const names = [
   'refreshTemplateTransfer', 'templateTransferError', 'readTemplateTransferFile', 'prepareTemplateTransfer',
   'stageTemplateTransfer', 'exportTemplateTransfer', 'handleTemplateTransferChange', 'captureTemplateEditorSnapshot',
   'saveTemplate', 'saveTemplateSnapshot', 'readEditorPayload', 'runtimeSettingsScope', 'runtimeSettingsScopeIsCurrent',
-  'readTemplateCode', 'readTemplateDescription', 'readTemplateActive', 'renderTemplateEditor', 'renderTemplateCopySelector'
+  'readTemplateCode', 'readTemplateDescription', 'readTemplateActive', 'renderTemplateEditor', 'renderTemplateCopySelector',
+  'stagedTemplateTransfer', 'templateVersionOwner', 'templateVersionOwnerIsCurrent', 'fetchVersions', 'loadVersion', 'renderVersions',
+  'clearDraftExecutionState', 'selectedExtractionSource'
 ];
 const functions = names.map((name) => {
   const start = source.indexOf('  function ' + name + '(');
@@ -21,7 +23,7 @@ const split = translations.findIndex(([key], index) => index > 0 && key === tran
 const en = Object.fromEntries(translations.slice(0, split));
 const ru = Object.fromEntries(translations.slice(split));
 const styles = source.split('\n').find((line) => line.includes('#cmdp-template-transfer{'));
-const actionLines = source.split('\n').filter((line) => line.includes("if (action === 'template-transfer-") || line.includes("if (action === 'save-template')"));
+const actionLines = source.split('\n').filter((line) => line.includes("if (action === 'template-transfer-") || line.includes("if (action === 'save-template')") || line.includes("if (action === 'load-version')"));
 
 const harness = `
 var apiPrefix = '/api';
@@ -32,6 +34,8 @@ window.evidence = { requests: [], downloads: [], captures: [], errors: [] };
 window.lang = 'en';
 var translations = ${JSON.stringify({ en, ru })};
 function t(key, params) { return (translations[window.lang][key] || key).replace(/\\{(\\w+)\\}/g, function(match, name) { return params && params[name] !== undefined ? params[name] : match; }); }
+function designerSectionUrl(section) { return '/' + section; }
+function extractionResultOptions(_spec, tables) { return tables.map(table => ({name:table.name})); }
 function escapeHtml(value) { return String(value == null ? '' : value).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;'); }
 function pretty(value) { return JSON.stringify(value, null, 2); }
 function cloneJsonValue(value) { return JSON.parse(JSON.stringify(value)); }
@@ -69,7 +73,7 @@ function validateUiResponse(result) { if (!result.json.template) throw new Error
 function createRequestError(result) { return new Error(result.json?.message || 'request failed'); }
 function setUiError(error) { evidence.errors.push(error.message); }
 function assistantTemplateRefClient() { return {root:state.root,templateCode:state.selectedTemplate.code,baseSpecHash:state.selectedTemplate.specHash}; }
-function request(path, options) {
+function request(path, options = {}) {
   evidence.requests.push({path,method:options.method,body:options.body});
   return fetch(path,{method:options.method,body:JSON.stringify(options.body),headers:{'Content-Type':'application/json'}}).then(async response => ({ok:response.ok,json:await response.json()}));
 }
@@ -81,7 +85,8 @@ function renderDesigner() {
    '<textarea id="cmdp-result-schema">'+escapeHtml(pretty(selected.resultSchema || {}))+'</textarea>' +
    '<input id="diagram-edit" value="'+escapeHtml(selected.spec.result?.diagrams?.[0]?.label || '')+'">' +
    '<textarea id="assistant-prompt">'+escapeHtml(state.prompt || '')+'</textarea>' +
-   '<button data-action="save-template">Save</button>';
+   '<input id="cmdp-active" type="checkbox"'+(selected.active ? ' checked' : '')+'>' +
+   '<button data-action="save-template">Save</button>' + renderVersions();
 }
 URL.createObjectURL = function(blob) { blob.text().then(text=>evidence.downloads.push(JSON.parse(text))); return 'blob:https://transfer.test/download'; };
 URL.revokeObjectURL = function() {};
@@ -100,6 +105,10 @@ renderDesigner();
 const template = { code: 'imported', description: 'Imported definition', active: true, id: 999, owner: 'foreign', specHash: 'foreign-hash', spec: { version: 1, authoring: { assistant: { diagramIntentPrompt: 'Imported prompt' } } }, paramsSchema: { type: 'object' }, resultSchema: { type: 'object' } };
 const ready = { success: true, template, checks: { status: 'ready', issues: [], environmentReferences: [], summary: { fields: 2 }, executionReady: true }, changes: { mode: 'new' } };
 const original = { id: 7, code: 'existing', description: 'Old', active: true, specHash: 'base-hash', owner: 'local', updatedAt: 'old-time', version: 4, spec: { version: 1 }, paramsSchema: {}, resultSchema: {} };
+const targetRevision = 'sha256:' + 'a'.repeat(64);
+const replacementReady = { ...ready,
+  template: { ...original, description: template.description, spec: template.spec, paramsSchema: template.paramsSchema, resultSchema: template.resultSchema },
+  changes: { mode: 'replace', targetId: original.id, targetRevision } };
 const file = { name: 'fixture.cmdp-template.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify({ formatVersion: 1, template: { ...template, id: undefined } })) };
 const button = (page, action) => page.locator('[data-action="template-transfer-' + action + '"]');
 
@@ -114,6 +123,7 @@ async function withPage(run, viewport = { width: 1280, height: 1000 }) {
       if (url.pathname === '/') return route.fulfill({contentType:'text/html',body:'<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font:14px system-ui;margin:12px}input,textarea,select{width:100%;box-sizing:border-box}label{display:grid}.row{display:flex;gap:8px}.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}button{min-height:32px}.section{padding:12px;border-bottom:1px solid #ccc}pre{overflow-wrap:anywhere;white-space:pre-wrap}' + styles + '</style></head><body><main id="app"></main></body></html>'});
       if (url.pathname.endsWith('/export')) return route.fulfill({ json: { success: true, package: { template: route.request().postDataJSON().template }, fileName: 'current.cmdp-template.json' } });
       if (url.pathname.endsWith('/prepare')) return route.fulfill({json:ready});
+      if (url.pathname.endsWith('/versions')) return route.fulfill({json:{success:true,data:[]}});
       if (url.pathname.startsWith('/api/templates')) return route.fulfill({json:{success:true,template:{...route.request().postDataJSON(),id:7,specHash:'saved-hash'},executionValidation:{executable:true}}});
       throw new Error('Unexpected request: ' + url);
     });
@@ -201,7 +211,7 @@ test('new import is visible with no selected template, stages inactive only on c
 test('replace retains target identity, history, activity and baseline; cancel leaves unsaved editor untouched', async () => {
   await withPage(async (page) => {
     await selectOriginal(page);
-    await page.route('**/template-transfer/prepare?**', (route) => route.fulfill({json:{...ready,template:{...template,code:'existing'},changes:{mode:'replace'}}}));
+    await page.route('**/template-transfer/prepare?**', (route) => route.fulfill({json:replacementReady}));
     await page.locator('#cmdp-description').fill('Unsaved existing description');
     await importFile(page);
     await page.locator('#cmdp-transfer-mode').selectOption('replace');
@@ -219,13 +229,16 @@ test('replace retains target identity, history, activity and baseline; cancel le
     await button(page, 'stage').click();
     const staged=await page.evaluate(() => state.selectedTemplate);
     for (const key of ['id','code','active','specHash','owner','updatedAt','version']) assert.deepEqual(staged[key],original[key],key);
-    assert.deepEqual(await page.evaluate(() => state.templateVersions),[{id:4}]);
+    assert.deepEqual(await page.evaluate(() => state.templateVersions),[]);
     assert.equal(staged.description,template.description);
     assert.equal(await page.evaluate(() => evidence.requests.length),2);
     await page.locator('[data-action="save-template"]').click();
     await page.waitForFunction(() => evidence.requests.length === 3);
     const save=await page.evaluate(() => evidence.requests.at(-1));
-    assert.equal(save.method,'PUT');assert.equal(save.body.expectedSpecHash,'base-hash');
+    assert.equal(save.method,'PUT');
+    assert.deepEqual(save.body.transferReplace,{targetId:original.id,revision:targetRevision});
+    assert.equal(Object.hasOwn(save.body,'expectedSpecHash'),false);
+    assert.equal(Object.hasOwn(save.body,'active'),false);
   });
 });
 
@@ -250,6 +263,93 @@ test('needsAttention shows issues, requires explicit reference acknowledgement, 
     await button(page,'stage').click();
     assert.equal(await page.evaluate(()=>state.selectedTemplate.active),false);
     assert.equal(await page.evaluate(()=>evidence.requests.length),2);
+    await page.locator('#cmdp-active').check();
+    await page.locator('[data-action="save-template"]').click();
+    await page.waitForFunction(() => evidence.requests.length === 3);
+    const save = await page.evaluate(() => evidence.requests.at(-1));
+    assert.equal(save.method, 'POST');
+    assert.equal(save.body.active, false, 'first Save of a staged import ignores the general Active checkbox');
+  });
+});
+
+test('incomplete replacement can be staged; final 422 and 409 keep the edited draft and never fall back to ordinary Save', async () => {
+  await withPage(async (page) => {
+    await selectOriginal(page);
+    await page.route('**/template-transfer/prepare?**', (route) => route.fulfill({ json: {
+      ...replacementReady, checks: { ...ready.checks, executionReady: false,
+        issues: [{ path: '$.spec', message: 'Incomplete on prepare', blocking: false }] }
+    } }));
+    await importFile(page);
+    await page.locator('#cmdp-transfer-mode').selectOption('replace');
+    await prepare(page);
+    assert.equal(await button(page, 'stage').isEnabled(), true);
+    assert.match(await page.locator('#cmdp-template-transfer').innerText(), /Stage the draft to fix/);
+    await page.evaluate(() => { state.result = { old: true }; state.extractionOperation = { old: true }; state.extractionSource = 'old'; });
+    page.once('dialog', (dialog) => dialog.accept());
+    await button(page, 'stage').click();
+    assert.deepEqual(await page.evaluate(() => [state.result, state.extractionOperation, state.extractionSource]), [null, null, '']);
+    assert.match(await page.locator('#cmdp-template-transfer').innerText(), /Incomplete on prepare/);
+    const save = page.locator('[data-action="save-template"]');
+    await page.locator('#cmdp-description').fill('Still my unsaved edit');
+    await page.locator('#cmdp-spec').fill('{"version":1,"edited":true}');
+    let status = 422;
+    await page.route('**/templates/existing?**', (route) => route.fulfill({ status, json: {
+      success: false, code: status === 422 ? 'template_transfer_incomplete' : 'template_transfer_revision_conflict',
+      issues: status === 422 ? [{ path: '$.spec.steps[0].filters[0].values[1]', message: 'Missing target card' }] : []
+    } }));
+    await save.click();
+    const panel = page.locator('#cmdp-template-transfer');
+    await panel.getByText('Missing target card', { exact: false }).waitFor({ state: 'visible' });
+    assert.ok((await panel.getByText('Missing target card', { exact: false }).boundingBox()).height > 0);
+    status = 409;
+    await save.click();
+    await panel.getByText(/The target changed/).waitFor({ state: 'visible' });
+    assert.equal(await page.locator('#cmdp-description').inputValue(), 'Still my unsaved edit');
+    assert.equal(JSON.parse(await page.locator('#cmdp-spec').inputValue()).edited, true);
+    assert.equal(await button(page, 'prepare').isEnabled(), true);
+    const writes = await page.evaluate(() => evidence.requests.filter((entry) => entry.method === 'PUT'));
+    assert.equal(writes.length, 2);
+    assert.ok(writes.every((entry) => entry.body.transferReplace.revision === 'sha256:' + 'a'.repeat(64)));
+  });
+});
+
+test('history ignores late responses and stale Load buttons across roots, card IDs and generations', async () => {
+  await withPage(async (page) => {
+    await selectOriginal(page);
+    const pending = [];
+    await page.route('**/versions?**', (route) => { pending.push(route); });
+    const versions = () => page.evaluate(() => {
+      (window.versionRequests ||= []).push(fetchVersions(state.selectedTemplate.code).then(renderDesigner));
+    });
+    const history = page.locator('[data-action="load-version"]');
+    const respond = (route, value) => route.fulfill({ json: { data: [{ id: 4, templateCode: 'existing', spec: { version: 1, loaded: value } }] } });
+    await versions();
+    await page.waitForFunction(() => evidence.requests[0]?.path.endsWith('root=Root_A'));
+    await page.evaluate(() => { state.root = 'Root_B'; state.selectedTemplate.id = 88; state.templateEditorInstance++; renderDesigner(); });
+    await versions();
+    const waitForRequest = async (n) => {
+      await page.waitForFunction((count) => evidence.requests.length === count, n);
+      while (pending.length < n) await new Promise((resolve) => setTimeout(resolve, 5));
+    };
+    await waitForRequest(2);
+    assert.match(pending[1].request().url(), /root=Root_B$/);
+    await respond(pending[1], 'current');
+    await history.waitFor({ state: 'visible' });
+    assert.ok((await history.boundingBox()).height > 0);
+    const staleGeneration = await history.getAttribute('data-version-generation');
+    await respond(pending[0], 'old-root');
+    await page.evaluate(() => window.versionRequests[0]);
+    assert.equal(await page.evaluate(() => state.templateVersions[0].spec.loaded), 'current');
+    await page.evaluate(() => { state.selectedTemplate.id = 89; renderDesigner(); });
+    assert.equal(await history.count(), 0, 'the same Code on another card cannot load the last card history');
+    await versions();
+    await waitForRequest(3);
+    await respond(pending[2], 'latest');
+    await page.evaluate(() => window.versionRequests[2]);
+    await page.evaluate((generation) => loadVersion(4, generation), staleGeneration);
+    assert.equal(await page.evaluate(() => state.selectedTemplate.spec.loaded), undefined);
+    await history.click();
+    assert.deepEqual(await page.evaluate(() => [state.root, state.selectedTemplate.id, state.selectedTemplate.spec.loaded]), ['Root_B', 89, 'latest']);
   });
 });
 

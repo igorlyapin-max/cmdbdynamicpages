@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 
 async function listen(t, server) {
@@ -134,11 +135,17 @@ async function fixture(t, options = {}) {
       let text = ''; for await (const chunk of req) text += chunk;
       data = { _id: 1, ...JSON.parse(text) }; configWrites.push(data);
       Object.assign(runtime, typeof data.RuntimeConfigJson === 'string' ? JSON.parse(data.RuntimeConfigJson) : data.RuntimeConfigJson);
-    } else if (path.endsWith('/Cst_QueryToolConfig')) data = { _can_read: auth !== 'denied-test-session' };
-    else if (path.endsWith('/Cst_QueryToolConfig/cards')) data = [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', RuntimeConfigJson: JSON.stringify(runtime) }];
-    else if (path.endsWith('/Cst_QueryTemplate')) data = { _can_create: true, _can_read: true };
+    } else if (/\/(Cst|Trace)_QueryToolConfig$/.test(path)) data = { _can_read: auth !== 'denied-test-session' };
+    else if (/\/(Cst|Trace)_QueryToolConfig\/cards$/.test(path)) {
+      const root = path.split('/').at(-2).replace(/Config$/, '');
+      data = [{ _id: 1, Code: root, RootCode: root, RuntimeConfigJson: JSON.stringify(runtime) }];
+    } else if (/\/(Cst|Trace)_QueryTemplate$/.test(path)) data = { _can_create: true, _can_read: true };
+    else if (/\/(Cst|Trace)_QueryTemplate\/cards$/.test(path)) data = options.templates || [];
     else if (path.endsWith('/classes')) data = [{ name: 'Asset', description: 'Asset', _can_read: true, active: true }];
     else if (path.endsWith('/classes/Asset')) data = { name: 'Asset', description: 'Asset', _can_read: true, active: true };
+    else if (path.endsWith('/classes/Asset/cards')) data = options.assetCards || [];
+    else if (path.includes('/classes/Asset/cards/')) data = options.assetCards?.find((card) => path.endsWith(`/cards/${card._id}`));
+    else if (options.failingClass && path.endsWith(`/classes/${options.failingClass}/cards`)) { status = 400; data = { detail: options.upstreamFailure }; }
     else data = [];
     res.writeHead(status, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ success: status === 200, data, meta: { total: Array.isArray(data) ? data.length : 1 } }));
@@ -155,6 +162,7 @@ async function fixture(t, options = {}) {
     ...process.env, NODE_ENV: 'test', PROXY_HOST: '127.0.0.1', PROXY_PORT: String(port),
     CMDBUILD_ORIGIN: `http://127.0.0.1:${upstreamPort}`, CMDBDYNAMIC_REDIS_ENABLED: 'true',
     CMDBDYNAMIC_REDIS_URL: `redis://127.0.0.1:${redisPort}`, CMDBDYNAMIC_REDIS_KEY_PREFIX: `diag-test-${port}`,
+    CMDP_INPUT_MAX_COLLECTION_ITEMS: '5000', CMDP_INPUT_MAX_TOTAL_ITEMS: '50000',
     CMDBDYNAMICPAGES_CSRF_SECRET: 'diagnostic-test-csrf-secret', CMDP_LOG_TARGET: 'stdout', CMDP_LOG_LEVEL: 'warn',
     LITELLM_API_KEY: 'diagnostic-test-key', LITELLM_BASE_URL: `http://127.0.0.1:${llmPort}`,
     CMDP_LITELLM_ALLOWED_BASE_URLS: `http://127.0.0.1:${llmPort}`
@@ -168,14 +176,14 @@ async function fixture(t, options = {}) {
     assert.ok(Date.now() < deadline && child.exitCode === null, logs);
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  async function request(path, { method = 'GET', body, session = 'admin-test-session', csrf = true } = {}) {
+  async function request(path, { method = 'GET', body, rawBody, session = 'admin-test-session', csrf = true } = {}) {
     const headers = { cookie: `CMDBuild-Authorization=${session}`, origin, 'content-type': 'application/json' };
     if (method !== 'GET' && csrf) {
       const response = await fetch(origin + '/cmdbuild/custom-api/csrf', { headers });
       headers['x-cmdbdynamicpages-csrf'] = (await response.json()).token;
     }
     const response = await fetch(origin + '/cmdbuild/custom-api' + path, { method, headers,
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(10000) });
+      ...(rawBody !== undefined ? { body: rawBody } : body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(10000) });
     return { status: response.status, headers: response.headers, json: await response.json() };
   }
   return { request, outgoing, writes, runtime, configWrites, logs: () => logs, unavailable: () => { unavailable = true; },
@@ -374,6 +382,185 @@ async function waitUntil(check, message) {
   const deadline = Date.now() + 3000;
   while (!await check()) { assert.ok(Date.now() < deadline, message); await new Promise((resolve) => setTimeout(resolve, 25)); }
 }
+
+async function exportFinishedTrace(f, response, mode, root = 'Trace_QueryTool') {
+  const ref = response.json.diagnostics?.assistantTrace;
+  assert.equal(ref?.mode, mode, JSON.stringify(response.json));
+  assert.ok(ref.traceId);
+  const status = response.status >= 400 ? 'error' : 'completed';
+  assert.equal(ref.status, status);
+  let trace;
+  await waitUntil(async () => {
+    trace = (await f.request(`/assistant/diagnostics/traces/${ref.traceId}/export?root=${root}`)).json.trace;
+    return trace?.status === status;
+  }, 'Final diagnostic snapshot was not persisted in the expected root.');
+  assert.equal(trace.requestId, ref.requestId);
+  assert.equal(trace.statusCode, response.status);
+  return trace;
+}
+
+test('draft Apply uses root and template scope and stores only allowlisted metadata', async (t) => {
+  const spec = { result: { tables: [] }, steps: [], version: 1 };
+  const secret = 'fixture-apply-password';
+  const contact = 'apply-private-contact@example.invalid';
+  const instruction = 'private free-form instruction for Apply';
+  const body = {
+    root: 'Trace_QueryTool', templateCode: 'TraceApply',
+    baseSpecHash: createHash('sha256').update(JSON.stringify(spec)).digest('hex'),
+    currentSpec: { ...spec, diagnosticFixture: { password: secret, value: contact, description: instruction } },
+    flow: { version: 1, selections: [{ id: 'selection:assets', name: 'Assets', alias: 'assets', className: 'Asset',
+      rules: [{ action: 'include', path: 'Code', op: 'matches', regex: '.*' }] }], operations: [] }
+  };
+  const apply = '/draft/object-flow/apply?root=Cst_QueryTool';
+  const capture = '/assistant/diagnostics/capture?root=Trace_QueryTool';
+  const cards = [{ _id: 1, Code: 'A-001', Description: 'First card' }, { _id: 2, Code: 'A-002', Description: 'Second card' }];
+  const f = await fixture(t, { assetCards: cards, templates: [{ _id: 1, Code: body.templateCode, SpecJson: JSON.stringify(spec) }] });
+
+  for (const mode of ['Basic', 'Verbose']) {
+    assert.equal((await f.request(capture, { method: 'POST', body: { mode, confirmed: true } })).status, 200);
+    const response = await f.request(apply, { method: 'POST', body, session: 'reader-test-session' });
+    assert.equal(response.status, 200, JSON.stringify(response.json));
+    assert.equal(response.json.spec.steps[0].as, 'assets');
+    const trace = await exportFinishedTrace(f, response, mode);
+    assert.equal(trace.action, '/draft/object-flow/apply');
+    assert.equal(trace.templateCode, 'TraceApply');
+    assert.equal(trace.spans.length, 1);
+    const [span] = trace.spans;
+    assert.equal(span.request, undefined);
+    assert.equal(span.response, undefined);
+    assert.equal(span.statusCode, 200);
+    assert.ok(span.durationMs >= 0);
+    assert.deepEqual(span.metadata, { stage: 'apply', code: 'applied',
+      ...(mode === 'Verbose' ? { selections: 1, matches: 0, setOperations: 0 } : {}) });
+    for (const value of [secret, contact, instruction]) assert.equal(JSON.stringify(trace).includes(value), false);
+    assert.equal((await f.request(`/assistant/diagnostics/traces/${trace.id}/export?root=Trace_QueryTool`, { session: 'reader-test-session' })).status, 403);
+    const preview = await f.request('/draft/preview?root=Trace_QueryTool&includeDiagrams=false&extractionSource=assets', {
+      method: 'POST', body: { template: { code: body.templateCode, spec: response.json.spec }, params: {} }, session: 'reader-test-session'
+    });
+    assert.equal(preview.status, 200, JSON.stringify(preview.json));
+    assert.deepEqual(preview.json.result.tables.find((table) => table.name === 'assets').rows.map((row) => row.Description),
+      cards.map((card) => card.Description));
+  }
+  const malformed = await f.request('/draft/object-flow/apply?root=Trace_QueryTool', { method: 'POST', rawBody: `{"currentSpec":"${secret}"` });
+  assert.equal(malformed.status, 400);
+  const errorTrace = await exportFinishedTrace(f, malformed, 'Verbose');
+  assert.equal(errorTrace.spans[0].request, undefined);
+  assert.equal(errorTrace.spans[0].response, undefined);
+  assert.deepEqual(errorTrace.spans[0].metadata, { stage: 'apply', code: 'invalid_json_body' });
+  const conflict = await f.request(apply, { method: 'POST', body: { ...body, baseSpecHash: '0'.repeat(64) },
+    session: 'reader-test-session' });
+  assert.equal(conflict.status, 409);
+  const conflictTrace = await exportFinishedTrace(f, conflict, 'Verbose');
+  assert.equal(conflictTrace.spans.length, 1);
+  assert.equal(conflictTrace.spans[0].request, undefined);
+  assert.equal(conflictTrace.spans[0].response, undefined);
+  assert.deepEqual(conflictTrace.spans[0].metadata, { stage: 'apply', code: 'template_version_conflict' });
+  for (const value of [secret, contact, instruction]) assert.equal(JSON.stringify(f.writes).includes(value), false);
+  assert.equal(f.outgoing.length, 0);
+});
+
+test('only Extraction preview is traced, with structural evidence and no card, parameter or error values', async (t) => {
+  const cardCode = 'PrivateReturnedCardCode';
+  const cardDescription = 'PrivateReturnedCardDescription';
+  const unmatched = 'PrivateUnmatchedFilterValue';
+  const filterLiteral = 'PrivateConfiguredFilterValue';
+  const templateDescription = 'PrivateTemplateDescription';
+  const failingClass = 'PrivateRuntimeClassValue';
+  const upstreamFailure = 'PrivateCmdbErrorPayload';
+  const f = await fixture(t, { assetCards: [{ _id: 73603562, Code: cardCode, Description: cardDescription }], failingClass, upstreamFailure });
+  const body = {
+    root: 'Cst_QueryTool', templateCode: 'NotThePreviewTemplate',
+    template: { code: 'TraceExtraction', description: templateDescription, spec: {
+      version: 1,
+      params: { criterion: { type: 'string', required: true } },
+      steps: [{ type: 'selectCards', as: 'assets', className: 'Asset', columns: ['Code'], limit: 1,
+        filters: [{ path: 'Code', op: 'equals', valueParam: 'criterion', value: filterLiteral }] }],
+      result: { tables: [{ name: 'assets', columns: ['Code'] }] }
+    } },
+    params: { criterion: unmatched }
+  };
+  const preview = '/draft/preview?root=Trace_QueryTool&maxRows=1';
+  const extraction = `${preview}&includeDiagrams=false&extractionSource=assets`;
+  const post = (path, payload, options = {}) => f.request(path, { method: 'POST', body: payload, ...options });
+  assert.equal((await post(extraction, body)).json.diagnostics?.assistantTrace, undefined);
+  const capture = '/assistant/diagnostics/capture?root=Trace_QueryTool';
+  assert.equal((await post(capture, { mode: 'Basic', confirmed: true })).status, 200);
+  const basic = await exportFinishedTrace(f, await post(extraction, body), 'Basic');
+  assert.ok(basic.spans.every((span) => !span.request && !span.response));
+  assert.equal((await post(capture, { mode: 'Verbose', confirmed: true })).status, 200);
+
+  for (const query of ['', '&includeDiagrams=false', '&includeDiagrams=false&extractionSource=%20', '&extractionSource=assets',
+    '&executionScope=diagrams&includeDiagrams=false&extractionSource=assets']) {
+    assert.equal((await post(preview + query, body)).json.diagnostics?.assistantTrace, undefined, query);
+  }
+  const denied = await post(extraction, body, { csrf: false });
+  assert.equal(denied.status, 403);
+  assert.equal(denied.json.diagnostics?.assistantTrace, undefined);
+
+  const exported = [];
+  for (const [criterion, rowCount] of [[unmatched, 0], [cardCode, 1]]) {
+    const response = await post(extraction, { ...body, params: { criterion } }, { session: 'reader-test-session' });
+    assert.equal(response.status, 200, JSON.stringify(response.json));
+    assert.equal(response.json.result.tables[0].rows.length, rowCount);
+    if (rowCount) assert.equal(response.json.result.tables[0].rows[0].Code, cardCode);
+    const trace = await exportFinishedTrace(f, response, 'Verbose');
+    exported.push(trace);
+    assert.equal(trace.action, '/draft/preview');
+    assert.equal(trace.templateCode, 'TraceExtraction');
+    assert.equal(trace.spans.length, 1);
+    const [span] = trace.spans;
+    assert.deepEqual(span.request.value, { executionScope: 'tables', extractionSource: 'assets', tableCount: 1,
+      steps: [{ index: 0, type: 'selectCards', as: 'assets', className: 'Asset', filterCount: 1, limit: 1 }] });
+    const result = span.response.value.result;
+    assert.deepEqual(result.selectedTable, { name: 'assets', rows: rowCount });
+    assert.equal(result.trace[0].rows, rowCount);
+    assert.equal(result.trace[0].status, 'ok');
+    assert.equal(result.limits.maxRows, 1);
+    if (rowCount) assert.deepEqual(result.trace[0].limitDiagnostics, [{ limitName: 'maxRows', configuredLimit: 1, returned: 1 }]);
+  }
+
+  const failedBody = structuredClone(body);
+  failedBody.template.spec.params.runtimeClass = { type: 'string', required: true };
+  delete failedBody.template.spec.steps[0].className;
+  failedBody.template.spec.steps[0].classNameParam = 'runtimeClass';
+  failedBody.params.runtimeClass = failingClass;
+  const failed = await post(extraction, failedBody);
+  assert.equal(failed.status, 400, JSON.stringify(failed.json));
+  assert.match(failed.json.result.trace[0].message, new RegExp(failingClass));
+  const failureTrace = await exportFinishedTrace(f, failed, 'Verbose');
+  exported.push(failureTrace);
+  const failureResult = failureTrace.spans[0].response.value.result;
+  assert.equal(failureResult.trace[0].status, 'error');
+  assert.equal(failureResult.trace[0].message, undefined);
+  assert.equal(failureResult.limits.maxRows, 1);
+
+  const invalid = await post(extraction, { ...body, template: { ...body.template, spec: {} } });
+  assert.equal(invalid.status, 400);
+  const invalidTrace = await exportFinishedTrace(f, invalid, 'Verbose');
+  assert.equal(invalidTrace.templateCode, 'TraceExtraction');
+  assert.deepEqual(invalidTrace.spans[0].response.value, { success: false });
+  exported.push(invalidTrace);
+
+  const excessive = structuredClone(body);
+  const filters = excessive.template.spec.steps[0].filters;
+  excessive.template.spec.steps[0].filters = Array(5001).fill(filters[0]);
+  const rejected = await post(extraction, excessive);
+  assert.equal(rejected.status, 413);
+  assert.equal(rejected.json.code, 'input_collection_limit');
+  const rejectedTrace = await exportFinishedTrace(f, rejected, 'Verbose');
+  assert.equal(rejectedTrace.templateCode, 'TraceExtraction');
+  assert.equal(rejectedTrace.spans[0].request, undefined);
+  assert.deepEqual(rejectedTrace.spans[0].response.value, { success: false });
+  exported.push(rejectedTrace);
+
+  const listed = await f.request('/assistant/diagnostics/traces?root=Trace_QueryTool&templateCode=TraceExtraction');
+  assert.equal(listed.json.traces.length, 6);
+  assert.equal((await f.request('/assistant/diagnostics/traces')).json.traces.length, 0);
+  for (const marker of [cardCode, cardDescription, '73603562', unmatched, filterLiteral, templateDescription, failingClass, upstreamFailure]) {
+    assert.equal(JSON.stringify(exported).includes(marker), false, marker);
+    assert.equal(JSON.stringify(f.writes).includes(marker), false, marker);
+  }
+});
 
 test('malformed provider credentials are masked in actual trace writes and export', async (t) => {
   const secrets = ['synthetic-cookie-secret', 'synthetic-session-secret'];

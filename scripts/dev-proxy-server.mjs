@@ -44,7 +44,7 @@ import { createAssistantDiagnosticsUi } from './assistant-diagnostics-ui.mjs';
 import { DEFAULT_ASSISTANT_DIAGNOSTICS, normalizeAssistantDiagnosticsPolicy, redactAssistantDiagnosticValue, createAssistantDiagnosticsStore, createAssistantCaptureController } from './assistant-diagnostics.mjs';
 import { purgeAssistantDiagnostics } from './assistant-diagnostics-maintenance.mjs';
 import { createTemplateTransferPackage, readTemplateTransferPackage, templateTransferDependencies,
-  templateTransferEnvironmentReferences, applyTemplateTransferOverrides } from './template-transfer.mjs';
+  isTemplateTransferReferenceId, templateTransferReferenceEntries, templateTransferTargetRevision } from './template-transfer.mjs';
 import { resolveTemplateParameters } from './template-parameters.mjs';
 import { runtimeRowIdentity, runtimeRowValue, runtimeSemanticKey, setRuntimeRowSemantics, setRuntimeRowValue,
   inheritRuntimeRowSemantics, mergeRuntimeRowSemantics, deriveRuntimeRowSemantics } from './runtime-row-semantics.mjs';
@@ -9636,10 +9636,23 @@ function securityHeaders(extra = {}) {
 }
 
 function sendJson(res, statusCode, payload, extraHeaders = {}) {
+  if (payload && payload.code === 'input_collection_limit') {
+    payload = inputCollectionLimitPayload({ details: Array.isArray(payload.errors) ? payload.errors[0] : payload.errors });
+    statusCode = 413;
+  }
   const capture = assistantTraceContext.getStore();
   if (capture && payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    if (capture.captureEarlyResponse) initializeAssistantTrace(capture, undefined, false);
     if (capture.trace) {
-      finishAssistantSpan(capture.bffSpan, { response: payload, statusCode }, capture);
+      const response = capture.trace.mode !== 'Verbose' ? undefined
+        : capture.extractionSource ? assistantExtractionTraceResponse(capture, payload)
+          : capture.draft ? undefined : payload;
+      const metadata = capture.draft && !capture.extractionSource ? {
+        stage: 'apply',
+        code: assistantApplyTraceCode(statusCode, payload),
+        ...(capture.trace.mode === 'Verbose' ? capture.applyCounts : {})
+      } : undefined;
+      finishAssistantSpan(capture.bffSpan, { response, statusCode, metadata }, capture);
       capture.trace.statusCode = statusCode;
       capture.trace.status = statusCode >= 400 ? 'error' : 'completed';
       capture.trace.finishedAt = new Date().toISOString();
@@ -9647,12 +9660,9 @@ function sendJson(res, statusCode, payload, extraHeaders = {}) {
     }
     if (capture.trace || capture.warning) payload = { ...payload, diagnostics: { ...payload.diagnostics,
       assistantTrace: { traceId: capture.trace?.id || null, requestId: capture.requestId,
+        ...(capture.trace ? { mode: capture.trace.mode } : {}),
         storageStatus: capture.storageStatus || 'unavailable',
         status: capture.warning ? 'unavailable' : capture.trace.status, ...(capture.warning ? { warning: capture.warning } : {}) } } };
-  }
-  if (payload && payload.code === 'input_collection_limit') {
-    payload = inputCollectionLimitPayload({ details: Array.isArray(payload.errors) ? payload.errors[0] : payload.errors });
-    statusCode = 413;
   }
   const body = JSON.stringify(payload, null, 2);
   res.writeHead(statusCode, securityHeaders({
@@ -10056,7 +10066,10 @@ function dynamicPagesClientScript() {
       transferTargetRequired: 'Select an existing target with a current definition hash.',
       transferReviewRequired: 'Resolve blocking issues, prepare again after edits, and acknowledge all required references.',
       transferExported: 'Current definition exported.',
-      transferIncomplete: 'Execution is not ready. The definition can be staged and saved as incomplete.',
+      transferIncomplete: 'Execution is not ready. Save this definition only as a new inactive template.',
+      transferReplaceIncomplete: 'Execution is not ready. Stage the draft to fix the reported issues before saving the replacement.',
+      transferSaveIncomplete: 'Replacement not saved. Fix the reported issues and save again.',
+      transferSaveConflict: 'Replacement not saved. The target changed. Check the target and prepare the replacement again.',
       templateCreateHelp: 'Set the template code and description, then save it. Query logic is configured in the constructor sections.',
       templateKind: 'Template type',
       templateKindDsl: 'Dynamic data template',
@@ -10279,6 +10292,15 @@ function dynamicPagesClientScript() {
       assistantFlowRejectedDraft: 'Rejected normalized flow',
       assistantNoFlowProposal: 'Generate a data flow proposal first.',
       assistantFlowApplyUnavailable: 'The draft is ready, but the selected template is not writable in the current CMDBuild session. Review the proposal; applying it is unavailable.',
+      flowApplyNeedsDraft: 'Generate the data flow before applying it.',
+      flowApplyInvalidated: 'The inputs changed. Prepare a new plan and generate the flow again.',
+      flowApplyNotAllowed: 'The current flow cannot be applied. Check the template and the named result bindings.',
+      flowApplyInProgress: 'Applying the data flow…',
+      flowPlanInProgress: 'Generating the data flow…',
+      flowSemanticInProgress: 'Preparing the semantic plan…',
+      flowAppliedToDraft: 'Flow applied to the draft. Data has not been extracted.',
+      flowApplied: 'Flow applied to the draft.',
+      draftUnsaved: 'Unsaved changes',
       assistantSelectionStage: 'Selection {number}',
       assistantMatchingStage: 'Matching rule {number}',
       assistantSelectionPrompt: 'Selection prompt',
@@ -10463,6 +10485,13 @@ function dynamicPagesClientScript() {
       extractionApplied: 'Extraction step applied to Spec JSON.',
       extractionPreviewReady: 'Extraction preview is ready.',
       extractionCompleted: 'Template extraction completed.',
+      extractionNotStarted: 'Data has not been extracted yet.',
+      extractionRunning: 'Extracting {source}…',
+      extractionNoSource: 'No executable result is selected.',
+      extractionSourceNotReturned: 'The response did not include the selected result {source}.',
+      extractionCount: '{source}: {rows} rows.',
+      extractionLimitedCount: '{source}: {rows} rows. The result is limited.',
+      extractionFailed: 'Extraction failed: {reason}',
       extractionPublishSelected: 'Publish selected table',
       extractionPublishedSelected: 'Published table selection applied to the draft.',
       extractionSelectedSourceEmpty: 'Selected extraction source {selected} returned 0 rows; {source} has {rows} rows.',
@@ -11391,7 +11420,10 @@ function dynamicPagesClientScript() {
       transferTargetRequired: 'Выберите существующий шаблон с актуальным хешем определения.',
       transferReviewRequired: 'Устраните блокирующие проблемы, повторите подготовку после правок и подтвердите обязательные ссылки.',
       transferExported: 'Текущее определение экспортировано.',
-      transferIncomplete: 'Определение пока не готово к выполнению. Его можно применить и сохранить незавершённым.',
+      transferIncomplete: 'Определение не готово к выполнению. Его можно сохранить только как новый неактивный шаблон.',
+      transferReplaceIncomplete: 'Определение не готово к выполнению. Откройте черновик и исправьте ошибки перед сохранением замены.',
+      transferSaveIncomplete: 'Замена не сохранена. Исправьте указанные ошибки и повторите сохранение.',
+      transferSaveConflict: 'Замена не сохранена: шаблон назначения изменился. Проверьте его и подготовьте замену заново.',
       templateCreateHelp: 'Укажите код и описание шаблона, затем сохраните. Логика запроса настраивается в разделах конструктора.',
       templateKind: 'Тип шаблона',
       templateKindDsl: 'Динамический шаблон данных',
@@ -11614,6 +11646,15 @@ function dynamicPagesClientScript() {
       assistantFlowRejectedDraft: 'Отклоненный нормализованный поток',
       assistantNoFlowProposal: 'Сначала сформируйте предложение потока данных.',
       assistantFlowApplyUnavailable: 'Черновик сформирован, но выбранный шаблон недоступен для изменения в текущей CMDBuild-сессии. Проверьте предложение; применить его нельзя.',
+      flowApplyNeedsDraft: 'Сначала сформируйте поток данных.',
+      flowApplyInvalidated: 'Описание изменилось. Подготовьте план и сформируйте поток заново.',
+      flowApplyNotAllowed: 'Цепочку нельзя применить. Проверьте шаблон и привязки именованных результатов.',
+      flowApplyInProgress: 'Применяем цепочку…',
+      flowPlanInProgress: 'Формируем поток данных…',
+      flowSemanticInProgress: 'Готовим семантический план…',
+      flowAppliedToDraft: 'Цепочка применена к черновику. Данные ещё не извлечены.',
+      flowApplied: 'Цепочка применена к черновику.',
+      draftUnsaved: 'Есть несохранённые изменения',
       assistantSelectionStage: 'Выборка {number}',
       assistantMatchingStage: 'Правило совмещения {number}',
       assistantSelectionPrompt: 'Промпт выборки',
@@ -11798,6 +11839,13 @@ function dynamicPagesClientScript() {
       extractionApplied: 'Шаг извлечения применен к Spec JSON.',
       extractionPreviewReady: 'Предпросмотр извлечения готов.',
       extractionCompleted: 'Извлечение по шаблону выполнено.',
+      extractionNotStarted: 'Данные ещё не извлечены.',
+      extractionRunning: 'Извлекаем данные: {source}…',
+      extractionNoSource: 'Нет выбранного исполняемого результата.',
+      extractionSourceNotReturned: 'Ответ не содержит выбранный результат «{source}».',
+      extractionCount: '«{source}»: получено строк: {rows}.',
+      extractionLimitedCount: '«{source}»: получено строк: {rows}. Результат ограничен.',
+      extractionFailed: 'Не удалось извлечь данные: {reason}',
       extractionPublishSelected: 'Назначить публикуемой таблицей',
       extractionPublishedSelected: 'Выбор публикуемой таблицы применен к draft.',
       extractionSelectedSourceEmpty: 'Выбранный источник извлечения {selected} вернул 0 строк; {source} содержит {rows} строк.',
@@ -12623,6 +12671,7 @@ function dynamicPagesClientScript() {
     viewComposerDraft: null,
     paramRowsDraft: null,
     extractionPreview: null,
+    extractionOperation: null,
     extractionSource: '',
     assistantDraftIntent: '',
     assistantTaskMode: 'both',
@@ -12646,6 +12695,10 @@ function dynamicPagesClientScript() {
     assistantFlowWarnings: [],
     assistantFlowOutputBindings: [],
     assistantFlowBusy: false,
+    assistantFlowBusyText: '',
+    assistantFlowApplyOperation: null,
+    assistantFlowApplied: false,
+    assistantFlowInvalidated: false,
     assistantFlowRequestGeneration: 0,
     assistantFlowExpandedBlockIds: {},
     assistantFlowDragSourceId: '',
@@ -13433,6 +13486,7 @@ function dynamicPagesClientScript() {
     });
     var operation = Promise.resolve().then(function () {
       if (callerSignal && callerSignal.aborted) throw Object.assign(new Error('Request cancelled: ' + path), { name: 'AbortError', code: 'request_cancelled' });
+      if (requestContext.requestSent === false && requestContext.method === 'POST') requestContext.requestSent = true;
       return fetch(path, options);
     }).then(function (response) {
       return parseResponse(response, requestContext);
@@ -13489,6 +13543,9 @@ function dynamicPagesClientScript() {
       blockName: options.blockName
     };
     requestContext.action = options.action || requestContext.owner.action || requestContext.owner.section;
+    if (['assistant.semanticPlan', 'assistant.objectFlow', 'assistant.objectFlowApply', 'designer.extraction'].indexOf(requestContext.action) !== -1) {
+      requestContext.requestSent = false;
+    }
     var maxRetries = method === 'GET' ? Math.max(0, Math.min(3, Number(options.maxRetries === undefined ? 2 : options.maxRetries) || 0)) : 0;
     var fetchOptions = {
       method: method,
@@ -13617,6 +13674,7 @@ function dynamicPagesClientScript() {
     return request(path, {
       method: 'POST',
       timeoutMs: draftPreviewRequestTimeoutMs(),
+      ...(owner && owner.action === 'extract-template' ? { action: 'designer.extraction', phase: 'extraction' } : {}),
       requestId: requestId,
       owner: owner,
       body: { template: template, params: params }
@@ -13954,6 +14012,8 @@ function dynamicPagesClientScript() {
 
   function resetAssistantObjectFlowProposal(options) {
     options = options || {};
+    state.assistantFlowApplied = false;
+    state.assistantFlowInvalidated = options.invalidated === true;
     state.assistantFlowProposal = null;
     state.assistantFlowSemanticPlan = null;
     state.assistantFlowRefinement = null;
@@ -14216,12 +14276,11 @@ function dynamicPagesClientScript() {
     // mapping intact, but never allow an earlier Assistant proposal to apply.
     invalidateAssistantObjectFlowRequests();
     state.assistantFlowBusy = false;
-    resetAssistantObjectFlowProposal();
+    resetAssistantObjectFlowProposal({ invalidated: true });
     state.assistantDiagramInterpretResult = null;
     state.assistantDiagramMappingResult = null;
     state.assistantDiagramMappingResume = null;
-    var flowApplyButton = document.querySelector('button[data-action="assistant-flow-apply"]');
-    if (flowApplyButton) flowApplyButton.disabled = true;
+    refreshAssistantFlowApplyStatus();
     var flowPrepareButton = document.querySelector('button[data-action="assistant-flow-prepare"]');
     if (flowPrepareButton) {
       flowPrepareButton.disabled = false;
@@ -14557,7 +14616,10 @@ function dynamicPagesClientScript() {
     query.set('maxRows', String(authoringPreviewMaxRows()));
     if (options.includeDiagrams === false) query.set('includeDiagrams', 'false');
     if (options.executionScope) query.set('executionScope', String(options.executionScope));
-    if (options.extractionSource) query.set('extractionSource', String(options.extractionSource));
+    if (options.extractionSource) {
+      query.set('root', String(state.root || 'Cst_QueryTool'));
+      query.set('extractionSource', String(options.extractionSource));
+    }
     return apiPrefix + '/draft/preview?' + query.toString();
   }
 
@@ -14680,6 +14742,7 @@ function dynamicPagesClientScript() {
   function hydrateDesignerStateFromTemplate(options) {
     state.templateEditorInstance = Number(state.templateEditorInstance || 0) + 1;
     state.savingTemplate = false;
+    state.extractionOperation = null;
     options = options || {};
     var selected = state.selectedTemplate;
     var spec = selected && selected.spec ? selected.spec : defaultSpec();
@@ -14693,6 +14756,7 @@ function dynamicPagesClientScript() {
       state.runParams = getRunParamsFromSpec(spec);
     }
     if (!options.preserveAssistantState) {
+      state.templateDirty = false;
       invalidateAssistantObjectFlowRequests();
       stopAssistantGenerationTimer();
       resetAssistantAuthoringDirty();
@@ -14781,7 +14845,7 @@ function dynamicPagesClientScript() {
   }
 
   function invalidateUiDiagnosticRevision(event) {
-    if (boot.mode === 'runtime' || !event.target || event.target.id === 'cmdp-language') return;
+    if (boot.mode === 'runtime' || !event.target || ['cmdp-language', 'cmdp-extraction-source'].indexOf(event.target.id) !== -1) return;
     if (event.target.closest && event.target.closest('[data-ui-error-diagnostics]')) return;
     if (event.target.matches && event.target.matches('[data-catalog-field-picker-search], [data-diagram-import-condition-picker-search], [data-compact-multi-select-search]')) return;
     state.uiDiagnosticRevision = Number(state.uiDiagnosticRevision || 0) + 1;
@@ -14814,18 +14878,21 @@ function dynamicPagesClientScript() {
     };
   }
 
-  function uiDiagnosticIsCurrent(diagnostic) {
+  function uiDiagnosticIsCurrent(diagnostic, draftRevisionOnly) {
     if (!diagnostic || boot.mode === 'runtime') return false;
     var owner = diagnostic.owner;
     if (!owner) return true;
     var current = uiRequestOwner();
+    // Apply belongs to the draft, not to the section showing it.
+    var draftScopedApply = diagnostic.action === 'assistant.objectFlowApply' || owner.action === 'assistant-flow-apply';
     return (owner.root === undefined || owner.root === current.root)
       && Number(owner.rootSelectionGeneration || 0) === current.rootSelectionGeneration
       && Number(owner.editorInstance || 0) === current.editorInstance
       && Number(owner.sessionInstance || 0) === current.sessionInstance
-      && owner.templateCode === current.templateCode && (owner.displaySection || owner.section) === current.section
-      && Number(owner.generation || 0) === current.generation
-      && Number(owner.revision || 0) === current.revision;
+      && owner.templateCode === current.templateCode
+      && Number(owner.revision || 0) === current.revision
+      && (draftRevisionOnly === true || (Number(owner.generation || 0) === current.generation
+        && (draftScopedApply ? current.action === 'assistant-flow-apply' : (owner.displaySection || owner.section) === current.section)));
   }
 
   function validateUiResponse(result, kind) {
@@ -14834,6 +14901,7 @@ function dynamicPagesClientScript() {
     var isObject = function (value) { return Boolean(value && typeof value === 'object' && !Array.isArray(value)); };
     var valid = isObject(json) && json.success === true;
     if (valid && kind === 'save') valid = isObject(json.template) && isObject(json.template.spec);
+    if (valid && kind === 'object-flow-apply') valid = isObject(json.spec);
     if (valid && kind === 'preview') valid = isObject(json.result) && Array.isArray(json.result.tables)
       && (json.result.diagrams === undefined || Array.isArray(json.result.diagrams));
     if (!valid) throw createRequestError(result, true);
@@ -14891,6 +14959,16 @@ function dynamicPagesClientScript() {
       + assistantDiagnosticsUi.renderReference(safe.assistantTrace);
   }
 
+  function renderAuthoringCaptureDiagnostics(diagnostic, details) {
+    if (!uiDiagnosticIsCurrent(diagnostic) || !state.session?.rolePrivileges?.admin_classes_modify) return '';
+    var mode = diagnostic.assistantTrace && diagnostic.assistantTrace.mode;
+    if (mode !== 'Basic' && mode !== 'Verbose') return assistantDiagnosticsUi.renderReference(diagnostic.assistantTrace);
+    return renderUiErrorDiagnostics(Object.assign({}, diagnostic, {
+      responseExcerpt: '',
+      diagnostics: Object.assign({}, diagnostic.diagnostics, details || {})
+    }));
+  }
+
   function copyUiErrorDiagnostics(button) {
     var detail = button.closest('[data-ui-error-diagnostics]');
     var report = detail && detail.querySelector('[data-ui-diagnostic-report]');
@@ -14911,14 +14989,17 @@ function dynamicPagesClientScript() {
 
   function renderNotice(message) {
     if (!message || !message.text) return '';
+    if (message.owner && !uiDiagnosticIsCurrent({ owner: message.owner })) return '';
     var flowFeedback = state.assistantFlowFeedback;
     if (flowFeedback && (message.text === flowFeedback.summary || message.text === flowFeedback.action)) {
       var localized = localizeAssistantSemanticPlanFeedback(flowFeedback);
       message = Object.assign({}, message, { text: message.text === flowFeedback.summary ? localized.summary : localized.action });
     }
     var error = message.type === 'error';
-    return '<div class="notice ' + escapeHtml(message.type || '') + '"' + (error ? ' role="alert" aria-live="assertive"' : ' aria-live="polite"') + '>' + escapeHtml(message.text) + '</div>'
-      + (message.diagnosticOwner === 'assistantFlow' ? '' : renderUiErrorDiagnostics(message.diagnostic || state.assistantLastTraceDiagnostic));
+    var flowDiagnosticInEditor = message.diagnosticOwner === 'assistantFlow' &&
+      (message.owner?.action !== 'assistant-flow-apply' || state.designerSection === 'assistant');
+    return '<div class="notice ' + escapeHtml(message.type || '') + '"' + (message.owner ? ' data-authoring-operation-message' : '') + (error ? ' role="alert" aria-live="assertive"' : ' aria-live="polite"') + '>' + escapeHtml(message.text) + '</div>'
+      + (flowDiagnosticInEditor ? '' : renderUiErrorDiagnostics(message.diagnostic || state.assistantLastTraceDiagnostic));
   }
 
   function renderKpi(label, value) {
@@ -18348,12 +18429,37 @@ function dynamicPagesClientScript() {
     if (notice) notice.outerHTML = renderAssistantFlowDependencyNotice(diagnostics);
   }
 
+  function assistantFlowApplyStatus() {
+    if (state.assistantFlowBusy) return { disabled: true, text: state.assistantFlowBusyText || t('flowPlanInProgress') };
+    if (state.assistantFlowApplied) {
+      var spec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
+      var status = extractionStatus(spec, selectedExtractionSource(spec));
+      return { disabled: true, text: t(status.table ? 'flowApplied' : 'flowAppliedToDraft') };
+    }
+    if (state.assistantFlowInvalidated) return { disabled: true, text: t('flowApplyInvalidated') };
+    if (!state.assistantFlowProposal) return { disabled: true, text: t('flowApplyNeedsDraft') };
+    if (!state.assistantFlowCanApply) return { disabled: true, text: state.assistantFlowErrors.length ? t('assistantFlowOwnershipIncomplete') : t('flowApplyNotAllowed') };
+    return { disabled: false, text: '' };
+  }
+
+  function refreshAssistantFlowApplyStatus() {
+    var button = document.querySelector('button[data-action="assistant-flow-apply"]');
+    var status = document.getElementById('cmdp-assistant-flow-apply-status');
+    if (!button || !status) return;
+    var current = assistantFlowApplyStatus();
+    button.disabled = current.disabled;
+    status.textContent = current.text;
+    if (state.message?.owner && !uiDiagnosticIsCurrent({ owner: state.message.owner })) {
+      document.querySelector('[data-authoring-operation-message]')?.remove();
+    }
+  }
+
   function renderAssistantFlowEditor() {
     var intent = normalizeAssistantObjectFlowIntentClient(state.assistantObjectFlowIntent);
     state.assistantObjectFlowIntent = intent;
     var proposal = state.assistantFlowProposal;
     var semanticPlan = state.assistantFlowSemanticPlan;
-    var applyDisabled = !proposal || state.assistantFlowBusy || !state.assistantFlowCanApply;
+    var applyStatus = assistantFlowApplyStatus();
     var dependencyDiagnostics = assistantObjectFlowDependencyDiagnostics(intent.blocks);
     var blockRows = intent.blocks.map(function (block, index) {
       var available = intent.blocks.filter(function (candidate) { return candidate.id !== block.id; });
@@ -18434,7 +18540,7 @@ function dynamicPagesClientScript() {
         var details = [block.summary, contractText, pairText, dependencyPathText, attributePredicateText, candidateFilterText, block.resolvedEntities && block.resolvedEntities.length ? block.resolvedEntities.join(', ') : '', block.relationPaths && block.relationPaths.length ? block.relationPaths.join('; ') : '', block.warnings && block.warnings.length ? t('assistantWarnings') + ': ' + block.warnings.join(' ') : ''].filter(Boolean).join(' | ');
         return '<li><strong>' + escapeHtml(block.name) + ':</strong> ' + escapeHtml(details || block.description || '') + '</li>';
       }).join('') + '</ul></div>' : '';
-    var flowPreview = proposal ? '<div class="assistant-draft-preview"><h4>' + escapeHtml(t('assistantFlowReady')) + '</h4><p>' + escapeHtml(state.assistantFlowExplanation || '') + '</p><ul class="steps">'
+    var flowPreview = proposal ? '<div class="assistant-draft-preview" data-assistant-flow-proposal><h4>' + escapeHtml(t('assistantFlowReady')) + '</h4><p>' + escapeHtml(state.assistantFlowExplanation || '') + '</p><ul class="steps">'
       + (proposal.selections || []).map(function (selection) { return '<li>' + escapeHtml(selection.name + ': ' + selection.className) + '</li>'; }).join('')
       + (proposal.operations || []).map(function (operation) { return '<li>' + escapeHtml(operation.type + ': ' + (operation.domain || operation.from || '')) + '</li>'; }).join('')
       + '</ul></div>' : '';
@@ -18446,7 +18552,8 @@ function dynamicPagesClientScript() {
     if (!requestDiagnostic && state.assistantFlowErrors.length) requestDiagnostic = uiRequestDiagnostics.response({
       ok: false, json: { code: 'validation_error', errors: state.assistantFlowErrors, diagnostics: state.assistantFlowDiagnostics }
     }, { owner: uiRequestOwner(), action: 'assistant.validation', phase: state.assistantFlowErrorStage, method: 'POST' });
-    var technical = renderUiErrorDiagnostics(requestDiagnostic);
+    var technical = renderAuthoringCaptureDiagnostics(requestDiagnostic) ||
+      (requestDiagnostic && (requestDiagnostic.code || state.assistantFlowErrors.length) ? renderUiErrorDiagnostics(requestDiagnostic) : '');
     var errorHeading = flowPlanRetryAvailable ? t('assistantFlowPlanPaused') : retryAvailable ? t('assistantSemanticPlanPaused') : state.assistantFlowErrorStage === 'semanticPlan' ? t('assistantSemanticPlanRejected') : t('assistantFlowRejected');
     var errors = state.assistantFlowErrors.length || feedback ? '<div class="assistant-draft-preview notice warning" data-assistant-flow-rejected><h4>' + escapeHtml(errorHeading) + '</h4>'
       + (feedback && feedback.summary ? '<p>' + escapeHtml(feedback.summary) + '</p>' : '')
@@ -18466,10 +18573,12 @@ function dynamicPagesClientScript() {
       '<div class="toolbar"><button type="button" data-action="assistant-flow-block-add"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantFlowAddBlock')) + '</button></div>',
       renderAssistantPromptAutosaveControl(),
       unresolvedNotice,
-      '<div class="toolbar"><button type="button" data-action="assistant-flow-prepare"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(state.assistantFlowBusy ? t('assistantGenerateBusy') : t('assistantPrepareSemanticPlan')) + '</button>' + (semanticPlanRetryAvailable ? '<button type="button" data-action="assistant-flow-prepare-retry"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantRetrySemanticPlan')) + '</button>' : '') + '<button type="button" data-action="assistant-flow-generate"' + (flowGenerationBlocked ? ' disabled' + (unresolvedBlocks.length ? ' aria-describedby="cmdp-assistant-flow-unresolved"' : '') : '') + '>' + escapeHtml(t('assistantGenerateFlow')) + '</button>' + (flowPlanRetryAvailable ? '<button type="button" data-action="assistant-flow-generate-retry"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantRetryFlowPlan')) + '</button>' : '') + '<button type="button" class="primary" data-action="assistant-flow-apply"' + (applyDisabled ? ' disabled' : '') + '>' + escapeHtml(t('assistantApplyFlow')) + '</button></div>',
+      '<div class="toolbar"><button type="button" data-action="assistant-flow-prepare"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantPrepareSemanticPlan')) + '</button>' + (semanticPlanRetryAvailable ? '<button type="button" data-action="assistant-flow-prepare-retry"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantRetrySemanticPlan')) + '</button>' : '') + '<button type="button" data-action="assistant-flow-generate"' + (flowGenerationBlocked ? ' disabled' + (unresolvedBlocks.length ? ' aria-describedby="cmdp-assistant-flow-unresolved"' : '') : '') + '>' + escapeHtml(t('assistantGenerateFlow')) + '</button>' + (flowPlanRetryAvailable ? '<button type="button" data-action="assistant-flow-generate-retry"' + (state.assistantFlowBusy ? ' disabled' : '') + '>' + escapeHtml(t('assistantRetryFlowPlan')) + '</button>' : '') + '<button type="button" class="primary" data-action="assistant-flow-apply" aria-describedby="cmdp-assistant-flow-apply-status"' + (applyStatus.disabled ? ' disabled' : '') + '>' + escapeHtml(t('assistantApplyFlow')) + '</button></div>',
+      '<p class="muted" id="cmdp-assistant-flow-apply-status" data-assistant-flow-apply-status role="status">' + escapeHtml(applyStatus.text) + '</p>',
       semanticPreview,
       flowPreview,
       errors,
+      !errors ? technical : '',
       '<p class="muted">' + t('assistantProposalOnly') + '</p>',
       '</div>'
     ].join('');
@@ -18896,6 +19005,12 @@ function dynamicPagesClientScript() {
     return state.templateTransfer;
   }
 
+  function stagedTemplateTransfer() {
+    var staged = state.stagedTemplateTransfer;
+    return staged && runtimeSettingsScopeIsCurrent(staged.scope) && staged.session === Number(state.sessionInstance || 0)
+      && staged.editor === Number(state.templateEditorInstance || 0) ? staged : null;
+  }
+
   function renderTemplateTransfer() {
     var draft = templateTransferDraft();
     var prepared = draft.prepared;
@@ -18912,9 +19027,9 @@ function dynamicPagesClientScript() {
         '<label>' + t('transferValue') + '<input data-transfer-review-value="' + index + '" value="' + escapeHtml(item.input) + '"></label>' +
         (item.requiresConfirmation ? '<label class="checkbox"><input type="checkbox" data-transfer-ack="' + index + '"' + (item.ack ? ' checked' : '') + '> ' + t('transferAck') + '</label>' : '') + '</div>';
     }).join('');
-    var issues = checks ? checks.issues.map(function (issue) {
+    var issues = (checks ? checks.issues : draft.saveIssues || []).map(function (issue) {
       return '<li>' + escapeHtml([issue.path, issue.code, issue.message].filter(Boolean).join(' - ')) + '</li>';
-    }).join('') : '';
+    }).join('');
     return [
       '<section class="section" id="cmdp-template-transfer" aria-labelledby="cmdp-transfer-title">',
       '<h2 id="cmdp-transfer-title">' + t('transferTitle') + '</h2>',
@@ -18927,7 +19042,8 @@ function dynamicPagesClientScript() {
       '</div>',
       '<label>' + t('transferOverrides') + '<textarea id="cmdp-transfer-overrides" rows="3">' + escapeHtml(draft.overrides) + '</textarea></label>',
       checks ? '<div role="status"><strong>' + t(checks.status === 'ready' ? 'transferReady' : 'transferAttention') + '</strong><ul>' + issues + '</ul><pre>' + escapeHtml(pretty({ summary: checks.summary, changes: prepared.changes })) + '</pre></div>' : '',
-      checks && checks.executionReady === false ? '<div class="notice warning">' + t('transferIncomplete') + '</div>' : '',
+      !checks && issues ? '<ul role="status">' + issues + '</ul>' : '',
+      checks && checks.executionReady === false ? '<div class="notice warning">' + t(draft.mode === 'replace' ? 'transferReplaceIncomplete' : 'transferIncomplete') + '</div>' : '',
       review,
       '<div class="row"><button type="button" data-action="template-transfer-prepare"' + (draft.busy || !draft.package || state.savingTemplate ? ' disabled' : '') + '>' + t(draft.busy ? 'transferBusy' : 'transferPrepare') + '</button>',
       '<button type="button" data-action="template-transfer-stage"' + (!prepared || draft.busy || state.savingTemplate ? ' disabled' : '') + '>' + t('transferStage') + '</button>',
@@ -18956,6 +19072,7 @@ function dynamicPagesClientScript() {
     draft.package = null;
     draft.fileName = '';
     draft.review = [];
+    draft.saveIssues = [];
     draft.busy = false;
     draft.message = '';
     if (!file || !file.name.endsWith('.cmdp-template.json')) {
@@ -19010,6 +19127,7 @@ function dynamicPagesClientScript() {
     draft.prepared = null;
     draft.busy = true;
     draft.message = '';
+    draft.saveIssues = [];
     refreshTemplateTransfer();
     return request(apiPrefix + '/template-transfer/prepare?root=' + encodeURIComponent(draft.owner.scope.root), { method: 'POST', body: body, owner: uiRequestOwner() }).then(function (result) {
       if (state.templateTransfer !== draft || draft.token !== token || !templateTransferOwnerIsCurrent(draft.owner)) return;
@@ -19017,7 +19135,9 @@ function dynamicPagesClientScript() {
       var value = result.json;
       if (!value.template || !value.template.code || !value.template.spec || !value.checks ||
           ['ready', 'needsAttention'].indexOf(value.checks.status) < 0 || !Array.isArray(value.checks.issues) || !Array.isArray(value.checks.environmentReferences)) throw new Error(t('transferInvalid'));
-      if (body.mode === 'replace' && value.template.code !== body.targetCode) throw new Error(t('transferInvalid'));
+      if (body.mode === 'replace' && (value.template.code !== body.targetCode || value.template.specHash !== body.baseSpecHash ||
+        !value.changes || String(value.changes.targetId) !== String(draft.target.id) ||
+        String(value.template.id) !== String(value.changes.targetId) || !/^sha256:[a-f0-9]{64}$/.test(value.changes.targetRevision))) throw new Error(t('transferInvalid'));
       draft.prepared = value;
       draft.overrides = JSON.stringify(body.overrides, null, 2);
       draft.review = value.checks.environmentReferences.map(function (item) {
@@ -19043,20 +19163,26 @@ function dynamicPagesClientScript() {
     if (!window.confirm(t('transferConfirm'))) return;
     if (!templateTransferOwnerIsCurrent(draft.owner)) return;
     var imported = cloneJsonValue(prepared.template, {});
-    var next = draft.mode === 'replace' ? Object.assign({}, draft.target) : { code: imported.code, active: false };
+    var replace = draft.mode === 'replace';
+    var next = replace ? Object.assign({}, draft.target, imported) : { code: imported.code, active: false };
     ['description', 'spec', 'paramsSchema', 'resultSchema'].forEach(function (key) { next[key] = imported[key]; });
     state.selectedTemplate = next;
     state.objectGroupDraft = null;
     state.relationDraft = null;
     state.viewComposerDraft = null;
     state.paramRowsDraft = null;
-    state.result = null;
-    state.extractionPreview = null;
-    state.templateVersions = draft.mode === 'replace' && draft.owner.code === next.code ? state.templateVersions : [];
+    clearDraftExecutionState();
+    state.extractionSource = selectedExtractionSource(next.spec);
+    state.templateVersions = [];
+    state.templateVersionsOwner = null;
     hydrateDesignerStateFromTemplate({ replaceRunParams: true });
+    state.stagedTemplateTransfer = {
+      scope: runtimeSettingsScope(), session: Number(state.sessionInstance || 0), editor: Number(state.templateEditorInstance || 0),
+      replacement: replace ? { targetId: prepared.changes.targetId, revision: prepared.changes.targetRevision } : null
+    };
     state.templateDirty = true;
     state.lastDraftPreviewOk = false;
-    state.templateTransfer = null;
+    state.templateTransfer = replace ? Object.assign(draft, { owner: templateTransferOwner(), prepared: null, review: [], saveIssues: prepared.checks.issues }) : null;
     state.message = { type: 'warning', text: t('transferNotSaved') };
     state.designerSection = 'template';
     renderDesigner();
@@ -19115,6 +19241,7 @@ function dynamicPagesClientScript() {
     draft.token = null;
     draft.busy = false;
     draft.message = '';
+    draft.saveIssues = [];
     if (target.id === 'cmdp-transfer-mode' || target.id === 'cmdp-transfer-target') { draft.review = []; refreshTemplateTransfer(); }
     else {
       var stage = document.querySelector('[data-action="template-transfer-stage"]');
@@ -19552,8 +19679,14 @@ function dynamicPagesClientScript() {
     } else if (section === 'cmdb-build-view') {
       actions.push(renderActionButton('apply-cmdb-build-view', t('apply'), { primary: true }));
     } else if (section === 'extraction') {
+      var applyPending = assistantFlowApplyPending();
+      var extractionPending = extractionIsRunning();
+      var extractionSource = selectedExtractionSource(selected && selected.spec || defaultSpec());
       actions.push(renderActionButton('extract-template', t('extractByTemplate'), {
-        primary: true
+        primary: true,
+        disabled: applyPending || extractionPending || !extractionSource,
+        busy: applyPending || extractionPending,
+        title: applyPending ? t('flowApplyInProgress') : !extractionSource ? t('extractionNoSource') : ''
       }));
     } else if (section === 'visualization') {
       actions.push(renderActionButton('apply-visualization', t('applyVisualization'), { primary: true }));
@@ -19623,6 +19756,8 @@ function dynamicPagesClientScript() {
       '<div class="designer-actionbar-title">' + escapeHtml(designerSectionTitle(section)) + '</div>',
       '<div class="designer-actionbar-actions">',
       actions.join(''),
+      templateSelected && state.templateDirty && (section === 'assistant' || section === 'extraction' || sectionPersistsTemplate(section))
+        ? '<span class="muted" data-authoring-unsaved role="status">' + escapeHtml(t('draftUnsaved')) + '</span>' : '',
       context ? '<div class="designer-actionbar-context">' + context + '</div>' : '',
       '</div>',
       '</div>'
@@ -20475,51 +20610,105 @@ function dynamicPagesClientScript() {
   function renderExtractionResultOptions(selectedName, spec, tables) {
     var preparedOptions = arguments[3];
     var options = preparedOptions || extractionResultOptions(spec, tables);
-    selectedName = preferredExtractionResultName(spec, tables, selectedName, options);
+    if (!preparedOptions) selectedName = preferredExtractionResultName(spec, tables, selectedName, options);
     return options.map(function (item) {
       return '<option value="' + escapeHtml(item.name) + '"' + (item.name === selectedName ? ' selected' : '') + '>' + escapeHtml(item.label) + '</option>';
     }).join('');
   }
 
-  function renderExtractionPreview(spec) {
+  function selectedExtractionSource(spec, resultOptions) {
+    var tables = spec && spec.result && spec.result.tables || [];
+    var options = resultOptions || extractionResultOptions(spec, tables, { executableOnly: true });
+    var selected = state.extractionSource;
+    if (options.some(function (item) { return item.name === selected; })) return selected;
+    return options.length ? options[0].name : '';
+  }
+
+  function extractionIsRunning() {
+    var operation = state.extractionOperation;
+    if (!operation || !uiDiagnosticIsCurrent({ owner: operation.owner })) return false;
+    var spec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
+    return extractionMatchesDraft(operation, spec, selectedExtractionSource(spec));
+  }
+
+  function extractionMatchesDraft(operation, spec, source) {
+    if (!operation || !source || operation.source !== source) return false;
+    var selected = state.selectedTemplate || {};
+    return uiDiagnosticIsCurrent({ owner: operation.owner }, true)
+      && operation.templateId === selected.id && operation.baseSpecHash === selected.specHash
+      && operation.specFingerprint === stableClientJsonStringify(spec);
+  }
+
+  function extractionResultForDraft(spec, source) {
     var result = state.extractionPreview;
-    if (!result) return '';
-    if (!result.ok) return renderRequestErrorNotice(result);
-    var tables = result.json && result.json.result && Array.isArray(result.json.result.tables) ? result.json.result.tables : [];
-    if (!tables.length || !tables.some(function (table) { return table && Array.isArray(table.rows) && table.rows.length; })) {
-      return '<div class="notice">' + t('extractionNoRows') + '</div>';
+    return result && extractionMatchesDraft(result.operation, spec, source) ? result : null;
+  }
+
+  function extractionStatus(spec, source) {
+    if (assistantFlowApplyPending()) return { kind: 'apply-pending', text: t('flowApplyInProgress') };
+    var name = userFacingResultLabel(source, spec);
+    var result = extractionResultForDraft(spec, source);
+    if (!source) return { kind: 'no-source', text: t('extractionNoSource') };
+    if (extractionIsRunning()) return { kind: 'running', text: t('extractionRunning', { source: name }) };
+    if (!result) return { kind: 'not-started', text: t('extractionNotStarted') };
+    if (!result.ok) return { kind: 'error', text: t('extractionFailed', { reason: result.errorText }), diagnostic: result.diagnostic };
+    var data = result.json && result.json.result || {};
+    var table = (data.tables || []).find(function (entry) { return entry && entry.name === source; });
+    if (!table || !Array.isArray(table.rows)) return { kind: 'missing-result', text: t('extractionSourceNotReturned', { source: name }), diagnostic: result.diagnostic };
+    var limited = table.truncated === true || (data.limitDiagnostics || []).some(function (limit) {
+      return limit && (limit.truncated === true || limit.limitHit === true);
+    });
+    var rows = table.rows.length;
+    return { kind: limited ? 'limited' : rows ? 'rows' : 'empty', table: table, diagnostic: result.diagnostic,
+      text: t(limited ? 'extractionLimitedCount' : 'extractionCount', { source: name, rows: rows }) +
+        (limited || rows ? '' : ' ' + extractionSelectedSourceEmptyWarning(result, source, spec)) };
+  }
+
+  function extractionCaptureDetails(result, spec, source) {
+    var data = result.json && result.json.result || {};
+    var steps = Array.isArray(spec.steps) ? spec.steps : [];
+    var trace = Array.isArray(data.trace) ? data.trace : [];
+    var selectedStep = steps.find(function (step) { return step && step.as === source; });
+    function config(step) {
+      if (!step) return {};
+      var filters = step.filters || step.where;
+      return { className: step.className || step.sourceClass || step.targetClass || '',
+        filterCount: Array.isArray(filters) ? filters.length : 0 };
     }
-    var selectedName = preferredExtractionResultName(spec, tables, state.extractionSource);
-    var table = tables.find(function (item) { return item && item.name === selectedName; }) || tables[0];
-    return table ? renderPlainDataTable(table) : '';
+    return Object.assign({ alias: source, limits: data.limitDiagnostics,
+      steps: trace.slice(0, 16).map(function (item) {
+        return Object.assign({ index: item.index, as: item.as, type: item.type, rows: item.rows,
+          elapsedMs: item.elapsedMs, restCalls: item.restCalls, truncated: item.truncated }, config(steps[item.index]));
+      }) }, config(selectedStep));
   }
 
   function renderExtractionEditor(selected) {
     var spec = (selected && selected.spec) || defaultSpec();
-    var previewTables = state.extractionPreview && state.extractionPreview.json && state.extractionPreview.json.result && Array.isArray(state.extractionPreview.json.result.tables)
-      ? state.extractionPreview.json.result.tables
-      : [];
     var specTables = spec && spec.result && Array.isArray(spec.result.tables) ? spec.result.tables : [];
-    var optionTables = previewTables.length ? previewTables : specTables;
     var assistantManifest = assistantObjectFlowOutputManifest(spec);
     var objectFlowRecovery = selected && selected.objectFlowRecovery && typeof selected.objectFlowRecovery === 'object'
       ? selected.objectFlowRecovery
       : null;
     var invalidStoredFlow = Boolean(objectFlowRecovery && objectFlowRecovery.status === 'skipped_invalid_flow');
     var recoveredLabels = Boolean(assistantManifest.warning || objectFlowRecovery && objectFlowRecovery.requiresSave === true);
-    var resultOptions = extractionResultOptions(spec, optionTables, { executableOnly: invalidStoredFlow });
-    var options = invalidStoredFlow
-      ? renderExtractionResultOptions(state.extractionSource, spec, optionTables, resultOptions)
-      : renderExtractionResultOptions(state.extractionSource, spec, optionTables);
-    var selectedName = preferredExtractionResultName(spec, optionTables, state.extractionSource, resultOptions);
+    var resultOptions = extractionResultOptions(spec, specTables, { executableOnly: true });
+    var source = selectedExtractionSource(spec, resultOptions);
+    state.extractionSource = source;
+    var options = (source ? '' : '<option value="" selected disabled>' + escapeHtml(t('extractionNoSource')) + '</option>') +
+      renderExtractionResultOptions(source, spec, specTables, resultOptions);
+    var status = extractionStatus(spec, source);
+    var technical = renderAuthoringCaptureDiagnostics(status.diagnostic, state.extractionPreview && state.extractionPreview.captureDetails) ||
+      (status.kind === 'error' ? renderUiErrorDiagnostics(status.diagnostic) : '');
     return [
       '<section class="section" id="cmdp-extraction-editor"><h2>' + t('extractionEditor') + '</h2>',
       invalidStoredFlow ? '<div class="notice warning" role="status" data-object-flow-invalid>' + escapeHtml(t('assistantFlowStoredFlowInvalid')) + '</div>' : '',
       recoveredLabels ? '<div class="notice warning" role="status" data-object-flow-recovery>' + escapeHtml(t('assistantFlowOutputManifestRecovered')) + '</div>' : '',
       '<div class="row">',
-      options ? '<label>' + t('extractionResultSource') + '<select id="cmdp-extraction-source">' + options + '</select><span class="muted">' + escapeHtml(t('extractionResultSourceHelp')) + '</span></label>' : '',
+      resultOptions.length ? '<label>' + t('extractionResultSource') + '<select id="cmdp-extraction-source"' + (status.kind === 'apply-pending' ? ' disabled' : '') + '>' + options + '</select><span class="muted">' + escapeHtml(t('extractionResultSourceHelp')) + '</span></label>' : '',
       '</div>',
-      renderExtractionPreview(spec),
+      '<div class="notice' + (status.kind === 'error' || status.kind === 'missing-result' || status.kind === 'limited' ? ' warning' : '') + '" data-extraction-status data-extraction-state="' + status.kind + '" role="status" aria-live="polite">' + escapeHtml(status.text) + '</div>',
+      technical,
+      status.table && status.table.rows.length ? renderPlainDataTable(status.table) : '',
       '</section>'
     ].join('');
   }
@@ -25233,10 +25422,12 @@ function dynamicPagesClientScript() {
   }
 
   function renderVersions() {
-    var rows = state.templateVersions.map(function (version) {
+    var owner = state.templateVersionsOwner;
+    var versions = templateVersionOwnerIsCurrent(owner) && !stagedTemplateTransfer() ? state.templateVersions : [];
+    var rows = versions.map(function (version) {
       return '<tr><td>' + escapeHtml(version.version == null ? '' : String(version.version)) + '</td><td>' +
         escapeHtml(version.changedAt || '') + '</td><td>' + escapeHtml(version.changedBy || '') + '</td><td>' +
-        escapeHtml(version.changeComment || '') + '</td><td><button data-action="load-version" data-version="' + escapeHtml(version.id) + '">' + t('load') + '</button></td></tr>';
+        escapeHtml(version.changeComment || '') + '</td><td><button data-action="load-version" data-version="' + escapeHtml(version.id) + '" data-version-generation="' + owner.generation + '">' + t('load') + '</button></td></tr>';
     }).join('');
     return '<section class="section" id="cmdp-template-versions"><h2>' + t('versions') + '</h2><table class="compact"><thead><tr><th>' + t('version') + '</th><th>' + t('changedAt') + '</th><th>' + t('changedBy') + '</th><th>' + t('comment') + '</th><th></th></tr></thead><tbody>' +
       (rows || '<tr><td colspan="5">' + t('noVersions') + '</td></tr>') + '</tbody></table></section>';
@@ -26131,10 +26322,13 @@ function dynamicPagesClientScript() {
       var failed = results.find(function (item) { return !item.ok; });
       if (failed) setUiError(createRequestError(failed));
       else if (!redirectedToTemplates || !state.message) state.message = null;
+      var versionOwner = templateVersionOwner();
       return loadCatalogCache().then(function () {
         clientLog('load-designer-catalog', 'loaded');
         return restoreDiagramImportAssistantCheckpoint().then(function () {
-          return fetchVersions(state.selectedTemplate && state.selectedTemplate.code).then(renderDesigner);
+          return fetchVersions(versionOwner.code, versionOwner).then(function () {
+            if (templateVersionOwnerIsCurrent(versionOwner)) renderDesigner();
+          });
         });
       });
     }).catch(function (error) {
@@ -26143,13 +26337,29 @@ function dynamicPagesClientScript() {
     });
   }
 
-  function fetchVersions(code) {
-    if (!code) {
-      state.templateVersions = [];
-      return Promise.resolve([]);
-    }
-    return request(apiPrefix + '/templates/' + encodeURIComponent(code) + '/versions?limit=20').then(function (result) {
-      state.templateVersions = result.ok && result.json && result.json.data ? result.json.data : [];
+  function templateVersionOwner() {
+    var owner = templateTransferOwner();
+    return { scope: owner.scope, session: owner.session, editor: owner.editor, id: owner.id, code: owner.code };
+  }
+
+  function templateVersionOwnerIsCurrent(owner) {
+    var current = templateVersionOwner();
+    return Boolean(owner && runtimeSettingsScopeIsCurrent(owner.scope) && owner.session === current.session &&
+      owner.editor === current.editor && owner.id === current.id && owner.code === current.code);
+  }
+
+  function fetchVersions(code, expectedOwner) {
+    var owner = expectedOwner || templateVersionOwner();
+    if (!templateVersionOwnerIsCurrent(owner) || code !== owner.code || stagedTemplateTransfer()) return Promise.resolve([]);
+    owner = Object.assign({}, owner, { generation: Number(state.templateVersionsGeneration || 0) + 1 });
+    state.templateVersionsGeneration = owner.generation;
+    state.templateVersionsOwner = owner;
+    state.templateVersions = [];
+    if (!owner.code || !owner.id) return Promise.resolve([]);
+    return request(apiPrefix + '/templates/' + encodeURIComponent(code) + '/versions?limit=20&root=' + encodeURIComponent(owner.scope.root)).then(function (result) {
+      if (state.templateVersionsOwner !== owner || !templateVersionOwnerIsCurrent(owner)) return [];
+      state.templateVersions = result.ok && result.json && Array.isArray(result.json.data)
+        ? result.json.data.filter(function (item) { return item && item.templateCode === owner.code; }) : [];
       return state.templateVersions;
     });
   }
@@ -27676,6 +27886,7 @@ function dynamicPagesClientScript() {
 
   function invalidateAssistantObjectFlowRequests() {
     state.assistantFlowRequestGeneration = Number(state.assistantFlowRequestGeneration || 0) + 1;
+    state.assistantFlowApplyOperation = null;
   }
 
   function assistantTemplateRevisionSnapshot(template, spec, requestGeneration) {
@@ -27823,6 +28034,7 @@ function dynamicPagesClientScript() {
     options = options || {};
     state.result = null;
     state.extractionPreview = null;
+    state.extractionOperation = null;
     if (options.clearExtractionSource) state.extractionSource = '';
     state.lastDraftPreviewOk = false;
   }
@@ -27950,37 +28162,51 @@ function dynamicPagesClientScript() {
   }
 
   function extractByTemplate() {
+    if (assistantFlowApplyPending() || extractionIsRunning()) return;
     var owner = uiRequestOwner();
     var payload;
     var params;
     try {
       payload = readEditorPayload();
       params = readRunParams();
-      var specTables = payload.spec && payload.spec.result && Array.isArray(payload.spec.result.tables) ? payload.spec.result.tables : [];
-      state.extractionSource = preferredExtractionResultName(payload.spec, specTables, readValue('cmdp-extraction-source') || state.extractionSource || '');
-      payload.spec = ensureExtractionPreviewTable(payload.spec, state.extractionSource);
+      state.extractionSource = readValue('cmdp-extraction-source') || state.extractionSource || '';
+      var source = selectedExtractionSource(payload.spec);
+      if (!source) {
+        state.message = null;
+        renderDesigner();
+        return;
+      }
+      state.extractionSource = source;
+      payload.spec = ensureExtractionPreviewTable(payload.spec, source);
     } catch (error) {
       setUiError(error);
       renderDesigner();
       return;
     }
+    var draft = state.selectedTemplate || {};
+    var operation = { owner: owner, source: source, templateId: draft.id, baseSpecHash: draft.specHash,
+      specFingerprint: stableClientJsonStringify(draft.spec || defaultSpec()) };
     state.extractionPreview = null;
-    requestDraftPreview(authoringPreviewPath({ includeDiagrams: false, extractionSource: state.extractionSource }), payload, params, undefined, owner).then(function (result) {
-      if (!uiDiagnosticIsCurrent(result.diagnostic)) return;
-      state.extractionPreview = result;
-      var sourceWarning = extractionSelectedSourceEmptyWarning(result, state.extractionSource, payload.spec);
-      state.message = {
-        type: result.ok ? (sourceWarning ? 'warning' : 'ok') : 'error',
-        text: result.ok ? (sourceWarning || t('extractionCompleted')) : draftPreviewResultErrorText(result),
-        diagnostic: result.ok ? null : result.diagnostic
-      };
-      renderDesigner();
+    state.extractionOperation = operation;
+    state.message = null;
+    renderDesigner();
+    return requestDraftPreview(authoringPreviewPath({ includeDiagrams: false, extractionSource: source }), payload, params, undefined, owner).then(function (result) {
+      if (state.extractionOperation !== operation || !extractionIsRunning()) return;
+      state.extractionPreview = Object.assign({}, result, { operation: operation,
+        errorText: result.ok ? '' : draftPreviewResultErrorText(result),
+        captureDetails: extractionCaptureDetails(result, payload.spec, source) });
     }).catch(function (error) {
-      if (!uiDiagnosticIsCurrent(error.diagnostic || { owner: owner })) return;
-      state.extractionPreview = null;
+      if (state.extractionOperation !== operation || !extractionIsRunning()) return;
       state.lastDraftPreviewOk = false;
       setUiError(error, draftPreviewErrorText(error));
-      renderDesigner();
+      state.extractionPreview = { ok: false, operation: operation,
+        errorText: state.message && state.message.text || draftPreviewErrorText(error), diagnostic: error.diagnostic,
+        captureDetails: extractionCaptureDetails({}, payload.spec, source) };
+      state.message = null;
+    }).finally(function () {
+      if (state.extractionOperation !== operation) return;
+      state.extractionOperation = null;
+      if (uiDiagnosticIsCurrent({ owner: owner })) renderDesigner();
     });
   }
 
@@ -30481,6 +30707,22 @@ function dynamicPagesClientScript() {
   function saveTemplateSnapshot(payload, savedDiagramEditorState) {
     var owner = uiRequestOwner();
     var exists = Boolean(state.selectedTemplate && state.selectedTemplate.id);
+    var staged = state.stagedTemplateTransfer && stagedTemplateTransfer();
+    var replacement = staged && staged.replacement;
+    if (staged) {
+      if (replacement && (!exists || String(state.selectedTemplate.id) !== String(replacement.targetId)) || !replacement && exists) {
+        setUiError(new Error(t('transferInvalid')));
+        renderDesigner();
+        return;
+      }
+      if (replacement) {
+        payload.transferReplace = replacement;
+        delete payload.expectedSpecHash;
+        delete payload.active;
+      } else {
+        payload.active = false;
+      }
+    }
     var saveScope = runtimeSettingsScope();
     var editorInstance = Number(state.templateEditorInstance || 0);
     var saveToken = {};
@@ -30496,8 +30738,23 @@ function dynamicPagesClientScript() {
     renderDesigner();
     request(path, { method: exists ? 'PUT' : 'POST', body: payload, owner: owner }).then(function (result) {
       if (!sameEditor()) return;
+      var transferError = replacement && !result.ok && result.json && result.json.code;
+      if (transferError === 'template_transfer_revision_conflict' || transferError === 'template_transfer_incomplete') {
+        var canRender = Number(state.uiDiagnosticRevision || 0) === owner.revision || captureVisibleDesignerState();
+        var draft = templateTransferDraft();
+        draft.saveIssues = Array.isArray(result.json.issues) ? result.json.issues : [];
+        draft.message = t(transferError === 'template_transfer_revision_conflict' ? 'transferSaveConflict' : 'transferSaveIncomplete');
+        state.savingTemplate = false;
+        state.message = { type: 'error', text: draft.message };
+        if (canRender) renderDesigner(); else refreshTemplateTransfer();
+        return;
+      }
       validateUiResponse(result, 'save');
       if (!result.ok) throw createRequestError(result);
+      if (staged) {
+        state.stagedTemplateTransfer = null;
+        state.templateTransfer = null;
+      }
       var unchanged = Number(state.uiDiagnosticRevision || 0) === owner.revision;
       if (!unchanged || !uiDiagnosticIsCurrent({ owner: owner })) {
         captureVisibleDesignerState();
@@ -30514,6 +30771,7 @@ function dynamicPagesClientScript() {
       }
       state.selectedTemplate = result.json.template;
       state.templateDirty = false;
+      state.assistantFlowApplied = false;
       var executionValidation = result.json.executionValidation || {};
       var saveMessage = result.json.cacheInvalidation && result.json.cacheInvalidation.complete === false
         ? { type: 'error', text: t('diagramImportCacheInvalidationPartial') }
@@ -30565,7 +30823,6 @@ function dynamicPagesClientScript() {
   }
 
   function captureAssistantObjectFlow() {
-    captureAssistantPromptsFromDom();
     if (!state.assistantFlowProposal) throw new Error(t('assistantNoFlowProposal'));
     return cloneJsonValue(state.assistantFlowProposal, { version: 1, selections: [], blocks: [] });
   }
@@ -30764,7 +31021,8 @@ function dynamicPagesClientScript() {
     state.assistantFlowBusy = true;
     state.assistantFlowResume = resume;
     resetAssistantObjectFlowProposal({ preserveResume: true });
-    state.message = { type: 'ok', text: t('assistantGeneratingTitle') };
+    state.assistantFlowBusyText = t('flowSemanticInProgress');
+    state.message = { type: 'ok', text: state.assistantFlowBusyText, owner: operationOwner };
     renderDesigner();
 
     function requestSemanticPlanStage(stage) {
@@ -30816,7 +31074,8 @@ function dynamicPagesClientScript() {
         state.assistantFlowSemanticPlan = cloneJsonValue(result.json.semanticPlan, { version: 1, blocks: [] });
         state.assistantFlowExplanation = String(result.json.explanation || '');
         state.assistantFlowWarnings = Array.isArray(result.json.warnings) ? result.json.warnings.map(String).filter(Boolean) : [];
-        state.message = { type: 'ok', text: assistantCompletionText(result.json, t('assistantFlowReady')) };
+        state.assistantFlowRequestDiagnostic = result.diagnostic || null;
+        state.message = { type: 'ok', text: assistantCompletionText(result.json, t('assistantSemanticPlanReady')), owner: operationOwner, diagnosticOwner: 'assistantFlow' };
       });
     }
 
@@ -30833,15 +31092,20 @@ function dynamicPagesClientScript() {
       }
       setUiError(error);
     }).finally(function () {
-      var currentOwner = uiRequestOwner();
-      if (Number(state.assistantFlowRequestGeneration || 0) !== requestGeneration ||
-          ['root', 'rootSelectionGeneration', 'editorInstance', 'sessionInstance', 'templateCode'].some(function (key) {
-            return operationOwner[key] !== currentOwner[key];
-          })) return;
-      state.assistantFlowBusy = false;
-      if (!uiDiagnosticIsCurrent({ owner: operationOwner }) && !captureVisibleDesignerState()) return;
-      renderDesigner();
+      finishAssistantFlowOperation(requestGeneration, operationOwner);
     });
+  }
+
+  function finishAssistantFlowOperation(requestGeneration, operationOwner) {
+    var currentOwner = uiRequestOwner();
+    if (Number(state.assistantFlowRequestGeneration || 0) !== requestGeneration ||
+        ['root', 'rootSelectionGeneration', 'editorInstance', 'sessionInstance', 'templateCode'].some(function (key) {
+          return operationOwner[key] !== currentOwner[key];
+        })) return;
+    state.assistantFlowBusy = false;
+    state.assistantFlowBusyText = '';
+    if (!uiDiagnosticIsCurrent({ owner: operationOwner }) && !captureVisibleDesignerState()) return;
+    renderDesigner();
   }
 
   function generateAssistantObjectFlow(retry) {
@@ -30874,7 +31138,11 @@ function dynamicPagesClientScript() {
     state.assistantFlowErrorStage = '';
     state.assistantFlowCanApply = false;
     state.assistantFlowOutputBindings = [];
-    state.message = { type: 'ok', text: t('assistantGeneratingTitle') };
+    state.assistantFlowRequestDiagnostic = null;
+    state.assistantFlowApplied = false;
+    state.assistantFlowInvalidated = false;
+    state.assistantFlowBusyText = t('flowPlanInProgress');
+    state.message = { type: 'ok', text: state.assistantFlowBusyText, owner: operationOwner };
     renderDesigner();
     request(apiPrefix + '/assistant/object-flow/plan?root=' + encodeURIComponent(state.root || 'Cst_QueryTool'), {
       method: 'POST', timeoutMs: assistantRequestTimeoutMs(1),
@@ -30888,6 +31156,7 @@ function dynamicPagesClientScript() {
         editorDelta: assistantEditorDeltaClient(requestSpec)
       }
     }).then(function (result) {
+      if (!uiDiagnosticIsCurrent({ owner: operationOwner })) return;
       var mismatch = assistantTemplateRevisionMismatch(requestRevision);
       if (mismatch === 'request') throw assistantTemplateRevisionError(requestRevision);
       if (!result.ok && result.json && result.json.retryable) {
@@ -30921,29 +31190,49 @@ function dynamicPagesClientScript() {
         }).filter(function (binding) { return binding.blockId && binding.alias; })
         : [];
       state.assistantFlowErrors = Array.isArray(result.json.ownershipErrors) ? result.json.ownershipErrors : [];
+      if (result.diagnostic) state.assistantFlowRequestDiagnostic = Object.assign({}, result.diagnostic, {
+        errors: state.assistantFlowErrors,
+        diagnostics: Object.assign({}, result.diagnostic.diagnostics, { canApply: state.assistantFlowCanApply })
+      });
       state.assistantFlowFeedback = state.assistantFlowErrors.length
         ? assistantFlowOwnershipFeedback(state.assistantFlowErrors)
         : null;
       state.assistantFlowErrorStage = state.assistantFlowErrors.length ? 'ownership' : '';
       state.assistantFlowResume = Object.assign({}, resume, { retryable: false, retryStage: '' });
-      state.message = state.assistantFlowErrors.length
-        ? { type: 'error', text: t('assistantFlowOwnershipIncomplete') }
-        : { type: 'ok', text: assistantCompletionText(result.json, t('assistantFlowReady')) };
+      state.message = !state.assistantFlowCanApply
+        ? { type: 'error', text: state.assistantFlowErrors.length ? t('assistantFlowOwnershipIncomplete') : t('flowApplyNotAllowed'), owner: operationOwner, diagnosticOwner: 'assistantFlow' }
+        : { type: 'ok', text: assistantCompletionText(result.json, t('assistantFlowReady')), owner: operationOwner, diagnosticOwner: 'assistantFlow' };
     }).catch(function (error) {
+      if (!uiDiagnosticIsCurrent({ owner: operationOwner }) || Number(state.assistantFlowRequestGeneration || 0) !== requestGeneration) return;
       if (resume && error && error.code === 'request_timeout') {
         setAssistantObjectFlowPlanRetryState(resume, {}, 'gateway', error.diagnostic);
         return;
       }
       setUiError(error);
     }).finally(function () {
-      if (Number(state.assistantFlowRequestGeneration || 0) === requestGeneration) state.assistantFlowBusy = false;
-      renderDesigner();
+      finishAssistantFlowOperation(requestGeneration, operationOwner);
     });
   }
 
+  function assistantFlowApplyIsCurrent(operation) {
+    if (!operation || state.assistantFlowApplyOperation !== operation || !uiDiagnosticIsCurrent({ owner: operation.owner })) return false;
+    var selected = state.selectedTemplate || {};
+    return selected.id === operation.templateId && selected.specHash === operation.baseSpecHash
+      && !assistantTemplateRevisionMismatch(operation.revision)
+      && stableClientJsonStringify(state.assistantFlowProposal) === operation.flowFingerprint
+      && stableClientJsonStringify(state.assistantObjectFlowIntent) === operation.intentFingerprint
+      && stableClientJsonStringify(state.assistantFlowOutputBindings) === operation.bindingsFingerprint;
+  }
+
+  function assistantFlowApplyPending() {
+    return assistantFlowApplyIsCurrent(state.assistantFlowApplyOperation);
+  }
+
   function applyAssistantObjectFlow() {
-    if (state.assistantFlowBusy || !state.assistantFlowCanApply) {
-      state.message = { type: 'error', text: t('assistantFlowApplyUnavailable') };
+    var operationOwner = uiRequestOwner();
+    var status = assistantFlowApplyStatus();
+    if (status.disabled) {
+      state.message = { type: 'error', text: status.text, owner: operationOwner };
       renderDesigner();
       return;
     }
@@ -30953,50 +31242,48 @@ function dynamicPagesClientScript() {
       return;
     }
     var flow;
-    try { flow = captureAssistantObjectFlow(); } catch (error) {
+    try {
+      captureAssistantPromptsFromDom();
+      flow = captureAssistantObjectFlow();
+      updateSelectedFromEditor(assistantSpecWithPrompts(state.selectedTemplate.spec || defaultSpec()));
+    } catch (error) {
       setUiError(error);
       renderDesigner();
       return;
     }
     var requestGeneration = Number(state.assistantFlowRequestGeneration || 0) + 1;
     state.assistantFlowRequestGeneration = requestGeneration;
-    var requestFlowFingerprint = stableClientJsonStringify(flow);
+    var selected = state.selectedTemplate;
+    var requestSpec = selected.spec || defaultSpec();
+    var operation = {
+      owner: operationOwner, templateId: selected.id, baseSpecHash: selected.specHash,
+      revision: assistantTemplateRevisionSnapshot(selected, requestSpec, requestGeneration),
+      flowFingerprint: stableClientJsonStringify(flow),
+      intentFingerprint: stableClientJsonStringify(state.assistantObjectFlowIntent),
+      bindingsFingerprint: stableClientJsonStringify(state.assistantFlowOutputBindings)
+    };
+    state.assistantFlowApplyOperation = operation;
     state.assistantFlowBusy = true;
-    state.message = { type: 'ok', text: t('assistantGeneratingTitle') };
+    state.assistantFlowBusyText = t('flowApplyInProgress');
+    state.assistantFlowRequestDiagnostic = null;
+    state.message = null;
     renderDesigner();
-    Promise.resolve().then(function () {
-      captureAssistantPromptsFromDom();
-      updateSelectedFromEditor(assistantSpecWithPrompts(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec()));
-      var requestSpec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
-      var requestRevision = assistantTemplateRevisionSnapshot(
-        state.selectedTemplate,
-        requestSpec,
-        requestGeneration
-      );
-      var requestIntentFingerprint = stableClientJsonStringify(state.assistantObjectFlowIntent);
-      var requestOutputBindingsFingerprint = stableClientJsonStringify(state.assistantFlowOutputBindings);
-      return request(apiPrefix + '/draft/object-flow/apply', {
+    return request(apiPrefix + '/draft/object-flow/apply', {
       method: 'POST', timeoutMs: 30000,
+      action: 'assistant.objectFlowApply', phase: 'apply', owner: operationOwner,
       body: {
-        root: state.root,
+        root: operationOwner.root,
         currentSpec: requestSpec,
         flow: flow,
         assistantOutputBindings: state.assistantFlowOutputBindings,
         assistantObjectFlowIntent: state.assistantObjectFlowIntent,
-        templateCode: state.selectedTemplate && state.selectedTemplate.code || '',
-        baseSpecHash: state.selectedTemplate && state.selectedTemplate.specHash || ''
+        templateCode: selected.code,
+        baseSpecHash: selected.specHash || ''
       }
-      }).then(function (result) {
-      var mismatch = assistantTemplateRevisionMismatch(requestRevision);
-      if (mismatch === 'request') throw assistantTemplateRevisionError(requestRevision);
-      if (stableClientJsonStringify(state.assistantFlowProposal) !== requestFlowFingerprint
-        || stableClientJsonStringify(state.assistantObjectFlowIntent) !== requestIntentFingerprint
-        || stableClientJsonStringify(state.assistantFlowOutputBindings) !== requestOutputBindingsFingerprint) {
-        throw assistantTemplateRevisionError(Object.assign({}, requestRevision, { requestGeneration: -1 }));
-      }
-      if (!result.ok || !result.json || !result.json.spec) throw createRequestError(result);
-      var staleError = assistantTemplateRevisionError(requestRevision);
-      if (staleError) throw staleError;
+    }).then(function (result) {
+      if (!assistantFlowApplyIsCurrent(operation)) return;
+      validateUiResponse(result, 'object-flow-apply');
+      if (!result.ok) throw createRequestError(result);
       updateSelectedFromEditor(result.json.spec);
       state.objectGroupDraft = null;
       state.relationDraft = null;
@@ -31012,14 +31299,20 @@ function dynamicPagesClientScript() {
       state.assistantFlowWarnings = [];
       state.assistantFlowOutputBindings = [];
       if (state.diagramImportProposal) state.diagramImportStale = true;
-      clearDraftExecutionState({ clearExtractionSource: true });
-      state.message = { type: 'ok', text: t('changesReadyToSave') };
-      });
+      clearDraftExecutionState();
+      state.extractionSource = selectedExtractionSource(state.selectedTemplate.spec);
+      state.templateDirty = true;
+      state.assistantFlowApplied = true;
+      state.assistantFlowRequestDiagnostic = result.diagnostic || null;
+      state.message = null;
     }).catch(function (error) {
+      if (!assistantFlowApplyIsCurrent(operation)) return;
       setUiError(error);
+      state.assistantFlowRequestDiagnostic = error.diagnostic || null;
+      if (state.message) Object.assign(state.message, { owner: operationOwner, diagnosticOwner: 'assistantFlow' });
     }).finally(function () {
-      if (Number(state.assistantFlowRequestGeneration || 0) === requestGeneration) state.assistantFlowBusy = false;
-      renderDesigner();
+      if (state.assistantFlowApplyOperation === operation) state.assistantFlowApplyOperation = null;
+      finishAssistantFlowOperation(requestGeneration, operationOwner);
     });
   }
 
@@ -31818,42 +32111,41 @@ function dynamicPagesClientScript() {
     // Selecting a saved template must restore the same persisted deterministic
     // D2 analysis as loadDesigner(). Without this, source survives selection
     // but its analyzed roles and preview are lost until the user re-analyzes.
+    var versionOwner = templateVersionOwner();
+    var versions = fetchVersions(versionOwner.code, versionOwner);
     renderDesigner();
-    return restoreDiagramImportAssistantCheckpoint().then(function () {
-      return fetchVersions(code);
-    }).then(function () {
-      if (!state.selectedTemplate || String(state.selectedTemplate.code || '') !== String(code || '')) return;
+    return Promise.all([restoreDiagramImportAssistantCheckpoint(), versions]).then(function () {
+      if (!templateVersionOwnerIsCurrent(versionOwner)) return;
       if (Number(state.diagramImportEditorMutationRevision || 0) !== editorMutationRevision) return;
       renderDesigner();
     });
   }
 
-  function loadVersion(versionId) {
+  function loadVersion(versionId, generation) {
+    var owner = state.templateVersionsOwner;
+    if (!templateVersionOwnerIsCurrent(owner) || String(owner.generation) !== String(generation) || state.savingTemplate || stagedTemplateTransfer()) return;
     var version = state.templateVersions.find(function (item) { return String(item.id) === String(versionId); });
-    if (!version) return;
+    if (!version || version.templateCode !== owner.code) return;
     var selected = state.selectedTemplate || {};
-    state.selectedTemplate = {
-      id: selected.id,
-      code: selected.code,
-      description: selected.description,
-      active: selected.active !== false,
+    state.selectedTemplate = Object.assign({}, selected, {
       spec: version.spec || selected.spec || defaultSpec(),
       paramsSchema: selected.paramsSchema || {},
-      resultSchema: selected.resultSchema || {},
-      specHash: selected.specHash
-    };
+      resultSchema: selected.resultSchema || {}
+    });
     state.objectGroupDraft = null;
     state.relationDraft = null;
     state.objectGroupExpandedSelectionId = '';
     state.relationExpandedOperationId = '';
     state.viewComposerDraft = null;
     state.paramRowsDraft = null;
-    state.extractionPreview = null;
-    state.extractionSource = '';
+    clearDraftExecutionState({ clearExtractionSource: true });
     state.checkedClass = null;
     state.classCheckResult = null;
     state.classAttributes = [];
     hydrateDesignerStateFromTemplate({ replaceRunParams: true });
+    state.templateDirty = true;
+    state.templateVersionsGeneration = Number(state.templateVersionsGeneration || 0) + 1;
+    state.templateVersionsOwner = Object.assign({}, templateVersionOwner(), { generation: state.templateVersionsGeneration });
     state.message = { type: 'ok', text: t('versionLoaded') };
     state.designerSection = 'template';
     if (window.history && window.history.pushState) window.history.pushState({ designerSection: 'template' }, '', designerSectionUrl('template'));
@@ -32561,11 +32853,11 @@ function dynamicPagesClientScript() {
     if (action === 'preview-template') runUiOperation(action, function () { runDraftAction('preview'); });
     if (action === 'assistant-generate') runUiOperation(action, function () { generateAssistantDraft(); });
     if (action === 'assistant-apply-draft') runUiMutation(function () { applyAssistantDraft(); });
-    if (action === 'assistant-flow-prepare') runUiOperation(action, function () { prepareAssistantObjectFlowSemanticPlan(); });
-    if (action === 'assistant-flow-prepare-retry') runUiOperation(action, function () { prepareAssistantObjectFlowSemanticPlan(true); });
-    if (action === 'assistant-flow-generate') runUiOperation(action, function () { generateAssistantObjectFlow(); });
-    if (action === 'assistant-flow-generate-retry') runUiOperation(action, function () { generateAssistantObjectFlow(true); });
-    if (action === 'assistant-flow-apply') runUiOperation(action, function () { applyAssistantObjectFlow(); });
+    if (action === 'assistant-flow-prepare' && !state.assistantFlowBusy) runUiOperation(action, function () { prepareAssistantObjectFlowSemanticPlan(); });
+    if (action === 'assistant-flow-prepare-retry' && !state.assistantFlowBusy) runUiOperation(action, function () { prepareAssistantObjectFlowSemanticPlan(true); });
+    if (action === 'assistant-flow-generate' && !state.assistantFlowBusy) runUiOperation(action, function () { generateAssistantObjectFlow(); });
+    if (action === 'assistant-flow-generate-retry' && !state.assistantFlowBusy) runUiOperation(action, function () { generateAssistantObjectFlow(true); });
+    if (action === 'assistant-flow-apply' && !state.assistantFlowBusy) runUiOperation(action, function () { applyAssistantObjectFlow(); });
     if (action === 'assistant-flow-block-add') runUiMutation(function () { addAssistantObjectFlowBlock(); });
     if (action === 'assistant-flow-block-remove') runUiMutation(function () { removeAssistantObjectFlowBlock(target.getAttribute('data-block-index')); });
     if (action === 'assistant-template-prompt-override') {
@@ -32613,7 +32905,7 @@ function dynamicPagesClientScript() {
     if (action === 'apply-params') runUiMutation(function () { applyParamsEditor(); });
     if (action === 'fill-param-examples') runUiMutation(function () { fillParamExamples(); });
     if (action === 'clear-param-row') runUiMutation(function () { clearParamRow(target); });
-    if (action === 'extract-template') runUiOperation(action, function () { extractByTemplate(); });
+    if (action === 'extract-template' && !assistantFlowApplyPending() && !extractionIsRunning()) runUiOperation(action, function () { extractByTemplate(); });
     if (action === 'apply-extraction') runUiMutation(function () { applyExtractionEditor(); });
     if (action === 'preview-extraction') runUiMutation(function () { previewExtraction(); });
     if (action === 'add-selection-filter-row') runUiMutation(function () { addSelectionFilterRow(); });
@@ -32660,7 +32952,7 @@ function dynamicPagesClientScript() {
     if (action === 'check-class') runUiOperation(action, function () { checkClassByName(readValue('cmdp-class-check')); });
     if (action === 'apply-class-fallback') runUiMutation(function () { applyClassFallback(); });
     if (action === 'select-class') runUiOperation(action, function () { checkClassByName(target.getAttribute('data-class')); });
-    if (action === 'load-version') runUiOperation(action, function () { loadVersion(target.getAttribute('data-version')); });
+    if (action === 'load-version') runUiOperation(action, function () { loadVersion(target.getAttribute('data-version'), target.getAttribute('data-version-generation')); });
     if (action === 'schema-preview') runUiOperation(action, function () { previewSchema(); });
     if (action === 'bootstrap-schema') runUiOperation(action, function () { bootstrapSchema(); });
     if (action === 'save-config') runUiOperation(action, function () { saveConfig(); });
@@ -33038,9 +33330,10 @@ function dynamicPagesClientScript() {
         if (summaryName) summaryName.textContent = String(event.target.value || '');
         refreshAssistantFlowDependencyPickerLabels();
       }
-      resetAssistantObjectFlowProposal();
-      var flowApplyButton = document.querySelector('button[data-action="assistant-flow-apply"]');
-      if (flowApplyButton) flowApplyButton.disabled = true;
+      resetAssistantObjectFlowProposal({ invalidated: true });
+      refreshAssistantFlowApplyStatus();
+      var flowProposal = document.querySelector('[data-assistant-flow-proposal]');
+      if (flowProposal) flowProposal.remove();
       var rejectedFlowPreview = document.querySelector('[data-assistant-flow-rejected]');
       if (rejectedFlowPreview) rejectedFlowPreview.remove();
       markAssistantAuthoringChanged();
@@ -33176,7 +33469,7 @@ function dynamicPagesClientScript() {
     }
     if (event.target && event.target.matches && event.target.matches('[data-assistant-flow-field="uses"]')) {
       state.assistantObjectFlowIntent = readAssistantObjectFlowIntentFromDom();
-      resetAssistantObjectFlowProposal();
+      resetAssistantObjectFlowProposal({ invalidated: true });
       markAssistantAuthoringChanged();
       renderDesigner();
     }
@@ -33322,8 +33615,14 @@ function dynamicPagesClientScript() {
       selectClassFromCatalog(target.value);
     }
     if (target.id === 'cmdp-extraction-source') {
-      state.extractionSource = target.value;
-      renderDesigner();
+      if (assistantFlowApplyPending() || state.extractionSource === target.value) return;
+      runUiMutation(function () {
+        state.extractionSource = target.value;
+        state.extractionPreview = null;
+        state.extractionOperation = null;
+        renderDesigner();
+      });
+      return;
     }
     if (target.id === 'cmdp-view-source') {
       var viewDraft = captureViewComposerDraftFromDom();
@@ -33441,6 +33740,7 @@ function readJsonBody(req, maxBytes = 64 * 1024) {
         resolve(body);
       } catch (error) {
         if (error.code === 'input_collection_limit') {
+          if (assistantCapture?.draft) initializeAssistantTrace(assistantCapture, body, false);
           logWarn('security.input_collection_limit', {
             requestId: currentRequestId(), method: req.method, path: sanitizeReqUrl(req),
             collection: error.details, limits: INPUT_COLLECTION_LIMITS
@@ -58801,11 +59101,95 @@ function queueAssistantTraceSave(capture) {
   return capture.queue;
 }
 
-function initializeAssistantTrace(capture, body = {}) {
+function assistantTraceIdentifier(value) {
+  return typeof value === 'string' && /^[A-Za-z_][A-Za-z0-9_]{0,255}$/.test(value.trim()) ? value.trim() : undefined;
+}
+
+function assistantTraceCounts(source, keys) {
+  return Object.fromEntries(keys.flatMap((key) => {
+    const value = source?.[key];
+    return Number.isSafeInteger(value) && value >= 0 ? [[key, value]] : [];
+  }));
+}
+
+const ASSISTANT_APPLY_TRACE_CODES = new Set([
+  'template_save_required', 'template_version_conflict', 'object_flow_invalid',
+  'object_flow_diagram_source_stale', 'object_flow_spec_invalid', 'input_collection_limit',
+  'invalid_json_body', 'assistant_output_bindings_invalid'
+]);
+
+function assistantApplyTraceCode(status, payload) {
+  if (status < 400) return 'applied';
+  if (ASSISTANT_APPLY_TRACE_CODES.has(payload.code)) return payload.code;
+  if (ASSISTANT_APPLY_TRACE_CODES.has(payload.reason)) return payload.reason;
+  return status >= 500 ? 'apply_error' : 'apply_rejected';
+}
+
+function draftExtractionSource(requestUrl) {
+  const query = requestUrl.searchParams;
+  return query.get('includeDiagrams') === 'false' && query.get('executionScope') !== 'diagrams'
+    ? (query.get('extractionSource') || '').trim() : '';
+}
+
+function captureAssistantExtractionSpec(capture, spec) {
+  if (capture?.trace?.mode !== 'Verbose') return;
+  const tables = Array.isArray(spec.result?.tables) ? spec.result.tables : [];
+  capture.selectedExtractionAlias = tables.some((table) => table.name === capture.extractionSource)
+    ? assistantTraceIdentifier(capture.extractionSource) : undefined;
+  finishAssistantSpan(capture.bffSpan, { request: {
+    executionScope: 'tables',
+    extractionSource: capture.selectedExtractionAlias,
+    tableCount: tables.length,
+    steps: (Array.isArray(spec.steps) ? spec.steps : []).map((step, index) => ({
+      index,
+      type: assistantTraceIdentifier(step.type),
+      as: assistantTraceIdentifier(step.as),
+      className: assistantTraceIdentifier(step.className || step.targetClass),
+      filterCount: Array.isArray(step.filters || step.where) ? (step.filters || step.where).length : 0,
+      ...assistantTraceCounts(step, ['limit'])
+    }))
+  } }, capture);
+}
+
+const ASSISTANT_EXTRACTION_LIMIT_KEYS = [
+  'maxRows', 'maxRowsMax', 'maxSelectionScanRows', 'maxSelectionScanRowsMax', 'maxRelationsPerCard',
+  'maxRelationsPerCardMax', 'maxRestCalls', 'maxRestCallsMax', 'maxTraversalDepth', 'maxTraversalDepthMax',
+  'maxClasses', 'maxClassesMax', 'maxDomains', 'maxDomainsMax', 'restCalls', 'requestTimeoutMs'
+];
+
+function assistantExtractionTraceResponse(capture, payload) {
+  // Never send the preview payload (including failed stage messages) through generic body redaction.
+  const result = payload.result;
+  const trace = Array.isArray(result?.trace) ? result.trace : [];
+  const table = capture.selectedExtractionAlias && Array.isArray(result?.tables)
+    ? result.tables.find((item) => item.name === capture.selectedExtractionAlias) : undefined;
+  return {
+    success: payload.success === true,
+    ...(result || capture.extractionLimits ? { result: {
+      limits: assistantTraceCounts(result?.limits || capture.extractionLimits, ASSISTANT_EXTRACTION_LIMIT_KEYS),
+      ...(table ? { selectedTable: { name: capture.selectedExtractionAlias, rows: Array.isArray(table.rows) ? table.rows.length : 0 } } : {}),
+      trace: trace.map((stage) => ({
+        ...assistantTraceCounts(stage, ['index', 'rows', 'columns', 'elapsedMs', 'restCalls']),
+        type: assistantTraceIdentifier(stage.type),
+        as: assistantTraceIdentifier(stage.as),
+        status: stage.status === 'error' ? 'error' : 'ok',
+        truncated: stage.truncated === true,
+        rowLimitReached: stage.rowLimitReached === true,
+        ...(stage.selectionScan ? { selectionScan: assistantTraceCounts(stage.selectionScan, ['scanLimit', 'scannedRows', 'availableTotal']) } : {}),
+        limitDiagnostics: (Array.isArray(stage.limitDiagnostics) ? stage.limitDiagnostics : [])
+          .filter((limit) => ASSISTANT_EXTRACTION_LIMIT_KEYS.includes(limit.limitName))
+          .map((limit) => ({ limitName: limit.limitName, ...assistantTraceCounts(limit, ['configuredLimit', 'returned', 'total']) }))
+      }))
+    } } : {})
+  };
+}
+
+function initializeAssistantTrace(capture, body = {}, includeRequest = true) {
   if (capture.initialized) return;
   capture.initialized = true;
   if (!REDIS_ENABLED) return;
-  const root = body.templateRef?.root || body.root || capture.root;
+  const root = capture.extractionSource ? capture.root
+    : (!capture.draft && body?.templateRef?.root) || body?.root || capture.root;
   try {
     capture.root = buildTechnicalSchema(root).root;
     const status = assistantCaptureController.snapshot(capture.root);
@@ -58813,22 +59197,28 @@ function initializeAssistantTrace(capture, body = {}) {
     if (!['Basic', 'Verbose'].includes(status.mode)) return;
     capture.policy = normalizeAssistantDiagnosticsPolicy(status.policy, ASSISTANT_DIAGNOSTICS_CAPS);
     const startedAt = new Date().toISOString();
+    const template = body?.template && typeof body.template === 'object' && !Array.isArray(body.template) ? body.template : body;
+    const templateCode = capture.extractionSource ? assistantTraceIdentifier(template?.code || template?.Code || 'DraftTemplate')
+      : capture.draft ? assistantTraceIdentifier(body?.templateCode)
+        : String(body?.templateRef?.templateCode || body?.templateCode || '');
     capture.storageStatus = 'pending';
     capture.trace = { id: crypto.randomUUID(), requestId: capture.requestId,
       captureGeneration: status.captureGeneration, storageEpoch: status.storageEpoch,
       expiresAt: new Date(Date.parse(startedAt) + capture.policy.retentionSec * 1000).toISOString(),
-      templateCode: String(body.templateRef?.templateCode || body.templateCode || ''), action: capture.action,
+      templateCode: templateCode || '', action: capture.action,
       mode: status.mode, startedAt, finishedAt: null, status: 'in_progress', statusCode: null,
       spans: [], capture: { activeUntil: status.activeUntil, policy: capture.policy } };
     const span = startAssistantSpan('bff', capture.action, { method: 'POST', path: capture.action }, capture);
     capture.bffSpan = span;
-    finishAssistantSpan(span, { request: body }, capture);
+    finishAssistantSpan(span, { request: includeRequest && !capture.draft ? body : undefined }, capture);
     queueAssistantTraceSave(capture);
   } catch { assistantTraceWarning(capture); }
 }
 
 function startAssistantSpan(kind, name, fields = {}, capture = assistantTraceContext.getStore()) {
   if (!capture?.trace || capture.warning || capture.closed || capture.discarded) return null;
+  // Deterministic authoring uses only its projected BFF span.
+  if (capture.draft && kind !== 'bff') return null;
   // The trace budget bounds span count as well as bodies, including Basic capture.
   if (capture.bytes + 512 > capture.policy.maxTraceBytes) {
     capture.trace.capture.truncated = true;
@@ -58943,10 +59333,14 @@ async function handleBackend(req, res, requestUrl) {
   if (requestUrl.pathname.startsWith(`${BACKEND_PREFIX}/assistant/diagnostics/`)) {
     return handleAssistantDiagnostics(req, res, requestUrl);
   }
-  if (requestUrl.pathname.startsWith(`${BACKEND_PREFIX}/assistant/`) && !assistantTraceContext.getStore()) {
+  const extractionSource = req.method === 'POST' && requestUrl.pathname.replace(/\/+$/, '') === `${BACKEND_PREFIX}/draft/preview`
+    ? draftExtractionSource(requestUrl) : '';
+  const draft = Boolean(extractionSource) || (req.method === 'POST' && requestUrl.pathname === `${BACKEND_PREFIX}/draft/object-flow/apply`);
+  if ((draft || requestUrl.pathname.startsWith(`${BACKEND_PREFIX}/assistant/`)) && !assistantTraceContext.getStore()) {
     const capture = { requestId: req.cmdpRequestId || currentRequestId() || crypto.randomUUID(),
       root: requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT,
       action: requestUrl.pathname.slice(BACKEND_PREFIX.length),
+      draft, extractionSource,
       authToken: backendAuthFromRequest(req, requestUrl).token,
       secrets: [LITELLM_API_KEY, backendAuthFromRequest(req, requestUrl).token].filter(Boolean),
       queue: Promise.resolve(), pending: null, saving: false, bytes: 0 };
@@ -59001,12 +59395,12 @@ async function validateTemplateTransferRawSteps(spec, parameters, { field, readC
     if (!origin) { unverified(path, `Cannot statically resolve row field ${name}.`); return null; }
     return origin.literal ? origin : { ...origin, attribute: await field(origin.className, origin.path, path) };
   };
-  const filters = async (source, values, path, alias) => {
+  const filters = async (source, values, path, step) => {
     for (const [index, filter] of (Array.isArray(values) ? values : []).entries()) {
-      const name = filter.path || filter.attribute || filter.column || filter.field;
+      const name = step.type === 'filterRows' ? filter.column || filter.field : filter.path || filter.attribute || filter.column || filter.field;
       const origin = await column(source, name, `${path}[${index}]`);
       if (origin && !origin.literal) {
-        filterReference(origin.attribute, filter, `${path}[${index}]`, alias);
+        filterReference(origin.attribute, filter, `${path}[${index}]`, step, name);
       }
     }
   };
@@ -59056,13 +59450,13 @@ async function validateTemplateTransferRawSteps(spec, parameters, { field, readC
         : readStepOrParam(step, parameters.values, 'targetClass', 'targetClassParam');
       source = step.type === 'expandRelations' ? await relationSource(step, left, path) : await cardSource(className, path);
       if (left) for (const [name, origin] of left.columns) source.columns.set(`Source_${name}`, origin);
-      await filters(source, step.filters || step.where, `${path}.${step.filters ? 'filters' : 'where'}`, step.as);
+      if (step.type === 'selectCards') await filters(source, step.filters || step.where, `${path}.${step.filters ? 'filters' : 'where'}`, step);
       for (const projection of normalizePathColumnSpecs(step.columns || step.cardColumns || step.outputColumns)) {
         const origin = await column(source, projection.path, `${path}.columns`);
         if (origin) source.columns.set(projection.as, origin);
       }
     } else if (step.type === 'filterRows') {
-      await filters(left, step.filters || step.where, `${path}.${step.filters ? 'filters' : 'where'}`, step.as);
+      await filters(left, step.filters || step.where, `${path}.${step.filters ? 'filters' : 'where'}`, step);
     } else if (['matchRows', 'semiJoinRows', 'existsRelatedRows', 'joinRows', 'intersectRows', 'differenceRows'].includes(step.type)) {
       const matching = ['matchRows', 'semiJoinRows', 'existsRelatedRows'].includes(step.type);
       const pairs = matching ? (step.rules || step.where || []).map((rule) => {
@@ -59199,27 +59593,56 @@ async function validateTemplateTransferTarget(authToken, root, spec, budget = { 
     return null;
   };
   const manifest = templateTransferDependencies(spec);
-  const references = templateTransferEnvironmentReferences(spec);
   const parameters = resolveTemplateParameters(spec);
+  const candidates = parameters.candidates.flatMap(templateTransferReferenceEntries);
+  const parameterPaths = new Set(candidates.map((candidate) => candidate.path));
+  const references = manifest.environmentReferences.filter((ref) => !parameterPaths.has(ref.path)
+    && (ref.kind === 'url' || !/^\$\.spec\.steps\[\d+\]\.(filters|where)\[/.test(ref.path)));
   const parameterTypes = new Map();
-  const selectionAliases = new Set(templateTransferSelections(spec).map(({ selection }) => selection.alias));
-  const rememberParameterType = (name, type) => {
-    if (!type) return;
+  const parameterSelectionLists = new Set();
+  const selectionRules = templateTransferSelectionRules(spec);
+  const mirrorKey = (alias, path, value) => stableJsonStringify([alias, path, value]);
+  const visualExpressions = new Set(selectionRules.map(({ selection, rule, valueKey }) => mirrorKey(selection.alias, rule.path, rule[valueKey])));
+  const rememberParameterType = (name, type, selectionList = false) => {
+    if (!type || typeof name !== 'string' || !name) return;
     if (!parameterTypes.has(name)) parameterTypes.set(name, new Map());
     parameterTypes.get(name).set(stableJsonStringify(type), type);
+    if (selectionList) parameterSelectionLists.add(name);
   };
   for (const [name, definition] of Object.entries(spec.params || {})) rememberParameterType(name, templateTransferReferenceType(definition));
-  const filterReference = (attr, filter, path, alias) => {
+  const expressionParameter = (value) => typeof value === 'string' && /^\$\{param\.([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\}$/.exec(value);
+  const addFilterExpression = (type, value, path, mirrored = false) => {
+    const parameter = expressionParameter(value);
+    if (parameter) rememberParameterType(parameter[1], type, true);
+    else if (typeof value === 'string' && value.includes('${')) {
+      // Previous-row references are resolved from target rows, not portable IDs.
+      if (value.includes('${param.')) issues.push(templateTransferIssue(path, 'template_transfer_dependency_unverified', 'The reference expression does not resolve to a single parameter or a literal list.'));
+    } else if (!mirrored && value !== undefined) {
+      references.push(...templateTransferReferenceEntries({ ...type, path, value, selectionList: !Array.isArray(value) }));
+    }
+  };
+  const filterReference = (attr, filter, path, step, fieldPath) => {
     const type = templateTransferReferenceType(attr);
     if (!type) return;
-    const key = Object.hasOwn(filter, 'valueExpression') ? 'valueExpression' : Object.hasOwn(filter, 'rightExpression') ? 'rightExpression' : 'value';
-    const value = filter[key];
-    const parameter = typeof value === 'string' && /^\$\{param\.([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(value);
-    if (parameter || filter.valueParam) rememberParameterType(parameter ? parameter[1] : filter.valueParam, type);
-    else if (!selectionAliases.has(alias) && /^[1-9][0-9]*$/.test(String(value))) references.push({ ...type, path: `${path}.${key}`, value });
+    const selection = step.type === 'selectCards';
+    const op = selection ? normalizeObjectGroupFilterOperator(filter) : filter.op;
+    if (selection ? ['matches', 'exists', 'isIpv4', 'isIpv4Network'].includes(op) : ['exists', 'notExists'].includes(op)) return;
+    // Mirror resolveSelectionExpected/getFilterExpected's own-property precedence.
+    const keys = ['valueParam', 'valuesParam', 'value', 'values'];
+    if (selection) keys.unshift('valueExpression', 'valueColumn', 'sourceColumn', 'fromColumn');
+    const key = keys.find((item) => Object.hasOwn(filter, item));
+    if (!key) return;
+    if (key === 'valueExpression') {
+      const mirrored = step.purpose === 'objectGroup' && visualExpressions.has(mirrorKey(step.as, fieldPath, filter[key]));
+      addFilterExpression(type, filter[key], `${path}.${key}`, mirrored);
+    } else if (key === 'valueParam' || key === 'valuesParam') {
+      rememberParameterType(filter[key], type, selection);
+    } else if (key === 'value' || key === 'values') {
+      references.push(...templateTransferReferenceEntries({ ...type, path: `${path}.${key}`, value: filter[key], selectionList: selection && !Array.isArray(filter[key]) }));
+    }
   };
   const addParameterReferences = () => {
-    for (const candidate of parameters.candidates) {
+    for (const candidate of candidates) {
       const types = parameterTypes.get(candidate.parameterName);
       const type = types?.size === 1 ? types.values().next().value
         : typeof candidate.value === 'string' && /^https?:\/\//i.test(candidate.value) ? { kind: 'url' } : null;
@@ -59227,7 +59650,8 @@ async function validateTemplateTransferTarget(authToken, root, spec, budget = { 
         if (candidate.effective && !issues.some((issue) => issue.path === candidate.path && issue.code === 'template_transfer_dependency_unverified')) issues.push(templateTransferIssue(candidate.path, 'template_transfer_dependency_unverified', `Parameter ${candidate.parameterName} has ambiguous reference targets.`));
         continue;
       }
-      if (type) references.push({ ...type, ...candidate });
+      if (type) references.push({ ...type, ...candidate, selectionList: parameterSelectionLists.has(candidate.parameterName)
+        && candidate.path === parameters.origins[candidate.parameterName] });
     }
   };
   try {
@@ -59252,14 +59676,11 @@ async function validateTemplateTransferTarget(authToken, root, spec, budget = { 
       }
     }
     const aliases = new Map((flow.selections || []).map((item) => [item.alias, item.className]));
-    for (const { selection, rule, valueKey, path, fieldPath } of templateTransferSelectionRules(spec)) {
+    for (const { selection, rule, valueKey, path, fieldPath } of selectionRules) {
         if (!rule.path) continue;
         const attr = await field(selection.className, rule.path, fieldPath);
-        const value = rule[valueKey];
-        filterReference(attr, rule, path.slice(0, path.lastIndexOf('.')), selection.alias);
-        if (attr && ['reference', 'lookup'].includes(attr.type) && value !== '' && value !== undefined && /^[1-9][0-9]*$/.test(String(value))) {
-          references.push({ path, value, kind: attr.type === 'lookup' ? 'lookup' : 'card', className: attr.targetClass || attr.targetType || '', lookupType: attr.lookupType || '' });
-        }
+        const type = templateTransferReferenceType(attr);
+        if (type && !['matches', 'exists', 'isIpv4', 'isIpv4Network'].includes(normalizeObjectGroupFilterOperator(rule))) addFilterExpression(type, rule[valueKey], path);
     }
     for (const [index, operation] of (flow.operations || []).entries()) {
       const source = aliases.get(operation.from);
@@ -59279,22 +59700,30 @@ async function validateTemplateTransferTarget(authToken, root, spec, budget = { 
       if (operation.alias && (target || source)) aliases.set(operation.alias, target || source);
     }
     addParameterReferences();
-    const checked = new Set();
+    const checked = new Map();
     for (const ref of [...new Map(references.map((item) => [item.path, item])).values()]) {
-      if (ref.effective === false) continue;
-      if (ref.kind !== 'url' && !/^[1-9][0-9]*$/.test(String(ref.value))) {
-        if (ref.value !== null && ref.value !== '') issues.push(templateTransferIssue(ref.path, 'template_transfer_reference_invalid', 'The effective reference must be a positive card or lookup ID.'));
-        continue;
-      }
-      const key = `${ref.kind}:${ref.className || ref.lookupType}:${ref.value}`;
-      if (checked.has(key)) continue;
-      checked.add(key);
-      if (ref.kind === 'card' && ref.className) {
-        const response = await request(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(ref.className)}/cards/${encodeURIComponent(ref.value)}`);
-        if (!response.ok || !response.json?.data || response.json.data._can_read === false) issues.push(templateTransferIssue(ref.path, 'template_transfer_card_unavailable', `Card ${ref.className}/${ref.value} is not readable in the target contour.`));
-      } else if (ref.kind === 'lookup' && ref.lookupType) {
-        const response = await request(`/cmdbuild/services/rest/v3/lookup_types/${encodeURIComponent(ref.lookupType)}/values/${encodeURIComponent(ref.value)}`);
-        if (!response.ok || !response.json?.data) issues.push(templateTransferIssue(ref.path, 'template_transfer_lookup_unavailable', `Lookup ${ref.lookupType}/${ref.value} is not readable in the target contour.`));
+      if (ref.effective === false || ref.kind === 'url') continue;
+      const { value } = ref;
+      if (!/\[\d+\]$/.test(ref.path) && (value === null || value === '')) continue;
+      const ids = ref.selectionList && typeof value === 'string' && value.includes(',')
+        ? normalizeSelectionExpected(value, true) : [value];
+      for (const id of ids) {
+        if (!isTemplateTransferReferenceId(id)) {
+          issues.push(templateTransferIssue(ref.path, 'template_transfer_reference_invalid', 'The effective reference must be a positive card or lookup ID.'));
+          continue;
+        }
+        const target = ref.className || ref.lookupType;
+        const key = `${ref.kind}:${target}:${id}`;
+        if (!checked.has(key)) {
+          const prefix = '/cmdbuild/services/rest/v3';
+          const endpoint = ref.kind === 'card'
+            ? `${prefix}/classes/${encodeURIComponent(target)}/cards/${encodeURIComponent(id)}`
+            : `${prefix}/lookup_types/${encodeURIComponent(target)}/values/${encodeURIComponent(id)}`;
+          const response = await request(endpoint);
+          const item = response.json?.data;
+          checked.set(key, response.ok && item && item._can_read !== false);
+        }
+        if (!checked.get(key)) issues.push(templateTransferIssue(ref.path, `template_transfer_${ref.kind}_unavailable`, `${ref.kind === 'card' ? 'Card' : 'Lookup'} ${target}/${id} is not readable in the target contour.`));
       }
     }
   } catch (error) {
@@ -59378,6 +59807,32 @@ async function prepareTemplateTransferD2(spec, validation) {
   return next;
 }
 
+function transferReplacementRevisionMatches(target, replacement) {
+  return target.card && String(target.card._id) === String(replacement.targetId)
+    && templateTransferTargetRevision(target.schema.root, target.card) === replacement.revision;
+}
+
+function sendTransferReplacementConflict(res) {
+  sendJson(res, 409, { success: false, code: 'template_transfer_revision_conflict',
+    message: 'The target template changed. Prepare the replacement again; no changes were saved.' });
+}
+
+function sendTransferReplacementIncomplete(res, issues) {
+  sendJson(res, 422, { success: false, code: 'template_transfer_incomplete',
+    message: 'An incomplete definition cannot replace an existing template.', issues });
+}
+
+async function verifyTransferReplacementTarget(authToken, res, target, templateCode, replacement) {
+  if (!target.card) { sendTransferReplacementConflict(res); return false; }
+  if (target.card._can_read === false || templateIsProtected(sanitizeTemplateCard(target.card))) {
+    sendJson(res, 403, { success: false, code: 'template_transfer_target_forbidden', message: 'The target template cannot be replaced by import.' });
+    return false;
+  }
+  if (!await requireTemplateUpdatePermission(authToken, res, target.schema, target.card, templateCode)) return false;
+  if (!transferReplacementRevisionMatches(target, replacement)) { sendTransferReplacementConflict(res); return false; }
+  return true;
+}
+
 async function handleTemplateTransfer(req, res, requestUrl, authToken) {
   if (!methodAllowed(req, res, 'POST') || !requireStateChangingRequest(req, res, authToken) || !requireJsonContentType(req, res)) return;
   const body = await readJsonBody(req, TEMPLATE_REQUEST_MAX_BYTES);
@@ -59397,7 +59852,11 @@ async function handleTemplateTransfer(req, res, requestUrl, authToken) {
     return;
   }
   if (!['new', 'replace'].includes(body.mode)) { sendJson(res, 400, { success: false, code: 'template_transfer_mode_invalid', message: 'Choose new or replace import mode.' }); return; }
-  let portable = readTemplateTransferPackage(body.package);
+  if (body.mode === 'replace' && (typeof body.targetCode !== 'string' || !body.targetCode.trim())) {
+    sendJson(res, 400, { success: false, code: 'template_transfer_target_required', message: 'Choose an existing target template.' });
+    return;
+  }
+  const portable = readTemplateTransferPackage(body.package);
   let code;
   try { code = validateCmdbuildIdentifier(String(body.targetCode || portable.code || '').trim(), 'template code'); }
   catch (error) { error.statusCode = 400; throw error; }
@@ -59406,9 +59865,9 @@ async function handleTemplateTransfer(req, res, requestUrl, authToken) {
   if (body.mode === 'new' && target.card) { sendJson(res, 409, { success: false, code: 'template_transfer_code_collision', message: `Template already exists: ${code}` }); return; }
   if (body.mode === 'replace' && !target.card) { sendJson(res, 404, { success: false, message: `Template not found: ${code}` }); return; }
   const existing = target.card ? sanitizeTemplateCard(target.card) : null;
-  if (existing && existing.protected) { sendJson(res, 403, { success: false, message: 'Protected templates cannot be replaced by import.' }); return; }
-  if (existing && (!isSpecHash(body.baseSpecHash) || body.baseSpecHash !== existing.specHash)) { sendJson(res, 409, { success: false, code: 'template_spec_conflict', message: 'The target template changed. Reload it before preparing replacement.' }); return; }
+  if (existing && (existing.protected || target.card._can_read === false)) { sendJson(res, 403, { success: false, code: 'template_transfer_target_forbidden', message: 'The target template cannot be replaced by import.' }); return; }
   if (existing ? !await requireTemplateUpdatePermission(authToken, res, target.schema, target.card, code) : !await requireTemplateClassPermission(authToken, res, target.schema, '_can_create')) return;
+  if (existing && (!isSpecHash(body.baseSpecHash) || body.baseSpecHash !== existing.specHash)) { sendJson(res, 409, { success: false, code: 'template_spec_conflict', message: 'The target template changed. Reload it before preparing replacement.' }); return; }
   // Resolve schema-typed literals before accepting overrides; arbitrary JSON paths are never writable.
   const budget = { calls: 0 };
   const validation = await validateTemplateTransferTarget(authToken, root, portable.spec, budget);
@@ -59423,7 +59882,8 @@ async function handleTemplateTransfer(req, res, requestUrl, authToken) {
     for (const override of overrides) {
       const reference = known.get(override.path);
       const valid = reference.kind === 'url' ? typeof override.value === 'string' && /^https?:\/\//i.test(override.value)
-        : (Number.isSafeInteger(override.value) && override.value > 0) || typeof override.value === 'string' && /^[1-9][0-9]*$/.test(override.value);
+        : isTemplateTransferReferenceId(override.value) || (reference.selectionList && typeof override.value === 'string'
+          && override.value.includes(',') && override.value.split(',').every((item) => isTemplateTransferReferenceId(item.trim())));
       if (!valid) throw Object.assign(new Error('Invalid typed card/lookup/URL override.'), { statusCode: 400 });
       if (reference.effective === false) shadowedOverrides.push(templateTransferIssue(override.path, 'template_transfer_override_shadowed', `Override does not reach runtime; the effective value comes from ${reference.shadowedBy || 'another parameter source'}.`));
       const item = rules.find((item) => item.path === override.path);
@@ -59449,7 +59909,9 @@ async function handleTemplateTransfer(req, res, requestUrl, authToken) {
     const template = { ...portable, code, description: body.description === undefined ? portable.description : String(body.description), active: existing ? existing.active : false, owner: existing ? existing.owner : session.data.username, updatedAt: existing ? existing.updatedAt : null, ...(existing ? { id: existing.id, specHash: existing.specHash } : {}), spec };
     const executionReady = execution.executable && !validation.issues.some((item) => item.severity === 'error');
     const checks = { status: validation.issues.length || validation.environmentReferences.length ? 'needsAttention' : 'ready', executionReady, issues: validation.issues, environmentReferences: validation.environmentReferences, summary: { restCalls: validation.calls, limits: validation.limits } };
-    const changes = { mode: body.mode, sourceCode: portable.code, targetCode: code, replacedSections: ['spec', 'paramsSchema', 'resultSchema', 'description'], previousSpecHash: existing ? existing.specHash : null, importedSpecHash: hashJson(spec) };
+    const changes = { mode: body.mode, sourceCode: portable.code, targetCode: code, replacedSections: ['spec', 'paramsSchema', 'resultSchema', 'description'],
+      previousSpecHash: existing ? existing.specHash : null, importedSpecHash: hashJson(spec),
+      ...(existing ? { targetId: existing.id, targetRevision: templateTransferTargetRevision(target.schema.root, target.card) } : {}) };
     logInfo('template.transfer.prepared', { requestId: req.cmdpRequestId || '', templateCode: code, mode: body.mode, status: checks.status, executionReady, issueCount: checks.issues.length });
     sendJson(res, 200, { success: true, template, checks, changes });
   }
@@ -60597,6 +61059,8 @@ async function handleBackendRequest(req, res, requestUrl) {
   if (requestUrl.pathname === `${BACKEND_PREFIX}/draft/object-flow/apply`) {
     if (!methodAllowed(req, res, 'POST')) return;
     if (!requireStateChangingRequest(req, res, authToken)) return;
+    const capture = assistantTraceContext.getStore();
+    if (capture) capture.captureEarlyResponse = true;
     if (!requireJsonContentType(req, res)) return;
     const body = await readJsonObjectBody(req, res, 512 * 1024);
     if (!body) return;
@@ -60614,6 +61078,11 @@ async function handleBackendRequest(req, res, requestUrl) {
     try {
       const localSpec = cloneJsonValueServer(body.currentSpec || authoring.template.spec || {}, {});
       const flow = normalizeObjectFlow(body.flow || {});
+      if (capture?.trace?.mode === 'Verbose') capture.applyCounts = {
+        selections: flow.selections.length,
+        matches: flow.blocks.length,
+        setOperations: flow.setOperations.length
+      };
       const errors = validateObjectFlow(flow);
       if (errors.length) {
         const error = new Error('Object-flow proposal failed deterministic validation.');
@@ -61642,6 +62111,8 @@ async function handleBackendRequest(req, res, requestUrl) {
     }
     if (!methodAllowed(req, res, 'POST')) return;
     if (!requireStateChangingRequest(req, res, authToken)) return;
+    const capture = assistantTraceContext.getStore();
+    if (capture) capture.captureEarlyResponse = true;
     if (!requireJsonContentType(req, res)) return;
 
     let draft;
@@ -61700,6 +62171,7 @@ async function handleBackendRequest(req, res, requestUrl) {
       return;
     }
 
+    captureAssistantExtractionSpec(capture, draft.spec);
     const root = requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
     const draftPreviewStartedAt = Date.now();
     const draftPreviewDeadlineAt = draftPreviewStartedAt + DRAFT_PREVIEW_TIMEOUT_MS;
@@ -61777,13 +62249,14 @@ async function handleBackendRequest(req, res, requestUrl) {
       maxTraversalDepthMax: executionLimits.maxTraversalDepthMax,
       includeDiagrams: includeDraftDiagrams,
       executionScope: draftExecutionScope,
-      extractionSource: draftExecutionScope === 'tables' ? String(requestUrl.searchParams.get('extractionSource') || '').trim() : '',
+      extractionSource: draftExtractionSource(requestUrl),
       allowPartialDiagramPreview: Boolean(partialDiagramPlan),
       partialDiagramOmissions: partialDiagramPlan ? partialDiagramPlan.omissions : [],
       partialDiagramRepairs: partialDiagramPlan ? partialDiagramPlan.repairs : [],
       executionDeadlineAt: draftPreviewDeadlineAt,
       executionDeadlineTimeoutMs: DRAFT_PREVIEW_TIMEOUT_MS
     };
+    if (capture?.trace?.mode === 'Verbose') capture.extractionLimits = previewExecutionOptions;
     const draftPreviewEffectiveLimits = {
       effectiveMaxRows: previewExecutionOptions.maxRows,
       effectiveMaxSelectionScanRows: previewExecutionOptions.maxSelectionScanRows,
@@ -62516,6 +62989,19 @@ async function handleBackendRequest(req, res, requestUrl) {
       if (!requireStateChangingRequest(req, res, authToken)) return;
       if (!requireJsonContentType(req, res)) return;
       const body = await readJsonBody(req, TEMPLATE_REQUEST_MAX_BYTES);
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        sendJson(res, 400, { success: false, message: 'Request body must be a JSON object.' });
+        return;
+      }
+      const isTransferReplace = Object.hasOwn(body, 'transferReplace');
+      const replacement = body.transferReplace;
+      if (isTransferReplace && (!replacement || typeof replacement !== 'object' || Array.isArray(replacement)
+          || !(isTemplateTransferReferenceId(replacement.targetId) || typeof replacement.targetId === 'string' && replacement.targetId.trim())
+          || typeof replacement.revision !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(replacement.revision)
+          || (body.code ?? body.Code ?? templateCode) !== templateCode)) {
+        sendJson(res, 400, { success: false, code: 'template_transfer_replace_invalid', message: 'A replacement requires the prepared target ID and revision for this template code.' });
+        return;
+      }
       const found = await findTemplateCard(authToken, root, templateCode);
       if (!found.response.ok) {
         if (sendTechnicalSchemaAccessDeniedIfNeeded(res, {
@@ -62531,18 +63017,21 @@ async function handleBackendRequest(req, res, requestUrl) {
         });
         return;
       }
-      if (!found.card) {
+      if (isTransferReplace) {
+        if (!await verifyTransferReplacementTarget(authToken, res, found, templateCode, replacement)) return;
+      } else if (!found.card) {
         sendJson(res, 404, {
           success: false,
           message: `Template not found: ${templateCode}`
         });
         return;
+      } else if (!await requireTemplateUpdatePermission(authToken, res, found.schema, found.card, templateCode)) {
+        return;
       }
-      if (!await requireTemplateUpdatePermission(authToken, res, found.schema, found.card, templateCode)) return;
 
       const expectedSpecHash = expectedSpecHashFromBody(body);
       const currentTemplate = sanitizeTemplateCard(found.card);
-      if (expectedSpecHash && currentTemplate && currentTemplate.specHash !== expectedSpecHash) {
+      if (!isTransferReplace && expectedSpecHash && currentTemplate && currentTemplate.specHash !== expectedSpecHash) {
         sendJson(res, 409, {
           success: false,
           reason: 'template_version_conflict',
@@ -62553,11 +63042,16 @@ async function handleBackendRequest(req, res, requestUrl) {
         });
         return;
       }
-      const session = await getSessionData(authToken);
+      const session = isTransferReplace ? await requireValidBackendSession(authToken, res) : await getSessionData(authToken);
+      if (!session) return;
       const storageOptions = { objectFlowOutcomes: [] };
       const rawSpec = body.spec !== undefined ? body.spec : body.SpecJson;
       const rawTemplateSpec = safeJsonValue(rawSpec, rawSpec);
       if (diagramAuthoringStatusForSpec(rawTemplateSpec).status === 'unsupported') {
+        if (isTransferReplace) {
+          sendTransferReplacementIncomplete(res, [templateTransferIssue('$.spec.authoring.d2', 'template_transfer_d2_unsupported', 'The D2 authoring contract requires fresh analysis.')]);
+          return;
+        }
         logWarn('template.authoring_unsupported', {
           requestId: req.cmdpRequestId || '',
           templateCode,
@@ -62575,10 +63069,14 @@ async function handleBackendRequest(req, res, requestUrl) {
         });
         return;
       }
-      let payload = normalizeTemplatePayload(body, templateCode, session.data && session.data.username, storageOptions);
-      if (body.owner === undefined && body.Owner === undefined && found.card.Owner !== undefined) payload.Owner = found.card.Owner;
-      let storedSpec = safeJsonValue(payload.SpecJson, null);
+      const payload = normalizeTemplatePayload(body, templateCode, session.data && session.data.username, storageOptions);
+      if (!isTransferReplace && body.owner === undefined && body.Owner === undefined && found.card.Owner !== undefined) payload.Owner = found.card.Owner;
+      const storedSpec = safeJsonValue(payload.SpecJson, null);
       if (diagramAuthoringStatusForSpec(storedSpec).status === 'unsupported') {
+        if (isTransferReplace) {
+          sendTransferReplacementIncomplete(res, [templateTransferIssue('$.spec.authoring.d2', 'template_transfer_d2_unsupported', 'The D2 authoring contract requires fresh analysis.')]);
+          return;
+        }
         sendJson(res, 409, d2AuthoringCurrentContractRequiredPayload(storedSpec));
         return;
       }
@@ -62592,9 +63090,37 @@ async function handleBackendRequest(req, res, requestUrl) {
         return;
       }
       const executionChanged = executionSpecHash(currentTemplate.spec || {}) !== executionSpecHash(storedSpec);
+      const executionValidation = executionValidationForSpec(storedSpec);
+      let writePayload = payload;
+      if (isTransferReplace) {
+        const slot = acquireExecutionSlot(req, res, { action: 'template-transfer-replace', templateCode });
+        if (!slot) return;
+        try {
+          const validation = await validateTemplateTransferTarget(authToken, found.schema.root, storedSpec);
+          if (!executionValidation.executable || validation.issues.some((issue) => issue.severity === 'error')) {
+            sendTransferReplacementIncomplete(res, validation.issues.concat(executionValidation.errors.map((issue) =>
+              templateTransferIssue(issue.path, 'template_transfer_execution_incomplete', issue.message))));
+            return;
+          }
+          // Catalog checks can take time. Re-read the revision and rights just before PUT.
+          const latest = await findTemplateCard(authToken, found.schema.root, templateCode);
+          if (!latest.response.ok) {
+            sendJson(res, 502, { success: false, code: 'template_transfer_target_unavailable', message: 'Could not verify the target before replacing it.' });
+            return;
+          }
+          if (!await verifyTransferReplacementTarget(authToken, res, latest, templateCode, replacement)) return;
+          writePayload = {
+            Description: typeof body.description === 'string' ? body.description : payload.Description,
+            SpecJson: payload.SpecJson, ParamsSchemaJson: payload.ParamsSchemaJson,
+            ResultSchemaJson: payload.ResultSchemaJson, UpdatedAt: new Date().toISOString()
+          };
+        } finally {
+          slot.release();
+        }
+      }
       const updated = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(found.schema.classNames.template)}/cards/${encodeURIComponent(found.card._id)}`, authToken, {
         method: 'PUT',
-        body: payload
+        body: writePayload
       });
       const versionLog = updated.ok
         ? await writeTemplateVersion(authToken, found.schema.root, payload.Code, storedSpec, session.data && session.data.username, body.changeComment || 'update')
@@ -62610,7 +63136,6 @@ async function handleBackendRequest(req, res, requestUrl) {
             { invalidated: 0, complete: true, skipped: true, reason: 'authoring_only' }
           ]
         : null;
-      const executionValidation = executionValidationForSpec(storedSpec);
       logInfo(updated.ok ? 'template.updated' : 'template.update_failed', {
         requestId: req.cmdpRequestId || '',
         templateCode: payload.Code,

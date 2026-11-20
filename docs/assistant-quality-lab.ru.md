@@ -1,5 +1,9 @@
 # Assistant Quality Lab
 
+Для раздельных проверок генерации Object Flow, D2 mapping и полной цепочки
+см. [пилот качества Assistant](assistant-quality-pilot.ru.md). Метрики пилота
+не объединяются с исторической симуляцией ниже.
+
 Автономный **abstract-stage-simulation**, не production baseline и не полноценное
 A/B-сравнение pipeline Assistant. Скрипт не импортирует backend, не читает ключи
 или `.env`, не обращается к CMDBuild. Production D2 binding replay реализуется

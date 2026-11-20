@@ -95,6 +95,11 @@ Use `CMDP_DIAGNOSTIC_MODE=Basic` for safe incident diagnostics. Use `Verbose` on
 
 Assistant capture is independent of `CMDP_DIAGNOSTIC_MODE`: `Off` by default,
 `Basic` for metadata, `Verbose` for bounded redacted request/response bodies too.
+Deterministic Apply is metadata-only in both modes: Verbose adds counts, not
+the draft, prompts, filter values, parameters or raw errors. If Apply was
+captured under Verbose before this change, stop capture and clear retained
+traces for the affected root to remove its stored copies. Clearing applies to
+all traces for that root; handle any previously downloaded exports separately.
 Redis-backed capture applies to **all users of the selected technical root**.
 Treat traces/exports as sensitive even after redaction; do not publish raw exports.
 

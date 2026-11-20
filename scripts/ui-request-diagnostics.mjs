@@ -56,14 +56,15 @@ export function createUiRequestDiagnostics() {
     'timeoutMs', 'durationMs', 'elapsedMs', 'maxBytes', 'actualBytes', 'restCalls', 'status', 'statusCode',
     'predicateIndex', 'index', 'min', 'max', 'maximum', 'configured', 'observed',
     'maxLength', 'actualLength', 'maxItems', 'actualItems', 'maxDepth', 'depth', 'requested', 'absoluteCap',
-    'upstreamStatus', 'maxTokens', 'prompt_tokens', 'completion_tokens', 'total_tokens', 'beforeBytes', 'afterBytes', 'beforeClasses', 'afterClasses'
+    'upstreamStatus', 'maxTokens', 'prompt_tokens', 'completion_tokens', 'total_tokens', 'beforeBytes', 'afterBytes', 'beforeClasses', 'afterClasses',
+    'rows', 'filterCount', 'returned'
   ];
   const identifierArrays = [
     'classNames', 'sourceFields', 'comparisonFields', 'availableDependencyIds',
     'supportedOperators', 'allowedOperators', 'supportedTypes', 'supported', 'aliases', 'availableAliases',
     'sourceEndpoint', 'targetEndpoint'
   ];
-  const booleanFields = ['timeout', 'truncated', 'limitHit', 'exceeded', 'retryable', 'classContextLimited', 'clamped'];
+  const booleanFields = ['timeout', 'truncated', 'limitHit', 'exceeded', 'retryable', 'classContextLimited', 'clamped', 'canApply'];
   function fields(input, depth = 0) {
     const source = object(input);
     const result = {};
@@ -74,7 +75,7 @@ export function createUiRequestDiagnostics() {
       if (Array.isArray(source[key])) result[key] = source[key].filter((item) => typeof item === 'string').slice(0, 16).map((item) => text(item));
     }
     if (depth < 2) {
-      for (const key of ['limits', 'errors', 'details', 'causes']) {
+      for (const key of ['limits', 'errors', 'details', 'causes', 'steps']) {
         if (Array.isArray(source[key])) result[key] = source[key].slice(0, 16).map((item) => fields(item, depth + 1));
       }
       for (const key of ['limit', 'catalogCompleteness', 'mcp', 'objectFlow', 'semanticContext', 'rootCause', 'llm', 'usage', 'contextAssembly']) {
@@ -133,11 +134,13 @@ export function createUiRequestDiagnostics() {
       truncated: source.truncated === true
     };
     const trace = object(source.assistantTrace);
+    if (typeof source.requestSent === 'boolean') result.requestSent = source.requestSent;
     if (typeof trace.traceId === 'string' || typeof trace.warning === 'string') {
       result.assistantTrace = {};
       for (const key of ['traceId', 'requestId', 'status', 'storageStatus', 'warning']) {
         if (typeof trace[key] === 'string') result.assistantTrace[key] = text(trace[key], key === 'warning' ? 512 : 128);
       }
+      if (['Basic', 'Verbose'].includes(trace.mode)) result.assistantTrace.mode = trace.mode;
     }
     if (typeof source.responseExcerpt === 'string' && bytes(source.responseExcerpt) > excerptLimit) result.truncated = true;
     return result;
@@ -151,7 +154,7 @@ export function createUiRequestDiagnostics() {
       time: new Date(now).toISOString(),
       method: typeof source.method === 'string' ? source.method.toUpperCase() : 'GET',
       durationMs: finite(source.startedAt) ? Math.max(0, now - source.startedAt) : null,
-      clientTimeoutMs: source.timeoutMs, clientRequestId: source.requestId
+      clientTimeoutMs: source.timeoutMs, clientRequestId: source.requestId, requestSent: source.requestSent
     };
   }
   function response(result, context) {

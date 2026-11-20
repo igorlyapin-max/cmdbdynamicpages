@@ -5108,7 +5108,7 @@ test('Assistant generates an ARM by router Location object group and preview ren
       throw new Error(`Assistant Object Flow apply did not start: ${JSON.stringify(diagnostic)} cause=${error.message || String(error)}`);
     }
     assert.equal(applyResponse.status(), 200, await applyResponse.text());
-    await page.waitForFunction(() => /изменения готовы|changes are ready/i.test(String(document.querySelector('.notice')?.textContent || '')), null, { timeout: 30_000 });
+    await page.waitForFunction(() => /цепочка применена|flow applied/i.test(String(document.querySelector('[data-assistant-flow-apply-status]')?.textContent || '')), null, { timeout: 30_000 });
 
     await page.locator('a[data-designer-section="extraction"]').click();
     await page.waitForSelector('#cmdp-extraction-editor', { timeout: 10_000 });
@@ -5125,7 +5125,7 @@ test('Assistant generates an ARM by router Location object group and preview ren
     const finalExtractionSource = extractionOptions.find((item) => item.text === 'АРМ в местоположении маршрутизатора')?.value || '';
     assert.ok(finalExtractionSource, `Extraction source options do not include a final matching stage: ${JSON.stringify(extractionOptions)}`);
     await page.locator('#cmdp-extraction-source').selectOption(finalExtractionSource);
-    const extractionPreviewRoute = /\/cmdbuild\/custom-api\/draft\/preview\?maxRows=100&includeDiagrams=false&extractionSource=[^&]+$/;
+    const extractionPreviewRoute = /\/cmdbuild\/custom-api\/draft\/preview\?maxRows=100&includeDiagrams=false&root=[^&]+&extractionSource=[^&]+$/;
     let delayedExtractionPreview = false;
     await page.route(extractionPreviewRoute, async (route) => {
       const response = await route.fetch();

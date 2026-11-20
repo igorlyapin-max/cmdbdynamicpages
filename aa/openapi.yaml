@@ -586,6 +586,9 @@ paths:
         cache. Нужны читаемый шаблон и совпадающий CAS base hash, но не update
         permission. Каждая selection и intermediate match stage возвращается как
         допустимый источник Diagram mapping.
+        При активном Assistant capture ответ может содержать diagnostics.assistantTrace.
+        Apply сохраняет только безопасные метаданные; даже Verbose не хранит
+        Spec, значения фильтров, параметры или тела запроса и ответа.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -730,9 +733,14 @@ paths:
         CMDB template. Хранилище принимает неполный `spec.authoring`; runtime и
         preview проходят строгую execution-валидацию. Runtime cache и static
         snapshots инвалидируются только при изменении executable Spec hash.
+        При наличии transferReplace применяется отдельная ветка: проверяются
+        identity, revision и права назначения, повторно валидируется итоговый
+        нормализованный spec, затем отправляется частичный PUT без Code, Active и Owner.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
+      parameters:
+        - $ref: "#/components/parameters/TemplateTransferRoot"
       requestBody:
         required: true
         content:
@@ -749,13 +757,35 @@ paths:
         "403":
           description: Нет Template update permission или не пройдена CSRF-проверка
         "409":
-          description: Шаблон изменился после его загрузки вызывающей стороной
+          description: Шаблон изменился после загрузки или после Prepare замены
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/TemplateVersionConflict"
+                oneOf:
+                  - $ref: "#/components/schemas/TemplateVersionConflict"
+                  - type: object
+                    required: [success, code, message]
+                    properties:
+                      success: { type: boolean, enum: [false] }
+                      code: { type: string, enum: [template_transfer_revision_conflict] }
+                      message: { type: string }
         "413":
           $ref: "#/components/responses/InputCollectionLimit"
+        "422":
+          description: Итоговое определение transferReplace не готово к выполнению; шаблон и история не изменены
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, code, message, issues]
+                properties:
+                  success: { type: boolean, enum: [false] }
+                  code: { type: string, enum: [template_transfer_incomplete] }
+                  message: { type: string }
+                  issues:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TemplateTransferIssue"
     delete:
       x-flow-id: OAPI24
       tags: [templates]
@@ -1274,6 +1304,12 @@ paths:
       x-flow-id: OAPI37
       tags: [templates]
       summary: Предварительный просмотр несохранённого черновика
+      description: >
+        Assistant capture применяется только к Extraction: includeDiagrams=false,
+        непустой extractionSource и без executionScope=diagrams. Trace scope задаётся
+        query-параметром root и кодом черновика (в том числе template.code).
+        Verbose trace хранит структурное описание и счётчики, но не параметры,
+        карточки или тексты ошибок выполнения.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -1286,6 +1322,10 @@ paths:
       responses:
         "200":
           description: Результат предварительного просмотра
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiResponse"
         "413":
           $ref: "#/components/responses/InputCollectionLimit"
   /cmdbuild/custom-api/draft/diagram-import/restore:
@@ -1970,13 +2010,15 @@ paths:
         При new проверяет право создания и отсутствие Code; новый черновик
         неактивен и не наследует identity источника. При replace обязательны
         существующий targetCode и baseSpecHash; identity, Code, activity,
-        ownership и history назначения сохраняются. baseSpecHash проверяется
-        при prepare и сохраняется как expectedSpecHash для последующего Save.
-        Только обычный Save записывает шаблон и версию. UI подтверждает замену
+        ownership и history назначения сохраняются. Prepare отклоняет устаревший
+        baseSpecHash и возвращает changes.targetId и changes.targetRevision для
+        явной ветки transferReplace при глобальном Save. Ревизия включает root,
+        ID, Code, Spec, Description, schemas, Active, Owner и UpdatedAt.
+        Только глобальный Save записывает шаблон и версию. UI подтверждает замену
         всего editor definition и каждую requiresConfirmation ссылку перед
-        staging. needsAttention не запрещает staging и Save незавершённого
-        определения; executionReady не подразумевается. Неподписанное/неполное
-        D2 mapping остаётся редактируемым; исполнение требует строгой проверки.
+        staging. Незавершённое определение можно открыть и исправить. Сохранение
+        незавершённого импорта допустимо только как нового неактивного шаблона.
+        Сохранение замены требует повторной проверки итоговой модели назначения.
         Нет LLM, автоматического Save/publish и миграции модели.
         Ограничение тела TEMPLATE_REQUEST_MAX_BYTES (CMDP_TEMPLATE_REQUEST_MAX_BYTES)
         совпадает с Save.
@@ -2348,7 +2390,7 @@ components:
       type: object
       required: [path, value, kind]
       properties:
-        path: { type: string, description: JSON path от $.spec }
+        path: { type: string, description: 'JSON path от $.spec; элементы массивов адресуются индексами [0], [1] и т. д.' }
         value:
           description: JSON-значение ID карточки/справочника или URL; сохраняет исходный JSON type
           nullable: true
@@ -2390,7 +2432,7 @@ components:
         baseSpecHash:
           type: string
           pattern: '^[a-f0-9]{64}$'
-          description: Обязателен для replace; хеш сохранённого spec назначения, затем expectedSpecHash при Save
+          description: Обязателен для replace; текущий хеш сохранённого spec назначения для проверки в Prepare
         description:
           type: string
           description: Необязательное описание; при отсутствии используется trimmed описание источника
@@ -2446,8 +2488,20 @@ components:
               items:
                 $ref: "#/components/schemas/TemplateTransferReference"
             summary: { type: object, additionalProperties: true }
-            executionReady: { type: boolean, description: false не запрещает staging или Save незавершённого определения }
-        changes: { type: object, additionalProperties: true }
+            executionReady: { type: boolean, description: 'false не мешает staging; сохранение незавершённого определения допускается только как новой неактивной копии' }
+        changes:
+          type: object
+          additionalProperties: true
+          properties:
+            targetId:
+              description: ID карточки назначения; возвращается для replace
+              oneOf:
+                - type: integer
+                - type: string
+            targetRevision:
+              description: Ревизия назначения на момент Prepare; возвращается для replace
+              type: string
+              pattern: '^sha256:[a-f0-9]{64}$'
     RuntimeConfigResponse:
       type: object
       required: [success, config, diagnostics, warnings, effectiveAssistantDiagnostics]
@@ -2544,6 +2598,7 @@ components:
       properties:
         traceId: { type: string, nullable: true }
         requestId: { type: string }
+        mode: { type: string, enum: [Basic, Verbose] }
         storageStatus: { type: string, enum: [pending, stored, discarded, unavailable] }
         warning: { type: string }
       additionalProperties: true
@@ -2993,6 +3048,11 @@ components:
         executionSpecHash:
           type: string
           description: Hash executable-части возвращённого draft; authoring-only изменения его не меняют.
+        diagnostics:
+          type: object
+          properties:
+            assistantTrace:
+              $ref: "#/components/schemas/AssistantDiagnosticReference"
     ObjectFlowProposal:
       type: object
       additionalProperties: false
@@ -3557,6 +3617,18 @@ components:
           type: string
           description: Необязательная оптимистическая защита обновления. Если передана при обновлении, backend возвращает 409 при несовпадении хэша сохранённого spec шаблона.
           pattern: "^[a-f0-9]{64}$"
+        transferReplace:
+          type: object
+          description: Только PUT. Явная замена после Prepare; при её наличии expectedSpecHash, Active и Owner не применяются.
+          required: [targetId, revision]
+          properties:
+            targetId:
+              oneOf:
+                - type: integer
+                - type: string
+            revision:
+              type: string
+              pattern: '^sha256:[a-f0-9]{64}$'
         paramsSchema:
           type: object
           additionalProperties: true
@@ -3687,6 +3759,11 @@ components:
         requestId:
           type: string
           description: Необязательный идентификатор корреляции structured logs.
+        diagnostics:
+          type: object
+          properties:
+            assistantTrace:
+              $ref: "#/components/schemas/AssistantDiagnosticReference"
         errors:
           type: array
           items:

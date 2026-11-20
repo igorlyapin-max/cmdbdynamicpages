@@ -87,6 +87,23 @@ function checksum(payload) {
   return `sha256:${createHash('sha256').update(canonical(payload)).digest('hex')}`;
 }
 
+export function templateTransferTargetRevision(root, card) {
+  return checksum([root, ...['_id', 'Code', 'Description', 'Active', 'Owner', 'UpdatedAt',
+    'SpecJson', 'ParamsSchemaJson', 'ResultSchemaJson'].map((key) => card[key] ?? null)]);
+}
+
+export function templateTransferReferenceEntries(reference) {
+  const { path, value } = reference;
+  return Array.isArray(value)
+    ? value.map((item, index) => ({ ...reference, path: `${path}[${index}]`, value: item }))
+    : [reference];
+}
+
+export function isTemplateTransferReferenceId(value) {
+  return (typeof value === 'number' && Number.isSafeInteger(value) && value > 0)
+    || (typeof value === 'string' && /^[1-9][0-9]*$/.test(value));
+}
+
 function portableSpec(spec) {
   keys(spec, SPEC_KEYS, '$.template.spec', ['version']);
   if (spec.version !== 1) fail('Unsupported template DSL version.');
@@ -148,8 +165,6 @@ function manifest(input) {
   object(spec, '$.spec');
   const result = { classes: [], directFields: [], domains: [], environmentReferences: [], inspection: [] };
   const namePattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
-  const literalId = (value) => (typeof value === 'number' && Number.isSafeInteger(value) && value > 0)
-    || (typeof value === 'string' && /^[1-9][0-9]*$/.test(value));
   const aliases = new Map();
   const stagePaths = new Set();
   for (const name of ['steps']) if (spec[name] !== undefined && !Array.isArray(spec[name])) fail(`Expected array at $.spec.${name}.`);
@@ -208,19 +223,22 @@ function manifest(input) {
       if (typeof item === 'string' && /^https?:\/\//i.test(item)) {
         result.environmentReferences.push({ kind: 'url', value: item, path: location });
       }
-      const typedLiteral = ['default', 'value', 'const'].includes(key);
-      if (literalId(item) && (['cardId', 'lookupId'].includes(key) || typedLiteral)) {
+      const typedLiteral = ['default', 'defaultValue', 'value', 'values', 'const'].includes(key);
+      if (['cardId', 'lookupId'].includes(key) || typedLiteral) {
         const kind = key === 'lookupId' || value.type === 'lookup' || value.referenceType === 'lookup' ? 'lookup'
           : key === 'cardId' || ['card', 'reference'].includes(value.type) || value.referenceType === 'card' ? 'card' : '';
-        const target = kind === 'lookup' ? lookupType : value.targetClass || value.className || (key === 'cardId' ? className : undefined);
-        if (kind && target) {
-          result.environmentReferences.push({ kind, [kind === 'lookup' ? 'lookupType' : 'className']: target, value: item, path: location });
-        } else if (kind || typedLiteral) {
-          result.inspection.push({ path: location, reason: 'Literal reference type/target requires schema inspection.' });
+        const target = kind === 'lookup' ? lookupType : value.targetClass || value.targetType || value.className || (key === 'cardId' ? className : undefined);
+        for (const entry of templateTransferReferenceEntries({ path: location, value: item })) {
+          if (!isTemplateTransferReferenceId(entry.value)) continue;
+          if (kind && target) {
+            result.environmentReferences.push({ ...entry, kind, [kind === 'lookup' ? 'lookupType' : 'className']: target });
+          } else if (kind || ['default', 'value', 'const'].includes(key) && !Array.isArray(item)) {
+            result.inspection.push({ path: entry.path, reason: 'Literal reference type/target requires schema inspection.' });
+          }
         }
       }
       // Prompts, D2 text and business literals are not parsed or rewritten.
-      if (!['default', 'value', 'values', 'const', 'enum'].includes(key)) {
+      if (!['default', 'defaultValue', 'value', 'values', 'const', 'enum'].includes(key)) {
         stack.push({ value: item, path: location, context: { className: key === 'right' ? rightClassName : className, rightClassName, lookupType, direct: ['left', 'right'].includes(key) ? false : direct } });
       }
     }
@@ -284,7 +302,7 @@ export function applyTemplateTransferOverrides(input, inputOverrides = {}) {
     for (const ref of references) {
       const value = byPath.get(ref.path);
       if (ref.kind === 'url' ? typeof value !== 'string' || !/^https?:\/\//i.test(value)
-        : !((Number.isSafeInteger(value) && value > 0) || (typeof value === 'string' && /^[1-9][0-9]*$/.test(value)))) fail('Invalid reference override value.');
+        : !isTemplateTransferReferenceId(value)) fail('Invalid reference override value.');
       replacements.set(ref.path, value);
     }
     const pending = [{ value: template.spec, path: '$.spec' }];

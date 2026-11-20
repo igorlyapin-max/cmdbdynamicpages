@@ -7,6 +7,7 @@ import {
   templateTransferDependencies,
   templateTransferEnvironmentReferences,
   applyTemplateTransferOverrides,
+  templateTransferTargetRevision,
 } from '../../scripts/template-transfer.mjs';
 
 const options = { producerVersion: '00.00.00.18' };
@@ -173,6 +174,39 @@ test('direct card and lookup fields use explicit target type and internal IDs ne
     { kind: 'card', className: 'Asset', value: 11, path: '$.spec.steps[0].cardId' },
     { kind: 'lookup', lookupType: 'Status', value: 3, path: '$.spec.steps[0].lookupId' },
   ]);
+});
+
+test('typed reference lists expose physical indices and can be overridden without replacing the arrays', () => {
+  const input = { code: 'Indexed', spec: { version: 1, params: {
+    cards: { type: 'array', referenceType: 'card', targetClass: 'Asset', default: [41, '42'] },
+    lookups: { type: 'array', referenceType: 'lookup', lookupType: 'Status', defaultValue: ['7', 8] },
+    counts: { type: 'array', default: [3, 4] }
+  } } };
+  const pkg = createTemplateTransferPackage(input, options);
+  const refs = pkg.dependencies.environmentReferences;
+  assert.deepEqual(refs.map(({ path, value }) => [path, value]), [
+    ['$.spec.params.cards.default[0]', 41], ['$.spec.params.cards.default[1]', '42'],
+    ['$.spec.params.lookups.defaultValue[0]', '7'], ['$.spec.params.lookups.defaultValue[1]', 8]
+  ]);
+  const imported = readTemplateTransferPackage(pkg);
+  const updated = applyTemplateTransferOverrides(imported, refs.map(({ path, value }, index) => ({ path, value: index === 1 ? 43 : value })));
+  assert.deepEqual(updated.spec.params.cards.default, [41, 43]);
+  assert.deepEqual(imported.spec.params.cards.default, [41, '42']);
+  assert.throws(() => applyTemplateTransferOverrides(imported, refs.map(({ path, value }, index) => ({
+    path: index === 1 ? '$.spec.params.cards.default[2]' : path, value
+  }))), invalid);
+});
+
+test('target revisions cover identity, root, editable metadata and stored definition, not permission flags', () => {
+  const card = { _id: 42, Code: 'Target', Description: 'Old', Owner: 'user', Active: false, UpdatedAt: 'now',
+    SpecJson: '{}', ParamsSchemaJson: '{}', ResultSchemaJson: '{}' };
+  const before = templateTransferTargetRevision('Root_A', card);
+  assert.match(before, /^sha256:[a-f0-9]{64}$/);
+  for (const key of Object.keys(card)) {
+    assert.notEqual(templateTransferTargetRevision('Root_A', { ...card, [key]: null }), before, key);
+  }
+  assert.notEqual(templateTransferTargetRevision('Root_B', card), before);
+  assert.equal(templateTransferTargetRevision('Root_A', { ...card, _can_update: false }), before);
 });
 
 test('override maps are complete, explicit, nonmutating and preserve graph IDs and prompts', () => {

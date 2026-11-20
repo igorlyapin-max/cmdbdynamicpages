@@ -46,7 +46,9 @@ jobs:
           npx playwright install --with-deps chromium
 
       - name: Run required browser UI smoke
-        run: npm run test:ui:required
+        run: |
+          export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="$(node --input-type=module -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())')"
+          npm run test:ui:required
 
   go_vulncheck:
     runs-on: ubuntu-latest
