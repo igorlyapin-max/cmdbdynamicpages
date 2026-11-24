@@ -69,6 +69,9 @@ export function createUiRequestDiagnostics() {
     const source = object(input);
     const result = {};
     for (const key of stringFields) if (typeof source[key] === 'string') result[key] = text(source[key]);
+    for (const key of ['expectedSpecHash', 'currentSpecHash']) {
+      if (typeof source[key] === 'string' && /^[0-9a-f]{64}$/i.test(source[key])) result[key] = source[key];
+    }
     for (const key of numberFields) if (finite(source[key])) result[key] = source[key];
     for (const key of booleanFields) if (typeof source[key] === 'boolean') result[key] = source[key];
     for (const key of identifierArrays) {

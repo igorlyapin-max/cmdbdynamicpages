@@ -5,7 +5,7 @@ import { chromium } from 'playwright';
 import { compileObjectFlowToSpec } from '../../scripts/assistant-object-flow.mjs';
 import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics.mjs';
 import { createAssistantDiagnosticsUi } from '../../scripts/assistant-diagnostics-ui.mjs';
-import { resolveTemplateParameters } from '../../scripts/template-parameters.mjs';
+import { resolveTemplateParameters, staticSnapshotParamPairs } from '../../scripts/template-parameters.mjs';
 
 function clientVersionConstants(source) {
   return Object.fromEntries(['D2_IMPORT_SEMANTIC_MODEL_REVISION', 'D2_IMPORT_ENDPOINT_PROFILE_VERSION',
@@ -23,7 +23,7 @@ function clientScript() {
   const end = source.indexOf('\nfunction isCollectionLimitedAuthoringRequest', start);
   assert.ok(start >= 0 && end > start, 'generated client boundaries must exist');
   const constants = {
-    createUiRequestDiagnostics, createAssistantDiagnosticsUi, resolveTemplateParameters,
+    createUiRequestDiagnostics, createAssistantDiagnosticsUi, resolveTemplateParameters, staticSnapshotParamPairs,
     DEFAULT_EMPTY_RESULT_TEXT: 'empty', DEFAULT_PERMISSION_DENIED_TEXT: 'denied', DEFAULT_TEMPLATE_CACHE_TTL_SEC: 3600,
     ...clientVersionConstants(source),
     DEFAULT_ASSISTANT_SYSTEM_PROMPT: 'system', DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT: 'flow', DEFAULT_ASSISTANT_OBJECT_FLOW_SEMANTIC_PROMPT: 'semantic',
@@ -241,6 +241,224 @@ function assertWidgetExtractionRequest(call, compiledSpec) {
   assert.ok(call.body.template.spec.result.tables.some((table) => table.name === 'widgets'));
   assert.deepEqual(call.body.params, {});
 }
+
+const writeViewport = { width: 1280, height: 900 };
+const templateApi = '/cmdbuild/custom-api/templates';
+const writeAction = (page, action) => page.locator('button[data-action="' + action + '"]');
+const openSection = (page, section) => page.locator('a[data-designer-section="' + section + '"]').click();
+
+async function openWriteFixture(page, section) {
+  await page.locator('#cmdp-language').selectOption('en');
+  return page.evaluate((section) => {
+    const ui = window.remediation;
+    const first = { id: 17, code: 'write-a', description: 'Initial A', active: true, specHash: 'a'.repeat(64),
+      spec: { ...ui.defaultSpec(), publish: { mode: 'staticSnapshot', warningAccepted: true, paramsMode: 'exact' } } };
+    const second = { ...first, id: 18, code: 'write-b', description: 'Initial B', specHash: 'b'.repeat(64) };
+    ui.state.root = 'Writes_QueryTool';
+    ui.state.templates = [first, second];
+    ui.state.selectedTemplate = structuredClone(first);
+    ui.hydrateDesignerStateFromTemplate({ replaceRunParams: true });
+    ui.state.designerSection = section;
+    ui.renderDesigner();
+    return first;
+  }, section);
+}
+
+async function selectWriteFixture(page, expectRequest, code) {
+  const versions = expectRequest('GET', templateApi + '/' + code + '/versions');
+  await page.locator('[data-action="select-template"][data-code="' + code + '"]').click();
+  await versions.received;
+  versions.respond({ success: true, data: [{ id: 1, templateCode: code, spec: {} }] });
+  await page.waitForFunction(() => window.remediation.state.templateVersions.length === 1);
+}
+
+test('pending template writes survive A-B-A reselection and ACKs update the list without replacing the new draft', async () => {
+  await withClient(writeViewport, async ({ page, expectRequest, writes }) => {
+    const first = await openWriteFixture(page, 'publication');
+    const save = writeAction(page, 'save-template');
+    const publish = writeAction(page, 'publish-snapshot');
+    await page.locator('#cmdp-publish-params-mode').selectOption('ignore');
+    const write = expectRequest('PUT', templateApi + '/write-a');
+    await publish.click();
+    const { body } = await write.received;
+    assert.equal(body.expectedSpecHash, first.specHash);
+    assert.equal(body.spec.publish.paramsMode, 'ignore');
+    await openSection(page, 'templates');
+    await selectWriteFixture(page, expectRequest, 'write-b');
+    assert.equal(await save.isEnabled(), true, 'a different template is not locked');
+    await selectWriteFixture(page, expectRequest, 'write-a');
+    assert.equal(await save.isDisabled(), true);
+    await save.dispatchEvent('click');
+    await openSection(page, 'publication');
+    assert.equal(await publish.isDisabled(), true);
+    await page.locator('#cmdp-publish-public-d2-source').check();
+    await openSection(page, 'templates');
+    await page.locator('[data-action="select-template"][data-code="write-a"]').click();
+    assert.equal(await save.isDisabled(), true);
+
+    const savedHash = 'c'.repeat(64);
+    write.respond({ success: true, template: { ...first, ...body, description: 'ACK list description', specHash: savedHash }, executionValidation: { executable: true } });
+    const savedCell = page.getByRole('cell', { name: 'ACK list description' });
+    await savedCell.waitFor();
+    assert.ok((await savedCell.boundingBox()).height > 0);
+    await openSection(page, 'publication');
+    assert.equal(await page.locator('#cmdp-publish-params-mode').inputValue(), 'exact');
+    assert.equal(await page.locator('#cmdp-publish-public-d2-source').isChecked(), true);
+    assert.equal(await publish.isEnabled(), true);
+    assert.equal(writes.length, 1, 'a reselected editor cannot publish the initial ACK');
+
+    const retry = expectRequest('PUT', templateApi + '/write-a');
+    await save.click();
+    const second = await retry.received;
+    assert.equal(second.body.expectedSpecHash, savedHash);
+    assert.equal(second.body.spec.publish.publicD2Source, true);
+    retry.respond({ success: true, template: { ...first, ...second.body, specHash: 'd'.repeat(64) }, executionValidation: { executable: true } });
+    await page.locator('button[data-action="save-template"]:enabled').waitFor();
+  });
+});
+
+test('publish failure survives section navigation and preserves a newer notice', async () => {
+  await withClient(writeViewport, async ({ page, expectRequest }) => {
+    const first = await openWriteFixture(page, 'publication');
+    const save = expectRequest('PUT', templateApi + '/write-a');
+    const publish = expectRequest('POST', templateApi + '/write-a/publish');
+    await writeAction(page, 'publish-snapshot').click();
+    const { body } = await save.received;
+    const specHash = 'c'.repeat(64);
+    save.respond({ success: true, template: { ...first, ...body, specHash }, executionValidation: { executable: true } });
+    assert.equal((await publish.received).body.savedSpecHash, specHash);
+    await openSection(page, 'cache');
+    await writeAction(page, 'apply-cache').click();
+    const notice = page.locator('#cmdp-designer-notice');
+    const newer = (await notice.innerText()).trim();
+    assert.ok(newer && !newer.includes('Publishing'));
+    publish.respond({ success: false, code: 'snapshot_write_failed', message: 'Snapshot storage rejected the revision' }, 503);
+    const failure = notice.getByRole('alert').filter({ hasText: 'Snapshot storage rejected the revision' });
+    await failure.waitFor();
+    assert.ok((await failure.boundingBox()).height > 0);
+    assert.ok((await notice.innerText()).includes(newer));
+    const diagnostic = JSON.parse(await notice.locator('[data-ui-diagnostic-report]').textContent());
+    assert.equal(diagnostic.phase, 'publish');
+    assert.equal(diagnostic.code, 'snapshot_write_failed');
+    assert.equal(await writeAction(page, 'save-template').isEnabled(), true);
+    await openSection(page, 'publication');
+    assert.equal(await failure.isVisible(), true);
+  });
+});
+
+test('pending snapshot revocation keeps the Save ACK, localizes the warning and skips Publish', async () => {
+  await withClient(writeViewport, async ({ page, expectRequest, writes }) => {
+    const first = await openWriteFixture(page, 'publication');
+    const publish = writeAction(page, 'publish-snapshot');
+    const save = expectRequest('PUT', templateApi + '/write-a');
+    await publish.click();
+    const { body } = await save.received;
+    const savedHash = 'c'.repeat(64);
+    save.respond({ success: true, template: { ...first, ...body, specHash: savedHash, version: 2 },
+      snapshotRevocationPending: true, executionValidation: { executable: true } });
+    const warning = page.locator('#cmdp-designer-publication-notice .notice.warning');
+    await warning.waitFor();
+    await assertVisible(warning, writeViewport);
+    assert.match(await warning.innerText(), /Template saved.*complete revocation/);
+    assert.deepEqual(writes.map(({ method }) => method), ['PUT']);
+    assert.deepEqual(await page.evaluate(() => {
+      const { specHash, version } = window.remediation.state.selectedTemplate;
+      return [specHash, version];
+    }), [savedHash, 2]);
+    await page.locator('#cmdp-language').selectOption('ru');
+    assert.match(await warning.innerText(), /Шаблон сохранён.*завершить отзыв/);
+    await openSection(page, 'cache');
+    assert.equal(await warning.isVisible(), true);
+    await openSection(page, 'publication');
+
+    const retry = expectRequest('PUT', templateApi + '/write-a');
+    const publication = expectRequest('POST', templateApi + '/write-a/publish');
+    await publish.click();
+    const next = await retry.received;
+    assert.equal(next.body.expectedSpecHash, savedHash);
+    const freshHash = 'd'.repeat(64);
+    retry.respond({ success: true, template: { ...first, ...next.body, specHash: freshHash, version: 3 },
+      snapshotRevocationPending: false, executionValidation: { executable: true } });
+    assert.equal((await publication.received).body.savedSpecHash, freshHash);
+    publication.respond({ success: true });
+    await page.locator('button[data-action="publish-snapshot"]:enabled').waitFor();
+    assert.equal(await warning.count(), 0);
+  });
+});
+
+test('pending writes for the same template code in different roots do not unlock or amend each other', async () => {
+  await withClient(writeViewport, async ({ page, expectRequest }) => {
+    const first = await openWriteFixture(page, 'templates');
+    const button = writeAction(page, 'save-template');
+    const writeA = expectRequest('PUT', templateApi + '/write-a');
+    await button.click();
+    const requestA = await writeA.received;
+    const second = { ...first, description: 'Other root version', specHash: 'b'.repeat(64) };
+    await page.evaluate((template) => {
+      const ui = window.remediation;
+      ui.state.root = 'Other_QueryTool';
+      ui.state.templates = [template];
+      ui.state.selectedTemplate = structuredClone(template);
+      ui.hydrateDesignerStateFromTemplate({ replaceRunParams: true });
+      ui.renderDesigner();
+    }, second);
+    assert.equal(await button.isEnabled(), true);
+    const writeB = expectRequest('PUT', templateApi + '/write-a');
+    await button.click();
+    const requestB = await writeB.received;
+    assert.notEqual(requestA.root, requestB.root);
+    assert.equal(requestB.body.expectedSpecHash, second.specHash);
+
+    writeA.respond({ success: true, template: { ...first, description: 'Do not copy across roots', specHash: 'c'.repeat(64) } });
+    await page.waitForFunction(() => window.remediation.state.pendingTemplateWrites.size === 1);
+    assert.equal(await button.isDisabled(), true);
+    assert.equal(await page.getByRole('cell', { name: 'Do not copy across roots' }).count(), 0);
+    assert.equal(await page.getByRole('cell', { name: second.description }).isVisible(), true);
+    writeB.respond({ success: true, template: { ...second, description: 'Other root ACK', specHash: 'd'.repeat(64) } });
+    const cell = page.getByRole('cell', { name: 'Other root ACK' });
+    await cell.waitFor();
+    assert.ok((await cell.boundingBox()).height > 0);
+    assert.equal(await button.isEnabled(), true);
+  });
+});
+
+test('Save unlocks transfer actions without replacing transfer inputs or prepared import', async () => {
+  await withClient(writeViewport, async ({ page, expectRequest }) => {
+    const first = await openWriteFixture(page, 'templates');
+    const prepare = expectRequest('POST', '/cmdbuild/custom-api/template-transfer/prepare');
+    const fileName = 'independent.cmdp-template.json';
+    await page.locator('#cmdp-transfer-file').setInputFiles({ name: fileName, mimeType: 'application/json', buffer: Buffer.from('{}') });
+    await page.locator('#cmdp-transfer-code').fill('transfer-target');
+    const description = page.locator('#cmdp-transfer-description');
+    await description.fill('Keep this import description');
+    await page.locator('#cmdp-transfer-overrides').fill('[{"path":"$.spec.example","value":"kept"}]');
+    await writeAction(page, 'template-transfer-prepare').click();
+    const prepared = await prepare.received;
+    prepare.respond({ success: true, template: { code: prepared.body.targetCode, spec: first.spec },
+      checks: { status: 'ready', issues: [], environmentReferences: [] }, changes: {} });
+    const stage = writeAction(page, 'template-transfer-stage');
+    await page.locator('button[data-action="template-transfer-stage"]:enabled').waitFor();
+    const overrides = await page.locator('#cmdp-transfer-overrides').inputValue();
+    const originalInput = await description.elementHandle();
+    const save = expectRequest('PUT', templateApi + '/write-a');
+    await writeAction(page, 'save-template').click();
+    const { body } = await save.received;
+    for (const action of ['export', 'prepare', 'stage']) assert.equal(await writeAction(page, 'template-transfer-' + action).isDisabled(), true);
+    await description.focus();
+    await description.evaluate((field) => field.setSelectionRange(5, 9));
+    save.respond({ success: true, template: { ...first, ...body, specHash: 'c'.repeat(64) }, executionValidation: { executable: true } });
+    await page.locator('button[data-action="template-transfer-stage"]:enabled').waitFor();
+    for (const action of ['export', 'prepare']) assert.equal(await writeAction(page, 'template-transfer-' + action).isEnabled(), true);
+    assert.equal(await stage.isVisible(), true);
+    assert.ok((await stage.boundingBox()).height > 0);
+    assert.equal(await originalInput.evaluate((field) => field === document.activeElement), true);
+    assert.deepEqual(await description.evaluate((field) => [field.selectionStart, field.selectionEnd]), [5, 9]);
+    assert.equal(await description.inputValue(), 'Keep this import description');
+    assert.equal(await page.locator('#cmdp-transfer-overrides').inputValue(), overrides);
+    assert.equal(await page.locator('#cmdp-transfer-code').inputValue(), 'transfer-target');
+    assert.equal(await page.getByText(fileName, { exact: true }).isVisible(), true);
+  });
+});
 
 for (const viewport of [{ width: 1280, height: 900 }, { width: 390, height: 844 }]) {
   test(`Assistant Apply and Extraction show draft-only Widget results at ${viewport.width}px`, async () => {

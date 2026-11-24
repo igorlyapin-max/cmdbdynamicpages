@@ -101,7 +101,8 @@ test('pilot plan envelope keeps typed Help and authored bindings separate from o
   assert.equal(known.split, 'holdout');
   assert.equal(known.dataKind, 'synthetic');
   assert.deepEqual(known.oracle, createPilotHoldoutCase(base, 'end-to-end').oracle);
-  assert.deepEqual(unknown.oracle, createPilotHoldoutCase(noHelp, 'end-to-end').oracle);
+  assert.deepEqual(unknown.oracle, { ...createPilotHoldoutCase(noHelp, 'end-to-end').oracle,
+    expectedStage: { flow: 'flow', mapping: 'mapping', 'end-to-end': 'flow' } });
   assert.deepEqual(unknown.input.knowledgeByBlock, {});
   assert.deepEqual({ ...known.input, knowledgeByBlock: {} }, unknown.input);
   assert.doesNotMatch(JSON.stringify(unknown.input), /oracle|outcome|refA|refB|Northport/);

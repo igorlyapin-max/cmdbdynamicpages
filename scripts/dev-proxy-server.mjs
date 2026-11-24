@@ -45,7 +45,7 @@ import { DEFAULT_ASSISTANT_DIAGNOSTICS, normalizeAssistantDiagnosticsPolicy, red
 import { purgeAssistantDiagnostics } from './assistant-diagnostics-maintenance.mjs';
 import { createTemplateTransferPackage, readTemplateTransferPackage, templateTransferDependencies,
   isTemplateTransferReferenceId, templateTransferReferenceEntries, templateTransferTargetRevision } from './template-transfer.mjs';
-import { resolveTemplateParameters } from './template-parameters.mjs';
+import { resolveTemplateParameters, staticSnapshotParamPairs } from './template-parameters.mjs';
 import { runtimeRowIdentity, runtimeRowValue, runtimeSemanticKey, setRuntimeRowSemantics, setRuntimeRowValue,
   inheritRuntimeRowSemantics, mergeRuntimeRowSemantics, deriveRuntimeRowSemantics } from './runtime-row-semantics.mjs';
 
@@ -146,7 +146,7 @@ const REGEX_MAX_INPUT_LENGTH = Math.max(1024, Number(process.env.CMDBDYNAMIC_REG
 const DEFAULT_EMPTY_RESULT_TEXT = 'В результате вашего запроса объекты не найдены';
 const DEFAULT_PERMISSION_DENIED_TEXT = 'Вам не хватает прав увидеть данные или интерфейс дизайнера';
 const SNAPSHOT_MISSING_TEXT = 'Страница отсутствует для загрузки';
-const RUNTIME_SYSTEM_PARAMS = new Set(['json', 'd2', 'diagram']);
+const RUNTIME_SYSTEM_PARAMS = new Set(['json', 'd2', 'diagram', 'root']);
 const D2_RENDER_ENABLED = process.env.CMDP_D2_RENDER_ENABLED !== 'false';
 const D2_BINARY = String(process.env.CMDP_D2_BINARY || '/usr/local/bin/d2').trim() || '/usr/local/bin/d2';
 const D2_TIMEOUT_MS = Math.max(500, Number(process.env.CMDP_D2_TIMEOUT_MS || 3000) || 3000);
@@ -541,7 +541,8 @@ function sanitizeHeaders(headers) {
 function sanitizeRequestPath(requestUrl) {
   const params = new URLSearchParams();
   requestUrl.searchParams.forEach((value, name) => {
-    params.append(name, truncateText(redactByName(name, value, LOG_REDACT_QUERY), 200));
+    const redacted = name.toLowerCase() === 'snapshotparams' ? '[REDACTED]' : redactByName(name, value, LOG_REDACT_QUERY);
+    params.append(name, truncateText(redacted, 200));
   });
   const query = params.toString();
   return truncateText(`${requestUrl.pathname}${query ? `?${query}` : ''}`, 1000);
@@ -9004,6 +9005,7 @@ function memorySet(map, key, value, ttlMs) {
 }
 
 async function cacheGetJson(namespace, key, memoryMap) {
+  let redisUnavailable = false;
   if (REDIS_ENABLED) {
     try {
       const value = await redisCommand(['GET', cacheKey(namespace, key)]);
@@ -9016,6 +9018,7 @@ async function cacheGetJson(namespace, key, memoryMap) {
     } catch (error) {
       if (REDIS_REQUIRED) throw redisRequiredError(error, 'read', namespace);
       // Redis fallback is expected in local dev when Redis is not started.
+      redisUnavailable = true;
     }
   } else if (REDIS_REQUIRED) {
     throw redisRequiredError(new Error('Redis is disabled.'), 'read', namespace);
@@ -9024,7 +9027,7 @@ async function cacheGetJson(namespace, key, memoryMap) {
   if (namespace === 'runtime') {
     incMetric(value ? 'cmdp_runtime_cache_hits_total' : 'cmdp_runtime_cache_misses_total', { backend: 'memory' });
   }
-  return { backend: 'memory', value };
+  return { backend: 'memory', value, ...(redisUnavailable ? { redisUnavailable: true } : {}) };
 }
 
 async function cacheSetJson(namespace, key, value, ttlMs, memoryMap) {
@@ -9101,7 +9104,7 @@ async function cacheReleaseClaim(namespace, key, token, memoryMap) {
 }
 
 function runtimeTemplateIndexId(root, templateCode) {
-  return hashJson({ root: String(root || ''), templateCode: String(templateCode || '') });
+  return hashJson({ templateClass: snapshotTemplateClass(root), templateCode });
 }
 
 async function registerRuntimeTemplateCacheKey(root, templateCode, key, ttlMs) {
@@ -9160,19 +9163,13 @@ async function invalidateTemplateRuntimeCache(root, templateCode) {
 }
 
 function staticSnapshotTemplateIndexId(root, templateCode) {
-  return hashJson({ root: String(root || ''), templateCode: String(templateCode || '') });
+  return hashJson({ version: 3, templateClass: snapshotTemplateClass(root), templateCode });
 }
 
-async function registerStaticSnapshotCacheKey(root, templateCode, key) {
+function registerLocalStaticSnapshotCacheKey(root, templateCode, key) {
   const indexId = staticSnapshotTemplateIndexId(root, templateCode);
   if (!staticSnapshotTemplateIndex.has(indexId)) staticSnapshotTemplateIndex.set(indexId, new Set());
   staticSnapshotTemplateIndex.get(indexId).add(key);
-  if (!REDIS_ENABLED) return;
-  try {
-    await redisCommand(['SADD', cacheKey('snapshot-index', indexId), key]);
-  } catch (error) {
-    if (REDIS_REQUIRED) throw redisRequiredError(error, 'index', 'snapshot');
-  }
 }
 
 async function invalidateTemplateStaticSnapshots(root, templateCode) {
@@ -9702,6 +9699,7 @@ function sendTechnicalSchemaAccessDenied(res, details = {}) {
   sendJson(res, 403, {
     success: false,
     reason: 'technical_schema_access_denied',
+    permissionDenied: true,
     message: DEFAULT_PERMISSION_DENIED_TEXT,
     permissionDeniedText: DEFAULT_PERMISSION_DENIED_TEXT,
     cmdbuildStatus: details.cmdbuildStatus || details.statusCode || 403,
@@ -9742,13 +9740,14 @@ function extractDesignerSection(pathname, requestUrl) {
   return /^[a-z0-9-]+$/.test(section) ? section : '';
 }
 
-function renderDynamicPagesShell({ mode, session, templateCode = '', designerSection = '', publicRuntime = false }) {
+function renderDynamicPagesShell({ mode, session, templateCode = '', designerSection = '', publicRuntime = false, root = DEFAULT_TECHNICAL_ROOT }) {
   const boot = JSON.stringify({
     mode,
     session,
     appVersion: APPLICATION_VERSION,
     build: APPLICATION_BUILD,
     templateCode,
+    root,
     designerSection,
     publicRuntime,
     apiPrefix: BACKEND_PREFIX,
@@ -9880,6 +9879,7 @@ function dynamicPagesClientScript() {
   var DEFAULT_PERMISSION_DENIED_TEXT = ${JSON.stringify(DEFAULT_PERMISSION_DENIED_TEXT)};
   var DEFAULT_TEMPLATE_CACHE_TTL_SEC = ${JSON.stringify(DEFAULT_TEMPLATE_CACHE_TTL_SEC)};
   var resolveTemplateParameters = (${resolveTemplateParameters.toString()});
+  var staticSnapshotParamPairs = (${staticSnapshotParamPairs.toString()});
   var D2_IMPORT_SEMANTIC_MODEL_REVISION = ${JSON.stringify(D2_IMPORT_SEMANTIC_MODEL_REVISION)};
   var D2_IMPORT_ENDPOINT_PROFILE_VERSION = ${JSON.stringify(D2_IMPORT_ENDPOINT_PROFILE_VERSION)};
   var D2_IMPORT_STRUCTURE_TREE_VERSION = ${JSON.stringify(D2_IMPORT_STRUCTURE_TREE_VERSION)};
@@ -10104,8 +10104,8 @@ function dynamicPagesClientScript() {
       no: 'no',
       noData: 'No data.',
       run: 'Run',
-      visualizeInEditor: 'Visualize in editor',
-      visualizeExternal: 'Visualize in separate page',
+      visualizeInEditor: 'Preview draft',
+      visualizeExternal: 'Open saved report',
       forceRefreshInEditor: 'Refresh cache and show',
       assistantDraft: 'Assistant draft',
       assistantPrompt: 'Describe the table or diagram you need.',
@@ -10116,7 +10116,7 @@ function dynamicPagesClientScript() {
       assistantResponseStaleSpec: 'Assistant response was discarded because the template definition changed.',
       assistantResponseStaleRequest: 'Assistant response was discarded because a newer Assistant request started.',
       assistantDraftApplied: 'Assistant draft applied.',
-      runLaunchUrl: 'Template launch URL',
+      runLaunchUrl: 'Saved report URL',
       runLaunchJsonUrl: 'JSON URL',
       runLaunchParams: 'Parameter variants',
       runLaunchParamsHelp: 'Query string used by the run links. The JSON variant adds the system parameter json=true; this parameter is not passed to the template as input.',
@@ -10271,6 +10271,11 @@ function dynamicPagesClientScript() {
       assistantTemplatePromptLimit: '{count} / {max} characters',
       savingTemplate: 'Saving template...',
       savedPreviousRevision: 'The previous revision was saved; there are unsaved changes.',
+      publishDraftChanged: 'The previous revision was saved. Save and publish the current draft after reviewing your changes.',
+      publishedPreviousRevision: 'The saved revision was published; newer changes are still in the draft.',
+      publishingSnapshot: 'Publishing the saved revision...',
+      snapshotRevocationPending: 'Template saved. Ask an administrator to complete revocation of the previous report before publishing again.',
+      templateVersionConflict: 'The saved revision changed. Your changes are still in the editor.',
       diagramImportSaveBusy: 'Wait for the Diagram Assistant operation to finish before saving the template.',
       changesReadyToSave: 'Changes are ready. Save the template to persist them.',
       savedNotExecutable: 'Template was saved, but execution remains unavailable until the deterministic configuration is complete.',
@@ -11188,6 +11193,10 @@ function dynamicPagesClientScript() {
       truncated: 'truncated',
       loadingDesigner: 'Loading designer...',
       runningTemplate: 'Running template...',
+      runtimeSessionInvalid: 'Your CMDBuild session has expired. Sign in and reopen the report.',
+      runtimeTemplateAccessDenied: 'Your role cannot read the saved report template.',
+      runtimeDataAccessDenied: 'CMDBuild denied access to data required by this report.',
+      runtimeRequestId: 'Request ID',
       runtimeCacheBuilt: 'Built now',
       runtimeCacheHit: 'Cached result',
       runtimeCacheJoined: 'Waiting for the current build',
@@ -11458,8 +11467,8 @@ function dynamicPagesClientScript() {
       no: 'нет',
       noData: 'Нет данных.',
       run: 'Запустить',
-      visualizeInEditor: 'Визуализировать в редакторе',
-      visualizeExternal: 'Визуализировать в отдельной странице',
+      visualizeInEditor: 'Прогнать черновик',
+      visualizeExternal: 'Открыть сохранённый отчёт',
       forceRefreshInEditor: 'Обновить кэш и показать',
       assistantDraft: 'Assistant draft',
       assistantPrompt: 'Опишите таблицу или диаграмму, которую нужно получить.',
@@ -11470,7 +11479,7 @@ function dynamicPagesClientScript() {
       assistantResponseStaleSpec: 'Ответ Assistant был отброшен: изменена детерминированная спецификация шаблона.',
       assistantResponseStaleRequest: 'Ответ Assistant был отброшен: уже запущен более новый запрос Assistant.',
       assistantDraftApplied: 'Assistant draft применен.',
-      runLaunchUrl: 'URL запуска шаблона',
+      runLaunchUrl: 'URL сохранённого отчёта',
       runLaunchJsonUrl: 'JSON URL',
       runLaunchParams: 'Варианты параметров',
       runLaunchParamsHelp: 'Query-строка, с которой будут построены ссылки запуска. Для JSON добавляется системный параметр json=true; он не передается в шаблон как входная переменная.',
@@ -11625,6 +11634,11 @@ function dynamicPagesClientScript() {
       assistantTemplatePromptLimit: '{count} / {max} символов',
       savingTemplate: 'Шаблон сохраняется...',
       savedPreviousRevision: 'Сохранена предыдущая редакция; есть несохранённые изменения.',
+      publishDraftChanged: 'Сохранена предыдущая редакция. Проверьте текущие правки и повторите публикацию.',
+      publishedPreviousRevision: 'Сохранённая редакция опубликована; новые правки остались в черновике.',
+      publishingSnapshot: 'Публикуется сохранённая редакция…',
+      snapshotRevocationPending: 'Шаблон сохранён. Перед повторной публикацией попросите администратора завершить отзыв предыдущего отчёта.',
+      templateVersionConflict: 'Сохранённая версия изменилась. Ваши правки остались в редакторе.',
       diagramImportSaveBusy: 'Дождитесь завершения операции Ассистента диаграмм перед сохранением шаблона.',
       changesReadyToSave: 'Изменения готовы. Нажмите «Сохранить», чтобы записать их в шаблон.',
       savedNotExecutable: 'Шаблон сохранен, но выполнение недоступно, пока детерминированная конфигурация не завершена.',
@@ -12542,6 +12556,10 @@ function dynamicPagesClientScript() {
       truncated: 'обрезано',
       loadingDesigner: 'Загрузка дизайнера...',
       runningTemplate: 'Выполняется шаблон...',
+      runtimeSessionInvalid: 'Сессия CMDBuild истекла. Войдите снова и откройте отчёт.',
+      runtimeTemplateAccessDenied: 'Текущая роль не может прочитать сохранённый шаблон отчёта.',
+      runtimeDataAccessDenied: 'CMDBuild запретил чтение данных, необходимых для отчёта.',
+      runtimeRequestId: 'Идентификатор запроса',
       runtimeCacheBuilt: 'Построено сейчас',
       runtimeCacheHit: 'Результат из кэша',
       runtimeCacheJoined: 'Ожидание текущего построения',
@@ -12631,7 +12649,7 @@ function dynamicPagesClientScript() {
   var diagramImportTreeChildrenCache = typeof WeakMap === 'function' ? new WeakMap() : null;
   var state = {
     language: activeLanguage,
-    root: 'Cst_QueryTool',
+    root: boot.root,
     session: boot.session || {},
     schema: null,
     schemaParents: [],
@@ -12703,7 +12721,9 @@ function dynamicPagesClientScript() {
     assistantFlowExpandedBlockIds: {},
     assistantFlowDragSourceId: '',
     assistantAuthoringDirty: false,
-    savingTemplate: false,
+    pendingTemplateWrites: new Map(),
+    templatePublicationNotices: new Map(),
+    get savingTemplate() { return templateWritePending(readTemplateCode()); },
     templateDirty: false,
     assistantTemplatePromptOverrides: {},
     assistantDiagramIntentPrompt: '',
@@ -12796,7 +12816,6 @@ function dynamicPagesClientScript() {
         state.rootSelectionGeneration = Number(state.rootSelectionGeneration || 0) + 1;
         state.runtimeSettingsDraft = null;
         state.runtimeConfigWarning = '';
-        state.savingTemplate = false;
         state.templateEditorInstance = Number(state.templateEditorInstance || 0) + 1;
       }
       designerRoot = value;
@@ -12810,7 +12829,7 @@ function dynamicPagesClientScript() {
       if (value !== designerSession) {
         state.sessionInstance = Number(state.sessionInstance || 0) + 1;
         state.runtimeSettingsDraft = null;
-        state.savingTemplate = false;
+        state.templatePublicationNotices.clear();
       }
       designerSession = value;
     }
@@ -13702,13 +13721,27 @@ function dynamicPagesClientScript() {
       ' Повторите операцию; если ошибка повторится, передайте Request ID администратору.';
   }
 
+  function runtimeRoot() {
+    return String(boot.mode === 'runtime' ? boot.root : state.root);
+  }
+
+  function runtimeQuery(params) {
+    var query = new URLSearchParams(params || {});
+    query.set('root', runtimeRoot());
+    return query;
+  }
+
   function publicSnapshotRunPath(templateCode, params) {
-    var query = new URLSearchParams(params || {}).toString();
-    return apiPrefix + '/public-snapshots/' + encodeURIComponent(templateCode) + '/run' + (query ? '?' + query : '');
+    var query = runtimeQuery(params);
+    if (boot.publicRuntime) {
+      var wire = new URLSearchParams(window.location.search || '').get('snapshotParams');
+      if (wire !== null) query.set('snapshotParams', wire);
+    }
+    return apiPrefix + '/public-snapshots/' + encodeURIComponent(templateCode) + '/run?' + query.toString();
   }
 
   function runtimeRunPath(templateCode, params, refresh, forceRefresh) {
-    var queryParams = new URLSearchParams(params || {});
+    var queryParams = runtimeQuery(params);
     if (refresh) queryParams.set('refresh', '1');
     if (forceRefresh) queryParams.set('forceRefresh', '1');
     var query = queryParams.toString();
@@ -13716,7 +13749,7 @@ function dynamicPagesClientScript() {
   }
 
   function runtimeSystemParam(name) {
-    return ['lang', 'cmdpLang', 'json', 'd2', 'diagram', 'refresh', 'noCache', 'forceRefresh', 'bypassRefreshCooldown'].indexOf(String(name || '')) !== -1;
+    return ['root', 'lang', 'cmdpLang', 'json', 'd2', 'diagram', 'refresh', 'noCache', 'forceRefresh', 'bypassRefreshCooldown'].indexOf(String(name || '')) !== -1;
   }
 
   function runtimeD2DownloadPath(result, diagram, diagramIndex) {
@@ -13806,13 +13839,13 @@ function dynamicPagesClientScript() {
 
   function coerceRunParamValue(name, type, value, required, defaultValue) {
     var text = String(value === undefined || value === null ? '' : value);
-    if (text === '' && defaultValue !== undefined && defaultValue !== '') text = String(defaultValue);
+    if (text === '' && defaultValue != null && defaultValue !== '') text = String(defaultValue);
     if (text === '' && !required) return undefined;
     if ((type === 'integer' || type === 'number' || type === 'boolean') && text === '') {
       throw new Error(t('fieldRequired', { label: name }));
     }
     if (type === 'integer') {
-      if (!/^-?\d+$/.test(text)) throw new Error(t('invalidParamValue', { name: name }));
+      if (!/^-?[0-9]+$/.test(text)) throw new Error(t('invalidParamValue', { name: name }));
       return Number(text);
     }
     if (type === 'number') {
@@ -14614,10 +14647,10 @@ function dynamicPagesClientScript() {
     options = options || {};
     var query = new URLSearchParams();
     query.set('maxRows', String(authoringPreviewMaxRows()));
+    query.set('root', runtimeRoot());
     if (options.includeDiagrams === false) query.set('includeDiagrams', 'false');
     if (options.executionScope) query.set('executionScope', String(options.executionScope));
     if (options.extractionSource) {
-      query.set('root', String(state.root || 'Cst_QueryTool'));
       query.set('extractionSource', String(options.extractionSource));
     }
     return apiPrefix + '/draft/preview?' + query.toString();
@@ -14741,7 +14774,6 @@ function dynamicPagesClientScript() {
 
   function hydrateDesignerStateFromTemplate(options) {
     state.templateEditorInstance = Number(state.templateEditorInstance || 0) + 1;
-    state.savingTemplate = false;
     state.extractionOperation = null;
     options = options || {};
     var selected = state.selectedTemplate;
@@ -14878,7 +14910,7 @@ function dynamicPagesClientScript() {
     };
   }
 
-  function uiDiagnosticIsCurrent(diagnostic, draftRevisionOnly) {
+  function uiDiagnosticIsCurrent(diagnostic, draftRevisionOnly, templateOnly) {
     if (!diagnostic || boot.mode === 'runtime') return false;
     var owner = diagnostic.owner;
     if (!owner) return true;
@@ -14890,9 +14922,9 @@ function dynamicPagesClientScript() {
       && Number(owner.editorInstance || 0) === current.editorInstance
       && Number(owner.sessionInstance || 0) === current.sessionInstance
       && owner.templateCode === current.templateCode
-      && Number(owner.revision || 0) === current.revision
-      && (draftRevisionOnly === true || (Number(owner.generation || 0) === current.generation
-        && (draftScopedApply ? current.action === 'assistant-flow-apply' : (owner.displaySection || owner.section) === current.section)));
+      && (templateOnly === true || (Number(owner.revision || 0) === current.revision
+        && (draftRevisionOnly === true || (Number(owner.generation || 0) === current.generation
+          && (draftScopedApply ? current.action === 'assistant-flow-apply' : (owner.displaySection || owner.section) === current.section)))));
   }
 
   function validateUiResponse(result, kind) {
@@ -14930,9 +14962,10 @@ function dynamicPagesClientScript() {
     return { type: 'error', text: uiRequestDiagnostics.sanitize({ message: message }).message, diagnostic: diagnostic || null };
   }
 
-  function setUiError(error, text) {
-    if (error && error.diagnostic && !uiDiagnosticIsCurrent(error.diagnostic)) return;
+  function setUiError(error, text, templateOnly) {
+    if (error && error.diagnostic && !uiDiagnosticIsCurrent(error.diagnostic, false, templateOnly)) return;
     state.message = uiErrorMessage(error, text);
+    if (templateOnly && state.message.diagnostic) state.message.templateWrite = true;
   }
 
   function routeUiRequestDiagnostic(result, section) {
@@ -14946,8 +14979,8 @@ function dynamicPagesClientScript() {
     return renderNotice(message);
   }
 
-  function renderUiErrorDiagnostics(diagnostic) {
-    if (!uiDiagnosticIsCurrent(diagnostic)) return '';
+  function renderUiErrorDiagnostics(diagnostic, templateOnly) {
+    if (!uiDiagnosticIsCurrent(diagnostic, false, templateOnly)) return '';
     var safe = uiRequestDiagnostics.sanitize(userFacingAssistantDiagnostics(diagnostic, (state.selectedTemplate && state.selectedTemplate.spec) || defaultSpec()));
     var report = uiRequestDiagnostics.serialize(safe);
     var status = safe.status ? 'HTTP ' + safe.status : t('diagnosticNoHttpResponse');
@@ -14987,7 +15020,7 @@ function dynamicPagesClientScript() {
     });
   }
 
-  function renderNotice(message) {
+  function renderNotice(message, standalone) {
     if (!message || !message.text) return '';
     if (message.owner && !uiDiagnosticIsCurrent({ owner: message.owner })) return '';
     var flowFeedback = state.assistantFlowFeedback;
@@ -14999,7 +15032,8 @@ function dynamicPagesClientScript() {
     var flowDiagnosticInEditor = message.diagnosticOwner === 'assistantFlow' &&
       (message.owner?.action !== 'assistant-flow-apply' || state.designerSection === 'assistant');
     return '<div class="notice ' + escapeHtml(message.type || '') + '"' + (message.owner ? ' data-authoring-operation-message' : '') + (error ? ' role="alert" aria-live="assertive"' : ' aria-live="polite"') + '>' + escapeHtml(message.text) + '</div>'
-      + (flowDiagnosticInEditor ? '' : renderUiErrorDiagnostics(message.diagnostic || state.assistantLastTraceDiagnostic));
+      + (flowDiagnosticInEditor ? '' : renderUiErrorDiagnostics(message.diagnostic || (!standalone && state.assistantLastTraceDiagnostic),
+        Boolean(message.diagnostic && message.templateWrite)));
   }
 
   function renderKpi(label, value) {
@@ -18968,7 +19002,7 @@ function dynamicPagesClientScript() {
       '<option value="dsl"' + (kind === 'dsl' ? ' selected' : '') + '>' + t('templateKindDsl') + '</option>',
       '<option value="' + CMDB_BUILD_VIEW_KIND + '"' + (kind === CMDB_BUILD_VIEW_KIND ? ' selected' : '') + '>' + t('templateKindCmdbBuildView') + '</option>',
       '</select><span class="muted">' + escapeHtml(t('templateKindHelp')) + '</span></label>',
-      '<label>' + t('code') + '<input id="cmdp-code" value="' + escapeHtml(selected.code || '') + '"' + (selected.id || state.savingTemplate ? ' readonly' : '') + '></label>',
+      '<label>' + t('code') + '<input id="cmdp-code" value="' + escapeHtml(selected.code || '') + '"' + (selected.id || templateWritePending(selected.code) ? ' readonly' : '') + '></label>',
       '<label>' + t('description') + '<input id="cmdp-description" value="' + escapeHtml(selected.description || '') + '"></label>',
       selected && selected.protected ? '<span class="pill">' + escapeHtml(t('protectedTemplate')) + '</span>' : '',
       protectedHelp,
@@ -18983,7 +19017,6 @@ function dynamicPagesClientScript() {
       scope: runtimeSettingsScope(), session: Number(state.sessionInstance || 0),
       editor: Number(state.templateEditorInstance || 0),
       id: String(state.selectedTemplate && state.selectedTemplate.id || ''),
-      hash: String(state.selectedTemplate && state.selectedTemplate.specHash || ''),
       code: String(state.selectedTemplate && state.selectedTemplate.code || '')
     };
   }
@@ -18991,7 +19024,7 @@ function dynamicPagesClientScript() {
   function templateTransferOwnerIsCurrent(owner) {
     var current = templateTransferOwner();
     return Boolean(owner && runtimeSettingsScopeIsCurrent(owner.scope) && owner.session === current.session &&
-      owner.editor === current.editor && owner.id === current.id && owner.code === current.code && owner.hash === current.hash);
+      owner.editor === current.editor && owner.id === current.id && owner.code === current.code);
   }
 
   function templateTransferDraft() {
@@ -19011,9 +19044,21 @@ function dynamicPagesClientScript() {
       && staged.editor === Number(state.templateEditorInstance || 0) ? staged : null;
   }
 
+  function renderTemplateTransferIssues(issues) {
+    return (issues || []).map(function (issue) {
+      return '<li>' + escapeHtml([issue.path, issue.code, issue.message].filter(Boolean).join(' - ')) + '</li>';
+    }).join('');
+  }
+
+  function renderTemplateTransferSaveIssues(draft) {
+    var issues = !draft.prepared && renderTemplateTransferIssues(draft.saveIssues);
+    return issues ? '<ul role="status">' + issues + '</ul>' : '';
+  }
+
   function renderTemplateTransfer() {
     var draft = templateTransferDraft();
     var prepared = draft.prepared;
+    var actions = templateTransferActionState(draft);
     var checks = prepared && prepared.checks;
     var options = (state.templates || []).map(function (item) {
       return '<option value="' + escapeHtml(item.code) + '"' + (draft.existingTarget === item.code ? ' selected' : '') + '>' + escapeHtml(item.code) + '</option>';
@@ -19027,13 +19072,11 @@ function dynamicPagesClientScript() {
         '<label>' + t('transferValue') + '<input data-transfer-review-value="' + index + '" value="' + escapeHtml(item.input) + '"></label>' +
         (item.requiresConfirmation ? '<label class="checkbox"><input type="checkbox" data-transfer-ack="' + index + '"' + (item.ack ? ' checked' : '') + '> ' + t('transferAck') + '</label>' : '') + '</div>';
     }).join('');
-    var issues = (checks ? checks.issues : draft.saveIssues || []).map(function (issue) {
-      return '<li>' + escapeHtml([issue.path, issue.code, issue.message].filter(Boolean).join(' - ')) + '</li>';
-    }).join('');
+    var issues = checks ? renderTemplateTransferIssues(checks.issues) : '';
     return [
       '<section class="section" id="cmdp-template-transfer" aria-labelledby="cmdp-transfer-title">',
       '<h2 id="cmdp-transfer-title">' + t('transferTitle') + '</h2>',
-      '<div class="row"><button type="button" data-action="template-transfer-export"' + (state.savingTemplate ? ' disabled' : '') + '>' + t('transferExport') + '</button></div>',
+      '<div class="row">' + renderActionButton('template-transfer-export', t('transferExport'), { type: 'button', disabled: actions.export }) + '</div>',
       '<div class="settings-grid">',
       '<label>' + t('transferFile') + '<input id="cmdp-transfer-file" type="file" accept=".cmdp-template.json,application/json"><span>' + escapeHtml(draft.fileName) + '</span></label>',
       '<label>' + t('transferMode') + '<select id="cmdp-transfer-mode"><option value="new"' + (draft.mode === 'new' ? ' selected' : '') + '>' + t('transferNew') + '</option><option value="replace"' + (draft.mode === 'replace' ? ' selected' : '') + '>' + t('transferReplace') + '</option></select></label>',
@@ -19042,14 +19085,23 @@ function dynamicPagesClientScript() {
       '</div>',
       '<label>' + t('transferOverrides') + '<textarea id="cmdp-transfer-overrides" rows="3">' + escapeHtml(draft.overrides) + '</textarea></label>',
       checks ? '<div role="status"><strong>' + t(checks.status === 'ready' ? 'transferReady' : 'transferAttention') + '</strong><ul>' + issues + '</ul><pre>' + escapeHtml(pretty({ summary: checks.summary, changes: prepared.changes })) + '</pre></div>' : '',
-      !checks && issues ? '<ul role="status">' + issues + '</ul>' : '',
+      '<div id="cmdp-transfer-save-issues">' + renderTemplateTransferSaveIssues(draft) + '</div>',
       checks && checks.executionReady === false ? '<div class="notice warning">' + t(draft.mode === 'replace' ? 'transferReplaceIncomplete' : 'transferIncomplete') + '</div>' : '',
       review,
-      '<div class="row"><button type="button" data-action="template-transfer-prepare"' + (draft.busy || !draft.package || state.savingTemplate ? ' disabled' : '') + '>' + t(draft.busy ? 'transferBusy' : 'transferPrepare') + '</button>',
-      '<button type="button" data-action="template-transfer-stage"' + (!prepared || draft.busy || state.savingTemplate ? ' disabled' : '') + '>' + t('transferStage') + '</button>',
+      '<div class="row">' + renderActionButton('template-transfer-prepare', t(draft.busy ? 'transferBusy' : 'transferPrepare'), { type: 'button', disabled: actions.prepare }),
+      renderActionButton('template-transfer-stage', t('transferStage'), { type: 'button', disabled: actions.stage }),
       '<button type="button" data-action="template-transfer-cancel">' + t('transferCancel') + '</button></div>',
-      '<div role="status" aria-live="polite">' + escapeHtml(draft.message || '') + '</div></section>'
+      '<div id="cmdp-transfer-message" role="status" aria-live="polite">' + escapeHtml(draft.message || '') + '</div></section>'
     ].join('');
+  }
+
+  function templateTransferActionState(draft, selectedCode) {
+    var selectedPending = templateWritePending(selectedCode);
+    var targetCode = draft.mode === 'replace' ? draft.existingTarget : String(draft.targetCode || '').trim();
+    var preparedCode = draft.prepared && draft.prepared.template.code;
+    var blocked = draft.busy || selectedPending || (targetCode && templateWritePending(targetCode));
+    return { export: selectedPending, prepare: Boolean(blocked || !draft.package),
+      stage: Boolean(blocked || !draft.prepared || draft.targetStale || (preparedCode && templateWritePending(preparedCode))) };
   }
 
   function refreshTemplateTransfer() {
@@ -19098,7 +19150,7 @@ function dynamicPagesClientScript() {
 
   function prepareTemplateTransfer() {
     var draft = templateTransferDraft();
-    if (draft.busy || state.savingTemplate) return Promise.resolve();
+    if (templateTransferActionState(draft, readTemplateCode()).prepare) return Promise.resolve();
     var body;
     try {
       if (!draft.package) throw new Error(t('transferFileRequired'));
@@ -19112,7 +19164,6 @@ function dynamicPagesClientScript() {
       if (draft.description.trim()) body.description = draft.description;
       if (draft.mode === 'replace') {
         var target = (state.templates || []).find(function (item) { return item.code === draft.existingTarget; });
-        if (state.selectedTemplate && state.selectedTemplate.id && state.selectedTemplate.code === draft.existingTarget) target = state.selectedTemplate;
         if (!target || !target.id || !target.specHash) throw new Error(t('transferTargetRequired'));
         body.targetCode = target.code;
         body.baseSpecHash = target.specHash;
@@ -19125,6 +19176,7 @@ function dynamicPagesClientScript() {
     var token = {};
     draft.token = token;
     draft.prepared = null;
+    draft.targetStale = false;
     draft.busy = true;
     draft.message = '';
     draft.saveIssues = [];
@@ -19155,7 +19207,7 @@ function dynamicPagesClientScript() {
   function stageTemplateTransfer() {
     var draft = templateTransferDraft();
     var prepared = draft.prepared;
-    if (!prepared || draft.busy || state.savingTemplate) return;
+    if (templateTransferActionState(draft, readTemplateCode()).stage) return;
     if (prepared.checks.issues.some(function (issue) { return issue.blocking === true; }) || draft.review.some(function (item) { return item.requiresConfirmation && !item.ack; })) {
       templateTransferError(draft, new Error(t('transferReviewRequired')));
       return;
@@ -19191,7 +19243,7 @@ function dynamicPagesClientScript() {
   }
 
   function exportTemplateTransfer() {
-    if (state.savingTemplate) return Promise.resolve();
+    if (templateWritePending(readTemplateCode())) return Promise.resolve();
     var snapshot;
     try { snapshot = captureTemplateEditorSnapshot(); } catch (error) {
       setUiError(error);
@@ -19238,17 +19290,13 @@ function dynamicPagesClientScript() {
     else if (target.hasAttribute('data-transfer-review-value')) draft.review[Number(target.getAttribute('data-transfer-review-value'))].input = target.value;
     else return;
     draft.prepared = null;
+    draft.targetStale = false;
     draft.token = null;
     draft.busy = false;
     draft.message = '';
     draft.saveIssues = [];
     if (target.id === 'cmdp-transfer-mode' || target.id === 'cmdp-transfer-target') { draft.review = []; refreshTemplateTransfer(); }
-    else {
-      var stage = document.querySelector('[data-action="template-transfer-stage"]');
-      if (stage) stage.disabled = true;
-      var prepare = document.querySelector('[data-action="template-transfer-prepare"]');
-      if (prepare) prepare.disabled = !draft.package || state.savingTemplate;
-    }
+    else syncImportedDiagramSaveGate();
   }
 
   function cmdbBuildViewModelForSpec(spec) {
@@ -19402,15 +19450,27 @@ function dynamicPagesClientScript() {
     return 'HTML: ' + htmlQuery + ' | JSON: ' + jsonQuery;
   }
 
+  function reportLaunchQuery(selected, includeDomValues) {
+    var publish = publishModelForSpec(selected && selected.spec);
+    if (publish.mode !== 'staticSnapshot' || publish.paramsMode !== 'exact') return runUrlParamsForTemplate(selected, includeDomValues);
+    try {
+      var pairs = staticSnapshotParamPairs(includeDomValues ? readRunParams() : state.runParams || {});
+      return pairs.length ? { snapshotParams: JSON.stringify(pairs) } : {};
+    } catch (_) {
+      return null;
+    }
+  }
+
   function renderTemplateLaunchUrl(selected, options) {
     options = options || {};
     var code = readTemplateCode(selected);
     if (!code) return '<div class="notice error">' + escapeHtml(t('templateCodeRequired')) + '</div>';
-    var params = runUrlParamsForTemplate(selected, false);
+    var query = reportLaunchQuery(selected, false);
+    var params = query || {};
     var url = absoluteRuntimeTemplateUrl(code, params);
     var jsonParams = Object.assign({}, params, { json: 'true' });
     var jsonUrl = absoluteRuntimeTemplateUrl(code, jsonParams);
-    var disabled = Boolean(options.disabled);
+    var disabled = Boolean(options.disabled || !query);
     var linkTitle = disabled ? String(options.title || t('runLaunchUrlHelp')) : t('runLaunchUrlHelp');
     var linkAttributes = disabled
       ? ' aria-disabled="true" tabindex="-1"'
@@ -19631,12 +19691,8 @@ function dynamicPagesClientScript() {
     var templateSelected = Boolean(state.selectedTemplate);
     var recoverySaveRequired = false;
     var recoveryBlocksStrictActions = false;
-    var saveDisabled = !templateSelected || state.savingTemplate;
-    var saveTitle = !templateSelected
-        ? t('templateSelectionRequired')
-        : state.savingTemplate
-          ? t('savingTemplate')
-          : '';
+    var saveTitle = templateSaveBlockTitle(selected.code);
+    var saveDisabled = Boolean(saveTitle);
 
     // This is the single persistence action for every template-bound section.
     // Local Apply actions validate and update only the in-browser draft.
@@ -19698,10 +19754,11 @@ function dynamicPagesClientScript() {
     } else if (section === 'publication') {
       actions.push(renderActionButton('apply-publication', t('applyPublication')));
       var snapshotPublicationEnabled = publishModelForSpec(selected && selected.spec || defaultSpec()).mode === 'staticSnapshot';
+      var publishTitle = templatePublishBlockTitle(saveTitle, snapshotPublicationEnabled);
       actions.push(renderActionButton('publish-snapshot', t('publishSnapshot'), {
         primary: true,
-        disabled: !snapshotPublicationEnabled,
-        title: snapshotPublicationEnabled ? '' : t('publicationDynamicHint')
+        disabled: Boolean(publishTitle),
+        title: publishTitle
       }));
       if (readTemplateCode(selected)) context = renderTemplateLaunchUrl(selected, {
         disabled: false
@@ -19764,6 +19821,19 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
+  function renderTemplateRows() {
+    return state.templates.map(function (template) {
+      var selectedRow = state.selectedTemplate && state.selectedTemplate.code === template.code ? ' class="selected"' : '';
+      var description = escapeHtml(template.description || '') + (template.protected ? ' <span class="pill">' + escapeHtml(t('protectedTemplate')) + '</span>' : '');
+      var deleteAction = template.protected
+        ? '<span class="muted">' + escapeHtml(t('protectedTemplate')) + '</span>'
+        : '<button class="danger" data-action="delete-template" data-code="' + escapeHtml(template.code) + '">' + t('deleteTemplate') + '</button>';
+      return '<tr' + selectedRow + '><td><button class="link" data-action="select-template" data-code="' + escapeHtml(template.code) + '">' + escapeHtml(template.code) + '</button></td>' +
+        '<td>' + description + '</td><td>' + escapeHtml(template.active ? t('yes') : t('no')) + '</td>' +
+        '<td>' + deleteAction + '</td></tr>';
+    }).join('');
+  }
+
   function renderDesigner(skipRuntimeCapture) {
     if (skipRuntimeCapture !== true) captureRuntimeSettingsFields();
     updateChrome();
@@ -19783,24 +19853,15 @@ function dynamicPagesClientScript() {
       paramsSchema: {},
       resultSchema: {}
     };
-    var templateRows = state.templates.map(function (template) {
-      var selectedRow = state.selectedTemplate && state.selectedTemplate.code === template.code ? ' class="selected"' : '';
-      var description = escapeHtml(template.description || '') + (template.protected ? ' <span class="pill">' + escapeHtml(t('protectedTemplate')) + '</span>' : '');
-      var deleteAction = template.protected
-        ? '<span class="muted">' + escapeHtml(t('protectedTemplate')) + '</span>'
-        : '<button class="danger" data-action="delete-template" data-code="' + escapeHtml(template.code) + '">' + t('deleteTemplate') + '</button>';
-      return '<tr' + selectedRow + '><td><button class="link" data-action="select-template" data-code="' + escapeHtml(template.code) + '">' + escapeHtml(template.code) + '</button></td>' +
-        '<td>' + description + '</td><td>' + escapeHtml(template.active ? t('yes') : t('no')) + '</td>' +
-        '<td>' + deleteAction + '</td></tr>';
-    }).join('');
 
     app.innerHTML = [
       renderDesignerMenu(),
       '<div class="designer-main">',
       renderDesignerActionBar(selected),
-      renderNotice(state.message),
+      '<div id="cmdp-designer-notice"><div id="cmdp-designer-current-notice">' + renderNotice(state.message) + '</div>' +
+        '<div id="cmdp-designer-publication-notice">' + renderNotice(templatePublicationNotice(), true) + '</div></div>',
       renderTemplateContext(selected),
-      renderDesignerSection(selected, config, templateRows),
+      renderDesignerSection(selected, config, renderTemplateRows()),
       '</div>'
     ].join('');
     restoreRuntimeSettingsFields();
@@ -25958,7 +26019,7 @@ function dynamicPagesClientScript() {
   function renderRuntimeNotice(text, cacheHtml, type) {
     var noticeClass = type === 'error' ? 'notice error' : 'notice';
     return '<div class="runtime-notice-shell">' +
-      '<div class="' + noticeClass + '">' + escapeHtml(text || DEFAULT_EMPTY_RESULT_TEXT) + '</div>' +
+      '<div class="' + noticeClass + '"' + (type === 'error' ? ' role="alert"' : '') + '>' + escapeHtml(text || DEFAULT_EMPTY_RESULT_TEXT) + '</div>' +
       (cacheHtml ? '<div class="runtime-notice-actions">' + cacheHtml + '</div>' : '') +
       '</div>';
   }
@@ -25971,7 +26032,16 @@ function dynamicPagesClientScript() {
     var diagrams = outputMode === 'tables' ? [] : visibleResultDiagrams(resultBody ? (resultBody.diagrams || []) : []);
     var cacheHtml = renderRuntimeCacheControl(result);
     if (!result.ok) {
-      return renderRuntimeNotice(result.json && result.json.permissionDeniedText || errorText(result), cacheHtml, 'error');
+      var reason = result.json && result.json.reason;
+      var message = errorText(result);
+      if (reason === 'cmdbuild_session_invalid' || result.status === 401) message = t('runtimeSessionInvalid');
+      else if (reason === 'technical_schema_access_denied') message = t('runtimeTemplateAccessDenied');
+      else if (reason === 'data_access_denied') {
+        var customText = result.json.permissionDeniedText;
+        message = customText && customText !== DEFAULT_PERMISSION_DENIED_TEXT ? customText : t('runtimeDataAccessDenied');
+      }
+      if (result.requestId) message += ' ' + t('runtimeRequestId') + ': ' + result.requestId + '.';
+      return renderRuntimeNotice(message, cacheHtml, 'error');
     }
     if (resultBody && resultBody.kind === 'html' && resultBody.htmlTrusted && resultBody.html) {
       return '<div class="result-table-wrap" data-result-table>' +
@@ -26286,7 +26356,7 @@ function dynamicPagesClientScript() {
         return { ok: true, status: 0, json: { parents: [] }, body: '' };
       }),
       namedRequest('config', apiPrefix + '/config?root=' + encodeURIComponent(state.root)),
-      namedRequest('templates', apiPrefix + '/templates?limit=1000')
+      namedRequest('templates', apiPrefix + '/templates?' + runtimeQuery({ limit: '1000' }))
     ]).then(function (results) {
       clientLog('load-designer-results', results.map(function (item) { return item.status; }).join(','));
       state.session = results[0].json && results[0].json.session ? results[0].json.session : state.session;
@@ -29991,14 +30061,50 @@ function dynamicPagesClientScript() {
     );
   }
 
+  function templateWriteKey(code, root) {
+    return JSON.stringify([root, code]);
+  }
+
+  function templateWritePending(code) {
+    if (code === undefined) code = state.selectedTemplate && state.selectedTemplate.code;
+    return Boolean(code && state.pendingTemplateWrites.has(templateWriteKey(code, runtimeSettingsScope().root)));
+  }
+
+  function templatePublicationNotice() {
+    var code = state.selectedTemplate && state.selectedTemplate.code;
+    var notice = state.templatePublicationNotices.get(templateWriteKey(code, runtimeSettingsScope().root));
+    return notice && notice.snapshotRevocationPending ? { type: 'warning', text: t('snapshotRevocationPending') } : notice;
+  }
+
+  function templateSaveBlockTitle(code) {
+    if (!state.selectedTemplate) return t('templateSelectionRequired');
+    if (templateWritePending(code)) return t('savingTemplate');
+    return state.diagramImportBusy || state.diagramImportAssistantBusy || state.assistantDiagramInterpretBusy || state.assistantDiagramMappingBusy
+      ? t('diagramImportSaveBusy') : '';
+  }
+
+  function templatePublishBlockTitle(saveTitle, publishEnabled) {
+    return saveTitle || (stagedTemplateTransfer() ? t('transferNotSaved') : publishEnabled ? '' : t('publicationDynamicHint'));
+  }
+
   function syncImportedDiagramSaveGate() {
-    var assistantBusy = state.diagramImportBusy || state.diagramImportAssistantBusy || state.assistantDiagramInterpretBusy || state.assistantDiagramMappingBusy;
-    var blocked = !state.selectedTemplate || state.savingTemplate || assistantBusy;
-    Array.prototype.slice.call(document.querySelectorAll('[data-action="save-template"]')).forEach(function (button) {
-      button.disabled = blocked;
-      button.setAttribute('aria-disabled', blocked ? 'true' : 'false');
-      button.title = state.savingTemplate ? t('savingTemplate') : assistantBusy ? t('diagramImportSaveBusy') : '';
-    });
+    function syncAction(action, disabled, title) {
+      document.querySelectorAll('[data-action="' + action + '"]').forEach(function (button) {
+        button.disabled = disabled;
+        button.setAttribute('aria-disabled', disabled ? 'true' : 'false');
+        if (title !== undefined) button.title = title;
+      });
+    }
+    var code = readTemplateCode();
+    var saveTitle = templateSaveBlockTitle(code);
+    var publishMode = hasField('cmdp-publish-mode') ? readValue('cmdp-publish-mode') : publishModelForSpec(state.selectedTemplate && state.selectedTemplate.spec).mode;
+    var publishTitle = templatePublishBlockTitle(saveTitle, publishMode === 'staticSnapshot');
+    syncAction('save-template', Boolean(saveTitle), saveTitle);
+    syncAction('publish-snapshot', Boolean(publishTitle), publishTitle);
+    if (document.getElementById('cmdp-template-transfer')) {
+      var actions = templateTransferActionState(templateTransferDraft(), code);
+      Object.keys(actions).forEach(function (action) { syncAction('template-transfer-' + action, actions[action]); });
+    }
   }
 
   function renderDiagramImportSafely() {
@@ -30661,23 +30767,30 @@ function dynamicPagesClientScript() {
     });
   }
 
-  function saveTemplate() {
+  function saveTemplate(options) {
     if (state.savingTemplate) return;
+    options = options || {};
     if (state.diagramImportBusy || state.diagramImportAssistantBusy || state.assistantDiagramInterpretBusy || state.assistantDiagramMappingBusy) {
       state.message = { type: 'warning', text: t('diagramImportSaveBusy') };
       renderDesigner();
       return;
     }
     var snapshot;
-    try { snapshot = captureTemplateEditorSnapshot(); } catch (error) {
+    var publication;
+    try {
+      snapshot = captureTemplateEditorSnapshot();
+      if (snapshot && options.publish) {
+        snapshot.payload.spec = applyPublicationToSpec(snapshot.payload.spec, true);
+        if (snapshot.payload.spec.publish.mode !== 'staticSnapshot') return;
+        publication = { params: cloneJsonValue(readRunParams(), {}) };
+      }
+    } catch (error) {
       setUiError(error);
       renderDesigner();
       return;
     }
     if (!snapshot) return;
-    var savedDiagramEditorState = snapshot.savedDiagramEditorState;
-    var payload = snapshot.payload;
-    saveTemplateSnapshot(payload, savedDiagramEditorState);
+    return saveTemplateSnapshot(snapshot.payload, snapshot.savedDiagramEditorState, publication);
   }
 
   function captureTemplateEditorSnapshot() {
@@ -30704,11 +30817,19 @@ function dynamicPagesClientScript() {
     return { payload: readEditorPayload(), savedDiagramEditorState: savedDiagramEditorState };
   }
 
-  function saveTemplateSnapshot(payload, savedDiagramEditorState) {
+  function saveTemplateSnapshot(payload, savedDiagramEditorState, publication) {
+    var saveScope = runtimeSettingsScope();
+    var key = templateWriteKey(payload.code, saveScope.root);
+    if (state.pendingTemplateWrites.has(key)) return;
     var owner = uiRequestOwner();
     var exists = Boolean(state.selectedTemplate && state.selectedTemplate.id);
     var staged = state.stagedTemplateTransfer && stagedTemplateTransfer();
     var replacement = staged && staged.replacement;
+    if (publication && staged) {
+      state.message = { type: 'warning', text: t('transferNotSaved') };
+      renderDesigner();
+      return;
+    }
     if (staged) {
       if (replacement && (!exists || String(state.selectedTemplate.id) !== String(replacement.targetId)) || !replacement && exists) {
         setUiError(new Error(t('transferInvalid')));
@@ -30723,55 +30844,111 @@ function dynamicPagesClientScript() {
         payload.active = false;
       }
     }
-    var saveScope = runtimeSettingsScope();
     var editorInstance = Number(state.templateEditorInstance || 0);
-    var saveToken = {};
-    state.templateSaveToken = saveToken;
     function sameEditor() {
-      return runtimeSettingsScopeIsCurrent(saveScope) && Number(state.templateEditorInstance || 0) === editorInstance && state.templateSaveToken === saveToken;
+      return runtimeSettingsScopeIsCurrent(saveScope) && Number(state.templateEditorInstance || 0) === editorInstance && sameTemplate();
     }
-    var path = (exists ? apiPrefix + '/templates/' + encodeURIComponent(state.selectedTemplate.code) : apiPrefix + '/templates') + '?root=' + encodeURIComponent(saveScope.root);
+    function sameScope() { return saveScope.session === state.session && saveScope.root === runtimeSettingsScope().root; }
+    function sameTemplate() { return sameScope() && state.selectedTemplate && state.selectedTemplate.code === payload.code; }
+    function sameDraft() { return Number(state.uiDiagnosticRevision || 0) === owner.revision; }
+    function refreshWriteNotice() {
+      var notice = document.getElementById('cmdp-designer-current-notice');
+      if (notice) notice.innerHTML = renderNotice(state.message);
+    }
+    function refreshPublicationNotice() {
+      var notice = document.getElementById('cmdp-designer-publication-notice');
+      if (notice) notice.innerHTML = renderNotice(templatePublicationNotice(), true);
+    }
+    var savingNotice = { type: 'ok', text: t('savingTemplate') };
+    var write = { notice: savingNotice };
+    function writeNotice(message) {
+      if (state.message !== write.notice) return;
+      write.notice = state.message = message;
+      refreshWriteNotice();
+    }
+    var rootQuery = '?root=' + encodeURIComponent(saveScope.root);
+    var path = (exists ? apiPrefix + '/templates/' + encodeURIComponent(state.selectedTemplate.code) : apiPrefix + '/templates') + rootQuery;
     var wasCreating = state.designerSection === 'template';
-    state.savingTemplate = true;
-    var savingMessage = { type: 'ok', text: t('savingTemplate') };
-    state.message = savingMessage;
-    renderDesigner();
-    request(path, { method: exists ? 'PUT' : 'POST', body: payload, owner: owner }).then(function (result) {
-      if (!sameEditor()) return;
+    state.pendingTemplateWrites.set(key, write);
+    if (publication && !state.templatePublicationNotices.get(key)?.snapshotRevocationPending) state.templatePublicationNotices.delete(key);
+    var redraw = false;
+    var publishing = false;
+    state.message = savingNotice;
+    refreshWriteNotice();
+    if (publication) refreshPublicationNotice();
+    syncImportedDiagramSaveGate();
+    var codeField = document.getElementById('cmdp-code');
+    if (codeField) codeField.readOnly = true;
+    return request(path, { method: exists ? 'PUT' : 'POST', body: payload, owner: owner, phase: 'save' }).then(async function (result) {
+      if (!sameScope()) return;
       var transferError = replacement && !result.ok && result.json && result.json.code;
-      if (transferError === 'template_transfer_revision_conflict' || transferError === 'template_transfer_incomplete') {
-        var canRender = Number(state.uiDiagnosticRevision || 0) === owner.revision || captureVisibleDesignerState();
+      if (sameEditor() && (transferError === 'template_transfer_revision_conflict' || transferError === 'template_transfer_incomplete')) {
         var draft = templateTransferDraft();
         draft.saveIssues = Array.isArray(result.json.issues) ? result.json.issues : [];
         draft.message = t(transferError === 'template_transfer_revision_conflict' ? 'transferSaveConflict' : 'transferSaveIncomplete');
-        state.savingTemplate = false;
-        state.message = { type: 'error', text: draft.message };
-        if (canRender) renderDesigner(); else refreshTemplateTransfer();
+        var issues = document.getElementById('cmdp-transfer-save-issues');
+        if (issues) issues.innerHTML = renderTemplateTransferSaveIssues(draft);
+        var message = document.getElementById('cmdp-transfer-message');
+        if (message) message.textContent = draft.message;
+        writeNotice({ type: 'error', text: draft.message });
         return;
       }
       validateUiResponse(result, 'save');
       if (!result.ok) throw createRequestError(result);
-      if (staged) {
-        state.stagedTemplateTransfer = null;
-        state.templateTransfer = null;
+      var savedTemplate = result.json.template;
+      var revocationPending = result.json.snapshotRevocationPending === true;
+      if (revocationPending) state.templatePublicationNotices.set(key, { snapshotRevocationPending: true });
+      else if (state.templatePublicationNotices.get(key)?.snapshotRevocationPending) state.templatePublicationNotices.delete(key);
+      if (sameTemplate()) refreshPublicationNotice();
+
+      // ACK belongs to the saved list even after the editor has moved on.
+      var savedIndex = state.templates.findIndex(function (item) { return item.code === savedTemplate.code; });
+      state.templates = state.templates.slice();
+      if (savedIndex < 0) state.templates.push(savedTemplate);
+      else state.templates[savedIndex] = savedTemplate;
+      var list = document.querySelector('#cmdp-template-list tbody');
+      if (list) list.innerHTML = renderTemplateRows();
+
+      var transferDraft = state.templateTransfer;
+      var transferCurrent = transferDraft && templateTransferOwnerIsCurrent(transferDraft.owner);
+      if (transferCurrent && transferDraft.mode === 'replace' && transferDraft.existingTarget === savedTemplate.code) {
+        transferDraft.targetStale = true;
       }
-      var unchanged = Number(state.uiDiagnosticRevision || 0) === owner.revision;
-      if (!unchanged || !uiDiagnosticIsCurrent({ owner: owner })) {
-        captureVisibleDesignerState();
+      if (!sameTemplate() || (!sameEditor() && String(state.selectedTemplate.id || '') !== String(savedTemplate.id || ''))) return;
+      var originalEditor = sameEditor();
+      if (originalEditor && staged && state.stagedTemplateTransfer === staged) state.stagedTemplateTransfer = null;
+      var unchanged = sameDraft();
+      if (!originalEditor || !unchanged || !uiDiagnosticIsCurrent({ owner: owner })) {
+        // Keep the current form intact, including inputs that are not yet parseable.
         ['id', 'code', 'specHash', 'version', 'updatedAt'].forEach(function (key) {
-          if (Object.prototype.hasOwnProperty.call(result.json.template, key)) state.selectedTemplate[key] = result.json.template[key];
+          if (Object.prototype.hasOwnProperty.call(savedTemplate, key)) state.selectedTemplate[key] = savedTemplate[key];
         });
-        if (!unchanged) {
+        if (transferCurrent) transferDraft.owner = templateTransferOwner();
+        if (!originalEditor || !unchanged) {
           state.templateDirty = true;
-          if (state.message === savingMessage) state.message = { type: 'warning', text: t('savedPreviousRevision') };
+          writeNotice({ type: 'warning', text: t(publication && !revocationPending ? 'publishDraftChanged' : 'savedPreviousRevision') });
+          return;
         }
-        state.savingTemplate = false;
-        renderDesigner();
+      } else {
+        state.selectedTemplate = cloneJsonValue(savedTemplate, {});
+        if (transferCurrent) transferDraft.owner = templateTransferOwner();
+        state.templateDirty = false;
+        state.assistantFlowApplied = false;
+        state.paramRowsDraft = null;
+        state.diagramImportAppliedEditorDirty = false;
+        state.assistantAuthoringDirty = false;
+        state.lastDraftPreviewOk = false;
+        state.diagramImportAppliedPendingPreview = savedDiagramEditorState;
+        if (wasCreating && state.designerSection === 'template') {
+          state.designerSection = 'templates';
+          if (window.history && window.history.pushState) window.history.pushState({ designerSection: 'templates' }, '', designerSectionUrl('templates'));
+        }
+        redraw = (state.designerSection !== 'templates' && state.designerSection !== 'publication') || wasCreating;
+      }
+      if (revocationPending) {
+        writeNotice(null);
         return;
       }
-      state.selectedTemplate = result.json.template;
-      state.templateDirty = false;
-      state.assistantFlowApplied = false;
       var executionValidation = result.json.executionValidation || {};
       var saveMessage = result.json.cacheInvalidation && result.json.cacheInvalidation.complete === false
         ? { type: 'error', text: t('diagramImportCacheInvalidationPartial') }
@@ -30780,34 +30957,51 @@ function dynamicPagesClientScript() {
           : !executionValidation.executable
           ? { type: 'ok', text: t('savedNotExecutable') }
           : { type: 'ok', text: savedDiagramEditorState ? t('diagramImportSavedNeedsValidation') : t('saved') };
-      state.message = saveMessage;
-      state.paramRowsDraft = null;
-      state.diagramImportAppliedEditorDirty = false;
-      state.assistantAuthoringDirty = false;
-      state.lastDraftPreviewOk = false;
-      state.diagramImportAppliedPendingPreview = savedDiagramEditorState;
-      if (wasCreating) {
-        state.designerSection = 'templates';
-        if (window.history && window.history.pushState) window.history.pushState({ designerSection: 'templates' }, '', designerSectionUrl('templates'));
+      writeNotice(saveMessage);
+      if (!publication) return;
+      if (diagramImportExecutionValidationHasMappingBlocker(executionValidation)) {
+        throw new Error(t('diagramImportPublicationIncomplete'));
       }
-      state.templates = state.templates.filter(function (item) { return item.code !== result.json.template.code; }).concat([result.json.template]);
-      state.savingTemplate = false;
-      renderDesigner();
-    }).catch(function (error) {
-      if (!sameEditor() || !uiDiagnosticIsCurrent(error.diagnostic || { owner: owner })) return;
-      state.lastDraftPreviewOk = false;
-      setUiError(error);
-      renderDesigner();
-    }).finally(function () {
+      if (!/^[0-9a-f]{64}$/i.test(String(savedTemplate.specHash || ''))) {
+        throw new Error(t('publishSavedSpecHashMissing'));
+      }
+      writeNotice({ type: 'ok', text: t('publishingSnapshot') });
+      publishing = true;
+      var published = await request(apiPrefix + '/templates/' + encodeURIComponent(savedTemplate.code) + '/publish' + rootQuery, {
+        method: 'POST',
+        owner: owner,
+        phase: 'publish',
+        body: { params: publication.params, savedSpecHash: savedTemplate.specHash }
+      });
+      if (!published.ok) throw createRequestError(published);
       if (!sameEditor()) return;
-      state.savingTemplate = false;
+      if (sameDraft() && uiDiagnosticIsCurrent({ owner: owner })) state.result = published;
+      if (!sameDraft()) state.templateDirty = true;
+      writeNotice({ type: sameDraft() ? 'ok' : 'warning', text: t(sameDraft() ? 'snapshotPublished' : 'publishedPreviousRevision') });
+    }).catch(function (error) {
+      if (publishing && saveScope.session === state.session) {
+        var failure = uiErrorMessage(error);
+        failure.templateWrite = true;
+        state.templatePublicationNotices.set(key, failure);
+        writeNotice(null);
+        if (sameTemplate()) refreshPublicationNotice();
+        return;
+      }
+      if (!sameEditor() || state.message !== write.notice) return;
+      var conflict = error.code === 'template_version_conflict';
+      if (!conflict && !uiDiagnosticIsCurrent(error.diagnostic || { owner: owner })) {
+        writeNotice(null);
+        return;
+      }
+      state.lastDraftPreviewOk = false;
+      setUiError(error, conflict ? t('templateVersionConflict') : undefined, conflict);
+      refreshWriteNotice();
+    }).finally(function () {
+      state.pendingTemplateWrites.delete(key);
       syncImportedDiagramSaveGate();
       var codeField = document.getElementById('cmdp-code');
-      if (codeField) codeField.readOnly = Boolean(state.selectedTemplate && state.selectedTemplate.id);
-      if (state.message === savingMessage && !uiDiagnosticIsCurrent({ owner: owner })) {
-        state.message = null;
-        renderDesigner();
-      }
+      if (codeField) codeField.readOnly = Boolean(state.selectedTemplate && (state.selectedTemplate.id || state.savingTemplate));
+      if (redraw && sameEditor() && sameDraft() && (uiDiagnosticIsCurrent({ owner: owner }) || (wasCreating && state.designerSection === 'templates'))) renderDesigner();
     });
   }
 
@@ -31803,7 +31997,7 @@ function dynamicPagesClientScript() {
       renderDesigner();
       return;
     }
-    request(apiPrefix + '/draft/' + action + '?maxRows=' + authoringPreviewMaxRows(), {
+    request(action === 'preview' ? authoringPreviewPath() : apiPrefix + '/draft/' + action + '?' + runtimeQuery({ maxRows: authoringPreviewMaxRows() }), {
       method: 'POST',
       owner: owner,
       body: { template: payload, params: params }
@@ -32091,8 +32285,12 @@ function dynamicPagesClientScript() {
   }
 
   function selectTemplate(code) {
+    if (state.selectedTemplate && state.selectedTemplate.code === code) return;
+    var pending = state.selectedTemplate && state.pendingTemplateWrites.get(templateWriteKey(state.selectedTemplate.code, runtimeSettingsScope().root));
+    if (pending && state.message === pending.notice) state.message = null;
     var editorMutationRevision = Number(state.diagramImportEditorMutationRevision || 0);
-    state.selectedTemplate = state.templates.find(function (item) { return item.code === code; }) || null;
+    var revision = Number(state.uiDiagnosticRevision || 0);
+    state.selectedTemplate = cloneJsonValue(state.templates.find(function (item) { return item.code === code; }), null);
     state.objectGroupDraft = null;
     state.relationDraft = null;
     state.objectGroupExpandedSelectionId = '';
@@ -32117,6 +32315,7 @@ function dynamicPagesClientScript() {
     return Promise.all([restoreDiagramImportAssistantCheckpoint(), versions]).then(function () {
       if (!templateVersionOwnerIsCurrent(versionOwner)) return;
       if (Number(state.diagramImportEditorMutationRevision || 0) !== editorMutationRevision) return;
+      if (Number(state.uiDiagnosticRevision || 0) !== revision) return;
       renderDesigner();
     });
   }
@@ -32289,7 +32488,6 @@ function dynamicPagesClientScript() {
 
   function applyBuilder() {
     state.templateEditorInstance = Number(state.templateEditorInstance || 0) + 1;
-    state.savingTemplate = false;
     var kind = readValue('cmdp-builder-kind') || 'classes';
     var built = buildBuilderTemplate(kind, {
       attrType: readValue('cmdp-builder-attr-type') || 'reference',
@@ -32430,7 +32628,7 @@ function dynamicPagesClientScript() {
     var templateCode = String(code || '').trim();
     if (!templateCode) return;
     if (!window.confirm(t('deleteTemplateConfirm', { code: templateCode }))) return;
-    request(apiPrefix + '/templates/' + encodeURIComponent(templateCode), { method: 'DELETE' }).then(function (result) {
+    request(apiPrefix + '/templates/' + encodeURIComponent(templateCode) + '?' + runtimeQuery(), { method: 'DELETE' }).then(function (result) {
       if (!result.ok) throw createRequestError(result);
       if (state.selectedTemplate && state.selectedTemplate.code === templateCode) {
         state.selectedTemplate = null;
@@ -32450,8 +32648,7 @@ function dynamicPagesClientScript() {
   }
 
   function runtimeTemplateUrl(code, params) {
-    var query = new URLSearchParams(params || {}).toString();
-    return '/cmdbuild/dynamicpages/ui/run/' + encodeURIComponent(code) + (query ? '?' + query : '');
+    return '/cmdbuild/dynamicpages/ui/run/' + encodeURIComponent(code) + '?' + runtimeQuery(params).toString();
   }
 
   function absoluteRuntimeTemplateUrl(code, params) {
@@ -32461,7 +32658,8 @@ function dynamicPagesClientScript() {
 
   function openRun(code, newTab) {
     var selected = state.selectedTemplate || {};
-    var params = runUrlParamsForTemplate(selected, true);
+    var params = reportLaunchQuery(selected, true);
+    if (!params) return;
     var url = runtimeTemplateUrl(code, params);
     if (newTab && window.open) {
       window.open(url, '_blank', 'noopener');
@@ -32559,52 +32757,7 @@ function dynamicPagesClientScript() {
   }
 
   function publishSnapshot() {
-    var code = readTemplateCode();
-    if (!code) {
-      state.message = { type: 'error', text: t('templateCodeRequired') };
-      renderDesigner();
-      return;
-    }
-    var params;
-    var payload;
-    try {
-      payload = readEditorPayload();
-      payload.spec = applyPublicationToSpec(payload.spec, true);
-      params = readRunParams();
-    } catch (error) {
-      setUiError(error);
-      renderDesigner();
-      return;
-    }
-    var exists = Boolean(state.selectedTemplate && state.selectedTemplate.id);
-    var savePath = exists ? apiPrefix + '/templates/' + encodeURIComponent(state.selectedTemplate.code) : apiPrefix + '/templates';
-    request(savePath, { method: exists ? 'PUT' : 'POST', body: payload }).then(function (saveResult) {
-      if (!saveResult.ok) throw createRequestError(saveResult);
-      var savedTemplate = saveResult.json && saveResult.json.template ? saveResult.json.template : {};
-      state.selectedTemplate = savedTemplate;
-      var executionValidation = saveResult.json && saveResult.json.executionValidation || {};
-      if (diagramImportExecutionValidationHasMappingBlocker(executionValidation)) {
-        throw new Error(t('diagramImportPublicationIncomplete'));
-      }
-      if (!savedTemplate.specHash || !/^[0-9a-f]{64}$/i.test(String(savedTemplate.specHash))) {
-        throw new Error(t('publishSavedSpecHashMissing'));
-      }
-      var publishCode = savedTemplate.code || payload.code || code;
-      return request(apiPrefix + '/templates/' + encodeURIComponent(publishCode) + '/publish', {
-        method: 'POST',
-        body: {
-          params: params,
-          savedSpecHash: savedTemplate.specHash
-        }
-      });
-    }).then(function (result) {
-      state.result = result;
-      if (result.ok) state.message = { type: 'ok', text: t('snapshotPublished') }; else setUiError(createRequestError(result));
-      renderDesigner();
-    }).catch(function (error) {
-      setUiError(error);
-      renderDesigner();
-    });
+    return saveTemplate({ publish: true });
   }
 
   function refreshTemplateLaunchUrl() {
@@ -32614,13 +32767,19 @@ function dynamicPagesClientScript() {
     if (!link && !jsonLink && !paramsText) return;
     var code = (link && link.getAttribute('data-template-code')) || (jsonLink && jsonLink.getAttribute('data-template-code')) || readTemplateCode();
     if (!code) return;
-    var params = runUrlParamsForTemplate(state.selectedTemplate || {}, true);
+    var params = reportLaunchQuery(state.selectedTemplate || {}, true);
+    if (!params) {
+      [link, jsonLink].filter(Boolean).forEach(function (anchor) { anchor.removeAttribute('href'); anchor.setAttribute('aria-disabled', 'true'); });
+      return;
+    }
     var url = absoluteRuntimeTemplateUrl(code, params);
     if (link) {
+      link.removeAttribute('aria-disabled');
       link.href = url;
       link.textContent = url;
     }
     if (jsonLink) {
+      jsonLink.removeAttribute('aria-disabled');
       var jsonUrl = absoluteRuntimeTemplateUrl(code, Object.assign({}, params, { json: 'true' }));
       jsonLink.href = jsonUrl;
       jsonLink.textContent = jsonUrl;
@@ -32641,7 +32800,7 @@ function dynamicPagesClientScript() {
     var templateCode = boot.templateCode || '';
     var params = {};
     new URLSearchParams(window.location.search || '').forEach(function (value, key) {
-      if (runtimeSystemParam(key)) return;
+      if (key === 'snapshotParams' || runtimeSystemParam(key)) return;
       params[key] = value;
     });
     state.runParams = params;
@@ -32660,13 +32819,6 @@ function dynamicPagesClientScript() {
     request(runtimeRunPath(templateCode, params, Boolean(refresh))).then(function (result) {
       result.downloadMode = 'template';
       state.runtimeRefreshInProgress = false;
-      if (!result.ok && resultIsPermissionDenied(result)) {
-        return request(publicSnapshotRunPath(templateCode, params)).then(function (publicResult) {
-          publicResult.downloadMode = 'public';
-          renderRuntimeIntoApp(publicResult.ok && publicResult.json && publicResult.json.snapshotFound ? publicResult : result);
-          startRuntimeCountdown();
-        });
-      }
       renderRuntimeIntoApp(result);
       startRuntimeCountdown();
     }).catch(function (error) {
@@ -32876,7 +33028,9 @@ function dynamicPagesClientScript() {
     if (action === 'visualize-editor') runUiOperation(action, function () { visualizeInEditor(); });
     if (action === 'force-refresh-editor') runUiOperation(action, function () { forceRefreshInEditor(); });
     if (action === 'visualize-external') visualizeExternal();
-    if (action === 'select-template') runUiOperation(action, function () { selectTemplate(target.getAttribute('data-code')); });
+    if (action === 'select-template' && (!state.selectedTemplate || state.selectedTemplate.code !== target.getAttribute('data-code'))) {
+      runUiOperation(action, function () { selectTemplate(target.getAttribute('data-code')); });
+    }
     if (action === 'delete-template') runUiOperation(action, function () { deleteTemplate(target.getAttribute('data-code')); });
     if (action === 'object-selection-expand') expandObjectGroupSelection(target.getAttribute('data-object-selection-id'));
     if (action === 'apply-object-group') runUiMutation(function () { applyObjectGroupEditor(); });
@@ -33670,6 +33824,9 @@ function dynamicPagesClientScript() {
 
   document.addEventListener('input', handleTemplateTransferChange);
   document.addEventListener('change', handleTemplateTransferChange);
+  document.addEventListener('input', function (event) {
+    if (event.target && (event.target.id === 'cmdp-code' || event.target.id === 'cmdp-publish-mode')) syncImportedDiagramSaveGate();
+  });
 
   updateChrome();
   setupLanguageSelector();
@@ -34047,7 +34204,7 @@ function buildTechnicalSchema(rootValue, options = {}) {
   const classNames = {
     root,
     config: validateCmdbuildIdentifier(overrides.config && overrides.config.name || `${prefix}QueryToolConfig`, 'config class'),
-    template: validateCmdbuildIdentifier(overrides.template && overrides.template.name || `${prefix}QueryTemplate`, 'template class'),
+    template: validateCmdbuildIdentifier(overrides.template && overrides.template.name || snapshotTemplateClass(root), 'template class'),
     version: validateCmdbuildIdentifier(overrides.version && overrides.version.name || `${prefix}QueryTemplateVersion`, 'template version class')
   };
   const rootDescription = technicalClassDescription(root, overrides.root && overrides.root.description || options.description || options.rootDescription || root);
@@ -35368,11 +35525,14 @@ function cmdbuildSessionFailureHttpStatus(upstreamStatus) {
   return [400, 401, 403].includes(Number(upstreamStatus || 0)) ? 401 : 502;
 }
 
-async function requireValidBackendSession(authToken, res) {
+async function requireValidBackendSession(authToken, res, runtimeContext) {
   const session = await getSessionData(authToken);
   if (session.response.ok && session.data) return session;
   const upstreamStatus = Number(session.response.statusCode || 0);
   const responseStatus = cmdbuildSessionFailureHttpStatus(upstreamStatus);
+  if (runtimeContext) {
+    logWarn('runtime.access_failed', { ...runtimeContext, stage: 'session', cmdbuildStatus: upstreamStatus });
+  }
   sendJson(res, responseStatus, {
     success: false,
     reason: 'cmdbuild_session_invalid',
@@ -35398,7 +35558,7 @@ async function requireTemplateClassPermission(authToken, res, schema, permission
   if (!classAccess.json || !classAccess.json.data || classAccess.json.data[permission] !== true) {
     sendJson(res, 403, {
       success: false,
-      reason: permission === '_can_create' ? 'template_create_forbidden' : 'template_update_forbidden',
+      reason: permission === '_can_create' ? 'template_create_forbidden' : permission === '_can_delete' ? 'template_delete_forbidden' : 'template_update_forbidden',
       message: `Template class does not grant ${permission} to the current CMDBuild session.`
     });
     return false;
@@ -37112,13 +37272,6 @@ function runtimeCacheMeta(entry, status, now = Date.now(), extra = {}) {
   };
 }
 
-function runtimeAccessError(message, statusCode = 403) {
-  const error = new Error(message);
-  error.statusCode = statusCode;
-  error.cmdbuildStatus = statusCode;
-  return error;
-}
-
 function attributeReadable(attribute) {
   if (!attribute) return false;
   if (attribute.active === false) return false;
@@ -37133,6 +37286,7 @@ async function probeClassUsedFields(cmdbuildExecRequest, className, fields, limi
   if (!attributesResponse.response.ok) {
     return {
       ok: false,
+      reason: 'attributes_unavailable',
       cmdbuildStatus: attributesResponse.response.statusCode,
       message: `CMDBuild attributes probe for ${className} failed with status ${attributesResponse.response.statusCode}.`
     };
@@ -37147,6 +37301,7 @@ async function probeClassUsedFields(cmdbuildExecRequest, className, fields, limi
     if (!attributeReadable(attribute)) {
       return {
         ok: false,
+        reason: 'attribute_unconfirmed',
         cmdbuildStatus: 403,
         message: `CMDBuild attribute is not readable for cache probe: ${className}.${direct}`
       };
@@ -37158,6 +37313,7 @@ async function probeClassUsedFields(cmdbuildExecRequest, className, fields, limi
   if (!cardsResponse.ok) {
     return {
       ok: false,
+      reason: 'cards_probe_failed',
       cmdbuildStatus: cardsResponse.statusCode,
       message: `CMDBuild cards probe for ${className} failed with status ${cardsResponse.statusCode}.`
     };
@@ -37276,6 +37432,7 @@ async function probeTemplateAccess(authToken, spec, params, executionOptions, de
       continue;
     }
     const classNames = await resolveExecutionClassNames(cmdbuildExecRequest, limits, requested, classesCache, resolvedClassCache);
+    if (!classesCache.ok || !classNames.length) incomplete = true;
     for (const className of classNames) {
       if (!className) continue;
       checkedClasses.push(className);
@@ -37285,6 +37442,7 @@ async function probeTemplateAccess(authToken, spec, params, executionOptions, de
           ok: false,
           mode: config.scopeMode,
           cmdbuildStatus: probe.cmdbuildStatus || 403,
+          reason: probe.reason,
           message: probe.message || 'CMDBuild cache permission probe failed.',
           checkedClasses: uniqueStrings(checkedClasses),
           incomplete
@@ -37323,11 +37481,35 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
     };
   }
   const dependencyMap = dependencyMapWithHash(executionSpec);
-  const accessProbe = await probeTemplateAccess(authToken, executionSpec, params, executionOptions, dependencyMap, templateCacheConfig);
-  if (!accessProbe.ok) {
-    const error = runtimeAccessError(accessProbe.message || 'CMDBuild cache permission probe failed.', accessProbe.cmdbuildStatus || 403);
-    error.reason = accessProbe.reason || '';
+  let accessProbe;
+  try {
+    accessProbe = await probeTemplateAccess(authToken, executionSpec, params, executionOptions, dependencyMap, templateCacheConfig);
+  } catch {
+    accessProbe = { ok: false, reason: 'probe_failed' };
+  }
+  if (accessProbe.reason === 'template_dependency_invalid') {
+    const error = new Error(accessProbe.message);
+    error.statusCode = 422;
+    error.reason = accessProbe.reason;
     throw error;
+  }
+  if (accessProbe.reason === 'cards_probe_failed' && isPermissionDeniedStatus(accessProbe.cmdbuildStatus)) {
+    // A denied data read is not the same as an unconfirmed cache probe.
+    throw Object.assign(new Error(accessProbe.message), { cmdbuildStatus: accessProbe.cmdbuildStatus });
+  }
+  if (!accessProbe.ok || accessProbe.incomplete) {
+    logInfo('runtime.cache_bypassed', {
+      requestId: currentRequestId(),
+      root,
+      templateCode: template.code,
+      stage: 'cache_access',
+      reason: accessProbe.reason || 'probe_incomplete',
+      cmdbuildStatus: accessProbe.cmdbuildStatus || undefined
+    });
+    return {
+      result: await executeTemplateSpec(authToken, template.spec, params, executionOptions),
+      cache: { enabled: false, status: 'bypass', reason: 'access_probe_unconfirmed' }
+    };
   }
   const resultTtlMs = templateCacheConfig.ttlSeconds * 1000;
   const refreshCooldownMs = runtimeCacheConfig.refreshCooldownSec * 1000;
@@ -37446,22 +37628,141 @@ function normalizePublishConfig(spec) {
   };
 }
 
-function staticSnapshotParamsHash(params, publishConfig) {
-  return publishConfig && publishConfig.paramsMode === 'ignore' ? 'any' : hashJson(params || {});
+const SNAPSHOT_PARAMS_QUERY = 'snapshotParams';
+const SNAPSHOT_MEMORY_ONLY = !REDIS_ENABLED && !REDIS_REQUIRED && process.env.NODE_ENV !== 'production';
+const snapshotStateMemory = new Map();
+const SNAPSHOT_STATE = /^(ready|pending):[0-9a-f-]{36}$/;
+
+function snapshotTemplateClass(root) {
+  return `${getTechnicalPrefix(validateCmdbuildIdentifier(root, 'root'))}QueryTemplate`;
 }
 
-function staticSnapshotKey(templateCode, params, publishConfig) {
+function staticSnapshotParamsHash(params, publishConfig) {
+  return publishConfig && publishConfig.paramsMode === 'ignore' ? 'any' : hashJson(staticSnapshotParamPairs(params || {}));
+}
+
+function staticSnapshotKey(root, templateCode, params, publishConfig) {
   const code = validateCmdbuildIdentifier(templateCode, 'template code');
-  return `${code}:${staticSnapshotParamsHash(params, publishConfig)}`;
+  return `v3:${snapshotTemplateClass(root)}:${code}:${staticSnapshotParamsHash(params, publishConfig)}`;
+}
+
+function snapshotStateKey(root, code) {
+  return cacheKey('snapshot-state', staticSnapshotTemplateIndexId(root, code));
+}
+
+function snapshotStoreError(reason, message, statusCode = 503) {
+  return Object.assign(new Error(message), { statusCode, reason, code: reason });
+}
+
+async function readSnapshotState(key) {
+  if (SNAPSHOT_MEMORY_ONLY) return snapshotStateMemory.get(key) ?? null;
+  const value = await redisCommand(['GET', key]);
+  if (value !== null && !SNAPSHOT_STATE.test(value)) throw new Error('Invalid snapshot publication state.');
+  return value;
+}
+
+async function snapshotPublicationState(root, code) {
+  const key = snapshotStateKey(root, code);
+  try {
+    let state = await readSnapshotState(key);
+    if (state === null) {
+      const first = `ready:${crypto.randomUUID()}`;
+      if (SNAPSHOT_MEMORY_ONLY) snapshotStateMemory.set(key, first);
+      else await redisCommand(['SET', key, first, 'NX']);
+      state = await readSnapshotState(key);
+    }
+    if (state?.startsWith('ready:')) return state;
+  } catch {
+    throw snapshotStoreError('snapshot_storage_unavailable', 'Published report storage is temporarily unavailable.');
+  }
+  throw snapshotStoreError('snapshot_revocation_pending', 'Publication is blocked until the previous template mutation is reconciled.', 409);
+}
+
+async function beginSnapshotRevocation(res, root, codes) {
+  const keys = codes.map((code) => snapshotStateKey(root, code));
+  const id = crypto.randomUUID();
+  const pending = `pending:${id}`;
+  const ready = `ready:${id}`;
+  try {
+    const states = await Promise.all(keys.map(readSnapshotState));
+    if (states.some((state) => state?.startsWith('pending:'))) throw new Error('A previous revocation is pending.');
+    if (SNAPSHOT_MEMORY_ONLY) keys.forEach((key) => snapshotStateMemory.set(key, pending));
+    else if (await redisCommand(['MSET', ...keys.flatMap((key) => [key, pending])]) !== 'OK') throw new Error('Revocation was not confirmed.');
+    logInfo('snapshot.revocation_started', { requestId: currentRequestId(), root, templateCodes: codes, stateKeys: keys });
+    return { keys, pending, ready, previous: states, root, codes };
+  } catch {
+    logWarn('snapshot.revocation_unavailable', { requestId: currentRequestId(), root, templateCodes: codes });
+    sendJson(res, 503, { success: false, code: 'snapshot_revocation_unavailable', reason: 'snapshot_revocation_unavailable',
+      message: 'The public snapshot could not be revoked. The template was not changed.' });
+    return null;
+  }
+}
+
+async function finishSnapshotRevocation(revocation, response) {
+  if (!revocation) return true;
+  // A transport timeout or upstream 5xx may hide a committed CMDB mutation.
+  const { keys, pending, ready } = revocation;
+  try {
+    if (!response.ok && !(response.statusCode >= 400 && response.statusCode < 500 && response.statusCode !== 408)) throw new Error('Unconfirmed CMDB mutation.');
+    // An explicit access denial did not change the card and cannot revoke its publication.
+    const nextStates = [401, 403].includes(response.statusCode) ? revocation.previous : keys.map(() => ready);
+    if (SNAPSHOT_MEMORY_ONLY) {
+      if (keys.some((key) => snapshotStateMemory.get(key) !== pending)) throw new Error('Revocation generation changed.');
+      keys.forEach((key, index) => nextStates[index] == null ? snapshotStateMemory.delete(key) : snapshotStateMemory.set(key, nextStates[index]));
+    } else {
+      const changed = await redisCommand(['EVAL', "for _, k in ipairs(KEYS) do if redis.call('GET', k) ~= ARGV[1] then return 0 end end; for i, k in ipairs(KEYS) do if ARGV[i+1] == '-' then redis.call('DEL', k) else redis.call('SET', k, ARGV[i+1]) end end; return 1",
+        keys.length, ...keys, pending, ...nextStates.map((state) => state ?? '-')]);
+      if (changed !== 1) throw new Error('Revocation generation changed.');
+    }
+    return true;
+  } catch {
+    logWarn('snapshot.revocation_pending', { requestId: currentRequestId(), root: revocation.root, templateCodes: revocation.codes, stateKeys: keys });
+    return false;
+  }
+}
+
+async function runRevokedTemplateMutation(revocation, mutation) {
+  try {
+    const response = await mutation();
+    return { response, finalized: await finishSnapshotRevocation(revocation, response) };
+  } catch (error) {
+    await finishSnapshotRevocation(revocation, { ok: false });
+    throw error;
+  }
+}
+
+function requireRuntimeRoot(res, requestUrl) {
+  const roots = requestUrl.searchParams.getAll('root');
+  try {
+    if (roots.length > 1) throw new Error('Specify at most one technical root.');
+    return validateCmdbuildIdentifier(roots[0] ?? DEFAULT_TECHNICAL_ROOT, 'root');
+  } catch (error) {
+    sendJson(res, 400, { success: false, reason: 'invalid_runtime_root', message: error.message });
+    return null;
+  }
+}
+
+function runtimeParamsFromUrl(requestUrl) {
+  const params = {};
+  requestUrl.searchParams.forEach((value, key) => {
+    if (key === SNAPSHOT_PARAMS_QUERY || key === 'lang' || key === 'cmdpLang' || key === 'refresh' || key === 'noCache' || key === 'forceRefresh' || key === 'bypassRefreshCooldown' || RUNTIME_SYSTEM_PARAMS.has(key)) return;
+    Object.defineProperty(params, key, { value, enumerable: true, configurable: true });
+  });
+  return params;
 }
 
 function publicSnapshotParamsFromUrl(requestUrl) {
-  const params = {};
-  requestUrl.searchParams.forEach((value, key) => {
-    if (key === 'lang' || key === 'cmdpLang' || key === 'refresh' || key === 'noCache' || key === 'forceRefresh' || key === 'bypassRefreshCooldown' || RUNTIME_SYSTEM_PARAMS.has(key)) return;
-    params[key] = value;
-  });
-  return params;
+  const values = requestUrl.searchParams.getAll(SNAPSHOT_PARAMS_QUERY);
+  if (!values.length) return runtimeParamsFromUrl(requestUrl);
+  try {
+    if (values.length !== 1 || Object.keys(runtimeParamsFromUrl(requestUrl)).length) throw new Error();
+    const pairs = JSON.parse(values[0]);
+    if (!Array.isArray(pairs) || pairs.some((item) => !Array.isArray(item) || item.length !== 2 || typeof item[0] !== 'string') ||
+      new Set(pairs.map(([name]) => name)).size !== pairs.length) throw new Error();
+    return Object.fromEntries(staticSnapshotParamPairs(Object.fromEntries(pairs)));
+  } catch {
+    throw snapshotStoreError('snapshot_params_invalid', 'Supply one snapshotParams value with unique scalar parameter pairs.', 400);
+  }
 }
 
 function truthyRuntimeFlag(value) {
@@ -37602,31 +37903,46 @@ function runtimeDisplayResponsePayload(payload, options = {}) {
   return next;
 }
 
-async function readStaticSnapshot(templateCode, params, publishConfig = { paramsMode: 'exact' }) {
-  const exactKey = staticSnapshotKey(templateCode, params, { paramsMode: 'exact' });
-  let cached = await cacheGetJson('snapshot', exactKey, staticSnapshotCache);
-  if (cached.value) return { key: exactKey, backend: cached.backend, snapshot: cached.value };
-
+async function readStaticSnapshot(root, templateCode, params, publishConfig = { paramsMode: 'exact' }) {
+  const exactKey = staticSnapshotKey(root, templateCode, params, { paramsMode: 'exact' });
+  if (!SNAPSHOT_MEMORY_ONLY && !REDIS_ENABLED && !REDIS_REQUIRED) return { key: exactKey, backend: 'disabled', snapshot: null };
+  const keys = [exactKey];
   if (!publishConfig || publishConfig.paramsMode !== 'exact') {
-    const anyKey = staticSnapshotKey(templateCode, {}, { paramsMode: 'ignore' });
-    if (anyKey !== exactKey) {
-      cached = await cacheGetJson('snapshot', anyKey, staticSnapshotCache);
-      if (cached.value) return { key: anyKey, backend: cached.backend, snapshot: cached.value };
-    }
+    keys.push(staticSnapshotKey(root, templateCode, {}, { paramsMode: 'ignore' }));
   }
-
-  return { key: exactKey, backend: cached.backend, snapshot: null };
+  const stateKey = snapshotStateKey(root, templateCode);
+  const memoryOnly = SNAPSHOT_MEMORY_ONLY;
+  const backend = memoryOnly ? 'memory' : 'redis';
+  try {
+    // Read payloads and the authoritative generation from the same Redis view.
+    const [state, ...stored] = memoryOnly
+      ? [snapshotStateMemory.get(stateKey), ...keys.map((key) => memoryGet(staticSnapshotCache, key))]
+      : await redisCommand(['MGET', stateKey, ...keys.map((key) => cacheKey('snapshot', key))]);
+    if (SNAPSHOT_STATE.test(state) && state.startsWith('ready:')) {
+      for (const [index, value] of stored.entries()) {
+        const snapshot = memoryOnly || !value ? value : JSON.parse(value);
+        if (snapshot?.version === 3 && snapshot.generation === state && snapshot.templateClass === snapshotTemplateClass(root) &&
+          snapshot.templateCode === templateCode && snapshot.publish?.mode === 'staticSnapshot' && snapshot.publish.warningAccepted === true) {
+          return { key: keys[index], backend, snapshot };
+        }
+      }
+    }
+  } catch {
+    throw snapshotStoreError('snapshot_storage_unavailable', 'Published report storage is temporarily unavailable.');
+  }
+  return { key: exactKey, backend, snapshot: null };
 }
 
-async function writeStaticSnapshot(root, template, params, result, sessionData, publishConfig) {
+async function writeStaticSnapshot(root, template, params, result, sessionData, publishConfig, generation) {
   const specHash = hashJson(template.spec || {});
   const paramsHash = staticSnapshotParamsHash(params, publishConfig);
-  const key = staticSnapshotKey(template.code, params, publishConfig);
+  const key = staticSnapshotKey(root, template.code, params, publishConfig);
   const now = new Date();
   const session = sanitizeSession(sessionData) || {};
   const snapshot = {
-    version: 1,
-    root,
+    version: 3,
+    templateClass: snapshotTemplateClass(root),
+    generation,
     templateCode: template.code,
     description: template.description || '',
     params: cloneJsonValueServer(params || {}, {}),
@@ -37638,8 +37954,23 @@ async function writeStaticSnapshot(root, template, params, result, sessionData, 
     publishedAt: now.toISOString(),
     result: cloneJsonValueServer(result, { tables: [] })
   };
-  const backend = await cacheSetJson('snapshot', key, snapshot, 0, staticSnapshotCache);
-  await registerStaticSnapshotCacheKey(root, template.code, key);
+  const stateKey = snapshotStateKey(root, template.code);
+  const memoryOnly = SNAPSHOT_MEMORY_ONLY;
+  const backend = memoryOnly ? 'memory' : 'redis';
+  try {
+    if (memoryOnly) {
+      if (snapshotStateMemory.get(stateKey) !== generation) return null;
+      memorySet(staticSnapshotCache, key, snapshot, 0);
+      registerLocalStaticSnapshotCacheKey(root, template.code, key);
+    } else {
+      const indexKey = cacheKey('snapshot-index', staticSnapshotTemplateIndexId(root, template.code));
+      const stored = await redisCommand(['EVAL', "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end; redis.call('SADD', KEYS[3], ARGV[3]); redis.call('SET', KEYS[2], ARGV[2]); return 1",
+        3, stateKey, cacheKey('snapshot', key), indexKey, generation, JSON.stringify(snapshot), key]);
+      if (stored !== 1) return null;
+    }
+  } catch {
+    throw snapshotStoreError('snapshot_storage_unavailable', 'Published report storage is temporarily unavailable.');
+  }
   return {
     key,
     backend,
@@ -51790,23 +52121,44 @@ async function createAssistantDiagramMappingDraft(input, runtimeConfig) {
   return createAssistantDiagramTopologyMappingDraft(input, runtimeConfig, prepared.roleDraft, prepared.topology);
 }
 
-async function sendPublicSnapshotRun(res, requestUrl, templateCode) {
-  const params = publicSnapshotParamsFromUrl(requestUrl);
-  const jsonOutput = runtimeJsonOutputRequested(requestUrl);
-  const d2Output = runtimeD2OutputRequested(requestUrl);
-  let lookup;
+async function lookupPublishedSnapshot(res, requestUrl, root, templateCode) {
   try {
-    lookup = await readStaticSnapshot(templateCode, params, { paramsMode: 'ignore' });
+    const params = publicSnapshotParamsFromUrl(requestUrl);
+    const lookup = await readStaticSnapshot(root, templateCode, params, { paramsMode: 'ignore' });
+    return { ...lookup, params };
   } catch (error) {
-    sendJson(res, error.statusCode || 400, {
+    if (error.code === 'snapshot_params_invalid') {
+      sendJson(res, 400, { success: false, reason: error.code, message: error.message });
+      return null;
+    }
+    logWarn('snapshot.lookup_unavailable', { requestId: currentRequestId(), root, templateCode });
+    sendJson(res, 503, {
       success: false,
-      message: error && error.message ? error.message : String(error)
+      reason: 'snapshot_storage_unavailable',
+      message: 'Published report storage is temporarily unavailable.'
     });
+    return null;
+  }
+}
+
+async function sendPublicSnapshotRun(res, requestUrl, templateCode) {
+  const root = requireRuntimeRoot(res, requestUrl);
+  if (!root) return;
+  try {
+    templateCode = validateCmdbuildIdentifier(templateCode, 'template code');
+  } catch (error) {
+    sendJson(res, 400, { success: false, message: error.message });
     return;
   }
-  const snapshot = lookup.snapshot;
-  const published = snapshot && snapshot.publish && snapshot.publish.mode === 'staticSnapshot' && snapshot.publish.warningAccepted === true;
-  if (!published) {
+  const lookup = await lookupPublishedSnapshot(res, requestUrl, root, templateCode);
+  if (lookup) sendPublicSnapshotResult(res, requestUrl, templateCode, lookup);
+}
+
+function sendPublicSnapshotResult(res, requestUrl, templateCode, lookup) {
+  const { params, snapshot } = lookup;
+  const jsonOutput = runtimeJsonOutputRequested(requestUrl);
+  const d2Output = runtimeD2OutputRequested(requestUrl);
+  if (!snapshot) {
     const payload = {
       success: true,
       snapshotFound: false,
@@ -51894,6 +52246,99 @@ async function findTemplateCard(authToken, root, code) {
     seen.add(pageKey);
     start += data.length;
   }
+}
+
+const templateMutationStates = new Map();
+
+function retainTemplateMutationState(root, code) {
+  const key = JSON.stringify([snapshotTemplateClass(root), validateCmdbuildIdentifier(code, 'template code')]);
+  let state = templateMutationStates.get(key);
+  if (!state) {
+    state = { tail: Promise.resolve(), generation: 0, references: 0 };
+    templateMutationStates.set(key, state);
+  }
+  state.references++;
+  return { state, release: () => {
+    if (--state.references === 0) templateMutationStates.delete(key);
+  } };
+}
+
+async function withTemplateMutationLock(root, codes, operation) {
+  const canonicalCodes = [...new Set(codes.map((code) => validateCmdbuildIdentifier(code, 'template code')))];
+  const entries = canonicalCodes.map((code) => retainTemplateMutationState(root, code));
+  const previous = entries.map(({ state }) => state.tail);
+  let unlock;
+  const tail = new Promise((resolve) => { unlock = resolve; });
+  // Reserve all keys synchronously so simultaneous renames cannot deadlock.
+  for (const { state } of entries) state.tail = tail;
+  try {
+    await Promise.all(previous);
+    return await operation(() => {
+      for (const { state } of entries) state.generation++;
+    });
+  } finally {
+    unlock();
+    for (const entry of entries) entry.release();
+  }
+}
+
+function sendTemplateVersionConflict(res, { root, templateCode, expectedSpecHash, currentTemplate, phase, cause,
+  reason = 'template_version_conflict', action, message }) {
+  const code = 'template_version_conflict';
+  const requestId = currentRequestId();
+  const expectedHash = isSpecHash(expectedSpecHash) ? expectedSpecHash.toLowerCase() : null;
+  const currentSpecHash = currentTemplate?.specHash ?? null;
+  logWarn('template.version_conflict', {
+    requestId, root, templateCode, code, reason, phase, cause,
+    expectedSpecHashPrefix: specHashLogPrefix(expectedSpecHash),
+    currentSpecHashPrefix: specHashLogPrefix(currentSpecHash)
+  });
+  sendJson(res, 409, {
+    success: false, code, reason, action, message, requestId,
+    expectedSpecHash: expectedHash,
+    currentSpecHash,
+    diagnostics: { stage: phase, cause, expectedSpecHash: expectedHash, currentSpecHash },
+    ...(currentTemplate ? { template: {
+      code: currentTemplate.code, description: currentTemplate.description, active: currentTemplate.active, specHash: currentSpecHash
+    } } : {})
+  });
+}
+
+function sendPublicationVersionConflict(res, context) {
+  sendTemplateVersionConflict(res, {
+    ...context,
+    action: 'publish',
+    reason: 'publication_saved_spec_mismatch',
+    message: 'Publication settings were saved to a different template version. Reload the template and publish again.'
+  });
+}
+
+async function readTemplateActionBody(req, res, action) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (error) {
+    sendJson(res, 400, { success: false, action, reason: 'request_body_invalid_json', message: error.message || String(error) });
+    return null;
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    sendJson(res, 400, { success: false, action, reason: 'request_body_must_be_object', message: 'Request body must be a JSON object.' });
+    return null;
+  }
+  return body;
+}
+
+async function invalidateTemplateCaches(root, codes) {
+  const invalidate = async (invalidateCache) => {
+    const [result, ...others] = await Promise.all(codes.map((code) => invalidateCache(root, code)));
+    for (const item of others) {
+      result.invalidated += item.invalidated;
+      result.complete &&= item.complete;
+      result.error ||= item.error;
+    }
+    return result;
+  };
+  return Promise.all([invalidate(invalidateTemplateRuntimeCache), invalidate(invalidateTemplateStaticSnapshots)]);
 }
 
 function applyTemplateParamDefaults(spec, params) {
@@ -59352,7 +59797,9 @@ async function handleBackend(req, res, requestUrl) {
       }
     });
   }
-  return handleBackendRequest(req, res, requestUrl);
+  const publication = {};
+  try { return await handleBackendRequest(req, res, requestUrl, publication); }
+  finally { publication.release?.(); }
 }
 
 function templateTransferIssue(path, code, message, severity = 'error') {
@@ -59383,6 +59830,10 @@ function templateTransferReferenceType(definition) {
     return { kind: 'card', className: definition.targetClass || definition.targetType || definition.className };
   }
   return null;
+}
+
+function templateTransferComparesReferenceIds(operator) {
+  return ['equals', 'notEquals', 'in'].includes(operator);
 }
 
 // Resolve row provenance using metadata only. No selection or relation rows are fetched.
@@ -59601,8 +60052,9 @@ async function validateTemplateTransferTarget(authToken, root, spec, budget = { 
   const parameterTypes = new Map();
   const parameterSelectionLists = new Set();
   const selectionRules = templateTransferSelectionRules(spec);
-  const mirrorKey = (alias, path, value) => stableJsonStringify([alias, path, value]);
-  const visualExpressions = new Set(selectionRules.map(({ selection, rule, valueKey }) => mirrorKey(selection.alias, rule.path, rule[valueKey])));
+  const mirrorKey = (alias, path, op, value) => stableJsonStringify([alias, path, op, value]);
+  const visualExpressions = new Set(selectionRules.map(({ selection, rule, valueKey }) =>
+    mirrorKey(selection.alias, rule.path, normalizeObjectGroupFilterOperator(rule), rule[valueKey])));
   const rememberParameterType = (name, type, selectionList = false) => {
     if (!type || typeof name !== 'string' || !name) return;
     if (!parameterTypes.has(name)) parameterTypes.set(name, new Map());
@@ -59625,15 +60077,15 @@ async function validateTemplateTransferTarget(authToken, root, spec, budget = { 
     const type = templateTransferReferenceType(attr);
     if (!type) return;
     const selection = step.type === 'selectCards';
-    const op = selection ? normalizeObjectGroupFilterOperator(filter) : filter.op;
-    if (selection ? ['matches', 'exists', 'isIpv4', 'isIpv4Network'].includes(op) : ['exists', 'notExists'].includes(op)) return;
+    const op = selection ? normalizeObjectGroupFilterOperator(filter) : filter.op || 'equals';
+    if (!templateTransferComparesReferenceIds(op)) return;
     // Mirror resolveSelectionExpected/getFilterExpected's own-property precedence.
     const keys = ['valueParam', 'valuesParam', 'value', 'values'];
     if (selection) keys.unshift('valueExpression', 'valueColumn', 'sourceColumn', 'fromColumn');
     const key = keys.find((item) => Object.hasOwn(filter, item));
     if (!key) return;
     if (key === 'valueExpression') {
-      const mirrored = step.purpose === 'objectGroup' && visualExpressions.has(mirrorKey(step.as, fieldPath, filter[key]));
+      const mirrored = step.purpose === 'objectGroup' && visualExpressions.has(mirrorKey(step.as, fieldPath, op, filter[key]));
       addFilterExpression(type, filter[key], `${path}.${key}`, mirrored);
     } else if (key === 'valueParam' || key === 'valuesParam') {
       rememberParameterType(filter[key], type, selection);
@@ -59680,7 +60132,7 @@ async function validateTemplateTransferTarget(authToken, root, spec, budget = { 
         if (!rule.path) continue;
         const attr = await field(selection.className, rule.path, fieldPath);
         const type = templateTransferReferenceType(attr);
-        if (type && !['matches', 'exists', 'isIpv4', 'isIpv4Network'].includes(normalizeObjectGroupFilterOperator(rule))) addFilterExpression(type, rule[valueKey], path);
+        if (type && templateTransferComparesReferenceIds(normalizeObjectGroupFilterOperator(rule))) addFilterExpression(type, rule[valueKey], path);
     }
     for (const [index, operation] of (flow.operations || []).entries()) {
       const source = aliases.get(operation.from);
@@ -59917,7 +60369,7 @@ async function handleTemplateTransfer(req, res, requestUrl, authToken) {
   }
 }
 
-async function handleBackendRequest(req, res, requestUrl) {
+async function handleBackendRequest(req, res, requestUrl, publication) {
   const auth = backendAuthFromRequest(req, requestUrl);
   const authToken = auth.token;
   const authSource = auth.source;
@@ -59959,6 +60411,8 @@ async function handleBackendRequest(req, res, requestUrl) {
   if (!authToken) {
     sendJson(res, 401, {
       success: false,
+      ...(/^\/templates\/[^/]+\/run\/?$/.test(requestUrl.pathname.slice(BACKEND_PREFIX.length))
+        ? { reason: 'cmdbuild_session_invalid' } : {}),
       receivedCmdbuildCookie: false,
       message: 'CMDBuild-Authorization cookie was not sent to backend route.'
     });
@@ -62423,45 +62877,47 @@ async function handleBackendRequest(req, res, requestUrl) {
         });
         return;
       }
-      const existing = await findTemplateCard(authToken, root, payload.Code);
-      if (!existing.response.ok && sendTechnicalSchemaAccessDeniedIfNeeded(res, {
-        cmdbuildStatus: existing.response.statusCode,
-        root: existing.schema.root,
-        className: existing.schema.classNames.template
-      })) return;
-      if (existing.response.ok && existing.card) {
-        sendJson(res, 409, {
-          success: false,
-          message: `Template already exists: ${payload.Code}`
-        });
-        return;
-      }
+      return withTemplateMutationLock(root, [payload.Code], async (markMutated) => {
+        const existing = await findTemplateCard(authToken, root, payload.Code);
+        if (!existing.response.ok && sendTechnicalSchemaAccessDeniedIfNeeded(res, {
+          cmdbuildStatus: existing.response.statusCode,
+          root: existing.schema.root,
+          className: existing.schema.classNames.template
+        })) return;
+        if (existing.response.ok && existing.card) {
+          sendJson(res, 409, {
+            success: false,
+            message: `Template already exists: ${payload.Code}`
+          });
+          return;
+        }
 
-      const created = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(existing.schema.classNames.template)}/cards`, authToken, {
-        method: 'POST',
-        body: payload
+        const created = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(existing.schema.classNames.template)}/cards`, authToken, {
+          method: 'POST',
+          body: payload
+        });
+        if (created.ok) markMutated();
+        const versionLog = created.ok
+          ? await writeTemplateVersion(authToken, existing.schema.root, payload.Code, storedSpec, session.data && session.data.username, body.changeComment || 'create')
+          : null;
+        const executionValidation = executionValidationForSpec(storedSpec);
+        logInfo(created.ok ? 'template.created' : 'template.create_failed', {
+          requestId: req.cmdpRequestId || '',
+          templateCode: payload.Code,
+          username: session.data && session.data.username || '',
+          cmdbuildStatus: created.statusCode,
+          versionLogged: Boolean(versionLog)
+        });
+        sendJson(res, created.ok ? 201 : 502, {
+          success: created.ok,
+          cmdbuildStatus: created.statusCode,
+          root: existing.schema.root,
+          className: existing.schema.classNames.template,
+          template: sanitizeTemplateCard(created.json && created.json.data),
+          versionLog,
+          executionValidation
+        });
       });
-      const versionLog = created.ok
-        ? await writeTemplateVersion(authToken, existing.schema.root, payload.Code, storedSpec, session.data && session.data.username, body.changeComment || 'create')
-        : null;
-      const executionValidation = executionValidationForSpec(storedSpec);
-      logInfo(created.ok ? 'template.created' : 'template.create_failed', {
-        requestId: req.cmdpRequestId || '',
-        templateCode: payload.Code,
-        username: session.data && session.data.username || '',
-        cmdbuildStatus: created.statusCode,
-        versionLogged: Boolean(versionLog)
-      });
-      sendJson(res, created.ok ? 201 : 502, {
-        success: created.ok,
-        cmdbuildStatus: created.statusCode,
-        root: existing.schema.root,
-        className: existing.schema.classNames.template,
-        template: sanitizeTemplateCard(created.json && created.json.data),
-        versionLog,
-        executionValidation
-      });
-      return;
     }
 
     methodAllowed(req, res, ['GET', 'POST']);
@@ -62469,12 +62925,16 @@ async function handleBackendRequest(req, res, requestUrl) {
   }
 
   if (requestUrl.pathname.startsWith(`${BACKEND_PREFIX}/templates/`)) {
-    const root = requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
     const templateSuffix = requestUrl.pathname.slice(`${BACKEND_PREFIX}/templates/`.length);
     const templateParts = templateSuffix.split('/').filter(Boolean).map((part) => decodeURIComponent(part));
     const templateCode = templateParts[0];
     const templateAction = templateParts[1] || '';
     const templateSubAction = templateParts[2] || '';
+    const runtimeAction = templateAction === 'run' || templateAction === 'publish';
+    const root = runtimeAction
+      ? requireRuntimeRoot(res, requestUrl)
+      : requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
+    if (!root) return;
 
     if (!templateCode || templateParts.length > 3) {
       sendJson(res, 404, {
@@ -62522,8 +62982,38 @@ async function handleBackendRequest(req, res, requestUrl) {
         if (!requireJsonContentType(req, res)) return;
       }
 
-      const found = await findTemplateCard(authToken, root, templateCode);
+      const runtimeLogContext = { requestId: req.cmdpRequestId || '', root, templateCode };
+      const runSession = templateAction === 'run'
+        ? await requireValidBackendSession(authToken, res, runtimeLogContext)
+        : null;
+      if (templateAction === 'run' && !runSession) return;
+
+      let body = {};
+      let observedGeneration;
+      let observation;
+      if (templateAction === 'publish') {
+        body = await readTemplateActionBody(req, res, templateAction);
+        if (!body) return;
+        // Keep the generation, not the lock, alive until the publish request ends.
+        observation = retainTemplateMutationState(root, templateCode);
+        publication.release = observation.release;
+      }
+      const savedSpecHash = savedSpecHashInfoFromBody(body);
+      const found = observation
+        ? await withTemplateMutationLock(root, [templateCode], () => {
+          observedGeneration = observation.state.generation;
+          return findTemplateCard(authToken, root, templateCode);
+        })
+        : await findTemplateCard(authToken, root, templateCode);
       if (!found.response.ok) {
+        if (runtimeAction) {
+          logWarn('runtime.access_failed', {
+            ...runtimeLogContext,
+            stage: 'template',
+            className: found.schema.classNames.template,
+            cmdbuildStatus: found.response.statusCode
+          });
+        }
         if (sendTechnicalSchemaAccessDeniedIfNeeded(res, {
           cmdbuildStatus: found.response.statusCode,
           root: found.schema.root,
@@ -62538,6 +63028,11 @@ async function handleBackendRequest(req, res, requestUrl) {
         return;
       }
       if (!found.card) {
+        if (observation && savedSpecHash.valid) {
+          sendPublicationVersionConflict(res, { root, templateCode, expectedSpecHash: savedSpecHash.value,
+            phase: 'publish_precondition', cause: 'template_missing' });
+          return;
+        }
         sendJson(res, 404, {
           success: false,
           message: `Template not found: ${templateCode}`
@@ -62548,6 +63043,11 @@ async function handleBackendRequest(req, res, requestUrl) {
       if (templateAction === 'publish' && !await requireTemplateUpdatePermission(authToken, res, found.schema, found.card, templateCode)) return;
 
       const template = sanitizeTemplateCard(found.card);
+      if (observation && savedSpecHash.valid && savedSpecHash.value !== template.specHash) {
+        sendPublicationVersionConflict(res, { root, templateCode, expectedSpecHash: savedSpecHash.value,
+          currentTemplate: template, phase: 'publish_precondition', cause: 'spec_hash_changed' });
+        return;
+      }
       const includeDiagrams = templateOutputIncludesDiagrams(template.spec);
       const diagramAuthoringStatus = diagramAuthoringStatusForSpec(template.spec);
       if (includeDiagrams && (diagramAuthoringStatus.status === 'unsupported' || diagramAuthoringStatus.status === 'needsReanalysis')) {
@@ -62580,39 +63080,23 @@ async function handleBackendRequest(req, res, requestUrl) {
         return;
       }
 
-      let body = {};
-      if (!runtimeReadOnly) {
-        try {
-          body = await readJsonBody(req);
-        } catch (error) {
-          sendJson(res, 400, {
-            success: false,
-            action: templateAction,
-            reason: 'request_body_invalid_json',
-            message: error && error.message ? error.message : String(error)
-          });
-          return;
-        }
-        if (!body || typeof body !== 'object' || Array.isArray(body)) {
-          sendJson(res, 400, {
-            success: false,
-            action: templateAction,
-            reason: 'request_body_must_be_object',
-            message: 'Request body must be a JSON object.'
-          });
-          return;
-        }
+      if (!runtimeReadOnly && !observation) {
+        body = await readTemplateActionBody(req, res, templateAction);
+        if (!body) return;
       }
-      const params = runtimeReadOnly ? publicSnapshotParamsFromUrl(requestUrl) : body.params || {};
+      const params = runtimeReadOnly
+        ? runtimeParamsFromUrl(requestUrl)
+        : runtimeAction
+          ? Object.fromEntries(Object.entries(body.params || {}).filter(([key]) => key !== 'root'))
+          : body.params || {};
       const jsonOutput = templateAction === 'run' && runtimeJsonOutputRequested(requestUrl);
       const d2Output = templateAction === 'run' && runtimeD2OutputRequested(requestUrl);
-      const session = await getSessionData(authToken);
+      const session = runSession || await getSessionData(authToken);
       const username = session.data && session.data.username ? session.data.username : '';
       const runtimeConfig = await getRuntimeConfig(authToken, root);
       const executionLimits = normalizeExecutionLimitConfig(runtimeConfig);
       const runtimeCacheConfig = normalizeRuntimeCacheConfig(runtimeConfig);
       const publishConfig = normalizePublishConfig(template.spec);
-      const savedSpecHash = savedSpecHashInfoFromBody(body);
       const maxRows = templateAction === 'preview'
         ? getPositiveInt(requestUrl.searchParams, 'maxRows', executionLimits.maxRowsPreviewDefault, executionLimits.maxRowsMax)
         : getPositiveInt(requestUrl.searchParams, 'maxRows', executionLimits.maxRowsDefault, executionLimits.maxRowsMax);
@@ -62646,7 +63130,15 @@ async function handleBackendRequest(req, res, requestUrl) {
       let cache = null;
 
       if (templateAction === 'run' && publishConfig.mode === 'staticSnapshot') {
-        const lookup = await readStaticSnapshot(template.code, params, publishConfig);
+        let lookup;
+        let snapshotParams;
+        try {
+          snapshotParams = runtimeReadOnly ? publicSnapshotParamsFromUrl(requestUrl) : params;
+          lookup = await readStaticSnapshot(root, template.code, snapshotParams, publishConfig);
+        } catch (error) {
+          sendJson(res, error.statusCode || 400, { success: false, reason: error.reason || 'snapshot_params_invalid', message: error.message });
+          return;
+        }
         if (lookup.snapshot) {
           result = cloneJsonValueServer(lookup.snapshot.result, { tables: [] });
           cache = staticSnapshotCacheMeta(lookup.snapshot, 'snapshot-hit', lookup.backend, lookup.key);
@@ -62672,7 +63164,7 @@ async function handleBackendRequest(req, res, requestUrl) {
             description: template.description,
             active: template.active
           },
-          params,
+          params: snapshotParams,
           result,
           cache
         };
@@ -62704,30 +63196,7 @@ async function handleBackendRequest(req, res, requestUrl) {
           });
           return;
         }
-        if (savedSpecHash.value !== template.specHash) {
-          logWarn('snapshot.publish_stale_spec', {
-            requestId: req.cmdpRequestId || '',
-            templateCode: template.code,
-            username,
-            savedSpecHashPrefix: savedSpecHash.prefix,
-            currentSpecHashPrefix: specHashLogPrefix(template.specHash)
-          });
-          sendJson(res, 409, {
-            success: false,
-            action: templateAction,
-            reason: 'publication_saved_spec_mismatch',
-            message: 'Publication settings were saved to a different template version. Reload the template and publish again.',
-            currentSpecHash: template.specHash,
-            template: {
-              code: template.code,
-              description: template.description,
-              active: template.active,
-              specHash: template.specHash
-            }
-          });
-          return;
-        }
-        if (publishConfig.mode !== 'staticSnapshot' || !publishConfig.warningAccepted) {
+        if (!template.active || publishConfig.mode !== 'staticSnapshot' || !publishConfig.warningAccepted) {
           sendJson(res, 400, {
             success: false,
             action: templateAction,
@@ -62766,8 +63235,40 @@ async function handleBackendRequest(req, res, requestUrl) {
       if (!executionSlot) return;
       try {
         if (templateAction === 'publish') {
+          if (publishConfig.paramsMode === 'exact') {
+            try { staticSnapshotParamPairs(params); }
+            catch (error) { throw snapshotStoreError('snapshot_params_invalid', error.message, 400); }
+          }
+          const snapshotGeneration = await snapshotPublicationState(root, templateCode);
           result = await executeTemplateSpec(authToken, template.spec, params, executionOptions);
-          const snapshot = await writeStaticSnapshot(root, template, params, result, session.data, publishConfig);
+          const snapshot = await withTemplateMutationLock(root, [templateCode], async () => {
+            const latest = await findTemplateCard(authToken, root, templateCode);
+            if (!latest.response.ok) {
+              if (!sendTechnicalSchemaAccessDeniedIfNeeded(res, {
+                cmdbuildStatus: latest.response.statusCode, root, className: latest.schema.classNames.template
+              })) {
+                sendJson(res, 502, { success: false, action: templateAction, reason: 'publication_template_recheck_failed',
+                  cmdbuildStatus: latest.response.statusCode, message: 'Could not verify the saved template before publishing.' });
+              }
+              return null;
+            }
+            const currentTemplate = sanitizeTemplateCard(latest.card);
+            if (latest.card && !await requireTemplateUpdatePermission(authToken, res, latest.schema, latest.card, templateCode)) return null;
+            const cause = !currentTemplate ? 'template_missing'
+              : String(currentTemplate.id) !== String(template.id) ? 'template_identity_changed'
+                : currentTemplate.specHash !== savedSpecHash.value ? 'spec_hash_changed'
+                  : observation.state.generation !== observedGeneration ? 'template_mutated' : '';
+            if (cause) {
+              sendPublicationVersionConflict(res, { root, templateCode, expectedSpecHash: savedSpecHash.value,
+                currentTemplate, phase: 'publish_commit', cause });
+              return null;
+            }
+            const saved = await writeStaticSnapshot(root, currentTemplate, params, result, session.data, publishConfig, snapshotGeneration);
+            if (!saved) sendPublicationVersionConflict(res, { root, templateCode, expectedSpecHash: savedSpecHash.value,
+              currentTemplate, phase: 'publish_commit', cause: 'snapshot_generation_changed' });
+            return saved;
+          });
+          if (!snapshot) return;
           cache = staticSnapshotCacheMeta({
             publishedAt: snapshot.publishedAt,
             publishedBy: snapshot.publishedBy,
@@ -62813,22 +63314,28 @@ async function handleBackendRequest(req, res, requestUrl) {
       } catch (error) {
         const permissionDenied = errorLooksPermissionDenied(error);
         const permissionDeniedText = permissionDeniedTextFromSpec(template.spec);
+        const cmdbuildStatus = permissionDenied
+          ? Number(error.cmdbuildStatus || error.statusCode || /\b(401|403)\b/.exec(error.message || '')?.[1] || 403)
+          : undefined;
+        const reason = permissionDenied ? 'data_access_denied' : error.reason || undefined;
         incMetric('cmdp_template_run_errors_total', {
           action: templateAction,
           reason: templateExecutionErrorReason(error)
         });
         logWarn('template.execution_failed', {
-          requestId: req.cmdpRequestId || '',
+          ...runtimeLogContext,
           action: templateAction,
-          templateCode: template.code,
-          username,
+          stage: 'data',
           permissionDenied,
-          error: error && error.message ? error.message : String(error)
+          cmdbuildStatus,
+          reason: reason || templateExecutionErrorReason(error)
         });
         sendJson(res, permissionDenied ? 403 : (error.statusCode || 400), {
           success: false,
           action: templateAction,
-          reason: error && error.reason || undefined,
+          reason,
+          cmdbuildStatus,
+          permissionDenied: permissionDenied || undefined,
           template: {
             code: template.code,
             description: template.description,
@@ -62882,75 +63389,82 @@ async function handleBackendRequest(req, res, requestUrl) {
 
     if (req.method === 'DELETE') {
       if (!requireStateChangingRequest(req, res, authToken)) return;
-      const found = await findTemplateCard(authToken, root, templateCode);
-      if (!found.response.ok) {
-        if (sendTechnicalSchemaAccessDeniedIfNeeded(res, {
-          cmdbuildStatus: found.response.statusCode,
-          root: found.schema.root,
-          className: found.schema.classNames.template
-        })) return;
-        sendJson(res, 502, {
-          success: false,
-          cmdbuildStatus: found.response.statusCode,
-          root: found.schema.root,
-          className: found.schema.classNames.template
-        });
-        return;
-      }
-      if (!found.card) {
-        sendJson(res, 404, {
-          success: false,
-          message: `Template not found: ${templateCode}`
-        });
-        return;
-      }
-      const protectedTemplate = sanitizeTemplateCard(found.card);
-      if (protectedTemplate && protectedTemplate.protected) {
-        sendJson(res, 403, {
-          success: false,
-          message: `Template ${templateCode} is protected and cannot be deleted.`,
-          template: protectedTemplate
-        });
-        return;
-      }
-      const cardId = found.card._id || found.card.Id || found.card.id;
-      if (!cardId) {
-        sendJson(res, 502, {
-          success: false,
-          message: `Template card id is missing: ${templateCode}`,
-          root: found.schema.root,
-          className: found.schema.classNames.template
-        });
-        return;
-      }
-      const deleted = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(found.schema.classNames.template)}/cards/${encodeURIComponent(cardId)}`, authToken, {
-        method: 'DELETE'
-      });
-      const cacheInvalidation = deleted.ok
-        ? await Promise.all([
-          invalidateTemplateRuntimeCache(found.schema.root, templateCode),
-          invalidateTemplateStaticSnapshots(found.schema.root, templateCode)
-        ])
-        : null;
-      logInfo(deleted.ok ? 'template.deleted' : 'template.delete_failed', {
-        requestId: req.cmdpRequestId || '',
-        templateCode,
-        cmdbuildStatus: deleted.statusCode,
-        runtimeCacheInvalidated: cacheInvalidation && cacheInvalidation[0].invalidated || 0,
-        staticSnapshotsInvalidated: cacheInvalidation && cacheInvalidation[1].invalidated || 0
-      });
-      sendJson(res, deleted.ok ? 200 : 502, {
-        success: deleted.ok,
-        cmdbuildStatus: deleted.statusCode,
-        root: found.schema.root,
-        className: found.schema.classNames.template,
-        template: sanitizeTemplateCard(found.card),
-        cacheInvalidation: cacheInvalidation && {
-          runtime: cacheInvalidation[0],
-          staticSnapshots: cacheInvalidation[1]
+      return withTemplateMutationLock(root, [templateCode], async (markMutated) => {
+        const found = await findTemplateCard(authToken, root, templateCode);
+        if (!found.response.ok) {
+          if (sendTechnicalSchemaAccessDeniedIfNeeded(res, {
+            cmdbuildStatus: found.response.statusCode,
+            root: found.schema.root,
+            className: found.schema.classNames.template
+          })) return;
+          sendJson(res, 502, {
+            success: false,
+            cmdbuildStatus: found.response.statusCode,
+            root: found.schema.root,
+            className: found.schema.classNames.template
+          });
+          return;
         }
+        if (!found.card) {
+          sendJson(res, 404, {
+            success: false,
+            message: `Template not found: ${templateCode}`
+          });
+          return;
+        }
+        const protectedTemplate = sanitizeTemplateCard(found.card);
+        if (protectedTemplate && protectedTemplate.protected) {
+          sendJson(res, 403, {
+            success: false,
+            message: `Template ${templateCode} is protected and cannot be deleted.`,
+            template: protectedTemplate
+          });
+          return;
+        }
+        if (found.card._can_delete === false) {
+          sendJson(res, 403, { success: false, reason: 'template_delete_forbidden', message: 'The current CMDBuild session cannot delete this template.' });
+          return;
+        }
+        if (found.card._can_delete !== true && !await requireTemplateClassPermission(authToken, res, found.schema, '_can_delete')) return;
+        const cardId = found.card._id || found.card.Id || found.card.id;
+        if (!cardId) {
+          sendJson(res, 502, {
+            success: false,
+            message: `Template card id is missing: ${templateCode}`,
+            root: found.schema.root,
+            className: found.schema.classNames.template
+          });
+          return;
+        }
+        const revocation = await beginSnapshotRevocation(res, root, [protectedTemplate.code]);
+        if (!revocation) return;
+        const { response: deleted, finalized: revocationFinalized } = await runRevokedTemplateMutation(revocation, () => cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(found.schema.classNames.template)}/cards/${encodeURIComponent(cardId)}`, authToken, {
+          method: 'DELETE'
+        }));
+        if (deleted.ok) markMutated();
+        const cacheInvalidation = deleted.ok
+          ? await invalidateTemplateCaches(found.schema.root, [protectedTemplate.code])
+          : null;
+        logInfo(deleted.ok ? 'template.deleted' : 'template.delete_failed', {
+          requestId: req.cmdpRequestId || '',
+          templateCode,
+          cmdbuildStatus: deleted.statusCode,
+          runtimeCacheInvalidated: cacheInvalidation && cacheInvalidation[0].invalidated || 0,
+          staticSnapshotsInvalidated: cacheInvalidation && cacheInvalidation[1].invalidated || 0
+        });
+        sendJson(res, deleted.ok ? 200 : 502, {
+          success: deleted.ok,
+          cmdbuildStatus: deleted.statusCode,
+          root: found.schema.root,
+          className: found.schema.classNames.template,
+          template: sanitizeTemplateCard(found.card),
+          snapshotRevocationPending: !revocationFinalized,
+          cacheInvalidation: cacheInvalidation && {
+            runtime: cacheInvalidation[0],
+            staticSnapshots: cacheInvalidation[1]
+          }
+        });
       });
-      return;
     }
 
     if (req.method === 'GET') {
@@ -63002,176 +63516,185 @@ async function handleBackendRequest(req, res, requestUrl) {
         sendJson(res, 400, { success: false, code: 'template_transfer_replace_invalid', message: 'A replacement requires the prepared target ID and revision for this template code.' });
         return;
       }
-      const found = await findTemplateCard(authToken, root, templateCode);
-      if (!found.response.ok) {
-        if (sendTechnicalSchemaAccessDeniedIfNeeded(res, {
-          cmdbuildStatus: found.response.statusCode,
-          root: found.schema.root,
-          className: found.schema.classNames.template
-        })) return;
-        sendJson(res, 502, {
-          success: false,
-          cmdbuildStatus: found.response.statusCode,
-          root: found.schema.root,
-          className: found.schema.classNames.template
-        });
-        return;
-      }
-      if (isTransferReplace) {
-        if (!await verifyTransferReplacementTarget(authToken, res, found, templateCode, replacement)) return;
-      } else if (!found.card) {
-        sendJson(res, 404, {
-          success: false,
-          message: `Template not found: ${templateCode}`
-        });
-        return;
-      } else if (!await requireTemplateUpdatePermission(authToken, res, found.schema, found.card, templateCode)) {
-        return;
-      }
+      const currentCode = validateCmdbuildIdentifier(templateCode, 'template code');
+      const nextCode = isTransferReplace ? currentCode : validateCmdbuildIdentifier(body.code || body.Code || currentCode, 'template code');
+      const expected = expectedSpecHashFromBody(body);
+      const expectedSpecHash = isSpecHash(expected) ? expected.toLowerCase() : expected;
+      return withTemplateMutationLock(root, [currentCode, nextCode], async (markMutated) => {
+        const found = await findTemplateCard(authToken, root, templateCode);
+        if (!found.response.ok) {
+          if (sendTechnicalSchemaAccessDeniedIfNeeded(res, {
+            cmdbuildStatus: found.response.statusCode,
+            root: found.schema.root,
+            className: found.schema.classNames.template
+          })) return;
+          sendJson(res, 502, {
+            success: false,
+            cmdbuildStatus: found.response.statusCode,
+            root: found.schema.root,
+            className: found.schema.classNames.template
+          });
+          return;
+        }
+        if (isTransferReplace) {
+          if (!await verifyTransferReplacementTarget(authToken, res, found, templateCode, replacement)) return;
+        } else if (!found.card) {
+          if (expectedSpecHash) {
+            sendTemplateVersionConflict(res, { root: found.schema.root, templateCode: currentCode, expectedSpecHash,
+              phase: 'save_precondition', cause: 'template_missing', message: 'The template no longer exists. Reload before saving.' });
+            return;
+          }
+          sendJson(res, 404, {
+            success: false,
+            message: `Template not found: ${templateCode}`
+          });
+          return;
+        } else if (!await requireTemplateUpdatePermission(authToken, res, found.schema, found.card, templateCode)) {
+          return;
+        }
 
-      const expectedSpecHash = expectedSpecHashFromBody(body);
-      const currentTemplate = sanitizeTemplateCard(found.card);
-      if (!isTransferReplace && expectedSpecHash && currentTemplate && currentTemplate.specHash !== expectedSpecHash) {
-        sendJson(res, 409, {
-          success: false,
-          reason: 'template_version_conflict',
-          message: `Template ${templateCode} was changed by another editor. Reload the template before saving.`,
-          expectedSpecHash,
-          currentSpecHash: currentTemplate.specHash,
-          template: currentTemplate
-        });
-        return;
-      }
-      const session = isTransferReplace ? await requireValidBackendSession(authToken, res) : await getSessionData(authToken);
-      if (!session) return;
-      const storageOptions = { objectFlowOutcomes: [] };
-      const rawSpec = body.spec !== undefined ? body.spec : body.SpecJson;
-      const rawTemplateSpec = safeJsonValue(rawSpec, rawSpec);
-      if (diagramAuthoringStatusForSpec(rawTemplateSpec).status === 'unsupported') {
-        if (isTransferReplace) {
-          sendTransferReplacementIncomplete(res, [templateTransferIssue('$.spec.authoring.d2', 'template_transfer_d2_unsupported', 'The D2 authoring contract requires fresh analysis.')]);
+        const currentTemplate = sanitizeTemplateCard(found.card);
+        if (!isTransferReplace && expectedSpecHash && currentTemplate && currentTemplate.specHash !== expectedSpecHash) {
+          sendTemplateVersionConflict(res, { root: found.schema.root, templateCode: currentCode, expectedSpecHash,
+            currentTemplate, phase: 'save_precondition', cause: 'spec_hash_changed',
+            message: `Template ${currentCode} was changed by another editor. Reload the template before saving.` });
           return;
         }
-        logWarn('template.authoring_unsupported', {
+        const session = isTransferReplace ? await requireValidBackendSession(authToken, res) : await getSessionData(authToken);
+        if (!session) return;
+        const storageOptions = { objectFlowOutcomes: [] };
+        const rawSpec = body.spec !== undefined ? body.spec : body.SpecJson;
+        const rawTemplateSpec = safeJsonValue(rawSpec, rawSpec);
+        if (diagramAuthoringStatusForSpec(rawTemplateSpec).status === 'unsupported') {
+          if (isTransferReplace) {
+            sendTransferReplacementIncomplete(res, [templateTransferIssue('$.spec.authoring.d2', 'template_transfer_d2_unsupported', 'The D2 authoring contract requires fresh analysis.')]);
+            return;
+          }
+          logWarn('template.authoring_unsupported', {
+            requestId: req.cmdpRequestId || '',
+            templateCode,
+            reasons: diagramAuthoringStatusForSpec(rawTemplateSpec).reasons
+          });
+          sendJson(res, 409, d2AuthoringCurrentContractRequiredPayload(rawTemplateSpec));
+          return;
+        }
+        const rawSpecErrors = validateTemplateSpecForStorage(rawTemplateSpec);
+        if (rawSpecErrors.length) {
+          sendJson(res, 400, {
+            success: false,
+            message: 'Template spec validation failed.',
+            errors: rawSpecErrors
+          });
+          return;
+        }
+        const payload = normalizeTemplatePayload(body, templateCode, session.data && session.data.username, storageOptions);
+        if (!isTransferReplace && body.owner === undefined && body.Owner === undefined && found.card.Owner !== undefined) payload.Owner = found.card.Owner;
+        const storedSpec = safeJsonValue(payload.SpecJson, null);
+        if (diagramAuthoringStatusForSpec(storedSpec).status === 'unsupported') {
+          if (isTransferReplace) {
+            sendTransferReplacementIncomplete(res, [templateTransferIssue('$.spec.authoring.d2', 'template_transfer_d2_unsupported', 'The D2 authoring contract requires fresh analysis.')]);
+            return;
+          }
+          sendJson(res, 409, d2AuthoringCurrentContractRequiredPayload(storedSpec));
+          return;
+        }
+        const specErrors = validateTemplateSpecForStorage(storedSpec);
+        if (specErrors.length) {
+          sendJson(res, 400, {
+            success: false,
+            message: 'Template spec validation failed.',
+            errors: specErrors
+          });
+          return;
+        }
+        const executionChanged = executionSpecHash(currentTemplate.spec || {}) !== executionSpecHash(storedSpec);
+        const executionValidation = executionValidationForSpec(storedSpec);
+        let writePayload = payload;
+        if (isTransferReplace) {
+          const slot = acquireExecutionSlot(req, res, { action: 'template-transfer-replace', templateCode });
+          if (!slot) return;
+          try {
+            const validation = await validateTemplateTransferTarget(authToken, found.schema.root, storedSpec);
+            if (!executionValidation.executable || validation.issues.some((issue) => issue.severity === 'error')) {
+              sendTransferReplacementIncomplete(res, validation.issues.concat(executionValidation.errors.map((issue) =>
+                templateTransferIssue(issue.path, 'template_transfer_execution_incomplete', issue.message))));
+              return;
+            }
+            // Catalog checks can take time. Re-read the revision and rights just before PUT.
+            const latest = await findTemplateCard(authToken, found.schema.root, templateCode);
+            if (!latest.response.ok) {
+              sendJson(res, 502, { success: false, code: 'template_transfer_target_unavailable', message: 'Could not verify the target before replacing it.' });
+              return;
+            }
+            if (!await verifyTransferReplacementTarget(authToken, res, latest, templateCode, replacement)) return;
+            writePayload = {
+              Description: typeof body.description === 'string' ? body.description : payload.Description,
+              SpecJson: payload.SpecJson, ParamsSchemaJson: payload.ParamsSchemaJson,
+              ResultSchemaJson: payload.ResultSchemaJson, UpdatedAt: new Date().toISOString()
+            };
+          } finally {
+            slot.release();
+          }
+        }
+        const renamed = currentCode !== nextCode;
+        const deactivated = currentTemplate.active && writePayload.Active === false;
+        const changedCodes = renamed ? [currentCode, nextCode] : [currentCode];
+        const revoke = renamed || deactivated || (executionChanged && normalizePublishConfig(currentTemplate.spec).mode === 'staticSnapshot');
+        const revocation = revoke ? await beginSnapshotRevocation(res, root, changedCodes) : null;
+        if (revoke && !revocation) return;
+        const { response: updated, finalized: revocationFinalized } = await runRevokedTemplateMutation(revocation, () => cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(found.schema.classNames.template)}/cards/${encodeURIComponent(found.card._id)}`, authToken, {
+          method: 'PUT',
+          body: writePayload
+        }));
+        if (updated.ok) markMutated();
+        const versionLog = updated.ok
+          ? await writeTemplateVersion(authToken, found.schema.root, payload.Code, storedSpec, session.data && session.data.username, body.changeComment || 'update')
+          : null;
+        const cacheInvalidation = updated.ok
+          ? executionChanged || renamed || deactivated
+            ? await invalidateTemplateCaches(found.schema.root, changedCodes)
+            : [
+              { invalidated: 0, complete: true, skipped: true, reason: 'authoring_only' },
+              { invalidated: 0, complete: true, skipped: true, reason: 'authoring_only' }
+            ]
+          : null;
+        logInfo(updated.ok ? 'template.updated' : 'template.update_failed', {
           requestId: req.cmdpRequestId || '',
-          templateCode,
-          reasons: diagramAuthoringStatusForSpec(rawTemplateSpec).reasons
+          templateCode: payload.Code,
+          username: session.data && session.data.username || '',
+          cmdbuildStatus: updated.statusCode,
+          versionLogged: Boolean(versionLog),
+          executionChanged,
+          runtimeCacheInvalidated: cacheInvalidation && cacheInvalidation[0].invalidated || 0,
+          staticSnapshotsInvalidated: cacheInvalidation && cacheInvalidation[1].invalidated || 0,
+          cacheInvalidationComplete: cacheInvalidation ? cacheInvalidation.every((item) => item.complete) : false,
+          objectFlowOutcomes: storageOptions.objectFlowOutcomes.map((item) => String(item && item.status || '')).filter(Boolean),
+          objectFlowOwnership: storageOptions.objectFlowOutcomes.map((item) => String(item && item.ownership || '')).filter(Boolean)
         });
-        sendJson(res, 409, d2AuthoringCurrentContractRequiredPayload(rawTemplateSpec));
-        return;
-      }
-      const rawSpecErrors = validateTemplateSpecForStorage(rawTemplateSpec);
-      if (rawSpecErrors.length) {
-        sendJson(res, 400, {
-          success: false,
-          message: 'Template spec validation failed.',
-          errors: rawSpecErrors
-        });
-        return;
-      }
-      const payload = normalizeTemplatePayload(body, templateCode, session.data && session.data.username, storageOptions);
-      if (!isTransferReplace && body.owner === undefined && body.Owner === undefined && found.card.Owner !== undefined) payload.Owner = found.card.Owner;
-      const storedSpec = safeJsonValue(payload.SpecJson, null);
-      if (diagramAuthoringStatusForSpec(storedSpec).status === 'unsupported') {
-        if (isTransferReplace) {
-          sendTransferReplacementIncomplete(res, [templateTransferIssue('$.spec.authoring.d2', 'template_transfer_d2_unsupported', 'The D2 authoring contract requires fresh analysis.')]);
-          return;
-        }
-        sendJson(res, 409, d2AuthoringCurrentContractRequiredPayload(storedSpec));
-        return;
-      }
-      const specErrors = validateTemplateSpecForStorage(storedSpec);
-      if (specErrors.length) {
-        sendJson(res, 400, {
-          success: false,
-          message: 'Template spec validation failed.',
-          errors: specErrors
-        });
-        return;
-      }
-      const executionChanged = executionSpecHash(currentTemplate.spec || {}) !== executionSpecHash(storedSpec);
-      const executionValidation = executionValidationForSpec(storedSpec);
-      let writePayload = payload;
-      if (isTransferReplace) {
-        const slot = acquireExecutionSlot(req, res, { action: 'template-transfer-replace', templateCode });
-        if (!slot) return;
-        try {
-          const validation = await validateTemplateTransferTarget(authToken, found.schema.root, storedSpec);
-          if (!executionValidation.executable || validation.issues.some((issue) => issue.severity === 'error')) {
-            sendTransferReplacementIncomplete(res, validation.issues.concat(executionValidation.errors.map((issue) =>
-              templateTransferIssue(issue.path, 'template_transfer_execution_incomplete', issue.message))));
-            return;
+        sendJson(res, updated.ok ? 200 : 502, {
+          success: updated.ok,
+          cmdbuildStatus: updated.statusCode,
+          root: found.schema.root,
+          className: found.schema.classNames.template,
+          template: sanitizeTemplateCard(updated.json && updated.json.data),
+          snapshotRevocationPending: !revocationFinalized,
+          versionLog,
+          executionValidation,
+          objectFlowRecovery: storageOptions.objectFlowOutcomes.map((item) => ({
+            status: String(item && item.status || ''),
+            changed: Boolean(item && item.changed),
+            executionReadyAfterSave: item && item.executionReadyAfterSave === true,
+            reasons: Array.isArray(item && item.reasons) ? cloneJsonValueServer(item.reasons, []) : [],
+            preservedLabels: Number(item && item.preservedLabels || 0),
+            generatedLabels: Number(item && item.generatedLabels || 0),
+            ownership: String(item && item.ownership || '')
+          })),
+          cacheInvalidation: cacheInvalidation && {
+            runtime: cacheInvalidation[0],
+            staticSnapshots: cacheInvalidation[1]
           }
-          // Catalog checks can take time. Re-read the revision and rights just before PUT.
-          const latest = await findTemplateCard(authToken, found.schema.root, templateCode);
-          if (!latest.response.ok) {
-            sendJson(res, 502, { success: false, code: 'template_transfer_target_unavailable', message: 'Could not verify the target before replacing it.' });
-            return;
-          }
-          if (!await verifyTransferReplacementTarget(authToken, res, latest, templateCode, replacement)) return;
-          writePayload = {
-            Description: typeof body.description === 'string' ? body.description : payload.Description,
-            SpecJson: payload.SpecJson, ParamsSchemaJson: payload.ParamsSchemaJson,
-            ResultSchemaJson: payload.ResultSchemaJson, UpdatedAt: new Date().toISOString()
-          };
-        } finally {
-          slot.release();
-        }
-      }
-      const updated = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(found.schema.classNames.template)}/cards/${encodeURIComponent(found.card._id)}`, authToken, {
-        method: 'PUT',
-        body: writePayload
+        });
       });
-      const versionLog = updated.ok
-        ? await writeTemplateVersion(authToken, found.schema.root, payload.Code, storedSpec, session.data && session.data.username, body.changeComment || 'update')
-        : null;
-      const cacheInvalidation = updated.ok
-        ? executionChanged
-          ? await Promise.all([
-            invalidateTemplateRuntimeCache(found.schema.root, payload.Code),
-            invalidateTemplateStaticSnapshots(found.schema.root, payload.Code)
-          ])
-          : [
-            { invalidated: 0, complete: true, skipped: true, reason: 'authoring_only' },
-            { invalidated: 0, complete: true, skipped: true, reason: 'authoring_only' }
-          ]
-        : null;
-      logInfo(updated.ok ? 'template.updated' : 'template.update_failed', {
-        requestId: req.cmdpRequestId || '',
-        templateCode: payload.Code,
-        username: session.data && session.data.username || '',
-        cmdbuildStatus: updated.statusCode,
-        versionLogged: Boolean(versionLog),
-        executionChanged,
-        runtimeCacheInvalidated: cacheInvalidation && cacheInvalidation[0].invalidated || 0,
-        staticSnapshotsInvalidated: cacheInvalidation && cacheInvalidation[1].invalidated || 0,
-        cacheInvalidationComplete: cacheInvalidation ? cacheInvalidation.every((item) => item.complete) : false,
-        objectFlowOutcomes: storageOptions.objectFlowOutcomes.map((item) => String(item && item.status || '')).filter(Boolean),
-        objectFlowOwnership: storageOptions.objectFlowOutcomes.map((item) => String(item && item.ownership || '')).filter(Boolean)
-      });
-      sendJson(res, updated.ok ? 200 : 502, {
-        success: updated.ok,
-        cmdbuildStatus: updated.statusCode,
-        root: found.schema.root,
-        className: found.schema.classNames.template,
-        template: sanitizeTemplateCard(updated.json && updated.json.data),
-        versionLog,
-        executionValidation,
-        objectFlowRecovery: storageOptions.objectFlowOutcomes.map((item) => ({
-          status: String(item && item.status || ''),
-          changed: Boolean(item && item.changed),
-          executionReadyAfterSave: item && item.executionReadyAfterSave === true,
-          reasons: Array.isArray(item && item.reasons) ? cloneJsonValueServer(item.reasons, []) : [],
-          preservedLabels: Number(item && item.preservedLabels || 0),
-          generatedLabels: Number(item && item.generatedLabels || 0),
-          ownership: String(item && item.ownership || '')
-        })),
-        cacheInvalidation: cacheInvalidation && {
-          runtime: cacheInvalidation[0],
-          staticSnapshots: cacheInvalidation[1]
-        }
-      });
-      return;
     }
 
     methodAllowed(req, res, ['GET', 'PUT', 'DELETE']);
@@ -63208,30 +63731,43 @@ async function handleDynamicPagesUi(req, res, requestUrl) {
 
   const pathname = requestUrl.pathname.replace(/\/+$/, '') || DYNAMIC_UI_PREFIX;
   const authToken = getCookieValue(req.headers.cookie, 'CMDBuild-Authorization');
-  const jsonOutput = runtimeJsonOutputRequested(requestUrl);
-  if (!authToken) {
-    if (pathname.startsWith(`${DYNAMIC_UI_PREFIX}/run/`)) {
-      const templateCode = decodeURIComponent(pathname.slice(`${DYNAMIC_UI_PREFIX}/run/`.length));
-      try {
-        validateCmdbuildIdentifier(templateCode, 'template code');
-      } catch (error) {
-        sendHtml(res, 400, `<!doctype html><html><head><meta charset="utf-8"><title>CMDB Dynamic Pages</title></head><body style="font-family:Arial,sans-serif;padding:24px"><h1>Invalid template code</h1><p>${htmlEscape(error.message)}</p></body></html>`);
-        return;
-      }
-      if (jsonOutput) {
-        const publicUrl = new URL(requestUrl.href);
-        publicUrl.pathname = `${BACKEND_PREFIX}/public-snapshots/${encodeURIComponent(templateCode)}/run`;
-        await handleBackend(req, res, publicUrl);
-        return;
-      }
-      sendHtml(res, 200, renderDynamicPagesShell({
-        mode: 'runtime',
-        session: {},
-        templateCode,
-        publicRuntime: true
-      }));
+  if (pathname.startsWith(`${DYNAMIC_UI_PREFIX}/run/`)) {
+    let templateCode;
+    try {
+      templateCode = validateCmdbuildIdentifier(decodeURIComponent(pathname.slice(`${DYNAMIC_UI_PREFIX}/run/`.length)), 'template code');
+    } catch (error) {
+      sendHtml(res, 400, `<!doctype html><html><head><meta charset="utf-8"><title>CMDB Dynamic Pages</title></head><body style="font-family:Arial,sans-serif;padding:24px"><h1>Invalid template code</h1><p>${htmlEscape(error.message)}</p></body></html>`);
       return;
     }
+    const root = requireRuntimeRoot(res, requestUrl);
+    if (!root) return;
+    const lookup = await lookupPublishedSnapshot(res, requestUrl, root, templateCode);
+    if (!lookup) return;
+    const publicRuntime = Boolean(lookup.snapshot) || !authToken;
+    if (runtimeJsonOutputRequested(requestUrl) || runtimeD2OutputRequested(requestUrl)) {
+      if (publicRuntime) {
+        sendPublicSnapshotResult(res, requestUrl, templateCode, lookup);
+        return;
+      }
+      const backendUrl = new URL(requestUrl.href);
+      backendUrl.pathname = `${BACKEND_PREFIX}/templates/${encodeURIComponent(templateCode)}/run`;
+      await handleBackend(req, res, backendUrl);
+      return;
+    }
+    const session = publicRuntime ? null : await requireValidBackendSession(authToken, res, {
+      requestId: req.cmdpRequestId || '', root, templateCode
+    });
+    if (!publicRuntime && !session) return;
+    sendHtml(res, 200, renderDynamicPagesShell({
+      mode: 'runtime',
+      session: session ? sanitizeSession(session.data) : {},
+      templateCode,
+      root,
+      publicRuntime
+    }));
+    return;
+  }
+  if (!authToken) {
     sendHtml(res, 401, `<!doctype html><html><head><meta charset="utf-8"><title>CMDB Dynamic Pages</title></head><body style="font-family:Arial,sans-serif;padding:24px"><h1>CMDB Dynamic Pages</h1><p>CMDBuild session cookie was not sent. Open CMDBuild through the proxy and log in first.</p><p><a href="/cmdbuild/ui/?cmdpMode=designer#custompages/CmdbDynamicPages">Open CMDBuild custom page</a></p><p><a href="/cmdbuild/dynamicpages/ui/designer">Open Designer directly</a></p></body></html>`);
     return;
   }
@@ -63252,28 +63788,6 @@ async function handleDynamicPagesUi(req, res, requestUrl) {
       mode: 'designer',
       session: sanitizeSession(session.data),
       designerSection: extractDesignerSection(pathname, requestUrl)
-    }));
-    return;
-  }
-
-  if (pathname.startsWith(`${DYNAMIC_UI_PREFIX}/run/`)) {
-    const templateCode = decodeURIComponent(pathname.slice(`${DYNAMIC_UI_PREFIX}/run/`.length));
-    try {
-      validateCmdbuildIdentifier(templateCode, 'template code');
-    } catch (error) {
-      sendHtml(res, 400, `<!doctype html><html><head><meta charset="utf-8"><title>CMDB Dynamic Pages</title></head><body style="font-family:Arial,sans-serif;padding:24px"><h1>Invalid template code</h1><p>${htmlEscape(error.message)}</p></body></html>`);
-      return;
-    }
-    if (jsonOutput) {
-      const backendUrl = new URL(requestUrl.href);
-      backendUrl.pathname = `${BACKEND_PREFIX}/templates/${encodeURIComponent(templateCode)}/run`;
-      await handleBackend(req, res, backendUrl);
-      return;
-    }
-    sendHtml(res, 200, renderDynamicPagesShell({
-      mode: 'runtime',
-      session: sanitizeSession(session.data),
-      templateCode
     }));
     return;
   }
@@ -63636,6 +64150,7 @@ export {
   executionValidationForSpec,
   executeFilterRows,
   executeSelectCards,
+  executeTemplateRunWithCache,
   executeMatchRows,
   executeEnrichRows,
   executeJoinRows,
@@ -63699,6 +64214,7 @@ export {
   mcpToolDefinitions,
   runtimeCacheKeyParts,
   runtimeCacheMeta,
+  validateTemplateTransferTarget,
   invalidateTemplateRuntimeCache,
   runtimeDisplayResponsePayload,
   runtimeD2OutputRequested,

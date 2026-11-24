@@ -1,4 +1,15 @@
-// Self-contained so the same resolver can be embedded in the browser client.
+// Both helpers are self-contained so Designer can embed the server contract.
+export function staticSnapshotParamPairs(params) {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) throw new Error('Snapshot parameters must be an object.');
+  return Object.entries(params).sort(([left], [right]) => left < right ? -1 : left === right ? 0 : 1).map(([name, value]) => {
+    if (!name || ['root', 'lang', 'cmdpLang', 'json', 'd2', 'diagram', 'refresh', 'noCache', 'forceRefresh', 'bypassRefreshCooldown', 'snapshotParams'].includes(name) ||
+      !(typeof value === 'string' || typeof value === 'boolean' || Number.isFinite(value))) {
+      throw new Error('Snapshot parameters must have non-reserved names and scalar string, boolean or finite number values.');
+    }
+    return [name, value];
+  });
+}
+
 export function resolveTemplateParameters(spec, params = {}) {
   const values = {};
   const origins = {};

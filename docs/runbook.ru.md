@@ -261,15 +261,30 @@ GET /cmdbuild/custom-api/auth/permission-scope
 
 ### Runtime iframe показывает login или пустой результат
 
-Проверить same-origin access через nginx/ingress, CMDBuild session cookie, template read grants и business-data read permissions. Dynamic runtime pages требуют current CMDBuild session cookie. Static snapshots требуют Redis snapshot.
+Проверить same-origin через nginx/ingress и `?root=<technicalRoot>` в ссылке. Добавить `json=true` в ссылку просмотра: выбор данных тот же, что для HTML и D2. Совпавший опубликованный снимок выдаётся без вызова CMDBuild даже при отсутствующей или истёкшей cookie. Только при отсутствии снимка включается защищённый путь: `401 cmdbuild_session_invalid` означает, что нужно войти заново; `403 technical_schema_access_denied` — проверить права чтения технической схемы выбранного root; `403 data_access_denied` — проверить права чтения бизнес-данных. После защищённого `403` снимок повторно не ищется. Для поиска события в структурированных логах использовать заголовок ответа `X-Request-ID`.
 
-### Static snapshot отсутствует
+### Static snapshot отсутствует или недоступен
 
-Если runtime показывает `Страница отсутствует для загрузки`, переопубликовать static snapshot из editor/admin session. Проверить Redis persistence и `CMDBDYNAMIC_REDIS_REQUIRED=true` для production.
+Проверить публичный `GET /cmdbuild/custom-api/public-snapshots/<code>/run` с теми же `root`, кодом и параметрами, что в ссылке просмотра. Для `exact` дизайнер передаёт `snapshotParams`: URL-кодированный JSON-массив типизированных пар, например `[["enabled",false],["site",42]]`. Копируйте ссылку из дизайнера, не преобразуя значения в строки. При отсутствии снимка API возвращает `snapshotFound=false`.
+
+Ключи версии 3 используют технический класс шаблона и Code; доступ проверяется по поколению отзыва. Старые снимки не мигрируют: нужные отчёты переопубликуйте явно. Используйте один пишущий экземпляр BFF на контур и Redis с гарантией сохранения подтверждённых записей (AOF с `appendfsync always` или эквивалент), без чтения с отстающей реплики. При восстановлении старой резервной копии Redis задайте новый `CMDBDYNAMIC_REDIS_KEY_PREFIX` до открытия публичных маршрутов. При откате не открывайте публичные маршруты, пока старые ключи не удалены из пространства имён.
+
+`503 snapshot_revocation_unavailable` означает, что запись в CMDB не началась. При `409 snapshot_revocation_pending` или `snapshotRevocationPending: true` публикация остаётся закрытой. Остановите запись, найдите `snapshot.revocation_started`/`snapshot.revocation_pending` по Request ID и сверьте фактическую карточку CMDB (при переименовании оба кода). В настроенном Redis проверьте `GET` для ключей из журнала: на всех должен быть тот же `pending:<uuid>`. Через `WATCH`/`MULTI`/`EXEC` атомарно замените проверенные значения на `ready:<тот-же-uuid>`; при расхождении прервите операцию. Не восстанавливайте прежнее поколение или payload. Возобновите запись и переопубликуйте только после проверки сохранённой версии.
+
+При `409 template_version_conflict` сохранённая версия больше не совпадает с
+базовой версией редактора. Черновик остаётся в редакторе; сохранение и публикация
+не повторяются автоматически. Сопоставьте правки с актуальной версией перед
+новым сохранением. Для диагностики используйте идентификатор запроса, этап
+записи и оба хеша из технического блока. При конфликте публикации старый снимок
+не записывается.
+
+Если ссылка просмотра или публичный API снимков возвращает HTTP `503` с `reason=snapshot_storage_unavailable`, проверить `/health/redis` и структурированные логи по `X-Request-ID`. Ошибка поиска не означает отсутствие снимка и не запускает защищённый путь. Если снимок найден, но `d2=true` возвращает `403`, проверить, был ли он опубликован с `publish.publicD2Source=true`.
 
 ### Cache не обновляется
 
 Проверить template cache settings, `RuntimeConfigJson.runtimeCache.refreshCooldownSec`, runtime response `cache.refreshAllowedAt`, а также тип запроса: read-only `GET run` или CSRF-protected `POST run` с `forceRefresh=true`.
+
+Успешный `cache.status=bypass` с `cache.reason=access_probe_unconfirmed` означает, что проверка не подтвердила возможность использовать кэш. Результат прочитан под текущей сессией с теми же лимитами, без чтения и записи кэша результатов. Принудительное обновление не отменяет это решение.
 
 ### Designer не сохраняет templates
 

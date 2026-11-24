@@ -12,6 +12,14 @@ const freeze = { dataHash: 'a'.repeat(64), catalogHash: 'b'.repeat(64), promptHa
 const limits = { maxModelRequests: 1, maxRows: 5, timeoutMs: 1000, traversalDepth: 2 };
 const templateRef = { root: 'Cst_QueryTool', templateCode: 'Example', baseSpecHash: 'd'.repeat(64) };
 
+test('unresolved pilot oracle requires an explicit stage for every requested mode', () => {
+  const base = { id: 'abstention', split: 'holdout', dataKind: 'synthetic', modes: ['flow'], input: { spec, templateRef } };
+  const plan = (oracle) => createPilotPlan({ freeze, limits, scenarios: [{ ...base, oracle }] });
+  assert.throws(() => plan({ outcome: 'unresolved' }), /pilot_unresolved_stage_required/);
+  assert.throws(() => plan({ outcome: 'unresolved', expectedStage: 'mapping' }), /pilot_unresolved_stage_required/);
+  assert.ok(plan({ outcome: 'unresolved', expectedStage: { flow: 'flow' } }).jobs.length);
+});
+
 test('frozen pilot schedules A/B for flow, includes exhausted jobs and does not expose the oracle', async () => {
   const options = { freeze, limits, scenarios: [{ id: 'case-example', split: 'holdout', dataKind: 'synthetic', modes: ['flow'],
     input: { spec, templateRef }, oracle: { outcome: 'accepted', rows: [{ blockId: 'example', values: { id: 'evaluator-private' } }] } }] };

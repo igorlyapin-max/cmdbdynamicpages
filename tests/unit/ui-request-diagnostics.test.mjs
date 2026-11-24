@@ -105,6 +105,23 @@ test('JSON 502 preserves approved error and limit metadata, not arbitrary payloa
   assert.doesNotMatch(api.serialize(diagnostic), /hidden|password|example\.invalid|token|prompt|stack|Spec/);
 });
 
+test('template conflicts keep only validated revision fingerprints and the write phase', () => {
+  const expectedSpecHash = 'a'.repeat(64);
+  const currentSpecHash = 'b'.repeat(64);
+  const response = api.response(result({
+    code: 'template_version_conflict',
+    reason: 'publication_saved_spec_mismatch',
+    diagnostics: { stage: 'publish', expectedSpecHash, currentSpecHash, spec: 'hidden-spec-marker' },
+    template: { spec: 'hidden-spec-marker' }
+  }, { status: 409 }), { ...context, method: 'POST', phase: 'publish' });
+  assert.equal(response.code, 'template_version_conflict');
+  assert.equal(response.phase, 'publish');
+  assert.deepEqual(response.diagnostics, { stage: 'publish', expectedSpecHash, currentSpecHash });
+  assert.equal(response.retryable, false);
+  assert.doesNotMatch(api.serialize(response), /hidden-spec-marker/);
+  assert.deepEqual(api.sanitize({ diagnostics: { expectedSpecHash: 'not-a-hash' } }).diagnostics, {});
+});
+
 test('HTML is inert plain text, strips attribute and script secrets, never infers source', () => {
   const diagnostic = api.response(result(undefined, {
     body: '<html><body><h1>502 Bad Gateway</h1><input value="secret"><script>secret</script></body></html>',

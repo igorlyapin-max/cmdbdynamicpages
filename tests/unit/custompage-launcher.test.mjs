@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics.mjs';
 import { createAssistantDiagnosticsUi } from '../../scripts/assistant-diagnostics-ui.mjs';
-import { resolveTemplateParameters } from '../../scripts/template-parameters.mjs';
+import { resolveTemplateParameters, staticSnapshotParamPairs } from '../../scripts/template-parameters.mjs';
 
 const launcherSource = fs.readFileSync('src/CmdbDynamicPages.js', 'utf8');
 const proxySource = fs.readFileSync('scripts/dev-proxy-server.mjs', 'utf8');
@@ -142,6 +142,7 @@ function generatedDynamicPagesClientScript() {
     'createUiRequestDiagnostics',
     'createAssistantDiagnosticsUi',
     'resolveTemplateParameters',
+    'staticSnapshotParamPairs',
     'DEFAULT_EMPTY_RESULT_TEXT',
     'DEFAULT_PERMISSION_DENIED_TEXT',
     'DEFAULT_TEMPLATE_CACHE_TTL_SEC',
@@ -168,7 +169,7 @@ function generatedDynamicPagesClientScript() {
     assert.ok(match, name);
     return Number(match[1]);
   });
-  return factory(createUiRequestDiagnostics, createAssistantDiagnosticsUi, resolveTemplateParameters, 'empty result', 'permission denied', 3600, ...versions, 'assistant system prompt', 'object flow prompt', 'semantic plan prompt', 'diagram semantics prompt', 'diagram binding intent prompt', 'diagram placement prompt', 'diagram connections prompt', 'diagram critique prompt')();
+  return factory(createUiRequestDiagnostics, createAssistantDiagnosticsUi, resolveTemplateParameters, staticSnapshotParamPairs, 'empty result', 'permission denied', 3600, ...versions, 'assistant system prompt', 'object flow prompt', 'semantic plan prompt', 'diagram semantics prompt', 'diagram binding intent prompt', 'diagram placement prompt', 'diagram connections prompt', 'diagram critique prompt')();
 }
 
 test('generated Dynamic Pages client script parses as browser JavaScript', () => {
@@ -1075,12 +1076,12 @@ test('assistant draft generation auto-applies only successful drafts to editor s
 
 test('Assistant authoring is persisted only through canonical authoring on normal Save', () => {
   const hydrateStart = proxySource.indexOf('function hydrateDesignerStateFromTemplate(options)');
-  const noticeStart = proxySource.indexOf('function renderNotice(message)');
+  const noticeStart = proxySource.indexOf('function renderNotice(');
   const authoringStart = proxySource.indexOf('function templateAuthoringClient(spec)');
   const authoringEnd = proxySource.indexOf('function assistantAuthoringFromState(spec)', authoringStart);
   const specWithPromptsStart = proxySource.indexOf('function assistantSpecWithPrompts(spec)');
   const specWithPromptsEnd = proxySource.indexOf('function markAssistantAuthoringChanged()', specWithPromptsStart);
-  const saveStart = proxySource.indexOf('function saveTemplate()');
+  const saveStart = proxySource.indexOf('function saveTemplate(options)');
   const saveEnd = proxySource.indexOf('function openAssistantSection()', saveStart);
   const defaultSpecStart = proxySource.indexOf('function defaultSpec()');
   assert.ok(hydrateStart > -1);
@@ -1111,7 +1112,7 @@ test('Assistant authoring is persisted only through canonical authoring on norma
 test('Assistant Save persists an analyzed D2 source without replacing the applied mapping', () => {
   const authoringStart = proxySource.indexOf('function assistantAuthoringFromState(spec)');
   const authoringEnd = proxySource.indexOf('function assistantSpecWithPrompts(spec)', authoringStart);
-  const saveStart = proxySource.indexOf('function saveTemplate()');
+  const saveStart = proxySource.indexOf('function saveTemplate(options)');
   const saveEnd = proxySource.indexOf('function openAssistantSection()', saveStart);
   assert.ok(authoringStart >= 0 && authoringEnd > authoringStart);
   assert.ok(saveStart >= 0 && saveEnd > saveStart);
@@ -1129,7 +1130,7 @@ test('Assistant Save persists an analyzed D2 source without replacing the applie
 
 test('new templates hydrate all template-owned Assistant state', () => {
   const hydrateStart = proxySource.indexOf('function hydrateDesignerStateFromTemplate(options)');
-  const noticeStart = proxySource.indexOf('function renderNotice(message)', hydrateStart);
+  const noticeStart = proxySource.indexOf('function renderNotice(', hydrateStart);
   const newTemplateStart = proxySource.indexOf('function newTemplate()');
   const newCmdbBuildViewStart = proxySource.indexOf('function newCmdbBuildViewTemplate()', newTemplateStart);
   const deleteTemplateStart = proxySource.indexOf('function deleteTemplate(code)', newCmdbBuildViewStart);
@@ -1304,10 +1305,10 @@ test('typed assistant flow renders one in-progress proposal before deterministic
 
 test('normal Save accepts canonical ACK without reloading; opening a template restores its D2 checkpoint without LLM', () => {
   const hydrateStart = proxySource.indexOf('function hydrateDesignerStateFromTemplate(options)');
-  const noticeStart = proxySource.indexOf('function renderNotice(message)', hydrateStart);
+  const noticeStart = proxySource.indexOf('function renderNotice(', hydrateStart);
   const loadStart = proxySource.indexOf('function loadDesigner(options)');
   const fetchVersionsStart = proxySource.indexOf('function fetchVersions(', loadStart);
-  const saveStart = proxySource.indexOf('function saveTemplate()');
+  const saveStart = proxySource.indexOf('function saveTemplate(options)');
   const assistantStart = proxySource.indexOf('function openAssistantSection()', saveStart);
   assert.ok(hydrateStart > -1);
   assert.ok(noticeStart > hydrateStart);
@@ -1324,8 +1325,8 @@ test('normal Save accepts canonical ACK without reloading; opening a template re
   assert.match(loadSource, /var selectedBeforeReload = state\.selectedTemplate/);
   assert.match(loadSource, /selectedBeforeReload\.specHash/);
   assert.match(loadSource, /preserveAssistantState: preserveAssistantState/);
-  assert.match(saveSource, /state\.selectedTemplate = result\.json\.template/);
-  assert.match(saveSource, /state\.templates = state\.templates\.filter/);
+  assert.match(saveSource, /var savedTemplate = result\.json\.template[\s\S]*state\.selectedTemplate = cloneJsonValue\(savedTemplate/);
+  assert.match(saveSource, /state\.templates\[savedIndex\] = savedTemplate/);
   assert.match(saveSource, /runtimeSettingsScopeIsCurrent\(saveScope\)/);
   assert.doesNotMatch(saveSource, /loadDesigner\(/);
   assert.doesNotMatch(hydrateSource, /analyzeDiagramImport\(/);
@@ -1466,7 +1467,7 @@ test('designer action bar exposes the global template Save in every selected-tem
   const templatesSource = actionBarSource.slice(templatesStart, assistantStart);
   const globalSaveSource = actionBarSource.slice(globalSaveStart, templatesStart);
   assert.match(actionBarSource, /var templateSelected = Boolean\(state\.selectedTemplate\)/);
-  assert.match(actionBarSource, /templateSelectionRequired/);
+  assert.match(actionBarSource, /var saveTitle = templateSaveBlockTitle\(selected\.code\)/);
   assert.match(templatesSource, /renderActionButton\('save-template', t\('save'\)/);
   assert.match(globalSaveSource, /renderActionButton\('save-template', t\('save'\), \{/);
   assert.match(globalSaveSource, /disabled: saveDisabled/);
@@ -1881,7 +1882,7 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   assert.match(proxySource, /diagramImportProposalHasReviewBlocker/);
   assert.match(proxySource, /'diagram',[\s\S]*?'visualization'/);
   assert.match(proxySource, /diagramImportAppliedPendingPreview && !state\.lastDraftPreviewOk/);
-  const saveFunctionStart = proxySource.indexOf('function saveTemplate()');
+  const saveFunctionStart = proxySource.indexOf('function saveTemplate(options)');
   const saveFunctionEnd = proxySource.indexOf('function openAssistantSection()', saveFunctionStart);
   const saveFunctionSource = proxySource.slice(saveFunctionStart, saveFunctionEnd);
   assert.ok(saveFunctionStart > -1);
@@ -2131,33 +2132,41 @@ test('runtime diagram view exposes D2 rendered SVG and source download affordanc
   assert.match(runtimeSource, /initializeDiagramViewports\(app\)/);
   assert.match(loadSource, /runtimeSystemParam\(key\)/);
   assert.match(loadSource, /result\.downloadMode = 'template'/);
-  assert.match(loadSource, /publicResult\.downloadMode = 'public'/);
+  assert.match(loadSource, /if \(boot\.publicRuntime\) \{\s*request\(publicSnapshotRunPath\(templateCode, params\)\)/);
+  const authenticatedLoad = loadSource.slice(loadSource.indexOf('request(runtimeRunPath'));
+  assert.doesNotMatch(authenticatedLoad, /publicSnapshotRunPath/);
 });
 
 test('snapshot publication saves static settings before publish and uses saved template version', () => {
   const publishStart = proxySource.indexOf('function publishSnapshot()');
   const launchStart = proxySource.indexOf('function refreshTemplateLaunchUrl()');
+  const saveStart = proxySource.indexOf('function saveTemplate(options)');
+  const saveEnd = proxySource.indexOf('function openAssistantSection()', saveStart);
   assert.ok(publishStart > -1);
   assert.ok(launchStart > publishStart);
   const publishSource = proxySource.slice(publishStart, launchStart);
 
-  assert.match(publishSource, /payload\.spec = applyPublicationToSpec\(payload\.spec, true\)/);
-  assert.match(publishSource, /request\(savePath, \{ method: exists \? 'PUT' : 'POST', body: payload \}\)/);
-  assert.match(publishSource, /var savedTemplate = saveResult\.json && saveResult\.json\.template \? saveResult\.json\.template : \{\}/);
-  assert.match(publishSource, /state\.selectedTemplate = savedTemplate/);
-  assert.match(publishSource, /publishSavedSpecHashMissing/);
-  assert.match(publishSource, /\^\[0-9a-f\]\{64\}\$/);
-  assert.match(publishSource, /var publishCode = savedTemplate\.code \|\| payload\.code \|\| code/);
-  assert.match(publishSource, /encodeURIComponent\(publishCode\) \+ '\/publish'/);
-  assert.match(publishSource, /savedSpecHash: savedTemplate\.specHash/);
-  assert.doesNotMatch(publishSource, /savedTemplate\.specHash \|\| ''/);
-  assert.doesNotMatch(publishSource, /encodeURIComponent\(payload\.code\) \+ '\/publish'/);
+  assert.match(publishSource, /return saveTemplate\(\{ publish: true \}\)/);
+  assert.doesNotMatch(publishSource, /request\(/);
+  assert.ok(saveStart > -1 && saveEnd > saveStart);
+  const saveSource = proxySource.slice(saveStart, saveEnd);
+  assert.match(saveSource, /if \(state\.savingTemplate\) return/);
+  assert.match(saveSource, /applyPublicationToSpec\(snapshot\.payload\.spec, true\)/);
+  assert.match(saveSource, /var rootQuery = '\?root=' \+ encodeURIComponent\(saveScope\.root\)/);
+  assert.match(saveSource, /phase: 'save'/);
+  assert.match(saveSource, /var savedTemplate = result\.json\.template/);
+  assert.match(saveSource, /var unchanged = sameDraft\(\);[\s\S]*if \(!originalEditor \|\| !unchanged\) \{[^\n]*\n[^\n]*\n[^\n]*publishDraftChanged[^\n]*\n\s*return;/);
+  assert.match(saveSource, /publishSavedSpecHashMissing/);
+  assert.match(saveSource, /encodeURIComponent\(savedTemplate\.code\) \+ '\/publish' \+ rootQuery/);
+  assert.match(saveSource, /phase: 'publish'/);
+  assert.match(saveSource, /savedSpecHash: savedTemplate\.specHash/);
 });
 
 test('dynamic runtime explains that snapshot publication is unavailable', () => {
   assert.match(proxySource, /publicationDynamicHint/);
   assert.match(proxySource, /snapshotPublicationEnabled/);
-  assert.match(proxySource, /disabled: !snapshotPublicationEnabled/);
+  assert.match(proxySource, /var publishTitle = templatePublishBlockTitle\(saveTitle, snapshotPublicationEnabled\)/);
+  assert.match(proxySource, /publishEnabled \? '' : t\('publicationDynamicHint'\)/);
 });
 
 test('catalog field pickers load attributes only after a search and retry transient errors', () => {

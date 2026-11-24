@@ -7,6 +7,7 @@ import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics
 const source = fs.readFileSync(new URL('../../scripts/dev-proxy-server.mjs', import.meta.url), 'utf8');
 const functions = ['parseResponse', 'validateUiResponse', 'createRequestError', 'requestDraftPreview',
   'runtimeSettingsScope', 'runtimeSettingsScopeIsCurrent', 'captureTemplateEditorSnapshot', 'saveTemplateSnapshot',
+  'templateWriteKey', 'templateWritePending',
   'draftPreviewRequestTimeoutMs', 'saveTemplate', 'extractByTemplate', 'extractionIsRunning', 'extractionMatchesDraft', 'extractionCaptureDetails', 'runDraftAction',
   'visualizeInEditor', 'queueDiagramImportRuntimePreview', 'runDiagramImportRuntimePreview'];
 const helpers = functions.map((name) => {
@@ -23,10 +24,12 @@ async function harness(body, { status = 200, current = true, mode = 'applied' } 
   const errors = [];
   let loads = 0;
   const state = { root: 'A', session: {}, templates: [], uiDiagnosticRevision: owner.revision,
+    pendingTemplateWrites: new Map(), templatePublicationNotices: new Map(),
+    get savingTemplate() { return sandbox.templateWritePending(sandbox.readTemplateCode()); },
     selectedTemplate: edited, designerSection: 'assistant', lastDraftPreviewOk: true };
   const sandbox = vm.createContext({
     state, boot: {}, apiPrefix: '/api', window: { history: {} },
-    document: { getElementById: () => null },
+    document: { getElementById: () => null, querySelector: () => null },
     cloneJsonValue: (value) => structuredClone(value),
     uiRequestDiagnostics: createUiRequestDiagnostics(),
     uiRequestOwner: () => ({ ...owner }),

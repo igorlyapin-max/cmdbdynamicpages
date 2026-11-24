@@ -193,7 +193,7 @@ export async function executePilotHoldoutSpec(caseId, mode, spec) {
 // Hand-authored from the address-register facts and card IDs, not from execution.
 export function pilotHoldoutOracle(caseId, mode) {
   checkCase(caseId, mode);
-  if (caseId === noHelpId) return { outcome: 'unresolved', rows: [], graph: emptyGraph() };
+  if (caseId === noHelpId) return { outcome: 'unresolved', expectedStage: mode === 'mapping' ? 'mapping' : 'flow', rows: [], graph: emptyGraph() };
   const changed = caseId === changedId;
   const city1 = { Class: 'City', _id: 11, Code: 'CP', Description: 'Northport' };
   const city2 = { Class: 'City', _id: 12, Code: 'CV', Description: 'Westhaven' };
@@ -268,6 +268,7 @@ export function createPilotHoldoutScenario(caseId = baseId) {
   return {
     id: caseId, split: 'holdout', dataKind: 'synthetic', modes: [...PILOT_HOLDOUT_MODES],
     input: { spec, d2Source, authoredD2Source, knowledgeByBlock },
-    oracle: pilotHoldoutOracle(caseId, 'end-to-end'),
+    oracle: caseId === noHelpId ? { ...pilotHoldoutOracle(caseId, 'end-to-end'),
+      expectedStage: { flow: 'flow', mapping: 'mapping', 'end-to-end': 'flow' } } : pilotHoldoutOracle(caseId, 'end-to-end'),
   };
 }

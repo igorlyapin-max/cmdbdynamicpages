@@ -60,19 +60,24 @@ export function scorePilotAttempt({ mode, oracle, capture }) {
     allMatched(compareField(oracle.blockIds, capture?.blockIds));
   const completeStages = required.every((stage) => capture?.stages?.[stage]?.status === 'accepted');
   const unresolvedAt = required.findIndex((stage) => capture?.stages?.[stage]?.status === 'unresolved');
+  const unresolvedStage = required[unresolvedAt];
+  const expectedStage = typeof oracle.expectedStage === 'string' ? oracle.expectedStage : oracle.expectedStage?.[mode];
   const validUnresolved = Boolean(!hasFailure && unresolvedAt >= 0 &&
-    ['flow', 'mapping'].includes(required[unresolvedAt]) &&
+    ['flow', 'mapping'].includes(unresolvedStage) &&
     required.slice(0, unresolvedAt).every((stage) => capture.stages?.[stage]?.status === 'accepted') &&
     required.slice(unresolvedAt + 1).every((stage) => !Object.hasOwn(capture.stages, stage)));
+  const correctAbstention = validUnresolved && oracle.outcome === 'unresolved' && unresolvedStage === expectedStage &&
+    (!required.slice(0, unresolvedAt).includes('rows') || blocksMatch && allMatched(metrics.rows));
   const requiredMetrics = FIELDS.filter((field) => required.includes(field === 'rows' ? 'rows' : 'graph'));
   const snapshotsPresent = requiredMetrics.every((field) => Array.isArray(field === 'rows' ? capture?.rows : capture?.graph?.[field]));
   const complete = capture?.complete === true && !hasFailure && completeStages && blocksMatch && snapshotsPresent &&
     (oracle.outcome === 'unresolved' || requiredMetrics.every((field) => metrics[field] !== null));
   const exact = complete && oracle.outcome !== 'unresolved' && requiredMetrics.every((field) => allMatched(metrics[field]));
   const failure = !capture ? 'missing_capture' : capture.failure ??
-    (complete || validUnresolved ? null : !blocksMatch ? 'incomplete_block_manifest' : 'incomplete_capture');
+    (validUnresolved && oracle.outcome === 'unresolved' && !correctAbstention ? 'pilot_unresolved_oracle_mismatch'
+      : complete || validUnresolved ? null : !blocksMatch ? 'incomplete_block_manifest' : 'incomplete_capture');
   const budgetSkipped = isPilotBudgetLimit(failure);
-  return { exact, complete, validUnresolved, correctAbstention: validUnresolved && oracle.outcome === 'unresolved',
+  return { exact, complete, validUnresolved, correctAbstention,
     falseAcceptance: complete && !exact, failed: failure !== null && !budgetSkipped, failure, budgetSkipped, metrics,
     telemetry: observedTelemetry(capture?.telemetry) };
 }

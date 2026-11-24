@@ -50,16 +50,16 @@ Production should also expose project UI routes on the same origin:
 The preferred runtime link is now a backend-owned UI route:
 
 ```text
-/cmdbuild/dynamicpages/ui/run/<templateCode>?param=value
+/cmdbuild/dynamicpages/ui/run/<templateCode>?root=<technicalRoot>&param=value
 ```
 
 The browser never sends URL fragments to the server. CMDBuild 4.1 may normalize extra path segments after a custom page name, so launcher-based runtime links should keep the custom page hash stable and put dynamic page routing in query parameters before `#`:
 
 ```text
-/cmdbuild/ui/?cmdpTemplate=<templateCode>&param=value#custompages/CmdbDynamicPages
+/cmdbuild/ui/?cmdpTemplate=<templateCode>&root=<technicalRoot>&param=value#custompages/CmdbDynamicPages
 ```
 
-The custom page must only parse the URL and redirect to a project-owned UI path. The backend UI calls real backend API paths:
+The custom page must only parse the URL and redirect to a project-owned UI path. The direct authenticated run API is separate from the viewer URL:
 
 ```text
 /cmdbuild/custom-api/templates/<templateCode>/run
@@ -90,14 +90,14 @@ CMDBuild/Tomcat owns the user session lifetime. The current test stand uses a 30
 </session-config>
 ```
 
-The value is in minutes and requires a CMDBuild/Tomcat restart when changed. This timeout is not the template runtime cache TTL. If the browser still sends a cookie but `/sessions/current` rejects it, the backend treats the session as expired and sends the user through the login flow.
+The value is in minutes and requires a CMDBuild/Tomcat restart when changed. This timeout is not the template runtime cache TTL. On protected requests, if the browser still sends a cookie but `/sessions/current` rejects it, the backend treats the session as expired and sends the user through the login flow.
 
 CSRF strategy:
 
 - `GET /cmdbuild/custom-api/csrf` returns a token derived server-side from the current CMDBuild session token and backend secret;
 - the backend-served UI sends this token in `X-CMDBDynamicPages-CSRF` for non-GET backend calls;
 - state-changing backend calls require both same-origin `Origin`/`Referer` and a valid CSRF token;
-- runtime iframe execution uses read-only `GET /cmdbuild/custom-api/templates/:code/run?param=value` and does not require a CSRF token;
+- the viewer URL and direct read-only `GET /cmdbuild/custom-api/templates/:code/run?param=value` do not require a CSRF token;
 - the CSRF token is not the CMDBuild token and cannot be used as CMDBuild REST authorization.
 
 ## Runtime Result Cache
@@ -109,7 +109,7 @@ Runtime template results may be expensive because templates can scan cards and r
 - `privateUser` keeps the result cache isolated by CMDBuild user/session scope;
 - `disabled` turns result caching off for the template.
 
-Cache keys include template code, spec hash, runtime params, executor limits, template cache policy, dependency-map hash, and either the endpoint visibility hash or the per-user scope hash depending on mode. Template `ttlSeconds` controls how long this template result is kept in cache; the Designer edits this value in hours and defaults new templates to 8 hours. System `RuntimeConfigJson.runtimeCache.refreshCooldownSec` controls how long users must wait before requesting a manual cache rebuild. The runtime page keeps the visible UI compact: the table header places the title on the left and right-aligns search plus a `⟳` refresh icon on the same line; the icon exposes cache status, generated time, expiry, refresh countdown, backend, and scope details in a hover/focus tooltip.
+Cache keys include the technical root, template code, spec hash, business parameters, executor limits, template cache policy, dependency-map hash, and either the endpoint visibility hash or the per-user scope hash depending on mode. An incomplete or non-eligible access probe skips both cache reads and writes. Direct reads use the current session and the same execution limits; on success they return `cache.status=bypass` and `cache.reason=access_probe_unconfirmed`. Template `ttlSeconds` controls how long this template result is kept in cache; the Designer edits this value in hours and defaults new templates to 8 hours. System `RuntimeConfigJson.runtimeCache.refreshCooldownSec` controls how long users must wait before requesting a manual cache rebuild. The runtime page keeps the visible UI compact: the table header places the title on the left and right-aligns search plus a `⟳` refresh icon on the same line; the icon exposes cache status, generated time, expiry, refresh countdown, backend, and scope details in a hover/focus tooltip.
 
 Designer draft preview is intentionally cache-free: `Visualize in editor` calls `/cmdbuild/custom-api/draft/preview` and executes the current unsaved draft. For saved endpoint testing the Designer Run page exposes a forced cache refresh action that calls `POST /cmdbuild/custom-api/templates/:code/run` with `forceRefresh=true`. Forced refresh ignores the user cooldown but is only accepted on CSRF-protected POST; read-only Runtime iframe `GET run` keeps the cooldown behavior.
 
@@ -127,7 +127,7 @@ Runtime final tables carry lightweight per-cell `cellMeta`: source selection (`S
 
 Both backend and client reject unsafe link schemes: `javascript:`, `data:`, and `vbscript:`. Empty or unsafe rendered URLs fall back to plain text.
 
-Published static snapshots are separate from the runtime result cache. `spec.publish.mode = "staticSnapshot"` requires `warningAccepted = true`; publication executes the template once under the editor's CMDBuild session and stores the result in Redis without TTL. Runtime then reads only Redis data and can serve the page without checking viewer permissions on source CMDBuild objects. If the snapshot is missing, runtime renders `Страница отсутствует для загрузки`. Redis dev mode uses RDB snapshots, so absent snapshots are restored by republishing.
+Published static snapshots are separate from the runtime result cache. `spec.publish.mode = "staticSnapshot"` requires `warningAccepted = true`; publication executes the template under the editor's CMDBuild session and stores the result in Redis without TTL. The viewer checks explicitly published snapshots before any session check, as described in [Runtime Flow](#runtime-flow). The public snapshots API returns `snapshotFound=false` on a miss. Version 3 keys use the technical template class and Code. Lookup requires a matching authoritative generation, and exact links encode typed parameters in `snapshotParams`. Revocation advances the generation before any CMDB mutation that withdraws publication. Old snapshot formats are not read.
 
 Production Redis is a password-protected dependency. The backend accepts credentials from `CMDBDYNAMIC_REDIS_PASSWORD_FILE`, `CMDBDYNAMIC_REDIS_PASSWORD`, or the password component of `CMDBDYNAMIC_REDIS_URL`; file-based secret injection is preferred. Redis credentials must not be committed to git. Health/status endpoints mask Redis credentials in returned URLs.
 
@@ -598,33 +598,22 @@ Publication is stored in `spec.publish`. `dynamicUser` keeps the normal current-
 User opens:
 
 ```text
-/cmdbuild/dynamicpages/ui/run/<templateCode>?param=value
+/cmdbuild/dynamicpages/ui/run/<templateCode>?root=<technicalRoot>&param=value
 ```
 
 CMDBuild launcher alternative:
 
 ```text
-/cmdbuild/ui/?cmdpTemplate=<templateCode>&param=value#custompages/CmdbDynamicPages
+/cmdbuild/ui/?cmdpTemplate=<templateCode>&root=<technicalRoot>&param=value#custompages/CmdbDynamicPages
 ```
 
-Runtime UI:
+The endpoint first looks up an explicitly published snapshot by technical root, template code, and business parameters. A hit serves the stored result without contacting CMDBuild, regardless of whether the cookie is absent, valid, or expired. HTML, `json=true`, and `d2=true` use the same selection. Public D2 source requires `publish.publicD2Source=true` in the publication. Output flags are not business parameters.
 
-- reads the template code from `/run/<templateCode>`;
-- extracts template code and params;
-- calls `GET /cmdbuild/custom-api/templates/<templateCode>/run?param=value`;
-- renders result tables or permission/validation errors.
-- when the reserved query parameter `json=true` is present, the backend-owned runtime route returns the same authorized final tables as `application/json`; `json` is excluded from business template params and does not alter permissions or cache policy.
-- runtime JSON treats an empty authorized result as HTTP `200` with empty rows and treats explicit CMDBuild `401/403` on a used class/attribute as HTTP `403` with `permissionDenied=true`; the executor does not return a partial multi-selection result when one required selection is denied.
-- known boundary: if CMDBuild masks a denied class/attribute as `404`, the current implementation may classify it as a generic execution error; if a superclass resolves to only readable descendants, the runtime can return the readable descendant subset.
+On a snapshot miss, a request with a cookie reaches the protected run. An anonymous miss never executes the template. A lookup error returns HTTP `503` with `reason=snapshot_storage_unavailable` and never invokes the protected run. A protected `403` does not trigger another snapshot lookup.
 
-Implemented Runtime MVP:
+On the protected path, runtime JSON distinguishes an authorized empty result (`200`), an invalid session (`401 cmdbuild_session_invalid`), a technical-schema denial (`403 technical_schema_access_denied`), and an explicit business-data read denial (`403 data_access_denied`). A read denial never returns partial rows. `X-Request-ID` correlates the response with structured logs. If CMDBuild masks a denied class or attribute as `404`, it may be classified as a generic execution error; if a superclass resolves to only readable descendants, runtime can return that subset.
 
-- serves `/cmdbuild/dynamicpages/ui/run/<templateCode>?param=value`;
-- custom page launcher redirects legacy launcher URLs to the direct runtime UI route;
-- calls `GET /cmdbuild/custom-api/templates/<templateCode>/run?param=value`;
-- renders result tables returned by the backend.
-
-Backend:
+The protected backend:
 
 - reads the user cookie;
 - validates `/sessions/current`;

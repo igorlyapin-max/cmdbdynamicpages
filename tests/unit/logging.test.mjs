@@ -185,12 +185,14 @@ test('redaction helpers mask configured header and query names', () => {
 });
 
 test('request path sanitizer redacts configured query secrets', () => {
-  const path = sanitizeRequestPath(new URL('http://127.0.0.1:8093/cmdbuild/custom-api/templates?token=secret&city=city49&password=pwd'));
+  const path = sanitizeRequestPath(new URL('http://127.0.0.1:8093/cmdbuild/custom-api/templates?token=secret&city=city49&password=pwd&snapshotParams=private-value'));
 
   assert.match(path, /^\/cmdbuild\/custom-api\/templates\?/);
   assert.match(path, /city=city49/);
   assert.match(path, /token=%5BREDACTED%5D/);
   assert.match(path, /password=%5BREDACTED%5D/);
+  assert.match(path, /snapshotParams=%5BREDACTED%5D/);
+  assert.doesNotMatch(path, /private-value/);
   assert.doesNotMatch(path, /secret/);
   assert.doesNotMatch(path, /pwd/);
 });

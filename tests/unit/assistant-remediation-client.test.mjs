@@ -17,15 +17,18 @@ function harness() {
   const fields = new Map();
   const state = {
     root: 'A', session: {}, selectedTemplate: { code: 'sample', spec: { text: 'initial' } },
-    templates: [], designerSection: 'template', uiDiagnosticRevision: 0, uiDiagnosticGeneration: 0
+    templates: [], designerSection: 'template', uiDiagnosticRevision: 0, uiDiagnosticGeneration: 0,
+    pendingTemplateWrites: new Map(), templatePublicationNotices: new Map(),
+    get savingTemplate() { return context.templateWritePending(context.readTemplateCode()); }
   };
   const calls = [];
   const context = vm.createContext({ state, boot: { mode: 'designer' }, apiPrefix: '/api',
-    document: { getElementById: (id) => fields.get(id), querySelectorAll: () => [...fields.values()] },
+    document: { getElementById: (id) => fields.get(id), querySelector: () => null, querySelectorAll: () => [...fields.values()] },
     window: {}, t: (key) => key, runtimeSettingsReadDraft: null,
     renderDesigner: () => {}, syncImportedDiagramSaveGate: () => {}, captureVisibleDesignerState: () => true,
     captureAssistantPromptsFromDom: () => {}, updateSelectedFromEditor: () => {}, assistantSpecWithPrompts: (value) => value,
     defaultSpec: () => ({}), activeDiagramImportEditorModel: () => null,
+    cloneJsonValue: (value) => structuredClone(value),
     validateUiResponse: (result) => { if (result.ok && !result.json.template) throw new Error('invalid response'); },
     createRequestError: () => new Error('failed'), setUiError: (error) => { state.message = error.message; },
     diagramImportExecutionValidationHasMappingBlocker: () => false,
@@ -36,7 +39,8 @@ function harness() {
   vm.runInContext(source.slice(start, source.indexOf('  function runtimeSettingsScope()', start)), context);
   load(context, ['runtimeSettingsScope', 'runtimeSettingsScopeIsCurrent', 'runtimeSettingsDraft', 'captureRuntimeSettingsInput',
     'captureRuntimeSettingsFields', 'restoreRuntimeSettingsFields', 'readValue', 'readChecked', 'hasField', 'readPositiveIntField',
-    'uiRequestOwner', 'uiDiagnosticIsCurrent', 'captureTemplateEditorSnapshot', 'saveTemplateSnapshot', 'saveTemplate', 'runtimeConfigWarnings', 'persistRuntimeConfig']);
+    'uiRequestOwner', 'uiDiagnosticIsCurrent', 'captureTemplateEditorSnapshot', 'saveTemplateSnapshot', 'saveTemplate', 'runtimeConfigWarnings', 'persistRuntimeConfig',
+    'readTemplateCode', 'templateWriteKey', 'templateWritePending']);
   return { fields, state, calls, context };
 }
 
@@ -67,11 +71,15 @@ test('another editor instance cannot receive late ACK or finally state', async (
   context.saveTemplate();
   state.templateEditorInstance = 1;
   state.selectedTemplate = { code: 'other', spec: {} };
-  state.savingTemplate = true;
+  context.saveTemplate();
   calls[0].resolve({ ok: true, json: { template: { id: 42, code: 'sample', specHash: 'old', spec: {} } } });
   await settle();
   assert.equal(state.selectedTemplate.code, 'other');
   assert.equal(state.savingTemplate, true);
+  assert.equal(state.templates[0].code, 'sample');
+  calls[1].resolve({ ok: true, json: { template: { id: 43, code: 'other', spec: {} } } });
+  await settle();
+  assert.equal(state.savingTemplate, false);
 });
 
 test('successful ACK and failed Save do not overwrite newer operation diagnostics', async () => {

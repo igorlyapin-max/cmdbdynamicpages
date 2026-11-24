@@ -19,10 +19,9 @@ Custom page внутри CMDBuild используется только как l
 
 ```text
 Browser -> CMDBuild UI custom page -> /cmdbuild/dynamicpages/ui/designer
-Browser -> /cmdbuild/dynamicpages/ui/run/<templateCode>?param=value
-Runtime UI -> GET /cmdbuild/custom-api/templates/<templateCode>/run
-Backend -> CMDBuild REST /cmdbuild/services/rest/v3/*
-Backend -> Redis
+Browser -> /cmdbuild/dynamicpages/ui/run/<templateCode>?root=<technicalRoot>&param=value
+Runtime UI -> Backend -> Redis (сначала поиск опубликованного снимка)
+Backend -> CMDBuild REST /cmdbuild/services/rest/v3/* (защищённый путь только при отсутствии снимка)
 ```
 
 Порты локального контура:
@@ -391,26 +390,26 @@ POST /cmdbuild/custom-api/draft/preview
 Пользователь открывает:
 
 ```text
-/cmdbuild/dynamicpages/ui/run/<templateCode>?param=value
+/cmdbuild/dynamicpages/ui/run/<templateCode>?root=<technicalRoot>&param=value
 ```
 
-Runtime UI вызывает:
+Ссылка просмотра сначала ищет явно опубликованный снимок по техническому root, коду шаблона и бизнес-параметрам. При совпадении backend отдаёт сохранённый результат без вызова CMDBuild, независимо от наличия или действительности cookie. HTML, `json=true` и `d2=true` используют один порядок выбора. Для публичной выдачи D2 source в публикации нужен `publish.publicD2Source=true`. Флаги формата не входят в бизнес-параметры.
 
-```text
-GET /cmdbuild/custom-api/templates/<templateCode>/run?param=value
-```
+`root` выбирает техническую схему и исключается из бизнес-параметров и их хеша. Если `root` отсутствует, применяется `CMDBDYNAMICPAGES_ROOT` или `Cst_QueryTool`. Ключ снимка версии 3 использует технический класс и Code. При отзыве поколение меняется до записи в CMDB; чтение требует совпадающего поколения. Для `exact` типизированные параметры передаются в `snapshotParams`. Снимки со старым ключом нужно переопубликовать.
 
-Если в runtime URL передан зарезервированный параметр `json=true`, backend-owned route возвращает те же авторизованные итоговые таблицы как `application/json`. `json` исключается из бизнес-параметров шаблона и не меняет модель прав, кэша, static snapshot или cooldown refresh.
+При отсутствии снимка запрос с cookie переходит на защищённый путь; после его `403` снимок повторно не ищется. Если cookie нет, шаблон не выполняется. Ошибка поиска возвращает HTTP `503` с `reason=snapshot_storage_unavailable` без защищённого запуска. Прямой `GET /cmdbuild/custom-api/templates/<templateCode>/run?root=<technicalRoot>&param=value` по-прежнему требует действительную сессию. Отдельный `/cmdbuild/custom-api/public-snapshots/<templateCode>/run` остаётся публичным и читает только сохранённые снимки.
 
-Для JSON runtime отсутствие данных в рамках прав пользователя является успешным ответом HTTP `200` с пустыми строками и настроенным `emptyText`. Явный `401/403` от CMDBuild на используемый класс или атрибут считается ошибкой прав: backend возвращает HTTP `403`, `permissionDenied=true` и настроенный `permissionDeniedText`; частичный результат по другим выборкам не отдается. Граница текущей реализации: если CMDBuild маскирует запрет как `404`, ответ может классифицироваться как общая ошибка выполнения; если суперкласс раскрывается только в читаемую часть наследников, runtime может вернуть это читаемое подмножество.
+На защищённом пути runtime JSON различает пустой разрешённый результат (`200`), недействительную сессию (`401 cmdbuild_session_invalid`), отказ в технической схеме (`403 technical_schema_access_denied`) и явный отказ чтения бизнес-данных (`403 data_access_denied`). При отказе чтения нет частичного результата. `X-Request-ID` связывает ответ со структурированными логами. Если CMDBuild маскирует отказ как `404`, возможна общая ошибка выполнения.
 
-Backend:
+Если проверка не подтвердила возможность использовать кэш или завершилась не полностью, backend не читает и не записывает кэш результатов. Данные читаются под текущей сессией с теми же лимитами. При успехе возвращаются `cache.status=bypass` и `cache.reason=access_probe_unconfirmed`.
 
-1. Загружает шаблон из `Cst_QueryTemplate`.
+Backend на защищённом пути:
+
+1. Проверяет сессию и загружает шаблон из технической схемы выбранного `root`.
 2. Проверяет параметры.
 3. Проверяет cache policy.
 4. Делает permission/visibility probe при необходимости.
-5. Возвращает cache hit либо выполняет DSL через CMDBuild REST.
+5. Возвращает cache hit только после успешной проверки; иначе выполняет DSL через CMDBuild REST под текущей сессией.
 6. Форматирует таблицы для Runtime UI.
 
 ## Архитектурные артефакты

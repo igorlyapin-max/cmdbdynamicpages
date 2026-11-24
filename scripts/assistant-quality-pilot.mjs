@@ -40,6 +40,12 @@ export function createPilotPlan({ scenarios, freeze, repeats = 3, ablations = fa
       Array.isArray(item.modes) && item.modes.length && new Set(item.modes).size === item.modes.length && item.modes.every((mode) => modes.includes(mode)) &&
       item.input?.spec && item.oracle && !Object.hasOwn(item.input, 'oracle'), 'pilot_invalid_scenarios');
     seen.add(item.id);
+    if (item.oracle.outcome === 'unresolved') {
+      check(item.modes.every((mode) => {
+        const stage = typeof item.oracle.expectedStage === 'string' ? item.oracle.expectedStage : item.oracle.expectedStage?.[mode];
+        return (mode !== 'flow' && stage === 'mapping') || (mode !== 'mapping' && stage === 'flow');
+      }), 'pilot_unresolved_stage_required');
+    }
     const blockIds = item.input.spec.authoring?.assistant?.objectFlowIntent?.blocks?.map((block) => block.id);
     check(blockIds?.length && new Set(blockIds).size === blockIds.length, 'pilot_missing_block_ids');
     for (const mode of item.modes) {

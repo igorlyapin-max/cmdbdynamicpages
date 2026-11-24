@@ -32,7 +32,7 @@ The CMDBuild/Tomcat deployment owns the user session lifetime; `cmdbdynamicpages
 </session-config>
 ```
 
-The value is in minutes. This is separate from template runtime cache TTL: the browser may still hold a cookie, but the backend validates `/sessions/current` and treats the user as unauthenticated after CMDBuild expires the session.
+The value is in minutes. This is separate from template runtime cache TTL: the browser may still hold a cookie, but protected requests validate `/sessions/current` and treat the user as unauthenticated after CMDBuild expires the session.
 
 ## Custom Page
 
@@ -269,23 +269,26 @@ CMDBuild 4.1 local `/sessions/current` does not currently expose a language fiel
 Runtime route example, direct backend UI:
 
 ```text
-http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/run/ProbeClassesByAttributeType?attrType=reference
+http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/run/ProbeClassesByAttributeType?root=Cst_QueryTool&attrType=reference
 ```
 
 The direct runtime page renders only the final result tables, without Designer chrome or diagnostic parameters.
-Use the same URL as a normal link or as an iframe source. Dynamic templates require a valid CMDBuild session cookie through the proxy. Published static snapshots can be served without that cookie because the runtime reads only Redis snapshot data and does not execute CMDBuild business-data requests.
-Saving a `dynamicUser` template does not publish data: its launch URL remains an authenticated runtime request. Snapshot publication is available only after `staticSnapshot` has been selected and saved.
+Use the same URL as a normal link or as an iframe source. For HTML, JSON, and D2, the viewer URL first looks for an explicitly published snapshot by technical root, template code, and business parameters. A match is served without contacting CMDBuild, whether the cookie is absent, valid, or expired. On a miss, a request with a cookie takes the protected path, which requires a valid session and checks permissions. Without a cookie the result is a public snapshot miss and no template executes. A protected `403` does not trigger another snapshot lookup. A lookup error returns HTTP `503` with `reason=snapshot_storage_unavailable`; the protected path is not called.
+
+Use `?root=<technicalRoot>` on `/cmdbuild/dynamicpages/ui/run/<code>`, `GET` and `POST /cmdbuild/custom-api/templates/<code>/run`, `POST /cmdbuild/custom-api/templates/<code>/publish`, and `GET /cmdbuild/custom-api/public-snapshots/<code>/run`. Only an absent `root` uses `CMDBDYNAMICPAGES_ROOT` (or `Cst_QueryTool` when the environment variable is unset). An empty, invalid, or repeated value returns `400`. `root` is reserved for routing, not a `spec.params` or JSON `params` input, and is not part of the business-parameter hash.
+
+Saving a `dynamicUser` template does not publish data. To publish, select and save `staticSnapshot` with the warning accepted, then copy the viewer link from Designer. Exact links preserve types in `snapshotParams`. Snapshot keys use the resolved technical class and template code; old snapshots must be republished. Operations that revoke a publication require Redis confirmation before modifying CMDB. See [snapshot recovery](docs/runbook.md#static-snapshot-is-missing-or-unavailable).
 Add the reserved system parameter `json=true` to the same runtime URL to receive the final tables as `application/json` instead of HTML:
 
 ```text
-http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/run/ProbeClassesByAttributeType?attrType=reference&json=true
+http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/run/ProbeClassesByAttributeType?root=Cst_QueryTool&attrType=reference&json=true
 ```
 
 `json` is not a template input variable and cannot be declared in `spec.params`. Permissions, cache keys, static snapshots, and refresh cooldown behavior stay the same as for the HTML runtime view.
-If the requested template has no matching data under the current user's CMDBuild permissions, JSON runtime returns HTTP `200`, `success: true`, empty `tables[].rows`, and the configured `emptyText`. If a class or attribute that is actually used by the template fails with CMDBuild `401/403`, JSON runtime returns HTTP `403`, `success: false`, `permissionDenied: true`, and the configured `permissionDeniedText`; it does not return a partial result from the other selections. Current behavior depends on CMDBuild exposing the denial as `401/403`: if CMDBuild masks a missing permission as `404`, the response may be a generic execution error, and superclass selections with only a subset of readable descendants may be returned as the readable subset.
-Runtime template execution uses a Redis-backed cache with in-memory fallback when Redis is unavailable in dev. Cache behavior is controlled by each template in `spec.cache`; the default mode is `permissionOnly`, which shares a result inside the same endpoint/template/params after the viewer passes a lightweight probe for the classes and attributes actually used by the template. This default assumes row-level CMDBuild scope is not different between users. Use `visibilityHash` when row-level scope can differ, or `privateUser` when the cache must stay isolated by CMDBuild user/session scope. The executor builds a used-field dependency map and avoids materializing unrelated card attributes in `selectCards`.
+On the protected path, an authorized empty result returns HTTP `200`, `success: true`, empty `tables[].rows`, and the configured `emptyText`. Runtime JSON reports an invalid or expired session as `401` (`cmdbuild_session_invalid`), denied access to the technical schema as `403` (`technical_schema_access_denied`), and an explicit denial during a business-data read as `403` (`data_access_denied`), without partial results. Use the `X-Request-ID` response header to correlate the failure with structured logs. If CMDBuild masks a denial as `404`, it may be reported as a general execution error.
+Runtime template execution uses a Redis-backed cache with in-memory fallback when Redis is unavailable in dev. The default `spec.cache` mode is `permissionOnly`, which shares a result within the same technical root/endpoint/template/params after a lightweight probe confirms access to the classes and attributes actually used by the template. This mode assumes row-level CMDBuild scope does not differ between users. Use `visibilityHash` when row-level scope can differ, or `privateUser` to isolate the cache by CMDBuild user/session scope. A probe that is incomplete or does not establish cache eligibility prevents both cache reads and writes. The runtime instead reads directly under the current session with the same execution limits. A successful direct run in this case returns `cache.status=bypass` and `cache.reason=access_probe_unconfirmed`. The executor builds a used-field dependency map and avoids materializing unrelated card attributes in `selectCards`.
 Cache TTL is a template setting. Manual refresh cooldown is a system Runtime setting stored in `Cst_QueryToolConfig.RuntimeConfigJson.runtimeCache.refreshCooldownSec`. The runtime page keeps cache controls compact: the table header shows the title on the left and search plus a `⟳` refresh icon on the right; the icon tooltip contains cache age/expiry, refresh countdown, backend, and scope details.
-Designer preview is separate from the saved runtime cache: `Visualize in editor` runs `/draft/preview` against the current draft and does not read the final runtime result cache. The Run page also has `Refresh cache and show`, which calls saved-template `POST run` with `forceRefresh=true`; this rebuilds the runtime cache without the user refresh cooldown and requires CSRF, so iframe/read-only `GET run` cannot bypass the timer.
+Designer preview is separate from the saved runtime cache: `Visualize in editor` runs `/draft/preview` against the current draft and does not read the final runtime result cache. `Refresh cache and show` calls saved-template `POST run` with `forceRefresh=true`, requesting a rebuild without the user cooldown if the access probe confirms cache eligibility. It requires CSRF; iframe/read-only `GET run` cannot bypass the timer.
 For cross-origin iframe experiments, the dev reverse proxy can rewrite CMDBuild `Set-Cookie` headers with `CMDBDYNAMIC_PROXY_COOKIE_SAMESITE=None` and `CMDBDYNAMIC_PROXY_COOKIE_SECURE=true`. The recommended local iframe setup is the nginx same-origin proxy below, so this rewrite is normally not needed.
 
 ### Diagrams and assistant
@@ -338,7 +341,7 @@ Redis dev helper:
 docker compose -f docker-compose.nginx.yml up -d redis
 ```
 
-The dev Redis container uses RDB snapshots (`--save 60 1`) and volume `cmdbdynamicpages-redis-data`. RDB is a pragmatic published-cache store, not strict durable storage: if a static snapshot is absent after a Redis loss, the runtime page shows `Страница отсутствует для загрузки` until an administrator/editor publishes it again.
+The dev Redis container uses RDB snapshots (`--save 60 1`) and volume `cmdbdynamicpages-redis-data`. RDB is a pragmatic published-cache store, not strict durable storage: if a static snapshot is lost, an administrator/editor must publish it again to restore public access.
 
 Production Redis must require a password and should use `rediss://`. Do not store the password or CA material in git. Configure the backend with deployment-platform secrets:
 
@@ -440,8 +443,8 @@ State-changing custom API routes compare `Origin` or `Referer` with configured `
 
 `GET /cmdbuild/custom-api/auth/permission-scope` probes what permission-scope metadata is visible to the current CMDBuild session. It returns session role data, endpoint statuses for roles/users/groups/classes/domains, sampled readable classes/attributes, and a visible-model hash. That hash is diagnostic only; runtime result sharing is controlled explicitly by each template's `spec.cache.scopeMode`.
 
-Runtime iframe pages call `GET /cmdbuild/custom-api/templates/<code>/run?param=value`. This endpoint still requires the CMDBuild session cookie for dynamic templates, but it is read-only from CMDBuild's perspective and does not require `X-CMDBDynamicPages-CSRF`. `POST /cmdbuild/custom-api/templates/<code>/run` remains available for API/Designer checks and keeps CSRF protection. Both GET and POST runtime executions use standard backend logging only.
-For diagram templates, the same runtime endpoint renders generated `.d2` source through the server-side D2 binary and stores the resulting SVG in runtime cache/static snapshots. `GET /cmdbuild/custom-api/templates/<code>/run?d2=true&diagram=<name>&param=value` downloads the generated D2 source as `text/vnd.d2` for an authenticated viewer. Public static snapshots expose raw `.d2` only when the saved template has `publish.publicD2Source=true`.
+Direct `GET /cmdbuild/custom-api/templates/<code>/run` requires a valid CMDBuild session cookie but not `X-CMDBDynamicPages-CSRF`. Direct `POST /cmdbuild/custom-api/templates/<code>/run` also requires CSRF. Both use standard backend logging only. The separate `GET /cmdbuild/custom-api/public-snapshots/<code>/run` remains public and reads only stored snapshots; it never executes a template.
+For diagram templates, the backend renders generated `.d2` source through the server-side D2 binary and stores the resulting SVG in runtime cache/static snapshots. Add `d2=true&diagram=<name>` to the viewer URL to download the selected result's source as `text/vnd.d2`. A public snapshot exposes raw `.d2` only if it was published with `publish.publicD2Source=true`. The direct authenticated download is unchanged: `GET /cmdbuild/custom-api/templates/<code>/run?root=<technicalRoot>&d2=true&diagram=<name>&param=value`.
 
 Production health/readiness endpoints are unauthenticated and are also available at root aliases `/health/live`, `/health/ready`, and `/health/redis`. `/metrics` and `/cmdbuild/custom-api/cache/status` are public operational endpoints too; they return aggregate health/cache state only and never return cookies, Redis credentials, or CMDBuild rows.
 
@@ -706,7 +709,7 @@ Templates can also define publication mode:
 }
 ```
 
-`dynamicUser` is the normal mode: execution runs under the current viewer permissions. `staticSnapshot` is an explicit publication mode: an editor accepts the warning, publishes a Redis snapshot, and runtime serves that stored result without checking viewer permissions on the original CMDBuild objects. Snapshot lookup uses the exact parameter set by default; `paramsMode: "ignore"` publishes one snapshot for all runtime parameters.
+`dynamicUser` executes under the current viewer's permissions. `staticSnapshot` serves only a snapshot explicitly published by an editor for the selected technical root, without checking viewer permissions on the original CMDBuild objects. Snapshot lookup uses exact business parameters by default; `paramsMode: "ignore"` publishes one snapshot per root and template for all business parameters.
 
 Templates can also define runtime-cache behavior:
 
@@ -738,10 +741,10 @@ Designer uses a two-level navigation menu for templates, visual design, checks, 
 Runtime views are formed from saved templates by URL:
 
 ```text
-/cmdbuild/dynamicpages/ui/run/<TemplateCode>?param=value
+/cmdbuild/dynamicpages/ui/run/<TemplateCode>?root=<technicalRoot>&param=value
 ```
 
-The backend loads the template, validates parameters, executes `steps` through CMDBuild REST as the current user, then renders every entry from `result.tables` as a table. The technical root only stores project classes and does not restrict business data reads.
+For `dynamicUser`, the backend loads the template from the selected technical root, validates business parameters, executes `steps` through CMDBuild REST as the current user, and renders `result.tables`. Selecting a root does not grant business-data access.
 Designer shows the generated absolute runtime URL next to the run buttons so it can be copied into a link or iframe.
 
 ## Limited User Grants
@@ -766,7 +769,7 @@ Runtime executions are not stored in CMDBuild technical classes. Preview, direct
 
 Designer can also validate and preview the current unsaved draft through `/cmdbuild/custom-api/draft/validate` and `/cmdbuild/custom-api/draft/preview`. Draft preview executes with the current user's CMDBuild permissions and shows an execution trace, but does not save templates or create versions.
 
-Template `create` and `update` write best-effort version snapshots into `Cst_QueryTemplateVersion`, and Designer shows the latest versions for the selected template. Template list/detail responses include `specHash`; Designer sends it back as `expectedSpecHash` on update. If the stored template changed meanwhile, update returns `409 template_version_conflict` with the current hash/template. API clients that omit `expectedSpecHash` keep the previous last-write-wins behavior.
+Template `create` and `update` write best-effort version snapshots into `Cst_QueryTemplateVersion`, and Designer shows the latest versions for the selected template. Template list/detail responses include `specHash`; Designer sends it back as `expectedSpecHash` on update. If the stored template changed meanwhile, update returns `409 template_version_conflict` with the expected and current hashes. Designer keeps its draft and does not retry automatically. Mutations of the same template are serialized within one backend instance, not across instances or direct CMDBuild writes. API clients that omit `expectedSpecHash` keep the previous last-write-wins behavior.
 
 ## CMDBuild Upload Constraints
 

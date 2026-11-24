@@ -7,6 +7,7 @@ const REQUIRED_TEST_IDS = [
   'designer-shell',
   'd2-current-contract',
   'object-flow-recovery-extraction',
+  'exact-snapshot-url',
   'build-identity'
 ];
 const TEST_NAME_PATTERN = `\\[required:(${REQUIRED_TEST_IDS.join('|')})\\]`;
@@ -98,6 +99,14 @@ function createMockCmdbuild() {
     UpdatedAt: '2026-01-01T00:00:00.000Z'
   }];
   const templateVersionCards = [];
+  templateCards.push({
+    ...templateCards[0], _id: 'required-ui-exact-snapshot', Code: 'RequiredExactSnapshot', Description: 'Typed snapshot fixture',
+    SpecJson: JSON.stringify({ version: 1, params: { site: { type: 'integer', default: 42 }, enabled: { type: 'boolean', default: false } },
+      steps: [{ type: 'selectCards', as: 'items', className: 'Cst_QueryTemplate', limit: 1,
+        filters: [{ path: 'Code', op: 'equals', value: 'RequiredExactSnapshot' }] }],
+      result: { tables: [{ name: 'items', columns: ['Code'] }] },
+      publish: { mode: 'staticSnapshot', warningAccepted: true, paramsMode: 'exact' } })
+  });
   return http.createServer(async (request, response) => {
     const url = new URL(request.url || '/', 'http://127.0.0.1');
     if (url.pathname === '/cmdbuild/services/rest/v3/sessions' && request.method === 'POST') {
@@ -121,7 +130,7 @@ function createMockCmdbuild() {
       const name = decodeURIComponent(classMatch[1]);
       const found = classes.find((item) => item.name === name);
       sendJson(response, found ? 200 : 404, found ? {
-        data: { ...found, _can_read: true, _can_create: true, _can_update: true }
+        data: { ...found, _can_read: true, _can_create: true, _can_update: true, _can_delete: true }
       } : { message: `Unknown class ${name}` });
       return;
     }
@@ -200,6 +209,7 @@ try {
       PROXY_PORT: String(proxyPort),
       CMDP_PUBLIC_ORIGIN: proxyOrigin,
       CMDBUILD_ORIGIN: `http://127.0.0.1:${cmdbuildPort}`,
+      CMDBDYNAMIC_REDIS_ENABLED: 'false',
       CMDBDYNAMIC_REDIS_REQUIRED: 'false',
       CMDBDYNAMIC_HEALTH_REDIS_REQUIRED: 'false',
       CMDP_D2_RENDER_ENABLED: 'false',

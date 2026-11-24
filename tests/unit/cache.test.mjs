@@ -80,6 +80,16 @@ test('permissionOnly cache mode shares a key across users after successful acces
   assert.equal(Object.prototype.hasOwnProperty.call(alice.keyPayload, 'userScopeHash'), false);
 });
 
+test('runtime cache keys separate otherwise identical templates under different roots', () => {
+  const runtimeCache = normalizeRuntimeCacheConfig(defaultRuntimeConfig());
+  const config = normalizeTemplateCacheConfig(baseSpec, runtimeCache);
+  const dependencyMap = dependencyMapWithHash(baseSpec);
+  const template = { code: 'CacheProbe', active: true, spec: baseSpec };
+  const keyFor = (root) => runtimeCacheKeyParts(root, template, { city: 'city49' }, { username: 'alice' }, executionOptions, runtimeCache, config, dependencyMap, {}).key;
+
+  assert.notEqual(keyFor('Cst_QueryTool'), keyFor('Acme_QueryTool'));
+});
+
 test('cache metadata exposes refresh cooldown and refresh permission', () => {
   const entry = {
     keyShort: 'abcdef1234567890',
@@ -104,8 +114,8 @@ test('cache metadata exposes refresh cooldown and refresh permission', () => {
   assert.equal(ready.refreshAllowed, true);
 });
 
-test('public snapshot URL params exclude runtime cache control switches', () => {
-  const url = new URL('http://127.0.0.1:8093/cmdbuild/custom-api/public-snapshots/test/run?city=city49&lang=ru&d2=true&diagram=infra&refresh=1&noCache=1&forceRefresh=1&bypassRefreshCooldown=1');
+test('public snapshot URL params exclude the root selector and runtime cache control switches', () => {
+  const url = new URL('http://127.0.0.1:8093/cmdbuild/custom-api/public-snapshots/test/run?city=city49&root=Acme_QueryTool&lang=ru&d2=true&diagram=infra&refresh=1&noCache=1&forceRefresh=1&bypassRefreshCooldown=1');
 
   assert.deepEqual(publicSnapshotParamsFromUrl(url), { city: 'city49' });
 });

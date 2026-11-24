@@ -11,7 +11,9 @@ const names = [
   'saveTemplate', 'saveTemplateSnapshot', 'readEditorPayload', 'runtimeSettingsScope', 'runtimeSettingsScopeIsCurrent',
   'readTemplateCode', 'readTemplateDescription', 'readTemplateActive', 'renderTemplateEditor', 'renderTemplateCopySelector',
   'stagedTemplateTransfer', 'templateVersionOwner', 'templateVersionOwnerIsCurrent', 'fetchVersions', 'loadVersion', 'renderVersions',
-  'clearDraftExecutionState', 'selectedExtractionSource'
+  'clearDraftExecutionState', 'selectedExtractionSource', 'renderActionButton', 'publishModelForSpec',
+  'templateWriteKey', 'templateWritePending', 'templateTransferActionState', 'templateSaveBlockTitle', 'templatePublishBlockTitle',
+  'syncImportedDiagramSaveGate', 'renderTemplateTransferIssues', 'renderTemplateTransferSaveIssues'
 ];
 const functions = names.map((name) => {
   const start = source.indexOf('  function ' + name + '(');
@@ -29,7 +31,8 @@ const harness = `
 var apiPrefix = '/api';
 var boot = { templateTransferMaxBytes: 131072 };
 var CMDB_BUILD_VIEW_KIND = 'cmdb-build-view';
-var state = { root: 'Root_A', session: 'session-A', sessionInstance: 1, templateEditorInstance: 1, templates: [], selectedTemplate: null, designerSection: 'template', templateVersions: [], uiDiagnosticRevision: 0 };
+var state = { root: 'Root_A', session: 'session-A', sessionInstance: 1, templateEditorInstance: 1, templates: [], selectedTemplate: null, designerSection: 'template', templateVersions: [], uiDiagnosticRevision: 0,
+  pendingTemplateWrites: new Map(), templatePublicationNotices: new Map(), get savingTemplate() { return templateWritePending(readTemplateCode()); } };
 window.evidence = { requests: [], downloads: [], captures: [], errors: [] };
 window.lang = 'en';
 var translations = ${JSON.stringify({ en, ru })};
@@ -67,7 +70,6 @@ function uiRequestOwner() { return { revision:0 }; }
 function uiDiagnosticIsCurrent() { return true; }
 function runUiOperation(_action, callback) { return callback(); }
 function runUiMutation(callback) { return callback(); }
-function syncImportedDiagramSaveGate() {}
 function diagramImportExecutionValidationHasMappingBlocker() { return false; }
 function validateUiResponse(result) { if (!result.json.template) throw new Error('invalid'); }
 function createRequestError(result) { return new Error(result.json?.message || 'request failed'); }

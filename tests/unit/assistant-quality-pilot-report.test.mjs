@@ -93,7 +93,7 @@ test('requires the optional complete terminal block manifest even when an expect
 });
 
 test('distinguishes a valid unresolved terminal from a false acceptance or a broken stage chain', () => {
-  const blockedOracle = { outcome: 'unresolved' };
+  const blockedOracle = { outcome: 'unresolved', expectedStage: 'flow' };
   const unresolved = { stages: { flow: { status: 'unresolved' } }, complete: false };
   const score = (expected, capture, mode = 'flow') => scorePilotAttempt({ mode, oracle: expected, capture });
   const correct = score(blockedOracle, unresolved);
@@ -107,6 +107,47 @@ test('distinguishes a valid unresolved terminal from a false acceptance or a bro
   assert.equal(score(blockedOracle, { ...unresolved, failure: 'pilot_transport_failure' }).validUnresolved, false);
   assert.equal(score(blockedOracle, { stages: { ...unresolved.stages, rows: accepted } }).validUnresolved, false);
   assert.equal(score(blockedOracle, { stages: { mapping: { status: 'unresolved' } } }, 'end-to-end').validUnresolved, false);
+});
+
+test('credits abstention only at the expected decision stage with exact preceding results', () => {
+  const unresolved = { status: 'unresolved' };
+  const flowAbstention = { stages: { flow: unresolved }, complete: false };
+  const mappingAbstention = { stages: { mapping: unresolved }, complete: false };
+  const endToEndAbstention = {
+    stages: { flow: accepted, rows: accepted, mapping: unresolved },
+    rows: [row, row], blockIds: ['buildings', 'empty'], complete: false,
+  };
+  const score = (mode, capture, expectedStage, earlier = {}) => scorePilotAttempt({
+    mode, capture, oracle: { outcome: 'unresolved', expectedStage, ...earlier },
+  });
+
+  assert.equal(score('flow', flowAbstention, 'flow').correctAbstention, true);
+  assert.equal(score('mapping', mappingAbstention, 'mapping').correctAbstention, true);
+  assert.equal(score('mapping', mappingAbstention).correctAbstention, false);
+  assert.equal(score('end-to-end', flowAbstention, 'mapping').correctAbstention, false);
+  assert.equal(score('end-to-end', endToEndAbstention).correctAbstention, false);
+  assert.equal(score('mapping', mappingAbstention, 'rows').correctAbstention, false);
+
+  const earlier = { rows: [row, row], blockIds: ['empty', 'buildings'] };
+  const scoreEndToEnd = (capture) => score('end-to-end', capture, 'mapping', earlier);
+  const correct = scoreEndToEnd(endToEndAbstention);
+  assert.equal(correct.correctAbstention, true);
+  assert.equal(correct.exact, false);
+  assert.equal(correct.failed, false);
+  assert.equal(correct.metrics.placements, null);
+  for (const changed of [
+    { rows: undefined }, { rows: [row] }, { rows: [row, { ...row, values: { id: 7, street: null } }] },
+    { blockIds: ['buildings'] }, { blockIds: undefined },
+  ]) {
+    const scored = scoreEndToEnd({ ...endToEndAbstention, ...changed });
+    assert.equal(scored.validUnresolved, true);
+    assert.equal(scored.correctAbstention, false);
+    assert.equal(scored.failure, 'pilot_unresolved_oracle_mismatch');
+  }
+  assert.equal(score('end-to-end', endToEndAbstention, 'mapping').correctAbstention, false, 'missing rows oracle');
+  assert.equal(scoreEndToEnd({ ...endToEndAbstention,
+    stages: { ...endToEndAbstention.stages, graph: accepted },
+  }).correctAbstention, false);
 });
 
 test('retains failures in denominator and aggregates flattened evaluations by scenario, variant and mode', () => {

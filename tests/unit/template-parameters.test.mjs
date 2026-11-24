@@ -1,8 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
-import { resolveTemplateParameters } from '../../scripts/template-parameters.mjs';
+import { resolveTemplateParameters, staticSnapshotParamPairs } from '../../scripts/template-parameters.mjs';
 import { applyTemplateParamDefaults } from '../../scripts/dev-proxy-server.mjs';
+
+test('exact snapshot parameters preserve scalar types, empty values and stable order', () => {
+  const params = { yes: 'false', no: false, number: 42, text: '42', empty: '' };
+  assert.deepEqual(staticSnapshotParamPairs(params), [['empty', ''], ['no', false], ['number', 42], ['text', '42'], ['yes', 'false']]);
+  assert.notDeepEqual(staticSnapshotParamPairs({}), staticSnapshotParamPairs({ empty: '' }));
+  assert.throws(() => staticSnapshotParamPairs({ root: 'Cst' }), /non-reserved/);
+  assert.throws(() => staticSnapshotParamPairs({ compound: [] }), /scalar/);
+});
 
 test('parameter defaults retain runtime precedence and expose all physical sources', () => {
   const spec = { defaults: { location: 901 }, paramDefaults: { location: 902 },

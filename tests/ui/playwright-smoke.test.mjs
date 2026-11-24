@@ -5,6 +5,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { createHash } from 'node:crypto';
 import { URL } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 
 const proxyOrigin = process.env.CMDBDYNAMIC_PROXY || 'http://127.0.0.1:8093';
 const nginxOrigin = process.env.CMDBDYNAMIC_NGINX_ORIGIN || 'http://localhost:8088';
@@ -3404,6 +3405,61 @@ test('Designer run page exposes contextual buttons after selecting a template', 
   });
 });
 
+test('Designer full preview and saved report URL show the same rows in one CMDBuild session', {
+  skip: skipReason || (process.env.CMDBDYNAMIC_E2E_WRITE !== '1' && 'Set CMDBDYNAMIC_E2E_WRITE=1 to use a temporary template.'),
+  timeout: 90_000
+}, async () => {
+  await withPage(async (page) => {
+    const code = `RuntimeAccessUiSmoke${Date.now()}`;
+    const api = `${proxyOrigin}/cmdbuild/custom-api`;
+    const csrf = await page.request.get(api + '/csrf');
+    assert.equal(csrf.status(), 200);
+    const headers = { origin: proxyOrigin, 'x-cmdbdynamicpages-csrf': (await csrf.json()).token };
+    const created = await page.request.post(api + '/templates', {
+      headers,
+      data: {
+        code,
+        description: 'Temporary report access smoke',
+        active: true,
+        spec: {
+          version: 1,
+          steps: [{ type: 'selectCards', as: 'systems', className: 'IS', columns: ['Code'], limit: 1 }],
+          result: { tables: [{ name: 'systems', columns: ['Code'] }] }
+        }
+      }
+    });
+    assert.equal(created.status(), 201, 'Failed to save the temporary report template.');
+    try {
+      await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+      const template = page.locator(`[data-action="select-template"][data-code=${JSON.stringify(code)}]`);
+      await template.click({ timeout: 10_000 });
+      await page.locator('a[data-designer-section="run"]').click();
+      const launch = page.locator('#cmdp-run-launch-url');
+      const previewResponse = page.waitForResponse((response) =>
+        new URL(response.url()).pathname === '/cmdbuild/custom-api/draft/preview' && response.request().method() === 'POST');
+      await page.locator('button[data-action="visualize-editor"]').click();
+      const preview = await previewResponse;
+      assert.equal(preview.status(), 200, 'Designer draft preview failed.');
+      const previewPayload = await preview.json();
+      const launchUrl = new URL(await launch.getAttribute('href'));
+      assert.equal(launchUrl.searchParams.get('root'), new URL(preview.url()).searchParams.get('root'));
+      const runResponse = page.waitForResponse((response) =>
+        new URL(response.url()).pathname === `/cmdbuild/custom-api/templates/${code}/run`);
+      await page.goto(launchUrl.href, { waitUntil: 'domcontentloaded' });
+      const runtime = await runResponse;
+      assert.equal(runtime.status(), 200, 'Opening the saved report failed.');
+      const runtimePayload = await runtime.json();
+      const rows = (payload) => (payload.result.tables || []).map((table) => table.rows || []);
+      assert.ok(rows(previewPayload).some((table) => table.length > 0), 'The preview must contain actual rows.');
+      assert.ok(isDeepStrictEqual(rows(runtimePayload), rows(previewPayload)), 'Draft and runtime rows differ.');
+      await page.locator('main#app [data-result-row]').first().waitFor({ timeout: 10_000 });
+    } finally {
+      const deleted = await page.request.delete(api + '/templates/' + code, { headers });
+      assert.equal(deleted.status(), 200, 'Failed to remove the temporary report template.');
+    }
+  });
+});
+
 test('Designer exposes Save in Assistant and Templates for the selected template', { skip: skipReason }, async (t) => {
   await withPage(async (page) => {
     await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
@@ -5237,6 +5293,277 @@ test('Runtime page renders the compact runtime shell and table area', { skip: sk
     assert.equal(await page.locator('header').count(), 0);
     const hasResultShell = await page.locator('.result-table-wrap, .notice').count();
     assert.ok(hasResultShell > 0, 'Runtime page did not render a result table or notice.');
+  });
+});
+
+test('Published report URL renders the same snapshot with valid, absent, and expired cookies', {
+  skip: skipReason || (process.env.CMDBDYNAMIC_E2E_WRITE !== '1' && 'Set CMDBDYNAMIC_E2E_WRITE=1 to use a temporary publication.'),
+  timeout: 90_000
+}, async () => {
+  await withPage(async (page) => {
+    const root = 'Cst_QueryTool';
+    const code = `PublicSnapshotUiSmoke${Date.now()}`;
+    const api = `${proxyOrigin}/cmdbuild/custom-api`;
+    const query = '?root=' + encodeURIComponent(root);
+    const params = { site: 42, enabled: false };
+    const wire = encodeURIComponent(JSON.stringify(Object.entries(params)));
+    const launch = `${proxyOrigin}/cmdbuild/dynamicpages/ui/run/${code}${query}&snapshotParams=${wire}`;
+    const csrf = await page.request.get(api + '/csrf');
+    assert.equal(csrf.status(), 200);
+    const headers = { origin: proxyOrigin, 'x-cmdbdynamicpages-csrf': (await csrf.json()).token };
+    const editorCookies = cookiesForOrigin(cookieHeader, proxyOrigin);
+    const created = await page.request.post(api + '/templates' + query, {
+      headers,
+      data: {
+        code,
+        description: 'Temporary public snapshot smoke',
+        active: true,
+        spec: {
+          version: 1,
+          steps: [{
+            type: 'selectCards', as: 'fixture', className: 'Cst_QueryTemplate', columns: ['Code'], limit: 1,
+            filters: [{ path: 'Code', op: 'equals', value: code }]
+          }],
+          result: { tables: [{ name: 'fixture', columns: ['Code'] }] },
+          publish: { mode: 'staticSnapshot', warningAccepted: true, paramsMode: 'exact' }
+        }
+      }
+    });
+    assert.equal(created.status(), 201, 'Failed to create the temporary publication.');
+    try {
+      const saved = (await created.json()).template;
+      const published = await page.request.post(api + '/templates/' + code + '/publish' + query, {
+        headers, data: { params, savedSpecHash: saved.specHash }
+      });
+      assert.equal(published.status(), 200, 'Failed to publish the temporary snapshot.');
+      for (const cookies of [editorCookies, [], cookiesForOrigin('CMDBuild-Authorization=expired-smoke-session', proxyOrigin)]) {
+        await page.context().clearCookies();
+        await page.context().addCookies(cookies);
+        const snapshotResponse = page.waitForResponse((response) =>
+          new URL(response.url()).pathname === `/cmdbuild/custom-api/public-snapshots/${code}/run`, { timeout: 10_000 });
+        const [snapshot, document] = await Promise.all([
+          snapshotResponse, page.goto(launch, { waitUntil: 'domcontentloaded' })
+        ]);
+        assert.equal(document.status(), 200);
+        assert.equal(snapshot.status(), 200);
+        assert.equal((await snapshot.json()).snapshotFound, true);
+        const row = page.locator('main#app [data-result-row]');
+        await row.waitFor({ timeout: 10_000 });
+        assert.equal(await row.innerText(), code);
+        const json = await page.request.get(launch + '&json=true');
+        assert.equal(json.status(), 200);
+        const result = await json.json();
+        assert.equal(result.snapshotFound, true);
+        assert.deepEqual(result.tables[0].rows, [{ Code: code }]);
+      }
+    } finally {
+      await page.context().clearCookies();
+      await page.context().addCookies(editorCookies);
+      const deleted = await page.request.delete(api + '/templates/' + code + query, { headers });
+      assert.equal(deleted.status(), 200, 'Failed to remove the temporary publication.');
+    }
+    await page.context().clearCookies();
+    const revoked = await page.request.get(launch + '&json=true');
+    assert.equal(revoked.status(), 200);
+    assert.equal((await revoked.json()).snapshotFound, false);
+  });
+});
+
+test('[required:exact-snapshot-url] Designer links open the typed exact snapshot without a session', {
+  skip: skipReason || (process.env.CMDBDYNAMIC_E2E_REQUIRED !== '1' && 'Requires the isolated browser fixture.'), timeout: 45_000
+}, async () => {
+  await withPage(async (page) => {
+    const code = 'RequiredExactSnapshot';
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
+    await page.locator('a[data-designer-section="publication"]').click();
+    const isPublication = (response) => response.request().method() === 'POST' && response.url().includes(`/${code}/publish?`);
+    const pending = page.waitForResponse(isPublication, { timeout: 5000 }).catch(() => null);
+    await page.locator('.designer-actionbar [data-action="publish-snapshot"]').click();
+    const published = await pending;
+    assert.ok(published, await page.locator('#cmdp-designer-notice').textContent());
+    assert.equal(published.status(), 200, await published.text());
+    assert.deepEqual((await published.json()).params, { site: 42, enabled: false });
+    const htmlLink = await page.locator('#cmdp-run-launch-url').getAttribute('href');
+    const jsonLink = await page.locator('#cmdp-run-launch-json-url').getAttribute('href');
+    assert.deepEqual(JSON.parse(new URL(htmlLink).searchParams.get('snapshotParams')), [['enabled', false], ['site', 42]]);
+    await page.context().clearCookies();
+    const json = await page.request.get(jsonLink);
+    assert.equal(json.status(), 200, await json.text());
+    assert.equal(json.headers()['cache-control'], 'no-store');
+    assert.equal((await json.json()).snapshotFound, true);
+    const mismatched = new URL(jsonLink);
+    mismatched.searchParams.set('snapshotParams', JSON.stringify([['enabled', 'false'], ['site', '42']]));
+    assert.equal((await (await page.request.get(mismatched.href)).json()).snapshotFound, false);
+    mismatched.searchParams.append('snapshotParams', '[]');
+    assert.equal((await page.request.get(mismatched.href)).status(), 400);
+    assert.equal((await page.goto(htmlLink, { waitUntil: 'domcontentloaded' })).status(), 200);
+    await page.locator('main#app [data-result-row]').getByText(code, { exact: true }).waitFor();
+  });
+});
+
+test('Designer serializes Save and Publish, reconciles the saved hash and preserves newer draft edits', {
+  skip: skipReason || (process.env.CMDBDYNAMIC_E2E_WRITE !== '1' && 'Set CMDBDYNAMIC_E2E_WRITE=1 to use a temporary template.'),
+  timeout: 90_000
+}, async () => {
+  await withPage(async (page) => {
+    const root = 'Cst_QueryTool';
+    const code = `TemplateWriteUiSmoke${Date.now()}`;
+    const api = `${proxyOrigin}/cmdbuild/custom-api`;
+    const query = '?root=' + root;
+    const csrf = await page.request.get(api + '/csrf');
+    assert.equal(csrf.status(), 200);
+    const headers = { origin: proxyOrigin, 'x-cmdbdynamicpages-csrf': (await csrf.json()).token };
+    const spec = {
+      version: 1,
+      steps: [{
+        type: 'selectCards', as: 'fixture', className: 'Cst_QueryTemplate', columns: ['Code'], limit: 1,
+        filters: [{ path: 'Code', op: 'equals', value: code }]
+      }],
+      result: { tables: [{ name: 'fixture', columns: ['Code'] }] },
+      publish: { mode: 'staticSnapshot', warningAccepted: true, paramsMode: 'exact', publicD2Source: false }
+    };
+    const created = await page.request.post(api + '/templates' + query, {
+      headers, data: { code, description: 'Temporary write race smoke', active: true, spec }
+    });
+    assert.equal(created.status(), 201);
+    const initial = (await created.json()).template;
+    const saves = [];
+    const publishes = [];
+    const releaseGates = [];
+    let nextSave;
+    function holdSaveResponse() {
+      let accept;
+      let release;
+      const saved = new Promise((resolve) => { accept = resolve; });
+      const gate = new Promise((resolve) => { release = resolve; });
+      releaseGates.push(release);
+      nextSave = { accept, gate };
+      return { saved, release };
+    }
+    await page.route(new RegExp('/cmdbuild/custom-api/templates/' + code + '(?:[/?]|$)'), async (route) => {
+      const request = route.request();
+      const path = new URL(request.url()).pathname;
+      if (request.method() === 'POST' && path.endsWith('/publish')) publishes.push(request.postDataJSON());
+      if (request.method() !== 'PUT' || path !== '/cmdbuild/custom-api/templates/' + code) return route.continue();
+      const hold = nextSave;
+      nextSave = null;
+      const write = { body: request.postDataJSON(), status: null, result: null };
+      saves.push(write);
+      const response = await route.fetch();
+      write.status = response.status();
+      write.result = await response.json();
+      if (hold) {
+        hold.accept(write);
+        await hold.gate;
+      }
+      await route.fulfill({ response });
+    });
+    try {
+      await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+      await page.locator('#cmdp-language').selectOption('ru');
+      await page.locator(`[data-action="select-template"][data-code="${code}"]`).click({ timeout: 10_000 });
+      const openPublication = () => page.locator('a[data-designer-section="publication"]').click();
+      await openPublication();
+      const actions = page.locator('.designer-actionbar');
+      const save = actions.locator('[data-action="save-template"]');
+      const publish = actions.locator('[data-action="publish-snapshot"]');
+      const paramsMode = page.locator('#cmdp-publish-params-mode');
+      const notice = page.locator('#cmdp-designer-notice');
+      const dispatchClick = (button) => button.dispatchEvent('click', { bubbles: true });
+
+      await paramsMode.selectOption('ignore');
+      const saveHold = holdSaveResponse();
+      await save.click();
+      const first = await saveHold.saved;
+      assert.equal(first.status, 200);
+      assert.equal(first.body.expectedSpecHash, initial.specHash);
+      assert.notEqual(first.result.template.specHash, initial.specHash);
+      assert.equal(await save.isDisabled(), true);
+      assert.equal(await publish.isDisabled(), true);
+      await dispatchClick(publish);
+      await page.locator('a[data-designer-section="cache"]').click();
+      await openPublication();
+      assert.equal(await publish.isDisabled(), true);
+      assert.equal(saves.length, 1);
+      assert.equal(publishes.length, 0);
+      saveHold.release();
+      await page.waitForFunction(() => !document.querySelector('[data-action="publish-snapshot"]').disabled);
+
+      await paramsMode.selectOption('exact');
+      const publicationHold = holdSaveResponse();
+      await publish.click();
+      const second = await publicationHold.saved;
+      assert.equal(second.status, 200);
+      assert.equal(second.body.expectedSpecHash, first.result.template.specHash);
+      await dispatchClick(publish);
+      await dispatchClick(save);
+      await paramsMode.selectOption('ignore');
+      publicationHold.release();
+      await notice.getByText('Проверьте текущие правки', { exact: false }).waitFor();
+      assert.equal(await paramsMode.inputValue(), 'ignore');
+      assert.equal(saves.length, 2);
+      assert.equal(publishes.length, 0);
+
+      const publicationResult = page.waitForResponse((response) =>
+        response.request().method() === 'POST' && new URL(response.url()).pathname.endsWith('/' + code + '/publish'));
+      await publish.click();
+      assert.equal((await publicationResult).status(), 200);
+      assert.equal(saves.length, 3);
+      assert.equal(publishes.length, 1);
+      assert.equal(saves[2].body.expectedSpecHash, second.result.template.specHash);
+      assert.equal(publishes[0].savedSpecHash, saves[2].result.template.specHash);
+
+      const concurrent = await page.request.put(api + '/templates/' + code + query, {
+        headers, data: { code, description: 'External saved revision', active: true, spec,
+          expectedSpecHash: saves[2].result.template.specHash }
+      });
+      assert.equal(concurrent.status(), 200);
+      await page.locator('#cmdp-publish-public-d2-source').check();
+      await save.click();
+      await notice.getByText('Ваши правки остались в редакторе', { exact: false }).waitFor();
+      assert.equal(await page.locator('#cmdp-publish-public-d2-source').isChecked(), true);
+      assert.equal(saves.length, 4);
+      assert.equal(saves[3].status, 409);
+      const diagnostic = JSON.parse(await notice.locator('[data-ui-diagnostic-report]').textContent());
+      assert.equal(diagnostic.code, 'template_version_conflict');
+      assert.equal(diagnostic.phase, 'save');
+      assert.equal(diagnostic.diagnostics.expectedSpecHash, saves[2].result.template.specHash);
+      assert.equal(diagnostic.diagnostics.currentSpecHash, (await concurrent.json()).template.specHash);
+      assert.equal(publishes.length, 1);
+    } finally {
+      for (const release of releaseGates) release();
+      const deleted = await page.request.delete(api + '/templates/' + code + query, { headers });
+      assert.equal(deleted.status(), 200, 'Failed to remove the temporary template.');
+    }
+  });
+});
+
+test('Runtime carries the URL root and shows data denial without requesting a public snapshot', { skip: skipReason }, async () => {
+  await withPage(async (page) => {
+    const root = 'BrowserScope_QueryTool';
+    const requestId = 'runtime-data-denied-browser';
+    const runtimeRoots = [];
+    let publicRequests = 0;
+    await page.route('**/cmdbuild/custom-api/public-snapshots/**', (route) => {
+      publicRequests += 1;
+      return route.fulfill({ json: { success: true, snapshotFound: true, result: { emptyText: 'Unexpected public result' } } });
+    });
+    await page.route('**/cmdbuild/custom-api/templates/*/run?*', (route) => {
+      runtimeRoots.push(new URL(route.request().url()).searchParams.getAll('root'));
+      return route.fulfill({
+        status: 403,
+        headers: { 'x-request-id': requestId },
+        json: { success: false, reason: 'data_access_denied' }
+      });
+    });
+    await page.goto(`${runtimeUrl()}&root=${root}&lang=ru`, { waitUntil: 'domcontentloaded' });
+    const alert = page.locator('main#app [role="alert"]');
+    await alert.waitFor({ timeout: 10_000 });
+    assert.match(await alert.innerText(), /CMDBuild запретил чтение данных/);
+    assert.ok((await alert.innerText()).includes(requestId));
+    assert.deepEqual(runtimeRoots, [[root]]);
+    assert.equal(publicRequests, 0);
   });
 });
 

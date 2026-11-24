@@ -62,7 +62,14 @@ Dry-run не выполняет сетевых запросов и не треб
   предметный факт имеет `id`, `kind`, `text`; knowledge не должен содержать
   карточки, эталонные строки, ответы или учётные данные. В C добавлять только
   точные директивы в Notes, не менять структуру D2 или прозу.
-- Oracle: `{outcome, blockIds, rows, graph}`. `outcome`: `accepted|unresolved`.
+- Oracle: `{outcome, expectedStage, blockIds, rows, graph}`. `outcome`: `accepted|unresolved`.
+  Для `unresolved` обязателен `expectedStage`: `flow|mapping` либо объект с явным этапом для каждого режима сценария.
+  По умолчанию ожидается первая стадия режима: `mapping` для `mapping`,
+  `flow` для `flow` и `end-to-end`. Отказ на другой стадии не засчитывается.
+  Если `end-to-end` должен завершиться на `mapping`, предыдущие `flow` и
+  `rows` должны быть приняты, все строки должны точно совпасть с `rows`
+  (включая кратность), а список блоков с `blockIds`, если он задан.
+  После `unresolved` последующие стадии не должны выполняться.
   `rows`: `[{blockId,values}]`, включая дубли; `blockIds` перечисляет и пустые
   результаты. `graph`: массивы `placements`, `hierarchy`, `edges`, `labels`.
   Идентичность размещения учитывает карточку, место в шаблоне и родителя, а

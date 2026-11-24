@@ -6869,11 +6869,197 @@ test('template publish rejects stale saved spec hash before executing the snapsh
   assert.equal(publish.statusCode, 409, publish.body);
   assert.equal(publish.json.success, false);
   assert.equal(publish.json.reason, 'publication_saved_spec_mismatch');
+  assert.equal(publish.json.code, 'template_version_conflict');
   assert.equal(publish.json.savedSpecHash, undefined);
   assert.ok(publish.json.currentSpecHash);
   assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/routerG/cards')), false);
   assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/ARM/cards')), false);
   assert.equal(backend.exitCode, null);
+});
+
+function deferredSignal() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function signalBeforeTimeout(signal, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      signal.then(() => true),
+      new Promise((resolve) => { timer = setTimeout(resolve, timeoutMs, false); })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function startTemplateRace(t, code, mockOptions) {
+  const mock = await startMockCmdbuild(t, { templateCodeFilter: true, ...mockOptions });
+  const port = await freePort();
+  await startBackend(t, port, mock.origin, {
+    CMDBDYNAMICPAGES_ROOT: 'Cst_QueryTool',
+    CMDBUILD_REQUEST_TIMEOUT_MS: '8000'
+  });
+  const origin = `http://127.0.0.1:${port}`;
+  const api = `${origin}/cmdbuild/custom-api`;
+  const cookie = testCmdbuildAuthorizationCookie('template-race-session');
+  const csrf = await requestJson('GET', `${api}/csrf`, undefined, { cookie });
+  assert.equal(csrf.statusCode, 200, csrf.body);
+  return {
+    mock,
+    templateUrl: `${api}/templates/${code}`,
+    snapshotUrl: `${api}/public-snapshots/${code}/run?json=true`,
+    headers: { cookie, origin, 'x-cmdbdynamicpages-csrf': csrf.json.token }
+  };
+}
+
+test('concurrent template PUTs with the same expectedSpecHash write only the winning SpecJson', async (t) => {
+  const code = 'ConcurrentTemplateSave';
+  const spec = publishSpec();
+  const expectedSpecHash = hashJson(spec);
+  const firstSpec = structuredClone(spec);
+  firstSpec.steps[1].limit = 1;
+  const secondSpec = structuredClone(spec);
+  secondSpec.steps[1].limit = 2;
+  const templates = [templateCard(code, spec)];
+  const templatePutPatches = [];
+  const versionCards = [];
+  const cardPath = `/cmdbuild/services/rest/v3/classes/Cst_QueryTemplate/cards/${code}`;
+  const firstWrite = deferredSignal();
+  const secondWrite = deferredSignal();
+  let upstreamWrites = 0;
+  const { mock, templateUrl, headers } = await startTemplateRace(t, code, {
+    templates, templatePutPatches, versionCards,
+    async responseOverride(url, req) {
+      if (req.method !== 'PUT' || url.pathname !== cardPath) return;
+      if (++upstreamWrites === 1) {
+        firstWrite.resolve();
+        // A serialized writer cannot reach CMDBuild until the first write completes.
+        await signalBeforeTimeout(secondWrite.promise, 1500);
+      } else {
+        secondWrite.resolve();
+      }
+    }
+  });
+  const save = (changedSpec) => requestJson('PUT', templateUrl, { code, expectedSpecHash, spec: changedSpec }, headers);
+
+  const first = save(firstSpec);
+  const second = (async () => {
+    assert.equal(await signalBeforeTimeout(firstWrite.promise, 4000), true, 'first PUT reached CMDBuild before the second save');
+    return save(secondSpec);
+  })();
+  const [saved, conflict] = await Promise.all([first, second]);
+
+  assert.equal(saved.statusCode, 200, saved.body);
+  assert.equal(conflict.statusCode, 409, `second PUT status: ${conflict.statusCode}; upstream PUTs: ${upstreamWrites}`);
+  assert.equal(conflict.json.success, false);
+  assert.equal(conflict.json.code, 'template_version_conflict');
+  assert.equal(saved.json.template.specHash, hashJson(firstSpec));
+  assert.notEqual(saved.json.template.specHash, expectedSpecHash);
+  assert.equal(conflict.json.currentSpecHash, saved.json.template.specHash);
+  assert.equal(mock.requests.filter(({ method, pathname }) => method === 'PUT' && pathname === cardPath).length, 1);
+  assert.equal(templatePutPatches.length, 1);
+  assert.deepEqual(JSON.parse(templatePutPatches[0].SpecJson), firstSpec);
+  assert.deepEqual(JSON.parse(templates[0].SpecJson), firstSpec);
+  assert.equal(versionCards.length, 1);
+});
+
+for (const method of ['PUT', 'DELETE']) {
+  test(`in-flight template publish rejects a stale snapshot after ${method} commits`, async (t) => {
+    const code = method === 'PUT' ? 'SaveDuringPublish' : 'DeleteDuringPublish';
+    const spec = publishSpec();
+    const savedSpecHash = hashJson(spec);
+    const templates = [templateCard(code, spec)];
+    const changedSpec = structuredClone(spec);
+    changedSpec.steps[1].limit = 1;
+    const executionStarted = deferredSignal();
+    const resumeExecution = deferredSignal();
+    let blocked = false;
+    let executionBarrierTimedOut = false;
+    const { mock, templateUrl, snapshotUrl, headers } = await startTemplateRace(t, code, {
+      templates,
+      async responseOverride(url, req) {
+        if (blocked || req.method !== 'GET' || url.pathname !== '/cmdbuild/services/rest/v3/classes/routerG/cards') return;
+        blocked = true;
+        executionStarted.resolve();
+        executionBarrierTimedOut = !await signalBeforeTimeout(resumeExecution.promise, 4000);
+        if (executionBarrierTimedOut) {
+          return { statusCode: 500, body: { message: 'Timed out waiting for the concurrent template mutation.' } };
+        }
+      }
+    });
+
+    const publishing = requestJson('POST', `${templateUrl}/publish`, { params: {}, savedSpecHash }, headers, 8000);
+    const mutating = (async () => {
+      try {
+        assert.equal(await signalBeforeTimeout(executionStarted.promise, 4000), true, 'publish began reading execution data');
+        const body = method === 'PUT' ? { code, expectedSpecHash: savedSpecHash, spec: changedSpec } : undefined;
+        const mutation = await requestJson(method, templateUrl + '?root=Cst', body, headers);
+        assert.equal(mutation.statusCode, 200, mutation.body);
+        const cardPath = `/cmdbuild/services/rest/v3/classes/Cst_QueryTemplate/cards/${code}`;
+        assert.equal(mock.requests.filter((req) => req.method === method && req.pathname === cardPath).length, 1);
+        if (method === 'PUT') {
+          assert.deepEqual(JSON.parse(templates[0].SpecJson), changedSpec);
+          assert.notEqual(mutation.json.template.specHash, savedSpecHash);
+        } else {
+          assert.deepEqual(templates, []);
+        }
+      } finally {
+        resumeExecution.resolve();
+      }
+    })();
+    const [stale] = await Promise.all([publishing, mutating]);
+
+    assert.equal(executionBarrierTimedOut, false, 'template mutation completed while publication execution was blocked');
+    const publicRun = await requestJson('GET', snapshotUrl);
+    assert.equal(publicRun.statusCode, 200, publicRun.body);
+    assert.equal(publicRun.json.snapshotFound, false, publicRun.body);
+    assert.equal(publicRun.json.cache.status, 'snapshot-miss');
+    assert.deepEqual(publicRun.json.tables, []);
+    assert.equal(stale.statusCode, 409, stale.body);
+    assert.equal(stale.json.success, false);
+    assert.equal(stale.json.reason, 'publication_saved_spec_mismatch');
+    assert.equal(stale.json.code, 'template_version_conflict');
+  });
+}
+
+test('ambiguous CMDB mutation leaves the old snapshot revoked and blocks republishing', async (t) => {
+  const code = 'UnconfirmedSnapshotMutation';
+  const spec = publishSpec();
+  const { templateUrl, snapshotUrl, headers } = await startTemplateRace(t, code, {
+    templates: [templateCard(code, spec)],
+    responseOverride(url, req) {
+      if (req.method === 'PUT' && url.pathname.endsWith(`/Cst_QueryTemplate/cards/${code}`)) {
+        return { statusCode: 502, body: { message: 'Unconfirmed fixture response.' } };
+      }
+    }
+  });
+  const body = { params: {}, savedSpecHash: hashJson(spec) };
+  assert.equal((await requestJson('POST', templateUrl + '/publish', body, headers)).statusCode, 200);
+  const changed = await requestJson('PUT', templateUrl, { code, expectedSpecHash: body.savedSpecHash,
+    spec: { ...spec, publish: { mode: 'dynamicUser' } } }, headers);
+  assert.equal(changed.statusCode, 502, changed.body);
+  assert.equal(changed.json.snapshotRevocationPending, true);
+  assert.equal((await requestJson('GET', snapshotUrl)).json.snapshotFound, false);
+  const retry = await requestJson('POST', templateUrl + '/publish', body, headers);
+  assert.equal(retry.statusCode, 409, retry.body);
+  assert.equal(retry.json.reason, 'snapshot_revocation_pending');
+});
+
+test('template delete denied by class permissions does not revoke a published snapshot', async (t) => {
+  const code = 'SnapshotCannotBeDeleted';
+  const spec = publishSpec();
+  const { mock, templateUrl, snapshotUrl, headers } = await startTemplateRace(t, code, {
+    templates: [templateCard(code, spec)], templateClassCanDelete: false
+  });
+  assert.equal((await requestJson('POST', templateUrl + '/publish', { params: {}, savedSpecHash: hashJson(spec) }, headers)).statusCode, 200);
+  const denied = await requestJson('DELETE', templateUrl, undefined, headers);
+  assert.equal(denied.statusCode, 403, denied.body);
+  assert.equal(denied.json.reason, 'template_delete_forbidden');
+  assert.ok(!mock.requests.some((request) => request.method === 'DELETE'));
+  assert.equal((await requestJson('GET', snapshotUrl)).json.snapshotFound, true);
 });
 
 test('template publish rejects missing saved spec hash before executing the snapshot', async (t) => {
@@ -7031,6 +7217,416 @@ test('template publish returns controlled client errors for malformed or null JS
   assert.equal(backend.exitCode, null);
 });
 
+test('runtime permissionOnly cache bypasses unconfirmed probes and never returns rows on data denial', async (t) => {
+  const code = 'RuntimeAccessProbe';
+  const spec = {
+    version: 1,
+    steps: [{ type: 'selectCards', as: 'arms', className: 'ARM', columns: ['Code'], limit: 1 }],
+    result: { tables: [{ name: 'arms', columns: ['Code'] }] }
+  };
+  const cardsPath = '/cmdbuild/services/rest/v3/classes/ARM/cards';
+  const attributesPath = '/cmdbuild/services/rest/v3/classes/ARM/attributes';
+  const templatePath = '/cmdbuild/services/rest/v3/classes/Cst_QueryTemplate/cards';
+  const mock = await startMockCmdbuild(t, {
+    templates: [templateCard(code, spec)],
+    armCards: [{ _id: 501, Code: 'PERMITTED-ARM' }],
+    responseOverride(url, req) {
+      const token = req.headers['cmdbuild-authorization'];
+      if (url.pathname === '/cmdbuild/services/rest/v3/sessions/current') {
+        if (token === 'expired-session') return { statusCode: 401, body: { success: false } };
+        return { statusCode: 200, body: { data: { username: token, role: 'Reader' } } };
+      }
+      if (url.pathname === attributesPath && ['probe-forbidden', 'probe-missing', 'cards-forbidden'].includes(token)) {
+        return { statusCode: token === 'probe-missing' ? 404 : 403, body: { message: 'Mock attributes unavailable' } };
+      }
+      if ((url.pathname === cardsPath && token === 'cards-forbidden') ||
+          (url.pathname === templatePath && token === 'technical-forbidden')) {
+        return { statusCode: 403, body: { message: 'Mock access denied' } };
+      }
+      if (url.pathname === cardsPath && ['probe-forbidden', 'probe-missing'].includes(token)) {
+        return { statusCode: 200, body: { data: [{ _id: 502, Code: 'CALLER-ARM' }] } };
+      }
+    }
+  });
+  const backendPort = await freePort();
+  await startBackend(t, backendPort, mock.origin);
+  const origin = `http://127.0.0.1:${backendPort}`;
+  const api = `${origin}/cmdbuild/custom-api`;
+  const endpoint = `${api}/templates/${code}/run?json=true`;
+  const run = (token) => requestJson('GET', endpoint, undefined, { cookie: testCmdbuildAuthorizationCookie(token) });
+
+  const warm = await run('permitted-session');
+  assert.equal(warm.statusCode, 200, warm.body);
+  assert.equal(warm.json.cache.status, 'miss');
+  assert.equal(warm.json.cache.scopeMode, 'permissionOnly');
+  assert.deepEqual(warm.json.tables[0].rows, [{ Code: 'PERMITTED-ARM' }]);
+
+  const sharedHit = await run('second-permitted-session');
+  assert.equal(sharedHit.statusCode, 200, sharedHit.body);
+  assert.equal(sharedHit.json.cache.status, 'hit');
+  assert.equal(sharedHit.json.cache.key, warm.json.cache.key);
+
+  for (const token of ['probe-forbidden', 'probe-missing']) {
+    const start = mock.requests.length;
+    const runWithoutCache = await run(token);
+    assert.equal(runWithoutCache.statusCode, 200, runWithoutCache.body);
+    assert.equal(runWithoutCache.json.cache.status, 'bypass');
+    assert.equal(runWithoutCache.json.cache.reason, 'access_probe_unconfirmed');
+    assert.deepEqual(runWithoutCache.json.tables[0].rows, [{ Code: 'CALLER-ARM' }]);
+    const dataReads = mock.requests.slice(start).filter((item) => [attributesPath, cardsPath].includes(item.pathname));
+    assert.deepEqual(dataReads.map((item) => item.pathname), [attributesPath, cardsPath]);
+  }
+
+  const cookie = testCmdbuildAuthorizationCookie('probe-forbidden');
+  const csrf = await requestJson('GET', `${api}/csrf`, undefined, { cookie });
+  assert.equal(csrf.statusCode, 200, csrf.body);
+  const draft = await requestJson('POST', `${api}/draft/preview?root=Cst_QueryTool`, {
+    template: { code, spec }, params: {}
+  }, { cookie, origin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
+  assert.equal(draft.statusCode, 200, draft.body);
+  const directUrl = await requestJson('GET', `${origin}/cmdbuild/dynamicpages/ui/run/${code}?root=Cst_QueryTool&json=true`, undefined, { cookie });
+  assert.equal(directUrl.statusCode, 200, directUrl.body);
+  assert.equal(directUrl.json.cache.status, 'bypass');
+  assert.deepEqual(directUrl.json.tables[0].rows, draft.json.result.tables[0].rows);
+
+  const start = mock.requests.length;
+  const denied = await run('cards-forbidden');
+  assert.equal(denied.statusCode, 403, denied.body);
+  assert.equal(denied.json.reason, 'data_access_denied');
+  assert.equal(denied.json.result, undefined);
+  assert.deepEqual(denied.json.tables ?? [], []);
+  assert.ok(mock.requests.slice(start).some((item) => item.pathname === cardsPath));
+
+  const technicalStart = mock.requests.length;
+  const technicalDenied = await run('technical-forbidden');
+  assert.equal(technicalDenied.statusCode, 403, technicalDenied.body);
+  assert.equal(technicalDenied.json.reason, 'technical_schema_access_denied');
+  assert.equal(technicalDenied.json.result, undefined);
+  assert.deepEqual(technicalDenied.json.tables ?? [], []);
+  assert.equal(mock.requests.slice(technicalStart).some((item) => [attributesPath, cardsPath].includes(item.pathname)), false);
+
+  for (const [token, deniedResponse] of [
+    ['cards-forbidden', denied],
+    ['technical-forbidden', technicalDenied]
+  ]) {
+    const directDenied = await requestJson('GET', `${origin}/cmdbuild/dynamicpages/ui/run/${code}?json=true`, undefined, {
+      cookie: testCmdbuildAuthorizationCookie(token)
+    });
+    assert.equal(directDenied.statusCode, 403, directDenied.body);
+    assert.equal(directDenied.json.reason, deniedResponse.json.reason);
+    assert.equal(directDenied.json.result, undefined);
+    assert.deepEqual(directDenied.json.tables ?? [], []);
+  }
+
+  const expiredStart = mock.requests.length;
+  const expired = await run('expired-session');
+  assert.equal(expired.statusCode, 401, expired.body);
+  assert.equal(expired.json.reason, 'cmdbuild_session_invalid');
+  assert.ok(expired.headers['x-request-id']);
+  assert.equal(mock.requests.slice(expiredStart).some((item) => item.pathname === templatePath || item.pathname === cardsPath), false);
+
+  const stillShared = await run('permitted-session');
+  assert.equal(stillShared.statusCode, 200, stillShared.body);
+  assert.equal(stillShared.json.cache.status, 'hit');
+  assert.deepEqual(stillShared.json.tables[0].rows, [{ Code: 'PERMITTED-ARM' }]);
+});
+
+test('runtime and public snapshot caches isolate templates with the same code by root', async (t) => {
+  const runtimeCode = 'RuntimeRootIsolation';
+  const snapshotCode = 'SnapshotRootIsolation';
+  const specForClass = (className) => ({
+    version: 1,
+    params: { code: { type: 'string', required: true } },
+    steps: [{
+      type: 'selectCards', as: 'items', className, columns: ['Code', 'Description'], limit: 1,
+      filters: [{ path: 'Code', op: 'equals', valueParam: 'code' }]
+    }],
+    result: { tables: [{ name: 'items', columns: ['Code', 'Description'] }] }
+  });
+  const defaultSpec = specForClass('ARM');
+  const alternateSpec = specForClass('routerG');
+  const publish = { mode: 'staticSnapshot', paramsMode: 'exact', warningAccepted: true };
+  const defaultSnapshot = { ...defaultSpec, publish };
+  const alternateSnapshot = { ...alternateSpec, publish };
+  const mock = await startMockCmdbuild(t, {
+    templateCodeFilter: true,
+    templates: [templateCard(runtimeCode, defaultSpec), templateCard(snapshotCode, defaultSnapshot)],
+    cardsByClass: {
+      Acme_QueryTemplate: [templateCard(runtimeCode, alternateSpec), templateCard(snapshotCode, alternateSnapshot)],
+      Acme_QueryToolConfig: []
+    },
+    armCards: [{ _id: 501, Code: 'selected', Description: 'Default root row' }],
+    routerCards: [{ _id: 301, Code: 'selected', Description: 'Alternate root row' }],
+    responseOverride(url, req) {
+      if (url.pathname.endsWith('/sessions/current') && req.headers['cmdbuild-authorization'] === 'expired-session') {
+        return { statusCode: 401, body: { success: false } };
+      }
+    }
+  });
+  const backendPort = await freePort();
+  await startBackend(t, backendPort, mock.origin, { CMDBDYNAMICPAGES_ROOT: 'Cst_QueryTool' });
+  const backendOrigin = `http://127.0.0.1:${backendPort}`;
+  const api = `${backendOrigin}/cmdbuild/custom-api`;
+  const cookie = testCmdbuildAuthorizationCookie('root-isolation-session');
+  const csrf = await requestJson('GET', `${api}/csrf`, undefined, { cookie });
+  assert.equal(csrf.statusCode, 200, csrf.body);
+  const headers = { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  const params = { code: 'selected' };
+  const runQuery = 'json=true&code=selected';
+  const defaultRoot = '&root=Cst_QueryTool';
+  const alternateRoot = '&root=Acme_QueryTool';
+  const directUrl = `${backendOrigin}/cmdbuild/dynamicpages/ui/run/${snapshotCode}`;
+  const expiredCookie = testCmdbuildAuthorizationCookie('expired-session');
+  const run = (code, root) => requestJson('GET', `${api}/templates/${code}/run?${runQuery}${root}`, undefined, { cookie });
+  const publicRun = (root) => requestJson('GET', `${api}/public-snapshots/${snapshotCode}/run?${runQuery}${root}`);
+  const readBoot = (html) => {
+    assert.equal(html.statusCode, 200);
+    assert.match(html.headers['content-type'], /^text\/html/);
+    const bootMatch = /<script>window\.CMDP_BOOT=(.*);<\/script>/.exec(html.body);
+    assert.ok(bootMatch, 'HTML contains runtime boot data');
+    return JSON.parse(bootMatch[1]);
+  };
+  const assertRows = (response, cacheStatus, description) => {
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal(response.json.cache.status, cacheStatus, response.body);
+    assert.deepEqual(response.json.params, params);
+    assert.deepEqual(response.json.tables[0].rows, [{ Code: params.code, Description: description }]);
+  };
+
+  const defaultRun = await run(runtimeCode, '');
+  assertRows(defaultRun, 'miss', 'Default root row');
+  const alternateRun = await run(runtimeCode, alternateRoot);
+  assertRows(alternateRun, 'miss', 'Alternate root row');
+  assert.notEqual(defaultRun.json.cache.key, alternateRun.json.cache.key);
+  const explicitDefault = await run(runtimeCode, defaultRoot);
+  assertRows(explicitDefault, 'hit', 'Default root row');
+  assert.equal(explicitDefault.json.cache.key, defaultRun.json.cache.key);
+  assertRows(await run(runtimeCode, alternateRoot), 'hit', 'Alternate root row');
+
+  const publishSnapshot = async (spec, query) => {
+    const response = await requestJson('POST', `${api}/templates/${snapshotCode}/publish${query}`, {
+      params, savedSpecHash: hashJson(spec)
+    }, headers);
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal(response.json.cache.status, 'snapshot-published', response.body);
+  };
+  await publishSnapshot(defaultSnapshot, '');
+  const missing = await publicRun(alternateRoot);
+  assert.equal(missing.statusCode, 200, missing.body);
+  assert.equal(missing.json.snapshotFound, false);
+  assert.equal(missing.json.cache.status, 'snapshot-miss');
+  assert.deepEqual(missing.json.params, params);
+  const alternateMiss = await requestJson('GET', `${directUrl}?${runQuery}${alternateRoot}`);
+  assert.equal(alternateMiss.statusCode, 200, alternateMiss.body);
+  assert.deepEqual(alternateMiss.json, missing.json);
+  await publishSnapshot(alternateSnapshot, '?root=Acme_QueryTool');
+  assertRows(await run(snapshotCode, ''), 'snapshot-hit', 'Default root row');
+  assertRows(await run(snapshotCode, alternateRoot), 'snapshot-hit', 'Alternate root row');
+
+  const publicStart = mock.requests.length;
+  const defaultPublic = await publicRun('');
+  const alternatePublic = await publicRun(alternateRoot);
+  assertRows(defaultPublic, 'snapshot-hit', 'Default root row');
+  assertRows(alternatePublic, 'snapshot-hit', 'Alternate root row');
+  assert.notEqual(defaultPublic.json.cache.key, alternatePublic.json.cache.key);
+
+  for (const requestHeaders of [{}, { cookie }, { cookie: expiredCookie }]) {
+    for (const [root, expected] of [[defaultRoot, defaultPublic], [alternateRoot, alternatePublic]]) {
+      const json = await requestJson('GET', `${directUrl}?${runQuery}${root}`, undefined, requestHeaders);
+      assert.equal(json.statusCode, 200, json.body);
+      assert.deepEqual(json.json, expected.json);
+    }
+
+    const html = await request('GET', `${directUrl}?code=selected${alternateRoot}`, undefined, requestHeaders);
+    const { mode, publicRuntime, session, root, templateCode } = readBoot(html);
+    assert.deepEqual({ mode, publicRuntime, session, root, templateCode }, {
+      mode: 'runtime', publicRuntime: true, session: {}, root: 'Acme_QueryTool', templateCode: snapshotCode
+    });
+  }
+  assert.equal(mock.requests.length, publicStart, 'snapshot hits make no CMDBuild requests, including session checks');
+
+  const wrongParamsUrl = `${directUrl}?json=true&code=unpublished${alternateRoot}`;
+  const anonymousMiss = await requestJson('GET', wrongParamsUrl);
+  assert.equal(anonymousMiss.statusCode, 200, anonymousMiss.body);
+  assert.equal(anonymousMiss.json.snapshotFound, false);
+  assert.equal(anonymousMiss.json.cache.status, 'snapshot-miss');
+  assert.deepEqual(anonymousMiss.json.tables, []);
+  assert.equal(mock.requests.length, publicStart, 'anonymous misses make no CMDBuild requests');
+
+  const expiredMiss = await requestJson('GET', wrongParamsUrl, undefined, { cookie: expiredCookie });
+  assert.equal(expiredMiss.statusCode, 401, expiredMiss.body);
+  assert.equal(expiredMiss.json.reason, 'cmdbuild_session_invalid');
+
+  const wrongParamsHtmlUrl = `${directUrl}?code=unpublished${alternateRoot}`;
+  const expiredHtml = await requestJson('GET', wrongParamsHtmlUrl, undefined, { cookie: expiredCookie });
+  assert.equal(expiredHtml.statusCode, 401, expiredHtml.body);
+  assert.equal(expiredHtml.json.reason, 'cmdbuild_session_invalid');
+  const authenticatedHtml = await request('GET', wrongParamsHtmlUrl, undefined, { cookie });
+  const authenticatedBoot = readBoot(authenticatedHtml);
+  assert.equal(authenticatedBoot.publicRuntime, false);
+  assert.equal(authenticatedBoot.session.username, 'preview-user');
+  assert.deepEqual(mock.requests.slice(publicStart).map(({ pathname }) => pathname), [
+    '/cmdbuild/services/rest/v3/sessions/current',
+    '/cmdbuild/services/rest/v3/sessions/current',
+    '/cmdbuild/services/rest/v3/sessions/current'
+  ]);
+});
+
+async function startSnapshotRedisFixture(t) {
+  const values = new Map();
+  const sets = new Map();
+  const faults = { mset: false, del: false };
+  const resp = (value) => value == null ? '$-1\r\n' : typeof value === 'number' ? `:${value}\r\n`
+    : Array.isArray(value) ? `*${value.length}\r\n${value.map(resp).join('')}` : `$${Buffer.byteLength(value)}\r\n${value}\r\n`;
+  const redis = net.createServer((socket) => {
+    let input = Buffer.alloc(0);
+    socket.on('data', (chunk) => {
+      input = Buffer.concat([input, chunk]);
+      const end = input.indexOf('\r\n');
+      if (end === -1) return;
+      const count = Number(input.subarray(1, end));
+      const parts = [];
+      let offset = end + 2;
+      for (let index = 0; index < count; index++) {
+        const header = input.indexOf('\r\n', offset);
+        if (header === -1) return;
+        const length = Number(input.subarray(offset + 1, header));
+        if (input.length < header + 2 + length + 2) return;
+        parts.push(input.subarray(header + 2, header + 2 + length).toString());
+        offset = header + 2 + length + 2;
+      }
+      const [command, key, ...args] = parts;
+      const add = (set, item) => { if (!sets.has(set)) sets.set(set, new Set()); sets.get(set).add(item); };
+      switch (command) {
+        case 'PING': return socket.end('+PONG\r\n');
+        case 'GET': return socket.end(resp(values.get(key)));
+        case 'MGET': return socket.end(resp([key, ...args].map((item) => values.get(item))));
+        case 'SET':
+          if (args[1] === 'NX' && values.has(key)) return socket.end(resp(null));
+          values.set(key, args[0]);
+          return socket.end('+OK\r\n');
+        case 'MSET': {
+          if (faults.mset) return socket.end('-ERR cannot persist revocation\r\n');
+          const pairs = [key, ...args];
+          for (let i = 0; i < pairs.length; i += 2) values.set(pairs[i], pairs[i + 1]);
+          return socket.end('+OK\r\n');
+        }
+        case 'SMEMBERS': return socket.end(resp([...(sets.get(key) || [])]));
+        case 'DEL':
+          if (faults.del && key.includes(':snapshot:')) return socket.end('-ERR cannot delete old payload\r\n');
+          return socket.end(resp(Number(values.delete(key) || sets.delete(key))));
+        case 'EVAL': {
+          const keyCount = Number(args[0]);
+          const keys = args.slice(1, 1 + keyCount);
+          const [expected, ...next] = args.slice(1 + keyCount);
+          const writeSnapshot = key.includes('SADD');
+          if ((writeSnapshot ? keys.slice(0, 1) : keys).some((item) => values.get(item) !== expected)) return socket.end(resp(0));
+          if (writeSnapshot) { values.set(keys[1], next[0]); add(keys[2], next[1]); }
+          else keys.forEach((item, index) => next[index] === '-' ? values.delete(item) : values.set(item, next[index]));
+          return socket.end(resp(1));
+        }
+        default: return socket.end('-ERR unexpected fixture command\r\n');
+      }
+    });
+  });
+  await listen(redis, 0);
+  t.after(() => closeServer(redis));
+  return { faults, values, env: { CMDBDYNAMIC_REDIS_ENABLED: 'true', CMDBDYNAMIC_REDIS_REQUIRED: 'false',
+    CMDBDYNAMIC_REDIS_URL: `redis://127.0.0.1:${redis.address().port}/0` } };
+}
+
+test('snapshot revocation uses the same class across root spellings and fences stale Redis payloads across restart', async (t) => {
+  const code = 'FencedSnapshot';
+  const spec = publishSpec();
+  const mock = await startMockCmdbuild(t, { templates: [templateCard(code, spec)] });
+  const redis = await startSnapshotRedisFixture(t);
+  const makeOrigin = async () => {
+    const port = await freePort();
+    const backend = await startBackend(t, port, mock.origin, redis.env);
+    return { backend, origin: `http://127.0.0.1:${port}` };
+  };
+  const { backend, origin } = await makeOrigin();
+  const cookie = testCmdbuildAuthorizationCookie('fenced-snapshot-session');
+  const headersFor = async (target) => {
+    const csrf = await requestJson('GET', `${target}/cmdbuild/custom-api/csrf`, undefined, { cookie });
+    return { cookie, origin: target, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  };
+  const headers = await headersFor(origin);
+  const templatePath = `/cmdbuild/custom-api/templates/${code}`;
+  const oldPublicPath = `/cmdbuild/custom-api/public-snapshots/${code}/run?root=Cst_QueryTool&json=true`;
+  const publish = await requestJson('POST', `${origin}${templatePath}/publish?root=Cst_QueryTool`,
+    { params: {}, savedSpecHash: hashJson(spec) }, headers);
+  assert.equal(publish.statusCode, 200, publish.body);
+  assert.equal((await requestJson('GET', origin + oldPublicPath)).json.snapshotFound, true);
+
+  redis.faults.mset = true;
+  const start = mock.requests.length;
+  for (const [method, body] of [['DELETE', undefined], ['PUT', { code, expectedSpecHash: hashJson(spec),
+    spec: { ...spec, publish: { mode: 'dynamicUser' } } }]]) {
+    const blocked = await requestJson(method, `${origin}${templatePath}?root=Cst`, body, headers);
+    assert.equal(blocked.statusCode, 503, blocked.body);
+    assert.equal(blocked.json.code, 'snapshot_revocation_unavailable');
+  }
+  assert.ok(!mock.requests.slice(start).some((entry) => entry.method === 'DELETE' || entry.method === 'PUT'));
+  redis.faults.mset = false;
+  // Restart clears the client-side Redis outage backoff, but keeps all Redis data.
+  backend.kill();
+  const recovered = await makeOrigin();
+  const nextHeaders = await headersFor(recovered.origin);
+  assert.equal((await requestJson('GET', recovered.origin + oldPublicPath)).json.snapshotFound, true);
+  redis.faults.del = true;
+  const deleted = await requestJson('DELETE', `${recovered.origin}${templatePath}?root=Cst`, undefined, nextHeaders);
+  assert.equal(deleted.statusCode, 200, deleted.body);
+  assert.equal(deleted.json.cacheInvalidation.staticSnapshots.complete, false);
+  assert.ok([...redis.values.keys()].some((key) => key.includes(':snapshot:v3:')), 'old payload still exists in Redis');
+  redis.faults.del = false;
+  recovered.backend.kill();
+  const restarted = await makeOrigin();
+  const missing = await requestJson('GET', restarted.origin + oldPublicPath);
+  assert.equal(missing.statusCode, 200, missing.body);
+  assert.equal(missing.json.snapshotFound, false);
+});
+
+test('public snapshot storage outage returns a controlled 503 without CMDBuild fallback', async (t) => {
+  const mock = await startMockCmdbuild(t);
+  let redisRequests = 0;
+  const redis = net.createServer((socket) => {
+    socket.once('data', () => {
+      redisRequests++;
+      socket.end('-ERR fixture storage unavailable\r\n');
+    });
+  });
+  await listen(redis, 0);
+  t.after(() => closeServer(redis));
+  const cookie = testCmdbuildAuthorizationCookie('snapshot-storage-session');
+  for (const redisRequired of ['false', 'true']) {
+    await t.test(`Redis required: ${redisRequired}`, async (subtest) => {
+      const port = await freePort();
+      await startBackend(subtest, port, mock.origin, {
+        CMDBDYNAMIC_REDIS_ENABLED: 'true',
+        CMDBDYNAMIC_REDIS_REQUIRED: redisRequired,
+        CMDBDYNAMIC_REDIS_URL: `redis://127.0.0.1:${redis.address().port}/0`
+      });
+      const origin = `http://127.0.0.1:${port}`;
+      const directUrl = `${origin}/cmdbuild/dynamicpages/ui/run/SnapshotStorageOutage`;
+      const start = redisRequests;
+      for (const [url, headers] of [
+        [`${origin}/cmdbuild/custom-api/public-snapshots/SnapshotStorageOutage/run?json=true`, {}],
+        [`${directUrl}?json=true`, { cookie }],
+        [directUrl, { cookie }]
+      ]) {
+        const response = await requestJson('GET', url, undefined, headers);
+        assert.equal(response.statusCode, 503, response.body);
+        assert.equal(response.json.success, false);
+        assert.equal(response.json.reason, 'snapshot_storage_unavailable');
+        assert.doesNotMatch(response.body, /fixture storage unavailable/);
+      }
+      assert.ok(redisRequests > start, 'backend attempted to use the fake Redis');
+      assert.deepEqual(mock.requests, []);
+    });
+  }
+});
+
 test('template publish executes static snapshot spec and returns published cache metadata', async (t) => {
   const spec = publishSpec();
   const mock = await startMockCmdbuild(t, {
@@ -7092,6 +7688,10 @@ test('template deletion revokes all public static snapshots', async (t) => {
   const beforeDelete = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/public-snapshots/StaticSnapshotRevoke/run?json=true`);
   assert.equal(beforeDelete.statusCode, 200, beforeDelete.body);
   assert.equal(beforeDelete.json.snapshotFound, true);
+  const directUrl = `${backendOrigin}/cmdbuild/dynamicpages/ui/run/StaticSnapshotRevoke?json=true`;
+  const directBeforeDelete = await requestJson('GET', directUrl, undefined, { cookie });
+  assert.equal(directBeforeDelete.statusCode, 200, directBeforeDelete.body);
+  assert.deepEqual(directBeforeDelete.json, beforeDelete.json);
 
   const updated = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/StaticSnapshotRevoke`, {
     code: 'StaticSnapshotRevoke',
@@ -7119,6 +7719,13 @@ test('template deletion revokes all public static snapshots', async (t) => {
   assert.equal(afterDelete.statusCode, 200, afterDelete.body);
   assert.equal(afterDelete.json.snapshotFound, false);
   assert.equal(afterDelete.json.cache.status, 'snapshot-miss');
+  const directAfterDelete = await requestJson('GET', directUrl);
+  assert.equal(directAfterDelete.statusCode, 200, directAfterDelete.body);
+  assert.deepEqual(directAfterDelete.json, afterDelete.json);
+  const authenticatedAfterDelete = await requestJson('GET', directUrl, undefined, { cookie });
+  assert.equal(authenticatedAfterDelete.statusCode, 404, authenticatedAfterDelete.body);
+  assert.equal(authenticatedAfterDelete.json.success, false);
+  assert.equal(authenticatedAfterDelete.json.tables, undefined);
   assert.equal(backend.exitCode, null);
 });
 
@@ -9029,6 +9636,12 @@ async function startMockCmdbuild(t, options = {}) {
     );
     if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
 
+    const responseOverride = options.responseOverride && await options.responseOverride(requestUrl, req);
+    if (responseOverride) {
+      sendJson(res, responseOverride.statusCode, responseOverride.body);
+      return;
+    }
+
     if (requestUrl.pathname === '/cmdbuild/services/rest/v3/sessions/current') {
       const status = Number(options.sessionStatus || 200);
       sendJson(res, status, status === 200 ? {
@@ -9046,7 +9659,8 @@ async function startMockCmdbuild(t, options = {}) {
           name: 'Cst_QueryTemplate',
           _can_read: true,
           _can_create: options.templateClassCanCreate !== false,
-          _can_update: options.templateClassCanUpdate !== false
+          _can_update: options.templateClassCanUpdate !== false,
+          _can_delete: options.templateClassCanDelete !== false
         }
       });
       return;
@@ -9901,6 +10515,47 @@ async function edgeAggregationApiFixture(t, aggregation = { enabled: true, group
   return { origin, headers, backend, mock, code, cards, currentSpec, applyBody, spec: applied.json.spec };
 }
 
+test('direct runtime enforces the published D2 source toggle even with a valid cookie', async (t) => {
+  const { origin, headers, mock, code, currentSpec, spec } = await edgeAggregationApiFixture(t);
+  const templateUrl = `${origin}/cmdbuild/custom-api/templates/${code}`;
+  const directUrl = `${origin}/cmdbuild/dynamicpages/ui/run/${code}`;
+  let savedSpecHash = hashJson(currentSpec);
+
+  for (const publicD2Source of [false, true]) {
+    const saved = await requestJson('PUT', templateUrl, {
+      code,
+      expectedSpecHash: savedSpecHash,
+      spec: { ...spec, publish: { ...publishSpec().publish, publicD2Source } }
+    }, headers);
+    assert.equal(saved.statusCode, 200, saved.body);
+    savedSpecHash = saved.json.template.specHash;
+    const published = await requestJson('POST', `${templateUrl}/publish`, { params: {}, savedSpecHash }, headers);
+    assert.equal(published.statusCode, 200, published.body);
+    assert.equal(published.json.cache.status, 'snapshot-published');
+
+    const start = mock.requests.length;
+    const anonymous = await request('GET', `${directUrl}?d2=true`);
+    const authenticated = await request('GET', `${directUrl}?d2=true`, undefined, { cookie: headers.cookie });
+    for (const response of [anonymous, authenticated]) {
+      assert.equal(response.statusCode, publicD2Source ? 200 : 403, response.body);
+      if (publicD2Source) {
+        assert.match(response.headers['content-type'], /^text\/vnd\.d2/);
+        assert.match(response.headers['content-disposition'], /^attachment; filename="[^"]+\.d2"$/);
+        assert.match(response.body, /Source object/);
+      } else {
+        assert.equal(response.headers['content-disposition'], undefined);
+        assert.match(JSON.parse(response.body).message, /not enabled for this published snapshot/);
+      }
+    }
+    assert.equal(authenticated.body, anonymous.body);
+    const runtime = await requestJson('GET', `${directUrl}?json=true`, undefined, { cookie: headers.cookie });
+    assert.equal(runtime.statusCode, 200, runtime.body);
+    assert.equal(runtime.json.diagrams[0].d2.downloadAvailable, publicD2Source);
+    assert.equal(runtime.json.diagrams[0].d2.source, undefined);
+    assert.equal(mock.requests.length, start, 'published D2 reads make no CMDBuild requests');
+  }
+});
+
 test('edge aggregation HTTP draft preview merges 100 distinct mock records and is deterministic', async (t) => {
   const fixture = await edgeAggregationApiFixture(t);
   const { origin, headers, spec, code, cards, mock, backend, currentSpec } = fixture;
@@ -9993,4 +10648,93 @@ test('edge aggregation strict Apply rejects invalid settings with 422 while tabl
   assert.deepEqual([...new Set(table.rows.map((row) => row.Category))].sort(), ['A', 'B']);
   assert.equal(mock.requests.some((request) => request.method === 'PUT'), false);
   assert.equal(backend.exitCode, null);
+});
+
+test('runtime cache probe preserves projected cards 403 despite successful unprojected reads', async (t) => {
+  const code = 'ProjectedCardsAccess';
+  const cardsPath = '/cmdbuild/services/rest/v3/classes/ARM/cards';
+  const restricted = 'projected-cards-restricted';
+  const spec = {
+    version: 1,
+    cache: { scopeMode: 'permissionOnly' },
+    steps: [{ type: 'selectCards', as: 'assets', className: 'ARM', columns: ['model'], limit: 1 }],
+    result: { tables: [{ name: 'assets', columns: ['model'] }] }
+  };
+  const fixture = await transferApiFixture(t, {
+    templates: [templateCard(code, spec)],
+    armCards: [{ _id: 501, model: 'warm-model' }],
+    responseOverride(url, req) {
+      if (url.pathname !== cardsPath || req.headers['cmdbuild-authorization'] !== restricted) return;
+      return url.searchParams.has('attributes')
+        ? { statusCode: 403, body: { message: 'Projected read denied' } }
+        : { statusCode: 200, body: { data: [{ _id: 502, model: 'unprojected-model' }] } };
+    }
+  });
+  const { mock } = fixture;
+  const unprojected = await requestJson('GET', `${mock.origin}${cardsPath}?limit=1`, undefined, { 'cmdbuild-authorization': restricted });
+  assert.equal(unprojected.statusCode, 200, unprojected.body);
+  assert.equal(unprojected.json.data[0].model, 'unprojected-model');
+
+  const endpoint = `${fixture.origin}/cmdbuild/custom-api/templates/${code}/run?json=true`;
+  const warm = await requestJson('GET', endpoint, undefined, { cookie: fixture.headers.cookie });
+  assert.equal(warm.statusCode, 200, warm.body);
+  assert.equal(warm.json.cache.status, 'miss');
+  assert.deepEqual(warm.json.tables[0].rows, [{ model: 'warm-model' }]);
+
+  const start = mock.requests.length;
+  const denied = await requestJson('GET', endpoint, undefined, { cookie: testCmdbuildAuthorizationCookie(restricted) });
+  assert.equal(denied.statusCode, 403, denied.body);
+  assert.equal(denied.json.reason, 'data_access_denied');
+  assert.equal(denied.json.cmdbuildStatus, 403);
+  assert.equal(denied.json.permissionDenied, true);
+  assert.equal(denied.json.cache, undefined);
+  assert.equal(denied.json.result, undefined);
+  assert.equal(denied.json.tables, undefined);
+  assert.deepEqual(mock.requests.slice(start).filter(({ pathname }) => pathname === cardsPath)
+    .map(({ search }) => new URLSearchParams(search).get('attributes')), ['model']);
+});
+
+test('template transfer roundtrips raw and managed text filters on card and lookup fields', async (t) => {
+  const fixture = await transferApiFixture(t, transferReferenceCatalog({
+    persistNewTemplates: true,
+    versionCards: [],
+    attributesByClass: { ARM: [
+      { name: 'Location', type: 'reference', targetClass: 'Location', active: true, _can_read: true },
+      { name: 'Status', type: 'lookup', lookupType: 'AssetStatus', active: true, _can_read: true }
+    ] },
+    armCards: [
+      { _id: 501, Code: 'MATCH', Location: 901, _Location_description: 'North Campus', Status: 7, _Status_description: 'Active' },
+      { _id: 502, Code: 'OTHER_SITE', Location: 902, _Location_description: 'South Office', Status: 7, _Status_description: 'Active' },
+      { _id: 503, Code: 'OTHER_STATUS', Location: 901, _Location_description: 'North Campus', Status: 8, _Status_description: 'Archived' }
+    ]
+  }));
+  const rules = [
+    { path: 'Location', op: 'contains', value: 'Campus' },
+    { path: 'Status', op: 'endsWith', value: 'ive' }
+  ];
+  const raw = transferRawSpec();
+  raw.steps[0].filters = rules;
+  const managed = compileObjectFlowToSpec(transferRawSpec({ steps: [] }), { version: 1, operations: [], selections: [{
+    id: 'selection:assets', name: 'Assets', alias: 'assets', className: 'ARM', limit: 100, columns: ['Code'], filterJoin: 'all',
+    rules: rules.map((rule) => ({ ...rule, action: 'include' }))
+  }] });
+  for (const [code, spec] of [['RawTextFilters', raw], ['ManagedTextFilters', managed]]) {
+    const start = fixture.mock.requests.length;
+    const prepared = await prepareRawTransfer(fixture, spec, code);
+    assert.equal(prepared.statusCode, 200, prepared.body);
+    assert.equal(prepared.json.checks.status, 'ready', prepared.body);
+    assert.equal(prepared.json.checks.executionReady, true, prepared.body);
+    assert.deepEqual(prepared.json.checks.environmentReferences, []);
+    assert.deepEqual(prepared.json.template.spec.steps[0].filters, spec.steps[0].filters);
+
+    const saved = await fixture.create(prepared.json.template);
+    assert.equal(saved.statusCode, 201, saved.body);
+    assert.deepEqual(saved.json.template.spec.steps[0].filters, spec.steps[0].filters);
+    const run = await requestJson('GET', `${fixture.origin}/cmdbuild/custom-api/templates/${code}/run?json=true&noCache=1`,
+      undefined, { cookie: fixture.headers.cookie });
+    assert.equal(run.statusCode, 200, run.body);
+    const table = run.json.tables.find(({ name }) => name === 'assets');
+    assert.deepEqual(table?.rows.map(({ Code }) => Code), ['MATCH']);
+    assert.ok(!fixture.mock.requests.slice(start).some(({ pathname }) => /\/(classes\/Location\/cards|lookup_types\/AssetStatus\/values)\//.test(pathname)));
+  }
 });

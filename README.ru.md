@@ -19,7 +19,7 @@ CMDBuild custom page оставлен тонким launcher-компоненто
 ```text
 /cmdbuild/dynamicpages/ui/designer
 /cmdbuild/dynamicpages/ui/designer/<section>
-/cmdbuild/dynamicpages/ui/run/<templateCode>?param=value
+/cmdbuild/dynamicpages/ui/run/<templateCode>?root=<technicalRoot>&param=value
 ```
 
 Все маршруты находятся под `/cmdbuild`, поэтому браузер автоматически отправляет `HttpOnly` cookie CMDBuild. JavaScript не читает и не пересылает `CMDBuild-Authorization`; backend получает cookie на same-origin маршруте и сам вызывает CMDBuild REST с серверным заголовком `CMDBuild-Authorization`.
@@ -36,7 +36,7 @@ Bundled nginx передает `Host`, `X-Forwarded-Host` и `X-Forwarded-Proto`
 </session-config>
 ```
 
-Значение указывается в минутах. Это не TTL runtime-кэша шаблона: cookie может оставаться в браузере, но backend все равно проверяет `/sessions/current`, и после истечения CMDBuild-сессии пользователь должен авторизоваться заново.
+Значение указывается в минутах. Это не TTL runtime-кэша шаблона: cookie может оставаться в браузере, но для защищённых запросов backend проверяет `/sessions/current`, и после истечения CMDBuild-сессии пользователь должен авторизоваться заново.
 
 Компоненты разработки:
 
@@ -315,33 +315,39 @@ ResultSchemaJson  дополнительная схема результата
 Runtime URL:
 
 ```text
-http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/run/<templateCode>?param=value
+http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/run/<templateCode>?root=<technicalRoot>&param=value
 ```
 
-Runtime вызывает read-only endpoint:
+Прямой read-only endpoint требует действительную CMDBuild-сессию, но не CSRF:
 
 ```text
-GET /cmdbuild/custom-api/templates/<templateCode>/run?param=value
+GET /cmdbuild/custom-api/templates/<templateCode>/run?root=<technicalRoot>&param=value
 ```
 
-Для dynamic шаблонов выполнение идет под правами текущего пользователя CMDBuild. Для static snapshot шаблонов Runtime читает опубликованный результат из Redis; права зрителя на исходные CMDBuild-объекты не проверяются, поэтому Designer требует явного подтверждения режима публикации.
+`?root=<technicalRoot>` используется на `/cmdbuild/dynamicpages/ui/run/<code>`, `GET` и `POST /cmdbuild/custom-api/templates/<code>/run`, `POST /cmdbuild/custom-api/templates/<code>/publish` и `GET /cmdbuild/custom-api/public-snapshots/<code>/run`. Только если `root` отсутствует, применяется `CMDBDYNAMICPAGES_ROOT` или `Cst_QueryTool`, если переменная не задана. Пустое, недопустимое или повторное значение даёт `400`. `root` зарезервирован для маршрута: это не вход `spec.params` или JSON `params`, и в хеш бизнес-параметров он не входит.
 
-Сохранение шаблона в режиме `dynamicUser` не публикует данные: URL запуска остается авторизованным runtime и требует сессию с правами на используемые классы и атрибуты. Кнопка публикации снимка доступна только после выбора и сохранения `staticSnapshot`.
+Для HTML, JSON и D2 ссылка просмотра сначала ищет явно опубликованный снимок по техническому root, коду шаблона и бизнес-параметрам. При совпадении CMDBuild не вызывается, независимо от того, отсутствует cookie, действительна или истекла. При отсутствии снимка запрос с cookie переходит на защищённое выполнение с проверкой сессии и прав. При отсутствии и снимка, и cookie шаблон не выполняется. После защищённого `403` повторного поиска снимка нет. Ошибка поиска возвращает HTTP `503` с `reason=snapshot_storage_unavailable` без перехода на защищённый путь.
+
+Отдельный `GET /cmdbuild/custom-api/public-snapshots/<code>/run` остаётся публичным: он читает только сохранённые снимки и не выполняет шаблон.
+
+Сохранение `dynamicUser` не публикует данные. Выберите `staticSnapshot`, подтвердите предупреждение, сохраните и опубликуйте снимок, затем скопируйте ссылку из дизайнера. Ссылки `exact` сохраняют типы в `snapshotParams`. Ключ использует технический класс и код шаблона; старые снимки нужно переопубликовать. Отзыв должен быть подтверждён Redis до записи в CMDB. См. [восстановление снимков](docs/runbook.ru.md#static-snapshot-отсутствует-или-недоступен).
 
 Чтобы получить те же итоговые таблицы как `application/json`, добавьте системный параметр `json=true`:
 
 ```text
-http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/run/<templateCode>?param=value&json=true
+http://127.0.0.1:8093/cmdbuild/dynamicpages/ui/run/<templateCode>?root=<technicalRoot>&param=value&json=true
 ```
 
 `json` зарезервирован для режима вывода runtime и не объявляется во входных переменных шаблона. Права, кэш, static snapshot и cooldown refresh работают так же, как для HTML runtime view.
-Если по запросу нет данных в рамках прав текущего пользователя CMDBuild, JSON runtime возвращает HTTP `200`, `success: true`, пустые `tables[].rows` и настроенный `emptyText`. Если используемый шаблоном класс или атрибут возвращает из CMDBuild `401/403`, JSON runtime возвращает HTTP `403`, `success: false`, `permissionDenied: true` и настроенный `permissionDeniedText`; частичный результат по остальным выборкам не отдается. Текущее поведение зависит от того, что CMDBuild явно показывает запрет как `401/403`: если отсутствие прав маскируется как `404`, ответ может быть общей ошибкой выполнения, а выбор суперкласса при доступности только части наследников может вернуть только читаемое подмножество.
+На защищённом пути пустой результат при разрешённом доступе возвращает HTTP `200`, `success: true`, пустые `tables[].rows` и настроенный `emptyText`. Runtime JSON возвращает `401` (`cmdbuild_session_invalid`) для недействительной или истёкшей сессии, `403` (`technical_schema_access_denied`) при отказе в доступе к технической схеме и `403` (`data_access_denied`) при явном отказе чтения бизнес-данных. Частичный результат не возвращается. Для поиска ошибки в структурированных логах используйте заголовок ответа `X-Request-ID`. Если CMDBuild маскирует отказ как `404`, возможна общая ошибка выполнения.
 
 Runtime ссылки в ячейках строятся только из итоговых данных, metadata ячейки и входных параметров. Небезопасные URL-схемы `javascript:`, `data:` и `vbscript:` блокируются; в этом случае значение выводится обычным текстом.
 
 ## Диаграммы и assistant
 
 Runtime может возвращать не только таблицы, но и статические диаграммы в `result.diagrams`. Первый поддержанный тип - `topology`: он берет узлы и связи из уже подготовленных DSL aliases и рендерит один и тот же результат как SVG в HTML runtime и как `diagrams[]` в JSON runtime. Права CMDBuild, runtime cache, static snapshot и JSON/HTML поведение остаются такими же, как у таблиц.
+
+Параметры `d2=true&diagram=<name>` в ссылке просмотра скачивают D2 source выбранного результата как `text/vnd.d2`. Публичный снимок отдаёт исходник только при явном `publish.publicD2Source=true` на момент публикации. Прямое авторизованное скачивание через `/templates/<code>/run` не меняется.
 
 В Designer раздел `Visualization` имеет переключатель вывода: `Tables`, `Diagrams` или `Both`. Блок таблиц остается прежним для table-only шаблонов; редактор диаграмм появляется только для diagram-capable вывода и сохраняет настройки в `result.diagrams[]`.
 
@@ -373,9 +379,11 @@ Designer показывает TTL в часах. Значение по умол�
 - `privateUser` - изоляция кэша по пользователю/сессии.
 - `disabled` - кэш runtime результата выключен.
 
+Если probe не подтвердил право использовать кэш или не завершился полностью, runtime не читает и не пишет кэш. Он читает данные напрямую под текущей сессией с теми же лимитами выполнения. При успехе ответ содержит `cache.status=bypass` и `cache.reason=access_probe_unconfirmed`.
+
 Системный cooldown ручного refresh хранится в `Cst_QueryToolConfig.RuntimeConfigJson.runtimeCache.refreshCooldownSec`. В Runtime cache UI компактный: в header таблицы название остается слева, а поиск и иконка `⟳` прижаты справа на том же уровне; подробности кэша показываются в tooltip по hover/focus.
 
-Preview в Designer отделен от кэша сохраненного runtime результата: `Визуализировать в редакторе` вызывает `/draft/preview` по текущему черновику и не читает final runtime cache. В разделе `Прогон` также есть `Обновить кэш и показать`: это `POST run` сохраненного шаблона с `forceRefresh=true`, он перестраивает runtime cache без пользовательского cooldown и требует CSRF, поэтому iframe/read-only `GET run` не может обходить таймер.
+Preview в Designer отделён от кэша сохранённого runtime результата: `Визуализировать в редакторе` вызывает `/draft/preview` по текущему черновику и не читает кэш результатов. `Обновить кэш и показать` вызывает `POST run` сохранённого шаблона с `forceRefresh=true`: он запрашивает обновление без пользовательского cooldown, только если проверка подтвердила возможность использовать кэш. Запрос требует CSRF; iframe/read-only `GET run` не может обходить таймер.
 
 ## Техническая схема CMDBuild
 
@@ -399,7 +407,7 @@ Root относится только к техническим классам п
 
 - Нет generic REST proxy к CMDBuild.
 - State-changing API сравнивает `Origin`/`Referer` с configured `CMDP_PUBLIC_ORIGIN` и требует `X-CMDBDynamicPages-CSRF`.
-- Runtime iframe использует read-only `GET run`, поэтому CSRF token ему не нужен.
+- Ссылка просмотра и прямой read-only `GET /templates/<code>/run` не требуют CSRF; для прямого `POST /templates/<code>/run` он обязателен.
 - Cookie и CMDBuild token не логируются.
 - Redis password хранится только как deployment secret.
 - Static snapshot режим требует явного предупреждения, потому что публикует результат из-под автора снимка.

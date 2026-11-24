@@ -265,17 +265,32 @@ Check `NODE_ENV=production`, `CMDBDYNAMICPAGES_CSRF_SECRET`, and `CMDP_PUBLIC_OR
 
 ### Runtime iframe shows login or no data
 
-Verify same-origin access through nginx/ingress, the CMDBuild session cookie, template read grants, and business-data read permissions. Dynamic runtime pages require the current CMDBuild session cookie. Static snapshots require Redis snapshot presence.
+Check same-origin access through nginx/ingress and the `?root=<technicalRoot>` in the viewer URL. Add `json=true` to the viewer URL to inspect the result using the same selection as HTML and D2. A matching published snapshot is served without contacting CMDBuild even if the cookie is absent or expired. Only a miss reaches the protected path: `401 cmdbuild_session_invalid` means re-authenticate, `403 technical_schema_access_denied` means check read grants on the selected technical schema, and `403 data_access_denied` means check read grants on the business data. A protected `403` does not trigger another snapshot lookup. Use the `X-Request-ID` response header to find the corresponding structured logs.
 
-### Static snapshot is missing
+### Static snapshot is missing or unavailable
 
-If runtime shows `Страница отсутствует для загрузки`, republish the static snapshot from an editor/admin session. Confirm Redis persistence and `CMDBDYNAMIC_REDIS_REQUIRED=true` for production.
+Check `GET /cmdbuild/custom-api/public-snapshots/<code>/run` with the same `root`, code, and parameter query as the viewer URL. Exact links use `snapshotParams`, a URL-encoded JSON array of typed name/value pairs, e.g. `[["enabled",false],["site",42]]`. Copy the URL from Designer; do not convert these values to strings. The public API returns `snapshotFound=false` when no published snapshot matches.
+
+Version 3 keys use the resolved technical template class, Code, and a generation check. Old snapshots are not migrated: republish approved reports explicitly. Use one writing BFF per contour and configure Redis durability for acknowledged writes (AOF with `appendfsync always` or equivalent), without stale replica reads. After restoring an older Redis backup, set a fresh `CMDBDYNAMIC_REDIS_KEY_PREFIX` before reopening public routes and republish only the required reports. Keep public routes closed on rollback unless older snapshot keys have been removed from that deployment's namespace.
+
+`503 snapshot_revocation_unavailable` means the BFF did not start the CMDB write. `409 snapshot_revocation_pending` or `snapshotRevocationPending: true` means publication remains closed. Stop writes, find `snapshot.revocation_started`/`snapshot.revocation_pending` by request ID, and reconcile the actual CMDB card (including both codes for a rename) under an editor/admin session. With the configured Redis connection, inspect the logged state keys with `GET`: all affected keys must hold the same `pending:<uuid>`. Atomically compare each key to that exact marker and change all of them to `ready:<same-uuid>` using Redis `WATCH`/`MULTI`/`EXEC`; abort if any key differs. Do not restore a prior generation or copy cached payloads. Resume writes and explicitly republish only after verifying the saved CMDB version.
+
+If the viewer URL or public snapshot API returns HTTP `503` with `reason=snapshot_storage_unavailable`, check `/health/redis` and structured logs using `X-Request-ID`. A lookup error is not a miss and does not invoke the protected path. If the snapshot is found but `d2=true` returns `403`, check whether the snapshot was published with `publish.publicD2Source=true`.
 
 ### Cache does not refresh
 
 Check template cache settings, `RuntimeConfigJson.runtimeCache.refreshCooldownSec`, runtime response `cache.refreshAllowedAt`, and whether the request used read-only `GET run` or CSRF-protected `POST run` with `forceRefresh=true`.
 
+Successful `cache.status=bypass` with `cache.reason=access_probe_unconfirmed` means the access probe did not confirm cache eligibility. The result was read under the current session with the same limits, without reading or populating the result cache. Forced refresh does not override this decision.
+
 ### Designer cannot save templates
+
+On `409 template_version_conflict`, the stored revision no longer matches the
+editor's base revision. Another tab, a prior save, or another editor may have
+changed it. Designer keeps the draft and does not retry the write or publish
+it. Compare with the latest saved template before saving again. Use the request
+ID, write phase, and the two revision hashes from technical diagnostics to
+correlate concurrent requests. A publish conflict never writes an older snapshot.
 
 Check CMDBuild CRUD grants on the technical classes, same-origin headers, `X-CMDBDynamicPages-CSRF`, and `Content-Type: application/json`.
 

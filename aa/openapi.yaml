@@ -732,7 +732,9 @@ paths:
         permission и является единственной update-операцией, записывающей версию
         CMDB template. Хранилище принимает неполный `spec.authoring`; runtime и
         preview проходят строгую execution-валидацию. Runtime cache и static
-        snapshots инвалидируются только при изменении executable Spec hash.
+        snapshots инвалидируются при изменении executable Spec hash, кода или
+        деактивации. Если изменение отзывает публичный снимок, отзыв в Redis
+        подтверждается до записи в CMDB.
         При наличии transferReplace применяется отдельная ветка: проверяются
         identity, revision и права назначения, повторно валидируется итоговый
         нормализованный spec, затем отправляется частичный PUT без Code, Active и Owner.
@@ -786,6 +788,8 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/TemplateTransferIssue"
+        "503":
+          $ref: "#/components/responses/SnapshotRevocationUnavailable"
     delete:
       x-flow-id: OAPI24
       tags: [templates]
@@ -796,6 +800,10 @@ paths:
       responses:
         "200":
           description: Шаблон удалён
+        "403":
+          description: Не подтверждено право удаления шаблона или не пройдена CSRF-проверка
+        "503":
+          $ref: "#/components/responses/SnapshotRevocationUnavailable"
   /cmdbuild/custom-api/templates/{code}/versions:
     parameters:
       - $ref: "#/components/parameters/TemplateCode"
@@ -837,12 +845,26 @@ paths:
   /cmdbuild/custom-api/templates/{code}/run:
     parameters:
       - $ref: "#/components/parameters/TemplateCode"
+      - $ref: "#/components/parameters/RuntimeRoot"
     get:
       x-flow-id: OAPI28
       tags: [runtime]
       summary: Выполнение шаблона только для чтения
-      description: Используется Runtime UI/iframe; CSRF не требуется. Выполнение не сохраняется в технических классах CMDBuild; события проходят через стандартное логирование backend. Пустые результаты при разрешённом доступе возвращаются как HTTP 200 с пустыми строками и `emptyText`. Явный ответ CMDBuild 401/403 для класса или атрибута, используемого шаблоном, возвращается как HTTP 403 с `permissionDenied=true`; частичный результат нескольких выборок в этом случае не возвращается. Если CMDBuild маскирует отказ в доступе ответом 404, текущая реализация может классифицировать его как общую ошибку выполнения.
+      description: >
+        Прямой вызов требует действительную сессию CMDBuild, CSRF не требуется.
+        Динамический шаблон выполняется под текущей сессией.
+        Если проверка доступа не подтвердила возможность использовать кэш или
+        не завершилась полностью, кэш результата не читается и не записывается.
+        Выполнение читает данные напрямую под той же сессией с теми же лимитами.
+        При успешном обходе кэша возвращаются cache.status=bypass и
+        cache.reason=access_probe_unconfirmed. Явный отказ при чтении данных
+        возвращается как 403 без частичных результатов. Если CMDBuild маскирует
+        отказ ответом 404, он может классифицироваться как общая ошибка выполнения.
+        Разрешённый пустой результат возвращается как 200 с пустыми строками
+        и emptyText. Для staticSnapshot читается только опубликованный снимок
+        выбранного root. События проходят через стандартное логирование backend.
       parameters:
+        - $ref: "#/components/parameters/RuntimeSnapshotParams"
         - name: refresh
           in: query
           schema:
@@ -861,22 +883,23 @@ paths:
             enum: ["true", "1", "yes"]
       responses:
         "200":
-          description: Результат выполнения
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/RuntimeJsonResult"
+          $ref: "#/components/responses/RuntimeRunResult"
+        "400":
+          description: Недопустимый root, параметры или определение шаблона
+        "401":
+          $ref: "#/components/responses/RuntimeSessionRequired"
         "403":
-          description: Недостаточно прав доступа
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/RuntimePermissionDenied"
+          $ref: "#/components/responses/RuntimeAccessDenied"
+        "404":
+          description: Шаблон не найден в выбранном root
     post:
       x-flow-id: OAPI29
       tags: [runtime]
       summary: Прямое выполнение шаблона
-      description: POST из Designer/API может передать `forceRefresh` для перестроения кэша выполнения без пользовательского интервала ожидания между обновлениями. GET выполнения не допускает принудительное обновление.
+      description: >
+        Требует действительную сессию CMDBuild и CSRF. Правила доступа к данным
+        и обхода кэша совпадают с GET. forceRefresh снимает интервал ожидания,
+        но не позволяет читать или писать кэш без подтверждения проверки доступа.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -890,38 +913,122 @@ paths:
         $ref: "#/components/requestBodies/RunParams"
       responses:
         "200":
-          description: Результат выполнения
+          $ref: "#/components/responses/RuntimeRunResult"
+        "400":
+          description: Недопустимый root, параметры или определение шаблона
+        "401":
+          $ref: "#/components/responses/RuntimeSessionRequired"
+        "403":
+          $ref: "#/components/responses/RuntimeAccessDenied"
+        "404":
+          description: Шаблон не найден в выбранном root
   /cmdbuild/custom-api/templates/{code}/publish:
     parameters:
       - $ref: "#/components/parameters/TemplateCode"
+      - $ref: "#/components/parameters/RuntimeRoot"
     post:
       x-flow-id: OAPI30
       tags: [runtime]
       summary: Опубликовать статический снимок в Redis
+      description: >
+        Требует действительную сессию издателя, право обновления шаблона,
+        сохранённый режим staticSnapshot с подтверждённым предупреждением и CSRF.
+        Данные читаются под сессией издателя; при отказе чтения частичный снимок
+        не публикуется. Ключ снимка включает технический класс шаблона и Code.
+        Сохранённая версия и поколение отзыва проверяются перед вычислением и записью.
+        Если после начала выполнения шаблон изменили или удалили, снимок не записывается.
+        Снимки со старым ключом требуется переопубликовать.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
       requestBody:
-        $ref: "#/components/requestBodies/RunParams"
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [savedSpecHash]
+              properties:
+                savedSpecHash:
+                  type: string
+                  pattern: "^[0-9a-fA-F]{64}$"
+                  description: Хеш утверждённой версии из ответа на сохранение.
+                params:
+                  type: object
+                  additionalProperties: true
       responses:
         "200":
           description: Снимок опубликован
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+        "400":
+          description: Недопустимый root, параметры или настройки публикации
+        "401":
+          description: Cookie издателя отсутствует
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuntimeSessionError"
+        "403":
+          $ref: "#/components/responses/RuntimeAccessDenied"
+        "409":
+          description: Сохранённая версия изменилась или отзыв прежней публикации требует сверки
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/TemplateVersionConflict"
+                  - type: object
+                    required: [reason, message]
+                    properties:
+                      reason: { type: string, enum: [snapshot_revocation_pending] }
+                      message: { type: string }
+        "503":
+          $ref: "#/components/responses/RuntimeSnapshotStorageUnavailable"
   /cmdbuild/custom-api/public-snapshots/{code}/run:
     parameters:
       - $ref: "#/components/parameters/TemplateCode"
+      - $ref: "#/components/parameters/RuntimeRoot"
     get:
       x-flow-id: OAPI31
       tags: [runtime]
       security: []
       summary: Получить публичный статический снимок
-      description: Публичный доступ разрешён только для явно опубликованного статического снимка. Читает сохранённый снимок и никогда не выполняет запрос CMDBuild от имени просматривающего пользователя.
+      description: >
+        Читает явно опубликованный статический снимок по root, коду и
+        бизнес-параметрам, независимо от cookie и без вызова CMDBuild.
+        При отсутствии снимка JSON содержит snapshotFound=false.
+        Для выдачи D2 требуется явный publish.publicD2Source=true в снимке.
+        Используется текущий ключ с техническим классом и поколением отзыва.
+        Снимки со старыми ключами не читаются. Ответы не кэшируются по HTTP.
+      parameters:
+        - $ref: "#/components/parameters/RuntimeD2"
+        - $ref: "#/components/parameters/RuntimeD2Diagram"
+        - $ref: "#/components/parameters/RuntimeSnapshotParams"
       responses:
         "200":
-          description: Результат снимка либо ответ об отсутствии снимка
+          description: Снимок или признак его отсутствия в JSON либо D2 source
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/RuntimeJsonResult"
+            text/vnd.d2:
+              schema: { type: string }
+        "400":
+          description: Недопустимый root, код или формат snapshotParams
+        "403":
+          description: Публичный снимок не разрешает скачивание D2
+        "404":
+          description: Запрошенный D2 source недоступен
+        "503":
+          $ref: "#/components/responses/RuntimeSnapshotStorageUnavailable"
   /cmdbuild/custom-api/draft/validate:
     post:
       x-flow-id: OAPI32
@@ -1727,39 +1834,68 @@ paths:
     get:
       x-flow-id: OAPI47
       tags: [runtime]
-      summary: Открыть runtime оболочку либо получить JSON результата
+      summary: Открыть runtime оболочку, получить JSON результата или скачать D2
       security:
         - {}
         - cmdbuildCookie: []
       description: >
-        Без cookie HTML оболочка публична; её получение не означает доступность
-        данных. При json=true без cookie делегирует public-snapshots/{code}/run,
-        с валидной cookie делегирует templates/{code}/run. Невалидная переданная
-        cookie даёт 401, без fallback на публичный режим. JSON статусы определяет
-        целевой обработчик, query передаётся ему без изменений.
+        Для HTML, JSON и D2 сначала ищется явно опубликованный снимок по root,
+        коду шаблона и бизнес-параметрам: сначала точное совпадение, затем снимок
+        с paramsMode=ignore для того же root и кода. Наличие и действительность
+        cookie на выбор снимка не влияют. При совпадении CMDBuild не вызывается;
+        выдача D2 разрешена только с явным publish.publicD2Source=true в снимке.
+        При отсутствии снимка запрос с cookie переходит на защищённый путь
+        с обычной проверкой сессии и прав. Без cookie остаётся публичный промах
+        (snapshotFound=false для JSON), без выполнения шаблона.
+        После 403 защищённого пути повторного
+        поиска снимка нет. Ошибка поиска снимка даёт 503 с причиной
+        snapshot_storage_unavailable без перехода на защищённый путь.
+        Снимки со старым форматом ключа нужно переопубликовать; такой ключ не читается.
+        HTTP-статус HTML оболочки не заменяет статус отдельного запроса данных.
       parameters:
         - $ref: "#/components/parameters/TemplateCode"
+        - $ref: "#/components/parameters/RuntimeRoot"
+        - $ref: "#/components/parameters/RuntimeSnapshotParams"
         - name: json
           in: query
           schema: { type: boolean, default: false }
+        - $ref: "#/components/parameters/RuntimeD2"
+        - $ref: "#/components/parameters/RuntimeD2Diagram"
       responses:
         "200":
-          description: HTML оболочка либо JSON результат целевого run
+          description: HTML оболочка, JSON результат или D2 source выбранного результата
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
           content:
             text/html:
               schema: { type: string }
             application/json:
-              schema: { type: object, additionalProperties: true }
+              schema:
+                $ref: "#/components/schemas/RuntimeJsonResult"
+            text/vnd.d2:
+              schema: { type: string }
         "400":
-          description: Недопустимый template code или параметры run
+          description: Недопустимый root, код шаблона или параметры run
         "401":
-          $ref: "#/components/responses/UiSessionRequired"
+          $ref: "#/components/responses/RuntimeSessionRequired"
         "403":
-          description: JSON run запрещён правами или настройками публикации
+          description: >
+            Защищённый путь отказал в доступе к технической схеме или бизнес-данным,
+            либо выбранный публичный снимок не разрешает скачивание D2.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuntimePermissionDenied"
         "404":
-          description: Шаблон либо разрешённый публичный snapshot не найден
+          description: Не найден защищённый шаблон или D2 source выбранного результата
+        "503":
+          $ref: "#/components/responses/RuntimeSnapshotStorageUnavailable"
         default:
-          description: Ошибка делегированного JSON run; см. соответствующий API-контракт
+          description: Прочая ошибка выполнения; см. соответствующий API-контракт
   /cmdbuild/custom-api/assistant/diagnostics/status:
     get:
       x-flow-id: OAPI48
@@ -2214,7 +2350,68 @@ components:
       content:
         text/html:
           schema: { type: string }
+    RuntimeRunResult:
+      description: Результат выполнения либо состояние снимка; при отсутствии снимка snapshotFound=false.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RuntimeJsonResult"
+    SnapshotRevocationUnavailable:
+      description: Отзыв публикации не подтверждён, запись в CMDB не начата
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [success, code, message]
+            properties:
+              success: { type: boolean, enum: [false] }
+              code: { type: string, enum: [snapshot_revocation_unavailable] }
+              message: { type: string }
+    RuntimeSnapshotStorageUnavailable:
+      description: Ошибка поиска опубликованного снимка; защищённый путь не вызывается.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [success, reason]
+            properties:
+              success: { type: boolean, enum: [false] }
+              reason: { type: string, enum: [snapshot_storage_unavailable] }
+              message: { type: string }
+    RuntimeSessionRequired:
+      description: >
+        Cookie отсутствует либо сессия недействительна или истекла
+        (reason=cmdbuild_session_invalid для неподтверждённой сессии).
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RuntimeSessionError"
+    RuntimeAccessDenied:
+      description: >
+        Отказ в доступе к технической схеме (technical_schema_access_denied)
+        или при чтении бизнес-данных (data_access_denied), без частичных
+        результатов. POST также может быть отклонён проверкой same-origin/CSRF,
+        а публикация — из-за отсутствия права обновления шаблона.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RuntimePermissionDenied"
   headers:
+    RequestId:
+      description: Идентификатор запроса для поиска связанных событий в структурированных логах backend.
+      schema: { type: string }
     CmdpVersion:
       description: Версия приложения, встроенная в запущенный образ.
       schema:
@@ -2243,6 +2440,38 @@ components:
       in: header
       name: X-CMDBDynamicPages-CSRF
   parameters:
+    RuntimeSnapshotParams:
+      name: snapshotParams
+      in: query
+      required: false
+      description: JSON-массив пар имя/типизированное скалярное значение для exact. Нельзя смешивать с обычными бизнес-параметрами, повторять имя, передавать null или служебное имя.
+      schema:
+        type: string
+        example: '[["enabled",false],["site",42]]'
+    RuntimeRoot:
+      name: root
+      in: query
+      description: >
+        Технический root маршрута. Только если параметр отсутствует, сервер
+        использует CMDBDYNAMICPAGES_ROOT или Cst_QueryTool, если переменная не
+        задана. Пустое, недопустимое или повторное значение даёт HTTP 400
+        с reason=invalid_runtime_root, без перехода к значению по умолчанию.
+        root зарезервирован: не является бизнес-параметром шаблона и не входит
+        в хеш бизнес-параметров. Хранение снимков разделено по root.
+      schema:
+        type: string
+        pattern: "^[A-Za-z][A-Za-z0-9_]*$"
+        example: Cst_QueryTool
+    RuntimeD2:
+      name: d2
+      in: query
+      description: При d2=true скачать D2 source, если источник доступен для выбранного результата.
+      schema: { type: boolean, default: false }
+    RuntimeD2Diagram:
+      name: diagram
+      in: query
+      description: Селектор для d2=true; без селектора выбирается первая диаграмма с D2 source.
+      schema: { type: string }
     TemplateTransferRoot:
       name: root
       in: query
@@ -2317,6 +2546,7 @@ components:
             properties:
               params:
                 type: object
+                description: Бизнес-параметры; технический root передаётся только в query, не в params.
                 additionalProperties: true
               refresh:
                 type: boolean
@@ -2721,7 +2951,7 @@ components:
       additionalProperties: true
     RuntimeJsonResult:
       type: object
-      description: JSON-вывод выполнения при `json=true`. Успешный ответ может содержать пустые строки, если права текущего пользователя CMDBuild не позволяют видеть ни одного объекта.
+      description: JSON-результат выполнения. При json=true таблицы и диаграммы на верхнем уровне; обычный ответ API содержит result. Разрешённый пустой результат не является ошибкой доступа.
       properties:
         success:
           type: boolean
@@ -2730,6 +2960,10 @@ components:
           example: run
         snapshotFound:
           type: boolean
+        result:
+          type: object
+          description: Результат в обычном ответе API без json=true.
+          additionalProperties: true
         template:
           type: object
           properties:
@@ -2800,6 +3034,13 @@ components:
           type: object
           nullable: true
           additionalProperties: true
+          properties:
+            status:
+              type: string
+              description: bypass, если результат получен напрямую без чтения или записи кэша.
+            reason:
+              type: string
+              description: access_probe_unconfirmed при успешном прямом выполнении после неподтверждённой проверки доступа.
     RuntimeDiagram:
       type: object
       properties:
@@ -3292,19 +3533,30 @@ components:
             data:
               type: object
               additionalProperties: true
+    RuntimeSessionError:
+      type: object
+      required: [success, message]
+      properties:
+        success: { type: boolean, enum: [false] }
+        reason: { type: string, enum: [cmdbuild_session_invalid] }
+        message: { type: string }
+        cmdbuildStatus: { type: integer }
     RuntimePermissionDenied:
       type: object
-      description: Возвращается, когда CMDBuild запрещает доступ к классу или атрибуту, фактически используемому при выполнении шаблона, ответом 401/403. Endpoint в этом случае не возвращает частичные данные других выборок.
+      description: Ошибка доступа без частичного результата. Для same-origin/CSRF reason может отсутствовать.
+      required: [success, message]
       properties:
-        success:
-          type: boolean
-          example: false
+        success: { type: boolean, enum: [false] }
+        reason:
+          type: string
+          enum: [technical_schema_access_denied, data_access_denied, template_update_forbidden]
+        permissionDenied: { type: boolean, enum: [true] }
+        cmdbuildStatus: { type: integer }
+        root: { type: string }
+        className: { type: string }
         action:
           type: string
           example: run
-        permissionDenied:
-          type: boolean
-          example: true
         template:
           type: object
           properties:
@@ -3707,18 +3959,34 @@ components:
       allOf:
         - $ref: "#/components/schemas/ApiResponse"
         - type: object
+          required: [code, reason, message]
           properties:
+            code: { type: string, enum: [template_version_conflict] }
             reason:
               type: string
-              enum: [template_version_conflict]
+              enum: [template_version_conflict, publication_saved_spec_mismatch]
             message:
               type: string
+            requestId:
+              type: string
             expectedSpecHash:
-              type: string
+              type: [string, "null"]
             currentSpecHash:
-              type: string
+              type: [string, "null"]
+            diagnostics:
+              type: object
+              properties:
+                stage: { type: string }
+                cause: { type: string }
+                expectedSpecHash: { type: [string, "null"] }
+                currentSpecHash: { type: [string, "null"] }
             template:
-              $ref: "#/components/schemas/TemplateCard"
+              type: object
+              properties:
+                code: { type: string }
+                description: { type: string }
+                active: { type: [boolean, "null"] }
+                specHash: { type: string }
     DraftPayload:
       type: object
       required: [spec]
