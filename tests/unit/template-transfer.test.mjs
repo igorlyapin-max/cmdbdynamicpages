@@ -13,6 +13,28 @@ import {
 const options = { producerVersion: '00.00.00.18' };
 const invalid = { code: 'template_transfer_invalid' };
 
+test('portable dependencies include selector classes and resolve projected selector fields', () => {
+  const input = fixture();
+  const table = (name, selector) => ({ name, presentation: { largeTable: { mode: 'key', selector } } });
+  input.spec.steps.push({ type: 'enrichRows', as: 'projected', from: 'assets', columns: [{ path: 'Location', as: 'LocationKey' }] });
+  input.spec.result.tables = [
+    table('projected', { kind: 'class', source: 'Location', idField: '_id', labelField: 'DisplayLabel', matchField: 'LocationKey' }),
+    table('rooms', { kind: 'result', source: 'projected', idField: 'LocationKey', labelField: 'Code', matchField: 'Code' })
+  ];
+  const pkg = createTemplateTransferPackage(input, options);
+  const selector = (index, key) => `$.spec.result.tables[${index}].presentation.largeTable.selector.${key}`;
+  assert.ok(pkg.dependencies.classes.some((dep) => dep.name === 'Location' && dep.path === selector(0, 'source')));
+  for (const [index, key, className, field] of [
+    [0, 'idField', 'Location', '_id'], [0, 'labelField', 'Location', 'DisplayLabel'],
+    [0, 'matchField', 'Asset', 'Location'], [1, 'idField', 'Asset', 'Location'],
+    [1, 'labelField', 'Asset', 'Code'], [1, 'matchField', 'Room', 'Code']
+  ]) assert.ok(pkg.dependencies.directFields.some((dep) => dep.path === selector(index, key) && dep.className === className && dep.field === field), key);
+  assert.deepEqual(readTemplateTransferPackage(pkg).spec.result.tables, input.spec.result.tables);
+  const altered = structuredClone(pkg);
+  altered.dependencies.directFields = altered.dependencies.directFields.filter((dep) => dep.path !== selector(0, 'matchField'));
+  assert.throws(() => readTemplateTransferPackage(resign(altered)), invalid);
+});
+
 function fixture() {
   const checkpoint = {
     version: 1, proposalId: 'source-proposal', deterministicSpecHash: 'source-spec-hash',

@@ -9,6 +9,8 @@ const REQUIRED_TEST_IDS = [
   'd2-current-contract',
   'object-flow-recovery-extraction',
   'exact-snapshot-url',
+  'snapshot-refresh',
+  'large-report-tables',
   'build-identity'
 ];
 const TEST_NAME_PATTERN = `\\[required:(${REQUIRED_TEST_IDS.join('|')})\\]`;
@@ -100,6 +102,7 @@ function createMockCmdbuild() {
     UpdatedAt: '2026-01-01T00:00:00.000Z'
   }];
   const templateVersionCards = [];
+  let nextTemplateId = 1;
   templateCards.push({
     ...templateCards[0], _id: 'required-ui-exact-snapshot', Code: 'RequiredExactSnapshot', Description: 'Typed snapshot fixture',
     SpecJson: JSON.stringify({ version: 1, params: { site: { type: 'integer', default: 42 }, enabled: { type: 'boolean', default: false } },
@@ -163,8 +166,14 @@ function createMockCmdbuild() {
       sendJson(response, 200, { data: templateCards });
       return;
     }
+    if (url.pathname === '/cmdbuild/services/rest/v3/classes/Cst_QueryTemplate/cards' && request.method === 'POST') {
+      const card = { _id: 'required-ui-created-' + nextTemplateId++, ...await readJson(request) };
+      templateCards.push(card);
+      sendJson(response, 200, { data: card });
+      return;
+    }
     const templateCardMatch = url.pathname.match(/^\/cmdbuild\/services\/rest\/v3\/classes\/Cst_QueryTemplate\/cards\/([^/]+)$/);
-    if (templateCardMatch && (request.method === 'GET' || request.method === 'PUT')) {
+    if (templateCardMatch && ['GET', 'PUT', 'DELETE'].includes(request.method)) {
       const cardId = decodeURIComponent(templateCardMatch[1]);
       const cardIndex = templateCards.findIndex((card) => String(card._id) === cardId);
       if (cardIndex < 0) {
@@ -173,6 +182,11 @@ function createMockCmdbuild() {
       }
       if (request.method === 'PUT') {
         templateCards[cardIndex] = { ...templateCards[cardIndex], ...await readJson(request) };
+      }
+      if (request.method === 'DELETE') {
+        templateCards.splice(cardIndex, 1);
+        sendJson(response, 200, { data: true });
+        return;
       }
       sendJson(response, 200, { data: templateCards[cardIndex] });
       return;

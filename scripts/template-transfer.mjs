@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { normalizeLargeTablePresentation } from './report-table-pages.mjs';
 
 const FORMAT = 'cmdbdynamicpages.template';
 const TEMPLATE_KEYS = ['code', 'description', 'spec', 'paramsSchema', 'resultSchema'];
@@ -160,6 +161,49 @@ function portableTemplate(input, strict = false) {
   return result;
 }
 
+export function templateTransferTableSelectorBindings(spec) {
+  const tables = Array.isArray(spec.result?.tables) ? spec.result.tables : [];
+  return tables.flatMap((table, index) => {
+    const config = normalizeLargeTablePresentation(table?.presentation?.largeTable);
+    if (config?.mode !== 'key') return [];
+    const { kind, source, idField, labelField, matchField } = config.selector;
+    const path = `$.spec.result.tables[${index}].presentation.largeTable.selector`;
+    const options = kind === 'class' ? { className: source } : { alias: source };
+    return [{ path, kind, source, fields: [
+      { ...options, field: idField, path: `${path}.idField` },
+      { ...options, field: labelField, path: `${path}.labelField` },
+      { alias: table.name, field: matchField, path: `${path}.matchField` }
+    ] }];
+  });
+}
+
+// Resolve simple projections in the portable manifest. Target validation checks
+// the full raw DSL with the destination catalog instead of trusting this hint.
+function selectorFieldOrigin(steps, alias, field) {
+  const seen = new Set();
+  while (steps.has(alias) && !seen.has(alias)) {
+    seen.add(alias);
+    const step = steps.get(alias);
+    if (['selectCards', 'expandRelations', 'enrichRows'].includes(step.type)) {
+      const columns = step.columns || (step.type === 'enrichRows' ? step.fields : step.cardColumns || step.outputColumns);
+      const projected = Array.isArray(columns) && columns.find((item) => {
+        if (typeof item === 'string') return item.trim() === field;
+        const path = item?.path || item?.field || item?.column || item?.name || '';
+        return typeof item === 'object' && item && String(item.as || item.name || item.label || path).trim() === field;
+      });
+      if (projected && typeof projected === 'object') field = String(projected.path || projected.field || projected.column || projected.name || '').trim();
+      if (step.type !== 'enrichRows') {
+        const className = step.type === 'selectCards' ? step.className : step.targetClass;
+        if (!className || !field || step.from && field.startsWith(step.sourcePrefix ?? 'Source_') ||
+          step.type === 'expandRelations' && /^(Source(Class|Id|Code|Description)|Related(Class|Id|ReadStatus)|Domain|Relation(Id|Direction|SourceSide))$/.test(field)) return null;
+        return { className, field };
+      }
+    } else if (!['filterRows', 'semiJoinRows', 'intersectRows', 'differenceRows'].includes(step.type)) return null;
+    alias = step.from;
+  }
+  return null;
+}
+
 function manifest(input) {
   const spec = cloneJson(input);
   object(spec, '$.spec');
@@ -240,6 +284,20 @@ function manifest(input) {
       // Prompts, D2 text and business literals are not parsed or rewritten.
       if (!['default', 'defaultValue', 'value', 'values', 'const', 'enum'].includes(key)) {
         stack.push({ value: item, path: location, context: { className: key === 'right' ? rightClassName : className, rightClassName, lookupType, direct: ['left', 'right'].includes(key) ? false : direct } });
+      }
+    }
+  }
+  const selectors = templateTransferTableSelectorBindings(spec);
+  if (selectors.length) {
+    const steps = new Map((spec.steps || []).filter(Boolean).map((step) => [step.as, step]));
+    for (const selector of selectors) {
+      if (selector.kind === 'class') result.classes.push({ name: selector.source, path: `${selector.path}.source` });
+      else if (!steps.has(selector.source)) result.inspection.push({ path: `${selector.path}.source`, reason: 'Selector result is not available in source steps.' });
+      for (const binding of selector.fields) {
+        const origin = binding.className ? { className: binding.className, field: binding.field }
+          : selectorFieldOrigin(steps, binding.alias, binding.field);
+        if (origin) result.directFields.push({ ...origin, path: binding.path });
+        else result.inspection.push({ path: binding.path, reason: 'Selector field provenance requires target inspection.' });
       }
     }
   }

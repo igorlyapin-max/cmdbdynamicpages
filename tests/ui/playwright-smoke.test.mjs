@@ -5699,6 +5699,210 @@ test('[required:exact-snapshot-url] Designer links retain the published typed pa
   }
 });
 
+test('[required:snapshot-refresh] Static reports reread, refresh personally or replace the shared snapshot', {
+  skip: skipReason || (!useExactSnapshotFixture && process.env.CMDBDYNAMIC_E2E_WRITE !== '1' && 'Set CMDBDYNAMIC_E2E_WRITE=1 to use temporary templates.'),
+  timeout: 90_000
+}, async () => {
+  await withPage(async (page) => {
+    const api = `${proxyOrigin}/cmdbuild/custom-api`;
+    const sourceCode = 'RefreshSourceUi' + Date.now();
+    const reportCode = 'RefreshReportUi' + Date.now();
+    const created = [];
+    const emptySpec = { version: 1, steps: [], result: { tables: [] } };
+    const csrf = await page.request.get(api + '/csrf');
+    assert.equal(csrf.status(), 200);
+    const headers = { origin: proxyOrigin, 'x-cmdbdynamicpages-csrf': (await csrf.json()).token };
+    const publicUrl = `${proxyOrigin}/cmdbuild/dynamicpages/ui/run/${reportCode}`;
+    const anonymous = await page.context().browser().newContext();
+    const reader = await anonymous.newPage();
+    async function createTemplate(code, description, spec) {
+      const response = await page.request.post(api + '/templates', { headers, data: { code, description, active: true, spec } });
+      assert.equal(response.status(), 201, await response.text());
+      created.push(code);
+      return (await response.json()).template;
+    }
+    async function updateSource(source, description) {
+      const response = await page.request.put(api + '/templates/' + sourceCode, { headers,
+        data: { code: sourceCode, description, active: true, spec: emptySpec, expectedSpecHash: source.specHash } });
+      assert.equal(response.status(), 200, await response.text());
+      return (await response.json()).template;
+    }
+    const row = (tab, value) => tab.locator('#app [data-result-row]').getByText(value, { exact: true });
+    const action = (tab, name) => tab.locator('[data-action="snapshot-' + name + '"]');
+    const refreshRequest = (response) => response.request().method() === 'POST' && new URL(response.url()).pathname.endsWith('/refresh-snapshot');
+    try {
+      let source = await createTemplate(sourceCode, 'Original source value', emptySpec);
+      const reportSpec = {
+        version: 1,
+        steps: [{ type: 'selectCards', as: 'source', className: 'Cst_QueryTemplate', columns: ['Description'],
+          filters: [{ path: 'Code', op: 'equals', value: sourceCode }] }],
+        result: { tables: [{ name: 'source', columns: ['Description'] }] },
+        publish: { mode: 'staticSnapshot', warningAccepted: true, paramsMode: 'ignore' }
+      };
+      const report = await createTemplate(reportCode, 'Temporary snapshot refresh smoke', reportSpec);
+      const publish = async (savedSpecHash) => {
+        const response = await page.request.post(api + '/templates/' + reportCode + '/publish', { headers, data: { savedSpecHash } });
+        assert.equal(response.status(), 200, await response.text());
+      };
+      await publish(report.specHash);
+      await page.goto(publicUrl, { waitUntil: 'domcontentloaded' });
+      await row(page, 'Original source value').waitFor();
+      await action(page, 'refresh').waitFor();
+      await reader.goto(publicUrl, { waitUntil: 'domcontentloaded' });
+      await row(reader, 'Original source value').waitFor();
+      assert.equal(await action(reader, 'refresh').isVisible(), false);
+
+      source = await updateSource(source, 'New personal value');
+      const [personal] = await Promise.all([page.waitForResponse(refreshRequest), action(page, 'refresh').click()]);
+      assert.equal(personal.status(), 200, await personal.text());
+      assert.equal((await personal.json()).mode, 'personal');
+      await row(page, 'New personal value').waitFor();
+      await action(reader, 'reload').click();
+      await row(reader, 'Original source value').waitFor();
+      assert.equal(await row(reader, 'New personal value').count(), 0);
+
+      await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+      await page.locator(`[data-action="select-template"][data-code="${reportCode}"]`).click();
+      await page.locator('a[data-designer-section="publication"]').click();
+      await page.locator('#cmdp-publish-refresh-mode').selectOption('shared');
+      await page.locator('#cmdp-publish-shared-refresh-accepted').check();
+      const [saved] = await Promise.all([
+        page.waitForResponse((response) => response.request().method() === 'PUT' && new URL(response.url()).pathname.endsWith('/' + reportCode)),
+        page.locator('.designer-actionbar [data-action="save-template"]').click()
+      ]);
+      assert.equal(saved.status(), 200, await saved.text());
+      await publish((await saved.json()).template.specHash);
+      source = await updateSource(source, 'New shared value');
+      await page.goto(publicUrl, { waitUntil: 'domcontentloaded' });
+      await row(page, 'New personal value').waitFor();
+      page.once('dialog', (dialog) => dialog.accept());
+      const [shared] = await Promise.all([page.waitForResponse(refreshRequest), action(page, 'refresh').click()]);
+      assert.equal(shared.status(), 200, await shared.text());
+      assert.equal((await shared.json()).mode, 'shared');
+      await row(page, 'New shared value').waitFor();
+      await action(reader, 'reload').click();
+      await row(reader, 'New shared value').waitFor();
+
+      const route = '**/templates/' + reportCode + '/refresh-snapshot?*';
+      await page.route(route, (intercept) => intercept.fulfill({ status: 403, json: { reason: 'data_access_denied' } }));
+      page.once('dialog', (dialog) => dialog.accept());
+      await Promise.all([page.waitForResponse(refreshRequest), action(page, 'refresh').click()]);
+      await page.locator('[data-snapshot-status].snapshot-error').waitFor();
+      assert.equal(await row(page, 'New shared value').isVisible(), true);
+      await page.unroute(route);
+    } finally {
+      await anonymous.close();
+      for (const code of created.reverse()) {
+        const response = await page.request.delete(api + '/templates/' + code, { headers });
+        assert.equal(response.status(), 200, await response.text());
+      }
+    }
+  });
+});
+
+test('[required:large-report-tables] Viewer selects a key and lazily opens grouped rows in dynamic and static reports', {
+  skip: skipReason || (!useExactSnapshotFixture && process.env.CMDBDYNAMIC_E2E_WRITE !== '1' && 'Set CMDBDYNAMIC_E2E_WRITE=1 to use temporary templates.'),
+  timeout: 75_000
+}, async () => {
+  await withPage(async (page) => {
+    const api = proxyOrigin + '/cmdbuild/custom-api';
+    const source = 'LargeTableSource' + Date.now();
+    const code = 'LargeTableView' + Date.now();
+    const label = 'Choice ' + source;
+    const url = proxyOrigin + '/cmdbuild/dynamicpages/ui/run/' + code;
+    const created = [];
+    const csrf = await page.request.get(api + '/csrf');
+    assert.equal(csrf.status(), 200);
+    const headers = { origin: proxyOrigin, 'x-cmdbdynamicpages-csrf': (await csrf.json()).token };
+    async function create(codeValue, description, spec) {
+      const response = await page.request.post(api + '/templates', { headers,
+        data: { code: codeValue, description, active: true, spec } });
+      assert.equal(response.status(), 201, await response.text());
+      created.push(codeValue);
+      return (await response.json()).template;
+    }
+    const spec = {
+      params: { selected: { type: 'string', default: source } },
+      version: 1, steps: [
+        { type: 'selectCards', as: 'reportRows', className: 'Cst_QueryTemplate', filters: [
+          { path: 'Code', op: 'equals', valueExpression: '${param.selected}' }
+        ] },
+        { type: 'enrichRows', from: 'reportRows', as: 'reportRowsView', purpose: 'viewComposer',
+          columns: [{ path: 'Code', as: 'Code' }, { path: 'Description', as: 'Description' }] }
+      ],
+      result: { presentation: { filters: false, sortable: false }, tables: [{ name: 'reportRowsView', columns: ['Code', 'Description'], presentation: { largeTable: {
+        mode: 'key', selector: { kind: 'class', source: 'Cst_QueryTemplate', idField: 'Code', labelField: 'Description', matchField: 'Code' },
+        groupKeys: ['Code'], reductions: [{ column: 'Description', kind: 'count' }]
+      } } }] }
+    };
+    const anonymous = await page.context().browser().newContext();
+    const reader = await anonymous.newPage();
+    try {
+      await create(source, label, { version: 1, steps: [], result: { tables: [] } });
+      await create(code, 'Temporary large report', spec);
+      await page.goto(proxyOrigin + '/cmdbuild/dynamicpages/ui/designer', { waitUntil: 'domcontentloaded' });
+      await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
+      await page.locator('a[data-designer-section="final-view"]').click();
+      assert.equal(await page.locator('#cmdp-view-source').inputValue(), 'reportRows');
+      await page.locator('[data-view-large-field="parameter"]').selectOption('selected');
+      const [savedBinding] = await Promise.all([
+        page.waitForResponse((response) => response.request().method() === 'PUT' && new URL(response.url()).pathname.endsWith('/' + code)),
+        page.locator('.designer-actionbar [data-action="save-template"]').click()
+      ]);
+      assert.equal(savedBinding.status(), 200, await savedBinding.text());
+      const dynamic = (await savedBinding.json()).template;
+      assert.equal(dynamic.spec.result.tables[0].presentation.largeTable.selector.parameter, 'selected');
+      await verify(page, 'templates');
+      const saved = await page.request.put(api + '/templates/' + code, { headers,
+        data: { code, description: 'Temporary large report', active: true, expectedSpecHash: dynamic.specHash,
+          spec: { ...dynamic.spec, publish: { mode: 'staticSnapshot', paramsMode: 'ignore', warningAccepted: true } } } });
+      assert.equal(saved.status(), 200, await saved.text());
+      const published = await page.request.post(api + '/templates/' + code + '/publish', { headers,
+        data: { savedSpecHash: (await saved.json()).template.specHash } });
+      assert.equal(published.status(), 200, await published.text());
+      await verify(reader, 'public-snapshots');
+    } finally {
+      await anonymous.close();
+      for (const name of created.reverse()) {
+        const response = await page.request.delete(api + '/templates/' + name, { headers });
+        assert.equal(response.status(), 200, await response.text());
+      }
+    }
+    async function verify(tab, collection) {
+      const requests = [];
+      const onRequest = (request) => {
+        const endpoint = new URL(request.url());
+        if (endpoint.pathname.endsWith('/table-page')) requests.push(endpoint);
+      };
+      tab.on('request', onRequest);
+      try {
+        await tab.goto(url, { waitUntil: 'domcontentloaded' });
+        const table = tab.locator('[data-large-table]');
+        const picker = table.locator('[data-large-action="picker"]');
+        await picker.waitFor();
+        assert.equal(await table.locator('[data-result-row]').count(), 0);
+        assert.equal(requests.length, 0);
+        await picker.click();
+        await table.locator('[data-large-option-search]').fill(source);
+        await table.locator('[data-large-action="option"]').filter({ hasText: label }).click();
+        const mainRow = table.locator('[data-large-rows] > table > tbody > tr[data-result-row]');
+        await mainRow.getByText(source, { exact: true }).waitFor();
+        assert.equal(await mainRow.nth(0).locator('td').nth(1).textContent(), '1');
+        assert.equal(await table.locator('[data-large-row-search]').count(), 0);
+        assert.equal(await table.locator('[data-large-action="sort"]').count(), 0);
+        assert.equal(await table.locator('[data-large-detail-content]').count(), 0);
+        await table.locator('[data-large-action="details"]').click();
+        await table.locator('[data-large-detail-content]').getByText(label, { exact: true }).waitFor();
+        assert.ok(requests.every((endpoint) => endpoint.pathname.includes('/' + collection + '/')));
+        assert.deepEqual([...new Set(requests.map((endpoint) => JSON.parse(endpoint.searchParams.get('cmdpTable')).op))],
+          ['options', 'rows', 'details']);
+      } finally {
+        tab.off('request', onRequest);
+      }
+    }
+  });
+});
+
 test('Designer serializes Save and Publish, reconciles the saved hash and preserves newer draft edits', {
   skip: skipReason || (process.env.CMDBDYNAMIC_E2E_WRITE !== '1' && 'Set CMDBDYNAMIC_E2E_WRITE=1 to use a temporary template.'),
   timeout: 90_000

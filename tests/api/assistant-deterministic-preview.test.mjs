@@ -7578,6 +7578,7 @@ async function startSnapshotRedisFixture(t) {
           const writeSnapshot = key.includes('SADD');
           if (!writeSnapshot && faults.finalize) return socket.end('-ERR cannot finalize revocation\r\n');
           if ((writeSnapshot ? keys.slice(0, 1) : keys).some((item) => values.get(item) !== expected)) return socket.end(resp(0));
+          if (writeSnapshot && next[2] !== undefined && values.get(keys[1]) !== next[2]) return socket.end(resp(0));
           if (writeSnapshot) { values.set(keys[1], next[0]); add(keys[2], next[1]); }
           else keys.forEach((item, index) => next[index] === '-' ? values.delete(item) : values.set(item, next[index]));
           return socket.end(resp(1));
@@ -7807,6 +7808,630 @@ test('template publish executes static snapshot spec and returns published cache
   assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/routerG/cards')), true);
   assert.equal(mock.requests.some((item) => item.pathname.endsWith('/classes/ARM/cards')), true);
   assert.equal(backend.exitCode, null);
+});
+
+test('large-table publication accepts exactly 10000 projected rows and retains the snapshot on overflow', async (t) => {
+  const code = 'ExactLargeTableBudget';
+  const spec = {
+    version: 1,
+    steps: [
+      { type: 'selectCards', as: 'cards', className: 'ARM' },
+      { type: 'enrichRows', as: 'view', from: 'cards', purpose: 'viewComposer', columns: [{ path: 'Code', as: 'Code' }] }
+    ],
+    result: { tables: [{ name: 'view', columns: ['Code'], published: true, presentation: { largeTable: { mode: 'all' } } }] },
+    publish: { ...publishSpec().publish, refreshMode: 'shared', sharedRefreshAccepted: true }
+  };
+  let total = 10000;
+  const mock = await startMockCmdbuild(t, {
+    templateCodeFilter: true,
+    templates: [templateCard(code, spec)],
+    responseOverride(url) {
+      if (url.pathname.endsWith('/classes/ARM/cards')) {
+        const offset = Number(url.searchParams.get('start') || 0);
+        const limit = Number(url.searchParams.get('limit') || 1000);
+        const data = Array.from({ length: Math.max(0, Math.min(limit, total - offset)) },
+          (_, index) => ({ _id: offset + index + 1, Code: 'R' + (offset + index) }));
+        return { statusCode: 200, body: { data, meta: { total } } };
+      }
+      if (/\/classes\/ARM\/cards\/[^/]+$/.test(url.pathname)) {
+        return { statusCode: 503, body: { message: 'The materialized projection must not reload each card.' } };
+      }
+    }
+  });
+  const port = await freePort();
+  await startBackend(t, port, mock.origin);
+  const origin = `http://127.0.0.1:${port}`;
+  const api = origin + '/cmdbuild/custom-api';
+  const headers = { cookie: testCmdbuildAuthorizationCookie('editor'), origin };
+  headers['x-cmdbdynamicpages-csrf'] = (await requestJson('GET', api + '/csrf', undefined, headers)).json.token;
+  const publish = await requestJson('POST', `${api}/templates/${code}/publish`, { savedSpecHash: hashJson(spec) }, headers);
+  assert.equal(publish.statusCode, 200, publish.body.slice(0, 2000));
+  const publicPath = `${api}/public-snapshots/${code}`;
+  const opened = await requestJson('GET', publicPath + '/run?cmdpTableShell=1');
+  const revision = opened.json.tableView.snapshotRevision;
+  const pagePath = publicPath + '/table-page?cmdpTable=' + encodeURIComponent(JSON.stringify({
+    table: 'view', op: 'rows', offset: 9999, snapshotRevision: revision
+  }));
+  const page = await requestJson('GET', pagePath);
+  assert.equal(page.statusCode, 200);
+  assert.equal(page.json.total, 10000);
+  assert.deepEqual(page.json.table.rows, [{ Code: 'R9999' }]);
+  assert.equal(page.json.incomplete, false);
+  total += 1;
+  const refresh = await requestJson('POST', `${api}/templates/${code}/refresh-snapshot`, {
+    expectedMode: 'shared', expectedSnapshotRevision: revision
+  }, headers);
+  assert.equal(refresh.statusCode, 422, refresh.body);
+  assert.equal(refresh.json.reason, 'table_result_incomplete');
+  assert.deepEqual((await requestJson('GET', pagePath)).json, page.json);
+});
+
+test('large-table publication rejects clamped relation pages and reports index budget errors', async (t) => {
+  const relationSpec = {
+    version: 1,
+    steps: [
+      { type: 'selectCards', as: 'assets', className: 'ARM' },
+      { type: 'expandRelations', as: 'links', from: 'assets', direction: 'source', fetchRelated: false }
+    ],
+    result: { tables: [{ name: 'links', columns: ['Code'], published: true, presentation: { largeTable: { mode: 'all' } } }] },
+    publish: publishSpec().publish
+  };
+  const budgetSpec = {
+    version: 1, steps: [{ type: 'selectCards', as: 'assets', className: 'ARM' }],
+    result: { tables: [{ name: 'assets', columns: ['Code'], published: true, presentation: { largeTable: {
+      mode: 'key', selector: { kind: 'class', source: 'IS', idField: 'Code', labelField: 'Description', matchField: 'Memberships' }
+    } } }] },
+    publish: publishSpec().publish
+  };
+  let totalRelations = 2;
+  const mock = await startMockCmdbuild(t, {
+    templateCodeFilter: true,
+    templates: [templateCard('ClampedRelationPage', relationSpec), templateCard('LargeTableMembershipBudget', budgetSpec)],
+    armCards: [{ _id: 501, Code: 'ARM-One', Memberships: Array.from({ length: 100001 }, () => 'IS-One') }],
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true,
+      RuntimeConfigJson: JSON.stringify({ executionLimits: { maxRelationsPerCardDefault: 1, maxRelationsPerCardMax: 1 } }) }],
+    responseOverride(url) {
+      if (url.pathname.endsWith('/classes/IS/cards')) {
+        return { statusCode: 200, body: { data: [{ _id: 1, Code: 'IS-One' }], meta: { total: 1 } } };
+      }
+      if (!url.pathname.endsWith('/classes/ARM/cards/501/relations')) return;
+      assert.equal(url.searchParams.get('limit'), '1');
+      const data = [{ _id: 51, domain: 'AssetSystem', _direction: 'direct', _sourceType: 'ARM', _sourceId: 501,
+        _destinationType: 'IS', _destinationId: 1, _destinationCode: 'IS-One' }];
+      return { statusCode: 200, body: { data, ...(totalRelations === null ? {} : { meta: { total: totalRelations } }) } };
+    }
+  });
+  const port = await freePort();
+  await startBackend(t, port, mock.origin);
+  const origin = `http://127.0.0.1:${port}`;
+  const api = origin + '/cmdbuild/custom-api';
+  const headers = { cookie: testCmdbuildAuthorizationCookie('editor'), origin };
+  headers['x-cmdbdynamicpages-csrf'] = (await requestJson('GET', api + '/csrf', undefined, headers)).json.token;
+  const publish = (code, spec) => requestJson('POST', `${api}/templates/${code}/publish`, { savedSpecHash: hashJson(spec) }, headers);
+  for (const upstreamTotal of [2, null]) {
+    totalRelations = upstreamTotal;
+    const partial = await publish('ClampedRelationPage', relationSpec);
+    assert.equal(partial.statusCode, 422, partial.body);
+    assert.equal(partial.json.reason, 'table_result_incomplete');
+  }
+  totalRelations = 1;
+  const exact = await publish('ClampedRelationPage', relationSpec);
+  assert.equal(exact.statusCode, 200, exact.body);
+  const budget = await publish('LargeTableMembershipBudget', budgetSpec);
+  assert.equal(budget.statusCode, 422, budget.body);
+  assert.equal(budget.json.reason, 'large_table_membership_limit');
+});
+
+test('large tables page 400 options, 4000 linked rows and 6000 unrestricted rows without sending the entire result', async (t) => {
+  const optionCards = Array.from({ length: 400 }, (_, index) => ({
+    _id: index + 1, Code: 'IS-' + index, Description: index < 2 ? 'Shared name' : 'Object ' + index
+  }));
+  const rows = Array.from({ length: 6000 }, (_, index) => ({
+    _id: 10_000 + index,
+    Code: 'Row-' + String(index).padStart(5, '0'),
+    OwnerKey: index < 110 ? 'IS-0' : 'IS-' + (1 + (index - 110) % 399),
+    Description: 'Description ' + index
+  }));
+  const keyed = {
+    version: 1, steps: [{ type: 'selectCards', as: 'items', className: 'ARM' }],
+    result: { tables: [{ name: 'items', columns: ['Code', 'Description'], presentation: { largeTable: {
+      mode: 'key', selector: { kind: 'class', source: 'IS', idField: 'Code', labelField: 'Description', matchField: 'OwnerKey' }
+    } } }] }
+  };
+  const unscoped = {
+    ...keyed, steps: [{ type: 'selectCards', as: 'items', className: 'routerG' }],
+    result: { tables: [{ name: 'items', columns: ['Code'], presentation: { largeTable: { mode: 'all' } } }] }
+  };
+  const snapshotSpec = { ...keyed, publish: { ...publishSpec().publish, refreshMode: 'shared', sharedRefreshAccepted: true } };
+  const personalSpec = { ...keyed, publish: { ...publishSpec().publish, refreshMode: 'personal' } };
+  let failReads = false;
+  let sourceVersion = '';
+  const mock = await startMockCmdbuild(t, {
+    templateCodeFilter: true,
+    templates: [templateCard('PagedKey', keyed), templateCard('PagedAll', unscoped), templateCard('PagedSnapshot', snapshotSpec),
+      templateCard('PagedPersonal', personalSpec)],
+    async responseOverride(url) {
+      const className = /\/classes\/(IS|ARM|routerG)\/cards$/.exec(url.pathname)?.[1];
+      if (!className) return;
+      if (failReads) return { statusCode: 403, body: { success: false } };
+      const source = className === 'IS' ? optionCards : className === 'ARM' ? rows.slice(0, 4000) : rows;
+      const start = Number(url.searchParams.get('start') || 0);
+      const limit = Number(url.searchParams.get('limit') || 1000);
+      const data = source.slice(start, start + limit);
+      return { statusCode: 200, body: { data: sourceVersion && className === 'ARM'
+        ? data.map((row) => ({ ...row, Description: row.Description + sourceVersion })) : data, meta: { total: source.length } } };
+    }
+  });
+  const port = await freePort();
+  await startBackend(t, port, mock.origin);
+  const origin = `http://127.0.0.1:${port}`;
+  const api = origin + '/cmdbuild/custom-api';
+  const reader = { cookie: testCmdbuildAuthorizationCookie('reader') };
+  const other = { cookie: testCmdbuildAuthorizationCookie('other') };
+  const editor = { cookie: testCmdbuildAuthorizationCookie('editor'), origin };
+  editor['x-cmdbdynamicpages-csrf'] = (await requestJson('GET', api + '/csrf', undefined, editor)).json.token;
+  const query = (data) => '?cmdpTable=' + encodeURIComponent(JSON.stringify({ table: 'items', ...data }));
+  const page = (code, data, headers = reader, prefix = 'templates') =>
+    requestJson('GET', `${api}/${prefix}/${code}/table-page${query(data)}`, undefined, headers);
+  const report = (code, headers = reader, prefix = 'templates') =>
+    requestJson('GET', `${api}/${prefix}/${code}/run?cmdpTableShell=1`, undefined, headers);
+  const readRows = () => mock.requests.filter((request) => /\/classes\/(ARM|routerG)\/cards$/.test(request.pathname)).length;
+
+  const before = readRows();
+  const initial = await report('PagedKey');
+  assert.equal(initial.statusCode, 200, initial.body);
+  assert.deepEqual(initial.json.tableView, { kind: 'dynamic' });
+  assert.deepEqual(initial.json.result.tables[0].rows, []);
+  const options = await page('PagedKey', { op: 'options' });
+  assert.equal(options.statusCode, 200, options.body);
+  assert.equal(options.json.total, 400);
+  assert.equal(options.json.items.length, 50);
+  const named = await page('PagedKey', { op: 'options', search: 'Shared name' });
+  assert.equal(named.json.items.length, 2);
+  assert.notEqual(named.json.items[0].key, named.json.items[1].key);
+  assert.equal(readRows(), before, 'opening the report or searching choices ran its dependent table');
+  const chosen = await Promise.all(named.json.items.map(({ key }) => page('PagedKey', { op: 'rows', key })));
+  const first = chosen.find((entry) => entry.json.total === 110);
+  assert.ok(first, chosen.map((entry) => entry.body).join('\n'));
+  const key = named.json.items[chosen.indexOf(first)].key;
+  assert.equal(first.json.table.rows.length, 50);
+  const afterCalculation = readRows();
+  const next = await page('PagedKey', { op: 'rows', key, offset: 50, viewId: first.json.viewId });
+  assert.equal(next.statusCode, 200, next.body);
+  assert.equal(next.json.table.rows[0].Code, 'Row-00050');
+  assert.equal(readRows(), afterCalculation);
+  const crossSession = await page('PagedKey', { op: 'rows', key, viewId: first.json.viewId }, other);
+  assert.equal(crossSession.statusCode, 409, crossSession.body);
+  const sixThousand = await page('PagedAll', { op: 'rows', sort: 'Code', direction: 'desc', offset: 5950, limit: 100 });
+  assert.equal(sixThousand.statusCode, 200, sixThousand.body);
+  assert.equal(sixThousand.json.total, 6000);
+  assert.equal(sixThousand.json.table.rows.length, 50);
+  assert.equal(sixThousand.json.table.rows[0].Code, 'Row-00049');
+  assert.equal(sixThousand.json.incomplete, false);
+
+  const publish = await requestJson('POST', api + '/templates/PagedSnapshot/publish', { savedSpecHash: hashJson(snapshotSpec) }, editor);
+  assert.equal(publish.statusCode, 200, publish.body);
+  const publishedPersonal = await requestJson('POST', api + '/templates/PagedPersonal/publish', { savedSpecHash: hashJson(personalSpec) }, editor);
+  assert.equal(publishedPersonal.statusCode, 200, publishedPersonal.body);
+  const startPublic = mock.requests.length;
+  const publicly = await report('PagedSnapshot', {}, 'public-snapshots');
+  assert.equal(publicly.statusCode, 200, publicly.body);
+  assert.deepEqual(publicly.json.result.tables[0].rows, []);
+  const { snapshotRevision } = publicly.json.tableView;
+  const publicPage = await page('PagedSnapshot', { op: 'rows', key, snapshotRevision }, {}, 'public-snapshots');
+  assert.equal(publicPage.statusCode, 200, publicPage.body);
+  assert.equal(publicPage.json.total, 110);
+  assert.equal(mock.requests.length, startPublic, 'anonymous paging must not contact CMDBuild');
+  failReads = true;
+  const refresh = (revision) => requestJson('POST', api + '/templates/PagedSnapshot/refresh-snapshot?cmdpTableShell=1',
+    { expectedMode: 'shared', expectedSnapshotRevision: revision }, editor);
+  const failed = await refresh(snapshotRevision);
+  assert.equal(failed.statusCode, 403, failed.body);
+  assert.deepEqual((await page('PagedSnapshot', { op: 'rows', key, snapshotRevision }, {}, 'public-snapshots')).json, publicPage.json);
+  failReads = false;
+  sourceVersion = ' updated';
+  const refreshed = await refresh(snapshotRevision);
+  assert.equal(refreshed.statusCode, 200, refreshed.body);
+  const latestRevision = refreshed.json.tableView.snapshotRevision;
+  assert.notEqual(latestRevision, snapshotRevision);
+  assert.equal((await page('PagedSnapshot', { op: 'rows', key, snapshotRevision }, {}, 'public-snapshots')).statusCode, 409);
+  const latest = await page('PagedSnapshot', { op: 'rows', key, snapshotRevision: latestRevision }, {}, 'public-snapshots');
+  assert.equal(latest.json.table.rows[0].Description, 'Description 0 updated');
+  const personalBefore = await report('PagedPersonal', {}, 'public-snapshots');
+  const personalRevision = personalBefore.json.tableView.snapshotRevision;
+  const personal = await requestJson('POST', api + '/templates/PagedPersonal/refresh-snapshot?cmdpTableShell=1',
+    { expectedMode: 'personal', expectedSnapshotRevision: personalRevision }, editor);
+  assert.equal(personal.statusCode, 200, personal.body);
+  assert.deepEqual(personal.json.result.tables[0].rows, []);
+  assert.equal(personal.json.tableView.kind, 'personal');
+  const viewId = personal.json.tableView.viewId;
+  const personalPage = await page('PagedPersonal', { op: 'rows', key, viewId }, editor);
+  assert.equal(personalPage.statusCode, 200, personalPage.body);
+  assert.equal(personalPage.json.table.rows[0].Description, 'Description 0 updated');
+  assert.equal((await page('PagedPersonal', { op: 'rows', key, viewId }, other)).statusCode, 409);
+  const staticPage = await page('PagedPersonal', { op: 'rows', key, snapshotRevision: personalRevision }, {}, 'public-snapshots');
+  assert.equal(staticPage.json.table.rows[0].Description, 'Description 0');
+});
+
+test('large report selector filters the computed difference without restricting the exclusion input', async (t) => {
+  const spec = { version: 1, steps: [
+    { type: 'selectCards', as: 'items', className: 'ARM' },
+    { type: 'selectCards', as: 'owners', className: 'routerG' },
+    { type: 'differenceRows', from: 'items', with: 'owners', on: 'Ticket', as: 'remaining' }
+  ], result: { presentation: { outputMode: 'tables' }, tables: [{ name: 'remaining', columns: ['Code', 'OwnerKey'],
+    presentation: { largeTable: { mode: 'key', groupKeys: ['OwnerKey'], reductions: [{ column: 'Code', kind: 'unique' }], selector: {
+      kind: 'result', source: 'owners', idField: 'Code', labelField: 'Description', matchField: 'OwnerKey'
+    } } } }] } };
+  const mock = await startMockCmdbuild(t, {
+    templateCodeFilter: true, templates: [templateCard('PagedDifference', spec)],
+    armCards: [{ _id: 1, Code: 'excluded', OwnerKey: 'A', Ticket: 'X' },
+      { _id: 2, Code: 'retained', OwnerKey: 'A', Ticket: 'Z' },
+      { _id: 3, Code: 'other', OwnerKey: 'B', Ticket: 'Z' }],
+    routerCards: [{ _id: 4, Code: 'A', Ticket: 'Y', Description: 'First' },
+      { _id: 5, Code: 'B', Ticket: 'X', Description: 'Second' }]
+  });
+  const port = await freePort();
+  await startBackend(t, port, mock.origin);
+  const url = `http://127.0.0.1:${port}/cmdbuild/custom-api/templates/PagedDifference`;
+  const headers = { cookie: testCmdbuildAuthorizationCookie('reader') };
+  const page = (op, key) => requestJson('GET', url + '/table-page?cmdpTable=' + encodeURIComponent(JSON.stringify({
+    table: 'remaining', op, key
+  })), undefined, headers);
+  const full = await requestJson('GET', url + '/run', undefined, headers);
+  assert.equal(full.statusCode, 200, full.body);
+  const expected = full.json.result.tables[0].rows.filter((row) => row.OwnerKey === 'A');
+  assert.deepEqual(expected, [{ Code: 'retained', OwnerKey: 'A' }]);
+  const options = await page('options');
+  assert.equal(options.statusCode, 200, options.body);
+  const start = mock.requests.length;
+  const chosen = await page('rows', options.json.items.find((item) => item.label === 'First').key);
+  assert.equal(chosen.statusCode, 200, chosen.body);
+  assert.deepEqual(chosen.json.table.rows, expected);
+  const exclusionReads = mock.requests.slice(start).filter((request) => request.pathname.endsWith('/routerG/cards'));
+  assert.equal(exclusionReads.length, 1, 'the selector result is executed only as the right input of differenceRows');
+  assert.equal(new URLSearchParams(exclusionReads[0].search).has('filter'), false);
+});
+
+test('large report selector validates a standalone source and binds Designer expressions through composeRows.right', async (t) => {
+  const createSpec = (filter) => ({ version: 1, params: { selected: { type: 'string', default: 'Not selected' } }, steps: [
+    { type: 'selectCards', as: 'owners', className: 'Location' },
+    { type: 'selectCards', as: 'items', className: 'ARM', filters: [filter] },
+    { type: 'selectCards', as: 'details', className: 'routerG' },
+    { type: 'composeRows', as: 'combined', from: 'items', right: 'details', on: 'Ticket', columns: [
+      { name: 'OwnerKey', column: 'OwnerKey' }, { name: 'Detail', source: 'right', column: 'Description' }
+    ] }
+  ], result: { presentation: { outputMode: 'tables' }, tables: [{ name: 'combined', columns: ['Detail'],
+    presentation: { largeTable: { mode: 'key', selector: {
+      kind: 'result', source: 'owners', idField: 'Code', labelField: 'Description', matchField: 'OwnerKey', parameter: 'selected'
+    } } } }] } });
+  const testCases = [
+    ['PagedValueExpression', { path: 'OwnerKey', op: 'equals', valueExpression: '${param.selected}' }],
+    ['PagedRegexExpression', { path: 'OwnerKey', op: 'matches', regexExpression: '^${param.selected}$' }]
+  ];
+  const mock = await startMockCmdbuild(t, {
+    templateCodeFilter: true, templates: testCases.map(([code, filter]) => templateCard(code, createSpec(filter))),
+    cardsByClass: { Location: [{ _id: 9, Code: 'A[1]', Description: 'Selected owner' }] },
+    armCards: [
+      { _id: 1, Code: 'retained', OwnerKey: 'A[1]', Ticket: 'X' },
+      { _id: 2, Code: 'excluded', OwnerKey: 'A1', Ticket: 'Y' }
+    ],
+    routerCards: [{ _id: 3, Ticket: 'X', Description: 'Matched detail' }, { _id: 4, Ticket: 'Y', Description: 'Other detail' }]
+  });
+  const port = await freePort();
+  await startBackend(t, port, mock.origin);
+  const origin = `http://127.0.0.1:${port}`;
+  const api = origin + '/cmdbuild/custom-api';
+  const headers = { origin, cookie: testCmdbuildAuthorizationCookie('editor') };
+  headers['x-cmdbdynamicpages-csrf'] = (await requestJson('GET', api + '/csrf', undefined, headers)).json.token;
+  const rowsRead = (after, name) => mock.requests.slice(after).filter((request) => request.pathname.endsWith(`/${name}/cards`));
+  for (const [code, filter] of testCases) {
+    const url = `${api}/templates/${code}`;
+    const spec = createSpec(filter);
+    const save = await requestJson('PUT', url, { code, expectedSpecHash: hashJson(spec), spec }, headers);
+    assert.equal(save.statusCode, 200, save.body);
+    const shellStart = mock.requests.length;
+    const shell = await requestJson('GET', url + '/run?cmdpTableShell=1', undefined, headers);
+    assert.equal(shell.statusCode, 200, shell.body);
+    assert.deepEqual(shell.json.result.tables[0].rows, []);
+    assert.equal(rowsRead(shellStart, 'Location').length, 0);
+    assert.equal(rowsRead(shellStart, 'ARM').length, 0);
+    const page = (op, key, reqHeaders = headers) => requestJson('GET', url + '/table-page?cmdpTable=' +
+      encodeURIComponent(JSON.stringify({ table: 'combined', op, key })), undefined, reqHeaders);
+    const options = await page('options');
+    assert.equal(options.statusCode, 200, options.body);
+    assert.equal(options.json.total, 1);
+    assert.equal(rowsRead(shellStart, 'Location').length, 1);
+    assert.equal(rowsRead(shellStart, 'ARM').length, 0);
+    const { key } = options.json.items[0];
+    const start = mock.requests.length;
+    const foreign = await page('rows', key, { cookie: testCmdbuildAuthorizationCookie('other') });
+    assert.equal(foreign.statusCode, 404, foreign.body);
+    assert.equal(foreign.json.reason, 'table_key_unavailable');
+    assert.equal(rowsRead(start, 'Location').length, 0);
+    assert.equal(rowsRead(start, 'ARM').length, 0);
+    const result = await page('rows', key);
+    assert.equal(result.statusCode, 200, result.body);
+    assert.deepEqual(result.json.table.rows, [{ Detail: 'Matched detail' }]);
+    assert.equal(rowsRead(start, 'Location').length, 0, 'a row request must not execute an independent options graph');
+    assert.equal(rowsRead(start, 'routerG').length, 1, 'composeRows.right is a runtime dependency');
+  }
+});
+
+test('large report selector from Object Flow restricts relation reads before execution', async (t) => {
+  const spec = {
+    version: 1, steps: [
+      { type: 'selectCards', as: 'parents', className: 'Source' },
+      { type: 'expandRelations', as: 'children', from: 'parents', domain: 'SourceTarget', direction: 'source',
+        targetClass: 'Target', fetchRelated: false },
+      { type: 'composeRows', as: 'projected', from: 'children', columns: [{ name: 'Code', column: 'Code' },
+        { name: 'ParentKey', column: 'SourceId' }] }
+    ], result: { tables: [{ name: 'projected', columns: ['Code'], presentation: { largeTable: {
+      mode: 'key', selector: { kind: 'result', source: 'parents', idField: '_id', labelField: 'Description', matchField: 'ParentKey' }
+    } } }] }
+  };
+  const targetMatch = structuredClone(spec);
+  targetMatch.steps[2].columns[1].column = 'RelatedId';
+  const classes = [
+    { _id: 'Source', name: 'Source', description: 'Source', active: true },
+    { _id: 'Target', name: 'Target', description: 'Target', active: true }
+  ];
+  const related = (id, sourceId, targetId, code) => ({ _id: id, domain: 'SourceTarget', _direction: 'direct',
+    _sourceType: 'Source', _sourceId: sourceId, _destinationType: 'Target', _destinationId: targetId,
+    _destinationCode: code });
+  const mock = await startMockCmdbuild(t, {
+    templates: [templateCard('PagedRelations', spec), templateCard('PagedRelationTargets', targetMatch)], templateCodeFilter: true,
+    classes: [...classes, ...['Cst_QueryTool', 'Cst_QueryToolConfig', 'Cst_QueryTemplate', 'Cst_QueryTemplateVersion']
+      .map((name) => ({ _id: name, name, active: true }))],
+    cardsByClass: { Source: [{ _id: 11, Code: 'A', Description: 'First' }, { _id: 12, Code: 'B', Description: 'Second' }] },
+    relationsByCard: { 'Source:11': [related(31, 11, 12, 'A child')], 'Source:12': [related(32, 12, 11, 'B child')] }
+  });
+  const port = await freePort();
+  await startBackend(t, port, mock.origin);
+  const api = `http://127.0.0.1:${port}/cmdbuild/custom-api/templates/`;
+  const cookie = testCmdbuildAuthorizationCookie('reader');
+  const page = (op, key, code = 'PagedRelations') => requestJson('GET', api + code + '/table-page?cmdpTable=' +
+    encodeURIComponent(JSON.stringify({ table: 'projected', op, key })), undefined, { cookie });
+  const options = await page('options');
+  assert.equal(options.statusCode, 200, options.body);
+  assert.equal(options.json.total, 2);
+  assert.equal(mock.requests.filter((request) => request.pathname.endsWith('/relations')).length, 0);
+  const chosen = await page('rows', options.json.items.find((item) => item.label === 'First').key);
+  assert.equal(chosen.statusCode, 200, chosen.body);
+  assert.deepEqual(chosen.json.table.rows, [{ Code: 'A child' }]);
+  assert.deepEqual(mock.requests.filter((request) => request.pathname.endsWith('/relations')).map((request) => request.pathname),
+    ['/cmdbuild/services/rest/v3/classes/Source/cards/11/relations']);
+  const alternateOptions = await page('options', undefined, 'PagedRelationTargets');
+  assert.equal(alternateOptions.statusCode, 200, alternateOptions.body);
+  const start = mock.requests.length;
+  const byTarget = await page('rows', alternateOptions.json.items.find((item) => item.label === 'First').key, 'PagedRelationTargets');
+  assert.equal(byTarget.statusCode, 200, byTarget.body);
+  assert.deepEqual(byTarget.json.table.rows, [{ Code: 'B child' }]);
+  assert.equal(mock.requests.slice(start).filter((request) => request.pathname.endsWith('/relations')).length, 2,
+    'a target id does not prove source lineage');
+});
+
+test('static snapshot refresh keeps personal data local and uses the opened exact or saved ignore parameters', async (t) => {
+  const exactCode = 'PersonalSnapshotRefresh';
+  const sharedCode = 'SharedSnapshotRefresh';
+  const params = { code: 'published', slot: 42, enabled: false };
+  const spec = {
+    version: 1,
+    params: { code: { type: 'string', required: true }, slot: { type: 'number', required: true }, enabled: { type: 'boolean', required: true } },
+    steps: [{ type: 'selectCards', as: 'items', className: 'ARM', columns: ['Code', 'Description'], limit: 2,
+      filters: [{ path: 'Code', op: 'equals', valueParam: 'code' }] }],
+    result: { tables: [{ name: 'items', columns: ['Code', 'Description'] }] },
+    publish: publishSpec().publish
+  };
+  const shared = { ...spec, publish: { ...spec.publish, paramsMode: 'ignore', refreshMode: 'shared', sharedRefreshAccepted: true } };
+  const protectedPath = '/cmdbuild/services/rest/v3/classes/Cst_QueryTemplate/cards';
+  const sharedCard = templateCard(sharedCode, shared);
+  let sourceStatus = 200;
+  let malformedData = false;
+  let empty = false;
+  let truncate = false;
+  let delayMs = 0;
+  const mock = await startMockCmdbuild(t, {
+    templateCodeFilter: true,
+    templates: [templateCard(exactCode, spec), sharedCard],
+    async responseOverride(url, req) {
+      const token = req.headers['cmdbuild-authorization'];
+      if (url.pathname.endsWith('/sessions/current')) return {
+        statusCode: 200, body: { data: { username: token, role: token === 'editor' ? 'Admin' : 'Reader' } }
+      };
+      if (url.pathname === protectedPath && token === 'no-template-read') return { statusCode: 403, body: {} };
+      if (url.pathname === protectedPath && token !== 'editor') return {
+        statusCode: 200, body: { data: [templateCard(exactCode, spec, { canUpdate: false }), { ...sharedCard, _can_update: false }] }
+      };
+      if (!url.pathname.endsWith('/classes/ARM/cards')) return;
+      if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      if (sourceStatus !== 200) return { statusCode: sourceStatus, body: { success: false } };
+      if (malformedData) return { statusCode: 200, body: { success: true } };
+      const row = { _id: 501, Code: 'published', Description: token };
+      const data = empty ? [] : truncate ? [row, { ...row, _id: 502 }, { ...row, _id: 503 }] : [row];
+      return { statusCode: 200, body: { data, meta: { total: data.length } } };
+    }
+  });
+  const port = await freePort();
+  await startBackend(t, port, mock.origin, { CMDP_DRAFT_PREVIEW_TIMEOUT_MS: '1000' });
+  const origin = `http://127.0.0.1:${port}`;
+  const api = `${origin}/cmdbuild/custom-api`;
+  const headers = async (token) => {
+    const cookie = testCmdbuildAuthorizationCookie(token);
+    const csrf = await requestJson('GET', `${api}/csrf`, undefined, { cookie });
+    assert.equal(csrf.statusCode, 200, csrf.body);
+    return { cookie, origin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+  };
+  const editor = await headers('editor');
+  const reader = await headers('reader');
+  const denied = await headers('no-template-read');
+  const query = (value) => 'snapshotParams=' + encodeURIComponent(JSON.stringify(Object.entries(value)));
+  const refresh = (code, value = params) => `${api}/templates/${code}/refresh-snapshot?${query(value)}`;
+  const publicReport = (code) => requestJson('GET', `${api}/public-snapshots/${code}/run?json=true&${query(params)}`);
+  for (const [code, savedSpec] of [[exactCode, spec], [sharedCode, shared]]) {
+    const missing = await requestJson('GET', refresh(code), undefined, reader);
+    assert.equal(missing.statusCode, 404, missing.body);
+    const published = await requestJson('POST', `${api}/templates/${code}/publish`, { params, savedSpecHash: hashJson(savedSpec) }, editor);
+    assert.equal(published.statusCode, 200, published.body);
+  }
+  const anonymousGet = await requestJson('GET', refresh(exactCode));
+  assert.equal(anonymousGet.statusCode, 401, anonymousGet.body);
+  const anonymousPost = await requestJson('POST', refresh(exactCode), { expectedMode: 'personal' });
+  assert.equal(anonymousPost.statusCode, 401, anonymousPost.body);
+  const noCsrf = await requestJson('POST', refresh(exactCode), { expectedMode: 'personal' }, { cookie: reader.cookie, origin });
+  assert.equal(noCsrf.statusCode, 403, noCsrf.body);
+  const noMode = await requestJson('POST', refresh(exactCode), {}, reader);
+  assert.equal(noMode.statusCode, 400, noMode.body);
+  const noRevision = await requestJson('POST', refresh(exactCode), { expectedMode: 'personal' }, reader);
+  assert.equal(noRevision.statusCode, 400, noRevision.body);
+  assert.equal(noRevision.json.reason, 'snapshot_refresh_revision_required');
+  const noTemplateRead = await requestJson('GET', refresh(exactCode), undefined, denied);
+  assert.equal(noTemplateRead.statusCode, 403, noTemplateRead.body);
+  const exactBefore = await publicReport(exactCode);
+  const sharedBefore = await publicReport(sharedCode);
+  const expectPersonal = { expectedMode: 'personal', expectedSnapshotRevision: exactBefore.json.cache.snapshotRevision };
+  const wrongParams = await requestJson('POST', refresh(exactCode, { ...params, slot: '42' }), expectPersonal, reader);
+  assert.equal(wrongParams.statusCode, 404, wrongParams.body);
+  const malformed = await requestJson('GET', `${api}/templates/${exactCode}/refresh-snapshot?snapshotParams=invalid`, undefined, reader);
+  assert.equal(malformed.statusCode, 400, malformed.body);
+  const exactGet = await requestJson('GET', refresh(exactCode), undefined, reader);
+  assert.deepEqual(exactGet.json, { available: true, mode: 'personal' }, exactGet.body);
+
+  const personal = await requestJson('POST', refresh(exactCode), { ...expectPersonal, params: { code: 'tampered' } }, reader);
+  assert.equal(personal.statusCode, 200, personal.body);
+  assert.equal(personal.json.mode, 'personal');
+  assert.deepEqual(personal.json.params, params);
+  assert.equal(personal.json.result.tables[0].rows[0].Description, 'reader');
+  assert.deepEqual((await publicReport(exactCode)).json, exactBefore.json);
+
+  const untrusted = { code: 'tampered', slot: 99, enabled: true };
+  const sharedGet = await requestJson('GET', refresh(sharedCode, untrusted), undefined, reader);
+  assert.deepEqual(sharedGet.json, { available: true, mode: 'shared' }, sharedGet.body);
+  const previousShared = { expectedMode: 'shared', expectedSnapshotRevision: sharedBefore.json.cache.snapshotRevision };
+  const wrongMode = await requestJson('POST', refresh(sharedCode, untrusted), { ...previousShared, expectedMode: 'personal' }, reader);
+  assert.equal(wrongMode.statusCode, 409, wrongMode.body);
+  assert.equal(wrongMode.json.reason, 'snapshot_refresh_conflict');
+  const updated = await requestJson('POST', refresh(sharedCode, untrusted), previousShared, reader);
+  assert.equal(updated.statusCode, 200, updated.body);
+  assert.equal(updated.json.mode, 'shared');
+  assert.deepEqual(updated.json.params, params);
+  assert.equal(updated.json.result.tables[0].rows[0].Description, 'reader');
+  const publicUpdated = await publicReport(sharedCode);
+  assert.equal(publicUpdated.json.tables[0].rows[0].Description, 'reader');
+  const expectShared = { expectedMode: 'shared', expectedSnapshotRevision: updated.json.cache.snapshotRevision };
+  assert.equal(expectShared.expectedSnapshotRevision, publicUpdated.json.cache.snapshotRevision);
+  assert.notEqual(expectShared.expectedSnapshotRevision, previousShared.expectedSnapshotRevision);
+  const obsolete = await requestJson('POST', refresh(sharedCode, untrusted), previousShared, reader);
+  assert.equal(obsolete.statusCode, 409, obsolete.body);
+  const originalSpecJson = sharedCard.SpecJson;
+  sharedCard.SpecJson = JSON.stringify({ ...shared, publish: { ...shared.publish, publicD2Source: true } });
+  const beforeDirectChange = mock.requests.length;
+  const stalePolicy = await requestJson('POST', refresh(sharedCode), expectShared, reader);
+  assert.equal(stalePolicy.statusCode, 409, stalePolicy.body);
+  assert.equal(mock.requests.slice(beforeDirectChange).some((item) => item.pathname.endsWith('/classes/ARM/cards')), false);
+  sharedCard.SpecJson = originalSpecJson;
+
+  sourceStatus = 403;
+  const dataDenied = await requestJson('POST', refresh(sharedCode), expectShared, reader);
+  assert.equal(dataDenied.statusCode, 403, dataDenied.body);
+  assert.equal(dataDenied.json.reason, 'data_access_denied');
+  assert.equal(dataDenied.json.result, undefined);
+  sourceStatus = 200;
+  malformedData = true;
+  const incompleteRead = await requestJson('POST', refresh(sharedCode), expectShared, reader);
+  assert.equal(incompleteRead.statusCode, 502, incompleteRead.body);
+  assert.equal(incompleteRead.json.reason, 'snapshot_refresh_data_unavailable');
+  malformedData = false;
+  truncate = true;
+  const partial = await requestJson('POST', refresh(sharedCode), expectShared, reader);
+  assert.equal(partial.statusCode, 422, partial.body);
+  assert.equal(partial.json.reason, 'snapshot_refresh_incomplete');
+  truncate = false;
+  delayMs = 1300;
+  const timedOut = await requestJson('POST', refresh(sharedCode), expectShared, reader);
+  assert.equal(timedOut.statusCode, 504, timedOut.body);
+  assert.equal(timedOut.json.reason, 'snapshot_refresh_timeout');
+  assert.equal((await publicReport(sharedCode)).json.tables[0].rows[0].Description, 'reader');
+  delayMs = 0;
+  empty = true;
+  const updatedEmpty = await requestJson('POST', refresh(sharedCode), expectShared, reader);
+  assert.equal(updatedEmpty.statusCode, 200, updatedEmpty.body);
+  assert.deepEqual((await publicReport(sharedCode)).json.tables[0].rows, []);
+});
+
+test('static snapshot refresh CAS rejects another refresh or a generation change across backends', async (t) => {
+  const code = 'SharedSnapshotRefreshCAS';
+  const spec = {
+    version: 1,
+    steps: [{ type: 'selectCards', as: 'items', className: 'ARM', columns: ['Code'] }],
+    result: { tables: [{ name: 'items', columns: ['Code'] }] },
+    publish: { ...publishSpec().publish, refreshMode: 'shared', sharedRefreshAccepted: true }
+  };
+  const redis = await startSnapshotRedisFixture(t);
+  let blocked;
+  const mock = await startMockCmdbuild(t, {
+    templateCodeFilter: true,
+    templates: [templateCard(code, spec)],
+    async responseOverride(url, req) {
+      if (!url.pathname.endsWith('/classes/ARM/cards')) return;
+      const user = String(req.headers['cmdbuild-authorization']);
+      if (user === 'slow') {
+        const gate = blocked;
+        gate.entered.resolve();
+        await gate.released.promise;
+      }
+      return { statusCode: 200, body: { data: [{ _id: 501, Code: user, Location: 300 }], meta: { total: 1 } } };
+    }
+  });
+  const endpoints = [];
+  for (const token of ['slow', 'fast']) {
+    const port = await freePort();
+    await startBackend(t, port, mock.origin, redis.env);
+    const origin = `http://127.0.0.1:${port}`;
+    const api = `${origin}/cmdbuild/custom-api`;
+    const cookie = testCmdbuildAuthorizationCookie(token);
+    const csrf = await requestJson('GET', `${api}/csrf`, undefined, { cookie });
+    assert.equal(csrf.statusCode, 200, csrf.body);
+    const headers = { cookie, origin, 'x-cmdbdynamicpages-csrf': csrf.json.token };
+    const template = `${api}/templates/${code}`;
+    endpoints.push({ template, headers,
+      refresh: (expectedSnapshotRevision) => requestJson('POST', `${template}/refresh-snapshot`, { expectedMode: 'shared', expectedSnapshotRevision }, headers),
+      publicReport: () => requestJson('GET', `${api}/public-snapshots/${code}/run?json=true`) });
+  }
+  const [slow, fast] = endpoints;
+  const published = await requestJson('POST', `${fast.template}/publish`, { params: {}, savedSpecHash: hashJson(spec) }, fast.headers);
+  assert.equal(published.statusCode, 200, published.body);
+  let stateKey;
+  for (const key of redis.values.keys()) if (key.includes(':snapshot-state:')) stateKey = key;
+  assert.ok(stateKey);
+
+  for (const race of ['snapshot', 'generation', 'template']) {
+    const beforeState = redis.values.get(stateKey);
+    const before = await fast.publicReport();
+    const revision = before.json.cache.snapshotRevision;
+    blocked = { entered: Promise.withResolvers(), released: Promise.withResolvers() };
+    const pending = slow.refresh(revision);
+    try {
+      await Promise.race([blocked.entered.promise, pending.then((response) => assert.fail(response.body))]);
+      if (race === 'snapshot') {
+        const winner = await fast.refresh(revision);
+        assert.equal(winner.statusCode, 200, winner.body);
+      } else if (race === 'generation') {
+        redis.values.set(stateKey, `pending:${crypto.randomUUID()}`);
+      } else {
+        const deactivated = await requestJson('PUT', fast.template, { code, active: false, spec, expectedSpecHash: hashJson(spec) }, fast.headers);
+        assert.equal(deactivated.statusCode, 200, deactivated.body);
+      }
+    } finally {
+      blocked.released.resolve();
+    }
+    const stale = await pending;
+    assert.equal(stale.statusCode, 409, stale.body);
+    assert.equal(stale.json.reason, 'snapshot_refresh_conflict');
+    const current = await fast.publicReport();
+    assert.equal(current.json.snapshotFound, race === 'snapshot');
+    if (race === 'snapshot') assert.equal(current.json.tables[0].rows[0].Code, 'fast');
+    if (race === 'generation') redis.values.set(stateKey, beforeState);
+  }
 });
 
 test('template deletion revokes all public static snapshots', async (t) => {
@@ -9505,6 +10130,49 @@ async function prepareRawTransfer(fixture, spec, code, overrides = []) {
   return fixture.post('prepare', { package: exported.json.package, mode: 'new', targetCode: code, overrides });
 }
 
+test('template transfer attests large table selectors in the target catalog without reading rows', async (t) => {
+  const fixture = await transferApiFixture(t, transferReferenceCatalog({ attributesByClass: {
+    ARM: [{ name: 'Location', type: 'reference', targetClass: 'Location', active: true, _can_read: true }],
+    Location: [{ name: 'DisplayName', type: 'string', active: true, _can_read: true },
+      { name: 'HiddenName', type: 'string', active: true, _can_read: false }]
+  } }));
+  const selectorPath = '$.spec.result.tables[0].presentation.largeTable.selector.';
+  for (const [name, override, missing] of [
+    ['Class', {}, []],
+    ['UnknownClass', { source: 'UnattestedClass' }, ['source']],
+    ['UnknownLabel', { labelField: 'HiddenName' }, ['labelField']],
+    ['UnknownId', { idField: 'HiddenId' }, ['idField']],
+    ['UnknownMatch', { matchField: 'HiddenMatch' }, ['matchField']],
+    ['Result', { kind: 'result', source: 'options', idField: 'ChoiceId', labelField: 'ChoiceLabel' }, []],
+    ['UnknownResultField', { kind: 'result', source: 'options', idField: 'ChoiceId', labelField: 'HiddenLabel' }, ['labelField']],
+  ]) {
+    const selector = { kind: 'class', source: 'Location', idField: '_id', labelField: 'DisplayName', matchField: 'SiteKey', ...override };
+    const spec = transferRawSpec({
+      publish: { mode: 'staticSnapshot', warningAccepted: true },
+      steps: [
+        { type: 'selectCards', as: 'assets', className: 'ARM', columns: ['Code'] },
+        { type: 'enrichRows', as: 'projected', from: 'assets', columns: [{ path: 'Location', as: 'SiteKey' }] },
+        { type: 'selectCards', as: 'locations', className: 'Location', columns: ['_id', 'DisplayName'] },
+        { type: 'composeRows', as: 'options', from: 'locations', columns: [
+          { name: 'ChoiceId', column: '_id' }, { name: 'ChoiceLabel', column: 'DisplayName' }
+        ] }
+      ],
+      result: { tables: [{ name: 'projected', columns: ['Code'], presentation: { largeTable: { mode: 'key', selector } } }] }
+    });
+    const prepared = await prepareRawTransfer(fixture, spec, `LargeSelector${name}`);
+    assert.equal(prepared.statusCode, 200, prepared.body);
+    assert.deepEqual(prepared.json.template.spec.result.tables[0].presentation.largeTable.selector, selector);
+    assert.equal(prepared.json.checks.executionReady, !missing.length, prepared.body);
+    assert.equal(prepared.json.checks.status, missing.length ? 'needsAttention' : 'ready', prepared.body);
+    for (const field of missing) {
+      assert.ok(prepared.json.checks.issues.some((issue) => issue.path === selectorPath + field && issue.severity === 'error' && issue.blocking === false), prepared.body);
+    }
+  }
+  assert.ok(fixture.mock.requests.some((request) => request.pathname.endsWith('/classes/Location/attributes')));
+  assert.equal(fixture.mock.requests.some((request) => /\/classes\/(ARM|Location|UnattestedClass)\/cards/.test(request.pathname)), false);
+  assertTransferReadOnly(fixture.mock);
+});
+
 test('template transfer parameter reference matrix checks only effective physical defaults and preserves shadowed candidates', async (t) => {
   const fixture = await transferApiFixture(t, transferReferenceCatalog());
   for (const [index, effectivePath] of ['$.spec.defaults.site', '$.spec.paramDefaults.site', '$.spec.params.site.default', '$.spec.params.site.defaultValue'].entries()) {
@@ -10673,7 +11341,7 @@ test('direct runtime enforces the published D2 source toggle even with a valid c
     const saved = await requestJson('PUT', templateUrl, {
       code,
       expectedSpecHash: savedSpecHash,
-      spec: { ...spec, publish: { ...publishSpec().publish, publicD2Source } }
+      spec: { ...spec, publish: { ...publishSpec().publish, publicD2Source, refreshMode: 'shared', sharedRefreshAccepted: true } }
     }, headers);
     assert.equal(saved.statusCode, 200, saved.body);
     savedSpecHash = saved.json.template.specHash;
@@ -10701,6 +11369,13 @@ test('direct runtime enforces the published D2 source toggle even with a valid c
     assert.equal(runtime.json.diagrams[0].d2.downloadAvailable, publicD2Source);
     assert.equal(runtime.json.diagrams[0].d2.source, undefined);
     assert.equal(mock.requests.length, start, 'published D2 reads make no CMDBuild requests');
+
+    const refreshed = await requestJson('POST', `${templateUrl}/refresh-snapshot?snapshotParams=${wire}`, {
+      expectedMode: 'shared', expectedSnapshotRevision: runtime.json.cache.snapshotRevision
+    }, headers);
+    assert.equal(refreshed.statusCode, 200, refreshed.body);
+    assert.equal(refreshed.json.result.diagrams[0].d2.downloadAvailable, publicD2Source);
+    assert.equal(refreshed.json.result.diagrams[0].d2.source, undefined);
   }
 
   const dynamic = await requestJson('PUT', templateUrl, { code, expectedSpecHash: savedSpecHash,

@@ -1467,7 +1467,7 @@ test('designer action bar exposes the global template Save in every selected-tem
   const templatesSource = actionBarSource.slice(templatesStart, assistantStart);
   const globalSaveSource = actionBarSource.slice(globalSaveStart, templatesStart);
   assert.match(actionBarSource, /var templateSelected = Boolean\(state\.selectedTemplate\)/);
-  assert.match(actionBarSource, /var saveTitle = templateSaveBlockTitle\(selected\.code\)/);
+  assert.match(actionBarSource, /var saveTitle = templateSaveBlockTitle\(selected\.code, selected\.spec \|\| null\)/);
   assert.match(templatesSource, /renderActionButton\('save-template', t\('save'\)/);
   assert.match(globalSaveSource, /renderActionButton\('save-template', t\('save'\), \{/);
   assert.match(globalSaveSource, /disabled: saveDisabled/);
@@ -1798,7 +1798,7 @@ test('Assistant owns D2 analysis while Diagram saves its current structure and d
   const visualizeSource = proxySource.slice(visualizeStart, visualizeEnd);
   assert.match(visualizeSource, /authoringPreviewPath\(diagramOnlyPreview \? \{ executionScope: 'diagrams' \} : \{\}\)/);
   assert.match(visualizeSource, /diagramImportRuntimePreviewMappingPartial/);
-  const runtimeResultStart = proxySource.indexOf('function renderRuntimeResult(result)');
+  const runtimeResultStart = proxySource.indexOf('function renderRuntimeResult(');
   const runtimeResultEnd = proxySource.indexOf('function renderExecutionTrace', runtimeResultStart);
   assert.match(proxySource.slice(runtimeResultStart, runtimeResultEnd), /renderDiagramImportRuntimeExecution/);
   assert.match(proxySource, /function diagramImportRuntimePreviewTiming\(preview, spec\)/);
@@ -2082,7 +2082,7 @@ test('D2 import helper handles stdin errors without crashing the backend', () =>
 test('runtime diagram view exposes D2 rendered SVG and source download affordances', () => {
   const downloadStart = proxySource.indexOf('function runtimeD2DownloadPath(result, diagram, diagramIndex)');
   const renderStart = proxySource.indexOf('function renderDiagramToolbar(diagram, toolbarHtml, d2DownloadHref)');
-  const renderRuntimeStart = proxySource.indexOf('function renderRuntimeResult(result)');
+  const renderRuntimeStart = proxySource.indexOf('function renderRuntimeResult(');
   const loadRuntimeStart = proxySource.indexOf('function loadRuntime(refresh)');
   assert.ok(downloadStart > -1);
   assert.ok(renderStart > downloadStart);
@@ -2132,7 +2132,7 @@ test('runtime diagram view exposes D2 rendered SVG and source download affordanc
   assert.match(runtimeSource, /initializeDiagramViewports\(app\)/);
   assert.match(loadSource, /runtimeSystemParam\(entry\[0\]\)/);
   assert.match(loadSource, /result\.downloadMode = 'template'/);
-  assert.match(loadSource, /if \(boot\.publicRuntime\) \{\s*request\(publicSnapshotRunPath\(templateCode, params\)\)/);
+  assert.match(loadSource, /if \(boot\.publicRuntime\) \{\s*request\(publicSnapshotRunPath\(templateCode, params, true\)\)/);
   const authenticatedLoad = loadSource.slice(loadSource.indexOf('request(runtimeRunPath'));
   assert.doesNotMatch(authenticatedLoad, /publicSnapshotRunPath/);
 });

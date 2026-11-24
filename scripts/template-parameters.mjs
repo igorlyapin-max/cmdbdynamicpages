@@ -2,7 +2,7 @@
 export function staticSnapshotParamPairs(params) {
   if (!params || typeof params !== 'object' || Array.isArray(params)) throw new Error('Snapshot parameters must be an object.');
   return Object.entries(params).sort(([left], [right]) => left < right ? -1 : left === right ? 0 : 1).map(([name, value]) => {
-    if (!name || ['root', 'lang', 'cmdpLang', 'json', 'd2', 'diagram', 'refresh', 'noCache', 'forceRefresh', 'bypassRefreshCooldown', 'snapshotParams'].includes(name) ||
+    if (!name || ['root', 'lang', 'cmdpLang', 'json', 'd2', 'diagram', 'refresh', 'noCache', 'forceRefresh', 'bypassRefreshCooldown', 'snapshotParams', 'cmdpTable', 'cmdpTableShell'].includes(name) ||
       !(typeof value === 'string' || typeof value === 'boolean' || Number.isFinite(value))) {
       throw new Error('Snapshot parameters must have non-reserved names and scalar string, boolean or finite number values.');
     }

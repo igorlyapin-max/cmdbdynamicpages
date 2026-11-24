@@ -39,12 +39,16 @@ import { compileAssistantPlacementIntent, assistantPlacementHasStageAncestor } f
 import { createAssistantBindingHandles } from './assistant-binding-handles.mjs';
 import { assertInputCollections, normalizeInputCollectionLimits } from './input-collection-limits.mjs';
 import { aggregateDiagramEdges, normalizeEdgeAggregation, validateEdgeAggregation } from './diagram-edge-aggregation.mjs';
+import { buildLargeTableIndex, encodeLargeTableKey, LARGE_TABLE_ROW_BUDGET as REPORT_TABLE_ROW_BUDGET,
+  normalizeLargeTablePresentation as normalizeLargeTable, queryLargeTablePage as readLargeTablePage,
+  validateLargeTablePresentation as validateLargeTable } from './report-table-pages.mjs';
 import { createUiRequestDiagnostics } from './ui-request-diagnostics.mjs';
 import { createAssistantDiagnosticsUi } from './assistant-diagnostics-ui.mjs';
 import { DEFAULT_ASSISTANT_DIAGNOSTICS, normalizeAssistantDiagnosticsPolicy, redactAssistantDiagnosticValue, createAssistantDiagnosticsStore, createAssistantCaptureController } from './assistant-diagnostics.mjs';
 import { purgeAssistantDiagnostics } from './assistant-diagnostics-maintenance.mjs';
 import { createTemplateTransferPackage, readTemplateTransferPackage, templateTransferDependencies,
-  isTemplateTransferReferenceId, templateTransferReferenceEntries, templateTransferTargetRevision } from './template-transfer.mjs';
+  isTemplateTransferReferenceId, templateTransferReferenceEntries, templateTransferTargetRevision,
+  templateTransferTableSelectorBindings } from './template-transfer.mjs';
 import { resolveTemplateParameters, staticSnapshotParamPairs } from './template-parameters.mjs';
 import { runtimeRowIdentity, runtimeRowValue, runtimeSemanticKey, setRuntimeRowSemantics, setRuntimeRowValue,
   inheritRuntimeRowSemantics, mergeRuntimeRowSemantics, deriveRuntimeRowSemantics } from './runtime-row-semantics.mjs';
@@ -146,7 +150,7 @@ const REGEX_MAX_INPUT_LENGTH = Math.max(1024, Number(process.env.CMDBDYNAMIC_REG
 const DEFAULT_EMPTY_RESULT_TEXT = 'В результате вашего запроса объекты не найдены';
 const DEFAULT_PERMISSION_DENIED_TEXT = 'Вам не хватает прав увидеть данные или интерфейс дизайнера';
 const SNAPSHOT_MISSING_TEXT = 'Страница отсутствует для загрузки';
-const RUNTIME_SYSTEM_PARAMS = new Set(['json', 'd2', 'diagram', 'root']);
+const RUNTIME_SYSTEM_PARAMS = new Set(['json', 'd2', 'diagram', 'root', 'cmdpTable', 'cmdpTableShell']);
 const D2_RENDER_ENABLED = process.env.CMDP_D2_RENDER_ENABLED !== 'false';
 const D2_BINARY = String(process.env.CMDP_D2_BINARY || '/usr/local/bin/d2').trim() || '/usr/local/bin/d2';
 const D2_TIMEOUT_MS = Math.max(500, Number(process.env.CMDP_D2_TIMEOUT_MS || 3000) || 3000);
@@ -340,6 +344,10 @@ const ASSISTANT_REFERENCE_PATH_MAX_DEPTH_ABSOLUTE = Math.max(1, Number(process.e
 const clientLogs = [];
 const proxyLogs = [];
 const runtimeResultCache = new Map();
+const runtimeRelationCacheGenerations = new Map();
+const reportTableViews = new Map();
+const REPORT_TABLE_VIEW_TTL_MS = 120000;
+const REPORT_TABLE_VIEW_MAX_BYTES = 64 * 1024 * 1024;
 const runtimeResultInFlight = new Map();
 const runtimeCacheTemplateIndex = new Map();
 const staticSnapshotCache = new Map();
@@ -9740,7 +9748,7 @@ function extractDesignerSection(pathname, requestUrl) {
   return /^[a-z0-9-]+$/.test(section) ? section : '';
 }
 
-function renderDynamicPagesShell({ mode, session, templateCode = '', designerSection = '', publicRuntime = false, root = DEFAULT_TECHNICAL_ROOT }) {
+function renderDynamicPagesShell({ mode, session, templateCode = '', designerSection = '', publicRuntime = false, snapshotRefreshSessionPresent = false, root = DEFAULT_TECHNICAL_ROOT }) {
   const boot = JSON.stringify({
     mode,
     session,
@@ -9750,6 +9758,8 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     root,
     designerSection,
     publicRuntime,
+    snapshotRefreshSessionPresent,
+    snapshotRefreshTimeoutMs: DRAFT_PREVIEW_TIMEOUT_MS + 10000,
     apiPrefix: BACKEND_PREFIX,
     assistant: assistantStatus(),
     assistantMcpCaps: {
@@ -9813,6 +9823,7 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     .runtime-page{background:#fff}.runtime-page main{padding:8px}.runtime-page .result-table-wrap:first-child{margin-top:0}.runtime-page .notice{margin:0}.run-launch-url{display:grid;grid-template-columns:max-content minmax(0,1fr);align-items:start;gap:4px 8px;min-width:0;max-width:100%;flex:1 1 420px}.run-launch-url span,.run-launch-params span{color:var(--muted);font-size:12px;white-space:nowrap}.run-launch-url a{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--accent);min-width:0;max-width:100%;word-break:normal;overflow-wrap:break-word;white-space:normal}.run-launch-url a[aria-disabled="true"]{color:var(--muted);text-decoration:none;cursor:not-allowed}.run-launch-params{display:grid;grid-template-columns:max-content minmax(0,1fr);align-items:start;gap:4px 8px;min-width:0;max-width:100%;flex:1 1 100%;font-size:12px}.run-launch-params code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:#334e68;background:#f8fafc;border:1px solid var(--line);padding:2px 4px;min-width:0;max-width:100%;word-break:normal;overflow-wrap:break-word;white-space:normal}
     .view-column-order{display:grid;grid-template-columns:24px repeat(2,28px);gap:2px;align-items:center}.view-column-order button,.view-column-grip{width:100%;height:28px;padding:0}.view-column-grip{display:grid;place-items:center;color:var(--muted);line-height:1;user-select:none;visibility:hidden}.view-column-grip[draggable="true"]{cursor:grab;visibility:visible}.view-column-order button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}.view-column-dragging{opacity:.55}.view-column-drop-before>td{box-shadow:inset 0 3px var(--accent)}.view-column-drop-after>td{box-shadow:inset 0 -3px var(--accent)}#cmdp-view-column-order-status{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
     .view-column-table-wrap{max-width:100%;overflow:auto}.view-column-order-cell{width:1%;vertical-align:middle}
+    #cmdp-view-large-table{min-width:0}#cmdp-view-large-table .settings-grid{grid-template-columns:repeat(auto-fit,minmax(min(100%,190px),1fr))}#cmdp-view-large-table .setting-field{display:grid;gap:4px;min-width:0}#cmdp-view-large-table .setting-field>span{color:var(--muted);font-size:12px}#cmdp-view-large-table .setting-field button{max-width:100%;overflow:hidden;text-overflow:ellipsis}#cmdp-view-large-table [data-view-large-details]:not([hidden]),#cmdp-view-large-table [data-view-large-reductions],#cmdp-view-large-table [data-view-large-tuple-fields]{display:grid;gap:8px}#cmdp-view-large-table [data-view-large-reduction]{border-top:1px solid var(--line);padding-top:8px}#cmdp-view-large-table [data-view-large-reduction] strong{display:block;overflow-wrap:anywhere;margin-bottom:4px}@media(max-width:768px){#cmdp-view-large-table select,#cmdp-view-large-table button,#cmdp-view-large-table input:not([type=checkbox]){min-height:44px}#cmdp-view-large-table .compact-multi-select-option{min-height:44px}}
     @media(max-width:768px){.view-column-order{grid-template-columns:24px repeat(2,44px)}.view-column-order button{height:44px}}
     @media(max-width:600px){.view-column-order{grid-template-columns:44px}.view-column-order .view-column-grip{display:none}}
     .designer-menu{position:fixed;left:16px;top:64px;bottom:14px;width:246px;overflow:auto;border:1px solid var(--line);background:#fff;padding:10px;display:grid;gap:10px;z-index:10}.designer-main{margin-left:266px}.designer-actionbar{position:sticky;top:0;z-index:30;border:1px solid var(--line);background:rgba(255,255,255,.96);box-shadow:0 6px 16px rgba(15,23,42,.08);padding:8px 10px;margin:0 0 12px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.designer-actionbar-title{font-weight:bold;color:#334e68;white-space:nowrap}.designer-actionbar-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;min-width:0;flex:1 1 auto}.designer-actionbar-context{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));align-items:start;gap:6px 12px;min-width:0;max-width:100%;flex:1 1 100%}.designer-actionbar-context .run-launch-url,.designer-actionbar-context .run-launch-params{grid-template-columns:1fr;min-width:0;flex:initial}.menu-groups{display:grid;grid-template-columns:1fr;gap:10px}.menu-group strong{display:block;font-size:12px;color:#334e68;margin-bottom:6px}.menu-links{display:grid;grid-template-columns:1fr;gap:5px}.menu-links a{border:1px solid var(--line);background:#f8fafc;color:var(--text);padding:5px 7px;border-radius:4px;text-decoration:none;font-size:12px}.menu-links a.active{background:#e6f4f1;border-color:#86b7b3;color:#07575b;font-weight:bold}.menu-links a.disabled{background:#f4f6f8;color:#9aa5b1;border-color:#e4e7eb;cursor:not-allowed}.template-context{border:1px solid #b7d8d4;background:#f2faf8;padding:8px 10px;margin-bottom:12px}.template-context strong{margin-right:6px}.template-context .code-inline{font-weight:bold}
@@ -9837,6 +9848,7 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     .matching-rule-operator .matching-rule-fields{grid-template-columns:minmax(120px,160px) minmax(220px,1fr)}
     .matching-ipv4-examples{margin-top:8px}
     .row{display:flex;gap:8px;align-items:end;flex-wrap:wrap}.form{display:grid;gap:8px}.form label,.row label{display:grid;gap:4px;color:var(--muted);font-size:12px}
+    #cmdp-publish-refresh-settings:not([hidden]){display:grid;gap:4px;min-width:0}@media(pointer:coarse),(max-width:768px){#cmdp-publish-refresh-mode,#cmdp-publish-shared-refresh-settings .checkbox{min-height:44px}}
     input,textarea,select{box-sizing:border-box;max-width:100%;border:1px solid #bcccdc;border-radius:4px;padding:6px;font:13px Arial,sans-serif;color:var(--text);background:#fff}.field-label-row{display:flex;align-items:center;justify-content:space-between;gap:6px;min-height:22px}.field-help{position:relative;display:inline-flex;align-items:center;flex:0 0 auto}.field-help-button{width:20px;height:20px;min-height:20px;padding:0;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;color:#334e68;font-weight:700;font-size:12px;line-height:1}.field-help-tooltip{display:none;position:absolute;z-index:70;right:0;top:calc(100% + 5px);width:max-content;min-width:220px;max-width:min(360px,calc(100vw - 32px));padding:8px 10px;border:1px solid var(--line);background:#1f2933;color:#fff;box-shadow:0 8px 22px rgba(15,23,42,.22);font-size:12px;font-weight:400;line-height:1.4;text-align:left;white-space:normal}.field-help:hover .field-help-tooltip,.field-help:focus-within .field-help-tooltip{display:block}.field-help.dismissed .field-help-tooltip{display:none}
     textarea{min-height:96px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.tall{min-height:180px}.checkbox{display:flex!important;gap:6px;align-items:center;color:var(--text)!important}
     table{border-collapse:collapse;width:100%;background:#fff}th,td{border:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}th{background:#f0f4f8}.compact th,.compact td{font-size:12px;padding:4px 6px}.compact tr.selected td{background:#eef8f6}
@@ -9860,6 +9872,13 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     .diagram-element-tree-branch{display:grid;gap:2px;position:relative}.diagram-element-tree-branch.nested{margin-left:15px;padding-left:12px;border-left:1px solid #c7d2de}.diagram-element-tree-node{display:grid;gap:2px;position:relative}.diagram-element-tree-branch.nested>.diagram-element-tree-node::before{content:"";position:absolute;left:-13px;top:16px;width:13px;border-top:1px solid #c7d2de}.diagram-element-tree-toggle{width:24px;height:24px;min-width:24px;padding:0;border:0;background:transparent;color:#52667a;font-weight:700;line-height:1}.diagram-element-tree-toggle:hover{background:#e6f4f1;color:#0f4c5c}.diagram-element-tree-hidden-count{color:var(--muted);font-size:11px;font-weight:400;white-space:nowrap}
     .code-inline{overflow-wrap:anywhere;word-break:break-word;white-space:normal}.diagram-element-inspector{display:grid;grid-template-columns:minmax(0,1fr);gap:10px;min-width:0;align-content:start}.diagram-element-inspector>*,.diagram-element-inspector .diagram-editor-block>*,.diagram-element-inspector .help-details,.diagram-element-inspector .diagram-grid{min-width:0}.diagram-element-inspector .diagram-grid{grid-template-columns:repeat(auto-fit,minmax(min(180px,100%),1fr))}.diagram-element-inspector .table-wrap{width:100%;min-width:0;overflow-x:auto}@media(min-width:901px){.diagram-element-workbench{grid-template-columns:minmax(240px,280px) minmax(0,1fr);align-items:start}.diagram-element-tree{min-width:0}}
     .ui-error-diagnostics{width:100%;min-width:0;margin-top:8px;border:1px solid var(--line);border-radius:4px;padding:8px;background:#fff}.ui-error-diagnostics>summary{cursor:pointer;overflow-wrap:anywhere}.ui-error-diagnostics .toolbar{margin:8px 0;min-height:32px;gap:8px}.ui-error-diagnostics .icon-button{width:32px;height:32px;padding:0}.ui-error-diagnostics pre{max-width:100%;max-height:480px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}.ui-error-diagnostics [data-diagnostic-copy-status]{color:var(--muted);font-size:12px}@media(max-width:640px){.ui-error-diagnostics .icon-button{width:44px;height:44px}.ui-error-diagnostics>summary .muted{display:block}}
+    .snapshot-toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px;min-height:36px;margin:0 0 8px}
+    .snapshot-toolbar button[hidden]{display:none}.snapshot-toolbar [role="status"]{overflow-wrap:anywhere}
+    .snapshot-toolbar .snapshot-error{color:#b91c1c}
+    .runtime-large-table{min-width:0}.runtime-large-table [hidden]{display:none!important}.runtime-large-controls,.runtime-large-pager{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.runtime-large-controls{margin-bottom:8px}.runtime-large-controls input,.runtime-large-picker input{width:100%;min-width:0}.runtime-large-filter{flex:1 1 180px;max-width:320px}.runtime-large-selection{position:relative;flex:0 1 280px;min-width:0}.runtime-large-selection>button{width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}.runtime-large-picker{position:absolute;z-index:5;inset:100% 0 auto;background:#fff;border:1px solid var(--line);border-radius:6px;padding:8px;box-shadow:0 4px 12px #11182722}.runtime-large-options{list-style:none;padding:0;margin:4px 0;max-height:220px;overflow:auto}.runtime-large-options button{display:block;width:100%;text-align:left;overflow-wrap:anywhere}.runtime-large-options button[aria-pressed="true"]{font-weight:700;border-color:var(--accent)}.runtime-large-scroll{max-width:100%;overflow:auto}.runtime-large-scroll table{margin:0}.runtime-large-scroll td,.runtime-large-scroll th{overflow-wrap:anywhere}.runtime-large-pager{margin:6px 0}.runtime-large-pager [role="status"]{overflow-wrap:anywhere;min-width:8ch}.runtime-large-message{min-height:1.4em;overflow-wrap:anywhere}.runtime-large-details{padding:8px 0}.runtime-large-table :focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+    .runtime-large-picker{position:fixed;inset:auto;display:flex;flex-direction:column;box-sizing:border-box}.runtime-large-picker>:not(.runtime-large-options){flex-shrink:0}.runtime-large-picker .runtime-large-options{min-height:0;overscroll-behavior:contain}.runtime-large-picker .runtime-large-pager{min-height:32px}
+    @media(max-width:768px){.runtime-large-table button,.runtime-large-table input{min-height:44px}.runtime-large-pager button{min-width:44px}.runtime-large-picker .runtime-large-pager{min-height:44px}.runtime-large-filter,.runtime-large-selection{flex:1 1 100%;max-width:none}}
+    @media(max-width:768px){.snapshot-toolbar button{min-width:44px;min-height:44px}}
   </style>
 </head>
 <body${mode === 'runtime' ? ' class="runtime-page"' : ''}>
@@ -10426,6 +10445,12 @@ function dynamicPagesClientScript() {
       publicationParamsModeHelp: 'Exact parameter set publishes the snapshot only for the current run parameters, for example city=city49. Ignore runtime parameters publishes one page for the template code; URL parameters are ignored and every viewer sees the same published result.',
       publicationWarning: 'Warning: users will see the published result without read permissions on the source CMDBuild objects.',
       publicationWarningAccepted: 'I understand and accept this publication mode',
+      publicationRefreshMode: 'Refresh from the report',
+      publicationRefreshPersonal: 'Personal result',
+      publicationRefreshShared: 'Shared snapshot',
+      publicationSharedRefreshWarning: 'A refresh replaces the snapshot using the CMDBuild permissions of the person who runs it. The result can contain more or fewer records and is visible to everyone, including anonymous readers with the public link.',
+      publicationSharedRefreshAccepted: 'I allow report readers to replace the shared snapshot',
+      publicationSharedRefreshRequired: 'Confirm shared snapshot refresh or select Personal result.',
       publicationPublicD2Source: 'Allow public D2 source download',
       publicationPublicD2SourceHelp: 'Keep disabled unless viewers may download raw .d2 with embedded structured diagram metadata.',
       applyPublication: 'Apply publication settings',
@@ -10949,6 +10974,29 @@ function dynamicPagesClientScript() {
       viewComposerApplied: 'Final data applied to Spec JSON.',
       viewComposerNeedsSource: 'Final data requires a result source.',
       viewComposerNeedsColumn: 'Final data requires at least one visible column.',
+      viewLargeTable: 'Large table',
+      viewLargeMode: 'Row browsing',
+      viewLargeNormal: 'Regular table',
+      viewLargeAll: 'All rows, paginated',
+      viewLargeKey: 'By selected object',
+      viewLargeSourceKind: 'Option source type',
+      viewLargeClass: 'CMDBuild class',
+      viewLargeResult: 'Confirmed flow result',
+      viewLargeSource: 'Option source',
+      viewLargeId: 'Option identifier field',
+      viewLargeLabel: 'Option label field',
+      viewLargeMatch: 'Matching field in the table source',
+      viewLargeParameter: 'Input parameter for the selected key',
+      viewLargeNoParameter: 'No parameter',
+      viewLargeGroupKeys: 'Grouping key columns',
+      viewLargeReductions: 'Column reductions',
+      viewLargeReduction: 'Reduction: {column}',
+      viewLargeNone: 'No reduction',
+      viewLargeUnique: 'Unique values',
+      viewLargeCount: 'Row count',
+      viewLargeTuples: 'Field tuples',
+      viewLargeTupleField: 'Field {index} of the tuple',
+      viewLargeTupleRequired: 'Choose at least one tuple field for {column}.',
       testWorkflow: 'Test run',
       testWorkflowHelp: 'Fill input values from declared variables, then validate and preview the current draft before saving it as a template.',
       emulateInput: 'Emulate input',
@@ -11213,6 +11261,34 @@ function dynamicPagesClientScript() {
       runtimeSnapshotPublished: 'Snapshot published',
       runtimeCacheRefreshWait: 'Refresh is available in {time}',
       runtimeCacheRefreshReady: 'Refresh is available',
+      snapshotReload: 'Reload snapshot',
+      snapshotRefreshPersonal: 'Refresh for me',
+      snapshotRefreshShared: 'Refresh shared snapshot',
+      snapshotRefreshConfirm: 'Replace the snapshot for everyone, including public link readers, with the data visible to you?',
+      snapshotRefreshedPersonal: 'Personal result. The shared snapshot has not changed.',
+      snapshotRefreshedShared: 'Shared snapshot updated.',
+      snapshotRefreshConflict: 'The template or snapshot changed. Reload the snapshot and try again.',
+      snapshotRefreshFailed: 'Could not refresh the report.',
+      snapshotReloadFailed: 'Could not reload the snapshot.',
+      snapshotRefreshLimited: 'The report could not be fully calculated within the execution limits.',
+      largeTableChoose: 'Select an object',
+      largeTableSearchOptions: 'Search objects',
+      largeTableSearchRows: 'Search table',
+      largeTableNoOptions: 'No matching objects.',
+      largeTableNoRows: 'No matching rows.',
+      largeTableLoading: 'Loading…',
+      largeTablePrevious: 'Previous page',
+      largeTableNext: 'Next page',
+      largeTableRange: '{first}–{last} of {total}',
+      largeTableDetails: 'Source rows',
+      largeTableDetailsForRow: 'Source rows for row {row}',
+      largeTableIncomplete: 'The table is incomplete. Execution limits were reached.',
+      largeTableError: 'Could not load the table data.',
+      largeTableRetry: 'Retry',
+      largeTableSnapshotExpired: 'The snapshot has changed or expired. Reload the snapshot.',
+      largeTableViewExpired: 'This table view has expired. Reopen the table.',
+      largeTableReopen: 'Reopen table',
+      largeTableKeyUnavailable: 'The selected object is no longer available. Select another object.',
       runtimeCacheGeneratedAt: 'Generated',
       runtimeCacheExpiresIn: 'Cache expires in {time}',
       runtimeCacheBackend: 'Backend',
@@ -11793,6 +11869,12 @@ function dynamicPagesClientScript() {
       publicationParamsModeHelp: 'Точный набор параметров публикует снимок только для текущих параметров запуска, например city=city49. Если runtime-параметры игнорируются, публикуется одна страница на код шаблона: параметры URL не учитываются, и все зрители видят один опубликованный результат.',
       publicationWarning: 'Внимание: пользователи увидят опубликованный результат без прав чтения на исходные CMDBuild-объекты.',
       publicationWarningAccepted: 'Я понимаю и принимаю этот режим публикации',
+      publicationRefreshMode: 'Обновление из отчёта',
+      publicationRefreshPersonal: 'Личный результат',
+      publicationRefreshShared: 'Общий снимок',
+      publicationSharedRefreshWarning: 'Снимок заменяется данными, доступными в CMDBuild пользователю, который запустил обновление. Карточек может стать больше или меньше. Результат увидят все, включая анонимных читателей по публичной ссылке.',
+      publicationSharedRefreshAccepted: 'Разрешаю читателям отчёта заменять общий снимок',
+      publicationSharedRefreshRequired: 'Подтвердите обновление общего снимка или выберите «Личный результат».',
       publicationPublicD2Source: 'Разрешить публичное скачивание D2 source',
       publicationPublicD2SourceHelp: 'Оставьте выключенным, если зрителям нельзя скачивать raw .d2 со встроенными structured diagram metadata.',
       applyPublication: 'Применить настройки публикации',
@@ -12316,6 +12398,29 @@ function dynamicPagesClientScript() {
       viewComposerApplied: 'Итоговые данные применены к Spec JSON.',
       viewComposerNeedsSource: 'Для итоговых данных нужен источник результата.',
       viewComposerNeedsColumn: 'Для итоговых данных нужна хотя бы одна видимая колонка.',
+      viewLargeTable: 'Большая таблица',
+      viewLargeMode: 'Просмотр строк',
+      viewLargeNormal: 'Обычная таблица',
+      viewLargeAll: 'Все строки, постранично',
+      viewLargeKey: 'По выбранному объекту',
+      viewLargeSourceKind: 'Тип источника вариантов',
+      viewLargeClass: 'Класс CMDBuild',
+      viewLargeResult: 'Подтверждённый результат потока',
+      viewLargeSource: 'Источник вариантов',
+      viewLargeId: 'Поле идентификатора варианта',
+      viewLargeLabel: 'Поле подписи варианта',
+      viewLargeMatch: 'Поле сопоставления в источнике таблицы',
+      viewLargeParameter: 'Входной параметр для выбранного ключа',
+      viewLargeNoParameter: 'Без параметра',
+      viewLargeGroupKeys: 'Колонки ключа группировки',
+      viewLargeReductions: 'Свёртка колонок',
+      viewLargeReduction: 'Свёртка: {column}',
+      viewLargeNone: 'Без свёртки',
+      viewLargeUnique: 'Уникальные значения',
+      viewLargeCount: 'Количество строк',
+      viewLargeTuples: 'Связки полей',
+      viewLargeTupleField: 'Поле {index} в связке',
+      viewLargeTupleRequired: 'Выберите хотя бы одно поле связки для колонки «{column}».',
       testWorkflow: 'Проверка',
       testWorkflowHelp: 'Заполните значения объявленных входных переменных, затем проверьте черновик и выполните preview перед сохранением в шаблон.',
       emulateInput: 'Эмулировать ввод',
@@ -12580,6 +12685,34 @@ function dynamicPagesClientScript() {
       runtimeSnapshotPublished: 'Снимок опубликован',
       runtimeCacheRefreshWait: 'Обновление доступно через {time}',
       runtimeCacheRefreshReady: 'Обновление доступно',
+      snapshotReload: 'Перечитать снимок',
+      snapshotRefreshPersonal: 'Обновить для себя',
+      snapshotRefreshShared: 'Обновить общий снимок',
+      snapshotRefreshConfirm: 'Заменить снимок для всех, включая читателей публичной ссылки, данными, доступными вам?',
+      snapshotRefreshedPersonal: 'Личный результат. Общий снимок не изменён.',
+      snapshotRefreshedShared: 'Общий снимок обновлён.',
+      snapshotRefreshConflict: 'Шаблон или снимок изменился. Перечитайте снимок и повторите попытку.',
+      snapshotRefreshFailed: 'Не удалось обновить отчёт.',
+      snapshotReloadFailed: 'Не удалось перечитать снимок.',
+      snapshotRefreshLimited: 'Не удалось полностью рассчитать отчёт в пределах лимитов выполнения.',
+      largeTableChoose: 'Выберите объект',
+      largeTableSearchOptions: 'Поиск объектов',
+      largeTableSearchRows: 'Поиск по таблице',
+      largeTableNoOptions: 'Объекты не найдены.',
+      largeTableNoRows: 'Строки не найдены.',
+      largeTableLoading: 'Загрузка…',
+      largeTablePrevious: 'Предыдущая страница',
+      largeTableNext: 'Следующая страница',
+      largeTableRange: '{first}–{last} из {total}',
+      largeTableDetails: 'Исходные строки',
+      largeTableDetailsForRow: 'Исходные строки для строки {row}',
+      largeTableIncomplete: 'Таблица неполная: достигнуты лимиты выполнения.',
+      largeTableError: 'Не удалось загрузить данные таблицы.',
+      largeTableRetry: 'Повторить',
+      largeTableSnapshotExpired: 'Снимок изменился или истёк. Перечитайте снимок.',
+      largeTableViewExpired: 'Срок действия результата истёк. Откройте таблицу заново.',
+      largeTableReopen: 'Открыть таблицу заново',
+      largeTableKeyUnavailable: 'Выбранный объект недоступен. Выберите другой объект.',
       runtimeCacheGeneratedAt: 'Построено',
       runtimeCacheExpiresIn: 'Кэш истекает через {time}',
       runtimeCacheBackend: 'Backend',
@@ -12798,6 +12931,8 @@ function dynamicPagesClientScript() {
     assistantLastTraceDiagnostic: null,
     result: null,
     runtimeRefreshInProgress: false,
+    snapshotRefreshMode: '',
+    snapshotRevision: '',
     runtimeCountdownTimer: null,
     technicalSchemaAccessDenied: false,
     accessDeniedText: DEFAULT_PERMISSION_DENIED_TEXT
@@ -13744,23 +13879,33 @@ function dynamicPagesClientScript() {
     return query;
   }
 
-  function publicSnapshotRunPath(templateCode, params) {
-    return apiPrefix + '/public-snapshots/' + encodeURIComponent(templateCode) + '/run?' + runtimeQuery(params).toString();
+  function publicSnapshotRunPath(templateCode, params, tableShell) {
+    var query = runtimeQuery(params);
+    if (tableShell) query.set('cmdpTableShell', '1');
+    return apiPrefix + '/public-snapshots/' + encodeURIComponent(templateCode) + '/run?' + query.toString();
   }
 
-  function runtimeRunPath(templateCode, params, refresh, forceRefresh) {
+  function snapshotRefreshPath(templateCode, tableShell) {
+    var query = runtimeQuery(state.runParams);
+    if (tableShell) query.set('cmdpTableShell', '1');
+    return apiPrefix + '/templates/' + encodeURIComponent(templateCode) + '/refresh-snapshot?' + query.toString();
+  }
+
+  function runtimeRunPath(templateCode, params, refresh, forceRefresh, tableShell) {
     var queryParams = runtimeQuery(params);
     if (refresh) queryParams.set('refresh', '1');
     if (forceRefresh) queryParams.set('forceRefresh', '1');
+    if (tableShell) queryParams.set('cmdpTableShell', '1');
     var query = queryParams.toString();
     return apiPrefix + '/templates/' + encodeURIComponent(templateCode) + '/run' + (query ? '?' + query : '');
   }
 
   function runtimeSystemParam(name) {
-    return ['root', 'lang', 'cmdpLang', 'json', 'd2', 'diagram', 'refresh', 'noCache', 'forceRefresh', 'bypassRefreshCooldown'].indexOf(String(name || '')) !== -1;
+    return ['root', 'lang', 'cmdpLang', 'json', 'd2', 'diagram', 'refresh', 'noCache', 'forceRefresh', 'bypassRefreshCooldown', 'cmdpTable', 'cmdpTableShell'].indexOf(String(name || '')) !== -1;
   }
 
   function runtimeD2DownloadPath(result, diagram, diagramIndex) {
+    if (result && result.downloadMode === 'personal') return '';
     var template = result && result.json && result.json.template ? result.json.template : {};
     var templateCode = template.code || boot.templateCode || '';
     if (!templateCode) return '';
@@ -14433,12 +14578,24 @@ function dynamicPagesClientScript() {
 
   function publishModelForSpec(spec) {
     var publish = spec && spec.publish && typeof spec.publish === 'object' && !Array.isArray(spec.publish) ? spec.publish : {};
+    var sharedRefresh = publish.mode === 'staticSnapshot' && publish.refreshMode === 'shared';
     return {
       mode: publish.mode === 'staticSnapshot' ? 'staticSnapshot' : 'dynamicUser',
       warningAccepted: Boolean(publish.warningAccepted),
       paramsMode: publish.paramsMode === 'ignore' ? 'ignore' : 'exact',
-      publicD2Source: Boolean(publish.publicD2Source || publish.allowPublicD2Source)
+      publicD2Source: Boolean(publish.publicD2Source || publish.allowPublicD2Source),
+      refreshMode: sharedRefresh ? 'shared' : 'personal',
+      sharedRefreshAccepted: sharedRefresh && publish.sharedRefreshAccepted === true
     };
+  }
+
+  function publicationRefreshConsentMissing(spec) {
+    if (spec === undefined && hasField('cmdp-publish-refresh-mode')) {
+      return readValue('cmdp-publish-mode') === 'staticSnapshot' && readValue('cmdp-publish-refresh-mode') === 'shared' &&
+        !readChecked('cmdp-publish-shared-refresh-accepted');
+    }
+    var publish = publishModelForSpec(spec === undefined ? state.selectedTemplate && state.selectedTemplate.spec : spec);
+    return publish.refreshMode === 'shared' && !publish.sharedRefreshAccepted;
   }
 
   function applyPublicationToSpec(spec, required) {
@@ -14448,13 +14605,17 @@ function dynamicPagesClientScript() {
     var paramsMode = String(readValue('cmdp-publish-params-mode') || 'exact') === 'ignore' ? 'ignore' : 'exact';
     var warningAccepted = readChecked('cmdp-publish-warning-accepted');
     var publicD2Source = readChecked('cmdp-publish-public-d2-source');
+    var sharedRefresh = mode === 'staticSnapshot' && readValue('cmdp-publish-refresh-mode') === 'shared';
     if (mode === 'staticSnapshot' && !warningAccepted) throw new Error(t('publicationWarning'));
+    if (required && publicationRefreshConsentMissing()) throw new Error(t('publicationSharedRefreshRequired'));
     spec.publish = {
       mode: mode,
       paramsMode: paramsMode,
       warningAccepted: warningAccepted,
-      publicD2Source: publicD2Source
+      publicD2Source: publicD2Source,
+      refreshMode: sharedRefresh ? 'shared' : 'personal'
     };
+    if (sharedRefresh) spec.publish.sharedRefreshAccepted = readChecked('cmdp-publish-shared-refresh-accepted');
     return spec;
   }
 
@@ -16992,12 +17153,12 @@ function dynamicPagesClientScript() {
     var label = catalogFieldPickerSelectedLabel(initialOptions, selected);
     var disabled = Boolean(context.disabled);
     var contextAttributes = Object.keys(context).map(function (key) {
-      if (key === 'disabled') return '';
+      if (key === 'disabled' || key === 'labelledby') return '';
       return ' data-catalog-field-picker-' + escapeHtml(key) + '="' + escapeHtml(String(context[key] || '')) + '"';
     }).join('');
     return '<div class="catalog-field-picker" data-catalog-field-picker' + contextAttributes + '>' +
       '<input type="hidden" data-catalog-field-picker-value data-catalog-field-picker-selected-label="' + escapeHtml(label) + '" ' + fieldAttribute + ' value="' + escapeHtml(selected) + '"' + (disabled ? ' disabled' : '') + '>' +
-      '<button type="button" class="catalog-field-picker-toggle" data-action="catalog-field-picker-toggle" aria-expanded="false"' + (disabled ? ' disabled' : '') + '>' + escapeHtml(label || t('fieldPickerChoose')) + '</button>' +
+      '<button type="button" class="catalog-field-picker-toggle" data-action="catalog-field-picker-toggle" aria-expanded="false"' + (context.labelledby ? ' id="' + escapeHtml(context.labelledby + '-value') + '" aria-labelledby="' + escapeHtml(context.labelledby + ' ' + context.labelledby + '-value') + '"' : '') + (disabled ? ' disabled' : '') + '>' + escapeHtml(label || t('fieldPickerChoose')) + '</button>' +
       '<div class="catalog-field-picker-menu" data-catalog-field-picker-menu hidden><input type="search" data-catalog-field-picker-search placeholder="' + escapeHtml(t('fieldPickerSearch')) + '" autocomplete="off" aria-label="' + escapeHtml(t('fieldPickerSearchAria')) + '"><div role="listbox" data-catalog-field-picker-results>' +
         renderCatalogFieldPickerPrompt() + '</div></div></div>';
   }
@@ -17048,7 +17209,7 @@ function dynamicPagesClientScript() {
       '<select multiple hidden data-compact-multi-select-value ' + fieldAttribute + (disabled ? ' disabled' : '') + '>' + choices.map(function (item) {
         return '<option value="' + escapeHtml(item.value) + '"' + (selected.indexOf(item.value) >= 0 ? ' selected' : '') + '>' + escapeHtml(item.label) + '</option>';
       }).join('') + '</select>' +
-      '<button type="button" class="compact-multi-select-toggle" data-action="compact-multi-select-toggle" aria-expanded="false"' + (disabled ? ' disabled' : '') + '>' + escapeHtml(compactMultiSelectSummary(choices, selected)) + '</button>' +
+      '<button type="button" class="compact-multi-select-toggle" data-action="compact-multi-select-toggle" aria-expanded="false"' + (options.labelledby ? ' id="' + escapeHtml(options.labelledby + '-value') + '" aria-labelledby="' + escapeHtml(options.labelledby + ' ' + options.labelledby + '-value') + '"' : '') + (disabled ? ' disabled' : '') + '>' + escapeHtml(compactMultiSelectSummary(choices, selected)) + '</button>' +
       '<div class="compact-multi-select-menu" data-compact-multi-select-menu hidden>' +
       (searchable ? '<input type="search" class="compact-multi-select-search" data-compact-multi-select-search placeholder="' + escapeHtml(t('multiSelectSearch')) + '" autocomplete="off" aria-label="' + escapeHtml(t('multiSelectSearch')) + '">' : '') +
       '<div class="compact-multi-select-options" data-compact-multi-select-options role="group">' + choices.map(function (item) {
@@ -17059,6 +17220,14 @@ function dynamicPagesClientScript() {
   function catalogFieldPickerOptions(picker, query) {
     if (!picker) return [];
     var kind = String(picker.getAttribute('data-catalog-field-picker-kind') || '').trim();
+    if (kind === 'viewLargeClass') return catalogClassOptionRows('').map(function (item) {
+      return { value: item.name, label: item.label || item.name };
+    });
+    if (kind === 'viewLargeAttribute') return viewLargeClassFieldOptions(picker.getAttribute('data-catalog-field-picker-class'));
+    if (kind === 'viewLargeMatch') {
+      var viewDraft = captureViewComposerDraftFromDom();
+      return viewLargeColumnOptions(viewDraft.columns).concat(diagramColumnOptionRowsForSource(readCurrentSpec(), viewDraft.sourceAlias, query));
+    }
     if (kind === 'scope') return catalogScopePathOptions(picker.getAttribute('data-catalog-field-picker-class') || '', query);
     if (kind === 'related') return relatedTargetColumnOptions(picker.getAttribute('data-catalog-field-picker-class') || '', '', query);
     if (kind === 'objectGroupSource') {
@@ -17117,7 +17286,7 @@ function dynamicPagesClientScript() {
       var name = String(className || '').trim();
       if (name && classes.indexOf(name) === -1) classes.push(name);
     }
-    if (kind === 'scope' || kind === 'related' || kind === 'relationPath') {
+    if (kind === 'scope' || kind === 'related' || kind === 'relationPath' || kind === 'viewLargeAttribute') {
       add(picker.getAttribute('data-catalog-field-picker-class'));
     } else if (kind === 'objectGroupSource') {
       var selection = picker.closest('[data-object-selection]');
@@ -17125,7 +17294,7 @@ function dynamicPagesClientScript() {
       var draft = captureObjectGroupDraftFromDom();
       var sourceAlias = String(selection && selection.querySelector('[data-object-selection-field="from"]') && selection.querySelector('[data-object-selection-field="from"]').value || '').trim();
       flowCatalogRootClassNames(draft, readCurrentSpec(), sourceAlias, selectionIndex).forEach(add);
-    } else if (kind === 'diagram' || kind === 'view' || kind === 'selection') {
+    } else if (kind === 'diagram' || kind === 'view' || kind === 'selection' || kind === 'viewLargeMatch') {
       add(sourceClassForAlias(readCurrentSpec(), picker.getAttribute('data-catalog-field-picker-source') || ''));
     } else if (kind === 'stage') {
       var stageSpec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
@@ -17348,6 +17517,10 @@ function dynamicPagesClientScript() {
     });
     var selected = Array.prototype.slice.call(select.selectedOptions || []).map(function (option) { return String(option.value || ''); });
     toggle.textContent = compactMultiSelectSummary(items, selected);
+    if (select.matches('[data-view-large-field="groupKeys"]')) {
+      handleViewLargeTableChange(select);
+      return;
+    }
     if (select.matches('[data-assistant-flow-field="uses"]')) {
       state.assistantObjectFlowIntent = readAssistantObjectFlowIntentFromDom();
       resetAssistantObjectFlowProposal();
@@ -19539,6 +19712,15 @@ function dynamicPagesClientScript() {
       '<option value="ignore"' + (publish.paramsMode === 'ignore' ? ' selected' : '') + '>' + t('publicationParamsIgnore') + '</option>',
       '</select><span class="muted">' + escapeHtml(t('publicationParamsModeHelp')) + '</span></label>',
       '<label class="checkbox"><input id="cmdp-publish-warning-accepted" type="checkbox" ' + (publish.warningAccepted ? 'checked' : '') + '> ' + t('publicationWarningAccepted') + '</label>',
+      '<div id="cmdp-publish-refresh-settings"' + (publish.mode === 'staticSnapshot' ? '' : ' hidden') + '>',
+      '<label>' + escapeHtml(t('publicationRefreshMode')) + '<select id="cmdp-publish-refresh-mode">',
+      '<option value="personal"' + (publish.refreshMode === 'personal' ? ' selected' : '') + '>' + escapeHtml(t('publicationRefreshPersonal')) + '</option>',
+      '<option value="shared"' + (publish.refreshMode === 'shared' ? ' selected' : '') + '>' + escapeHtml(t('publicationRefreshShared')) + '</option>',
+      '</select></label>',
+      '<div id="cmdp-publish-shared-refresh-settings"' + (publish.refreshMode === 'shared' ? '' : ' hidden') + '>',
+      '<div class="notice warning" id="cmdp-publish-shared-refresh-warning">' + escapeHtml(t('publicationSharedRefreshWarning')) + '</div>',
+      '<label class="checkbox"><input id="cmdp-publish-shared-refresh-accepted" type="checkbox" aria-describedby="cmdp-publish-shared-refresh-warning"' + (publish.sharedRefreshAccepted ? ' checked' : '') + '> ' + escapeHtml(t('publicationSharedRefreshAccepted')) + '</label>',
+      '</div></div>',
       '<label class="checkbox"><input id="cmdp-publish-public-d2-source" type="checkbox" ' + (publish.publicD2Source ? 'checked' : '') + '> ' + t('publicationPublicD2Source') + '</label>',
       '<p class="muted">' + t('publicationPublicD2SourceHelp') + '</p>',
       '</div>',
@@ -19708,7 +19890,7 @@ function dynamicPagesClientScript() {
     var templateSelected = Boolean(state.selectedTemplate);
     var recoverySaveRequired = false;
     var recoveryBlocksStrictActions = false;
-    var saveTitle = templateSaveBlockTitle(selected.code);
+    var saveTitle = templateSaveBlockTitle(selected.code, selected.spec || null);
     var saveDisabled = Boolean(saveTitle);
 
     // This is the single persistence action for every template-bound section.
@@ -19769,7 +19951,11 @@ function dynamicPagesClientScript() {
         disabled: false
       });
     } else if (section === 'publication') {
-      actions.push(renderActionButton('apply-publication', t('applyPublication')));
+      var consentMissing = publicationRefreshConsentMissing(selected.spec || null);
+      actions.push(renderActionButton('apply-publication', t('applyPublication'), {
+        disabled: consentMissing,
+        title: consentMissing ? t('publicationSharedRefreshRequired') : ''
+      }));
       var snapshotPublicationEnabled = publishModelForSpec(selected && selected.spec || defaultSpec()).mode === 'staticSnapshot';
       var publishTitle = templatePublishBlockTitle(saveTitle, snapshotPublicationEnabled);
       actions.push(renderActionButton('publish-snapshot', t('publishSnapshot'), {
@@ -20196,7 +20382,13 @@ function dynamicPagesClientScript() {
 
   function getViewComposerOutputAlias(spec) {
     var visual = getStoredVisualModel(spec || {}, 'viewComposer');
-    return visual && visual.output && visual.output.alias || '';
+    var alias = visual && visual.output && visual.output.alias;
+    if (alias) return alias;
+    var step = (Array.isArray(spec && spec.steps) ? spec.steps : []).find(function (candidate) {
+      return candidate && candidate.type === 'enrichRows' && candidate.purpose === 'viewComposer' &&
+        findResultTableByName(spec, candidate.as);
+    });
+    return step && step.as || '';
   }
 
   function getObjectMatchingOutputAlias(spec) {
@@ -20346,6 +20538,12 @@ function dynamicPagesClientScript() {
     });
     if (prepared.length) return prepared[prepared.length - 1].name;
 
+    if (viewAlias) {
+      var step = (Array.isArray(spec.steps) ? spec.steps : []).find(function (candidate) {
+        return candidate && candidate.as === viewAlias && candidate.type === 'enrichRows' && candidate.purpose === 'viewComposer';
+      });
+      if (step && step.from) return step.from;
+    }
     var raw = resultTablesForSpec(spec).filter(function (table) { return table && table.name; });
     return raw.length ? raw[raw.length - 1].name : '';
   }
@@ -25296,22 +25494,29 @@ function dynamicPagesClientScript() {
     }).join('');
   }
 
+  function inferStoredViewLargeTable(spec) {
+    var table = finalResultTableForSpec(spec, true) || firstResultTable(spec);
+    return table.presentation && table.presentation.largeTable || null;
+  }
+
   function inferViewComposerModel(spec) {
     if (state.viewComposerDraft) return state.viewComposerDraft;
     spec = spec || defaultSpec();
     var finalSourceAlias = finalBaseResultAlias(spec);
     var visual = getStoredVisualModel(spec, 'viewComposer');
+    var table = finalResultTableForSpec(spec, true) || firstResultTable(spec);
+    var largeTable = inferStoredViewLargeTable(spec);
     if (visual) {
       return {
         sourceAlias: visual.source && visual.source.alias || finalSourceAlias || '',
         title: visual.output && visual.output.title || '',
         mode: visual.output && visual.output.mode || 'table',
         showOnly: true,
+        largeTable: largeTable,
         columns: visual.output && Array.isArray(visual.output.columns) ? visual.output.columns : []
       };
     }
 
-    var table = finalResultTableForSpec(spec, false) || firstResultTable(spec);
     var labels = table.columnLabels && typeof table.columnLabels === 'object' && !Array.isArray(table.columnLabels) ? table.columnLabels : {};
     var columns = Array.isArray(table.columns) ? table.columns.map(function (field) {
       return { field: field, title: labels[field] || field };
@@ -25321,8 +25526,129 @@ function dynamicPagesClientScript() {
       title: table.title || table.label || '',
       mode: table.mode || table.view || 'table',
       showOnly: true,
+      largeTable: largeTable,
       columns: columns
     };
+  }
+
+  function viewLargeColumnOptions(columns) {
+    var seen = new Set();
+    return columns.map(normalizeViewComposerColumn).filter(function (column) {
+      if (!column.field || seen.has(column.field)) return false;
+      seen.add(column.field);
+      return true;
+    }).map(function (column) { return { value: column.field, label: column.title }; });
+  }
+
+  function viewLargeClassFieldOptions(className) {
+    return className ? catalogAttributeOptions(className).map(function (attribute) {
+      return { value: attribute.name, label: attribute.description || attribute.name };
+    }) : [];
+  }
+
+  function viewLargeResultOptions(spec) {
+    var manifest = assistantObjectFlowOutputManifest(spec);
+    var aliases = (Array.isArray(spec.steps) ? spec.steps : []).filter(function (step) {
+      return step && step.as && step.type !== 'extractVariables' && step.purpose !== 'viewComposer';
+    }).map(function (step) { return step.as; });
+    if (manifest.assistantManaged) {
+      return manifest.warning ? [] : manifest.outputs.filter(function (output) {
+        return aliases.indexOf(output.alias) !== -1;
+      }).map(function (output) { return { value: output.alias, label: output.label }; });
+    }
+    return uniqueList(aliases).map(function (alias) { return { value: alias, label: userFacingResultLabel(alias, spec) }; });
+  }
+
+  function renderViewLargeChoiceOptions(choices, value) {
+    return choices.map(function (choice) {
+      return '<option value="' + escapeHtml(choice[0]) + '"' + (choice[0] === value ? ' selected' : '') + '>' + escapeHtml(t(choice[1])) + '</option>';
+    }).join('');
+  }
+
+  function renderViewLargePicker(field, label, value, options, context) {
+    var labelId = 'cmdp-view-large-' + field + '-label';
+    return '<div class="setting-field"><span id="' + labelId + '">' + escapeHtml(t(label)) + '</span>' +
+      renderCatalogFieldPicker('data-view-large-field="' + field + '"', value, options, Object.assign({ labelledby: labelId }, context)) + '</div>';
+  }
+
+  function renderViewLargeSelectorFields(selector, columns, spec, tableSourceAlias) {
+    var source = selector.source || '';
+    var isResult = selector.kind === 'result';
+    var pickerContext = isResult
+      ? { kind: 'view', source: source, disabled: !source }
+      : { kind: 'viewLargeAttribute', class: source, disabled: !source };
+    function fieldOptions(selected) {
+      return !source ? [] : isResult ? diagramInitialColumnOptionRowsForSource(spec, source, selected) : viewLargeClassFieldOptions(source);
+    }
+    return [
+      isResult ? '<label>' + escapeHtml(t('viewLargeSource')) + '<select data-view-large-field="source">' + renderColumnSelectOptions(viewLargeResultOptions(spec), source) + '</select></label>'
+        : renderViewLargePicker('source', 'viewLargeSource', source, source ? [{ value: source, label: (catalogClassByName(source) || {}).description || source }] : [], { kind: 'viewLargeClass' }),
+      renderViewLargePicker('idField', 'viewLargeId', selector.idField || '', fieldOptions(selector.idField), pickerContext),
+      renderViewLargePicker('labelField', 'viewLargeLabel', selector.labelField || '', fieldOptions(selector.labelField), pickerContext),
+      renderViewLargePicker('matchField', 'viewLargeMatch', selector.matchField || '', columns, {
+        kind: 'viewLargeMatch', source: tableSourceAlias, disabled: !tableSourceAlias
+      }),
+      '<label>' + escapeHtml(t('viewLargeParameter')) + '<select data-view-large-field="parameter">' + renderColumnSelectOptions(getParamRows(spec).map(function (param) {
+        return { value: param.name, label: param.name };
+      }), selector.parameter, t('viewLargeNoParameter')) + '</select></label>'
+    ].join('');
+  }
+
+  function renderViewLargeReductionFields(reduction, columns) {
+    if (!reduction || (reduction.kind !== 'unique' && reduction.kind !== 'tuples')) return '';
+    var html = '';
+    if (reduction.kind === 'tuples') {
+      var fields = uniqueList(reduction.fields).filter(function (field) {
+        return columns.some(function (column) { return column.value === field; });
+      });
+      if (fields.length < columns.length) fields.push('');
+      html = '<div class="settings-grid" data-view-large-tuple-fields>' + fields.map(function (field, index) {
+        var choices = columns.filter(function (column) { return column.value === field || fields.indexOf(column.value) === -1; });
+        return '<label>' + escapeHtml(t('viewLargeTupleField', { index: index + 1 })) + '<select data-view-large-tuple-field>' + renderColumnSelectOptions(choices, field) + '</select></label>';
+      }).join('') + '</div>';
+    }
+    return html + '<label>' + escapeHtml(t('viewComposerSeparator')) + '<input data-view-large-separator maxlength="64" value="' + escapeHtml(reduction.separator == null ? ', ' : reduction.separator) + '"></label>';
+  }
+
+  function renderViewLargeReductions(largeTable, columns) {
+    var keys = largeTable && largeTable.groupKeys || [];
+    if (!keys.length) return '';
+    var reductions = largeTable.reductions || [];
+    return '<h4>' + escapeHtml(t('viewLargeReductions')) + '</h4>' + columns.filter(function (column) {
+      return keys.indexOf(column.value) === -1;
+    }).map(function (column) {
+      var reduction = reductions.find(function (item) { return item.column === column.value; }) || {};
+      return '<div data-view-large-reduction="' + escapeHtml(column.value) + '"><strong>' + escapeHtml(column.label) + '</strong><div class="settings-grid">' +
+        '<label><select aria-label="' + escapeHtml(t('viewLargeReduction', { column: column.label })) + '" data-view-large-reduction-kind>' +
+        renderViewLargeChoiceOptions([['', 'viewLargeNone'], ['unique', 'viewLargeUnique'], ['count', 'viewLargeCount'], ['tuples', 'viewLargeTuples']], reduction.kind || '') +
+        '</select></label><div class="setting-field" data-view-large-reduction-fields>' + renderViewLargeReductionFields(reduction, columns) + '</div></div></div>';
+    }).join('');
+  }
+
+  function renderViewLargeTableDetails(largeTable, columns, spec, tableSourceAlias) {
+    var mode = largeTable && largeTable.mode || '';
+    var selector = largeTable && largeTable.selector || {};
+    var kind = selector.kind === 'result' ? 'result' : 'class';
+    return (mode === 'key' ? '<div class="settings-grid"><label>' + escapeHtml(t('viewLargeSourceKind')) +
+      '<select data-view-large-field="kind">' + renderViewLargeChoiceOptions([['class', 'viewLargeClass'], ['result', 'viewLargeResult']], kind) + '</select></label></div>' +
+      '<div class="settings-grid" data-view-large-selector>' + renderViewLargeSelectorFields(Object.assign({}, selector, { kind: kind }), columns, spec, tableSourceAlias) + '</div>' : '') +
+      '<div class="settings-grid"><div class="setting-field" data-view-large-groups>' + renderViewLargeGroupPicker(largeTable, columns) + '</div></div>' +
+      '<div data-view-large-reductions>' + renderViewLargeReductions(largeTable, columns) + '</div>';
+  }
+
+  function renderViewLargeGroupPicker(largeTable, columns) {
+    return '<span id="cmdp-view-large-group-label">' + escapeHtml(t('viewLargeGroupKeys')) + '</span>' +
+      renderCompactMultiSelect('data-view-large-field="groupKeys"', largeTable.groupKeys || [], columns, {
+        kind: 'viewLargeGroupKeys', labelledby: 'cmdp-view-large-group-label', disabled: !columns.length
+      });
+  }
+
+  function renderViewLargeTable(model, columns, spec) {
+    var largeTable = model.largeTable;
+    return '<div class="settings-block" id="cmdp-view-large-table"' + (model.largeTableEdited ? ' data-view-large-edited' : '') + '><h3>' + escapeHtml(t('viewLargeTable')) + '</h3>' +
+      '<div class="settings-grid"><label>' + escapeHtml(t('viewLargeMode')) + '<select id="cmdp-view-large-mode">' +
+      renderViewLargeChoiceOptions([['', 'viewLargeNormal'], ['all', 'viewLargeAll'], ['key', 'viewLargeKey']], largeTable && largeTable.mode || '') +
+      '</select></label></div><div data-view-large-details' + (largeTable ? '>' + renderViewLargeTableDetails(largeTable, columns, spec, model.sourceAlias) : ' hidden>') + '</div></div>';
   }
 
   function renderViewComposerColumnRow(column, spec, sourceAlias) {
@@ -25375,6 +25701,7 @@ function dynamicPagesClientScript() {
       renderViewComposerColumnRow({}, spec, model.sourceAlias),
       '</tbody></table></div>',
       '<div id="cmdp-view-column-order-status" role="status"></div>',
+      renderViewLargeTable(model, viewLargeColumnOptions(columns), spec),
       '</section>'
     ].join('');
   }
@@ -25637,7 +25964,7 @@ function dynamicPagesClientScript() {
 
   function renderRuntimeCacheControl(result) {
     var cache = result && result.json ? result.json.cache : null;
-    if (!cache || !cache.enabled) return '';
+    if (!cache || !cache.enabled || boot.mode === 'runtime' && cache.scope === 'staticSnapshot') return '';
     var now = Date.now();
     var nextRefreshMs = Date.parse(cache.nextRefreshAllowedAt || '');
     var expiresMs = Date.parse(cache.expiresAt || '');
@@ -26049,11 +26376,15 @@ function dynamicPagesClientScript() {
       '</div>';
   }
 
-  function renderRuntimeResult(result) {
+  function renderRuntimeResult(result, pagedTables) {
     if (!result) return '';
     var resultBody = result.json && result.json.result ? result.json.result : null;
     var outputMode = resultOutputMode(resultBody);
-    var tables = outputMode === 'diagrams' ? [] : visibleResultTables(resultBody ? (resultBody.tables || []) : []);
+    var sourceTables = resultBody ? (resultBody.tables || []) : [];
+    var tables = outputMode === 'diagrams' ? [] : visibleResultTables(sourceTables);
+    if (pagedTables && pagedTables.length && outputMode !== 'diagrams') {
+      tables = sourceTables.filter(function (table) { return tables.indexOf(table) !== -1 || pagedTables.some(function (item) { return item.table === table; }); });
+    }
     var diagrams = outputMode === 'tables' ? [] : visibleResultDiagrams(resultBody ? (resultBody.diagrams || []) : []);
     var cacheHtml = renderRuntimeCacheControl(result);
     if (!result.ok) {
@@ -26085,6 +26416,8 @@ function dynamicPagesClientScript() {
       }).concat(tables.map(function (table) {
         var toolbar = cacheUsed ? '' : cacheHtml;
         cacheUsed = cacheUsed || Boolean(toolbar);
+        var pagedIndex = pagedTables ? pagedTables.findIndex(function (item) { return item.table === table; }) : -1;
+        if (pagedIndex !== -1) return renderLargeTableShell(pagedTables[pagedIndex], pagedIndex, toolbar);
         return renderResultTable(table, toolbar);
       })).join('');
       return rendered + (result.downloadMode === 'draft'
@@ -26459,12 +26792,15 @@ function dynamicPagesClientScript() {
     });
   }
 
-  function readEditorPayload() {
+  function readEditorPayload(options) {
     var selected = state.selectedTemplate || {};
     var code = readTemplateCode(selected);
     if (!code) throw new Error(t('templateCodeRequired'));
     var specData = readSpecWithEditorBlocks();
     specData.spec = normalizeTemplateProtection(applyTemplateKindFromEditor(specData.spec));
+    if (options && options.requirePublicationConsent && publicationRefreshConsentMissing(specData.spec)) {
+      throw new Error(t('publicationSharedRefreshRequired'));
+    }
     var payload = {
       code: code,
       description: readTemplateDescription(selected, code) || code,
@@ -26701,19 +27037,73 @@ function dynamicPagesClientScript() {
   }
 
   function readViewComposerFields() {
-    var sourceAlias = String(readValue('cmdp-view-source') || '').trim() || finalBaseResultAlias(readCurrentSpec());
-    var title = String(readValue('cmdp-view-title') || '').trim();
-    var mode = String(readValue('cmdp-view-mode') || 'table').trim() || 'table';
-    var columns = readViewComposerColumnRows();
-    if (!sourceAlias) throw new Error(t('viewComposerNeedsSource'));
-    if (!columns.length) throw new Error(t('viewComposerNeedsColumn'));
-    return {
-      sourceAlias: sourceAlias,
-      title: title || sourceAlias,
+    var draft = captureViewComposerDraftFromDom();
+    draft.columns = readViewComposerColumnRows();
+    return validateViewComposerDraft(draft, readCurrentSpec());
+  }
+
+  function readViewLargeTableDraft() {
+    var host = document.getElementById('cmdp-view-large-table');
+    var mode = host && host.querySelector('#cmdp-view-large-mode').value;
+    if (mode !== 'all' && mode !== 'key') return null;
+    function fieldValue(name) {
+      var input = host.querySelector('[data-view-large-field="' + name + '"]');
+      return String(input && input.value || '').trim();
+    }
+    var groups = host.querySelector('[data-view-large-field="groupKeys"]');
+    var largeTable = {
       mode: mode,
-      showOnly: true,
-      columns: columns
+      groupKeys: Array.from(groups ? groups.selectedOptions : [], function (option) { return option.value; }),
+      reductions: Array.from(host.querySelectorAll('[data-view-large-reduction]')).flatMap(function (row) {
+        var kind = row.querySelector('[data-view-large-reduction-kind]').value;
+        if (!kind) return [];
+        var rule = { column: row.getAttribute('data-view-large-reduction'), kind: kind };
+        var separator = row.querySelector('[data-view-large-separator]');
+        if (separator) rule.separator = separator.value;
+        if (kind === 'tuples') rule.fields = uniqueList(Array.from(row.querySelectorAll('[data-view-large-tuple-field]'), function (input) { return input.value; }));
+        return [rule];
+      })
     };
+    if (mode === 'key') {
+      largeTable.selector = { kind: fieldValue('kind') === 'result' ? 'result' : 'class', source: fieldValue('source'),
+        idField: fieldValue('idField'), labelField: fieldValue('labelField'), matchField: fieldValue('matchField') };
+      var parameter = fieldValue('parameter');
+      if (parameter) largeTable.selector.parameter = parameter;
+    }
+    return largeTable;
+  }
+
+  function validateViewComposerDraft(draft, spec) {
+    if (!draft.sourceAlias) throw new Error(t('viewComposerNeedsSource'));
+    if (!draft.columns.length) throw new Error(t('viewComposerNeedsColumn'));
+    if (draft.columns.some(function (column) { return !column.field; })) throw new Error(t('fieldRequired', { label: t('viewComposerColumnField') }));
+    var table = draft.largeTable;
+    if (table) {
+      var columns = viewLargeColumnOptions(draft.columns);
+      function hasColumn(value) { return columns.some(function (item) { return item.value === value; }); }
+      function requireField(valid, label) {
+        if (!valid) throw new Error(t('fieldRequired', { label: t(label) }));
+      }
+      if (table.mode === 'key') {
+        var selector = table.selector || {};
+        requireField(selector.source && (selector.kind !== 'result' || viewLargeResultOptions(spec).some(function (item) { return item.value === selector.source; })), 'viewLargeSource');
+        requireField(selector.idField, 'viewLargeId');
+        requireField(selector.labelField, 'viewLargeLabel');
+        requireField(selector.matchField, 'viewLargeMatch');
+        requireField(!selector.parameter || getParamRows(spec).some(function (param) { return param.name === selector.parameter; }), 'viewLargeParameter');
+      }
+      var groupKeys = columns.map(function (item) { return item.value; }).filter(function (field) { return table.groupKeys.indexOf(field) !== -1; });
+      var reductions = groupKeys.length ? table.reductions.filter(function (rule) {
+        return hasColumn(rule.column) && groupKeys.indexOf(rule.column) === -1;
+      }).map(function (rule) {
+        if (rule.kind !== 'tuples') return rule;
+        var fields = (rule.fields || []).filter(hasColumn);
+        if (!fields.length) throw new Error(t('viewLargeTupleRequired', { column: columnOptionLabel(columns, rule.column) }));
+        return Object.assign({}, rule, { fields: fields });
+      }) : [];
+      table = Object.assign({}, table, { groupKeys: groupKeys, reductions: reductions });
+    }
+    return Object.assign({}, draft, { title: draft.title || draft.sourceAlias, largeTable: table });
   }
 
   function buildViewComposerSpec(model, previousSpec) {
@@ -26757,6 +27147,10 @@ function dynamicPagesClientScript() {
         });
       }
     });
+    var matchField = model.largeTable && model.largeTable.selector && model.largeTable.selector.matchField;
+    if (matchField && fields.indexOf(matchField) === -1) {
+      enrichColumns.push({ path: matchField, as: matchField, multiMode: 'join', emptyRow: true });
+    }
     spec.steps.push({
       type: 'enrichRows',
       from: model.sourceAlias,
@@ -26775,6 +27169,11 @@ function dynamicPagesClientScript() {
       return candidate && candidate.name === outputAlias;
     });
     if (existingOutputTable && existingOutputTable.emptyText) table.emptyText = existingOutputTable.emptyText;
+    if (existingOutputTable && existingOutputTable.published) table.published = true;
+    var tablePresentation = Object.assign({}, existingOutputTable && existingOutputTable.presentation || {});
+    if (model.largeTable) tablePresentation.largeTable = cloneJsonValue(model.largeTable, null);
+    else if (model.largeTable === null) delete tablePresentation.largeTable;
+    if (Object.keys(tablePresentation).length) table.presentation = tablePresentation;
 
     if (model.showOnly) {
       spec.result.tables = [table];
@@ -26828,6 +27227,8 @@ function dynamicPagesClientScript() {
       title: String(readValue('cmdp-view-title') || '').trim(),
       mode: String(readValue('cmdp-view-mode') || 'table').trim() || 'table',
       showOnly: true,
+      largeTable: readViewLargeTableDraft(),
+      largeTableEdited: Boolean(document.querySelector('#cmdp-view-large-table[data-view-large-edited]')),
       columns: columns
     };
   }
@@ -27088,7 +27489,11 @@ function dynamicPagesClientScript() {
       zebra: Boolean(settings.zebra),
       filters: Boolean(settings.filters),
       sortable: Boolean(settings.sortable),
-      tables: settings.tables
+      tables: settings.tables.map(function (table) {
+        var namedPresentation = Object.assign({}, table);
+        delete namedPresentation.largeTable;
+        return namedPresentation;
+      })
     };
     if (settings.outputMode !== 'tables' && settings.diagram) {
       var existingDiagrams = Array.isArray(spec.result.diagrams) ? spec.result.diagrams.slice() : [];
@@ -27119,6 +27524,7 @@ function dynamicPagesClientScript() {
         sortDirection: settingsTable.sortDirection || 'asc',
         columnLinks: normalizeColumnLinks(settingsTable.columnLinks)
       };
+      if (table.presentation && table.presentation.largeTable) next.presentation.largeTable = table.presentation.largeTable;
       return next;
     }) : [];
     upsertStoredVisualModel(spec, {
@@ -28109,6 +28515,14 @@ function dynamicPagesClientScript() {
 
   function readSpecWithEditorBlocks() {
     var specData = readSpecWithParamEditor();
+    var viewDraft = document.querySelector('#cmdp-view-large-table[data-view-large-edited]')
+      ? captureViewComposerDraftFromDom() : state.viewComposerDraft;
+    if (viewDraft && viewDraft.largeTableEdited) {
+      state.viewComposerDraft = viewDraft;
+      if (viewDraft.largeTable || inferStoredViewLargeTable(specData.spec)) {
+        specData.spec = buildViewComposerSpec(validateViewComposerDraft(viewDraft, specData.spec), specData.spec);
+      }
+    }
     var extractionStep = readExtractionStepFields(false);
     if (extractionStep) specData.spec = upsertExtractionStep(specData.spec, extractionStep);
     var selectionStep = readDataSelectionStepFields(false);
@@ -28418,10 +28832,12 @@ function dynamicPagesClientScript() {
   function applyViewComposerEditor() {
     try {
       var previousSpec = readCurrentSpec();
+      state.viewComposerDraft = captureViewComposerDraftFromDom();
       var model = readViewComposerFields();
       var spec = buildViewComposerSpec(model, previousSpec);
       updateSelectedFromEditor(spec);
       state.viewComposerDraft = model;
+      state.viewComposerDraft.largeTableEdited = false;
       clearDraftExecutionState({ clearExtractionSource: true });
       state.message = { type: 'ok', text: t('viewComposerApplied') };
       renderDesigner();
@@ -28928,6 +29344,65 @@ function dynamicPagesClientScript() {
     syncViewComposerColumnOrderControls();
   }
 
+  function syncViewLargeTableColumns() {
+    var largeTable = readViewLargeTableDraft();
+    if (!largeTable) return;
+    var host = document.getElementById('cmdp-view-large-table');
+    var columns = viewLargeColumnOptions(captureViewComposerDraftFromDom().columns);
+    var groupHost = host.querySelector('[data-view-large-groups]');
+    groupHost.innerHTML = renderViewLargeGroupPicker(largeTable, columns);
+    host.querySelector('[data-view-large-reductions]').innerHTML = renderViewLargeReductions(readViewLargeTableDraft(), columns);
+    markViewLargeTableEdited();
+  }
+
+  function markViewLargeTableEdited() {
+    var host = document.getElementById('cmdp-view-large-table');
+    if (!host) return;
+    host.setAttribute('data-view-large-edited', '');
+    clearDraftExecutionState();
+  }
+
+  function handleViewLargeTableChange(target) {
+    var host = target && target.closest('#cmdp-view-large-table');
+    if (!host) return;
+    markViewLargeTableEdited();
+    var field = target.getAttribute('data-view-large-field');
+    if (['idField', 'labelField', 'matchField', 'parameter'].indexOf(field) !== -1 || target.matches('[data-view-large-separator]')) return;
+    var spec = readCurrentSpec();
+    var draft = captureViewComposerDraftFromDom();
+    var largeTable = draft.largeTable;
+    var columns = viewLargeColumnOptions(draft.columns);
+    if (target.id === 'cmdp-view-large-mode') {
+      var details = host.querySelector('[data-view-large-details]');
+      details.hidden = !largeTable;
+      details.innerHTML = largeTable ? renderViewLargeTableDetails(largeTable, columns, spec, draft.sourceAlias) : '';
+    } else if (largeTable && (field === 'kind' || field === 'source')) {
+      var selectorHost = host.querySelector('[data-view-large-selector]');
+      var selector = largeTable.selector;
+      if (field === 'kind') selector.source = '';
+      selector.idField = '';
+      selector.labelField = '';
+      selectorHost.innerHTML = renderViewLargeSelectorFields(selector, columns, spec, draft.sourceAlias);
+      if (field === 'source') {
+        var next = selectorHost.querySelector('select[data-view-large-field="source"], #cmdp-view-large-source-label-value');
+        if (next) next.focus();
+      }
+    } else if (largeTable && field === 'groupKeys') {
+      host.querySelector('[data-view-large-reductions]').innerHTML = renderViewLargeReductions(largeTable, columns);
+    } else if (largeTable && target.matches('[data-view-large-reduction-kind], [data-view-large-tuple-field]')) {
+      var row = target.closest('[data-view-large-reduction]');
+      var rule = largeTable.reductions.find(function (item) { return item.column === row.getAttribute('data-view-large-reduction'); });
+      var fields = row.querySelector('[data-view-large-reduction-fields]');
+      var tupleIndex = Array.from(fields.querySelectorAll('[data-view-large-tuple-field]')).indexOf(target);
+      var changingKind = target.hasAttribute('data-view-large-reduction-kind');
+      fields.innerHTML = renderViewLargeReductionFields(rule, columns);
+      if (!changingKind && tupleIndex !== -1) {
+        var inputs = fields.querySelectorAll('[data-view-large-tuple-field]');
+        if (inputs.length) inputs[Math.min(tupleIndex, inputs.length - 1)].focus();
+      }
+    }
+  }
+
   function clearViewComposerColumnRow(button) {
     var row = button && button.closest ? button.closest('[data-view-column-row]') : null;
     if (!row) return;
@@ -28938,6 +29413,7 @@ function dynamicPagesClientScript() {
       field.value = '';
     });
     syncViewComposerColumnOrderControls();
+    syncViewLargeTableColumns();
   }
 
   function diagramMappingKindFromElement(element) {
@@ -30155,9 +30631,10 @@ function dynamicPagesClientScript() {
     return notice && notice.snapshotRevocationPending ? { type: 'warning', text: t('snapshotRevocationPending') } : notice;
   }
 
-  function templateSaveBlockTitle(code) {
+  function templateSaveBlockTitle(code, spec) {
     if (!state.selectedTemplate) return t('templateSelectionRequired');
     if (templateWritePending(code)) return t('savingTemplate');
+    if (publicationRefreshConsentMissing(spec)) return t('publicationSharedRefreshRequired');
     return state.diagramImportBusy || state.diagramImportAssistantBusy || state.assistantDiagramInterpretBusy || state.assistantDiagramMappingBusy
       ? t('diagramImportSaveBusy') : '';
   }
@@ -30180,6 +30657,8 @@ function dynamicPagesClientScript() {
     var publishTitle = templatePublishBlockTitle(saveTitle, publishMode === 'staticSnapshot');
     syncAction('save-template', Boolean(saveTitle), saveTitle);
     syncAction('publish-snapshot', Boolean(publishTitle), publishTitle);
+    var consentMissing = publicationRefreshConsentMissing();
+    syncAction('apply-publication', consentMissing, consentMissing ? t('publicationSharedRefreshRequired') : '');
     if (document.getElementById('cmdp-template-transfer')) {
       var actions = templateTransferActionState(templateTransferDraft(), code);
       Object.keys(actions).forEach(function (action) { syncAction('template-transfer-' + action, actions[action]); });
@@ -30893,7 +31372,7 @@ function dynamicPagesClientScript() {
     }
     captureAssistantPromptsFromDom();
     updateSelectedFromEditor(assistantSpecWithPrompts(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec()));
-    return { payload: readEditorPayload(), savedDiagramEditorState: savedDiagramEditorState };
+    return { payload: readEditorPayload({ requirePublicationConsent: true }), savedDiagramEditorState: savedDiagramEditorState };
   }
 
   function saveTemplateSnapshot(payload, savedDiagramEditorState, publication) {
@@ -32871,13 +33350,490 @@ function dynamicPagesClientScript() {
     if (paramsText) paramsText.textContent = runParamVariantsText(params);
   }
 
+  var runtimeLargeTables = [];
+  var largeTablePageSize = 50;
+
+  function largeTablePagePath(item, op, options) {
+    var query = runtimeQuery(state.runParams);
+    var viewId = item.view.kind === 'personal' ? item.view.viewId :
+      item.view.kind === 'dynamic' && op !== 'options' ? item.viewId : undefined;
+    query.set('cmdpTable', JSON.stringify(Object.assign({
+      table: item.table.name, op: op, limit: largeTablePageSize,
+      key: op !== 'options' && item.selection ? item.selection.key : undefined,
+      viewId: viewId || undefined, snapshotRevision: item.view.snapshotRevision || undefined
+    }, options)));
+    var collection = item.view.kind === 'public' ? '/public-snapshots/' : '/templates/';
+    return apiPrefix + collection + encodeURIComponent(boot.templateCode) + '/table-page?' + query.toString();
+  }
+
+  function largeTableButton(action, label, text, disabled) {
+    return '<button type="button" data-large-action="' + action + '" aria-label="' + escapeHtml(t(label)) +
+      '" title="' + escapeHtml(t(label)) + '"' + (disabled ? ' disabled' : '') + '>' + text + '</button>';
+  }
+
+  function largeTablePager(page, name) {
+    if (!page || !page.total) return '';
+    return largeTableButton(name + '-prev', 'largeTablePrevious', '&#8592;', page.offset <= 0) +
+      '<span role="status">' + escapeHtml(t('largeTableRange', {
+        first: page.offset + 1, last: Math.min(page.total, page.offset + page.limit), total: page.total
+      })) + '</span>' + largeTableButton(name + '-next', 'largeTableNext', '&#8594;', page.offset + page.limit >= page.total);
+  }
+
+  function renderLargeTableShell(item, index, toolbar) {
+    var id = 'cmdp-large-table-' + index;
+    var table = item.table;
+    return '<section class="result-table-wrap runtime-large-table" data-result-table data-large-table="' + index + '" aria-labelledby="' + id + '">' +
+      '<div class="result-table-header"><div class="result-table-title"' + titleAlignStyle(item.presentation, true) +
+      '><h3 id="' + id + '">' + escapeHtml(displayTitleForResult(table.name, table.title || table.label || '')) + '</h3></div>' +
+      (toolbar ? '<div class="result-table-actions">' + toolbar + '</div>' : '') + '</div>' +
+      '<div class="runtime-large-controls">' + (item.keyed ? '<div class="runtime-large-selection" data-large-selection>' +
+        '<button type="button" data-large-action="picker" aria-expanded="false" aria-controls="' + id + '-picker">' +
+        escapeHtml(item.selection ? item.selection.label : t('largeTableChoose')) + '</button>' +
+        '<div class="runtime-large-picker" id="' + id + '-picker" data-large-picker hidden>' +
+        '<input type="search" maxlength="256" data-large-option-search aria-label="' + escapeHtml(t('largeTableSearchOptions')) +
+        '" placeholder="' + escapeHtml(t('largeTableSearchOptions')) + '">' +
+        '<ul class="runtime-large-options" aria-label="' + escapeHtml(t('largeTableSearchOptions')) + '" data-large-options></ul>' +
+        '<div class="runtime-large-message" role="status" data-large-option-status></div>' +
+        '<div class="runtime-large-pager" data-large-option-pager></div></div></div>' : '') +
+      (item.presentation.filters !== false ? '<div class="runtime-large-filter"' + (item.keyed && !item.selection ? ' hidden' : '') +
+        '><input type="search" maxlength="256" data-large-row-search aria-label="' + escapeHtml(t('largeTableSearchRows')) +
+        '" placeholder="' + escapeHtml(t('largeTableSearchRows')) + '" value="' + escapeHtml(item.search) + '"></div>' : '') + '</div>' +
+      '<div class="runtime-large-message" role="status" data-large-status></div><div data-large-message-action></div>' +
+      '<div class="runtime-large-scroll" data-large-rows></div><div class="runtime-large-pager" data-large-pager></div></section>';
+  }
+
+  function largeTableGrid(item, page, detail) {
+    var table = page.table;
+    var columns = table.columns || [];
+    var labels = table.columnLabels || {};
+    var presentation = table.presentation || {};
+    var drilldown = !detail && Array.isArray(page.groupIds) && page.groupIds.some(function (group) { return typeof group === 'string' && group; });
+    var head = columns.map(function (column, index) {
+      var label = escapeHtml(labels[column] || column);
+      if (detail || item.presentation.sortable === false) return '<th scope="col">' + label + '</th>';
+      var sorted = item.sort === column;
+      return '<th scope="col"' + (sorted ? ' aria-sort="' + (item.direction === 'desc' ? 'descending' : 'ascending') + '"' : '') +
+        '><button type="button" class="table-sort" data-large-action="sort" data-large-index="' + index + '">' + label +
+        (sorted ? ' <span aria-hidden="true">' + (item.direction === 'desc' ? '&#8595;' : '&#8593;') + '</span>' : '') + '</button></th>';
+    }).join('') + (drilldown ? '<th scope="col">' + escapeHtml(t('largeTableDetails')) + '</th>' : '');
+    var rows = table.rows.map(function (row, index) {
+      var indexed = Object.assign({}, row || {}, { __cmdpRowIndex: index });
+      var group = drilldown ? page.groupIds[index] : '';
+      var detailsId = item.node.getAttribute('aria-labelledby') + '-detail-' + index;
+      var cells = columns.map(function (column) { return '<td>' + renderResultCell(indexed, column, table, []).html + '</td>'; }).join('');
+      var action = typeof group === 'string' && group ? '<button type="button" data-large-action="details" data-large-index="' + index +
+        '" aria-expanded="false" aria-controls="' + detailsId + '" aria-label="' + escapeHtml(t('largeTableDetailsForRow', { row: page.offset + index + 1 })) +
+        '">' + escapeHtml(t('largeTableDetails')) + '</button>' : '';
+      return '<tr data-result-row>' + cells + (drilldown ? '<td>' + action + '</td>' : '') + '</tr>' +
+        (action ? '<tr hidden data-large-detail-row><td colspan="' + (columns.length + 1) + '"><div id="' + detailsId +
+          '" class="runtime-large-details" data-large-detail></div></td></tr>' : '');
+    }).join('');
+    return rows ? '<table class="' + presentationClassNames(presentation, (table.mode || table.view) === 'compact') +
+      '"><thead><tr>' + head + '</tr></thead><tbody>' + rows + '</tbody></table>' : '';
+  }
+
+  function largeTableStop(item, channel) {
+    window.clearTimeout(item[channel + 'Timer']);
+    if (item.pending[channel]) item.pending[channel].abort();
+    delete item.pending[channel];
+  }
+
+  function largeTableRequest(item, op, offset) {
+    largeTableStop(item, op);
+    var picker = op === 'options';
+    var detail = op === 'details';
+    var destination = detail ? item.detail.node : item.node;
+    var status = picker ? '[data-large-option-status]' : '[data-large-status]';
+    var focused = document.activeElement;
+    var focusedAction = focused && focused.getAttribute('data-large-action');
+    var focusIndex = focused && focused.getAttribute('data-large-index');
+    var restoreFocus = focused && destination.contains(focused) &&
+      (focusedAction === 'sort' || focusedAction && focusedAction.indexOf(op + '-') === 0);
+    var params = { offset: offset };
+    if (picker) params.search = item.optionSearch;
+    else if (detail) params.group = item.detail.group;
+    else {
+      params.search = item.search;
+      if (item.sort) { params.sort = item.sort; params.direction = item.direction; }
+    }
+    var controller = new AbortController();
+    item.pending[op] = controller;
+    if (detail) destination.innerHTML = '<div role="status" data-large-status></div><div data-large-message-action></div><div data-large-detail-content></div>';
+    var statusNode = destination.querySelector(status);
+    statusNode.textContent = t('largeTableLoading');
+    statusNode.setAttribute('role', 'status');
+    if (picker) {
+      item.options = null;
+      item.node.querySelector('[data-large-options]').innerHTML = '';
+      item.node.querySelector('[data-large-option-pager]').innerHTML = '';
+    } else {
+      destination.querySelector('[data-large-message-action]').innerHTML = '';
+      if (!detail) item.node.querySelector('[data-large-rows]').setAttribute('aria-busy', 'true');
+    }
+    var active = function () { return item.node.isConnected && item.pending[op] === controller; };
+    function failed(result) {
+      var reason = result && result.json && result.json.reason;
+      var conflict = result && (result.status === 409 || result.status === 410 || item.view.kind === 'public' && result.status === 404);
+      var keyUnavailable = reason === 'table_key_unavailable' && item.keyed;
+      var message = conflict ? t(item.view.kind === 'public' ? 'largeTableSnapshotExpired' : 'largeTableViewExpired') :
+        keyUnavailable ? t('largeTableKeyUnavailable') :
+        result && result.status === 401 ? t('runtimeSessionInvalid') : reason === 'data_access_denied' ? t('runtimeDataAccessDenied') :
+        result && result.status === 403 ? t('runtimeTemplateAccessDenied') : t('largeTableError');
+      statusNode.setAttribute('role', 'alert');
+      statusNode.textContent = message + (result && result.requestId ? ' ' + t('runtimeRequestId') + ': ' + result.requestId + '.' : '');
+      var target = picker ? item.node.querySelector('[data-large-option-pager]') : destination.querySelector('[data-large-message-action]');
+      item.retry[op] = offset;
+      var action = conflict ? (item.view.kind === 'public' ? 'reload' : 'reopen') : keyUnavailable ? 'choose' : op + '-retry';
+      var label = conflict ? (item.view.kind === 'public' ? 'snapshotReload' : 'largeTableReopen') : keyUnavailable ? 'largeTableChoose' : 'largeTableRetry';
+      target.innerHTML = largeTableButton(action, label, escapeHtml(t(label)));
+    }
+    return request(largeTablePagePath(item, op, params), { signal: controller.signal, maxRetries: 0 }).then(function (response) {
+      if (!active()) return;
+      var page = response.json;
+      if (!response.ok || !page || (picker ? !Array.isArray(page.items) : !page.table || !Array.isArray(page.table.rows)) ||
+          !Number.isInteger(page.total) || page.total < 0 || !Number.isInteger(page.offset) || page.offset < 0 || !Number.isInteger(page.limit) || page.limit < 1) {
+        failed(response);
+        return;
+      }
+      if (picker) {
+        item.options = page;
+        item.node.querySelector('[data-large-options]').innerHTML = page.items.map(function (option, index) {
+          return '<li><button type="button" data-large-action="option" data-large-index="' + index + '" aria-pressed="' +
+            Boolean(item.selection && item.selection.key === option.key) + '">' + escapeHtml(option.label) + '</button></li>';
+        }).join('');
+        item.node.querySelector('[data-large-option-pager]').innerHTML = largeTablePager(page, 'options');
+        statusNode.textContent = page.incomplete ? t('largeTableIncomplete') : !page.items.length ? t('largeTableNoOptions') : '';
+      } else {
+        if (op === 'rows' && item.view.kind === 'dynamic' && typeof page.viewId === 'string' && page.viewId) item.viewId = page.viewId;
+        statusNode.textContent = page.incomplete ? t('largeTableIncomplete') : !page.table.rows.length ? t('largeTableNoRows') : '';
+        if (detail) {
+          item.detail.page = page;
+          destination.querySelector('[data-large-detail-content]').innerHTML = largeTableGrid(item, page, true) +
+            '<div class="runtime-large-pager">' + largeTablePager(page, 'details') + '</div>';
+        } else {
+          item.page = page;
+          item.node.querySelector('[data-large-rows]').innerHTML = largeTableGrid(item, page, false);
+          item.node.querySelector('[data-large-pager]').innerHTML = largeTablePager(page, 'rows');
+        }
+      }
+    }).catch(function () {
+      if (active()) failed();
+    }).finally(function () {
+      if (!active()) return;
+      delete item.pending[op];
+      if (picker) positionLargeTablePicker(item);
+      if (op === 'rows') item.node.querySelector('[data-large-rows]').removeAttribute('aria-busy');
+      if (restoreFocus && document.activeElement === document.body) {
+        var candidates = Array.from(destination.querySelectorAll('[data-large-action]'));
+        var next = candidates.find(function (button) {
+          return !button.disabled && button.getAttribute('data-large-action') === focusedAction && button.getAttribute('data-large-index') === focusIndex;
+        }) || candidates.find(function (button) {
+          return !button.disabled && [op + '-prev', op + '-next', op + '-retry', 'reopen', 'reload'].indexOf(button.getAttribute('data-large-action')) !== -1;
+        }) || (picker ? destination.querySelector('[data-large-option-search]') : detail ? item.detail.trigger : destination.querySelector('[data-large-row-search]'));
+        if (next) next.focus();
+      }
+    });
+  }
+
+  function positionLargeTablePicker(item) {
+    var panel = item.node && item.node.querySelector('[data-large-picker]');
+    if (!panel || panel.hidden) return;
+    var trigger = item.node.querySelector('[data-large-action="picker"]').getBoundingClientRect();
+    var viewport = window.visualViewport;
+    var top = (viewport ? viewport.offsetTop : 0) + 8;
+    var bottom = top + (viewport ? viewport.height : window.innerHeight) - 16;
+    var left = (viewport ? viewport.offsetLeft : 0) + 8;
+    var width = (viewport ? viewport.width : document.documentElement.clientWidth) - 16;
+    if (trigger.bottom <= top || trigger.top >= bottom) { closeLargeTablePicker(item, false); return; }
+    var panelWidth = Math.min(width, trigger.width);
+    panel.style.width = panelWidth + 'px';
+    panel.style.left = Math.max(left, Math.min(trigger.left, left + width - panelWidth)) + 'px';
+    var options = panel.querySelector('[data-large-options]');
+    var chrome = panel.offsetHeight - options.offsetHeight;
+    var preferred = chrome + 220;
+    var below = Math.max(0, bottom - trigger.bottom - 4);
+    var above = Math.max(0, trigger.top - top - 4);
+    var opensUp = below < preferred && above > below;
+    var space = opensUp ? above : below;
+    // Keep search and pagination available even when neither side can hold them.
+    var overlaysTrigger = space < chrome + 44;
+    panel.style.maxHeight = (overlaysTrigger ? bottom - top : space) + 'px';
+    panel.style.top = (overlaysTrigger ? top : opensUp ? trigger.top - 4 - panel.offsetHeight : trigger.bottom + 4) + 'px';
+  }
+
+  function closeLargeTablePicker(item, focus) {
+    var panel = item.node.querySelector('[data-large-picker]');
+    if (!panel || panel.hidden) return;
+    largeTableStop(item, 'options');
+    panel.hidden = true;
+    var trigger = item.node.querySelector('[data-large-action="picker"]');
+    trigger.setAttribute('aria-expanded', 'false');
+    if (focus) trigger.focus({ preventScroll: true });
+  }
+
+  function closeLargeTableDetails(item) {
+    largeTableStop(item, 'details');
+    if (!item.detail) return;
+    item.detail.node.closest('tr').hidden = true;
+    item.detail.trigger.setAttribute('aria-expanded', 'false');
+    item.detail = null;
+  }
+
+  function resetLargeTableRows(item) {
+    largeTableStop(item, 'rows');
+    closeLargeTableDetails(item);
+    item.page = null;
+    item.node.querySelector('[data-large-rows]').innerHTML = '';
+    item.node.querySelector('[data-large-pager]').innerHTML = '';
+    item.node.querySelector('[data-large-message-action]').innerHTML = '';
+  }
+
+  function mountLargeTable(item, node) {
+    item.node = node;
+    node.addEventListener('click', function (event) {
+      var button = event.target.closest('[data-large-action]');
+      if (!button || button.disabled) return;
+      var action = button.getAttribute('data-large-action');
+      var index = Number(button.getAttribute('data-large-index'));
+      if (action === 'picker') {
+        var panel = node.querySelector('[data-large-picker]');
+        if (!panel.hidden) { closeLargeTablePicker(item, true); return; }
+        panel.hidden = false;
+        button.setAttribute('aria-expanded', 'true');
+        var input = panel.querySelector('[data-large-option-search]');
+        input.value = '';
+        item.optionSearch = '';
+        largeTableRequest(item, 'options', 0);
+        positionLargeTablePicker(item);
+        input.focus({ preventScroll: true });
+      } else if (action === 'option') {
+        var option = item.options && item.options.items[index];
+        if (!option || typeof option.key !== 'string') return;
+        closeLargeTablePicker(item, true);
+        if (item.selection && item.selection.key === option.key) return;
+        item.selection = option;
+        if (item.view.kind === 'dynamic') item.viewId = '';
+        node.querySelector('[data-large-action="picker"]').textContent = option.label;
+        var rowFilter = node.querySelector('.runtime-large-filter');
+        if (rowFilter) rowFilter.hidden = false;
+        resetLargeTableRows(item);
+        largeTableRequest(item, 'rows', 0);
+      } else if (action === 'sort') {
+        var column = item.page && item.page.table.columns[index];
+        if (!column) return;
+        closeLargeTableDetails(item);
+        item.direction = item.sort === column && item.direction === 'asc' ? 'desc' : 'asc';
+        item.sort = column;
+        largeTableRequest(item, 'rows', 0);
+      } else if (action === 'details') {
+        var alreadyOpen = item.detail && item.detail.trigger === button;
+        closeLargeTableDetails(item);
+        if (alreadyOpen || item.pending.rows || !item.page || !item.page.groupIds || !item.page.groupIds[index]) return;
+        var detail = document.getElementById(button.getAttribute('aria-controls'));
+        item.detail = { trigger: button, node: detail, group: item.page.groupIds[index] };
+        detail.closest('tr').hidden = false;
+        button.setAttribute('aria-expanded', 'true');
+        largeTableRequest(item, 'details', 0);
+      } else if (action === 'reload') {
+        refreshOpenSnapshot(true);
+      } else if (action === 'choose') {
+        node.querySelector('[data-large-action="picker"]').click();
+      } else if (action === 'reopen') {
+        if (item.view.kind === 'personal') {
+          refreshOpenSnapshot(state.snapshotRefreshMode !== 'personal');
+        } else {
+          var fromPicker = Boolean(button.closest('[data-large-picker]'));
+          item.viewId = '';
+          resetLargeTableRows(item);
+          if (!item.keyed || item.selection) largeTableRequest(item, 'rows', 0);
+          if (fromPicker) largeTableRequest(item, 'options', 0);
+        }
+      } else {
+        var parts = action.split('-');
+        var op = parts[0];
+        var current = op === 'rows' ? item.page : op === 'options' ? item.options : item.detail && item.detail.page;
+        if (item.pending[op]) return;
+        if (parts[1] === 'retry' && item.retry[op] !== undefined) largeTableRequest(item, op, item.retry[op]);
+        else if (current && (parts[1] === 'prev' || parts[1] === 'next')) {
+          if (op === 'rows') closeLargeTableDetails(item);
+          largeTableRequest(item, op, Math.max(0, current.offset + (parts[1] === 'next' ? current.limit : -current.limit)));
+        }
+      }
+    });
+    node.addEventListener('input', function (event) {
+      var options = event.target.hasAttribute('data-large-option-search');
+      if (!options && !event.target.hasAttribute('data-large-row-search')) return;
+      var op = options ? 'options' : 'rows';
+      if (options) {
+        largeTableStop(item, op);
+        item.optionSearch = event.target.value;
+        item.options = null;
+        node.querySelector('[data-large-options]').innerHTML = '';
+        node.querySelector('[data-large-option-pager]').innerHTML = '';
+      } else {
+        item.search = event.target.value;
+        resetLargeTableRows(item);
+      }
+      node.querySelector(options ? '[data-large-option-status]' : '[data-large-status]').textContent = t('largeTableLoading');
+      item[op + 'Timer'] = window.setTimeout(function () { largeTableRequest(item, op, 0); }, 180);
+    });
+    node.addEventListener('keydown', function (event) {
+      var panel = event.target.closest('[data-large-picker]');
+      if (!panel) return;
+      if (event.key === 'Escape') { event.preventDefault(); closeLargeTablePicker(item, true); return; }
+      if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+      var buttons = Array.from(panel.querySelectorAll('[data-large-action="option"]'));
+      var index = buttons.indexOf(event.target);
+      if (!buttons.length || index === -1 && !event.target.hasAttribute('data-large-option-search')) return;
+      event.preventDefault();
+      var next = index + (event.key === 'ArrowDown' ? 1 : -1);
+      if (index !== -1 && next < 0) panel.querySelector('[data-large-option-search]').focus();
+      else buttons[next < 0 ? buttons.length - 1 : Math.min(next, buttons.length - 1)].focus();
+    });
+    if (!item.keyed || item.selection) largeTableRequest(item, 'rows', 0);
+  }
+
+  document.addEventListener('click', function (event) {
+    var path = event.composedPath();
+    runtimeLargeTables.forEach(function (item) {
+      var picker = item.node && item.node.querySelector('[data-large-selection]');
+      if (picker && path.indexOf(picker) === -1) closeLargeTablePicker(item, false);
+    });
+  });
+
+  function repositionRuntimePickers(event) {
+    if (event.target.closest && event.target.closest('[data-large-picker]')) return;
+    runtimeLargeTables.forEach(positionLargeTablePicker);
+  }
+  window.addEventListener('resize', repositionRuntimePickers);
+  window.addEventListener('scroll', repositionRuntimePickers, { capture: true, passive: true });
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', repositionRuntimePickers);
+    window.visualViewport.addEventListener('scroll', repositionRuntimePickers);
+  }
+
+  function stopRuntimeLargeTables() {
+    runtimeLargeTables.forEach(function (item) {
+      ['options', 'rows', 'details'].forEach(function (op) { largeTableStop(item, op); });
+    });
+  }
+
+  function prepareRuntimeLargeTables(result) {
+    stopRuntimeLargeTables();
+    var payload = result.ok && result.json || {};
+    var view = payload.tableView;
+    var body = payload.result || {};
+    if (!view || ['public', 'dynamic', 'personal'].indexOf(view.kind) === -1 || resultOutputMode(body) === 'diagrams') return [];
+    var global = body.presentation || {};
+    var tableSettings = Array.isArray(global.tables) ? global.tables : [];
+    return (Array.isArray(body.tables) ? body.tables : []).filter(function (table) {
+      return table && table.name && table.presentation && table.presentation.largeTable;
+    }).map(function (table) {
+      var named = tableSettings.find(function (settings) { return settings && settings.name === table.name; });
+      var presentation = Object.assign(Object.create(null), global, named, table.presentation);
+      delete presentation.tables;
+      var keyed = presentation.largeTable.mode === 'key';
+      var previous = runtimeLargeTables.find(function (item) { return item.table.name === table.name; });
+      var sort = previous && presentation.sortable !== false && (table.columns || []).indexOf(previous.sort) !== -1 ? previous.sort : '';
+      return {
+        table: table, presentation: presentation, view: view, keyed: keyed, pending: {}, retry: {},
+        viewId: keyed ? '' : view.viewId,
+        selection: keyed && previous ? previous.selection : null,
+        search: previous && presentation.filters !== false ? previous.search : '', sort: sort, direction: sort ? previous.direction : ''
+      };
+    });
+  }
+
   function renderRuntimeIntoApp(result) {
-    app.innerHTML = renderRuntimeResult(result);
+    var cache = result.json && result.json.cache;
+    var snapshot = result.ok && (cache && cache.scope === 'staticSnapshot' || result.downloadMode === 'personal');
+    if (result.downloadMode !== 'personal') state.snapshotRevision = cache && cache.snapshotRevision || '';
+    runtimeLargeTables = prepareRuntimeLargeTables(result);
+    app.innerHTML = (snapshot ? '<div class="snapshot-toolbar">' +
+      '<button type="button" class="runtime-cache-button" data-action="snapshot-reload" title="' + escapeHtml(t('snapshotReload')) +
+      '" aria-label="' + escapeHtml(t('snapshotReload')) + '">&#8635;</button>' +
+      '<button type="button" data-action="snapshot-refresh" hidden></button>' +
+      '<span data-snapshot-status role="status"></span></div>' : '') + renderRuntimeResult(result, runtimeLargeTables);
+    app.querySelectorAll('[data-large-table]').forEach(function (node) {
+      mountLargeTable(runtimeLargeTables[Number(node.getAttribute('data-large-table'))], node);
+    });
+    updateSnapshotActions();
     initializeDiagramViewports(app);
+  }
+
+  function updateSnapshotActions() {
+    var refresh = app.querySelector('[data-action="snapshot-refresh"]');
+    if (!refresh) return;
+    refresh.hidden = !state.snapshotRefreshMode;
+    refresh.textContent = t(state.snapshotRefreshMode === 'shared' ? 'snapshotRefreshShared' : 'snapshotRefreshPersonal');
+    refresh.disabled = state.runtimeRefreshInProgress;
+    app.querySelector('[data-action="snapshot-reload"]').disabled = state.runtimeRefreshInProgress;
+  }
+
+  function snapshotStatus(message, failed) {
+    var status = app.querySelector('[data-snapshot-status]');
+    if (!status) return;
+    status.classList.toggle('snapshot-error', Boolean(failed));
+    status.textContent = message;
+  }
+
+  function updateSnapshotCapability(result) {
+    state.snapshotRefreshMode = '';
+    updateSnapshotActions();
+    if (!boot.snapshotRefreshSessionPresent || !state.snapshotRevision || !result.ok || !result.json || !result.json.snapshotFound) return;
+    request(snapshotRefreshPath(boot.templateCode), { maxRetries: 0 }).then(function (capability) {
+      var mode = capability.json && capability.json.available && capability.json.mode;
+      state.snapshotRefreshMode = capability.ok && (mode === 'personal' || mode === 'shared') ? mode : '';
+      updateSnapshotActions();
+    }).catch(function () {});
+  }
+
+  function snapshotRefreshError(result, fallback) {
+    var reason = result.json && result.json.reason;
+    if (result.status === 401) return t('runtimeSessionInvalid');
+    if (reason === 'data_access_denied') return t('runtimeDataAccessDenied');
+    if (result.status === 403) return t('runtimeTemplateAccessDenied');
+    if (result.status === 409 || result.status === 404) return t('snapshotRefreshConflict');
+    if (reason === 'snapshot_refresh_incomplete') return t('snapshotRefreshLimited');
+    return t(fallback);
+  }
+
+  function refreshOpenSnapshot(reload) {
+    if (state.runtimeRefreshInProgress || !reload && !state.snapshotRefreshMode) return;
+    if (!reload && state.snapshotRefreshMode === 'shared' && !window.confirm(t('snapshotRefreshConfirm'))) return;
+    state.runtimeRefreshInProgress = true;
+    updateSnapshotActions();
+    snapshotStatus(t('runtimeRefreshing'));
+    var path = reload ? publicSnapshotRunPath(boot.templateCode, state.runParams, true) : snapshotRefreshPath(boot.templateCode, true);
+    var fallback = reload ? 'snapshotReloadFailed' : 'snapshotRefreshFailed';
+    request(path, reload ? { maxRetries: 0 } : {
+      method: 'POST',
+      body: { expectedMode: state.snapshotRefreshMode, expectedSnapshotRevision: state.snapshotRevision },
+      timeoutMs: boot.snapshotRefreshTimeoutMs
+    }).then(function (result) {
+      if (!result.ok || !result.json) {
+        snapshotStatus(snapshotRefreshError(result, fallback) + (result.requestId ? ' ' + t('runtimeRequestId') + ': ' + result.requestId + '.' : ''), true);
+        return;
+      }
+      result.downloadMode = !reload && result.json.mode === 'personal' ? 'personal' : 'public';
+      renderRuntimeIntoApp(result);
+      if (reload) updateSnapshotCapability(result);
+      else snapshotStatus(t(result.downloadMode === 'personal' ? 'snapshotRefreshedPersonal' : 'snapshotRefreshedShared'));
+      var button = app.querySelector('[data-action="' + (reload ? 'snapshot-reload' : 'snapshot-refresh') + '"]');
+      state.runtimeRefreshInProgress = false;
+      updateSnapshotActions();
+      if (button && !button.hidden) button.focus();
+    }).catch(function () {
+      snapshotStatus(t(fallback), true);
+    }).finally(function () {
+      state.runtimeRefreshInProgress = false;
+      updateSnapshotActions();
+    });
   }
 
   function loadRuntime(refresh) {
     updateChrome();
+    stopRuntimeLargeTables();
     if (state.runtimeCountdownTimer) window.clearInterval(state.runtimeCountdownTimer);
     state.runtimeRefreshInProgress = Boolean(refresh);
     app.innerHTML = '<div class="notice">' + escapeHtml(refresh ? t('runtimeRefreshing') : t('runningTemplate')) + '</div>';
@@ -32887,10 +33843,11 @@ function dynamicPagesClientScript() {
       .filter(function (entry) { return !runtimeSystemParam(entry[0]); }));
     state.runParams = params;
     if (boot.publicRuntime) {
-      request(publicSnapshotRunPath(templateCode, params)).then(function (result) {
+      request(publicSnapshotRunPath(templateCode, params, true)).then(function (result) {
         result.downloadMode = 'public';
         state.runtimeRefreshInProgress = false;
         renderRuntimeIntoApp(result);
+        updateSnapshotCapability(result);
         startRuntimeCountdown();
       }).catch(function (error) {
         state.runtimeRefreshInProgress = false;
@@ -32898,7 +33855,7 @@ function dynamicPagesClientScript() {
       });
       return;
     }
-    request(runtimeRunPath(templateCode, params, Boolean(refresh))).then(function (result) {
+    request(runtimeRunPath(templateCode, params, Boolean(refresh), false, true)).then(function (result) {
       result.downloadMode = 'template';
       state.runtimeRefreshInProgress = false;
       renderRuntimeIntoApp(result);
@@ -33070,6 +34027,10 @@ function dynamicPagesClientScript() {
     if (action === 'runtime-refresh') {
       if (target.getAttribute('data-disabled') === 'true') return;
       loadRuntime(true);
+    }
+    if (action === 'snapshot-reload' || action === 'snapshot-refresh') {
+      refreshOpenSnapshot(action === 'snapshot-reload');
+      return;
     }
     if (action === 'download-draft-d2') runUiOperation(action, function () { downloadDraftD2Source(target); });
     if (action === 'diagram-zoom-out') adjustDiagramViewportScale(target, -DIAGRAM_VIEWPORT_SCALE_STEP);
@@ -33782,6 +34743,7 @@ function dynamicPagesClientScript() {
     }
     if (event.target && event.target.matches && event.target.matches('[data-view-column-field="field"], [data-view-column-field="title"]')) {
       ensureTrailingViewComposerColumnRow(event.target);
+      syncViewLargeTableColumns();
     }
     if (event.target && event.target.matches && event.target.matches('[data-diagram-mapping-field]')) {
       markImportedDiagramChanged();
@@ -33794,6 +34756,10 @@ function dynamicPagesClientScript() {
     if (!target) return;
     if (target._diagramImportPickerCommitted) {
       target._diagramImportPickerCommitted = false;
+      return;
+    }
+    if (target.matches('#cmdp-view-large-mode, [data-view-large-field], [data-view-large-reduction-kind], [data-view-large-tuple-field], [data-view-large-separator]')) {
+      handleViewLargeTableChange(target);
       return;
     }
     if (target.matches && target.matches('[data-relation-path-source]')) {
@@ -33926,6 +34892,12 @@ function dynamicPagesClientScript() {
       var viewDraft = captureViewComposerDraftFromDom();
       viewDraft.sourceAlias = String(target.value || '').trim();
       viewDraft.columns = [];
+      if (viewDraft.largeTable) {
+        viewDraft.largeTable.groupKeys = [];
+        viewDraft.largeTable.reductions = [];
+        if (viewDraft.largeTable.selector) viewDraft.largeTable.selector.matchField = '';
+        viewDraft.largeTableEdited = true;
+      }
       state.viewComposerDraft = viewDraft;
       clearDraftExecutionState({ clearExtractionSource: true });
       renderDesigner();
@@ -33968,8 +34940,21 @@ function dynamicPagesClientScript() {
 
   document.addEventListener('input', handleTemplateTransferChange);
   document.addEventListener('change', handleTemplateTransferChange);
+  function handlePublicationRefreshChange(event) {
+    if (!event.target || ['cmdp-publish-mode', 'cmdp-publish-refresh-mode', 'cmdp-publish-shared-refresh-accepted'].indexOf(event.target.id) < 0) return;
+    var settings = document.getElementById('cmdp-publish-refresh-settings');
+    var mode = document.getElementById('cmdp-publish-refresh-mode');
+    var sharedSettings = document.getElementById('cmdp-publish-shared-refresh-settings');
+    var consent = document.getElementById('cmdp-publish-shared-refresh-accepted');
+    settings.hidden = readValue('cmdp-publish-mode') !== 'staticSnapshot';
+    if (settings.hidden) mode.value = 'personal';
+    sharedSettings.hidden = settings.hidden || mode.value !== 'shared';
+    if (sharedSettings.hidden) consent.checked = false;
+    syncImportedDiagramSaveGate();
+  }
+  document.addEventListener('change', handlePublicationRefreshChange);
   document.addEventListener('input', function (event) {
-    if (event.target && (event.target.id === 'cmdp-code' || event.target.id === 'cmdp-publish-mode')) syncImportedDiagramSaveGate();
+    if (event.target && event.target.id === 'cmdp-code') syncImportedDiagramSaveGate();
   });
 
   updateChrome();
@@ -36754,6 +37739,15 @@ function resultPresentationFromSpec(spec) {
     : {};
 }
 
+function runtimeTablePresentation(global, table) {
+  const named = (Array.isArray(global.tables) ? global.tables : []).find((entry) => entry?.name === table.name) || {};
+  const local = table.presentation && typeof table.presentation === 'object' && !Array.isArray(table.presentation)
+    ? table.presentation : {};
+  const presentation = { ...global, ...named, ...local };
+  delete presentation.tables;
+  return { named, presentation, mode: named.mode || table.mode || table.view || 'table' };
+}
+
 function emptyResultTextFromSpec(spec) {
   const result = spec && spec.result && typeof spec.result === 'object' && !Array.isArray(spec.result) ? spec.result : {};
   const presentation = resultPresentationFromSpec(spec);
@@ -37257,8 +38251,19 @@ function buildAliasColumnDependencies(spec) {
       continue;
     }
     if (step.type === 'composeRows' || step.type === 'compose') {
+      const right = composeRightAlias(step);
+      if (right) {
+        try {
+          for (const pair of normalizeRowOperationKeys(step)) {
+            add(step.from, pair.left);
+            add(right, pair.right);
+          }
+        } catch {
+          // Validation reports malformed keys.
+        }
+      }
       for (const column of normalizeComposeColumns(step)) {
-        if (column.source === 'right') add(step.with, column.column);
+        if (column.source === 'right') add(right, column.column);
         else add(step.from, column.column);
       }
       continue;
@@ -37355,7 +38360,8 @@ function dependencyMapWithHash(spec) {
 
 function runtimeCacheKeyParts(root, template, params, sessionData, executionOptions, runtimeCacheConfig, templateCacheConfig, dependencyMap, accessProbe, cacheContext = {}) {
   const userScope = runtimeUserCacheScope(sessionData);
-  if (dependencyMap?.relationSensitive) {
+  const visibilityFallback = accessProbe?.reason === 'visibility_unconfirmed';
+  if (dependencyMap?.relationSensitive || visibilityFallback) {
     const session = sanitizeSession(sessionData);
     userScope.multigroup = Boolean(session?.multigroup);
     userScope.language = session?.language || '';
@@ -37391,6 +38397,8 @@ function runtimeCacheKeyParts(root, template, params, sessionData, executionOpti
     visibilityHash: accessProbe && accessProbe.visibilityHash || '',
     contextHash
   };
+  if (dependencyMap?.relationSensitive) keyPayload.relationFence = 1;
+  if (keyPayload.scopeMode === 'visibilityHash' || visibilityFallback) keyPayload.visibilityProof = 1;
   if (cacheScope !== 'endpoint') keyPayload.userScopeHash = userScopeHash;
   return {
     key: hashJson(keyPayload),
@@ -37439,6 +38447,58 @@ function runtimeCacheMeta(entry, status, now = Date.now(), extra = {}) {
   };
 }
 
+function runtimeRelationCacheUnavailable() {
+  return Object.assign(new Error('The runtime cache is temporarily unavailable.'), {
+    statusCode: 503, reason: 'runtime_cache_unavailable', redisRequired: true
+  });
+}
+
+async function runtimeRelationCacheCommand(operation, script, keys, args = []) {
+  try {
+    return await redisCommand(['EVAL', script, keys.length, ...keys, ...args], { force: operation === 'revoke' });
+  } catch {
+    // Do not split a fenced cache across Redis and per-process memory.
+    throw runtimeRelationCacheUnavailable();
+  }
+}
+
+async function beginRuntimeRelationCacheBuild(key, ttlMs) {
+  const token = crypto.randomUUID();
+  if (REDIS_ENABLED) {
+    return runtimeRelationCacheCommand('begin',
+      "local generation = redis.call('GET', KEYS[1]); if not generation then generation = ARGV[1] end; redis.call('SET', KEYS[1], generation, 'PX', ARGV[2]); redis.call('DEL', KEYS[2]); return generation",
+      [cacheKey('runtime-relation-generation', key), cacheKey('runtime', key)], [token, ttlMs]);
+  }
+  const generation = memoryGet(runtimeRelationCacheGenerations, key) || token;
+  memorySet(runtimeRelationCacheGenerations, key, generation, ttlMs);
+  runtimeResultCache.delete(key);
+  return generation;
+}
+
+async function revokeRuntimeRelationCache(key) {
+  if (REDIS_ENABLED) {
+    await runtimeRelationCacheCommand('revoke', "return redis.call('DEL', KEYS[1], KEYS[2])",
+      [cacheKey('runtime-relation-generation', key), cacheKey('runtime', key)]);
+  } else {
+    runtimeRelationCacheGenerations.delete(key);
+    runtimeResultCache.delete(key);
+  }
+}
+
+async function storeRuntimeRelationCache(root, templateCode, key, generation, entry, ttlMs) {
+  if (REDIS_ENABLED) {
+    const indexKey = cacheKey('runtime-index', runtimeTemplateIndexId(root, templateCode));
+    return await runtimeRelationCacheCommand('write',
+      "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end; redis.call('SADD', KEYS[3], ARGV[4]); redis.call('EXPIRE', KEYS[3], ARGV[5]); redis.call('SET', KEYS[2], ARGV[2], 'PX', ARGV[3]); return 1",
+      [cacheKey('runtime-relation-generation', key), cacheKey('runtime', key), indexKey],
+      [generation, JSON.stringify(entry), ttlMs, key, Math.ceil(ttlMs / 1000) + 60]) === 1;
+  }
+  if (memoryGet(runtimeRelationCacheGenerations, key) !== generation) return false;
+  memorySet(runtimeResultCache, key, entry, ttlMs);
+  await registerRuntimeTemplateCacheKey(root, templateCode, key, ttlMs);
+  return true;
+}
+
 function attributeReadable(attribute) {
   if (!attribute) return false;
   if (attribute.active === false) return false;
@@ -37447,7 +38507,15 @@ function attributeReadable(attribute) {
   return true;
 }
 
-async function probeClassUsedFields(cmdbuildExecRequest, className, fields, limits, visibilityIds) {
+function completeVisibilityPage(response) {
+  const { data, meta, success } = response?.json || {};
+  const total = meta?.total;
+  return response?.ok && success !== false && Array.isArray(data) &&
+    ((typeof total === 'number' && Number.isSafeInteger(total) && total >= 0) ||
+      (typeof total === 'string' && /^\d+$/.test(total))) && Number(total) === data.length;
+}
+
+async function probeClassUsedFields(cmdbuildExecRequest, className, fields, limits, visibilityParts) {
   validateCmdbuildIdentifier(className, 'cache probe className');
   const attributesResponse = await readExecutionClassAttributes(cmdbuildExecRequest, className);
   if (!attributesResponse.response.ok) {
@@ -37476,7 +38544,8 @@ async function probeClassUsedFields(cmdbuildExecRequest, className, fields, limi
   }
 
   const probeLimit = Math.max(1, Math.min(limits.maxRows || 500, 1000));
-  const cardsResponse = await requestCardsForSelection(cmdbuildExecRequest, className, probeLimit, ['_id'].concat(fields || []));
+  const cardsResponse = await requestCardsForSelection(cmdbuildExecRequest, className, probeLimit,
+    visibilityParts ? [] : ['_id'].concat(fields || []));
   if (!cardsResponse.ok) {
     return {
       ok: false,
@@ -37485,12 +38554,14 @@ async function probeClassUsedFields(cmdbuildExecRequest, className, fields, limi
       message: `CMDBuild cards probe for ${className} failed with status ${cardsResponse.statusCode}.`
     };
   }
-  if (visibilityIds) {
-    const rows = Array.isArray(cardsResponse.json && cardsResponse.json.data) ? cardsResponse.json.data : [];
-    for (const row of rows) {
-      const id = row && (row._id || row.Id || row.id);
-      if (id !== undefined && id !== null && id !== '') visibilityIds.push(`${className}:${id}`);
-    }
+  if (visibilityParts) {
+    if (!completeVisibilityPage(cardsResponse)) return { ok: true, incomplete: true };
+    const rows = cardsResponse.json.data;
+    const ids = rows.map((row) => row?._id ?? row?.Id ?? row?.id);
+    if (ids.some((id) => !((typeof id === 'string' && id) || Number.isSafeInteger(id))) ||
+      new Set(ids.map(String)).size !== ids.length) return { ok: true, incomplete: true };
+    // Include readable values and ordering, not only the visible identity set.
+    visibilityParts.push([className, hashJson(rows), hashJson(attributes)]);
   }
   return { ok: true };
 }
@@ -37533,6 +38604,15 @@ async function probeTemplateAccess(authToken, spec, params, executionOptions, de
   };
   const effectiveParams = applyTemplateParamDefaults(spec, params);
   const cmdbuildExecRequest = createExecutionRequest(authToken, limits);
+  const requireVisibility = config.scopeMode === 'visibilityHash';
+  // Only graphs whose data reads are fully covered by the card and class
+  // probes can opt into shared visibility. Unknown stages stay private.
+  if (requireVisibility && (isCmdbBuildViewSpec(spec) || spec.result?.diagrams?.length || !spec.steps?.length ||
+    !spec.steps.every((step) => step.type === 'selectCards' || step.type === 'filterRows'))) {
+    const permission = await probeTemplateAccess(authToken, spec, params, executionOptions, dependencyMap,
+      { ...config, scopeMode: 'permissionOnly' });
+    return { ...permission, mode: config.scopeMode, visibilityIncomplete: true };
+  }
   if (isCmdbBuildViewSpec(spec)) {
     const viewConfig = normalizeCmdbBuildViewConfig(spec, effectiveParams);
     const probes = [
@@ -37563,10 +38643,24 @@ async function probeTemplateAccess(authToken, spec, params, executionOptions, de
   }
   const classesCache = { loaded: false, classes: [], ok: false };
   const resolvedClassCache = new Map();
-  const visibilityIds = config.scopeMode === 'visibilityHash' ? [] : null;
+  const visibilityParts = requireVisibility ? [] : null;
   const checkedClasses = [];
   let incomplete = false;
+  let visibilityIncomplete = false;
   const selections = dependencyMap && Array.isArray(dependencyMap.selections) ? dependencyMap.selections : [];
+
+  if (requireVisibility) {
+    const maxClasses = Math.max(limits.maxClasses, limits.maxClassesMax);
+    const catalog = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes?limit=${maxClasses}&detailed=true`);
+    if (!catalog.ok || catalog.json?.success === false || !Array.isArray(catalog.json?.data)) {
+      return { ok: false, cmdbuildStatus: catalog.statusCode, reason: 'classes_probe_failed' };
+    }
+    visibilityIncomplete = !completeVisibilityPage(catalog);
+    classesCache.loaded = true;
+    classesCache.ok = true;
+    classesCache.classes = readableClassItemsFromResponse(catalog);
+    visibilityParts.push(['catalog', hashJson(classesCache.classes)]);
+  }
 
   if (!selections.length) {
     try {
@@ -37600,10 +38694,13 @@ async function probeTemplateAccess(authToken, spec, params, executionOptions, de
     }
     const classNames = await resolveExecutionClassNames(cmdbuildExecRequest, limits, requested, classesCache, resolvedClassCache);
     if (!classesCache.ok || !classNames.length) incomplete = true;
+    if (requireVisibility && !classesCache.classes.some((entry) => entry.name.toLowerCase() === String(requested).toLowerCase())) {
+      visibilityIncomplete = true;
+    }
     for (const className of classNames) {
       if (!className) continue;
       checkedClasses.push(className);
-      const probe = await probeClassUsedFields(cmdbuildExecRequest, className, selection.directFields || selection.fields || [], limits, visibilityIds);
+      const probe = await probeClassUsedFields(cmdbuildExecRequest, className, selection.directFields || selection.fields || [], limits, visibilityParts);
       if (!probe.ok) {
         return {
           ok: false,
@@ -37615,15 +38712,17 @@ async function probeTemplateAccess(authToken, spec, params, executionOptions, de
           incomplete
         };
       }
+      if (probe.incomplete) visibilityIncomplete = true;
     }
   }
 
   return {
     ok: true,
     mode: config.scopeMode,
-    visibilityHash: visibilityIds ? hashJson(uniqueStrings(visibilityIds).sort()) : '',
+    visibilityHash: visibilityParts && !incomplete && !visibilityIncomplete ? hashJson(visibilityParts) : '',
     checkedClasses: uniqueStrings(checkedClasses),
-    incomplete
+    incomplete,
+    ...(requireVisibility ? { visibilityIncomplete } : {})
   };
 }
 
@@ -37649,7 +38748,7 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
   const dependencyMap = dependencyMapWithHash(executionSpec);
   const { relationSensitive } = dependencyMap;
   // Class/field and visible card probes do not establish relation visibility.
-  const templateCacheConfig = relationSensitive
+  let templateCacheConfig = relationSensitive
     ? { ...configuredCache, scopeMode: 'privateUser', shareMode: 'user' }
     : configuredCache;
   let accessProbe;
@@ -37658,19 +38757,24 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
   } catch {
     accessProbe = { ok: false, reason: 'probe_failed' };
   }
-  if (relationSensitive && accessProbe.ok) {
-    const { userId, username } = runtimeUserCacheScope(sessionData);
-    if (!userId && !username) accessProbe = { ok: false, reason: 'user_scope_unconfirmed' };
-  }
   if (accessProbe.reason === 'template_dependency_invalid') {
     const error = new Error(accessProbe.message);
     error.statusCode = 422;
     error.reason = accessProbe.reason;
     throw error;
   }
-  if (accessProbe.reason === 'cards_probe_failed' && isPermissionDeniedStatus(accessProbe.cmdbuildStatus)) {
+  if (!accessProbe.ok && isPermissionDeniedStatus(accessProbe.cmdbuildStatus) &&
+    (accessProbe.reason === 'cards_probe_failed' || templateCacheConfig.scopeMode === 'visibilityHash')) {
     // A denied data read is not the same as an unconfirmed cache probe.
-    throw Object.assign(new Error(accessProbe.message), { cmdbuildStatus: accessProbe.cmdbuildStatus });
+    throw Object.assign(new Error(accessProbe.message || 'CMDBuild cache permission probe was denied.'), { cmdbuildStatus: accessProbe.cmdbuildStatus });
+  }
+  if (templateCacheConfig.scopeMode === 'visibilityHash' && accessProbe.ok && !accessProbe.incomplete && !accessProbe.visibilityHash) {
+    templateCacheConfig = { ...templateCacheConfig, scopeMode: 'privateUser', shareMode: 'user' };
+    accessProbe = { ok: true, visibilityIncomplete: true, reason: 'visibility_unconfirmed' };
+  }
+  if (templateCacheConfig.scopeMode === 'privateUser' && accessProbe.ok) {
+    const { userId, username } = runtimeUserCacheScope(sessionData);
+    if (!userId && !username) accessProbe = { ok: false, reason: 'user_scope_unconfirmed' };
   }
   if (!accessProbe.ok || accessProbe.incomplete) {
     logInfo('runtime.cache_bypassed', {
@@ -37691,7 +38795,13 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
   const keyParts = runtimeCacheKeyParts(root, template, params, sessionData, executionOptions, runtimeCacheConfig, templateCacheConfig, dependencyMap, accessProbe, options.cacheContext || {});
   const refreshRequested = Boolean(options.refreshRequested);
   const forceRefreshRequested = Boolean(options.forceRefreshRequested);
-  const cached = await cacheGetJson('runtime', keyParts.key, runtimeResultCache);
+  const cached = await cacheGetJson('runtime', keyParts.key, runtimeResultCache).catch((error) => {
+    if (relationSensitive && error.redisRequired) throw runtimeRelationCacheUnavailable();
+    throw error;
+  });
+  if (relationSensitive && cached.redisUnavailable) {
+    throw runtimeRelationCacheUnavailable();
+  }
   const now = Date.now();
   let entry = cached.value?.expiresAt > now ? cached.value : null;
   const serveHit = async () => {
@@ -37745,12 +38855,16 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
   const promise = (async () => {
     // A relation rebuild uses this request's session, never another session's
     // in-flight build. Do not keep serving the former result after a denial.
-    if (relationSensitive && entry) await cacheDelete('runtime', keyParts.key, runtimeResultCache);
+    const generation = relationSensitive
+      ? await beginRuntimeRelationCacheBuild(keyParts.key, Math.max(resultTtlMs, 5 * 60_000)) : null;
     const buildStartedAt = Date.now();
-    const result = await executeTemplateSpec(authToken, template.spec, params, {
-      ...executionOptions,
-      dependencyMap
-    });
+    let result;
+    try {
+      result = await executeTemplateSpec(authToken, template.spec, params, { ...executionOptions, dependencyMap });
+    } catch (error) {
+      if (relationSensitive && errorLooksPermissionDenied(error)) await revokeRuntimeRelationCache(keyParts.key);
+      throw error;
+    }
     observeMetricSeconds('cmdp_runtime_cache_build_seconds', {
       scopeMode: templateCacheConfig.scopeMode
     }, (Date.now() - buildStartedAt) / 1000);
@@ -37773,7 +38887,8 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
       userScope: keyParts.userScope,
       accessProbe: {
         checkedClasses: accessProbe.checkedClasses || [],
-        incomplete: Boolean(accessProbe.incomplete)
+        incomplete: Boolean(accessProbe.incomplete || accessProbe.visibilityIncomplete),
+        ...(accessProbe.reason ? { reason: accessProbe.reason } : {})
       },
       result: cloneJsonValueServer(result, { tables: [] }),
       contentHash: runtimeResultContentHash(result),
@@ -37784,8 +38899,15 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
       resultTtlMs,
       allowManualRefresh: templateCacheConfig.allowManualRefresh
     };
-    newEntry.cacheBackend = await cacheSetJson('runtime', keyParts.key, newEntry, resultTtlMs, runtimeResultCache);
-    await registerRuntimeTemplateCacheKey(root, template.code, keyParts.key, resultTtlMs);
+    if (relationSensitive) {
+      newEntry.cacheBackend = REDIS_ENABLED ? 'redis' : 'memory';
+      if (!await storeRuntimeRelationCache(root, template.code, keyParts.key, generation, newEntry, resultTtlMs)) {
+        throw Object.assign(new Error('Relation cache access changed during execution.'), { cmdbuildStatus: 403 });
+      }
+    } else {
+      newEntry.cacheBackend = await cacheSetJson('runtime', keyParts.key, newEntry, resultTtlMs, runtimeResultCache);
+      await registerRuntimeTemplateCacheKey(root, template.code, keyParts.key, resultTtlMs);
+    }
     return newEntry;
   })();
 
@@ -37804,11 +38926,14 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
 function normalizePublishConfig(spec) {
   const publish = spec && spec.publish && typeof spec.publish === 'object' && !Array.isArray(spec.publish) ? spec.publish : {};
   const mode = publish.mode === 'staticSnapshot' ? 'staticSnapshot' : 'dynamicUser';
+  const refreshMode = mode === 'staticSnapshot' && publish.refreshMode === 'shared' ? 'shared' : 'personal';
   return {
     mode,
     warningAccepted: Boolean(publish.warningAccepted),
     paramsMode: publish.paramsMode === 'ignore' ? 'ignore' : 'exact',
-    publicD2Source: publicD2SourceAllowed(publish)
+    publicD2Source: publicD2SourceAllowed(publish),
+    refreshMode,
+    sharedRefreshAccepted: refreshMode === 'shared' && publish.sharedRefreshAccepted === true
   };
 }
 
@@ -38110,7 +39235,7 @@ function runtimeDisplayResponsePayload(payload, options = {}) {
   return next;
 }
 
-async function readStaticSnapshot(root, templateCode, params, publishConfig = { paramsMode: 'exact' }) {
+async function readStaticSnapshot(root, templateCode, params, publishConfig = { paramsMode: 'exact' }, captureRevision = false) {
   const exactKey = staticSnapshotKey(root, templateCode, params, { paramsMode: 'exact' });
   if (!SNAPSHOT_MEMORY_ONLY && !REDIS_ENABLED && !REDIS_REQUIRED) return { key: exactKey, backend: 'disabled', snapshot: null };
   const keys = [exactKey];
@@ -38130,7 +39255,10 @@ async function readStaticSnapshot(root, templateCode, params, publishConfig = { 
         const snapshot = memoryOnly || !value ? value : JSON.parse(value);
         if (snapshot?.version === 3 && snapshot.generation === state && snapshot.templateClass === snapshotTemplateClass(root) &&
           snapshot.templateCode === templateCode && snapshot.publish?.mode === 'staticSnapshot' && snapshot.publish.warningAccepted === true) {
-          return { key: keys[index], backend, snapshot };
+          return {
+            key: keys[index], backend, snapshot,
+            ...(captureRevision ? { revision: memoryOnly ? staticSnapshotCache.get(keys[index]) : value } : {})
+          };
         }
       }
     }
@@ -38140,14 +39268,16 @@ async function readStaticSnapshot(root, templateCode, params, publishConfig = { 
   return { key: exactKey, backend, snapshot: null };
 }
 
-async function writeStaticSnapshot(root, template, params, result, sessionData, publishConfig, generation) {
+async function writeStaticSnapshot(root, template, params, result, sessionData, publishConfig, generation, replaces, tableIndexes) {
   const specHash = hashJson(template.spec || {});
   const paramsHash = staticSnapshotParamsHash(params, publishConfig);
   const key = staticSnapshotKey(root, template.code, params, publishConfig);
+  if (replaces && (replaces.key !== key || !replaces.revision)) return null;
   const now = new Date();
   const session = sanitizeSession(sessionData) || {};
   const snapshot = {
     version: 3,
+    refreshRevision: crypto.randomUUID(),
     templateClass: snapshotTemplateClass(root),
     generation,
     templateCode: template.code,
@@ -38159,7 +39289,8 @@ async function writeStaticSnapshot(root, template, params, result, sessionData, 
     publishedBy: session.username || '',
     publishedRole: session.role || '',
     publishedAt: now.toISOString(),
-    result: cloneJsonValueServer(result, { tables: [] })
+    result: cloneJsonValueServer(result, { tables: [] }),
+    ...(tableIndexes ? { tableIndexes } : {})
   };
   const stateKey = snapshotStateKey(root, template.code);
   const memoryOnly = SNAPSHOT_MEMORY_ONLY;
@@ -38167,12 +39298,14 @@ async function writeStaticSnapshot(root, template, params, result, sessionData, 
   try {
     if (memoryOnly) {
       if (snapshotStateMemory.get(stateKey) !== generation) return null;
+      if (replaces && staticSnapshotCache.get(key) !== replaces.revision) return null;
       memorySet(staticSnapshotCache, key, snapshot, 0);
       registerLocalStaticSnapshotCacheKey(root, template.code, key);
     } else {
       const indexKey = cacheKey('snapshot-index', staticSnapshotTemplateIndexId(root, template.code));
-      const stored = await redisCommand(['EVAL', "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end; redis.call('SADD', KEYS[3], ARGV[3]); redis.call('SET', KEYS[2], ARGV[2]); return 1",
-        3, stateKey, cacheKey('snapshot', key), indexKey, generation, JSON.stringify(snapshot), key]);
+      const stored = await redisCommand(['EVAL', "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end; if ARGV[4] and redis.call('GET', KEYS[2]) ~= ARGV[4] then return 0 end; redis.call('SADD', KEYS[3], ARGV[3]); redis.call('SET', KEYS[2], ARGV[2]); return 1",
+        3, stateKey, cacheKey('snapshot', key), indexKey, generation, JSON.stringify(snapshot), key,
+        ...(replaces ? [replaces.revision] : [])]);
       if (stored !== 1) return null;
     }
   } catch {
@@ -38181,12 +39314,19 @@ async function writeStaticSnapshot(root, template, params, result, sessionData, 
   return {
     key,
     backend,
+    generation,
+    refreshRevision: snapshot.refreshRevision,
     paramsHash,
     specHash,
     publishedBy: snapshot.publishedBy,
     publishedAt: snapshot.publishedAt,
     result: snapshot.result
   };
+}
+
+function staticSnapshotViewRevision(snapshot) {
+  if (!snapshot?.generation) return '';
+  return hashJson([snapshot.generation, snapshot.specHash, snapshot.paramsHash, snapshot.publishedAt, snapshot.refreshRevision || '']);
 }
 
 function staticSnapshotCacheMeta(snapshot, status, backend, key) {
@@ -38201,6 +39341,7 @@ function staticSnapshotCacheMeta(snapshot, status, backend, key) {
     publishedBy: snapshot && snapshot.publishedBy || '',
     paramsHash: snapshot && snapshot.paramsHash || '',
     specHash: snapshot && snapshot.specHash || '',
+    snapshotRevision: staticSnapshotViewRevision(snapshot),
     sharedAcrossUsers: true
   };
 }
@@ -38284,6 +39425,14 @@ function visibleRuntimeResultTables(tables) {
   return source.length ? [source[source.length - 1]] : [];
 }
 
+function publishedReportTables(result) {
+  return runtimeResultOutputMode(result) === 'diagrams' ? [] : visibleRuntimeResultTables(result?.tables);
+}
+
+function publishedReportResult(result = {}) {
+  return { ...result, tables: publishedReportTables(result) };
+}
+
 function normalizeRuntimeOutputMode(value) {
   const mode = String(value || 'both').trim();
   return ['tables', 'diagrams', 'both'].includes(mode) ? mode : 'both';
@@ -38334,8 +39483,7 @@ function runtimeJsonCellLinks(row, rowIndex, columns, table, params) {
 }
 
 function runtimeJsonTables(result, params = {}) {
-  if (runtimeResultOutputMode(result) === 'diagrams') return [];
-  const tables = visibleRuntimeResultTables(result && result.tables);
+  const tables = publishedReportTables(result);
   return tables.map((table) => {
     const columns = Array.isArray(table.columns) ? table.columns : [];
     const labels = table.columnLabels && typeof table.columnLabels === 'object' && !Array.isArray(table.columnLabels) ? table.columnLabels : {};
@@ -52394,7 +53542,7 @@ function sendPublicSnapshotResult(res, requestUrl, templateCode, lookup) {
       description: snapshot.description || ''
     },
     params: snapshot.params || params,
-    result: snapshot.result || { tables: [] },
+    result: publishedReportResult(snapshot.result),
     cache: staticSnapshotCacheMeta(snapshot, 'snapshot-hit', lookup.backend, lookup.key)
   };
   const sourceAllowed = publicD2SourceAllowed(snapshot.publish);
@@ -52405,9 +53553,431 @@ function sendPublicSnapshotResult(res, requestUrl, templateCode, lookup) {
     });
     return;
   }
+  if (!jsonOutput && browserTableShellRequested(requestUrl)) {
+    sendJson(res, 200, runtimeDisplayResponsePayload(reportTableShell(payload, {
+      kind: 'public', snapshotRevision: staticSnapshotViewRevision(snapshot)
+    }), { d2DownloadAllowed: sourceAllowed }));
+    return;
+  }
   sendJson(res, 200, jsonOutput
     ? runtimeJsonResponsePayload(payload, { d2DownloadAllowed: sourceAllowed })
     : runtimeDisplayResponsePayload(payload, { d2DownloadAllowed: sourceAllowed }));
+}
+
+function reportPagedTables(spec) {
+  if (normalizeRuntimeOutputMode(resultPresentationFromSpec(spec).outputMode || 'both') === 'diagrams') return [];
+  return (Array.isArray(spec?.result?.tables) ? spec.result.tables : []).filter((table) => table?.presentation?.largeTable);
+}
+
+function reportTableUsesParameter(value, name) {
+  if (!value || typeof value !== 'object') return false;
+  return Object.entries(value).some(([key, child]) => ([
+    'valueParam', 'valuesParam', 'sourceIdParam', 'targetIdParam', 'sourceParam', 'param'
+  ].includes(key) && child === name) || (
+    ['valueExpression', 'regexExpression'].includes(key) && typeof child === 'string' &&
+    Array.from(child.matchAll(SELECTION_RIGHT_EXPRESSION_TOKEN)).some(([, kind, parameter]) => kind === 'param' && parameter === name)
+  ) || reportTableUsesParameter(child, name));
+}
+
+function reportTablePushdown(scope, alias, selector) {
+  const steps = new Map(scope.steps.map(({ step }) => [step.as, step]));
+  const seen = new Set();
+  const trace = (name, field, mustExist = false) => {
+    const step = steps.get(name);
+    if (!step || seen.has(name)) return null;
+    seen.add(name);
+    if (step.type === 'selectCards') {
+      if (step.from || step.limit !== undefined || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(field) ||
+        mustExist && !['_id', 'Class', 'Code', 'Description'].includes(field)) return null;
+      const column = normalizePathColumnSpecs(step.columns || step.cardColumns || step.outputColumns)
+        .find((item) => item.as === field);
+      return !column || column.path === field ? { alias: name, field } : null;
+    }
+    if (step.type === 'enrichRows' && step.purpose === 'viewComposer') {
+      const column = normalizePathColumnSpecs(step.columns || step.fields).find((item) => item.as === field);
+      if (column?.sourceCandidates.length || column?.correlationKey) return null;
+      return trace(step.from, column?.path || field, mustExist || Boolean(column));
+    }
+    if ((step.type === 'composeRows' || step.type === 'compose') && !composeRightAlias(step)) {
+      const columns = normalizeComposeColumns(step).filter((item) => item.name === field);
+      const [column] = columns;
+      return columns.length === 1 && column.source === 'left' && !column.valueParam && !column.hasValue && !column.template
+        ? trace(step.from, column.column, mustExist) : null;
+    }
+    // A relation's target attributes and custom source prefixes may overwrite technical columns.
+    // Only restrict the drivers when the output really preserves the selected source card id.
+    if (step.type === 'expandRelations' && field === 'SourceId' && step.fetchRelated === false &&
+      (step.includeSource === false || !'SourceId'.startsWith(step.sourcePrefix === undefined ? 'Source_' : String(step.sourcePrefix))) &&
+      step.sourceId === undefined && !step.sourceIdParam && (step.sourceIdColumn || step.idColumn || '_id') === '_id' &&
+      selector.kind === 'result' && selector.source === step.from && selector.idField === '_id') {
+      return { alias: name, field };
+    }
+    // traverseDomains is a class graph, not a card-id traversal. Set operations
+    // and other multi-input steps likewise do not prove cardinality or key lineage.
+    return null;
+  };
+  return trace(alias, selector.matchField);
+}
+
+function validateReportTables(spec) {
+  const errors = [];
+  const tables = Array.isArray(spec?.result?.tables) ? spec.result.tables : [];
+  const steps = Array.isArray(spec?.steps) ? spec.steps : [];
+  tables.forEach((table, index) => {
+    const raw = table?.presentation?.largeTable;
+    if (raw == null) return;
+    const path = `$.result.tables[${index}].presentation.largeTable`;
+    const fields = Array.isArray(table.columns) && table.columns.length ? table.columns : undefined;
+    errors.push(...validateLargeTable(raw, { visibleFields: fields }).map((error) => ({
+      path: error.path ? `${path}.${error.path}` : path, message: error.message
+    })));
+    const config = normalizeLargeTable(raw);
+    if (!config) return;
+    const add = (field, message) => errors.push({ path: `${path}${field ? '.' + field : ''}`, message });
+    if (!table.name || tables.filter((entry) => entry?.name === table.name).length !== 1 ||
+      !steps.some((step) => step?.as === table.name)) add('', 'A large table needs a unique, executable result alias.');
+    if ((config.groupKeys.length || config.reductions.length) && !fields) {
+      add('groupKeys', 'Select the visible columns before configuring aggregation.');
+    }
+    if (config.mode !== 'key') return;
+    const selector = config.selector;
+    if (selector.kind === 'class' && !/^[A-Za-z][A-Za-z0-9_]*$/.test(selector.source) ||
+      selector.kind === 'result' && (selector.source === table.name || !steps.some((step) => step?.as === selector.source))) {
+      add('selector.source', 'Select an existing class or Object Flow result.');
+    }
+    const safeScopeSpec = { ...spec, steps: steps.filter(Boolean), result: { ...spec.result, tables: [table] } };
+    const scope = tableExecutionScope(safeScopeSpec);
+    if (selector.parameter) {
+      if (!Object.hasOwn(spec.params || {}, selector.parameter) ||
+        !scope.steps.some(({ step }) => reportTableUsesParameter(step, selector.parameter))) {
+        add('selector.parameter', 'The selected parameter must be used by this table or one of its dependent steps.');
+      }
+    }
+  });
+  return errors;
+}
+
+function browserTableShellRequested(requestUrl) {
+  return requestUrl.searchParams.get('cmdpTableShell') === '1';
+}
+
+function publicLargeTableSettings(settings) {
+  const config = normalizeLargeTable(settings);
+  return { mode: config.mode, groupKeys: config.groupKeys };
+}
+
+function reportTableShell(payload, tableView) {
+  const result = payload.result;
+  const tables = result?.tables;
+  if (!Array.isArray(tables) || !tables.some((table) => table.presentation?.largeTable)) return payload;
+  return { ...payload, tableView, result: {
+    ...result,
+    tables: tables.map((table) => table.presentation?.largeTable ? {
+      ...table, rows: [], cellMeta: {},
+      presentation: { ...table.presentation, largeTable: publicLargeTableSettings(table.presentation.largeTable) }
+    } : table)
+  } };
+}
+
+function tableShellSpec(spec, includeDiagrams) {
+  const ordinary = { ...spec, result: {
+    ...spec.result, tables: (spec.result?.tables || []).filter((table) => !table.presentation?.largeTable)
+  } };
+  const aliases = new Set([
+    ...tableExecutionScope(ordinary).includedAliases,
+    ...(includeDiagrams ? diagramExecutionScope(ordinary).includedAliases : [])
+  ]);
+  return { ...ordinary, steps: (ordinary.steps || []).filter((step) => aliases.has(step.as)) };
+}
+
+function attachPagedTableResults(spec, result, materialized = new Map()) {
+  const resultTables = new Map((result.tables || []).map((table) => [table.name, table]));
+  const global = resultPresentationFromSpec(spec);
+  return { ...result, tables: (spec.result?.tables || []).map((table) => {
+    if (!table.presentation?.largeTable) return resultTables.get(table.name);
+    const { named, presentation, mode } = runtimeTablePresentation(global, table);
+    return materialized.get(table.name) || {
+      name: table.name,
+      title: named.title || table.title || table.label || table.name,
+      published: table.published === true,
+      mode,
+      columns: table.columns || [],
+      columnLabels: table.columnLabels || {},
+      rows: [], cellMeta: {},
+      presentation
+    };
+  }).filter(Boolean) };
+}
+
+function reportTableOwner(authToken, session, root, template, params) {
+  return hashJson([sha256Hex(authToken), runtimeUserCacheScope(session), root, template.id, template.code, template.specHash, params]);
+}
+
+function putReportTableView(owner, indexes, key = '') {
+  const id = crypto.randomUUID();
+  storeReportTableView(id, { owner, indexes, key });
+  return id;
+}
+
+function reportTableOptionsViewId(owner, tableName) {
+  return 'options:' + hashJson([owner, tableName]);
+}
+
+function storeReportTableView(id, view) {
+  const bytes = Buffer.byteLength(JSON.stringify(view.indexes || view.available));
+  if (bytes > REPORT_TABLE_VIEW_MAX_BYTES / 2) {
+    throw snapshotStoreError('table_view_too_large', 'The prepared table exceeds the view storage budget.', 422);
+  }
+  const now = Date.now();
+  for (const [entryId, view] of reportTableViews) if (view.expiresAt <= now) reportTableViews.delete(entryId);
+  reportTableViews.delete(id);
+  let totalBytes = [...reportTableViews.values()].reduce((total, view) => total + view.bytes, 0);
+  for (const [entryId, view] of reportTableViews) {
+    if (totalBytes + bytes <= REPORT_TABLE_VIEW_MAX_BYTES && reportTableViews.size < 32) break;
+    reportTableViews.delete(entryId);
+    totalBytes -= view.bytes;
+  }
+  reportTableViews.set(id, { ...view, bytes, expiresAt: now + REPORT_TABLE_VIEW_TTL_MS });
+}
+
+function parseReportTableQuery(requestUrl) {
+  const payloads = requestUrl.searchParams.getAll('cmdpTable');
+  try {
+    if (payloads.length !== 1 || payloads[0].length > 8192) throw new Error();
+    const query = JSON.parse(payloads[0]);
+    if (!query || typeof query.table !== 'string' || !query.table || query.table.length > 256 ||
+      !['options', 'rows', 'details'].includes(query.op)) throw new Error();
+    for (const field of ['key', 'group', 'search', 'sort', 'direction', 'viewId', 'snapshotRevision']) {
+      if (query[field] !== undefined && (typeof query[field] !== 'string' || query[field].length > 2048)) throw new Error();
+    }
+    for (const field of ['offset', 'limit']) {
+      if (query[field] !== undefined && (!Number.isSafeInteger(query[field]) || query[field] < 0)) throw new Error();
+    }
+    return query;
+  } catch {
+    throw snapshotStoreError('table_page_invalid', 'Invalid report table request.', 400);
+  }
+}
+
+function tablePageResult(index, query) {
+  const page = readLargeTablePage(index, query);
+  page.incomplete = Boolean(index.table.truncated);
+  if (page.table?.presentation?.largeTable) {
+    page.table = { ...page.table, presentation: {
+      ...page.table.presentation, largeTable: publicLargeTableSettings(page.table.presentation.largeTable)
+    } };
+  }
+  return page;
+}
+
+function reportTableSourceSpec(spec, table) {
+  return { ...spec, result: { ...spec.result, diagrams: [], tables: [table] } };
+}
+
+function reportTableExecutionOptions(runtimeConfig, deadlineAt) {
+  const limits = normalizeExecutionLimitConfig(runtimeConfig);
+  return {
+    ...limits,
+    maxClasses: limits.maxClassesDefault, maxDomains: limits.maxDomainsDefault,
+    maxRestCalls: limits.maxRestCallsDefault, maxRelationsPerCard: limits.maxRelationsPerCardDefault,
+    maxSelectionScanRows: limits.maxSelectionScanRowsDefault,
+    maxTraversalDepth: limits.maxTraversalDepthMax, traversalDepthDefault: limits.maxTraversalDepthDefault,
+    maxRows: REPORT_TABLE_ROW_BUDGET, maxRowsMax: REPORT_TABLE_ROW_BUDGET, largeTableExecution: true,
+    includeDiagrams: false, executionScope: 'tables', strictDataReads: true,
+    executionDeadlineAt: deadlineAt
+  };
+}
+
+async function executeReportTableSource(authToken, spec, table, params, options, restriction = null) {
+  let records = [];
+  const result = await executeTemplateSpec(authToken, reportTableSourceSpec(spec, table), params, {
+    ...options, reportTableRestriction: restriction,
+    reportTableRawProjection: { alias: table.name, fields: [...(table.columns || []),
+      table.presentation?.largeTable?.selector?.matchField].filter(Boolean) },
+    captureReportTableRows: (rows) => { records = rows; }
+  });
+  const rendered = result.tables[0];
+  if (result.trace.some((step) => step.truncated)) rendered.truncated = true;
+  return { rendered, records };
+}
+
+async function reportTableOptions(authToken, spec, settings, params, options) {
+  if (settings.mode !== 'key') return { rows: [], incomplete: false };
+  const selector = settings.selector;
+  const fields = [selector.idField, selector.labelField];
+  const alias = selector.kind === 'result' ? selector.source : 'ReportTableOptions';
+  const optionSpec = selector.kind === 'result' ? spec : {
+    ...spec, steps: [{ type: 'selectCards', as: alias, className: selector.source, columns: fields }],
+    result: {}
+  };
+  const { rendered, records } = await executeReportTableSource(authToken, optionSpec, {
+    name: alias, columns: fields
+  }, params, options);
+  return {
+    rows: rendered.rows.map((row, index) => ({
+      ...row, [selector.idField]: reportTableKeyValue(runtimeRowValue(records[index], selector.idField), selector.idField)
+    })),
+    incomplete: rendered.truncated
+  };
+}
+
+function reportTableKeyValue(value, idField) {
+  if (Array.isArray(value)) return value.map((item) => reportTableKeyValue(item, idField));
+  if (!['_id', 'Id', 'SourceId', 'RelatedId'].includes(idField)) return value;
+  const id = value && typeof value === 'object' ? value._id ?? value.Id ?? value.id : value;
+  return typeof id === 'number' || typeof id === 'string' ? String(id) : id;
+}
+
+function reportTableRowMatches(row, restriction) {
+  const value = reportTableKeyValue(runtimeRowValue(row, restriction.field), restriction.idField);
+  return (Array.isArray(value) ? value : [value]).some((candidate) => encodeLargeTableKey(candidate) === restriction.token);
+}
+
+function reportTableRestriction(spec, table, settings, token, value) {
+  if (!token || settings.mode !== 'key') return null;
+  const selector = settings.selector;
+  const scope = tableExecutionScope(reportTableSourceSpec(spec, table));
+  return {
+    field: selector.matchField, idField: selector.idField, token, value,
+    pushdown: reportTablePushdown(scope, table.name, selector)
+  };
+}
+
+async function buildReportTableIndex(authToken, spec, table, params, options, available, selectedToken, selectedValue) {
+  const config = normalizeLargeTable(table.presentation.largeTable);
+  const parameterName = selectedToken && config.selector.parameter;
+  const type = parameterName && spec.params?.[parameterName]?.type;
+  const parameterValue = ['number', 'integer'].includes(type) && typeof selectedValue === 'string' &&
+    selectedValue !== '' && Number.isFinite(Number(selectedValue)) ? Number(selectedValue) : selectedValue;
+  const scopedParams = parameterName ? { ...params, [parameterName]: parameterValue } : params;
+  const restriction = reportTableRestriction(spec, table, config, selectedToken, selectedValue);
+  const { rendered, records } = await executeReportTableSource(authToken, spec, table, scopedParams, options, restriction);
+  const matchValues = config.mode === 'key' ? records.map((row) =>
+    reportTableKeyValue(runtimeRowValue(row, config.selector.matchField), config.selector.idField)) : undefined;
+  rendered.truncated ||= available.incomplete;
+  return {
+    index: buildLargeTableIndex(rendered, available.rows, { matchValues,
+      groupValues: records.map((row) => config.groupKeys.map((field) => runtimeRowValue(row, field))) }),
+    rendered
+  };
+}
+
+async function materializePublishedReport(authToken, spec, params, options, runtimeConfig, publicOutput = true) {
+  if (publicOutput && Array.isArray(spec.result?.tables)) {
+    spec = { ...spec, result: { ...spec.result, tables: publishedReportTables(spec.result) } };
+  }
+  const paged = reportPagedTables(spec);
+  if (!paged.length) return { result: await executeTemplateSpec(authToken, spec, params, options) };
+  const deadlineAt = options.executionDeadlineAt || Date.now() + DRAFT_PREVIEW_TIMEOUT_MS;
+  const tableOptions = reportTableExecutionOptions(runtimeConfig, deadlineAt);
+  const result = await executeTemplateSpec(authToken, tableShellSpec(spec, options.includeDiagrams !== false),
+    params, { ...options, strictDataReads: true, executionDeadlineAt: deadlineAt });
+  const indexes = Object.create(null);
+  const tables = new Map();
+  for (const table of paged) {
+    const config = normalizeLargeTable(table.presentation.largeTable);
+    const available = await reportTableOptions(authToken, spec, config, params, tableOptions);
+    const prepared = await buildReportTableIndex(authToken, spec, table, params, tableOptions, available);
+    if (prepared.rendered.truncated) {
+      throw snapshotStoreError('table_result_incomplete', 'The large table did not finish within its execution budget; no snapshot was replaced.', 422);
+    }
+    indexes[table.name] = prepared.index;
+    tables.set(table.name, prepared.rendered);
+  }
+  if (Buffer.byteLength(JSON.stringify(indexes)) > REPORT_TABLE_VIEW_MAX_BYTES / 2) {
+    throw snapshotStoreError('table_view_too_large', 'The report exceeds the snapshot table index storage budget.', 422);
+  }
+  return { result: attachPagedTableResults(spec, result, tables), indexes };
+}
+
+async function handleReportTablePage(req, res, requestUrl, root, templateCode, authToken, publicRead = false) {
+  if (!methodAllowed(req, res, 'GET')) return;
+  const action = 'table-page';
+  const context = { requestId: currentRequestId(), root, templateCode, action };
+  let slot;
+  try {
+    validateCmdbuildIdentifier(templateCode, 'template code');
+    const params = reportParamsFromUrl(requestUrl);
+    const query = parseReportTableQuery(requestUrl);
+    if (publicRead) {
+      const { snapshot } = await readStaticSnapshot(root, templateCode, params, { paramsMode: 'ignore' });
+      const [allowed] = publishedReportTables(snapshot?.result);
+      if (allowed?.name !== query.table || !snapshot?.tableIndexes || !Object.hasOwn(snapshot.tableIndexes, query.table)) {
+        throw snapshotStoreError('table_not_available', 'Published report table not found.', 404);
+      }
+      if (query.snapshotRevision !== staticSnapshotViewRevision(snapshot)) {
+        throw snapshotStoreError('table_snapshot_changed', 'The published report has changed. Reload it before paging.', 409);
+      }
+      sendJson(res, 200, tablePageResult(snapshot.tableIndexes[query.table], query));
+      return;
+    }
+    const session = await requireValidBackendSession(authToken, res, context);
+    if (!session) return;
+    const found = await findTemplateCard(authToken, root, templateCode);
+    if (isPermissionDeniedStatus(found.response.statusCode) || found.card?._can_read === false) {
+      throw snapshotStoreError('technical_schema_access_denied', DEFAULT_PERMISSION_DENIED_TEXT, 403);
+    }
+    if (!found.response.ok || found.response.json?.success === false) {
+      throw snapshotStoreError('table_template_unavailable', 'The saved report could not be read.', 502);
+    }
+    const template = sanitizeTemplateCard(found.card);
+    const table = template?.active && reportPagedTables(template.spec).find((entry) => entry.name === query.table);
+    if (!table) throw snapshotStoreError('table_not_available', 'Report table not found.', 404);
+    const owner = reportTableOwner(authToken, session.data, root, template, params);
+    if (query.viewId) {
+      const view = reportTableViews.get(query.viewId);
+      if (!view?.indexes || view.expiresAt <= Date.now() || view.owner !== owner ||
+        !Object.hasOwn(view.indexes, query.table) || view.key && view.key !== query.key) {
+        throw snapshotStoreError('table_view_expired', 'This table view has expired. Run the table again.', 409);
+      }
+      sendJson(res, 200, { ...tablePageResult(view.indexes[query.table], query), viewId: query.viewId });
+      return;
+    }
+    if (query.op === 'details' || normalizePublishConfig(template.spec).mode === 'staticSnapshot') {
+      throw snapshotStoreError('table_view_expired', 'A current table view is required.', 409);
+    }
+    slot = acquireExecutionSlot(req, res, { action, templateCode });
+    if (!slot) return;
+    const runtimeConfig = await getRuntimeConfig(authToken, root);
+    const options = reportTableExecutionOptions(runtimeConfig, Date.now() + DRAFT_PREVIEW_TIMEOUT_MS);
+    const config = normalizeLargeTable(table.presentation.largeTable);
+    const optionViewId = reportTableOptionsViewId(owner, table.name);
+    if (query.op === 'options' || config.mode === 'key' && !query.key) {
+      const available = await reportTableOptions(authToken, template.spec, config, params, options);
+      const emptyTable = { ...table, rows: [], truncated: available.incomplete };
+      const result = tablePageResult(buildLargeTableIndex(emptyTable, available.rows), query);
+      if (config.mode === 'key') storeReportTableView(optionViewId, { available });
+      sendJson(res, 200, result);
+      return;
+    }
+    let available = { rows: [], incomplete: false };
+    let selectedValue;
+    if (config.mode === 'key') {
+      const optionView = reportTableViews.get(optionViewId);
+      const idField = config.selector.idField;
+      const item = optionView?.expiresAt > Date.now()
+        ? optionView.available.rows.find((row) => encodeLargeTableKey(row[idField]) === query.key) : null;
+      if (!item) throw snapshotStoreError('table_key_unavailable', 'The selected item is no longer available. Reopen the selector.', 404);
+      selectedValue = item[idField];
+      available = { rows: [item], incomplete: optionView.available.incomplete };
+    }
+    const prepared = await buildReportTableIndex(authToken, template.spec, table, params, options, available, query.key, selectedValue);
+    if (res.destroyed) return;
+    const viewId = putReportTableView(owner, { [table.name]: prepared.index }, query.key);
+    sendJson(res, 200, { ...tablePageResult(prepared.index, query), viewId });
+    logInfo('report.table_prepared', { ...context, table: table.name, incomplete: prepared.rendered.truncated });
+  } catch (error) {
+    const denied = errorLooksPermissionDenied(error);
+    const status = denied ? 403 : error.statusCode || 400;
+    const reason = denied ? 'data_access_denied' : error.reason || 'table_page_failed';
+    logWarn('report.table_page_failed', { ...context, reason, status });
+    if (!res.destroyed) sendJson(res, status, {
+      success: false, reason, message: denied ? DEFAULT_PERMISSION_DENIED_TEXT
+        : error.reason ? error.message : 'Could not load the report table.'
+    });
+  } finally {
+    slot?.release();
+  }
 }
 
 async function listTemplateCards(authToken, root, requestUrl) {
@@ -52518,6 +54088,168 @@ function sendPublicationVersionConflict(res, context) {
     reason: 'publication_saved_spec_mismatch',
     message: 'Publication settings were saved to a different template version. Reload the template and publish again.'
   });
+}
+
+async function handleSnapshotRefresh(req, res, requestUrl, authToken, root, templateCode) {
+  const action = 'refresh-snapshot';
+  if (!methodAllowed(req, res, ['GET', 'POST'])) return;
+  if (req.method === 'POST' && (!requireStateChangingRequest(req, res, authToken) || !requireJsonContentType(req, res))) return;
+  let observation;
+  let slot;
+  let stage = 'precondition';
+  const context = { requestId: currentRequestId(), root, templateCode, action };
+  const fail = (reason, message, status) => { throw snapshotStoreError(reason, message, status); };
+  const conflict = () => fail('snapshot_refresh_conflict', 'The template, refresh mode or published snapshot changed. Reload the report and try again.', 409);
+  const unavailable = () => fail('snapshot_refresh_unavailable', 'No active published report is available to refresh.', 404);
+  const incomplete = () => fail('snapshot_refresh_incomplete', 'The report did not complete. The published snapshot was not replaced.', 422);
+
+  async function readTemplate() {
+    const found = await findTemplateCard(authToken, root, templateCode);
+    if (isPermissionDeniedStatus(found.response.statusCode) || found.card?._can_read === false) {
+      fail('technical_schema_access_denied', DEFAULT_PERMISSION_DENIED_TEXT, 403);
+    }
+    if (!found.response.ok || found.response.json?.success === false) {
+      fail('snapshot_refresh_template_unavailable', 'The saved report could not be verified.', 502);
+    }
+    return sanitizeTemplateCard(found.card);
+  }
+
+  try {
+    try {
+      validateCmdbuildIdentifier(templateCode, 'template code');
+    } catch {
+      fail('snapshot_refresh_invalid_template', 'Invalid template code.', 400);
+    }
+    const paramsFromUrl = reportParamsFromUrl(requestUrl);
+    const session = await requireValidBackendSession(authToken, res, context);
+    if (!session) return;
+    let expectedMode;
+    let expectedSnapshotRevision;
+    if (req.method === 'POST') {
+      const body = await readTemplateActionBody(req, res, action);
+      if (!body) return;
+      expectedMode = body.expectedMode;
+      if (!['personal', 'shared'].includes(expectedMode)) {
+        fail('snapshot_refresh_mode_required', 'Specify the expected refresh mode: personal or shared.', 400);
+      }
+      expectedSnapshotRevision = body.expectedSnapshotRevision;
+      if (typeof expectedSnapshotRevision !== 'string' || !/^[a-f0-9]{64}$/.test(expectedSnapshotRevision)) {
+        fail('snapshot_refresh_revision_required', 'Specify the expected published snapshot revision.', 400);
+      }
+      observation = retainTemplateMutationState(root, templateCode);
+    }
+    const observedGeneration = observation?.state.generation;
+    const template = await readTemplate();
+    if (!template?.active) unavailable();
+    const publish = normalizePublishConfig(template.spec);
+    if (publish.mode !== 'staticSnapshot' || !publish.warningAccepted) unavailable();
+    const mode = publish.refreshMode === 'shared' && publish.sharedRefreshAccepted === true ? 'shared' : 'personal';
+    if (expectedMode && expectedMode !== mode) conflict();
+    const lookup = await readStaticSnapshot(root, templateCode, paramsFromUrl, publish, expectedMode === 'shared');
+    const { snapshot } = lookup;
+    if (!snapshot || snapshot.publish.paramsMode !== publish.paramsMode) unavailable();
+    if (snapshot.specHash !== template.specHash ||
+      (expectedSnapshotRevision && staticSnapshotViewRevision(snapshot) !== expectedSnapshotRevision)) conflict();
+    const params = snapshot.params;
+    if (!params || typeof params !== 'object' || Array.isArray(params) ||
+      lookup.key !== staticSnapshotKey(root, templateCode, params, publish)) incomplete();
+
+    const includeDiagrams = templateOutputIncludesDiagrams(template.spec);
+    if (validateTemplateSpecForExecution(template.spec, { includeDiagrams }).length) incomplete();
+    if (includeDiagrams) {
+      const d2Workflow = await d2WorkflowStatusForSpec(template.spec);
+      if (d2Workflow.state === 'pending' || d2Workflow.state === 'unsupported') incomplete();
+    }
+    if (req.method === 'GET') {
+      sendJson(res, 200, { available: true, mode });
+      return;
+    }
+    slot = acquireExecutionSlot(req, res, { action, templateCode });
+    if (!slot) return;
+    stage = 'data';
+    const runtimeConfig = await getRuntimeConfig(authToken, root);
+    const limits = normalizeExecutionLimitConfig(runtimeConfig);
+    const deadlineAt = Date.now() + DRAFT_PREVIEW_TIMEOUT_MS;
+    const { result, indexes } = await materializePublishedReport(authToken, template.spec, params, {
+      maxRows: limits.maxRowsDefault,
+      maxRowsMax: limits.maxRowsMax,
+      maxRelationsPerCard: limits.maxRelationsPerCardDefault,
+      maxRelationsPerCardMax: limits.maxRelationsPerCardMax,
+      maxSelectionScanRows: limits.maxSelectionScanRowsDefault,
+      maxSelectionScanRowsMax: limits.maxSelectionScanRowsMax,
+      maxClasses: limits.maxClassesDefault,
+      maxClassesMax: limits.maxClassesMax,
+      maxDomains: limits.maxDomainsDefault,
+      maxDomainsMax: limits.maxDomainsMax,
+      maxRestCalls: limits.maxRestCallsDefault,
+      maxRestCallsMax: limits.maxRestCallsMax,
+      maxTraversalDepth: limits.maxTraversalDepthMax,
+      traversalDepthDefault: limits.maxTraversalDepthDefault,
+      maxTraversalDepthMax: limits.maxTraversalDepthMax,
+      includeDiagrams,
+      ...(includeDiagrams ? {} : { executionScope: 'tables' }),
+      strictDataReads: true,
+      executionDeadlineAt: deadlineAt,
+      executionDeadlineTimeoutMs: DRAFT_PREVIEW_TIMEOUT_MS
+    }, runtimeConfig, mode === 'shared');
+    if (result.truncated || result.trace?.some((step) => step.truncated) ||
+      result.limitDiagnostics?.some((item) => item.truncated || item.timeout) ||
+      result.tables?.some((table) => table.truncated) ||
+      result.diagrams?.some((diagram) => diagram.truncated || (diagram.d2?.source && !diagram.svg?.rendered))) incomplete();
+
+    stage = 'commit';
+    const saved = await withTemplateMutationLock(root, [templateCode], async () => {
+      if (observation.state.generation !== observedGeneration) conflict();
+      const current = await readTemplate();
+      if (!current?.active || current.id !== template.id || current.specHash !== template.specHash) conflict();
+      assertExecutionDeadline(deadlineAt, DRAFT_PREVIEW_TIMEOUT_MS);
+      if (res.destroyed) return null;
+      if (mode === 'shared') {
+        const replacement = await writeStaticSnapshot(root, current, params, result, session.data, publish, snapshot.generation, lookup, indexes);
+        if (!replacement) conflict();
+        return replacement;
+      }
+      const latest = await readStaticSnapshot(root, templateCode, paramsFromUrl, publish);
+      if (latest.key !== lookup.key || staticSnapshotViewRevision(latest.snapshot) !== expectedSnapshotRevision) conflict();
+      return snapshot;
+    });
+    if (!saved) return;
+    logInfo('snapshot.refresh_succeeded', { ...context, mode, rowsCount: countResultRows(result), backend: lookup.backend });
+    let response = {
+      success: true,
+      snapshotFound: true,
+      action,
+      mode,
+      template: { code: template.code, description: template.description, active: true },
+      params,
+      result,
+      cache: mode === 'shared' ? staticSnapshotCacheMeta(saved, 'snapshot-published', lookup.backend, lookup.key) : null
+    };
+    if (indexes && browserTableShellRequested(requestUrl)) {
+      const tableView = mode === 'shared' ? { kind: 'public', snapshotRevision: staticSnapshotViewRevision(saved) }
+        : { kind: 'personal', viewId: putReportTableView(reportTableOwner(authToken, session.data, root, template, paramsFromUrl), indexes) };
+      response = reportTableShell(response, tableView);
+    }
+    sendJson(res, 200, runtimeDisplayResponsePayload(response, { d2DownloadAllowed: mode === 'shared' && publicD2SourceAllowed(publish) }));
+  } catch (error) {
+    if (res.destroyed) return;
+    const denied = stage === 'data' && errorLooksPermissionDenied(error);
+    const timeout = error.statusCode === 504 || error.code === 'draft_preview_timeout';
+    const limited = stage === 'data' && !error.reason && templateExecutionErrorReason(error) === 'execution_limit';
+    const reason = denied ? 'data_access_denied' : timeout ? 'snapshot_refresh_timeout' : limited ? 'snapshot_refresh_incomplete'
+      : error.reason || (error.code === 'template_code_ambiguous' ? error.code : 'snapshot_refresh_failed');
+    const status = denied ? 403 : timeout ? 504 : limited ? 422 : error.statusCode || 502;
+    logWarn('snapshot.refresh_failed', { ...context, stage, reason, status });
+    sendJson(res, status, {
+      success: false, action, reason, code: reason,
+      message: denied ? DEFAULT_PERMISSION_DENIED_TEXT : timeout ? 'Refreshing the report timed out.' : limited
+        ? 'The report exceeded its execution limits. The published snapshot was not replaced.'
+        : error.reason ? error.message : 'Could not refresh the published report.'
+    });
+  } finally {
+    slot?.release();
+    observation?.release();
+  }
 }
 
 async function readTemplateActionBody(req, res, action) {
@@ -52662,6 +54394,7 @@ function validateTemplateSpec(spec) {
   if (spec.version !== 1) {
     errors.push({ path: '$.version', message: 'Only DSL version 1 is supported.' });
   }
+  errors.push(...validateReportTables(spec));
   if (spec.publish !== undefined) {
     if (!spec.publish || typeof spec.publish !== 'object' || Array.isArray(spec.publish)) {
       errors.push({ path: '$.publish', message: 'Template publish settings must be an object.' });
@@ -52672,6 +54405,15 @@ function validateTemplateSpec(spec) {
       }
       if (spec.publish.paramsMode !== undefined && !['exact', 'ignore'].includes(spec.publish.paramsMode)) {
         errors.push({ path: '$.publish.paramsMode', message: 'Publish paramsMode must be exact or ignore.' });
+      }
+      if (spec.publish.refreshMode !== undefined && !['personal', 'shared'].includes(spec.publish.refreshMode)) {
+        errors.push({ path: '$.publish.refreshMode', message: 'Publish refreshMode must be personal or shared.' });
+      }
+      if (spec.publish.sharedRefreshAccepted !== undefined && typeof spec.publish.sharedRefreshAccepted !== 'boolean') {
+        errors.push({ path: '$.publish.sharedRefreshAccepted', message: 'Publish sharedRefreshAccepted must be boolean.' });
+      }
+      if (publish.refreshMode === 'shared' && !publish.sharedRefreshAccepted) {
+        errors.push({ path: '$.publish.sharedRefreshAccepted', message: 'Shared snapshot refresh requires explicit consent.' });
       }
       if (spec.publish.publicD2Source !== undefined && typeof spec.publish.publicD2Source !== 'boolean') {
         errors.push({ path: '$.publish.publicD2Source', message: 'Publish publicD2Source must be boolean.' });
@@ -52825,10 +54567,10 @@ function validateTemplateSpec(spec) {
         if (!step.from || typeof step.from !== 'string') {
           errors.push({ path: `${path}.from`, message: 'composeRows requires a left source alias in "from".' });
         }
-        if (step.with !== undefined && typeof step.with !== 'string') {
-          errors.push({ path: `${path}.with`, message: 'composeRows with must be a right source alias string.' });
+        for (const field of ['with', 'right']) if (step[field] !== undefined && typeof step[field] !== 'string') {
+          errors.push({ path: `${path}.${field}`, message: `composeRows ${field} must be a right source alias string.` });
         }
-        if (step.with) {
+        if (composeRightAlias(step)) {
           try {
             normalizeRowOperationKeys(step);
           } catch (error) {
@@ -53314,6 +55056,7 @@ function validateTemplateSpecForStorage(spec) {
   if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
     return [{ path: '$', message: 'Template spec must be an object.' }];
   }
+  errors.push(...validateReportTables(spec));
   if (Buffer.byteLength(stableJsonStringify(spec), 'utf8') > TEMPLATE_REQUEST_MAX_BYTES) {
     errors.push({ path: '$', message: `Template spec exceeds configured maxBytes=${TEMPLATE_REQUEST_MAX_BYTES}.` });
   }
@@ -53405,12 +55148,34 @@ function templateSpecWithoutDiagrams(spec) {
   return tableOnlySpec;
 }
 
-function tableExecutionScope(spec) {
+function composeRightAlias(step) {
+  return step.with || step.right || '';
+}
+
+function operationInputAliases(step) {
+  if (!step) return [];
+  switch (step.type) {
+    case 'composeRows': case 'compose':
+      return [step.from, composeRightAlias(step)].filter(Boolean);
+    case 'extractVariables': case 'extract': {
+      const source = step.from || step.source;
+      return step.sourceValue === undefined && !step.sourceParam && typeof source === 'string' && !source.startsWith('params.')
+        ? [source] : [];
+    }
+    case 'joinRows': case 'intersectRows': case 'unionRows': case 'differenceRows':
+    case 'matchRows': case 'semiJoinRows': case 'existsRelatedRows':
+      return [step.from, step.with].filter(Boolean);
+    case 'selectCards': case 'filterRows': case 'enrichRows': case 'traverseDomains':
+    case 'expandRelations': case 'compareClassAttributes':
+      return step.from ? [step.from] : [];
+    default:
+      return [];
+  }
+}
+
+function executionScopeFromAliases(spec, requested) {
   const steps = Array.isArray(spec && spec.steps) ? spec.steps : [];
   const byAlias = new Map(steps.map((step, index) => [String(step && step.as || '').trim(), { step, index }]).filter(([alias]) => alias));
-  const requested = new Set((Array.isArray(spec && spec.result && spec.result.tables) ? spec.result.tables : [])
-    .map((table) => String(table && table.name || '').trim())
-    .filter(Boolean));
   const included = new Set();
   const visit = (alias) => {
     const name = String(alias || '').trim();
@@ -53418,8 +55183,7 @@ function tableExecutionScope(spec) {
     const entry = byAlias.get(name);
     if (!entry) return;
     included.add(name);
-    visit(entry.step && entry.step.from);
-    visit(entry.step && entry.step.with);
+    operationInputAliases(entry.step).forEach(visit);
   };
   requested.forEach(visit);
   const selected = steps
@@ -53432,9 +55196,18 @@ function tableExecutionScope(spec) {
   };
 }
 
+function tableExecutionScope(spec, { includeSelectors = false } = {}) {
+  const tables = Array.isArray(spec?.result?.tables) ? spec.result.tables : [];
+  const requested = tables.flatMap((table) => {
+    const selector = includeSelectors && normalizeLargeTable(table?.presentation?.largeTable)?.selector;
+    return selector?.kind === 'result' ? [table.name, selector.source] : [table?.name];
+  });
+  return executionScopeFromAliases(spec, requested);
+}
+
 function templateSpecForTableExecution(spec) {
   const tableSpec = templateSpecWithoutDiagrams(spec);
-  const scope = tableExecutionScope(tableSpec);
+  const scope = tableExecutionScope(tableSpec, { includeSelectors: true });
   tableSpec.steps = scope.steps.map(({ step }) => cloneJsonValueServer(step, {}));
   return tableSpec;
 }
@@ -57456,6 +59229,14 @@ function referenceValueId(value) {
   return String(value).trim();
 }
 
+function relationReadIsIncomplete(response, items, limit, requested) {
+  const totalValue = response.json?.meta?.total;
+  const total = typeof totalValue === 'number' || typeof totalValue === 'string' && /^\d+$/.test(totalValue)
+    ? Number(totalValue) : null;
+  const confirmedTotal = Number.isSafeInteger(total) && total >= items.length;
+  return items.length > limit || (confirmedTotal ? total > items.length : items.length >= requested);
+}
+
 async function readRelationsForPath(cmdbuildExecRequest, pathCache, className, id) {
   const key = `${className}:${id}`;
   if (pathCache.relations.has(key)) return pathCache.relations.get(key);
@@ -57468,7 +59249,7 @@ async function readRelationsForPath(cmdbuildExecRequest, pathCache, className, i
   const readLimit = Math.min(relationLimit + 1, relationLimitMax);
   const response = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}/cards/${encodeURIComponent(id)}/relations?limit=${readLimit}`);
   const items = response.ok && Array.isArray(response.json && response.json.data) ? response.json.data : [];
-  if (items.length > relationLimit) pathCache.relationLimitReached = true;
+  if (response.ok && relationReadIsIncomplete(response, items, relationLimit, readLimit)) pathCache.relationLimitReached = true;
   const relations = items.slice(0, relationLimit);
   pathCache.relations.set(key, relations);
   return relations;
@@ -57644,10 +59425,11 @@ function buildSelectionResultRow(className, card, driverRow, columns, step) {
   return setRuntimeRowSemantics(row, includeSource ? ['pair', cardIdentity, runtimeRowIdentity(driverRow)] : cardIdentity, rawFields);
 }
 
-function cardListPath(className, limit, fields, start = 0) {
+function cardListPath(className, limit, fields, start = 0, filter) {
   const query = new URLSearchParams();
   query.set('limit', String(limit));
   if (start) query.set('start', String(start));
+  if (filter) query.set('filter', JSON.stringify(filter));
   const attributes = uniqueStrings((fields || [])
     .map(directCardFieldFromPath)
     .filter((field) => field && !CARD_BUILTIN_FIELDS.has(field)));
@@ -57655,16 +59437,24 @@ function cardListPath(className, limit, fields, start = 0) {
   return `/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}/cards?${query.toString()}`;
 }
 
-async function requestCardsForSelection(cmdbuildExecRequest, className, limit, fields, start = 0) {
-  const response = await cmdbuildExecRequest(cardListPath(className, limit, fields, start));
+async function requestCardsForSelection(cmdbuildExecRequest, className, limit, fields, start = 0, filter) {
+  const response = await cmdbuildExecRequest(cardListPath(className, limit, fields, start, filter));
   if (response.ok || !fields || !fields.length || isPermissionDeniedStatus(response.statusCode)) return response;
   const query = new URLSearchParams();
   query.set('limit', String(limit));
   if (start) query.set('start', String(start));
+  if (filter) query.set('filter', JSON.stringify(filter));
   return cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}/cards?${query.toString()}`);
 }
 
 function selectionScanLimit(step, filters, limits, resultLimit) {
+  if (limits.largeTableExecution) {
+    const configured = limits.maxSelectionScanRows || resultLimit;
+    const maximum = limits.maxSelectionScanRowsMax || configured;
+    const explicit = toPositiveInt(step.scanLimit || step.searchLimit || step.fetchLimit, 0, maximum);
+    if (explicit) return Math.min(maximum, Math.max(resultLimit, explicit));
+    return Math.min(maximum, filters.length ? configured : Math.min(configured, resultLimit));
+  }
   const maxScan = Math.max(resultLimit, limits.maxSelectionScanRowsMax || limits.maxSelectionScanRows || resultLimit);
   const explicit = toPositiveInt(step.scanLimit || step.searchLimit || step.fetchLimit, 0, maxScan);
   if (explicit) return Math.max(resultLimit, explicit);
@@ -57673,7 +59463,7 @@ function selectionScanLimit(step, filters, limits, resultLimit) {
     : resultLimit;
 }
 
-async function requestCardsForSelectionScan(cmdbuildExecRequest, className, scanLimit, fields) {
+async function requestCardsForSelectionScan(cmdbuildExecRequest, className, scanLimit, fields, requireComplete = false, filter) {
   const limit = Math.max(1, Number(scanLimit) || 1);
   const pageSize = Math.min(limit, 1000);
   const rows = [];
@@ -57681,13 +59471,18 @@ async function requestCardsForSelectionScan(cmdbuildExecRequest, className, scan
   let knownTotal = null;
   while (rows.length < limit) {
     const pageLimit = Math.min(pageSize, limit - rows.length);
-    const response = await requestCardsForSelection(cmdbuildExecRequest, className, pageLimit, fields, start);
+    const response = await requestCardsForSelection(cmdbuildExecRequest, className, pageLimit, fields, start, filter);
     if (!response.ok) return response;
     const pageRows = Array.isArray(response.json && response.json.data) ? response.json.data : [];
     const metaTotal = Number(response.json && response.json.meta && (response.json.meta.total ?? response.json.meta.count));
     if (Number.isFinite(metaTotal) && metaTotal >= 0) knownTotal = metaTotal;
     rows.push.apply(rows, pageRows);
-    if (pageRows.length < pageLimit) break;
+    if (pageRows.length < pageLimit) {
+      if (requireComplete && (!Array.isArray(response.json?.data) || knownTotal !== null && rows.length < knownTotal)) {
+        throw snapshotStoreError('snapshot_refresh_incomplete', 'CMDBuild returned an incomplete page of cards.', 422);
+      }
+      break;
+    }
     start += pageRows.length;
   }
   return {
@@ -57715,7 +59510,8 @@ function inferredAssistantSelectionFilterJoin(step) {
   return includeFilters.length > 1 && valueColumns.size === 1 && operators.size === 1 && paths.size > 1 ? 'any' : 'all';
 }
 
-async function executeSelectCards(cmdbuildExecRequest, step, params, context, limits, dependencyMap, assistantSelectionAliases = new Set()) {
+async function executeSelectCards(cmdbuildExecRequest, step, params, context, limits, dependencyMap, assistantSelectionAliases = new Set(), requireComplete = false,
+  restriction = null, extraPaths = []) {
   const driverRows = resolveSelectionDriverRows(step, context, limits);
   const maxRows = toPositiveInt(step.limit, limits.maxRows, limits.maxRows);
   const filters = Array.isArray(step.filters || step.where) ? (step.filters || step.where) : [];
@@ -57728,7 +59524,13 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
     : null;
   const requestedColumns = normalizePathColumnSpecs([]
     .concat(step.columns || step.cardColumns || step.outputColumns || [])
-    .concat((dependency && dependency.fields || []).map((field) => ({ path: field, as: field }))));
+    .concat((dependency && dependency.fields || []).map((field) => ({ path: field, as: field })))
+    .concat(extraPaths.map((field) => ({ path: field, as: field }))));
+  const directRestriction = restriction && (restriction.field === 'Code' && typeof restriction.value === 'string' ||
+    restriction.field === '_id' && typeof restriction.value === 'string' && /^\d+$/.test(restriction.value))
+    ? { attribute: { simple: {
+      attribute: restriction.field === '_id' ? 'Id' : restriction.field, operator: 'equal', value: [restriction.value]
+    } } } : undefined;
   // Read every direct, permission-filtered card attribute. Deep paths remain
   // an explicit compiler projection below, but the working result is never
   // narrowed by a presentation field list.
@@ -57755,6 +59557,15 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
     availableTotal: Array.from(cardsByClass.values()).reduce((total, item) => total + (Number.isFinite(item.availableTotal) ? item.availableTotal : 0), 0) || null,
     classes: Array.from(cardsByClass.entries()).filter(([, item]) => item.truncated).map(([className]) => className)
   } : null;
+  const cappedResult = () => ({
+    columns,
+    rows,
+    truncated: true,
+    rowLimitReached: true,
+    rowLimit: maxRows,
+    selectionScan: selectionScan(),
+    relationLimitReached: Boolean(pathCache.relationLimitReached)
+  });
 
   for (const driverRow of driverRows) {
     const requestedClassName = resolveSelectionClassName(step, params, driverRow);
@@ -57768,7 +59579,7 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
     for (const className of targetClassNames) {
       validateCmdbuildIdentifier(className, 'selectCards className');
       if (!cardsByClass.has(className)) {
-        const cards = await requestCardsForSelectionScan(cmdbuildExecRequest, className, scanLimit, readFields);
+        const cards = await requestCardsForSelectionScan(cmdbuildExecRequest, className, scanLimit, readFields, requireComplete, directRestriction);
         if (!cards.ok) {
           throw new Error(`CMDBuild cards request for ${className} failed with status ${cards.statusCode}.`);
         }
@@ -57784,6 +59595,8 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
       scanTruncated = scanTruncated || Boolean(classCards && classCards.truncated);
       for (const card of classCards && classCards.rows || []) {
         if (!await cardPassesSelectionFilters(cmdbuildExecRequest, pathCache, className, card, filters, params, driverRow, filterJoin)) continue;
+        const outputRow = restriction ? buildSelectionResultRow(className, card, driverRow, [], step) : null;
+        if (restriction && !reportTableRowMatches(outputRow, restriction)) continue;
         if (deduplicateCards) {
           const cardIdentity = card && card._id !== undefined && card._id !== null
             ? `${className}:${String(card._id)}`
@@ -57791,20 +59604,12 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
           if (seenCards.has(cardIdentity)) continue;
           seenCards.add(cardIdentity);
         }
-        const row = buildSelectionResultRow(className, card, driverRow, columns, step);
-        await materializeRowPathColumns(cmdbuildExecRequest, pathCache, row, className, card, requestedColumns, columns);
-        rows.push(row);
-        if (rows.length >= maxRows) {
-          return {
-            columns,
-            rows,
-            truncated: true,
-            rowLimitReached: true,
-            rowLimit: maxRows,
-            selectionScan: selectionScan(),
-            relationLimitReached: Boolean(pathCache.relationLimitReached)
-          };
-        }
+        if (requireComplete && rows.length >= maxRows) return cappedResult();
+        const resultRow = outputRow || buildSelectionResultRow(className, card, driverRow, columns, step);
+        if (outputRow) Object.keys(outputRow).forEach((field) => addColumnOnce(columns, field));
+        await materializeRowPathColumns(cmdbuildExecRequest, pathCache, resultRow, className, card, requestedColumns, columns);
+        rows.push(resultRow);
+        if (!requireComplete && rows.length >= maxRows) return cappedResult();
       }
     }
   }
@@ -58080,7 +59885,7 @@ async function buildRelationResultRow(cmdbuildExecRequest, pathCache, driverRow,
   return row;
 }
 
-async function executeExpandRelations(cmdbuildExecRequest, step, params, context, limits) {
+async function executeExpandRelations(cmdbuildExecRequest, step, params, context, limits, restriction = null) {
   const driverRows = resolveRelationDriverRows(step, context, limits);
   const maxRows = limits.maxRows;
   const perCardLimit = toPositiveInt(limits.maxRelationsPerCard, 100, limits.maxRelationsPerCardMax || ABSOLUTE_EXECUTION_LIMITS.maxRelationsPerCard);
@@ -58120,6 +59925,7 @@ async function executeExpandRelations(cmdbuildExecRequest, step, params, context
       throw new Error('expandRelations source class or id resolved to an empty value.');
     }
     validateCmdbuildIdentifier(sourceClass, 'expandRelations sourceClass');
+    if (restriction && !reportTableRowMatches({ SourceId: sourceId }, restriction)) continue;
 
     const relationReadLimit = Math.min(perCardLimit + 1, limits.maxRelationsPerCardMax || ABSOLUTE_EXECUTION_LIMITS.maxRelationsPerCard);
     const relations = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(sourceClass)}/cards/${encodeURIComponent(sourceId)}/relations?limit=${relationReadLimit}`);
@@ -58128,7 +59934,7 @@ async function executeExpandRelations(cmdbuildExecRequest, step, params, context
     }
 
     const relationItems = Array.isArray(relations.json && relations.json.data) ? relations.json.data : [];
-    if (relationItems.length > perCardLimit) relationLimitReached = true;
+    if (relationReadIsIncomplete(relations, relationItems, perCardLimit, relationReadLimit)) relationLimitReached = true;
     for (const relation of relationItems.slice(0, perCardLimit)) {
       const domain = relationDomainName(relation);
       if (domainFilter.size && !domainFilter.has(domain.toLowerCase())) continue;
@@ -58143,11 +59949,6 @@ async function executeExpandRelations(cmdbuildExecRequest, step, params, context
       if (distinct && seen.has(distinctKey)) continue;
       seen.add(distinctKey);
 
-      const relatedCardInfo = fetchRelated
-        ? await readRelatedCard(cmdbuildExecRequest, relatedCardCache, relatedClass, chosen.relatedEndpoint.id)
-        : { card: null, statusCode: '' };
-      rows.push(await buildRelationResultRow(cmdbuildExecRequest, pathCache, driverRow, relation, sourceClass, sourceId, chosen.sourceSide, chosen.relatedEndpoint, relatedCardInfo, columns, step));
-      if (pathCache.relationLimitReached) relationLimitReached = true;
       if (rows.length >= maxRows) {
         return {
           columns,
@@ -58157,6 +59958,11 @@ async function executeExpandRelations(cmdbuildExecRequest, step, params, context
           truncationReason: relationLimitReached ? 'maxRelationsPerCard' : 'maxRows'
         };
       }
+      const relatedCardInfo = fetchRelated
+        ? await readRelatedCard(cmdbuildExecRequest, relatedCardCache, relatedClass, chosen.relatedEndpoint.id)
+        : { card: null, statusCode: '' };
+      rows.push(await buildRelationResultRow(cmdbuildExecRequest, pathCache, driverRow, relation, sourceClass, sourceId, chosen.sourceSide, chosen.relatedEndpoint, relatedCardInfo, columns, step));
+      if (pathCache.relationLimitReached) relationLimitReached = true;
     }
   }
 
@@ -58188,7 +59994,7 @@ async function executeEnrichRows(cmdbuildExecRequest, step, params, context, lim
   };
   const rows = [];
   const sourceResolution = { resolved: 0, equivalent: 0, ambiguous: 0, unavailable: 0 };
-  let truncated = Boolean(source.truncated) || (Array.isArray(source.rows) && source.rows.length > sourceRows.length);
+  const truncated = Boolean(source.truncated) || (Array.isArray(source.rows) && source.rows.length > sourceRows.length);
 
   for (const sourceRow of sourceRows) {
     const row = inheritRuntimeRowSemantics({ ...(sourceRow && typeof sourceRow === 'object' ? sourceRow : {}) }, sourceRow);
@@ -58197,7 +60003,10 @@ async function executeEnrichRows(cmdbuildExecRequest, step, params, context, lim
       ? row[idColumn]
       : row.RelatedId;
     let card = null;
-    if (className && id !== undefined && id !== null && id !== '') {
+    const projectionAlreadyAvailable = enrichColumns.every((column) => !column.sourceCandidates?.length &&
+      (Object.hasOwn(row, column.path) ||
+        Object.hasOwn(row, column.as) && row[column.as] !== undefined && row[column.as] !== null && row[column.as] !== ''));
+    if (!projectionAlreadyAvailable && className && id !== undefined && id !== null && id !== '') {
       const related = await readRelatedCard(cmdbuildExecRequest, pathCache.cards, className, id);
       card = related.card || null;
       if (card && row._id === undefined) row._id = card._id;
@@ -58268,23 +60077,24 @@ async function executeEnrichRows(cmdbuildExecRequest, step, params, context, lim
       }
     }
     for (const variant of variants) {
-      rows.push(variant);
       if (rows.length >= limits.maxRows) {
-        truncated = true;
         return {
           columns,
           rows,
-          truncated,
+          truncated: true,
+          relationLimitReached: Boolean(pathCache.relationLimitReached),
           sourceResolution
         };
       }
+      rows.push(variant);
     }
   }
 
   return {
     columns,
     rows,
-    truncated,
+    truncated: truncated || Boolean(pathCache.relationLimitReached),
+    relationLimitReached: Boolean(pathCache.relationLimitReached),
     sourceResolution
   };
 }
@@ -58945,7 +60755,7 @@ function executeComposeRows(step, params, context, limits) {
   const left = context[step.from];
   if (!left) throw new Error(`composeRows source not found: ${step.from}`);
 
-  const rightName = step.with || step.right || '';
+  const rightName = composeRightAlias(step);
   const right = rightName ? context[rightName] : null;
   if (rightName && !right) throw new Error(`composeRows source not found: ${rightName}`);
 
@@ -59015,9 +60825,9 @@ function executeComposeRows(step, params, context, limits) {
 
 function createExecutionRequest(authToken, limits, options = {}) {
   let restCalls = 0;
-  let permissionError = null;
+  let readError = null;
   const assertAccess = () => {
-    if (permissionError) throw permissionError;
+    if (readError) throw readError;
   };
   const deadlineAt = Number(options.deadlineAt || 0);
   const deadlineTimeoutMs = Number(options.deadlineTimeoutMs || DRAFT_PREVIEW_TIMEOUT_MS);
@@ -59030,16 +60840,23 @@ function createExecutionRequest(authToken, limits, options = {}) {
     }
     try {
       const response = await cmdbuildRequest(path, authToken, { deadlineAt, deadlineTimeoutMs });
-      if (options.relationSensitive && isPermissionDeniedStatus(response.statusCode)) {
-        permissionError = Object.assign(new Error(`CMDBuild data request failed with status ${response.statusCode}.`), {
+      if ((options.relationSensitive || options.strictDataReads) && isPermissionDeniedStatus(response.statusCode)) {
+        readError = Object.assign(new Error(`CMDBuild data request failed with status ${response.statusCode}.`), {
           cmdbuildStatus: response.statusCode
         });
         assertAccess();
       }
+      if (options.strictDataReads && (!response.ok || response.json?.success === false ||
+        !response.json?.data || typeof response.json.data !== 'object')) {
+        throw snapshotStoreError('snapshot_refresh_data_unavailable', 'CMDBuild did not complete a data read.', 502);
+      }
       return response;
     } catch (error) {
-      if (executionDeadlineRemainingMs(deadlineAt) <= 0) throw executionDeadlineTimeoutError(deadlineTimeoutMs);
-      throw error;
+      const failure = executionDeadlineRemainingMs(deadlineAt) <= 0 ? executionDeadlineTimeoutError(deadlineTimeoutMs) : error;
+      // Some readers treat auxiliary fetch failures as missing data. Do not
+      // allow such a partial result to replace an existing publication.
+      if (options.strictDataReads && !readError) readError = failure;
+      throw failure;
     }
   };
   request.getRestCalls = () => restCalls;
@@ -59337,8 +61154,6 @@ async function executeCompareClassAttributes(cmdbuildExecRequest, step, params, 
 }
 
 function diagramExecutionScope(spec) {
-  const steps = Array.isArray(spec && spec.steps) ? spec.steps : [];
-  const byAlias = new Map(steps.map((step, index) => [String(step && step.as || '').trim(), { step, index }]).filter(([alias]) => alias));
   const requested = new Set();
   const addMapping = (mapping) => {
     const alias = diagramMappingSourceName(mapping);
@@ -59361,32 +61176,15 @@ function diagramExecutionScope(spec) {
       if (alias) requested.add(alias);
     }
   }
-  const included = new Set();
-  const visit = (alias) => {
-    const name = String(alias || '').trim();
-    if (!name || included.has(name)) return;
-    const entry = byAlias.get(name);
-    if (!entry) return;
-    included.add(name);
-    visit(entry.step && entry.step.from);
-    visit(entry.step && entry.step.with);
-  };
-  requested.forEach(visit);
-  const selected = steps
-    .map((step, index) => ({ step, index }))
-    .filter(({ step }) => included.has(String(step && step.as || '').trim()));
-  return {
-    steps: selected,
-    includedAliases: selected.map(({ step }) => String(step && step.as || '').trim()),
-    skippedAliases: steps.map((step) => String(step && step.as || '').trim()).filter((alias) => alias && !included.has(alias))
-  };
+  return executionScopeFromAliases(spec, requested);
 }
 
 async function executeTemplateSpec(authToken, spec, params, options = {}) {
   const effectiveParams = applyTemplateParamDefaults(spec, params);
   const executionDeadlineAt = Number(options.executionDeadlineAt || 0);
   const executionDeadlineTimeoutMs = Number(options.executionDeadlineTimeoutMs || DRAFT_PREVIEW_TIMEOUT_MS);
-  const maxRowsMax = Math.min(options.maxRowsMax || ABSOLUTE_EXECUTION_LIMITS.maxRows, ABSOLUTE_EXECUTION_LIMITS.maxRows);
+  const rowCap = options.largeTableExecution === true ? REPORT_TABLE_ROW_BUDGET : ABSOLUTE_EXECUTION_LIMITS.maxRows;
+  const maxRowsMax = Math.min(options.maxRowsMax || rowCap, rowCap);
   const maxRelationsPerCardMax = Math.min(options.maxRelationsPerCardMax || ABSOLUTE_EXECUTION_LIMITS.maxRelationsPerCard, ABSOLUTE_EXECUTION_LIMITS.maxRelationsPerCard);
   const maxSelectionScanRowsMax = Math.min(options.maxSelectionScanRowsMax || ABSOLUTE_EXECUTION_LIMITS.maxSelectionScanRows, ABSOLUTE_EXECUTION_LIMITS.maxSelectionScanRows);
   const maxClassesMax = Math.min(options.maxClassesMax || ABSOLUTE_EXECUTION_LIMITS.maxClasses, ABSOLUTE_EXECUTION_LIMITS.maxClasses);
@@ -59405,7 +61203,8 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
     maxSelectionScanRowsMax,
     maxRestCalls: Math.min(options.maxRestCalls || 250, maxRestCallsMax),
     maxTraversalDepth: Math.min(options.maxTraversalDepth || maxTraversalDepthMax, maxTraversalDepthMax),
-    traversalDepthDefault: Math.min(options.traversalDepthDefault || 1, maxTraversalDepthMax)
+    traversalDepthDefault: Math.min(options.traversalDepthDefault || 1, maxTraversalDepthMax),
+    ...(options.largeTableExecution === true ? { largeTableExecution: true } : {})
   };
   const context = {};
   const diagramScope = options.executionScope === 'diagrams' ? diagramExecutionScope(spec) : null;
@@ -59419,7 +61218,8 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
   const cmdbuildExecRequest = createExecutionRequest(authToken, limits, {
     deadlineAt: executionDeadlineAt,
     deadlineTimeoutMs: executionDeadlineTimeoutMs,
-    relationSensitive: dependencyMap.relationSensitive
+    relationSensitive: dependencyMap.relationSensitive,
+    strictDataReads: options.strictDataReads === true
   });
   if (isCmdbBuildViewSpec(spec)) {
     const result = await executeCmdbBuildViewSpec(cmdbuildExecRequest, spec, effectiveParams, { limits });
@@ -59444,49 +61244,62 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
     assertExecutionDeadline(executionDeadlineAt, executionDeadlineTimeoutMs);
     const startedAt = Date.now();
     const restBefore = cmdbuildExecRequest.getRestCalls();
+    const stageLimits = options.largeTableExecution && !['selectCards', 'expandRelations', 'enrichRows'].includes(step.type)
+      ? { ...limits, maxRows: limits.maxRows + 1 } : limits;
+    const restriction = options.reportTableRestriction;
+    const tableRestriction = restriction?.pushdown?.alias === step.as ? { ...restriction, ...restriction.pushdown } : null;
     try {
       if (step.type === 'findClassesByAttributeType') {
-        context[step.as] = await executeFindClassesByAttributeType(cmdbuildExecRequest, step, effectiveParams, limits);
+        context[step.as] = await executeFindClassesByAttributeType(cmdbuildExecRequest, step, effectiveParams, stageLimits);
       } else if (step.type === 'extractVariables' || step.type === 'extract') {
-        context[step.as] = executeExtractVariables(step, effectiveParams, context, limits);
+        context[step.as] = executeExtractVariables(step, effectiveParams, context, stageLimits);
       } else if (step.type === 'selectCards') {
-        context[step.as] = await executeSelectCards(cmdbuildExecRequest, step, effectiveParams, context, limits, dependencyMap, assistantSelectionAliases);
+        const extraPaths = options.reportTableRawProjection?.alias === step.as ? options.reportTableRawProjection.fields : [];
+        context[step.as] = await executeSelectCards(cmdbuildExecRequest, step, effectiveParams, context, limits, dependencyMap, assistantSelectionAliases,
+          options.strictDataReads === true, tableRestriction, extraPaths);
       } else if (step.type === 'listDomains') {
-        context[step.as] = await executeListDomains(cmdbuildExecRequest, limits);
+        context[step.as] = await executeListDomains(cmdbuildExecRequest, stageLimits);
       } else if (step.type === 'filterRows') {
-        context[step.as] = executeFilterRows(step, effectiveParams, context, limits);
+        context[step.as] = executeFilterRows(step, effectiveParams, context, stageLimits);
       } else if (step.type === 'joinRows') {
-        context[step.as] = executeJoinRows(step, context, limits);
+        context[step.as] = executeJoinRows(step, context, stageLimits);
       } else if (step.type === 'intersectRows') {
-        context[step.as] = executeIntersectRows(step, context, limits);
+        context[step.as] = executeIntersectRows(step, context, stageLimits);
       } else if (step.type === 'unionRows') {
-        context[step.as] = executeUnionRows(step, context, limits);
+        context[step.as] = executeUnionRows(step, context, stageLimits);
       } else if (step.type === 'differenceRows') {
-        context[step.as] = executeDifferenceRows(step, context, limits);
+        context[step.as] = executeDifferenceRows(step, context, stageLimits);
       } else if (step.type === 'matchRows') {
-        context[step.as] = executeMatchRows(step, effectiveParams, context, limits);
+        context[step.as] = executeMatchRows(step, effectiveParams, context, stageLimits);
       } else if (step.type === 'semiJoinRows') {
-        context[step.as] = executeSemiJoinRows(step, effectiveParams, context, limits);
+        context[step.as] = executeSemiJoinRows(step, effectiveParams, context, stageLimits);
       } else if (step.type === 'existsRelatedRows') {
-        context[step.as] = await executeExistsRelatedRows(cmdbuildExecRequest, step, effectiveParams, context, limits);
+        context[step.as] = await executeExistsRelatedRows(cmdbuildExecRequest, step, effectiveParams, context, stageLimits);
       } else if (step.type === 'composeRows' || step.type === 'compose') {
-        context[step.as] = executeComposeRows(step, effectiveParams, context, limits);
+        context[step.as] = executeComposeRows(step, effectiveParams, context, stageLimits);
       } else if (step.type === 'enrichRows') {
         context[step.as] = await executeEnrichRows(cmdbuildExecRequest, step, effectiveParams, context, limits);
       } else if (step.type === 'traverseDomains') {
-        context[step.as] = await executeTraverseDomains(cmdbuildExecRequest, step, effectiveParams, context, limits);
+        context[step.as] = await executeTraverseDomains(cmdbuildExecRequest, step, effectiveParams, context, stageLimits);
       } else if (step.type === 'expandRelations') {
-        context[step.as] = await executeExpandRelations(cmdbuildExecRequest, step, effectiveParams, context, limits);
+        context[step.as] = await executeExpandRelations(cmdbuildExecRequest, step, effectiveParams, context, limits, tableRestriction);
       } else if (step.type === 'compareClassAttributes') {
-        context[step.as] = await executeCompareClassAttributes(cmdbuildExecRequest, step, effectiveParams, context, limits);
+        context[step.as] = await executeCompareClassAttributes(cmdbuildExecRequest, step, effectiveParams, context, stageLimits);
       } else {
         throw new Error(`Unsupported step type: ${step.type}`);
       }
       // Optional metadata/path readers may catch a failed upstream request.
       cmdbuildExecRequest.assertAccess();
+      if (stageLimits !== limits && context[step.as]?.rows?.length > limits.maxRows) {
+        const stage = context[step.as];
+        stage.rows = stage.rows.slice(0, limits.maxRows);
+        stage.truncated = true;
+        stage.rowLimitReached = true;
+        stage.rowLimit = limits.maxRows;
+      }
       const output = context[step.as] || {};
       const selectionScan = output.selectionScan && typeof output.selectionScan === 'object' ? output.selectionScan : null;
-      const sourceResults = [step.from, step.with]
+      const sourceResults = operationInputAliases(step)
         .map((alias) => context[String(alias || '').trim()])
         .filter((value) => value && typeof value === 'object');
       const inheritedTruncation = sourceResults.some((value) => value.truncated === true);
@@ -59590,7 +61403,6 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
   const globalPresentation = spec.result && spec.result.presentation && typeof spec.result.presentation === 'object' && !Array.isArray(spec.result.presentation)
     ? spec.result.presentation
     : {};
-  const globalTablePresentations = Array.isArray(globalPresentation.tables) ? globalPresentation.tables : [];
   const defaultEmptyText = emptyResultTextFromSpec(spec);
   const defaultPermissionDeniedText = permissionDeniedTextFromSpec(spec);
   const resultTables = Array.isArray(spec.result && spec.result.tables) ? spec.result.tables : [];
@@ -59600,7 +61412,10 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
   for (const table of resultTables) {
     const source = context[table.name] || { columns: [], rows: [], truncated: false };
     let columns = Array.isArray(table.columns) && table.columns.length ? table.columns : source.columns;
-    const sourceRows = Array.isArray(source.rows) ? source.rows : [];
+    const restriction = options.reportTableRestriction;
+    const sourceRows = Array.isArray(source.rows) ? (restriction
+      ? source.rows.filter((row) => reportTableRowMatches(row, restriction)) : source.rows) : [];
+    options.captureReportTableRows?.(sourceRows);
     let rows = sourceRows;
     if (extractionSource && table.name === extractionSource) {
       const materialized = await materializeExtractionTableRows(cmdbuildExecRequest, sourceRows, columns);
@@ -59611,27 +61426,18 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
     // normalize typed CMDBuild values before preview, publication and JSON output.
     const normalized = await normalizeFinalTableRows(cmdbuildExecRequest, spec, table, rows, columns, finalTableNormalizationCache);
     rows = normalized.rows;
-    const namedPresentation = globalTablePresentations.find((item) => item && item.name === table.name) || {};
-    const tablePresentation = table.presentation && typeof table.presentation === 'object' && !Array.isArray(table.presentation)
-      ? table.presentation
-      : {};
+    const { named: namedPresentation, presentation, mode } = runtimeTablePresentation(globalPresentation, table);
     const titleParam = table.titleParam && effectiveParams[table.titleParam] !== undefined && effectiveParams[table.titleParam] !== null
       ? displayCardValue(effectiveParams[table.titleParam])
       : '';
     const titleTemplate = namedPresentation.title || table.title || table.label || '';
     const renderedTitle = renderRuntimeParamTemplate(titleTemplate, effectiveParams);
-    const presentation = {
-      ...globalPresentation,
-      ...namedPresentation,
-      ...tablePresentation
-    };
-    delete presentation.tables;
     tables.push({
       name: table.name,
       published: table.published === true,
       title: renderedTitle || titleParam || table.name,
       titleParam: table.titleParam || '',
-      mode: namedPresentation.mode || table.mode || table.view || 'table',
+      mode,
       emptyText: table.emptyText || defaultEmptyText,
       columns,
       columnLabels: table.columnLabels && typeof table.columnLabels === 'object' && !Array.isArray(table.columnLabels) ? table.columnLabels : {},
@@ -60066,7 +61872,7 @@ function templateTransferComparesReferenceIds(operator) {
 }
 
 // Resolve row provenance using metadata only. No selection or relation rows are fetched.
-async function validateTemplateTransferRawSteps(spec, parameters, { field, readClass, readDomain, catalog, issues, filterReference }) {
+async function validateTemplateTransferRawSteps(spec, parameters, { field, readClass, readDomain, catalog, issues, filterReference, selectors }) {
   const aliases = new Map();
   const unverified = (path, message) => issues.push(templateTransferIssue(path, 'template_transfer_dependency_unverified', message));
   const copy = (source) => ({ className: source?.className || '', columns: new Map(source?.columns || []) });
@@ -60120,7 +61926,7 @@ async function validateTemplateTransferRawSteps(spec, parameters, { field, readC
   for (const [index, step] of (Array.isArray(spec.steps) ? spec.steps : []).entries()) {
     const path = `$.spec.steps[${index}]`;
     const left = aliases.get(step.from);
-    const right = aliases.get(step.with);
+    const right = aliases.get(['composeRows', 'compose'].includes(step.type) ? step.with || step.right : step.with);
     let source = copy(left);
     if (step.type === 'selectCards' || step.type === 'expandRelations') {
       const className = step.type === 'selectCards'
@@ -60183,6 +61989,14 @@ async function validateTemplateTransferRawSteps(spec, parameters, { field, readC
   }
   for (const [index, table] of (spec.result?.tables || []).entries()) {
     for (const name of table.columns || []) await column(aliases.get(table.name), name, `$.spec.result.tables[${index}].columns`);
+  }
+  for (const selector of selectors) {
+    if (selector.kind === 'result' && !aliases.has(selector.source)) {
+      unverified(`${selector.path}.source`, `Selector result ${selector.source} has no verified source.`);
+    }
+    for (const binding of selector.fields) {
+      if (!binding.className) await column(aliases.get(binding.alias), binding.field, binding.path);
+    }
   }
 }
 
@@ -60273,6 +62087,8 @@ async function validateTemplateTransferTarget(authToken, root, spec, budget = { 
     return null;
   };
   const manifest = templateTransferDependencies(spec);
+  const selectors = templateTransferTableSelectorBindings(spec);
+  const selectorAliasFields = new Set(selectors.flatMap((selector) => selector.fields.filter((binding) => !binding.className).map((binding) => binding.path)));
   const parameters = resolveTemplateParameters(spec);
   const candidates = parameters.candidates.flatMap(templateTransferReferenceEntries);
   const parameterPaths = new Set(candidates.map((candidate) => candidate.path));
@@ -60338,8 +62154,10 @@ async function validateTemplateTransferTarget(authToken, root, spec, budget = { 
   try {
     for (const dep of manifest.classes) if (dep.name && !await readClass(dep.name)) issues.push(templateTransferIssue(dep.path, 'template_transfer_class_unavailable', `CMDBuild class ${dep.name} is not readable in the target contour.`));
     for (const dep of manifest.domains) if (dep.name && !await readDomain(dep.name)) issues.push(templateTransferIssue(dep.path, 'template_transfer_domain_unavailable', `CMDBuild domain ${dep.name} is not readable in the target contour.`));
-    for (const dep of manifest.directFields) if (!dep.path.startsWith('$.spec.steps[')) await field(dep.className, dep.field, dep.path);
-    await validateTemplateTransferRawSteps(spec, parameters, { field, readClass, readDomain, catalog, issues, filterReference });
+    for (const dep of manifest.directFields) {
+      if (!dep.path.startsWith('$.spec.steps[') && !selectorAliasFields.has(dep.path)) await field(dep.className, dep.field, dep.path);
+    }
+    await validateTemplateTransferRawSteps(spec, parameters, { field, readClass, readDomain, catalog, issues, filterReference, selectors });
     const flow = objectFlowFromSpecServer(spec);
     const stages = assistantObjectFlowDiagramStages(spec, flow);
     for (const stage of stages) {
@@ -60612,14 +62430,17 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
     if (!methodAllowed(req, res, 'GET')) return;
     const suffix = requestUrl.pathname.slice(`${BACKEND_PREFIX}/public-snapshots/`.length);
     const parts = suffix.split('/').filter(Boolean).map((part) => decodeURIComponent(part));
-    if (parts.length !== 2 || parts[1] !== 'run') {
+    if (parts.length !== 2 || !['run', 'table-page'].includes(parts[1])) {
       sendJson(res, 404, {
         success: false,
         message: `Unknown public snapshot route: ${requestUrl.pathname}`
       });
       return;
     }
-    await sendPublicSnapshotRun(res, requestUrl, parts[0]);
+    if (parts[1] === 'table-page') {
+      const root = requireRuntimeRoot(res, requestUrl);
+      if (root) await handleReportTablePage(req, res, requestUrl, root, parts[0], '', true);
+    } else await sendPublicSnapshotRun(res, requestUrl, parts[0]);
     return;
   }
 
@@ -63159,7 +64980,7 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
     const templateCode = templateParts[0];
     const templateAction = templateParts[1] || '';
     const templateSubAction = templateParts[2] || '';
-    const runtimeAction = templateAction === 'run' || templateAction === 'publish';
+    const runtimeAction = ['run', 'publish', 'refresh-snapshot', 'table-page'].includes(templateAction);
     const root = runtimeAction
       ? requireRuntimeRoot(res, requestUrl)
       : requestUrl.searchParams.get('root') || DEFAULT_TECHNICAL_ROOT;
@@ -63176,6 +64997,14 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
     if (templateAction) {
       if (templateSubAction) {
         sendJson(res, 404, { success: false, message: `Unknown template route: ${requestUrl.pathname}` });
+        return;
+      }
+      if (templateAction === 'refresh-snapshot') {
+        await handleSnapshotRefresh(req, res, requestUrl, authToken, root, templateCode);
+        return;
+      }
+      if (templateAction === 'table-page') {
+        await handleReportTablePage(req, res, requestUrl, root, templateCode, authToken);
         return;
       }
       if (templateAction === 'versions') {
@@ -63361,6 +65190,8 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
         body.bypassRefreshCooldown === true
       );
       const refreshRequested = forceRefreshRequested || requestUrl.searchParams.get('refresh') === '1' || body.refresh === true;
+      const pagedShell = templateAction === 'run' && !jsonOutput && !d2Output && browserTableShellRequested(requestUrl) &&
+        reportPagedTables(template.spec).length > 0;
       let result;
       let cache = null;
 
@@ -63373,7 +65204,7 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
           return;
         }
         if (lookup.snapshot) {
-          result = cloneJsonValueServer(lookup.snapshot.result, { tables: [] });
+          result = publishedReportResult(lookup.snapshot.result);
           cache = staticSnapshotCacheMeta(lookup.snapshot, 'snapshot-hit', lookup.backend, lookup.key);
         } else {
           result = { emptyText: SNAPSHOT_MISSING_TEXT, tables: [] };
@@ -63408,7 +65239,10 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
           });
           return;
         }
-        sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : runtimeDisplayResponsePayload(payload));
+        const viewerPayload = pagedShell && lookup.snapshot ? reportTableShell(payload, {
+          kind: 'public', snapshotRevision: staticSnapshotViewRevision(lookup.snapshot)
+        }) : payload;
+        sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : runtimeDisplayResponsePayload(viewerPayload));
         return;
       }
 
@@ -63473,7 +65307,8 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
             catch (error) { throw snapshotStoreError('snapshot_params_invalid', error.message, 400); }
           }
           const snapshotGeneration = await snapshotPublicationState(root, templateCode);
-          result = await executeTemplateSpec(authToken, template.spec, params, executionOptions);
+          const preparedReport = await materializePublishedReport(authToken, template.spec, params, executionOptions, runtimeConfig);
+          result = preparedReport.result;
           const snapshot = await withTemplateMutationLock(root, [templateCode], async () => {
             const latest = await findTemplateCard(authToken, root, templateCode);
             if (!latest.response.ok) {
@@ -63496,7 +65331,8 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
                 currentTemplate, phase: 'publish_commit', cause });
               return null;
             }
-            const saved = await writeStaticSnapshot(root, currentTemplate, params, result, session.data, publishConfig, snapshotGeneration);
+            const saved = await writeStaticSnapshot(root, currentTemplate, params, result, session.data, publishConfig,
+              snapshotGeneration, undefined, preparedReport.indexes);
             if (!saved) sendPublicationVersionConflict(res, { root, templateCode, expectedSpecHash: savedSpecHash.value,
               currentTemplate, phase: 'publish_commit', cause: 'snapshot_generation_changed' });
             return saved;
@@ -63517,6 +65353,9 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
             key: snapshot.key,
             paramsMode: publishConfig.paramsMode || 'exact'
           });
+        } else if (pagedShell) {
+          const reduced = tableShellSpec(template.spec, includeDiagrams);
+          result = attachPagedTableResults(template.spec, await executeTemplateSpec(authToken, reduced, params, executionOptions));
         } else if (templateAction === 'run' && !cacheDisabled) {
           const cached = await executeTemplateRunWithCache(authToken, root, template, params, session.data, executionOptions, {
             refreshRequested,
@@ -63534,6 +65373,7 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
             scope: cache && cache.scope || '',
             scopeMode: cache && cache.scopeMode || '',
             backend: cache && cache.backend || '',
+            accessReason: cache?.accessProbe?.reason || cache?.reason || undefined,
             rowsCount: countResultRows(result),
             refreshRequested: Boolean(refreshRequested),
             forceRefreshRequested: Boolean(forceRefreshRequested)
@@ -63616,7 +65456,8 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
         });
         return;
       }
-      sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : runtimeDisplayResponsePayload(payload));
+      sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) :
+        runtimeDisplayResponsePayload(pagedShell ? reportTableShell(payload, { kind: 'dynamic' }) : payload));
       return;
     }
 
@@ -63998,7 +65839,8 @@ async function handleDynamicPagesUi(req, res, requestUrl) {
       session: session ? sanitizeSession(session.data) : {},
       templateCode,
       root,
-      publicRuntime
+      publicRuntime,
+      snapshotRefreshSessionPresent: Boolean(authToken && lookup.snapshot)
     }));
     return;
   }

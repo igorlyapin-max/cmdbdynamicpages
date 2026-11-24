@@ -13,19 +13,33 @@ const names = [
   'stagedTemplateTransfer', 'templateVersionOwner', 'templateVersionOwnerIsCurrent', 'fetchVersions', 'loadVersion', 'renderVersions',
   'clearDraftExecutionState', 'selectedExtractionSource', 'renderActionButton', 'publishModelForSpec',
   'templateWriteKey', 'templateWritePending', 'templateTransferActionState', 'templateSaveBlockTitle', 'templatePublishBlockTitle',
-  'syncImportedDiagramSaveGate', 'renderTemplateTransferIssues', 'renderTemplateTransferSaveIssues'
+  'syncImportedDiagramSaveGate', 'renderTemplateTransferIssues', 'renderTemplateTransferSaveIssues',
+  'applyPublicationToSpec', 'publicationRefreshConsentMissing', 'handlePublicationRefreshChange',
+  'renderPublicationEditor', 'applyPublicationEditor', 'publishSnapshot',
+  'inferStoredViewLargeTable', 'inferViewComposerModel', 'normalizeViewComposerColumn', 'renderViewComposerMultiModeOptions',
+  'viewLargeColumnOptions', 'viewLargeClassFieldOptions', 'viewLargeResultOptions', 'renderViewLargeChoiceOptions',
+  'renderViewLargePicker', 'renderViewLargeSelectorFields', 'renderViewLargeReductionFields', 'renderViewLargeReductions',
+  'renderViewLargeTableDetails', 'renderViewLargeGroupPicker', 'renderViewLargeTable', 'renderViewComposerColumnRow', 'renderViewComposerEditor',
+  'renderColumnSelectOptions', 'normalizeColumnOption', 'columnOptionLabel', 'uniqueList', 'renderCatalogFieldPicker',
+  'catalogFieldPickerSelectedLabel', 'renderCatalogFieldPickerPrompt', 'renderCompactMultiSelect', 'compactMultiSelectSummary',
+  'catalogFieldPickerOptions', 'catalogFieldPickerMatches', 'renderCatalogFieldPickerRows', 'selectCatalogFieldPickerField',
+  'syncCompactMultiSelectOption', 'handleViewLargeTableChange', 'markViewLargeTableEdited', 'readViewLargeTableDraft',
+  'captureViewComposerDraftFromDom', 'validateViewComposerDraft', 'buildViewComposerSpec', 'runDraftAction', 'readSpecWithEditorBlocks'
 ];
 const functions = names.map((name) => {
   const start = source.indexOf('  function ' + name + '(');
   assert.ok(start >= 0, name);
   return source.slice(start, source.indexOf('\n  }', start) + 4);
 }).join('\n');
-const translations = [...source.matchAll(/^      (transfer\w+): ('[^\n]*'),$/gm)].map((match) => [match[1], Function('return ' + match[2])()]);
+const translations = [...source.matchAll(/^      ((?:transfer|publication|viewComposer|viewLarge|multiSelect|fieldPicker|fieldRequired)\w*): ('[^\n]*'),$/gm)].map((match) => [match[1], Function('return ' + match[2])()]);
 const split = translations.findIndex(([key], index) => index > 0 && key === translations[0][0]);
 const en = Object.fromEntries(translations.slice(0, split));
 const ru = Object.fromEntries(translations.slice(split));
 const styles = source.split('\n').find((line) => line.includes('#cmdp-template-transfer{'));
-const actionLines = source.split('\n').filter((line) => line.includes("if (action === 'template-transfer-") || line.includes("if (action === 'save-template')") || line.includes("if (action === 'load-version')"));
+const publicationStyles = source.split('\n').find((line) => line.includes('#cmdp-publish-refresh-settings:not([hidden])'));
+const largeTableStyles = source.split('\n').find((line) => line.includes('#cmdp-view-large-table{'));
+const actionLines = source.split('\n').filter((line) => line.includes("if (action === 'template-transfer-") ||
+  ['save-template', 'load-version', 'apply-publication', 'publish-snapshot'].some((action) => line.includes("if (action === '" + action + "')")));
 
 const harness = `
 var apiPrefix = '/api';
@@ -44,18 +58,51 @@ function pretty(value) { return JSON.stringify(value, null, 2); }
 function cloneJsonValue(value) { return JSON.parse(JSON.stringify(value)); }
 function defaultSpec() { return {version:1}; }
 function templateKindForSpec() { return 'dsl'; }
-function readValue(id) { return document.getElementById(id).value; }
+function readValue(id) { return document.getElementById(id)?.value || ''; }
 function hasField(id) { return Boolean(document.getElementById(id)); }
 function readChecked(id) { return document.getElementById(id).checked; }
 function normalizeTemplateProtection(value) { return value; }
 function applyTemplateKindFromEditor(value) { return value; }
 function readCurrentParamsSchema() { return JSON.parse(readValue('cmdp-params-schema')); }
 function readCurrentResultSchema() { return JSON.parse(readValue('cmdp-result-schema')); }
-function readSpecWithEditorBlocks() { return { spec: state.selectedTemplate.spec }; }
+function readSpecWithParamEditor() { return { spec: state.selectedTemplate.spec, examples: {} }; }
+function readExtractionStepFields() { return null; }
+function readDataSelectionStepFields() { return null; }
+function applyVisualizationToSpec(spec) { return spec; }
+function applyCacheToSpec(spec) { return spec; }
+function applyCmdbBuildViewToSpec(spec) { return spec; }
+function applyAssistantDraftFromDomToSpec(spec) { return spec; }
+function readCurrentSpec() { return state.selectedTemplate.spec; }
+function firstResultTable(spec) { return spec.result?.tables?.[0] || {}; }
+function finalResultTableForSpec(spec) { return firstResultTable(spec); }
+function finalBaseResultAlias(spec) { return getStoredVisualModel(spec, 'viewComposer')?.source?.alias || firstResultTable(spec).name || ''; }
+function resultTablesForSpec(spec) { return spec.result?.tables || []; }
+function renderExtractionResultOptions(value) { return '<option value="'+escapeHtml(value)+'">'+escapeHtml(value)+'</option>'; }
+function renderVisualizationModeOptions() { return '<option value="table">Table</option>'; }
+function tableColumnsForAlias(spec) { return firstResultTable(spec).columns || []; }
+function getStoredVisualModel(spec, kind) { return spec.visualModels?.find(item => item.mode === kind); }
+function upsertStoredVisualModel(spec, data) { spec.visualModels = [data]; }
+function cloneSpecForEdit(spec) { return structuredClone(spec); }
+function diagramInitialColumnOptionRowsForSource(_spec, _source, selected) { return selected ? [{value:selected,label:selected}] : []; }
+function diagramColumnOptionRowsForSource() { return [{value:'_id',label:'Identifier'},{value:'Description',label:'Description'},{value:'HiddenParentId',label:'Hidden parent ID'}]; }
+function catalogAttributeOptions() { return [{name:'_id',description:'Identifier'},{name:'Description',description:'Description'}]; }
+function catalogClassByName(name) { return { description: name }; }
+function catalogClassOptionRows() { return [{name:'Parent',label:'Parent'}]; }
+function closeCatalogFieldPickers() { document.querySelectorAll('[data-catalog-field-picker-menu]').forEach(menu => { menu.hidden = true; }); }
+function getParamRows(spec) { return Object.keys(spec.params || {}).map(name => ({name})); }
+function userFacingResultLabel(name) { return name; }
+function assistantObjectFlowOutputManifest() { return {assistantManaged:false}; }
+function authoringPreviewPath() { return '/api/draft/preview'; }
+function routeUiRequestDiagnostic() {}
+function renderRunParamsEditor() { return ''; }
+function d2WorkflowStatusForEditor() { return {}; }
+function readRunParams() { return {}; }
+function exactReportLaunchQuery() { return {}; }
+function refreshTemplateLaunchUrl() {}
 function captureVisibleDesignerState() {
   evidence.captures.push('visible');
   state.selectedTemplate = Object.assign({}, state.selectedTemplate || {}, {code:readValue('cmdp-code'),description:readValue('cmdp-description')});
-  state.selectedTemplate.spec = JSON.parse(readValue('cmdp-spec'));
+  state.selectedTemplate.spec = applyPublicationToSpec(JSON.parse(readValue('cmdp-spec')), false);
   return true;
 }
 function activeDiagramImportEditorModel() { return {version:3}; }
@@ -65,13 +112,13 @@ function markImportedDiagramChanged() {}
 function captureAssistantPromptsFromDom() { evidence.captures.push('prompts'); state.prompt=readValue('assistant-prompt'); }
 function assistantSpecWithPrompts(spec) { return Object.assign({}, spec, {authoring:{assistant:{diagramIntentPrompt:state.prompt}}}); }
 function updateSelectedFromEditor(spec) { state.selectedTemplate.spec=spec; }
-function hydrateDesignerStateFromTemplate() { state.templateEditorInstance++; state.prompt=state.selectedTemplate.spec.authoring?.assistant?.diagramIntentPrompt || ''; }
+function hydrateDesignerStateFromTemplate() { state.templateEditorInstance++; state.viewComposerDraft=null; state.prompt=state.selectedTemplate.spec.authoring?.assistant?.diagramIntentPrompt || ''; }
 function uiRequestOwner() { return { revision:0 }; }
 function uiDiagnosticIsCurrent() { return true; }
 function runUiOperation(_action, callback) { return callback(); }
 function runUiMutation(callback) { return callback(); }
 function diagramImportExecutionValidationHasMappingBlocker() { return false; }
-function validateUiResponse(result) { if (!result.json.template) throw new Error('invalid'); }
+function validateUiResponse(result, kind) { if (kind !== 'preview' && !result.json.template) throw new Error('invalid'); }
 function createRequestError(result) { return new Error(result.json?.message || 'request failed'); }
 function setUiError(error) { evidence.errors.push(error.message); }
 function assistantTemplateRefClient() { return {root:state.root,templateCode:state.selectedTemplate.code,baseSpecHash:state.selectedTemplate.specHash}; }
@@ -88,7 +135,10 @@ function renderDesigner() {
    '<input id="diagram-edit" value="'+escapeHtml(selected.spec.result?.diagrams?.[0]?.label || '')+'">' +
    '<textarea id="assistant-prompt">'+escapeHtml(state.prompt || '')+'</textarea>' +
    '<input id="cmdp-active" type="checkbox"'+(selected.active ? ' checked' : '')+'>' +
-   '<button data-action="save-template">Save</button>' + renderVersions();
+   '<button data-action="save-template">Save</button>' + renderVersions() +
+   (state.designerSection === 'view' ? renderViewComposerEditor(selected) + '<button data-action="draft-preview">Preview</button>' : '') +
+   (state.designerSection === 'publication' ? renderPublicationEditor(selected) + '<button data-action="apply-publication">Apply</button><button data-action="publish-snapshot">Publish</button>' : '');
+  if (state.designerSection === 'publication') syncImportedDiagramSaveGate();
 }
 URL.createObjectURL = function(blob) { blob.text().then(text=>evidence.downloads.push(JSON.parse(text))); return 'blob:https://transfer.test/download'; };
 URL.revokeObjectURL = function() {};
@@ -96,9 +146,30 @@ HTMLAnchorElement.prototype.click = function() {};
 ${functions}
 document.addEventListener('input',handleTemplateTransferChange);
 document.addEventListener('change',handleTemplateTransferChange);
+document.addEventListener('change',handlePublicationRefreshChange);
+document.addEventListener('change', function(event) {
+ if (event.target.matches('[data-compact-multi-select-option]')) syncCompactMultiSelectOption(event.target);
+ else if (event.target.closest('#cmdp-view-large-table')) handleViewLargeTableChange(event.target);
+});
+document.addEventListener('input', function(event) {
+ if (!event.target.matches('[data-catalog-field-picker-search]')) return;
+ var picker = event.target.closest('[data-catalog-field-picker]');
+ var results = picker.querySelector('[data-catalog-field-picker-results]');
+ results.innerHTML = event.target.value.trim() ? renderCatalogFieldPickerRows(catalogFieldPickerOptions(picker, event.target.value), '', event.target.value) : renderCatalogFieldPickerPrompt();
+});
 document.addEventListener('click', function(event) {
  var target=event.target.closest('[data-action]'); if (!target) return;
  var action=target.getAttribute('data-action');
+ if (action === 'compact-multi-select-toggle') {
+   var menu = target.parentNode.querySelector('[data-compact-multi-select-menu]');
+   menu.hidden = !menu.hidden;
+ }
+ if (action === 'catalog-field-picker-toggle') {
+   var menu = target.parentNode.querySelector('[data-catalog-field-picker-menu]');
+   menu.hidden = !menu.hidden;
+ }
+ if (action === 'catalog-field-picker-select') selectCatalogFieldPickerField(target);
+ if (action === 'draft-preview') runDraftAction('preview');
  ${actionLines.join('\n')}
 });
 renderDesigner();
@@ -122,11 +193,13 @@ async function withPage(run, viewport = { width: 1280, height: 1000 }) {
     page.on('pageerror', (error) => pageErrors.push(error.message));
     await page.route('https://transfer.test/**', async (route) => {
       const url = new URL(route.request().url());
-      if (url.pathname === '/') return route.fulfill({contentType:'text/html',body:'<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font:14px system-ui;margin:12px}input,textarea,select{width:100%;box-sizing:border-box}label{display:grid}.row{display:flex;gap:8px}.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}button{min-height:32px}.section{padding:12px;border-bottom:1px solid #ccc}pre{overflow-wrap:anywhere;white-space:pre-wrap}' + styles + '</style></head><body><main id="app"></main></body></html>'});
+      if (url.pathname === '/') return route.fulfill({contentType:'text/html',body:'<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font:14px system-ui;margin:12px}input,textarea,select{width:100%;box-sizing:border-box}input[type=checkbox]{width:auto}label{display:grid}.checkbox{display:flex;align-items:center}.checkbox input{width:auto}.row{display:flex;gap:8px}.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}button{min-height:32px}.section{padding:12px;border-bottom:1px solid #ccc}pre{overflow-wrap:anywhere;white-space:pre-wrap}.view-column-table-wrap{max-width:100%;overflow:auto}' + styles + publicationStyles + largeTableStyles + '</style></head><body><main id="app"></main></body></html>'});
       if (url.pathname.endsWith('/export')) return route.fulfill({ json: { success: true, package: { template: route.request().postDataJSON().template }, fileName: 'current.cmdp-template.json' } });
       if (url.pathname.endsWith('/prepare')) return route.fulfill({json:ready});
       if (url.pathname.endsWith('/versions')) return route.fulfill({json:{success:true,data:[]}});
-      if (url.pathname.startsWith('/api/templates')) return route.fulfill({json:{success:true,template:{...route.request().postDataJSON(),id:7,specHash:'saved-hash'},executionValidation:{executable:true}}});
+      if (url.pathname.endsWith('/publish')) return route.fulfill({json:{success:true}});
+      if (url.pathname === '/api/draft/preview') return route.fulfill({json:{success:true,result:{tables:[]}}});
+      if (url.pathname.startsWith('/api/templates')) return route.fulfill({json:{success:true,template:{...route.request().postDataJSON(),id:7,specHash:'a'.repeat(64)},executionValidation:{executable:true}}});
       throw new Error('Unexpected request: ' + url);
     });
     await page.goto('https://transfer.test/');
@@ -147,6 +220,186 @@ async function prepare(page) {
 async function selectOriginal(page) {
   await page.evaluate((item) => { state.selectedTemplate=structuredClone(item);state.templates=[structuredClone(item)];state.templateVersions=[{id:4}];state.templateEditorInstance++;renderDesigner(); }, original);
 }
+
+test('Designer saves, previews and transfers large-table settings on the result table only', async () => {
+  await withPage(async (page) => {
+    await selectOriginal(page);
+    await page.evaluate(() => {
+      window.lang = 'ru';
+      state.selectedTemplate.spec = {
+        version: 1, params: { parentId: { type: 'integer' } },
+        steps: [{ type: 'selectCards', as: 'items', className: 'Item' }, { type: 'selectCards', as: 'parents', className: 'Parent' }],
+        result: { tables: [{ name: 'items', columns: ['Source', 'Parent', 'Protocol', 'Port', 'Owner', 'Count'] }] }
+      };
+      state.designerSection = 'view';
+      renderDesigner();
+    });
+    const large = page.locator('#cmdp-view-large-table');
+    const mode = large.getByRole('combobox', { name: 'Просмотр строк' });
+    const field = (name) => large.locator(`[data-view-large-field="${name}"]`);
+    const reduction = (column) => large.locator(`[data-view-large-reduction="${column}"]`);
+    async function pick(name, value) {
+      const picker = field(name).locator('..');
+      await picker.locator('[data-action="catalog-field-picker-toggle"]').click();
+      assert.equal(await picker.getByRole('option').count(), 0);
+      await picker.getByRole('searchbox').fill(value);
+      await picker.locator(`[role="option"][data-catalog-field-picker-value="${value}"]`).click();
+      assert.equal(await field(name).inputValue(), value);
+    }
+    assert.equal(await mode.inputValue(), '');
+    assert.equal(await large.locator('[data-view-large-details]').isVisible(), false);
+    await mode.selectOption('all');
+    assert.equal(await field('kind').count(), 0);
+    await large.getByRole('button', { name: /Колонки ключа группировки/ }).click();
+    await large.getByRole('checkbox', { name: 'Source' }).check();
+    await large.getByRole('checkbox', { name: 'Parent' }).check();
+    await large.getByRole('button', { name: /Колонки ключа группировки/ }).click();
+    await reduction('Count').locator('[data-view-large-reduction-kind]').selectOption('count');
+    await reduction('Owner').locator('[data-view-large-reduction-kind]').selectOption('unique');
+    await reduction('Owner').locator('[data-view-large-separator]').fill(' | ');
+    await reduction('Protocol').locator('[data-view-large-reduction-kind]').selectOption('tuples');
+    assert.equal(await reduction('Source').count(), 0);
+    const tuple = reduction('Protocol').locator('[data-view-large-tuple-field]');
+    await tuple.nth(0).selectOption('Protocol');
+    const all = await page.evaluate(() => readEditorPayload().spec.result.tables[0].presentation.largeTable);
+    assert.equal(all.mode, 'all');
+    assert.equal(all.selector, undefined);
+    assert.deepEqual(all.reductions.find((rule) => rule.kind === 'tuples').fields, ['Protocol']);
+    await tuple.nth(1).selectOption('Port');
+    await reduction('Protocol').locator('[data-view-large-separator]').fill('; ');
+
+    await mode.selectOption('key');
+    assert.equal(await field('kind').inputValue(), 'class');
+    assert.equal(await large.getByRole('button', { name: /Поле идентификатора варианта/ }).isDisabled(), true);
+    await assert.rejects(page.evaluate(() => readEditorPayload()), /Источник вариантов/);
+    await pick('source', 'Parent');
+    await pick('idField', '_id');
+    await field('kind').selectOption('result');
+    assert.equal(await field('idField').inputValue(), '');
+    await field('source').selectOption('parents');
+    await pick('matchField', 'HiddenParentId');
+    await field('parameter').selectOption('parentId');
+    await pick('idField', '_id');
+    await pick('labelField', 'Description');
+    assert.ok((await mode.boundingBox()).height >= 44);
+    const matchButton = large.getByRole('button', { name: /Поле сопоставления в источнике таблицы/ });
+    assert.ok((await matchButton.boundingBox()).x + (await matchButton.boundingBox()).width <= 390);
+    const expected = { mode: 'key', selector: { kind: 'result', source: 'parents', idField: '_id', labelField: 'Description', matchField: 'HiddenParentId', parameter: 'parentId' },
+      groupKeys: ['Source', 'Parent'], reductions: [{ column: 'Protocol', kind: 'tuples', fields: ['Protocol', 'Port'], separator: '; ' },
+        { column: 'Owner', kind: 'unique', separator: ' | ' }, { column: 'Count', kind: 'count' }] };
+    await page.locator('[data-action="draft-preview"]').click();
+    await page.waitForFunction(() => state.designerSection === 'run');
+    await button(page, 'export').click();
+    await page.waitForFunction(() => evidence.downloads.length === 1);
+    await page.locator('[data-action="save-template"]').click();
+    await page.waitForFunction(() => evidence.requests.length === 3 && !state.savingTemplate);
+    for (const spec of await page.evaluate(() => [evidence.requests[0].body.template.spec, evidence.downloads[0].template.spec, evidence.requests[2].body.spec])) {
+      assert.deepEqual(spec.result.tables[0].presentation.largeTable, expected);
+      assert.equal(spec.result.presentation?.tables?.[0]?.largeTable, undefined);
+      assert.equal(spec.visualModels[0].output.largeTable, undefined);
+      assert.ok(spec.steps.at(-1).columns.some((column) => column.path === 'HiddenParentId'));
+      assert.equal(spec.result.tables[0].columns.includes('HiddenParentId'), false);
+    }
+    await page.evaluate(() => { hydrateDesignerStateFromTemplate(); state.designerSection = 'view'; renderDesigner(); });
+    assert.equal(await mode.inputValue(), 'key');
+    assert.equal(await tuple.nth(1).inputValue(), 'Port');
+    assert.equal(await field('parameter').inputValue(), 'parentId');
+    await mode.selectOption('');
+    await page.locator('[data-action="save-template"]').click();
+    await page.waitForFunction(() => evidence.requests.length === 4 && !state.savingTemplate);
+    assert.equal(await page.evaluate(() => evidence.requests[3].body.spec.result.tables[0].presentation?.largeTable), undefined);
+  }, { width: 390, height: 844 });
+});
+
+test('Designer publication defaults to personal and publishes without extra consent', async () => {
+  await withPage(async (page) => {
+    await selectOriginal(page);
+    await page.evaluate(() => {
+      state.selectedTemplate.spec.publish = { mode: 'staticSnapshot', warningAccepted: true };
+      state.designerSection = 'publication';
+      renderDesigner();
+    });
+    const mode = page.getByRole('combobox', { name: 'Refresh from the report' });
+    assert.equal(await mode.inputValue(), 'personal');
+    assert.equal(await page.locator('#cmdp-publish-shared-refresh-warning').isVisible(), false);
+    await page.locator('[data-action="publish-snapshot"]').click();
+    await page.waitForFunction(() => evidence.requests.length === 2 && !state.savingTemplate);
+    const [save, publish] = await page.evaluate(() => evidence.requests);
+    assert.equal(save.body.spec.publish.refreshMode, 'personal');
+    assert.equal(Object.hasOwn(save.body.spec.publish, 'sharedRefreshAccepted'), false);
+    assert.equal(publish.path, '/api/templates/existing/publish?root=Root_A');
+    assert.deepEqual(publish.body, { params: {}, savedSpecHash: 'a'.repeat(64) });
+  });
+});
+
+test('Designer publication gates shared refresh and clears consent when switched away', async () => {
+  await withPage(async (page) => {
+    await selectOriginal(page);
+    await page.evaluate(() => {
+      window.lang = 'ru';
+      state.designerSection = 'publication';
+      renderDesigner();
+    });
+    const runtimeMode = page.locator('#cmdp-publish-mode');
+    const refreshMode = page.getByRole('combobox', { name: 'Обновление из отчёта' });
+    const warning = page.locator('#cmdp-publish-shared-refresh-warning');
+    const consent = page.getByRole('checkbox', { name: 'Разрешаю читателям отчёта заменять общий снимок' });
+    const save = page.locator('[data-action="save-template"]');
+    const apply = page.locator('[data-action="apply-publication"]');
+    const publish = page.locator('[data-action="publish-snapshot"]');
+
+    assert.equal(await refreshMode.isVisible(), false);
+    await runtimeMode.selectOption('staticSnapshot');
+    await page.locator('#cmdp-publish-warning-accepted').check();
+    await refreshMode.selectOption({ label: 'Общий снимок' });
+    assert.match(await warning.textContent(), /CMDBuild.*анонимных читателей/);
+    for (const target of [refreshMode, warning, consent.locator('..')]) {
+      const box = await target.boundingBox();
+      assert.ok(box && box.x >= 0 && box.x + box.width <= 390 && box.height > 0);
+    }
+    assert.ok((await refreshMode.boundingBox()).height >= 44);
+    assert.ok((await consent.locator('..').boundingBox()).height >= 44);
+    assert.equal(await consent.getAttribute('aria-describedby'), 'cmdp-publish-shared-refresh-warning');
+    assert.equal(await consent.isChecked(), false);
+    for (const action of [apply, save, publish]) assert.equal(await action.isDisabled(), true);
+    await page.evaluate(() => saveTemplate());
+    assert.equal(await page.evaluate(() => evidence.requests.length), 0);
+    assert.match(await page.evaluate(() => evidence.errors.at(-1)), /Подтвердите обновление общего снимка/);
+
+    await consent.focus();
+    await consent.press('Space');
+    for (const action of [apply, save, publish]) assert.equal(await action.isEnabled(), true);
+    await apply.click();
+    assert.equal(await consent.isChecked(), true);
+    assert.equal(await page.evaluate(() => evidence.requests.length), 0);
+    await save.click();
+    await page.waitForFunction(() => evidence.requests.length === 1 && !state.savingTemplate);
+    assert.deepEqual(await page.evaluate(() => evidence.requests[0].body.spec.publish), {
+      mode: 'staticSnapshot', paramsMode: 'exact', warningAccepted: true, publicD2Source: false,
+      refreshMode: 'shared', sharedRefreshAccepted: true
+    });
+    await page.evaluate(() => renderDesigner());
+    assert.equal(await consent.isChecked(), true);
+
+    await refreshMode.selectOption('personal');
+    assert.equal(await warning.isVisible(), false);
+    assert.equal(await page.locator('#cmdp-publish-shared-refresh-accepted').isChecked(), false);
+    await refreshMode.selectOption('shared');
+    assert.equal(await consent.isChecked(), false);
+    assert.equal(await save.isDisabled(), true);
+    await consent.check();
+    await runtimeMode.selectOption('dynamicUser');
+    assert.equal(await refreshMode.isVisible(), false);
+    await runtimeMode.selectOption('staticSnapshot');
+    assert.equal(await refreshMode.inputValue(), 'personal');
+    assert.equal(await publish.isEnabled(), true);
+    await save.click();
+    await page.waitForFunction(() => evidence.requests.length === 2 && !state.savingTemplate);
+    const config = await page.evaluate(() => evidence.requests[1].body.spec.publish);
+    assert.equal(config.refreshMode, 'personal');
+    assert.equal(Object.hasOwn(config, 'sharedRefreshAccepted'), false);
+  }, { width: 390, height: 844 });
+});
 
 test('export captures unsaved definition, schemas, diagram and assistant prompts through Save snapshot without DB writes', async () => {
   await withPage(async (page) => {

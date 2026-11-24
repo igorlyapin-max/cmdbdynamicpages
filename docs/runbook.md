@@ -269,6 +269,10 @@ Check same-origin access through nginx/ingress and the `?root=<technicalRoot>` i
 
 ### Static snapshot is missing or unavailable
 
+**Reload snapshot** is read-only and available without signing in. A signed-in reader who can run the saved template can request a recalculation under their own CMDBuild session, without permission to edit the template. The template's publication settings control the outcome: **Personal result** (default) displays fresh data only in the open tab; **Shared snapshot** requires explicit template consent and a viewer confirmation, and replaces the existing public snapshot. Card-level visibility under the initiating session can change the public set in shared mode. Never enable that mode for a report whose visible results are not safe for public distribution under every eligible reader's access context.
+
+Both modes use the parameters stored in the opened snapshot, including `ignore` mode. For a conflict, reload the snapshot before retrying. An explicit access denial or an incomplete run must leave the public snapshot unchanged. Use `X-Request-ID` to correlate `snapshot.refresh_*` structured events. A transport or storage failure may be ambiguous; reread the stored snapshot before retrying a shared update.
+
 Check `GET /cmdbuild/custom-api/public-snapshots/<code>/run` with the same `root`, code, and parameter query as the viewer URL. Exact links use `snapshotParams`, a URL-encoded JSON array of typed name/value pairs, e.g. `[["enabled",false],["site",42]]`. Copy the URL from Designer; do not convert these values to strings. The public API returns `snapshotFound=false` when no published snapshot matches.
 
 Version 3 keys use the resolved technical template class, Code, and a generation check. Old snapshots are not migrated: republish approved reports explicitly. Use one writing BFF per contour and configure Redis durability for acknowledged writes (AOF with `appendfsync always` or equivalent), without stale replica reads. After restoring an older Redis backup, set a fresh `CMDBDYNAMIC_REDIS_KEY_PREFIX` before reopening public routes and republish only the required reports. Keep public routes closed on rollback unless older snapshot keys have been removed from that deployment's namespace.
@@ -282,6 +286,14 @@ Version 3 keys use the resolved technical template class, Code, and a generation
 
 If the viewer URL or public snapshot API returns HTTP `503` with `reason=snapshot_storage_unavailable`, check `/health/redis` and structured logs using `X-Request-ID`. A lookup error is not a miss and does not invoke the protected path. If the snapshot is found but `d2=true` returns `403`, check whether the snapshot was published with `publish.publicD2Source=true`.
 
+### Large table
+
+Enable pagination on the intended table in Result Data. In key mode, configure the option source, label, identifier, and matching column. A composed dynamic table also needs an upstream Object Flow result as its selector or a parameter used by a dependency. Grouping preserves key columns; other columns can show unique values, counts, or linked fields. Original records open as separate pages.
+
+The browser receives 50 records by default and at most 100 per request. The 10,000-row budget accepts exactly 10,000 rows when the end is confirmed; CMDBuild, relation, and deadline limits apply independently. A relation read at its limit without a confirmed end is incomplete. Incomplete runs and `422 large_table_*_limit` errors do not replace the shared snapshot.
+
+Public options, rows and group details are available only for the report's visible result table. Neither refresh mode returns a calculation for a stale snapshot revision. On `409`, reload the snapshot or reopen the table. Correlate `report.table_prepared` and `report.table_page_failed` using `X-Request-ID`.
+
 ### Cache does not refresh
 
 Check template cache settings, `RuntimeConfigJson.runtimeCache.refreshCooldownSec`, runtime response `cache.refreshAllowedAt`, and whether the request used read-only `GET run` or CSRF-protected `POST run` with `forceRefresh=true`.
@@ -289,6 +301,8 @@ Check template cache settings, `RuntimeConfigJson.runtimeCache.refreshCooldownSe
 Successful `cache.status=bypass` with `cache.reason=access_probe_unconfirmed` means the access probe did not confirm cache eligibility. The result was read under the current session with the same limits, without reading or populating the result cache. Forced refresh does not override this decision.
 
 Runtime reports that read relations use `cache.scopeMode=privateUser` even when the template configures a shared cache. A hit can reuse a result only for the same user and access context, and it does not extend the expiration time. CMDBuild relation permission changes may become visible only at expiration or forced refresh. On a rebuild, an explicit CMDBuild data access denial fails the request instead of returning the previous result.
+
+An explicit denial also revokes the private entry so a rebuild started before revocation cannot restore it. With `visibilityHash`, the first card page is not proof of shared visibility. If the probe cannot confirm visibility of the whole set that execution may read, the result cache is private.
 
 ### Designer cannot save templates
 
