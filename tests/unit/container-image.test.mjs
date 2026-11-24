@@ -74,13 +74,12 @@ test('canonical GKM image helper requires paired prepared bases and verified pro
     nodeBaseImage: 'registry.example/node:20-alpine-ca',
     goBaseImage: 'registry.example/go:1.25-alpine-ca'
   });
-  assert.deepEqual(canonicalDockerBuildArguments(cleanWorkspace, {
-    tag: 'example:gkm',
-    target: 'gkm-runtime-canonical',
-    requireClean: true,
-    nodeBaseImage: 'registry.example/node:20-alpine-ca',
-    goBaseImage: 'registry.example/go:1.25-alpine-ca'
-  }).slice(-9), [
+  const cliOptions = parseOptions([
+    '--tag', 'example:gkm', '--target', 'gkm-runtime-canonical', '--require-clean',
+    '--node-base-image', 'registry.example/node:20-alpine-ca',
+    '--go-base-image', 'registry.example/go:1.25-alpine-ca'
+  ]);
+  assert.deepEqual(canonicalDockerBuildArguments(cleanWorkspace, cliOptions).slice(-9), [
     '--build-arg', `RUNTIME_MANIFEST_SHA256=${'c'.repeat(64)}`,
     '--build-arg', 'GKM_NODE_BASE_IMAGE=registry.example/node:20-alpine-ca',
     '--build-arg', 'GKM_GO_BASE_IMAGE=registry.example/go:1.25-alpine-ca',

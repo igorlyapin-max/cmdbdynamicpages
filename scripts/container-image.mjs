@@ -47,6 +47,10 @@ function command(commandName, args, options = {}) {
 }
 
 function parseOptions(args) {
+  const valueOptions = new Map([
+    ['--tag', 'tag'], ['--image', 'image'], ['--container', 'container'], ['--target', 'target'],
+    ['--node-base-image', 'nodeBaseImage'], ['--go-base-image', 'goBaseImage']
+  ]);
   const options = {
     noCache: false,
     requireClean: false,
@@ -59,10 +63,10 @@ function parseOptions(args) {
     const value = args[index];
     if (value === '--no-cache') options.noCache = true;
     else if (value === '--require-clean') options.requireClean = true;
-    else if (value === '--tag' || value === '--image' || value === '--container' || value === '--target' || value === '--node-base-image' || value === '--go-base-image') {
+    else if (valueOptions.has(value)) {
       const next = args[index + 1];
       if (!next || next.startsWith('--')) throw new Error(`${value} requires a value.`);
-      options[value.slice(2)] = next;
+      options[valueOptions.get(value)] = next;
       index += 1;
     } else if (value === '--help' || value === '-h') options.help = true;
     else throw new Error(`Unknown option: ${value}`);
