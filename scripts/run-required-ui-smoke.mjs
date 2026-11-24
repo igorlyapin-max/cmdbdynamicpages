@@ -5,6 +5,7 @@ import { once } from 'node:events';
 
 const REQUIRED_TEST_IDS = [
   'designer-shell',
+  'visible-columns-order',
   'd2-current-contract',
   'object-flow-recovery-extraction',
   'exact-snapshot-url',
@@ -105,7 +106,23 @@ function createMockCmdbuild() {
       steps: [{ type: 'selectCards', as: 'items', className: 'Cst_QueryTemplate', limit: 1,
         filters: [{ path: 'Code', op: 'equals', value: 'RequiredExactSnapshot' }] }],
       result: { tables: [{ name: 'items', columns: ['Code'] }] },
-      publish: { mode: 'staticSnapshot', warningAccepted: true, paramsMode: 'exact' } })
+      publish: { mode: 'dynamicUser', paramsMode: 'exact' } })
+  });
+  const visibleColumnsCode = 'RequiredVisibleColumnsOrder';
+  const visibleColumns = ['Code', 'Description', 'Owner'];
+  templateCards.push({
+    ...templateCards[0],
+    _id: 'required-ui-visible-columns-order',
+    Code: visibleColumnsCode,
+    Description: 'Visible columns order fixture',
+    SpecJson: JSON.stringify({
+      version: 1,
+      steps: [{
+        type: 'selectCards', as: 'items', className: 'Cst_QueryTemplate', columns: visibleColumns,
+        filters: [{ path: 'Code', op: 'equals', value: visibleColumnsCode }]
+      }],
+      result: { tables: [{ name: 'items', columns: visibleColumns }] }
+    })
   });
   return http.createServer(async (request, response) => {
     const url = new URL(request.url || '/', 'http://127.0.0.1');
@@ -147,14 +164,16 @@ function createMockCmdbuild() {
       return;
     }
     const templateCardMatch = url.pathname.match(/^\/cmdbuild\/services\/rest\/v3\/classes\/Cst_QueryTemplate\/cards\/([^/]+)$/);
-    if (templateCardMatch && request.method === 'PUT') {
+    if (templateCardMatch && (request.method === 'GET' || request.method === 'PUT')) {
       const cardId = decodeURIComponent(templateCardMatch[1]);
       const cardIndex = templateCards.findIndex((card) => String(card._id) === cardId);
       if (cardIndex < 0) {
         sendJson(response, 404, { message: `Unknown template card ${cardId}` });
         return;
       }
-      templateCards[cardIndex] = { ...templateCards[cardIndex], ...await readJson(request) };
+      if (request.method === 'PUT') {
+        templateCards[cardIndex] = { ...templateCards[cardIndex], ...await readJson(request) };
+      }
       sendJson(response, 200, { data: templateCards[cardIndex] });
       return;
     }
@@ -238,6 +257,7 @@ try {
       CMDBUILD_LOGIN_ORIGIN: `http://127.0.0.1:${cmdbuildPort}`,
       CMDBUILD_USERNAME: 'ui-fixture',
       CMDBUILD_PASSWORD: 'ui-fixture',
+      CMDBDYNAMIC_E2E_VISIBLE_COLUMNS_FIXTURE: '1',
       CMDBDYNAMIC_E2E_REQUIRED: '1'
     }
   });

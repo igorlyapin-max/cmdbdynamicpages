@@ -2130,7 +2130,7 @@ test('runtime diagram view exposes D2 rendered SVG and source download affordanc
   assert.match(runtimeSource, /renderResultDiagram\(diagram, toolbar, d2DownloadHref\)/);
   assert.match(runtimeSource, /function renderRuntimeIntoApp\(result\)/);
   assert.match(runtimeSource, /initializeDiagramViewports\(app\)/);
-  assert.match(loadSource, /runtimeSystemParam\(key\)/);
+  assert.match(loadSource, /runtimeSystemParam\(entry\[0\]\)/);
   assert.match(loadSource, /result\.downloadMode = 'template'/);
   assert.match(loadSource, /if \(boot\.publicRuntime\) \{\s*request\(publicSnapshotRunPath\(templateCode, params\)\)/);
   const authenticatedLoad = loadSource.slice(loadSource.indexOf('request(runtimeRunPath'));

@@ -734,7 +734,9 @@ paths:
         preview проходят строгую execution-валидацию. Runtime cache и static
         snapshots инвалидируются при изменении executable Spec hash, кода или
         деактивации. Если изменение отзывает публичный снимок, отзыв в Redis
-        подтверждается до записи в CMDB.
+        подтверждается до записи в CMDB. Явный отказ CMDB (400, 401, 403, 409,
+        412, 422) восстанавливает прежнее поколение; неопределённый результат
+        оставляет поколение в pending.
         При наличии transferReplace применяется отдельная ветка: проверяются
         identity, revision и права назначения, повторно валидируется итоговый
         нормализованный spec, затем отправляется частичный PUT без Code, Active и Owner.
@@ -752,10 +754,13 @@ paths:
       responses:
         "200":
           description: Шаблон обновлён
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/TemplateResponse"
+                $ref: "#/components/schemas/TemplateMutationResponse"
         "403":
           description: Нет Template update permission или не пройдена CSRF-проверка
         "409":
@@ -788,20 +793,32 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/TemplateTransferIssue"
+        "502":
+          $ref: "#/components/responses/TemplateMutationFailed"
         "503":
           $ref: "#/components/responses/SnapshotRevocationUnavailable"
     delete:
       x-flow-id: OAPI24
       tags: [templates]
       summary: Удалить один шаблон
+      description: Удаление использует те же правила подтверждения и восстановления отзыва, что PUT.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
       responses:
         "200":
           description: Шаблон удалён
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateMutationResponse"
         "403":
           description: Не подтверждено право удаления шаблона или не пройдена CSRF-проверка
+        "502":
+          $ref: "#/components/responses/TemplateMutationFailed"
         "503":
           $ref: "#/components/responses/SnapshotRevocationUnavailable"
   /cmdbuild/custom-api/templates/{code}/versions:
@@ -852,7 +869,9 @@ paths:
       summary: Выполнение шаблона только для чтения
       description: >
         Прямой вызов требует действительную сессию CMDBuild, CSRF не требуется.
-        Динамический шаблон выполняется под текущей сессией.
+        Динамический шаблон выполняется под текущей сессией. Типизированные
+        значения из snapshotParams передаются в выполнение без преобразования
+        в строки, в том числе при переходе по ссылке прежнего снимка.
         Если проверка доступа не подтвердила возможность использовать кэш или
         не завершилась полностью, кэш результата не читается и не записывается.
         Выполнение читает данные напрямую под той же сессией с теми же лимитами.
@@ -2359,17 +2378,45 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/RuntimeJsonResult"
-    SnapshotRevocationUnavailable:
-      description: Отзыв публикации не подтверждён, запись в CMDB не начата
+    TemplateMutationFailed:
+      description: >
+        CMDB отклонила запрос или результат записи не подтверждён. При
+        snapshotRevocationPending=true не повторяйте запрос до сверки состояния.
+        Ответ CMDB 202 либо 2xx с success=false не подтверждает запись.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
       content:
         application/json:
           schema:
-            type: object
-            required: [success, code, message]
-            properties:
-              success: { type: boolean, enum: [false] }
-              code: { type: string, enum: [snapshot_revocation_unavailable] }
-              message: { type: string }
+            allOf:
+              - $ref: "#/components/schemas/SnapshotRevocationStatus"
+              - type: object
+                required: [success]
+                properties:
+                  success: { type: boolean, enum: [false] }
+                  cmdbuildStatus:
+                    type: integer
+                    description: HTTP-статус CMDB. 0 означает, что ответ на запись не получен.
+    SnapshotRevocationUnavailable:
+      description: >
+        Запись в CMDB не начата. При потере подтверждения Redis pending-маркер
+        мог сохраниться; ответ содержит snapshotRevocationPending и ID операции.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/SnapshotRevocationStatus"
+              - type: object
+                required: [success, code, reason, message]
+                properties:
+                  success: { type: boolean, enum: [false] }
+                  code: { type: string, enum: [snapshot_revocation_unavailable] }
+                  reason: { type: string, enum: [snapshot_revocation_unavailable] }
+                  message: { type: string }
     RuntimeSnapshotStorageUnavailable:
       description: Ошибка поиска опубликованного снимка; защищённый путь не вызывается.
       headers:
@@ -2444,7 +2491,7 @@ components:
       name: snapshotParams
       in: query
       required: false
-      description: JSON-массив пар имя/типизированное скалярное значение для exact. Нельзя смешивать с обычными бизнес-параметрами, повторять имя, передавать null или служебное имя.
+      description: Типизированные параметры для поиска exact-снимка и защищённого выполнения. JSON-массив пар имя/значение с уникальными именами и скалярными значениями. Нельзя смешивать с обычными бизнес-параметрами, передавать null или служебное имя.
       schema:
         type: string
         example: '[["enabled",false],["site",42]]'
@@ -3942,6 +3989,25 @@ components:
               type: object
               description: Статус строгой execution-валидации сохранённого Spec. Успешное Save может вернуть неполный неисполняемый authoring draft.
               additionalProperties: true
+    TemplateMutationResponse:
+      allOf:
+        - $ref: "#/components/schemas/TemplateResponse"
+        - $ref: "#/components/schemas/SnapshotRevocationStatus"
+        - type: object
+          properties:
+            cmdbuildStatus:
+              type: integer
+              description: HTTP-статус CMDB. 0 означает, что ответ на запись не получен.
+    SnapshotRevocationStatus:
+      type: object
+      properties:
+        snapshotRevocationPending:
+          type: boolean
+          description: Отзыв не завершён или его завершение не подтверждено. Не отменяет подтверждённый успех записи при HTTP 200.
+        snapshotRevocationOperationId:
+          type: string
+          format: uuid
+          description: ID операции отзыва для сверки по X-Request-ID; присутствует при snapshotRevocationPending=true.
     TemplateListResponse:
       allOf:
         - $ref: "#/components/schemas/ApiResponse"

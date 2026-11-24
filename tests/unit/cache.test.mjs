@@ -7,7 +7,7 @@ import {
   dependencyMapWithHash,
   normalizeRuntimeCacheConfig,
   normalizeTemplateCacheConfig,
-  publicSnapshotParamsFromUrl,
+  reportParamsFromUrl,
   runtimeCacheKeyParts,
   runtimeCacheMeta
 } from '../../scripts/dev-proxy-server.mjs';
@@ -90,6 +90,24 @@ test('runtime cache keys separate otherwise identical templates under different 
   assert.notEqual(keyFor('Cst_QueryTool'), keyFor('Acme_QueryTool'));
 });
 
+test('execution dependencies mark relation steps and indirect CMDBuild paths, not direct fields', () => {
+  assert.equal(dependencyMapWithHash(baseSpec).relationSensitive, undefined);
+  for (const type of ['expandRelations', 'existsRelatedRows', 'traverseDomains', 'listDomains']) {
+    const steps = [...baseSpec.steps, { type, from: 'Selection1', as: 'related' }];
+    assert.equal(dependencyMapWithHash({ ...baseSpec, steps }).relationSensitive, true, type);
+  }
+
+  const path = 'Location.{LocationOwner:Person}.Code';
+  const selection = baseSpec.steps[0];
+  for (const steps of [
+    [{ ...selection, columns: [{ path, as: 'OwnerCode' }] }],
+    [{ ...selection, filters: [{ path, op: 'exists' }] }],
+    [selection, { type: 'enrichRows', from: 'Selection1', as: 'enriched', fields: [{ path: 'Location.Code', as: 'LocationCode' }] }]
+  ]) {
+    assert.equal(dependencyMapWithHash({ ...baseSpec, steps }).relationSensitive, true);
+  }
+});
+
 test('cache metadata exposes refresh cooldown and refresh permission', () => {
   const entry = {
     keyShort: 'abcdef1234567890',
@@ -117,7 +135,7 @@ test('cache metadata exposes refresh cooldown and refresh permission', () => {
 test('public snapshot URL params exclude the root selector and runtime cache control switches', () => {
   const url = new URL('http://127.0.0.1:8093/cmdbuild/custom-api/public-snapshots/test/run?city=city49&root=Acme_QueryTool&lang=ru&d2=true&diagram=infra&refresh=1&noCache=1&forceRefresh=1&bypassRefreshCooldown=1');
 
-  assert.deepEqual(publicSnapshotParamsFromUrl(url), { city: 'city49' });
+  assert.deepEqual(reportParamsFromUrl(url), { city: 'city49' });
 });
 
 test('D2 renderer policy participates in runtime cache key context', () => {

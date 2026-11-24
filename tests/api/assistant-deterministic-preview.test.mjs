@@ -6895,12 +6895,14 @@ async function signalBeforeTimeout(signal, timeoutMs) {
   }
 }
 
-async function startTemplateRace(t, code, mockOptions) {
+async function startTemplateRace(t, code, mockOptions, envOverrides = {}) {
   const mock = await startMockCmdbuild(t, { templateCodeFilter: true, ...mockOptions });
   const port = await freePort();
-  await startBackend(t, port, mock.origin, {
+  const backend = await startBackend(t, port, mock.origin, {
     CMDBDYNAMICPAGES_ROOT: 'Cst_QueryTool',
-    CMDBUILD_REQUEST_TIMEOUT_MS: '8000'
+    CMDBUILD_REQUEST_TIMEOUT_MS: '8000',
+    CMDP_LOG_FORMAT: 'json',
+    ...envOverrides
   });
   const origin = `http://127.0.0.1:${port}`;
   const api = `${origin}/cmdbuild/custom-api`;
@@ -6908,6 +6910,7 @@ async function startTemplateRace(t, code, mockOptions) {
   const csrf = await requestJson('GET', `${api}/csrf`, undefined, { cookie });
   assert.equal(csrf.statusCode, 200, csrf.body);
   return {
+    backend,
     mock,
     templateUrl: `${api}/templates/${code}`,
     snapshotUrl: `${api}/public-snapshots/${code}/run?json=true`,
@@ -7025,28 +7028,80 @@ for (const method of ['PUT', 'DELETE']) {
   });
 }
 
-test('ambiguous CMDB mutation leaves the old snapshot revoked and blocks republishing', async (t) => {
-  const code = 'UnconfirmedSnapshotMutation';
+test('snapshot revocation preserves the previous generation on confirmed CMDB rejection', async (t) => {
+  const code = 'RejectedSnapshotMutation';
+  const nextCode = 'RejectedSnapshotRename';
   const spec = publishSpec();
-  const { templateUrl, snapshotUrl, headers } = await startTemplateRace(t, code, {
-    templates: [templateCard(code, spec)],
+  const templates = [templateCard(code, spec)];
+  const redis = await startSnapshotRedisFixture(t);
+  let statusCode;
+  const { mock, templateUrl, snapshotUrl, headers } = await startTemplateRace(t, code, {
+    templates,
     responseOverride(url, req) {
-      if (req.method === 'PUT' && url.pathname.endsWith(`/Cst_QueryTemplate/cards/${code}`)) {
-        return { statusCode: 502, body: { message: 'Unconfirmed fixture response.' } };
+      if (['PUT', 'DELETE'].includes(req.method) && url.pathname.endsWith(`/Cst_QueryTemplate/cards/${code}`)) {
+        return { statusCode, body: { success: false, message: 'Fixture mutation rejected.' } };
       }
     }
-  });
-  const body = { params: {}, savedSpecHash: hashJson(spec) };
-  assert.equal((await requestJson('POST', templateUrl + '/publish', body, headers)).statusCode, 200);
-  const changed = await requestJson('PUT', templateUrl, { code, expectedSpecHash: body.savedSpecHash,
-    spec: { ...spec, publish: { mode: 'dynamicUser' } } }, headers);
-  assert.equal(changed.statusCode, 502, changed.body);
-  assert.equal(changed.json.snapshotRevocationPending, true);
-  assert.equal((await requestJson('GET', snapshotUrl)).json.snapshotFound, false);
-  const retry = await requestJson('POST', templateUrl + '/publish', body, headers);
-  assert.equal(retry.statusCode, 409, retry.body);
-  assert.equal(retry.json.reason, 'snapshot_revocation_pending');
+  }, redis.env);
+  const expectedSpecHash = hashJson(spec);
+  const publish = await requestJson('POST', templateUrl + '/publish', { params: {}, savedSpecHash: expectedSpecHash }, headers);
+  assert.equal(publish.statusCode, 200, publish.body);
+  const stateEntries = () => [...redis.values].filter(([key]) => key.includes(':snapshot-state:'));
+  const previous = stateEntries();
+  assert.equal(previous.length, 1);
+  assert.match(previous[0][1], /^ready:/);
+  const cached = await requestJson('GET', snapshotUrl);
+  assert.equal(cached.json.snapshotFound, true);
+
+  const rejections = [['DELETE', 401], ['DELETE', 403], ['PUT', 400], ['PUT', 409], ['PUT', 412], ['PUT', 422]];
+  for (const [method, status] of rejections) {
+    statusCode = status;
+    const rejected = await requestJson(method, templateUrl,
+      method === 'PUT' ? { code: nextCode, expectedSpecHash, spec } : undefined, headers);
+    assert.equal(rejected.statusCode, 502, rejected.body);
+    assert.equal(rejected.json.cmdbuildStatus, status);
+    assert.equal(rejected.json.snapshotRevocationPending, false);
+    assert.deepEqual(stateEntries(), previous, 'restore previous ready marker and remove an initially absent rename marker');
+    assert.deepEqual((await requestJson('GET', snapshotUrl)).json, cached.json);
+  }
+  assert.deepEqual(templates, [templateCard(code, spec)]);
+  assert.deepEqual(mock.requests.filter(({ method }) => ['PUT', 'DELETE'].includes(method)).map(({ method }) => method),
+    rejections.map(([method]) => method));
 });
+
+for (const outcome of [200, 202, 408, 429, 502, 'disconnect']) {
+  test(`ambiguous CMDB mutation (${outcome}) leaves the old snapshot revoked and blocks republishing`, async (t) => {
+    const code = 'UnconfirmedSnapshotMutation';
+    const spec = publishSpec();
+    const { mock, backend, templateUrl, snapshotUrl, headers } = await startTemplateRace(t, code, {
+      templates: [templateCard(code, spec)],
+      responseOverride(url, req) {
+        if (req.method === 'PUT' && url.pathname.endsWith(`/Cst_QueryTemplate/cards/${code}`)) {
+          if (outcome === 'disconnect') req.socket.destroy();
+          return { statusCode: outcome === 'disconnect' ? 502 : outcome,
+            body: { message: 'Unconfirmed fixture response.', ...(outcome === 200 ? { success: false } : {}) } };
+        }
+      }
+    });
+    const body = { params: {}, savedSpecHash: hashJson(spec) };
+    assert.equal((await requestJson('POST', templateUrl + '/publish', body, headers)).statusCode, 200);
+    const requestId = 'unconfirmed-mutation-fixture';
+    const changed = await requestJson('PUT', templateUrl, { code, expectedSpecHash: body.savedSpecHash,
+      spec: { ...spec, publish: { mode: 'dynamicUser' } } }, { ...headers, 'x-request-id': requestId });
+    assert.equal(changed.statusCode, 502, changed.body);
+    assert.equal(changed.json.cmdbuildStatus, outcome === 'disconnect' ? 0 : outcome);
+    assert.equal(changed.json.snapshotRevocationPending, true);
+    const [, , pending] = await assertSnapshotRevocationLog(backend, requestId, changed.json.snapshotRevocationOperationId,
+      ['attempted', 'started', 'pending'], 1);
+    assert.equal(pending.mutationOutcome, 'unconfirmed');
+    assert.equal(pending.reason, 'mutation_unconfirmed');
+    assert.equal(mock.requests.filter(({ method }) => method === 'PUT').length, 1, 'never retry an ambiguous write');
+    assert.equal((await requestJson('GET', snapshotUrl)).json.snapshotFound, false);
+    const retry = await requestJson('POST', templateUrl + '/publish', body, headers);
+    assert.equal(retry.statusCode, 409, retry.body);
+    assert.equal(retry.json.reason, 'snapshot_revocation_pending');
+  });
+}
 
 test('template delete denied by class permissions does not revoke a published snapshot', async (t) => {
   const code = 'SnapshotCannotBeDeleted';
@@ -7475,7 +7530,7 @@ test('runtime and public snapshot caches isolate templates with the same code by
 async function startSnapshotRedisFixture(t) {
   const values = new Map();
   const sets = new Map();
-  const faults = { mset: false, del: false };
+  const faults = { mset: false, del: false, finalize: false };
   const resp = (value) => value == null ? '$-1\r\n' : typeof value === 'number' ? `:${value}\r\n`
     : Array.isArray(value) ? `*${value.length}\r\n${value.map(resp).join('')}` : `$${Buffer.byteLength(value)}\r\n${value}\r\n`;
   const redis = net.createServer((socket) => {
@@ -7506,9 +7561,10 @@ async function startSnapshotRedisFixture(t) {
           values.set(key, args[0]);
           return socket.end('+OK\r\n');
         case 'MSET': {
-          if (faults.mset) return socket.end('-ERR cannot persist revocation\r\n');
+          if (faults.mset === true) return socket.end('-ERR cannot persist revocation\r\n');
           const pairs = [key, ...args];
           for (let i = 0; i < pairs.length; i += 2) values.set(pairs[i], pairs[i + 1]);
+          if (faults.mset === 'lost-ack') return socket.end();
           return socket.end('+OK\r\n');
         }
         case 'SMEMBERS': return socket.end(resp([...(sets.get(key) || [])]));
@@ -7520,6 +7576,7 @@ async function startSnapshotRedisFixture(t) {
           const keys = args.slice(1, 1 + keyCount);
           const [expected, ...next] = args.slice(1 + keyCount);
           const writeSnapshot = key.includes('SADD');
+          if (!writeSnapshot && faults.finalize) return socket.end('-ERR cannot finalize revocation\r\n');
           if ((writeSnapshot ? keys.slice(0, 1) : keys).some((item) => values.get(item) !== expected)) return socket.end(resp(0));
           if (writeSnapshot) { values.set(keys[1], next[0]); add(keys[2], next[1]); }
           else keys.forEach((item, index) => next[index] === '-' ? values.delete(item) : values.set(item, next[index]));
@@ -7534,6 +7591,95 @@ async function startSnapshotRedisFixture(t) {
   return { faults, values, env: { CMDBDYNAMIC_REDIS_ENABLED: 'true', CMDBDYNAMIC_REDIS_REQUIRED: 'false',
     CMDBDYNAMIC_REDIS_URL: `redis://127.0.0.1:${redis.address().port}/0` } };
 }
+
+async function assertSnapshotRevocationLog(backend, requestId, operationId, outcomes, keyCount) {
+  assert.match(operationId, /^[0-9a-f-]{36}$/);
+  let events;
+  await waitFor(() => {
+    events = backend.testOutput.split('\n').filter((line) => line.includes('"event":"snapshot.revocation_') && line.endsWith('}'))
+      .map((line) => JSON.parse(line)).filter((item) => item.requestId === requestId);
+    return events.length >= outcomes.length;
+  }, 1500, () => backend.testOutput);
+  assert.deepEqual(events.map(({ event }) => event), outcomes.map((outcome) => `snapshot.revocation_${outcome}`));
+  const [{ stateKeys }] = events;
+  assert.equal(stateKeys.length, keyCount);
+  for (const event of events) {
+    assert.equal(event.operationId, operationId);
+    assert.deepEqual(event.stateKeys, stateKeys);
+  }
+  return events;
+}
+
+test('snapshot revocation with a lost MSET ACK leaves both rename markers discoverable and never writes CMDB', async (t) => {
+  const code = 'LostRevocationAck';
+  const nextCode = 'LostRevocationAckRename';
+  const spec = publishSpec();
+  const redis = await startSnapshotRedisFixture(t);
+  const { mock, backend, templateUrl, snapshotUrl, headers } = await startTemplateRace(t, code, {
+    templates: [templateCard(code, spec)]
+  }, { ...redis.env, CMDBDYNAMIC_REDIS_RETRY_AFTER_MS: '1000', CMDBDYNAMIC_REDIS_TIMEOUT_MS: '2500' });
+  const expectedSpecHash = hashJson(spec);
+  const publishBody = { params: {}, savedSpecHash: expectedSpecHash };
+  assert.equal((await requestJson('POST', templateUrl + '/publish', publishBody, headers)).statusCode, 200);
+  assert.equal((await requestJson('GET', snapshotUrl)).json.snapshotFound, true);
+
+  const requestId = 'lost-revocation-ack-fixture';
+  redis.faults.mset = 'lost-ack';
+  const saving = requestJson('PUT', templateUrl, { code: nextCode, expectedSpecHash, spec },
+    { ...headers, 'x-request-id': requestId });
+  let pending;
+  await waitFor(() => (pending = [...redis.values.values()].find((value) => value.startsWith('pending:'))), 1000);
+  const operationId = pending.slice('pending:'.length);
+  const [attempt] = await assertSnapshotRevocationLog(backend, requestId, operationId, ['attempted'], 2);
+  assert.deepEqual(attempt.templateCodes, [code, nextCode]);
+  assert.deepEqual(attempt.stateKeys.map((key) => redis.values.get(key)), [pending, pending]);
+
+  const blocked = await saving;
+  assert.equal(blocked.statusCode, 503, blocked.body);
+  assert.equal(blocked.headers['x-request-id'], requestId);
+  assert.equal(blocked.json.code, 'snapshot_revocation_unavailable');
+  assert.equal(blocked.json.snapshotRevocationPending, true);
+  assert.equal(blocked.json.snapshotRevocationOperationId, operationId);
+  const [, unavailable] = await assertSnapshotRevocationLog(backend, requestId, operationId,
+    ['attempted', 'unavailable'], 2);
+  assert.equal(unavailable.reason, 'pending_write_unconfirmed');
+  assert.deepEqual(attempt.stateKeys.map((key) => redis.values.get(key)), [pending, pending]);
+  assert.ok(!mock.requests.some(({ method }) => ['PUT', 'DELETE', 'POST'].includes(method)), 'no card or version write');
+
+  // Wait for the client backoff; the persisted marker must still fence the old payload.
+  await waitFor(async () => (await requestJson('GET', snapshotUrl)).statusCode === 200, 4000);
+  assert.equal((await requestJson('GET', snapshotUrl)).json.snapshotFound, false);
+  const retry = await requestJson('POST', templateUrl + '/publish', publishBody, headers);
+  assert.equal(retry.statusCode, 409, retry.body);
+  assert.equal(retry.json.reason, 'snapshot_revocation_pending');
+});
+
+test('snapshot revocation reports pending if restoration of a rejected write cannot be confirmed', async (t) => {
+  const code = 'RejectedSnapshotRestoreUnavailable';
+  const spec = publishSpec();
+  const redis = await startSnapshotRedisFixture(t);
+  const { templateUrl, headers, backend } = await startTemplateRace(t, code, {
+    templates: [templateCard(code, spec)],
+    responseOverride(url, req) {
+      if (req.method === 'DELETE' && url.pathname.endsWith(`/Cst_QueryTemplate/cards/${code}`)) {
+        return { statusCode: 403, body: { success: false } };
+      }
+    }
+  }, redis.env);
+  assert.equal((await requestJson('POST', templateUrl + '/publish', { params: {}, savedSpecHash: hashJson(spec) }, headers)).statusCode, 200);
+  redis.faults.finalize = true;
+  const requestId = 'unconfirmed-restoration-fixture';
+  const rejected = await requestJson('DELETE', templateUrl, undefined, { ...headers, 'x-request-id': requestId });
+  assert.equal(rejected.statusCode, 502, rejected.body);
+  assert.equal(rejected.json.cmdbuildStatus, 403);
+  assert.equal(rejected.json.snapshotRevocationPending, true);
+  const operationId = rejected.json.snapshotRevocationOperationId;
+  const [attempt, , pending] = await assertSnapshotRevocationLog(backend, requestId, operationId,
+    ['attempted', 'started', 'pending'], 1);
+  assert.equal(pending.reason, 'state_finalization_unconfirmed');
+  assert.equal(pending.mutationOutcome, 'rejected');
+  assert.equal(redis.values.get(attempt.stateKeys[0]), `pending:${operationId}`);
+});
 
 test('snapshot revocation uses the same class across root spellings and fences stale Redis payloads across restart', async (t) => {
   const code = 'FencedSnapshot';
@@ -10519,6 +10665,8 @@ test('direct runtime enforces the published D2 source toggle even with a valid c
   const { origin, headers, mock, code, currentSpec, spec } = await edgeAggregationApiFixture(t);
   const templateUrl = `${origin}/cmdbuild/custom-api/templates/${code}`;
   const directUrl = `${origin}/cmdbuild/dynamicpages/ui/run/${code}`;
+  const params = { site: 42, enabled: false };
+  const wire = encodeURIComponent(JSON.stringify(Object.entries(params)));
   let savedSpecHash = hashJson(currentSpec);
 
   for (const publicD2Source of [false, true]) {
@@ -10529,13 +10677,13 @@ test('direct runtime enforces the published D2 source toggle even with a valid c
     }, headers);
     assert.equal(saved.statusCode, 200, saved.body);
     savedSpecHash = saved.json.template.specHash;
-    const published = await requestJson('POST', `${templateUrl}/publish`, { params: {}, savedSpecHash }, headers);
+    const published = await requestJson('POST', `${templateUrl}/publish`, { params, savedSpecHash }, headers);
     assert.equal(published.statusCode, 200, published.body);
     assert.equal(published.json.cache.status, 'snapshot-published');
 
     const start = mock.requests.length;
-    const anonymous = await request('GET', `${directUrl}?d2=true`);
-    const authenticated = await request('GET', `${directUrl}?d2=true`, undefined, { cookie: headers.cookie });
+    const anonymous = await request('GET', `${directUrl}?d2=true&snapshotParams=${wire}`);
+    const authenticated = await request('GET', `${directUrl}?d2=true&snapshotParams=${wire}`, undefined, { cookie: headers.cookie });
     for (const response of [anonymous, authenticated]) {
       assert.equal(response.statusCode, publicD2Source ? 200 : 403, response.body);
       if (publicD2Source) {
@@ -10548,12 +10696,22 @@ test('direct runtime enforces the published D2 source toggle even with a valid c
       }
     }
     assert.equal(authenticated.body, anonymous.body);
-    const runtime = await requestJson('GET', `${directUrl}?json=true`, undefined, { cookie: headers.cookie });
+    const runtime = await requestJson('GET', `${directUrl}?json=true&snapshotParams=${wire}`, undefined, { cookie: headers.cookie });
     assert.equal(runtime.statusCode, 200, runtime.body);
     assert.equal(runtime.json.diagrams[0].d2.downloadAvailable, publicD2Source);
     assert.equal(runtime.json.diagrams[0].d2.source, undefined);
     assert.equal(mock.requests.length, start, 'published D2 reads make no CMDBuild requests');
   }
+
+  const dynamic = await requestJson('PUT', templateUrl, { code, expectedSpecHash: savedSpecHash,
+    spec: { ...spec, publish: { mode: 'dynamicUser' } } }, headers);
+  assert.equal(dynamic.statusCode, 200, dynamic.body);
+  const protectedD2 = await request('GET', `${directUrl}?d2=true&snapshotParams=${wire}`, undefined, { cookie: headers.cookie });
+  assert.equal(protectedD2.statusCode, 200, protectedD2.body);
+  assert.match(protectedD2.body, /Source object/);
+  const malformed = await requestJson('GET', `${templateUrl}/run?d2=true&snapshotParams=invalid`, undefined, { cookie: headers.cookie });
+  assert.equal(malformed.statusCode, 400, malformed.body);
+  assert.equal(malformed.json.reason, 'snapshot_params_invalid');
 });
 
 test('edge aggregation HTTP draft preview merges 100 distinct mock records and is deterministic', async (t) => {
@@ -10693,6 +10851,163 @@ test('runtime cache probe preserves projected cards 403 despite successful unpro
   assert.deepEqual(mock.requests.slice(start).filter(({ pathname }) => pathname === cardsPath)
     .map(({ search }) => new URLSearchParams(search).get('attributes')), ['model']);
 });
+
+test('runtime relation cache isolates users and access contexts and expires despite hits', async (t) => {
+  const code = 'PrivateRelationCache';
+  const relationsPath = '/cmdbuild/services/rest/v3/classes/ARM/cards/501/relations';
+  const relationReads = [];
+  let denyAlice = false;
+  const spec = {
+    version: 1,
+    cache: { scopeMode: 'permissionOnly', ttlSeconds: 3 },
+    steps: [
+      { type: 'selectCards', as: 'assets', className: 'ARM', limit: 1 },
+      { type: 'expandRelations', as: 'related', from: 'assets', domain: 'AssetLocation', fetchRelated: false }
+    ],
+    result: { tables: [{ name: 'related', columns: ['Code'] }] }
+  };
+  const fixture = await transferApiFixture(t, {
+    templates: [templateCard(code, spec)],
+    armCards: [{ _id: 501, Code: 'ASSET' }],
+    responseOverride(url, req) {
+      const token = req.headers['cmdbuild-authorization'];
+      if (url.pathname.endsWith('/sessions/current')) {
+        const username = token === 'relation-auditor' || token === 'relation-alice-renewed' ? 'relation-alice' : token;
+        return { statusCode: 200, body: { data: { username, role: token === 'relation-auditor' ? 'Auditor' : 'Reader' } } };
+      }
+      if (url.pathname !== relationsPath) return;
+      relationReads.push(token);
+      if (denyAlice && token === 'relation-alice-renewed') return { statusCode: 403, body: { message: 'Relations denied' } };
+      return { statusCode: 200, body: { data: [{
+        domain: 'AssetLocation', _sourceType: 'ARM', _sourceId: 501,
+        _destinationType: 'Location', _destinationId: 9, _destinationCode: token
+      }] } };
+    }
+  });
+  const endpoint = `${fixture.origin}/cmdbuild/custom-api/templates/${code}/run?json=true`;
+  const run = (token, query = '') => requestJson('GET', endpoint + query, undefined, { cookie: testCmdbuildAuthorizationCookie(token) });
+  const warm = await run('relation-alice');
+  assert.equal(warm.statusCode, 200, warm.body);
+  assert.equal(warm.json.cache.status, 'miss');
+  assert.equal(warm.json.cache.scope, 'per-user');
+  assert.equal(warm.json.cache.scopeMode, 'privateUser');
+  assert.equal(warm.json.cache.sharedAcrossUsers, false);
+  assert.deepEqual(warm.json.tables[0].rows, [{ Code: 'relation-alice' }]);
+  assert.equal(Date.parse(warm.json.cache.expiresAt) - Date.parse(warm.json.cache.generatedAt), 3000);
+
+  for (const token of ['relation-bob', 'relation-auditor']) {
+    const isolated = await run(token);
+    assert.equal(isolated.statusCode, 200, isolated.body);
+    assert.equal(isolated.json.cache.status, 'miss');
+    assert.notEqual(isolated.json.cache.key, warm.json.cache.key);
+    assert.deepEqual(isolated.json.tables[0].rows, [{ Code: token }]);
+  }
+
+  const expiresAt = Date.parse(warm.json.cache.expiresAt);
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, expiresAt - Date.now() - 1200)));
+  const hit = await run('relation-alice-renewed');
+  assert.equal(hit.statusCode, 200, hit.body);
+  assert.equal(hit.json.cache.status, 'hit');
+  assert.equal(hit.json.cache.key, warm.json.cache.key);
+  assert.equal(hit.json.cache.generatedAt, warm.json.cache.generatedAt);
+  assert.equal(hit.json.cache.expiresAt, warm.json.cache.expiresAt);
+  assert.ok(hit.json.cache.ttlSec < warm.json.cache.ttlSec);
+  assert.deepEqual(hit.json.tables[0].rows, [{ Code: 'relation-alice' }]);
+  assert.deepEqual(relationReads, ['relation-alice', 'relation-bob', 'relation-auditor']);
+
+  denyAlice = true;
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, expiresAt - Date.now() + 20)));
+  const denied = await run('relation-alice-renewed', '&refresh=1');
+  assertRuntimeRelationDenied(denied);
+  assert.deepEqual(relationReads, ['relation-alice', 'relation-bob', 'relation-auditor', 'relation-alice-renewed']);
+});
+
+test('runtime relation path cache rejects eligible refresh on related card denial without stale rows', async (t) => {
+  const code = 'PrivateRelationPathCache';
+  const path = '{AssetLocation:Location}.Code';
+  const deniedReads = [];
+  const spec = {
+    version: 1,
+    cache: { scopeMode: 'visibilityHash', ttlSeconds: 20 },
+    steps: [{ type: 'selectCards', as: 'assets', className: 'ARM', limit: 2 }],
+    result: { tables: [{ name: 'assets', columns: ['Code', path] }] }
+  };
+  const fixture = await transferApiFixture(t, {
+    templates: [templateCard(code, spec)],
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true,
+      RuntimeConfigJson: JSON.stringify({ runtimeCache: { refreshCooldownSec: 1 } }) }],
+    armCards: [{ _id: 501, Code: 'ASSET-1' }, { _id: 502, Code: 'ASSET-2' }],
+    relationsByCard: Object.fromEntries([501, 502].map((id) => [`ARM:${id}`, [{
+      domain: 'AssetLocation', _sourceType: 'ARM', _sourceId: id,
+      _destinationType: 'Location', _destinationId: id, _destinationCode: 'Fallback'
+    }]])),
+    cardsByClass: { Location: [{ _id: 501, Code: 'East' }, { _id: 502, Code: 'West' }] },
+    responseOverride(url, req) {
+      const token = req.headers['cmdbuild-authorization'];
+      if (token !== 'relation-refresh' || !url.pathname.endsWith('/classes/Location/cards/502')) return;
+      deniedReads.push(token);
+      return { statusCode: 403, body: { message: 'Related card denied' } };
+    }
+  });
+  const endpoint = `${fixture.origin}/cmdbuild/custom-api/templates/${code}/run?json=true`;
+  const warm = await requestJson('GET', endpoint, undefined, { cookie: fixture.headers.cookie });
+  assert.equal(warm.statusCode, 200, warm.body);
+  assert.equal(warm.json.cache.scopeMode, 'privateUser');
+  assert.equal(warm.json.cache.refreshCooldownSec, 1);
+  assert.deepEqual(warm.json.tables[0].rows, [{ Code: 'ASSET-1', [path]: 'East' }, { Code: 'ASSET-2', [path]: 'West' }]);
+
+  const refreshHeaders = { cookie: testCmdbuildAuthorizationCookie('relation-refresh') };
+  const wait = Math.max(0, Date.parse(warm.json.cache.nextRefreshAllowedAt) - Date.now() + 20);
+  await new Promise((resolve) => setTimeout(resolve, wait));
+  const denied = await requestJson('GET', `${endpoint}&refresh=1`, undefined, refreshHeaders);
+  assertRuntimeRelationDenied(denied);
+  const deniedAgain = await requestJson('GET', endpoint, undefined, refreshHeaders);
+  assertRuntimeRelationDenied(deniedAgain);
+  assert.deepEqual(deniedReads, ['relation-refresh', 'relation-refresh']);
+});
+
+test('runtime relation traversal rejects denied domain details instead of using list data', async (t) => {
+  const code = 'PrivateDomainTraversal';
+  const spec = {
+    version: 1,
+    steps: [
+      { type: 'selectCards', as: 'assets', className: 'ARM', limit: 1 },
+      { type: 'traverseDomains', as: 'related', from: 'assets', depth: 1 }
+    ],
+    result: { tables: [{ name: 'related', columns: ['RelatedClass'] }] }
+  };
+  const fixture = await transferApiFixture(t, {
+    templates: [templateCard(code, spec)],
+    armCards: [{ _id: 501, Code: 'ASSET' }],
+    domains: [{ name: 'AssetLocation', source: 'ARM', destination: 'Location' }],
+    responseOverride(url, req) {
+      const token = req.headers['cmdbuild-authorization'];
+      if (url.pathname.endsWith('/sessions/current')) {
+        return { statusCode: 200, body: { data: { username: token, role: 'Reader' } } };
+      }
+      if (token !== 'relation-domain-restricted' || !url.pathname.endsWith('/domains/AssetLocation')) return;
+      return { statusCode: 403, body: { message: 'Domain detail denied' } };
+    }
+  });
+  const endpoint = `${fixture.origin}/cmdbuild/custom-api/templates/${code}/run?json=true`;
+  const warm = await requestJson('GET', endpoint, undefined, { cookie: fixture.headers.cookie });
+  assert.equal(warm.statusCode, 200, warm.body);
+  assert.equal(warm.json.cache.scopeMode, 'privateUser');
+  assert.deepEqual(warm.json.tables[0].rows, [{ RelatedClass: 'Location' }]);
+
+  const denied = await requestJson('GET', endpoint, undefined, { cookie: testCmdbuildAuthorizationCookie('relation-domain-restricted') });
+  assertRuntimeRelationDenied(denied);
+});
+
+function assertRuntimeRelationDenied(response) {
+  assert.equal(response.statusCode, 403, response.body);
+  assert.equal(response.json.reason, 'data_access_denied');
+  assert.equal(response.json.cmdbuildStatus, 403);
+  assert.equal(response.json.permissionDenied, true);
+  assert.equal(response.json.cache, undefined);
+  assert.equal(response.json.result, undefined);
+  assert.equal(response.json.tables, undefined);
+}
 
 test('template transfer roundtrips raw and managed text filters on card and lookup fields', async (t) => {
   const fixture = await transferApiFixture(t, transferReferenceCatalog({

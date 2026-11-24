@@ -9811,6 +9811,10 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     p{margin:0 0 8px}.guide-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.guide-card{border:1px solid var(--line);padding:10px;background:#fbfdff}.guide-card h3{margin-top:0}.steps{margin:8px 0 0;padding-left:20px}.steps li{margin:4px 0}.code-inline{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:#f8fafc;border:1px solid var(--line);padding:1px 4px;border-radius:3px}
     main{padding:14px 16px}.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
     .runtime-page{background:#fff}.runtime-page main{padding:8px}.runtime-page .result-table-wrap:first-child{margin-top:0}.runtime-page .notice{margin:0}.run-launch-url{display:grid;grid-template-columns:max-content minmax(0,1fr);align-items:start;gap:4px 8px;min-width:0;max-width:100%;flex:1 1 420px}.run-launch-url span,.run-launch-params span{color:var(--muted);font-size:12px;white-space:nowrap}.run-launch-url a{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--accent);min-width:0;max-width:100%;word-break:normal;overflow-wrap:break-word;white-space:normal}.run-launch-url a[aria-disabled="true"]{color:var(--muted);text-decoration:none;cursor:not-allowed}.run-launch-params{display:grid;grid-template-columns:max-content minmax(0,1fr);align-items:start;gap:4px 8px;min-width:0;max-width:100%;flex:1 1 100%;font-size:12px}.run-launch-params code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:#334e68;background:#f8fafc;border:1px solid var(--line);padding:2px 4px;min-width:0;max-width:100%;word-break:normal;overflow-wrap:break-word;white-space:normal}
+    .view-column-order{display:grid;grid-template-columns:24px repeat(2,28px);gap:2px;align-items:center}.view-column-order button,.view-column-grip{width:100%;height:28px;padding:0}.view-column-grip{display:grid;place-items:center;color:var(--muted);line-height:1;user-select:none;visibility:hidden}.view-column-grip[draggable="true"]{cursor:grab;visibility:visible}.view-column-order button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}.view-column-dragging{opacity:.55}.view-column-drop-before>td{box-shadow:inset 0 3px var(--accent)}.view-column-drop-after>td{box-shadow:inset 0 -3px var(--accent)}#cmdp-view-column-order-status{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+    .view-column-table-wrap{max-width:100%;overflow:auto}.view-column-order-cell{width:1%;vertical-align:middle}
+    @media(max-width:768px){.view-column-order{grid-template-columns:24px repeat(2,44px)}.view-column-order button{height:44px}}
+    @media(max-width:600px){.view-column-order{grid-template-columns:44px}.view-column-order .view-column-grip{display:none}}
     .designer-menu{position:fixed;left:16px;top:64px;bottom:14px;width:246px;overflow:auto;border:1px solid var(--line);background:#fff;padding:10px;display:grid;gap:10px;z-index:10}.designer-main{margin-left:266px}.designer-actionbar{position:sticky;top:0;z-index:30;border:1px solid var(--line);background:rgba(255,255,255,.96);box-shadow:0 6px 16px rgba(15,23,42,.08);padding:8px 10px;margin:0 0 12px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.designer-actionbar-title{font-weight:bold;color:#334e68;white-space:nowrap}.designer-actionbar-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;min-width:0;flex:1 1 auto}.designer-actionbar-context{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));align-items:start;gap:6px 12px;min-width:0;max-width:100%;flex:1 1 100%}.designer-actionbar-context .run-launch-url,.designer-actionbar-context .run-launch-params{grid-template-columns:1fr;min-width:0;flex:initial}.menu-groups{display:grid;grid-template-columns:1fr;gap:10px}.menu-group strong{display:block;font-size:12px;color:#334e68;margin-bottom:6px}.menu-links{display:grid;grid-template-columns:1fr;gap:5px}.menu-links a{border:1px solid var(--line);background:#f8fafc;color:var(--text);padding:5px 7px;border-radius:4px;text-decoration:none;font-size:12px}.menu-links a.active{background:#e6f4f1;border-color:#86b7b3;color:#07575b;font-weight:bold}.menu-links a.disabled{background:#f4f6f8;color:#9aa5b1;border-color:#e4e7eb;cursor:not-allowed}.template-context{border:1px solid #b7d8d4;background:#f2faf8;padding:8px 10px;margin-bottom:12px}.template-context strong{margin-right:6px}.template-context .code-inline{font-weight:bold}
     button,a.button{border:1px solid #9fb3c8;background:#fff;color:var(--text);padding:6px 10px;border-radius:4px;cursor:pointer;text-decoration:none;display:inline-block}
     button.primary,a.button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
@@ -10928,6 +10932,10 @@ function dynamicPagesClientScript() {
       viewComposerMode: 'Display mode',
       viewComposerOnlyThis: 'Show only this table',
       viewComposerColumns: 'Visible columns',
+      viewComposerReorderColumn: 'Drag to move column',
+      viewComposerMoveColumnUp: 'Move column up',
+      viewComposerMoveColumnDown: 'Move column down',
+      viewComposerColumnMoved: 'Column moved to position {position} of {total}.',
       columnsCount: 'columns',
       viewComposerColumnField: 'Field',
       viewComposerColumnTitle: 'Column title',
@@ -12291,6 +12299,10 @@ function dynamicPagesClientScript() {
       viewComposerMode: 'Режим отображения',
       viewComposerOnlyThis: 'Показывать только эту таблицу',
       viewComposerColumns: 'Видимые колонки',
+      viewComposerReorderColumn: 'Перетащить колонку',
+      viewComposerMoveColumnUp: 'Переместить колонку выше',
+      viewComposerMoveColumnDown: 'Переместить колонку ниже',
+      viewComposerColumnMoved: 'Колонка перемещена на позицию {position} из {total}.',
       columnsCount: 'колонок',
       viewComposerColumnField: 'Поле',
       viewComposerColumnTitle: 'Заголовок колонки',
@@ -12723,6 +12735,7 @@ function dynamicPagesClientScript() {
     assistantAuthoringDirty: false,
     pendingTemplateWrites: new Map(),
     templatePublicationNotices: new Map(),
+    lastPublishedReportLink: null,
     get savingTemplate() { return templateWritePending(readTemplateCode()); },
     templateDirty: false,
     assistantTemplatePromptOverrides: {},
@@ -13732,12 +13745,7 @@ function dynamicPagesClientScript() {
   }
 
   function publicSnapshotRunPath(templateCode, params) {
-    var query = runtimeQuery(params);
-    if (boot.publicRuntime) {
-      var wire = new URLSearchParams(window.location.search || '').get('snapshotParams');
-      if (wire !== null) query.set('snapshotParams', wire);
-    }
-    return apiPrefix + '/public-snapshots/' + encodeURIComponent(templateCode) + '/run?' + query.toString();
+    return apiPrefix + '/public-snapshots/' + encodeURIComponent(templateCode) + '/run?' + runtimeQuery(params).toString();
   }
 
   function runtimeRunPath(templateCode, params, refresh, forceRefresh) {
@@ -19450,12 +19458,21 @@ function dynamicPagesClientScript() {
     return 'HTML: ' + htmlQuery + ' | JSON: ' + jsonQuery;
   }
 
+  function exactReportLaunchQuery(params) {
+    var pairs = staticSnapshotParamPairs(params);
+    return pairs.length ? { snapshotParams: JSON.stringify(pairs) } : {};
+  }
+
   function reportLaunchQuery(selected, includeDomValues) {
+    var publishedLink = state.lastPublishedReportLink;
+    if (publishedLink && selected && publishedLink.session === state.session && publishedLink.root === runtimeRoot() &&
+        publishedLink.code === selected.code && publishedLink.specHash === selected.specHash && publishedLink.id === String(selected.id || '')) {
+      return publishedLink.query;
+    }
     var publish = publishModelForSpec(selected && selected.spec);
     if (publish.mode !== 'staticSnapshot' || publish.paramsMode !== 'exact') return runUrlParamsForTemplate(selected, includeDomValues);
     try {
-      var pairs = staticSnapshotParamPairs(includeDomValues ? readRunParams() : state.runParams || {});
-      return pairs.length ? { snapshotParams: JSON.stringify(pairs) } : {};
+      return exactReportLaunchQuery(includeDomValues ? readRunParams() : state.runParams || {});
     } catch (_) {
       return null;
     }
@@ -19835,6 +19852,7 @@ function dynamicPagesClientScript() {
   }
 
   function renderDesigner(skipRuntimeCapture) {
+    clearViewComposerColumnDrag();
     if (skipRuntimeCapture !== true) captureRuntimeSettingsFields();
     updateChrome();
     if (state.technicalSchemaAccessDenied) {
@@ -19865,6 +19883,7 @@ function dynamicPagesClientScript() {
       '</div>'
     ].join('');
     restoreRuntimeSettingsFields();
+    syncViewComposerColumnOrderControls();
     var structureViewportSnapshot = state.diagramImportStructureViewportRestoreSnapshot || state.diagramImportStructureViewport;
     hydrateVisualizationRowGroupOptions(app);
     applyObjectPathFilter(app);
@@ -25310,6 +25329,11 @@ function dynamicPagesClientScript() {
     column = normalizeViewComposerColumn(column);
     return [
       '<tr data-view-column-row>',
+      '<td class="view-column-order-cell"><div class="view-column-order">' +
+        '<span class="view-column-grip" data-view-column-drag draggable="false" aria-hidden="true" title="' + escapeHtml(t('viewComposerReorderColumn')) + '">&#8942;&#8942;</span>' +
+        '<button type="button" data-action="move-view-column-up" disabled aria-label="' + escapeHtml(t('viewComposerMoveColumnUp')) + '" title="' + escapeHtml(t('viewComposerMoveColumnUp')) + '">&#8593;</button>' +
+        '<button type="button" data-action="move-view-column-down" disabled aria-label="' + escapeHtml(t('viewComposerMoveColumnDown')) + '" title="' + escapeHtml(t('viewComposerMoveColumnDown')) + '">&#8595;</button>' +
+        '</div></td>',
       '<td>' + renderCatalogFieldPicker(
         'data-view-column-field="field"',
         column.field || '',
@@ -25345,11 +25369,12 @@ function dynamicPagesClientScript() {
       '<label>' + t('viewComposerMode') + '<select id="cmdp-view-mode">' + renderVisualizationModeOptions(model.mode || 'table') + '</select></label>',
       '</div>',
       '<h3>' + t('viewComposerColumns') + '</h3>',
-      '<table class="compact"><thead><tr><th>' + t('viewComposerColumnField') + '</th><th>' + t('viewComposerColumnTitle') + '</th><th>' + t('viewComposerMultiMode') + '</th><th>' + t('viewComposerSeparator') + '</th><th>' + t('viewComposerEmptyRow') + '</th><th></th></tr></thead>',
+      '<div class="view-column-table-wrap"><table class="compact"><thead><tr><th></th><th>' + t('viewComposerColumnField') + '</th><th>' + t('viewComposerColumnTitle') + '</th><th>' + t('viewComposerMultiMode') + '</th><th>' + t('viewComposerSeparator') + '</th><th>' + t('viewComposerEmptyRow') + '</th><th></th></tr></thead>',
       '<tbody id="cmdp-view-column-rows">',
       rows,
       renderViewComposerColumnRow({}, spec, model.sourceAlias),
-      '</tbody></table>',
+      '</tbody></table></div>',
+      '<div id="cmdp-view-column-order-status" role="status"></div>',
       '</section>'
     ].join('');
   }
@@ -28832,11 +28857,66 @@ function dynamicPagesClientScript() {
     if (body) body.insertAdjacentHTML('beforeend', renderViewComposerColumnRow({}, spec, sourceAlias));
   }
 
-  function viewComposerColumnRowHasValue(row) {
-    if (!row) return false;
-    var field = row.querySelector('[data-view-column-field="field"]');
+  function viewComposerColumnRowName(row) {
+    if (!row) return '';
     var title = row.querySelector('[data-view-column-field="title"]');
-    return Boolean(String(field && field.value || '').trim() || String(title && title.value || '').trim());
+    var field = row.querySelector('[data-view-column-field="field"]');
+    return String(title && title.value || '').trim() || String(field && field.value || '').trim();
+  }
+
+  function viewComposerColumnRowHasValue(row) {
+    return Boolean(viewComposerColumnRowName(row));
+  }
+
+  function syncViewComposerColumnOrderControls() {
+    var body = document.getElementById('cmdp-view-column-rows');
+    if (!body) return;
+    var rows = Array.from(body.rows);
+    var populated = rows.filter(viewComposerColumnRowHasValue);
+    rows.forEach(function (row) {
+      var index = populated.indexOf(row);
+      var column = viewComposerColumnRowName(row);
+      var up = row.querySelector('[data-action="move-view-column-up"]');
+      var down = row.querySelector('[data-action="move-view-column-down"]');
+      var suffix = column ? ': ' + column : '';
+      row.querySelector('[data-view-column-drag]').draggable = index !== -1;
+      up.disabled = index <= 0;
+      down.disabled = index === -1 || index === populated.length - 1;
+      up.setAttribute('aria-label', t('viewComposerMoveColumnUp') + suffix);
+      down.setAttribute('aria-label', t('viewComposerMoveColumnDown') + suffix);
+      up.title = up.getAttribute('aria-label');
+      down.title = down.getAttribute('aria-label');
+    });
+  }
+
+  function reorderViewComposerColumn(row, target, after) {
+    var body = document.getElementById('cmdp-view-column-rows');
+    if (!body || !row || !target || row === target || row.parentNode !== body || target.parentNode !== body) return false;
+    var populated = Array.from(body.rows).filter(viewComposerColumnRowHasValue);
+    var from = populated.indexOf(row);
+    var targetIndex = populated.indexOf(target);
+    if (from < 0 || targetIndex < 0) return false;
+    var to = targetIndex + (after ? 1 : 0) - (from < targetIndex ? 1 : 0);
+    if (from === to) return false;
+    runUiMutation(function () {
+      body.insertBefore(row, after ? target.nextElementSibling : target);
+      state.viewComposerDraft = captureViewComposerDraftFromDom();
+      syncViewComposerColumnOrderControls();
+      var status = document.getElementById('cmdp-view-column-order-status');
+      if (status) status.textContent = t('viewComposerColumnMoved', { position: to + 1, total: populated.length });
+    });
+    return true;
+  }
+
+  function moveViewComposerColumn(button, direction) {
+    var body = document.getElementById('cmdp-view-column-rows');
+    var row = button.closest('[data-view-column-row]');
+    if (!body || !row || button.disabled) return;
+    var rows = Array.from(body.rows).filter(viewComposerColumnRowHasValue);
+    var index = rows.indexOf(row);
+    if (index < 0 || !reorderViewComposerColumn(row, rows[index + direction], direction > 0)) return;
+    var focus = button.disabled ? row.querySelector('.view-column-order button:not(:disabled)') : button;
+    if (focus) focus.focus();
   }
 
   function ensureTrailingViewComposerColumnRow(target) {
@@ -28844,10 +28924,8 @@ function dynamicPagesClientScript() {
     var body = document.getElementById('cmdp-view-column-rows');
     var row = target.closest('[data-view-column-row]');
     if (!body || !row || !body.contains(row)) return;
-    var rows = Array.prototype.slice.call(body.querySelectorAll('[data-view-column-row]'));
-    if (!rows.length || rows[rows.length - 1] !== row) return;
-    if (!viewComposerColumnRowHasValue(row)) return;
-    addViewComposerColumnRow();
+    if (body.lastElementChild === row && viewComposerColumnRowHasValue(row)) addViewComposerColumnRow();
+    syncViewComposerColumnOrderControls();
   }
 
   function clearViewComposerColumnRow(button) {
@@ -28859,6 +28937,7 @@ function dynamicPagesClientScript() {
     row.querySelectorAll('select').forEach(function (field) {
       field.value = '';
     });
+    syncViewComposerColumnOrderControls();
   }
 
   function diagramMappingKindFromElement(element) {
@@ -30974,6 +31053,13 @@ function dynamicPagesClientScript() {
         body: { params: publication.params, savedSpecHash: savedTemplate.specHash }
       });
       if (!published.ok) throw createRequestError(published);
+      if (sameScope()) {
+        var publishedMode = publishModelForSpec(savedTemplate.spec);
+        state.lastPublishedReportLink = { session: saveScope.session, root: saveScope.root, code: savedTemplate.code,
+          id: String(savedTemplate.id || ''), specHash: savedTemplate.specHash,
+          query: publishedMode.paramsMode === 'ignore' ? {} : exactReportLaunchQuery(publication.params) };
+        if (sameTemplate()) refreshTemplateLaunchUrl();
+      }
       if (!sameEditor()) return;
       if (sameDraft() && uiDiagnosticIsCurrent({ owner: owner })) state.result = published;
       if (!sameDraft()) state.templateDirty = true;
@@ -32721,9 +32807,7 @@ function dynamicPagesClientScript() {
       renderDesigner();
       return;
     }
-    var url = runtimeTemplateUrl(code, runUrlParamsForTemplate(state.selectedTemplate || {}, true));
-    if (window.open) window.open(url, '_blank', 'noopener');
-    else window.location.href = url;
+    openRun(code, true);
   }
 
   function forceRefreshInEditor() {
@@ -32798,11 +32882,9 @@ function dynamicPagesClientScript() {
     state.runtimeRefreshInProgress = Boolean(refresh);
     app.innerHTML = '<div class="notice">' + escapeHtml(refresh ? t('runtimeRefreshing') : t('runningTemplate')) + '</div>';
     var templateCode = boot.templateCode || '';
-    var params = {};
-    new URLSearchParams(window.location.search || '').forEach(function (value, key) {
-      if (key === 'snapshotParams' || runtimeSystemParam(key)) return;
-      params[key] = value;
-    });
+    // Keep the typed wire value for protected and public requests, including D2 downloads.
+    var params = Object.fromEntries(Array.from(new URLSearchParams(window.location.search || ''))
+      .filter(function (entry) { return !runtimeSystemParam(entry[0]); }));
     state.runParams = params;
     if (boot.publicRuntime) {
       request(publicSnapshotRunPath(templateCode, params)).then(function (result) {
@@ -33067,6 +33149,9 @@ function dynamicPagesClientScript() {
     if (action === 'apply-selection') runUiMutation(function () { applyDataSelectionEditor(); });
     if (action === 'add-view-column-row') runUiMutation(function () { addViewComposerColumnRow(); });
     if (action === 'clear-view-column-row') runUiMutation(function () { clearViewComposerColumnRow(target); });
+    if (action === 'move-view-column-up' || action === 'move-view-column-down') {
+      moveViewComposerColumn(target, action === 'move-view-column-up' ? -1 : 1);
+    }
     if (action === 'add-diagram-mapping-row') runUiMutation(function () { addDiagramMappingRow(target); });
     if (action === 'clear-diagram-mapping-row') runUiMutation(function () { clearDiagramMappingRow(target); });
     if (action === 'insert-diagram-template-token') insertDiagramTemplateToken(target);
@@ -33123,7 +33208,41 @@ function dynamicPagesClientScript() {
     });
   }
 
+  var viewComposerColumnDragType = 'application/x-cmdp-view-column';
+  var viewComposerDraggedRow = null;
+  var viewComposerDropRow = null;
+
+  function clearViewComposerDropTarget() {
+    if (viewComposerDropRow) viewComposerDropRow.classList.remove('view-column-drop-before', 'view-column-drop-after');
+    viewComposerDropRow = null;
+  }
+
+  function clearViewComposerColumnDrag() {
+    if (viewComposerDraggedRow) viewComposerDraggedRow.classList.remove('view-column-dragging');
+    viewComposerDraggedRow = null;
+    clearViewComposerDropTarget();
+  }
+
+  function viewComposerColumnDropLocation(event) {
+    var target = event.target && event.target.closest && event.target.closest('[data-view-column-row]');
+    var body = document.getElementById('cmdp-view-column-rows');
+    if (!body || viewComposerDraggedRow.parentNode !== body || !target || target === viewComposerDraggedRow ||
+        target.parentNode !== body || !viewComposerColumnRowHasValue(target)) return null;
+    var rect = target.getBoundingClientRect();
+    return { row: target, after: event.clientY >= rect.top + rect.height / 2 };
+  }
+
   document.addEventListener('dragstart', function (event) {
+    var viewHandle = event.target && event.target.closest && event.target.closest('[data-view-column-drag]');
+    if (viewHandle) {
+      clearViewComposerColumnDrag();
+      if (!viewHandle.draggable || !event.dataTransfer) { event.preventDefault(); return; }
+      viewComposerDraggedRow = viewHandle.closest('[data-view-column-row]');
+      viewComposerDraggedRow.classList.add('view-column-dragging');
+      event.dataTransfer.effectAllowed = 'move';
+      event.dataTransfer.setData(viewComposerColumnDragType, 'column');
+      return;
+    }
     var structureHandle = event.target && event.target.closest && event.target.closest('[data-diagram-structure-tree-drag]');
     if (structureHandle) {
       var structureItemId = String(structureHandle.getAttribute('data-diagram-structure-tree-drag') || '');
@@ -33150,6 +33269,17 @@ function dynamicPagesClientScript() {
   });
 
   document.addEventListener('dragover', function (event) {
+    if (viewComposerDraggedRow) {
+      clearViewComposerDropTarget();
+      if (!event.dataTransfer || !event.dataTransfer.types.includes(viewComposerColumnDragType)) return;
+      var viewLocation = viewComposerColumnDropLocation(event);
+      if (!viewLocation) return;
+      event.preventDefault();
+      viewComposerDropRow = viewLocation.row;
+      viewComposerDropRow.classList.add(viewLocation.after ? 'view-column-drop-after' : 'view-column-drop-before');
+      event.dataTransfer.dropEffect = 'move';
+      return;
+    }
     var structureTarget = event.target && event.target.closest && event.target.closest('[data-diagram-structure-tree-drop-target]');
     var structureRoot = event.target && event.target.closest && event.target.closest('[data-diagram-structure-tree-root]');
     if (state.diagramStructureTreeDragId && (structureTarget || structureRoot)) {
@@ -33169,6 +33299,16 @@ function dynamicPagesClientScript() {
   });
 
   document.addEventListener('drop', function (event) {
+    if (viewComposerDraggedRow) {
+      event.preventDefault();
+      var viewLocation = event.dataTransfer && event.dataTransfer.getData(viewComposerColumnDragType) === 'column'
+        ? viewComposerColumnDropLocation(event) : null;
+      var viewSource = viewComposerDraggedRow;
+      clearViewComposerColumnDrag();
+      if (!viewLocation) return;
+      reorderViewComposerColumn(viewSource, viewLocation.row, viewLocation.after);
+      return;
+    }
     var structureTarget = event.target && event.target.closest && event.target.closest('[data-diagram-structure-tree-drop-target]');
     var structureRoot = event.target && event.target.closest && event.target.closest('[data-diagram-structure-tree-root]');
     if (state.diagramStructureTreeDragId && (structureTarget || structureRoot)) {
@@ -33241,6 +33381,10 @@ function dynamicPagesClientScript() {
   });
 
   document.addEventListener('dragend', clearAssistantObjectFlowDragState);
+  document.addEventListener('dragend', clearViewComposerColumnDrag);
+  document.addEventListener('dragleave', function (event) {
+    if (viewComposerDraggedRow && !event.relatedTarget) clearViewComposerDropTarget();
+  });
 
   document.addEventListener('toggle', function (event) {
     var details = event.target;
@@ -37146,6 +37290,21 @@ function selectionDependencyFieldsForStep(step, aliasDependencies) {
   return fields;
 }
 
+function templateReadsRelations(spec, steps, selections) {
+  if (isCmdbBuildViewSpec(spec)) return normalizeCmdbBuildViewConfig(spec).sections.includes('domains');
+  const relationPath = (field) => field.includes('.') || field.startsWith('{');
+  return steps.some((step) => {
+    if (['expandRelations', 'existsRelatedRows', 'traverseDomains', 'listDomains'].includes(step?.type)) return true;
+    if (step?.type === 'selectCards') {
+      return (Array.isArray(step.filters || step.where) ? (step.filters || step.where) : [])
+        .some((filter) => typeof filter?.path === 'string' && relationPath(filter.path.trim()));
+    }
+    return step?.type === 'enrichRows' && normalizePathColumnSpecs(step.columns || step.fields)
+      .some((column) => relationPath(column.path) || column.sourceCandidates.some((candidate) =>
+        relationPath(diagramImportCardSourceRawField(candidate, column.path))));
+  }) || selections.some((selection) => selection.fields.some(relationPath));
+}
+
 function buildTemplateDependencyMap(spec) {
   const dependencyInfo = buildAliasColumnDependencies(spec || {});
   const aliasDependencies = dependencyInfo.aliases;
@@ -37179,6 +37338,7 @@ function buildTemplateDependencyMap(spec) {
     version: 1,
     strategy: 'usedFieldsOnly',
     hash: '',
+    ...(templateReadsRelations(spec, steps, selections) ? { relationSensitive: true } : {}),
     classes: uniqueStrings(classes),
     selections,
     aliases: Object.fromEntries(Array.from(aliasDependencies.entries()).map(([alias, fields]) => [alias, uniqueStrings(fields)])),
@@ -37195,6 +37355,13 @@ function dependencyMapWithHash(spec) {
 
 function runtimeCacheKeyParts(root, template, params, sessionData, executionOptions, runtimeCacheConfig, templateCacheConfig, dependencyMap, accessProbe, cacheContext = {}) {
   const userScope = runtimeUserCacheScope(sessionData);
+  if (dependencyMap?.relationSensitive) {
+    const session = sanitizeSession(sessionData);
+    userScope.multigroup = Boolean(session?.multigroup);
+    userScope.language = session?.language || '';
+    userScope.locale = session?.locale || '';
+    userScope.rolePrivilegesHash = hashJson(sessionData?.rolePrivileges || {});
+  }
   // Authoring state (Assistant prompts, D2 source, checkpoints) cannot alter
   // deterministic execution and must therefore not fragment runtime cache.
   const specHash = executionSpecHash(template.spec || {});
@@ -37461,13 +37628,12 @@ async function probeTemplateAccess(authToken, spec, params, executionOptions, de
 }
 
 async function executeTemplateRunWithCache(authToken, root, template, params, sessionData, executionOptions, options = {}) {
-  const now = Date.now();
   const runtimeCacheConfig = normalizeRuntimeCacheConfig(options.runtimeCacheConfig || defaultRuntimeConfig());
-  const templateCacheConfig = normalizeTemplateCacheConfig(template.spec, runtimeCacheConfig);
+  const configuredCache = normalizeTemplateCacheConfig(template.spec, runtimeCacheConfig);
   const executionSpec = executionOptions.includeDiagrams === false
     ? templateSpecForTableExecution(template.spec)
     : template.spec;
-  if (!templateCacheConfig.enabled || templateCacheConfig.scopeMode === 'disabled') {
+  if (!configuredCache.enabled) {
     return {
       result: await executeTemplateSpec(authToken, template.spec, params, {
         ...executionOptions
@@ -37481,11 +37647,20 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
     };
   }
   const dependencyMap = dependencyMapWithHash(executionSpec);
+  const { relationSensitive } = dependencyMap;
+  // Class/field and visible card probes do not establish relation visibility.
+  const templateCacheConfig = relationSensitive
+    ? { ...configuredCache, scopeMode: 'privateUser', shareMode: 'user' }
+    : configuredCache;
   let accessProbe;
   try {
     accessProbe = await probeTemplateAccess(authToken, executionSpec, params, executionOptions, dependencyMap, templateCacheConfig);
   } catch {
     accessProbe = { ok: false, reason: 'probe_failed' };
+  }
+  if (relationSensitive && accessProbe.ok) {
+    const { userId, username } = runtimeUserCacheScope(sessionData);
+    if (!userId && !username) accessProbe = { ok: false, reason: 'user_scope_unconfirmed' };
   }
   if (accessProbe.reason === 'template_dependency_invalid') {
     const error = new Error(accessProbe.message);
@@ -37517,12 +37692,20 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
   const refreshRequested = Boolean(options.refreshRequested);
   const forceRefreshRequested = Boolean(options.forceRefreshRequested);
   const cached = await cacheGetJson('runtime', keyParts.key, runtimeResultCache);
-  let entry = cached.value;
+  const now = Date.now();
+  let entry = cached.value?.expiresAt > now ? cached.value : null;
+  const serveHit = async () => {
+    // Private relation hits do not rewrite the entry: a concurrent refresh
+    // can replace or remove it, and a hit must not restore the old result.
+    if (!relationSensitive) {
+      entry.lastServedAt = now;
+      const remainingTtlMs = Math.max(1, entry.expiresAt - Date.now());
+      await cacheSetJson('runtime', keyParts.key, entry, remainingTtlMs, runtimeResultCache);
+    }
+  };
 
-  if (entry && refreshRequested && !forceRefreshRequested && templateCacheConfig.allowManualRefresh === false && entry.expiresAt > now) {
-    entry.lastServedAt = now;
-    const remainingTtlMs = Math.max(1, entry.expiresAt - now);
-    await cacheSetJson('runtime', keyParts.key, entry, remainingTtlMs, runtimeResultCache);
+  if (entry && refreshRequested && !forceRefreshRequested && templateCacheConfig.allowManualRefresh === false) {
+    await serveHit();
     return {
       result: cloneJsonValueServer(entry.result, { tables: [] }),
       cache: runtimeCacheMeta(entry, 'hit', now, {
@@ -37542,17 +37725,15 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
     };
   }
 
-  if (entry && !refreshRequested && entry.expiresAt > now) {
-    entry.lastServedAt = now;
-    const remainingTtlMs = Math.max(1, entry.expiresAt - now);
-    await cacheSetJson('runtime', keyParts.key, entry, remainingTtlMs, runtimeResultCache);
+  if (entry && !refreshRequested) {
+    await serveHit();
     return {
       result: cloneJsonValueServer(entry.result, { tables: [] }),
       cache: runtimeCacheMeta(entry, 'hit', now, { backend: cached.backend })
     };
   }
 
-  if (runtimeResultInFlight.has(keyParts.key)) {
+  if (!relationSensitive && runtimeResultInFlight.has(keyParts.key)) {
     entry = await runtimeResultInFlight.get(keyParts.key);
     entry.lastServedAt = Date.now();
     return {
@@ -37562,6 +37743,9 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
   }
 
   const promise = (async () => {
+    // A relation rebuild uses this request's session, never another session's
+    // in-flight build. Do not keep serving the former result after a denial.
+    if (relationSensitive && entry) await cacheDelete('runtime', keyParts.key, runtimeResultCache);
     const buildStartedAt = Date.now();
     const result = await executeTemplateSpec(authToken, template.spec, params, {
       ...executionOptions,
@@ -37605,7 +37789,7 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
     return newEntry;
   })();
 
-  runtimeResultInFlight.set(keyParts.key, promise);
+  if (!relationSensitive) runtimeResultInFlight.set(keyParts.key, promise);
   try {
     entry = await promise;
     return {
@@ -37613,7 +37797,7 @@ async function executeTemplateRunWithCache(authToken, root, template, params, se
       cache: runtimeCacheMeta(entry, forceRefreshRequested ? 'force-refresh' : (refreshRequested ? 'refresh' : 'miss'), Date.now(), { backend: entry.cacheBackend || 'memory' })
     };
   } finally {
-    runtimeResultInFlight.delete(keyParts.key);
+    if (!relationSensitive) runtimeResultInFlight.delete(keyParts.key);
   }
 }
 
@@ -37680,32 +37864,49 @@ async function snapshotPublicationState(root, code) {
 
 async function beginSnapshotRevocation(res, root, codes) {
   const keys = codes.map((code) => snapshotStateKey(root, code));
-  const id = crypto.randomUUID();
-  const pending = `pending:${id}`;
-  const ready = `ready:${id}`;
+  const operationId = crypto.randomUUID();
+  const pending = `pending:${operationId}`;
+  const ready = `ready:${operationId}`;
+  const audit = { requestId: currentRequestId(), operationId, root, templateCodes: codes, stateKeys: keys };
+  let reason = 'state_read_failed';
+  let blockingOperationIds = [];
   try {
-    const states = await Promise.all(keys.map(readSnapshotState));
-    if (states.some((state) => state?.startsWith('pending:'))) throw new Error('A previous revocation is pending.');
+    const previous = await Promise.all(keys.map(readSnapshotState));
+    blockingOperationIds = [...new Set(previous.filter((state) => state?.startsWith('pending:')).map((state) => state.slice('pending:'.length)))];
+    if (blockingOperationIds.length) {
+      reason = 'previous_revocation_pending';
+      throw new Error('A previous revocation is pending.');
+    }
+    reason = 'pending_write_unconfirmed';
+    // Redis can apply MSET even if its reply never reaches this process.
+    writeStructuredLog('info', 'snapshot.revocation_attempted', audit, { force: true });
     if (SNAPSHOT_MEMORY_ONLY) keys.forEach((key) => snapshotStateMemory.set(key, pending));
     else if (await redisCommand(['MSET', ...keys.flatMap((key) => [key, pending])]) !== 'OK') throw new Error('Revocation was not confirmed.');
-    logInfo('snapshot.revocation_started', { requestId: currentRequestId(), root, templateCodes: codes, stateKeys: keys });
-    return { keys, pending, ready, previous: states, root, codes };
+    writeStructuredLog('info', 'snapshot.revocation_started', audit, { force: true });
+    return { keys, pending, ready, previous, operationId, audit };
   } catch {
-    logWarn('snapshot.revocation_unavailable', { requestId: currentRequestId(), root, templateCodes: codes });
+    writeStructuredLog('warn', 'snapshot.revocation_unavailable', { ...audit, reason,
+      ...(blockingOperationIds.length ? { blockingOperationIds } : {}) }, { force: true });
     sendJson(res, 503, { success: false, code: 'snapshot_revocation_unavailable', reason: 'snapshot_revocation_unavailable',
-      message: 'The public snapshot could not be revoked. The template was not changed.' });
+      message: 'Snapshot revocation could not be confirmed. No template write was started.',
+      ...(reason === 'pending_write_unconfirmed' ? { snapshotRevocationPending: true, snapshotRevocationOperationId: operationId } : {}) });
     return null;
   }
 }
 
 async function finishSnapshotRevocation(revocation, response) {
   if (!revocation) return true;
-  // A transport timeout or upstream 5xx may hide a committed CMDB mutation.
-  const { keys, pending, ready } = revocation;
+  const { keys, pending, ready, audit } = revocation;
+  // Restore only for statuses that explicitly reject the write, not every 4xx.
+  const mutationOutcome = response.ok ? 'committed'
+    : [400, 401, 403, 409, 412, 422].includes(response.statusCode) ? 'rejected' : 'unconfirmed';
+  const outcome = { ...audit, mutationOutcome, cmdbuildStatus: response.statusCode };
+  if (mutationOutcome === 'unconfirmed') {
+    writeStructuredLog('warn', 'snapshot.revocation_pending', { ...outcome, reason: 'mutation_unconfirmed' }, { force: true });
+    return false;
+  }
   try {
-    if (!response.ok && !(response.statusCode >= 400 && response.statusCode < 500 && response.statusCode !== 408)) throw new Error('Unconfirmed CMDB mutation.');
-    // An explicit access denial did not change the card and cannot revoke its publication.
-    const nextStates = [401, 403].includes(response.statusCode) ? revocation.previous : keys.map(() => ready);
+    const nextStates = mutationOutcome === 'rejected' ? revocation.previous : keys.map(() => ready);
     if (SNAPSHOT_MEMORY_ONLY) {
       if (keys.some((key) => snapshotStateMemory.get(key) !== pending)) throw new Error('Revocation generation changed.');
       keys.forEach((key, index) => nextStates[index] == null ? snapshotStateMemory.delete(key) : snapshotStateMemory.set(key, nextStates[index]));
@@ -37714,21 +37915,27 @@ async function finishSnapshotRevocation(revocation, response) {
         keys.length, ...keys, pending, ...nextStates.map((state) => state ?? '-')]);
       if (changed !== 1) throw new Error('Revocation generation changed.');
     }
+    writeStructuredLog('info', 'snapshot.revocation_finished', outcome, { force: true });
     return true;
   } catch {
-    logWarn('snapshot.revocation_pending', { requestId: currentRequestId(), root: revocation.root, templateCodes: revocation.codes, stateKeys: keys });
+    writeStructuredLog('warn', 'snapshot.revocation_pending', { ...outcome, reason: 'state_finalization_unconfirmed' }, { force: true });
     return false;
   }
 }
 
 async function runRevokedTemplateMutation(revocation, mutation) {
+  let response;
   try {
-    const response = await mutation();
-    return { response, finalized: await finishSnapshotRevocation(revocation, response) };
+    response = await mutation();
   } catch (error) {
-    await finishSnapshotRevocation(revocation, { ok: false });
-    throw error;
+    if (!revocation) throw error;
+    // No HTTP response does not imply that CMDB did not apply the write.
+    response = { ok: false, statusCode: 0, json: null };
   }
+  if (revocation && response.ok && (response.statusCode === 202 || response.json?.success === false)) {
+    response = { ...response, ok: false };
+  }
+  return { response, finalized: await finishSnapshotRevocation(revocation, response) };
 }
 
 function requireRuntimeRoot(res, requestUrl) {
@@ -37751,7 +37958,7 @@ function runtimeParamsFromUrl(requestUrl) {
   return params;
 }
 
-function publicSnapshotParamsFromUrl(requestUrl) {
+function reportParamsFromUrl(requestUrl) {
   const values = requestUrl.searchParams.getAll(SNAPSHOT_PARAMS_QUERY);
   if (!values.length) return runtimeParamsFromUrl(requestUrl);
   try {
@@ -52123,7 +52330,7 @@ async function createAssistantDiagramMappingDraft(input, runtimeConfig) {
 
 async function lookupPublishedSnapshot(res, requestUrl, root, templateCode) {
   try {
-    const params = publicSnapshotParamsFromUrl(requestUrl);
+    const params = reportParamsFromUrl(requestUrl);
     const lookup = await readStaticSnapshot(root, templateCode, params, { paramsMode: 'ignore' });
     return { ...lookup, params };
   } catch (error) {
@@ -58808,22 +59015,35 @@ function executeComposeRows(step, params, context, limits) {
 
 function createExecutionRequest(authToken, limits, options = {}) {
   let restCalls = 0;
+  let permissionError = null;
+  const assertAccess = () => {
+    if (permissionError) throw permissionError;
+  };
   const deadlineAt = Number(options.deadlineAt || 0);
   const deadlineTimeoutMs = Number(options.deadlineTimeoutMs || DRAFT_PREVIEW_TIMEOUT_MS);
   const request = async (path) => {
+    assertAccess();
     assertExecutionDeadline(deadlineAt, deadlineTimeoutMs);
     restCalls += 1;
     if (restCalls > limits.maxRestCalls) {
       throw new Error(`Template execution exceeded REST call limit (${limits.maxRestCalls}).`);
     }
     try {
-      return await cmdbuildRequest(path, authToken, { deadlineAt, deadlineTimeoutMs });
+      const response = await cmdbuildRequest(path, authToken, { deadlineAt, deadlineTimeoutMs });
+      if (options.relationSensitive && isPermissionDeniedStatus(response.statusCode)) {
+        permissionError = Object.assign(new Error(`CMDBuild data request failed with status ${response.statusCode}.`), {
+          cmdbuildStatus: response.statusCode
+        });
+        assertAccess();
+      }
+      return response;
     } catch (error) {
       if (executionDeadlineRemainingMs(deadlineAt) <= 0) throw executionDeadlineTimeoutError(deadlineTimeoutMs);
       throw error;
     }
   };
   request.getRestCalls = () => restCalls;
+  request.assertAccess = assertAccess;
   return request;
 }
 
@@ -59188,21 +59408,27 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
     traversalDepthDefault: Math.min(options.traversalDepthDefault || 1, maxTraversalDepthMax)
   };
   const context = {};
-  const cmdbuildExecRequest = createExecutionRequest(authToken, limits, {
-    deadlineAt: executionDeadlineAt,
-    deadlineTimeoutMs: executionDeadlineTimeoutMs
-  });
-  if (isCmdbBuildViewSpec(spec)) {
-    return executeCmdbBuildViewSpec(cmdbuildExecRequest, spec, effectiveParams, { limits });
-  }
-  const dependencyMap = options.dependencyMap || dependencyMapWithHash(options.includeDiagrams === false ? templateSpecWithoutDiagrams(spec) : spec);
-  const assistantSelectionAliases = assistantObjectFlowSelectionAliases(spec);
-  const trace = [];
-  const stageResults = [];
   const diagramScope = options.executionScope === 'diagrams' ? diagramExecutionScope(spec) : null;
   const tableScope = options.executionScope === 'tables' ? tableExecutionScope(spec) : null;
   const executionScope = diagramScope || tableScope;
   const executableSteps = executionScope ? executionScope.steps : (Array.isArray(spec.steps) ? spec.steps.map((step, index) => ({ step, index })) : []);
+  const dependencySpec = options.includeDiagrams === false ? templateSpecWithoutDiagrams(spec) : spec;
+  const dependencyMap = options.dependencyMap || dependencyMapWithHash(executionScope
+    ? { ...dependencySpec, steps: executableSteps.map(({ step }) => step) }
+    : dependencySpec);
+  const cmdbuildExecRequest = createExecutionRequest(authToken, limits, {
+    deadlineAt: executionDeadlineAt,
+    deadlineTimeoutMs: executionDeadlineTimeoutMs,
+    relationSensitive: dependencyMap.relationSensitive
+  });
+  if (isCmdbBuildViewSpec(spec)) {
+    const result = await executeCmdbBuildViewSpec(cmdbuildExecRequest, spec, effectiveParams, { limits });
+    cmdbuildExecRequest.assertAccess();
+    return result;
+  }
+  const assistantSelectionAliases = assistantObjectFlowSelectionAliases(spec);
+  const trace = [];
+  const stageResults = [];
   const attachExecutionSnapshot = (error) => {
     error.executionTrace = Array.isArray(error.executionTrace) ? error.executionTrace : trace;
     error.executionSnapshot = error.executionSnapshot || {
@@ -59256,6 +59482,8 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
       } else {
         throw new Error(`Unsupported step type: ${step.type}`);
       }
+      // Optional metadata/path readers may catch a failed upstream request.
+      cmdbuildExecRequest.assertAccess();
       const output = context[step.as] || {};
       const selectionScan = output.selectionScan && typeof output.selectionScan === 'object' ? output.selectionScan : null;
       const sourceResults = [step.from, step.with]
@@ -59413,6 +59641,7 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
       truncated: Boolean(source.truncated)
     });
   }
+  cmdbuildExecRequest.assertAccess();
   const includeDiagrams = options.includeDiagrams !== false;
   const d2Workflow = includeDiagrams ? await d2WorkflowStatusForSpec(spec) : { state: 'not-requested' };
   const partialDiagramPreview = includeDiagrams && options.allowPartialDiagramPreview === true && d2Workflow.state === 'pending';
@@ -63084,11 +63313,17 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
         body = await readTemplateActionBody(req, res, templateAction);
         if (!body) return;
       }
-      const params = runtimeReadOnly
-        ? runtimeParamsFromUrl(requestUrl)
-        : runtimeAction
-          ? Object.fromEntries(Object.entries(body.params || {}).filter(([key]) => key !== 'root'))
-          : body.params || {};
+      let params;
+      try {
+        params = runtimeReadOnly
+          ? reportParamsFromUrl(requestUrl)
+          : runtimeAction
+            ? Object.fromEntries(Object.entries(body.params || {}).filter(([key]) => key !== 'root'))
+            : body.params || {};
+      } catch (error) {
+        sendJson(res, 400, { success: false, reason: error.reason, message: error.message });
+        return;
+      }
       const jsonOutput = templateAction === 'run' && runtimeJsonOutputRequested(requestUrl);
       const d2Output = templateAction === 'run' && runtimeD2OutputRequested(requestUrl);
       const session = runSession || await getSessionData(authToken);
@@ -63131,10 +63366,8 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
 
       if (templateAction === 'run' && publishConfig.mode === 'staticSnapshot') {
         let lookup;
-        let snapshotParams;
         try {
-          snapshotParams = runtimeReadOnly ? publicSnapshotParamsFromUrl(requestUrl) : params;
-          lookup = await readStaticSnapshot(root, template.code, snapshotParams, publishConfig);
+          lookup = await readStaticSnapshot(root, template.code, params, publishConfig);
         } catch (error) {
           sendJson(res, error.statusCode || 400, { success: false, reason: error.reason || 'snapshot_params_invalid', message: error.message });
           return;
@@ -63164,7 +63397,7 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
             description: template.description,
             active: template.active
           },
-          params: snapshotParams,
+          params,
           result,
           cache
         };
@@ -63459,6 +63692,7 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
           className: found.schema.classNames.template,
           template: sanitizeTemplateCard(found.card),
           snapshotRevocationPending: !revocationFinalized,
+          ...(!revocationFinalized ? { snapshotRevocationOperationId: revocation.operationId } : {}),
           cacheInvalidation: cacheInvalidation && {
             runtime: cacheInvalidation[0],
             staticSnapshots: cacheInvalidation[1]
@@ -63678,6 +63912,7 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
           className: found.schema.classNames.template,
           template: sanitizeTemplateCard(updated.json && updated.json.data),
           snapshotRevocationPending: !revocationFinalized,
+          ...(!revocationFinalized ? { snapshotRevocationOperationId: revocation.operationId } : {}),
           versionLog,
           executionValidation,
           objectFlowRecovery: storageOptions.objectFlowOutcomes.map((item) => ({
@@ -64193,7 +64428,7 @@ export {
   parseAssistantJson,
   parsePublicOriginConfiguration,
   parseNameSet,
-  publicSnapshotParamsFromUrl,
+  reportParamsFromUrl,
   parseRedisUrl,
   redactByName,
   redisTransportSecurity,

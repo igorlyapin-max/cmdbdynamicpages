@@ -3405,6 +3405,212 @@ test('Designer run page exposes contextual buttons after selecting a template', 
   });
 });
 
+const useVisibleColumnsFixture = process.env.CMDBDYNAMIC_E2E_VISIBLE_COLUMNS_FIXTURE === '1';
+
+test('[required:visible-columns-order] Designer reorders visible columns and keeps the order in preview and the saved report', {
+  skip: skipReason || (!useVisibleColumnsFixture && process.env.CMDBDYNAMIC_E2E_WRITE !== '1' && 'Set CMDBDYNAMIC_E2E_WRITE=1 to use a temporary template.'),
+  timeout: 90_000
+}, async () => {
+  const root = 'Cst_QueryTool';
+  const description = 'Visible columns order fixture';
+  const owner = 'ui-fixture';
+  const initialFields = ['Code', 'Description', 'Owner'];
+  await withPage(async (page) => {
+    if (useVisibleColumnsFixture) {
+      await checkVisibleColumnsOrder(page, 'RequiredVisibleColumnsOrder');
+      return;
+    }
+
+    const code = `VisibleColumnsOrderUiSmoke${Date.now()}`;
+    const api = `${proxyOrigin}/cmdbuild/custom-api`;
+    const query = `?root=${root}`;
+    const csrf = await page.request.get(`${api}/csrf`);
+    assert.equal(csrf.status(), 200, 'Could not prepare the temporary template request.');
+    const headers = { origin: proxyOrigin, 'x-cmdbdynamicpages-csrf': (await csrf.json()).token };
+    const created = await page.request.post(`${api}/templates${query}`, {
+      headers,
+      data: {
+        code, description, owner, active: true,
+        spec: {
+          version: 1,
+          steps: [{
+            type: 'selectCards', as: 'items', className: 'Cst_QueryTemplate', columns: initialFields,
+            filters: [{ path: 'Code', op: 'equals', value: code }]
+          }],
+          result: { tables: [{ name: 'items', columns: initialFields }] }
+        }
+      }
+    });
+    assert.equal(created.status(), 201, `Could not create temporary template ${code}.`);
+    try {
+      await checkVisibleColumnsOrder(page, code);
+    } finally {
+      const deleted = await page.request.delete(`${api}/templates/${code}${query}`, { headers });
+      assert.equal(deleted.status(), 200, `Could not remove temporary template ${code}.`);
+    }
+  }, { contextOptions: { hasTouch: true } });
+
+  async function checkVisibleColumnsOrder(page, code) {
+    const templatePath = `/cmdbuild/custom-api/templates/${code}`;
+    const designerUrl = `${proxyOrigin}/cmdbuild/dynamicpages/ui/designer?root=${root}`;
+    const template = page.locator(`[data-action="select-template"][data-code="${code}"]`);
+    const section = (name) => page.locator(`a[data-designer-section="${name}"]`);
+    const action = (name) => page.locator(`.designer-actionbar button[data-action="${name}"]`);
+    const editor = page.locator('#cmdp-view-composer-editor');
+    const rows = editor.locator('[data-view-column-row]');
+    const field = (name) => `[data-view-column-field="${name}"]`;
+    const move = (row, direction) => row.locator(`[data-action="move-view-column-${direction}"]`);
+    const draggable = 'td:first-child [data-view-column-drag][draggable="true"]';
+    const columns = [
+      { field: 'Code', title: 'Card code', multiMode: 'join', separator: ' | ', emptyRow: false },
+      { field: 'Description', title: 'Card description', multiMode: 'rows', separator: ' / ', emptyRow: true },
+      { field: 'Owner', title: 'Card owner', multiMode: 'join', separator: '; ', emptyRow: true }
+    ];
+    const [codeColumn, descriptionColumn, ownerColumn] = columns;
+    const expectedOrder = [descriptionColumn, ownerColumn, codeColumn];
+    const orderStatus = editor.locator('#cmdp-view-column-order-status[role="status"]');
+    const responseFor = (method, path) => page.waitForResponse(
+      (response) => response.request().method() === method && new URL(response.url()).pathname === path,
+      { timeout: 15_000 }
+    );
+
+    async function openFinalData() {
+      await page.goto(designerUrl, { waitUntil: 'domcontentloaded' });
+      await template.click();
+      await section('final-view').click();
+      await editor.waitFor({ state: 'visible' });
+    }
+
+    async function assertColumns(expected, stage) {
+      const actual = await rows.evaluateAll((nodes) => nodes.map((row) => {
+        const control = (name) => row.querySelector(`[data-view-column-field="${name}"]`);
+        return {
+          field: control('field').value,
+          title: control('title').value,
+          multiMode: control('multiMode').value,
+          separator: control('separator').value,
+          emptyRow: control('emptyRow').checked
+        };
+      }));
+      assert.deepEqual(actual.slice(0, -1), expected, `${stage}: populated rows and their settings`);
+      assert.deepEqual([actual.at(-1)?.field, actual.at(-1)?.title], ['', ''], `${stage}: one trailing blank row`);
+      assert.equal(await rows.locator(draggable).count(), expected.length, `${stage}: populated drag handles`);
+      assert.equal(await rows.last().locator('[data-view-column-drag][draggable="true"]').count(), 0, `${stage}: blank row is not draggable`);
+      assert.equal(await move(rows.last(), 'up').isDisabled(), true, `${stage}: blank row cannot move up`);
+      assert.equal(await move(rows.last(), 'down').isDisabled(), true, `${stage}: blank row cannot move down`);
+    }
+
+    async function dragColumn(from, to, targetFraction) {
+      const target = rows.nth(to);
+      const bounds = await target.boundingBox();
+      assert.ok(bounds && bounds.width > 24 && bounds.height > 0, 'The drop target must have visible geometry.');
+      await rows.nth(from).locator(draggable).dragTo(target, {
+        targetPosition: { x: 24, y: Math.floor(bounds.height * targetFraction) }
+      });
+    }
+
+    async function assertReport(response, stage) {
+      assert.equal(response.status(), 200, `${stage}: ${await response.text()}`);
+      const { result } = await response.json();
+      assert.deepEqual(result.tables.map((table) => table.columns), [expectedOrder.map((column) => column.field)], `${stage}: API column order`);
+      const table = page.locator('[data-result-table]');
+      await table.locator('[data-result-row]').first().waitFor({ state: 'visible' });
+      assert.deepEqual(await visibleResultHeaderCells(page), expectedOrder.map((column) => column.title), `${stage}: rendered header order`);
+      assert.deepEqual(await visibleResultTableRows(page), [[description, owner, code]], `${stage}: rendered cell order`);
+    }
+
+    await openFinalData();
+    assert.deepEqual(await rows.locator(field('field')).evaluateAll((nodes) => nodes.map((node) => node.value)), [...initialFields, '']);
+    for (const [index, column] of columns.entries()) {
+      const row = rows.nth(index);
+      await row.locator(field('title')).fill(column.title);
+      await row.locator(field('multiMode')).selectOption(column.multiMode);
+      await row.locator(field('separator')).fill(column.separator);
+      await row.locator(field('emptyRow')).setChecked(column.emptyRow);
+    }
+    await assertColumns(columns, 'Before reorder');
+    assert.equal(await move(rows.first(), 'up').isDisabled(), true);
+    assert.equal(await move(rows.nth(2), 'down').isDisabled(), true);
+
+    await dragColumn(0, 2, 0.75);
+    await assertColumns([descriptionColumn, ownerColumn, codeColumn], 'Drop below the target midpoint');
+    await dragColumn(2, 0, 0.25);
+    await assertColumns(columns, 'Drop above the target midpoint');
+    const blankTitle = rows.last().locator(field('title'));
+    await rows.first().locator(draggable).dragTo(blankTitle);
+    await assertColumns(columns, 'Native drop onto the blank title does not insert text');
+
+    const blankDrop = await blankTitle.evaluate((input) => {
+      const handle = document.querySelector('[data-view-column-drag][draggable="true"]');
+      const dataTransfer = new DataTransfer();
+      const options = { bubbles: true, cancelable: true, dataTransfer };
+      handle.dispatchEvent(new DragEvent('dragstart', options));
+      const canceled = !input.dispatchEvent(new DragEvent('drop', options));
+      return { canceled, types: [...dataTransfer.types], dragging: Boolean(document.querySelector('.view-column-dragging')) };
+    });
+    assert.deepEqual(blankDrop, { canceled: true, types: ['application/x-cmdp-view-column'], dragging: false },
+      'An internal drop on an invalid row is canceled and clears drag state without a text payload');
+    await assertColumns(columns, 'A canceled drop preserves the single blank row');
+
+    const keyboardUp = editor.getByRole('button', { name: /^(?:Move column up|Переместить колонку выше): Card description$/ });
+    const keyboardDown = editor.getByRole('button', { name: /^(?:Move column down|Переместить колонку ниже): Card description$/ });
+    await keyboardUp.press('NumpadEnter');
+    await assertColumns([descriptionColumn, codeColumn, ownerColumn], 'Keyboard move up');
+    assert.equal(await keyboardDown.evaluate((button) => button === document.activeElement), true,
+      'Focus follows the moved column to its enabled move button');
+    assert.match(await orderStatus.textContent(), /\b1 (?:of|из) 3\b/);
+
+    const desktopViewport = page.viewportSize();
+    for (const width of [390, 768]) {
+      const touchViewport = { width, height: 844 };
+      await page.setViewportSize(touchViewport);
+      for (const direction of ['up', 'down']) {
+        const button = move(rows.nth(1), direction);
+        await button.scrollIntoViewIfNeeded();
+        const box = await button.boundingBox();
+        assert.ok(box && box.width >= 44 && box.height >= 44 &&
+          box.x >= 0 && box.x + box.width <= touchViewport.width &&
+          box.y >= 0 && box.y + box.height <= touchViewport.height,
+        `Move ${direction} at ${width}px must be a 44px touch target: ${JSON.stringify(box)}`);
+      }
+      await move(rows.nth(1), 'down').tap();
+      await assertColumns(expectedOrder, `Touch move down at ${width}px`);
+      assert.match(await orderStatus.textContent(), /\b3 (?:of|из) 3\b/);
+      if (width === 390) {
+        await move(rows.nth(2), 'up').tap();
+        await assertColumns([descriptionColumn, codeColumn, ownerColumn], `Touch move up at ${width}px`);
+      }
+    }
+    await page.setViewportSize(desktopViewport);
+
+    await section('params').click();
+    await editor.waitFor({ state: 'hidden' });
+    await section('final-view').click();
+    await editor.waitFor({ state: 'visible' });
+    await assertColumns(expectedOrder, 'Return to Final data without applying');
+
+    await action('apply-view-composer').click();
+    await page.locator('#cmdp-designer-notice').getByText(/Final data applied to Spec JSON\.|Итоговые данные применены к Spec JSON\./).waitFor();
+    const [saved] = await Promise.all([responseFor('PUT', templatePath), action('save-template').click()]);
+    assert.equal(saved.status(), 200, await saved.text());
+    await openFinalData();
+    await assertColumns(expectedOrder, 'Reopen the saved template');
+
+    await section('run').click();
+    const launchUrl = await page.locator('#cmdp-run-launch-url').getAttribute('href');
+    assert.ok(launchUrl, 'The saved template must expose a report URL.');
+    const [preview] = await Promise.all([
+      responseFor('POST', '/cmdbuild/custom-api/draft/preview'), action('visualize-editor').click()
+    ]);
+    await assertReport(preview, 'Designer preview');
+
+    const [report] = await Promise.all([
+      responseFor('GET', `${templatePath}/run`), page.goto(launchUrl, { waitUntil: 'domcontentloaded' })
+    ]);
+    await assertReport(report, 'Saved report');
+  }
+});
+
 test('Designer full preview and saved report URL show the same rows in one CMDBuild session', {
   skip: skipReason || (process.env.CMDBDYNAMIC_E2E_WRITE !== '1' && 'Set CMDBDYNAMIC_E2E_WRITE=1 to use a temporary template.'),
   timeout: 90_000
@@ -5369,24 +5575,89 @@ test('Published report URL renders the same snapshot with valid, absent, and exp
   });
 });
 
-test('[required:exact-snapshot-url] Designer links open the typed exact snapshot without a session', {
-  skip: skipReason || (process.env.CMDBDYNAMIC_E2E_REQUIRED !== '1' && 'Requires the isolated browser fixture.'), timeout: 45_000
+const useExactSnapshotFixture = process.env.CMDBDYNAMIC_E2E_REQUIRED === '1';
+
+test('[required:exact-snapshot-url] Designer links retain the published typed parameters in static and dynamic modes', {
+  skip: skipReason || (!useExactSnapshotFixture && process.env.CMDBDYNAMIC_E2E_WRITE !== '1' && 'Set CMDBDYNAMIC_E2E_WRITE=1 to use a temporary template.'), timeout: 60_000
 }, async () => {
   await withPage(async (page) => {
-    const code = 'RequiredExactSnapshot';
+    if (useExactSnapshotFixture) return assertExactSnapshotLinks(page, 'RequiredExactSnapshot');
+    const code = `ExactSnapshotLinkUiSmoke${Date.now()}`;
+    const api = `${proxyOrigin}/cmdbuild/custom-api`;
+    const csrf = await page.request.get(`${api}/csrf`);
+    assert.equal(csrf.status(), 200);
+    const headers = { origin: proxyOrigin, 'x-cmdbdynamicpages-csrf': (await csrf.json()).token };
+    const created = await page.request.post(`${api}/templates`, {
+      headers,
+      data: { code, active: true, description: 'Temporary typed report smoke',
+        spec: { version: 1, params: { site: { type: 'integer', default: 42 }, enabled: { type: 'boolean', default: false } },
+          steps: [{ type: 'selectCards', as: 'items', className: 'Cst_QueryTemplate', limit: 1,
+            filters: [{ path: 'Code', op: 'equals', value: code }] }],
+          result: { tables: [{ name: 'items', columns: ['Code'] }] }, publish: { mode: 'dynamicUser', paramsMode: 'exact' } }
+      }
+    });
+    assert.equal(created.status(), 201, 'Could not create the temporary typed report.');
+    const editorCookies = await page.context().cookies();
+    try {
+      await assertExactSnapshotLinks(page, code);
+    } finally {
+      await page.context().clearCookies();
+      await page.context().addCookies(editorCookies);
+      const deleted = await page.request.delete(`${api}/templates/${code}`, { headers });
+      assert.equal(deleted.status(), 200, 'Could not remove the temporary typed report.');
+    }
+  });
+
+  async function assertExactSnapshotLinks(page, code) {
     await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
     await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
     await page.locator('a[data-designer-section="publication"]').click();
+    const publishMode = page.locator('#cmdp-publish-mode');
+    assert.equal(await publishMode.inputValue(), 'dynamicUser');
+    await publishMode.selectOption('staticSnapshot');
+    await page.locator('#cmdp-publish-warning-accepted').check();
+    await page.locator('[data-run-param-field="site"]').fill('42');
+    await page.locator('[data-run-param-field="enabled"]').selectOption('false');
+
+    const publishRoute = `**/templates/${code}/publish?*`;
+    let responseReady;
+    let releaseResponse;
+    const prepared = new Promise((resolve) => { responseReady = resolve; });
+    const gate = new Promise((resolve) => { releaseResponse = resolve; });
+    await page.route(publishRoute, async (route) => {
+      const response = await route.fetch();
+      responseReady();
+      await gate;
+      await route.fulfill({ response });
+    });
     const isPublication = (response) => response.request().method() === 'POST' && response.url().includes(`/${code}/publish?`);
     const pending = page.waitForResponse(isPublication, { timeout: 5000 }).catch(() => null);
-    await page.locator('.designer-actionbar [data-action="publish-snapshot"]').click();
+    try {
+      await Promise.all([page.waitForRequest((request) => request.method() === 'POST' && request.url().includes(`/${code}/publish?`),
+        { timeout: 5000 }), page.locator('.designer-actionbar [data-action="publish-snapshot"]').click()]);
+      await prepared;
+      await page.locator('[data-run-param-field="site"]').fill('99');
+    } finally {
+      releaseResponse();
+    }
     const published = await pending;
     assert.ok(published, await page.locator('#cmdp-designer-notice').textContent());
     assert.equal(published.status(), 200, await published.text());
     assert.deepEqual((await published.json()).params, { site: 42, enabled: false });
+    await page.unroute(publishRoute);
+    await page.waitForFunction(() => {
+      const url = new URL(document.getElementById('cmdp-run-launch-url').href);
+      return url.searchParams.get('snapshotParams') === '[["enabled",false],["site",42]]';
+    });
     const htmlLink = await page.locator('#cmdp-run-launch-url').getAttribute('href');
     const jsonLink = await page.locator('#cmdp-run-launch-json-url').getAttribute('href');
     assert.deepEqual(JSON.parse(new URL(htmlLink).searchParams.get('snapshotParams')), [['enabled', false], ['site', 42]]);
+    assert.equal(await page.locator('[data-run-param-field="site"]').inputValue(), '99');
+    await page.locator('a[data-designer-section="run"]').click();
+    await page.evaluate(() => { window.open = (url) => { window.cmdpTestOpenedReport = new URL(url, location.origin).href; }; });
+    await page.locator('.designer-actionbar [data-action="visualize-external"]').click();
+    assert.equal(await page.evaluate(() => window.cmdpTestOpenedReport), htmlLink);
+    const viewerCookies = await page.context().cookies();
     await page.context().clearCookies();
     const json = await page.request.get(jsonLink);
     assert.equal(json.status(), 200, await json.text());
@@ -5399,7 +5670,33 @@ test('[required:exact-snapshot-url] Designer links open the typed exact snapshot
     assert.equal((await page.request.get(mismatched.href)).status(), 400);
     assert.equal((await page.goto(htmlLink, { waitUntil: 'domcontentloaded' })).status(), 200);
     await page.locator('main#app [data-result-row]').getByText(code, { exact: true }).waitFor();
-  });
+
+    await page.context().addCookies(viewerCookies);
+    await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+    await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
+    await page.locator('a[data-designer-section="publication"]').click();
+    await publishMode.selectOption('dynamicUser');
+    const [saved] = await Promise.all([
+      page.waitForResponse((response) => response.request().method() === 'PUT' && new URL(response.url()).pathname.endsWith(`/templates/${code}`)),
+      page.locator('.designer-actionbar [data-action="save-template"]').click()
+    ]);
+    assert.equal(saved.status(), 200, await saved.text());
+
+    const jsonRun = await page.request.get(jsonLink);
+    assert.equal(jsonRun.status(), 200, await jsonRun.text());
+    assert.deepEqual((await jsonRun.json()).params, { site: 42, enabled: false });
+    const protectedRun = page.waitForResponse((response) => new URL(response.url()).pathname.endsWith(`/templates/${code}/run`));
+    assert.equal((await page.goto(htmlLink, { waitUntil: 'domcontentloaded' })).status(), 200);
+    const htmlRun = await protectedRun;
+    assert.equal(htmlRun.status(), 200, await htmlRun.text());
+    assert.deepEqual((await htmlRun.json()).params, { site: 42, enabled: false });
+    await page.locator('main#app [data-result-row]').getByText(code, { exact: true }).waitFor();
+    const malformed = new URL(htmlRun.url());
+    malformed.searchParams.set('snapshotParams', 'invalid');
+    const invalid = await page.request.get(malformed.href);
+    assert.equal(invalid.status(), 400);
+    assert.equal((await invalid.json()).reason, 'snapshot_params_invalid');
+  }
 });
 
 test('Designer serializes Save and Publish, reconciles the saved hash and preserves newer draft edits', {
@@ -5955,7 +6252,7 @@ async function withPage(fn, options = {}) {
   if (executablePath) launchOptions.executablePath = executablePath;
   const browser = await playwright.chromium.launch(launchOptions);
   try {
-    const context = await browser.newContext();
+    const context = await browser.newContext(options.contextOptions);
     await context.addCookies(cookiesForOrigin(cookieHeader, options.cookieOrigin || proxyOrigin));
     const page = await context.newPage();
     await fn(page);
