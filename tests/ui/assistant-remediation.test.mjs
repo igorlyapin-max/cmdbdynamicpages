@@ -6,6 +6,7 @@ import { compileObjectFlowToSpec } from '../../scripts/assistant-object-flow.mjs
 import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics.mjs';
 import { createAssistantDiagnosticsUi } from '../../scripts/assistant-diagnostics-ui.mjs';
 import { resolveTemplateParameters, staticSnapshotParamPairs } from '../../scripts/template-parameters.mjs';
+import { bindViewLargeExecutionHelpers } from '../fixtures/view-large-execution-helpers.mjs';
 
 function clientVersionConstants(source) {
   return Object.fromEntries(['D2_IMPORT_SEMANTIC_MODEL_REVISION', 'D2_IMPORT_ENDPOINT_PROFILE_VERSION',
@@ -24,6 +25,7 @@ function clientScript() {
   assert.ok(start >= 0 && end > start, 'generated client boundaries must exist');
   const constants = {
     createUiRequestDiagnostics, createAssistantDiagnosticsUi, resolveTemplateParameters, staticSnapshotParamPairs,
+    renderViewLargeExecutionHelpers: bindViewLargeExecutionHelpers(source),
     DEFAULT_EMPTY_RESULT_TEXT: 'empty', DEFAULT_PERMISSION_DENIED_TEXT: 'denied', DEFAULT_TEMPLATE_CACHE_TTL_SEC: 3600,
     ...clientVersionConstants(source),
     DEFAULT_ASSISTANT_SYSTEM_PROMPT: 'system', DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT: 'flow', DEFAULT_ASSISTANT_OBJECT_FLOW_SEMANTIC_PROMPT: 'semantic',
@@ -332,14 +334,16 @@ test('publish failure survives section navigation and preserves a newer notice',
     const notice = page.locator('#cmdp-designer-notice');
     const newer = (await notice.innerText()).trim();
     assert.ok(newer && !newer.includes('Publishing'));
-    publish.respond({ success: false, code: 'snapshot_write_failed', message: 'Snapshot storage rejected the revision' }, 503);
-    const failure = notice.getByRole('alert').filter({ hasText: 'Snapshot storage rejected the revision' });
+    const code = 'snapshot_storage_unavailable';
+    const message = 'Published report storage is temporarily unavailable.';
+    publish.respond({ success: false, action: 'publish', reason: code, code, message }, 503);
+    const failure = notice.getByRole('alert').filter({ hasText: message });
     await failure.waitFor();
     assert.ok((await failure.boundingBox()).height > 0);
     assert.ok((await notice.innerText()).includes(newer));
     const diagnostic = JSON.parse(await notice.locator('[data-ui-diagnostic-report]').textContent());
     assert.equal(diagnostic.phase, 'publish');
-    assert.equal(diagnostic.code, 'snapshot_write_failed');
+    assert.equal(diagnostic.code, code);
     assert.equal(await writeAction(page, 'save-template').isEnabled(), true);
     await openSection(page, 'publication');
     assert.equal(await failure.isVisible(), true);
@@ -379,8 +383,12 @@ test('pending snapshot revocation keeps the Save ACK, localizes the warning and 
     const freshHash = 'd'.repeat(64);
     retry.respond({ success: true, template: { ...first, ...next.body, specHash: freshHash, version: 3 },
       snapshotRevocationPending: false, executionValidation: { executable: true } });
-    assert.equal((await publication.received).body.savedSpecHash, freshHash);
-    publication.respond({ success: true });
+    const { body: published } = await publication.received;
+    assert.equal(published.savedSpecHash, freshHash);
+    publication.respond({ success: true, action: 'publish', template: { code: first.code, active: true },
+      params: published.params, result: { tables: [] }, cache: { enabled: true, scope: 'staticSnapshot', status: 'snapshot-published',
+        sharedAcrossUsers: true, backend: 'memory', key: 'a'.repeat(16), specHash: freshHash, paramsHash: 'b'.repeat(64),
+        publishedAt: '2026-01-01T00:00:00Z' } });
     await page.locator('button[data-action="publish-snapshot"]:enabled').waitFor();
     assert.equal(await warning.count(), 0);
   });

@@ -82,7 +82,9 @@ test('strict selection does not probe without a REST slot, or accept a repeated 
       ? page([classItem('Asset')], { total: 1 }) : page(cards(start ? 1 : 2)), { maxRestCalls });
     assert.equal((await f.run()).truncated, true);
     assert.equal(f.requests.length, maxRestCalls);
-    assert.deepEqual(f.evidence.map((item) => item.reason), ['completeness_unconfirmed']);
+    assert.deepEqual(f.evidence.map(({ limitName, reason, observed, total }) => [limitName, reason, observed, total]), maxRestCalls === 2
+      ? [['maxRestCalls', 'limit_exceeded', 2, undefined]]
+      : [['maxSelectionScanRows', 'completeness_unconfirmed', 2, undefined]]);
   }
 });
 

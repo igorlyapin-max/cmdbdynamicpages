@@ -5712,7 +5712,8 @@ test('[required:snapshot-refresh] Static reports reread, refresh personally or r
     const csrf = await page.request.get(api + '/csrf');
     assert.equal(csrf.status(), 200);
     const headers = { origin: proxyOrigin, 'x-cmdbdynamicpages-csrf': (await csrf.json()).token };
-    const publicUrl = `${proxyOrigin}/cmdbuild/dynamicpages/ui/run/${reportCode}`;
+    const snapshotParams = JSON.stringify([['enabled', false], ['site', 42]]);
+    const publicUrl = `${proxyOrigin}/cmdbuild/dynamicpages/ui/run/${reportCode}?` + new URLSearchParams({ snapshotParams });
     const anonymous = await page.context().browser().newContext();
     const reader = await anonymous.newPage();
     async function createTemplate(code, description, spec) {
@@ -5737,11 +5738,12 @@ test('[required:snapshot-refresh] Static reports reread, refresh personally or r
         steps: [{ type: 'selectCards', as: 'source', className: 'Cst_QueryTemplate', columns: ['Description'],
           filters: [{ path: 'Code', op: 'equals', value: sourceCode }] }],
         result: { tables: [{ name: 'source', columns: ['Description'] }] },
-        publish: { mode: 'staticSnapshot', warningAccepted: true, paramsMode: 'ignore' }
+        publish: { mode: 'staticSnapshot', warningAccepted: true, paramsMode: 'exact' }
       };
       const report = await createTemplate(reportCode, 'Temporary snapshot refresh smoke', reportSpec);
       const publish = async (savedSpecHash) => {
-        const response = await page.request.post(api + '/templates/' + reportCode + '/publish', { headers, data: { savedSpecHash } });
+        const response = await page.request.post(api + '/templates/' + reportCode + '/publish', { headers,
+          data: { savedSpecHash, params: { site: 42, enabled: false } } });
         assert.equal(response.status(), 200, await response.text());
       };
       await publish(report.specHash);
@@ -5778,7 +5780,8 @@ test('[required:snapshot-refresh] Static reports reread, refresh personally or r
       page.once('dialog', (dialog) => dialog.accept());
       const [shared] = await Promise.all([page.waitForResponse(refreshRequest), action(page, 'refresh').click()]);
       assert.equal(shared.status(), 200, await shared.text());
-      assert.equal((await shared.json()).mode, 'shared');
+      const sharedAck = await shared.json();
+      assert.equal(sharedAck.mode, 'shared');
       await row(page, 'New shared value').waitFor();
       await action(reader, 'reload').click();
       await row(reader, 'New shared value').waitFor();
@@ -5790,6 +5793,43 @@ test('[required:snapshot-refresh] Static reports reread, refresh personally or r
       await page.locator('[data-snapshot-status].snapshot-error').waitFor();
       assert.equal(await row(page, 'New shared value').isVisible(), true);
       await page.unroute(route);
+
+      const check = page.locator('[data-action="check-current-snapshot"]');
+      const status = page.locator('[data-snapshot-status]');
+      const fixtures = [
+        { id: 'refresh-proven-timeout', status: 504, json: { success: false, action: 'refresh-snapshot', reason: 'snapshot_refresh_timeout' } },
+        { id: 'refresh-proxy-timeout', status: 504, body: 'Gateway Timeout', unknown: true },
+        { id: 'refresh-commit-unknown', status: 503, json: { success: false, action: 'refresh-snapshot', reason: 'snapshot_commit_outcome_unknown' }, unknown: true },
+        { id: 'refresh-invalid-success', status: 200, json: sharedAck, unknown: true }
+      ];
+      const posts = [];
+      page.on('request', (request) => {
+        if (request.method() === 'POST' && new URL(request.url()).pathname.endsWith(`/${reportCode}/refresh-snapshot`)) {
+          posts.push(request.postDataJSON());
+        }
+      });
+      for (const { id, unknown, ...reply } of fixtures) {
+        const intercept = (requestRoute) => requestRoute.fulfill({ ...reply, headers: { 'x-request-id': id } });
+        await page.route(route, intercept);
+        page.once('dialog', (dialog) => dialog.accept());
+        await Promise.all([page.waitForResponse(refreshRequest), action(page, 'refresh').click()]);
+        await status.filter({ hasText: id }).waitFor();
+        assert.equal(await check.isVisible(), Boolean(unknown));
+        assert.equal(await row(page, 'New shared value').isVisible(), true);
+        await page.unroute(route, intercept);
+      }
+      const [current] = await Promise.all([page.waitForResponse((response) =>
+        new URL(response.url()).pathname.endsWith(`/public-snapshots/${reportCode}/run`)), check.click()]);
+      assert.equal(current.request().method(), 'GET');
+      assert.equal(new URL(current.url()).searchParams.get('snapshotParams'), snapshotParams);
+      assert.equal((await current.json()).cache.snapshotRevision, sharedAck.cache.snapshotRevision);
+      const checked = page.locator('[data-snapshot-check-status]');
+      await checked.locator('a').waitFor();
+      assert.match(await checked.innerText(), /does not confirm the refresh attempt|не подтверждает результат попытки обновления/);
+      assert.ok((await checked.innerText()).includes(sharedAck.cache.publishedAt));
+      assert.equal(posts.length, fixtures.length);
+      assert.ok(posts.every(({ expectedMode, expectedSnapshotRevision }) =>
+        expectedMode === 'shared' && expectedSnapshotRevision === sharedAck.cache.snapshotRevision));
     } finally {
       await anonymous.close();
       for (const code of created.reverse()) {
@@ -5931,7 +5971,7 @@ test('[required:publication-limit-diagnostics] Snapshot publish and refresh expl
   });
 });
 
-test('[required:publication-outcome] Designer distinguishes a late server deadline from an unconfirmed publication', {
+test('[required:publication-outcome] Designer distinguishes a proven deadline from an unconfirmed publication', {
   skip: skipReason || (!useExactSnapshotFixture && process.env.CMDBDYNAMIC_E2E_WRITE !== '1' && 'Set CMDBDYNAMIC_E2E_WRITE=1 to use a temporary template.'),
   timeout: 60_000
 }, async () => {
@@ -5965,6 +6005,7 @@ test('[required:publication-outcome] Designer distinguishes a late server deadli
       const isPublish = (request) => request.method() === 'POST' && new URL(request.url()).pathname.endsWith(`/${code}/publish`);
       const [initial] = await Promise.all([page.waitForResponse((response) => isPublish(response.request())), publish.click()]);
       assert.equal(initial.status(), 200, await initial.text());
+      const initialAck = await initial.json();
       await page.getByText('Снимок опубликован.', { exact: true }).waitFor();
       const snapshotUrl = `${api}/public-snapshots/${code}/run?` + new URLSearchParams({ snapshotParams: JSON.stringify([['site', 42]]) });
       const initialSnapshot = await page.request.get(snapshotUrl);
@@ -5990,14 +6031,23 @@ test('[required:publication-outcome] Designer distinguishes a late server deadli
       let outcome = 'deadline';
       await page.route(`**/templates/${code}/publish?*`, async (route) => {
         posts.push(route.request().postDataJSON());
+        const headers = { 'x-request-id': outcome === 'deadline' ? 'publication-fixture-id' : `publication-${outcome}` };
         if (outcome === 'disconnect') {
           await disconnectGate;
           return route.abort('connectionreset');
         }
+        if (outcome === 'proxy-502') return route.fulfill({ status: 502, headers, body: '<html>Bad Gateway</html>' });
+        if (outcome === 'proxy-503') return route.fulfill({ status: 503, headers, json: { success: false, code: 'upstream_unavailable' } });
+        if (outcome === 'proxy-504') return route.fulfill({ status: 504, headers, body: 'Gateway Timeout' });
+        if (outcome === 'commit-unknown') return route.fulfill({ status: 503, headers, json: {
+          success: false, action: 'publish', reason: 'snapshot_commit_outcome_unknown', code: 'snapshot_commit_outcome_unknown'
+        } });
+        if (outcome === 'invalid-success') return route.fulfill({ status: 200, headers, json: { ...initialAck, cache: null } });
         if (outcome === 'deadline') await deadlineGate;
         const denied = outcome === 'denied';
-        return route.fulfill({ status: denied ? 403 : 504, headers: { 'x-request-id': 'publication-fixture-id' }, json: {
-          success: false, code: denied ? 'data_access_denied' : 'table_execution_timeout',
+        const reason = denied ? 'data_access_denied' : 'draft_preview_timeout';
+        return route.fulfill({ status: denied ? 403 : 504, headers, json: {
+          success: false, action: 'publish', reason, code: reason,
           ...(denied ? { permissionDeniedText: 'Нет прав на публикацию.' } : {}),
           diagnostics: { limits: evidence, omittedCount: 3, privateData: 'PRIVATE_FIXTURE' }
         } });
@@ -6035,18 +6085,41 @@ test('[required:publication-outcome] Designer distinguishes a late server deadli
       assert.match(await details.locator('summary').innerText(), /HTTP 403/);
       assert.equal(posts.length, 2);
 
+      for (const fixture of ['proxy-502', 'proxy-503', 'proxy-504', 'commit-unknown', 'invalid-success']) {
+        outcome = fixture;
+        await startPublish();
+        await check.waitFor();
+        await details.locator('summary').filter({ hasText: `publication-${fixture}` }).waitFor();
+        assert.match(await alert.innerText(), /Результат публикации неизвестен/);
+        assert.equal(await page.getByText('Снимок опубликован.', { exact: true }).count(), 0);
+      }
+      assert.equal(posts.length, 7);
+      assert.equal(checks.length, 0);
+
       outcome = 'disconnect';
-      await startPublish();
+      const [interrupted] = await startPublish();
+      const interruptedId = interrupted.headers()['x-request-id'];
       await page.locator('[data-run-param-field="site"]').fill('99');
       await page.locator('#cmdp-publish-params-mode').selectOption('ignore');
+      await page.locator('a[data-designer-section="templates"]').click();
+      const other = page.locator(`[data-action="select-template"]:not([data-code="${code}"])`).first();
+      await other.click();
+      await page.locator('a[data-designer-section="publication"]').click();
+      const failed = page.waitForEvent('requestfailed', isPublish);
       releaseDisconnect();
-      await check.waitFor();
+      await failed;
+      assert.equal(await check.count(), 0);
+      assert.equal(await details.count(), 0);
+      await page.locator('a[data-designer-section="templates"]').click();
+      await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
+      await page.locator('a[data-designer-section="publication"]').click();
+      await details.locator('summary').filter({ hasText: interruptedId }).waitFor();
       assert.ok((await check.boundingBox())?.height > 0);
       assert.match(await alert.innerText(), /Результат публикации неизвестен/);
       assert.equal(checks.length, 0);
-      assert.deepEqual(posts[2].params, { site: 42 });
+      assert.deepEqual(posts[7].params, { site: 42 });
       await page.clock.fastForward(snapshotRefreshTimeoutMs);
-      assert.equal(posts.length, 3);
+      assert.equal(posts.length, 8);
 
       const [checked] = await Promise.all([page.waitForResponse((response) =>
         new URL(response.url()).pathname.endsWith(`/public-snapshots/${code}/run`)), check.click()]);
@@ -6058,6 +6131,7 @@ test('[required:publication-outcome] Designer distinguishes a late server deadli
       await link.waitFor({ timeout: 5000 });
       assert.ok((await link.boundingBox())?.width > 0);
       assert.match(await notice.locator('[data-snapshot-check-status]').innerText(), /Это не подтверждает результат попытки публикации/);
+      assert.ok((await notice.locator('[data-snapshot-check-status]').innerText()).includes(initialSnapshotBody.cache.publishedAt));
       assert.equal(checks.length, 1);
       assert.equal(checks[0].method(), 'GET');
       const expectedParams = [['site', 42]];
@@ -6070,7 +6144,7 @@ test('[required:publication-outcome] Designer distinguishes a late server deadli
       assert.equal(await viewer.locator('[data-action="snapshot-refresh"]').isVisible(), false);
       await viewer.close();
       assert.equal(protectedRuns.length, 0);
-      assert.equal(posts.length, 3);
+      assert.equal(posts.length, 8);
     } finally {
       releaseDeadline();
       releaseDisconnect();
@@ -6179,6 +6253,86 @@ test('[required:large-report-tables] Viewer selects a key and lazily opens group
       } finally {
         tab.off('request', onRequest);
       }
+    }
+  });
+});
+
+test('[required:large-table-column-filter] A filter on the current result groups duplicate keys in dynamic and static reports', {
+  skip: skipReason || (!useExactSnapshotFixture && process.env.CMDBDYNAMIC_E2E_WRITE !== '1' && 'Set CMDBDYNAMIC_E2E_WRITE=1 to use temporary templates.'),
+  timeout: 75_000
+}, async () => {
+  await withPage(async (page) => {
+    const api = proxyOrigin + '/cmdbuild/custom-api';
+    const prefix = 'LargeColumnFixture' + Date.now();
+    const [first, second, other, code] = ['A', 'B', 'C', 'Report'].map((suffix) => prefix + suffix);
+    const choice = 'Matching system';
+    const url = proxyOrigin + '/cmdbuild/dynamicpages/ui/run/' + code;
+    const created = [];
+    const csrf = await page.request.get(api + '/csrf');
+    assert.equal(csrf.status(), 200);
+    const headers = { origin: proxyOrigin, 'x-cmdbdynamicpages-csrf': (await csrf.json()).token };
+    const anonymous = await page.context().browser().newContext();
+    try {
+      const emptySpec = { version: 1, steps: [], result: { tables: [] } };
+      await create(first, choice, emptySpec);
+      await create(second, choice, emptySpec);
+      await create(other, 'Other system', emptySpec);
+      await create(code, 'Filtered report', { version: 1, steps: [
+        { type: 'selectCards', as: 'reportRows', className: 'Cst_QueryTemplate', filters: [
+          { path: 'Code', op: 'matches', regex: '^' + prefix + '[ABC]$' }
+        ] },
+        { type: 'enrichRows', from: 'reportRows', as: 'reportRowsView', purpose: 'viewComposer', columns: [{ path: 'Code', as: 'Code' }] }
+      ], result: { tables: [{ name: 'reportRowsView', columns: ['Code'] }] } });
+      await page.goto(proxyOrigin + '/cmdbuild/dynamicpages/ui/designer', { waitUntil: 'domcontentloaded' });
+      await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
+      await page.locator('a[data-designer-section="final-view"]').click();
+      await page.locator('#cmdp-view-large-mode').selectOption('key');
+      await page.locator('#cmdp-view-large-simple-field').selectOption('Description');
+      const [result] = await Promise.all([
+        page.waitForResponse((response) => response.request().method() === 'PUT' && new URL(response.url()).pathname.endsWith('/' + code)),
+        page.locator('.designer-actionbar [data-action="save-template"]').click()
+      ]);
+      assert.equal(result.status(), 200, await result.text());
+      const dynamic = (await result.json()).template;
+      assert.deepEqual(dynamic.spec.result.tables[0].presentation.largeTable.selector, {
+        kind: 'result', source: 'reportRows', idField: 'Description', labelField: 'Description', matchField: 'Description'
+      });
+      assert.deepEqual(dynamic.spec.result.tables[0].columns, ['Code']);
+      await verify(page);
+      const saved = await page.request.put(api + '/templates/' + code, { headers,
+        data: { code, description: 'Filtered report', active: true, expectedSpecHash: dynamic.specHash,
+          spec: { ...dynamic.spec, publish: { mode: 'staticSnapshot', paramsMode: 'ignore', warningAccepted: true } } } });
+      assert.equal(saved.status(), 200, await saved.text());
+      const published = await page.request.post(api + '/templates/' + code + '/publish', { headers,
+        data: { savedSpecHash: (await saved.json()).template.specHash } });
+      assert.equal(published.status(), 200, await published.text());
+      await verify(await anonymous.newPage());
+    } finally {
+      await anonymous.close();
+      for (const name of created.reverse()) {
+        const response = await page.request.delete(api + '/templates/' + name, { headers });
+        assert.equal(response.status(), 200, await response.text());
+      }
+    }
+
+    async function create(name, description, spec) {
+      const response = await page.request.post(api + '/templates', { headers,
+        data: { code: name, description, active: true, spec } });
+      assert.equal(response.status(), 201, await response.text());
+      created.push(name);
+    }
+
+    async function verify(tab) {
+      await tab.goto(url, { waitUntil: 'domcontentloaded' });
+      const table = tab.locator('[data-large-table]');
+      await table.locator('[data-large-action="picker"]').click();
+      const options = table.locator('[data-large-action="option"]');
+      await options.filter({ hasText: 'Other system' }).waitFor();
+      assert.equal(await options.count(), 2);
+      await options.filter({ hasText: choice }).click();
+      const rows = table.locator('[data-large-rows] [data-result-row]');
+      await rows.getByText(second, { exact: true }).waitFor();
+      assert.deepEqual((await rows.allTextContents()).sort(), [first, second]);
     }
   });
 });

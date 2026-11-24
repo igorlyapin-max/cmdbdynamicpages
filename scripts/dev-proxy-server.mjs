@@ -8917,24 +8917,39 @@ async function redisCommand(parts, options = {}) {
   const commands = [];
   if (config.password) commands.push(['AUTH', config.password]);
   if (config.db) commands.push(['SELECT', config.db]);
-  commands.push(parts);
+  const commit = options.snapshotCommit;
+  commands.push(commit ? ['TIME'] : parts);
   const commandTimeoutMs = options.isolatedDiagnostics ? 5000 : REDIS_TIMEOUT_MS;
+  const deadlineWaitMs = commit ? commit.remainingMs() : Infinity;
+  const waitMs = Math.min(commandTimeoutMs, deadlineWaitMs);
+  if (waitMs <= 0) throw executionDeadlineTimeoutError();
   return await new Promise((resolve, reject) => {
     let settled = false;
+    let dispatched = false;
+    let nextCommand = 0;
     let buffer = Buffer.alloc(0);
     const socket = config.tls
       ? tls.connect(tlsOptions)
       : net.createConnection({ host: config.host, port: config.port });
-    const timer = setTimeout(() => {
-      socket.destroy();
-      finish(new Error(`Redis command timed out after ${commandTimeoutMs}ms.`));
-    }, commandTimeoutMs);
+    const timer = setTimeout(() => finish(waitMs === deadlineWaitMs ? executionDeadlineTimeoutError()
+      : new Error(`Redis command timed out after ${commandTimeoutMs}ms.`)), Math.ceil(waitMs));
     function finish(error, value, beforeDispatch = false) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       socket.destroy();
       if (error) {
+        if (commit) {
+          const deadlineExpired = error.code === 'draft_preview_timeout' || commit.remainingMs() <= 0;
+          if (dispatched) {
+            error = snapshotStoreError('snapshot_commit_outcome_unknown',
+              'The snapshot write was sent, but its outcome could not be confirmed. Reload the public report before retrying.');
+          } else if (deadlineExpired) {
+            error = executionDeadlineTimeoutError();
+          }
+          // Expiring the caller's budget is not evidence Redis is unavailable.
+          if (deadlineExpired) { reject(error); return; }
+        }
         if (beforeDispatch) { reject(error); return; }
         if (options.isolatedDiagnostics) {
           incMetric('cmdp_redis_errors_total', { reason: 'assistant_diagnostics' });
@@ -8973,18 +8988,52 @@ async function redisCommand(parts, options = {}) {
         resolve(value);
       }
     }
-    socket.on(config.tls ? 'secureConnect' : 'connect', () => {
-      try {
-        options.beforeSend?.();
-      } catch (error) {
-        finish(error, undefined, true);
+    function sendSnapshotCommand(command, isCommit = false) {
+      const encoded = encodeRedisCommand(command);
+      if (commit.remainingMs() <= 0) throw executionDeadlineTimeoutError();
+      if (commit.isDisconnected()) {
+        finish(new Error('Snapshot client disconnected before storage dispatch.'), undefined, true);
         return;
       }
-      commands.forEach((command) => socket.write(encodeRedisCommand(command)));
+      if (isCommit) dispatched = true;
+      socket.write(encoded);
+    }
+    socket.on(config.tls ? 'secureConnect' : 'connect', () => {
+      if (settled) return;
+      try {
+        if (commit) sendSnapshotCommand(commands[nextCommand++]);
+        else commands.forEach((command) => socket.write(encodeRedisCommand(command)));
+      } catch (error) {
+        finish(error);
+      }
     });
     socket.on('data', (chunk) => {
+      if (settled) return;
       try {
         buffer = Buffer.concat([buffer, chunk]);
+        if (commit) {
+          const parsed = parseRedisReply(buffer);
+          if (!parsed) return;
+          buffer = buffer.subarray(parsed.offset);
+          if (dispatched) {
+            if (![-1, 0, 1].includes(parsed.value)) throw new Error('Invalid Redis snapshot commit reply.');
+            finish(null, parsed.value);
+          } else if (nextCommand < commands.length) {
+            if (parsed.value !== 'OK') throw new Error('Invalid Redis session setup reply.');
+            sendSnapshotCommand(commands[nextCommand++]);
+          } else {
+            const [seconds, microseconds] = Array.isArray(parsed.value) ? parsed.value : [];
+            if (!/^\d+$/.test(seconds ?? '') || !/^\d{1,6}$/.test(microseconds ?? '')) {
+              throw new Error('Invalid Redis TIME reply.');
+            }
+            const timeMs = Number(seconds) * 1000 + Math.floor(Number(microseconds) / 1000);
+            // TIME ran before its reply arrived; do not add that transit time to the budget.
+            const redisDeadlineMs = timeMs + Math.floor(commit.remainingMs());
+            if (!Number.isSafeInteger(redisDeadlineMs)) throw new Error('Invalid Redis snapshot deadline.');
+            sendSnapshotCommand([...parts, redisDeadlineMs, ...(commit.revision === undefined ? [] : [commit.revision])], true);
+          }
+          return;
+        }
         let offset = 0;
         const replies = [];
         while (replies.length < commands.length) {
@@ -8999,6 +9048,7 @@ async function redisCommand(parts, options = {}) {
       }
     });
     socket.on('error', finish);
+    if (commit) socket.on('close', () => finish(new Error('Redis connection closed without a complete reply.')));
   });
 }
 
@@ -9772,6 +9822,13 @@ function extractDesignerSection(pathname, requestUrl) {
   return /^[a-z0-9-]+$/.test(section) ? section : '';
 }
 
+function renderViewLargeExecutionHelpers() {
+  return [
+    normalizeStringList, normalizePathColumnSpecs, normalizeComposeColumns, composeRightAlias,
+    buildMatchRowsColumnMapping, buildRightColumnMapping, normalizeRowOperationKeys
+  ].map((helper) => helper.toString()).join('\n');
+}
+
 function renderDynamicPagesShell({ mode, session, templateCode = '', designerSection = '', publicRuntime = false, snapshotRefreshSessionPresent = false, root = DEFAULT_TECHNICAL_ROOT }) {
   const boot = JSON.stringify({
     mode,
@@ -9849,6 +9906,10 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     .view-column-table-wrap{max-width:100%;overflow:auto}.view-column-order-cell{width:1%;vertical-align:middle}
     #cmdp-view-large-table{min-width:0}#cmdp-view-large-table .settings-grid{grid-template-columns:repeat(auto-fit,minmax(min(100%,190px),1fr))}#cmdp-view-large-table .setting-field{display:grid;gap:4px;min-width:0}#cmdp-view-large-table .setting-field>span{color:var(--muted);font-size:12px}#cmdp-view-large-table .setting-field button{max-width:100%;overflow:hidden;text-overflow:ellipsis}#cmdp-view-large-table [data-view-large-details]:not([hidden]),#cmdp-view-large-table [data-view-large-reductions],#cmdp-view-large-table [data-view-large-tuple-fields]{display:grid;gap:8px}#cmdp-view-large-table [data-view-large-reduction]{border-top:1px solid var(--line);padding-top:8px}#cmdp-view-large-table [data-view-large-reduction] strong{display:block;overflow-wrap:anywhere;margin-bottom:4px}@media(max-width:768px){#cmdp-view-large-table select,#cmdp-view-large-table button,#cmdp-view-large-table input:not([type=checkbox]){min-height:44px}#cmdp-view-large-table .compact-multi-select-option{min-height:44px}}
     @media(max-width:768px){.view-column-order{grid-template-columns:24px repeat(2,44px)}.view-column-order button{height:44px}}
+    #cmdp-view-large-table .field-label-row>label,#cmdp-view-large-table .field-label-row>span:first-child{min-width:0;overflow-wrap:anywhere}
+    .view-large-advanced>summary{cursor:pointer;padding-block:6px}.view-large-advanced>.settings-grid{margin-top:6px}
+    .field-help[data-positioned-field-help] .field-help-tooltip{position:fixed;box-sizing:border-box;inset:auto;left:var(--field-help-left,8px);top:var(--field-help-top,8px);min-width:0;max-width:min(360px,calc(100vw - 16px));max-height:calc(100dvh - 16px);overflow:auto;overflow-wrap:anywhere}
+    .field-help[data-positioned-field-help].pinned:not(.dismissed) .field-help-tooltip{display:block}
     @media(max-width:600px){.view-column-order{grid-template-columns:44px}.view-column-order .view-column-grip{display:none}}
     .designer-menu{position:fixed;left:16px;top:64px;bottom:14px;width:246px;overflow:auto;border:1px solid var(--line);background:#fff;padding:10px;display:grid;gap:10px;z-index:10}.designer-main{margin-left:266px}.designer-actionbar{position:sticky;top:0;z-index:30;border:1px solid var(--line);background:rgba(255,255,255,.96);box-shadow:0 6px 16px rgba(15,23,42,.08);padding:8px 10px;margin:0 0 12px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.designer-actionbar-title{font-weight:bold;color:#334e68;white-space:nowrap}.designer-actionbar-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;min-width:0;flex:1 1 auto}.designer-actionbar-context{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));align-items:start;gap:6px 12px;min-width:0;max-width:100%;flex:1 1 100%}.designer-actionbar-context .run-launch-url,.designer-actionbar-context .run-launch-params{grid-template-columns:1fr;min-width:0;flex:initial}.menu-groups{display:grid;grid-template-columns:1fr;gap:10px}.menu-group strong{display:block;font-size:12px;color:#334e68;margin-bottom:6px}.menu-links{display:grid;grid-template-columns:1fr;gap:5px}.menu-links a{border:1px solid var(--line);background:#f8fafc;color:var(--text);padding:5px 7px;border-radius:4px;text-decoration:none;font-size:12px}.menu-links a.active{background:#e6f4f1;border-color:#86b7b3;color:#07575b;font-weight:bold}.menu-links a.disabled{background:#f4f6f8;color:#9aa5b1;border-color:#e4e7eb;cursor:not-allowed}.template-context{border:1px solid #b7d8d4;background:#f2faf8;padding:8px 10px;margin-bottom:12px}.template-context strong{margin-right:6px}.template-context .code-inline{font-weight:bold}
     button,a.button{border:1px solid #9fb3c8;background:#fff;color:var(--text);padding:6px 10px;border-radius:4px;cursor:pointer;text-decoration:none;display:inline-block}
@@ -9928,6 +9989,7 @@ function dynamicPagesClientScript() {
   var DEFAULT_TEMPLATE_CACHE_TTL_SEC = ${JSON.stringify(DEFAULT_TEMPLATE_CACHE_TTL_SEC)};
   var resolveTemplateParameters = (${resolveTemplateParameters.toString()});
   var staticSnapshotParamPairs = (${staticSnapshotParamPairs.toString()});
+  ${renderViewLargeExecutionHelpers()}
   var D2_IMPORT_SEMANTIC_MODEL_REVISION = ${JSON.stringify(D2_IMPORT_SEMANTIC_MODEL_REVISION)};
   var D2_IMPORT_ENDPOINT_PROFILE_VERSION = ${JSON.stringify(D2_IMPORT_ENDPOINT_PROFILE_VERSION)};
   var D2_IMPORT_STRUCTURE_TREE_VERSION = ${JSON.stringify(D2_IMPORT_STRUCTURE_TREE_VERSION)};
@@ -10488,6 +10550,9 @@ function dynamicPagesClientScript() {
       snapshotCheckingCurrent: 'Checking the current snapshot…',
       snapshotCurrentFound: 'A current snapshot is available. This does not confirm the publication attempt.',
       snapshotCurrentMissing: 'No current snapshot was found. The publication outcome is still unknown.',
+      snapshotRefreshCurrentFound: 'A current snapshot is available. This does not confirm the refresh attempt.',
+      snapshotRefreshCurrentMissing: 'No current snapshot was found. The refresh outcome is still unknown.',
+      snapshotCurrentPublishedAt: 'Published: {time}',
       snapshotCheckFailed: 'Could not check the current snapshot.',
       snapshotOpenCurrent: 'Open current snapshot',
       cacheEditor: 'Caching',
@@ -11012,14 +11077,27 @@ function dynamicPagesClientScript() {
       viewLargeNormal: 'Regular table',
       viewLargeAll: 'All rows, paginated',
       viewLargeKey: 'By selected object',
+      viewLargeModeHelp: 'All rows, paginated shows the entire result in pages. By selected object shows a list of values first, then only the rows matching your choice.',
+      viewLargeSelectorMode: 'Filter setup',
+      viewLargeSimple: 'From a column',
+      viewLargeAdvanced: 'Advanced settings',
+      viewLargeAdvancedFields: 'Option and matching fields',
+      viewLargeSimpleField: 'Filter by column',
+      viewLargeSimpleFieldHelp: 'The list contains distinct, non-empty values from one column of this result. Choose a field with one value per row. It does not need to be a visible table column.',
       viewLargeSourceKind: 'Option source type',
+      viewLargeSourceKindHelp: 'Use a confirmed flow result to keep the flow’s selection rules. A CMDBuild class is read separately and can include objects with no matching report rows.',
       viewLargeClass: 'CMDBuild class',
       viewLargeResult: 'Confirmed flow result',
       viewLargeSource: 'Option source',
+      viewLargeSourceHelp: 'Choose the result or class that supplies items for the list. It can differ from the table source; for example, list systems from one result and show groups from another.',
       viewLargeId: 'Option identifier field',
+      viewLargeIdHelp: 'The value used to find matching rows, for example the system card identifier (_id). Repeated keys appear as one item in the list.',
       viewLargeLabel: 'Option label field',
+      viewLargeLabelHelp: 'The text shown in the list, for example the system name. The label is not used to match rows.',
       viewLargeMatch: 'Matching field in the table source',
+      viewLargeMatchHelp: 'The value in each table row compared with the selected identifier. For example, match the system card identifier (_id) to SourceId in the group rows. It can be a hidden column.',
       viewLargeParameter: 'Input parameter for the selected key',
+      viewLargeParameterHelp: 'Optional. Passes the key to an existing parameter used by the dynamic selection. It does not add a filter by itself. Viewing a static snapshot does not rerun the flow.',
       viewLargeNoParameter: 'No parameter',
       viewLargeGroupKeys: 'Grouping key columns',
       viewLargeReductions: 'Column reductions',
@@ -11302,6 +11380,7 @@ function dynamicPagesClientScript() {
       snapshotRefreshedShared: 'Shared snapshot updated.',
       snapshotRefreshConflict: 'The template or snapshot changed. Reload the snapshot and try again.',
       snapshotRefreshFailed: 'Could not refresh the report.',
+      snapshotRefreshOutcomeUnknown: 'Shared refresh outcome is unknown. Check the current snapshot before refreshing again.',
       snapshotReloadFailed: 'Could not reload the snapshot.',
       snapshotRefreshLimited: 'The report could not be fully calculated within the execution limits.',
       reportLimitPhase_selector: 'Selector options',
@@ -11961,6 +12040,9 @@ function dynamicPagesClientScript() {
       snapshotCheckingCurrent: 'Проверяется текущий снимок…',
       snapshotCurrentFound: 'Текущий снимок доступен. Это не подтверждает результат попытки публикации.',
       snapshotCurrentMissing: 'Текущий снимок не найден. Результат публикации по-прежнему неизвестен.',
+      snapshotRefreshCurrentFound: 'Текущий снимок доступен. Это не подтверждает результат попытки обновления.',
+      snapshotRefreshCurrentMissing: 'Текущий снимок не найден. Результат обновления по-прежнему неизвестен.',
+      snapshotCurrentPublishedAt: 'Опубликован: {time}',
       snapshotCheckFailed: 'Не удалось проверить текущий снимок.',
       snapshotOpenCurrent: 'Открыть текущий снимок',
       cacheEditor: 'Кэширование',
@@ -12485,14 +12567,27 @@ function dynamicPagesClientScript() {
       viewLargeNormal: 'Обычная таблица',
       viewLargeAll: 'Все строки, постранично',
       viewLargeKey: 'По выбранному объекту',
+      viewLargeModeHelp: '«Все строки, постранично» показывает весь результат порциями. «По выбранному объекту» сначала предлагает список значений, затем показывает строки для выбранного значения.',
+      viewLargeSelectorMode: 'Настройка фильтра',
+      viewLargeSimple: 'По колонке',
+      viewLargeAdvanced: 'Расширенные настройки',
+      viewLargeAdvancedFields: 'Источник вариантов и сопоставление',
+      viewLargeSimpleField: 'Фильтровать по колонке',
+      viewLargeSimpleFieldHelp: 'В список попадут уникальные непустые значения одной колонки текущей выборки. Выберите поле с одним значением в каждой строке. Делать его видимой колонкой не нужно.',
       viewLargeSourceKind: 'Тип источника вариантов',
+      viewLargeSourceKindHelp: 'Результат потока сохраняет правила настроенной выборки. Класс CMDBuild читается отдельно: в список могут попасть объекты, для которых в таблице нет строк.',
       viewLargeClass: 'Класс CMDBuild',
       viewLargeResult: 'Подтверждённый результат потока',
       viewLargeSource: 'Источник вариантов',
+      viewLargeSourceHelp: 'Выберите конкретный результат или класс, из которого брать пункты списка. Он может отличаться от источника таблицы: например, список из выборки ИС, а строки из выборки групп.',
       viewLargeId: 'Поле идентификатора варианта',
+      viewLargeIdHelp: 'Значение, по которому ищутся строки, например идентификатор карточки ИС (_id). Одинаковые ключи объединяются в один пункт списка.',
       viewLargeLabel: 'Поле подписи варианта',
+      viewLargeLabelHelp: 'Текст, который увидит пользователь, например название ИС. Подпись не участвует в сравнении строк.',
       viewLargeMatch: 'Поле сопоставления в источнике таблицы',
+      viewLargeMatchHelp: 'Значение строки таблицы, с которым сравнивается выбранный идентификатор. Например, _id ИС сравнивается с SourceId в строках групп. Поле не обязано быть видимой колонкой.',
       viewLargeParameter: 'Входной параметр для выбранного ключа',
+      viewLargeParameterHelp: 'Необязательно. Передаёт ключ в существующий параметр динамической выборки, которая уже его использует. Сам фильтр не создаёт. Просмотр статического снимка не запускает цепочку заново.',
       viewLargeNoParameter: 'Без параметра',
       viewLargeGroupKeys: 'Колонки ключа группировки',
       viewLargeReductions: 'Свёртка колонок',
@@ -12775,6 +12870,7 @@ function dynamicPagesClientScript() {
       snapshotRefreshedShared: 'Общий снимок обновлён.',
       snapshotRefreshConflict: 'Шаблон или снимок изменился. Перечитайте снимок и повторите попытку.',
       snapshotRefreshFailed: 'Не удалось обновить отчёт.',
+      snapshotRefreshOutcomeUnknown: 'Результат обновления общего снимка неизвестен. Проверьте текущий снимок перед повторным обновлением.',
       snapshotReloadFailed: 'Не удалось перечитать снимок.',
       snapshotRefreshLimited: 'Не удалось полностью рассчитать отчёт в пределах лимитов выполнения.',
       reportLimitPhase_selector: 'Варианты выбора',
@@ -13056,6 +13152,8 @@ function dynamicPagesClientScript() {
     runtimeRefreshInProgress: false,
     snapshotRefreshMode: '',
     snapshotRevision: '',
+    snapshotCache: null,
+    runtimeSnapshotCheck: null,
     runtimeCountdownTimer: null,
     technicalSchemaAccessDenied: false,
     accessDeniedText: DEFAULT_PERMISSION_DENIED_TEXT
@@ -13101,6 +13199,7 @@ function dynamicPagesClientScript() {
         state.sessionInstance = Number(state.sessionInstance || 0) + 1;
         state.runtimeSettingsDraft = null;
         state.templatePublicationNotices.clear();
+        state.lastPublishedReportLink = null;
       }
       designerSession = value;
     }
@@ -13757,7 +13856,7 @@ function dynamicPagesClientScript() {
     if (controller) options.signal = controller.signal;
     var timeoutMs = remainingRequestDeadlineMs(deadlineAt, path, requestContext);
     var timedOut = false;
-    var publishFailureResponse = null;
+    var snapshotResponseHeaders = null;
     var timeoutId = null;
     var cancelHandler = null;
     var cancelled = new Promise(function (_, reject) {
@@ -13784,15 +13883,17 @@ function dynamicPagesClientScript() {
       if (requestContext.requestSent === false && requestContext.method === 'POST') requestContext.requestSent = true;
       return fetch(path, options);
     }).then(function (response) {
-      if (requestContext.phase === 'publish' && !response.ok) publishFailureResponse = responseResult(response, requestContext, '');
+      if ((requestContext.phase === 'publish' || requestContext.phase === 'refresh-snapshot') && (!response.ok || requestContext.requestSent)) {
+        snapshotResponseHeaders = responseResult(response, requestContext, '');
+      }
       return parseResponse(response, requestContext);
     });
     return Promise.race([operation, timeout, cancelled]).finally(function () {
       window.clearTimeout(timeoutId);
       if (callerSignal && cancelHandler) callerSignal.removeEventListener('abort', cancelHandler);
     }).catch(function (error) {
-      // A known HTTP failure (including a CSRF denial) is not an unknown publication outcome.
-      if (publishFailureResponse) return publishFailureResponse;
+      // Keep the status and request ID even if the snapshot response body was lost.
+      if (snapshotResponseHeaders) return snapshotResponseHeaders;
       if (timedOut && (!error || error.code !== 'request_timeout')) throw requestTimeoutError(path, requestContext);
       if (!error.diagnostic) error.diagnostic = uiRequestDiagnostics.exception(error, requestContext);
       throw error;
@@ -13841,7 +13942,8 @@ function dynamicPagesClientScript() {
       blockName: options.blockName
     };
     requestContext.action = options.action || requestContext.owner.action || requestContext.owner.section;
-    if (options.phase === 'publish' || ['assistant.semanticPlan', 'assistant.objectFlow', 'assistant.objectFlowApply', 'designer.extraction'].indexOf(requestContext.action) !== -1) {
+    if (options.phase === 'publish' || options.phase === 'refresh-snapshot' ||
+        ['assistant.semanticPlan', 'assistant.objectFlow', 'assistant.objectFlowApply', 'designer.extraction'].indexOf(requestContext.action) !== -1) {
       requestContext.requestSent = false;
     }
     var maxRetries = method === 'GET' ? Math.max(0, Math.min(3, Number(options.maxRetries === undefined ? 2 : options.maxRetries) || 0)) : 0;
@@ -15238,6 +15340,59 @@ function dynamicPagesClientScript() {
       && (json.result.diagrams === undefined || Array.isArray(json.result.diagrams));
     if (!valid) throw createRequestError(result, true);
     return result;
+  }
+
+  function isSnapshotHash(value) {
+    return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+  }
+
+  function isSnapshotResult(json, action, code) {
+    return json && json.success === true && json.action === action && json.template?.code === code &&
+      json.result && Array.isArray(json.result.tables) &&
+      (json.result.diagrams === undefined || Array.isArray(json.result.diagrams));
+  }
+
+  function isPersistedSnapshotCache(cache, status) {
+    return cache && cache.scope === 'staticSnapshot' && cache.status === status && cache.enabled === true &&
+      cache.sharedAcrossUsers === true && ['redis', 'memory'].indexOf(cache.backend) !== -1 &&
+      typeof cache.key === 'string' && /^[0-9a-f]{16}$/.test(cache.key) &&
+      typeof cache.publishedAt === 'string' && Number.isFinite(Date.parse(cache.publishedAt)) &&
+      isSnapshotHash(cache.specHash) && (cache.paramsHash === 'any' || isSnapshotHash(cache.paramsHash));
+  }
+
+  function validateSnapshotMutationResponse(result, action, expected) {
+    var json = result.json;
+    var cache = json && json.cache;
+    var valid = isSnapshotResult(json, action, expected.code) && json.template.active === true;
+    if (valid && action === 'publish') {
+      valid = isPersistedSnapshotCache(cache, 'snapshot-published') && cache.specHash === expected.specHash &&
+        (cache.paramsHash === 'any') === (expected.paramsMode === 'ignore');
+      if (valid && expected.paramsMode === 'exact') {
+        try { valid = exactReportLaunchQuery(json.params).snapshotParams === expected.query.snapshotParams; }
+        catch (_) { valid = false; }
+      }
+    } else if (valid) {
+      valid = json.snapshotFound === true && json.mode === expected.mode && (expected.mode === 'personal' ? cache === null :
+        isPersistedSnapshotCache(cache, 'snapshot-published') && isSnapshotHash(cache.snapshotRevision) &&
+        cache.snapshotRevision !== expected.snapshotRevision && cache.key === expected.cache?.key &&
+        cache.specHash === expected.cache?.specHash && cache.paramsHash === expected.cache?.paramsHash);
+    }
+    if (!valid) throw createRequestError(result, true);
+  }
+
+  function snapshotMutationOutcomeUnknown(result, diagnostic, action) {
+    if (!diagnostic?.requestSent) return false;
+    if (!result) return diagnostic.responseFormat === 'none';
+    if (result.ok) return true; // Called only if the success envelope failed validation.
+    if ([502, 503, 504].indexOf(result.status) === -1) return false;
+    var json = result.json;
+    if (json?.success !== false || json.action !== action) return true;
+    var reason = json.reason || json.code;
+    // Only API failures known to precede the write prove a gateway status is definitive.
+    if (result.status === 504) return reason !== (action === 'publish' ? 'draft_preview_timeout' : 'snapshot_refresh_timeout');
+    if (result.status === 503) return reason !== 'snapshot_storage_unavailable';
+    return (action === 'publish' ? ['publication_template_recheck_failed'] :
+      ['snapshot_refresh_template_unavailable', 'snapshot_refresh_data_unavailable']).indexOf(reason) === -1;
   }
 
   function createRequestError(result, invalidEnvelope) {
@@ -17333,12 +17488,12 @@ function dynamicPagesClientScript() {
     var label = catalogFieldPickerSelectedLabel(initialOptions, selected);
     var disabled = Boolean(context.disabled);
     var contextAttributes = Object.keys(context).map(function (key) {
-      if (key === 'disabled' || key === 'labelledby') return '';
+      if (key === 'disabled' || key === 'labelledby' || key === 'describedby') return '';
       return ' data-catalog-field-picker-' + escapeHtml(key) + '="' + escapeHtml(String(context[key] || '')) + '"';
     }).join('');
     return '<div class="catalog-field-picker" data-catalog-field-picker' + contextAttributes + '>' +
       '<input type="hidden" data-catalog-field-picker-value data-catalog-field-picker-selected-label="' + escapeHtml(label) + '" ' + fieldAttribute + ' value="' + escapeHtml(selected) + '"' + (disabled ? ' disabled' : '') + '>' +
-      '<button type="button" class="catalog-field-picker-toggle" data-action="catalog-field-picker-toggle" aria-expanded="false"' + (context.labelledby ? ' id="' + escapeHtml(context.labelledby + '-value') + '" aria-labelledby="' + escapeHtml(context.labelledby + ' ' + context.labelledby + '-value') + '"' : '') + (disabled ? ' disabled' : '') + '>' + escapeHtml(label || t('fieldPickerChoose')) + '</button>' +
+      '<button type="button" class="catalog-field-picker-toggle" data-action="catalog-field-picker-toggle" aria-expanded="false"' + (context.labelledby ? ' id="' + escapeHtml(context.labelledby + '-value') + '" aria-labelledby="' + escapeHtml(context.labelledby + ' ' + context.labelledby + '-value') + '"' : '') + (context.describedby ? ' aria-describedby="' + escapeHtml(context.describedby) + '"' : '') + (disabled ? ' disabled' : '') + '>' + escapeHtml(label || t('fieldPickerChoose')) + '</button>' +
       '<div class="catalog-field-picker-menu" data-catalog-field-picker-menu hidden><input type="search" data-catalog-field-picker-search placeholder="' + escapeHtml(t('fieldPickerSearch')) + '" autocomplete="off" aria-label="' + escapeHtml(t('fieldPickerSearchAria')) + '"><div role="listbox" data-catalog-field-picker-results>' +
         renderCatalogFieldPickerPrompt() + '</div></div></div>';
   }
@@ -17404,9 +17559,12 @@ function dynamicPagesClientScript() {
       return { value: item.name, label: item.label || item.name };
     });
     if (kind === 'viewLargeAttribute') return viewLargeClassFieldOptions(picker.getAttribute('data-catalog-field-picker-class'));
-    if (kind === 'viewLargeMatch') {
-      var viewDraft = captureViewComposerDraftFromDom();
-      return viewLargeColumnOptions(viewDraft.columns).concat(diagramColumnOptionRowsForSource(readCurrentSpec(), viewDraft.sourceAlias, query));
+    if (kind === 'viewLargeMatch' || kind === 'viewLargeResult') {
+      var spec = readCurrentSpec();
+      var alias = picker.getAttribute('data-catalog-field-picker-source');
+      var fields = Array.from(viewLargeSourceFields(spec, alias).values());
+      if (kind === 'viewLargeMatch') fields = viewLargeColumnOptions(captureViewComposerDraftFromDom().columns).concat(fields);
+      return fields.concat(diagramColumnOptionRowsForSource(spec, alias, query));
     }
     if (kind === 'scope') return catalogScopePathOptions(picker.getAttribute('data-catalog-field-picker-class') || '', query);
     if (kind === 'related') return relatedTargetColumnOptions(picker.getAttribute('data-catalog-field-picker-class') || '', '', query);
@@ -17474,7 +17632,7 @@ function dynamicPagesClientScript() {
       var draft = captureObjectGroupDraftFromDom();
       var sourceAlias = String(selection && selection.querySelector('[data-object-selection-field="from"]') && selection.querySelector('[data-object-selection-field="from"]').value || '').trim();
       flowCatalogRootClassNames(draft, readCurrentSpec(), sourceAlias, selectionIndex).forEach(add);
-    } else if (kind === 'diagram' || kind === 'view' || kind === 'selection' || kind === 'viewLargeMatch') {
+    } else if (kind === 'diagram' || kind === 'view' || kind === 'selection' || kind === 'viewLargeMatch' || kind === 'viewLargeResult') {
       add(sourceClassForAlias(readCurrentSpec(), picker.getAttribute('data-catalog-field-picker-source') || ''));
     } else if (kind === 'stage') {
       var stageSpec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
@@ -18640,6 +18798,13 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
+  function renderFieldHelp(id, label, help, positioned) {
+    var helpId = id + '-help';
+    return '<span class="field-help"' + (positioned ? ' data-positioned-field-help' : '') + '><button type="button" class="field-help-button" aria-label="' +
+      escapeHtml(t('fieldHelpAria', { label: label })) + '" aria-describedby="' + escapeHtml(helpId) + '">?</button>' +
+      '<span class="field-help-tooltip" id="' + escapeHtml(helpId) + '" role="tooltip">' + escapeHtml(help) + '</span></span>';
+  }
+
   function renderNumberSetting(id, labelKey, helpKey, value, options) {
     options = options || {};
     var label = t(labelKey);
@@ -18655,8 +18820,7 @@ function dynamicPagesClientScript() {
     ];
     if (options.max) attrs.push('max="' + escapeHtml(options.max) + '"');
     return '<div class="setting-field"><div class="field-label-row"><label for="' + escapeHtml(id) + '">' + escapeHtml(label) + '</label>' +
-      '<span class="field-help"><button type="button" class="field-help-button" aria-label="' + escapeHtml(t('fieldHelpAria', { label: label })) + '" aria-describedby="' + escapeHtml(helpId) + '">?</button>' +
-      '<span class="field-help-tooltip" id="' + escapeHtml(helpId) + '" role="tooltip">' + escapeHtml(help) + '</span></span></div>' +
+      renderFieldHelp(id, label, help) + '</div>' +
       '<input ' + attrs.join(' ') + '></div>';
   }
 
@@ -25720,6 +25884,11 @@ function dynamicPagesClientScript() {
     }).map(function (column) { return { value: column.field, label: column.title }; });
   }
 
+  function viewLargeAttributeIsMultiple(attribute) {
+    return Boolean(attribute && (/array|multiple|multivalue/i.test(attribute.type) ||
+      attribute.multiple === true || attribute.multiValued === true));
+  }
+
   function viewLargeClassFieldOptions(className) {
     return className ? catalogAttributeOptions(className).map(function (attribute) {
       return { value: attribute.name, label: attribute.description || attribute.name };
@@ -25739,39 +25908,188 @@ function dynamicPagesClientScript() {
     return uniqueList(aliases).map(function (alias) { return { value: alias, label: userFacingResultLabel(alias, spec) }; });
   }
 
+  function viewLargeDeclaredColumns(spec, alias) {
+    var visual = getStoredVisualModel(spec, 'viewComposer');
+    var source = visual && visual.source || {};
+    return uniqueList(tableColumnsForAlias(spec, alias).concat(source.alias === alias && Array.isArray(source.columns) ? source.columns : []));
+  }
+
+  function viewLargeSourceFields(spec, sourceAlias) {
+    var steps = new Map((spec.steps || []).filter(Boolean).map(function (step) { return [step.as, step]; }));
+    var fieldsByAlias = new Map();
+    var standard = ['Class', '_id', 'Code', 'Description'];
+    function pathIsMultiple(path, className) {
+      return path.split('.').some(function (part) {
+        if (!className) return false;
+        var domain = /^\{[^:}]+:([^}]+)\}$/.exec(part);
+        if (domain) {
+          className = domain[1];
+          return false;
+        }
+        var attribute = catalogAttributeOptions(className).find(function (item) { return item.name === part; });
+        className = attribute && (attribute.targetClass || attribute.targetType) || '';
+        return viewLargeAttributeIsMultiple(attribute);
+      });
+    }
+    function fieldsFor(alias) {
+      if (fieldsByAlias.has(alias)) return fieldsByAlias.get(alias);
+      var step = steps.get(alias);
+      if (!step) return new Map();
+      var fields = new Map();
+      fieldsByAlias.set(alias, fields);
+      function add(name, multiple, label) {
+        if (name) fields.set(name, { value: name, label: label || name, multiple: Boolean(multiple) });
+      }
+      function project(columns, classes) {
+        normalizePathColumnSpecs(columns).forEach(function (column) {
+          var origin = fields.get(column.path);
+          add(column.as, origin ? origin.multiple : classes.some(function (name) { return pathIsMultiple(column.path, name); }));
+        });
+      }
+      if (step.type === 'selectCards' || step.type === 'expandRelations') {
+        var relation = step.type === 'expandRelations';
+        var classes = relation ? normalizeStringList(step.targetClass) : normalizeStringList(step.className);
+        if (relation) {
+          ['SourceClass', 'SourceId', 'SourceCode', 'SourceDescription', 'Domain', 'RelationId', 'RelationDirection', 'RelationSourceSide',
+            'RelatedClass', 'RelatedId', 'RelatedReadStatus'].forEach(function (name) { add(name); });
+        }
+        standard.forEach(function (name) { add(name); });
+        if (!relation) addAttributes();
+        if (step.includeSource !== false && step.from) {
+          var prefix = step.sourcePrefix === undefined ? 'Source_' : String(step.sourcePrefix);
+          fieldsFor(step.from).forEach(function (item, name) {
+            if (!relation || standard.indexOf(name) === -1) add(prefix + name, item.multiple);
+          });
+        }
+        function addAttributes() {
+          classes.forEach(function (name) {
+            catalogAttributeOptions(name).forEach(function (attribute) {
+              if (!attribute.name.startsWith('_') && standard.indexOf(attribute.name) === -1) {
+                add(attribute.name, (fields.get(attribute.name) || {}).multiple || viewLargeAttributeIsMultiple(attribute), attribute.description);
+              }
+            });
+          });
+        }
+        if (relation && step.fetchRelated !== false) addAttributes();
+        project(relation ? normalizeStringList(step.columns || step.relatedColumns).filter(function (path) {
+          return path.includes('.') || path.includes('{');
+        }) : [].concat(step.columns || step.cardColumns || step.outputColumns || []), classes);
+      } else if (step.type === 'composeRows' || step.type === 'compose') {
+        var left = fieldsFor(step.from);
+        var right = fieldsFor(composeRightAlias(step));
+        normalizeComposeColumns(step).forEach(function (column) {
+          var origin = (column.source === 'right' ? right : left).get(column.column);
+          add(column.name, column.hasValue ? Array.isArray(column.value) : !column.valueParam && !column.template && origin && origin.multiple);
+        });
+      } else if (['filterRows', 'semiJoinRows', 'existsRelatedRows', 'intersectRows', 'differenceRows', 'unionRows', 'enrichRows', 'matchRows', 'joinRows'].includes(step.type)) {
+        fieldsFor(step.from).forEach(function (item, name) { fields.set(name, item); });
+        if (step.type === 'unionRows') fieldsFor(step.with).forEach(function (item, name) {
+          var current = fields.get(name);
+          add(name, item.multiple || current && current.multiple, current && current.label || item.label);
+        });
+        if (step.type === 'matchRows' || step.type === 'joinRows') {
+          var rightFields = fieldsFor(step.with);
+          var leftNames = Array.from(fields.keys());
+          var rightNames = Array.from(rightFields.keys());
+          var mapping;
+          try {
+            mapping = step.type === 'matchRows' ? buildMatchRowsColumnMapping(leftNames, rightNames, step)
+              : buildRightColumnMapping(leftNames, rightNames, normalizeRowOperationKeys(step), step);
+          } catch (_) {
+            fields.clear();
+            return fields;
+          }
+          mapping.mapping.forEach(function (item) {
+            var origin = rightFields.get(item.source);
+            add(item.target, origin.multiple, item.target === item.source ? origin.label : item.target);
+          });
+        }
+        if (step.type === 'enrichRows') project(step.columns || step.fields, [sourceClassForAlias(spec, step.from)]);
+      }
+      viewLargeDeclaredColumns(spec, alias).forEach(function (name) {
+        if (!fields.has(name)) add(name);
+      });
+      return fields;
+    }
+    return fieldsFor(sourceAlias);
+  }
+
+  function viewLargeSourceFieldOptions(spec, sourceAlias) {
+    return Array.from(viewLargeSourceFields(spec, sourceAlias).values()).filter(function (item) { return !item.multiple; });
+  }
+
+  function viewLargeSimpleFieldOptions(spec, sourceAlias) {
+    return viewLargeResultOptions(spec).some(function (item) { return item.value === sourceAlias; })
+      ? viewLargeSourceFieldOptions(spec, sourceAlias) : [];
+  }
+
+  function viewLargeSimpleSelector(sourceAlias, field) {
+    return { kind: 'result', source: sourceAlias, idField: field, labelField: field, matchField: field };
+  }
+
+  function viewLargeSelectorMode(selector, sourceAlias) {
+    return !selector || selector.kind === 'result' && selector.source === sourceAlias && !selector.parameter &&
+      selector.idField === selector.labelField && selector.idField === selector.matchField ? 'simple' : 'advanced';
+  }
+
   function renderViewLargeChoiceOptions(choices, value) {
     return choices.map(function (choice) {
       return '<option value="' + escapeHtml(choice[0]) + '"' + (choice[0] === value ? ' selected' : '') + '>' + escapeHtml(t(choice[1])) + '</option>';
     }).join('');
   }
 
+  function renderViewLargeField(id, labelKey, control, picker) {
+    var label = t(labelKey);
+    return '<div class="setting-field"><div class="field-label-row">' +
+      (picker ? '<span id="' + id + '">' + escapeHtml(label) + '</span>' : '<label for="' + id + '">' + escapeHtml(label) + '</label>') +
+      renderFieldHelp(id, label, t(labelKey + 'Help'), true) + '</div>' + control + '</div>';
+  }
+
+  function renderViewLargeSelect(id, label, attributes, options) {
+    return renderViewLargeField(id, label, '<select id="' + id + '" aria-describedby="' + id + '-help" ' + attributes + '>' + options + '</select>');
+  }
+
   function renderViewLargePicker(field, label, value, options, context) {
     var labelId = 'cmdp-view-large-' + field + '-label';
-    return '<div class="setting-field"><span id="' + labelId + '">' + escapeHtml(t(label)) + '</span>' +
-      renderCatalogFieldPicker('data-view-large-field="' + field + '"', value, options, Object.assign({ labelledby: labelId }, context)) + '</div>';
+    return renderViewLargeField(labelId, label, renderCatalogFieldPicker('data-view-large-field="' + field + '"', value, options,
+      Object.assign({ labelledby: labelId, describedby: labelId + '-help' }, context)), true);
   }
 
   function renderViewLargeSelectorFields(selector, columns, spec, tableSourceAlias) {
     var source = selector.source || '';
     var isResult = selector.kind === 'result';
     var pickerContext = isResult
-      ? { kind: 'view', source: source, disabled: !source }
+      ? { kind: 'viewLargeResult', source: source, disabled: !source }
       : { kind: 'viewLargeAttribute', class: source, disabled: !source };
     function fieldOptions(selected) {
-      return !source ? [] : isResult ? diagramInitialColumnOptionRowsForSource(spec, source, selected) : viewLargeClassFieldOptions(source);
+      return !source ? [] : isResult ? Array.from(viewLargeSourceFields(spec, source).values())
+        .concat(diagramInitialColumnOptionRowsForSource(spec, source, selected)) : viewLargeClassFieldOptions(source);
     }
     return [
-      isResult ? '<label>' + escapeHtml(t('viewLargeSource')) + '<select data-view-large-field="source">' + renderColumnSelectOptions(viewLargeResultOptions(spec), source) + '</select></label>'
+      isResult ? renderViewLargeSelect('cmdp-view-large-result-source', 'viewLargeSource', 'data-view-large-field="source"', renderColumnSelectOptions(viewLargeResultOptions(spec), source))
         : renderViewLargePicker('source', 'viewLargeSource', source, source ? [{ value: source, label: (catalogClassByName(source) || {}).description || source }] : [], { kind: 'viewLargeClass' }),
       renderViewLargePicker('idField', 'viewLargeId', selector.idField || '', fieldOptions(selector.idField), pickerContext),
       renderViewLargePicker('labelField', 'viewLargeLabel', selector.labelField || '', fieldOptions(selector.labelField), pickerContext),
       renderViewLargePicker('matchField', 'viewLargeMatch', selector.matchField || '', columns, {
         kind: 'viewLargeMatch', source: tableSourceAlias, disabled: !tableSourceAlias
       }),
-      '<label>' + escapeHtml(t('viewLargeParameter')) + '<select data-view-large-field="parameter">' + renderColumnSelectOptions(getParamRows(spec).map(function (param) {
+      renderViewLargeSelect('cmdp-view-large-parameter', 'viewLargeParameter', 'data-view-large-field="parameter"', renderColumnSelectOptions(getParamRows(spec).map(function (param) {
         return { value: param.name, label: param.name };
-      }), selector.parameter, t('viewLargeNoParameter')) + '</select></label>'
+      }), selector.parameter, t('viewLargeNoParameter')))
     ].join('');
+  }
+
+  function renderViewLargeFilter(selectorMode, selector, columns, spec, sourceAlias) {
+    if (selectorMode === 'simple') {
+      var options = viewLargeSimpleFieldOptions(spec, sourceAlias);
+      return '<div class="settings-grid">' + renderViewLargeSelect('cmdp-view-large-simple-field', 'viewLargeSimpleField',
+        options.length ? '' : 'disabled', renderColumnSelectOptions(options, options.some(function (item) { return item.value === selector.matchField; }) ? selector.matchField : '')) + '</div>';
+    }
+    var kind = selector.kind === 'class' ? 'class' : 'result';
+    return '<details class="view-large-advanced" open><summary>' + escapeHtml(t('viewLargeAdvancedFields')) + '</summary><div class="settings-grid">' +
+      renderViewLargeSelect('cmdp-view-large-kind', 'viewLargeSourceKind', 'data-view-large-field="kind"',
+        renderViewLargeChoiceOptions([['result', 'viewLargeResult'], ['class', 'viewLargeClass']], kind)) + '</div>' +
+      '<div class="settings-grid" data-view-large-selector>' + renderViewLargeSelectorFields(Object.assign({}, selector, { kind: kind }), columns, spec, sourceAlias) + '</div></details>';
   }
 
   function renderViewLargeReductionFields(reduction, columns) {
@@ -25805,13 +26123,18 @@ function dynamicPagesClientScript() {
     }).join('');
   }
 
-  function renderViewLargeTableDetails(largeTable, columns, spec, tableSourceAlias) {
+  function renderViewLargeTableDetails(largeTable, columns, spec, tableSourceAlias, selectorMode) {
     var mode = largeTable && largeTable.mode || '';
     var selector = largeTable && largeTable.selector || {};
-    var kind = selector.kind === 'result' ? 'result' : 'class';
-    return (mode === 'key' ? '<div class="settings-grid"><label>' + escapeHtml(t('viewLargeSourceKind')) +
-      '<select data-view-large-field="kind">' + renderViewLargeChoiceOptions([['class', 'viewLargeClass'], ['result', 'viewLargeResult']], kind) + '</select></label></div>' +
-      '<div class="settings-grid" data-view-large-selector>' + renderViewLargeSelectorFields(Object.assign({}, selector, { kind: kind }), columns, spec, tableSourceAlias) + '</div>' : '') +
+    if (!selectorMode) {
+      selectorMode = viewLargeSelectorMode(largeTable.selector, tableSourceAlias);
+      if (selectorMode === 'simple' && selector.matchField && !viewLargeSimpleFieldOptions(spec, tableSourceAlias).some(function (item) {
+        return item.value === selector.matchField;
+      })) selectorMode = 'advanced';
+    }
+    return (mode === 'key' ? '<div class="settings-grid"><label>' + escapeHtml(t('viewLargeSelectorMode')) +
+      '<select id="cmdp-view-large-selector-mode">' + renderViewLargeChoiceOptions([['simple', 'viewLargeSimple'], ['advanced', 'viewLargeAdvanced']], selectorMode) + '</select></label></div>' +
+      '<div data-view-large-filter>' + renderViewLargeFilter(selectorMode, selector, columns, spec, tableSourceAlias) + '</div>' : '') +
       '<div class="settings-grid"><div class="setting-field" data-view-large-groups>' + renderViewLargeGroupPicker(largeTable, columns) + '</div></div>' +
       '<div data-view-large-reductions>' + renderViewLargeReductions(largeTable, columns) + '</div>';
   }
@@ -25825,10 +26148,10 @@ function dynamicPagesClientScript() {
 
   function renderViewLargeTable(model, columns, spec) {
     var largeTable = model.largeTable;
-    return '<div class="settings-block" id="cmdp-view-large-table"' + (model.largeTableEdited ? ' data-view-large-edited' : '') + '><h3>' + escapeHtml(t('viewLargeTable')) + '</h3>' +
-      '<div class="settings-grid"><label>' + escapeHtml(t('viewLargeMode')) + '<select id="cmdp-view-large-mode">' +
-      renderViewLargeChoiceOptions([['', 'viewLargeNormal'], ['all', 'viewLargeAll'], ['key', 'viewLargeKey']], largeTable && largeTable.mode || '') +
-      '</select></label></div><div data-view-large-details' + (largeTable ? '>' + renderViewLargeTableDetails(largeTable, columns, spec, model.sourceAlias) : ' hidden>') + '</div></div>';
+    return '<div class="settings-block" id="cmdp-view-large-table" data-view-large-source="' + escapeHtml(model.sourceAlias) + '"' + (model.largeTableEdited ? ' data-view-large-edited' : '') + '><h3>' + escapeHtml(t('viewLargeTable')) + '</h3>' +
+      '<div class="settings-grid">' + renderViewLargeSelect('cmdp-view-large-mode', 'viewLargeMode', '',
+        renderViewLargeChoiceOptions([['', 'viewLargeNormal'], ['all', 'viewLargeAll'], ['key', 'viewLargeKey']], largeTable && largeTable.mode || '')) +
+      '</div><div data-view-large-details' + (largeTable ? '>' + renderViewLargeTableDetails(largeTable, columns, spec, model.sourceAlias, model.largeTableSelectorMode) : ' hidden>') + '</div></div>';
   }
 
   function renderViewComposerColumnRow(column, spec, sourceAlias) {
@@ -27226,10 +27549,6 @@ function dynamicPagesClientScript() {
     var host = document.getElementById('cmdp-view-large-table');
     var mode = host && host.querySelector('#cmdp-view-large-mode').value;
     if (mode !== 'all' && mode !== 'key') return null;
-    function fieldValue(name) {
-      var input = host.querySelector('[data-view-large-field="' + name + '"]');
-      return String(input && input.value || '').trim();
-    }
     var groups = host.querySelector('[data-view-large-field="groupKeys"]');
     var largeTable = {
       mode: mode,
@@ -27244,13 +27563,53 @@ function dynamicPagesClientScript() {
         return [rule];
       })
     };
-    if (mode === 'key') {
-      largeTable.selector = { kind: fieldValue('kind') === 'result' ? 'result' : 'class', source: fieldValue('source'),
-        idField: fieldValue('idField'), labelField: fieldValue('labelField'), matchField: fieldValue('matchField') };
-      var parameter = fieldValue('parameter');
-      if (parameter) largeTable.selector.parameter = parameter;
-    }
+    var selector = mode === 'key' && readViewLargeSelectorDraft(host);
+    if (selector) largeTable.selector = selector;
     return largeTable;
+  }
+
+  function readViewLargeSelectorDraft(host) {
+    var simple = host.querySelector('#cmdp-view-large-simple-field');
+    if (simple) return viewLargeSimpleSelector(host.getAttribute('data-view-large-source'), simple.value);
+    if (!host.querySelector('[data-view-large-selector]')) return null;
+    function fieldValue(name) {
+      var input = host.querySelector('[data-view-large-field="' + name + '"]');
+      return String(input && input.value || '').trim();
+    }
+    var selector = { kind: fieldValue('kind') === 'result' ? 'result' : 'class', source: fieldValue('source'),
+      idField: fieldValue('idField'), labelField: fieldValue('labelField'), matchField: fieldValue('matchField') };
+    var parameter = fieldValue('parameter');
+    if (parameter) selector.parameter = parameter;
+    return selector;
+  }
+
+  function captureViewLargeSelectorDrafts(host) {
+    if (!host) return {};
+    var previous = state.viewComposerDraft;
+    var drafts = Object.assign({}, previous && previous.sourceAlias === host.getAttribute('data-view-large-source') && previous.largeTableSelectorDrafts);
+    var selector = readViewLargeSelectorDraft(host);
+    if (selector) drafts[host.querySelector('#cmdp-view-large-simple-field') ? 'simple' : 'advanced'] = selector;
+    return drafts;
+  }
+
+  function rebindViewLargeTableSource(draft, oldSource, spec) {
+    if (draft.sourceAlias === oldSource) return;
+    var fields = viewLargeSourceFields(spec, draft.sourceAlias);
+    var drafts = draft.largeTableSelectorDrafts;
+    if (drafts.simple) {
+      var simpleField = fields.get(drafts.simple.matchField);
+      drafts.simple = viewLargeSimpleSelector(draft.sourceAlias, simpleField && !simpleField.multiple ? simpleField.value : '');
+    }
+    var advancedField = drafts.advanced && drafts.advanced.matchField;
+    if (advancedField && !fields.has(advancedField) && viewLargeSourceFields(spec, oldSource).has(advancedField) &&
+      !diagramColumnOptionRowsForSource(spec, draft.sourceAlias, advancedField).some(function (item) { return item.value === advancedField; })) {
+      drafts.advanced = Object.assign({}, drafts.advanced, { matchField: '' });
+    }
+    if (!draft.largeTable) return;
+    draft.largeTable.groupKeys = [];
+    draft.largeTable.reductions = [];
+    if (draft.largeTable.mode === 'key') draft.largeTable.selector = drafts[draft.largeTableSelectorMode];
+    draft.largeTableEdited = true;
   }
 
   function validateViewComposerDraft(draft, spec) {
@@ -27266,6 +27625,9 @@ function dynamicPagesClientScript() {
       }
       if (table.mode === 'key') {
         var selector = table.selector || {};
+        if (draft.largeTableSelectorMode === 'simple') {
+          requireField(viewLargeSimpleFieldOptions(spec, draft.sourceAlias).some(function (item) { return item.value === selector.matchField; }), 'viewLargeSimpleField');
+        }
         requireField(selector.source && (selector.kind !== 'result' || viewLargeResultOptions(spec).some(function (item) { return item.value === selector.source; })), 'viewLargeSource');
         requireField(selector.idField, 'viewLargeId');
         requireField(selector.labelField, 'viewLargeLabel');
@@ -27365,12 +27727,16 @@ function dynamicPagesClientScript() {
       else spec.result.tables[tableIndex] = Object.assign({}, spec.result.tables[tableIndex], table);
     }
 
+    var visualSource = { alias: model.sourceAlias };
+    var declared = viewLargeDeclaredColumns(previousSpec, model.sourceAlias);
+    if (declared.length && (model.largeTable || previousVisual && previousVisual.source && previousVisual.source.columns)) {
+      // showOnly replaces the source table; keep its declarations as editor metadata.
+      visualSource.columns = declared;
+    }
     upsertStoredVisualModel(spec, {
       version: 1,
       mode: 'viewComposer',
-      source: {
-        alias: model.sourceAlias
-      },
+      source: visualSource,
       output: {
         alias: outputAlias,
         title: model.title,
@@ -27408,6 +27774,8 @@ function dynamicPagesClientScript() {
       mode: String(readValue('cmdp-view-mode') || 'table').trim() || 'table',
       showOnly: true,
       largeTable: readViewLargeTableDraft(),
+      largeTableSelectorMode: readValue('cmdp-view-large-selector-mode'),
+      largeTableSelectorDrafts: captureViewLargeSelectorDrafts(document.getElementById('cmdp-view-large-table')),
       largeTableEdited: Boolean(document.querySelector('#cmdp-view-large-table[data-view-large-edited]')),
       columns: columns
     };
@@ -29547,21 +29915,40 @@ function dynamicPagesClientScript() {
     if (!host) return;
     markViewLargeTableEdited();
     var field = target.getAttribute('data-view-large-field');
-    if (['idField', 'labelField', 'matchField', 'parameter'].indexOf(field) !== -1 || target.matches('[data-view-large-separator]')) return;
     var spec = readCurrentSpec();
     var draft = captureViewComposerDraftFromDom();
     var largeTable = draft.largeTable;
+    var drafts = draft.largeTableSelectorDrafts;
     var columns = viewLargeColumnOptions(draft.columns);
     if (target.id === 'cmdp-view-large-mode') {
       var details = host.querySelector('[data-view-large-details]');
       details.hidden = !largeTable;
-      details.innerHTML = largeTable ? renderViewLargeTableDetails(largeTable, columns, spec, draft.sourceAlias) : '';
+      if (largeTable && largeTable.mode === 'key') {
+        draft.largeTableSelectorMode = draft.largeTableSelectorMode || (drafts.advanced && !drafts.simple ? 'advanced' : 'simple');
+        largeTable.selector = drafts[draft.largeTableSelectorMode];
+      } else {
+        draft.largeTableSelectorMode = state.viewComposerDraft && state.viewComposerDraft.largeTableSelectorMode;
+      }
+      details.innerHTML = largeTable ? renderViewLargeTableDetails(largeTable, columns, spec, draft.sourceAlias, draft.largeTableSelectorMode) : '';
+    } else if (largeTable && target.id === 'cmdp-view-large-selector-mode') {
+      var filter = host.querySelector('[data-view-large-filter]');
+      var current = drafts[target.value];
+      if (!current) current = target.value === 'advanced' && drafts.simple ? Object.assign({}, drafts.simple)
+        : viewLargeSimpleSelector(draft.sourceAlias, '');
+      largeTable.selector = drafts[target.value] = current;
+      filter.innerHTML = renderViewLargeFilter(target.value, current, columns, spec, draft.sourceAlias);
     } else if (largeTable && (field === 'kind' || field === 'source')) {
       var selectorHost = host.querySelector('[data-view-large-selector]');
       var selector = largeTable.selector;
       if (field === 'kind') selector.source = '';
-      selector.idField = '';
-      selector.labelField = '';
+      var options = !selector.source ? [] : selector.kind === 'result' ? Array.from(viewLargeSourceFields(spec, selector.source).values())
+        .concat(diagramColumnOptionRowsForSource(spec, selector.source, selector.idField),
+          diagramColumnOptionRowsForSource(spec, selector.source, selector.labelField))
+        : viewLargeClassFieldOptions(selector.source);
+      ['idField', 'labelField'].forEach(function (name) {
+        if (!options.some(function (item) { return item.value === selector[name]; })) selector[name] = '';
+      });
+      drafts.advanced = selector;
       selectorHost.innerHTML = renderViewLargeSelectorFields(selector, columns, spec, draft.sourceAlias);
       if (field === 'source') {
         var next = selectorHost.querySelector('select[data-view-large-field="source"], #cmdp-view-large-source-label-value');
@@ -29581,6 +29968,7 @@ function dynamicPagesClientScript() {
         if (inputs.length) inputs[Math.min(tupleIndex, inputs.length - 1)].focus();
       }
     }
+    state.viewComposerDraft = draft;
   }
 
   function clearViewComposerColumnRow(button) {
@@ -30806,36 +31194,45 @@ function dynamicPagesClientScript() {
   }
 
   function templatePublicationNotice() {
-    var code = state.selectedTemplate && state.selectedTemplate.code;
-    var notice = state.templatePublicationNotices.get(templateWriteKey(code, runtimeSettingsScope().root));
-    return notice && notice.snapshotRevocationPending ? { type: 'warning', text: t('snapshotRevocationPending') } : notice;
+    var template = state.selectedTemplate;
+    var notice = template && state.templatePublicationNotices.get(templateWriteKey(template.code, runtimeSettingsScope().root));
+    if (notice?.snapshotRevocationPending) return { type: 'warning', text: t('snapshotRevocationPending') };
+    if (notice?.cardId && notice.cardId === String(template.id || '') && notice.sessionInstance === Number(state.sessionInstance || 0)) return notice;
   }
 
   function renderTemplatePublicationNotice() {
     var notice = templatePublicationNotice();
-    var check = notice && notice.snapshotCheck;
-    if (!check || check.id !== String(state.selectedTemplate && state.selectedTemplate.id || '')) return renderNotice(notice, true);
-    return renderNotice(Object.assign({}, notice, { text: t('snapshotPublishOutcomeUnknown') }), true) +
-      '<div class="toolbar"><button type="button" data-action="check-current-snapshot" aria-disabled="' + Boolean(check.pending) + '">' +
+    if (!notice) return '';
+    // Publication belongs to the card, not to the editor instance that sent the request.
+    return renderNotice(Object.assign({}, notice, { diagnostic: null }), true) +
+      (notice.diagnostic ? renderTechnicalRequestDiagnostics(notice.diagnostic) : '') + renderSnapshotCheck(notice.snapshotCheck);
+  }
+
+  function renderSnapshotCheck(check) {
+    if (!check) return '';
+    return '<div class="toolbar"><button type="button" data-action="check-current-snapshot" aria-disabled="' + Boolean(check.pending) + '">' +
       escapeHtml(t('snapshotCheckCurrent')) + '</button><span data-snapshot-check-status role="status">' + renderSnapshotCheckStatus(check) + '</span></div>';
   }
 
   function renderSnapshotCheckStatus(check) {
     var message = check.status ? t(check.status) : '';
     if (check.httpStatus && check.status === 'snapshotCheckFailed') message += ' ' + t('httpStatus', { status: check.httpStatus });
-    return escapeHtml(message) + (check.status === 'snapshotCurrentFound' ? ' <a href="' +
+    if (check.publishedAt) message += ' ' + t('snapshotCurrentPublishedAt', { time: check.publishedAt });
+    return escapeHtml(message) + (check.publishedAt ? ' <a href="' +
       escapeHtml(runtimeTemplateUrl(check.code, check.query) + '#cmdp-current-snapshot') + '" target="_blank" rel="noreferrer">' +
       escapeHtml(t('snapshotOpenCurrent')) + '</a>' : '');
   }
 
   function checkCurrentSnapshot() {
-    var notice = templatePublicationNotice();
-    var check = notice && notice.snapshotCheck;
-    if (!check || check.pending || check.id !== String(state.selectedTemplate && state.selectedTemplate.id || '')) return;
-    function updateCheckStatus(status, httpStatus) {
+    var runtime = boot.mode === 'runtime';
+    var notice = runtime ? null : templatePublicationNotice();
+    var check = runtime ? state.runtimeSnapshotCheck : notice?.snapshotCheck;
+    if (!check || check.pending) return;
+    function updateCheckStatus(status, httpStatus, publishedAt) {
       check.status = status;
       check.httpStatus = httpStatus;
-      if (templatePublicationNotice() !== notice) return;
+      check.publishedAt = publishedAt;
+      if (runtime ? state.runtimeSnapshotCheck !== check : templatePublicationNotice() !== notice) return;
       var button = document.querySelector('[data-action="check-current-snapshot"]');
       var output = document.querySelector('[data-snapshot-check-status]');
       if (button) button.setAttribute('aria-disabled', String(check.pending));
@@ -30843,10 +31240,15 @@ function dynamicPagesClientScript() {
     }
     check.pending = true;
     updateCheckStatus('snapshotCheckingCurrent');
-    request(publicSnapshotRunPath(check.code, check.query, true), { maxRetries: 0 }).then(function (result) {
+    return request(publicSnapshotRunPath(check.code, check.query, true), { maxRetries: 0 }).then(function (result) {
       check.pending = false;
-      if (result.ok && result.json && result.json.success === true && typeof result.json.snapshotFound === 'boolean') {
-        updateCheckStatus(result.json.snapshotFound ? 'snapshotCurrentFound' : 'snapshotCurrentMissing');
+      var json = result.json;
+      if (result.ok && isSnapshotResult(json, 'run', check.code) && json.snapshotFound === true &&
+          isPersistedSnapshotCache(json.cache, 'snapshot-hit') && isSnapshotHash(json.cache.snapshotRevision)) {
+        updateCheckStatus(runtime ? 'snapshotRefreshCurrentFound' : 'snapshotCurrentFound', null, json.cache.publishedAt);
+      } else if (result.ok && isSnapshotResult(json, 'run', check.code) && json.snapshotFound === false &&
+          json.cache?.scope === 'staticSnapshot' && json.cache.status === 'snapshot-miss') {
+        updateCheckStatus(runtime ? 'snapshotRefreshCurrentMissing' : 'snapshotCurrentMissing');
       } else {
         updateCheckStatus(result.status === 401 ? 'runtimeSessionInvalid' :
           resultIsPermissionDenied(result) ? 'runtimeTemplateAccessDenied' : 'snapshotCheckFailed', result.status);
@@ -31606,6 +32008,7 @@ function dynamicPagesClientScript() {
     var key = templateWriteKey(payload.code, saveScope.root);
     if (state.pendingTemplateWrites.has(key)) return;
     var owner = uiRequestOwner();
+    var sessionInstance = Number(state.sessionInstance || 0);
     var exists = Boolean(state.selectedTemplate && state.selectedTemplate.id);
     var staged = state.stagedTemplateTransfer && stagedTemplateTransfer();
     var replacement = staged && staged.replacement;
@@ -31632,7 +32035,8 @@ function dynamicPagesClientScript() {
     function sameEditor() {
       return runtimeSettingsScopeIsCurrent(saveScope) && Number(state.templateEditorInstance || 0) === editorInstance && sameTemplate();
     }
-    function sameScope() { return saveScope.session === state.session && saveScope.root === runtimeSettingsScope().root; }
+    function sameSession() { return saveScope.session === state.session && sessionInstance === Number(state.sessionInstance || 0); }
+    function sameScope() { return sameSession() && saveScope.root === runtimeSettingsScope().root; }
     function sameTemplate() { return sameScope() && state.selectedTemplate && state.selectedTemplate.code === payload.code; }
     function sameDraft() { return Number(state.uiDiagnosticRevision || 0) === owner.revision; }
     function refreshWriteNotice() {
@@ -31753,7 +32157,7 @@ function dynamicPagesClientScript() {
       writeNotice({ type: 'ok', text: t('publishingSnapshot') });
       var publishedMode = publishModelForSpec(savedTemplate.spec);
       publicationTarget = {
-        code: savedTemplate.code, id: String(savedTemplate.id || ''),
+        code: savedTemplate.code, id: String(savedTemplate.id || ''), specHash: savedTemplate.specHash, paramsMode: publishedMode.paramsMode,
         query: publishedMode.paramsMode === 'ignore' ? {} : exactReportLaunchQuery(publication.params)
       };
       published = await request(apiPrefix + '/templates/' + encodeURIComponent(savedTemplate.code) + '/publish' + rootQuery, {
@@ -31764,7 +32168,7 @@ function dynamicPagesClientScript() {
         body: { params: publication.params, savedSpecHash: savedTemplate.specHash }
       });
       if (!published.ok) throw createRequestError(published);
-      validateUiResponse(published, 'publish');
+      validateSnapshotMutationResponse(published, 'publish', publicationTarget);
       if (sameScope()) {
         state.lastPublishedReportLink = Object.assign({}, publicationTarget, {
           session: saveScope.session, root: saveScope.root, specHash: savedTemplate.specHash
@@ -31776,16 +32180,16 @@ function dynamicPagesClientScript() {
       if (!sameDraft()) state.templateDirty = true;
       writeNotice({ type: sameDraft() ? 'ok' : 'warning', text: t(sameDraft() ? 'snapshotPublished' : 'publishedPreviousRevision') });
     }).catch(function (error) {
-      if (publicationTarget && saveScope.session === state.session) {
+      if (publicationTarget && sameSession()) {
         var failure = publicationErrorMessage(error, published);
-        var diagnostic = failure.diagnostic;
-        if (diagnostic && diagnostic.requestSent && (diagnostic.responseFormat === 'none' || (published && published.ok && error.code === 'invalid_response'))) {
+        if (snapshotMutationOutcomeUnknown(published, failure.diagnostic, 'publish')) {
           failure.text = t('snapshotPublishOutcomeUnknown');
           failure.snapshotCheck = publicationTarget;
         }
-        failure.templateWrite = true;
+        failure.cardId = publicationTarget.id;
+        failure.sessionInstance = sessionInstance;
         state.templatePublicationNotices.set(key, failure);
-        writeNotice(null);
+        if (sameScope()) writeNotice(null);
         if (sameTemplate()) refreshPublicationNotice();
         return;
       }
@@ -33984,13 +34388,16 @@ function dynamicPagesClientScript() {
   function renderRuntimeIntoApp(result) {
     var cache = result.json && result.json.cache;
     var snapshot = result.ok && (cache && cache.scope === 'staticSnapshot' || result.downloadMode === 'personal');
-    if (result.downloadMode !== 'personal') state.snapshotRevision = cache && cache.snapshotRevision || '';
+    if (result.downloadMode !== 'personal') {
+      state.snapshotRevision = cache && cache.snapshotRevision || '';
+      state.snapshotCache = snapshot ? cache : null;
+    }
     runtimeLargeTables = prepareRuntimeLargeTables(result);
     app.innerHTML = (snapshot ? '<div class="snapshot-toolbar">' +
       '<button type="button" class="runtime-cache-button" data-action="snapshot-reload" title="' + escapeHtml(t('snapshotReload')) +
       '" aria-label="' + escapeHtml(t('snapshotReload')) + '">&#8635;</button>' +
       '<button type="button" data-action="snapshot-refresh" hidden></button>' +
-      '<span data-snapshot-status role="status"></span></div><div data-snapshot-diagnostics hidden></div>' : '') + renderRuntimeResult(result, runtimeLargeTables);
+      '<span data-snapshot-status role="status"></span></div><div data-snapshot-diagnostics hidden></div><div data-snapshot-current-check></div>' : '') + renderRuntimeResult(result, runtimeLargeTables);
     app.querySelectorAll('[data-large-table]').forEach(function (node) {
       mountLargeTable(runtimeLargeTables[Number(node.getAttribute('data-large-table'))], node);
     });
@@ -34044,23 +34451,43 @@ function dynamicPagesClientScript() {
 
   function refreshOpenSnapshot(reload) {
     if (state.runtimeRefreshInProgress || !reload && !state.snapshotRefreshMode) return;
-    if (!reload && state.snapshotRefreshMode === 'shared' && !window.confirm(t('snapshotRefreshConfirm'))) return;
+    var mode = state.snapshotRefreshMode;
+    var shared = !reload && mode === 'shared';
+    if (shared && !window.confirm(t('snapshotRefreshConfirm'))) return;
     state.runtimeRefreshInProgress = true;
     updateSnapshotActions();
     snapshotStatus(t('runtimeRefreshing'));
-    var path = reload ? publicSnapshotRunPath(boot.templateCode, state.runParams, true) : snapshotRefreshPath(boot.templateCode, true);
+    var target = { code: boot.templateCode, query: Object.assign({}, state.runParams), mode: mode,
+      snapshotRevision: state.snapshotRevision, cache: state.snapshotCache };
+    var path = reload ? publicSnapshotRunPath(target.code, target.query, true) : snapshotRefreshPath(target.code, true);
     var fallback = reload ? 'snapshotReloadFailed' : 'snapshotRefreshFailed';
-    request(path, reload ? { maxRetries: 0 } : {
+    function renderCheck(check) {
+      state.runtimeSnapshotCheck = check;
+      var container = app.querySelector('[data-snapshot-current-check]');
+      if (container) container.innerHTML = renderSnapshotCheck(check);
+    }
+    function handleFailure(result, diagnostic) {
+      var unknown = shared && snapshotMutationOutcomeUnknown(result, diagnostic, 'refresh-snapshot');
+      if (unknown) renderCheck(target);
+      snapshotStatus(unknown ? t('snapshotRefreshOutcomeUnknown') : snapshotRefreshError(result || {
+        status: diagnostic && diagnostic.status, diagnostic: diagnostic
+      }, fallback), true, diagnostic);
+    }
+    var response;
+    renderCheck(null);
+    return request(path, reload ? { maxRetries: 0 } : {
       method: 'POST',
       phase: 'refresh-snapshot',
-      body: { expectedMode: state.snapshotRefreshMode, expectedSnapshotRevision: state.snapshotRevision },
+      body: { expectedMode: target.mode, expectedSnapshotRevision: target.snapshotRevision },
       timeoutMs: boot.snapshotRefreshTimeoutMs
     }).then(function (result) {
-      if (!result.ok || !result.json) {
-        snapshotStatus(snapshotRefreshError(result, fallback), true, result.diagnostic);
+      response = result;
+      if (!result.ok || reload && !result.json) {
+        handleFailure(result, result.diagnostic);
         return;
       }
-      result.downloadMode = !reload && result.json.mode === 'personal' ? 'personal' : 'public';
+      if (!reload) validateSnapshotMutationResponse(result, 'refresh-snapshot', target);
+      result.downloadMode = !reload && mode === 'personal' ? 'personal' : 'public';
       renderRuntimeIntoApp(result);
       if (reload) updateSnapshotCapability(result);
       else snapshotStatus(t(result.downloadMode === 'personal' ? 'snapshotRefreshedPersonal' : 'snapshotRefreshedShared'));
@@ -34069,8 +34496,7 @@ function dynamicPagesClientScript() {
       updateSnapshotActions();
       if (button && !button.hidden) button.focus();
     }).catch(function (error) {
-      var diagnostic = error.diagnostic;
-      snapshotStatus(snapshotRefreshError({ status: diagnostic && diagnostic.status, diagnostic: diagnostic }, fallback), true, diagnostic);
+      handleFailure(response, error.diagnostic);
     }).finally(function () {
       state.runtimeRefreshInProgress = false;
       updateSnapshotActions();
@@ -34081,6 +34507,7 @@ function dynamicPagesClientScript() {
     updateChrome();
     stopRuntimeLargeTables();
     if (state.runtimeCountdownTimer) window.clearInterval(state.runtimeCountdownTimer);
+    state.runtimeSnapshotCheck = null;
     state.runtimeRefreshInProgress = Boolean(refresh);
     app.innerHTML = '<div class="notice">' + escapeHtml(refresh ? t('runtimeRefreshing') : t('runningTemplate')) + '</div>';
     var templateCode = boot.templateCode || '';
@@ -34609,6 +35036,8 @@ function dynamicPagesClientScript() {
 
   document.addEventListener('focusin', function (event) {
     var input = event.target;
+    var fieldHelp = input.closest && input.closest('[data-positioned-field-help]');
+    if (fieldHelp) positionFieldHelp(fieldHelp);
     if (input && input.matches && input.matches('[data-diagram-import-label-template], [data-diagram-template-expression]')) renderDiagramImportLabelAutocomplete(input);
   });
 
@@ -34616,14 +35045,62 @@ function dynamicPagesClientScript() {
     var input = event.target;
     if (input && input.matches && input.matches('.field-help-button')) {
       var fieldHelp = input.closest('.field-help');
-      if (fieldHelp) fieldHelp.classList.remove('dismissed');
+      if (fieldHelp) fieldHelp.classList.remove('dismissed', 'pinned');
     }
     if (!input || !input.matches || !input.matches('[data-diagram-import-label-template], [data-diagram-template-expression]')) return;
     var host = diagramImportLabelAutocompleteHost(input);
     if (!host || !host.contains(event.relatedTarget)) closeDiagramImportLabelAutocomplete();
   });
 
+  function positionFieldHelp(help) {
+    var anchor = help.querySelector('.field-help-button').getBoundingClientRect();
+    var viewport = document.documentElement;
+    if (help.closest('#cmdp-view-large-table') && (anchor.width === 0 || anchor.height === 0 ||
+      anchor.right <= 0 || anchor.left >= viewport.clientWidth || anchor.bottom <= 0 || anchor.top >= viewport.clientHeight)) {
+      help.classList.remove('pinned');
+      help.classList.add('dismissed');
+      return;
+    }
+    var tooltip = help.querySelector('[role="tooltip"]').getBoundingClientRect();
+    if (!tooltip.width) return;
+    var left = Math.max(8, Math.min(anchor.right - tooltip.width, viewport.clientWidth - tooltip.width - 8));
+    var top = anchor.bottom;
+    if (top + tooltip.height > viewport.clientHeight - 8 && anchor.top - tooltip.height >= 8) top = anchor.top - tooltip.height;
+    top = Math.max(8, Math.min(top, viewport.clientHeight - tooltip.height - 8));
+    help.style.setProperty('--field-help-left', left + 'px');
+    help.style.setProperty('--field-help-top', top + 'px');
+  }
+
+  document.addEventListener('pointerover', function (event) {
+    var help = event.target.closest && event.target.closest('[data-positioned-field-help]');
+    if (help) positionFieldHelp(help);
+  });
+  document.addEventListener('pointerout', function (event) {
+    var help = event.target.closest && event.target.closest('[data-positioned-field-help]');
+    if (help && !help.contains(event.relatedTarget) && !help.contains(document.activeElement)) help.classList.remove('dismissed');
+  });
+  document.addEventListener('click', function (event) {
+    var button = event.target.closest && event.target.closest('[data-positioned-field-help] .field-help-button');
+    if (!button) return;
+    var help = button.closest('[data-positioned-field-help]');
+    if (help.classList.toggle('pinned')) {
+      help.classList.remove('dismissed');
+      positionFieldHelp(help);
+    } else help.classList.add('dismissed');
+  });
+  function repositionVisibleFieldHelp() {
+    document.querySelectorAll('[data-positioned-field-help]:is(:hover,:focus-within,.pinned)').forEach(positionFieldHelp);
+  }
+  window.addEventListener('resize', repositionVisibleFieldHelp);
+  document.addEventListener('scroll', repositionVisibleFieldHelp, true);
+
   document.addEventListener('pointerdown', function (event) {
+    document.querySelectorAll('[data-positioned-field-help].pinned').forEach(function (help) {
+      if (!help.contains(event.target)) {
+        help.classList.remove('pinned');
+        help.classList.add('dismissed');
+      }
+    });
     var target = event.target && event.target.closest ? event.target.closest('[data-action="diagram-import-label-token-select"]') : null;
     if (!target) return;
     event.preventDefault();
@@ -34660,9 +35137,20 @@ function dynamicPagesClientScript() {
     if (target && target.matches && target.matches('.field-help-button') && event.key === 'Escape') {
       event.preventDefault();
       var fieldHelp = target.closest('.field-help');
-      if (fieldHelp) fieldHelp.classList.add('dismissed');
+      if (fieldHelp) {
+        fieldHelp.classList.remove('pinned');
+        fieldHelp.classList.add('dismissed');
+      }
       target.focus();
       return;
+    }
+    if (event.key === 'Escape') {
+      var hoveredHelp = document.querySelector('[data-positioned-field-help]:is(:hover,.pinned):not(.dismissed)');
+      if (hoveredHelp) {
+        hoveredHelp.classList.remove('pinned');
+        hoveredHelp.classList.add('dismissed');
+        return;
+      }
     }
     var compactPickerForEscape = target && target.closest ? target.closest('[data-compact-multi-select]') : null;
     if (compactPickerForEscape && event.key === 'Escape') {
@@ -35136,15 +35624,10 @@ function dynamicPagesClientScript() {
       return;
     }
     if (target.id === 'cmdp-view-source') {
+      var largeTableHost = document.getElementById('cmdp-view-large-table');
       var viewDraft = captureViewComposerDraftFromDom();
-      viewDraft.sourceAlias = String(target.value || '').trim();
       viewDraft.columns = [];
-      if (viewDraft.largeTable) {
-        viewDraft.largeTable.groupKeys = [];
-        viewDraft.largeTable.reductions = [];
-        if (viewDraft.largeTable.selector) viewDraft.largeTable.selector.matchField = '';
-        viewDraft.largeTableEdited = true;
-      }
+      rebindViewLargeTableSource(viewDraft, largeTableHost && largeTableHost.getAttribute('data-view-large-source'), readCurrentSpec());
       state.viewComposerDraft = viewDraft;
       clearDraftExecutionState({ clearExtractionSource: true });
       renderDesigner();
@@ -39517,10 +40000,19 @@ async function readStaticSnapshot(root, templateCode, params, publishConfig = { 
   return { key: exactKey, backend, snapshot: null };
 }
 
+function snapshotDeadlineBudget(deadlineAt) {
+  const expires = performance.now() + executionDeadlineRemainingMs(deadlineAt);
+  return () => Math.min(executionDeadlineRemainingMs(deadlineAt), expires - performance.now());
+}
+
+function assertSnapshotDeadline(remainingMs) {
+  if (remainingMs() <= 0) throw executionDeadlineTimeoutError();
+}
+
 async function writeStaticSnapshot(root, template, params, result, sessionData, publishConfig, generation, replaces, tableIndexes, boundary) {
-  const { deadlineAt, response } = boundary;
+  const { remainingMs, response } = boundary;
   if (response.destroyed) return null;
-  assertExecutionDeadline(deadlineAt, DRAFT_PREVIEW_TIMEOUT_MS);
+  assertSnapshotDeadline(remainingMs);
   const specHash = hashJson(template.spec || {});
   const paramsHash = staticSnapshotParamsHash(params, publishConfig);
   const key = staticSnapshotKey(root, template.code, params, publishConfig);
@@ -39547,30 +40039,41 @@ async function writeStaticSnapshot(root, template, params, result, sessionData, 
   const stateKey = snapshotStateKey(root, template.code);
   const memoryOnly = SNAPSHOT_MEMORY_ONLY;
   const backend = memoryOnly ? 'memory' : 'redis';
-  const snapshotJson = memoryOnly ? '' : JSON.stringify(snapshot);
-  assertExecutionDeadline(deadlineAt, DRAFT_PREVIEW_TIMEOUT_MS);
-  if (response.destroyed) return null;
   try {
     if (memoryOnly) {
+      const value = cloneJsonValueServer(snapshot, null);
+      assertSnapshotDeadline(remainingMs);
       if (snapshotStateMemory.get(stateKey) !== generation) return null;
       if (replaces && staticSnapshotCache.get(key) !== replaces.revision) return null;
-      memorySet(staticSnapshotCache, key, snapshot, 0);
+      staticSnapshotCache.set(key, { value, expiresAt: 0 });
+      while (staticSnapshotCache.size > RUNTIME_CACHE_MAX_ENTRIES) {
+        staticSnapshotCache.delete(staticSnapshotCache.keys().next().value);
+      }
       registerLocalStaticSnapshotCacheKey(root, template.code, key);
     } else {
+      const snapshotJson = JSON.stringify(snapshot);
+      assertSnapshotDeadline(remainingMs);
+      if (response.destroyed) return null;
       const indexKey = cacheKey('snapshot-index', staticSnapshotTemplateIndexId(root, template.code));
-      const stored = await redisCommand(['EVAL', "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end; if ARGV[4] and redis.call('GET', KEYS[2]) ~= ARGV[4] then return 0 end; redis.call('SADD', KEYS[3], ARGV[3]); redis.call('SET', KEYS[2], ARGV[2]); return 1",
-        3, stateKey, cacheKey('snapshot', key), indexKey, generation, snapshotJson, key,
-        ...(replaces ? [replaces.revision] : [])], {
-        beforeSend() {
-          assertExecutionDeadline(deadlineAt, DRAFT_PREVIEW_TIMEOUT_MS);
-          if (response.destroyed) throw new Error('Snapshot client disconnected before storage dispatch.');
-        }
+      const stored = await redisCommand(['EVAL', `
+        local matches = redis.call('GET', KEYS[1]) == ARGV[1]
+          and (not ARGV[5] or redis.call('GET', KEYS[2]) == ARGV[5])
+        local time = redis.call('TIME')
+        if time[1] * 1000 + math.floor(time[2] / 1000) >= tonumber(ARGV[4]) then return -1 end
+        if not matches then return 0 end
+        redis.call('SADD', KEYS[3], ARGV[3])
+        redis.call('SET', KEYS[2], ARGV[2])
+        return 1
+      `, 3, stateKey, cacheKey('snapshot', key), indexKey, generation, snapshotJson, key], {
+        snapshotCommit: { remainingMs, isDisconnected: () => response.destroyed, revision: replaces?.revision }
       });
-      if (stored !== 1) return null;
+      if (stored === -1) throw executionDeadlineTimeoutError();
+      if (stored === 0) return null;
     }
   } catch (error) {
     if (response.destroyed) return null;
-    if (error.code === 'draft_preview_timeout') throw error;
+    if (error.code === 'draft_preview_timeout' || error.code === 'snapshot_commit_outcome_unknown') throw error;
+    assertSnapshotDeadline(remainingMs);
     throw snapshotStoreError('snapshot_storage_unavailable', 'Published report storage is temporarily unavailable.');
   }
   return {
@@ -53985,8 +54488,9 @@ function reportTableOptionsViewId(owner, tableName) {
   return 'options:' + hashJson([owner, tableName]);
 }
 
-function storeReportTableView(id, view) {
+function storeReportTableView(id, view, remainingMs) {
   const bytes = Buffer.byteLength(JSON.stringify(view.indexes || view.available));
+  if (remainingMs) assertSnapshotDeadline(remainingMs);
   if (bytes > REPORT_TABLE_VIEW_MAX_BYTES / 2) {
     throw snapshotStoreError('table_view_too_large', 'The prepared table exceeds the view storage budget.', 422);
   }
@@ -54248,7 +54752,7 @@ async function buildReportTableIndex(authToken, spec, table, params, options, av
     };
   } catch (error) {
     if (error.indexBudget) error.reportLimits = [{
-      table: table.name.slice(0, 128), phase: 'index', ...reportLimitEvidence(...error.indexBudget)
+      table: table.name, phase: 'index', ...reportLimitEvidence(...error.indexBudget)
     }];
     if (error.code === 'draft_preview_timeout') {
       const context = { table: table.name, phase: 'index', limits: [] };
@@ -54265,6 +54769,7 @@ async function materializePublishedReport(authToken, spec, params, options, runt
   }
   const paged = reportPagedTables(spec);
   const deadlineAt = options.executionDeadlineAt || Date.now() + DRAFT_PREVIEW_TIMEOUT_MS;
+  const remainingMs = options.snapshotRemainingMs || snapshotDeadlineBudget(deadlineAt);
   const tableOptions = { ...reportTableExecutionOptions(runtimeConfig, deadlineAt), requireCompleteReport: true };
   const tableName = paged.length === 1 ? paged[0].name : '';
   const shell = tableShellSpec(spec, options.includeDiagrams !== false);
@@ -54274,33 +54779,48 @@ async function materializePublishedReport(authToken, spec, params, options, runt
   const result = await executeSnapshotReportPhase(authToken, shell, params, {
     ...options, strictDataReads: true, executionDeadlineAt: deadlineAt
   }, evidence);
-  if (evidence.limits.length || snapshotExecutionIncomplete(result)) {
+  const incomplete = evidence.limits.length || snapshotExecutionIncomplete(result);
+  if (remainingMs() <= 0) {
+    recordReportDeadline(evidence, deadlineAt);
+    throw attachReportLimits(executionDeadlineTimeoutError(), evidence);
+  }
+  if (incomplete) {
     if (!evidence.limits.length) recordReportLimit(evidence, { reason: 'completeness_unconfirmed', limitHit: false, truncated: true });
     throw incompleteReportTable(evidence);
   }
   if (!paged.length) return { result };
   const indexes = Object.create(null);
   const tables = new Map();
-  for (const table of paged) {
-    const config = normalizeLargeTable(table.presentation.largeTable);
-    const available = await reportTableOptions(authToken, spec, config, params, tableOptions, table.name);
-    const prepared = await buildReportTableIndex(authToken, spec, table, params, tableOptions, available);
-    indexes[table.name] = prepared.index;
-    tables.set(table.name, prepared.rendered);
-  }
-  const indexBytes = Buffer.byteLength(JSON.stringify(indexes));
-  if (indexBytes > REPORT_TABLE_VIEW_MAX_BYTES / 2) {
-    throw Object.assign(snapshotStoreError('table_view_too_large', 'The report exceeds the snapshot table index storage budget.', 422), {
-      reportLimits: [{ table: tableName.slice(0, 128), phase: 'index',
-        ...reportLimitEvidence('maxIndexStorageBytes', REPORT_TABLE_VIEW_MAX_BYTES / 2, indexBytes, 'bytes') }]
-    });
-  }
-  if (executionDeadlineRemainingMs(deadlineAt) <= 0) {
-    const context = { table: tableName, phase: 'index', limits: [] };
+  let indexTable = tableName;
+  try {
+    for (const table of paged) {
+      indexTable = table.name;
+      assertSnapshotDeadline(remainingMs);
+      const config = normalizeLargeTable(table.presentation.largeTable);
+      const available = await reportTableOptions(authToken, spec, config, params, tableOptions, table.name);
+      const prepared = await buildReportTableIndex(authToken, spec, table, params, tableOptions, available);
+      indexes[table.name] = prepared.index;
+      tables.set(table.name, prepared.rendered);
+    }
+    indexTable = tableName;
+    const indexBytes = Buffer.byteLength(JSON.stringify(indexes));
+    if (indexBytes > REPORT_TABLE_VIEW_MAX_BYTES / 2) {
+      throw Object.assign(snapshotStoreError('table_view_too_large', 'The report exceeds the snapshot table index storage budget.', 422), {
+        reportLimits: [{ table: tableName, phase: 'index',
+          ...reportLimitEvidence('maxIndexStorageBytes', REPORT_TABLE_VIEW_MAX_BYTES / 2, indexBytes, 'bytes') }]
+      });
+    }
+    const prepared = attachPagedTableResults(spec, result, tables);
+    assertSnapshotDeadline(remainingMs);
+    return { result: prepared, indexes };
+  } catch (error) {
+    if (error.reportLimits?.some((item) => item.reason === 'deadline_exceeded')) throw error;
+    if (error.code !== 'draft_preview_timeout' && (error.statusCode !== 422 || remainingMs() > 0)) throw error;
+    const context = { table: indexTable, phase: 'index', limits: [] };
     recordReportDeadline(context, deadlineAt);
-    throw attachReportLimits(executionDeadlineTimeoutError(), context);
+    throw attachReportLimits(executionDeadlineTimeoutError(), context,
+      { limits: error.reportLimits, omittedCount: error.reportLimitsOmitted });
   }
-  return { result: attachPagedTableResults(spec, result, tables), indexes };
 }
 
 async function handleReportTablePage(req, res, requestUrl, root, templateCode, authToken, publicRead = false) {
@@ -54585,6 +55105,7 @@ async function handleSnapshotRefresh(req, res, requestUrl, authToken, root, temp
     if (!slot) return;
     stage = 'data';
     deadlineAt = Date.now() + DRAFT_PREVIEW_TIMEOUT_MS;
+    const remainingMs = snapshotDeadlineBudget(deadlineAt);
     const deadlineOptions = { deadlineAt, deadlineTimeoutMs: DRAFT_PREVIEW_TIMEOUT_MS };
     const runtimeConfig = await waitForExecutionDeadline(getRuntimeConfig(authToken, root, deadlineOptions), deadlineAt);
     const limits = normalizeExecutionLimitConfig(runtimeConfig);
@@ -54608,6 +55129,7 @@ async function handleSnapshotRefresh(req, res, requestUrl, authToken, root, temp
       ...(includeDiagrams ? {} : { executionScope: 'tables' }),
       strictDataReads: true,
       executionDeadlineAt: deadlineAt,
+      snapshotRemainingMs: remainingMs,
       executionDeadlineTimeoutMs: DRAFT_PREVIEW_TIMEOUT_MS
     }, runtimeConfig, mode === 'shared');
     stage = 'commit';
@@ -54616,11 +55138,11 @@ async function handleSnapshotRefresh(req, res, requestUrl, authToken, root, temp
       if (observation.state.generation !== observedGeneration) conflict();
       const current = await waitForExecutionDeadline(readTemplate(deadlineOptions), deadlineAt);
       if (!current?.active || current.id !== template.id || current.specHash !== template.specHash) conflict();
-      assertExecutionDeadline(deadlineAt, DRAFT_PREVIEW_TIMEOUT_MS);
+      assertSnapshotDeadline(remainingMs);
       if (res.destroyed) return null;
       if (mode === 'shared') {
         const replacement = await writeStaticSnapshot(root, current, params, result, session.data, publish, snapshot.generation, lookup, indexes,
-          { deadlineAt, response: res });
+          { remainingMs, response: res });
         if (!replacement && !res.destroyed) conflict();
         return replacement;
       }
@@ -54629,7 +55151,6 @@ async function handleSnapshotRefresh(req, res, requestUrl, authToken, root, temp
       return snapshot;
     }, { deadlineAt });
     if (!saved || res.destroyed) return;
-    logInfo('snapshot.refresh_succeeded', { ...context, mode, rowsCount: countResultRows(result), backend: lookup.backend });
     let response = {
       success: true,
       snapshotFound: true,
@@ -54640,12 +55161,23 @@ async function handleSnapshotRefresh(req, res, requestUrl, authToken, root, temp
       result,
       cache: mode === 'shared' ? staticSnapshotCacheMeta(saved, 'snapshot-published', lookup.backend, lookup.key) : null
     };
+    let personalView;
     if (indexes && browserTableShellRequested(requestUrl)) {
       const tableView = mode === 'shared' ? { kind: 'public', snapshotRevision: staticSnapshotViewRevision(saved) }
-        : { kind: 'personal', viewId: putReportTableView(reportTableOwner(authToken, session.data, root, template, paramsFromUrl), indexes) };
+        : { kind: 'personal', viewId: crypto.randomUUID() };
       response = reportTableShell(response, tableView);
+      if (mode === 'personal') personalView = tableView;
     }
-    sendJson(res, 200, runtimeDisplayResponsePayload(response, { d2DownloadAllowed: mode === 'shared' && publicD2SourceAllowed(publish) }));
+    response = runtimeDisplayResponsePayload(response, { d2DownloadAllowed: mode === 'shared' && publicD2SourceAllowed(publish) });
+    if (mode === 'personal') {
+      assertSnapshotDeadline(remainingMs);
+      if (personalView) {
+        const owner = reportTableOwner(authToken, session.data, root, template, paramsFromUrl);
+        storeReportTableView(personalView.viewId, { owner, indexes, key: '' }, remainingMs);
+      }
+    }
+    logInfo('snapshot.refresh_succeeded', { ...context, mode, rowsCount: countResultRows(result), backend: lookup.backend });
+    sendJson(res, 200, response);
   } catch (error) {
     if (res.destroyed) return;
     const denied = stage === 'data' && errorLooksPermissionDenied(error);
@@ -58960,7 +59492,7 @@ async function getExecutionClasses(cmdbuildExecRequest, limits, cache) {
   if (cache.loaded) return cache.classes;
   cache.loaded = true;
   const maxClasses = Math.max(limits.maxClasses || 100, limits.maxClassesMax || limits.maxClasses || 100);
-  const response = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes?limit=${maxClasses}&detailed=true`);
+  const response = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes?limit=${maxClasses}&detailed=true`, { catalogPage: true });
   recordIncompleteExecutionCatalog(cmdbuildExecRequest, response, maxClasses, 'maxClasses', 'maxClassesMax', 'classes');
   cache.classes = response.ok ? readableClassItemsFromResponse(response) : [];
   cache.ok = response.ok;
@@ -59763,12 +60295,11 @@ function selectionPageEvidence(response, start, limit, knownTotal) {
 }
 
 function recordIncompleteExecutionCatalog(request, response, limit, limitName, configKey, unit) {
-  if (!request.recordReportLimit || !response.ok || !Array.isArray(response.json?.data)) return;
-  const observed = response.json.data.length;
-  const reportedTotal = executionPageTotal(response);
-  const total = reportedTotal !== null && reportedTotal >= observed ? reportedTotal : null;
+  if (!request.recordReportLimit || !response.ok) return;
+  const { rows, total, conflict } = selectionPageEvidence(response, 0, limit, null);
+  const observed = rows.length;
   const exceeded = observed > limit || total > limit;
-  if (exceeded || (total === null ? observed >= limit : total > observed)) {
+  if (exceeded || conflict || (total === null ? observed >= limit : total > observed)) {
     request.recordReportLimit(reportLimitEvidence(limitName, limit, observed, unit, {
       source: 'runtime-settings', configKey, total,
       reason: exceeded ? 'limit_exceeded' : 'completeness_unconfirmed'
@@ -60020,8 +60551,8 @@ async function requestCompleteCardsForSelectionScan(request, className, limit, f
   const rows = [];
   const ids = new Set();
   let total = null;
-  const finish = (reason) => {
-    if (reason) request.recordReportLimit?.(reportLimitEvidence('maxSelectionScanRows', limit, rows.length, 'cards', {
+  const finish = (reason, evidence) => {
+    if (reason) request.recordReportLimit?.(evidence || reportLimitEvidence('maxSelectionScanRows', limit, rows.length, 'cards', {
       ...budget, total, reason
     }));
     return { ok: true, statusCode: 200, json: { data: rows.slice(0, limit) }, truncated: Boolean(reason), total };
@@ -60049,7 +60580,10 @@ async function requestCompleteCardsForSelectionScan(request, className, limit, f
     if (page.short || total === rows.length) return finish();
   }
 
-  if (request.getRestCalls && request.getRestCalls() >= maxRestCalls) return finish('completeness_unconfirmed');
+  const restCalls = request.getRestCalls?.();
+  if (restCalls >= maxRestCalls) return finish('limit_exceeded', reportLimitEvidence('maxRestCalls', maxRestCalls, restCalls, 'calls', {
+    source: 'runtime-settings', configKey: 'maxRestCallsDefault'
+  }));
   // Only probe the next position; never add the lookahead card to the selection.
   const probe = await request(cardListPath(className, 1, fields, limit, filter));
   if (!probe.ok) return probe;
@@ -61469,7 +62003,7 @@ function createExecutionRequest(authToken, limits, options = {}) {
   };
   const deadlineAt = Number(options.deadlineAt || 0);
   const deadlineTimeoutMs = Number(options.deadlineTimeoutMs || DRAFT_PREVIEW_TIMEOUT_MS);
-  const request = async (path, { optionalMissing = false } = {}) => {
+  const request = async (path, { optionalMissing = false, catalogPage = false } = {}) => {
     assertAccess();
     assertExecutionDeadline(deadlineAt, deadlineTimeoutMs);
     if (restCalls >= limits.maxRestCalls) {
@@ -61492,8 +62026,8 @@ function createExecutionRequest(authToken, limits, options = {}) {
         assertAccess();
       }
       if (optionalMissing && response.statusCode === 404) return response;
-      if (options.strictDataReads && (!response.ok || response.json?.success === false ||
-        !response.json?.data || typeof response.json.data !== 'object')) {
+      if (options.strictDataReads && (!response.ok || !(catalogPage && options.reportLimitContext) &&
+        (response.json?.success === false || !response.json?.data || typeof response.json.data !== 'object'))) {
         throw snapshotStoreError('snapshot_refresh_data_unavailable', 'CMDBuild did not complete a data read.', 502);
       }
       return response;
@@ -61517,7 +62051,7 @@ async function executeFindClassesByAttributeType(cmdbuildExecRequest, step, para
     throw new Error(`Missing attribute type parameter: ${step.attributeTypeParam}`);
   }
 
-  const classes = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes?limit=${limits.maxClasses}&detailed=true`);
+  const classes = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes?limit=${limits.maxClasses}&detailed=true`, { catalogPage: true });
   recordIncompleteExecutionCatalog(cmdbuildExecRequest, classes, limits.maxClasses, 'maxClasses', 'maxClassesDefault', 'classes');
   if (!classes.ok) {
     throw new Error(`CMDBuild classes request failed with status ${classes.statusCode}.`);
@@ -61557,7 +62091,7 @@ async function executeFindClassesByAttributeType(cmdbuildExecRequest, step, para
 }
 
 async function executeListDomains(cmdbuildExecRequest, limits) {
-  const domains = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/domains?limit=${limits.maxDomains}`);
+  const domains = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/domains?limit=${limits.maxDomains}`, { catalogPage: true });
   recordIncompleteExecutionCatalog(cmdbuildExecRequest, domains, limits.maxDomains, 'maxDomains', 'maxDomainsDefault', 'domains');
   if (!domains.ok) {
     throw new Error(`CMDBuild domains request failed with status ${domains.statusCode}.`);
@@ -61605,7 +62139,7 @@ async function executeTraverseDomains(cmdbuildExecRequest, step, params, context
   const direction = step.direction || 'both';
   const requestedDepth = step.depthParam ? params[step.depthParam] : step.depth;
   const maxDepth = toPositiveInt(requestedDepth, limits.traversalDepthDefault, limits.maxTraversalDepth);
-  const domains = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/domains?limit=${limits.maxDomains}`);
+  const domains = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/domains?limit=${limits.maxDomains}`, { catalogPage: true });
   recordIncompleteExecutionCatalog(cmdbuildExecRequest, domains, limits.maxDomains, 'maxDomains', 'maxDomainsDefault', 'domains');
   if (!domains.ok) {
     throw new Error(`CMDBuild domains request failed with status ${domains.statusCode}.`);
@@ -61622,31 +62156,23 @@ async function executeTraverseDomains(cmdbuildExecRequest, step, params, context
   const rows = [];
   const seenClasses = new Set(classNames);
   const seenEdges = new Set();
-  const traversedDomains = new Set();
   let frontier = classNames;
   let reachableAtNextDepth = [];
   const matchesDirection = (sourceMatch, destinationMatch) =>
     direction === 'source' ? sourceMatch : direction === 'destination' ? destinationMatch : sourceMatch || destinationMatch;
-  const domainKey = (item) => JSON.stringify([item.name, item.source, item.destination]);
-
-  for (let depth = 1; depth <= maxDepth && frontier.length; depth += 1) {
-    const nextFrontier = [];
-
+  function* unseenEdgesAtDepth(depth, classesAtDepth) {
     for (const item of detailedDomains) {
       const sourceName = item.source || '';
       const destinationName = item.destination || '';
 
-      for (const className of frontier) {
+      for (const className of classesAtDepth) {
         const sourceMatch = className === sourceName;
         const destinationMatch = className === destinationName;
         if (!matchesDirection(sourceMatch, destinationMatch)) continue;
         const relatedClass = sourceMatch ? destinationName : sourceName;
         const edgeKey = `${depth}|${className}|${item.name}|${relatedClass}`;
         if (seenEdges.has(edgeKey)) continue;
-        seenEdges.add(edgeKey);
-        traversedDomains.add(domainKey(item));
-
-        rows.push({
+        yield { edgeKey, row: {
           Depth: depth,
           Class: className,
           Domain: item.name,
@@ -61656,18 +62182,26 @@ async function executeTraverseDomains(cmdbuildExecRequest, step, params, context
           Direction: sourceMatch ? 'source' : 'destination',
           RelatedClass: relatedClass,
           Cardinality: item.cardinality || ''
-        });
-        if (relatedClass && !seenClasses.has(relatedClass)) {
-          seenClasses.add(relatedClass);
-          nextFrontier.push(relatedClass);
-        }
-        if (rows.length >= limits.maxRows) {
-          return {
-            columns: ['Depth', 'Class', 'Domain', 'Description', 'Source', 'Destination', 'Direction', 'RelatedClass', 'Cardinality'],
-            rows,
-            truncated: true
-          };
-        }
+        } };
+      }
+    }
+  }
+
+  for (let depth = 1; depth <= maxDepth && frontier.length; depth += 1) {
+    const nextFrontier = [];
+    for (const { edgeKey, row } of unseenEdgesAtDepth(depth, frontier)) {
+      seenEdges.add(edgeKey);
+      rows.push(row);
+      if (row.RelatedClass && !seenClasses.has(row.RelatedClass)) {
+        seenClasses.add(row.RelatedClass);
+        nextFrontier.push(row.RelatedClass);
+      }
+      if (rows.length >= limits.maxRows) {
+        return {
+          columns: ['Depth', 'Class', 'Domain', 'Description', 'Source', 'Destination', 'Direction', 'RelatedClass', 'Cardinality'],
+          rows,
+          truncated: true
+        };
       }
     }
     const uniqueFrontier = uniqueStrings(nextFrontier);
@@ -61677,14 +62211,11 @@ async function executeTraverseDomains(cmdbuildExecRequest, step, params, context
       reportLimitEvidence('maxClasses', limits.maxClasses, uniqueFrontier.length, 'classes', { source: 'runtime-settings', configKey: 'maxClassesDefault' }));
   }
 
-  if (cmdbuildExecRequest.recordReportLimit && Number(requestedDepth) > maxDepth && reachableAtNextDepth.length) {
-    const next = new Set(reachableAtNextDepth);
-    if (detailedDomains.some((item) => item.name && item.source && item.destination && item.active !== false &&
-      !traversedDomains.has(domainKey(item)) && matchesDirection(next.has(item.source), next.has(item.destination)))) {
-      cmdbuildExecRequest.recordReportLimit(reportLimitEvidence('maxTraversalDepth', maxDepth, maxDepth + 1, 'hops', {
-        source: 'runtime-settings', configKey: 'maxTraversalDepthMax', requested: Number(requestedDepth)
-      }));
-    }
+  if (cmdbuildExecRequest.recordReportLimit && Number(requestedDepth) > maxDepth &&
+      !unseenEdgesAtDepth(maxDepth + 1, reachableAtNextDepth).next().done) {
+    cmdbuildExecRequest.recordReportLimit(reportLimitEvidence('maxTraversalDepth', maxDepth, maxDepth + 1, 'hops', {
+      source: 'runtime-settings', configKey: 'maxTraversalDepthMax', requested: Number(requestedDepth)
+    }));
   }
   return {
     columns: ['Depth', 'Class', 'Domain', 'Description', 'Source', 'Destination', 'Direction', 'RelatedClass', 'Cardinality'],
@@ -65983,6 +66514,7 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
       });
       if (!executionSlot) return;
       const publicationDeadlineAt = templateAction === 'publish' ? Date.now() + DRAFT_PREVIEW_TIMEOUT_MS : 0;
+      const publicationRemainingMs = snapshotDeadlineBudget(publicationDeadlineAt);
       let publicationPhase = 'rows';
       try {
         if (templateAction === 'publish') {
@@ -65993,7 +66525,7 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
           const deadlineOptions = { deadlineAt: publicationDeadlineAt, deadlineTimeoutMs: DRAFT_PREVIEW_TIMEOUT_MS };
           const snapshotGeneration = await waitForExecutionDeadline(snapshotPublicationState(root, templateCode), publicationDeadlineAt);
           const preparedReport = await materializePublishedReport(authToken, template.spec, params, {
-            ...executionOptions, executionDeadlineAt: publicationDeadlineAt
+            ...executionOptions, executionDeadlineAt: publicationDeadlineAt, snapshotRemainingMs: publicationRemainingMs
           }, runtimeConfig);
           result = preparedReport.result;
           publicationPhase = 'commit';
@@ -66011,6 +66543,7 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
             }
             const currentTemplate = sanitizeTemplateCard(latest.card);
             if (latest.card && !await requireTemplateUpdatePermission(authToken, res, latest.schema, latest.card, templateCode, deadlineOptions)) return null;
+            assertSnapshotDeadline(publicationRemainingMs);
             const cause = !currentTemplate ? 'template_missing'
               : String(currentTemplate.id) !== String(template.id) ? 'template_identity_changed'
                 : currentTemplate.specHash !== savedSpecHash.value ? 'spec_hash_changed'
@@ -66021,7 +66554,7 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
               return null;
             }
             const saved = await writeStaticSnapshot(root, currentTemplate, params, result, session.data, publishConfig,
-              snapshotGeneration, undefined, preparedReport.indexes, { deadlineAt: publicationDeadlineAt, response: res });
+              snapshotGeneration, undefined, preparedReport.indexes, { remainingMs: publicationRemainingMs, response: res });
             if (!saved && !res.destroyed) sendPublicationVersionConflict(res, { root, templateCode, expectedSpecHash: savedSpecHash.value,
               currentTemplate, phase: 'publish_commit', cause: 'snapshot_generation_changed' });
             return saved;
@@ -66090,7 +66623,7 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
         logWarn('template.execution_failed', {
           ...runtimeLogContext,
           action: templateAction,
-          stage: 'data',
+          stage: publicationPhase === 'commit' ? 'commit' : 'data',
           permissionDenied,
           cmdbuildStatus,
           reason: reason || code || templateExecutionErrorReason(error),

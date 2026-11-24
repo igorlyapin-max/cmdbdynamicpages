@@ -5,6 +5,7 @@ import { chromium } from 'playwright';
 import { createAssistantDiagnosticsUi } from '../../scripts/assistant-diagnostics-ui.mjs';
 import { resolveTemplateParameters, staticSnapshotParamPairs } from '../../scripts/template-parameters.mjs';
 import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics.mjs';
+import { bindViewLargeExecutionHelpers } from '../fixtures/view-large-execution-helpers.mjs';
 
 const source = readFileSync(new URL('../../scripts/dev-proxy-server.mjs', import.meta.url), 'utf8');
 const first = source.indexOf('function renderDynamicPagesShell(');
@@ -22,6 +23,7 @@ Object.assign(shellBindings, {
   DEFAULT_EMPTY_RESULT_TEXT: 'Nothing to display.',
   DEFAULT_PERMISSION_DENIED_TEXT: 'Denied',
   assistantStatus: () => ({}),
+  renderViewLargeExecutionHelpers: bindViewLargeExecutionHelpers(source),
   createAssistantDiagnosticsUi, createUiRequestDiagnostics, resolveTemplateParameters, staticSnapshotParamPairs
 });
 const renderShell = Function(...Object.keys(shellBindings), shellSource + '\nreturn renderDynamicPagesShell;')(...Object.values(shellBindings));
@@ -238,7 +240,9 @@ test('public snapshot and personal refresh keep their own transport and restore 
     if (path.endsWith('/csrf')) return { success: true, token: 'fixture' };
     if (path.endsWith('/refresh-snapshot')) {
       if (call.method === 'GET') return { available: true, mode: 'personal' };
-      return shellPayload({ kind: 'personal', viewId: 'personal-id' }, [keyed], { mode: 'personal' });
+      return shellPayload({ kind: 'personal', viewId: 'personal-id' }, [keyed], {
+        snapshotFound: true, action: 'refresh-snapshot', mode: 'personal', template: { code: 'Report', active: true }, cache: null
+      });
     }
     if (!q) return shellPayload({ kind: 'public', snapshotRevision: revision }, [keyed], { snapshotFound: true, cache: { scope: 'staticSnapshot', snapshotRevision: revision } });
     const personal = path.startsWith(api + '/templates/');

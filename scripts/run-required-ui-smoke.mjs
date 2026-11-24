@@ -13,6 +13,7 @@ const REQUIRED_TEST_IDS = [
   'publication-limit-diagnostics',
   'publication-outcome',
   'large-report-tables',
+  'large-table-column-filter',
   'build-identity'
 ];
 const TEST_NAME_PATTERN = `\\[required:(${REQUIRED_TEST_IDS.join('|')})\\]`;

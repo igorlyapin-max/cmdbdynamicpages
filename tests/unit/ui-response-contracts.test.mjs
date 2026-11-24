@@ -3,11 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics.mjs';
+import { staticSnapshotParamPairs } from '../../scripts/template-parameters.mjs';
 
 const source = fs.readFileSync(new URL('../../scripts/dev-proxy-server.mjs', import.meta.url), 'utf8');
 const functions = ['responseResult', 'parseResponse', 'validateUiResponse', 'createRequestError', 'requestDraftPreview',
   'runtimeSettingsScope', 'runtimeSettingsScopeIsCurrent', 'captureTemplateEditorSnapshot', 'saveTemplateSnapshot',
-  'templateWriteKey', 'templateWritePending',
+  'templateWriteKey', 'templateWritePending', 'templatePublicationNotice', 'exactReportLaunchQuery',
+  'isSnapshotHash', 'isSnapshotResult', 'isPersistedSnapshotCache', 'validateSnapshotMutationResponse', 'snapshotMutationOutcomeUnknown',
   'draftPreviewRequestTimeoutMs', 'saveTemplate', 'extractByTemplate', 'extractionIsRunning', 'extractionMatchesDraft', 'extractionCaptureDetails', 'runDraftAction',
   'visualizeInEditor', 'queueDiagramImportRuntimePreview', 'runDiagramImportRuntimePreview'];
 const helpers = functions.map((name) => {
@@ -32,6 +34,7 @@ async function harness(body, { status = 200, current = true, mode = 'applied' } 
     document: { getElementById: () => null, querySelector: () => null },
     cloneJsonValue: (value) => structuredClone(value),
     uiRequestDiagnostics: createUiRequestDiagnostics(),
+    staticSnapshotParamPairs,
     uiRequestOwner: () => ({ ...owner }),
     // Deliberately test current/stale consumers independently of root ownership implementation.
     uiDiagnosticIsCurrent: typeof current === 'function' ? current : () => current,
@@ -80,6 +83,73 @@ async function invoke(h, name, ...args) {
   // Some consumers do not return their request promise.
   for (let i = 0; i < 30; i += 1) await Promise.resolve();
 }
+
+test('snapshot mutations only treat known API gateway failures as definitive after dispatch', async () => {
+  const { sandbox } = await harness('{}');
+  const sent = { requestSent: true, responseFormat: 'none' };
+  for (const [action, timeout] of [['publish', 'draft_preview_timeout'], ['refresh-snapshot', 'snapshot_refresh_timeout']]) {
+    const unknown = (result, diagnostic = sent) => sandbox.snapshotMutationOutcomeUnknown(result, diagnostic, action);
+    const bad = (status, json) => ({ status, json, ok: false });
+    assert.equal(unknown(undefined), true);
+    assert.equal(unknown(undefined, { ...sent, requestSent: false }), false);
+    assert.equal(unknown({ status: 200, ok: true }), true);
+    for (const status of [502, 503, 504]) {
+      assert.equal(unknown(bad(status, null)), true);
+      assert.equal(unknown(bad(status, { success: false, code: 'proxy_error' })), true);
+    }
+    assert.equal(unknown(bad(504, { success: false, action, reason: timeout })), false);
+    assert.equal(unknown(bad(504, { success: false, action: 'run', reason: timeout })), true);
+    assert.equal(unknown(bad(503, { success: false, action, reason: 'snapshot_commit_outcome_unknown' })), true);
+    assert.equal(unknown(bad(503, { success: false, action, reason: 'snapshot_storage_unavailable' })), false);
+    assert.equal(unknown(bad(503, null), { ...sent, requestSent: false }), false);
+    assert.equal(unknown(bad(403, null)), false);
+  }
+});
+
+test('snapshot mutation success requires matching action, template and persisted metadata', async () => {
+  const { sandbox } = await harness('{}');
+  const code = 'sample';
+  const cache = { enabled: true, scope: 'staticSnapshot', status: 'snapshot-published', sharedAcrossUsers: true,
+    backend: 'memory', key: 'a'.repeat(16), publishedAt: '2026-01-01T00:00:00.000Z',
+    specHash: 'b'.repeat(64), paramsHash: 'c'.repeat(64), snapshotRevision: 'd'.repeat(64) };
+  const params = { site: 42, enabled: false };
+  const target = { code, specHash: cache.specHash, paramsMode: 'exact', query: sandbox.exactReportLaunchQuery(params) };
+  const published = { success: true, action: 'publish', template: { code, active: true }, result: { tables: [] }, params, cache };
+  const validate = (json, action, expected) => sandbox.validateSnapshotMutationResponse({ status: 200, ok: true, json }, action, expected);
+  const reject = (json, action, expected) => assert.throws(() => validate(json, action, expected), { code: 'invalid_response' });
+  validate(published, 'publish', target);
+  for (const invalid of [{ success: true }, { ...published, action: 'run' }, { ...published, template: { code: 'other', active: true } },
+    { ...published, result: {} }, { ...published, cache: null }, { ...published, cache: { ...cache, status: 'snapshot-hit' } },
+    { ...published, cache: { ...cache, specHash: 'e'.repeat(64) } }, { ...published, params: { ...params, site: '42' } }]) {
+    reject(invalid, 'publish', target);
+  }
+  const shared = { ...published, action: 'refresh-snapshot', mode: 'shared', snapshotFound: true };
+  const refresh = { code, mode: 'shared', snapshotRevision: 'e'.repeat(64), cache };
+  validate(shared, 'refresh-snapshot', refresh);
+  reject(shared, 'refresh-snapshot', { ...refresh, snapshotRevision: cache.snapshotRevision });
+  reject({ ...shared, cache: { ...cache, key: 'f'.repeat(16) } }, 'refresh-snapshot', refresh);
+  reject({ ...shared, mode: 'personal', cache: null }, 'refresh-snapshot', refresh);
+  validate({ ...shared, mode: 'personal', cache: null }, 'refresh-snapshot', { ...refresh, mode: 'personal' });
+});
+
+test('publication diagnostics follow a card across editors but not card, root or session changes', async () => {
+  const { sandbox, state, edited } = await harness('{}');
+  const notice = { cardId: '1', sessionInstance: 0, diagnostic: { serverRequestId: 'publication-id' } };
+  state.templatePublicationNotices.set(sandbox.templateWriteKey(edited.code, state.root), notice);
+  assert.equal(sandbox.templatePublicationNotice(), notice);
+  state.selectedTemplate = { id: 2, code: 'other' };
+  assert.equal(sandbox.templatePublicationNotice(), undefined);
+  state.selectedTemplate = { ...edited, id: 2 };
+  assert.equal(sandbox.templatePublicationNotice(), undefined);
+  state.selectedTemplate = { ...edited };
+  state.templateEditorInstance = 7;
+  assert.equal(sandbox.templatePublicationNotice(), notice);
+  state.root = 'B';
+  assert.equal(sandbox.templatePublicationNotice(), undefined);
+  state.root = 'A';
+  state.sessionInstance = 1;
+  assert.equal(sandbox.templatePublicationNotice(), undefined);
+});
 
 const invalidEnvelopes = [
   ['HTML', '<html>upstream unavailable</html>'], ['empty', ''], ['whitespace', '  '],

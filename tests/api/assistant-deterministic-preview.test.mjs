@@ -7550,10 +7550,15 @@ async function startSnapshotRedisFixture(t) {
         parts.push(input.subarray(header + 2, header + 2 + length).toString());
         offset = header + 2 + length + 2;
       }
+      input = input.subarray(offset);
       const [command, key, ...args] = parts;
       const add = (set, item) => { if (!sets.has(set)) sets.set(set, new Set()); sets.get(set).add(item); };
       switch (command) {
         case 'PING': return socket.end('+PONG\r\n');
+        case 'TIME': {
+          const now = Date.now();
+          return socket.write(resp([String(Math.floor(now / 1000)), String(now % 1000 * 1000)]));
+        }
         case 'GET': return socket.end(resp(values.get(key)));
         case 'MGET': return socket.end(resp([key, ...args].map((item) => values.get(item))));
         case 'SET':
@@ -7577,8 +7582,9 @@ async function startSnapshotRedisFixture(t) {
           const [expected, ...next] = args.slice(1 + keyCount);
           const writeSnapshot = key.includes('SADD');
           if (!writeSnapshot && faults.finalize) return socket.end('-ERR cannot finalize revocation\r\n');
+          if (writeSnapshot && Date.now() >= Number(next[2])) return socket.end(resp(-1));
           if ((writeSnapshot ? keys.slice(0, 1) : keys).some((item) => values.get(item) !== expected)) return socket.end(resp(0));
-          if (writeSnapshot && next[2] !== undefined && values.get(keys[1]) !== next[2]) return socket.end(resp(0));
+          if (writeSnapshot && next[3] !== undefined && values.get(keys[1]) !== next[3]) return socket.end(resp(0));
           if (writeSnapshot) { values.set(keys[1], next[0]); add(keys[2], next[1]); }
           else keys.forEach((item, index) => next[index] === '-' ? values.delete(item) : values.set(item, next[index]));
           return socket.end(resp(1));
@@ -8088,6 +8094,38 @@ test('large-table publish and shared refresh keep real deadlines at 504 and reta
   assert.deepEqual((await requestJson('GET', snapshotUrl)).json, before.json);
 });
 
+test('snapshot lookahead blocked by the REST budget identifies the budget and keeps the previous data', async (t) => {
+  const code = 'SnapshotLookaheadBudget';
+  const spec = publishSpec({ steps: [{ type: 'selectCards', as: 'assets', className: 'ARM', limit: 1 }],
+    result: { tables: [{ name: 'assets', columns: ['Code'] }] } });
+  let incomplete = false;
+  const { mock, templateUrl, snapshotUrl, headers } = await startTemplateRace(t, code, {
+    templates: [templateCard(code, spec)],
+    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true,
+      RuntimeConfigJson: JSON.stringify({ executionLimits: { maxRestCallsDefault: 2 } }) }],
+    responseOverride(url) {
+      if (url.pathname.endsWith('/classes/ARM/cards')) return { statusCode: 200, body: {
+        data: [{ _id: 501, Code: incomplete ? 'unconfirmed' : 'published' }],
+        meta: incomplete ? { count: 1 } : { total: 1 }
+      } };
+    }
+  });
+  const publish = () => requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+  const published = await publish();
+  assert.equal(published.statusCode, 200, published.body);
+  const before = await requestJson('GET', snapshotUrl);
+  incomplete = true;
+  const start = mock.requests.length;
+  const result = await publish();
+  assertSnapshotLimitError(result, 'table_result_incomplete', {
+    table: 'assets', phase: 'rows', stepAlias: 'assets', limitName: 'maxRestCalls', effectiveLimit: 2,
+    observed: 2, unit: 'calls', total: undefined, reason: 'limit_exceeded'
+  });
+  assert.deepEqual(result.json.diagnostics.limits.map(({ limitName }) => limitName), ['maxRestCalls']);
+  assert.equal(mock.requests.slice(start).filter(({ pathname }) => pathname.endsWith('/classes/ARM/cards')).length, 1);
+  assert.deepEqual((await requestJson('GET', snapshotUrl)).json, before.json);
+});
+
 test('snapshot completeness rejects ordinary publish and mixed personal refresh without a partial view', async (t) => {
   for (const mixed of [false, true]) {
     await t.test(mixed ? 'mixed personal refresh' : 'ordinary publish', async (t) => {
@@ -8192,6 +8230,37 @@ test('snapshot report diagnostics bound overflow, retain deadline evidence and m
     assert.deepEqual(failure.diagnostics, response.json.diagnostics);
     assert.ok(!backend.testOutput.includes(table) && !backend.testOutput.includes(maskedAlias));
   }
+});
+
+test('snapshot index budget masks the complete diagnostic label before clipping it in the API and log', async (t) => {
+  const code = 'SnapshotIndexLabel';
+  const prefix = 'Report' + 'a'.repeat(110);
+  const simulatedCredential = 'template-race-session';
+  const table = prefix + simulatedCredential;
+  const spec = publishSpec({ steps: [
+    { type: 'selectCards', as: 'options', className: 'routerG' },
+    { type: 'selectCards', as: table, className: 'ARM' }
+  ], result: { tables: [{ name: table, columns: ['Code'], presentation: { largeTable: {
+    mode: 'key', selector: { kind: 'result', source: 'options', idField: 'Code', labelField: 'Code', matchField: 'Membership' }
+  } } }] } });
+  const { backend, templateUrl, headers } = await startTemplateRace(t, code, {
+    templates: [templateCard(code, spec)],
+    armCards: [{ _id: 501, Code: 'asset', Membership: Array.from({ length: 100001 }, () => 'membership') }]
+  }, { CMDP_LOG_LEVEL: 'warn' });
+  const failed = await requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+  const limits = assertSnapshotLimitError(failed, 'large_table_membership_limit', {
+    table: prefix + '[REDACTED]', phase: 'index', limitName: 'maxIndexMemberships', observed: 100001
+  });
+  assert.ok(!failed.body.includes(table.slice(0, 128)));
+  const requestId = failed.headers['x-request-id'];
+  let failure;
+  await waitFor(() => {
+    failure = backend.testOutput.split('\n')
+      .filter((line) => line.includes('"event":"template.execution_failed"') && line.endsWith('}'))
+      .map((line) => JSON.parse(line)).find((entry) => entry.requestId === requestId);
+    return Boolean(failure);
+  }, 1500);
+  assert.deepEqual(failure.diagnostics.limits, limits);
 });
 
 function assertSnapshotCommitDeadline(response, reason, timeoutMs) {
@@ -8318,7 +8387,41 @@ test('snapshot deadline in the mutation queue does not let the next writer overt
   assert.equal(await signalBeforeTimeout(nextWriterEntered.promise, 100), true);
 });
 
-test('snapshot reader reports a depth cap only for a new domain edge in the requested direction', async (t) => {
+test('snapshot catalog rejects invalid envelopes and conflicting counts without replacing the report', async (t) => {
+  const code = 'SnapshotInvalidCatalog';
+  const spec = publishSpec({ steps: [{ type: 'listDomains', as: 'domains' }],
+    result: { tables: [{ name: 'domains', columns: ['Domain'], published: true, presentation: { largeTable: { mode: 'all' } } }] } });
+  const domain = { name: 'AssetLocation', source: 'ARM', destination: 'Location' };
+  let catalog = { data: [domain], meta: { total: 1 } };
+  const { templateUrl, snapshotUrl, headers } = await startTemplateRace(t, code, {
+    templates: [templateCard(code, spec)],
+    responseOverride(url) {
+      if (url.pathname.endsWith('/rest/v3/domains')) return { statusCode: 200, body: catalog };
+      if (url.pathname.endsWith('/domains/AssetLocation')) return { statusCode: 200, body: { data: domain } };
+    }
+  });
+  const publish = () => requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+  const initial = await publish();
+  assert.equal(initial.statusCode, 200, initial.body);
+  const before = await requestJson('GET', snapshotUrl);
+  for (const invalid of [
+    { meta: { total: 1 } }, { success: false, data: [] }, { data: [domain], meta: { count: 2 } },
+    { data: [domain], meta: { total: 0 } }, { data: [domain], meta: { total: 'unknown' } }
+  ]) {
+    catalog = invalid;
+    for (const result of [await publish(), await requestJson('POST', templateUrl + '/refresh-snapshot?cmdpTableShell=1', {
+      expectedMode: 'personal', expectedSnapshotRevision: before.json.cache.snapshotRevision
+    }, headers)]) {
+      assertSnapshotLimitError(result, 'table_result_incomplete', {
+        limitName: 'maxDomains', reason: 'completeness_unconfirmed', total: undefined, stepAlias: 'domains'
+      });
+      assert.equal(result.json.tableView, undefined);
+    }
+    assert.deepEqual((await requestJson('GET', snapshotUrl)).json, before.json);
+  }
+});
+
+test('snapshot traversal keeps the reverse row visible when a smaller depth cap rejects a replacement', async (t) => {
   const code = 'SnapshotReaderDomainDepth';
   const spec = {
     version: 1,
@@ -8326,14 +8429,15 @@ test('snapshot reader reports a depth cap only for a new domain edge in the requ
       { type: 'selectCards', as: 'assets', className: 'ARM' },
       { type: 'traverseDomains', as: 'domains', from: 'assets', direction: 'both', depth: 2 }
     ],
-    result: { tables: [{ name: 'domains', columns: ['Domain'], published: true, presentation: { largeTable: { mode: 'all' } } }] },
+    result: { tables: [{ name: 'domains', columns: ['Depth', 'Class', 'Domain', 'Direction'], published: true, presentation: { largeTable: { mode: 'all' } } }] },
     publish: publishSpec().publish
   };
   const domains = [{ name: 'AssetLocation', source: 'ARM', destination: 'Location' }];
-  const { templateUrl, headers } = await startTemplateRace(t, code, {
+  const configCard = { _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true,
+    RuntimeConfigJson: JSON.stringify({ executionLimits: { maxTraversalDepthMax: 2 } }) };
+  const { templateUrl, snapshotUrl, headers } = await startTemplateRace(t, code, {
     templates: [templateCard(code, spec)],
-    configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true,
-      RuntimeConfigJson: JSON.stringify({ executionLimits: { maxTraversalDepthMax: 1 } }) }],
+    configCards: [configCard],
     responseOverride(url) {
       if (url.pathname.endsWith('/rest/v3/domains')) {
         return { statusCode: 200, body: { data: domains, meta: { total: domains.length } } };
@@ -8345,7 +8449,15 @@ test('snapshot reader reports a depth cap only for a new domain edge in the requ
   const publish = () => requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
   const terminal = await publish();
   assert.equal(terminal.statusCode, 200, terminal.body);
-  domains.push({ name: 'LocationSite', source: 'Location', destination: 'Site' });
+  const before = await requestJson('GET', snapshotUrl);
+  const query = encodeURIComponent(JSON.stringify({ table: 'domains', op: 'rows', snapshotRevision: before.json.cache.snapshotRevision }));
+  const pageUrl = snapshotUrl.replace('/run?json=true', '/table-page?cmdpTable=' + query);
+  const page = await requestJson('GET', pageUrl);
+  assert.equal(page.statusCode, 200, page.body);
+  assert.deepEqual(page.json.table.rows.map(({ Depth, Class, Domain, Direction }) => [Number(Depth), Class, Domain, Direction]), [
+    [1, 'ARM', 'AssetLocation', 'source'], [2, 'Location', 'AssetLocation', 'destination']
+  ]);
+  configCard.RuntimeConfigJson = JSON.stringify({ executionLimits: { maxTraversalDepthMax: 1 } });
   const incomplete = await publish();
   assert.equal(incomplete.statusCode, 422, incomplete.body);
   assert.equal(incomplete.json.reason, 'table_result_incomplete', incomplete.body);
@@ -8355,6 +8467,8 @@ test('snapshot reader reports a depth cap only for a new domain edge in the requ
     source: 'runtime-settings', configKey: 'maxTraversalDepthMax', limitName: 'maxTraversalDepth', reason: 'limit_exceeded',
     unit: 'hops', requested: 2, effectiveLimit: 1, observed: 2, limitHit: true, truncated: true, timeout: false
   }, incomplete.body);
+  assert.deepEqual((await requestJson('GET', snapshotUrl)).json, before.json);
+  assert.deepEqual((await requestJson('GET', pageUrl)).json, page.json);
 });
 
 test('snapshot reader resolves relation targets past a partial catalog without swallowing denied detail reads', async (t) => {

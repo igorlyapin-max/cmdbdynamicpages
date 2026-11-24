@@ -5,6 +5,7 @@ import vm from 'node:vm';
 import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics.mjs';
 import { createAssistantDiagnosticsUi } from '../../scripts/assistant-diagnostics-ui.mjs';
 import { resolveTemplateParameters, staticSnapshotParamPairs } from '../../scripts/template-parameters.mjs';
+import { bindViewLargeExecutionHelpers } from '../fixtures/view-large-execution-helpers.mjs';
 
 const launcherSource = fs.readFileSync('src/CmdbDynamicPages.js', 'utf8');
 const proxySource = fs.readFileSync('scripts/dev-proxy-server.mjs', 'utf8');
@@ -143,6 +144,7 @@ function generatedDynamicPagesClientScript() {
     'createAssistantDiagnosticsUi',
     'resolveTemplateParameters',
     'staticSnapshotParamPairs',
+    'renderViewLargeExecutionHelpers',
     'DEFAULT_EMPTY_RESULT_TEXT',
     'DEFAULT_PERMISSION_DENIED_TEXT',
     'DEFAULT_TEMPLATE_CACHE_TTL_SEC',
@@ -169,7 +171,10 @@ function generatedDynamicPagesClientScript() {
     assert.ok(match, name);
     return Number(match[1]);
   });
-  return factory(createUiRequestDiagnostics, createAssistantDiagnosticsUi, resolveTemplateParameters, staticSnapshotParamPairs, 'empty result', 'permission denied', 3600, ...versions, 'assistant system prompt', 'object flow prompt', 'semantic plan prompt', 'diagram semantics prompt', 'diagram binding intent prompt', 'diagram placement prompt', 'diagram connections prompt', 'diagram critique prompt')();
+  return factory(createUiRequestDiagnostics, createAssistantDiagnosticsUi, resolveTemplateParameters, staticSnapshotParamPairs,
+    bindViewLargeExecutionHelpers(proxySource), 'empty result', 'permission denied', 3600, ...versions, 'assistant system prompt',
+    'object flow prompt', 'semantic plan prompt', 'diagram semantics prompt', 'diagram binding intent prompt', 'diagram placement prompt',
+    'diagram connections prompt', 'diagram critique prompt')();
 }
 
 test('generated Dynamic Pages client script parses as browser JavaScript', () => {
@@ -2218,14 +2223,16 @@ test('shared authoring controls keep localized, stable, and compact UI contracts
   assert.ok(diagramTitleStart > -1 && diagramTitleEnd > diagramTitleStart);
 
   const numberSettingSource = proxySource.slice(numberSettingStart, numberSettingEnd);
+  const fieldHelpSource = proxySource.slice(proxySource.indexOf('function renderFieldHelp('), numberSettingStart);
   const compactSource = proxySource.slice(compactStart, compactEnd);
   const collapsedSource = proxySource.slice(collapsedStart, collapsedEnd);
   const diagramTitleSource = proxySource.slice(diagramTitleStart, diagramTitleEnd);
   const russianLocaleSource = proxySource.slice(proxySource.indexOf('    ru: {'), proxySource.indexOf('  function t(key, vars)'));
   assert.match(russianLocaleSource, /menuRuntimeSettings: 'Настройки выполнения'/);
   assert.doesNotMatch(russianLocaleSource, /Runtime-настройки|draft generation/);
-  assert.match(numberSettingSource, /class="field-help-button"/);
-  assert.match(numberSettingSource, /role="tooltip"/);
+  assert.match(numberSettingSource, /renderFieldHelp\(id, label, help\)/);
+  assert.match(fieldHelpSource, /class="field-help-button"/);
+  assert.match(fieldHelpSource, /role="tooltip"/);
   assert.match(numberSettingSource, /aria-describedby/);
   assert.doesNotMatch(numberSettingSource, /class="muted"/);
   assert.match(compactSource, /<select multiple hidden data-compact-multi-select-value/);

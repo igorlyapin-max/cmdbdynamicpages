@@ -958,7 +958,9 @@ paths:
         правилом выдачи отчёта. Ошибка лимита, неполный расчёт и таймаут
         не заменяют ранее опубликованный снимок.
         Сохранённая версия и поколение отзыва проверяются перед вычислением и записью.
-        Дедлайн проверяется повторно перед записью после проверки сохранённого шаблона.
+        После проверки сохранённого шаблона Redis атомарно проверяет дедлайн и
+        поколение перед записью. Если подтверждение записи не получено, исход
+        неизвестен; перечитайте опубликованные данные и ревизию до повтора.
         Если после начала выполнения шаблон изменили или удалили, снимок не записывается.
         Снимки со старым ключом требуется переопубликовать.
       security:
@@ -1023,9 +1025,9 @@ paths:
                       reason: { type: string, enum: [d2_authoring_current_contract_required, publication_d2_mapping_pending] }
                       message: { type: string }
         "503":
-          $ref: "#/components/responses/RuntimeSnapshotStorageUnavailable"
+          $ref: "#/components/responses/RuntimeSnapshotWriteUnavailable"
         "504":
-          description: Истёк срок расчёта или проверки перед записью; снимок не заменён
+          description: Дедлайн истёк до записи или Redis подтвердил отказ по дедлайну; снимок не заменён
           content:
             application/json:
               schema:
@@ -1076,9 +1078,12 @@ paths:
         права редактирования. Использует параметры существующего снимка,
         включая режим ignore. personal возвращает результат только вызывающему;
         shared атомарно заменяет публичный снимок при неизменённых шаблоне и снимке.
-        В обоих режимах ревизия снимка и дедлайн проверяются повторно после расчёта.
-        В обоих режимах ошибка лимита, неполный расчёт и таймаут не заменяют
-        публичный снимок и не возвращают частичный результат.
+        После расчёта personal повторно проверяет ревизию и дедлайн до выдачи
+        результата и сохранения личного представления. Redis атомарно проверяет
+        ревизию, поколение и дедлайн до записи shared. При ошибке лимита,
+        неполном расчёте или подтверждённом таймауте частичный результат не
+        выдаётся и снимок не заменяется. При неподтверждённой записи shared
+        перечитайте публичные данные и ревизию до повтора.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -1132,9 +1137,9 @@ paths:
                       message: { type: string }
         "429": { description: Достигнут предел параллельных вычислений }
         "503":
-          $ref: "#/components/responses/RuntimeSnapshotStorageUnavailable"
+          $ref: "#/components/responses/RuntimeSnapshotWriteUnavailable"
         "504":
-          description: Истёк срок расчёта или проверки перед выдачей либо записью; частичный результат не возвращается
+          description: Дедлайн истёк до выдачи или записи либо Redis подтвердил отказ по дедлайну; снимок не заменён, личное представление не создано
           content:
             application/json:
               schema:
@@ -2661,6 +2666,33 @@ components:
               success: { type: boolean, enum: [false] }
               reason: { type: string, enum: [snapshot_storage_unavailable] }
               message: { type: string }
+    RuntimeSnapshotWriteUnavailable:
+      description: Ошибка доступа к хранилищу или неизвестный исход уже отправленной записи.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - type: object
+                required: [success, reason, code, message]
+                properties:
+                  success: { type: boolean, enum: [false] }
+                  reason: { type: string, enum: [snapshot_storage_unavailable] }
+                  code: { type: string, enum: [snapshot_storage_unavailable] }
+                  message: { type: string }
+              - type: object
+                description: >
+                  Только Publish и shared Refresh. Запись могла выполниться.
+                  Автоматического повтора нет: сначала перечитайте публичный снимок
+                  и сравните его данные и cache.snapshotRevision.
+                required: [success, reason, code, message]
+                properties:
+                  success: { type: boolean, enum: [false] }
+                  reason: { type: string, enum: [snapshot_commit_outcome_unknown] }
+                  code: { type: string, enum: [snapshot_commit_outcome_unknown] }
+                  message: { type: string }
     RuntimeSessionRequired:
       description: >
         Cookie отсутствует либо сессия недействительна или истекла

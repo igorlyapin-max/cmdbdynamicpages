@@ -8,6 +8,7 @@ import net from 'node:net';
 
 const ROOT = 'Cst_QueryTool';
 const STATIC = { mode: 'staticSnapshot', paramsMode: 'ignore', warningAccepted: true };
+const SHARED = { ...STATIC, refreshMode: 'shared', sharedRefreshAccepted: true };
 const SELECT = { type: 'selectCards', as: 'items', className: 'Asset' };
 const TABLE = { name: 'items', columns: ['Code'] };
 const PAGED = { ...TABLE, presentation: { largeTable: { mode: 'all' } } };
@@ -72,7 +73,7 @@ async function upstream(t, templates, read, userForToken = (token) => token) {
   return 'http://127.0.0.1:' + server.address().port;
 }
 
-async function backend(t, upstreamOrigin, redisOrigin) {
+async function backend(t, upstreamOrigin, redisOrigin, env = {}) {
   const reservation = net.createServer();
   const port = await listen(reservation);
   await close(reservation);
@@ -82,7 +83,7 @@ async function backend(t, upstreamOrigin, redisOrigin) {
     CMDBUILD_ORIGIN: upstreamOrigin, CMDBDYNAMIC_REDIS_ENABLED: String(Boolean(redisOrigin)),
     CMDBDYNAMIC_REDIS_REQUIRED: String(Boolean(redisOrigin)), CMDBDYNAMIC_HEALTH_REDIS_REQUIRED: 'false',
     ...(redisOrigin ? { CMDBDYNAMIC_REDIS_URL: redisOrigin, CMDBDYNAMIC_REDIS_KEY_PREFIX: 'publication-test' } : {}),
-    CMDBDYNAMICPAGES_CSRF_SECRET: 'fixture-only-csrf', CMDP_LOG_TARGET: 'stdout', CMDP_LOG_LEVEL: 'silent'
+    CMDBDYNAMICPAGES_CSRF_SECRET: 'fixture-only-csrf', CMDP_LOG_TARGET: 'stdout', CMDP_LOG_LEVEL: 'silent', ...env
   }, stdio: ['ignore', 'ignore', 'pipe'] });
   let stderr = '';
   child.stderr.on('data', (data) => { stderr += data; });
@@ -136,14 +137,16 @@ function redisArguments(input) {
     parts.push(input.subarray(header + 2, header + 2 + length).toString());
     offset = header + 4 + length;
   }
-  return parts;
+  return { parts, offset };
 }
 
 async function redisFixture(t) {
   const values = new Map();
   const events = [];
-  const faults = { runtimeRead: false };
+  const faults = { runtimeRead: false, timeReplyDelay: 0, beforeCommit: null, commitAck: 'normal' };
   const sets = new Map();
+  const commits = [];
+  const redisNow = () => Date.now() + 24 * 60 * 60 * 1000;
   const add = (key, value) => {
     if (!sets.has(key)) sets.set(key, new Set());
     sets.get(key).add(value);
@@ -188,9 +191,9 @@ async function redisFixture(t) {
           events.push('write');
           return 1;
         }
-        if (values.get(state) !== argv[0]) return 0;
         if (count === 3 && key.includes('SADD')) {
-          if (argv[3] && values.get(value) !== argv[3]) return 0;
+          if (redisNow() >= Number(argv[3])) return -1;
+          if (values.get(state) !== argv[0] || (argv[4] !== undefined && values.get(value) !== argv[4])) return 0;
           add(index, argv[2]);
           values.set(value, argv[1]);
           return 1;
@@ -202,18 +205,41 @@ async function redisFixture(t) {
   };
   const server = net.createServer((socket) => {
     let input = Buffer.alloc(0);
-    socket.on('data', (chunk) => {
+    let sampledTime;
+    socket.on('data', async (chunk) => {
       input = Buffer.concat([input, chunk]);
-      const parts = redisArguments(input);
-      if (faults.runtimeRead && parts?.[0] === 'GET' && parts[1].includes(':runtime:')) {
-        return socket.end('-ERR fixture backend unavailable\r\n');
+      const parsed = redisArguments(input);
+      if (!parsed) return;
+      input = input.subarray(parsed.offset);
+      const { parts } = parsed;
+      if (faults.runtimeRead && parts[0] === 'GET' && parts[1].includes(':runtime:')) {
+        socket.end('-ERR fixture backend unavailable\r\n');
+        return;
       }
-      if (parts) socket.end(reply(command(parts)));
+      if (parts[0] === 'TIME') {
+        sampledTime = redisNow();
+        if (faults.timeReplyDelay) await new Promise((resolve) => setTimeout(resolve, faults.timeReplyDelay));
+        socket.write(reply([String(Math.floor(sampledTime / 1000)), String(sampledTime % 1000 * 1000)]));
+        return;
+      }
+      if (parts[0] === 'EVAL' && parts[3].includes(':snapshot-state:') && parts[1].includes('SADD')) {
+        assert.ok(sampledTime, 'snapshot EVAL uses the socket that sampled Redis TIME');
+        assert.match(parts[1], /GET[\s\S]*TIME[\s\S]*ARGV\[4\][\s\S]*SADD[\s\S]*SET/);
+        const attempt = { sampledTime, deadline: Number(parts[9]) };
+        const ack = faults.commitAck;
+        commits.push(attempt);
+        await faults.beforeCommit?.(attempt);
+        attempt.outcome = command(parts);
+        if (ack === 'drop') socket.end();
+        else if (ack !== 'hold') socket.end(reply(attempt.outcome));
+        return;
+      }
+      socket.end(reply(command(parts)));
     });
   });
   await listen(server);
   t.after(() => close(server));
-  return { origin: 'redis://127.0.0.1:' + server.address().port, values, events, faults };
+  return { origin: 'redis://127.0.0.1:' + server.address().port, values, events, sets, faults, commits, redisNow };
 }
 
 const rows = (...codes) => codes.map((Code, i) => ({ _id: i + 1, Code, Description: Code }));
@@ -309,6 +335,186 @@ test('personal refresh conflicts with republish of an ignore snapshot across two
   assert.equal((await a(page, { token: 'reader' })).json.table.rows[0].Code, 'reader');
   assert.equal((await a(page, { token: 'different-reader' })).status, 409);
   assert.deepEqual((await b(publicRun)).json, current.json);
+});
+
+test('Redis fences delayed snapshot writes and distinguishes a timeout before EVAL', async (t) => {
+  const redis = await redisFixture(t);
+  const code = 'CommitDeadline';
+  const spec = { version: 1, steps: [SELECT], result: { tables: [PAGED] }, publish: SHARED };
+  const mock = await upstream(t, { [code]: spec }, (url, token) => {
+    if (url.pathname.endsWith('/classes/Asset/cards')) return { data: rows(token) };
+  });
+  const timeoutMs = 1000;
+  const request = await backend(t, mock, redis.origin, {
+    CMDP_DRAFT_PREVIEW_TIMEOUT_MS: String(timeoutMs), CMDBDYNAMIC_REDIS_TIMEOUT_MS: '2000'
+  });
+  assert.equal((await publish(request, code, spec, 'original')).status, 200);
+  const publicPath = '/public-snapshots/' + code + '/run?json=true';
+  const before = (await request(publicPath)).json;
+  const revision = before.cache.snapshotRevision;
+  assert.ok(revision);
+  assert.equal(before.tables[0].rows[0].Code, 'original');
+  const initialIndex = [...redis.sets].map(([key, items]) => [key, [...items]]);
+  const refresh = () => request('/templates/' + code + '/refresh-snapshot?cmdpTableShell=1', {
+    method: 'POST', token: 'replacement', body: { expectedMode: 'shared', expectedSnapshotRevision: revision }
+  });
+  const assertTimeout = (response, reason) => {
+    assert.equal(response.status, 504, JSON.stringify(response.json));
+    assert.equal(response.json.reason, reason);
+    assert.equal(response.json.code, reason);
+    assert.equal(response.json.result, undefined);
+    assert.equal(response.json.tableView, undefined);
+    const [limit] = response.json.diagnostics.limits;
+    assert.deepEqual([limit.phase, limit.table, limit.limitName, limit.reason],
+      ['commit', '', 'executionTimeoutMs', 'deadline_exceeded']);
+    assert.equal(limit.stepAlias, undefined);
+  };
+
+  redis.faults.timeReplyDelay = 350;
+  redis.faults.beforeCommit = async ({ sampledTime, deadline }) => {
+    assert.ok(deadline > redis.redisNow(), 'EVAL was sent before the translated deadline');
+    assert.ok(deadline - sampledTime <= timeoutMs - 300, 'TIME reply transit consumes the commit budget');
+    await new Promise((resolve) => setTimeout(resolve, deadline - redis.redisNow() + 30));
+  };
+  assertTimeout(await publish(request, code, spec, 'replacement'), 'draft_preview_timeout');
+  assertTimeout(await refresh(), 'snapshot_refresh_timeout');
+  assert.deepEqual(redis.commits.map(({ outcome }) => outcome), [1, -1, -1]);
+  assert.deepEqual((await request(publicPath)).json, before);
+
+  redis.faults.timeReplyDelay = timeoutMs + 150;
+  assertTimeout(await refresh(), 'snapshot_refresh_timeout');
+  assert.equal(redis.commits.length, 3, 'a TIME reply arriving out of budget cannot dispatch EVAL');
+  assert.deepEqual((await request(publicPath)).json, before);
+  assert.deepEqual([...redis.sets].map(([key, items]) => [key, [...items]]), initialIndex);
+});
+
+test('lost Redis ACK is a typed unknown whether or not the caller deadline expires', async (t) => {
+  const redis = await redisFixture(t);
+  const code = 'CommitAck';
+  const spec = { version: 1, steps: [SELECT], result: { tables: [PAGED] }, publish: SHARED };
+  const mock = await upstream(t, { [code]: spec }, (url, token) => {
+    if (url.pathname.endsWith('/classes/Asset/cards')) return { data: rows(token) };
+  });
+  const env = { CMDP_DRAFT_PREVIEW_TIMEOUT_MS: '1000', CMDBDYNAMIC_REDIS_TIMEOUT_MS: '2000' };
+  const writer = await backend(t, mock, redis.origin, env);
+  const observer = await backend(t, mock, redis.origin, env);
+  assert.equal((await publish(writer, code, spec, 'original')).status, 200);
+  const publicPath = '/public-snapshots/' + code + '/run?json=true';
+  const before = await observer(publicPath);
+  const assertUnknown = (response) => {
+    assert.equal(response.status, 503, JSON.stringify(response.json));
+    assert.equal(response.json.reason, 'snapshot_commit_outcome_unknown');
+    assert.equal(response.json.code, response.json.reason);
+    assert.equal(response.json.result, undefined);
+    assert.equal(response.json.tableView, undefined);
+    assert.equal(response.json.diagnostics, undefined);
+  };
+
+  redis.faults.commitAck = 'hold';
+  assertUnknown(await writer('/templates/' + code + '/refresh-snapshot?cmdpTableShell=1', {
+    method: 'POST', token: 'shared', body: {
+      expectedMode: 'shared', expectedSnapshotRevision: before.json.cache.snapshotRevision
+    }
+  }));
+  const shared = await observer(publicPath);
+  assert.equal(shared.status, 200);
+  assert.notEqual(shared.json.cache.snapshotRevision, before.json.cache.snapshotRevision);
+  assert.equal(shared.json.tables[0].rows[0].Code, 'shared');
+
+  redis.faults.commitAck = 'drop';
+  assertUnknown(await publish(writer, code, spec, 'republished'));
+  const republished = await observer(publicPath);
+  assert.equal(republished.status, 200);
+  assert.notEqual(republished.json.cache.snapshotRevision, shared.json.cache.snapshotRevision);
+  assert.equal(republished.json.tables[0].rows[0].Code, 'republished');
+  assert.deepEqual(redis.commits.map(({ outcome }) => outcome), [1, 1, 1], 'each write was dispatched exactly once');
+});
+
+test('shared refresh uses Redis revision CAS to reject a competing republish', async (t) => {
+  const redis = await redisFixture(t);
+  const code = 'CommitCas';
+  const spec = { version: 1, steps: [SELECT], result: { tables: [TABLE] }, publish: SHARED };
+  const mock = await upstream(t, { [code]: spec }, (url, token) => {
+    if (url.pathname.endsWith('/classes/Asset/cards')) return { data: rows(token) };
+  });
+  const env = { CMDBDYNAMIC_REDIS_TIMEOUT_MS: '2000' };
+  const writer = await backend(t, mock, redis.origin, env);
+  const competitor = await backend(t, mock, redis.origin, env);
+  assert.equal((await publish(writer, code, spec, 'original')).status, 200);
+  const publicPath = '/public-snapshots/' + code + '/run?json=true';
+  const before = await competitor(publicPath);
+  const entered = deferredSignal();
+  const release = deferredSignal();
+  redis.faults.beforeCommit = () => {
+    entered.resolve();
+    return release.promise;
+  };
+  const pending = writer('/templates/' + code + '/refresh-snapshot', {
+    method: 'POST', token: 'stale-writer',
+    body: { expectedMode: 'shared', expectedSnapshotRevision: before.json.cache.snapshotRevision }
+  });
+  let current;
+  try {
+    await Promise.race([entered.promise, pending.then((response) => assert.fail(JSON.stringify(response)))]);
+    redis.faults.beforeCommit = null;
+    assert.equal((await publish(competitor, code, spec, 'competitor')).status, 200);
+    current = await competitor(publicPath);
+  } finally {
+    release.resolve();
+  }
+  const stale = await pending;
+  assert.equal(stale.status, 409, JSON.stringify(stale.json));
+  assert.equal(stale.json.reason, 'snapshot_refresh_conflict');
+  assert.equal(redis.commits[1].outcome, 0);
+  assert.notEqual(current.json.cache.snapshotRevision, before.json.cache.snapshotRevision);
+  assert.equal(current.json.tables[0].rows[0].Code, 'competitor');
+  assert.deepEqual(await competitor(publicPath), current);
+});
+
+test('personal refresh timing out at the final recheck neither returns a view nor replaces existing data', async (t) => {
+  const redis = await redisFixture(t);
+  const code = 'PersonalCommitDeadline';
+  const spec = { version: 1, steps: [SELECT], result: { tables: [PAGED] }, publish: STATIC };
+  let timeOut = false;
+  let readRows = false;
+  let delayed = false;
+  const mock = await upstream(t, { [code]: spec }, async (url, token) => {
+    if (url.pathname.endsWith('/classes/Asset/cards')) {
+      if (timeOut && token === 'reader') readRows = true;
+      return { data: rows(timeOut ? 'candidate' : token) };
+    }
+    if (readRows && url.pathname.endsWith('/classes/Cst_QueryTemplate/cards')) {
+      readRows = false;
+      delayed = true;
+      await new Promise((resolve) => setTimeout(resolve, 1150));
+    }
+  });
+  const request = await backend(t, mock, redis.origin, { CMDP_DRAFT_PREVIEW_TIMEOUT_MS: '1000' });
+  assert.equal((await publish(request, code, spec, 'original')).status, 200);
+  const publicPath = '/public-snapshots/' + code + '/run?json=true';
+  const before = await request(publicPath);
+  const refresh = () => request('/templates/' + code + '/refresh-snapshot?cmdpTableShell=1', {
+    method: 'POST', token: 'reader',
+    body: { expectedMode: 'personal', expectedSnapshotRevision: before.json.cache.snapshotRevision }
+  });
+  const open = await refresh();
+  assert.equal(open.status, 200);
+  const viewId = open.json.tableView.viewId;
+  assert.ok(viewId);
+  timeOut = true;
+  const expired = await refresh();
+  assert.equal(delayed, true, 'the timeout happened at the final template recheck');
+  assert.equal(expired.status, 504, JSON.stringify(expired.json));
+  assert.equal(expired.json.reason, 'snapshot_refresh_timeout');
+  assert.equal(expired.json.diagnostics.limits[0].phase, 'commit');
+  assert.equal(expired.json.result, undefined);
+  assert.equal(expired.json.tableView, undefined);
+  const page = await request('/templates/' + code + '/table-page?cmdpTable=' +
+    encodeURIComponent(JSON.stringify({ table: 'items', op: 'rows', viewId })), { token: 'reader' });
+  assert.equal(page.status, 200);
+  assert.equal(page.json.table.rows[0].Code, 'reader');
+  assert.deepEqual(await request(publicPath), before);
+  assert.equal(redis.commits.length, 1, 'only the initial publication wrote to Redis');
 });
 
 test('visibilityHash shares only a complete visibility proof and isolates an identical partial first page', async (t) => {
