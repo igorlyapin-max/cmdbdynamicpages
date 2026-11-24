@@ -955,9 +955,10 @@ paths:
         Данные читаются под сессией издателя; при отказе чтения частичный снимок
         не публикуется. Ключ снимка включает технический класс шаблона и Code.
         В публичный индекс попадает только итоговая таблица, выбранная общим
-        правилом выдачи отчёта. Неполный расчёт и превышение бюджета индекса
+        правилом выдачи отчёта. Ошибка лимита, неполный расчёт и таймаут
         не заменяют ранее опубликованный снимок.
         Сохранённая версия и поколение отзыва проверяются перед вычислением и записью.
+        Дедлайн проверяется повторно перед записью после проверки сохранённого шаблона.
         Если после начала выполнения шаблон изменили или удалили, снимок не записывается.
         Снимки со старым ключом требуется переопубликовать.
       security:
@@ -1010,9 +1011,30 @@ paths:
                       reason: { type: string, enum: [snapshot_revocation_pending] }
                       message: { type: string }
         "422":
-          $ref: "#/components/responses/RuntimeTableBudgetExceeded"
+          description: Превышен лимит расчёта или индекса, не подтверждена полнота либо не готов D2 mapping
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/RuntimeSnapshotLimitError"
+                  - type: object
+                    required: [reason, message]
+                    properties:
+                      reason: { type: string, enum: [d2_authoring_current_contract_required, publication_d2_mapping_pending] }
+                      message: { type: string }
         "503":
           $ref: "#/components/responses/RuntimeSnapshotStorageUnavailable"
+        "504":
+          description: Истёк срок расчёта или проверки перед записью; снимок не заменён
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/RuntimeSnapshotDeadlineError"
+                  - type: object
+                    properties:
+                      reason: { type: string, enum: [draft_preview_timeout] }
+                      code: { type: string, enum: [draft_preview_timeout] }
   /cmdbuild/custom-api/templates/{code}/refresh-snapshot:
     parameters:
       - $ref: "#/components/parameters/TemplateCode"
@@ -1054,8 +1076,9 @@ paths:
         права редактирования. Использует параметры существующего снимка,
         включая режим ignore. personal возвращает результат только вызывающему;
         shared атомарно заменяет публичный снимок при неизменённых шаблоне и снимке.
-        В обоих режимах ревизия снимка проверяется повторно после расчёта.
-        При запрете чтения или неполном расчёте общего обновления нет.
+        В обоих режимах ревизия снимка и дедлайн проверяются повторно после расчёта.
+        В обоих режимах ошибка лимита, неполный расчёт и таймаут не заменяют
+        публичный снимок и не возвращают частичный результат.
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -1094,11 +1117,33 @@ paths:
         "404": { description: Доступный актуальный снимок не найден }
         "409": { description: Режим, сохранённый шаблон или исходный снимок изменился }
         "422":
-          $ref: "#/components/responses/RuntimeTableBudgetExceeded"
+          description: Превышен лимит расчёта или индекса, не подтверждена полнота либо шаблон не готов к пересчёту
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/RuntimeSnapshotLimitError"
+                  - type: object
+                    required: [reason, message]
+                    not:
+                      required: [diagnostics]
+                    properties:
+                      reason: { type: string, enum: [snapshot_refresh_incomplete] }
+                      message: { type: string }
         "429": { description: Достигнут предел параллельных вычислений }
         "503":
           $ref: "#/components/responses/RuntimeSnapshotStorageUnavailable"
-        "504": { description: Превышен таймаут расчёта }
+        "504":
+          description: Истёк срок расчёта или проверки перед выдачей либо записью; частичный результат не возвращается
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/RuntimeSnapshotDeadlineError"
+                  - type: object
+                    properties:
+                      reason: { type: string, enum: [snapshot_refresh_timeout] }
+                      code: { type: string, enum: [snapshot_refresh_timeout] }
   /cmdbuild/custom-api/templates/{code}/table-page:
     parameters:
       - $ref: "#/components/parameters/TemplateCode"
@@ -2811,6 +2856,100 @@ components:
               bypassRefreshCooldown:
                 type: boolean
   schemas:
+    RuntimeSnapshotLimitError:
+      type: object
+      required: [reason, code, message, diagnostics]
+      properties:
+        reason:
+          type: string
+          enum: [table_result_incomplete, large_table_row_limit, large_table_membership_limit, large_table_aggregate_limit, table_view_too_large]
+          description: >
+            table_result_incomplete означает неподтверждённую полноту или превышение
+            лимита (в том числе REST-бюджета) обычного, смешанного или постраничного
+            результата. Коды ошибок индекса сохраняются.
+        code:
+          type: string
+          description: Совпадает с reason.
+        message: { type: string }
+        diagnostics:
+          $ref: "#/components/schemas/RuntimeSnapshotLimitDiagnostics"
+    RuntimeSnapshotDeadlineError:
+      type: object
+      description: diagnostics.limits содержит приоритетную запись с reason=deadline_exceeded и limitName=executionTimeoutMs.
+      required: [reason, code, message, diagnostics]
+      properties:
+        reason: { type: string }
+        code:
+          type: string
+          description: Совпадает с reason.
+        message: { type: string }
+        diagnostics:
+          $ref: "#/components/schemas/RuntimeSnapshotLimitDiagnostics"
+    RuntimeSnapshotLimitDiagnostics:
+      type: object
+      required: [limits]
+      properties:
+        limits:
+          type: array
+          minItems: 1
+          maxItems: 16
+          description: >
+            Ограниченный плоский список; повторные наблюдения одного шага могут
+            объединяться. Запись deadline_exceeded сохраняется даже при переполнении.
+            Чувствительные значения в метках маскируются и в API, и в журнале.
+          items:
+            $ref: "#/components/schemas/RuntimeSnapshotLimitEntry"
+        omittedCount:
+          type: integer
+          minimum: 0
+          description: Число записей, отброшенных из-за ограничения списка. При отсутствии потерь равно нулю или опускается.
+    RuntimeSnapshotLimitEntry:
+      type: object
+      required: [table, phase, reason]
+      additionalProperties: false
+      properties:
+        table:
+          type: string
+          description: Имя итоговой таблицы, в том числе при расчёте её селектора. Пустая строка означает диагностику отчёта в целом.
+        phase:
+          type: string
+          enum: [selector, rows, index, commit]
+          description: >
+            selector — варианты выбора, rows — расчёт отчёта или строк постраничной
+            таблицы, index — индекс таблицы,
+            commit — истечение времени при повторной проверке шаблона или ожидании
+            блокировки перед записью или выдачей. Для commit table пустая,
+            сведения о шаге не указываются.
+        stepAlias: { type: string }
+        stepIndex: { type: integer, minimum: 0 }
+        stepType: { type: string }
+        limitName:
+          type: string
+          description: >
+            Например, maxRows, maxSelectionScanRows, maxRestCalls, maxRelationsPerCard, maxClasses, maxDomains, maxTraversalDepth,
+            maxIndexMemberships, maxIndexAggregateBytes, maxIndexStorageBytes или
+            executionTimeoutMs для фактического таймаута.
+        source: { type: string, enum: [runtime-settings, object-flow-step, product, upstream] }
+        configKey: { type: string }
+        requested: { type: number, minimum: 0 }
+        effectiveLimit: { type: number, minimum: 0 }
+        elapsedMs: { type: number, minimum: 0 }
+        observed:
+          type: number
+          minimum: 0
+          description: >
+            Фактически измеренное значение в unit; REST считает вызовы чтения движка, не сетевые повторы этого чтения.
+            Не включает непрочитанные записи или отклонённый до отправки вызов.
+            Не указывается, если значение неизвестно.
+        total:
+          type: integer
+          minimum: 0
+          description: Отдельный известный итог, например из метаданных upstream. При отсутствии подтверждения не указывается.
+        unit: { type: string, enum: [cards, relations, calls, rows, memberships, bytes, classes, domains, milliseconds, hops] }
+        reason: { type: string, enum: [limit_exceeded, completeness_unconfirmed, deadline_exceeded] }
+        limitHit: { type: boolean }
+        truncated: { type: boolean }
+        timeout: { type: boolean }
     TemplateTransferExportRequest:
       type: object
       required: [template]

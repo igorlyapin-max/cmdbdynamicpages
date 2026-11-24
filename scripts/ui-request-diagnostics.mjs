@@ -3,6 +3,7 @@ export function createUiRequestDiagnostics() {
   const encoder = new TextEncoder();
   const excerptLimit = 4096;
   const serializedLimit = 16384;
+  const reportLimitCount = 16;
   const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {};
   const finite = (value) => typeof value === 'number' && Number.isFinite(value);
   const bytes = (value) => encoder.encode(value).length;
@@ -65,7 +66,7 @@ export function createUiRequestDiagnostics() {
     'sourceEndpoint', 'targetEndpoint'
   ];
   const booleanFields = ['timeout', 'truncated', 'limitHit', 'exceeded', 'retryable', 'classContextLimited', 'clamped', 'canApply'];
-  function fields(input, depth = 0) {
+  function fields(input, depth = 0, publication = false) {
     const source = object(input);
     const result = {};
     for (const key of stringFields) if (typeof source[key] === 'string') result[key] = text(source[key]);
@@ -79,7 +80,15 @@ export function createUiRequestDiagnostics() {
     }
     if (depth < 2) {
       for (const key of ['limits', 'errors', 'details', 'causes', 'steps']) {
-        if (Array.isArray(source[key])) result[key] = source[key].slice(0, 16).map((item) => fields(item, depth + 1));
+        if (!Array.isArray(source[key])) continue;
+        result[key] = publication && key === 'limits'
+          ? source[key].slice(0, reportLimitCount).map(reportLimitFields).filter(Boolean)
+          : source[key].slice(0, 16).map((item) => fields(item, depth + 1));
+      }
+      if (publication) {
+        const overflow = Array.isArray(source.limits) ? Math.max(0, source.limits.length - reportLimitCount) : 0;
+        const count = Number.isSafeInteger(source.omittedCount) && source.omittedCount >= 0 ? source.omittedCount : null;
+        if (count !== null || overflow) result.omittedCount = Math.min(Number.MAX_SAFE_INTEGER, (count ?? 0) + overflow);
       }
       for (const key of ['limit', 'catalogCompleteness', 'mcp', 'objectFlow', 'semanticContext', 'rootCause', 'llm', 'usage', 'contextAssembly']) {
         if (source[key] && typeof source[key] === 'object') result[key] = fields(source[key], depth + 1);
@@ -94,6 +103,31 @@ export function createUiRequestDiagnostics() {
     }
     return result;
   }
+  function isPublicationRequest(phase) {
+    return phase === 'publish' || phase === 'refresh-snapshot';
+  }
+  function reportLimitFields(input) {
+    const source = object(input);
+    if (typeof source.table !== 'string' ||
+        !['selector', 'rows', 'index', 'commit'].includes(source.phase) ||
+        !['limit_exceeded', 'completeness_unconfirmed', 'deadline_exceeded'].includes(source.reason)) return null;
+    const item = { phase: source.phase, reason: source.reason };
+    for (const key of ['table', 'stepAlias', 'stepType', 'limitName', 'configKey']) {
+      if (typeof source[key] !== 'string') continue;
+      const max = key === 'table' || key === 'stepAlias' ? 128 : 64;
+      const label = text(source[key], max).replace(/\s+/g, ' ').trim();
+      // Budget encoded JSON too, so escaped characters cannot crowd out other entries.
+      item[key] = bytes(JSON.stringify(label)) <= max + 2 ? label : clip(label, max / 2);
+    }
+    if (['runtime-settings', 'object-flow-step', 'product', 'upstream'].includes(source.source)) item.source = source.source;
+    if (['cards', 'relations', 'calls', 'rows', 'memberships', 'bytes', 'classes', 'domains', 'milliseconds', 'hops'].includes(source.unit)) item.unit = source.unit;
+    if (Number.isSafeInteger(source.stepIndex) && source.stepIndex >= 0) item.stepIndex = source.stepIndex;
+    for (const key of ['requested', 'effectiveLimit', 'observed', 'total', 'elapsedMs']) {
+      if (finite(source[key]) && source[key] >= 0) item[key] = source[key];
+    }
+    for (const key of ['limitHit', 'truncated', 'timeout']) if (typeof source[key] === 'boolean') item[key] = source[key];
+    return item;
+  }
   function iso(value) {
     if (typeof value !== 'string' && !finite(value)) return null;
     const date = new Date(value);
@@ -107,6 +141,7 @@ export function createUiRequestDiagnostics() {
   function sanitize(input) {
     const source = object(input);
     const owner = object(source.owner);
+    const publication = isPublicationRequest(source.phase);
     const result = {
       time: iso(source.time),
       action: text(source.action, 128), phase: text(source.phase, 128), blockName: text(source.blockName),
@@ -122,7 +157,7 @@ export function createUiRequestDiagnostics() {
       responseFormat: ['json', 'html', 'text', 'invalid_json', 'empty', 'none'].includes(source.responseFormat) ? source.responseFormat : 'none',
       responseExcerpt: text(source.responseExcerpt, excerptLimit),
       errors: Array.isArray(source.errors) ? source.errors.slice(0, 16).map((item) => fields(item)) : [],
-      diagnostics: fields(source.diagnostics),
+      diagnostics: fields(source.diagnostics, 0, publication),
       checkpoint: checkpoint(source.checkpoint), retryable: source.retryable === true,
       owner: {
         ...(typeof owner.root === 'string' ? { root: text(owner.root, 128) } : {}),
@@ -137,6 +172,8 @@ export function createUiRequestDiagnostics() {
       truncated: source.truncated === true
     };
     const trace = object(source.assistantTrace);
+    const limits = object(source.diagnostics).limits;
+    if (publication && Array.isArray(limits) && limits.length > reportLimitCount) result.truncated = true;
     if (typeof source.requestSent === 'boolean') result.requestSent = source.requestSent;
     if (typeof trace.traceId === 'string' || typeof trace.warning === 'string') {
       result.assistantTrace = {};
@@ -182,7 +219,8 @@ export function createUiRequestDiagnostics() {
     const diagnostic = {
       ...base(context), status: source.status,
       contentType: source.contentType,
-      serverRequestId: source.serverRequestId !== undefined ? source.serverRequestId : source.requestId || data.requestId,
+      serverRequestId: isPublicationRequest(context?.phase) ? source.serverRequestId || data.requestId || ''
+        : source.serverRequestId !== undefined ? source.serverRequestId : source.requestId || data.requestId,
       code: data.code || error.code || (source.ok ? '' : 'http_error'),
       message: data.message || error.message || (typeof data.error === 'string' ? data.error : '') || (source.ok ? '' : 'Request failed'),
       responseFormat: format,
@@ -192,8 +230,14 @@ export function createUiRequestDiagnostics() {
       retryable: typeof data.retryable === 'boolean' ? data.retryable : [408, 429, 502, 503, 504].includes(source.status)
     };
     // JSON excerpts contain approved diagnostics only, never the original payload.
-    const excerpt = format === 'json' ? JSON.stringify({ code: text(diagnostic.code), message: text(diagnostic.message), errors: (Array.isArray(data.errors) ? data.errors : []).slice(0, 16).map((item) => fields(item)), diagnostics: fields(data.diagnostics) }) : text(body, excerptLimit + 4);
-    return sanitize({ ...diagnostic, responseExcerpt: excerpt, truncated: bytes(excerpt) > excerptLimit || (format !== 'json' && bytes(body) > excerptLimit) });
+    const safe = sanitize(diagnostic);
+    const excerptDiagnostics = { ...safe.diagnostics };
+    if (isPublicationRequest(safe.phase)) delete excerptDiagnostics.limits;
+    const excerpt = format === 'json' ? JSON.stringify({ code: safe.code, message: safe.message, errors: safe.errors, diagnostics: excerptDiagnostics })
+      : text(body, excerptLimit + 4);
+    safe.responseExcerpt = text(excerpt, excerptLimit);
+    safe.truncated ||= bytes(excerpt) > excerptLimit || (format !== 'json' && bytes(body) > excerptLimit);
+    return safe;
   }
   function exception(error, context) {
     if (error && error.diagnostic && typeof error.diagnostic === 'object') return sanitize(error.diagnostic);
@@ -212,6 +256,19 @@ export function createUiRequestDiagnostics() {
     let serialized = JSON.stringify(safe, null, 2);
     if (bytes(serialized) <= serializedLimit) return serialized;
     safe.truncated = true;
+    if (isPublicationRequest(safe.phase) && (safe.diagnostics.limits?.length || safe.diagnostics.omittedCount !== undefined)) {
+      safe.responseExcerpt = '';
+      safe.errors = [];
+      const { limits, omittedCount } = safe.diagnostics;
+      safe.diagnostics = { limits, omittedCount };
+      serialized = JSON.stringify(safe, null, 2);
+      if (bytes(serialized) <= serializedLimit) return serialized;
+      serialized = JSON.stringify(safe);
+      if (bytes(serialized) <= serializedLimit) return serialized;
+      for (const key of ['assistantTrace', 'message', 'contentType', 'blockName', 'owner']) delete safe[key];
+      serialized = JSON.stringify(safe);
+      if (bytes(serialized) <= serializedLimit) return serialized;
+    }
     // Drop optional detail before identity/context, retaining a valid JSON envelope.
     for (const key of ['responseExcerpt', 'diagnostics', 'errors']) {
       safe[key] = key === 'responseExcerpt' ? '' : key === 'errors' ? [] : {};

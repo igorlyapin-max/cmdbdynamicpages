@@ -242,9 +242,9 @@ function tableHeader(table, columns, config) {
   return result;
 }
 
-function contractError(code, message, ErrorType = TypeError) {
-  const budget = /^large_table_(row|membership|aggregate)_limit$/.test(code);
-  return Object.assign(new ErrorType(message), { code, ...(budget ? { reason: code, statusCode: 422 } : {}) });
+function contractError(code, message, indexBudget) {
+  if (indexBudget) return Object.assign(new RangeError(message), { code, reason: code, statusCode: 422, indexBudget });
+  return Object.assign(new TypeError(message), { code });
 }
 
 // matchValues and groupValues are private, row-aligned values from before projection.
@@ -260,7 +260,8 @@ export function buildLargeTableIndex(table, optionRows = [], { matchValues, grou
   const rows = table.rows ?? [];
   if (!Array.isArray(rows)) throw contractError('invalid_large_table_rows', 'Large table rows must be an array.');
   if (rows.length > LARGE_TABLE_ROW_BUDGET) {
-    throw contractError('large_table_row_limit', `Large table row budget of ${LARGE_TABLE_ROW_BUDGET} exceeded.`, RangeError);
+    throw contractError('large_table_row_limit', `Large table row budget of ${LARGE_TABLE_ROW_BUDGET} exceeded.`,
+      ['maxRows', LARGE_TABLE_ROW_BUDGET, rows.length, 'rows']);
   }
   for (const values of [matchValues, groupValues]) {
     if (values !== undefined && (!Array.isArray(values) || values.length !== rows.length)) {
@@ -298,7 +299,8 @@ export function buildLargeTableIndex(table, optionRows = [], { matchValues, grou
       const matches = Array.isArray(value) ? value : value == null ? [] : [value];
       memberships += matches.length;
       if (memberships > LARGE_TABLE_MAX_MEMBERSHIPS) {
-        throw contractError('large_table_membership_limit', 'Large table membership budget exceeded.', RangeError);
+        throw contractError('large_table_membership_limit', 'Large table membership budget exceeded.',
+          ['maxIndexMemberships', LARGE_TABLE_MAX_MEMBERSHIPS, memberships, 'memberships']);
       }
       const keys = new Set(matches.map(encodeLargeTableKey));
       for (const key of keys) {
@@ -318,7 +320,8 @@ export function buildLargeTableIndex(table, optionRows = [], { matchValues, grou
     const accountReduction = (value) => {
       if (typeof value === 'string') aggregateTextBytes += Buffer.byteLength(value);
       if (aggregateTextBytes > MAX_AGGREGATE_TEXT_BYTES) {
-        throw contractError('large_table_aggregate_limit', 'Large table aggregate text budget exceeded.', RangeError);
+        throw contractError('large_table_aggregate_limit', 'Large table aggregate text budget exceeded.',
+          ['maxIndexAggregateBytes', MAX_AGGREGATE_TEXT_BYTES, aggregateTextBytes, 'bytes']);
       }
       return value;
     };

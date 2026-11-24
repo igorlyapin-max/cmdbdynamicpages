@@ -5800,6 +5800,286 @@ test('[required:snapshot-refresh] Static reports reread, refresh personally or r
   });
 });
 
+test('[required:publication-limit-diagnostics] Snapshot publish and refresh explain a real step limit', {
+  skip: skipReason || (!useExactSnapshotFixture && process.env.CMDBDYNAMIC_E2E_WRITE !== '1' && 'Set CMDBDYNAMIC_E2E_WRITE=1 to use temporary templates.'),
+  timeout: 75_000
+}, async () => {
+  await withPage(async (page) => {
+    const api = `${proxyOrigin}/cmdbuild/custom-api`;
+    const code = `PublicationLimitUi${Date.now()}`;
+    const marker = `Source cards for ${code}`;
+    const publicUrl = `${proxyOrigin}/cmdbuild/dynamicpages/ui/run/${code}`;
+    const alias = 'limitedItems';
+    const created = [];
+    const csrf = await page.request.get(api + '/csrf');
+    assert.equal(csrf.status(), 200);
+    const headers = { origin: proxyOrigin, 'x-cmdbdynamicpages-csrf': (await csrf.json()).token };
+    async function createTemplate(name, description, spec) {
+      const response = await page.request.post(api + '/templates', { headers, data: { code: name, description, active: true, spec } });
+      assert.equal(response.status(), 201, await response.text());
+      created.push(name);
+      return (await response.json()).template;
+    }
+    function postResponse(action) {
+      return page.waitForResponse((response) => response.request().method() === 'POST' &&
+        new URL(response.url()).pathname.endsWith('/' + code + '/' + action));
+    }
+    async function assertLimitResponse(response) {
+      assert.equal(response.status(), 422, await response.text());
+      const body = await response.json();
+      assert.equal(body.code, 'table_result_incomplete');
+      const limit = body.diagnostics?.limits?.find((entry) => entry.limitName === 'maxRows');
+      assert.ok(limit, 'The server must return structured step limit evidence.');
+      assert.equal(limit.table, alias);
+      assert.equal(limit.phase, 'rows');
+      assert.equal(limit.stepAlias, alias);
+      assert.equal(limit.stepIndex, 0);
+      assert.equal(limit.source, 'object-flow-step');
+      assert.equal(limit.configKey, 'limit');
+      assert.equal(limit.effectiveLimit, 2);
+      assert.equal(limit.observed, 3);
+      assert.equal(limit.reason, 'limit_exceeded');
+      return body;
+    }
+    const row = (name) => page.locator('#app [data-result-row]').getByText(name, { exact: true });
+    try {
+      if (useExactSnapshotFixture) {
+        const capture = await page.request.get(api + '/assistant/diagnostics/status?root=Cst_QueryTool');
+        const body = await capture.json();
+        if (capture.ok()) assert.equal(body.status.mode, 'Off');
+        else {
+          assert.equal(capture.status(), 503);
+          assert.equal(body.code, 'assistant_diagnostics_unavailable');
+        }
+      }
+      const sourceSpec = { version: 1, steps: [], result: { tables: [] } };
+      const first = code + 'Source1';
+      const second = code + 'Source2';
+      const third = code + 'Source3';
+      await createTemplate(first, marker, sourceSpec);
+      await createTemplate(second, marker, sourceSpec);
+      const report = await createTemplate(code, 'Temporary snapshot limit smoke', {
+        version: 1,
+        steps: [{ type: 'selectCards', as: alias, className: 'Cst_QueryTemplate', limit: 2, columns: ['Code'],
+          filters: [{ path: 'Description', op: 'equals', value: marker }] }],
+        result: { tables: [{ name: alias, columns: ['Code'], presentation: { largeTable: { mode: 'all' } } }] },
+        publish: { mode: 'staticSnapshot', warningAccepted: true, paramsMode: 'ignore' }
+      });
+      const initial = await page.request.post(api + '/templates/' + code + '/publish', {
+        headers, data: { savedSpecHash: report.specHash }
+      });
+      assert.equal(initial.status(), 200, await initial.text());
+      await createTemplate(third, marker, sourceSpec);
+
+      const designerUrl = `${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`;
+      await page.goto(designerUrl, { waitUntil: 'domcontentloaded' });
+      await page.locator('#cmdp-language').selectOption('en');
+      await page.goto(publicUrl, { waitUntil: 'domcontentloaded' });
+      await row(first).waitFor();
+      await row(second).waitFor();
+      const [refresh] = await Promise.all([postResponse('refresh-snapshot'), page.locator('[data-action="snapshot-refresh"]').click()]);
+      const refreshFailure = await assertLimitResponse(refresh);
+      const refreshNotice = page.locator('[data-snapshot-status].snapshot-error');
+      await refreshNotice.waitFor();
+      assert.match(await refreshNotice.innerText(), /Could not refresh the report.*Report rows.*limitedItems.*Limit exceeded.*Result row count \(object flow step\).*Limit \(rows\): 2.*Observed: 3/);
+      assert.equal(await row(first).isVisible(), true);
+      assert.equal(await row(third).count(), 0);
+      const viewerDetails = page.locator('[data-snapshot-diagnostics] [data-ui-error-diagnostics]');
+      const viewerSummary = viewerDetails.locator('summary');
+      await viewerSummary.waitFor();
+      assert.equal(await viewerDetails.getAttribute('open'), null);
+      assert.ok((await viewerSummary.boundingBox())?.height > 0);
+      assert.match(await viewerSummary.innerText(), /HTTP 422/);
+      await viewerSummary.press('Enter');
+      const viewerReport = viewerDetails.locator('[data-ui-diagnostic-report]');
+      await viewerReport.waitFor();
+      assert.ok((await viewerReport.boundingBox())?.width > 0);
+      const viewerDiagnostic = JSON.parse(await viewerReport.innerText());
+      assert.equal(viewerDiagnostic.serverRequestId, refresh.headers()['x-request-id']);
+      assert.ok((await refreshNotice.innerText()).includes(viewerDiagnostic.serverRequestId));
+      assert.deepEqual(viewerDiagnostic.diagnostics.limits, refreshFailure.diagnostics.limits);
+
+      await page.goto(designerUrl, { waitUntil: 'domcontentloaded' });
+      await page.locator('#cmdp-language').selectOption('ru');
+      await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
+      await page.locator('a[data-designer-section="publication"]').click();
+      const [publish] = await Promise.all([postResponse('publish'), page.locator('.designer-actionbar [data-action="publish-snapshot"]').click()]);
+      const failure = await assertLimitResponse(publish);
+      const notice = page.locator('#cmdp-designer-publication-notice');
+      const alert = notice.getByRole('alert');
+      await alert.waitFor();
+      const summary = await alert.innerText();
+      assert.match(summary, /Не удалось опубликовать снимок.*Строки отчёта.*limitedItems.*Лимит превышен.*Число строк результата \(шаг потока объектов\).*Лимит \(строки\): 2.*Фактически: 3/);
+      assert.doesNotMatch(summary, /table_result_incomplete|maxRows|limit_exceeded|Запрошено/);
+      const details = notice.locator('[data-ui-error-diagnostics]');
+      assert.equal(await details.isVisible(), true);
+      assert.equal(await details.getAttribute('open'), null);
+      await page.setViewportSize({ width: 390, height: 844 });
+      await details.locator('summary').click();
+      const pre = details.locator('[data-ui-diagnostic-report]');
+      const diagnostic = JSON.parse(await pre.innerText());
+      assert.equal(diagnostic.code, failure.code);
+      assert.deepEqual(diagnostic.diagnostics.limits, failure.diagnostics.limits);
+      assert.match(await details.locator('summary').innerText(), /HTTP 422/);
+      assert.equal(await pre.evaluate((node) => node.scrollWidth <= node.clientWidth + 1), true);
+    } finally {
+      for (const name of created.reverse()) {
+        const response = await page.request.delete(api + '/templates/' + name, { headers });
+        assert.equal(response.status(), 200, await response.text());
+      }
+    }
+  });
+});
+
+test('[required:publication-outcome] Designer distinguishes a late server deadline from an unconfirmed publication', {
+  skip: skipReason || (!useExactSnapshotFixture && process.env.CMDBDYNAMIC_E2E_WRITE !== '1' && 'Set CMDBDYNAMIC_E2E_WRITE=1 to use a temporary template.'),
+  timeout: 60_000
+}, async () => {
+  await withPage(async (page) => {
+    const api = `${proxyOrigin}/cmdbuild/custom-api`;
+    const code = `PublicationOutcomeUi${Date.now()}`;
+    const templatePath = `${api}/templates/${code}`;
+    const csrf = await page.request.get(api + '/csrf');
+    assert.equal(csrf.status(), 200);
+    const headers = { origin: proxyOrigin, 'x-cmdbdynamicpages-csrf': (await csrf.json()).token };
+    const created = await page.request.post(api + '/templates', { headers, data: {
+      code, description: 'Current snapshot before interrupted publication', active: true,
+      spec: { version: 1, params: { site: { type: 'integer', default: 42 } },
+        steps: [{ type: 'selectCards', as: 'items', className: 'Cst_QueryTemplate', limit: 1,
+          filters: [{ path: 'Code', op: 'equals', value: code }] }],
+        result: { tables: [{ name: 'items', columns: ['Code'] }] },
+        publish: { mode: 'staticSnapshot', paramsMode: 'exact', warningAccepted: true } }
+    } });
+    assert.equal(created.status(), 201, await created.text());
+    let releaseDeadline;
+    let releaseDisconnect;
+    const deadlineGate = new Promise((resolve) => { releaseDeadline = resolve; });
+    const disconnectGate = new Promise((resolve) => { releaseDisconnect = resolve; });
+    try {
+      await page.clock.install();
+      await page.goto(`${proxyOrigin}/cmdbuild/dynamicpages/ui/designer`, { waitUntil: 'domcontentloaded' });
+      await page.locator('#cmdp-language').selectOption('ru');
+      await page.locator(`[data-action="select-template"][data-code="${code}"]`).click();
+      await page.locator('a[data-designer-section="publication"]').click();
+      const publish = page.locator('.designer-actionbar [data-action="publish-snapshot"]');
+      const isPublish = (request) => request.method() === 'POST' && new URL(request.url()).pathname.endsWith(`/${code}/publish`);
+      const [initial] = await Promise.all([page.waitForResponse((response) => isPublish(response.request())), publish.click()]);
+      assert.equal(initial.status(), 200, await initial.text());
+      await page.getByText('Снимок опубликован.', { exact: true }).waitFor();
+      const snapshotUrl = `${api}/public-snapshots/${code}/run?` + new URLSearchParams({ snapshotParams: JSON.stringify([['site', 42]]) });
+      const initialSnapshot = await page.request.get(snapshotUrl);
+      assert.equal(initialSnapshot.status(), 200, await initialSnapshot.text());
+      const initialSnapshotBody = await initialSnapshot.json();
+      assert.equal(initialSnapshotBody.snapshotFound, true);
+      assert.ok(initialSnapshotBody.cache.snapshotRevision);
+      const posts = [];
+      const checks = [];
+      const protectedRuns = [];
+      page.context().on('request', (request) => {
+        const path = new URL(request.url()).pathname;
+        if (path.endsWith(`/public-snapshots/${code}/run`)) checks.push(request);
+        if (path.endsWith(`/templates/${code}/run`)) protectedRuns.push(request);
+      });
+      const { snapshotRefreshTimeoutMs, draftPreviewTimeoutMs } = await page.evaluate(() => window.CMDP_BOOT);
+      assert.equal(snapshotRefreshTimeoutMs, draftPreviewTimeoutMs + 10000);
+      const evidence = [
+        { table: 'items', phase: 'rows', reason: 'limit_exceeded', limitName: 'maxRows', effectiveLimit: 25, observed: 26, unit: 'rows' },
+        { table: '', phase: 'commit', reason: 'deadline_exceeded', limitName: 'executionTimeoutMs', effectiveLimit: draftPreviewTimeoutMs,
+          elapsedMs: draftPreviewTimeoutMs + 100, unit: 'milliseconds', timeout: true }
+      ];
+      let outcome = 'deadline';
+      await page.route(`**/templates/${code}/publish?*`, async (route) => {
+        posts.push(route.request().postDataJSON());
+        if (outcome === 'disconnect') {
+          await disconnectGate;
+          return route.abort('connectionreset');
+        }
+        if (outcome === 'deadline') await deadlineGate;
+        const denied = outcome === 'denied';
+        return route.fulfill({ status: denied ? 403 : 504, headers: { 'x-request-id': 'publication-fixture-id' }, json: {
+          success: false, code: denied ? 'data_access_denied' : 'table_execution_timeout',
+          ...(denied ? { permissionDeniedText: 'Нет прав на публикацию.' } : {}),
+          diagnostics: { limits: evidence, omittedCount: 3, privateData: 'PRIVATE_FIXTURE' }
+        } });
+      });
+      const notice = page.locator('#cmdp-designer-publication-notice');
+      const alert = notice.getByRole('alert');
+      const check = notice.getByRole('button', { name: 'Проверить текущий снимок' });
+      const startPublish = () => Promise.all([page.waitForRequest(isPublish), publish.click()]);
+      await startPublish();
+      await page.clock.fastForward(draftPreviewTimeoutMs + 100);
+      releaseDeadline();
+      await alert.waitFor();
+      assert.match(await alert.innerText(), /Запись снимка: Истекло время выполнения/);
+      assert.doesNotMatch(await alert.innerText(), /Строки отчёта|Результат публикации неизвестен/);
+      assert.equal(await check.count(), 0);
+      const details = notice.locator('[data-ui-error-diagnostics]');
+      assert.equal(await details.getAttribute('open'), null);
+      await details.locator('summary').click();
+      const pre = details.locator('[data-ui-diagnostic-report]');
+      await pre.waitFor();
+      assert.ok((await pre.boundingBox())?.height > 0);
+      const diagnostic = JSON.parse(await pre.innerText());
+      assert.equal(diagnostic.status, 504);
+      assert.equal(diagnostic.serverRequestId, 'publication-fixture-id');
+      assert.equal(diagnostic.clientTimeoutMs, snapshotRefreshTimeoutMs);
+      assert.ok(diagnostic.durationMs >= draftPreviewTimeoutMs);
+      assert.deepEqual(diagnostic.diagnostics, { limits: evidence, omittedCount: 3 });
+      assert.doesNotMatch(await pre.innerText(), /PRIVATE_FIXTURE/);
+      assert.equal(posts.length, 1);
+
+      outcome = 'denied';
+      await startPublish();
+      await alert.getByText('Нет прав на публикацию.').waitFor();
+      assert.equal(await check.count(), 0);
+      assert.match(await details.locator('summary').innerText(), /HTTP 403/);
+      assert.equal(posts.length, 2);
+
+      outcome = 'disconnect';
+      await startPublish();
+      await page.locator('[data-run-param-field="site"]').fill('99');
+      await page.locator('#cmdp-publish-params-mode').selectOption('ignore');
+      releaseDisconnect();
+      await check.waitFor();
+      assert.ok((await check.boundingBox())?.height > 0);
+      assert.match(await alert.innerText(), /Результат публикации неизвестен/);
+      assert.equal(checks.length, 0);
+      assert.deepEqual(posts[2].params, { site: 42 });
+      await page.clock.fastForward(snapshotRefreshTimeoutMs);
+      assert.equal(posts.length, 3);
+
+      const [checked] = await Promise.all([page.waitForResponse((response) =>
+        new URL(response.url()).pathname.endsWith(`/public-snapshots/${code}/run`)), check.click()]);
+      const checkedResult = await checked.json();
+      assert.equal(checked.status(), 200, checkedResult.code || checkedResult.reason);
+      assert.equal(checkedResult.snapshotFound, true, `Expected the previously published snapshot at ${new URL(checked.url()).search}`);
+      assert.equal(checkedResult.cache.snapshotRevision, initialSnapshotBody.cache.snapshotRevision);
+      const link = notice.getByRole('link', { name: 'Открыть текущий снимок' });
+      await link.waitFor({ timeout: 5000 });
+      assert.ok((await link.boundingBox())?.width > 0);
+      assert.match(await notice.locator('[data-snapshot-check-status]').innerText(), /Это не подтверждает результат попытки публикации/);
+      assert.equal(checks.length, 1);
+      assert.equal(checks[0].method(), 'GET');
+      const expectedParams = [['site', 42]];
+      assert.deepEqual(JSON.parse(new URL(checks[0].url()).searchParams.get('snapshotParams')), expectedParams);
+      assert.deepEqual(JSON.parse(new URL(await link.getAttribute('href'), proxyOrigin).searchParams.get('snapshotParams')), expectedParams);
+      const [viewer] = await Promise.all([page.waitForEvent('popup'), link.click()]);
+      const row = viewer.locator('#app [data-result-row]').getByText(code, { exact: true });
+      await row.waitFor();
+      assert.ok((await row.boundingBox())?.height > 0);
+      assert.equal(await viewer.locator('[data-action="snapshot-refresh"]').isVisible(), false);
+      await viewer.close();
+      assert.equal(protectedRuns.length, 0);
+      assert.equal(posts.length, 3);
+    } finally {
+      releaseDeadline();
+      releaseDisconnect();
+      const deleted = await page.request.delete(templatePath, { headers });
+      assert.equal(deleted.status(), 200, await deleted.text());
+    }
+  });
+});
+
 test('[required:large-report-tables] Viewer selects a key and lazily opens grouped rows in dynamic and static reports', {
   skip: skipReason || (!useExactSnapshotFixture && process.env.CMDBDYNAMIC_E2E_WRITE !== '1' && 'Set CMDBDYNAMIC_E2E_WRITE=1 to use temporary templates.'),
   timeout: 75_000

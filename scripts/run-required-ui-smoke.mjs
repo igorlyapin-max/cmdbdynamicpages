@@ -10,6 +10,8 @@ const REQUIRED_TEST_IDS = [
   'object-flow-recovery-extraction',
   'exact-snapshot-url',
   'snapshot-refresh',
+  'publication-limit-diagnostics',
+  'publication-outcome',
   'large-report-tables',
   'build-identity'
 ];

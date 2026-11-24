@@ -15,7 +15,7 @@ const names = [
   'templateWriteKey', 'templateWritePending', 'templateTransferActionState', 'templateSaveBlockTitle', 'templatePublishBlockTitle',
   'syncImportedDiagramSaveGate', 'renderTemplateTransferIssues', 'renderTemplateTransferSaveIssues',
   'applyPublicationToSpec', 'publicationRefreshConsentMissing', 'handlePublicationRefreshChange',
-  'renderPublicationEditor', 'applyPublicationEditor', 'publishSnapshot',
+  'renderPublicationEditor', 'applyPublicationEditor', 'publishSnapshot', 'validateUiResponse',
   'inferStoredViewLargeTable', 'inferViewComposerModel', 'normalizeViewComposerColumn', 'renderViewComposerMultiModeOptions',
   'viewLargeColumnOptions', 'viewLargeClassFieldOptions', 'viewLargeResultOptions', 'renderViewLargeChoiceOptions',
   'renderViewLargePicker', 'renderViewLargeSelectorFields', 'renderViewLargeReductionFields', 'renderViewLargeReductions',
@@ -43,7 +43,7 @@ const actionLines = source.split('\n').filter((line) => line.includes("if (actio
 
 const harness = `
 var apiPrefix = '/api';
-var boot = { templateTransferMaxBytes: 131072 };
+var boot = { templateTransferMaxBytes: 131072, snapshotRefreshTimeoutMs: 70000 };
 var CMDB_BUILD_VIEW_KIND = 'cmdb-build-view';
 var state = { root: 'Root_A', session: 'session-A', sessionInstance: 1, templateEditorInstance: 1, templates: [], selectedTemplate: null, designerSection: 'template', templateVersions: [], uiDiagnosticRevision: 0,
   pendingTemplateWrites: new Map(), templatePublicationNotices: new Map(), get savingTemplate() { return templateWritePending(readTemplateCode()); } };
@@ -118,12 +118,11 @@ function uiDiagnosticIsCurrent() { return true; }
 function runUiOperation(_action, callback) { return callback(); }
 function runUiMutation(callback) { return callback(); }
 function diagramImportExecutionValidationHasMappingBlocker() { return false; }
-function validateUiResponse(result, kind) { if (kind !== 'preview' && !result.json.template) throw new Error('invalid'); }
 function createRequestError(result) { return new Error(result.json?.message || 'request failed'); }
 function setUiError(error) { evidence.errors.push(error.message); }
 function assistantTemplateRefClient() { return {root:state.root,templateCode:state.selectedTemplate.code,baseSpecHash:state.selectedTemplate.specHash}; }
 function request(path, options = {}) {
-  evidence.requests.push({path,method:options.method,body:options.body});
+  evidence.requests.push({path,method:options.method,body:options.body,timeoutMs:options.timeoutMs});
   return fetch(path,{method:options.method,body:JSON.stringify(options.body),headers:{'Content-Type':'application/json'}}).then(async response => ({ok:response.ok,json:await response.json()}));
 }
 function renderDesigner() {
@@ -328,6 +327,7 @@ test('Designer publication defaults to personal and publishes without extra cons
     assert.equal(save.body.spec.publish.refreshMode, 'personal');
     assert.equal(Object.hasOwn(save.body.spec.publish, 'sharedRefreshAccepted'), false);
     assert.equal(publish.path, '/api/templates/existing/publish?root=Root_A');
+    assert.equal(publish.timeoutMs, 70000);
     assert.deepEqual(publish.body, { params: {}, savedSpecHash: 'a'.repeat(64) });
   });
 });

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 
 const source = fs.readFileSync('scripts/dev-proxy-server.mjs', 'utf8');
-const helperNames = ['parseResponse', 'requestRetryDelayMs', 'requestTimeoutError',
+const helperNames = ['responseResult', 'parseResponse', 'requestRetryDelayMs', 'requestTimeoutError',
   'remainingRequestDeadlineMs', 'fetchWithinDeadline', 'getCsrfToken', 'request'];
 const helpers = helperNames.map((name) => {
   const start = source.indexOf('  function ' + name + '(');
@@ -291,6 +291,19 @@ test('CSRF HTTP and network errors identify the actual GET, not target POST', as
     });
     assert.equal(h.calls.length, 1);
     assert.equal(h.diagnostics.length, 1);
+  }
+});
+
+test('publish preserves a confirmed HTTP failure with an unreadable body and never retries', async () => {
+  for (const status of [401, 403, 504]) {
+    const h = harness(() => response(status, () => new Promise(() => {}), { 'x-request-id': 'server-publish-id' }), { csrfToken: 'ready' });
+    const pending = h.request('/api/templates/sample/publish', { method: 'POST', phase: 'publish', timeoutMs: 70000 });
+    await h.advance(70000);
+    const result = await pending;
+    assert.equal(result.status, status);
+    assert.equal(result.serverRequestId, 'server-publish-id');
+    assert.equal(result.diagnostic.kind, 'response');
+    assert.equal(h.calls.length, 1);
   }
 });
 

@@ -620,6 +620,20 @@ function assertExecutionDeadline(deadlineAt, timeoutMs) {
   if (executionDeadlineRemainingMs(deadlineAt) <= 0) throw executionDeadlineTimeoutError(timeoutMs);
 }
 
+async function waitForExecutionDeadline(promise, deadlineAt) {
+  if (!deadlineAt) return await promise;
+  let timer;
+  try {
+    const result = await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(executionDeadlineTimeoutError()), Math.max(0, executionDeadlineRemainingMs(deadlineAt)));
+    })]);
+    assertExecutionDeadline(deadlineAt, DRAFT_PREVIEW_TIMEOUT_MS);
+    return result;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function shouldRetryCmdbuildResult(result) {
   const statusCode = Number(result && result.statusCode || 0);
   return statusCode === 408 ||
@@ -8526,7 +8540,7 @@ function d2SourceForCompiler(source) {
   return output.join('');
 }
 
-async function renderD2SourceToSvg(source, diagram = {}) {
+async function renderD2SourceToSvg(source, diagram = {}, deadlineAt = 0) {
   const config = d2RendererConfig();
   if (!config.enabled) {
     return d2RenderError('disabled', 'D2 renderer is disabled by CMDP_D2_RENDER_ENABLED=false.');
@@ -8541,7 +8555,10 @@ async function renderD2SourceToSvg(source, diagram = {}) {
   }
 
   const layout = d2LayoutForDiagram(diagram);
-  const result = await runD2Process([`--layout=${layout}`, '-', '-'], d2SourceForCompiler(d2Source), config);
+  assertExecutionDeadline(deadlineAt, DRAFT_PREVIEW_TIMEOUT_MS);
+  const timeoutMs = Math.min(config.timeoutMs, executionDeadlineRemainingMs(deadlineAt));
+  const result = await runD2Process([`--layout=${layout}`, '-', '-'], d2SourceForCompiler(d2Source), { ...config, timeoutMs });
+  assertExecutionDeadline(deadlineAt, DRAFT_PREVIEW_TIMEOUT_MS);
   observeMetricSeconds('cmdp_d2_render_seconds', { layout }, result.elapsedMs / 1000);
   if (!result.ok) {
     incMetric('cmdp_d2_render_errors_total', { reason: result.reason || 'unknown' });
@@ -8563,7 +8580,7 @@ async function renderD2SourceToSvg(source, diagram = {}) {
 
   let renderedSvg = result.stdout;
   if (/<foreignObject\b/i.test(renderedSvg)) {
-    const imported = await d2ImportIrForRender(d2Source);
+    const imported = await waitForExecutionDeadline(d2ImportIrForRender(d2Source), deadlineAt);
     if (!imported.ok) {
       incMetric('cmdp_d2_render_errors_total', { reason: 'markdown_frame_import' });
       logWarn('d2.markdown_frame_import_failed', {
@@ -8611,7 +8628,7 @@ async function renderD2ImportPreview(source) {
   };
 }
 
-async function renderD2ArtifactsForDiagrams(diagrams) {
+async function renderD2ArtifactsForDiagrams(diagrams, deadlineAt = 0) {
   if (!Array.isArray(diagrams) || !diagrams.length) return diagrams;
   const config = d2RendererConfig();
   const renderable = diagrams
@@ -8647,7 +8664,7 @@ async function renderD2ArtifactsForDiagrams(diagrams) {
       cursor += 1;
       const diagram = current.diagram;
       if (!diagram || !diagram.d2 || typeof diagram.d2.source !== 'string' || !diagram.d2.source.trim()) continue;
-      const rendered = await renderD2SourceToSvg(diagram.d2.source, diagram);
+      const rendered = await renderD2SourceToSvg(diagram.d2.source, diagram, deadlineAt);
       const embeddedSvg = rendered.rendered
         ? embedDiagramSvgMetadata(rendered.content || '', diagram.svg && diagram.svg.metadata)
         : { content: rendered.content || '', embedded: false };
@@ -8912,12 +8929,13 @@ async function redisCommand(parts, options = {}) {
       socket.destroy();
       finish(new Error(`Redis command timed out after ${commandTimeoutMs}ms.`));
     }, commandTimeoutMs);
-    function finish(error, value) {
+    function finish(error, value, beforeDispatch = false) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       socket.destroy();
       if (error) {
+        if (beforeDispatch) { reject(error); return; }
         if (options.isolatedDiagnostics) {
           incMetric('cmdp_redis_errors_total', { reason: 'assistant_diagnostics' });
           reject(error);
@@ -8956,6 +8974,12 @@ async function redisCommand(parts, options = {}) {
       }
     }
     socket.on(config.tls ? 'secureConnect' : 'connect', () => {
+      try {
+        options.beforeSend?.();
+      } catch (error) {
+        finish(error, undefined, true);
+        return;
+      }
       commands.forEach((command) => socket.write(encodeRedisCommand(command)));
     });
     socket.on('data', (chunk) => {
@@ -9895,6 +9919,7 @@ function dynamicPagesClientScript() {
 (function () {
   'use strict';
   var boot = window.CMDP_BOOT || {};
+  var currentSnapshotViewer = window.location.hash === '#cmdp-current-snapshot';
   var uiRequestDiagnostics = (${createUiRequestDiagnostics.toString()})();
   var apiPrefix = boot.apiPrefix || '/cmdbuild/custom-api';
   var app = document.getElementById('app');
@@ -10457,6 +10482,14 @@ function dynamicPagesClientScript() {
       publishSnapshot: 'Publish/update snapshot',
       publicationApplied: 'Publication settings applied to Spec JSON.',
       snapshotPublished: 'Snapshot published.',
+      snapshotPublishFailed: 'Could not publish the snapshot.',
+      snapshotPublishOutcomeUnknown: 'Publication outcome is unknown. Check the current snapshot before publishing again.',
+      snapshotCheckCurrent: 'Check current snapshot',
+      snapshotCheckingCurrent: 'Checking the current snapshot…',
+      snapshotCurrentFound: 'A current snapshot is available. This does not confirm the publication attempt.',
+      snapshotCurrentMissing: 'No current snapshot was found. The publication outcome is still unknown.',
+      snapshotCheckFailed: 'Could not check the current snapshot.',
+      snapshotOpenCurrent: 'Open current snapshot',
       cacheEditor: 'Caching',
       cacheHelp: 'Controls result sharing and retention for this template endpoint. User refresh wait is a system Runtime setting.',
       cacheEnabled: 'Enable runtime cache',
@@ -11271,6 +11304,47 @@ function dynamicPagesClientScript() {
       snapshotRefreshFailed: 'Could not refresh the report.',
       snapshotReloadFailed: 'Could not reload the snapshot.',
       snapshotRefreshLimited: 'The report could not be fully calculated within the execution limits.',
+      reportLimitPhase_selector: 'Selector options',
+      reportLimitPhase_rows: 'Report rows',
+      reportLimitPhase_index: 'Table index',
+      reportLimitPhase_commit: 'Snapshot commit',
+      reportLimitTable: 'table “{name}”',
+      reportLimitStep: 'step “{name}”',
+      reportLimitReason_limit_exceeded: 'Limit exceeded.',
+      reportLimitReason_completeness_unconfirmed: 'Could not confirm that all data was read.',
+      reportLimitReason_deadline_exceeded: 'Execution timed out.',
+      reportLimitName_maxRows: 'Result row count',
+      reportLimitName_maxSelectionScanRows: 'Cards scanned for selection',
+      reportLimitName_maxRelationsPerCard: 'Relations per card',
+      reportLimitName_maxRestCalls: 'REST requests per execution',
+      reportLimitName_maxClasses: 'Class count',
+      reportLimitName_maxDomains: 'Domain count',
+      reportLimitName_maxTraversalDepth: 'Traversal depth',
+      reportLimitName_executionTimeoutMs: 'Execution time',
+      reportLimitName_maxIndexStorageBytes: 'Index storage size',
+      reportLimitName_maxIndexMemberships: 'Index group memberships',
+      reportLimitName_maxIndexAggregateBytes: 'Index aggregate data size',
+      reportLimitSourceLabel: 'Source: {source}',
+      'reportLimitSource_runtime-settings': 'runtime settings',
+      'reportLimitSource_object-flow-step': 'object flow step',
+      reportLimitSource_product: 'application',
+      reportLimitSource_upstream: 'data source',
+      reportLimitValue: 'Limit: {count}',
+      reportLimitValueWithUnit: 'Limit ({unit}): {count}',
+      reportLimitRequested: 'Requested: {count}',
+      reportLimitObserved: 'Observed: {count}',
+      reportLimitTotal: 'Total: {count}',
+      reportLimitElapsed: 'Elapsed: {count} ms',
+      reportLimitUnit_cards: 'cards',
+      reportLimitUnit_relations: 'relations',
+      reportLimitUnit_calls: 'calls',
+      reportLimitUnit_rows: 'rows',
+      reportLimitUnit_memberships: 'group memberships',
+      reportLimitUnit_bytes: 'bytes',
+      reportLimitUnit_classes: 'classes',
+      reportLimitUnit_domains: 'domains',
+      reportLimitUnit_milliseconds: 'ms',
+      reportLimitUnit_hops: 'hops',
       largeTableChoose: 'Select an object',
       largeTableSearchOptions: 'Search objects',
       largeTableSearchRows: 'Search table',
@@ -11881,6 +11955,14 @@ function dynamicPagesClientScript() {
       publishSnapshot: 'Опубликовать/обновить снимок',
       publicationApplied: 'Настройки публикации применены к Spec JSON.',
       snapshotPublished: 'Снимок опубликован.',
+      snapshotPublishFailed: 'Не удалось опубликовать снимок.',
+      snapshotPublishOutcomeUnknown: 'Результат публикации неизвестен. Проверьте текущий снимок перед повторной публикацией.',
+      snapshotCheckCurrent: 'Проверить текущий снимок',
+      snapshotCheckingCurrent: 'Проверяется текущий снимок…',
+      snapshotCurrentFound: 'Текущий снимок доступен. Это не подтверждает результат попытки публикации.',
+      snapshotCurrentMissing: 'Текущий снимок не найден. Результат публикации по-прежнему неизвестен.',
+      snapshotCheckFailed: 'Не удалось проверить текущий снимок.',
+      snapshotOpenCurrent: 'Открыть текущий снимок',
       cacheEditor: 'Кэширование',
       cacheHelp: 'Управляет шарингом и временем хранения результата для этого endpoint шаблона. Ожидание перед refresh задается в системных Runtime-настройках.',
       cacheEnabled: 'Включить runtime-кэш',
@@ -12695,6 +12777,47 @@ function dynamicPagesClientScript() {
       snapshotRefreshFailed: 'Не удалось обновить отчёт.',
       snapshotReloadFailed: 'Не удалось перечитать снимок.',
       snapshotRefreshLimited: 'Не удалось полностью рассчитать отчёт в пределах лимитов выполнения.',
+      reportLimitPhase_selector: 'Варианты выбора',
+      reportLimitPhase_rows: 'Строки отчёта',
+      reportLimitPhase_index: 'Индекс таблицы',
+      reportLimitPhase_commit: 'Запись снимка',
+      reportLimitTable: 'таблица «{name}»',
+      reportLimitStep: 'шаг «{name}»',
+      reportLimitReason_limit_exceeded: 'Лимит превышен.',
+      reportLimitReason_completeness_unconfirmed: 'Не удалось подтвердить полноту данных.',
+      reportLimitReason_deadline_exceeded: 'Истекло время выполнения.',
+      reportLimitName_maxRows: 'Число строк результата',
+      reportLimitName_maxSelectionScanRows: 'Число проверяемых карточек',
+      reportLimitName_maxRelationsPerCard: 'Число связей на карточку',
+      reportLimitName_maxRestCalls: 'Число REST-запросов за выполнение',
+      reportLimitName_maxClasses: 'Число классов',
+      reportLimitName_maxDomains: 'Число доменов',
+      reportLimitName_maxTraversalDepth: 'Глубина обхода',
+      reportLimitName_executionTimeoutMs: 'Время выполнения',
+      reportLimitName_maxIndexStorageBytes: 'Размер хранилища индекса',
+      reportLimitName_maxIndexMemberships: 'Число вхождений в группы индекса',
+      reportLimitName_maxIndexAggregateBytes: 'Размер агрегированных данных индекса',
+      reportLimitSourceLabel: 'Источник: {source}',
+      'reportLimitSource_runtime-settings': 'настройки выполнения',
+      'reportLimitSource_object-flow-step': 'шаг потока объектов',
+      reportLimitSource_product: 'приложение',
+      reportLimitSource_upstream: 'источник данных',
+      reportLimitValue: 'Лимит: {count}',
+      reportLimitValueWithUnit: 'Лимит ({unit}): {count}',
+      reportLimitRequested: 'Запрошено: {count}',
+      reportLimitObserved: 'Фактически: {count}',
+      reportLimitTotal: 'Всего: {count}',
+      reportLimitElapsed: 'Прошло: {count} мс',
+      reportLimitUnit_cards: 'карточки',
+      reportLimitUnit_relations: 'связи',
+      reportLimitUnit_calls: 'запросы',
+      reportLimitUnit_rows: 'строки',
+      reportLimitUnit_memberships: 'вхождения в группы',
+      reportLimitUnit_bytes: 'байты',
+      reportLimitUnit_classes: 'классы',
+      reportLimitUnit_domains: 'домены',
+      reportLimitUnit_milliseconds: 'мс',
+      reportLimitUnit_hops: 'переходы',
       largeTableChoose: 'Выберите объект',
       largeTableSearchOptions: 'Поиск объектов',
       largeTableSearchRows: 'Поиск по таблице',
@@ -13517,8 +13640,7 @@ function dynamicPagesClientScript() {
     return JSON.stringify(value === undefined ? {} : value, null, 2);
   }
 
-  function parseResponse(response, requestContext) {
-    return response.text().then(function (body) {
+  function responseResult(response, requestContext, body) {
       var json = null;
       try { json = body ? JSON.parse(body) : null; } catch (error) { json = null; }
       return {
@@ -13533,6 +13655,11 @@ function dynamicPagesClientScript() {
           ? response.headers.get('x-request-id') || String(requestContext && requestContext.requestId || '')
           : String(requestContext && requestContext.requestId || '')
       };
+  }
+
+  function parseResponse(response, requestContext) {
+    return response.text().then(function (body) {
+      return responseResult(response, requestContext, body);
     });
   }
 
@@ -13630,6 +13757,7 @@ function dynamicPagesClientScript() {
     if (controller) options.signal = controller.signal;
     var timeoutMs = remainingRequestDeadlineMs(deadlineAt, path, requestContext);
     var timedOut = false;
+    var publishFailureResponse = null;
     var timeoutId = null;
     var cancelHandler = null;
     var cancelled = new Promise(function (_, reject) {
@@ -13656,12 +13784,15 @@ function dynamicPagesClientScript() {
       if (requestContext.requestSent === false && requestContext.method === 'POST') requestContext.requestSent = true;
       return fetch(path, options);
     }).then(function (response) {
+      if (requestContext.phase === 'publish' && !response.ok) publishFailureResponse = responseResult(response, requestContext, '');
       return parseResponse(response, requestContext);
     });
     return Promise.race([operation, timeout, cancelled]).finally(function () {
       window.clearTimeout(timeoutId);
       if (callerSignal && cancelHandler) callerSignal.removeEventListener('abort', cancelHandler);
     }).catch(function (error) {
+      // A known HTTP failure (including a CSRF denial) is not an unknown publication outcome.
+      if (publishFailureResponse) return publishFailureResponse;
       if (timedOut && (!error || error.code !== 'request_timeout')) throw requestTimeoutError(path, requestContext);
       if (!error.diagnostic) error.diagnostic = uiRequestDiagnostics.exception(error, requestContext);
       throw error;
@@ -13710,7 +13841,7 @@ function dynamicPagesClientScript() {
       blockName: options.blockName
     };
     requestContext.action = options.action || requestContext.owner.action || requestContext.owner.section;
-    if (['assistant.semanticPlan', 'assistant.objectFlow', 'assistant.objectFlowApply', 'designer.extraction'].indexOf(requestContext.action) !== -1) {
+    if (options.phase === 'publish' || ['assistant.semanticPlan', 'assistant.objectFlow', 'assistant.objectFlowApply', 'designer.extraction'].indexOf(requestContext.action) !== -1) {
       requestContext.requestSent = false;
     }
     var maxRetries = method === 'GET' ? Math.max(0, Math.min(3, Number(options.maxRetries === undefined ? 2 : options.maxRetries) || 0)) : 0;
@@ -15131,6 +15262,50 @@ function dynamicPagesClientScript() {
     return { type: 'error', text: uiRequestDiagnostics.sanitize({ message: message }).message, diagnostic: diagnostic || null };
   }
 
+  function reportLimitSummary(diagnostic) {
+    var limits = diagnostic && diagnostic.diagnostics && diagnostic.diagnostics.limits || [];
+    var deadline = diagnostic && diagnostic.status === 504 && limits.find(function (entry) { return entry.reason === 'deadline_exceeded'; });
+    var limit = deadline || limits[0];
+    if (!limit) return '';
+    var location = [t('reportLimitPhase_' + limit.phase)];
+    if (limit.table) location.push(t('reportLimitTable', { name: limit.table }));
+    if (limit.stepAlias && limit.stepAlias !== limit.table) location.push(t('reportLimitStep', { name: limit.stepAlias }));
+    var limitKey = 'reportLimitName_' + limit.limitName;
+    var name = Object.hasOwn(I18N.en, limitKey) ? t(limitKey) : '';
+    var source = limit.source ? t('reportLimitSource_' + limit.source) : '';
+    var limitDescription = name && source ? name + ' (' + source + ')' : name || (source ? t('reportLimitSourceLabel', { source: source }) : '');
+    var counts = [];
+    if (limit.effectiveLimit !== undefined) counts.push(t(limit.unit ? 'reportLimitValueWithUnit' : 'reportLimitValue', {
+      count: limit.effectiveLimit, unit: limit.unit && t('reportLimitUnit_' + limit.unit)
+    }));
+    if (limit.requested !== undefined && limit.requested !== limit.effectiveLimit) counts.push(t('reportLimitRequested', { count: limit.requested }));
+    if (limit.observed !== undefined) counts.push(t('reportLimitObserved', { count: limit.observed }));
+    if (limit.total !== undefined) counts.push(t('reportLimitTotal', { count: limit.total }));
+    if (limit.elapsedMs !== undefined && !(limit.unit === 'milliseconds' && limit.observed === limit.elapsedMs)) {
+      counts.push(t('reportLimitElapsed', { count: limit.elapsedMs }));
+    }
+    return location.join(', ') + ': ' + t('reportLimitReason_' + limit.reason) +
+      (limitDescription ? ' ' + limitDescription + '.' : '') +
+      (counts.length ? ' ' + counts.join('; ') + '.' : '');
+  }
+
+  function publicationErrorMessage(error, result) {
+    var failure = uiErrorMessage(error);
+    var diagnostic = failure.diagnostic;
+    if (!diagnostic || diagnostic.responseFormat === 'none') return failure;
+    if (diagnostic.status === 401) return Object.assign(failure, { text: t('runtimeSessionInvalid') });
+    if (diagnostic.status === 403 || result && resultIsPermissionDenied(result)) {
+      var denied = result && result.json && accessDeniedTextFromResult(result) || t('runtimeTemplateAccessDenied');
+      return Object.assign(failure, { text: uiRequestDiagnostics.sanitize({ message: denied }).message });
+    }
+    var summary = reportLimitSummary(diagnostic);
+    var message = diagnostic.responseFormat === 'json' ? diagnostic.message.trim() : '';
+    var codeOnly = message === diagnostic.code || /^[A-Za-z0-9]+(?:[_.-][A-Za-z0-9]+)+$/.test(message) || message === 'Request failed';
+    failure.text = summary ? t('snapshotPublishFailed') + ' ' + summary :
+      (message && !codeOnly ? message : t('snapshotPublishFailed'));
+    return failure;
+  }
+
   function setUiError(error, text, templateOnly) {
     if (error && error.diagnostic && !uiDiagnosticIsCurrent(error.diagnostic, false, templateOnly)) return;
     state.message = uiErrorMessage(error, text);
@@ -15150,15 +15325,20 @@ function dynamicPagesClientScript() {
 
   function renderUiErrorDiagnostics(diagnostic, templateOnly) {
     if (!uiDiagnosticIsCurrent(diagnostic, false, templateOnly)) return '';
-    var safe = uiRequestDiagnostics.sanitize(userFacingAssistantDiagnostics(diagnostic, (state.selectedTemplate && state.selectedTemplate.spec) || defaultSpec()));
+    var safe = diagnostic.phase === 'publish' ? diagnostic :
+      userFacingAssistantDiagnostics(diagnostic, (state.selectedTemplate && state.selectedTemplate.spec) || defaultSpec());
+    return renderTechnicalRequestDiagnostics(safe) + assistantDiagnosticsUi.renderReference(uiRequestDiagnostics.sanitize(safe).assistantTrace);
+  }
+
+  function renderTechnicalRequestDiagnostics(diagnostic) {
+    var safe = uiRequestDiagnostics.sanitize(diagnostic);
     var report = uiRequestDiagnostics.serialize(safe);
     var status = safe.status ? 'HTTP ' + safe.status : t('diagnosticNoHttpResponse');
     var requestId = safe.serverRequestId || safe.clientRequestId || '';
     return '<details class="help-details ui-error-diagnostics" data-ui-error-diagnostics><summary>'
       + escapeHtml(t('technicalDiagnostics')) + ' <span class="muted">' + escapeHtml(status + (requestId ? ' · ' + requestId : '')) + '</span></summary>'
       + '<div class="toolbar"><button type="button" class="icon-button" data-action="copy-error-diagnostics" title="' + escapeHtml(t('copyDiagnostics')) + '" aria-label="' + escapeHtml(t('copyDiagnostics')) + '">⧉</button><span data-diagnostic-copy-status role="status" aria-live="polite"></span></div>'
-      + '<pre data-ui-diagnostic-report tabindex="0">' + escapeHtml(report) + '</pre></details>'
-      + assistantDiagnosticsUi.renderReference(safe.assistantTrace);
+      + '<pre data-ui-diagnostic-report tabindex="0">' + escapeHtml(report) + '</pre></details>';
   }
 
   function renderAuthoringCaptureDiagnostics(diagnostic, details) {
@@ -20063,7 +20243,7 @@ function dynamicPagesClientScript() {
       '<div class="designer-main">',
       renderDesignerActionBar(selected),
       '<div id="cmdp-designer-notice"><div id="cmdp-designer-current-notice">' + renderNotice(state.message) + '</div>' +
-        '<div id="cmdp-designer-publication-notice">' + renderNotice(templatePublicationNotice(), true) + '</div></div>',
+        '<div id="cmdp-designer-publication-notice">' + renderTemplatePublicationNotice() + '</div></div>',
       renderTemplateContext(selected),
       renderDesignerSection(selected, config, renderTemplateRows()),
       '</div>'
@@ -30631,6 +30811,52 @@ function dynamicPagesClientScript() {
     return notice && notice.snapshotRevocationPending ? { type: 'warning', text: t('snapshotRevocationPending') } : notice;
   }
 
+  function renderTemplatePublicationNotice() {
+    var notice = templatePublicationNotice();
+    var check = notice && notice.snapshotCheck;
+    if (!check || check.id !== String(state.selectedTemplate && state.selectedTemplate.id || '')) return renderNotice(notice, true);
+    return renderNotice(Object.assign({}, notice, { text: t('snapshotPublishOutcomeUnknown') }), true) +
+      '<div class="toolbar"><button type="button" data-action="check-current-snapshot" aria-disabled="' + Boolean(check.pending) + '">' +
+      escapeHtml(t('snapshotCheckCurrent')) + '</button><span data-snapshot-check-status role="status">' + renderSnapshotCheckStatus(check) + '</span></div>';
+  }
+
+  function renderSnapshotCheckStatus(check) {
+    var message = check.status ? t(check.status) : '';
+    if (check.httpStatus && check.status === 'snapshotCheckFailed') message += ' ' + t('httpStatus', { status: check.httpStatus });
+    return escapeHtml(message) + (check.status === 'snapshotCurrentFound' ? ' <a href="' +
+      escapeHtml(runtimeTemplateUrl(check.code, check.query) + '#cmdp-current-snapshot') + '" target="_blank" rel="noreferrer">' +
+      escapeHtml(t('snapshotOpenCurrent')) + '</a>' : '');
+  }
+
+  function checkCurrentSnapshot() {
+    var notice = templatePublicationNotice();
+    var check = notice && notice.snapshotCheck;
+    if (!check || check.pending || check.id !== String(state.selectedTemplate && state.selectedTemplate.id || '')) return;
+    function updateCheckStatus(status, httpStatus) {
+      check.status = status;
+      check.httpStatus = httpStatus;
+      if (templatePublicationNotice() !== notice) return;
+      var button = document.querySelector('[data-action="check-current-snapshot"]');
+      var output = document.querySelector('[data-snapshot-check-status]');
+      if (button) button.setAttribute('aria-disabled', String(check.pending));
+      if (output) output.innerHTML = renderSnapshotCheckStatus(check);
+    }
+    check.pending = true;
+    updateCheckStatus('snapshotCheckingCurrent');
+    request(publicSnapshotRunPath(check.code, check.query, true), { maxRetries: 0 }).then(function (result) {
+      check.pending = false;
+      if (result.ok && result.json && result.json.success === true && typeof result.json.snapshotFound === 'boolean') {
+        updateCheckStatus(result.json.snapshotFound ? 'snapshotCurrentFound' : 'snapshotCurrentMissing');
+      } else {
+        updateCheckStatus(result.status === 401 ? 'runtimeSessionInvalid' :
+          resultIsPermissionDenied(result) ? 'runtimeTemplateAccessDenied' : 'snapshotCheckFailed', result.status);
+      }
+    }).catch(function () {
+      check.pending = false;
+      updateCheckStatus('snapshotCheckFailed');
+    });
+  }
+
   function templateSaveBlockTitle(code, spec) {
     if (!state.selectedTemplate) return t('templateSelectionRequired');
     if (templateWritePending(code)) return t('savingTemplate');
@@ -31415,7 +31641,7 @@ function dynamicPagesClientScript() {
     }
     function refreshPublicationNotice() {
       var notice = document.getElementById('cmdp-designer-publication-notice');
-      if (notice) notice.innerHTML = renderNotice(templatePublicationNotice(), true);
+      if (notice) notice.innerHTML = renderTemplatePublicationNotice();
     }
     var savingNotice = { type: 'ok', text: t('savingTemplate') };
     var write = { notice: savingNotice };
@@ -31430,7 +31656,8 @@ function dynamicPagesClientScript() {
     state.pendingTemplateWrites.set(key, write);
     if (publication && !state.templatePublicationNotices.get(key)?.snapshotRevocationPending) state.templatePublicationNotices.delete(key);
     var redraw = false;
-    var publishing = false;
+    var publicationTarget;
+    var published;
     state.message = savingNotice;
     refreshWriteNotice();
     if (publication) refreshPublicationNotice();
@@ -31524,19 +31751,24 @@ function dynamicPagesClientScript() {
         throw new Error(t('publishSavedSpecHashMissing'));
       }
       writeNotice({ type: 'ok', text: t('publishingSnapshot') });
-      publishing = true;
-      var published = await request(apiPrefix + '/templates/' + encodeURIComponent(savedTemplate.code) + '/publish' + rootQuery, {
+      var publishedMode = publishModelForSpec(savedTemplate.spec);
+      publicationTarget = {
+        code: savedTemplate.code, id: String(savedTemplate.id || ''),
+        query: publishedMode.paramsMode === 'ignore' ? {} : exactReportLaunchQuery(publication.params)
+      };
+      published = await request(apiPrefix + '/templates/' + encodeURIComponent(savedTemplate.code) + '/publish' + rootQuery, {
         method: 'POST',
         owner: owner,
         phase: 'publish',
+        timeoutMs: boot.snapshotRefreshTimeoutMs,
         body: { params: publication.params, savedSpecHash: savedTemplate.specHash }
       });
       if (!published.ok) throw createRequestError(published);
+      validateUiResponse(published, 'publish');
       if (sameScope()) {
-        var publishedMode = publishModelForSpec(savedTemplate.spec);
-        state.lastPublishedReportLink = { session: saveScope.session, root: saveScope.root, code: savedTemplate.code,
-          id: String(savedTemplate.id || ''), specHash: savedTemplate.specHash,
-          query: publishedMode.paramsMode === 'ignore' ? {} : exactReportLaunchQuery(publication.params) };
+        state.lastPublishedReportLink = Object.assign({}, publicationTarget, {
+          session: saveScope.session, root: saveScope.root, specHash: savedTemplate.specHash
+        });
         if (sameTemplate()) refreshTemplateLaunchUrl();
       }
       if (!sameEditor()) return;
@@ -31544,8 +31776,13 @@ function dynamicPagesClientScript() {
       if (!sameDraft()) state.templateDirty = true;
       writeNotice({ type: sameDraft() ? 'ok' : 'warning', text: t(sameDraft() ? 'snapshotPublished' : 'publishedPreviousRevision') });
     }).catch(function (error) {
-      if (publishing && saveScope.session === state.session) {
-        var failure = uiErrorMessage(error);
+      if (publicationTarget && saveScope.session === state.session) {
+        var failure = publicationErrorMessage(error, published);
+        var diagnostic = failure.diagnostic;
+        if (diagnostic && diagnostic.requestSent && (diagnostic.responseFormat === 'none' || (published && published.ok && error.code === 'invalid_response'))) {
+          failure.text = t('snapshotPublishOutcomeUnknown');
+          failure.snapshotCheck = publicationTarget;
+        }
         failure.templateWrite = true;
         state.templatePublicationNotices.set(key, failure);
         writeNotice(null);
@@ -33753,7 +33990,7 @@ function dynamicPagesClientScript() {
       '<button type="button" class="runtime-cache-button" data-action="snapshot-reload" title="' + escapeHtml(t('snapshotReload')) +
       '" aria-label="' + escapeHtml(t('snapshotReload')) + '">&#8635;</button>' +
       '<button type="button" data-action="snapshot-refresh" hidden></button>' +
-      '<span data-snapshot-status role="status"></span></div>' : '') + renderRuntimeResult(result, runtimeLargeTables);
+      '<span data-snapshot-status role="status"></span></div><div data-snapshot-diagnostics hidden></div>' : '') + renderRuntimeResult(result, runtimeLargeTables);
     app.querySelectorAll('[data-large-table]').forEach(function (node) {
       mountLargeTable(runtimeLargeTables[Number(node.getAttribute('data-large-table'))], node);
     });
@@ -33770,17 +34007,21 @@ function dynamicPagesClientScript() {
     app.querySelector('[data-action="snapshot-reload"]').disabled = state.runtimeRefreshInProgress;
   }
 
-  function snapshotStatus(message, failed) {
+  function snapshotStatus(message, failed, diagnostic) {
     var status = app.querySelector('[data-snapshot-status]');
     if (!status) return;
+    var requestId = diagnostic && (diagnostic.serverRequestId || diagnostic.clientRequestId);
     status.classList.toggle('snapshot-error', Boolean(failed));
-    status.textContent = message;
+    status.textContent = message + (requestId ? ' ' + t('runtimeRequestId') + ': ' + requestId + '.' : '');
+    var details = app.querySelector('[data-snapshot-diagnostics]');
+    details.hidden = !diagnostic;
+    details.innerHTML = diagnostic ? renderTechnicalRequestDiagnostics(diagnostic) : '';
   }
 
   function updateSnapshotCapability(result) {
     state.snapshotRefreshMode = '';
     updateSnapshotActions();
-    if (!boot.snapshotRefreshSessionPresent || !state.snapshotRevision || !result.ok || !result.json || !result.json.snapshotFound) return;
+    if (currentSnapshotViewer || !boot.snapshotRefreshSessionPresent || !state.snapshotRevision || !result.ok || !result.json || !result.json.snapshotFound) return;
     request(snapshotRefreshPath(boot.templateCode), { maxRetries: 0 }).then(function (capability) {
       var mode = capability.json && capability.json.available && capability.json.mode;
       state.snapshotRefreshMode = capability.ok && (mode === 'personal' || mode === 'shared') ? mode : '';
@@ -33789,12 +34030,15 @@ function dynamicPagesClientScript() {
   }
 
   function snapshotRefreshError(result, fallback) {
-    var reason = result.json && result.json.reason;
+    var reason = result.json && (result.json.code || result.json.reason);
     if (result.status === 401) return t('runtimeSessionInvalid');
     if (reason === 'data_access_denied') return t('runtimeDataAccessDenied');
     if (result.status === 403) return t('runtimeTemplateAccessDenied');
     if (result.status === 409 || result.status === 404) return t('snapshotRefreshConflict');
+    var summary = reportLimitSummary(result.diagnostic);
+    if (summary) return t(fallback) + ' ' + summary;
     if (reason === 'snapshot_refresh_incomplete') return t('snapshotRefreshLimited');
+    if (reason === 'snapshot_refresh_timeout') return t(fallback) + ' ' + t('reportLimitReason_deadline_exceeded');
     return t(fallback);
   }
 
@@ -33808,11 +34052,12 @@ function dynamicPagesClientScript() {
     var fallback = reload ? 'snapshotReloadFailed' : 'snapshotRefreshFailed';
     request(path, reload ? { maxRetries: 0 } : {
       method: 'POST',
+      phase: 'refresh-snapshot',
       body: { expectedMode: state.snapshotRefreshMode, expectedSnapshotRevision: state.snapshotRevision },
       timeoutMs: boot.snapshotRefreshTimeoutMs
     }).then(function (result) {
       if (!result.ok || !result.json) {
-        snapshotStatus(snapshotRefreshError(result, fallback) + (result.requestId ? ' ' + t('runtimeRequestId') + ': ' + result.requestId + '.' : ''), true);
+        snapshotStatus(snapshotRefreshError(result, fallback), true, result.diagnostic);
         return;
       }
       result.downloadMode = !reload && result.json.mode === 'personal' ? 'personal' : 'public';
@@ -33823,8 +34068,9 @@ function dynamicPagesClientScript() {
       state.runtimeRefreshInProgress = false;
       updateSnapshotActions();
       if (button && !button.hidden) button.focus();
-    }).catch(function () {
-      snapshotStatus(t(fallback), true);
+    }).catch(function (error) {
+      var diagnostic = error.diagnostic;
+      snapshotStatus(snapshotRefreshError({ status: diagnostic && diagnostic.status, diagnostic: diagnostic }, fallback), true, diagnostic);
     }).finally(function () {
       state.runtimeRefreshInProgress = false;
       updateSnapshotActions();
@@ -33842,7 +34088,7 @@ function dynamicPagesClientScript() {
     var params = Object.fromEntries(Array.from(new URLSearchParams(window.location.search || ''))
       .filter(function (entry) { return !runtimeSystemParam(entry[0]); }));
     state.runParams = params;
-    if (boot.publicRuntime) {
+    if (boot.publicRuntime || currentSnapshotViewer) {
       request(publicSnapshotRunPath(templateCode, params, true)).then(function (result) {
         result.downloadMode = 'public';
         state.runtimeRefreshInProgress = false;
@@ -33975,6 +34221,7 @@ function dynamicPagesClientScript() {
     var action = target.getAttribute('data-action');
     if (assistantDiagnosticsUi.handleAction(target)) { event.preventDefault(); return; }
     if (action === 'copy-error-diagnostics') { copyUiErrorDiagnostics(target); return; }
+    if (action === 'check-current-snapshot') { checkCurrentSnapshot(); return; }
     if (action === 'diagram-import-label-token-select') {
       selectDiagramImportLabelAutocompleteTarget(target);
       return;
@@ -36695,7 +36942,7 @@ async function requireTemplateClassPermission(authToken, res, schema, permission
   return true;
 }
 
-async function resolveTemplateUpdatePermission(authToken, schema, card) {
+async function resolveTemplateUpdatePermission(authToken, schema, card, requestOptions = {}) {
   if (card && typeof card._can_update === 'boolean') {
     return {
       allowed: card._can_update === true,
@@ -36704,7 +36951,7 @@ async function resolveTemplateUpdatePermission(authToken, schema, card) {
       cmdbuildStatus: 200
     };
   }
-  const classAccess = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(schema.classNames.template)}`, authToken);
+  const classAccess = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(schema.classNames.template)}`, authToken, requestOptions);
   if (!classAccess.ok) {
     return {
       allowed: false,
@@ -36721,8 +36968,10 @@ async function resolveTemplateUpdatePermission(authToken, schema, card) {
   };
 }
 
-async function requireTemplateUpdatePermission(authToken, res, schema, card, templateCode) {
-  const permission = await resolveTemplateUpdatePermission(authToken, schema, card);
+async function requireTemplateUpdatePermission(authToken, res, schema, card, templateCode, requestOptions) {
+  const permission = await resolveTemplateUpdatePermission(authToken, schema, card, requestOptions);
+  assertExecutionDeadline(requestOptions?.deadlineAt, DRAFT_PREVIEW_TIMEOUT_MS);
+  if (res.destroyed) return false;
   if (!permission.verified) {
     sendJson(res, 502, {
       success: false,
@@ -39268,7 +39517,10 @@ async function readStaticSnapshot(root, templateCode, params, publishConfig = { 
   return { key: exactKey, backend, snapshot: null };
 }
 
-async function writeStaticSnapshot(root, template, params, result, sessionData, publishConfig, generation, replaces, tableIndexes) {
+async function writeStaticSnapshot(root, template, params, result, sessionData, publishConfig, generation, replaces, tableIndexes, boundary) {
+  const { deadlineAt, response } = boundary;
+  if (response.destroyed) return null;
+  assertExecutionDeadline(deadlineAt, DRAFT_PREVIEW_TIMEOUT_MS);
   const specHash = hashJson(template.spec || {});
   const paramsHash = staticSnapshotParamsHash(params, publishConfig);
   const key = staticSnapshotKey(root, template.code, params, publishConfig);
@@ -39295,6 +39547,9 @@ async function writeStaticSnapshot(root, template, params, result, sessionData, 
   const stateKey = snapshotStateKey(root, template.code);
   const memoryOnly = SNAPSHOT_MEMORY_ONLY;
   const backend = memoryOnly ? 'memory' : 'redis';
+  const snapshotJson = memoryOnly ? '' : JSON.stringify(snapshot);
+  assertExecutionDeadline(deadlineAt, DRAFT_PREVIEW_TIMEOUT_MS);
+  if (response.destroyed) return null;
   try {
     if (memoryOnly) {
       if (snapshotStateMemory.get(stateKey) !== generation) return null;
@@ -39304,11 +39559,18 @@ async function writeStaticSnapshot(root, template, params, result, sessionData, 
     } else {
       const indexKey = cacheKey('snapshot-index', staticSnapshotTemplateIndexId(root, template.code));
       const stored = await redisCommand(['EVAL', "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end; if ARGV[4] and redis.call('GET', KEYS[2]) ~= ARGV[4] then return 0 end; redis.call('SADD', KEYS[3], ARGV[3]); redis.call('SET', KEYS[2], ARGV[2]); return 1",
-        3, stateKey, cacheKey('snapshot', key), indexKey, generation, JSON.stringify(snapshot), key,
-        ...(replaces ? [replaces.revision] : [])]);
+        3, stateKey, cacheKey('snapshot', key), indexKey, generation, snapshotJson, key,
+        ...(replaces ? [replaces.revision] : [])], {
+        beforeSend() {
+          assertExecutionDeadline(deadlineAt, DRAFT_PREVIEW_TIMEOUT_MS);
+          if (response.destroyed) throw new Error('Snapshot client disconnected before storage dispatch.');
+        }
+      });
       if (stored !== 1) return null;
     }
-  } catch {
+  } catch (error) {
+    if (response.destroyed) return null;
+    if (error.code === 'draft_preview_timeout') throw error;
     throw snapshotStoreError('snapshot_storage_unavailable', 'Published report storage is temporarily unavailable.');
   }
   return {
@@ -53784,24 +54046,139 @@ function reportTableExecutionOptions(runtimeConfig, deadlineAt) {
     maxTraversalDepth: limits.maxTraversalDepthMax, traversalDepthDefault: limits.maxTraversalDepthDefault,
     maxRows: REPORT_TABLE_ROW_BUDGET, maxRowsMax: REPORT_TABLE_ROW_BUDGET, largeTableExecution: true,
     includeDiagrams: false, executionScope: 'tables', strictDataReads: true,
-    executionDeadlineAt: deadlineAt
+    executionDeadlineAt: deadlineAt, reportLimitSettings: runtimeConfig?.executionLimits
   };
 }
 
-async function executeReportTableSource(authToken, spec, table, params, options, restriction = null) {
-  let records = [];
-  const result = await executeTemplateSpec(authToken, reportTableSourceSpec(spec, table), params, {
-    ...options, reportTableRestriction: restriction,
-    reportTableRawProjection: { alias: table.name, fields: [...(table.columns || []),
-      table.presentation?.largeTable?.selector?.matchField].filter(Boolean) },
-    captureReportTableRows: (rows) => { records = rows; }
-  });
-  const rendered = result.tables[0];
-  if (result.trace.some((step) => step.truncated)) rendered.truncated = true;
-  return { rendered, records };
+const REPORT_LIMIT_DIAGNOSTICS_MAX = 16;
+
+function reportLimitEvidence(limitName, effectiveLimit, observed, unit, options = {}) {
+  const reason = options.reason || 'limit_exceeded';
+  return {
+    limitName, effectiveLimit, observed, unit, reason,
+    limitHit: reason !== 'completeness_unconfirmed', truncated: reason !== 'deadline_exceeded',
+    timeout: reason === 'deadline_exceeded', source: options.source || 'product',
+    ...(options.configKey ? { configKey: options.configKey } : {}),
+    ...(Number.isFinite(options.requested) ? { requested: options.requested } : {}),
+    ...(Number.isFinite(options.total) ? { total: options.total } : {})
+  };
 }
 
-async function reportTableOptions(authToken, spec, settings, params, options) {
+function recordReportLimit(context, evidence, terminal = false) {
+  if (!context) return;
+  const { step, phase, table, limits, settings } = context;
+  const priority = evidence.reason === 'deadline_exceeded' ? 3 : terminal ? 2 : evidence.limitHit ? 1 : 0;
+  const item = { table, phase, ...evidence, priority };
+  if (step) {
+    context.stepHasEvidence = true;
+    Object.assign(item, { stepAlias: step.alias, stepIndex: step.index, stepType: step.type });
+  }
+  if (item.source === 'runtime-settings' && item.requested === undefined) {
+    const requested = Number(settings?.[item.configKey]);
+    if (Number.isFinite(requested) && requested > 0 && requested !== item.effectiveLimit) item.requested = requested;
+  }
+  const existing = limits.findIndex((entry) => entry.stepIndex === item.stepIndex && entry.phase === item.phase &&
+    entry.limitName === item.limitName && entry.reason === item.reason);
+  if (existing !== -1) {
+    if (priority <= limits[existing].priority &&
+      (item.total ?? item.observed ?? -1) <= (limits[existing].total ?? limits[existing].observed ?? -1)) return;
+    limits.splice(existing, 1);
+  }
+  const before = limits.findIndex((entry) => (entry.priority || 0) < priority);
+  limits.splice(before === -1 ? limits.length : before, 0, item);
+  if (limits.length > REPORT_LIMIT_DIAGNOSTICS_MAX) {
+    limits.pop();
+    context.omittedCount = (context.omittedCount || 0) + 1;
+  }
+}
+
+function attachReportLimits(error, ...contexts) {
+  const all = contexts.flatMap((context) => context?.limits || []);
+  if (!all.length) return error;
+  all.sort((left, right) => (right.priority || 0) - (left.priority || 0));
+  error.reportLimits = all.slice(0, REPORT_LIMIT_DIAGNOSTICS_MAX);
+  error.reportLimitsOmitted = contexts.reduce((total, context) => total + (context?.omittedCount || 0), 0) +
+    Math.max(0, all.length - REPORT_LIMIT_DIAGNOSTICS_MAX);
+  return error;
+}
+
+function incompleteReportTable(...contexts) {
+  return attachReportLimits(snapshotStoreError('table_result_incomplete',
+    'The report did not complete; no snapshot was replaced.', 422), ...contexts);
+}
+
+function safeReportDiagnosticLabel(value, authToken) {
+  const masked = redactAssistantDiagnosticValue(String(value ?? ''), { secretValues: [authToken] }).value;
+  return String(masked).replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s<>"']+/gi, '[REDACTED]')
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 128);
+}
+
+function reportLimitErrorDetails(error, denied, authToken) {
+  if (denied || !error.reportLimits?.length) return {};
+  const limits = error.reportLimits.map(({ priority, table, stepAlias, ...item }) => ({
+    ...item, table: safeReportDiagnosticLabel(table, authToken),
+    ...(stepAlias === undefined ? {} : { stepAlias: safeReportDiagnosticLabel(stepAlias, authToken) })
+  }));
+  return { diagnostics: { limits, ...(error.reportLimitsOmitted > 0 ? { omittedCount: error.reportLimitsOmitted } : {}) } };
+}
+
+function recordReportDeadline(context, deadlineAt) {
+  const requested = Number(process.env.CMDP_DRAFT_PREVIEW_TIMEOUT_MS);
+  recordReportLimit(context, reportLimitEvidence('executionTimeoutMs', DRAFT_PREVIEW_TIMEOUT_MS,
+    Date.now() - deadlineAt + DRAFT_PREVIEW_TIMEOUT_MS, 'milliseconds', {
+      configKey: 'CMDP_DRAFT_PREVIEW_TIMEOUT_MS', reason: 'deadline_exceeded',
+      requested: requested > 0 && requested !== DRAFT_PREVIEW_TIMEOUT_MS ? requested : undefined
+    }));
+}
+
+function ensureSnapshotDeadlineEvidence(error, deadlineAt, phase) {
+  if (error.code !== 'draft_preview_timeout' || !deadlineAt ||
+    error.reportLimits?.some((item) => item.reason === 'deadline_exceeded')) return;
+  const context = { table: '', phase, limits: [] };
+  recordReportDeadline(context, deadlineAt);
+  attachReportLimits(error, context, { limits: error.reportLimits, omittedCount: error.reportLimitsOmitted });
+}
+
+function snapshotExecutionIncomplete(result) {
+  return result.truncated || result.trace?.some((step) => step.truncated) ||
+    result.limitDiagnostics?.some((item) => item.truncated || item.timeout) ||
+    result.tables?.some((table) => table.truncated) ||
+    result.diagrams?.some((diagram) => diagram.truncated || (diagram.d2?.source && !diagram.svg?.rendered));
+}
+
+async function executeSnapshotReportPhase(authToken, spec, params, options, context) {
+  try {
+    return await executeTemplateSpec(authToken, spec, params, { ...options, reportLimitContext: context });
+  } catch (error) {
+    if (error.code === 'draft_preview_timeout') recordReportDeadline(context, options.executionDeadlineAt);
+    if (error.reason === 'snapshot_refresh_incomplete') {
+      if (!context.limits.length) recordReportLimit(context, { reason: 'completeness_unconfirmed', limitHit: false, truncated: true });
+      throw incompleteReportTable(context);
+    }
+    throw attachReportLimits(error, context);
+  }
+}
+
+async function executeReportTableSource(authToken, spec, table, params, options, {
+  restriction = null, phase = 'rows', publishedTable = table.name
+} = {}) {
+  const reportLimitContext = { table: publishedTable, phase, settings: options.reportLimitSettings, limits: [] };
+  let records = [];
+  const result = await executeSnapshotReportPhase(authToken, reportTableSourceSpec(spec, table), params, {
+      ...options, reportTableRestriction: restriction,
+      reportTableRawProjection: { alias: table.name, fields: [...(table.columns || []),
+        table.presentation?.largeTable?.selector?.matchField].filter(Boolean) },
+      captureReportTableRows: (rows) => { records = rows; }
+  }, reportLimitContext);
+  const rendered = result.tables[0];
+  if (reportLimitContext.limits.length || snapshotExecutionIncomplete(result)) rendered.truncated = true;
+  if (rendered.truncated && !reportLimitContext.limits.length) {
+    recordReportLimit(reportLimitContext, { reason: 'completeness_unconfirmed', limitHit: false, truncated: true });
+  }
+  return { rendered, records, evidence: reportLimitContext };
+}
+
+async function reportTableOptions(authToken, spec, settings, params, options, tableName) {
   if (settings.mode !== 'key') return { rows: [], incomplete: false };
   const selector = settings.selector;
   const fields = [selector.idField, selector.labelField];
@@ -53810,14 +54187,14 @@ async function reportTableOptions(authToken, spec, settings, params, options) {
     ...spec, steps: [{ type: 'selectCards', as: alias, className: selector.source, columns: fields }],
     result: {}
   };
-  const { rendered, records } = await executeReportTableSource(authToken, optionSpec, {
+  const { rendered, records, evidence } = await executeReportTableSource(authToken, optionSpec, {
     name: alias, columns: fields
-  }, params, options);
+  }, params, options, { phase: 'selector', publishedTable: tableName });
   return {
     rows: rendered.rows.map((row, index) => ({
       ...row, [selector.idField]: reportTableKeyValue(runtimeRowValue(records[index], selector.idField), selector.idField)
     })),
-    incomplete: rendered.truncated
+    incomplete: rendered.truncated, evidence
   };
 }
 
@@ -53851,15 +54228,35 @@ async function buildReportTableIndex(authToken, spec, table, params, options, av
     selectedValue !== '' && Number.isFinite(Number(selectedValue)) ? Number(selectedValue) : selectedValue;
   const scopedParams = parameterName ? { ...params, [parameterName]: parameterValue } : params;
   const restriction = reportTableRestriction(spec, table, config, selectedToken, selectedValue);
-  const { rendered, records } = await executeReportTableSource(authToken, spec, table, scopedParams, options, restriction);
+  let prepared;
+  try {
+    prepared = await executeReportTableSource(authToken, spec, table, scopedParams, options, { restriction });
+  } catch (error) {
+    throw attachReportLimits(error, { limits: error.reportLimits, omittedCount: error.reportLimitsOmitted }, available.evidence);
+  }
+  const { rendered, records, evidence } = prepared;
   const matchValues = config.mode === 'key' ? records.map((row) =>
     reportTableKeyValue(runtimeRowValue(row, config.selector.matchField), config.selector.idField)) : undefined;
   rendered.truncated ||= available.incomplete;
-  return {
-    index: buildLargeTableIndex(rendered, available.rows, { matchValues,
-      groupValues: records.map((row) => config.groupKeys.map((field) => runtimeRowValue(row, field))) }),
-    rendered
-  };
+  if (options.requireCompleteReport && rendered.truncated) throw incompleteReportTable(available.evidence, evidence);
+  try {
+    const index = buildLargeTableIndex(rendered, available.rows, { matchValues,
+      groupValues: records.map((row) => config.groupKeys.map((field) => runtimeRowValue(row, field))) });
+    assertExecutionDeadline(options.executionDeadlineAt, DRAFT_PREVIEW_TIMEOUT_MS);
+    return {
+      index, rendered
+    };
+  } catch (error) {
+    if (error.indexBudget) error.reportLimits = [{
+      table: table.name.slice(0, 128), phase: 'index', ...reportLimitEvidence(...error.indexBudget)
+    }];
+    if (error.code === 'draft_preview_timeout') {
+      const context = { table: table.name, phase: 'index', limits: [] };
+      recordReportDeadline(context, options.executionDeadlineAt);
+      error.reportLimits = context.limits;
+    }
+    throw error;
+  }
 }
 
 async function materializePublishedReport(authToken, spec, params, options, runtimeConfig, publicOutput = true) {
@@ -53867,25 +54264,41 @@ async function materializePublishedReport(authToken, spec, params, options, runt
     spec = { ...spec, result: { ...spec.result, tables: publishedReportTables(spec.result) } };
   }
   const paged = reportPagedTables(spec);
-  if (!paged.length) return { result: await executeTemplateSpec(authToken, spec, params, options) };
   const deadlineAt = options.executionDeadlineAt || Date.now() + DRAFT_PREVIEW_TIMEOUT_MS;
-  const tableOptions = reportTableExecutionOptions(runtimeConfig, deadlineAt);
-  const result = await executeTemplateSpec(authToken, tableShellSpec(spec, options.includeDiagrams !== false),
-    params, { ...options, strictDataReads: true, executionDeadlineAt: deadlineAt });
+  const tableOptions = { ...reportTableExecutionOptions(runtimeConfig, deadlineAt), requireCompleteReport: true };
+  const tableName = paged.length === 1 ? paged[0].name : '';
+  const shell = tableShellSpec(spec, options.includeDiagrams !== false);
+  const evidence = { table: shell.result.tables.length === 1 ? shell.result.tables[0].name : '', phase: 'rows',
+    settings: runtimeConfig?.executionLimits, limits: [],
+    stepIndexes: new Map((spec.steps || []).map((step, index) => [step.as, index])) };
+  const result = await executeSnapshotReportPhase(authToken, shell, params, {
+    ...options, strictDataReads: true, executionDeadlineAt: deadlineAt
+  }, evidence);
+  if (evidence.limits.length || snapshotExecutionIncomplete(result)) {
+    if (!evidence.limits.length) recordReportLimit(evidence, { reason: 'completeness_unconfirmed', limitHit: false, truncated: true });
+    throw incompleteReportTable(evidence);
+  }
+  if (!paged.length) return { result };
   const indexes = Object.create(null);
   const tables = new Map();
   for (const table of paged) {
     const config = normalizeLargeTable(table.presentation.largeTable);
-    const available = await reportTableOptions(authToken, spec, config, params, tableOptions);
+    const available = await reportTableOptions(authToken, spec, config, params, tableOptions, table.name);
     const prepared = await buildReportTableIndex(authToken, spec, table, params, tableOptions, available);
-    if (prepared.rendered.truncated) {
-      throw snapshotStoreError('table_result_incomplete', 'The large table did not finish within its execution budget; no snapshot was replaced.', 422);
-    }
     indexes[table.name] = prepared.index;
     tables.set(table.name, prepared.rendered);
   }
-  if (Buffer.byteLength(JSON.stringify(indexes)) > REPORT_TABLE_VIEW_MAX_BYTES / 2) {
-    throw snapshotStoreError('table_view_too_large', 'The report exceeds the snapshot table index storage budget.', 422);
+  const indexBytes = Buffer.byteLength(JSON.stringify(indexes));
+  if (indexBytes > REPORT_TABLE_VIEW_MAX_BYTES / 2) {
+    throw Object.assign(snapshotStoreError('table_view_too_large', 'The report exceeds the snapshot table index storage budget.', 422), {
+      reportLimits: [{ table: tableName.slice(0, 128), phase: 'index',
+        ...reportLimitEvidence('maxIndexStorageBytes', REPORT_TABLE_VIEW_MAX_BYTES / 2, indexBytes, 'bytes') }]
+    });
+  }
+  if (executionDeadlineRemainingMs(deadlineAt) <= 0) {
+    const context = { table: tableName, phase: 'index', limits: [] };
+    recordReportDeadline(context, deadlineAt);
+    throw attachReportLimits(executionDeadlineTimeoutError(), context);
   }
   return { result: attachPagedTableResults(spec, result, tables), indexes };
 }
@@ -53943,7 +54356,7 @@ async function handleReportTablePage(req, res, requestUrl, root, templateCode, a
     const config = normalizeLargeTable(table.presentation.largeTable);
     const optionViewId = reportTableOptionsViewId(owner, table.name);
     if (query.op === 'options' || config.mode === 'key' && !query.key) {
-      const available = await reportTableOptions(authToken, template.spec, config, params, options);
+      const available = await reportTableOptions(authToken, template.spec, config, params, options, table.name);
       const emptyTable = { ...table, rows: [], truncated: available.incomplete };
       const result = tablePageResult(buildLargeTableIndex(emptyTable, available.rows), query);
       if (config.mode === 'key') storeReportTableView(optionViewId, { available });
@@ -53970,9 +54383,10 @@ async function handleReportTablePage(req, res, requestUrl, root, templateCode, a
     const denied = errorLooksPermissionDenied(error);
     const status = denied ? 403 : error.statusCode || 400;
     const reason = denied ? 'data_access_denied' : error.reason || 'table_page_failed';
-    logWarn('report.table_page_failed', { ...context, reason, status });
+    const details = reportLimitErrorDetails(error, denied, authToken);
+    logWarn('report.table_page_failed', { ...context, reason, status, ...details });
     if (!res.destroyed) sendJson(res, status, {
-      success: false, reason, message: denied ? DEFAULT_PERMISSION_DENIED_TEXT
+      success: false, reason, ...(error.reportLimits?.length ? { code: reason, ...details } : {}), message: denied ? DEFAULT_PERMISSION_DENIED_TEXT
         : error.reason ? error.message : 'Could not load the report table.'
     });
   } finally {
@@ -53993,7 +54407,7 @@ async function listTemplateCards(authToken, root, requestUrl) {
   };
 }
 
-async function findTemplateCard(authToken, root, code) {
+async function findTemplateCard(authToken, root, code, requestOptions = {}) {
   const schema = buildTechnicalSchema(root);
   const templateCode = validateCmdbuildIdentifier(code, 'template code');
   const filter = JSON.stringify({ attribute: { simple: { attribute: 'Code', operator: 'equal', value: [templateCode] } } });
@@ -54003,7 +54417,7 @@ async function findTemplateCard(authToken, root, code) {
   while (true) {
     const query = new URLSearchParams({ limit: '1000', filter });
     if (start) query.set('start', String(start));
-    const response = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(schema.classNames.template)}/cards?${query}`, authToken);
+    const response = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(schema.classNames.template)}/cards?${query}`, authToken, requestOptions);
     if (!response.ok) return { schema, response, card: null };
     const data = responseDataArray(response);
     for (const item of data) if (item.Code === templateCode && (!card || String(item._id) !== String(card._id))) {
@@ -54040,16 +54454,18 @@ function retainTemplateMutationState(root, code) {
   } };
 }
 
-async function withTemplateMutationLock(root, codes, operation) {
+async function withTemplateMutationLock(root, codes, operation, { deadlineAt = 0 } = {}) {
   const canonicalCodes = [...new Set(codes.map((code) => validateCmdbuildIdentifier(code, 'template code')))];
   const entries = canonicalCodes.map((code) => retainTemplateMutationState(root, code));
-  const previous = entries.map(({ state }) => state.tail);
+  const previous = Promise.all(entries.map(({ state }) => state.tail));
   let unlock;
   const tail = new Promise((resolve) => { unlock = resolve; });
-  // Reserve all keys synchronously so simultaneous renames cannot deadlock.
-  for (const { state } of entries) state.tail = tail;
+  // A timed-out reservation must still wait behind prior mutations.
+  const queued = previous.then(() => tail);
+  for (const { state } of entries) state.tail = queued;
   try {
-    await Promise.all(previous);
+    await waitForExecutionDeadline(previous, deadlineAt);
+    assertExecutionDeadline(deadlineAt, DRAFT_PREVIEW_TIMEOUT_MS);
     return await operation(() => {
       for (const { state } of entries) state.generation++;
     });
@@ -54096,6 +54512,7 @@ async function handleSnapshotRefresh(req, res, requestUrl, authToken, root, temp
   if (req.method === 'POST' && (!requireStateChangingRequest(req, res, authToken) || !requireJsonContentType(req, res))) return;
   let observation;
   let slot;
+  let deadlineAt = 0;
   let stage = 'precondition';
   const context = { requestId: currentRequestId(), root, templateCode, action };
   const fail = (reason, message, status) => { throw snapshotStoreError(reason, message, status); };
@@ -54103,8 +54520,8 @@ async function handleSnapshotRefresh(req, res, requestUrl, authToken, root, temp
   const unavailable = () => fail('snapshot_refresh_unavailable', 'No active published report is available to refresh.', 404);
   const incomplete = () => fail('snapshot_refresh_incomplete', 'The report did not complete. The published snapshot was not replaced.', 422);
 
-  async function readTemplate() {
-    const found = await findTemplateCard(authToken, root, templateCode);
+  async function readTemplate(requestOptions) {
+    const found = await findTemplateCard(authToken, root, templateCode, requestOptions);
     if (isPermissionDeniedStatus(found.response.statusCode) || found.card?._can_read === false) {
       fail('technical_schema_access_denied', DEFAULT_PERMISSION_DENIED_TEXT, 403);
     }
@@ -54167,9 +54584,10 @@ async function handleSnapshotRefresh(req, res, requestUrl, authToken, root, temp
     slot = acquireExecutionSlot(req, res, { action, templateCode });
     if (!slot) return;
     stage = 'data';
-    const runtimeConfig = await getRuntimeConfig(authToken, root);
+    deadlineAt = Date.now() + DRAFT_PREVIEW_TIMEOUT_MS;
+    const deadlineOptions = { deadlineAt, deadlineTimeoutMs: DRAFT_PREVIEW_TIMEOUT_MS };
+    const runtimeConfig = await waitForExecutionDeadline(getRuntimeConfig(authToken, root, deadlineOptions), deadlineAt);
     const limits = normalizeExecutionLimitConfig(runtimeConfig);
-    const deadlineAt = Date.now() + DRAFT_PREVIEW_TIMEOUT_MS;
     const { result, indexes } = await materializePublishedReport(authToken, template.spec, params, {
       maxRows: limits.maxRowsDefault,
       maxRowsMax: limits.maxRowsMax,
@@ -54192,28 +54610,25 @@ async function handleSnapshotRefresh(req, res, requestUrl, authToken, root, temp
       executionDeadlineAt: deadlineAt,
       executionDeadlineTimeoutMs: DRAFT_PREVIEW_TIMEOUT_MS
     }, runtimeConfig, mode === 'shared');
-    if (result.truncated || result.trace?.some((step) => step.truncated) ||
-      result.limitDiagnostics?.some((item) => item.truncated || item.timeout) ||
-      result.tables?.some((table) => table.truncated) ||
-      result.diagrams?.some((diagram) => diagram.truncated || (diagram.d2?.source && !diagram.svg?.rendered))) incomplete();
-
     stage = 'commit';
     const saved = await withTemplateMutationLock(root, [templateCode], async () => {
+      if (res.destroyed) return null;
       if (observation.state.generation !== observedGeneration) conflict();
-      const current = await readTemplate();
+      const current = await waitForExecutionDeadline(readTemplate(deadlineOptions), deadlineAt);
       if (!current?.active || current.id !== template.id || current.specHash !== template.specHash) conflict();
       assertExecutionDeadline(deadlineAt, DRAFT_PREVIEW_TIMEOUT_MS);
       if (res.destroyed) return null;
       if (mode === 'shared') {
-        const replacement = await writeStaticSnapshot(root, current, params, result, session.data, publish, snapshot.generation, lookup, indexes);
-        if (!replacement) conflict();
+        const replacement = await writeStaticSnapshot(root, current, params, result, session.data, publish, snapshot.generation, lookup, indexes,
+          { deadlineAt, response: res });
+        if (!replacement && !res.destroyed) conflict();
         return replacement;
       }
-      const latest = await readStaticSnapshot(root, templateCode, paramsFromUrl, publish);
+      const latest = await waitForExecutionDeadline(readStaticSnapshot(root, templateCode, paramsFromUrl, publish), deadlineAt);
       if (latest.key !== lookup.key || staticSnapshotViewRevision(latest.snapshot) !== expectedSnapshotRevision) conflict();
       return snapshot;
-    });
-    if (!saved) return;
+    }, { deadlineAt });
+    if (!saved || res.destroyed) return;
     logInfo('snapshot.refresh_succeeded', { ...context, mode, rowsCount: countResultRows(result), backend: lookup.backend });
     let response = {
       success: true,
@@ -54234,14 +54649,16 @@ async function handleSnapshotRefresh(req, res, requestUrl, authToken, root, temp
   } catch (error) {
     if (res.destroyed) return;
     const denied = stage === 'data' && errorLooksPermissionDenied(error);
-    const timeout = error.statusCode === 504 || error.code === 'draft_preview_timeout';
+    const timeout = error.code === 'draft_preview_timeout';
     const limited = stage === 'data' && !error.reason && templateExecutionErrorReason(error) === 'execution_limit';
     const reason = denied ? 'data_access_denied' : timeout ? 'snapshot_refresh_timeout' : limited ? 'snapshot_refresh_incomplete'
       : error.reason || (error.code === 'template_code_ambiguous' ? error.code : 'snapshot_refresh_failed');
     const status = denied ? 403 : timeout ? 504 : limited ? 422 : error.statusCode || 502;
-    logWarn('snapshot.refresh_failed', { ...context, stage, reason, status });
+    ensureSnapshotDeadlineEvidence(error, deadlineAt, stage === 'commit' ? 'commit' : 'rows');
+    const details = reportLimitErrorDetails(error, denied, authToken);
+    logWarn('snapshot.refresh_failed', { ...context, stage, reason, status, ...details });
     sendJson(res, status, {
-      success: false, action, reason, code: reason,
+      success: false, action, reason, code: reason, ...details,
       message: denied ? DEFAULT_PERMISSION_DENIED_TEXT : timeout ? 'Refreshing the report timed out.' : limited
         ? 'The report exceeded its execution limits. The published snapshot was not replaced.'
         : error.reason ? error.message : 'Could not refresh the published report.'
@@ -58544,6 +58961,7 @@ async function getExecutionClasses(cmdbuildExecRequest, limits, cache) {
   cache.loaded = true;
   const maxClasses = Math.max(limits.maxClasses || 100, limits.maxClassesMax || limits.maxClasses || 100);
   const response = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes?limit=${maxClasses}&detailed=true`);
+  recordIncompleteExecutionCatalog(cmdbuildExecRequest, response, maxClasses, 'maxClasses', 'maxClassesMax', 'classes');
   cache.classes = response.ok ? readableClassItemsFromResponse(response) : [];
   cache.ok = response.ok;
   return cache.classes;
@@ -58588,9 +59006,98 @@ function classNamesForSelection(classes, requestedClassName) {
   return uniqueStrings(selected.prototype ? descendants.map((item) => item.name) : [selected.name]);
 }
 
-async function resolveExecutionClassNames(cmdbuildExecRequest, limits, requestedClassName, classesCache, resolvedCache) {
+async function readSelectionClassPage(request, catalog, pageLimit) {
+  const path = '/cmdbuild/services/rest/v3/classes?scope=service&detailed=true&limit=' + pageLimit;
+  const response = await request(catalog.items.size ? path + '&start=' + catalog.items.size : path);
+  const page = selectionPageEvidence(response, catalog.items.size, pageLimit, catalog.total);
+  catalog.total = page.total;
+  catalog.invalid = page.conflict || page.rows.length > pageLimit;
+  if (catalog.invalid) return;
+  for (const item of page.rows) {
+    const name = typeof item?.name === 'string' ? item.name : '';
+    const key = name.toLowerCase();
+    if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(name) || catalog.items.has(key)) {
+      catalog.invalid = true;
+      break;
+    }
+    catalog.items.set(key, item);
+  }
+  catalog.complete = !catalog.invalid && (catalog.total === catalog.items.size ||
+    catalog.total === null && page.short);
+  if (!page.rows.length && !catalog.complete) catalog.invalid = true;
+}
+
+async function resolveCompleteSelectionBranch(request, limits, requested, cache) {
+  const maxClasses = limits.maxClasses || 100;
+  const pageLimit = limits.maxClassesMax || maxClasses;
+  const key = requested.toLowerCase();
+  if (!cache.selectionCatalog) {
+    cache.selectionCatalog = { items: new Map(), total: null };
+    await readSelectionClassPage(request, cache.selectionCatalog, pageLimit);
+  }
+  const catalog = cache.selectionCatalog;
+  let detailItem;
+  if (!catalog.invalid && !catalog.complete) {
+    const name = catalog.items.get(key)?.name || requested;
+    const detail = await request(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(name)}?scope=service`,
+      { optionalMissing: true });
+    const item = detail.ok && detail.json?.success !== false ? detail.json?.data : null;
+    if (item?.name === name) detailItem = item;
+    // Class detail proves identity and access, not the absence of descendants.
+    while (!catalog.complete && !catalog.invalid) await readSelectionClassPage(request, catalog, pageLimit);
+  }
+  if (!catalog.complete) {
+    request.recordReportLimit?.(reportLimitEvidence('maxClasses', maxClasses, 0, 'classes', {
+      source: 'upstream', reason: 'completeness_unconfirmed'
+    }));
+    return null;
+  }
+  const root = catalog.items.get(key);
+  if (root?.active === false || detailItem?.active === false) return [];
+
+  const children = new Map();
+  for (const item of catalog.items.values()) {
+    const parent = String(item.parent || '').toLowerCase();
+    if (!children.has(parent)) children.set(parent, []);
+    children.get(parent).push(item);
+  }
+  const names = [];
+  const visited = new Set([key]);
+  const pending = [...(children.get(key) || [])].reverse();
+  while (pending.length) {
+    const item = pending.pop();
+    const childKey = item.name.toLowerCase();
+    if (visited.has(childKey)) continue;
+    visited.add(childKey);
+    if (item.active === true && item._can_read !== false && item.prototype !== true) names.push(item.name);
+    const descendants = children.get(childKey) || [];
+    for (let i = descendants.length - 1; i >= 0; i -= 1) pending.push(descendants[i]);
+  }
+  if (names.length) return names;
+  if (root?.prototype === true || detailItem?.prototype === true) return [];
+  if (root?._can_read === false || detailItem?._can_read === false) {
+    throw Object.assign(new Error('CMDBuild class read failed with status 403.'), { cmdbuildStatus: 403 });
+  }
+  // A complete service catalog can omit an addressable class. Its cards are still permission-checked.
+  return [root?.name || detailItem?.name || requested];
+}
+
+function selectionClassBudgetExceeded(request, limits, count) {
+  if (!(count > limits.maxClasses)) return false;
+  request.recordReportLimit?.(reportLimitEvidence('maxClasses', limits.maxClasses, count, 'classes', {
+    source: 'runtime-settings', configKey: 'maxClassesDefault'
+  }));
+  return true;
+}
+
+async function resolveExecutionClassNames(cmdbuildExecRequest, limits, requestedClassName, classesCache, resolvedCache, requireComplete = false) {
   const cacheKey = String(requestedClassName || '').toLowerCase();
   if (resolvedCache.has(cacheKey)) return resolvedCache.get(cacheKey);
+  if (requireComplete) {
+    const branch = await resolveCompleteSelectionBranch(cmdbuildExecRequest, limits, requestedClassName, classesCache);
+    resolvedCache.set(cacheKey, branch);
+    return branch;
+  }
   let classNames = [String(requestedClassName || '').trim()].filter(Boolean);
   try {
     const classes = await getExecutionClasses(cmdbuildExecRequest, limits, classesCache);
@@ -59229,12 +59736,58 @@ function referenceValueId(value) {
   return String(value).trim();
 }
 
-function relationReadIsIncomplete(response, items, limit, requested) {
-  const totalValue = response.json?.meta?.total;
-  const total = typeof totalValue === 'number' || typeof totalValue === 'string' && /^\d+$/.test(totalValue)
-    ? Number(totalValue) : null;
-  const confirmedTotal = Number.isSafeInteger(total) && total >= items.length;
-  return items.length > limit || (confirmedTotal ? total > items.length : items.length >= requested);
+function executionPageCount(value) {
+  const count = typeof value === 'number' || typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : null;
+  return Number.isSafeInteger(count) && count >= 0 ? count : null;
+}
+
+function executionPageTotal(response, includeCount = false) {
+  return executionPageCount(response.json?.meta?.total ?? (includeCount ? response.json?.meta?.count : undefined));
+}
+
+function selectionPageEvidence(response, start, limit, knownTotal) {
+  const data = response.json?.data;
+  const rows = Array.isArray(data) ? data : [];
+  const meta = response.json?.meta;
+  const reportedTotal = executionPageTotal(response);
+  const nextTotal = reportedTotal ?? knownTotal;
+  const totalConflict = nextTotal !== null && nextTotal < start + rows.length ||
+    reportedTotal !== null && knownTotal !== null && reportedTotal !== knownTotal ||
+    meta?.total != null && reportedTotal === null;
+  const invalid = !response.ok || response.json?.success === false || !Array.isArray(data);
+  const short = rows.length < limit;
+  return {
+    rows, short, total: invalid || totalConflict ? null : nextTotal,
+    conflict: invalid || totalConflict || short && nextTotal === null && executionPageCount(meta?.count) > rows.length
+  };
+}
+
+function recordIncompleteExecutionCatalog(request, response, limit, limitName, configKey, unit) {
+  if (!request.recordReportLimit || !response.ok || !Array.isArray(response.json?.data)) return;
+  const observed = response.json.data.length;
+  const reportedTotal = executionPageTotal(response);
+  const total = reportedTotal !== null && reportedTotal >= observed ? reportedTotal : null;
+  const exceeded = observed > limit || total > limit;
+  if (exceeded || (total === null ? observed >= limit : total > observed)) {
+    request.recordReportLimit(reportLimitEvidence(limitName, limit, observed, unit, {
+      source: 'runtime-settings', configKey, total,
+      reason: exceeded ? 'limit_exceeded' : 'completeness_unconfirmed'
+    }));
+  }
+}
+
+function recordIncompleteRelationRead(request, response, items, limit, requested) {
+  const page = request.recordReportLimit ? selectionPageEvidence(response, 0, requested, null) : null;
+  const total = page ? page.total : executionPageTotal(response);
+  const confirmed = total !== null && total >= items.length;
+  const exceeded = items.length > limit || confirmed && total > limit;
+  const incomplete = exceeded || page?.conflict ||
+    (confirmed ? total > items.length : items.length >= (page ? Math.min(limit, requested) : requested));
+  if (incomplete) request.recordReportLimit?.(reportLimitEvidence('maxRelationsPerCard', limit, items.length, 'relations', {
+    source: 'runtime-settings', configKey: 'maxRelationsPerCardDefault', total: confirmed ? total : null,
+    reason: exceeded ? 'limit_exceeded' : 'completeness_unconfirmed'
+  }));
+  return incomplete;
 }
 
 async function readRelationsForPath(cmdbuildExecRequest, pathCache, className, id) {
@@ -59249,7 +59802,7 @@ async function readRelationsForPath(cmdbuildExecRequest, pathCache, className, i
   const readLimit = Math.min(relationLimit + 1, relationLimitMax);
   const response = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}/cards/${encodeURIComponent(id)}/relations?limit=${readLimit}`);
   const items = response.ok && Array.isArray(response.json && response.json.data) ? response.json.data : [];
-  if (response.ok && relationReadIsIncomplete(response, items, relationLimit, readLimit)) pathCache.relationLimitReached = true;
+  if (response.ok && recordIncompleteRelationRead(cmdbuildExecRequest, response, items, relationLimit, readLimit)) pathCache.relationLimitReached = true;
   const relations = items.slice(0, relationLimit);
   pathCache.relations.set(key, relations);
   return relations;
@@ -59463,8 +60016,56 @@ function selectionScanLimit(step, filters, limits, resultLimit) {
     : resultLimit;
 }
 
-async function requestCardsForSelectionScan(cmdbuildExecRequest, className, scanLimit, fields, requireComplete = false, filter) {
+async function requestCompleteCardsForSelectionScan(request, className, limit, fields, filter, budget, maxRestCalls) {
+  const rows = [];
+  const ids = new Set();
+  let total = null;
+  const finish = (reason) => {
+    if (reason) request.recordReportLimit?.(reportLimitEvidence('maxSelectionScanRows', limit, rows.length, 'cards', {
+      ...budget, total, reason
+    }));
+    return { ok: true, statusCode: 200, json: { data: rows.slice(0, limit) }, truncated: Boolean(reason), total };
+  };
+  while (rows.length < limit) {
+    const pageLimit = Math.min(1000, limit - rows.length);
+    const response = await requestCardsForSelection(request, className, pageLimit, fields, rows.length, filter);
+    if (!response.ok) return response;
+    const page = selectionPageEvidence(response, rows.length, pageLimit, total);
+    total = page.total;
+    let repeats = false;
+    for (const row of page.rows) {
+      if (row?._id == null) continue;
+      const id = String(row._id);
+      if (ids.has(id)) repeats = true;
+      ids.add(id);
+    }
+    rows.push(...page.rows);
+    if (repeats) {
+      total = null;
+      return finish('completeness_unconfirmed');
+    }
+    if (rows.length > limit || total > limit && (page.short || rows.length >= limit)) return finish('limit_exceeded');
+    if (page.conflict || page.short && total > rows.length) return finish('completeness_unconfirmed');
+    if (page.short || total === rows.length) return finish();
+  }
+
+  if (request.getRestCalls && request.getRestCalls() >= maxRestCalls) return finish('completeness_unconfirmed');
+  // Only probe the next position; never add the lookahead card to the selection.
+  const probe = await request(cardListPath(className, 1, fields, limit, filter));
+  if (!probe.ok) return probe;
+  const page = selectionPageEvidence(probe, limit, 1, total);
+  total = page.total;
+  if (page.conflict || page.rows.some((row) => row?._id != null && ids.has(String(row._id)))) {
+    return finish('completeness_unconfirmed');
+  }
+  return finish(page.rows.length || total > limit ? 'limit_exceeded' : undefined);
+}
+
+async function requestCardsForSelectionScan(cmdbuildExecRequest, className, scanLimit, fields, requireComplete, filter, budget, maxRestCalls) {
   const limit = Math.max(1, Number(scanLimit) || 1);
+  if (requireComplete) {
+    return requestCompleteCardsForSelectionScan(cmdbuildExecRequest, className, limit, fields, filter, budget, maxRestCalls);
+  }
   const pageSize = Math.min(limit, 1000);
   const rows = [];
   let start = 0;
@@ -59474,22 +60075,22 @@ async function requestCardsForSelectionScan(cmdbuildExecRequest, className, scan
     const response = await requestCardsForSelection(cmdbuildExecRequest, className, pageLimit, fields, start, filter);
     if (!response.ok) return response;
     const pageRows = Array.isArray(response.json && response.json.data) ? response.json.data : [];
-    const metaTotal = Number(response.json && response.json.meta && (response.json.meta.total ?? response.json.meta.count));
-    if (Number.isFinite(metaTotal) && metaTotal >= 0) knownTotal = metaTotal;
+    const metaTotal = executionPageTotal(response, true);
+    if (metaTotal !== null) knownTotal = metaTotal >= rows.length + pageRows.length ? metaTotal : null;
     rows.push.apply(rows, pageRows);
-    if (pageRows.length < pageLimit) {
-      if (requireComplete && (!Array.isArray(response.json?.data) || knownTotal !== null && rows.length < knownTotal)) {
-        throw snapshotStoreError('snapshot_refresh_incomplete', 'CMDBuild returned an incomplete page of cards.', 422);
-      }
-      break;
-    }
+    if (pageRows.length < pageLimit) break;
     start += pageRows.length;
   }
+  const exceeded = rows.length > limit || knownTotal !== null && knownTotal > limit;
+  const truncated = exceeded || rows.length >= limit && knownTotal === null;
+  if (truncated) cmdbuildExecRequest.recordReportLimit?.(reportLimitEvidence('maxSelectionScanRows', limit, rows.length, 'cards', {
+    ...budget, total: knownTotal, reason: exceeded ? 'limit_exceeded' : 'completeness_unconfirmed'
+  }));
   return {
     ok: true,
     statusCode: 200,
-    json: { data: rows },
-    truncated: rows.length >= limit && (knownTotal === null || rows.length < knownTotal),
+    json: { data: rows.slice(0, limit) },
+    truncated,
     total: knownTotal
   };
 }
@@ -59519,6 +60120,13 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
     ? step.filterJoin
     : assistantSelectionAliases.has(step.as) ? inferredAssistantSelectionFilterJoin(step) : 'any';
   const scanLimit = selectionScanLimit(step, filters, limits, maxRows);
+  const scanSetting = ['scanLimit', 'searchLimit', 'fetchLimit'].find((key) => step[key]);
+  const scanRequested = Number(step[scanSetting]);
+  const scanBudget = Number.isFinite(scanRequested) && scanRequested > 0
+    ? { source: 'object-flow-step', configKey: scanSetting, requested: scanRequested }
+    : !filters.length && !scanSetting && maxRows < limits.maxSelectionScanRows && scanLimit === maxRows
+      ? { source: step.limit ? 'object-flow-step' : 'product', ...(step.limit ? { configKey: 'limit', requested: Number(step.limit) } : {}) }
+      : { source: 'runtime-settings', configKey: 'maxSelectionScanRowsDefault' };
   const dependency = dependencyMap && Array.isArray(dependencyMap.selections)
     ? dependencyMap.selections.find((item) => item && item.as === step.as)
     : null;
@@ -59540,7 +60148,9 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
   const deduplicateCards = step.deduplicateCards === true || step.dedupeCards === true;
   const seenCards = new Set();
   const cardsByClass = new Map();
+  const selectedClasses = new Set();
   let scanTruncated = false;
+  let classScopeTruncated = false;
   const classesCache = { loaded: false, classes: [], ok: false };
   const resolvedClassCache = new Map();
   const pathCache = {
@@ -59554,7 +60164,8 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
   const selectionScan = () => scanTruncated ? {
     scanLimit,
     scannedRows: Array.from(cardsByClass.values()).reduce((total, item) => total + (item.rows || []).length, 0),
-    availableTotal: Array.from(cardsByClass.values()).reduce((total, item) => total + (Number.isFinite(item.availableTotal) ? item.availableTotal : 0), 0) || null,
+    availableTotal: Array.from(cardsByClass.values()).every((item) => item.availableTotal !== null)
+      ? Array.from(cardsByClass.values()).reduce((total, item) => total + item.availableTotal, 0) : null,
     classes: Array.from(cardsByClass.entries()).filter(([, item]) => item.truncated).map(([className]) => className)
   } : null;
   const cappedResult = () => ({
@@ -59574,19 +60185,31 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
       throw new Error('selectCards class source resolved to an empty value.');
     }
     validateCmdbuildIdentifier(requestedClassName, 'selectCards className');
-    const targetClassNames = await resolveExecutionClassNames(cmdbuildExecRequest, limits, requestedClassName, classesCache, resolvedClassCache);
+    const targetClassNames = await resolveExecutionClassNames(cmdbuildExecRequest, limits, requestedClassName, classesCache, resolvedClassCache, requireComplete);
+    if (!targetClassNames) {
+      classScopeTruncated = true;
+      break;
+    }
+    if (requireComplete) {
+      for (const className of targetClassNames) selectedClasses.add(className.toLowerCase());
+      if (selectionClassBudgetExceeded(cmdbuildExecRequest, limits, selectedClasses.size)) {
+        classScopeTruncated = true;
+        break;
+      }
+    }
 
     for (const className of targetClassNames) {
       validateCmdbuildIdentifier(className, 'selectCards className');
       if (!cardsByClass.has(className)) {
-        const cards = await requestCardsForSelectionScan(cmdbuildExecRequest, className, scanLimit, readFields, requireComplete, directRestriction);
+        const cards = await requestCardsForSelectionScan(cmdbuildExecRequest, className, scanLimit, readFields, requireComplete,
+          directRestriction, scanBudget, limits.maxRestCalls);
         if (!cards.ok) {
           throw new Error(`CMDBuild cards request for ${className} failed with status ${cards.statusCode}.`);
         }
         cardsByClass.set(className, {
           rows: Array.isArray(cards.json && cards.json.data) ? cards.json.data : [],
           truncated: Boolean(cards.truncated),
-          availableTotal: Number.isFinite(Number(cards.total)) ? Number(cards.total) : null,
+          availableTotal: cards.total,
           scanLimit
         });
       }
@@ -59604,7 +60227,12 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
           if (seenCards.has(cardIdentity)) continue;
           seenCards.add(cardIdentity);
         }
-        if (requireComplete && rows.length >= maxRows) return cappedResult();
+        if (requireComplete && rows.length >= maxRows) {
+          cmdbuildExecRequest.recordReportLimit?.(reportLimitEvidence('maxRows', maxRows, rows.length + 1, 'rows', step.limit
+            ? { source: 'object-flow-step', configKey: 'limit', requested: Number(step.limit) }
+            : limits.largeTableExecution ? {} : { source: 'runtime-settings', configKey: 'maxRowsDefault' }));
+          return cappedResult();
+        }
         const resultRow = outputRow || buildSelectionResultRow(className, card, driverRow, columns, step);
         if (outputRow) Object.keys(outputRow).forEach((field) => addColumnOnce(columns, field));
         await materializeRowPathColumns(cmdbuildExecRequest, pathCache, resultRow, className, card, requestedColumns, columns);
@@ -59617,7 +60245,7 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
   return {
     columns,
     rows,
-    truncated: scanTruncated || Boolean(pathCache.relationLimitReached),
+    truncated: classScopeTruncated || scanTruncated || Boolean(pathCache.relationLimitReached),
     rowLimitReached: false,
     rowLimit: maxRows,
     selectionScan: selectionScan(),
@@ -59895,11 +60523,17 @@ async function executeExpandRelations(cmdbuildExecRequest, step, params, context
   if (targetClassNames.length) {
     const classesCache = { loaded: false, classes: [], ok: false };
     const resolvedClassCache = new Map();
+    const requireComplete = Boolean(cmdbuildExecRequest.recordReportLimit);
     for (const className of targetClassNames) {
       validateCmdbuildIdentifier(className, 'expandRelations targetClass');
-      const resolved = await resolveExecutionClassNames(cmdbuildExecRequest, limits, className, classesCache, resolvedClassCache);
+      const resolved = await resolveExecutionClassNames(cmdbuildExecRequest, limits, className, classesCache, resolvedClassCache, requireComplete);
+      if (!resolved) return { columns: [], rows: [], truncated: true };
       resolved.forEach((item) => targetClassFilter.add(item.toLowerCase()));
+      if (requireComplete && selectionClassBudgetExceeded(cmdbuildExecRequest, limits, targetClassFilter.size)) {
+        return { columns: [], rows: [], truncated: true };
+      }
     }
+    if (requireComplete && !targetClassFilter.size) return { columns: [], rows: [], truncated: false };
   }
   const requestedDirection = step.direction || 'both';
   const fetchRelated = step.fetchRelated !== false;
@@ -59934,7 +60568,7 @@ async function executeExpandRelations(cmdbuildExecRequest, step, params, context
     }
 
     const relationItems = Array.isArray(relations.json && relations.json.data) ? relations.json.data : [];
-    if (relationReadIsIncomplete(relations, relationItems, perCardLimit, relationReadLimit)) relationLimitReached = true;
+    if (recordIncompleteRelationRead(cmdbuildExecRequest, relations, relationItems, perCardLimit, relationReadLimit)) relationLimitReached = true;
     for (const relation of relationItems.slice(0, perCardLimit)) {
       const domain = relationDomainName(relation);
       if (domainFilter.size && !domainFilter.has(domain.toLowerCase())) continue;
@@ -59950,11 +60584,13 @@ async function executeExpandRelations(cmdbuildExecRequest, step, params, context
       seen.add(distinctKey);
 
       if (rows.length >= maxRows) {
+        cmdbuildExecRequest.recordReportLimit?.(reportLimitEvidence('maxRows', maxRows, rows.length + 1, 'rows',
+          limits.largeTableExecution ? {} : { source: 'runtime-settings', configKey: 'maxRowsDefault' }));
         return {
           columns,
           rows,
           truncated: true,
-          relationLimitReached,
+          relationLimitReached, rowLimitReached: true,
           truncationReason: relationLimitReached ? 'maxRelationsPerCard' : 'maxRows'
         };
       }
@@ -60078,10 +60714,12 @@ async function executeEnrichRows(cmdbuildExecRequest, step, params, context, lim
     }
     for (const variant of variants) {
       if (rows.length >= limits.maxRows) {
+        cmdbuildExecRequest.recordReportLimit?.(reportLimitEvidence('maxRows', limits.maxRows, rows.length + 1, 'rows',
+          limits.largeTableExecution ? {} : { source: 'runtime-settings', configKey: 'maxRowsDefault' }));
         return {
           columns,
           rows,
-          truncated: true,
+          truncated: true, rowLimitReached: true,
           relationLimitReached: Boolean(pathCache.relationLimitReached),
           sourceResolution
         };
@@ -60831,13 +61469,20 @@ function createExecutionRequest(authToken, limits, options = {}) {
   };
   const deadlineAt = Number(options.deadlineAt || 0);
   const deadlineTimeoutMs = Number(options.deadlineTimeoutMs || DRAFT_PREVIEW_TIMEOUT_MS);
-  const request = async (path) => {
+  const request = async (path, { optionalMissing = false } = {}) => {
     assertAccess();
     assertExecutionDeadline(deadlineAt, deadlineTimeoutMs);
-    restCalls += 1;
-    if (restCalls > limits.maxRestCalls) {
+    if (restCalls >= limits.maxRestCalls) {
+      if (options.reportLimitContext) {
+        recordReportLimit(options.reportLimitContext, reportLimitEvidence('maxRestCalls', limits.maxRestCalls, restCalls, 'calls', {
+          source: 'runtime-settings', configKey: 'maxRestCallsDefault'
+        }), true);
+        readError = incompleteReportTable(options.reportLimitContext);
+        throw readError;
+      }
       throw new Error(`Template execution exceeded REST call limit (${limits.maxRestCalls}).`);
     }
+    restCalls += 1;
     try {
       const response = await cmdbuildRequest(path, authToken, { deadlineAt, deadlineTimeoutMs });
       if ((options.relationSensitive || options.strictDataReads) && isPermissionDeniedStatus(response.statusCode)) {
@@ -60846,6 +61491,7 @@ function createExecutionRequest(authToken, limits, options = {}) {
         });
         assertAccess();
       }
+      if (optionalMissing && response.statusCode === 404) return response;
       if (options.strictDataReads && (!response.ok || response.json?.success === false ||
         !response.json?.data || typeof response.json.data !== 'object')) {
         throw snapshotStoreError('snapshot_refresh_data_unavailable', 'CMDBuild did not complete a data read.', 502);
@@ -60861,6 +61507,7 @@ function createExecutionRequest(authToken, limits, options = {}) {
   };
   request.getRestCalls = () => restCalls;
   request.assertAccess = assertAccess;
+  if (options.reportLimitContext) request.recordReportLimit = (evidence) => recordReportLimit(options.reportLimitContext, evidence);
   return request;
 }
 
@@ -60871,6 +61518,7 @@ async function executeFindClassesByAttributeType(cmdbuildExecRequest, step, para
   }
 
   const classes = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes?limit=${limits.maxClasses}&detailed=true`);
+  recordIncompleteExecutionCatalog(cmdbuildExecRequest, classes, limits.maxClasses, 'maxClasses', 'maxClassesDefault', 'classes');
   if (!classes.ok) {
     throw new Error(`CMDBuild classes request failed with status ${classes.statusCode}.`);
   }
@@ -60910,6 +61558,7 @@ async function executeFindClassesByAttributeType(cmdbuildExecRequest, step, para
 
 async function executeListDomains(cmdbuildExecRequest, limits) {
   const domains = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/domains?limit=${limits.maxDomains}`);
+  recordIncompleteExecutionCatalog(cmdbuildExecRequest, domains, limits.maxDomains, 'maxDomains', 'maxDomainsDefault', 'domains');
   if (!domains.ok) {
     throw new Error(`CMDBuild domains request failed with status ${domains.statusCode}.`);
   }
@@ -60949,11 +61598,15 @@ async function executeTraverseDomains(cmdbuildExecRequest, step, params, context
   }
 
   const classColumn = step.classColumn || 'Class';
-  const classNames = uniqueStrings((source.rows || []).map((row) => row[classColumn])).slice(0, limits.maxClasses);
+  const allClasses = uniqueStrings((source.rows || []).map((row) => row[classColumn]));
+  const classNames = allClasses.slice(0, limits.maxClasses);
+  if (allClasses.length > classNames.length) cmdbuildExecRequest.recordReportLimit?.(
+    reportLimitEvidence('maxClasses', limits.maxClasses, allClasses.length, 'classes', { source: 'runtime-settings', configKey: 'maxClassesDefault' }));
   const direction = step.direction || 'both';
   const requestedDepth = step.depthParam ? params[step.depthParam] : step.depth;
   const maxDepth = toPositiveInt(requestedDepth, limits.traversalDepthDefault, limits.maxTraversalDepth);
   const domains = await cmdbuildExecRequest(`/cmdbuild/services/rest/v3/domains?limit=${limits.maxDomains}`);
+  recordIncompleteExecutionCatalog(cmdbuildExecRequest, domains, limits.maxDomains, 'maxDomains', 'maxDomainsDefault', 'domains');
   if (!domains.ok) {
     throw new Error(`CMDBuild domains request failed with status ${domains.statusCode}.`);
   }
@@ -60969,7 +61622,12 @@ async function executeTraverseDomains(cmdbuildExecRequest, step, params, context
   const rows = [];
   const seenClasses = new Set(classNames);
   const seenEdges = new Set();
+  const traversedDomains = new Set();
   let frontier = classNames;
+  let reachableAtNextDepth = [];
+  const matchesDirection = (sourceMatch, destinationMatch) =>
+    direction === 'source' ? sourceMatch : direction === 'destination' ? destinationMatch : sourceMatch || destinationMatch;
+  const domainKey = (item) => JSON.stringify([item.name, item.source, item.destination]);
 
   for (let depth = 1; depth <= maxDepth && frontier.length; depth += 1) {
     const nextFrontier = [];
@@ -60981,13 +61639,12 @@ async function executeTraverseDomains(cmdbuildExecRequest, step, params, context
       for (const className of frontier) {
         const sourceMatch = className === sourceName;
         const destinationMatch = className === destinationName;
-        if (direction === 'source' && !sourceMatch) continue;
-        if (direction === 'destination' && !destinationMatch) continue;
-        if (direction === 'both' && !sourceMatch && !destinationMatch) continue;
+        if (!matchesDirection(sourceMatch, destinationMatch)) continue;
         const relatedClass = sourceMatch ? destinationName : sourceName;
         const edgeKey = `${depth}|${className}|${item.name}|${relatedClass}`;
         if (seenEdges.has(edgeKey)) continue;
         seenEdges.add(edgeKey);
+        traversedDomains.add(domainKey(item));
 
         rows.push({
           Depth: depth,
@@ -61013,9 +61670,22 @@ async function executeTraverseDomains(cmdbuildExecRequest, step, params, context
         }
       }
     }
-    frontier = uniqueStrings(nextFrontier).slice(0, limits.maxClasses);
+    const uniqueFrontier = uniqueStrings(nextFrontier);
+    reachableAtNextDepth = uniqueFrontier;
+    frontier = uniqueFrontier.slice(0, limits.maxClasses);
+    if (depth < maxDepth && uniqueFrontier.length > frontier.length) cmdbuildExecRequest.recordReportLimit?.(
+      reportLimitEvidence('maxClasses', limits.maxClasses, uniqueFrontier.length, 'classes', { source: 'runtime-settings', configKey: 'maxClassesDefault' }));
   }
 
+  if (cmdbuildExecRequest.recordReportLimit && Number(requestedDepth) > maxDepth && reachableAtNextDepth.length) {
+    const next = new Set(reachableAtNextDepth);
+    if (detailedDomains.some((item) => item.name && item.source && item.destination && item.active !== false &&
+      !traversedDomains.has(domainKey(item)) && matchesDirection(next.has(item.source), next.has(item.destination)))) {
+      cmdbuildExecRequest.recordReportLimit(reportLimitEvidence('maxTraversalDepth', maxDepth, maxDepth + 1, 'hops', {
+        source: 'runtime-settings', configKey: 'maxTraversalDepthMax', requested: Number(requestedDepth)
+      }));
+    }
+  }
   return {
     columns: ['Depth', 'Class', 'Domain', 'Description', 'Source', 'Destination', 'Direction', 'RelatedClass', 'Cardinality'],
     rows,
@@ -61219,7 +61889,8 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
     deadlineAt: executionDeadlineAt,
     deadlineTimeoutMs: executionDeadlineTimeoutMs,
     relationSensitive: dependencyMap.relationSensitive,
-    strictDataReads: options.strictDataReads === true
+    strictDataReads: options.strictDataReads === true,
+    reportLimitContext: options.reportLimitContext
   });
   if (isCmdbBuildViewSpec(spec)) {
     const result = await executeCmdbBuildViewSpec(cmdbuildExecRequest, spec, effectiveParams, { limits });
@@ -61241,10 +61912,15 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
   };
 
   for (const { index, step } of executableSteps) {
+    const reportStepIndex = options.reportLimitContext?.stepIndexes?.get(step.as) ?? index;
+    if (options.reportLimitContext) {
+      options.reportLimitContext.step = { index: reportStepIndex, alias: step.as || '', type: step.type };
+      options.reportLimitContext.stepHasEvidence = false;
+    }
     assertExecutionDeadline(executionDeadlineAt, executionDeadlineTimeoutMs);
     const startedAt = Date.now();
     const restBefore = cmdbuildExecRequest.getRestCalls();
-    const stageLimits = options.largeTableExecution && !['selectCards', 'expandRelations', 'enrichRows'].includes(step.type)
+    const stageLimits = (options.largeTableExecution || options.reportLimitContext) && !['selectCards', 'expandRelations', 'enrichRows'].includes(step.type)
       ? { ...limits, maxRows: limits.maxRows + 1 } : limits;
     const restriction = options.reportTableRestriction;
     const tableRestriction = restriction?.pushdown?.alias === step.as ? { ...restriction, ...restriction.pushdown } : null;
@@ -61292,6 +61968,8 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
       cmdbuildExecRequest.assertAccess();
       if (stageLimits !== limits && context[step.as]?.rows?.length > limits.maxRows) {
         const stage = context[step.as];
+        cmdbuildExecRequest.recordReportLimit?.(reportLimitEvidence('maxRows', limits.maxRows, stage.rows.length, 'rows',
+          limits.largeTableExecution ? {} : { source: 'runtime-settings', configKey: 'maxRowsDefault' }));
         stage.rows = stage.rows.slice(0, limits.maxRows);
         stage.truncated = true;
         stage.rowLimitReached = true;
@@ -61328,6 +62006,9 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
           truncated: true,
           reason: 'result-row-limit'
         });
+      }
+      if (output.truncated && !inheritedTruncation && !options.reportLimitContext?.stepHasEvidence) {
+        cmdbuildExecRequest.recordReportLimit?.({ reason: 'completeness_unconfirmed', limitHit: false, truncated: true });
       }
       if (selectionScan) {
         limitDiagnostics.push({
@@ -61394,6 +62075,7 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
     }
   }
 
+  if (options.reportLimitContext) options.reportLimitContext.step = null;
   try {
     assertExecutionDeadline(executionDeadlineAt, executionDeadlineTimeoutMs);
   } catch (error) {
@@ -61456,7 +62138,7 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
     ? buildResultDiagrams(spec, context, effectiveParams, limits, { allowPartialAggregation: partialDiagramPreview })
     : [];
   if (includeDiagrams && !options.skipD2Render && diagrams.length) {
-    await renderD2ArtifactsForDiagrams(diagrams);
+    await renderD2ArtifactsForDiagrams(diagrams, executionDeadlineAt);
   }
   try {
     assertExecutionDeadline(executionDeadlineAt, executionDeadlineTimeoutMs);
@@ -65300,17 +65982,24 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
         templateCode: template.code
       });
       if (!executionSlot) return;
+      const publicationDeadlineAt = templateAction === 'publish' ? Date.now() + DRAFT_PREVIEW_TIMEOUT_MS : 0;
+      let publicationPhase = 'rows';
       try {
         if (templateAction === 'publish') {
           if (publishConfig.paramsMode === 'exact') {
             try { staticSnapshotParamPairs(params); }
             catch (error) { throw snapshotStoreError('snapshot_params_invalid', error.message, 400); }
           }
-          const snapshotGeneration = await snapshotPublicationState(root, templateCode);
-          const preparedReport = await materializePublishedReport(authToken, template.spec, params, executionOptions, runtimeConfig);
+          const deadlineOptions = { deadlineAt: publicationDeadlineAt, deadlineTimeoutMs: DRAFT_PREVIEW_TIMEOUT_MS };
+          const snapshotGeneration = await waitForExecutionDeadline(snapshotPublicationState(root, templateCode), publicationDeadlineAt);
+          const preparedReport = await materializePublishedReport(authToken, template.spec, params, {
+            ...executionOptions, executionDeadlineAt: publicationDeadlineAt
+          }, runtimeConfig);
           result = preparedReport.result;
+          publicationPhase = 'commit';
           const snapshot = await withTemplateMutationLock(root, [templateCode], async () => {
-            const latest = await findTemplateCard(authToken, root, templateCode);
+            if (res.destroyed) return null;
+            const latest = await waitForExecutionDeadline(findTemplateCard(authToken, root, templateCode, deadlineOptions), publicationDeadlineAt);
             if (!latest.response.ok) {
               if (!sendTechnicalSchemaAccessDeniedIfNeeded(res, {
                 cmdbuildStatus: latest.response.statusCode, root, className: latest.schema.classNames.template
@@ -65321,7 +66010,7 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
               return null;
             }
             const currentTemplate = sanitizeTemplateCard(latest.card);
-            if (latest.card && !await requireTemplateUpdatePermission(authToken, res, latest.schema, latest.card, templateCode)) return null;
+            if (latest.card && !await requireTemplateUpdatePermission(authToken, res, latest.schema, latest.card, templateCode, deadlineOptions)) return null;
             const cause = !currentTemplate ? 'template_missing'
               : String(currentTemplate.id) !== String(template.id) ? 'template_identity_changed'
                 : currentTemplate.specHash !== savedSpecHash.value ? 'spec_hash_changed'
@@ -65332,11 +66021,11 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
               return null;
             }
             const saved = await writeStaticSnapshot(root, currentTemplate, params, result, session.data, publishConfig,
-              snapshotGeneration, undefined, preparedReport.indexes);
-            if (!saved) sendPublicationVersionConflict(res, { root, templateCode, expectedSpecHash: savedSpecHash.value,
+              snapshotGeneration, undefined, preparedReport.indexes, { deadlineAt: publicationDeadlineAt, response: res });
+            if (!saved && !res.destroyed) sendPublicationVersionConflict(res, { root, templateCode, expectedSpecHash: savedSpecHash.value,
               currentTemplate, phase: 'publish_commit', cause: 'snapshot_generation_changed' });
             return saved;
-          });
+          }, { deadlineAt: publicationDeadlineAt });
           if (!snapshot) return;
           cache = staticSnapshotCacheMeta({
             publishedAt: snapshot.publishedAt,
@@ -65391,6 +66080,9 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
           ? Number(error.cmdbuildStatus || error.statusCode || /\b(401|403)\b/.exec(error.message || '')?.[1] || 403)
           : undefined;
         const reason = permissionDenied ? 'data_access_denied' : error.reason || undefined;
+        ensureSnapshotDeadlineEvidence(error, publicationDeadlineAt, publicationPhase);
+        const details = reportLimitErrorDetails(error, permissionDenied, authToken);
+        const code = templateAction === 'publish' ? reason || error.code : undefined;
         incMetric('cmdp_template_run_errors_total', {
           action: templateAction,
           reason: templateExecutionErrorReason(error)
@@ -65401,12 +66093,15 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
           stage: 'data',
           permissionDenied,
           cmdbuildStatus,
-          reason: reason || templateExecutionErrorReason(error)
+          reason: reason || code || templateExecutionErrorReason(error),
+          ...details
         });
         sendJson(res, permissionDenied ? 403 : (error.statusCode || 400), {
           success: false,
           action: templateAction,
-          reason,
+          reason: reason || code,
+          code,
+          ...details,
           cmdbuildStatus,
           permissionDenied: permissionDenied || undefined,
           template: {

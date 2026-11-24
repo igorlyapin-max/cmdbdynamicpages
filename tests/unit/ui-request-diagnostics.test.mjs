@@ -40,6 +40,84 @@ test('clamp diagnostics and scoped owner survive projection without arbitrary pa
   assert.doesNotMatch(api.serialize(diagnostic), /private/);
 });
 
+test('publish and refresh preserve flat limit evidence without admitting unknown fields or values', () => {
+  const rowLimit = { table: 'items', phase: 'rows', stepAlias: 'selected', stepIndex: 0, stepType: 'selectCards',
+    limitName: 'maxRows', source: 'object-flow-step', configKey: 'limit', requested: 2, effectiveLimit: 2,
+    observed: 3, total: 4, unit: 'rows', reason: 'limit_exceeded', limitHit: true, truncated: true, timeout: false };
+  const catalogLimit = { table: 'items', phase: 'selector', observed: 0,
+    reason: 'completeness_unconfirmed', limitHit: false, truncated: true };
+  const timeout = { table: '', phase: 'index', unit: 'milliseconds', reason: 'deadline_exceeded', timeout: true };
+  const commit = { table: '', phase: 'commit', unit: 'milliseconds', reason: 'deadline_exceeded', elapsedMs: 61000 };
+  const depth = { table: 'items', phase: 'rows', limitName: 'maxTraversalDepth', unit: 'hops',
+    effectiveLimit: 5, requested: 6, reason: 'limit_exceeded' };
+  const malformed = { ...catalogLimit, stepAlias: 'Bearer fixture-secret', source: 'fixture-secret',
+    unit: 'fixture-secret', requested: 'fixture-secret', stepIndex: -1, effectiveLimit: -1 };
+  for (const phase of ['publish', 'refresh-snapshot']) {
+    const diagnostic = api.response(result({ code: 'table_result_incomplete', requestId: 'server-body-id', diagnostics: { omittedCount: 4, limits: [
+      { ...rowLimit, rawBody: 'fixture-secret', message: 'fixture-secret', details: [catalogLimit] },
+      { ...malformed, elapsedMs: -1 }, timeout, commit, depth, { ...rowLimit, phase: 'fixture-secret' }, null, { ...rowLimit, reason: 'fixture-secret' }
+    ] } }), { ...context, phase });
+    assert.deepEqual(diagnostic.diagnostics.limits, [rowLimit, { ...catalogLimit, stepAlias: '[REDACTED]' }, timeout, commit, depth]);
+    assert.equal(diagnostic.serverRequestId, 'server-body-id');
+    assert.equal(diagnostic.diagnostics.omittedCount, 4);
+    const report = api.serialize(diagnostic);
+    assert.equal(JSON.parse(report).code, 'table_result_incomplete');
+    assert.deepEqual(JSON.parse(report).diagnostics.limits, diagnostic.diagnostics.limits);
+    assert.doesNotMatch(report, /fixture-secret|rawBody/);
+  }
+  for (const omittedCount of [-1, 1.5, '2', Number.MAX_SAFE_INTEGER + 1]) {
+    assert.equal(api.sanitize({ phase: 'publish', diagnostics: { omittedCount } }).diagnostics.omittedCount, undefined);
+  }
+  assert.equal(api.sanitize({ phase: 'publish', diagnostics: { omittedCount: 0 } }).diagnostics.omittedCount, 0);
+});
+
+test('serialization keeps all 16 report limit entries ahead of optional report detail', () => {
+  const long = '\\"'.repeat(200);
+  const limits = Array.from({ length: 17 }, (_, stepIndex) => ({
+    table: long, phase: 'selector', reason: 'completeness_unconfirmed', source: 'runtime-settings', unit: 'milliseconds',
+    stepIndex, stepAlias: long, stepType: long, configKey: long, limitName: long, requested: 1.001001e35, effectiveLimit: 3.001001e34,
+    observed: 1.041567e35, total: 1.123456e35, elapsedMs: 9.123456e20, limitHit: true, truncated: false, timeout: false
+  }));
+  const diagnostic = api.response(result({ code: 'table_result_incomplete', message: long,
+    errors: Array.from({ length: 16 }, () => ({ message: long, blockName: long })), diagnostics: { limits, omittedCount: 3 }
+  }), { ...context, phase: 'publish' });
+  const report = api.serialize(diagnostic);
+  const parsed = JSON.parse(report);
+  assert.ok(Buffer.byteLength(report) <= 16384);
+  assert.equal(parsed.truncated, true);
+  assert.equal(parsed.clientRequestId, context.requestId);
+  assert.equal(parsed.diagnostics.omittedCount, 4);
+  assert.deepEqual(parsed.diagnostics.limits, diagnostic.diagnostics.limits);
+  assert.deepEqual(parsed.diagnostics.limits.map((limit) => limit.stepIndex), Array.from({ length: 16 }, (_, index) => index));
+});
+
+test('publication notice localizes limit and source, shows a different requested value, and hides unknown codes', () => {
+  const source = fs.readFileSync(new URL('../../scripts/dev-proxy-server.mjs', import.meta.url), 'utf8');
+  const sandbox = vm.createContext({ uiRequestDiagnostics: api, state: { language: 'ru' }, DEFAULT_PERMISSION_DENIED_TEXT: '' });
+  const dictionaryStart = source.indexOf('  var I18N = {');
+  vm.runInContext(source.slice(dictionaryStart, source.indexOf('\n  };', dictionaryStart) + 5), sandbox);
+  for (const name of ['t', 'uiErrorMessage', 'reportLimitSummary', 'publicationErrorMessage']) {
+    const start = source.indexOf('  function ' + name + '(');
+    vm.runInContext(source.slice(start, source.indexOf('\n  }', start) + 4), sandbox);
+  }
+  const code = 'unknown_internal_code';
+  function notice(limits, status = 422) {
+    const diagnostic = api.response(result({ code, message: code, diagnostics: { limits } }, { status }), { ...context, phase: 'publish' });
+    return sandbox.publicationErrorMessage({ diagnostic });
+  }
+  const limit = { table: 'items', phase: 'selector', reason: 'completeness_unconfirmed', limitName: 'maxSelectionScanRows',
+    source: 'runtime-settings', unit: 'cards', requested: 500, effectiveLimit: 100, observed: 100 };
+  assert.match(notice([limit]).text, /Не удалось подтвердить полноту данных.*Число проверяемых карточек \(настройки выполнения\).*Лимит \(карточки\): 100; Запрошено: 500/);
+  assert.doesNotMatch(notice([{ ...limit, limitName: 'unknown_limit', requested: 100 }]).text, /unknown_limit|Запрошено/);
+  assert.equal(notice([]).text, 'Не удалось опубликовать снимок.');
+  assert.equal(notice([]).diagnostic.code, code);
+  const timeout = { table: '', phase: 'commit', reason: 'deadline_exceeded', limitName: 'executionTimeoutMs',
+    unit: 'milliseconds', effectiveLimit: 60000, elapsedMs: 60001 };
+  assert.match(notice([limit, timeout], 422).text, /Варианты выбора/);
+  assert.match(notice([limit, timeout], 504).text, /Запись снимка: Истекло время выполнения.*Прошло: 60001 мс/);
+  assert.doesNotMatch(notice([limit, timeout], 504).text, /Варианты выбора|commit/);
+});
+
 test('diagnostic ownership rejects stale template, section, revision, generation and runtime', () => {
   const source = fs.readFileSync(new URL('../../scripts/dev-proxy-server.mjs', import.meta.url), 'utf8');
   const state = { selectedTemplate: { code: 'sample' }, designerSection: 'assistant', uiDiagnosticGeneration: 2, uiDiagnosticRevision: 4 };

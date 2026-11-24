@@ -22,6 +22,12 @@ function specHash(spec) {
   return createHash('sha256').update(stableJson(spec)).digest('hex');
 }
 
+function deferredSignal() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 async function listen(server) {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -267,8 +273,8 @@ test('personal refresh conflicts with republish of an ignore snapshot across two
   const redis = await redisFixture(t);
   const spec = { version: 1, params: { marker: { type: 'string', required: true } },
     steps: [SELECT], result: { tables: [PAGED] }, publish: STATIC };
-  const entered = Promise.withResolvers();
-  const release = Promise.withResolvers();
+  const entered = deferredSignal();
+  const release = deferredSignal();
   const mock = await upstream(t, { Refresh: spec }, async (url, token) => {
     if (!url.pathname.endsWith('/classes/Asset/cards')) return;
     if (token === 'slow') { entered.resolve(); await release.promise; }
@@ -355,8 +361,8 @@ test('a denied relation read fences a late successful computation across Redis-b
   const spec = { version: 1, steps: [SELECT, { type: 'expandRelations', as: 'related',
     from: 'items', domain: 'AssetTarget', targetClass: 'Target', targetColumns: ['Code'] }],
     result: { tables: [{ name: 'related', columns: ['Code'] }] } };
-  const entered = Promise.withResolvers();
-  const release = Promise.withResolvers();
+  const entered = deferredSignal();
+  const release = deferredSignal();
   let allowed = false;
   const mock = await upstream(t, { Related: spec }, async (url, token) => {
     if (url.pathname.endsWith('/classes/Asset/cards')) return { data: rows('asset') };

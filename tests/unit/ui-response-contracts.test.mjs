@@ -5,7 +5,7 @@ import vm from 'node:vm';
 import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics.mjs';
 
 const source = fs.readFileSync(new URL('../../scripts/dev-proxy-server.mjs', import.meta.url), 'utf8');
-const functions = ['parseResponse', 'validateUiResponse', 'createRequestError', 'requestDraftPreview',
+const functions = ['responseResult', 'parseResponse', 'validateUiResponse', 'createRequestError', 'requestDraftPreview',
   'runtimeSettingsScope', 'runtimeSettingsScopeIsCurrent', 'captureTemplateEditorSnapshot', 'saveTemplateSnapshot',
   'templateWriteKey', 'templateWritePending',
   'draftPreviewRequestTimeoutMs', 'saveTemplate', 'extractByTemplate', 'extractionIsRunning', 'extractionMatchesDraft', 'extractionCaptureDetails', 'runDraftAction',
