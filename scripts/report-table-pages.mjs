@@ -248,7 +248,7 @@ function contractError(code, message, indexBudget) {
 }
 
 // matchValues and groupValues are private, row-aligned values from before projection.
-export function buildLargeTableIndex(table, optionRows = [], { matchValues, groupValues } = {}) {
+export function buildLargeTableIndex(table, optionRows = [], { matchValues, groupValues, maxRows = LARGE_TABLE_ROW_BUDGET } = {}) {
   const rawConfig = table?.presentation?.largeTable;
   if (rawConfig == null) return null;
   const columns = Array.isArray(table.columns) ? [...new Set(table.columns.filter(identifier))] : [];
@@ -259,9 +259,9 @@ export function buildLargeTableIndex(table, optionRows = [], { matchValues, grou
   const config = normalizeLargeTablePresentation(rawConfig);
   const rows = table.rows ?? [];
   if (!Array.isArray(rows)) throw contractError('invalid_large_table_rows', 'Large table rows must be an array.');
-  if (rows.length > LARGE_TABLE_ROW_BUDGET) {
-    throw contractError('large_table_row_limit', `Large table row budget of ${LARGE_TABLE_ROW_BUDGET} exceeded.`,
-      ['maxRows', LARGE_TABLE_ROW_BUDGET, rows.length, 'rows']);
+  if (rows.length > maxRows) {
+    throw contractError('large_table_row_limit', `Large table row budget of ${maxRows} exceeded.`,
+      ['maxRows', maxRows, rows.length, 'rows']);
   }
   for (const values of [matchValues, groupValues]) {
     if (values !== undefined && (!Array.isArray(values) || values.length !== rows.length)) {

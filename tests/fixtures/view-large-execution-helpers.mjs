@@ -10,7 +10,11 @@ function functionSource(source, name) {
 export function bindViewLargeExecutionHelpers(proxySource) {
   const helpers = [
     'normalizeStringList', 'normalizePathColumnSpecs', 'normalizeComposeColumns', 'composeRightAlias',
-    'buildMatchRowsColumnMapping', 'buildRightColumnMapping', 'normalizeRowOperationKeys', 'renderViewLargeExecutionHelpers'
+    'buildMatchRowsColumnMapping', 'buildRightColumnMapping', 'normalizeRowOperationKeys', 'reportClosedOutputFields',
+    'operationInputAliases', 'executionScopeFromAliases', 'isRawObjectGroupTableNameServer', 'visibleRuntimeResultTables',
+    'normalizeRuntimeOutputMode', 'runtimeResultOutputMode', 'publishedReportTables',
+    'resultDiagramSourceName', 'normalizeDiagramMappingList', 'diagramMappingSourceName', 'diagramExecutionScope',
+    'renderViewLargeExecutionHelpers'
   ];
   return Function(helpers.map((name) => functionSource(proxySource, name)).join('\n') + '\nreturn renderViewLargeExecutionHelpers;')();
 }

@@ -7823,14 +7823,16 @@ function assertSnapshotLimitError(response, reason, expected, status = 422) {
   assert.equal(response.json.result, undefined);
   const limits = response.json.diagnostics?.limits;
   assert.ok(Array.isArray(limits) && limits.length > 0 && limits.length <= 16, response.body);
-  const stringKeys = ['table', 'stepAlias', 'stepType', 'limitName', 'configKey'];
+  const stringKeys = ['table', 'stepAlias', 'stepType', 'limitName', 'configKey', 'sourceAlias', 'sourceLabel', 'stepLabel'];
   const countKeys = ['stepIndex', 'requested', 'effectiveLimit', 'observed', 'total'];
-  const flagKeys = ['limitHit', 'truncated', 'timeout'];
+  const flagKeys = ['limitHit', 'truncated', 'timeout', 'canUseLargeTable', 'usedByDiagram'];
+  const rowLimitCauses = ['stepLimit', 'ordinaryCeiling', 'runtimeMaximum', 'pagedCeiling'];
   const enums = {
     phase: ['selector', 'rows', 'index'],
     source: ['runtime-settings', 'object-flow-step', 'product', 'upstream'],
-    unit: ['cards', 'relations', 'calls', 'rows', 'memberships', 'bytes', 'classes', 'domains', 'milliseconds'],
-    reason: ['limit_exceeded', 'completeness_unconfirmed', 'deadline_exceeded']
+        unit: ['cards', 'relations', 'calls', 'rows', 'memberships', 'bytes', 'classes', 'domains', 'milliseconds', 'checks'],
+    reason: ['limit_exceeded', 'completeness_unconfirmed', 'deadline_exceeded', 'row_limit_configuration_conflict'],
+    rowLimitMode: ['ordinary', 'paged']
   };
   for (const entry of limits) {
     assert.equal(typeof entry.table, 'string', response.body);
@@ -7839,7 +7841,8 @@ function assertSnapshotLimitError(response, reason, expected, status = 422) {
       const valid = stringKeys.includes(key) ? typeof value === 'string'
         : countKeys.includes(key) ? Number.isSafeInteger(value) && value >= 0
           : flagKeys.includes(key) ? typeof value === 'boolean'
-            : Object.hasOwn(enums, key) && enums[key].includes(value);
+            : key === 'rowLimitCauses' ? Array.isArray(value) && value.length > 0 && value.every((cause) => rowLimitCauses.includes(cause))
+              : Object.hasOwn(enums, key) && enums[key].includes(value);
       assert.ok(valid, `Unexpected diagnostic field ${key}: ${response.body}`);
     }
   }
@@ -7901,9 +7904,10 @@ test('large-table publication accepts exactly 10000 projected rows and retains t
   }, headers);
   const limits = assertSnapshotLimitError(refresh, 'table_result_incomplete', {
     table: 'view', phase: 'rows', stepAlias: 'cards', stepType: 'selectCards',
-    limitName: 'maxSelectionScanRows', source: 'runtime-settings',
+    limitName: 'maxSelectionScanRows', source: 'product', rowLimitMode: 'paged', canUseLargeTable: false,
     unit: 'cards', effectiveLimit: 10000, observed: 10000, total: 10001, reason: 'limit_exceeded'
   });
+  assert.deepEqual(limits.find((entry) => entry.limitName === 'maxSelectionScanRows').rowLimitCauses, ['pagedCeiling']);
   assert.ok(!limits.some((entry) => entry.limitName === 'maxRows'), refresh.body);
   assert.deepEqual((await requestJson('GET', pagePath)).json, page.json);
 });
@@ -7983,11 +7987,95 @@ test('large-table publication distinguishes relation totals, unconfirmed ends an
   assert.deepEqual((await requestJson('GET', snapshotUrl)).json, before.json);
 });
 
+test('publication row ceilings respect the independent scan maximum without an explicit scanLimit', async (t) => {
+  for (const large of [true, false]) {
+    await t.test(large ? '11000 rows within the paged budget of 12000' : '3000 rows cannot override a scan maximum of 2000', async (t) => {
+      const code = large ? 'RaisedPagedBudget' : 'OrdinaryScanMaximum';
+      const total = large ? 11000 : 2500;
+      const spec = publishSpec({
+        steps: [{ type: 'selectCards', as: 'assets', className: 'ARM', ...(large ? { limit: 11000,
+          filters: [{ path: 'Code', op: 'matches', regex: '^R' }] } : {}) }],
+        result: { tables: [{ name: 'assets', columns: ['Code'], published: true,
+          ...(large ? { presentation: { largeTable: { mode: 'all' } } } : {}) }] }
+      });
+      let fetched = 0;
+      const { templateUrl, headers } = await startTemplateRace(t, code, {
+        templates: [templateCard(code, spec)],
+        configCards: [{ _id: 1, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Active: true,
+          RuntimeConfigJson: JSON.stringify({ executionLimits: { maxRowsMax: 3000,
+            maxSelectionScanRowsDefault: 10000, maxSelectionScanRowsMax: large ? 50000 : 2000 } }) }],
+        responseOverride(url) {
+          if (!url.pathname.endsWith('/classes/ARM/cards')) return;
+          const offset = Number(url.searchParams.get('start') || 0);
+          const count = Math.min(Number(url.searchParams.get('limit')), total - offset);
+          const data = Array.from({ length: Math.max(0, count) }, (_, index) => ({ _id: offset + index + 1, Code: 'R' + (offset + index) }));
+          fetched += data.length;
+          return { statusCode: 200, body: { data, meta: { total } } };
+        }
+      }, { CMDP_EXECUTION_MAX_ROWS_ABSOLUTE: '3000', CMDP_LARGE_TABLE_MAX_ROWS: '12000' });
+      const response = await requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+      if (large) {
+        assert.equal(response.statusCode, 200, response.body.slice(0, 1800));
+        assert.equal(fetched, 11000);
+      } else {
+        assertSnapshotLimitError(response, 'table_result_incomplete', {
+          table: 'assets', stepAlias: 'assets', limitName: 'maxSelectionScanRows', source: 'runtime-settings',
+          configKey: 'maxSelectionScanRowsMax', effectiveLimit: 2000, observed: 2000, total: 2500
+        });
+        assert.equal(fetched, 2000);
+      }
+    });
+  }
+});
+
+test('matchRows with no matches stops at its budget without replacing the published snapshot', async (t) => {
+  const code = 'BoundedMatchingPublication';
+  const spec = publishSpec({
+    steps: [
+      { type: 'selectCards', as: 'left', className: 'ARM' },
+      { type: 'selectCards', as: 'right', className: 'routerG' },
+      { type: 'matchRows', as: 'different', from: 'left', with: 'right',
+        rules: [{ leftColumn: 'Code', rightColumn: 'Code', operator: 'equals' }] }
+    ],
+    result: { tables: [{ name: 'different', columns: ['Code'], published: true, presentation: { largeTable: { mode: 'all' } } }] }
+  });
+  let total = 1;
+  const lastPage = deferredSignal();
+  const { templateUrl, snapshotUrl, headers } = await startTemplateRace(t, code, {
+    templates: [templateCard(code, spec)],
+    responseOverride(url) {
+      if (!/\/(ARM|routerG)\/cards$/.test(url.pathname)) return;
+      const arm = url.pathname.endsWith('/ARM/cards');
+      const offset = Number(url.searchParams.get('start') || 0);
+      const size = Math.min(Number(url.searchParams.get('limit')), total - offset);
+      const data = Array.from({ length: Math.max(0, size) }, (_, index) => ({ _id: offset + index + 1,
+        Code: (total === 1 || arm ? 'A' : 'B') + (offset + index) }));
+      if (!arm && total > 1 && offset + data.length === total) lastPage.resolve();
+      return { statusCode: 200, body: { data, meta: { total } } };
+    }
+  });
+  const publish = () => requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+  const initial = await publish();
+  assert.equal(initial.statusCode, 200, initial.body.slice(0, 1000));
+  const before = await requestJson('GET', snapshotUrl);
+  total = 2300;
+  const inflight = publish();
+  assert.equal(await signalBeforeTimeout(lastPage.promise, 10000), true, 'both input datasets were read');
+  let finished = false;
+  void inflight.then(() => { finished = true; });
+  assert.equal((await requestJson('GET', headers.origin + '/health/live')).statusCode, 200);
+  assert.equal(finished, false, 'backend serves liveness while matching is in progress');
+  assertSnapshotLimitError(await inflight, 'table_result_incomplete', {
+    limitName: 'maxMatchRuleChecks', stepAlias: 'different', effectiveLimit: 5000000, observed: 5000000, unit: 'checks'
+  });
+  assert.deepEqual((await requestJson('GET', snapshotUrl)).json, before.json);
+});
+
 test('large-table publication and personal refresh distinguish selector scan and explicit row limits', async (t) => {
   const code = 'PagedSelectorAndRowLimits';
   const spec = publishSpec({
     steps: [
-      { type: 'selectCards', as: 'options', className: 'routerG' },
+      { type: 'selectCards', as: 'options', className: 'routerG', scanLimit: 1 },
       { type: 'selectCards', as: 'assets', className: 'ARM', limit: 1, scanLimit: 2 }
     ],
     result: { tables: [{ name: 'assets', columns: ['Code'], published: true, presentation: { largeTable: {
@@ -8023,7 +8111,7 @@ test('large-table publication and personal refresh distinguish selector scan and
   selectorTotal = 2;
   assertSnapshotLimitError(await publish(), 'table_result_incomplete', {
     table: 'assets', phase: 'selector', stepAlias: 'options', limitName: 'maxSelectionScanRows',
-    source: 'runtime-settings', unit: 'cards', effectiveLimit: 1, observed: 1, total: 2, reason: 'limit_exceeded'
+    source: 'object-flow-step', configKey: 'scanLimit', unit: 'cards', effectiveLimit: 1, observed: 1, total: 2, reason: 'limit_exceeded'
   });
   assert.deepEqual((await requestJson('GET', snapshotUrl)).json, before.json);
   selectorTotal = 1;
@@ -10128,6 +10216,49 @@ function transferReplacementSaveBody(prepared) {
   return { code, description, spec, paramsSchema, resultSchema, transferReplace: { targetId, revision: targetRevision } };
 }
 
+test('general config save preserves an above-ceiling row limit and validates changes made in Runtime settings', async (t) => {
+  const configCard = {
+    _id: 42, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Description: 'Existing settings', Active: false,
+    RuntimeConfigJson: JSON.stringify({
+      executionLimits: { maxRowsMax: 2000, maxRowsDefault: 600 },
+      runtimeCache: { refreshCooldownSec: 180 },
+      assistant: { llm: { maxTokens: 4096 } }
+    })
+  };
+  let writes = 0;
+  const { origin, headers } = await transferApiFixture(t, {
+    configCards: [configCard],
+    async responseOverride(url, request) {
+      if (request.method !== 'PUT' || url.pathname !== '/cmdbuild/services/rest/v3/classes/Cst_QueryToolConfig/cards/42') return;
+      writes++;
+      Object.assign(configCard, await readRequestJson(request));
+      return { statusCode: 200, body: { data: configCard } };
+    }
+  }, { CMDP_EXECUTION_MAX_ROWS_ABSOLUTE: '1800' });
+  const configUrl = origin + '/cmdbuild/custom-api/config?root=Cst_QueryTool';
+  const update = await requestJson('PUT', configUrl + '&scope=general', {
+    active: true, runtimeConfig: { runtimeCache: { refreshCooldownSec: 240 }, executionLimits: { maxRowsMax: 1500 } }
+  }, headers);
+  assert.equal(update.statusCode, 200, update.body);
+  const { runtimeConfig, active, description } = update.json.config;
+  assert.equal(active, false);
+  assert.equal(description, 'Existing settings');
+  assert.equal(runtimeConfig.executionLimits.maxRowsMax, 2000);
+  assert.equal(runtimeConfig.executionLimits.maxRowsDefault, 600);
+  assert.equal(runtimeConfig.assistant.llm.maxTokens, 4096);
+  assert.equal(runtimeConfig.runtimeCache.refreshCooldownSec, 240);
+  assert.equal(JSON.parse(configCard.RuntimeConfigJson).executionLimits.maxRowsMax, 2000);
+  const invalid = await requestJson('PUT', configUrl, { runtimeConfig }, headers);
+  assert.equal(invalid.statusCode, 422, invalid.body);
+  assert.equal(invalid.json.errors[0].path, 'executionLimits.maxRowsMax');
+  assert.equal(writes, 1);
+  runtimeConfig.executionLimits.maxRowsMax = 1800;
+  const valid = await requestJson('PUT', configUrl, { runtimeConfig }, headers);
+  assert.equal(valid.statusCode, 200, valid.body);
+  assert.equal(JSON.parse(configCard.RuntimeConfigJson).executionLimits.maxRowsMax, 1800);
+  assert.equal(writes, 2);
+});
+
 function assertTransferReadOnly(mock) {
   assert.deepEqual(mock.requests.filter((item) => !['GET', 'HEAD'].includes(item.method)), [],
     'export/prepare must not mutate CMDBuild cards, schema, runtime config or version history');
@@ -10776,6 +10907,11 @@ test('template transfer attests large table selectors in the target catalog with
     assert.equal(prepared.json.checks.status, missing.length ? 'needsAttention' : 'ready', prepared.body);
     for (const field of missing) {
       assert.ok(prepared.json.checks.issues.some((issue) => issue.path === selectorPath + field && issue.severity === 'error' && issue.blocking === false), prepared.body);
+    }
+    if (name === 'UnknownResultField') {
+      const rejected = await fixture.create(prepared.json.template);
+      assert.equal(rejected.statusCode, 400, rejected.body);
+      assert.ok(rejected.json.errors.some((error) => error.path === '$.result.tables[0].presentation.largeTable.selector.labelField'), rejected.body);
     }
   }
   assert.ok(fixture.mock.requests.some((request) => request.pathname.endsWith('/classes/Location/attributes')));

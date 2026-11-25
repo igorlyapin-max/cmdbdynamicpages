@@ -449,6 +449,15 @@ paths:
         Сохраняет запрошенные RAW assistant.llm.maxTokens и числовую policy
         assistant.diagnostics; caps применяются при выполнении. Некорректные
         числовые значения отклоняются до CMDBuild write. Не включает capture.
+        С scope=general обновляет только runtimeConfig.runtimeCache.refreshCooldownSec
+        (положительное целое число), сохраняя остальные значения карточки.
+      parameters:
+        - name: scope
+          in: query
+          description: Без параметра сохраняется полная конфигурация.
+          schema:
+            type: string
+            enum: [general]
       security:
         - cmdbuildCookie: []
           csrfHeader: []
@@ -466,7 +475,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/RuntimeConfigResponse"
         "422":
-          description: Некорректные числовые Assistant settings; CMDBuild write не выполнялся
+          description: Некорректные настройки выполнения; CMDBuild write не выполнялся
           content:
             application/json:
               schema:
@@ -2955,14 +2964,27 @@ components:
         stepAlias: { type: string }
         stepIndex: { type: integer, minimum: 0 }
         stepType: { type: string }
+        sourceAlias: { type: string, description: Внутренний ключ источника итоговых данных. }
+        sourceLabel: { type: string, description: Название источника в исполненной версии шаблона. }
+        stepLabel: { type: string, description: Название шага в исполненной версии шаблона. }
         limitName:
           type: string
           description: >
-            Например, maxRows, maxSelectionScanRows, maxRestCalls, maxRelationsPerCard, maxClasses, maxDomains, maxTraversalDepth,
+            Например, maxRows, maxSelectionScanRows, maxMatchRuleChecks, maxRestCalls, maxRelationsPerCard, maxClasses, maxDomains, maxTraversalDepth,
             maxIndexMemberships, maxIndexAggregateBytes, maxIndexStorageBytes или
             executionTimeoutMs для фактического таймаута.
         source: { type: string, enum: [runtime-settings, object-flow-step, product, upstream] }
         configKey: { type: string }
+        rowLimitMode: { type: string, enum: [ordinary, paged] }
+        rowLimitCauses:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string, enum: [stepLimit, runtimeMaximum, ordinaryCeiling, pagedCeiling] }
+        canUseLargeTable:
+          type: boolean
+          description: Постраничный режим устраняет этот порог для проверенной цепочки.
+        usedByDiagram: { type: boolean, description: Шаг нужен для построения диаграммы с обычным порогом. }
         requested: { type: number, minimum: 0 }
         effectiveLimit: { type: number, minimum: 0 }
         elapsedMs: { type: number, minimum: 0 }
@@ -2977,8 +2999,8 @@ components:
           type: integer
           minimum: 0
           description: Отдельный известный итог, например из метаданных upstream. При отсутствии подтверждения не указывается.
-        unit: { type: string, enum: [cards, relations, calls, rows, memberships, bytes, classes, domains, milliseconds, hops] }
-        reason: { type: string, enum: [limit_exceeded, completeness_unconfirmed, deadline_exceeded] }
+        unit: { type: string, enum: [cards, relations, calls, rows, memberships, bytes, classes, domains, milliseconds, hops, checks] }
+        reason: { type: string, enum: [limit_exceeded, completeness_unconfirmed, deadline_exceeded, row_limit_configuration_conflict] }
         limitHit: { type: boolean }
         truncated: { type: boolean }
         timeout: { type: boolean }

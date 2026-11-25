@@ -229,8 +229,13 @@ async function redisFixture(t) {
         const ack = faults.commitAck;
         commits.push(attempt);
         await faults.beforeCommit?.(attempt);
+        if (ack === 'denied') {
+          socket.end("-NOPERM this user has no permissions to run the 'eval' command\r\n");
+          return;
+        }
         attempt.outcome = command(parts);
         if (ack === 'drop') socket.end();
+        else if (ack === 'script-error') socket.end('-ERR ACL failure in script fixture\r\n');
         else if (ack !== 'hold') socket.end(reply(attempt.outcome));
         return;
       }
@@ -245,6 +250,184 @@ async function redisFixture(t) {
 const rows = (...codes) => codes.map((Code, i) => ({ _id: i + 1, Code, Description: Code }));
 const publish = (request, name, spec, token = 'editor', params = {}) =>
   request('/templates/' + name + '/publish', { token, method: 'POST', body: { savedSpecHash: specHash(spec), params } });
+
+test('invalid deployment row ceilings refuse startup and name the offending variable', { timeout: 5000 }, async (t) => {
+  for (const [ordinary, paged, expected] of [
+    ['0', '7', 'CMDP_EXECUTION_MAX_ROWS_ABSOLUTE'],
+    ['4', '', 'CMDP_LARGE_TABLE_MAX_ROWS'],
+    ['4', '4', 'CMDP_LARGE_TABLE_MAX_ROWS']
+  ]) {
+    const child = spawn(process.execPath, ['scripts/dev-proxy-server.mjs'], {
+      env: { ...process.env, CMDP_EXECUTION_MAX_ROWS_ABSOLUTE: ordinary, CMDP_LARGE_TABLE_MAX_ROWS: paged,
+        CMDP_LOG_TARGETS: 'stdout' }, stdio: ['ignore', 'pipe', 'pipe']
+    });
+    t.after(() => { if (child.exitCode === null) child.kill(); });
+    const output = [];
+    child.stdout.on('data', (chunk) => output.push(chunk));
+    child.stderr.on('data', (chunk) => output.push(chunk));
+    const [code] = await once(child, 'close');
+    const logs = Buffer.concat(output).toString();
+    assert.equal(code, 1, logs);
+    assert.match(logs, /app\.config_invalid/);
+    assert.match(logs, new RegExp(expected));
+  }
+});
+
+test('snapshot publication applies configured row ceilings and diagnoses explicit step limits', async (t) => {
+  const ordinaryCap = 4;
+  const pagedCap = 7;
+  const stepLabel = 'Select report assets';
+  const spec = (table, limit) => ({
+    version: 1,
+    steps: [{ ...SELECT, title: stepLabel, scanLimit: pagedCap + 1, ...(limit === undefined ? {} : { limit }) }],
+    result: { tables: [table] }, publish: SHARED
+  });
+  const templates = {
+    Ordinary: spec(TABLE),
+    OrdinaryConflict: spec(TABLE, ordinaryCap + 1),
+    ExplicitLower: spec(TABLE, 3),
+    Paged: spec(PAGED),
+    PagedConflict: spec(PAGED, pagedCap + 1)
+  };
+  const matching = {
+    ...spec(TABLE, ordinaryCap + 1),
+    result: { tables: [{ ...TABLE, name: 'view', published: true }] }
+  };
+  matching.steps = [...matching.steps,
+    { ...SELECT, as: 'other', limit: 1, filters: [{ path: 'Code', op: 'equals', value: 'missing' }] },
+    { type: 'unionRows', as: 'combined', from: 'items', with: 'other', on: 'Code', title: 'Matched assets' },
+    { type: 'enrichRows', as: 'view', from: 'combined', purpose: 'viewComposer', columns: [{ path: 'Code', as: 'Code' }] }];
+  templates.Matching = matching;
+  templates.MatchingPaged = { ...matching, result: { tables: [
+    { ...matching.result.tables[0], presentation: { largeTable: { mode: 'all' } } }
+  ] } };
+  const redis = await redisFixture(t);
+  let total = 0;
+  let sourceReads = 0;
+  const mock = await upstream(t, templates, (url) => {
+    if (url.pathname.endsWith('/Cst_QueryToolConfig/cards')) return { data: [{
+      _id: 1, Code: ROOT, RootCode: ROOT, Active: true,
+      RuntimeConfigJson: JSON.stringify({ executionLimits: { maxRowsDefault: 2, maxRowsMax: 6 } })
+    }] };
+    if (!/\/classes\/Asset\/cards(?:\/|$)/.test(url.pathname)) return;
+    sourceReads += 1;
+    const offset = Number(url.searchParams.get('start') || 0);
+    const limit = Number(url.searchParams.get('limit') || total);
+    const data = rows(...Array.from({ length: total }, (_, i) => 'asset-' + (i + 1)));
+    return { data: data.slice(offset, offset + limit), total };
+  });
+  const request = await backend(t, mock, redis.origin, {
+    CMDP_EXECUTION_MAX_ROWS_ABSOLUTE: String(ordinaryCap), CMDP_LARGE_TABLE_MAX_ROWS: String(pagedCap)
+  });
+  const publishTemplate = (code) => publish(request, code, templates[code]);
+  const publicRun = (code, query = 'json=true') => request('/public-snapshots/' + code + '/run?' + query);
+  const assertRowLimit = ({ status, json }, expected) => {
+    assert.equal(status, 422, JSON.stringify(json));
+    assert.equal(json.code, 'table_result_incomplete');
+    assert.equal(json.result, undefined);
+    assert.equal(json.tableView, undefined);
+    const diagnostic = json.diagnostics?.limits?.find(({ limitName }) => limitName === 'maxRows');
+    assert.ok(diagnostic, JSON.stringify(json));
+    for (const [key, value] of Object.entries({
+      table: 'items', phase: 'rows', stepAlias: 'items', sourceLabel: stepLabel, stepLabel, ...expected
+    })) {
+      assert.deepEqual(diagnostic[key], value, `${key}: ${JSON.stringify(diagnostic)}`);
+    }
+  };
+
+  await t.test('ordinary steps without a limit inherit the ordinary ceiling, not maxRowsDefault', async () => {
+    total = ordinaryCap;
+    const published = await publishTemplate('Ordinary');
+    assert.equal(published.status, 200, JSON.stringify(published.json));
+    const before = await publicRun('Ordinary');
+    assert.equal(before.status, 200);
+    assert.deepEqual(before.json.tables[0].rows, Array.from({ length: ordinaryCap }, (_, i) => ({ Code: 'asset-' + (i + 1) })));
+    total += 1;
+    assertRowLimit(await publishTemplate('Ordinary'), {
+      rowLimitMode: 'ordinary', reason: 'limit_exceeded', effectiveLimit: ordinaryCap, observed: total,
+      rowLimitCauses: ['ordinaryCeiling'], canUseLargeTable: true
+    });
+    assert.deepEqual(await publicRun('Ordinary'), before);
+  });
+
+  await t.test('ordinary and paged configuration conflicts fail before reading source data', async () => {
+    total = 1;
+    const readsBefore = sourceReads;
+    const commitsBefore = redis.commits.length;
+    for (const [code, rowLimitMode, cap, cause, canUseLargeTable] of [
+      ['OrdinaryConflict', 'ordinary', ordinaryCap, 'ordinaryCeiling', true],
+      ['PagedConflict', 'paged', pagedCap, 'pagedCeiling', false]
+    ]) {
+      assertRowLimit(await publishTemplate(code), {
+        rowLimitMode, reason: 'row_limit_configuration_conflict', requested: cap + 1, effectiveLimit: cap,
+        rowLimitCauses: [cause], canUseLargeTable, observed: undefined, truncated: false
+      });
+      assert.equal(sourceReads, readsBefore, `${code} must not read source data`);
+      assert.equal(redis.commits.length, commitsBefore, `${code} must not commit a snapshot`);
+    }
+  });
+
+  await t.test('a lower explicit step limit aborts refresh and preserves the prior snapshot', async () => {
+    total = 3;
+    const published = await publishTemplate('ExplicitLower');
+    assert.equal(published.status, 200, JSON.stringify(published.json));
+    const before = await publicRun('ExplicitLower');
+    assert.equal(before.status, 200);
+    const expectedSnapshotRevision = before.json.cache.snapshotRevision;
+    assert.ok(expectedSnapshotRevision);
+    const readsBefore = sourceReads;
+    const commitsBefore = redis.commits.length;
+    total += 1;
+    const refresh = await request('/templates/ExplicitLower/refresh-snapshot', {
+      token: 'editor', method: 'POST', body: { expectedMode: 'shared', expectedSnapshotRevision }
+    });
+    assertRowLimit(refresh, {
+      rowLimitMode: 'ordinary', reason: 'limit_exceeded', requested: 3, effectiveLimit: 3, observed: total,
+      rowLimitCauses: ['stepLimit']
+    });
+    assert.ok(sourceReads > readsBefore, 'a valid lower limit is enforced on the actual result');
+    assert.equal(redis.commits.length, commitsBefore);
+    assert.deepEqual(await publicRun('ExplicitLower'), before);
+  });
+
+  await t.test('enabling pagination removes an ordinary threshold conflict in a matching input', async () => {
+    const readsBefore = sourceReads;
+    const failed = await publishTemplate('Matching');
+    assertRowLimit(failed, {
+      table: 'view', rowLimitMode: 'ordinary', reason: 'row_limit_configuration_conflict',
+      requested: ordinaryCap + 1, effectiveLimit: ordinaryCap, canUseLargeTable: true, sourceLabel: 'Matched assets'
+    });
+    assert.equal(sourceReads, readsBefore);
+    total = ordinaryCap + 1;
+    const published = await publishTemplate('MatchingPaged');
+    assert.equal(published.status, 200, JSON.stringify(published.json));
+    assert.equal(published.json.result.tables[0].rows.length, total);
+  });
+
+  await t.test('paged steps inherit the paged ceiling and publish every row up to that ceiling', async () => {
+    total = pagedCap;
+    const published = await publishTemplate('Paged');
+    assert.equal(published.status, 200, JSON.stringify(published.json));
+    const shell = await publicRun('Paged', 'cmdpTableShell=1');
+    assert.equal(shell.status, 200);
+    const snapshotRevision = shell.json.tableView.snapshotRevision;
+    const pagePath = '/public-snapshots/Paged/table-page?cmdpTable=' + encodeURIComponent(JSON.stringify({
+      table: 'items', op: 'rows', offset: pagedCap - 1, limit: 1, snapshotRevision
+    }));
+    const lastPage = await request(pagePath);
+    assert.equal(lastPage.status, 200);
+    assert.equal(lastPage.json.total, pagedCap);
+    assert.equal(lastPage.json.incomplete, false);
+    assert.deepEqual(lastPage.json.table.rows, [{ Code: 'asset-' + pagedCap }]);
+    total += 1;
+    assertRowLimit(await publishTemplate('Paged'), {
+      rowLimitMode: 'paged', reason: 'limit_exceeded', effectiveLimit: pagedCap, observed: total,
+      rowLimitCauses: ['pagedCeiling'], canUseLargeTable: false
+    });
+    assert.deepEqual(await publicRun('Paged', 'cmdpTableShell=1'), shell);
+    assert.deepEqual(await request(pagePath), lastPage);
+  });
+});
 
 test('anonymous run, viewer shell and public paging expose only the canonical table, even with an old index', async (t) => {
   const redis = await redisFixture(t);
@@ -388,7 +571,7 @@ test('Redis fences delayed snapshot writes and distinguishes a timeout before EV
   assert.deepEqual([...redis.sets].map(([key, items]) => [key, [...items]]), initialIndex);
 });
 
-test('lost Redis ACK is a typed unknown whether or not the caller deadline expires', async (t) => {
+test('lost Redis ACK permits same-instance readback without repeating the write', async (t) => {
   const redis = await redisFixture(t);
   const code = 'CommitAck';
   const spec = { version: 1, steps: [SELECT], result: { tables: [PAGED] }, publish: SHARED };
@@ -397,10 +580,9 @@ test('lost Redis ACK is a typed unknown whether or not the caller deadline expir
   });
   const env = { CMDP_DRAFT_PREVIEW_TIMEOUT_MS: '1000', CMDBDYNAMIC_REDIS_TIMEOUT_MS: '2000' };
   const writer = await backend(t, mock, redis.origin, env);
-  const observer = await backend(t, mock, redis.origin, env);
   assert.equal((await publish(writer, code, spec, 'original')).status, 200);
   const publicPath = '/public-snapshots/' + code + '/run?json=true';
-  const before = await observer(publicPath);
+  const before = await writer(publicPath);
   const assertUnknown = (response) => {
     assert.equal(response.status, 503, JSON.stringify(response.json));
     assert.equal(response.json.reason, 'snapshot_commit_outcome_unknown');
@@ -416,18 +598,54 @@ test('lost Redis ACK is a typed unknown whether or not the caller deadline expir
       expectedMode: 'shared', expectedSnapshotRevision: before.json.cache.snapshotRevision
     }
   }));
-  const shared = await observer(publicPath);
+  const shared = await writer(publicPath);
   assert.equal(shared.status, 200);
   assert.notEqual(shared.json.cache.snapshotRevision, before.json.cache.snapshotRevision);
   assert.equal(shared.json.tables[0].rows[0].Code, 'shared');
 
   redis.faults.commitAck = 'drop';
   assertUnknown(await publish(writer, code, spec, 'republished'));
-  const republished = await observer(publicPath);
+  const republished = await writer(publicPath);
   assert.equal(republished.status, 200);
   assert.notEqual(republished.json.cache.snapshotRevision, shared.json.cache.snapshotRevision);
   assert.equal(republished.json.tables[0].rows[0].Code, 'republished');
   assert.deepEqual(redis.commits.map(({ outcome }) => outcome), [1, 1, 1], 'each write was dispatched exactly once');
+});
+
+test('snapshot command ACL denial and pre-write read failure are definitive; script errors are not', async (t) => {
+  const redis = await redisFixture(t);
+  const code = 'CommitDenial';
+  const spec = { version: 1, steps: [SELECT], result: { tables: [TABLE] }, publish: SHARED };
+  const mock = await upstream(t, { [code]: spec }, (url, token) => {
+    if (url.pathname.endsWith('/classes/Asset/cards')) {
+      if (token === 'read-failure') return { status: 502 };
+      return { data: rows(token) };
+    }
+  });
+  const writer = await backend(t, mock, redis.origin);
+  const publicPath = '/public-snapshots/' + code + '/run?json=true';
+  assert.equal((await publish(writer, code, spec, 'original')).status, 200);
+  const before = await writer(publicPath);
+
+  const readFailed = await publish(writer, code, spec, 'read-failure');
+  assert.equal(readFailed.status, 502, JSON.stringify(readFailed.json));
+  assert.equal(readFailed.json.reason, 'snapshot_refresh_data_unavailable');
+  assert.equal(redis.commits.length, 1);
+  assert.deepEqual(await writer(publicPath), before);
+
+  redis.faults.commitAck = 'denied';
+  const denied = await publish(writer, code, spec, 'acl-denied');
+  assert.equal(denied.status, 503, JSON.stringify(denied.json));
+  assert.equal(denied.json.reason, 'snapshot_storage_unavailable');
+  assert.equal(redis.commits[1].outcome, undefined);
+  assert.deepEqual(await writer(publicPath), before);
+
+  redis.faults.commitAck = 'script-error';
+  const uncertain = await publish(writer, code, spec, 'script-error');
+  assert.equal(uncertain.status, 503, JSON.stringify(uncertain.json));
+  assert.equal(uncertain.json.reason, 'snapshot_commit_outcome_unknown');
+  assert.equal((await writer(publicPath)).json.tables[0].rows[0].Code, 'script-error');
+  assert.equal(redis.commits.length, 3);
 });
 
 test('shared refresh uses Redis revision CAS to reject a competing republish', async (t) => {

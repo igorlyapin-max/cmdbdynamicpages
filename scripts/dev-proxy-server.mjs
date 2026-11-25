@@ -320,8 +320,34 @@ const DEFAULT_ASSISTANT_DIAGRAM_CRITIQUE_PROMPT = [
   'Если все обязательства подтверждены, верни approved=true и пустой violations. Не применяй, не сохраняй, не публикуй и не выполняй шаблон.'
 ].join('\n\n');
 const STARTED_AT = new Date();
+const REPORT_ROW_LIMIT_RECOMMENDATIONS = Object.freeze({ ordinary: 2000, paged: REPORT_TABLE_ROW_BUDGET });
+const DIAGRAM_ABSOLUTE_NODE_LIMIT = 2000;
+const MATCH_RULE_CHECK_LIMIT = 5_000_000;
+const MATCH_RULE_YIELD_INTERVAL = 4096;
+const REPORT_ROW_LIMIT_CONFIG_ERRORS = [];
+function deploymentReportRowLimit(key, fallback) {
+  const raw = process.env[key];
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!/^[0-9]+$/.test(raw) || !Number.isSafeInteger(value) || value < 1) {
+    REPORT_ROW_LIMIT_CONFIG_ERRORS.push({ code: 'report_row_limit_invalid', env: key,
+      message: `${key} must be a positive safe integer.` });
+    return fallback;
+  }
+  return value;
+}
+const REPORT_ROW_LIMITS = Object.freeze({
+  ordinary: deploymentReportRowLimit('CMDP_EXECUTION_MAX_ROWS_ABSOLUTE', REPORT_ROW_LIMIT_RECOMMENDATIONS.ordinary),
+  paged: deploymentReportRowLimit('CMDP_LARGE_TABLE_MAX_ROWS', REPORT_ROW_LIMIT_RECOMMENDATIONS.paged),
+  recommendedOrdinary: REPORT_ROW_LIMIT_RECOMMENDATIONS.ordinary,
+  recommendedPaged: REPORT_ROW_LIMIT_RECOMMENDATIONS.paged
+});
+if (REPORT_ROW_LIMITS.paged <= REPORT_ROW_LIMITS.ordinary) {
+  REPORT_ROW_LIMIT_CONFIG_ERRORS.push({ code: 'report_row_limit_order_invalid', env: 'CMDP_LARGE_TABLE_MAX_ROWS',
+    message: 'CMDP_LARGE_TABLE_MAX_ROWS must exceed CMDP_EXECUTION_MAX_ROWS_ABSOLUTE.' });
+}
 const ABSOLUTE_EXECUTION_LIMITS = {
-  maxRows: 2000,
+  maxRows: REPORT_ROW_LIMITS.ordinary,
   maxRelationsPerCard: Math.max(1, Number(process.env.CMDP_EXECUTION_MAX_RELATIONS_PER_CARD_ABSOLUTE || 50000) || 50000),
   maxSelectionScanRows: Math.max(1, Number(process.env.CMDP_EXECUTION_MAX_SELECTION_SCAN_ROWS_ABSOLUTE || 50000) || 50000),
   maxClasses: 500,
@@ -859,7 +885,7 @@ function validateRuntimeConfig(input = {}) {
     ? applicationBuildConfigurationError
     : input.applicationBuildError || '').trim();
   const publicOriginConfiguration = parsePublicOriginConfiguration(input.publicOrigin === undefined ? process.env.CMDP_PUBLIC_ORIGIN || '' : input.publicOrigin);
-  const errors = [];
+  const errors = [...REPORT_ROW_LIMIT_CONFIG_ERRORS];
   const warnings = [];
 
   let tlsCaBundle = { configured: Boolean(tlsCaFile || nodeExtraCaCerts), readable: false };
@@ -1031,6 +1057,8 @@ function runtimeConfigLogSummary(validation = validateRuntimeConfig()) {
     redis: validation.redis || redisTransportSecurity(),
     d2: validation.d2 || d2RendererConfigSummary(),
     inputCollections: validation.inputCollections || INPUT_COLLECTION_LIMITS,
+    reportRowLimits: REPORT_ROW_LIMITS,
+    ...(REPORT_ROW_LIMIT_CONFIG_ERRORS.length ? { reportRowLimitErrors: REPORT_ROW_LIMIT_CONFIG_ERRORS } : {}),
     errors: validation.errors.map((item) => item.code),
     warnings: validation.warnings.map((item) => item.code)
   };
@@ -8940,15 +8968,19 @@ async function redisCommand(parts, options = {}) {
       socket.destroy();
       if (error) {
         if (commit) {
-          const deadlineExpired = error.code === 'draft_preview_timeout' || commit.remainingMs() <= 0;
           if (dispatched) {
-            error = snapshotStoreError('snapshot_commit_outcome_unknown',
-              'The snapshot write was sent, but its outcome could not be confirmed. Reload the public report before retrying.');
-          } else if (deadlineExpired) {
-            error = executionDeadlineTimeoutError();
+            // A command-level ACL rejection is different from an error inside the script.
+            const evalDenied = error.redisError && /^Redis error: NOPERM .*permissions? to run (?:the )?['`]?eval['`]? command\b/i.test(error.message);
+            incMetric('cmdp_redis_errors_total', { reason: evalDenied ? 'snapshot_commit_denied' : 'snapshot_commit_unconfirmed' });
+            reject(evalDenied
+              ? snapshotStoreError('snapshot_storage_unavailable', 'Redis denied the snapshot write command.')
+              : snapshotStoreError('snapshot_commit_outcome_unknown',
+                'The snapshot write was sent, but its outcome could not be confirmed. Reload the public report before retrying.'));
+            return;
           }
+          const deadlineExpired = error.code === 'draft_preview_timeout' || commit.remainingMs() <= 0;
           // Expiring the caller's budget is not evidence Redis is unavailable.
-          if (deadlineExpired) { reject(error); return; }
+          if (deadlineExpired) { reject(executionDeadlineTimeoutError()); return; }
         }
         if (beforeDispatch) { reject(error); return; }
         if (options.isolatedDiagnostics) {
@@ -9825,7 +9857,10 @@ function extractDesignerSection(pathname, requestUrl) {
 function renderViewLargeExecutionHelpers() {
   return [
     normalizeStringList, normalizePathColumnSpecs, normalizeComposeColumns, composeRightAlias,
-    buildMatchRowsColumnMapping, buildRightColumnMapping, normalizeRowOperationKeys
+    buildMatchRowsColumnMapping, buildRightColumnMapping, normalizeRowOperationKeys, reportClosedOutputFields,
+    operationInputAliases, executionScopeFromAliases, isRawObjectGroupTableNameServer, visibleRuntimeResultTables,
+    normalizeRuntimeOutputMode, runtimeResultOutputMode, publishedReportTables,
+    resultDiagramSourceName, normalizeDiagramMappingList, diagramMappingSourceName, diagramExecutionScope
   ].map((helper) => helper.toString()).join('\n');
 }
 
@@ -9841,6 +9876,7 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     publicRuntime,
     snapshotRefreshSessionPresent,
     snapshotRefreshTimeoutMs: DRAFT_PREVIEW_TIMEOUT_MS + 10000,
+    reportRowLimits: REPORT_ROW_LIMITS,
     apiPrefix: BACKEND_PREFIX,
     assistant: assistantStatus(),
     assistantMcpCaps: {
@@ -10115,7 +10151,32 @@ function dynamicPagesClientScript() {
       runtimeMaxRowsDataPreviewDefault: 'Extraction and diagram preview rows',
       runtimeMaxRowsDataPreviewDefaultHelp: 'Shared row limit for Extraction and diagram preview. Diagram maxNodes and maxEdges remain separate visual limits.',
       runtimeMaxRowsMax: 'Maximum rows',
-      runtimeMaxRowsMaxHelp: 'Upper cap for rows returned by one execution.',
+      runtimeMaxRowsMaxHelp: 'Publication threshold for ordinary reports and the upper bound for ordinary runs.',
+      ordinaryRowCeiling: 'Ordinary report ceiling',
+      pagedRowCeiling: 'Large table ceiling',
+      reportRowRecommendations: 'Do not exceed {ordinary} rows for ordinary reports or {paged} for large tables. Higher budgets increase publication time and load on CMDBuild and the server.',
+      reportRowDeploymentHelp: 'Set at deployment. Restart the service after changing it.',
+      objectSelectionLimitHelp: 'Optional. Leave blank to use the limit for the current report mode.',
+      reportRowModeCap: 'Limit for this mode: {limit} rows.',
+      reportRowConfigConflict: 'You entered {requested} rows, but this mode allows {limit}.',
+      reportRowSavedAboveCeiling: 'Saved maximum: {saved} rows. Effective maximum: {limit} rows. To update the saved value, go to {path}.',
+      reportRowUseLarge: 'For more rows, go to {path}.',
+      reportRowReduce: 'Reduce the number of rows with a filter or split the report.',
+      reportRowLimitUnset: 'Inherit from report mode',
+      reportRowSource: 'Final data → Data source: {name}.',
+      reportRowStep: 'Step: {name}.',
+      reportRowStepSetting: 'Object group → {name} → Limit',
+      reportRowUnnamedStep: 'Selection {number}',
+      reportRowRuntimeSetting: 'Runtime settings → Execution limits → Maximum rows',
+      reportRowAdjust: 'Review: {fields}.',
+      reportRowClearStepLimit: 'Lower the value or clear it to inherit the limit for this mode.',
+      reportRowRaiseStepLimit: 'Raise this selection limit within the mode threshold, or clear it to inherit that threshold.',
+      reportRowInheritedStepLimit: 'Clear the selection limit to use the threshold for the chosen mode.',
+      reportRowRaiseMaximum: 'Raise Maximum rows within the deployment ceiling.',
+      reportRowUsedByDiagram: 'This step also feeds a diagram, which still uses the ordinary threshold.',
+      reportRowPagedBudget: 'Large table is already enabled. Changing the page size does not increase the preparation budget.',
+      reportRowAtLeast: 'Found at least {count} rows.',
+      reportRowFixedCap: 'This ceiling cannot be raised in the editor.',
       runtimeMaxRelationsPerCardDefault: 'Relations per source card',
       runtimeMaxRelationsPerCardDefaultHelp: 'Shared limit for relations read from one CMDBuild card. It applies to every relation operation.',
       runtimeMaxRelationsPerCardMax: 'Maximum relations per source card',
@@ -10546,12 +10607,14 @@ function dynamicPagesClientScript() {
       snapshotPublished: 'Snapshot published.',
       snapshotPublishFailed: 'Could not publish the snapshot.',
       snapshotPublishOutcomeUnknown: 'Publication outcome is unknown. Check the current snapshot before publishing again.',
+      snapshotPublicationNotConfirmed: 'The previous publication was not confirmed.',
       snapshotCheckCurrent: 'Check current snapshot',
       snapshotCheckingCurrent: 'Checking the current snapshot…',
-      snapshotCurrentFound: 'A current snapshot is available. This does not confirm the publication attempt.',
-      snapshotCurrentMissing: 'No current snapshot was found. The publication outcome is still unknown.',
-      snapshotRefreshCurrentFound: 'A current snapshot is available. This does not confirm the refresh attempt.',
-      snapshotRefreshCurrentMissing: 'No current snapshot was found. The refresh outcome is still unknown.',
+      snapshotCheckRequired: 'Check the current snapshot before retrying.',
+      snapshotBaselineUnavailable: 'Could not read the current snapshot. No publication request was sent.',
+      snapshotCurrentUnchanged: 'The snapshot has not changed. You can retry manually.',
+      snapshotCurrentMissing: 'No current snapshot was found. You can retry manually.',
+      snapshotCurrentChanged: 'The current snapshot changed. Revision: {revision}. No write was repeated.',
       snapshotCurrentPublishedAt: 'Published: {time}',
       snapshotCheckFailed: 'Could not check the current snapshot.',
       snapshotOpenCurrent: 'Open current snapshot',
@@ -11077,7 +11140,7 @@ function dynamicPagesClientScript() {
       viewLargeNormal: 'Regular table',
       viewLargeAll: 'All rows, paginated',
       viewLargeKey: 'By selected object',
-      viewLargeModeHelp: 'All rows, paginated shows the entire result in pages. By selected object shows a list of values first, then only the rows matching your choice.',
+      viewLargeModeHelp: 'All rows, paginated shows the result in pages. By selected object shows rows matching a chosen value. The limit for preparing data is not the page size.',
       viewLargeSelectorMode: 'Filter setup',
       viewLargeSimple: 'From a column',
       viewLargeAdvanced: 'Advanced settings',
@@ -11394,6 +11457,10 @@ function dynamicPagesClientScript() {
       reportLimitReason_deadline_exceeded: 'Execution timed out.',
       reportLimitName_maxRows: 'Result row count',
       reportLimitName_maxSelectionScanRows: 'Cards scanned for selection',
+      reportLimitName_maxMatchRuleChecks: 'Matching rule checks',
+      reportLimitUnit_checks: 'checks',
+      reportLimitMatchAction: 'Narrow both input selections before matching.',
+      reportLimitScanAction: 'Narrow the selection or review Runtime settings → Execution limits → {field}.',
       reportLimitName_maxRelationsPerCard: 'Relations per card',
       reportLimitName_maxRestCalls: 'REST requests per execution',
       reportLimitName_maxClasses: 'Class count',
@@ -11605,7 +11672,32 @@ function dynamicPagesClientScript() {
       runtimeMaxRowsDataPreviewDefault: 'Строк для извлечения и предпросмотра диаграмм',
       runtimeMaxRowsDataPreviewDefaultHelp: 'Единый лимит строк для «Извлечения» и предпросмотра диаграмм. Визуальные maxNodes и maxEdges задаются отдельно в самой диаграмме.',
       runtimeMaxRowsMax: 'Максимум строк',
-      runtimeMaxRowsMaxHelp: 'Верхний предел строк, которые может вернуть одно выполнение.',
+      runtimeMaxRowsMaxHelp: 'Порог публикации в обычном режиме и верхняя граница для лимитов обычного запуска.',
+      ordinaryRowCeiling: 'Потолок обычного выполнения',
+      pagedRowCeiling: 'Потолок большой таблицы',
+      reportRowRecommendations: 'Не рекомендуется превышать {ordinary} строк в обычном режиме и {paged} в режиме большой таблицы. Повышение увеличивает время публикации и нагрузку на CMDBuild и сервер.',
+      reportRowDeploymentHelp: 'Задаётся при развёртывании. После изменения требуется перезапуск сервиса.',
+      objectSelectionLimitHelp: 'Необязательное ограничение выборки. Оставьте поле пустым, чтобы использовать лимит текущего режима отчёта.',
+      reportRowModeCap: 'Лимит для этого режима: {limit} строк.',
+      reportRowConfigConflict: 'Указано {requested} строк, но режим допускает {limit}.',
+      reportRowSavedAboveCeiling: 'Сохранённый максимум: {saved} строк. Действующий максимум: {limit} строк. Чтобы изменить сохранённое значение, откройте «{path}».',
+      reportRowUseLarge: 'Для большего объёма выберите «{path}».',
+      reportRowReduce: 'Сузьте выборку фильтром или разделите отчёт.',
+      reportRowLimitUnset: 'Лимит режима отчёта',
+      reportRowSource: 'Итоговые данные → Источник данных: {name}.',
+      reportRowStep: 'Шаг: {name}.',
+      reportRowStepSetting: 'Группа объектов → {name} → Лимит',
+      reportRowUnnamedStep: 'Выборка {number}',
+      reportRowRuntimeSetting: 'Настройки выполнения → Лимиты выполнения → Максимум строк',
+      reportRowAdjust: 'Проверьте: {fields}.',
+      reportRowClearStepLimit: 'Уменьшите значение или очистите поле, чтобы использовать лимит режима.',
+      reportRowRaiseStepLimit: 'Увеличьте лимит выборки в пределах порога режима или очистите поле, чтобы использовать этот порог.',
+      reportRowInheritedStepLimit: 'Очистите лимит выборки, чтобы использовать порог выбранного режима.',
+      reportRowRaiseMaximum: 'Увеличьте «Максимум строк» в пределах потолка развёртывания.',
+      reportRowUsedByDiagram: 'Этот шаг также используется в диаграмме, для которой сохраняется обычный порог.',
+      reportRowPagedBudget: 'Режим «Большая таблица» уже включён. Изменение размера страницы не повышает лимит подготовки данных.',
+      reportRowAtLeast: 'Найдено не менее {count} строк.',
+      reportRowFixedCap: 'Этот потолок нельзя повысить в редакторе.',
       runtimeMaxRelationsPerCardDefault: 'Связей на одну карточку',
       runtimeMaxRelationsPerCardDefaultHelp: 'Общий лимит связей, читаемых для одной карточки CMDBuild. Применяется ко всем операциям связей.',
       runtimeMaxRelationsPerCardMax: 'Максимум связей на одну карточку',
@@ -12036,12 +12128,14 @@ function dynamicPagesClientScript() {
       snapshotPublished: 'Снимок опубликован.',
       snapshotPublishFailed: 'Не удалось опубликовать снимок.',
       snapshotPublishOutcomeUnknown: 'Результат публикации неизвестен. Проверьте текущий снимок перед повторной публикацией.',
+      snapshotPublicationNotConfirmed: 'Предыдущая публикация не была подтверждена.',
       snapshotCheckCurrent: 'Проверить текущий снимок',
       snapshotCheckingCurrent: 'Проверяется текущий снимок…',
-      snapshotCurrentFound: 'Текущий снимок доступен. Это не подтверждает результат попытки публикации.',
-      snapshotCurrentMissing: 'Текущий снимок не найден. Результат публикации по-прежнему неизвестен.',
-      snapshotRefreshCurrentFound: 'Текущий снимок доступен. Это не подтверждает результат попытки обновления.',
-      snapshotRefreshCurrentMissing: 'Текущий снимок не найден. Результат обновления по-прежнему неизвестен.',
+      snapshotCheckRequired: 'Перед повтором проверьте текущий снимок.',
+      snapshotBaselineUnavailable: 'Не удалось прочитать текущий снимок. Запрос на публикацию не отправлен.',
+      snapshotCurrentUnchanged: 'Снимок не изменился. Можно повторить операцию вручную.',
+      snapshotCurrentMissing: 'Текущий снимок не найден. Можно повторить операцию вручную.',
+      snapshotCurrentChanged: 'Текущий снимок изменился. Ревизия: {revision}. Повторная запись не выполнялась.',
       snapshotCurrentPublishedAt: 'Опубликован: {time}',
       snapshotCheckFailed: 'Не удалось проверить текущий снимок.',
       snapshotOpenCurrent: 'Открыть текущий снимок',
@@ -12567,7 +12661,7 @@ function dynamicPagesClientScript() {
       viewLargeNormal: 'Обычная таблица',
       viewLargeAll: 'Все строки, постранично',
       viewLargeKey: 'По выбранному объекту',
-      viewLargeModeHelp: '«Все строки, постранично» показывает весь результат порциями. «По выбранному объекту» сначала предлагает список значений, затем показывает строки для выбранного значения.',
+      viewLargeModeHelp: '«Все строки, постранично» показывает результат порциями. «По выбранному объекту» показывает строки для выбранного значения. Лимит подготовки данных не равен размеру страницы.',
       viewLargeSelectorMode: 'Настройка фильтра',
       viewLargeSimple: 'По колонке',
       viewLargeAdvanced: 'Расширенные настройки',
@@ -12884,6 +12978,10 @@ function dynamicPagesClientScript() {
       reportLimitReason_deadline_exceeded: 'Истекло время выполнения.',
       reportLimitName_maxRows: 'Число строк результата',
       reportLimitName_maxSelectionScanRows: 'Число проверяемых карточек',
+      reportLimitName_maxMatchRuleChecks: 'Проверки правил сопоставления',
+      reportLimitUnit_checks: 'проверки',
+      reportLimitMatchAction: 'Сузьте обе входные выборки перед сопоставлением.',
+      reportLimitScanAction: 'Сузьте выборку или проверьте «Настройки выполнения → Лимиты выполнения → {field}».',
       reportLimitName_maxRelationsPerCard: 'Число связей на карточку',
       reportLimitName_maxRestCalls: 'Число REST-запросов за выполнение',
       reportLimitName_maxClasses: 'Число классов',
@@ -14106,14 +14204,14 @@ function dynamicPagesClientScript() {
     return String(boot.mode === 'runtime' ? boot.root : state.root);
   }
 
-  function runtimeQuery(params) {
+  function runtimeQuery(params, root) {
     var query = new URLSearchParams(params || {});
-    query.set('root', runtimeRoot());
+    query.set('root', root === undefined ? runtimeRoot() : root);
     return query;
   }
 
-  function publicSnapshotRunPath(templateCode, params, tableShell) {
-    var query = runtimeQuery(params);
+  function publicSnapshotRunPath(templateCode, params, tableShell, root) {
+    var query = runtimeQuery(params, root);
     if (tableShell) query.set('cmdpTableShell', '1');
     return apiPrefix + '/public-snapshots/' + encodeURIComponent(templateCode) + '/run?' + query.toString();
   }
@@ -15000,7 +15098,7 @@ function dynamicPagesClientScript() {
         maxRowsDefault: 500,
         maxRowsPreviewDefault: 25,
         maxRowsDataPreviewDefault: 100,
-        maxRowsMax: 2000,
+        maxRowsMax: boot.reportRowLimits.ordinary,
         maxRelationsPerCardDefault: 100,
         maxRelationsPerCardMax: 5000,
         maxClassesDefault: 100,
@@ -15360,6 +15458,15 @@ function dynamicPagesClientScript() {
       isSnapshotHash(cache.specHash) && (cache.paramsHash === 'any' || isSnapshotHash(cache.paramsHash));
   }
 
+  function publicSnapshotRevision(result, code) {
+    var json = result.ok && result.json;
+    if (!isSnapshotResult(json, 'run', code)) return undefined;
+    var cache = json.cache;
+    if (json.snapshotFound === true && isPersistedSnapshotCache(cache, 'snapshot-hit') &&
+        isSnapshotHash(cache.snapshotRevision)) return cache.snapshotRevision;
+    if (json.snapshotFound === false && cache?.scope === 'staticSnapshot' && cache.status === 'snapshot-miss') return '';
+  }
+
   function validateSnapshotMutationResponse(result, action, expected) {
     var json = result.json;
     var cache = json && json.cache;
@@ -15391,8 +15498,8 @@ function dynamicPagesClientScript() {
     // Only API failures known to precede the write prove a gateway status is definitive.
     if (result.status === 504) return reason !== (action === 'publish' ? 'draft_preview_timeout' : 'snapshot_refresh_timeout');
     if (result.status === 503) return reason !== 'snapshot_storage_unavailable';
-    return (action === 'publish' ? ['publication_template_recheck_failed'] :
-      ['snapshot_refresh_template_unavailable', 'snapshot_refresh_data_unavailable']).indexOf(reason) === -1;
+    return reason !== 'snapshot_refresh_data_unavailable' && reason !==
+      (action === 'publish' ? 'publication_template_recheck_failed' : 'snapshot_refresh_template_unavailable');
   }
 
   function createRequestError(result, invalidEnvelope) {
@@ -15422,9 +15529,21 @@ function dynamicPagesClientScript() {
     var deadline = diagnostic && diagnostic.status === 504 && limits.find(function (entry) { return entry.reason === 'deadline_exceeded'; });
     var limit = deadline || limits[0];
     if (!limit) return '';
+    if (!deadline) {
+      var seenRowLimits = new Set();
+      var rowLimits = limits.filter(function (entry) {
+        if (!entry.rowLimitCauses || !entry.rowLimitCauses.length || entry.reason === 'completeness_unconfirmed') return false;
+        var key = JSON.stringify([entry.sourceAlias, entry.stepAlias, entry.rowLimitMode, entry.reason, entry.effectiveLimit, entry.rowLimitCauses]);
+        if (seenRowLimits.has(key)) return false;
+        seenRowLimits.add(key);
+        return true;
+      });
+      if (rowLimits.length && limit.limitName !== 'maxMatchRuleChecks') return rowLimits.map(reportRowLimitSummary).join(' ');
+    }
     var location = [t('reportLimitPhase_' + limit.phase)];
     if (limit.table) location.push(t('reportLimitTable', { name: limit.table }));
-    if (limit.stepAlias && limit.stepAlias !== limit.table) location.push(t('reportLimitStep', { name: limit.stepAlias }));
+    if (limit.stepLabel) location.push(t('reportLimitStep', { name: limit.stepLabel }));
+    else if (limit.stepAlias && limit.stepAlias !== limit.table) location.push(t('reportLimitStep', { name: limit.stepAlias }));
     var limitKey = 'reportLimitName_' + limit.limitName;
     var name = Object.hasOwn(I18N.en, limitKey) ? t(limitKey) : '';
     var source = limit.source ? t('reportLimitSource_' + limit.source) : '';
@@ -15439,9 +15558,40 @@ function dynamicPagesClientScript() {
     if (limit.elapsedMs !== undefined && !(limit.unit === 'milliseconds' && limit.observed === limit.elapsedMs)) {
       counts.push(t('reportLimitElapsed', { count: limit.elapsedMs }));
     }
+    var action = limit.limitName === 'maxMatchRuleChecks' ? t('reportLimitMatchAction') :
+      limit.limitName === 'maxSelectionScanRows' && limit.source === 'runtime-settings' ?
+        t('reportLimitScanAction', { field: t(limit.configKey === 'maxSelectionScanRowsMax' ? 'runtimeMaxSelectionScanRowsMax' : 'runtimeMaxSelectionScanRowsDefault') }) : '';
     return location.join(', ') + ': ' + t('reportLimitReason_' + limit.reason) +
       (limitDescription ? ' ' + limitDescription + '.' : '') +
-      (counts.length ? ' ' + counts.join('; ') + '.' : '');
+      (counts.length ? ' ' + counts.join('; ') + '.' : '') + (action ? ' ' + action : '');
+  }
+
+  function reportRowLimitSummary(limit) {
+    var causes = limit.rowLimitCauses;
+    var stepName = limit.stepLabel || (limit.stepType === 'selectCards' && Number.isInteger(limit.stepIndex)
+      ? t('reportRowUnnamedStep', { number: limit.stepIndex + 1 }) : '');
+    var parts = [];
+    if (limit.sourceLabel) parts.push(t('reportRowSource', { name: limit.sourceLabel }));
+    if (stepName) parts.push(t('reportRowStep', { name: stepName }));
+    var conflict = limit.reason === 'row_limit_configuration_conflict';
+    parts.push(conflict ? t('reportRowConfigConflict', { requested: limit.requested, limit: limit.effectiveLimit })
+      : t('reportLimitReason_limit_exceeded') + ' ' + t('reportRowModeCap', { limit: limit.effectiveLimit }));
+    if (limit.total !== undefined) parts.push(t('reportLimitTotal', { count: limit.total }) + '.');
+    else if (limit.observed !== undefined) parts.push(t('reportRowAtLeast', { count: limit.observed }));
+    var fields = [];
+    if (conflict || causes.includes('stepLimit')) fields.push(t('reportRowStepSetting', { name: stepName }));
+    if (causes.includes('runtimeMaximum')) fields.push(t('reportRowRuntimeSetting'));
+    if (fields.length) parts.push(t('reportRowAdjust', { fields: fields.join('; ') }));
+    if (conflict) parts.push(t('reportRowClearStepLimit'));
+    else if (causes.includes('stepLimit')) parts.push(t(causes.length > 1 ? 'reportRowInheritedStepLimit' : 'reportRowRaiseStepLimit'));
+    if (causes.includes('runtimeMaximum')) parts.push(t('reportRowRaiseMaximum'));
+    if (causes.includes('ordinaryCeiling') || causes.includes('pagedCeiling')) parts.push(t('reportRowFixedCap'));
+    if (causes.includes('pagedCeiling')) parts.push(t('reportRowPagedBudget'));
+    if (limit.usedByDiagram) parts.push(t('reportRowUsedByDiagram'));
+    if (limit.canUseLargeTable && causes.some(function (cause) { return cause === 'ordinaryCeiling' || cause === 'runtimeMaximum'; })) {
+      parts.push(reportRowUseLargeHint());
+    } else if (!conflict) parts.push(t('reportRowReduce'));
+    return parts.join(' ');
   }
 
   function publicationErrorMessage(error, result) {
@@ -17058,7 +17208,6 @@ function dynamicPagesClientScript() {
       alias: alias,
       className: className || state.selectedClass || '',
       from: '',
-      limit: 100,
       columns: [],
       rules: [{ action: 'include', path: 'Code', rightExpression: '.*' }]
     };
@@ -17117,14 +17266,14 @@ function dynamicPagesClientScript() {
     var rules = Array.isArray(selection.rules || selection.scopeRules) ? (selection.rules || selection.scopeRules) : [];
     var className = String(selection.className || selection.source && selection.source.className || '').trim();
     var alias = String(selection.alias || selection.as || selection.output && selection.output.alias || objectSelectionAlias(index)).trim() || objectSelectionAlias(index);
-    var limit = Number(selection.limit !== undefined ? selection.limit : selection.source && selection.source.limit);
+    var rawLimit = selection.limit !== undefined ? selection.limit : selection.source && selection.source.limit;
     return {
       id: String(selection.id || ('selection:' + alias)).trim(),
       name: String(selection.name || selection.title || selection.output && selection.output.title || defaultObjectSelectionName(index)).trim() || defaultObjectSelectionName(index),
       alias: alias,
       className: className,
       from: String(selection.from || selection.source && selection.source.from || '').trim(),
-      limit: Number.isInteger(limit) && limit > 0 ? limit : 100,
+      limit: rawLimit == null || rawLimit === '' ? undefined : Number(rawLimit),
       filterJoin: selection.filterJoin === 'all' ? 'all' : 'any',
       columns: normalizeObjectSelectionColumns(selection.columns || selection.source && selection.source.columns || selection.output && selection.output.columns),
       rules: rules.length ? rules.map(normalizeObjectSelectionRule) : [normalizeObjectSelectionRule({ action: 'include', path: 'Code', regex: '.*' })]
@@ -17562,9 +17711,7 @@ function dynamicPagesClientScript() {
     if (kind === 'viewLargeMatch' || kind === 'viewLargeResult') {
       var spec = readCurrentSpec();
       var alias = picker.getAttribute('data-catalog-field-picker-source');
-      var fields = Array.from(viewLargeSourceFields(spec, alias).values());
-      if (kind === 'viewLargeMatch') fields = viewLargeColumnOptions(captureViewComposerDraftFromDom().columns).concat(fields);
-      return fields.concat(diagramColumnOptionRowsForSource(spec, alias, query));
+      return viewLargeAdvancedResultFields(spec, alias, query, kind === 'viewLargeMatch');
     }
     if (kind === 'scope') return catalogScopePathOptions(picker.getAttribute('data-catalog-field-picker-class') || '', query);
     if (kind === 'related') return relatedTargetColumnOptions(picker.getAttribute('data-catalog-field-picker-class') || '', '', query);
@@ -18298,6 +18445,19 @@ function dynamicPagesClientScript() {
     }).join('');
     var classId = index === 0 ? ' id="cmdp-object-class"' : '';
     var rowsId = index === 0 ? ' id="cmdp-object-scope-rows"' : '';
+    var limitFieldId = 'cmdp-object-row-limit-' + index;
+    var limits = currentReportRowLimits();
+    var output = publishedReportTables(spec && spec.result)[0];
+    var selector = output && output.presentation && output.presentation.largeTable && output.presentation.largeTable.selector;
+    var aliases = output ? [output.name] : [];
+    if (selector && selector.kind === 'result') aliases.push(selector.source);
+    var reached = executionScopeFromAliases(spec, aliases).includedAliases.includes(selection.alias);
+    var diagram = runtimeResultOutputMode(spec && spec.result) !== 'tables' &&
+      diagramExecutionScope(spec).includedAliases.includes(selection.alias);
+    var paged = reached && !diagram && Boolean(output.presentation && output.presentation.largeTable);
+    var canPage = !paged && reached && !diagram;
+    var modeLimit = paged ? limits.paged : limits.ordinaryThreshold;
+    var help = t('objectSelectionLimitHelp') + ' ' + t('reportRowModeCap', { limit: modeLimit }) + ' ' + reportRowRecommendationHelp();
     return [
       '<div class="object-selection" data-object-selection data-object-selection-index="' + index + '" data-object-selection-id="' + escapeHtml(selection.id || ('selection:' + selection.alias)) + '" data-object-filter-join="' + escapeHtml(selection.filterJoin) + '">',
       '<div class="section-title-row"><h3>' + escapeHtml(t('objectSelectionSummaryKind', { number: index + 1 }) + ': ' + (selection.name || defaultObjectSelectionName(index))) + '</h3>',
@@ -18309,7 +18469,13 @@ function dynamicPagesClientScript() {
       assistantManagedObjectFlow(spec)
         ? '<label>' + t('objectSelectionFrom') + '<input type="hidden" data-object-selection-field="from" value="' + escapeHtml(selection.from || '') + '"><output class="result-display-name">' + escapeHtml(selection.from ? userFacingResultLabel(selection.from, spec) : '') + '</output></label>'
         : '<label>' + t('objectSelectionFrom') + '<input data-object-selection-field="from" value="' + escapeHtml(selection.from || '') + '"></label>',
-      '<label>' + t('objectSelectionLimit') + '<input data-object-selection-field="limit" value="' + escapeHtml(selection.limit == null ? '' : String(selection.limit)) + '"></label>',
+      '<div class="setting-field"><div class="field-label-row"><label for="' + limitFieldId + '">' + escapeHtml(t('objectSelectionLimit')) + '</label>' +
+      renderFieldHelp(limitFieldId, t('objectSelectionLimit'), help, true) + '</div>' +
+      '<input id="' + limitFieldId + '" type="number" min="1" step="1" aria-describedby="' + limitFieldId + '-help ' + limitFieldId + '-conflict" data-object-selection-field="limit" data-row-mode-limit="' + modeLimit +
+      '" data-row-can-page="' + String(canPage) + '" placeholder="' + escapeHtml(t('reportRowLimitUnset')) +
+      '" value="' + escapeHtml(selection.limit == null ? '' : String(selection.limit)) + '">' +
+      '<span id="' + limitFieldId + '-conflict" class="muted" data-row-limit-conflict role="status">' +
+      escapeHtml(objectSelectionRowConflict(selection.limit, modeLimit, canPage)) + '</span></div>',
       '</div>',
       selection.filterJoin === 'all' ? '<p class="muted">Все условия (AND)</p>' : '',
       dependencies.length ? '<p class="notice warning">' + escapeHtml(t('objectSelectionDeleteDependencies', { items: dependencies.join(', ') })) + '</p>' : '',
@@ -18808,7 +18974,7 @@ function dynamicPagesClientScript() {
   function renderNumberSetting(id, labelKey, helpKey, value, options) {
     options = options || {};
     var label = t(labelKey);
-    var help = t(helpKey);
+    var help = options.help || t(helpKey);
     var helpId = id + '-help';
     var attrs = [
       'id="' + escapeHtml(id) + '"',
@@ -18819,9 +18985,37 @@ function dynamicPagesClientScript() {
       'aria-describedby="' + escapeHtml(helpId) + '"'
     ];
     if (options.max) attrs.push('max="' + escapeHtml(options.max) + '"');
+    if (options.readonly) attrs.push('readonly');
     return '<div class="setting-field"><div class="field-label-row"><label for="' + escapeHtml(id) + '">' + escapeHtml(label) + '</label>' +
       renderFieldHelp(id, label, help) + '</div>' +
       '<input ' + attrs.join(' ') + '></div>';
+  }
+
+  function currentReportRowLimits() {
+    var settings = state.config && state.config.runtimeConfig && state.config.runtimeConfig.executionLimits;
+    var configured = Number(settings && settings.maxRowsMax);
+    return Object.assign({}, boot.reportRowLimits, {
+      ordinaryThreshold: Number.isSafeInteger(configured) && configured > 0
+        ? Math.min(configured, boot.reportRowLimits.ordinary) : boot.reportRowLimits.ordinary
+    });
+  }
+
+  function reportRowRecommendationHelp() {
+    return t('reportRowRecommendations', {
+      ordinary: boot.reportRowLimits.recommendedOrdinary, paged: boot.reportRowLimits.recommendedPaged
+    });
+  }
+
+  function objectSelectionRowConflict(value, limit, canPage) {
+    if (!(Number(value) > limit)) return '';
+    return t('reportRowConfigConflict', { requested: value, limit: limit }) + ' ' +
+      (canPage && Number(value) <= boot.reportRowLimits.paged ? reportRowUseLargeHint() : t('reportRowClearStepLimit'));
+  }
+
+  function reportRowUseLargeHint() {
+    return t('reportRowUseLarge', { path: ['menuFinalView', 'viewLargeTable', 'viewLargeMode', 'viewLargeAll'].map(function (key) {
+      return t(key);
+    }).join(' → ') });
   }
 
   function assistantConfigForEditor(config) {
@@ -19176,12 +19370,20 @@ function dynamicPagesClientScript() {
   }
 
   function renderExecutionLimitFields(executionLimits) {
+    var ceilings = boot.reportRowLimits;
+    var recommendation = reportRowRecommendationHelp();
+    var deploymentHelp = t('reportRowDeploymentHelp') + ' ' + recommendation;
+    var runMax = Math.min(Number(executionLimits.maxRowsMax) || ceilings.ordinary, ceilings.ordinary);
     return [
+      renderSavedMaximumWarning(executionLimits),
       '<div class="visual-grid">',
-      renderNumberSetting('cmdp-runtime-max-rows-default', 'runtimeMaxRowsDefault', 'runtimeMaxRowsDefaultHelp', executionLimits.maxRowsDefault, { max: 2000 }),
-      renderNumberSetting('cmdp-runtime-max-rows-preview-default', 'runtimeMaxRowsPreviewDefault', 'runtimeMaxRowsPreviewDefaultHelp', executionLimits.maxRowsPreviewDefault, { max: 2000 }),
-      renderNumberSetting('cmdp-runtime-max-rows-data-preview-default', 'runtimeMaxRowsDataPreviewDefault', 'runtimeMaxRowsDataPreviewDefaultHelp', executionLimits.maxRowsDataPreviewDefault, { max: 2000 }),
-      renderNumberSetting('cmdp-runtime-max-rows-max', 'runtimeMaxRowsMax', 'runtimeMaxRowsMaxHelp', executionLimits.maxRowsMax, { max: 2000 }),
+      renderNumberSetting('cmdp-runtime-max-rows-default', 'runtimeMaxRowsDefault', 'runtimeMaxRowsDefaultHelp', executionLimits.maxRowsDefault, { max: ceilings.ordinary }),
+      renderNumberSetting('cmdp-runtime-max-rows-preview-default', 'runtimeMaxRowsPreviewDefault', 'runtimeMaxRowsPreviewDefaultHelp', executionLimits.maxRowsPreviewDefault, { max: ceilings.ordinary }),
+      renderNumberSetting('cmdp-runtime-max-rows-data-preview-default', 'runtimeMaxRowsDataPreviewDefault', 'runtimeMaxRowsDataPreviewDefaultHelp', executionLimits.maxRowsDataPreviewDefault, { max: ceilings.ordinary }),
+      renderNumberSetting('cmdp-runtime-max-rows-max', 'runtimeMaxRowsMax', 'runtimeMaxRowsMaxHelp', executionLimits.maxRowsMax, { max: ceilings.ordinary,
+        help: t('runtimeMaxRowsMaxHelp') + ' ' + t('reportRowModeCap', { limit: runMax }) + ' ' + recommendation }),
+      renderNumberSetting('cmdp-report-ordinary-ceiling', 'ordinaryRowCeiling', '', ceilings.ordinary, { readonly: true, help: deploymentHelp }),
+      renderNumberSetting('cmdp-report-paged-ceiling', 'pagedRowCeiling', '', ceilings.paged, { readonly: true, help: deploymentHelp }),
       renderNumberSetting('cmdp-runtime-max-relations-per-card-default', 'runtimeMaxRelationsPerCardDefault', 'runtimeMaxRelationsPerCardDefaultHelp', executionLimits.maxRelationsPerCardDefault, { max: executionLimits.maxRelationsPerCardMax }),
       renderNumberSetting('cmdp-runtime-max-relations-per-card-max', 'runtimeMaxRelationsPerCardMax', 'runtimeMaxRelationsPerCardMaxHelp', executionLimits.maxRelationsPerCardMax, { max: 50000 }),
       renderNumberSetting('cmdp-runtime-max-selection-scan-rows-default', 'runtimeMaxSelectionScanRowsDefault', 'runtimeMaxSelectionScanRowsDefaultHelp', executionLimits.maxSelectionScanRowsDefault, { max: executionLimits.maxSelectionScanRowsMax }),
@@ -19466,6 +19668,13 @@ function dynamicPagesClientScript() {
     ].join('');
   }
 
+  function renderSavedMaximumWarning(executionLimits) {
+    var saved = executionLimits.maxRowsMax;
+    var limit = boot.reportRowLimits.ordinary;
+    return saved > limit ? '<p class="notice warning" role="status">' +
+      escapeHtml(t('reportRowSavedAboveCeiling', { saved: saved, limit: limit, path: t('reportRowRuntimeSetting') })) + '</p>' : '';
+  }
+
   function renderGeneralSettings() {
     var config = state.config || { runtimeConfig: defaultRuntimeConfig(), exists: false };
     var runtimeConfig = normalizeRuntimeConfigForEditor(config.runtimeConfig || defaultRuntimeConfig());
@@ -19483,6 +19692,7 @@ function dynamicPagesClientScript() {
       '<p class="muted">' + t('catalogPathCandidateLimitHelp') + '</p>',
       '<h3>' + t('runtimeCacheSettings') + '</h3>',
       renderRuntimeCacheFields(runtimeCache),
+      renderSavedMaximumWarning(runtimeConfig.executionLimits),
       '</div>',
       '</section>'
     ].join('');
@@ -26015,7 +26225,20 @@ function dynamicPagesClientScript() {
   }
 
   function viewLargeSourceFieldOptions(spec, sourceAlias) {
-    return Array.from(viewLargeSourceFields(spec, sourceAlias).values()).filter(function (item) { return !item.multiple; });
+    return viewLargeAdvancedResultFields(spec, sourceAlias, '').filter(function (item) { return !item.multiple; });
+  }
+
+  function viewLargeAdvancedResultFields(spec, alias, query, matching) {
+    var fields = Array.from(viewLargeSourceFields(spec, alias).values());
+    var projection = reportClosedOutputFields(spec, alias);
+    if (projection) return fields.filter(function (item) { return projection.has(item.value); });
+    var step = (spec.steps || []).find(function (item) { return item && item.as === alias; });
+    if (query && (matching || step && step.type === 'selectCards')) {
+      fields = fields.concat(diagramColumnOptionRowsForSource(spec, alias, query).filter(function (item) {
+        return /[.{]/.test(item.value);
+      }));
+    }
+    return fields;
   }
 
   function viewLargeSimpleFieldOptions(spec, sourceAlias) {
@@ -26040,9 +26263,15 @@ function dynamicPagesClientScript() {
 
   function renderViewLargeField(id, labelKey, control, picker) {
     var label = t(labelKey);
+    var help = t(labelKey + 'Help');
+    if (labelKey === 'viewLargeMode') {
+      var caps = currentReportRowLimits();
+      help += ' ' + t('ordinaryRowCeiling') + ': ' + caps.ordinaryThreshold + '. ' +
+        t('pagedRowCeiling') + ': ' + caps.paged + '. ' + reportRowRecommendationHelp();
+    }
     return '<div class="setting-field"><div class="field-label-row">' +
       (picker ? '<span id="' + id + '">' + escapeHtml(label) + '</span>' : '<label for="' + id + '">' + escapeHtml(label) + '</label>') +
-      renderFieldHelp(id, label, t(labelKey + 'Help'), true) + '</div>' + control + '</div>';
+      renderFieldHelp(id, label, help, true) + '</div>' + control + '</div>';
   }
 
   function renderViewLargeSelect(id, label, attributes, options) {
@@ -26062,8 +26291,7 @@ function dynamicPagesClientScript() {
       ? { kind: 'viewLargeResult', source: source, disabled: !source }
       : { kind: 'viewLargeAttribute', class: source, disabled: !source };
     function fieldOptions(selected) {
-      return !source ? [] : isResult ? Array.from(viewLargeSourceFields(spec, source).values())
-        .concat(diagramInitialColumnOptionRowsForSource(spec, source, selected)) : viewLargeClassFieldOptions(source);
+      return !source ? [] : isResult ? viewLargeAdvancedResultFields(spec, source, selected) : viewLargeClassFieldOptions(source);
     }
     return [
       isResult ? renderViewLargeSelect('cmdp-view-large-result-source', 'viewLargeSource', 'data-view-large-field="source"', renderColumnSelectOptions(viewLargeResultOptions(spec), source))
@@ -27594,15 +27822,15 @@ function dynamicPagesClientScript() {
 
   function rebindViewLargeTableSource(draft, oldSource, spec) {
     if (draft.sourceAlias === oldSource) return;
-    var fields = viewLargeSourceFields(spec, draft.sourceAlias);
+    var fields = new Map(viewLargeAdvancedResultFields(spec, draft.sourceAlias, '').map(function (item) { return [item.value, item]; }));
     var drafts = draft.largeTableSelectorDrafts;
     if (drafts.simple) {
       var simpleField = fields.get(drafts.simple.matchField);
       drafts.simple = viewLargeSimpleSelector(draft.sourceAlias, simpleField && !simpleField.multiple ? simpleField.value : '');
     }
     var advancedField = drafts.advanced && drafts.advanced.matchField;
-    if (advancedField && !fields.has(advancedField) && viewLargeSourceFields(spec, oldSource).has(advancedField) &&
-      !diagramColumnOptionRowsForSource(spec, draft.sourceAlias, advancedField).some(function (item) { return item.value === advancedField; })) {
+    if (advancedField && !viewLargeAdvancedResultFields(spec, draft.sourceAlias, advancedField, true)
+      .some(function (item) { return item.value === advancedField; })) {
       drafts.advanced = Object.assign({}, drafts.advanced, { matchField: '' });
     }
     if (!draft.largeTable) return;
@@ -27629,9 +27857,11 @@ function dynamicPagesClientScript() {
           requireField(viewLargeSimpleFieldOptions(spec, draft.sourceAlias).some(function (item) { return item.value === selector.matchField; }), 'viewLargeSimpleField');
         }
         requireField(selector.source && (selector.kind !== 'result' || viewLargeResultOptions(spec).some(function (item) { return item.value === selector.source; })), 'viewLargeSource');
-        requireField(selector.idField, 'viewLargeId');
-        requireField(selector.labelField, 'viewLargeLabel');
-        requireField(selector.matchField, 'viewLargeMatch');
+        var projection = selector.kind === 'result' && reportClosedOutputFields(spec, selector.source);
+        var matchProjection = reportClosedOutputFields(spec, draft.sourceAlias);
+        requireField(selector.idField && (!projection || projection.has(selector.idField)), 'viewLargeId');
+        requireField(selector.labelField && (!projection || projection.has(selector.labelField)), 'viewLargeLabel');
+        requireField(selector.matchField && (!matchProjection || matchProjection.has(selector.matchField)), 'viewLargeMatch');
         requireField(!selector.parameter || getParamRows(spec).some(function (param) { return param.name === selector.parameter; }), 'viewLargeParameter');
       }
       var groupKeys = columns.map(function (item) { return item.value; }).filter(function (field) { return table.groupKeys.indexOf(field) !== -1; });
@@ -28120,15 +28350,18 @@ function dynamicPagesClientScript() {
   }
 
   function readObjectGroupFields() {
+    if (Array.from(document.querySelectorAll('[data-object-selection-field="limit"]')).some(function (field) {
+      return field.validity.badInput;
+    })) throw new Error(t('selectionInvalidLimit'));
     var draft = captureObjectGroupDraftFromDom();
     var selections = objectSelectionsFromModel(draft);
     selections.forEach(function (selection, index) {
       var className = String(selection && selection.className || '').trim();
       var alias = String(selection && selection.alias || '').trim() || objectSelectionAlias(index);
-      var limit = Number(selection && selection.limit || 0);
+      var limit = selection.limit;
       if (!className) throw new Error(t('objectGroupNeedsClass'));
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias)) throw new Error(t('invalidParamName'));
-      if (!Number.isFinite(limit) || limit < 1) throw new Error(t('selectionInvalidLimit'));
+      if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) throw new Error(t('selectionInvalidLimit'));
     });
     if (!selections.length) selections = [defaultObjectSelection(0, state.selectedClass || '')];
     return {
@@ -28172,9 +28405,9 @@ function dynamicPagesClientScript() {
         className: selection.className,
         filters: filters,
         filterJoin: selection.filterJoin,
-        limit: selection.limit || 100,
         as: alias
       };
+      if (selection.limit !== undefined) step.limit = selection.limit;
       if (selection.from) step.from = selection.from;
       if (selection.columns && selection.columns.length) step.columns = selection.columns.slice();
       return step;
@@ -28220,7 +28453,7 @@ function dynamicPagesClientScript() {
         alias: alias,
         className: selection.className,
         from: selection.from || '',
-        limit: selection.limit || 100,
+        limit: selection.limit,
         filterJoin: selection.filterJoin,
         columns: selection.columns && selection.columns.length ? selection.columns.slice() : [],
         sourceType: 'cmdb',
@@ -28229,7 +28462,7 @@ function dynamicPagesClientScript() {
           type: 'cmdb',
           className: selection.className,
           from: selection.from || '',
-          limit: selection.limit || 100,
+          limit: selection.limit,
           columns: selection.columns && selection.columns.length ? selection.columns.slice() : []
         },
         output: {
@@ -28251,7 +28484,7 @@ function dynamicPagesClientScript() {
         source: {
           className: first.className,
           from: first.from || '',
-          limit: first.limit || 100,
+          limit: first.limit,
           columns: first.columns && first.columns.length ? first.columns.slice() : []
         },
         output: {
@@ -28389,7 +28622,7 @@ function dynamicPagesClientScript() {
         alias: String(aliasField && aliasField.value || '').trim() || objectSelectionAlias(index),
         className: String(classField && classField.value || '').trim(),
         from: String(fromField && fromField.value || '').trim(),
-        limit: String(limitField && limitField.value || '').trim() ? Number(limitField.value) : 100,
+        limit: limitField && !limitField.validity.badInput ? limitField.value.trim() : existing.limit,
         filterJoin: String(node.getAttribute('data-object-filter-join') || '').trim(),
         // Columns are an internal projection retained for existing templates
         // and extended automatically from downstream dependencies.
@@ -29941,11 +30174,9 @@ function dynamicPagesClientScript() {
       var selectorHost = host.querySelector('[data-view-large-selector]');
       var selector = largeTable.selector;
       if (field === 'kind') selector.source = '';
-      var options = !selector.source ? [] : selector.kind === 'result' ? Array.from(viewLargeSourceFields(spec, selector.source).values())
-        .concat(diagramColumnOptionRowsForSource(spec, selector.source, selector.idField),
-          diagramColumnOptionRowsForSource(spec, selector.source, selector.labelField))
-        : viewLargeClassFieldOptions(selector.source);
       ['idField', 'labelField'].forEach(function (name) {
+        var options = !selector.source ? [] : selector.kind === 'result'
+          ? viewLargeAdvancedResultFields(spec, selector.source, selector[name]) : viewLargeClassFieldOptions(selector.source);
         if (!options.some(function (item) { return item.value === selector[name]; })) selector[name] = '';
       });
       drafts.advanced = selector;
@@ -31196,7 +31427,7 @@ function dynamicPagesClientScript() {
   function templatePublicationNotice() {
     var template = state.selectedTemplate;
     var notice = template && state.templatePublicationNotices.get(templateWriteKey(template.code, runtimeSettingsScope().root));
-    if (notice?.snapshotRevocationPending) return { type: 'warning', text: t('snapshotRevocationPending') };
+    if (notice?.snapshotRevocationPending && !notice.snapshotCheck) return { type: 'warning', text: t('snapshotRevocationPending') };
     if (notice?.cardId && notice.cardId === String(template.id || '') && notice.sessionInstance === Number(state.sessionInstance || 0)) return notice;
   }
 
@@ -31210,16 +31441,18 @@ function dynamicPagesClientScript() {
 
   function renderSnapshotCheck(check) {
     if (!check) return '';
-    return '<div class="toolbar"><button type="button" data-action="check-current-snapshot" aria-disabled="' + Boolean(check.pending) + '">' +
-      escapeHtml(t('snapshotCheckCurrent')) + '</button><span data-snapshot-check-status role="status">' + renderSnapshotCheckStatus(check) + '</span></div>';
+    return '<div class="toolbar">' + (check.confirmed ? '' :
+      '<button type="button" data-action="check-current-snapshot" aria-disabled="' + Boolean(check.pending) + '">' +
+      escapeHtml(t('snapshotCheckCurrent')) + '</button>') +
+      '<span data-snapshot-check-status role="status">' + renderSnapshotCheckStatus(check) + '</span></div>';
   }
 
   function renderSnapshotCheckStatus(check) {
-    var message = check.status ? t(check.status) : '';
+    var message = check.status ? t(check.status, { revision: check.currentRevision }) : '';
     if (check.httpStatus && check.status === 'snapshotCheckFailed') message += ' ' + t('httpStatus', { status: check.httpStatus });
     if (check.publishedAt) message += ' ' + t('snapshotCurrentPublishedAt', { time: check.publishedAt });
     return escapeHtml(message) + (check.publishedAt ? ' <a href="' +
-      escapeHtml(runtimeTemplateUrl(check.code, check.query) + '#cmdp-current-snapshot') + '" target="_blank" rel="noreferrer">' +
+      escapeHtml(runtimeTemplateUrl(check.code, check.query, check.root) + '#cmdp-current-snapshot') + '" target="_blank" rel="noreferrer">' +
       escapeHtml(t('snapshotOpenCurrent')) + '</a>' : '');
   }
 
@@ -31227,28 +31460,48 @@ function dynamicPagesClientScript() {
     var runtime = boot.mode === 'runtime';
     var notice = runtime ? null : templatePublicationNotice();
     var check = runtime ? state.runtimeSnapshotCheck : notice?.snapshotCheck;
-    if (!check || check.pending) return;
-    function updateCheckStatus(status, httpStatus, publishedAt) {
+    if (!check || check.pending || check.confirmed) return;
+    function updateCheckStatus(status, httpStatus) {
       check.status = status;
       check.httpStatus = httpStatus;
-      check.publishedAt = publishedAt;
       if (runtime ? state.runtimeSnapshotCheck !== check : templatePublicationNotice() !== notice) return;
       var button = document.querySelector('[data-action="check-current-snapshot"]');
       var output = document.querySelector('[data-snapshot-check-status]');
-      if (button) button.setAttribute('aria-disabled', String(check.pending));
+      if (button) {
+        if (check.confirmed) button.remove();
+        else button.setAttribute('aria-disabled', String(check.pending));
+      }
       if (output) output.innerHTML = renderSnapshotCheckStatus(check);
+      if (runtime) updateSnapshotActions();
+      else {
+        if (check.confirmed) {
+          notice.text = t('snapshotPublicationNotConfirmed');
+          var warning = document.querySelector('#cmdp-designer-publication-notice [role="alert"]');
+          if (warning) warning.textContent = notice.text;
+        }
+        syncImportedDiagramSaveGate();
+      }
     }
     check.pending = true;
     updateCheckStatus('snapshotCheckingCurrent');
-    return request(publicSnapshotRunPath(check.code, check.query, true), { maxRetries: 0 }).then(function (result) {
+    return request(publicSnapshotRunPath(check.code, check.query, true, check.root), { maxRetries: 0 }).then(function (result) {
       check.pending = false;
-      var json = result.json;
-      if (result.ok && isSnapshotResult(json, 'run', check.code) && json.snapshotFound === true &&
-          isPersistedSnapshotCache(json.cache, 'snapshot-hit') && isSnapshotHash(json.cache.snapshotRevision)) {
-        updateCheckStatus(runtime ? 'snapshotRefreshCurrentFound' : 'snapshotCurrentFound', null, json.cache.publishedAt);
-      } else if (result.ok && isSnapshotResult(json, 'run', check.code) && json.snapshotFound === false &&
-          json.cache?.scope === 'staticSnapshot' && json.cache.status === 'snapshot-miss') {
-        updateCheckStatus(runtime ? 'snapshotRefreshCurrentMissing' : 'snapshotCurrentMissing');
+      var revision = publicSnapshotRevision(result, check.code);
+      if (revision !== undefined) {
+        var changed = revision && revision !== check.snapshotRevision;
+        check.confirmed = true;
+        check.currentRevision = revision;
+        check.publishedAt = revision ? result.json.cache.publishedAt : '';
+        if (runtime && state.runtimeSnapshotCheck === check) {
+          if (changed) {
+            result.downloadMode = 'public';
+            renderRuntimeIntoApp(result);
+            var container = app.querySelector('[data-snapshot-current-check]');
+            if (container) container.innerHTML = renderSnapshotCheck(check);
+          }
+          snapshotStatus('');
+        }
+        updateCheckStatus(!revision ? 'snapshotCurrentMissing' : changed ? 'snapshotCurrentChanged' : 'snapshotCurrentUnchanged');
       } else {
         updateCheckStatus(result.status === 401 ? 'runtimeSessionInvalid' :
           resultIsPermissionDenied(result) ? 'runtimeTemplateAccessDenied' : 'snapshotCheckFailed', result.status);
@@ -31268,7 +31521,9 @@ function dynamicPagesClientScript() {
   }
 
   function templatePublishBlockTitle(saveTitle, publishEnabled) {
-    return saveTitle || (stagedTemplateTransfer() ? t('transferNotSaved') : publishEnabled ? '' : t('publicationDynamicHint'));
+    var check = templatePublicationNotice()?.snapshotCheck;
+    return saveTitle || (check && !check.confirmed ? t('snapshotCheckRequired') :
+      stagedTemplateTransfer() ? t('transferNotSaved') : publishEnabled ? '' : t('publicationDynamicHint'));
   }
 
   function syncImportedDiagramSaveGate() {
@@ -32007,6 +32262,8 @@ function dynamicPagesClientScript() {
     var saveScope = runtimeSettingsScope();
     var key = templateWriteKey(payload.code, saveScope.root);
     if (state.pendingTemplateWrites.has(key)) return;
+    var pendingCheck = publication && templatePublicationNotice()?.snapshotCheck;
+    if (pendingCheck && !pendingCheck.confirmed) return;
     var owner = uiRequestOwner();
     var sessionInstance = Number(state.sessionInstance || 0);
     var exists = Boolean(state.selectedTemplate && state.selectedTemplate.id);
@@ -32086,7 +32343,9 @@ function dynamicPagesClientScript() {
       if (!result.ok) throw createRequestError(result);
       var savedTemplate = result.json.template;
       var revocationPending = result.json.snapshotRevocationPending === true;
-      if (revocationPending) state.templatePublicationNotices.set(key, { snapshotRevocationPending: true });
+      if (revocationPending && !state.templatePublicationNotices.get(key)?.snapshotCheck) {
+        state.templatePublicationNotices.set(key, { snapshotRevocationPending: true });
+      }
       else if (state.templatePublicationNotices.get(key)?.snapshotRevocationPending) state.templatePublicationNotices.delete(key);
       if (sameTemplate()) refreshPublicationNotice();
 
@@ -32156,10 +32415,19 @@ function dynamicPagesClientScript() {
       }
       writeNotice({ type: 'ok', text: t('publishingSnapshot') });
       var publishedMode = publishModelForSpec(savedTemplate.spec);
-      publicationTarget = {
+      var target = {
         code: savedTemplate.code, id: String(savedTemplate.id || ''), specHash: savedTemplate.specHash, paramsMode: publishedMode.paramsMode,
-        query: publishedMode.paramsMode === 'ignore' ? {} : exactReportLaunchQuery(publication.params)
+        query: publishedMode.paramsMode === 'ignore' ? {} : exactReportLaunchQuery(publication.params), root: saveScope.root
       };
+      var baseline = await request(publicSnapshotRunPath(target.code, target.query, true, target.root), { owner: owner, maxRetries: 0 })
+        .catch(function (error) { return { ok: false, diagnostic: error.diagnostic }; });
+      if (!sameScope()) return;
+      target.snapshotRevision = publicSnapshotRevision(baseline, target.code);
+      if (target.snapshotRevision === undefined) {
+        writeNotice({ type: 'error', text: t('snapshotBaselineUnavailable'), diagnostic: baseline.diagnostic });
+        return;
+      }
+      publicationTarget = target;
       published = await request(apiPrefix + '/templates/' + encodeURIComponent(savedTemplate.code) + '/publish' + rootQuery, {
         method: 'POST',
         owner: owner,
@@ -33326,6 +33594,10 @@ function dynamicPagesClientScript() {
       if (!hasField(item[0])) return;
       next.executionLimits[item[2]] = readPositiveIntField(item[0], t(item[1]), next.executionLimits[item[2]]);
     });
+    if (hasField('cmdp-runtime-max-rows-max') && next.executionLimits.maxRowsMax > boot.reportRowLimits.ordinary) {
+      throw new Error(t('reportRowSavedAboveCeiling', { saved: next.executionLimits.maxRowsMax,
+        limit: boot.reportRowLimits.ordinary, path: t('reportRowRuntimeSetting') }));
+    }
     return next;
   }
 
@@ -33397,19 +33669,23 @@ function dynamicPagesClientScript() {
     })).join(' ');
   }
 
-  function persistRuntimeConfig(root, runtimeConfig, snapshot) {
+  function persistRuntimeConfig(root, runtimeConfig, snapshot, generalOnly) {
     snapshot = snapshot || { scope: runtimeSettingsScope(), revision: runtimeSettingsDraft().revision };
     var owner = uiRequestOwner();
-    return request(apiPrefix + '/config?root=' + encodeURIComponent(root), {
+    return request(apiPrefix + '/config?root=' + encodeURIComponent(root) + (generalOnly ? '&scope=general' : ''), {
       method: 'PUT',
-      body: { active: true, runtimeConfig: runtimeConfig }, owner: owner
+      body: generalOnly ? { runtimeConfig: runtimeConfig } : { active: true, runtimeConfig: runtimeConfig }, owner: owner
     }).then(function (result) {
       if (!result.ok || !result.json || result.json.success !== true) throw createRequestError(result);
       if (!runtimeSettingsScopeIsCurrent(snapshot.scope)) return result;
       state.config = result.json.config;
       var warning = runtimeConfigWarnings(result.json);
       state.runtimeConfigWarning = warning;
-      if (!warning && runtimeSettingsDraft().revision === snapshot.revision) state.runtimeSettingsDraft = null;
+      var draft = runtimeSettingsDraft();
+      if (!warning && draft.revision === snapshot.revision) {
+        if (generalOnly) delete draft.fields['cmdp-runtime-refresh-cooldown-sec'];
+        else state.runtimeSettingsDraft = null;
+      }
       if (uiDiagnosticIsCurrent({ owner: owner })) state.message = { type: warning ? 'warning' : 'ok', text: warning || t('configSaved') };
       renderDesigner(true);
       return result;
@@ -33438,13 +33714,14 @@ function dynamicPagesClientScript() {
     var runtimeConfig = state.config && state.config.runtimeConfig ? state.config.runtimeConfig : defaultRuntimeConfig();
     state.root = root;
     try {
-      runtimeConfig = applyRuntimeConfigFields(runtimeConfig);
+      runtimeConfig = applyRuntimeCacheFields(runtimeConfig);
     } catch (error) {
       setUiError(error);
       renderDesigner();
       return;
     }
-    persistRuntimeConfig(root, runtimeConfig).catch(function () {});
+    return persistRuntimeConfig(root, { runtimeCache: { refreshCooldownSec: runtimeConfig.runtimeCache.refreshCooldownSec } },
+      null, true).catch(function () {});
   }
 
   function refreshDesigner() {
@@ -33853,8 +34130,8 @@ function dynamicPagesClientScript() {
     });
   }
 
-  function runtimeTemplateUrl(code, params) {
-    return '/cmdbuild/dynamicpages/ui/run/' + encodeURIComponent(code) + '?' + runtimeQuery(params).toString();
+  function runtimeTemplateUrl(code, params, root) {
+    return '/cmdbuild/dynamicpages/ui/run/' + encodeURIComponent(code) + '?' + runtimeQuery(params, root).toString();
   }
 
   function absoluteRuntimeTemplateUrl(code, params) {
@@ -34410,7 +34687,7 @@ function dynamicPagesClientScript() {
     if (!refresh) return;
     refresh.hidden = !state.snapshotRefreshMode;
     refresh.textContent = t(state.snapshotRefreshMode === 'shared' ? 'snapshotRefreshShared' : 'snapshotRefreshPersonal');
-    refresh.disabled = state.runtimeRefreshInProgress;
+    refresh.disabled = state.runtimeRefreshInProgress || Boolean(state.runtimeSnapshotCheck && !state.runtimeSnapshotCheck.confirmed);
     app.querySelector('[data-action="snapshot-reload"]').disabled = state.runtimeRefreshInProgress;
   }
 
@@ -34451,13 +34728,17 @@ function dynamicPagesClientScript() {
 
   function refreshOpenSnapshot(reload) {
     if (state.runtimeRefreshInProgress || !reload && !state.snapshotRefreshMode) return;
+    if (state.runtimeSnapshotCheck && !state.runtimeSnapshotCheck.confirmed) {
+      if (reload) return checkCurrentSnapshot();
+      return;
+    }
     var mode = state.snapshotRefreshMode;
     var shared = !reload && mode === 'shared';
     if (shared && !window.confirm(t('snapshotRefreshConfirm'))) return;
     state.runtimeRefreshInProgress = true;
     updateSnapshotActions();
     snapshotStatus(t('runtimeRefreshing'));
-    var target = { code: boot.templateCode, query: Object.assign({}, state.runParams), mode: mode,
+    var target = { code: boot.templateCode, query: Object.assign({}, state.runParams), mode: mode, root: runtimeRoot(),
       snapshotRevision: state.snapshotRevision, cache: state.snapshotCache };
     var path = reload ? publicSnapshotRunPath(target.code, target.query, true) : snapshotRefreshPath(target.code, true);
     var fallback = reload ? 'snapshotReloadFailed' : 'snapshotRefreshFailed';
@@ -35453,6 +35734,13 @@ function dynamicPagesClientScript() {
       event.preventDefault();
       selectDiagramImportLabelAutocompleteCandidate(input, active.activeIndex);
     }
+  });
+
+  document.addEventListener('input', function (event) {
+    var field = event.target;
+    if (!field || !field.matches || !field.matches('[data-row-mode-limit]')) return;
+    var output = field.parentElement.querySelector('[data-row-limit-conflict]');
+    if (output) output.textContent = objectSelectionRowConflict(field.value, Number(field.dataset.rowModeLimit), field.dataset.rowCanPage === 'true');
   });
 
   document.addEventListener('change', function (event) {
@@ -38447,7 +38735,7 @@ function defaultRuntimeConfig() {
       maxRowsDefault: 500,
       maxRowsPreviewDefault: 25,
       maxRowsDataPreviewDefault: 100,
-      maxRowsMax: 2000,
+      maxRowsMax: REPORT_ROW_LIMITS.ordinary,
       maxRelationsPerCardDefault: 100,
       maxRelationsPerCardMax: 5000,
       maxSelectionScanRowsDefault: 10000,
@@ -40072,7 +40360,7 @@ async function writeStaticSnapshot(root, template, params, result, sessionData, 
     }
   } catch (error) {
     if (response.destroyed) return null;
-    if (error.code === 'draft_preview_timeout' || error.code === 'snapshot_commit_outcome_unknown') throw error;
+    if (['draft_preview_timeout', 'snapshot_commit_outcome_unknown', 'snapshot_storage_unavailable'].includes(error.code)) throw error;
     assertSnapshotDeadline(remainingMs);
     throw snapshotStoreError('snapshot_storage_unavailable', 'Published report storage is temporarily unavailable.');
   }
@@ -46947,7 +47235,6 @@ function assistantRepairReferencePathPredicates(flow, semanticPlan, intent) {
         alias: terminalAlias,
         className: predicate.terminalClass,
         from: comparisonAlias,
-        limit: 1000,
         columns: uniqueStrings(['Code', 'Description', predicate.terminalField]),
         rules: [{ action: 'include', path: predicate.terminalField, negate: false, op: predicate.operator, regex: '', value: '', valueParam: '', valueColumn: predicate.comparisonField }]
       };
@@ -48570,7 +48857,7 @@ function assistantObjectFlowCandidate(value, options = {}) {
       alias,
       className,
       from: assistantFlowTextCandidate(item.from, item.sourceAlias, item.leftAlias),
-      limit: Number(item.limit) || 100,
+      ...(item.limit == null || item.limit === '' ? {} : { limit: Number(item.limit) }),
       columns: columns.map((column) => assistantFlowTextCandidate(column, column && column.name, column && column.path)).filter(Boolean),
       rules: assistantFlowSelectionRules(rawRules, alias, warnings, assistantFlowTextCandidate(item.from, item.sourceAlias, item.leftAlias))
     };
@@ -49702,7 +49989,6 @@ function assistantDeterministicSemanticFlow(intent, semanticPlan, mcpContext, cu
       alias,
       className,
       from: from || '',
-      limit: 1000,
       filterJoin,
       columns: uniqueStrings([
         'Code',
@@ -50156,7 +50442,7 @@ function assistantSelectionSuggestionFromSpec(spec, stageId, expectedAlias, stag
     alias: String(step.as || (Number(stageIndex || 0) === 0 ? 'objects' : `objects${Number(stageIndex || 0) + 1}`)),
     className: String(step.className || ''),
     from: String(step.from || ''),
-    limit: Number.isInteger(Number(step.limit)) && Number(step.limit) > 0 ? Number(step.limit) : 100,
+    ...(step.limit === undefined ? {} : { limit: Number(step.limit) }),
     columns: uniqueStrings((Array.isArray(step.columns) ? step.columns : []).map((column) => typeof column === 'string' ? column : column && (column.path || column.field || column.name))),
     rules: (Array.isArray(step.filters) ? step.filters : []).map((filter) => ({
       action: filter && (filter.action === 'exclude' || filter.scope === 'exclude') ? 'exclude' : 'include',
@@ -54384,7 +54670,43 @@ function reportTablePushdown(scope, alias, selector) {
   return trace(alias, selector.matchField);
 }
 
-function validateReportTables(spec) {
+function reportClosedOutputFields(spec, alias) {
+  const steps = new Map((Array.isArray(spec?.steps) ? spec.steps : []).filter(Boolean).map((step) => [step.as, step]));
+  const fieldsByAlias = new Map();
+  function fieldsFor(name) {
+    if (fieldsByAlias.has(name)) return fieldsByAlias.get(name);
+    const step = steps.get(name);
+    if (!step) return null;
+    fieldsByAlias.set(name, null);
+    let fields = null;
+    if (step.type === 'composeRows' || step.type === 'compose') {
+      fields = new Set(normalizeComposeColumns(step).map((column) => column.name));
+    } else if (['filterRows', 'semiJoinRows', 'existsRelatedRows', 'intersectRows', 'differenceRows', 'unionRows', 'enrichRows', 'matchRows', 'joinRows'].includes(step.type)) {
+      const left = fieldsFor(step.from);
+      if (!left) return null;
+      fields = new Set(left);
+      if (step.type === 'enrichRows') {
+        normalizePathColumnSpecs(step.columns || step.fields).forEach((column) => fields.add(column.as));
+      } else if (['unionRows', 'matchRows', 'joinRows'].includes(step.type)) {
+        const right = fieldsFor(step.with);
+        if (!right) return null;
+        if (step.type === 'unionRows') right.forEach((field) => fields.add(field));
+        else {
+          try {
+            const mapping = step.type === 'matchRows' ? buildMatchRowsColumnMapping([...left], [...right], step)
+              : buildRightColumnMapping([...left], [...right], normalizeRowOperationKeys(step), step);
+            mapping.mapping.forEach((item) => fields.add(item.target));
+          } catch (_) { return null; }
+        }
+      }
+    }
+    fieldsByAlias.set(name, fields);
+    return fields;
+  }
+  return fieldsFor(alias);
+}
+
+function validateReportTables(spec, { checkReportProjection = true } = {}) {
   const errors = [];
   const tables = Array.isArray(spec?.result?.tables) ? spec.result.tables : [];
   const steps = Array.isArray(spec?.steps) ? spec.steps : [];
@@ -54393,7 +54715,12 @@ function validateReportTables(spec) {
     if (raw == null) return;
     const path = `$.result.tables[${index}].presentation.largeTable`;
     const fields = Array.isArray(table.columns) && table.columns.length ? table.columns : undefined;
-    errors.push(...validateLargeTable(raw, { visibleFields: fields }).map((error) => ({
+    const selectorSource = checkReportProjection && raw.selector?.kind === 'result'
+      ? reportClosedOutputFields(spec, raw.selector.source) : null;
+    errors.push(...validateLargeTable(raw, {
+      visibleFields: fields, optionFields: selectorSource,
+      fields: checkReportProjection ? reportClosedOutputFields(spec, table.name) : null
+    }).map((error) => ({
       path: error.path ? `${path}.${error.path}` : path, message: error.message
     })));
     const config = normalizeLargeTable(raw);
@@ -54540,6 +54867,91 @@ function reportTableSourceSpec(spec, table) {
   return { ...spec, result: { ...spec.result, diagrams: [], tables: [table] } };
 }
 
+function reportDataSourceAlias(spec, outputAlias) {
+  const step = (spec.steps || []).find((item) => item.as === outputAlias);
+  return step?.type === 'enrichRows' && step.purpose === 'viewComposer' ? step.from : outputAlias;
+}
+
+function reportSavedResultLabels(spec) {
+  const models = [...(Array.isArray(spec.visualModels) ? spec.visualModels : []), spec.visualModel].filter(Boolean);
+  const labels = new Map();
+  const remember = (alias, label) => {
+    if (alias && typeof label === 'string' && label.trim() && label.trim() !== alias && !labels.has(alias)) {
+      labels.set(alias, label.trim());
+    }
+  };
+  for (const model of models.filter((item) => item.mode === 'objectMatching' || item.mode === 'objectGroup')) {
+    for (const output of Array.isArray(model.outputs) ? model.outputs : []) remember(output?.alias, output?.label);
+    for (const selection of Array.isArray(model.selections) ? model.selections : []) remember(selection?.alias, selection?.name);
+    remember(model.output?.alias, model.output?.title);
+  }
+  for (const step of spec.steps || []) remember(step.as, step.title || step.name);
+  for (const table of spec.result?.tables || []) remember(table.name, table.title || table.label);
+  return labels;
+}
+
+function publicationRowScope(spec, shell, paged, ordinaryLimit, includeDiagrams, labels) {
+  const ordinary = new Map();
+  const diagramAliases = new Set(includeDiagrams ? diagramExecutionScope(shell).includedAliases : []);
+  const addOutput = (into, table, aliases, canSwitch = false) => {
+    const sourceAlias = reportDataSourceAlias(spec, table.name);
+    for (const alias of aliases) {
+      const current = into.get(alias);
+      if (current) {
+        current.canUseLargeTable = false;
+        if (current.sourceAlias !== sourceAlias) {
+          delete current.sourceAlias;
+          delete current.sourceLabel;
+        }
+      } else {
+        into.set(alias, { sourceAlias, sourceLabel: labels.get(sourceAlias), stepLabel: labels.get(alias),
+          canUseLargeTable: canSwitch && !diagramAliases.has(alias),
+          ...(canSwitch && diagramAliases.has(alias) ? { usedByDiagram: true } : {}) });
+      }
+    }
+  };
+  for (const table of shell.result.tables) {
+    addOutput(ordinary, table, tableExecutionScope(reportTableSourceSpec(shell, table)).includedAliases, true);
+  }
+  for (const alias of diagramAliases) {
+    if (!ordinary.has(alias)) ordinary.set(alias, { stepLabel: labels.get(alias), canUseLargeTable: false, usedByDiagram: true });
+  }
+  const pagedScopes = new Map(paged.map((table) => {
+    const scope = new Map();
+    addOutput(scope, table, tableExecutionScope(reportTableSourceSpec(spec, table), { includeSelectors: true }).includedAliases);
+    return [table.name, scope];
+  }));
+  for (const alias of diagramAliases) {
+    const entry = ordinary.get(alias);
+    if (entry.sourceAlias) continue;
+    const pagedSources = [...pagedScopes.values()].map((scope) => scope.get(alias)).filter(Boolean);
+    if (pagedSources.length === 1) {
+      entry.sourceAlias = pagedSources[0].sourceAlias;
+      entry.sourceLabel = pagedSources[0].sourceLabel;
+    }
+  }
+  const ordinaryCauses = [ordinaryLimit === REPORT_ROW_LIMITS.ordinary ? 'ordinaryCeiling' : 'runtimeMaximum'];
+  const stepIndexes = new Map((spec.steps || []).map((step, index) => [step.as, index]));
+  const check = (scope, mode, limit, causes, table) => {
+    const context = { table, phase: 'rows', limits: [], rowLimitMode: mode, rowLimitPresentation: scope };
+    for (const [index, step] of (spec.steps || []).entries()) {
+      if (step.type !== 'selectCards' || !scope.has(step.as) || !(Number(step.limit) > limit)) continue;
+      context.step = { alias: step.as, index, type: step.type };
+      recordReportLimit(context, reportLimitEvidence('maxRows', limit, undefined, 'rows', {
+        source: 'object-flow-step', configKey: 'limit', requested: Number(step.limit),
+        rowLimitCauses: causes, reason: 'row_limit_configuration_conflict'
+      }));
+    }
+    return context;
+  };
+  const conflicts = [
+    check(ordinary, 'ordinary', ordinaryLimit, ordinaryCauses, shell.result.tables.length === 1 ? shell.result.tables[0].name : ''),
+    ...paged.map((table) => check(pagedScopes.get(table.name), 'paged', REPORT_ROW_LIMITS.paged, ['pagedCeiling'], table.name))
+  ];
+  if (conflicts.some((context) => context.limits.length)) throw incompleteReportTable(...conflicts);
+  return { ordinary, pagedScopes, ordinaryCauses, stepIndexes };
+}
+
 function reportTableExecutionOptions(runtimeConfig, deadlineAt) {
   const limits = normalizeExecutionLimitConfig(runtimeConfig);
   return {
@@ -54548,7 +54960,8 @@ function reportTableExecutionOptions(runtimeConfig, deadlineAt) {
     maxRestCalls: limits.maxRestCallsDefault, maxRelationsPerCard: limits.maxRelationsPerCardDefault,
     maxSelectionScanRows: limits.maxSelectionScanRowsDefault,
     maxTraversalDepth: limits.maxTraversalDepthMax, traversalDepthDefault: limits.maxTraversalDepthDefault,
-    maxRows: REPORT_TABLE_ROW_BUDGET, maxRowsMax: REPORT_TABLE_ROW_BUDGET, largeTableExecution: true,
+    maxRows: REPORT_ROW_LIMITS.paged, maxRowsMax: REPORT_ROW_LIMITS.paged, largeTableExecution: true,
+    reportRowLimitCauses: ['pagedCeiling'],
     includeDiagrams: false, executionScope: 'tables', strictDataReads: true,
     executionDeadlineAt: deadlineAt, reportLimitSettings: runtimeConfig?.executionLimits
   };
@@ -54560,11 +54973,30 @@ function reportLimitEvidence(limitName, effectiveLimit, observed, unit, options 
   const reason = options.reason || 'limit_exceeded';
   return {
     limitName, effectiveLimit, observed, unit, reason,
-    limitHit: reason !== 'completeness_unconfirmed', truncated: reason !== 'deadline_exceeded',
+    limitHit: reason !== 'completeness_unconfirmed', truncated: !['deadline_exceeded', 'row_limit_configuration_conflict'].includes(reason),
     timeout: reason === 'deadline_exceeded', source: options.source || 'product',
     ...(options.configKey ? { configKey: options.configKey } : {}),
+    ...(options.rowLimitCauses ? { rowLimitCauses: options.rowLimitCauses } : {}),
     ...(Number.isFinite(options.requested) ? { requested: options.requested } : {}),
     ...(Number.isFinite(options.total) ? { total: options.total } : {})
+  };
+}
+
+function reportRowBudget(limits, step) {
+  const requested = Number(step?.limit) || undefined;
+  if (!limits.reportRowLimitCauses) return requested
+    ? { source: 'object-flow-step', configKey: 'limit', requested }
+    : limits.largeTableExecution ? {} : { source: 'runtime-settings', configKey: 'maxRowsDefault' };
+  const atStep = requested !== undefined && requested <= limits.maxRows;
+  const rowLimitCauses = [
+    ...(atStep ? ['stepLimit'] : []),
+    ...(requested === undefined || requested >= limits.maxRows ? limits.reportRowLimitCauses : [])
+  ];
+  return {
+    source: atStep || requested !== undefined ? 'object-flow-step'
+      : rowLimitCauses.includes('runtimeMaximum') ? 'runtime-settings' : 'product',
+    configKey: requested !== undefined ? 'limit' : rowLimitCauses.includes('runtimeMaximum') ? 'maxRowsMax' : undefined,
+    requested, rowLimitCauses
   };
 }
 
@@ -54576,6 +55008,19 @@ function recordReportLimit(context, evidence, terminal = false) {
   if (step) {
     context.stepHasEvidence = true;
     Object.assign(item, { stepAlias: step.alias, stepIndex: step.index, stepType: step.type });
+  }
+  if (evidence.limitName === 'maxMatchRuleChecks') {
+    const labels = context.rowLimitPresentation?.get(step?.alias);
+    if (labels?.stepLabel) item.stepLabel = labels.stepLabel;
+    if (labels?.sourceLabel) item.sourceLabel = labels.sourceLabel;
+  }
+  if (evidence.rowLimitCauses && context.rowLimitMode) {
+    Object.assign(item, { rowLimitMode: context.rowLimitMode }, context.rowLimitPresentation?.get(step?.alias));
+    if (context.rowLimitMode === 'paged' && !item.sourceLabel && context.sourceLabel) item.sourceLabel = context.sourceLabel;
+    if (item.canUseLargeTable && (evidence.rowLimitCauses.includes('stepLimit') ||
+        Math.max(evidence.requested || 0, evidence.total || 0, evidence.observed || 0) > REPORT_ROW_LIMITS.paged)) {
+      item.canUseLargeTable = false;
+    }
   }
   if (item.source === 'runtime-settings' && item.requested === undefined) {
     const requested = Number(settings?.[item.configKey]);
@@ -54619,9 +55064,12 @@ function safeReportDiagnosticLabel(value, authToken) {
 
 function reportLimitErrorDetails(error, denied, authToken) {
   if (denied || !error.reportLimits?.length) return {};
-  const limits = error.reportLimits.map(({ priority, table, stepAlias, ...item }) => ({
+  const limits = error.reportLimits.map(({ priority, table, stepAlias, sourceAlias, sourceLabel, stepLabel, ...item }) => ({
     ...item, table: safeReportDiagnosticLabel(table, authToken),
-    ...(stepAlias === undefined ? {} : { stepAlias: safeReportDiagnosticLabel(stepAlias, authToken) })
+    ...(stepAlias === undefined ? {} : { stepAlias: safeReportDiagnosticLabel(stepAlias, authToken) }),
+    ...(sourceAlias ? { sourceAlias: safeReportDiagnosticLabel(sourceAlias, authToken) } : {}),
+    ...(sourceLabel ? { sourceLabel: safeReportDiagnosticLabel(sourceLabel, authToken) } : {}),
+    ...(stepLabel ? { stepLabel: safeReportDiagnosticLabel(stepLabel, authToken) } : {})
   }));
   return { diagnostics: { limits, ...(error.reportLimitsOmitted > 0 ? { omittedCount: error.reportLimitsOmitted } : {}) } };
 }
@@ -54666,7 +55114,11 @@ async function executeSnapshotReportPhase(authToken, spec, params, options, cont
 async function executeReportTableSource(authToken, spec, table, params, options, {
   restriction = null, phase = 'rows', publishedTable = table.name
 } = {}) {
-  const reportLimitContext = { table: publishedTable, phase, settings: options.reportLimitSettings, limits: [] };
+  const reportLimitContext = {
+    table: publishedTable, phase, settings: options.reportLimitSettings, limits: [],
+    rowLimitMode: 'paged', rowLimitPresentation: options.rowLimitPresentation,
+    sourceLabel: options.sourceLabel, stepIndexes: options.stepIndexes
+  };
   let records = [];
   const result = await executeSnapshotReportPhase(authToken, reportTableSourceSpec(spec, table), params, {
       ...options, reportTableRestriction: restriction,
@@ -54744,16 +55196,20 @@ async function buildReportTableIndex(authToken, spec, table, params, options, av
   rendered.truncated ||= available.incomplete;
   if (options.requireCompleteReport && rendered.truncated) throw incompleteReportTable(available.evidence, evidence);
   try {
-    const index = buildLargeTableIndex(rendered, available.rows, { matchValues,
+    const index = buildLargeTableIndex(rendered, available.rows, { matchValues, maxRows: REPORT_ROW_LIMITS.paged,
       groupValues: records.map((row) => config.groupKeys.map((field) => runtimeRowValue(row, field))) });
     assertExecutionDeadline(options.executionDeadlineAt, DRAFT_PREVIEW_TIMEOUT_MS);
     return {
       index, rendered
     };
   } catch (error) {
-    if (error.indexBudget) error.reportLimits = [{
-      table: table.name, phase: 'index', ...reportLimitEvidence(...error.indexBudget)
-    }];
+    if (error.indexBudget) {
+      const [name, max, observed, unit] = error.indexBudget;
+      const context = { table: table.name, phase: 'index', limits: [], rowLimitMode: 'paged', sourceLabel: options.sourceLabel };
+      recordReportLimit(context, reportLimitEvidence(name, max, observed, unit,
+        name === 'maxRows' ? { rowLimitCauses: ['pagedCeiling'] } : {}));
+      error.reportLimits = context.limits;
+    }
     if (error.code === 'draft_preview_timeout') {
       const context = { table: table.name, phase: 'index', limits: [] };
       recordReportDeadline(context, options.executionDeadlineAt);
@@ -54770,14 +55226,21 @@ async function materializePublishedReport(authToken, spec, params, options, runt
   const paged = reportPagedTables(spec);
   const deadlineAt = options.executionDeadlineAt || Date.now() + DRAFT_PREVIEW_TIMEOUT_MS;
   const remainingMs = options.snapshotRemainingMs || snapshotDeadlineBudget(deadlineAt);
-  const tableOptions = { ...reportTableExecutionOptions(runtimeConfig, deadlineAt), requireCompleteReport: true };
+  const matchBudget = { checked: 0 };
+  const tableOptions = { ...reportTableExecutionOptions(runtimeConfig, deadlineAt),
+    requireCompleteReport: true, matchBudget, isDisconnected: options.isDisconnected };
   const tableName = paged.length === 1 ? paged[0].name : '';
-  const shell = tableShellSpec(spec, options.includeDiagrams !== false);
+  const includeDiagrams = options.includeDiagrams !== false;
+  const shell = tableShellSpec(spec, includeDiagrams);
+  const ordinaryLimit = normalizeExecutionLimitConfig(runtimeConfig).maxRowsMax;
+  const labels = reportSavedResultLabels(spec);
+  const rowScope = publicationRowScope(spec, shell, paged, ordinaryLimit, includeDiagrams, labels);
   const evidence = { table: shell.result.tables.length === 1 ? shell.result.tables[0].name : '', phase: 'rows',
-    settings: runtimeConfig?.executionLimits, limits: [],
-    stepIndexes: new Map((spec.steps || []).map((step, index) => [step.as, index])) };
+    settings: runtimeConfig?.executionLimits, limits: [], rowLimitMode: 'ordinary',
+    rowLimitPresentation: rowScope.ordinary, stepIndexes: rowScope.stepIndexes };
   const result = await executeSnapshotReportPhase(authToken, shell, params, {
-    ...options, strictDataReads: true, executionDeadlineAt: deadlineAt
+    ...options, maxRows: ordinaryLimit, maxRowsMax: ordinaryLimit, reportRowLimitCauses: rowScope.ordinaryCauses,
+    strictDataReads: true, executionDeadlineAt: deadlineAt, matchBudget
   }, evidence);
   const incomplete = evidence.limits.length || snapshotExecutionIncomplete(result);
   if (remainingMs() <= 0) {
@@ -54797,8 +55260,10 @@ async function materializePublishedReport(authToken, spec, params, options, runt
       indexTable = table.name;
       assertSnapshotDeadline(remainingMs);
       const config = normalizeLargeTable(table.presentation.largeTable);
-      const available = await reportTableOptions(authToken, spec, config, params, tableOptions, table.name);
-      const prepared = await buildReportTableIndex(authToken, spec, table, params, tableOptions, available);
+      const scopedOptions = { ...tableOptions, rowLimitPresentation: rowScope.pagedScopes.get(table.name),
+        sourceLabel: labels.get(reportDataSourceAlias(spec, table.name)), stepIndexes: rowScope.stepIndexes };
+      const available = await reportTableOptions(authToken, spec, config, params, scopedOptions, table.name);
+      const prepared = await buildReportTableIndex(authToken, spec, table, params, scopedOptions, available);
       indexes[table.name] = prepared.index;
       tables.set(table.name, prepared.rendered);
     }
@@ -54872,13 +55337,14 @@ async function handleReportTablePage(req, res, requestUrl, root, templateCode, a
     slot = acquireExecutionSlot(req, res, { action, templateCode });
     if (!slot) return;
     const runtimeConfig = await getRuntimeConfig(authToken, root);
-    const options = reportTableExecutionOptions(runtimeConfig, Date.now() + DRAFT_PREVIEW_TIMEOUT_MS);
+    const options = { ...reportTableExecutionOptions(runtimeConfig, Date.now() + DRAFT_PREVIEW_TIMEOUT_MS),
+      matchBudget: { checked: 0 }, isDisconnected: () => res.destroyed };
     const config = normalizeLargeTable(table.presentation.largeTable);
     const optionViewId = reportTableOptionsViewId(owner, table.name);
     if (query.op === 'options' || config.mode === 'key' && !query.key) {
       const available = await reportTableOptions(authToken, template.spec, config, params, options, table.name);
       const emptyTable = { ...table, rows: [], truncated: available.incomplete };
-      const result = tablePageResult(buildLargeTableIndex(emptyTable, available.rows), query);
+      const result = tablePageResult(buildLargeTableIndex(emptyTable, available.rows, { maxRows: REPORT_ROW_LIMITS.paged }), query);
       if (config.mode === 'key') storeReportTableView(optionViewId, { available });
       sendJson(res, 200, result);
       return;
@@ -55129,6 +55595,7 @@ async function handleSnapshotRefresh(req, res, requestUrl, authToken, root, temp
       ...(includeDiagrams ? {} : { executionScope: 'tables' }),
       strictDataReads: true,
       executionDeadlineAt: deadlineAt,
+      isDisconnected: () => res.destroyed,
       snapshotRemainingMs: remainingMs,
       executionDeadlineTimeoutMs: DRAFT_PREVIEW_TIMEOUT_MS
     }, runtimeConfig, mode === 'shared');
@@ -55472,7 +55939,7 @@ function validateTemplateSpec(spec) {
         if (step.from !== undefined && typeof step.from !== 'string') {
           errors.push({ path: `${path}.from`, message: 'selectCards from must be a source alias string.' });
         }
-        if (step.limit !== undefined && (!Number.isInteger(Number(step.limit)) || Number(step.limit) <= 0)) {
+        if (step.limit !== undefined && (!Number.isSafeInteger(Number(step.limit)) || Number(step.limit) <= 0)) {
           errors.push({ path: `${path}.limit`, message: 'selectCards limit must be a positive integer.' });
         }
         if (step.filterJoin !== undefined && !['all', 'any'].includes(step.filterJoin)) {
@@ -55996,7 +56463,7 @@ function validateTemplateSpec(spec) {
   return errors;
 }
 
-function validateTemplateSpecForStorage(spec) {
+function validateTemplateSpecForStorage(spec, options) {
   try { assertInputCollections(spec, INPUT_COLLECTION_LIMITS, { rootKind: 'spec' }); } catch (error) {
     if (error.code !== 'input_collection_limit') throw error;
     return [{ ...error.details, code: error.code, message: error.message }];
@@ -56005,7 +56472,7 @@ function validateTemplateSpecForStorage(spec) {
   if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
     return [{ path: '$', message: 'Template spec must be an object.' }];
   }
-  errors.push(...validateReportTables(spec));
+  errors.push(...validateReportTables(spec, options));
   if (Buffer.byteLength(stableJsonStringify(spec), 'utf8') > TEMPLATE_REQUEST_MAX_BYTES) {
     errors.push({ path: '$', message: `Template spec exceeds configured maxBytes=${TEMPLATE_REQUEST_MAX_BYTES}.` });
   }
@@ -57317,9 +57784,9 @@ function prepareDiagramEdgeAggregation(edges, context, options = {}) {
 function buildTopologyDiagram(diagram, context, params, limits, options = {}) {
   const name = String(diagram.name || diagram.as || 'diagram').trim();
   const titleTemplate = String(diagram.title || diagram.label || name);
-  const maxNodes = normalizeDiagramLimit(diagram.maxNodes || diagram.limit && diagram.limit.maxNodes || diagram.limits && diagram.limits.maxNodes, Math.min(limits.maxRows || 500, 300), ABSOLUTE_EXECUTION_LIMITS.maxRows);
-  const maxEdges = normalizeDiagramLimit(diagram.maxEdges || diagram.limit && diagram.limit.maxEdges || diagram.limits && diagram.limits.maxEdges, Math.min((limits.maxRows || 500) * 2, 800), ABSOLUTE_EXECUTION_LIMITS.maxRows * 2);
-  const maxGroups = normalizeDiagramLimit(diagram.maxGroups || diagram.limit && diagram.limit.maxGroups || diagram.limits && diagram.limits.maxGroups, Math.min(maxNodes, 100), ABSOLUTE_EXECUTION_LIMITS.maxRows);
+  const maxNodes = normalizeDiagramLimit(diagram.maxNodes || diagram.limit && diagram.limit.maxNodes || diagram.limits && diagram.limits.maxNodes, 300, DIAGRAM_ABSOLUTE_NODE_LIMIT);
+  const maxEdges = normalizeDiagramLimit(diagram.maxEdges || diagram.limit && diagram.limit.maxEdges || diagram.limits && diagram.limits.maxEdges, 800, DIAGRAM_ABSOLUTE_NODE_LIMIT * 2);
+  const maxGroups = normalizeDiagramLimit(diagram.maxGroups || diagram.limit && diagram.limit.maxGroups || diagram.limits && diagram.limits.maxGroups, Math.min(maxNodes, 100), DIAGRAM_ABSOLUTE_NODE_LIMIT);
   const warnings = [];
   let edgeInputLimitReached = false;
   const unplaced = [];
@@ -60531,23 +60998,23 @@ async function requestCardsForSelection(cmdbuildExecRequest, className, limit, f
   return cmdbuildExecRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(className)}/cards?${query.toString()}`);
 }
 
-function selectionScanLimit(step, filters, limits, resultLimit) {
-  if (limits.largeTableExecution) {
-    const configured = limits.maxSelectionScanRows || resultLimit;
-    const maximum = limits.maxSelectionScanRowsMax || configured;
-    const explicit = toPositiveInt(step.scanLimit || step.searchLimit || step.fetchLimit, 0, maximum);
-    if (explicit) return Math.min(maximum, Math.max(resultLimit, explicit));
-    return Math.min(maximum, filters.length ? configured : Math.min(configured, resultLimit));
-  }
-  const maxScan = Math.max(resultLimit, limits.maxSelectionScanRowsMax || limits.maxSelectionScanRows || resultLimit);
-  const explicit = toPositiveInt(step.scanLimit || step.searchLimit || step.fetchLimit, 0, maxScan);
-  if (explicit) return Math.max(resultLimit, explicit);
-  return Array.isArray(filters) && filters.length
-    ? Math.max(resultLimit, Math.min(limits.maxSelectionScanRows || maxScan, maxScan))
-    : resultLimit;
+function selectionScanPolicy(step, filters, limits, resultLimit) {
+  const maximum = limits.maxSelectionScanRowsMax || ABSOLUTE_EXECUTION_LIMITS.maxSelectionScanRows;
+  const key = ['scanLimit', 'searchLimit', 'fetchLimit'].find((field) =>
+    Number.isSafeInteger(Number(step[field])) && Number(step[field]) > 0);
+  const explicit = key && Number(step[key]);
+  const requested = explicit || (filters.length ? Math.max(resultLimit, limits.maxSelectionScanRows || 0) : resultLimit);
+  return {
+    maximum,
+    limit: Math.min(requested, maximum),
+    usesResultLimit: !explicit && filters.length === 0 && requested <= maximum,
+    budget: requested > maximum ? { source: 'runtime-settings', configKey: 'maxSelectionScanRowsMax', requested }
+      : explicit ? { source: 'object-flow-step', configKey: key, requested }
+        : { source: 'runtime-settings', configKey: 'maxSelectionScanRowsDefault' }
+  };
 }
 
-async function requestCompleteCardsForSelectionScan(request, className, limit, fields, filter, budget, maxRestCalls) {
+async function requestCompleteCardsForSelectionScan(request, className, limit, fields, filter, budget, maxRestCalls, canProbe) {
   const rows = [];
   const ids = new Set();
   let total = null;
@@ -60580,6 +61047,7 @@ async function requestCompleteCardsForSelectionScan(request, className, limit, f
     if (page.short || total === rows.length) return finish();
   }
 
+  if (!canProbe) return finish('completeness_unconfirmed');
   const restCalls = request.getRestCalls?.();
   if (restCalls >= maxRestCalls) return finish('limit_exceeded', reportLimitEvidence('maxRestCalls', maxRestCalls, restCalls, 'calls', {
     source: 'runtime-settings', configKey: 'maxRestCallsDefault'
@@ -60595,10 +61063,10 @@ async function requestCompleteCardsForSelectionScan(request, className, limit, f
   return finish(page.rows.length || total > limit ? 'limit_exceeded' : undefined);
 }
 
-async function requestCardsForSelectionScan(cmdbuildExecRequest, className, scanLimit, fields, requireComplete, filter, budget, maxRestCalls) {
+async function requestCardsForSelectionScan(cmdbuildExecRequest, className, scanLimit, fields, requireComplete, filter, budget, maxRestCalls, canProbe) {
   const limit = Math.max(1, Number(scanLimit) || 1);
   if (requireComplete) {
-    return requestCompleteCardsForSelectionScan(cmdbuildExecRequest, className, limit, fields, filter, budget, maxRestCalls);
+    return requestCompleteCardsForSelectionScan(cmdbuildExecRequest, className, limit, fields, filter, budget, maxRestCalls, canProbe);
   }
   const pageSize = Math.min(limit, 1000);
   const rows = [];
@@ -60653,14 +61121,12 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
   const filterJoin = step.filterJoin === 'all' || step.filterJoin === 'any'
     ? step.filterJoin
     : assistantSelectionAliases.has(step.as) ? inferredAssistantSelectionFilterJoin(step) : 'any';
-  const scanLimit = selectionScanLimit(step, filters, limits, maxRows);
-  const scanSetting = ['scanLimit', 'searchLimit', 'fetchLimit'].find((key) => step[key]);
-  const scanRequested = Number(step[scanSetting]);
-  const scanBudget = Number.isFinite(scanRequested) && scanRequested > 0
-    ? { source: 'object-flow-step', configKey: scanSetting, requested: scanRequested }
-    : !filters.length && !scanSetting && maxRows < limits.maxSelectionScanRows && scanLimit === maxRows
-      ? { source: step.limit ? 'object-flow-step' : 'product', ...(step.limit ? { configKey: 'limit', requested: Number(step.limit) } : {}) }
-      : { source: 'runtime-settings', configKey: 'maxSelectionScanRowsDefault' };
+  const { maximum: scanMaximum, limit: scanLimit, usesResultLimit, budget: selectionBudget } = selectionScanPolicy(step, filters, limits, maxRows);
+  const aggregateScanLimit = usesResultLimit ? scanMaximum : scanLimit;
+  const scanBudget = selectionBudget.requested === undefined &&
+    !filters.length && !restriction && !step.from && limits.reportRowLimitCauses && scanLimit === maxRows
+      ? reportRowBudget(limits, step)
+      : selectionBudget;
   const dependency = dependencyMap && Array.isArray(dependencyMap.selections)
     ? dependencyMap.selections.find((item) => item && item.as === step.as)
     : null;
@@ -60684,6 +61150,7 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
   const cardsByClass = new Map();
   const selectedClasses = new Set();
   let scanTruncated = false;
+  let scannedCards = 0;
   let classScopeTruncated = false;
   const classesCache = { loaded: false, classes: [], ok: false };
   const resolvedClassCache = new Map();
@@ -60735,11 +61202,25 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
     for (const className of targetClassNames) {
       validateCmdbuildIdentifier(className, 'selectCards className');
       if (!cardsByClass.has(className)) {
-        const cards = await requestCardsForSelectionScan(cmdbuildExecRequest, className, scanLimit, readFields, requireComplete,
-          directRestriction, scanBudget, limits.maxRestCalls);
+        const remainingScan = Math.min(scanLimit, aggregateScanLimit - scannedCards);
+        if (remainingScan <= 0) {
+          scanTruncated = true;
+          cmdbuildExecRequest.recordReportLimit?.(reportLimitEvidence('maxSelectionScanRows', aggregateScanLimit, scannedCards, 'cards', {
+            ...(usesResultLimit ? { source: 'runtime-settings', configKey: 'maxSelectionScanRowsMax' } : selectionBudget),
+            reason: 'completeness_unconfirmed'
+          }));
+          continue;
+        }
+        const atScanMaximum = scannedCards + remainingScan >= scanMaximum;
+        const cardBudget = usesResultLimit && remainingScan < scanLimit
+          ? { source: 'runtime-settings', configKey: 'maxSelectionScanRowsMax', requested: scanLimit + scannedCards }
+          : scanBudget;
+        const cards = await requestCardsForSelectionScan(cmdbuildExecRequest, className, remainingScan, readFields, requireComplete,
+          directRestriction, cardBudget, limits.maxRestCalls, !atScanMaximum);
         if (!cards.ok) {
           throw new Error(`CMDBuild cards request for ${className} failed with status ${cards.statusCode}.`);
         }
+        scannedCards += cards.json?.data?.length || 0;
         cardsByClass.set(className, {
           rows: Array.isArray(cards.json && cards.json.data) ? cards.json.data : [],
           truncated: Boolean(cards.truncated),
@@ -60762,9 +61243,7 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
           seenCards.add(cardIdentity);
         }
         if (requireComplete && rows.length >= maxRows) {
-          cmdbuildExecRequest.recordReportLimit?.(reportLimitEvidence('maxRows', maxRows, rows.length + 1, 'rows', step.limit
-            ? { source: 'object-flow-step', configKey: 'limit', requested: Number(step.limit) }
-            : limits.largeTableExecution ? {} : { source: 'runtime-settings', configKey: 'maxRowsDefault' }));
+          cmdbuildExecRequest.recordReportLimit?.(reportLimitEvidence('maxRows', maxRows, rows.length + 1, 'rows', reportRowBudget(limits, step)));
           return cappedResult();
         }
         const resultRow = outputRow || buildSelectionResultRow(className, card, driverRow, columns, step);
@@ -61119,7 +61598,7 @@ async function executeExpandRelations(cmdbuildExecRequest, step, params, context
 
       if (rows.length >= maxRows) {
         cmdbuildExecRequest.recordReportLimit?.(reportLimitEvidence('maxRows', maxRows, rows.length + 1, 'rows',
-          limits.largeTableExecution ? {} : { source: 'runtime-settings', configKey: 'maxRowsDefault' }));
+          reportRowBudget(limits)));
         return {
           columns,
           rows,
@@ -61249,7 +61728,7 @@ async function executeEnrichRows(cmdbuildExecRequest, step, params, context, lim
     for (const variant of variants) {
       if (rows.length >= limits.maxRows) {
         cmdbuildExecRequest.recordReportLimit?.(reportLimitEvidence('maxRows', limits.maxRows, rows.length + 1, 'rows',
-          limits.largeTableExecution ? {} : { source: 'runtime-settings', configKey: 'maxRowsDefault' }));
+          reportRowBudget(limits)));
         return {
           columns,
           rows,
@@ -61714,7 +62193,7 @@ function mergeMatchRows(leftRow, rightRow, leftColumns, rightMapping) {
   return mergeRuntimeRowSemantics(row, leftRow, rightRow, leftColumns, rightMapping);
 }
 
-function executeMatchRows(step, params, context, limits) {
+async function executeMatchRows(step, params, context, limits, execution = {}) {
   const left = context[step.from];
   const right = context[step.with];
   if (!left) throw new Error(`matchRows source not found: ${step.from}`);
@@ -61730,15 +62209,37 @@ function executeMatchRows(step, params, context, limits) {
   const rightColumns = inferColumns(right);
   const { columns, mapping } = buildMatchRowsColumnMapping(leftColumns, rightColumns, step);
   const rows = [];
+  const budget = execution.matchBudget || { checked: 0 };
+  function assertRunning() {
+    assertExecutionDeadline(execution.deadlineAt, execution.timeoutMs);
+    if (execution.isDisconnected?.()) throw snapshotStoreError('execution_cancelled', 'Report execution was cancelled.', 499);
+  }
+  function charge() {
+    if (budget.checked >= MATCH_RULE_CHECK_LIMIT) {
+      execution.recordLimit?.(reportLimitEvidence('maxMatchRuleChecks', MATCH_RULE_CHECK_LIMIT, budget.checked, 'checks'), true);
+      throw snapshotStoreError('table_result_incomplete', 'The matching rule budget was exhausted. Narrow both input selections.', 422);
+    }
+    budget.checked += 1;
+    return budget.checked % MATCH_RULE_YIELD_INTERVAL === 0;
+  }
+  const yieldToRequests = () => new Promise((resolve) => setImmediate(resolve));
 
+  assertRunning();
   for (const leftRow of leftRows) {
-    for (const rightRow of rightRows) {
-      const included = includeRules.length
-        ? includeRules.some((rule) => matchRowsRuleMatches(leftRow, rightRow, rule, params, step.caseSensitive))
-        : true;
+    pair: for (const rightRow of rightRows) {
+      let included = includeRules.length === 0;
+      for (const rule of includeRules) {
+        if (charge()) { await yieldToRequests(); assertRunning(); }
+        if (matchRowsRuleMatches(leftRow, rightRow, rule, params, step.caseSensitive)) {
+          included = true;
+          break;
+        }
+      }
       if (!included) continue;
-      const excluded = excludeRules.some((rule) => matchRowsRuleMatches(leftRow, rightRow, rule, params, step.caseSensitive));
-      if (excluded) continue;
+      for (const rule of excludeRules) {
+        if (charge()) { await yieldToRequests(); assertRunning(); }
+        if (matchRowsRuleMatches(leftRow, rightRow, rule, params, step.caseSensitive)) continue pair;
+      }
       rows.push(mergeMatchRows(leftRow, rightRow, leftColumns, mapping));
       if (rows.length >= limits.maxRows) {
         return {
@@ -62041,7 +62542,9 @@ function createExecutionRequest(authToken, limits, options = {}) {
   };
   request.getRestCalls = () => restCalls;
   request.assertAccess = assertAccess;
-  if (options.reportLimitContext) request.recordReportLimit = (evidence) => recordReportLimit(options.reportLimitContext, evidence);
+  if (options.reportLimitContext) {
+    request.recordReportLimit = (evidence, terminal) => recordReportLimit(options.reportLimitContext, evidence, terminal);
+  }
   return request;
 }
 
@@ -62384,7 +62887,8 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
   const effectiveParams = applyTemplateParamDefaults(spec, params);
   const executionDeadlineAt = Number(options.executionDeadlineAt || 0);
   const executionDeadlineTimeoutMs = Number(options.executionDeadlineTimeoutMs || DRAFT_PREVIEW_TIMEOUT_MS);
-  const rowCap = options.largeTableExecution === true ? REPORT_TABLE_ROW_BUDGET : ABSOLUTE_EXECUTION_LIMITS.maxRows;
+  const matchBudget = options.matchBudget || { checked: 0 };
+  const rowCap = options.largeTableExecution === true ? REPORT_ROW_LIMITS.paged : ABSOLUTE_EXECUTION_LIMITS.maxRows;
   const maxRowsMax = Math.min(options.maxRowsMax || rowCap, rowCap);
   const maxRelationsPerCardMax = Math.min(options.maxRelationsPerCardMax || ABSOLUTE_EXECUTION_LIMITS.maxRelationsPerCard, ABSOLUTE_EXECUTION_LIMITS.maxRelationsPerCard);
   const maxSelectionScanRowsMax = Math.min(options.maxSelectionScanRowsMax || ABSOLUTE_EXECUTION_LIMITS.maxSelectionScanRows, ABSOLUTE_EXECUTION_LIMITS.maxSelectionScanRows);
@@ -62405,6 +62909,7 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
     maxRestCalls: Math.min(options.maxRestCalls || 250, maxRestCallsMax),
     maxTraversalDepth: Math.min(options.maxTraversalDepth || maxTraversalDepthMax, maxTraversalDepthMax),
     traversalDepthDefault: Math.min(options.traversalDepthDefault || 1, maxTraversalDepthMax),
+    reportRowLimitCauses: options.reportRowLimitCauses,
     ...(options.largeTableExecution === true ? { largeTableExecution: true } : {})
   };
   const context = {};
@@ -62477,7 +62982,10 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
       } else if (step.type === 'differenceRows') {
         context[step.as] = executeDifferenceRows(step, context, stageLimits);
       } else if (step.type === 'matchRows') {
-        context[step.as] = executeMatchRows(step, effectiveParams, context, stageLimits);
+        context[step.as] = await executeMatchRows(step, effectiveParams, context, stageLimits, {
+          matchBudget, deadlineAt: executionDeadlineAt, timeoutMs: executionDeadlineTimeoutMs,
+          isDisconnected: options.isDisconnected, recordLimit: cmdbuildExecRequest.recordReportLimit
+        });
       } else if (step.type === 'semiJoinRows') {
         context[step.as] = executeSemiJoinRows(step, effectiveParams, context, stageLimits);
       } else if (step.type === 'existsRelatedRows') {
@@ -62500,7 +63008,7 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
       if (stageLimits !== limits && context[step.as]?.rows?.length > limits.maxRows) {
         const stage = context[step.as];
         cmdbuildExecRequest.recordReportLimit?.(reportLimitEvidence('maxRows', limits.maxRows, stage.rows.length, 'rows',
-          limits.largeTableExecution ? {} : { source: 'runtime-settings', configKey: 'maxRowsDefault' }));
+          reportRowBudget(limits)));
         stage.rows = stage.rows.slice(0, limits.maxRows);
         stage.truncated = true;
         stage.rowLimitReached = true;
@@ -63553,7 +64061,8 @@ async function handleTemplateTransfer(req, res, requestUrl, authToken) {
   if (!session) return;
   if (requestUrl.pathname.endsWith('/export')) {
     const raw = body.template;
-    const errors = validateTemplateSpecForStorage(raw && raw.spec);
+    // A portable draft can carry an unresolved selector for target attestation.
+    const errors = validateTemplateSpecForStorage(raw && raw.spec, { checkReportProjection: false });
     if (errors.length) { sendJson(res, 400, { success: false, code: 'template_transfer_invalid', message: 'Template spec validation failed.', errors }); return; }
     const schema = buildTechnicalSchema(root);
     const access = await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(schema.classNames.template)}`, authToken);
@@ -63614,7 +64123,7 @@ async function handleTemplateTransfer(req, res, requestUrl, authToken) {
   validation.issues.push(...shadowedOverrides);
   {
     const spec = await prepareTemplateTransferD2(portable.spec, validation);
-    const storageErrors = validateTemplateSpecForStorage(spec);
+    const storageErrors = validateTemplateSpecForStorage(spec, { checkReportProjection: false });
     if (storageErrors.length) { sendJson(res, 400, { success: false, code: 'template_transfer_invalid', message: 'Imported template is invalid.', errors: storageErrors }); return; }
     const execution = executionValidationForSpec(spec);
     validation.issues.push(...execution.errors.map((item) => templateTransferIssue(item.path, 'template_transfer_execution_incomplete', item.message, 'warning')));
@@ -64091,9 +64600,24 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
       const body = await readJsonObjectBody(req, res);
       if (!body) return;
       const requestedRuntimeConfig = body.runtimeConfig ?? safeJsonValue(body.RuntimeConfigJson, {});
-      const numericErrors = [...validateAssistantConfigurationNumbers(requestedRuntimeConfig), ...validateAssistantResponseFormat(requestedRuntimeConfig)];
+      const generalOnly = requestUrl.searchParams.get('scope') === 'general';
+      const numericErrors = [];
+      const cooldown = requestedRuntimeConfig?.runtimeCache?.refreshCooldownSec;
+      if (generalOnly) {
+        if (!Number.isSafeInteger(cooldown) || cooldown < 1) {
+          numericErrors.push({ path: 'runtimeCache.refreshCooldownSec',
+            message: 'runtimeCache.refreshCooldownSec must be a positive integer.' });
+        }
+      } else {
+        numericErrors.push(...validateAssistantConfigurationNumbers(requestedRuntimeConfig), ...validateAssistantResponseFormat(requestedRuntimeConfig));
+        const maxRows = requestedRuntimeConfig?.executionLimits?.maxRowsMax;
+        if (maxRows !== undefined && (!Number.isSafeInteger(maxRows) || maxRows < 1 || maxRows > REPORT_ROW_LIMITS.ordinary)) {
+          numericErrors.push({ path: 'executionLimits.maxRowsMax',
+            message: `executionLimits.maxRowsMax must be an integer from 1 to ${REPORT_ROW_LIMITS.ordinary}.` });
+        }
+      }
       if (numericErrors.length) return sendJson(res, 422, { success: false, code: 'runtime_config_invalid',
-        message: 'Assistant settings contain invalid values.', errors: numericErrors });
+        message: 'Runtime settings contain invalid values.', errors: numericErrors });
       const found = await findConfigCard(authToken, root);
       if (!found.response.ok) {
         if (sendTechnicalSchemaAccessDeniedIfNeeded(res, {
@@ -64110,7 +64634,13 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
         return;
       }
 
-      const payload = normalizeConfigPayload(body, found.schema.root);
+      const currentConfig = generalOnly ? sanitizeConfigCard(found.card, found.schema.root) : null;
+      const payload = normalizeConfigPayload(generalOnly ? {
+        active: currentConfig.active ?? true,
+        description: currentConfig.description,
+        runtimeConfig: { ...currentConfig.runtimeConfig,
+          runtimeCache: { ...currentConfig.runtimeConfig.runtimeCache, refreshCooldownSec: cooldown } }
+      } : body, found.schema.root);
       const saved = found.card
         ? await cmdbuildRequest(`/cmdbuild/services/rest/v3/classes/${encodeURIComponent(found.schema.classNames.config)}/cards/${encodeURIComponent(found.card._id)}`, authToken, {
           method: 'PUT',
@@ -65949,6 +66479,7 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
       : null;
     const executionSpec = partialDiagramPlan ? partialDiagramPlan.spec : draft.spec;
     const previewExecutionOptions = {
+      isDisconnected: () => res.destroyed,
       maxRows: getPositiveInt(requestUrl.searchParams, 'maxRows', executionLimits.maxRowsPreviewDefault, executionLimits.maxRowsMax),
       maxRowsMax: executionLimits.maxRowsMax,
       maxRelationsPerCard: executionLimits.maxRelationsPerCardDefault,
@@ -66378,6 +66909,7 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
         ? getPositiveInt(requestUrl.searchParams, 'maxRows', executionLimits.maxRowsPreviewDefault, executionLimits.maxRowsMax)
         : getPositiveInt(requestUrl.searchParams, 'maxRows', executionLimits.maxRowsDefault, executionLimits.maxRowsMax);
       const executionOptions = {
+        isDisconnected: () => res.destroyed,
         maxRows,
         maxRowsMax: executionLimits.maxRowsMax,
         maxRelationsPerCard: executionLimits.maxRelationsPerCardDefault,
@@ -67346,6 +67878,7 @@ if (isMainModule) {
 }
 
 export {
+  renderDynamicPagesShell,
   purgeAssistantDiagnosticHistory,
   assistantConfigurationLimitDiagnostics,
   validateAssistantConfigurationNumbers,

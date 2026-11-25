@@ -84,11 +84,18 @@ async function withClient(viewport, scenario) {
         if (url.pathname === '/cmdbuild/custom-api/csrf') return route.fulfill({ json: { success: true, token: 'mock-csrf' } });
         if (url.pathname === '/cmdbuild/custom-api/client-log' && url.searchParams.get('stage') === 'script-loaded') return route.fulfill({ status: 204 });
         if (url.pathname === '/cmdbuild/custom-api/assistant/diagnostics/status') return route.fulfill({ json: { success: true, status: { mode: 'Off' } } });
+        if (url.pathname === '/cmdbuild/custom-api/public-snapshots/write-a/run') return route.fulfill({ json: {
+          success: true, action: 'run', template: { code: 'write-a' }, snapshotFound: false, result: { tables: [] },
+          cache: { scope: 'staticSnapshot', status: 'snapshot-miss' }
+        } });
       }
       unexpected.push(call);
       return route.abort('blockedbyclient');
     });
     await page.goto('http://remediation.test/');
+    await page.evaluate(() => {
+      window.CMDP_BOOT = { reportRowLimits: { ordinary: 2000, paged: 10000, recommendedOrdinary: 2000, recommendedPaged: 10000 } };
+    });
     await page.addScriptTag({ content: clientScript() });
     await page.evaluate(() => {
       const ui = window.remediation;

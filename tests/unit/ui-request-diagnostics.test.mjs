@@ -43,6 +43,8 @@ test('clamp diagnostics and scoped owner survive projection without arbitrary pa
 test('publish and refresh preserve flat limit evidence without admitting unknown fields or values', () => {
   const rowLimit = { table: 'items', phase: 'rows', stepAlias: 'selected', stepIndex: 0, stepType: 'selectCards',
     limitName: 'maxRows', source: 'object-flow-step', configKey: 'limit', requested: 2, effectiveLimit: 2,
+    sourceAlias: 'reportSource', sourceLabel: 'Assets', stepLabel: 'All assets',
+    rowLimitMode: 'ordinary', rowLimitCauses: ['stepLimit', 'ordinaryCeiling'], canUseLargeTable: true,
     observed: 3, total: 4, unit: 'rows', reason: 'limit_exceeded', limitHit: true, truncated: true, timeout: false };
   const catalogLimit = { table: 'items', phase: 'selector', observed: 0,
     reason: 'completeness_unconfirmed', limitHit: false, truncated: true };
@@ -54,7 +56,8 @@ test('publish and refresh preserve flat limit evidence without admitting unknown
     unit: 'fixture-secret', requested: 'fixture-secret', stepIndex: -1, effectiveLimit: -1 };
   for (const phase of ['publish', 'refresh-snapshot']) {
     const diagnostic = api.response(result({ code: 'table_result_incomplete', requestId: 'server-body-id', diagnostics: { omittedCount: 4, limits: [
-      { ...rowLimit, rawBody: 'fixture-secret', message: 'fixture-secret', details: [catalogLimit] },
+      { ...rowLimit, rowLimitCauses: [...rowLimit.rowLimitCauses, 'fixture-secret'],
+        rawBody: 'fixture-secret', message: 'fixture-secret', details: [catalogLimit] },
       { ...malformed, elapsedMs: -1 }, timeout, commit, depth, { ...rowLimit, phase: 'fixture-secret' }, null, { ...rowLimit, reason: 'fixture-secret' }
     ] } }), { ...context, phase });
     assert.deepEqual(diagnostic.diagnostics.limits, [rowLimit, { ...catalogLimit, stepAlias: '[REDACTED]' }, timeout, commit, depth]);

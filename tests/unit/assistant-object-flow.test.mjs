@@ -197,7 +197,7 @@ test('normalizeObjectFlow derives stable ids without mutating the input', () => 
     'match:routerRooms',
     'match:routerRoomVlans'
   ]);
-  assert.equal(normalized.selections[1].limit, 100);
+  assert.equal(Object.hasOwn(normalized.selections[1], 'limit'), false);
   assert.equal(input.selections[0].id, undefined);
   assert.equal(input.operations[0].id, undefined);
 

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { compileObjectFlowToSpec } from '../../scripts/assistant-object-flow.mjs';
 import { buildResultDiagrams, dependencyMapWithHash, executeSelectCards, executeMatchRows, executeEnrichRows,
   executeFilterRows, executeSemiJoinRows, executeJoinRows, executeUnionRows, executeDifferenceRows,
@@ -24,6 +25,38 @@ function diagramSpec(alias, fields = ['Source', 'Target'], groupBy = ['Category'
 
 const objects = { rows: [{ _id: 'a', Address: 'source', Description: 'A' }, { _id: 'b', Address: ['target-1', 'target-2'], Description: 'B' }] };
 
+test('ordinary deployment row ceiling does not clamp explicit diagram node limits', () => {
+  const proxy = new URL('../../scripts/dev-proxy-server.mjs', import.meta.url).href;
+  const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
+    import { buildResultDiagrams } from ${JSON.stringify(proxy)};
+    const nodes = (prefix) => ({ rows: [1, 2, 3].map(number => ({ Code: prefix + number })) });
+    const spec = { result: { diagrams: [{ name: 'topology', maxNodes: 10,
+      nodeMappings: ['left', 'right'].map(from => ({ from, fields: { id: 'Code', label: 'Code' } }))
+    }] } };
+    const [diagram] = buildResultDiagrams(spec, { left: nodes('L'), right: nodes('R') }, {}, { maxRows: 4 });
+    console.log(JSON.stringify({ count: diagram.nodes.length, truncated: diagram.truncated }));
+  `], { env: { ...process.env, CMDP_EXECUTION_MAX_ROWS_ABSOLUTE: '4', CMDP_LARGE_TABLE_MAX_ROWS: '10000' }, encoding: 'utf8' });
+  assert.deepEqual(JSON.parse(output), { count: 6, truncated: false });
+});
+
+test('matching yields without output rows and stops on its cumulative budget, deadline or cancellation', async () => {
+  const repeated = Array.from({ length: 5000 }, () => ({ Code: 'left' }));
+  const context = { left: { rows: repeated }, right: { rows: [{ Code: 'right' }] } };
+  const step = { from: 'left', with: 'right', rules: [{ leftColumn: 'Code', rightColumn: 'Code', operator: 'equals' }] };
+  const matchBudget = { checked: 5_000_000 - 5000 + 1 };
+  const evidence = [];
+  let responsive = false;
+  setImmediate(() => { responsive = true; });
+  await assert.rejects(executeMatchRows(step, {}, context, limits, { matchBudget, recordLimit: (item) => evidence.push(item) }),
+    { statusCode: 422, code: 'table_result_incomplete' });
+  assert.equal(responsive, true);
+  assert.deepEqual(evidence.map(({ limitName, observed }) => [limitName, observed]), [['maxMatchRuleChecks', 5_000_000]]);
+  let cancelled = false;
+  setImmediate(() => { cancelled = true; });
+  await assert.rejects(executeMatchRows(step, {}, context, limits, { isDisconnected: () => cancelled }), { statusCode: 499 });
+  await assert.rejects(executeMatchRows(step, {}, context, limits, { deadlineAt: Date.now() - 1 }), { statusCode: 504 });
+});
+
 test('real selected lookup IDs remain distinct when their display descriptions are equal', async () => {
   const spec = diagramSpec('links');
   const step = { type: 'selectCards', as: 'links', className: 'Connection' };
@@ -41,7 +74,7 @@ test('real selected lookup IDs remain distinct when their display descriptions a
   assert.doesNotMatch(JSON.stringify(links), /rawFields|rowSemantics|recordIdentity/);
 });
 
-test('pair-grain source records and labels survive aggregation, source reordering and row-preserving operations', () => {
+test('pair-grain source records and labels survive aggregation, source reordering and row-preserving operations', async () => {
   const context = { objects,
     left: { columns: ['Class', '_id', 'Source', 'Value'], rows: [{ Class: 'Origin', _id: 1, Source: 'source', Value: 'left' }] },
     right: { columns: ['Class', '_id', 'Address', 'Category', 'Value'], rows: [
@@ -50,7 +83,7 @@ test('pair-grain source records and labels survive aggregation, source reorderin
     ] }
   };
   const step = { from: 'left', with: 'right', rightPrefix: 'right_', rules: [] };
-  context.matched = executeMatchRows(step, {}, context, limits);
+  context.matched = await executeMatchRows(step, {}, context, limits);
   assert.notEqual(runtimeRowIdentity(context.matched.rows[0]), runtimeRowIdentity(context.matched.rows[1]));
   const spec = diagramSpec('matched', ['Source', 'right_Address'], ['right_Category']);
   spec.result.diagrams[0].edgeMappings[0].labelTemplate = '${right_Value}';
@@ -58,7 +91,7 @@ test('pair-grain source records and labels survive aggregation, source reorderin
   assert.equal(expected.label, 'X [first]\nY [second]');
   assert.equal(expected.data.aggregation.memberCount, 2);
   context.right.rows.reverse();
-  context.matched = executeMatchRows(step, {}, context, limits);
+  context.matched = await executeMatchRows(step, {}, context, limits);
   const reordered = buildResultDiagrams(spec, context, {}, limits)[0].edges[0];
   assert.equal(reordered.label, expected.label);
   assert.equal(reordered.id, expected.id);
@@ -120,7 +153,7 @@ test(`catalog-confirmed deep fields on ${sourceKind} match cards are materialize
   const dependencies = dependencyMapWithHash(spec);
   for (const step of spec.steps) {
     if (step.type === 'selectCards') context[step.as] = await executeSelectCards(request, step, {}, context, limits, dependencies);
-    else if (step.type === 'matchRows') context[step.as] = executeMatchRows(step, {}, context, limits);
+    else if (step.type === 'matchRows') context[step.as] = await executeMatchRows(step, {}, context, limits);
     else if (step.type === 'enrichRows') context[step.as] = await executeEnrichRows(request, step, {}, context, limits);
     else assert.fail(`Unexpected step: ${step.type}`);
   }

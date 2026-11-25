@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { chromium } from 'playwright';
 import { buildLargeTableIndex, queryLargeTablePage } from '../../scripts/report-table-pages.mjs';
+import { defaultRuntimeConfig, renderDynamicPagesShell, validateTemplateSpecForStorage } from '../../scripts/dev-proxy-server.mjs';
 import { bindViewLargeExecutionHelpers } from '../fixtures/view-large-execution-helpers.mjs';
 
 const source = readFileSync(new URL('../../scripts/dev-proxy-server.mjs', import.meta.url), 'utf8');
@@ -15,6 +16,7 @@ const names = [
   'stagedTemplateTransfer', 'templateVersionOwner', 'templateVersionOwnerIsCurrent', 'fetchVersions', 'loadVersion', 'renderVersions',
   'clearDraftExecutionState', 'selectedExtractionSource', 'renderActionButton', 'publishModelForSpec',
   'templateWriteKey', 'templateWritePending', 'templateTransferActionState', 'templateSaveBlockTitle', 'templatePublishBlockTitle',
+  'templatePublicationNotice', 'runtimeQuery', 'publicSnapshotRunPath', 'publicSnapshotRevision',
   'syncImportedDiagramSaveGate', 'renderTemplateTransferIssues', 'renderTemplateTransferSaveIssues',
   'applyPublicationToSpec', 'publicationRefreshConsentMissing', 'handlePublicationRefreshChange',
   'renderPublicationEditor', 'applyPublicationEditor', 'publishSnapshot', 'validateUiResponse',
@@ -22,6 +24,7 @@ const names = [
   'inferStoredViewLargeTable', 'inferViewComposerModel', 'normalizeViewComposerColumn', 'renderViewComposerMultiModeOptions',
   'viewLargeColumnOptions', 'viewLargeAttributeIsMultiple', 'viewLargeClassFieldOptions', 'viewLargeResultOptions',
   'viewLargeDeclaredColumns', 'viewLargeSourceFields', 'viewLargeSourceFieldOptions', 'viewLargeSimpleFieldOptions',
+  'viewLargeAdvancedResultFields', 'currentReportRowLimits', 'reportRowRecommendationHelp',
   'diagramImportUniqueStageCardSources',
   'viewLargeSimpleSelector', 'viewLargeSelectorMode', 'renderViewLargeChoiceOptions', 'renderFieldHelp',
   'renderViewLargeField', 'renderViewLargeSelect', 'renderViewLargePicker', 'renderViewLargeSelectorFields',
@@ -40,7 +43,7 @@ const functions = names.map((name) => {
   return source.slice(start, source.indexOf('\n  }', start) + 4);
 }).join('\n');
 const viewLargeExecutionHelpers = bindViewLargeExecutionHelpers(source)();
-const translations = [...source.matchAll(/^      ((?:transfer|publication|viewComposer|viewLarge|multiSelect|fieldPicker|fieldRequired|fieldHelpAria)\w*): ('[^\n]*'),$/gm)].map((match) => [match[1], Function('return ' + match[2])()]);
+const translations = [...source.matchAll(/^      ((?:transfer|publication|viewComposer|viewLarge|multiSelect|fieldPicker|fieldRequired|fieldHelpAria|ordinaryRowCeiling|pagedRowCeiling|reportRowRecommendations)\w*): ('[^\n]*'),$/gm)].map((match) => [match[1], Function('return ' + match[2])()]);
 const split = translations.findIndex(([key], index) => index > 0 && key === translations[0][0]);
 const en = Object.fromEntries(translations.slice(0, split));
 const ru = Object.fromEntries(translations.slice(split));
@@ -62,7 +65,8 @@ assert.ok(helpEscape, 'Designer field help Escape handler');
 
 const harness = `
 var apiPrefix = '/api';
-var boot = { templateTransferMaxBytes: 131072, snapshotRefreshTimeoutMs: 70000 };
+var boot = { templateTransferMaxBytes: 131072, snapshotRefreshTimeoutMs: 70000,
+  reportRowLimits: { ordinary: 1800, paged: 8000, recommendedOrdinary: 2000, recommendedPaged: 10000 } };
 var CMDB_BUILD_VIEW_KIND = 'cmdb-build-view';
 var state = { root: 'Root_A', session: 'session-A', sessionInstance: 1, templateEditorInstance: 1, templates: [], selectedTemplate: null, designerSection: 'template', templateVersions: [], uiDiagnosticRevision: 0,
   pendingTemplateWrites: new Map(), templatePublicationNotices: new Map(), get savingTemplate() { return templateWritePending(readTemplateCode()); } };
@@ -229,6 +233,7 @@ async function withPage(run, viewport = { width: 1280, height: 1000 }, contextOp
   const browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || '/usr/bin/google-chrome' });
   try {
     const page = await browser.newPage({ viewport, ...contextOptions });
+    page.setDefaultTimeout(5000);
     const pageErrors = [];
     page.on('pageerror', (error) => pageErrors.push(error.message));
     await page.route('https://transfer.test/**', async (route) => {
@@ -237,6 +242,10 @@ async function withPage(run, viewport = { width: 1280, height: 1000 }, contextOp
       if (url.pathname.endsWith('/export')) return route.fulfill({ json: { success: true, package: { template: route.request().postDataJSON().template }, fileName: 'current.cmdp-template.json' } });
       if (url.pathname.endsWith('/prepare')) return route.fulfill({json:ready});
       if (url.pathname.endsWith('/versions')) return route.fulfill({json:{success:true,data:[]}});
+      if (url.pathname === '/api/public-snapshots/existing/run') {
+        return route.fulfill({ json: { success: true, action: 'run', template: { code: 'existing' },
+          snapshotFound: false, result: { tables: [] }, cache: { scope: 'staticSnapshot', status: 'snapshot-miss' } } });
+      }
       if (url.pathname.endsWith('/publish')) {
         const { savedSpecHash, params } = route.request().postDataJSON();
         return route.fulfill({ json: { success: true, action: 'publish', template: { code: 'existing', active: true },
@@ -250,10 +259,130 @@ async function withPage(run, viewport = { width: 1280, height: 1000 }, contextOp
     });
     await page.goto('https://transfer.test/');
     await page.addScriptTag({ content: harness });
-    await run(page);
-    assert.deepEqual(pageErrors, []);
+    try { await run(page); }
+    finally { assert.deepEqual(pageErrors, []); }
   } finally { await browser.close(); }
 }
+
+async function withFullDesigner({ locale, section, runtimeConfig, spec }, run) {
+  const browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || '/usr/bin/google-chrome' });
+  const origin = 'https://designer.test';
+  const base = '/cmdbuild/dynamicpages/ui/designer';
+  const session = { username: 'editor', role: 'Admin' };
+  let saved = { ...original, spec };
+  const config = { exists: true, runtimeConfig: structuredClone(runtimeConfig) };
+  const writes = [];
+  try {
+    const page = await browser.newPage();
+    page.setDefaultTimeout(5000);
+    const errors = [];
+    page.on('pageerror', (error) => errors.push(error.message));
+    await page.route(origin + '/**', async (route) => {
+      const url = new URL(route.request().url());
+      if (url.pathname.startsWith(base)) {
+        return route.fulfill({ contentType: 'text/html', body: renderDynamicPagesShell({
+          mode: 'designer', session, designerSection: url.pathname.split('/').at(-1)
+        }) });
+      }
+      const method = route.request().method();
+      const name = url.pathname.split('/').at(-1);
+      if (name === 'client-log') return route.fulfill({ status: 204 });
+      let json = { success: true, data: [] };
+      if (name === 'session') json.session = session;
+      if (name === 'schema') json.schema = { root: 'Cst_QueryTool', ready: true };
+      if (name === 'csrf') json.token = 'test-csrf';
+      if (name === 'templates') json.data = spec ? [saved] : [];
+      if (name === 'config') {
+        if (method === 'PUT') {
+          const body = route.request().postDataJSON();
+          writes.push({ scope: url.searchParams.get('scope'), body });
+          config.runtimeConfig = url.searchParams.get('scope') === 'general'
+            ? { ...config.runtimeConfig, runtimeCache: body.runtimeConfig.runtimeCache } : body.runtimeConfig;
+        }
+        json.config = config;
+      }
+      if (name === 'existing' && method === 'PUT') {
+        const body = route.request().postDataJSON();
+        writes.push({ body });
+        saved = { ...saved, ...body, specHash: 'c'.repeat(64) };
+        json.template = saved;
+        json.executionValidation = { executable: true };
+      }
+      await route.fulfill({ json });
+    });
+    await page.goto(origin + base + '/' + section + '?lang=' + locale);
+    try { await run(page, writes); }
+    finally { assert.deepEqual(errors, []); }
+  } finally { await browser.close(); }
+}
+
+test('Designer saves general settings without submitting an unchanged above-ceiling row limit', async () => {
+  const ceiling = defaultRuntimeConfig().executionLimits.maxRowsMax;
+  for (const locale of ['ru', 'en']) {
+    await withFullDesigner({ locale, section: 'general-settings',
+      runtimeConfig: { executionLimits: { maxRowsMax: ceiling + 200 }, runtimeCache: { refreshCooldownSec: 180 } } },
+    async (page, writes) => {
+      const general = page.locator('#cmdp-general-settings');
+      const warning = general.getByRole('status');
+      await warning.waitFor();
+      assert.ok((await warning.boundingBox()).height > 0);
+      assert.match(await warning.innerText(), new RegExp(String(ceiling + 200)));
+      assert.match(await warning.innerText(), new RegExp(String(ceiling)));
+      assert.match(await warning.innerText(), locale === 'ru' ? /Лимиты выполнения → Максимум строк/ : /Execution limits → Maximum rows/);
+      await general.locator('#cmdp-runtime-refresh-cooldown-sec').fill('240');
+      await page.locator('[data-action="save-general-settings"]').click();
+      await page.locator('.notice.ok').filter({ hasText: locale === 'ru' ? 'Настройки сохранены' : 'Config saved' }).waitFor();
+      assert.deepEqual(writes, [{ scope: 'general', body: { runtimeConfig: { runtimeCache: { refreshCooldownSec: 240 } } } }]);
+      await page.locator('a[data-designer-section="settings"]').click();
+      const maximum = page.locator('#cmdp-runtime-max-rows-max');
+      assert.equal(await maximum.inputValue(), String(ceiling + 200));
+      await page.locator('[data-action="save-config"]').click();
+      await page.getByRole('alert').filter({ hasText: String(ceiling) }).waitFor();
+      assert.equal(writes.length, 1);
+      await maximum.fill(String(ceiling));
+      await page.locator('[data-action="save-config"]').click();
+      await page.locator('.notice.ok').filter({ hasText: locale === 'ru' ? 'Настройки сохранены' : 'Config saved' }).waitFor();
+      assert.equal(writes[1].body.runtimeConfig.executionLimits.maxRowsMax, ceiling);
+      assert.equal(writes[1].body.runtimeConfig.runtimeCache.refreshCooldownSec, 240);
+    });
+  }
+});
+
+test('Designer rejects bad numeric input and removes a selection limit only on deliberate clear', async () => {
+  const spec = { version: 1, steps: [{ type: 'selectCards', as: 'objects', className: 'Item', limit: 100 }],
+    result: { tables: [{ name: 'objects', columns: ['Code'] }] } };
+  await withFullDesigner({ locale: 'ru', section: 'templates', spec }, async (page, writes) => {
+    await page.locator('[data-action="select-template"][data-code="existing"]').click();
+    await page.locator('a[data-designer-section="object-group"]').click();
+    const field = page.locator('#cmdp-object-row-limit-0');
+    await field.waitFor();
+    assert.ok((await field.boundingBox()).width > 0);
+    assert.equal(await field.inputValue(), '100');
+    await field.fill('');
+    await field.press('-');
+    assert.equal(await field.evaluate((input) => input.validity.badInput), true);
+    await page.locator('[data-action="apply-object-group"]').click();
+    await page.getByRole('alert').filter({ hasText: 'должен быть положительным целым числом' }).waitFor();
+    assert.equal(await field.inputValue(), '100');
+    for (const value of ['0', '1.5']) {
+      await field.fill(value);
+      await page.locator('[data-action="apply-object-group"]').click();
+      await page.getByRole('alert').filter({ hasText: 'должен быть положительным целым числом' }).waitFor();
+      assert.equal(await field.inputValue(), '100');
+    }
+    assert.deepEqual(writes, []);
+    await field.fill('');
+    await page.locator('[data-action="apply-object-group"]').click();
+    await page.locator('.notice.ok').filter({ hasText: 'Спецификация группы объектов применена' }).waitFor();
+    assert.equal(await field.inputValue(), '');
+    await Promise.all([
+      page.waitForResponse((response) => new URL(response.url()).pathname.endsWith('/templates/existing') && response.request().method() === 'PUT'),
+      page.locator('[data-action="save-template"]').click()
+    ]);
+    assert.equal(writes.length, 1);
+    assert.equal(Object.hasOwn(writes[0].body.spec.steps[0], 'limit'), false);
+  });
+});
 
 async function importFile(page) {
   await page.locator('#cmdp-transfer-file').setInputFiles(file);
@@ -428,6 +557,47 @@ test('Designer restores each selector draft and keeps fields still valid when th
     assert.deepEqual(await page.evaluate(() => readEditorPayload().spec.result.tables[0].presentation.largeTable.selector), {
       kind: 'result', source: 'services', idField: 'Code', labelField: 'Code', matchField: 'Code'
     });
+  });
+});
+
+test('Designer clears projected-out advanced fields and saves the corrected binding after reopening', async () => {
+  await withPage(async (page) => {
+    const { mode, field, advanced } = await openSimpleLargeTable(page);
+    await page.evaluate(() => {
+      state.selectedTemplate.spec.steps.push({ type: 'composeRows', as: 'projected', from: 'services',
+        columns: [{ name: 'Name', field: 'Code' }] });
+    });
+    await field.selectOption('Code');
+    await mode.selectOption('advanced');
+    // A full rerender picks up the new candidate without changing the draft.
+    await page.evaluate(() => renderDesigner());
+    await advanced('source').selectOption('projected');
+    assert.equal(await advanced('idField').inputValue(), '');
+    assert.equal(await advanced('labelField').inputValue(), '');
+    assert.equal(await advanced('matchField').inputValue(), 'Code');
+    await page.locator('[data-action="save-template"]').click();
+    assert.equal(await page.evaluate(() => evidence.requests.length), 0);
+    for (const name of ['idField', 'labelField']) {
+      const picker = advanced(name).locator('..');
+      const toggle = picker.locator('[data-action="catalog-field-picker-toggle"]');
+      assert.ok((await toggle.boundingBox()).width > 0);
+      await toggle.click();
+      await picker.getByRole('searchbox').fill('Code');
+      assert.equal(await picker.locator('[data-catalog-field-picker-value="Code"]').count(), 0);
+      await picker.getByRole('searchbox').fill('Name');
+      await picker.locator('[role="option"][data-catalog-field-picker-value="Name"]').click();
+    }
+    await page.locator('[data-action="save-template"]').click();
+    await page.waitForFunction(() => evidence.requests.length === 1 && !state.savingTemplate);
+    const { spec } = await page.evaluate(() => evidence.requests[0].body);
+    assert.deepEqual(spec.result.tables[0].presentation.largeTable.selector,
+      { kind: 'result', source: 'projected', idField: 'Name', labelField: 'Name', matchField: 'Code' });
+    assert.deepEqual(validateTemplateSpecForStorage(spec), []);
+    spec.result.tables[0].presentation.largeTable.selector.labelField = 'Code';
+    assert.ok(validateTemplateSpecForStorage(spec).some(({ path }) => path.endsWith('.selector.labelField')));
+    await page.evaluate(() => { hydrateDesignerStateFromTemplate(); renderDesigner(); });
+    assert.equal(await advanced('idField').inputValue(), 'Name');
+    assert.equal(await advanced('labelField').inputValue(), 'Name');
   });
 });
 
@@ -706,10 +876,11 @@ test('Designer publication defaults to personal and publishes without extra cons
     assert.equal(await mode.inputValue(), 'personal');
     assert.equal(await page.locator('#cmdp-publish-shared-refresh-warning').isVisible(), false);
     await page.locator('[data-action="publish-snapshot"]').click();
-    await page.waitForFunction(() => evidence.requests.length === 2 && !state.savingTemplate);
-    const [save, publish] = await page.evaluate(() => evidence.requests);
+    await page.waitForFunction(() => evidence.requests.length === 3 && !state.savingTemplate);
+    const [save, baseline, publish] = await page.evaluate(() => evidence.requests);
     assert.equal(save.body.spec.publish.refreshMode, 'personal');
     assert.equal(Object.hasOwn(save.body.spec.publish, 'sharedRefreshAccepted'), false);
+    assert.match(baseline.path, /^\/api\/public-snapshots\/existing\/run\?/);
     assert.equal(publish.path, '/api/templates/existing/publish?root=Root_A');
     assert.equal(publish.timeoutMs, 70000);
     assert.deepEqual(publish.body, { params: {}, savedSpecHash: 'a'.repeat(64) });

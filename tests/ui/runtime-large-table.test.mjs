@@ -11,7 +11,9 @@ const source = readFileSync(new URL('../../scripts/dev-proxy-server.mjs', import
 const first = source.indexOf('function renderDynamicPagesShell(');
 const last = source.indexOf('\nfunction isCollectionLimitedAuthoringRequest(', first);
 assert.ok(first >= 0 && last > first);
-const shellSource = source.slice(first, last);
+const shellSource = source.slice(first, last).replace('  function reportLimitSummary(diagnostic) {',
+  '  window.reportLimitTest = { summary: reportLimitSummary, fields: renderExecutionLimitFields, view: renderViewLargeTable };\n' +
+  '  function reportLimitSummary(diagnostic) {');
 // Render the actual embedded script and stylesheet without starting the backend.
 const shellBindings = Object.fromEntries([...shellSource.matchAll(/(?<!\\)\$\{(?:JSON\.stringify\()?([A-Z][A-Z0-9_]+)\b/g)].map(([, name]) => [name, 1]));
 Object.assign(shellBindings, {
@@ -20,6 +22,7 @@ Object.assign(shellBindings, {
   DEFAULT_TECHNICAL_ROOT: 'Root_A',
   APPLICATION_VERSION: 'test',
   DRAFT_PREVIEW_TIMEOUT_MS: 5000,
+  REPORT_ROW_LIMITS: { ordinary: 1800, paged: 8000, recommendedOrdinary: 2000, recommendedPaged: 10000 },
   DEFAULT_EMPTY_RESULT_TEXT: 'Nothing to display.',
   DEFAULT_PERMISSION_DENIED_TEXT: 'Denied',
   assistantStatus: () => ({}),
@@ -83,6 +86,44 @@ async function withViewer({ kind, snapshotRefreshSessionPresent = false, locale 
     await browser.close();
   }
 }
+
+test('report limit controls and remediation use deployment values in both locales', async () => {
+  for (const [locale, source, action, clear] of [
+    ['ru', /Итоговые данные → Источник данных/, /Все строки, постранично/, /уменьшите значение или очистите поле/i],
+    ['en', /Final data → Data source/, /All rows, paginated/, /lower the value or clear it/i]
+  ]) {
+    await withViewer({ kind: 'dynamic', locale, respond: () => shellPayload(null, [ordinary]) }, async (page) => {
+      const summary = await page.evaluate(() => {
+        const fixture = document.createElement('section');
+        fixture.id = 'row-limit-fixture';
+        fixture.innerHTML = window.reportLimitTest.fields({ maxRowsMax: 1700, maxRowsDefault: 500,
+          maxRowsPreviewDefault: 25, maxRowsDataPreviewDefault: 100 }) +
+          window.reportLimitTest.view({ sourceAlias: 'chosen' }, [], {});
+        document.body.append(fixture);
+        const ordinary = { reason: 'row_limit_configuration_conflict', phase: 'rows', sourceLabel: 'Source label',
+          stepAlias: 'internal_alias', stepLabel: 'Step label', requested: 5000, effectiveLimit: 1800,
+          rowLimitMode: 'ordinary', rowLimitCauses: ['ordinaryCeiling'], canUseLargeTable: true };
+        return {
+          ordinary: window.reportLimitTest.summary({ diagnostics: { limits: [{ ...ordinary, phase: 'selector' }, ordinary] } }),
+          paged: window.reportLimitTest.summary({ diagnostics: { limits: [{ ...ordinary, reason: 'limit_exceeded',
+            rowLimitMode: 'paged', rowLimitCauses: ['pagedCeiling'], effectiveLimit: 8000, observed: 8001, canUseLargeTable: false }] } })
+        };
+      });
+      assert.match(summary.ordinary, source);
+      assert.match(summary.ordinary, action);
+      assert.match(summary.ordinary, clear);
+      assert.equal(summary.ordinary.split('Step label.').length, 2);
+      assert.doesNotMatch(summary.ordinary, /internal_alias/);
+      assert.doesNotMatch(summary.paged, action);
+      assert.match(summary.paged, /8001/);
+      assert.equal(await page.locator('#cmdp-report-ordinary-ceiling[readonly]').inputValue(), '1800');
+      assert.equal(await page.locator('#cmdp-report-paged-ceiling[readonly]').inputValue(), '8000');
+      assert.equal(await page.locator('#cmdp-runtime-max-rows-max').getAttribute('max'), '1800');
+      const help = await page.locator('#cmdp-view-large-mode-help').textContent();
+      for (const value of ['1800', '8000', '2000', '10000']) assert.match(help, new RegExp(value));
+    });
+  }
+});
 
 test('dynamic viewer separates table views and rejects late keyed rows', async () => {
   let expire = false;

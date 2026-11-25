@@ -101,6 +101,7 @@ test('snapshot mutations only treat known API gateway failures as definitive aft
     assert.equal(unknown(bad(504, { success: false, action: 'run', reason: timeout })), true);
     assert.equal(unknown(bad(503, { success: false, action, reason: 'snapshot_commit_outcome_unknown' })), true);
     assert.equal(unknown(bad(503, { success: false, action, reason: 'snapshot_storage_unavailable' })), false);
+    assert.equal(unknown(bad(502, { success: false, action, reason: 'snapshot_refresh_data_unavailable' })), false);
     assert.equal(unknown(bad(503, null), { ...sent, requestSent: false }), false);
     assert.equal(unknown(bad(403, null)), false);
   }

@@ -16,7 +16,7 @@
  * @property {string} alias
  * @property {string} className
  * @property {string} from
- * @property {number} limit
+ * @property {number} [limit]
  * @property {string[]} columns
  * @property {ObjectFlowSelectionRule[]} rules
  */
@@ -401,7 +401,7 @@ function normalizeSelection(value, index) {
   const selection = isRecord(value) ? value : {};
   const alias = text(selection.alias);
   const requestedLimit = selection.limit === undefined || selection.limit === null || selection.limit === ''
-    ? 100
+    ? undefined
     : Number(selection.limit);
   const rules = Array.isArray(selection.rules) ? selection.rules.map(normalizeSelectionRule) : [];
   const requestedFilterJoin = text(selection.filterJoin);
@@ -411,7 +411,7 @@ function normalizeSelection(value, index) {
     alias,
     className: text(selection.className),
     from: text(selection.from),
-    limit: requestedLimit,
+    ...(requestedLimit === undefined ? {} : { limit: requestedLimit }),
     columns: normalizeColumns(selection.columns),
     filterJoin: requestedFilterJoin || inferredSelectionFilterJoin(rules),
     rules
@@ -827,7 +827,7 @@ export function validateObjectFlow(flow) {
     if (!selection.className || !CLASS_NAME_PATTERN.test(selection.className)) {
       addError(errors, `${path}.className`, 'Selection className must be a CMDBuild identifier.');
     }
-    if (!Number.isInteger(selection.limit) || selection.limit <= 0) {
+    if (selection.limit !== undefined && (!Number.isSafeInteger(selection.limit) || selection.limit <= 0)) {
       addError(errors, `${path}.limit`, 'Selection limit must be a positive integer.');
     }
     if (!FILTER_JOINS.has(selection.filterJoin)) {
@@ -1183,7 +1183,7 @@ function compileObjectFlowSteps(flow) {
       className: selection.className,
       filters,
       filterJoin: selection.filterJoin,
-      limit: selection.limit,
+      ...(selection.limit === undefined ? {} : { limit: selection.limit }),
       as: selection.alias
     };
     if (selection.from) step.from = selection.from;
@@ -1373,7 +1373,7 @@ function visualSelection(selection) {
     alias: selection.alias,
     className: selection.className,
     from: selection.from,
-    limit: selection.limit,
+    ...(selection.limit === undefined ? {} : { limit: selection.limit }),
     columns: selection.columns.slice(),
     filterJoin: selection.filterJoin,
     sourceType: 'cmdb',
@@ -1382,7 +1382,7 @@ function visualSelection(selection) {
       type: 'cmdb',
       className: selection.className,
       from: selection.from,
-      limit: selection.limit,
+      ...(selection.limit === undefined ? {} : { limit: selection.limit }),
       columns: selection.columns.slice()
     },
     output: {

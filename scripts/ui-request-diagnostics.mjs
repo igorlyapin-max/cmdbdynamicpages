@@ -110,17 +110,22 @@ export function createUiRequestDiagnostics() {
     const source = object(input);
     if (typeof source.table !== 'string' ||
         !['selector', 'rows', 'index', 'commit'].includes(source.phase) ||
-        !['limit_exceeded', 'completeness_unconfirmed', 'deadline_exceeded'].includes(source.reason)) return null;
+        !['limit_exceeded', 'completeness_unconfirmed', 'deadline_exceeded', 'row_limit_configuration_conflict'].includes(source.reason)) return null;
     const item = { phase: source.phase, reason: source.reason };
-    for (const key of ['table', 'stepAlias', 'stepType', 'limitName', 'configKey']) {
+    for (const key of ['table', 'stepAlias', 'stepType', 'limitName', 'configKey', 'sourceAlias', 'sourceLabel', 'stepLabel']) {
       if (typeof source[key] !== 'string') continue;
-      const max = key === 'table' || key === 'stepAlias' ? 128 : 64;
+      const max = ['table', 'stepAlias', 'sourceAlias', 'sourceLabel', 'stepLabel'].includes(key) ? 128 : 64;
       const label = text(source[key], max).replace(/\s+/g, ' ').trim();
       // Budget encoded JSON too, so escaped characters cannot crowd out other entries.
       item[key] = bytes(JSON.stringify(label)) <= max + 2 ? label : clip(label, max / 2);
     }
     if (['runtime-settings', 'object-flow-step', 'product', 'upstream'].includes(source.source)) item.source = source.source;
-    if (['cards', 'relations', 'calls', 'rows', 'memberships', 'bytes', 'classes', 'domains', 'milliseconds', 'hops'].includes(source.unit)) item.unit = source.unit;
+    if (['ordinary', 'paged'].includes(source.rowLimitMode)) item.rowLimitMode = source.rowLimitMode;
+    if (Array.isArray(source.rowLimitCauses)) {
+      item.rowLimitCauses = ['stepLimit', 'runtimeMaximum', 'ordinaryCeiling', 'pagedCeiling'].filter((cause) => source.rowLimitCauses.includes(cause));
+    }
+    for (const key of ['canUseLargeTable', 'usedByDiagram']) if (typeof source[key] === 'boolean') item[key] = source[key];
+    if (['cards', 'relations', 'calls', 'rows', 'memberships', 'bytes', 'classes', 'domains', 'milliseconds', 'hops', 'checks'].includes(source.unit)) item.unit = source.unit;
     if (Number.isSafeInteger(source.stepIndex) && source.stepIndex >= 0) item.stepIndex = source.stepIndex;
     for (const key of ['requested', 'effectiveLimit', 'observed', 'total', 'elapsedMs']) {
       if (finite(source[key]) && source[key] >= 0) item[key] = source[key];

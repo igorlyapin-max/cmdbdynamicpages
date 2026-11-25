@@ -63,6 +63,19 @@ CMDBDYNAMIC_REDIS_URL=redis://:password@redis-host:6379/0
 
 In every case the value must come from deployment secret/env, not from git. Precedence is `CMDBDYNAMIC_REDIS_PASSWORD_FILE`, then `CMDBDYNAMIC_REDIS_PASSWORD`, then the password embedded in `CMDBDYNAMIC_REDIS_URL`.
 
+### Report row limits
+
+| Deployment variable | Default and recommendation | What it controls |
+| --- | ---: | --- |
+| `CMDP_EXECUTION_MAX_ROWS_ABSOLUTE` | `2000` | Deployment ceiling for the Designer **Maximum rows** setting (`executionLimits.maxRowsMax`). Ordinary publication uses **Maximum rows**, not the default row count used for ordinary runs or previews. |
+| `CMDP_LARGE_TABLE_MAX_ROWS` | `10000` | Total source-row budget per paged table, not the number of rows fetched by the browser (50 by default, up to 100 per request). |
+
+Use positive safe integers for both values (`1` through `9007199254740991`). `CMDP_LARGE_TABLE_MAX_ROWS` must be strictly greater than `CMDP_EXECUTION_MAX_ROWS_ABSOLUTE`. Defaults apply only to unset variables. An empty value or other invalid configuration prevents the backend from starting. Restart the backend after changing its environment. With Compose, apply the updated `.env` by recreating `cmdbdynamicpages` with the same overlays used for deployment; `docker compose restart` does not apply changed environment variables.
+
+Keep the recommended ceilings unless a measured workload justifies raising them. When a report needs more rows than **Maximum rows**, select **Final data → Large table → Row browsing → All rows, paginated**. If the large-table budget is already exhausted, narrow the selection or split the report. Leave **Limit** blank in new **Object group** selections unless an intentional restriction is needed. Existing explicit step limits are not rewritten or removed. If a row limit makes a result incomplete, publication and refresh report the problem instead of silently trimming the result. Check the [runbook diagnostics](runbook.md#large-table) before raising the ceilings.
+
+Raising a row ceiling does not raise the card scan maximum, the D2 visual limits, or the matching budget. If diagnostics report `maxMatchRuleChecks`, narrow both input selections. One execution can check up to 5,000,000 match rules, regardless of how many rows match.
+
 ## 3. Redis
 
 For dev:

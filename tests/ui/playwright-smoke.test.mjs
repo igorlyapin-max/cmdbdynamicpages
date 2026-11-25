@@ -5808,6 +5808,7 @@ test('[required:snapshot-refresh] Static reports reread, refresh personally or r
           posts.push(request.postDataJSON());
         }
       });
+      const isCheckResponse = (response) => new URL(response.url()).pathname.endsWith(`/public-snapshots/${reportCode}/run`);
       for (const { id, unknown, ...reply } of fixtures) {
         const intercept = (requestRoute) => requestRoute.fulfill({ ...reply, headers: { 'x-request-id': id } });
         await page.route(route, intercept);
@@ -5816,16 +5817,22 @@ test('[required:snapshot-refresh] Static reports reread, refresh personally or r
         await status.filter({ hasText: id }).waitFor();
         assert.equal(await check.isVisible(), Boolean(unknown));
         assert.equal(await row(page, 'New shared value').isVisible(), true);
+        if (unknown) {
+          assert.equal(await action(page, 'refresh').isDisabled(), true);
+          const writesBeforeCheck = posts.length;
+          const [current] = await Promise.all([page.waitForResponse(isCheckResponse), check.click()]);
+          assert.equal(current.request().method(), 'GET');
+          assert.equal(new URL(current.url()).searchParams.get('snapshotParams'), snapshotParams);
+          assert.equal((await current.json()).cache.snapshotRevision, sharedAck.cache.snapshotRevision);
+          await check.waitFor({ state: 'hidden' });
+          assert.equal(await action(page, 'refresh').isEnabled(), true);
+          assert.equal(posts.length, writesBeforeCheck);
+        }
         await page.unroute(route, intercept);
       }
-      const [current] = await Promise.all([page.waitForResponse((response) =>
-        new URL(response.url()).pathname.endsWith(`/public-snapshots/${reportCode}/run`)), check.click()]);
-      assert.equal(current.request().method(), 'GET');
-      assert.equal(new URL(current.url()).searchParams.get('snapshotParams'), snapshotParams);
-      assert.equal((await current.json()).cache.snapshotRevision, sharedAck.cache.snapshotRevision);
       const checked = page.locator('[data-snapshot-check-status]');
       await checked.locator('a').waitFor();
-      assert.match(await checked.innerText(), /does not confirm the refresh attempt|не подтверждает результат попытки обновления/);
+      assert.match(await checked.innerText(), /has not changed|Снимок не изменился/);
       assert.ok((await checked.innerText()).includes(sharedAck.cache.publishedAt));
       assert.equal(posts.length, fixtures.length);
       assert.ok(posts.every(({ expectedMode, expectedSnapshotRevision }) =>
@@ -5921,7 +5928,7 @@ test('[required:publication-limit-diagnostics] Snapshot publish and refresh expl
       const refreshFailure = await assertLimitResponse(refresh);
       const refreshNotice = page.locator('[data-snapshot-status].snapshot-error');
       await refreshNotice.waitFor();
-      assert.match(await refreshNotice.innerText(), /Could not refresh the report.*Report rows.*limitedItems.*Limit exceeded.*Result row count \(object flow step\).*Limit \(rows\): 2.*Observed: 3/);
+      assert.match(await refreshNotice.innerText(), /Could not refresh the report.*Limit exceeded.*Limit for this mode: 2 rows.*Found at least 3 rows.*Object group/);
       assert.equal(await row(first).isVisible(), true);
       assert.equal(await row(third).count(), 0);
       const viewerDetails = page.locator('[data-snapshot-diagnostics] [data-ui-error-diagnostics]');
@@ -5949,7 +5956,7 @@ test('[required:publication-limit-diagnostics] Snapshot publish and refresh expl
       const alert = notice.getByRole('alert');
       await alert.waitFor();
       const summary = await alert.innerText();
-      assert.match(summary, /Не удалось опубликовать снимок.*Строки отчёта.*limitedItems.*Лимит превышен.*Число строк результата \(шаг потока объектов\).*Лимит \(строки\): 2.*Фактически: 3/);
+      assert.match(summary, /Не удалось опубликовать снимок.*Лимит превышен.*Лимит для этого режима: 2 строк.*Найдено не менее 3 строк.*Группа объектов/);
       assert.doesNotMatch(summary, /table_result_incomplete|maxRows|limit_exceeded|Запрошено/);
       const details = notice.locator('[data-ui-error-diagnostics]');
       assert.equal(await details.isVisible(), true);
@@ -6037,6 +6044,9 @@ test('[required:publication-outcome] Designer distinguishes a proven deadline fr
           return route.abort('connectionreset');
         }
         if (outcome === 'proxy-502') return route.fulfill({ status: 502, headers, body: '<html>Bad Gateway</html>' });
+        if (outcome === 'data-unavailable') return route.fulfill({ status: 502, headers, json: {
+          success: false, action: 'publish', reason: 'snapshot_refresh_data_unavailable', code: 'snapshot_refresh_data_unavailable'
+        } });
         if (outcome === 'proxy-503') return route.fulfill({ status: 503, headers, json: { success: false, code: 'upstream_unavailable' } });
         if (outcome === 'proxy-504') return route.fulfill({ status: 504, headers, body: 'Gateway Timeout' });
         if (outcome === 'commit-unknown') return route.fulfill({ status: 503, headers, json: {
@@ -6056,6 +6066,7 @@ test('[required:publication-outcome] Designer distinguishes a proven deadline fr
       const alert = notice.getByRole('alert');
       const check = notice.getByRole('button', { name: 'Проверить текущий снимок' });
       const startPublish = () => Promise.all([page.waitForRequest(isPublish), publish.click()]);
+      const isCheckResponse = (response) => new URL(response.url()).pathname.endsWith(`/public-snapshots/${code}/run`);
       await startPublish();
       await page.clock.fastForward(draftPreviewTimeoutMs + 100);
       releaseDeadline();
@@ -6085,6 +6096,14 @@ test('[required:publication-outcome] Designer distinguishes a proven deadline fr
       assert.match(await details.locator('summary').innerText(), /HTTP 403/);
       assert.equal(posts.length, 2);
 
+      outcome = 'data-unavailable';
+      await startPublish();
+      await details.locator('summary').filter({ hasText: 'publication-data-unavailable' }).waitFor();
+      assert.equal(await check.count(), 0);
+      assert.equal(posts.length, 3);
+
+      const checkRoute = `**/public-snapshots/${code}/run?*`;
+      let reconciliationReads = 0;
       for (const fixture of ['proxy-502', 'proxy-503', 'proxy-504', 'commit-unknown', 'invalid-success']) {
         outcome = fixture;
         await startPublish();
@@ -6092,9 +6111,37 @@ test('[required:publication-outcome] Designer distinguishes a proven deadline fr
         await details.locator('summary').filter({ hasText: `publication-${fixture}` }).waitFor();
         assert.match(await alert.innerText(), /Результат публикации неизвестен/);
         assert.equal(await page.getByText('Снимок опубликован.', { exact: true }).count(), 0);
+        assert.equal(await publish.isDisabled(), true);
+        const beforeCheck = posts.length;
+        if (fixture === 'proxy-502') {
+          const unavailable = (route) => route.fulfill({ status: 503, json: { success: false } });
+          await page.route(checkRoute, unavailable);
+          await Promise.all([page.waitForResponse(isCheckResponse), check.click()]);
+          await notice.locator('[data-snapshot-check-status]').filter({ hasText: 'Не удалось проверить' }).waitFor();
+          assert.equal(await publish.isDisabled(), true);
+          assert.equal(posts.length, beforeCheck);
+          reconciliationReads++;
+          await page.unroute(checkRoute, unavailable);
+        }
+        const revision = 'c'.repeat(64);
+        const replacement = fixture === 'proxy-503' ? (route) => route.fulfill({ json: {
+          ...initialSnapshotBody, cache: { ...initialSnapshotBody.cache, snapshotRevision: revision }
+        } }) : fixture === 'proxy-504' ? (route) => route.fulfill({ json: {
+          ...initialSnapshotBody, snapshotFound: false, cache: { scope: 'staticSnapshot', status: 'snapshot-miss' }
+        } }) : null;
+        if (replacement) await page.route(checkRoute, replacement);
+        await Promise.all([page.waitForResponse(isCheckResponse), check.click()]);
+        await check.waitFor({ state: 'hidden' });
+        if (replacement) await page.unroute(checkRoute, replacement);
+        const status = await notice.locator('[data-snapshot-check-status]').innerText();
+        assert.match(status, fixture === 'proxy-503' ? new RegExp(revision) :
+          fixture === 'proxy-504' ? /Текущий снимок не найден/ : /Снимок не изменился/);
+        assert.equal(posts.length, beforeCheck, 'reconciliation never repeats a write');
+        assert.equal(await publish.isEnabled(), true);
+        reconciliationReads++;
       }
-      assert.equal(posts.length, 7);
-      assert.equal(checks.length, 0);
+      assert.equal(posts.length, 8);
+      assert.equal(checks.length, posts.length + reconciliationReads);
 
       outcome = 'disconnect';
       const [interrupted] = await startPublish();
@@ -6116,10 +6163,10 @@ test('[required:publication-outcome] Designer distinguishes a proven deadline fr
       await details.locator('summary').filter({ hasText: interruptedId }).waitFor();
       assert.ok((await check.boundingBox())?.height > 0);
       assert.match(await alert.innerText(), /Результат публикации неизвестен/);
-      assert.equal(checks.length, 0);
-      assert.deepEqual(posts[7].params, { site: 42 });
+      assert.equal(checks.length, posts.length + reconciliationReads);
+      assert.deepEqual(posts[8].params, { site: 42 });
       await page.clock.fastForward(snapshotRefreshTimeoutMs);
-      assert.equal(posts.length, 8);
+      assert.equal(posts.length, 9);
 
       const [checked] = await Promise.all([page.waitForResponse((response) =>
         new URL(response.url()).pathname.endsWith(`/public-snapshots/${code}/run`)), check.click()]);
@@ -6130,12 +6177,14 @@ test('[required:publication-outcome] Designer distinguishes a proven deadline fr
       const link = notice.getByRole('link', { name: 'Открыть текущий снимок' });
       await link.waitFor({ timeout: 5000 });
       assert.ok((await link.boundingBox())?.width > 0);
-      assert.match(await notice.locator('[data-snapshot-check-status]').innerText(), /Это не подтверждает результат попытки публикации/);
+      assert.match(await notice.locator('[data-snapshot-check-status]').innerText(), /Снимок не изменился/);
       assert.ok((await notice.locator('[data-snapshot-check-status]').innerText()).includes(initialSnapshotBody.cache.publishedAt));
-      assert.equal(checks.length, 1);
-      assert.equal(checks[0].method(), 'GET');
+      assert.equal(checks.length, posts.length + reconciliationReads + 1);
+      assert.equal(checks.at(-1).method(), 'GET');
       const expectedParams = [['site', 42]];
-      assert.deepEqual(JSON.parse(new URL(checks[0].url()).searchParams.get('snapshotParams')), expectedParams);
+      const checkUrl = new URL(checks.at(-1).url());
+      assert.deepEqual(JSON.parse(checkUrl.searchParams.get('snapshotParams')), expectedParams);
+      assert.equal(checkUrl.searchParams.get('root'), new URL(interrupted.url()).searchParams.get('root'));
       assert.deepEqual(JSON.parse(new URL(await link.getAttribute('href'), proxyOrigin).searchParams.get('snapshotParams')), expectedParams);
       const [viewer] = await Promise.all([page.waitForEvent('popup'), link.click()]);
       const row = viewer.locator('#app [data-result-row]').getByText(code, { exact: true });
@@ -6144,7 +6193,7 @@ test('[required:publication-outcome] Designer distinguishes a proven deadline fr
       assert.equal(await viewer.locator('[data-action="snapshot-refresh"]').isVisible(), false);
       await viewer.close();
       assert.equal(protectedRuns.length, 0);
-      assert.equal(posts.length, 8);
+      assert.equal(posts.length, 9);
     } finally {
       releaseDeadline();
       releaseDisconnect();
