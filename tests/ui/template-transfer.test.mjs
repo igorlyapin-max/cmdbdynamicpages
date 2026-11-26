@@ -24,7 +24,9 @@ const names = [
   'inferStoredViewLargeTable', 'inferViewComposerModel', 'normalizeViewComposerColumn', 'renderViewComposerMultiModeOptions',
   'viewLargeColumnOptions', 'viewLargeAttributeIsMultiple', 'viewLargeClassFieldOptions', 'viewLargeResultOptions',
   'viewLargeDeclaredColumns', 'viewLargeSourceFields', 'viewLargeSourceFieldOptions', 'viewLargeSimpleFieldOptions',
-  'viewLargeAdvancedResultFields', 'currentReportRowLimits', 'reportRowRecommendationHelp',
+  'viewLargeSelectionClassNames', 'viewLargeFieldMetadata', 'viewLargeSimpleFieldModel', 'renderViewLargeSimpleFieldOptions',
+  'hydrateViewLargeSimpleFields', 'catalogAttributeLoadKey',
+  'viewLargeAdvancedResultFields', 'viewLargeResultFieldAvailable', 'boundedReportSetting', 'currentReportRowLimits', 'reportRowRecommendationHelp',
   'diagramImportUniqueStageCardSources',
   'viewLargeSimpleSelector', 'viewLargeSelectorMode', 'renderViewLargeChoiceOptions', 'renderFieldHelp',
   'renderViewLargeField', 'renderViewLargeSelect', 'renderViewLargePicker', 'renderViewLargeSelectorFields',
@@ -35,7 +37,8 @@ const names = [
   'catalogFieldPickerOptions', 'catalogFieldPickerMatches', 'renderCatalogFieldPickerRows', 'selectCatalogFieldPickerField',
   'syncCompactMultiSelectOption', 'handleViewLargeTableChange', 'markViewLargeTableEdited', 'readViewLargeTableDraft',
   'readViewLargeSelectorDraft', 'captureViewLargeSelectorDrafts', 'rebindViewLargeTableSource',
-  'captureViewComposerDraftFromDom', 'validateViewComposerDraft', 'buildViewComposerSpec', 'runDraftAction', 'readSpecWithEditorBlocks'
+  'captureViewComposerDraftFromDom', 'readViewComposerColumnRows', 'readViewComposerFields', 'validateViewComposerDraft',
+  'buildViewComposerSpec', 'applyViewComposerEditor', 'runDraftAction', 'readSpecWithEditorBlocks'
 ];
 const functions = names.map((name) => {
   const start = source.indexOf('  function ' + name + '(');
@@ -69,6 +72,7 @@ var boot = { templateTransferMaxBytes: 131072, snapshotRefreshTimeoutMs: 70000,
   reportRowLimits: { ordinary: 1800, paged: 8000, recommendedOrdinary: 2000, recommendedPaged: 10000 } };
 var CMDB_BUILD_VIEW_KIND = 'cmdb-build-view';
 var state = { root: 'Root_A', session: 'session-A', sessionInstance: 1, templateEditorInstance: 1, templates: [], selectedTemplate: null, designerSection: 'template', templateVersions: [], uiDiagnosticRevision: 0,
+  catalogAttributeLoaded: { item: true, service: true, rightcard: true },
   pendingTemplateWrites: new Map(), templatePublicationNotices: new Map(), get savingTemplate() { return templateWritePending(readTemplateCode()); } };
 window.evidence = { requests: [], downloads: [], captures: [], errors: [] };
 window.lang = 'en';
@@ -80,6 +84,7 @@ function escapeHtml(value) { return String(value == null ? '' : value).replaceAl
 function pretty(value) { return JSON.stringify(value, null, 2); }
 function cloneJsonValue(value) { return JSON.parse(JSON.stringify(value)); }
 function defaultSpec() { return {version:1}; }
+function defaultRuntimeConfig() { return { executionLimits: ${JSON.stringify(defaultRuntimeConfig().executionLimits)} }; }
 function templateKindForSpec() { return 'dsl'; }
 function readValue(id) { return document.getElementById(id)?.value || ''; }
 function hasField(id) { return Boolean(document.getElementById(id)); }
@@ -116,6 +121,9 @@ function diagramColumnOptionRowsForSource(spec, alias) {
     .concat(paths).map(value => ({value, label:value}));
 }
 function sourceClassForAlias(spec, alias) { return spec.steps?.find(step => step.as === alias)?.className || ''; }
+function catalogScopePathOptions(className) {
+  return className === 'Service' ? [{ value: 'Owner.Description', label: 'Owner.Description' }] : [];
+}
 function catalogAttributeOptions(className) {
   return [{name:'Code',description:'Code'},{name:'_id',description:'Identifier'},{name:'Description',description:'Description'}].concat({
     Item: [{name:'HiddenParentId',type:'integer'},{name:'ScopeIds',type:'lookupArray'}],
@@ -172,9 +180,11 @@ function renderDesigner() {
    '<textarea id="assistant-prompt">'+escapeHtml(state.prompt || '')+'</textarea>' +
    '<input id="cmdp-active" type="checkbox"'+(selected.active ? ' checked' : '')+'>' +
    '<button data-action="save-template">Save</button>' + renderVersions() +
-   (state.designerSection === 'view' ? renderViewComposerEditor(selected) + '<button data-action="draft-preview">Preview</button>' : '') +
+   (state.designerSection === 'view' ? renderViewComposerEditor(selected) +
+      '<button data-action="apply-view-composer">Apply</button><button data-action="draft-preview">Preview</button>' : '') +
    (state.designerSection === 'publication' ? renderPublicationEditor(selected) + '<button data-action="apply-publication">Apply</button><button data-action="publish-snapshot">Publish</button>' : '');
   if (state.designerSection === 'publication') syncImportedDiagramSaveGate();
+  hydrateViewLargeSimpleFields();
 }
 URL.createObjectURL = function(blob) { blob.text().then(text=>evidence.downloads.push(JSON.parse(text))); return 'blob:https://transfer.test/download'; };
 URL.revokeObjectURL = function() {};
@@ -213,6 +223,7 @@ document.addEventListener('click', function(event) {
    menu.hidden = !menu.hidden;
  }
  if (action === 'catalog-field-picker-select') selectCatalogFieldPickerField(target);
+ if (action === 'apply-view-composer') applyViewComposerEditor();
  if (action === 'draft-preview') runDraftAction('preview');
  ${actionLines.join('\n')}
 });
@@ -242,16 +253,16 @@ async function withPage(run, viewport = { width: 1280, height: 1000 }, contextOp
       if (url.pathname.endsWith('/export')) return route.fulfill({ json: { success: true, package: { template: route.request().postDataJSON().template }, fileName: 'current.cmdp-template.json' } });
       if (url.pathname.endsWith('/prepare')) return route.fulfill({json:ready});
       if (url.pathname.endsWith('/versions')) return route.fulfill({json:{success:true,data:[]}});
-      if (url.pathname === '/api/public-snapshots/existing/run') {
-        return route.fulfill({ json: { success: true, action: 'run', template: { code: 'existing' },
-          snapshotFound: false, result: { tables: [] }, cache: { scope: 'staticSnapshot', status: 'snapshot-miss' } } });
-      }
       if (url.pathname.endsWith('/publish')) {
+        if (route.request().method() === 'GET') {
+          return route.fulfill({ json: { success: true, action: 'publish', savedSpecHash: 'a'.repeat(64),
+            snapshotRevision: null, publishBaseline: 'c'.repeat(64) } });
+        }
         const { savedSpecHash, params } = route.request().postDataJSON();
         return route.fulfill({ json: { success: true, action: 'publish', template: { code: 'existing', active: true },
           params, result: { tables: [] }, cache: { enabled: true, scope: 'staticSnapshot', status: 'snapshot-published',
             sharedAcrossUsers: true, backend: 'memory', key: 'a'.repeat(16), specHash: savedSpecHash, paramsHash: 'b'.repeat(64),
-            publishedAt: '2026-01-01T00:00:00Z' } } });
+            publishedAt: '2026-01-01T00:00:00Z', snapshotRevision: 'd'.repeat(64) } } });
       }
       if (url.pathname === '/api/draft/preview') return route.fulfill({json:{success:true,result:{tables:[]}}});
       if (url.pathname.startsWith('/api/templates')) return route.fulfill({json:{success:true,template:{...route.request().postDataJSON(),id:7,specHash:'a'.repeat(64)},executionValidation:{executable:true}}});
@@ -264,7 +275,7 @@ async function withPage(run, viewport = { width: 1280, height: 1000 }, contextOp
   } finally { await browser.close(); }
 }
 
-async function withFullDesigner({ locale, section, runtimeConfig, spec }, run) {
+async function withFullDesigner({ locale, section, runtimeConfig, spec, attributes }, run) {
   const browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || '/usr/bin/google-chrome' });
   const origin = 'https://designer.test';
   const base = '/cmdbuild/dynamicpages/ui/designer';
@@ -287,6 +298,10 @@ async function withFullDesigner({ locale, section, runtimeConfig, spec }, run) {
       const method = route.request().method();
       const name = url.pathname.split('/').at(-1);
       if (name === 'client-log') return route.fulfill({ status: 204 });
+      if (name === 'attributes' && attributes) {
+        const response = await attributes(url.pathname.split('/').at(-2));
+        return route.fulfill(response);
+      }
       let json = { success: true, data: [] };
       if (name === 'session') json.session = session;
       if (name === 'schema') json.schema = { root: 'Cst_QueryTool', ready: true };
@@ -328,7 +343,7 @@ test('Designer saves general settings without submitting an unchanged above-ceil
       assert.ok((await warning.boundingBox()).height > 0);
       assert.match(await warning.innerText(), new RegExp(String(ceiling + 200)));
       assert.match(await warning.innerText(), new RegExp(String(ceiling)));
-      assert.match(await warning.innerText(), locale === 'ru' ? /Лимиты выполнения → Максимум строк/ : /Execution limits → Maximum rows/);
+      assert.match(await warning.innerText(), locale === 'ru' ? /Лимиты выполнения → Строк в обычном отчёте/ : /Execution limits → Rows in an ordinary report/);
       await general.locator('#cmdp-runtime-refresh-cooldown-sec').fill('240');
       await page.locator('[data-action="save-general-settings"]').click();
       await page.locator('.notice.ok').filter({ hasText: locale === 'ru' ? 'Настройки сохранены' : 'Config saved' }).waitFor();
@@ -419,18 +434,27 @@ async function openSimpleLargeTable(page) {
   };
 }
 
-test('Designer defaults to simple selection and restores hidden fields declared only by the source table', async () => {
+test('Designer restores a hidden source field without offering stale table or visual columns', async () => {
   await withPage(async (page) => {
     const { mode, field, advanced } = await openSimpleLargeTable(page);
     await page.evaluate(() => {
-      state.selectedTemplate.spec.result.tables[0].columns.push('DeclaredOnly', 'AlsoDeclared');
+      state.selectedTemplate.spec.result.tables[0].columns.push('DeclaredOnly', 'Retired.Description');
+      state.selectedTemplate.spec.visualModels = [{ mode: 'viewComposer', source: { alias: 'items', columns: ['LegacyVisual'] } }];
       state.viewComposerDraft.columns = [{ field: 'Code', title: 'Code' }];
       renderDesigner();
     });
     assert.equal(await mode.inputValue({ timeout: 5000 }), 'simple');
     assert.equal(await field.isVisible(), true);
     assert.equal(await advanced('kind').isVisible(), false);
-    await field.selectOption('DeclaredOnly');
+    const stale = 'option[value="DeclaredOnly"], option[value="Retired.Description"], option[value="LegacyVisual"]';
+    assert.equal(await field.locator(stale).count(), 0);
+    await field.selectOption('HiddenParentId');
+    await mode.selectOption('advanced');
+    const picker = advanced('matchField').locator('..');
+    await picker.locator('[data-action="catalog-field-picker-toggle"]').click();
+    await picker.getByRole('searchbox').fill('Retired.Description');
+    assert.equal(await picker.getByRole('option').count(), 0);
+    await mode.selectOption('simple');
 
     await page.locator('[data-action="save-template"]').click();
     await page.waitForFunction(() => evidence.requests.length === 1 && !state.savingTemplate);
@@ -439,18 +463,18 @@ test('Designer defaults to simple selection and restores hidden fields declared 
     const table = spec.result.tables[0];
     assert.equal(table.presentation.largeTable.mode, 'key');
     assert.deepEqual(table.presentation.largeTable.selector, {
-      kind: 'result', source: 'items', idField: 'DeclaredOnly', labelField: 'DeclaredOnly', matchField: 'DeclaredOnly'
+      kind: 'result', source: 'items', idField: 'HiddenParentId', labelField: 'HiddenParentId', matchField: 'HiddenParentId'
     });
     assert.deepEqual(table.columns, ['Code']);
     assert.ok(spec.steps.some((step) => step.purpose === 'viewComposer' && step.from === 'items' &&
-      step.columns.some((column) => column.as === 'DeclaredOnly' && column.path === 'DeclaredOnly')));
-    assert.ok(!spec.steps[0].columns.includes('DeclaredOnly'));
+      step.columns.some((column) => column.as === 'HiddenParentId' && column.path === 'HiddenParentId')));
+    assert.ok(!spec.steps[0].columns.includes('HiddenParentId'));
 
     await page.evaluate(() => { hydrateDesignerStateFromTemplate(); renderDesigner(); });
     assert.equal(await page.locator('#cmdp-view-large-mode').inputValue(), 'key');
     assert.equal(await mode.inputValue(), 'simple');
-    assert.equal(await field.inputValue(), 'DeclaredOnly');
-    assert.equal(await field.locator('option[value="AlsoDeclared"]').count(), 1);
+    assert.equal(await field.inputValue(), 'HiddenParentId');
+    assert.equal(await field.locator(stale).count(), 0);
     assert.equal(await advanced('kind').isVisible(), false);
     await button(page, 'export').click();
     await page.waitForFunction(() => evidence.downloads.length === 1);
@@ -479,7 +503,7 @@ test('Designer offers actual projected fields for match and join, excluding arra
           { type: 'matchRows', as: 'matched', from: 'left', with: 'right', rightPrefix: 'M_' },
           { type: 'joinRows', as: 'joined', from: 'left', with: 'right', rightPrefix: 'J_', on: [{ left: 'LeftKey', right: 'RightKey' }] }
         ],
-        result: { tables: [{ name: 'matched', columns: ['LeftKey'] }, { name: 'joined', columns: ['LeftKey'] }] }
+        result: { tables: [{ name: 'matched', columns: ['LeftKey', 'Arbitrary'] }, { name: 'joined', columns: ['LeftKey', 'J_RightKey'] }] }
       };
       renderDesigner();
     });
@@ -638,7 +662,7 @@ test('Designer keeps advanced array matching and dotted paths selectable after s
   });
 });
 
-test('Designer preserves an existing field not offered by the simple filter', async () => {
+test('Designer retains a stale saved filter separately and blocks apply until it is corrected', async () => {
   await withPage(async (page) => {
     const { mode, field, advanced } = await openSimpleLargeTable(page);
     const selector = { kind: 'result', source: 'items', idField: 'OtherKey', labelField: 'OtherKey', matchField: 'OtherKey' };
@@ -647,10 +671,155 @@ test('Designer preserves an existing field not offered by the simple filter', as
       hydrateDesignerStateFromTemplate();
       renderDesigner();
     }, selector);
-    assert.equal(await mode.inputValue(), 'advanced');
-    assert.equal(await field.count(), 0);
-    assert.equal(await advanced('matchField').inputValue(), 'OtherKey');
-    assert.deepEqual(await page.evaluate(() => readEditorPayload().spec.result.tables[0].presentation.largeTable.selector), selector);
+    assert.equal(await mode.inputValue(), 'simple');
+    assert.equal(await field.inputValue(), '');
+    assert.equal(await field.getAttribute('aria-invalid'), 'true');
+    assert.equal(await field.locator('option[value="OtherKey"]').count(), 0);
+    assert.match(await page.locator('[data-view-large-field-status]').textContent(), /OtherKey/);
+    assert.deepEqual(await page.evaluate(() => readViewLargeTableDraft().selector), selector);
+    await page.locator('[data-action="apply-view-composer"]').click();
+    assert.match(await page.evaluate(() => evidence.errors.at(-1)), /Фильтровать по колонке/);
+    await mode.selectOption('advanced');
+    assert.equal(await advanced('matchField').inputValue(), '');
+    await mode.selectOption('simple');
+    assert.deepEqual(await page.evaluate(() => readViewLargeTableDraft().selector), selector);
+    await page.locator('[data-action="save-template"]').click();
+    assert.deepEqual(await page.evaluate(() => evidence.requests), []);
+    assert.deepEqual(await page.evaluate(() => state.selectedTemplate.spec.result.tables[0].presentation.largeTable.selector), selector);
+    await field.selectOption('Region');
+    assert.equal(await field.getAttribute('aria-invalid'), null);
+    await page.locator('[data-action="save-template"]').click();
+    await page.waitForFunction(() => evidence.requests.length === 1 && !state.savingTemplate);
+    assert.deepEqual(await page.evaluate(() => evidence.requests[0].body.spec.result.tables[0].presentation.largeTable.selector),
+      { kind: 'result', source: 'items', idField: 'Region', labelField: 'Region', matchField: 'Region' });
+  });
+});
+
+test('Designer hydrates a saved simple filter from permission-filtered class metadata without losing the draft', async () => {
+  const classes = [];
+  let finish;
+  const metadataReady = new Promise(resolve => { finish = resolve; });
+  const selector = { kind: 'result', source: 'software', idField: 'VendorName', labelField: 'VendorName', matchField: 'VendorName' };
+  await withFullDesigner({
+    locale: 'ru', section: 'templates', runtimeConfig: defaultRuntimeConfig(),
+    spec: {
+      version: 1, params: { target: { type: 'string', default: 'Software' } },
+      steps: [
+        { type: 'selectCards', as: 'software', classNameParam: 'target' },
+        { type: 'enrichRows', as: 'softwareView', from: 'software', purpose: 'viewComposer',
+          columns: [{ path: 'Code', as: 'Code' }, { path: 'VendorName', as: 'VendorName' }] }
+      ],
+      result: { tables: [{ name: 'softwareView', columns: ['Code'], title: 'Каталог',
+        presentation: { largeTable: { mode: 'key', selector } } }] }
+    },
+    attributes: async className => {
+      classes.push(className);
+      await metadataReady;
+      if (classes.length === 1) return { status: 403, json: { success: false } };
+      return { json: { data: [
+        { name: 'VendorName', description: 'Издатель', type: 'string' },
+        { name: 'Release', description: 'Версия', type: 'string' },
+        { name: 'Tags', type: 'lookup', multiValued: true },
+        { name: 'ReadDenied', type: 'string', permissions: { _can_read: false } },
+        { name: 'DisabledField', active: false }
+      ] } };
+    }
+  }, async (page, writes) => {
+    const field = page.locator('#cmdp-view-large-simple-field');
+    const status = page.locator('[data-view-large-field-status]');
+    const title = page.locator('#cmdp-view-title');
+    try {
+      await page.locator('[data-action="select-template"][data-code="existing"]').click();
+      await page.locator('a[data-designer-section="final-view"]').click();
+      await status.filter({ hasText: 'Загрузка полей источника…' }).waitFor();
+      assert.equal(await field.isDisabled(), true);
+      assert.match(await status.textContent(), /VendorName/);
+      assert.equal(await field.locator('option[value="VendorName"]').count(), 0);
+      await title.fill('Изменённый заголовок');
+    } finally {
+      finish();
+    }
+    await status.filter({ hasText: 'Не удалось загрузить поля источника.' }).waitFor();
+    assert.match(await status.textContent(), /VendorName/);
+    assert.equal(await field.getAttribute('data-view-large-saved-field'), 'VendorName');
+    assert.equal(await field.isDisabled(), true);
+    await page.getByRole('button', { name: 'Повторить', exact: true }).click();
+    const release = field.locator('option[value="Release"]');
+    await release.waitFor({ state: 'attached' });
+    assert.equal(await field.isEnabled(), true);
+    assert.equal(await field.inputValue(), 'VendorName');
+    assert.equal(await field.locator('option[value="VendorName"]').textContent(), 'Издатель (VendorName)');
+    assert.equal(await field.locator('option[value="Tags"], option[value="ReadDenied"], option[value="DisabledField"]').count(), 0);
+    assert.equal(await title.inputValue(), 'Изменённый заголовок');
+    assert.equal(await page.locator('#cmdp-view-large-selector-mode').inputValue(), 'simple');
+    assert.deepEqual(classes, ['Software', 'Software']);
+    assert.deepEqual(writes, []);
+  });
+});
+
+test('Designer ignores late metadata from the previous filter source and can retry the current one', async () => {
+  let finishOld;
+  let oldRequests = 0;
+  let currentRequests = 0;
+  const oldMetadataReady = new Promise(resolve => { finishOld = resolve; });
+  await withFullDesigner({
+    locale: 'en', section: 'templates', runtimeConfig: defaultRuntimeConfig(),
+    spec: {
+      version: 1,
+      steps: [
+        { type: 'selectCards', as: 'software', className: 'Software' },
+        { type: 'selectCards', as: 'services', className: 'Service' },
+        { type: 'composeRows', as: 'projected', from: 'services', columns: [{ name: 'ProjectTags', column: 'Tags' }] }
+      ],
+      result: { tables: [
+        { name: 'services', columns: ['Code'] },
+        { name: 'projected', columns: ['ProjectTags', 'Code'] },
+        { name: 'software', columns: ['Code'], presentation: { largeTable: { mode: 'key',
+          selector: { kind: 'result', source: 'software', idField: 'Code', labelField: 'Code', matchField: 'Code' } } } }
+      ] }
+    },
+    attributes: async className => {
+      if (className === 'Software') {
+        oldRequests++;
+        await oldMetadataReady;
+        return { json: { data: [{ name: 'RetiredField', type: 'string' }] } };
+      }
+      assert.equal(className, 'Service');
+      if (++currentRequests === 1) return { status: 403, json: { success: false } };
+      return { json: { data: [
+        { name: 'Department', type: 'string' }, { name: 'Tags', type: 'lookupArray' }
+      ] } };
+    }
+  }, async (page) => {
+    const source = page.locator('#cmdp-view-source');
+    const field = page.locator('#cmdp-view-large-simple-field');
+    const status = page.locator('[data-view-large-field-status]');
+    try {
+      await page.locator('[data-action="select-template"][data-code="existing"]').click();
+      await page.locator('a[data-designer-section="final-view"]').click();
+      await status.filter({ hasText: 'Loading source fields…' }).waitFor();
+      assert.equal(await source.inputValue(), 'software');
+      assert.equal(await field.inputValue(), 'Code');
+      await source.selectOption('services');
+      await status.filter({ hasText: 'Could not load source fields.' }).waitFor();
+      assert.equal(await field.isDisabled(), true);
+      assert.equal(await field.inputValue(), 'Code');
+      await page.getByRole('button', { name: 'Retry', exact: true }).click();
+      await field.selectOption('Department');
+      const late = page.waitForResponse(response => response.url().includes('/Software/attributes'));
+      finishOld();
+      await (await late).finished();
+      assert.equal(await field.inputValue(), 'Department');
+      assert.equal(await field.locator('option[value="RetiredField"]').count(), 0);
+      await source.selectOption('projected');
+      await status.filter({ hasText: 'No single-value fields are available.' }).waitFor();
+      assert.equal(await field.isDisabled(), true);
+      assert.deepEqual(await field.locator('option').evaluateAll(options => options.map(option => option.value)), ['']);
+      assert.equal(oldRequests, 1);
+      assert.equal(currentRequests, 2);
+    } finally {
+      finishOld();
+    }
   });
 });
 
@@ -877,13 +1046,16 @@ test('Designer publication defaults to personal and publishes without extra cons
     assert.equal(await page.locator('#cmdp-publish-shared-refresh-warning').isVisible(), false);
     await page.locator('[data-action="publish-snapshot"]').click();
     await page.waitForFunction(() => evidence.requests.length === 3 && !state.savingTemplate);
-    const [save, baseline, publish] = await page.evaluate(() => evidence.requests);
+    const { requests: [save, baseline, publish], errors } = await page.evaluate(() => evidence);
+    assert.deepEqual(errors, []);
     assert.equal(save.body.spec.publish.refreshMode, 'personal');
     assert.equal(Object.hasOwn(save.body.spec.publish, 'sharedRefreshAccepted'), false);
-    assert.match(baseline.path, /^\/api\/public-snapshots\/existing\/run\?/);
+    assert.equal(baseline.path, '/api/templates/existing/publish?root=Root_A');
+    assert.equal(baseline.method ?? 'GET', 'GET');
+    assert.equal(baseline.body, undefined);
     assert.equal(publish.path, '/api/templates/existing/publish?root=Root_A');
     assert.equal(publish.timeoutMs, 70000);
-    assert.deepEqual(publish.body, { params: {}, savedSpecHash: 'a'.repeat(64) });
+    assert.deepEqual(publish.body, { params: {}, savedSpecHash: 'a'.repeat(64), publishBaseline: 'c'.repeat(64) });
   });
 });
 

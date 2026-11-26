@@ -451,6 +451,8 @@ paths:
         числовые значения отклоняются до CMDBuild write. Не включает capture.
         С scope=general обновляет только runtimeConfig.runtimeCache.refreshCooldownSec
         (положительное целое число), сохраняя остальные значения карточки.
+        executionLimits.reportPageSize принимает целое от 1 до 100; при публикации
+        новой версии снимка сохраняется только как настройка отображения.
       parameters:
         - name: scope
           in: query
@@ -954,6 +956,46 @@ paths:
     parameters:
       - $ref: "#/components/parameters/TemplateCode"
       - $ref: "#/components/parameters/RuntimeRoot"
+    get:
+      x-flow-id: OAPI62
+      tags: [runtime]
+      summary: Прочитать состояние снимка для публикации
+      description: >
+        Проверяет права издателя и читает только точный ключ будущей записи.
+        Не создаёт поколение или снимок. После чтения передайте publishBaseline
+        в POST. При отсутствии актуального снимка snapshotRevision равна null.
+      security:
+        - cmdbuildCookie: []
+      parameters:
+        - $ref: "#/components/parameters/RuntimeSnapshotParams"
+      responses:
+        "200":
+          description: Исходное состояние публикации подтверждено
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, action, savedSpecHash, snapshotRevision, publishBaseline]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  action: { type: string, enum: [publish] }
+                  savedSpecHash: { type: string, pattern: "^[0-9a-f]{64}$" }
+                  snapshotRevision: { type: string, nullable: true, pattern: "^[0-9a-f]{64}$" }
+                  publishBaseline: { type: string, pattern: "^[0-9a-f]{64}$" }
+        "400":
+          description: Недопустимые параметры или настройки публикации
+        "401":
+          $ref: "#/components/responses/RuntimeSessionRequired"
+        "403":
+          $ref: "#/components/responses/RuntimeAccessDenied"
+        "404":
+          description: Шаблон не найден
+        "409":
+          description: Отзыв прежней публикации требует сверки
+        "502":
+          description: Не удалось прочитать сохранённый шаблон
+        "503":
+          $ref: "#/components/responses/RuntimeSnapshotWriteUnavailable"
     post:
       x-flow-id: OAPI30
       tags: [runtime]
@@ -967,8 +1009,8 @@ paths:
         правилом выдачи отчёта. Ошибка лимита, неполный расчёт и таймаут
         не заменяют ранее опубликованный снимок.
         Сохранённая версия и поколение отзыва проверяются перед вычислением и записью.
-        После проверки сохранённого шаблона Redis атомарно проверяет дедлайн и
-        поколение перед записью. Если подтверждение записи не получено, исход
+        После проверки сохранённого шаблона Redis атомарно проверяет дедлайн,
+        поколение и прежнее значение ключа перед записью. Если подтверждение записи не получено, исход
         неизвестен; перечитайте опубликованные данные и ревизию до повтора.
         Если после начала выполнения шаблон изменили или удалили, снимок не записывается.
         Снимки со старым ключом требуется переопубликовать.
@@ -981,12 +1023,16 @@ paths:
           application/json:
             schema:
               type: object
-              required: [savedSpecHash]
+              required: [savedSpecHash, publishBaseline]
               properties:
                 savedSpecHash:
                   type: string
                   pattern: "^[0-9a-fA-F]{64}$"
                   description: Хеш утверждённой версии из ответа на сохранение.
+                publishBaseline:
+                  type: string
+                  pattern: "^[0-9a-f]{64}$"
+                  description: Значение GET /publish для той же версии, root, Code и параметров.
                 params:
                   type: object
                   additionalProperties: true
@@ -1010,7 +1056,7 @@ paths:
         "403":
           $ref: "#/components/responses/RuntimeAccessDenied"
         "409":
-          description: Сохранённая версия изменилась или отзыв прежней публикации требует сверки
+          description: Сохранённая версия или снимок изменились, либо отзыв прежней публикации требует сверки
           content:
             application/json:
               schema:
@@ -1019,7 +1065,7 @@ paths:
                   - type: object
                     required: [reason, message]
                     properties:
-                      reason: { type: string, enum: [snapshot_revocation_pending] }
+                      reason: { type: string, enum: [snapshot_revocation_pending, snapshot_publish_conflict] }
                       message: { type: string }
         "422":
           description: Превышен лимит расчёта или индекса, не подтверждена полнота либо не готов D2 mapping
@@ -1033,6 +1079,8 @@ paths:
                     properties:
                       reason: { type: string, enum: [d2_authoring_current_contract_required, publication_d2_mapping_pending] }
                       message: { type: string }
+        "502":
+          description: Не удалось прочитать шаблон, Runtime settings (report_runtime_config_unavailable) или данные отчёта; снимок не заменён
         "503":
           $ref: "#/components/responses/RuntimeSnapshotWriteUnavailable"
         "504":
@@ -1145,6 +1193,8 @@ paths:
                       reason: { type: string, enum: [snapshot_refresh_incomplete] }
                       message: { type: string }
         "429": { description: Достигнут предел параллельных вычислений }
+        "502":
+          description: Не удалось прочитать Runtime settings (report_runtime_config_unavailable) или данные отчёта; снимок не заменён
         "503":
           $ref: "#/components/responses/RuntimeSnapshotWriteUnavailable"
         "504":
@@ -2777,7 +2827,12 @@ components:
               sort: { type: string }
               direction: { type: string, enum: [asc, desc] }
               offset: { type: integer, minimum: 0, default: 0 }
-              limit: { type: integer, minimum: 1, maximum: 100, default: 50 }
+              limit:
+                type: integer
+                minimum: 1
+                maximum: 100
+                default: 50
+                description: Размер страницы выдачи. Интерфейс передаёт 10 для options и использует tableView.pageSize для строк и деталей.
               viewId: { type: string }
               snapshotRevision: { type: string }
     RuntimeSnapshotParams:
@@ -3194,6 +3249,11 @@ components:
             runtimeConfig:
               type: object
               properties:
+                executionLimits:
+                  type: object
+                  properties:
+                    reportPageSize: { type: integer, minimum: 1, maximum: 100, default: 50 }
+                  additionalProperties: true
                 assistant:
                   type: object
                   properties:

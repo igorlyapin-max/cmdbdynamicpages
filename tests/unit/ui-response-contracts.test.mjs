@@ -114,13 +114,16 @@ test('snapshot mutation success requires matching action, template and persisted
     backend: 'memory', key: 'a'.repeat(16), publishedAt: '2026-01-01T00:00:00.000Z',
     specHash: 'b'.repeat(64), paramsHash: 'c'.repeat(64), snapshotRevision: 'd'.repeat(64) };
   const params = { site: 42, enabled: false };
-  const target = { code, specHash: cache.specHash, paramsMode: 'exact', query: sandbox.exactReportLaunchQuery(params) };
+  const target = { code, specHash: cache.specHash, paramsMode: 'exact',
+    query: sandbox.exactReportLaunchQuery(params), snapshotRevision: 'e'.repeat(64) };
   const published = { success: true, action: 'publish', template: { code, active: true }, result: { tables: [] }, params, cache };
   const validate = (json, action, expected) => sandbox.validateSnapshotMutationResponse({ status: 200, ok: true, json }, action, expected);
   const reject = (json, action, expected) => assert.throws(() => validate(json, action, expected), { code: 'invalid_response' });
   validate(published, 'publish', target);
   for (const invalid of [{ success: true }, { ...published, action: 'run' }, { ...published, template: { code: 'other', active: true } },
     { ...published, result: {} }, { ...published, cache: null }, { ...published, cache: { ...cache, status: 'snapshot-hit' } },
+    { ...published, cache: { ...cache, snapshotRevision: undefined } },
+    { ...published, cache: { ...cache, snapshotRevision: target.snapshotRevision } },
     { ...published, cache: { ...cache, specHash: 'e'.repeat(64) } }, { ...published, params: { ...params, site: '42' } }]) {
     reject(invalid, 'publish', target);
   }

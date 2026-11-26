@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { chromium } from 'playwright';
 import { createAssistantDiagnosticsUi } from '../../scripts/assistant-diagnostics-ui.mjs';
+import { LARGE_TABLE_DEFAULT_PAGE_SIZE, LARGE_TABLE_MAX_PAGE_SIZE, queryLargeTablePage } from '../../scripts/report-table-pages.mjs';
 import { resolveTemplateParameters, staticSnapshotParamPairs } from '../../scripts/template-parameters.mjs';
 import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics.mjs';
 import { bindViewLargeExecutionHelpers } from '../fixtures/view-large-execution-helpers.mjs';
@@ -21,6 +22,8 @@ Object.assign(shellBindings, {
   BACKEND_PREFIX: '/cmdbuild/custom-api',
   DEFAULT_TECHNICAL_ROOT: 'Root_A',
   APPLICATION_VERSION: 'test',
+  LARGE_TABLE_DEFAULT_PAGE_SIZE,
+  LARGE_TABLE_MAX_PAGE_SIZE,
   DRAFT_PREVIEW_TIMEOUT_MS: 5000,
   REPORT_ROW_LIMITS: { ordinary: 1800, paged: 8000, recommendedOrdinary: 2000, recommendedPaged: 10000 },
   DEFAULT_EMPTY_RESULT_TEXT: 'Nothing to display.',
@@ -116,8 +119,15 @@ test('report limit controls and remediation use deployment values in both locale
       assert.doesNotMatch(summary.ordinary, /internal_alias/);
       assert.doesNotMatch(summary.paged, action);
       assert.match(summary.paged, /8001/);
-      assert.equal(await page.locator('#cmdp-report-ordinary-ceiling[readonly]').inputValue(), '1800');
-      assert.equal(await page.locator('#cmdp-report-paged-ceiling[readonly]').inputValue(), '8000');
+      assert.equal(await page.locator('[data-report-limit-controls] input').count(), 5);
+      assert.equal(await page.locator('#cmdp-report-page-size').inputValue(), '50');
+      assert.equal(await page.locator('#cmdp-report-page-size').getAttribute('max'), '100');
+      assert.equal(await page.locator('#cmdp-report-timeout[readonly]').inputValue(), '5');
+      const technical = page.locator('#row-limit-fixture details');
+      await technical.locator('summary').click();
+      assert.match(await technical.innerText(), /1800/);
+      assert.match(await technical.innerText(), /8000/);
+      assert.equal(await technical.locator('input').count(), 0);
       assert.equal(await page.locator('#cmdp-runtime-max-rows-max').getAttribute('max'), '1800');
       const help = await page.locator('#cmdp-view-large-mode-help').textContent();
       for (const value of ['1800', '8000', '2000', '10000']) assert.match(help, new RegExp(value));
@@ -157,7 +167,7 @@ test('dynamic viewer separates table views and rejects late keyed rows', async (
     assert.equal(d2.searchParams.get('snapshotParams'), typed);
     await action(scoped, 'picker').click();
     await action(scoped, 'options-next').click();
-    await scoped.getByText('51–100 of 400', { exact: true }).waitFor();
+    await scoped.getByText('11–20 of 400', { exact: true }).waitFor();
     const optionSearch = scoped.getByRole('searchbox', { name: 'Search objects' });
     await optionSearch.press('ArrowDown');
     await scoped.getByRole('button', { name: 'First' }).press('Enter');
@@ -184,7 +194,8 @@ test('dynamic viewer separates table views and rejects late keyed rows', async (
     const queries = calls.filter((call) => call.query);
     assert.ok(queries.every((call) => call.path === api + '/templates/Report/table-page' && call.method === 'GET' &&
       call.params.snapshotParams === typed && call.params.region === 'url-value' && call.params.root === 'Root_A' &&
-      !('key' in call.params) && !('offset' in call.params) && !('cmdpTableShell' in call.params) && call.query.limit === 50));
+      !('key' in call.params) && !('offset' in call.params) && !('cmdpTableShell' in call.params) &&
+      call.query.limit === (call.query.op === 'options' ? 10 : 50)));
     const keyedRows = queries.filter(({ query }) => query.table === keyed.name && query.op === 'rows');
     assert.deepEqual(keyedRows.slice(0, 3).map(({ query: q }) => [q.key, q.offset, q.viewId]), [
       ['slow', 0, undefined], ['typed:&+/', 0, undefined], ['typed:&+/', 50, 'keyed-view']
@@ -241,7 +252,7 @@ test('object picker contains search, scrolling options and pager at 390x450', as
   await withViewer({ kind: 'dynamic', viewport: { width: 390, height: 450 }, async respond(call) {
     if (!call.query) return { ...shellPayload({ kind: 'dynamic' }, [keyed]), result: { tables: [keyed] } };
     assert.equal(call.query.op, 'options');
-    return { total: 400, limit: 50, offset: call.query.offset, items: Array.from({ length: 50 }, (_, index) => ({
+    return { total: 400, limit: call.query.limit, offset: call.query.offset, items: Array.from({ length: call.query.limit }, (_, index) => ({
       key: 'key-' + (call.query.offset + index), label: 'Object ' + (call.query.offset + index)
     })) };
   } }, async (page) => {
@@ -266,10 +277,66 @@ test('object picker contains search, scrolling options and pager at 390x450', as
     assert.equal(await panel.evaluate((node) => node.scrollTop), 0);
     assert.deepEqual(await page.evaluate(() => ({ y: window.scrollY, height: document.documentElement.scrollHeight })), scrollBefore);
     await next.click();
-    await region.getByText('51–100 of 400', { exact: true }).waitFor();
+    await region.getByText('11–20 of 400', { exact: true }).waitFor();
     assert.equal(await list.evaluate((node) => node.scrollTop), 0);
     await region.getByRole('searchbox', { name: 'Search objects' }).press('Escape');
     assert.equal(await trigger.evaluate((node) => document.activeElement === node), true);
+  });
+});
+
+test('published object picker shows ten choices and searches beyond the first page', async () => {
+  const options = Array.from({ length: 36 }, (_, index) => ({
+    key: 'key-' + index, label: (index < 24 ? 'Object ' : 'Match ') + index
+  }));
+  await withViewer({ kind: 'public', respond(call) {
+    const q = call.query;
+    if (!q) return shellPayload({ kind: 'public', snapshotRevision: 'rev', pageSize: 17 }, [keyed], { snapshotFound: true });
+    if (q.op === 'rows') return rowPage(q, ['Rows for ' + q.key]);
+    return queryLargeTablePage({ table: keyed, options }, q);
+  } }, async (page, calls) => {
+    const region = page.getByRole('region', { name: keyed.name });
+    const trigger = action(region, 'picker');
+    const search = region.getByRole('searchbox', { name: 'Search objects' });
+    const list = region.locator('[data-large-options]');
+    await trigger.waitFor();
+    assert.equal(calls.some(({ query }) => query), false);
+    await trigger.click();
+    await region.getByText('1–10 of 36', { exact: true }).waitFor();
+    assert.equal(await search.inputValue(), '');
+    assert.equal(await action(list, 'option').count(), 10);
+    assert.equal(await action(list, 'option').first().textContent(), 'Object 0');
+    assert.equal(calls.some(({ query }) => query?.op === 'rows'), false);
+
+    await search.fill('match');
+    await region.getByText('1–10 of 12', { exact: true }).waitFor();
+    assert.equal(await action(list, 'option').first().textContent(), 'Match 24');
+    assert.equal(await action(list, 'option').count(), 10);
+    await action(region, 'options-next').click();
+    await region.getByText('11–12 of 12', { exact: true }).waitFor();
+    assert.equal(await action(list, 'option').count(), 2);
+    assert.equal(calls.some(({ query }) => query?.op === 'rows'), false);
+
+    await search.press('ArrowDown');
+    assert.equal(await page.evaluate(() => document.activeElement.textContent), 'Match 34');
+    await page.keyboard.press('Enter');
+    await region.getByText('Rows for key-34', { exact: true }).waitFor();
+    assert.equal(await trigger.textContent(), 'Match 34');
+    assert.equal(await trigger.getAttribute('aria-expanded'), 'false');
+    assert.equal(await trigger.evaluate((node) => document.activeElement === node), true);
+    await trigger.click();
+    await region.getByText('1–10 of 36', { exact: true }).waitFor();
+    assert.equal(await search.inputValue(), '');
+    assert.equal(await trigger.textContent(), 'Match 34');
+
+    const queries = calls.filter(({ query }) => query);
+    assert.ok(queries.every(({ path, method, query }) => path === api + '/public-snapshots/Report/table-page' &&
+      method === 'GET' && query.snapshotRevision === 'rev' && !query.viewId));
+    assert.deepEqual(queries.filter(({ query }) => query.op === 'options').map(({ query }) => [
+      query.search, query.offset, query.limit, query.key
+    ]), [['', 0, 10, undefined], ['match', 0, 10, undefined], ['match', 10, 10, undefined], ['', 0, 10, undefined]]);
+    assert.deepEqual(queries.filter(({ query }) => query.op === 'rows').map(({ query }) => [
+      query.key, query.offset, query.limit
+    ]), [['key-34', 0, 17]]);
   });
 });
 
@@ -288,7 +355,7 @@ test('public snapshot and personal refresh keep their own transport and restore 
     if (!q) return shellPayload({ kind: 'public', snapshotRevision: revision }, [keyed], { snapshotFound: true, cache: { scope: 'staticSnapshot', snapshotRevision: revision } });
     const personal = path.startsWith(api + '/templates/');
     if (!personal && q.snapshotRevision !== revision) return { status: 409, body: { reason: 'table_snapshot_changed' } };
-    if (q.op === 'options') return { items: [{ key: 'one', label: 'Первая' }, { key: 'two', label: 'Вторая' }], total: 2, offset: 0, limit: 50 };
+    if (q.op === 'options') return { items: [{ key: 'one', label: 'Первая' }, { key: 'two', label: 'Вторая' }], total: 2, offset: 0, limit: q.limit };
     return rowPage(q, [personal ? 'Личный результат ' + q.key : 'Снимок ' + revision], { total: 51 });
   } }, async (page, calls) => {
     const scoped = page.getByRole('region', { name: keyed.name });
@@ -321,5 +388,51 @@ test('public snapshot and personal refresh keep their own transport and restore 
     const publicCalls = calls.filter((call) => call.query && call.path === api + '/public-snapshots/Report/table-page');
     assert.ok(publicCalls.every(({ query: q }) => q.snapshotRevision && !q.viewId));
     assert.ok(publicCalls.some(({ query: q }) => q.key === 'one' && q.snapshotRevision === 'after'));
+  });
+});
+
+test('shared refresh replaces the row and detail page size but not the filter option size', async () => {
+  const before = 'a'.repeat(64);
+  const after = 'b'.repeat(64);
+  const cache = (snapshotRevision, status) => ({
+    scope: 'staticSnapshot', status, enabled: true, sharedAcrossUsers: true, backend: 'redis',
+    key: 'a'.repeat(16), publishedAt: '2026-11-26T06:00:00Z', specHash: 'c'.repeat(64), paramsHash: 'any', snapshotRevision
+  });
+  await withViewer({ kind: 'public', snapshotRefreshSessionPresent: true, respond(call) {
+    if (call.path.endsWith('/csrf')) return { success: true, token: 'fixture' };
+    if (call.path.endsWith('/refresh-snapshot')) {
+      if (call.method === 'GET') return { available: true, mode: 'shared' };
+      return shellPayload({ kind: 'public', snapshotRevision: after, pageSize: 2 }, [keyed], {
+        snapshotFound: true, action: 'refresh-snapshot', mode: 'shared', template: { code: 'Report', active: true },
+        cache: cache(after, 'snapshot-published')
+      });
+    }
+    const q = call.query;
+    if (!q) return shellPayload({ kind: 'public', snapshotRevision: before, pageSize: 3 }, [keyed], {
+      snapshotFound: true, action: 'run', cache: cache(before, 'snapshot-hit')
+    });
+    if (q.op === 'options') return { items: [{ key: 'item', label: 'Item' }], total: 1, offset: 0, limit: q.limit };
+    if (q.op === 'details') return rowPage(q, ['Detail page ' + q.limit]);
+    return rowPage(q, ['Group page ' + q.limit], { groupIds: ['group-1'] });
+  } }, async (page, calls) => {
+    const region = page.getByRole('region', { name: keyed.name });
+    const trigger = action(region, 'picker');
+    await trigger.click();
+    await region.getByRole('button', { name: 'Item', exact: true }).click();
+    await region.getByText('Group page 3', { exact: true }).waitFor();
+    await action(region, 'details').click();
+    await region.getByText('Detail page 3', { exact: true }).waitFor();
+    page.once('dialog', (dialog) => dialog.accept());
+    await page.getByRole('button', { name: 'Refresh shared snapshot' }).click();
+    await region.getByText('Group page 2', { exact: true }).waitFor();
+    await action(region, 'details').click();
+    await region.getByText('Detail page 2', { exact: true }).waitFor();
+    await trigger.click();
+    await region.getByRole('button', { name: 'Item', exact: true }).waitFor();
+    const requests = calls.filter(({ query }) => query).map(({ query }) => [query.snapshotRevision, query.op, query.limit]);
+    assert.deepEqual(requests, [
+      [before, 'options', 10], [before, 'rows', 3], [before, 'details', 3],
+      [after, 'rows', 2], [after, 'details', 2], [after, 'options', 10]
+    ]);
   });
 });

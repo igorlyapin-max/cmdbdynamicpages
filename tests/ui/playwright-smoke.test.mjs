@@ -5502,6 +5502,27 @@ test('Runtime page renders the compact runtime shell and table area', { skip: sk
   });
 });
 
+async function publishReport(page, url, headers, savedSpecHash, params = {}) {
+  const baselineUrl = new URL(url);
+  const pairs = Object.entries(params);
+  if (pairs.length) baselineUrl.searchParams.set('snapshotParams', JSON.stringify(pairs));
+  const baseline = await page.request.get(baselineUrl.href, { headers });
+  assert.equal(baseline.status(), 200, await baseline.text());
+  const { success, action, savedSpecHash: baselineHash, snapshotRevision, publishBaseline } = await baseline.json();
+  assert.equal(success, true);
+  assert.equal(action, 'publish');
+  assert.equal(baselineHash, savedSpecHash);
+  assert.match(publishBaseline, /^[a-f0-9]{64}$/);
+  if (snapshotRevision !== null) assert.match(snapshotRevision, /^[a-f0-9]{64}$/);
+  const response = await page.request.post(url, { headers, data: { savedSpecHash, params, publishBaseline } });
+  if (response.ok()) {
+    const { cache } = await response.json();
+    assert.match(cache.snapshotRevision, /^[a-f0-9]{64}$/);
+    assert.notEqual(cache.snapshotRevision, snapshotRevision);
+  }
+  return response;
+}
+
 test('Published report URL renders the same snapshot with valid, absent, and expired cookies', {
   skip: skipReason || (process.env.CMDBDYNAMIC_E2E_WRITE !== '1' && 'Set CMDBDYNAMIC_E2E_WRITE=1 to use a temporary publication.'),
   timeout: 90_000
@@ -5538,9 +5559,7 @@ test('Published report URL renders the same snapshot with valid, absent, and exp
     assert.equal(created.status(), 201, 'Failed to create the temporary publication.');
     try {
       const saved = (await created.json()).template;
-      const published = await page.request.post(api + '/templates/' + code + '/publish' + query, {
-        headers, data: { params, savedSpecHash: saved.specHash }
-      });
+      const published = await publishReport(page, api + '/templates/' + code + '/publish' + query, headers, saved.specHash, params);
       assert.equal(published.status(), 200, 'Failed to publish the temporary snapshot.');
       for (const cookies of [editorCookies, [], cookiesForOrigin('CMDBuild-Authorization=expired-smoke-session', proxyOrigin)]) {
         await page.context().clearCookies();
@@ -5625,6 +5644,7 @@ test('[required:exact-snapshot-url] Designer links retain the published typed pa
     const prepared = new Promise((resolve) => { responseReady = resolve; });
     const gate = new Promise((resolve) => { releaseResponse = resolve; });
     await page.route(publishRoute, async (route) => {
+      if (route.request().method() !== 'POST') return route.continue();
       const response = await route.fetch();
       responseReady();
       await gate;
@@ -5742,8 +5762,8 @@ test('[required:snapshot-refresh] Static reports reread, refresh personally or r
       };
       const report = await createTemplate(reportCode, 'Temporary snapshot refresh smoke', reportSpec);
       const publish = async (savedSpecHash) => {
-        const response = await page.request.post(api + '/templates/' + reportCode + '/publish', { headers,
-          data: { savedSpecHash, params: { site: 42, enabled: false } } });
+        const response = await publishReport(page, api + '/templates/' + reportCode + '/publish',
+          headers, savedSpecHash, { site: 42, enabled: false });
         assert.equal(response.status(), 200, await response.text());
       };
       await publish(report.specHash);
@@ -5912,9 +5932,7 @@ test('[required:publication-limit-diagnostics] Snapshot publish and refresh expl
         result: { tables: [{ name: alias, columns: ['Code'], presentation: { largeTable: { mode: 'all' } } }] },
         publish: { mode: 'staticSnapshot', warningAccepted: true, paramsMode: 'ignore' }
       });
-      const initial = await page.request.post(api + '/templates/' + code + '/publish', {
-        headers, data: { savedSpecHash: report.specHash }
-      });
+      const initial = await publishReport(page, api + '/templates/' + code + '/publish', headers, report.specHash);
       assert.equal(initial.status(), 200, await initial.text());
       await createTemplate(third, marker, sourceSpec);
 
@@ -6019,8 +6037,10 @@ test('[required:publication-outcome] Designer distinguishes a proven deadline fr
       assert.equal(initialSnapshot.status(), 200, await initialSnapshot.text());
       const initialSnapshotBody = await initialSnapshot.json();
       assert.equal(initialSnapshotBody.snapshotFound, true);
-      assert.ok(initialSnapshotBody.cache.snapshotRevision);
+      assert.match(initialAck.cache.snapshotRevision, /^[a-f0-9]{64}$/);
+      assert.equal(initialSnapshotBody.cache.snapshotRevision, initialAck.cache.snapshotRevision);
       const posts = [];
+      const baselines = [];
       const checks = [];
       const protectedRuns = [];
       page.context().on('request', (request) => {
@@ -6037,7 +6057,16 @@ test('[required:publication-outcome] Designer distinguishes a proven deadline fr
       ];
       let outcome = 'deadline';
       await page.route(`**/templates/${code}/publish?*`, async (route) => {
-        posts.push(route.request().postDataJSON());
+        if (route.request().method() === 'GET') {
+          const response = await route.fetch();
+          baselines.push({ url: new URL(route.request().url()), body: await response.json() });
+          return route.fulfill({ response });
+        }
+        const body = route.request().postDataJSON();
+        const baseline = baselines.at(-1);
+        assert.equal(body.publishBaseline, baseline.body.publishBaseline);
+        assert.equal(body.savedSpecHash, baseline.body.savedSpecHash);
+        posts.push(body);
         const headers = { 'x-request-id': outcome === 'deadline' ? 'publication-fixture-id' : `publication-${outcome}` };
         if (outcome === 'disconnect') {
           await disconnectGate;
@@ -6141,7 +6170,8 @@ test('[required:publication-outcome] Designer distinguishes a proven deadline fr
         reconciliationReads++;
       }
       assert.equal(posts.length, 8);
-      assert.equal(checks.length, posts.length + reconciliationReads);
+      assert.equal(baselines.length, posts.length);
+      assert.equal(checks.length, reconciliationReads);
 
       outcome = 'disconnect';
       const [interrupted] = await startPublish();
@@ -6163,7 +6193,8 @@ test('[required:publication-outcome] Designer distinguishes a proven deadline fr
       await details.locator('summary').filter({ hasText: interruptedId }).waitFor();
       assert.ok((await check.boundingBox())?.height > 0);
       assert.match(await alert.innerText(), /Результат публикации неизвестен/);
-      assert.equal(checks.length, posts.length + reconciliationReads);
+      assert.equal(baselines.length, posts.length);
+      assert.equal(checks.length, reconciliationReads);
       assert.deepEqual(posts[8].params, { site: 42 });
       await page.clock.fastForward(snapshotRefreshTimeoutMs);
       assert.equal(posts.length, 9);
@@ -6179,10 +6210,12 @@ test('[required:publication-outcome] Designer distinguishes a proven deadline fr
       assert.ok((await link.boundingBox())?.width > 0);
       assert.match(await notice.locator('[data-snapshot-check-status]').innerText(), /Снимок не изменился/);
       assert.ok((await notice.locator('[data-snapshot-check-status]').innerText()).includes(initialSnapshotBody.cache.publishedAt));
-      assert.equal(checks.length, posts.length + reconciliationReads + 1);
+      assert.equal(checks.length, reconciliationReads + 1);
       assert.equal(checks.at(-1).method(), 'GET');
       const expectedParams = [['site', 42]];
       const checkUrl = new URL(checks.at(-1).url());
+      assert.deepEqual(JSON.parse(baselines.at(-1).url.searchParams.get('snapshotParams')), expectedParams);
+      assert.equal(baselines.at(-1).url.searchParams.get('root'), checkUrl.searchParams.get('root'));
       assert.deepEqual(JSON.parse(checkUrl.searchParams.get('snapshotParams')), expectedParams);
       assert.equal(checkUrl.searchParams.get('root'), new URL(interrupted.url()).searchParams.get('root'));
       assert.deepEqual(JSON.parse(new URL(await link.getAttribute('href'), proxyOrigin).searchParams.get('snapshotParams')), expectedParams);
@@ -6260,8 +6293,7 @@ test('[required:large-report-tables] Viewer selects a key and lazily opens group
         data: { code, description: 'Temporary large report', active: true, expectedSpecHash: dynamic.specHash,
           spec: { ...dynamic.spec, publish: { mode: 'staticSnapshot', paramsMode: 'ignore', warningAccepted: true } } } });
       assert.equal(saved.status(), 200, await saved.text());
-      const published = await page.request.post(api + '/templates/' + code + '/publish', { headers,
-        data: { savedSpecHash: (await saved.json()).template.specHash } });
+      const published = await publishReport(page, api + '/templates/' + code + '/publish', headers, (await saved.json()).template.specHash);
       assert.equal(published.status(), 200, await published.text());
       await verify(reader, 'public-snapshots');
     } finally {
@@ -6352,8 +6384,7 @@ test('[required:large-table-column-filter] A filter on the current result groups
         data: { code, description: 'Filtered report', active: true, expectedSpecHash: dynamic.specHash,
           spec: { ...dynamic.spec, publish: { mode: 'staticSnapshot', paramsMode: 'ignore', warningAccepted: true } } } });
       assert.equal(saved.status(), 200, await saved.text());
-      const published = await page.request.post(api + '/templates/' + code + '/publish', { headers,
-        data: { savedSpecHash: (await saved.json()).template.specHash } });
+      const published = await publishReport(page, api + '/templates/' + code + '/publish', headers, (await saved.json()).template.specHash);
       assert.equal(published.status(), 200, await published.text());
       await verify(await anonymous.newPage());
     } finally {

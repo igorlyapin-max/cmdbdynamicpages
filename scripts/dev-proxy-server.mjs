@@ -40,6 +40,7 @@ import { createAssistantBindingHandles } from './assistant-binding-handles.mjs';
 import { assertInputCollections, normalizeInputCollectionLimits } from './input-collection-limits.mjs';
 import { aggregateDiagramEdges, normalizeEdgeAggregation, validateEdgeAggregation } from './diagram-edge-aggregation.mjs';
 import { buildLargeTableIndex, encodeLargeTableKey, LARGE_TABLE_ROW_BUDGET as REPORT_TABLE_ROW_BUDGET,
+  LARGE_TABLE_DEFAULT_PAGE_SIZE, LARGE_TABLE_MAX_PAGE_SIZE,
   normalizeLargeTablePresentation as normalizeLargeTable, queryLargeTablePage as readLargeTablePage,
   validateLargeTablePresentation as validateLargeTable } from './report-table-pages.mjs';
 import { createUiRequestDiagnostics } from './ui-request-diagnostics.mjs';
@@ -9062,7 +9063,7 @@ async function redisCommand(parts, options = {}) {
             // TIME ran before its reply arrived; do not add that transit time to the budget.
             const redisDeadlineMs = timeMs + Math.floor(commit.remainingMs());
             if (!Number.isSafeInteger(redisDeadlineMs)) throw new Error('Invalid Redis snapshot deadline.');
-            sendSnapshotCommand([...parts, redisDeadlineMs, ...(commit.revision === undefined ? [] : [commit.revision])], true);
+            sendSnapshotCommand([...parts, redisDeadlineMs, ...commit.compare], true);
           }
           return;
         }
@@ -9877,6 +9878,8 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     snapshotRefreshSessionPresent,
     snapshotRefreshTimeoutMs: DRAFT_PREVIEW_TIMEOUT_MS + 10000,
     reportRowLimits: REPORT_ROW_LIMITS,
+    reportPaging: { defaultSize: LARGE_TABLE_DEFAULT_PAGE_SIZE, maxSize: LARGE_TABLE_MAX_PAGE_SIZE },
+    reportExecutionCaps: { restCalls: ABSOLUTE_EXECUTION_LIMITS.maxRestCalls, scanRows: ABSOLUTE_EXECUTION_LIMITS.maxSelectionScanRows },
     apiPrefix: BACKEND_PREFIX,
     assistant: assistantStatus(),
     assistantMcpCaps: {
@@ -10150,13 +10153,22 @@ function dynamicPagesClientScript() {
       runtimeMaxRowsPreviewDefaultHelp: 'Default row limit for draft preview and test runs.',
       runtimeMaxRowsDataPreviewDefault: 'Extraction and diagram preview rows',
       runtimeMaxRowsDataPreviewDefaultHelp: 'Shared row limit for Extraction and diagram preview. Diagram maxNodes and maxEdges remain separate visual limits.',
-      runtimeMaxRowsMax: 'Maximum rows',
+      runtimeMaxRowsMax: 'Rows in an ordinary report',
       runtimeMaxRowsMaxHelp: 'Publication threshold for ordinary reports and the upper bound for ordinary runs.',
+      reportOrdinaryPublicationThreshold: 'Ordinary publication threshold: {limit} rows.',
+      reportDynamicRunDefault: 'Dynamic run without an explicit limit: {limit} rows.',
+      runtimeExecutionLimitRange: '{field}: enter a whole number from 1 to {max}.',
+      runtimeReportPageSize: 'Rows per page',
+      runtimeReportPageSizeHelp: 'Applies to large-table rows and group details, not the published volume or filter suggestions. A published report picks up changes at publication or shared refresh.',
+      runtimeReportTimeout: 'Execution time (seconds)',
+      runtimeReportTimeoutHelp: 'The report deadline includes reading and preparing data. Configured at deployment. If it expires, narrow the selection or split the report.',
+      runtimeTechnicalLimits: 'Technical limits',
+      runtimeTechnicalLimitsHelp: 'Saved settings and deployment ceilings. They still apply; changing the visible limits does not overwrite them.',
       ordinaryRowCeiling: 'Ordinary report ceiling',
       pagedRowCeiling: 'Large table ceiling',
       reportRowRecommendations: 'Do not exceed {ordinary} rows for ordinary reports or {paged} for large tables. Higher budgets increase publication time and load on CMDBuild and the server.',
       reportRowDeploymentHelp: 'Set at deployment. Restart the service after changing it.',
-      objectSelectionLimitHelp: 'Optional. Leave blank to use the limit for the current report mode.',
+      objectSelectionLimitHelp: 'Optional. Leave blank to use the limit for the current report mode. See the run trace for requests and cards read by this selection.',
       reportRowModeCap: 'Limit for this mode: {limit} rows.',
       reportRowConfigConflict: 'You entered {requested} rows, but this mode allows {limit}.',
       reportRowSavedAboveCeiling: 'Saved maximum: {saved} rows. Effective maximum: {limit} rows. To update the saved value, go to {path}.',
@@ -10167,12 +10179,12 @@ function dynamicPagesClientScript() {
       reportRowStep: 'Step: {name}.',
       reportRowStepSetting: 'Object group → {name} → Limit',
       reportRowUnnamedStep: 'Selection {number}',
-      reportRowRuntimeSetting: 'Runtime settings → Execution limits → Maximum rows',
+      reportRowRuntimeSetting: 'Runtime settings → Execution limits → Rows in an ordinary report',
       reportRowAdjust: 'Review: {fields}.',
       reportRowClearStepLimit: 'Lower the value or clear it to inherit the limit for this mode.',
       reportRowRaiseStepLimit: 'Raise this selection limit within the mode threshold, or clear it to inherit that threshold.',
       reportRowInheritedStepLimit: 'Clear the selection limit to use the threshold for the chosen mode.',
-      reportRowRaiseMaximum: 'Raise Maximum rows within the deployment ceiling.',
+      reportRowRaiseMaximum: 'Increase Rows in an ordinary report within the deployment ceiling.',
       reportRowUsedByDiagram: 'This step also feeds a diagram, which still uses the ordinary threshold.',
       reportRowPagedBudget: 'Large table is already enabled. Changing the page size does not increase the preparation budget.',
       reportRowAtLeast: 'Found at least {count} rows.',
@@ -10181,8 +10193,8 @@ function dynamicPagesClientScript() {
       runtimeMaxRelationsPerCardDefaultHelp: 'Shared limit for relations read from one CMDBuild card. It applies to every relation operation.',
       runtimeMaxRelationsPerCardMax: 'Maximum relations per source card',
       runtimeMaxRelationsPerCardMaxHelp: 'Upper cap for the shared relation limit.',
-      runtimeMaxSelectionScanRowsDefault: 'Default selection scan rows',
-      runtimeMaxSelectionScanRowsDefaultHelp: 'Maximum cards inspected for a filtered selection before the result is marked incomplete.',
+      runtimeMaxSelectionScanRowsDefault: 'Cards to inspect',
+      runtimeMaxSelectionScanRowsDefaultHelp: 'Reading budget for a filtered selection. It may be increased to the row threshold but cannot exceed the technical card scan maximum.',
       runtimeMaxSelectionScanRowsMax: 'Maximum selection scan rows',
       runtimeMaxSelectionScanRowsMaxHelp: 'Upper cap for cards inspected by one filtered selection.',
       selectionScanLimitReached: 'Selection {alias} inspected {scannedRows} of {availableTotal} {className} cards (scan limit {scanLimit}). Results may be incomplete.',
@@ -10194,8 +10206,8 @@ function dynamicPagesClientScript() {
       runtimeMaxDomainsDefaultHelp: 'Default number of CMDBuild domains read by relation/domain operations.',
       runtimeMaxDomainsMax: 'Maximum domains',
       runtimeMaxDomainsMaxHelp: 'Upper cap for domains read by one execution.',
-      runtimeMaxRestCallsDefault: 'Default REST calls',
-      runtimeMaxRestCallsDefaultHelp: 'Default budget for CMDBuild REST calls during one template execution.',
+      runtimeMaxRestCallsDefault: 'Requests to CMDBuild',
+      runtimeMaxRestCallsDefaultHelp: 'Default shared REST budget for the execution. In the trace, each Object group selection shows its own share.',
       runtimeMaxRestCallsMax: 'Maximum REST calls',
       runtimeMaxRestCallsMaxHelp: 'Upper cap for CMDBuild REST calls during one template execution.',
       runtimeMaxTraversalDepthDefault: 'Default traversal depth',
@@ -11147,6 +11159,13 @@ function dynamicPagesClientScript() {
       viewLargeAdvancedFields: 'Option and matching fields',
       viewLargeSimpleField: 'Filter by column',
       viewLargeSimpleFieldHelp: 'The list contains distinct, non-empty values from one column of this result. Choose a field with one value per row. It does not need to be a visible table column.',
+      viewLargeFieldsLoading: 'Loading source fields…',
+      viewLargeFieldsError: 'Could not load source fields.',
+      viewLargeFieldPending: 'Saved filter field: {field}.',
+      viewLargeFieldsRetry: 'Retry',
+      viewLargeFieldsEmpty: 'No single-value fields are available. Add one to the source result.',
+      viewLargeFieldsDynamic: 'Some fields cannot be listed because the source class is only known at execution time.',
+      viewLargeFieldUnavailable: 'The saved filter field {field} is not available. Select another field.',
       viewLargeSourceKind: 'Option source type',
       viewLargeSourceKindHelp: 'Use a confirmed flow result to keep the flow’s selection rules. A CMDBuild class is read separately and can include objects with no matching report rows.',
       viewLargeClass: 'CMDBuild class',
@@ -11186,6 +11205,8 @@ function dynamicPagesClientScript() {
       traceRows: 'Rows',
       traceMs: 'ms',
       traceRest: 'REST',
+      traceScannedCards: 'Cards read',
+      traceExecutionBudget: 'CMDBuild requests: {used} of {calls}. Maximum cards per selection: {cards}.',
       traceStatus: 'Status',
       builder: 'Builder',
       preset: 'Preset',
@@ -11461,6 +11482,9 @@ function dynamicPagesClientScript() {
       reportLimitUnit_checks: 'checks',
       reportLimitMatchAction: 'Narrow both input selections before matching.',
       reportLimitScanAction: 'Narrow the selection or review Runtime settings → Execution limits → {field}.',
+      reportLimitScanTechnicalAction: 'Narrow the selection or ask an administrator to review the technical card scan maximum.',
+      reportLimitRestAction: 'Reduce the number of selections or review Runtime settings → Execution limits → Requests to CMDBuild.',
+      reportLimitTimeAction: 'Narrow the selection or split the report to finish within the execution time.',
       reportLimitName_maxRelationsPerCard: 'Relations per card',
       reportLimitName_maxRestCalls: 'REST requests per execution',
       reportLimitName_maxClasses: 'Class count',
@@ -11671,13 +11695,22 @@ function dynamicPagesClientScript() {
       runtimeMaxRowsPreviewDefaultHelp: 'Лимит строк для предпросмотра черновика и тестового прогона.',
       runtimeMaxRowsDataPreviewDefault: 'Строк для извлечения и предпросмотра диаграмм',
       runtimeMaxRowsDataPreviewDefaultHelp: 'Единый лимит строк для «Извлечения» и предпросмотра диаграмм. Визуальные maxNodes и maxEdges задаются отдельно в самой диаграмме.',
-      runtimeMaxRowsMax: 'Максимум строк',
+      runtimeMaxRowsMax: 'Строк в обычном отчёте',
       runtimeMaxRowsMaxHelp: 'Порог публикации в обычном режиме и верхняя граница для лимитов обычного запуска.',
+      reportOrdinaryPublicationThreshold: 'Порог обычной публикации: {limit} строк.',
+      reportDynamicRunDefault: 'Динамический запуск без явного лимита: {limit} строк.',
+      runtimeExecutionLimitRange: '{field}: укажите целое число от 1 до {max}.',
+      runtimeReportPageSize: 'Строк на странице',
+      runtimeReportPageSizeHelp: 'Размер страницы большой таблицы и её детализации. Не меняет объём публикации или число подсказок фильтра. Опубликованный отчёт получит новое значение при публикации или общем пересчёте.',
+      runtimeReportTimeout: 'Время выполнения (секунды)',
+      runtimeReportTimeoutHelp: 'Общее время чтения и подготовки отчёта задаётся при развёртывании. Если времени не хватает, сузьте выборку или разделите отчёт.',
+      runtimeTechnicalLimits: 'Технические лимиты',
+      runtimeTechnicalLimitsHelp: 'Сохранённые значения и потолки развёртывания. Они продолжают действовать и не переписываются при изменении основных лимитов.',
       ordinaryRowCeiling: 'Потолок обычного выполнения',
       pagedRowCeiling: 'Потолок большой таблицы',
       reportRowRecommendations: 'Не рекомендуется превышать {ordinary} строк в обычном режиме и {paged} в режиме большой таблицы. Повышение увеличивает время публикации и нагрузку на CMDBuild и сервер.',
       reportRowDeploymentHelp: 'Задаётся при развёртывании. После изменения требуется перезапуск сервиса.',
-      objectSelectionLimitHelp: 'Необязательное ограничение выборки. Оставьте поле пустым, чтобы использовать лимит текущего режима отчёта.',
+      objectSelectionLimitHelp: 'Необязательный лимит выборки. Оставьте поле пустым, чтобы использовать лимит текущего режима отчёта. В трассировке прогона видно, сколько запросов и карточек потребовалось выборке.',
       reportRowModeCap: 'Лимит для этого режима: {limit} строк.',
       reportRowConfigConflict: 'Указано {requested} строк, но режим допускает {limit}.',
       reportRowSavedAboveCeiling: 'Сохранённый максимум: {saved} строк. Действующий максимум: {limit} строк. Чтобы изменить сохранённое значение, откройте «{path}».',
@@ -11688,12 +11721,12 @@ function dynamicPagesClientScript() {
       reportRowStep: 'Шаг: {name}.',
       reportRowStepSetting: 'Группа объектов → {name} → Лимит',
       reportRowUnnamedStep: 'Выборка {number}',
-      reportRowRuntimeSetting: 'Настройки выполнения → Лимиты выполнения → Максимум строк',
+      reportRowRuntimeSetting: 'Настройки выполнения → Лимиты выполнения → Строк в обычном отчёте',
       reportRowAdjust: 'Проверьте: {fields}.',
       reportRowClearStepLimit: 'Уменьшите значение или очистите поле, чтобы использовать лимит режима.',
       reportRowRaiseStepLimit: 'Увеличьте лимит выборки в пределах порога режима или очистите поле, чтобы использовать этот порог.',
       reportRowInheritedStepLimit: 'Очистите лимит выборки, чтобы использовать порог выбранного режима.',
-      reportRowRaiseMaximum: 'Увеличьте «Максимум строк» в пределах потолка развёртывания.',
+      reportRowRaiseMaximum: 'Увеличьте «Строк в обычном отчёте» в пределах потолка развёртывания.',
       reportRowUsedByDiagram: 'Этот шаг также используется в диаграмме, для которой сохраняется обычный порог.',
       reportRowPagedBudget: 'Режим «Большая таблица» уже включён. Изменение размера страницы не повышает лимит подготовки данных.',
       reportRowAtLeast: 'Найдено не менее {count} строк.',
@@ -11702,8 +11735,8 @@ function dynamicPagesClientScript() {
       runtimeMaxRelationsPerCardDefaultHelp: 'Общий лимит связей, читаемых для одной карточки CMDBuild. Применяется ко всем операциям связей.',
       runtimeMaxRelationsPerCardMax: 'Максимум связей на одну карточку',
       runtimeMaxRelationsPerCardMaxHelp: 'Верхний предел общего лимита связей.',
-      runtimeMaxSelectionScanRowsDefault: 'Сканирование выборки по умолчанию',
-      runtimeMaxSelectionScanRowsDefaultHelp: 'Сколько карточек проверяется для выборки с фильтрами, прежде чем результат будет помечен как неполный.',
+      runtimeMaxSelectionScanRowsDefault: 'Карточек для проверки',
+      runtimeMaxSelectionScanRowsDefaultHelp: 'Бюджет чтения для выборки с фильтрами. Может увеличиваться до порога строк, но не превышает технический максимум сканирования.',
       runtimeMaxSelectionScanRowsMax: 'Максимум сканирования выборки',
       runtimeMaxSelectionScanRowsMaxHelp: 'Верхний предел карточек, которые одна выборка с фильтрами может проверить.',
       selectionScanLimitReached: 'Выборка {alias} проверила {scannedRows} из {availableTotal} карточек класса {className} (лимит сканирования {scanLimit}). Результат может быть неполным.',
@@ -11715,8 +11748,8 @@ function dynamicPagesClientScript() {
       runtimeMaxDomainsDefaultHelp: 'Сколько доменов CMDBuild читают операции по связям/доменам по умолчанию.',
       runtimeMaxDomainsMax: 'Максимум доменов',
       runtimeMaxDomainsMaxHelp: 'Верхний предел доменов, читаемых за одно выполнение.',
-      runtimeMaxRestCallsDefault: 'REST-вызовов по умолчанию',
-      runtimeMaxRestCallsDefaultHelp: 'Бюджет REST-вызовов к CMDBuild для одного выполнения шаблона по умолчанию.',
+      runtimeMaxRestCallsDefault: 'Запросов к CMDBuild',
+      runtimeMaxRestCallsDefaultHelp: 'Общий бюджет REST-запросов на выполнение. В трассировке видно, сколько запросов использовала каждая выборка «Группы объектов».',
       runtimeMaxRestCallsMax: 'Максимум REST-вызовов',
       runtimeMaxRestCallsMaxHelp: 'Верхний предел REST-вызовов к CMDBuild за одно выполнение.',
       runtimeMaxTraversalDepthDefault: 'Глубина раскрытия по умолчанию',
@@ -12668,6 +12701,13 @@ function dynamicPagesClientScript() {
       viewLargeAdvancedFields: 'Источник вариантов и сопоставление',
       viewLargeSimpleField: 'Фильтровать по колонке',
       viewLargeSimpleFieldHelp: 'В список попадут уникальные непустые значения одной колонки текущей выборки. Выберите поле с одним значением в каждой строке. Делать его видимой колонкой не нужно.',
+      viewLargeFieldsLoading: 'Загрузка полей источника…',
+      viewLargeFieldsError: 'Не удалось загрузить поля источника.',
+      viewLargeFieldPending: 'Сохранённое поле фильтра: {field}.',
+      viewLargeFieldsRetry: 'Повторить',
+      viewLargeFieldsEmpty: 'Нет доступных полей с одним значением. Добавьте такое поле в результат источника.',
+      viewLargeFieldsDynamic: 'Часть полей недоступна для выбора: класс источника определяется только при выполнении.',
+      viewLargeFieldUnavailable: 'Сохранённое поле фильтра {field} недоступно. Выберите другое поле.',
       viewLargeSourceKind: 'Тип источника вариантов',
       viewLargeSourceKindHelp: 'Результат потока сохраняет правила настроенной выборки. Класс CMDBuild читается отдельно: в список могут попасть объекты, для которых в таблице нет строк.',
       viewLargeClass: 'Класс CMDBuild',
@@ -12707,6 +12747,8 @@ function dynamicPagesClientScript() {
       traceRows: 'Строк',
       traceMs: 'мс',
       traceRest: 'REST',
+      traceScannedCards: 'Карточек прочитано',
+      traceExecutionBudget: 'Запросы к CMDBuild: {used} из {calls}. Не более {cards} карточек на выборку.',
       traceStatus: 'Статус',
       builder: 'Конструктор',
       preset: 'Заготовка',
@@ -12982,6 +13024,9 @@ function dynamicPagesClientScript() {
       reportLimitUnit_checks: 'проверки',
       reportLimitMatchAction: 'Сузьте обе входные выборки перед сопоставлением.',
       reportLimitScanAction: 'Сузьте выборку или проверьте «Настройки выполнения → Лимиты выполнения → {field}».',
+      reportLimitScanTechnicalAction: 'Сузьте выборку или попросите администратора проверить технический максимум сканирования.',
+      reportLimitRestAction: 'Сократите число выборок или проверьте «Настройки выполнения → Лимиты выполнения → Запросов к CMDBuild».',
+      reportLimitTimeAction: 'Сузьте выборку или разделите отчёт, чтобы уложиться во время выполнения.',
       reportLimitName_maxRelationsPerCard: 'Число связей на карточку',
       reportLimitName_maxRestCalls: 'Число REST-запросов за выполнение',
       reportLimitName_maxClasses: 'Число классов',
@@ -13659,32 +13704,39 @@ function dynamicPagesClientScript() {
     return true;
   }
 
-  function ensureCatalogAttributesForClass(className) {
+  function ensureCatalogAttributesForClass(className, quiet) {
     var name = String(className || '').trim();
     var key = catalogAttributeLoadKey(name);
     if (!name) return Promise.resolve(false);
-    if (state.catalogAttributeLoaded[key]) return Promise.resolve(false);
-    if (state.catalogAttributeLoads[key]) return state.catalogAttributeLoads[key];
+    if (state.catalogAttributeLoaded[key] === true) return Promise.resolve(false);
+    var session = state.session;
+    var inFlight = state.catalogAttributeLoads[key];
+    if (inFlight && inFlight.session === session) return inFlight.promise;
     var failedAt = Number(state.catalogAttributeFailedAt[key] || 0);
     if (failedAt && Date.now() - failedAt < 5000) return Promise.resolve(false);
-    state.catalogAttributeLoads[key] = request(apiPrefix + '/model/classes/' + encodeURIComponent(name) + '/attributes').then(function (result) {
+    var sessionInstance = state.sessionInstance;
+    var pending = { session: session };
+    Object.defineProperty(state.catalogAttributeLoads, key, { configurable: true, value: pending });
+    pending.promise = request(apiPrefix + '/model/classes/' + encodeURIComponent(name) + '/attributes').then(function (result) {
+      if (session !== state.session || sessionInstance !== state.sessionInstance) return false;
       if (!result.ok || !result.json || !Array.isArray(result.json.data)) {
         throw createRequestError(result);
       }
       delete state.catalogAttributeFailedAt[key];
       return mergeCatalogClassAttributes(name, result.json.data);
     }).catch(function (error) {
+      if (session !== state.session || sessionInstance !== state.sessionInstance) return false;
       state.catalogAttributeFailedAt[key] = Date.now();
-      state.message = {
+      if (!quiet) state.message = {
         type: 'warning',
         text: t('catalogError') + ': ' + name + ' ' + (error && error.message ? error.message : String(error))
       };
       clientLog('catalog-attributes-error', name + ' ' + (error && error.message ? error.message : String(error)));
       return 'failed';
     }).finally(function () {
-      delete state.catalogAttributeLoads[key];
+      if (state.catalogAttributeLoads[key] === pending) delete state.catalogAttributeLoads[key];
     });
-    return state.catalogAttributeLoads[key];
+    return pending.promise;
   }
 
   function viewComposerCatalogClassNames(spec) {
@@ -13720,8 +13772,8 @@ function dynamicPagesClientScript() {
   }
 
   function ensureCatalogAttributesForDesignerSection() {
-    // Field pickers are query-first. Opening a Designer section must not load
-    // a class catalog until the author starts searching for a field.
+    // Other catalog pickers remain query-first; the simple filter is a native select.
+    hydrateViewLargeSimpleFields();
   }
 
   function extractLanguageFromValue(value) {
@@ -15099,8 +15151,11 @@ function dynamicPagesClientScript() {
         maxRowsPreviewDefault: 25,
         maxRowsDataPreviewDefault: 100,
         maxRowsMax: boot.reportRowLimits.ordinary,
+        reportPageSize: boot.reportPaging?.defaultSize || 50,
         maxRelationsPerCardDefault: 100,
         maxRelationsPerCardMax: 5000,
+        maxSelectionScanRowsDefault: 10000,
+        maxSelectionScanRowsMax: 50000,
         maxClassesDefault: 100,
         maxClassesMax: 500,
         maxDomainsDefault: 100,
@@ -15473,6 +15528,7 @@ function dynamicPagesClientScript() {
     var valid = isSnapshotResult(json, action, expected.code) && json.template.active === true;
     if (valid && action === 'publish') {
       valid = isPersistedSnapshotCache(cache, 'snapshot-published') && cache.specHash === expected.specHash &&
+        isSnapshotHash(cache.snapshotRevision) && cache.snapshotRevision !== expected.snapshotRevision &&
         (cache.paramsHash === 'any') === (expected.paramsMode === 'ignore');
       if (valid && expected.paramsMode === 'exact') {
         try { valid = exactReportLaunchQuery(json.params).snapshotParams === expected.query.snapshotParams; }
@@ -15498,7 +15554,7 @@ function dynamicPagesClientScript() {
     // Only API failures known to precede the write prove a gateway status is definitive.
     if (result.status === 504) return reason !== (action === 'publish' ? 'draft_preview_timeout' : 'snapshot_refresh_timeout');
     if (result.status === 503) return reason !== 'snapshot_storage_unavailable';
-    return reason !== 'snapshot_refresh_data_unavailable' && reason !==
+    return reason !== 'report_runtime_config_unavailable' && reason !== 'snapshot_refresh_data_unavailable' && reason !==
       (action === 'publish' ? 'publication_template_recheck_failed' : 'snapshot_refresh_template_unavailable');
   }
 
@@ -15559,8 +15615,10 @@ function dynamicPagesClientScript() {
       counts.push(t('reportLimitElapsed', { count: limit.elapsedMs }));
     }
     var action = limit.limitName === 'maxMatchRuleChecks' ? t('reportLimitMatchAction') :
-      limit.limitName === 'maxSelectionScanRows' && limit.source === 'runtime-settings' ?
-        t('reportLimitScanAction', { field: t(limit.configKey === 'maxSelectionScanRowsMax' ? 'runtimeMaxSelectionScanRowsMax' : 'runtimeMaxSelectionScanRowsDefault') }) : '';
+      limit.limitName === 'maxSelectionScanRows' ? (limit.configKey === 'maxSelectionScanRowsDefault'
+        ? t('reportLimitScanAction', { field: t('runtimeMaxSelectionScanRowsDefault') }) : t('reportLimitScanTechnicalAction')) :
+      limit.limitName === 'maxRestCalls' ? t('reportLimitRestAction') :
+      limit.reason === 'deadline_exceeded' ? t('reportLimitTimeAction') : '';
     return location.join(', ') + ': ' + t('reportLimitReason_' + limit.reason) +
       (limitDescription ? ' ' + limitDescription + '.' : '') +
       (counts.length ? ' ' + counts.join('; ') + '.' : '') + (action ? ' ' + action : '');
@@ -18457,7 +18515,8 @@ function dynamicPagesClientScript() {
     var paged = reached && !diagram && Boolean(output.presentation && output.presentation.largeTable);
     var canPage = !paged && reached && !diagram;
     var modeLimit = paged ? limits.paged : limits.ordinaryThreshold;
-    var help = t('objectSelectionLimitHelp') + ' ' + t('reportRowModeCap', { limit: modeLimit }) + ' ' + reportRowRecommendationHelp();
+    var rowHelp = paged ? t('reportRowModeCap', { limit: modeLimit }) : reportOrdinaryRowLimitHelp(limits);
+    var help = t('objectSelectionLimitHelp') + ' ' + rowHelp + ' ' + reportRowRecommendationHelp();
     return [
       '<div class="object-selection" data-object-selection data-object-selection-index="' + index + '" data-object-selection-id="' + escapeHtml(selection.id || ('selection:' + selection.alias)) + '" data-object-filter-join="' + escapeHtml(selection.filterJoin) + '">',
       '<div class="section-title-row"><h3>' + escapeHtml(t('objectSelectionSummaryKind', { number: index + 1 }) + ': ' + (selection.name || defaultObjectSelectionName(index))) + '</h3>',
@@ -18991,13 +19050,32 @@ function dynamicPagesClientScript() {
       '<input ' + attrs.join(' ') + '></div>';
   }
 
-  function currentReportRowLimits() {
-    var settings = state.config && state.config.runtimeConfig && state.config.runtimeConfig.executionLimits;
-    var configured = Number(settings && settings.maxRowsMax);
-    return Object.assign({}, boot.reportRowLimits, {
-      ordinaryThreshold: Number.isSafeInteger(configured) && configured > 0
-        ? Math.min(configured, boot.reportRowLimits.ordinary) : boot.reportRowLimits.ordinary
+  function boundedReportSetting(value, fallback, cap) {
+    var number = Number(value);
+    return Math.min(Number.isSafeInteger(number) && number > 0 ? number : fallback, cap);
+  }
+
+  function currentReportRowLimits(settings = state.config?.runtimeConfig?.executionLimits) {
+    var ceilings = boot.reportRowLimits;
+    var ordinaryThreshold = boundedReportSetting(settings?.maxRowsMax, ceilings.ordinary, ceilings.ordinary);
+    return Object.assign({}, ceilings, {
+      ordinaryThreshold: ordinaryThreshold,
+      dynamicDefault: boundedReportSetting(settings?.maxRowsDefault, defaultRuntimeConfig().executionLimits.maxRowsDefault, ordinaryThreshold)
     });
+  }
+
+  function reportOrdinaryRowLimitHelp(limits) {
+    return t('reportOrdinaryPublicationThreshold', { limit: limits.ordinaryThreshold }) + ' ' +
+      t('reportDynamicRunDefault', { limit: limits.dynamicDefault });
+  }
+
+  function runtimeRequestBudgetCaps(executionLimits) {
+    var caps = boot.reportExecutionCaps;
+    var defaults = defaultRuntimeConfig().executionLimits;
+    return {
+      restCalls: boundedReportSetting(executionLimits.maxRestCallsMax, defaults.maxRestCallsMax, caps.restCalls),
+      scanRows: boundedReportSetting(executionLimits.maxSelectionScanRowsMax, defaults.maxSelectionScanRowsMax, caps.scanRows)
+    };
   }
 
   function reportRowRecommendationHelp() {
@@ -19372,31 +19450,34 @@ function dynamicPagesClientScript() {
   function renderExecutionLimitFields(executionLimits) {
     var ceilings = boot.reportRowLimits;
     var recommendation = reportRowRecommendationHelp();
-    var deploymentHelp = t('reportRowDeploymentHelp') + ' ' + recommendation;
-    var runMax = Math.min(Number(executionLimits.maxRowsMax) || ceilings.ordinary, ceilings.ordinary);
+    var rowLimits = currentReportRowLimits(executionLimits);
+    var caps = runtimeRequestBudgetCaps(executionLimits);
+    var pageSize = boot.reportPaging || { defaultSize: 50, maxSize: 100 };
+    var technical = [
+      ['ordinaryRowCeiling', ceilings.ordinary], ['pagedRowCeiling', ceilings.paged],
+      ['runtimeMaxRowsDefault', executionLimits.maxRowsDefault], ['runtimeMaxRowsPreviewDefault', executionLimits.maxRowsPreviewDefault],
+      ['runtimeMaxRowsDataPreviewDefault', executionLimits.maxRowsDataPreviewDefault],
+      ['runtimeMaxRelationsPerCardDefault', executionLimits.maxRelationsPerCardDefault], ['runtimeMaxRelationsPerCardMax', executionLimits.maxRelationsPerCardMax],
+      ['runtimeMaxSelectionScanRowsMax', executionLimits.maxSelectionScanRowsMax],
+      ['runtimeMaxClassesDefault', executionLimits.maxClassesDefault], ['runtimeMaxClassesMax', executionLimits.maxClassesMax],
+      ['runtimeMaxDomainsDefault', executionLimits.maxDomainsDefault], ['runtimeMaxDomainsMax', executionLimits.maxDomainsMax],
+      ['runtimeMaxRestCallsMax', executionLimits.maxRestCallsMax],
+      ['runtimeMaxTraversalDepthDefault', executionLimits.maxTraversalDepthDefault], ['runtimeMaxTraversalDepthMax', executionLimits.maxTraversalDepthMax]
+    ];
     return [
       renderSavedMaximumWarning(executionLimits),
-      '<div class="visual-grid">',
-      renderNumberSetting('cmdp-runtime-max-rows-default', 'runtimeMaxRowsDefault', 'runtimeMaxRowsDefaultHelp', executionLimits.maxRowsDefault, { max: ceilings.ordinary }),
-      renderNumberSetting('cmdp-runtime-max-rows-preview-default', 'runtimeMaxRowsPreviewDefault', 'runtimeMaxRowsPreviewDefaultHelp', executionLimits.maxRowsPreviewDefault, { max: ceilings.ordinary }),
-      renderNumberSetting('cmdp-runtime-max-rows-data-preview-default', 'runtimeMaxRowsDataPreviewDefault', 'runtimeMaxRowsDataPreviewDefaultHelp', executionLimits.maxRowsDataPreviewDefault, { max: ceilings.ordinary }),
+      '<div class="visual-grid" data-report-limit-controls>',
       renderNumberSetting('cmdp-runtime-max-rows-max', 'runtimeMaxRowsMax', 'runtimeMaxRowsMaxHelp', executionLimits.maxRowsMax, { max: ceilings.ordinary,
-        help: t('runtimeMaxRowsMaxHelp') + ' ' + t('reportRowModeCap', { limit: runMax }) + ' ' + recommendation }),
-      renderNumberSetting('cmdp-report-ordinary-ceiling', 'ordinaryRowCeiling', '', ceilings.ordinary, { readonly: true, help: deploymentHelp }),
-      renderNumberSetting('cmdp-report-paged-ceiling', 'pagedRowCeiling', '', ceilings.paged, { readonly: true, help: deploymentHelp }),
-      renderNumberSetting('cmdp-runtime-max-relations-per-card-default', 'runtimeMaxRelationsPerCardDefault', 'runtimeMaxRelationsPerCardDefaultHelp', executionLimits.maxRelationsPerCardDefault, { max: executionLimits.maxRelationsPerCardMax }),
-      renderNumberSetting('cmdp-runtime-max-relations-per-card-max', 'runtimeMaxRelationsPerCardMax', 'runtimeMaxRelationsPerCardMaxHelp', executionLimits.maxRelationsPerCardMax, { max: 50000 }),
-      renderNumberSetting('cmdp-runtime-max-selection-scan-rows-default', 'runtimeMaxSelectionScanRowsDefault', 'runtimeMaxSelectionScanRowsDefaultHelp', executionLimits.maxSelectionScanRowsDefault, { max: executionLimits.maxSelectionScanRowsMax }),
-      renderNumberSetting('cmdp-runtime-max-selection-scan-rows-max', 'runtimeMaxSelectionScanRowsMax', 'runtimeMaxSelectionScanRowsMaxHelp', executionLimits.maxSelectionScanRowsMax, { max: 50000 }),
-      renderNumberSetting('cmdp-runtime-max-classes-default', 'runtimeMaxClassesDefault', 'runtimeMaxClassesDefaultHelp', executionLimits.maxClassesDefault, { max: 500 }),
-      renderNumberSetting('cmdp-runtime-max-classes-max', 'runtimeMaxClassesMax', 'runtimeMaxClassesMaxHelp', executionLimits.maxClassesMax, { max: 500 }),
-      renderNumberSetting('cmdp-runtime-max-domains-default', 'runtimeMaxDomainsDefault', 'runtimeMaxDomainsDefaultHelp', executionLimits.maxDomainsDefault, { max: 500 }),
-      renderNumberSetting('cmdp-runtime-max-domains-max', 'runtimeMaxDomainsMax', 'runtimeMaxDomainsMaxHelp', executionLimits.maxDomainsMax, { max: 500 }),
-      renderNumberSetting('cmdp-runtime-max-rest-calls-default', 'runtimeMaxRestCallsDefault', 'runtimeMaxRestCallsDefaultHelp', executionLimits.maxRestCallsDefault, { max: 1000 }),
-      renderNumberSetting('cmdp-runtime-max-rest-calls-max', 'runtimeMaxRestCallsMax', 'runtimeMaxRestCallsMaxHelp', executionLimits.maxRestCallsMax, { max: 1000 }),
-      renderNumberSetting('cmdp-runtime-max-traversal-depth-default', 'runtimeMaxTraversalDepthDefault', 'runtimeMaxTraversalDepthDefaultHelp', executionLimits.maxTraversalDepthDefault, { max: 5 }),
-      renderNumberSetting('cmdp-runtime-max-traversal-depth-max', 'runtimeMaxTraversalDepthMax', 'runtimeMaxTraversalDepthMaxHelp', executionLimits.maxTraversalDepthMax, { max: 5 }),
-      '</div>'
+        help: t('runtimeMaxRowsMaxHelp') + ' ' + reportOrdinaryRowLimitHelp(rowLimits) + ' ' + reportRowUseLargeHint() + ' ' + recommendation }),
+      renderNumberSetting('cmdp-report-page-size', 'runtimeReportPageSize', 'runtimeReportPageSizeHelp', executionLimits.reportPageSize ?? pageSize.defaultSize, { max: pageSize.maxSize }),
+      renderNumberSetting('cmdp-runtime-max-rest-calls-default', 'runtimeMaxRestCallsDefault', 'runtimeMaxRestCallsDefaultHelp', executionLimits.maxRestCallsDefault, { max: caps.restCalls }),
+      renderNumberSetting('cmdp-runtime-max-selection-scan-rows-default', 'runtimeMaxSelectionScanRowsDefault', 'runtimeMaxSelectionScanRowsDefaultHelp', executionLimits.maxSelectionScanRowsDefault, { max: caps.scanRows }),
+      renderNumberSetting('cmdp-report-timeout', 'runtimeReportTimeout', 'runtimeReportTimeoutHelp', Number(boot.draftPreviewTimeoutMs || 60000) / 1000, { readonly: true }),
+      '</div>',
+      '<details><summary>' + escapeHtml(t('runtimeTechnicalLimits')) + '</summary><p class="muted">' + escapeHtml(t('runtimeTechnicalLimitsHelp')) + '</p>',
+      '<table class="compact"><tbody>' + technical.filter(function (item) { return item[1] !== undefined; }).map(function (item) {
+        return '<tr><th scope="row">' + escapeHtml(t(item[0])) + '</th><td>' + escapeHtml(item[1]) + '</td></tr>';
+      }).join('') + '</tbody></table></details>'
     ].join('');
   }
 
@@ -21509,7 +21590,7 @@ function dynamicPagesClientScript() {
     }
     return Object.assign({ alias: source, limits: data.limitDiagnostics,
       steps: trace.slice(0, 16).map(function (item) {
-        return Object.assign({ index: item.index, as: item.as, type: item.type, rows: item.rows,
+        return Object.assign({ index: item.index, as: item.as, type: item.type, rows: item.rows, scannedCards: item.scannedCards,
           elapsedMs: item.elapsedMs, restCalls: item.restCalls, truncated: item.truncated }, config(steps[item.index]));
       }) }, config(selectedStep));
   }
@@ -26100,7 +26181,9 @@ function dynamicPagesClientScript() {
   }
 
   function viewLargeClassFieldOptions(className) {
-    return className ? catalogAttributeOptions(className).map(function (attribute) {
+    return className ? catalogAttributeOptions(className).filter(function (attribute) {
+      return attribute.active !== false && (!attribute.permissions || attribute.permissions._can_read !== false);
+    }).map(function (attribute) {
       return { value: attribute.name, label: attribute.description || attribute.name };
     }) : [];
   }
@@ -26122,6 +26205,55 @@ function dynamicPagesClientScript() {
     var visual = getStoredVisualModel(spec, 'viewComposer');
     var source = visual && visual.source || {};
     return uniqueList(tableColumnsForAlias(spec, alias).concat(source.alias === alias && Array.isArray(source.columns) ? source.columns : []));
+  }
+
+  function viewLargeSelectionClassNames(spec, step) {
+    function classParam(key) {
+      var value = resolveTemplateParameters(spec).values[key];
+      return typeof value === 'string' ? value.trim() : '';
+    }
+    function isClassName(name) { return /^[A-Za-z][A-Za-z0-9_]*$/.test(name); }
+    if (step.type === 'expandRelations') return normalizeStringList(step.targetClass).filter(isClassName);
+    var className = String(step.className || '').trim();
+    var expression = /^[$][{]param[.]([A-Za-z_][A-Za-z0-9_]*)[}]$/.exec(className);
+    if (expression) className = classParam(expression[1]);
+    else if (!className && step.classNameParam) className = classParam(step.classNameParam);
+    return isClassName(className) ? [className] : [];
+  }
+
+  function viewLargeFieldMetadata(spec, alias) {
+    var byAlias = new Map((spec.steps || []).filter(Boolean).map(function (step) { return [step.as, step]; }));
+    var visited = new Set();
+    var classes = new Set();
+    var dynamic = false;
+    function visit(name) {
+      if (!name || visited.has(name)) return;
+      visited.add(name);
+      var step = byAlias.get(name);
+      if (!step) return;
+      if (step.type === 'selectCards' || step.type === 'expandRelations') {
+        var relation = step.type === 'expandRelations';
+        if (!relation || step.fetchRelated !== false) {
+          var resolved = viewLargeSelectionClassNames(spec, step);
+          resolved.forEach(function (className) { classes.add(className); });
+          if (!resolved.length) dynamic = true;
+        }
+        if (step.includeSource !== false) visit(step.from);
+      } else if (step.type === 'composeRows' || step.type === 'compose') {
+        var columns = normalizeComposeColumns(step).filter(function (column) {
+          return !column.hasValue && !column.valueParam && !column.template;
+        });
+        if (columns.some(function (column) { return column.source !== 'right'; })) visit(step.from);
+        if (columns.some(function (column) { return column.source === 'right'; })) visit(composeRightAlias(step));
+      } else if (['filterRows', 'semiJoinRows', 'existsRelatedRows', 'intersectRows', 'differenceRows', 'unionRows', 'enrichRows', 'matchRows', 'joinRows'].includes(step.type)) {
+        visit(step.from);
+        if (['unionRows', 'matchRows', 'joinRows'].includes(step.type)) visit(step.with);
+      }
+    }
+    visit(alias);
+    return { missing: Array.from(classes).filter(function (name) {
+      return state.catalogAttributeLoaded[catalogAttributeLoadKey(name)] !== true;
+    }), dynamic: dynamic };
   }
 
   function viewLargeSourceFields(spec, sourceAlias) {
@@ -26158,7 +26290,7 @@ function dynamicPagesClientScript() {
       }
       if (step.type === 'selectCards' || step.type === 'expandRelations') {
         var relation = step.type === 'expandRelations';
-        var classes = relation ? normalizeStringList(step.targetClass) : normalizeStringList(step.className);
+        var classes = viewLargeSelectionClassNames(spec, step);
         if (relation) {
           ['SourceClass', 'SourceId', 'SourceCode', 'SourceDescription', 'Domain', 'RelationId', 'RelationDirection', 'RelationSourceSide',
             'RelatedClass', 'RelatedId', 'RelatedReadStatus'].forEach(function (name) { add(name); });
@@ -26174,7 +26306,8 @@ function dynamicPagesClientScript() {
         function addAttributes() {
           classes.forEach(function (name) {
             catalogAttributeOptions(name).forEach(function (attribute) {
-              if (!attribute.name.startsWith('_') && standard.indexOf(attribute.name) === -1) {
+              if (attribute.active !== false && (!attribute.permissions || attribute.permissions._can_read !== false) &&
+                  !attribute.name.startsWith('_') && standard.indexOf(attribute.name) === -1) {
                 add(attribute.name, (fields.get(attribute.name) || {}).multiple || viewLargeAttributeIsMultiple(attribute), attribute.description);
               }
             });
@@ -26216,9 +26349,6 @@ function dynamicPagesClientScript() {
         }
         if (step.type === 'enrichRows') project(step.columns || step.fields, [sourceClassForAlias(spec, step.from)]);
       }
-      viewLargeDeclaredColumns(spec, alias).forEach(function (name) {
-        if (!fields.has(name)) add(name);
-      });
       return fields;
     }
     return fieldsFor(sourceAlias);
@@ -26233,8 +26363,11 @@ function dynamicPagesClientScript() {
     var projection = reportClosedOutputFields(spec, alias);
     if (projection) return fields.filter(function (item) { return projection.has(item.value); });
     var step = (spec.steps || []).find(function (item) { return item && item.as === alias; });
-    if (query && (matching || step && step.type === 'selectCards')) {
-      fields = fields.concat(diagramColumnOptionRowsForSource(spec, alias, query).filter(function (item) {
+    if (query && step && (matching || step.type === 'selectCards')) {
+      var classNames = step.type === 'selectCards' ? viewLargeSelectionClassNames(spec, step) : [sourceClassForAlias(spec, alias)];
+      fields = fields.concat(classNames.filter(Boolean).flatMap(function (className) {
+        return catalogScopePathOptions(className, query);
+      }).filter(function (item) {
         return /[.{]/.test(item.value);
       }));
     }
@@ -26244,6 +26377,73 @@ function dynamicPagesClientScript() {
   function viewLargeSimpleFieldOptions(spec, sourceAlias) {
     return viewLargeResultOptions(spec).some(function (item) { return item.value === sourceAlias; })
       ? viewLargeSourceFieldOptions(spec, sourceAlias) : [];
+  }
+
+  function viewLargeResultFieldAvailable(spec, alias, field, matching) {
+    if (!field) return false;
+    var projection = reportClosedOutputFields(spec, alias);
+    if (projection) return projection.has(field);
+    if (viewLargeAdvancedResultFields(spec, alias, field, matching).some(function (item) { return item.value === field; })) return true;
+    var metadata = viewLargeFieldMetadata(spec, alias);
+    return metadata.missing.length > 0 || metadata.dynamic;
+  }
+
+  function viewLargeSimpleFieldModel(spec, sourceAlias, selected) {
+    var metadata = viewLargeFieldMetadata(spec, sourceAlias);
+    var options = viewLargeSimpleFieldOptions(spec, sourceAlias);
+    var unavailable = selected && !options.some(function (item) { return item.value === selected; }) ? selected : '';
+    return { missing: metadata.missing, options: options, unavailable: unavailable, dynamic: metadata.dynamic };
+  }
+
+  function renderViewLargeSimpleFieldOptions(model, selected) {
+    return renderColumnSelectOptions(model.options, model.unavailable ? '' : selected);
+  }
+
+  function hydrateViewLargeSimpleFields(retry) {
+    var input = document.getElementById('cmdp-view-large-simple-field');
+    if (!input) return;
+    var host = input.closest('#cmdp-view-large-table');
+    var status = host.querySelector('[data-view-large-field-status]');
+    var retryButton = host.querySelector('[data-action="retry-view-large-fields"]');
+    var alias = host.getAttribute('data-view-large-source');
+    var spec = readCurrentSpec();
+    function selectedField() { return input.value || input.getAttribute('data-view-large-saved-field') || ''; }
+    var model = viewLargeSimpleFieldModel(spec, alias, selectedField());
+    var owner = uiRequestOwner();
+    var session = state.session;
+    var ticket = {};
+    input.viewLargeMetadataTicket = ticket;
+    function update(current, phase) {
+      var selected = selectedField();
+      input.disabled = Boolean(phase || !current.options.length);
+      input.setAttribute('aria-busy', phase === 'loading' ? 'true' : 'false');
+      if (current.unavailable) input.setAttribute('data-view-large-saved-field', current.unavailable);
+      else input.removeAttribute('data-view-large-saved-field');
+      if (current.unavailable && !phase) input.setAttribute('aria-invalid', 'true');
+      else input.removeAttribute('aria-invalid');
+      var html = renderViewLargeSimpleFieldOptions(current, selected);
+      if (input.innerHTML !== html) input.innerHTML = html;
+      input.value = current.unavailable ? '' : selected;
+      status.textContent = phase ? t(phase === 'loading' ? 'viewLargeFieldsLoading' : 'viewLargeFieldsError') +
+        (current.unavailable ? ' ' + t('viewLargeFieldPending', { field: current.unavailable }) : '')
+        : current.unavailable ? t('viewLargeFieldUnavailable', { field: current.unavailable }) : current.dynamic ? t('viewLargeFieldsDynamic')
+          : !current.options.length ? t('viewLargeFieldsEmpty') : '';
+      retryButton.hidden = phase !== 'error';
+    }
+    if (!model.missing.length) {
+      update(model, '');
+      return;
+    }
+    update(model, 'loading');
+    Promise.all(model.missing.map(function (name) {
+      if (retry) delete state.catalogAttributeFailedAt[catalogAttributeLoadKey(name)];
+      return ensureCatalogAttributesForClass(name, true);
+    })).then(function () {
+      if (!input.isConnected || ticket !== input.viewLargeMetadataTicket || session !== state.session ||
+          !uiDiagnosticIsCurrent({ owner: owner }, false, true) || host.getAttribute('data-view-large-source') !== alias) return;
+      var current = viewLargeSimpleFieldModel(readCurrentSpec(), alias, selectedField());
+      update(current, current.missing.length ? 'error' : '');
+    });
   }
 
   function viewLargeSimpleSelector(sourceAlias, field) {
@@ -26309,9 +26509,15 @@ function dynamicPagesClientScript() {
 
   function renderViewLargeFilter(selectorMode, selector, columns, spec, sourceAlias) {
     if (selectorMode === 'simple') {
-      var options = viewLargeSimpleFieldOptions(spec, sourceAlias);
+      var field = selector.matchField || '';
+      var model = viewLargeSimpleFieldModel(spec, sourceAlias, field);
       return '<div class="settings-grid">' + renderViewLargeSelect('cmdp-view-large-simple-field', 'viewLargeSimpleField',
-        options.length ? '' : 'disabled', renderColumnSelectOptions(options, options.some(function (item) { return item.value === selector.matchField; }) ? selector.matchField : '')) + '</div>';
+        (model.missing.length || !model.options.length ? 'disabled ' : '') +
+        (model.unavailable ? 'data-view-large-saved-field="' + escapeHtml(model.unavailable) + '" ' : '') +
+        'aria-busy="' + (model.missing.length ? 'true' : 'false') + '"', renderViewLargeSimpleFieldOptions(model, field)) +
+        '</div><div class="muted" role="status" data-view-large-field-status>' +
+        (model.missing.length ? escapeHtml(t('viewLargeFieldsLoading')) : '') + '</div>' +
+        '<button type="button" data-action="retry-view-large-fields" hidden>' + escapeHtml(t('viewLargeFieldsRetry')) + '</button>';
     }
     var kind = selector.kind === 'class' ? 'class' : 'result';
     return '<details class="view-large-advanced" open><summary>' + escapeHtml(t('viewLargeAdvancedFields')) + '</summary><div class="settings-grid">' +
@@ -26356,9 +26562,11 @@ function dynamicPagesClientScript() {
     var selector = largeTable && largeTable.selector || {};
     if (!selectorMode) {
       selectorMode = viewLargeSelectorMode(largeTable.selector, tableSourceAlias);
-      if (selectorMode === 'simple' && selector.matchField && !viewLargeSimpleFieldOptions(spec, tableSourceAlias).some(function (item) {
-        return item.value === selector.matchField;
-      })) selectorMode = 'advanced';
+      if (selectorMode === 'simple' && selector.matchField) {
+        var model = viewLargeSimpleFieldModel(spec, tableSourceAlias, selector.matchField);
+        if (!model.missing.length && model.unavailable && viewLargeAdvancedResultFields(spec, tableSourceAlias, selector.matchField)
+          .some(function (item) { return item.value === selector.matchField; })) selectorMode = 'advanced';
+      }
     }
     return (mode === 'key' ? '<div class="settings-grid"><label>' + escapeHtml(t('viewLargeSelectorMode')) +
       '<select id="cmdp-view-large-selector-mode">' + renderViewLargeChoiceOptions([['simple', 'viewLargeSimple'], ['advanced', 'viewLargeAdvanced']], selectorMode) + '</select></label></div>' +
@@ -26643,7 +26851,7 @@ function dynamicPagesClientScript() {
     var warnings = resultBody && Array.isArray(resultBody.warnings) ? resultBody.warnings : [];
     if (!result.ok) {
       var errorHtml = '<section class="section" id="cmdp-result-section">' + renderRequestErrorNotice(result);
-      if (trace.length) errorHtml += renderExecutionTrace(trace);
+      if (trace.length) errorHtml += renderExecutionTrace(trace, null, resultBody && resultBody.limits);
       return errorHtml + '</section>';
     }
     var html = '<section class="section" id="cmdp-result-section"><h2>' + t('result') + '</h2>';
@@ -26656,7 +26864,7 @@ function dynamicPagesClientScript() {
     } else {
       html += '<pre>' + escapeHtml(pretty(result.json || {})) + '</pre>';
     }
-    if (trace.length) html += renderExecutionTrace(trace);
+    if (trace.length) html += renderExecutionTrace(trace, null, resultBody && resultBody.limits);
     return html + '</section>';
   }
 
@@ -27158,7 +27366,7 @@ function dynamicPagesClientScript() {
     return renderRuntimeNotice(resultBody && resultBody.emptyText || DEFAULT_EMPTY_RESULT_TEXT, cacheHtml);
   }
 
-  function renderExecutionTrace(trace, spec) {
+  function renderExecutionTrace(trace, spec, limits) {
     var currentSpec = spec || state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
     var warnings = trace.filter(function (item) { return item && item.warning; }).map(function (item) { return userFacingResultText(item.warning, currentSpec); });
     var rows = trace.map(function (item) {
@@ -27167,13 +27375,19 @@ function dynamicPagesClientScript() {
         '<td>' + escapeHtml(userFacingResultLabel(item.as || '', currentSpec)) + '</td>' +
         '<td>' + escapeHtml(item.status || '') + '</td>' +
         '<td>' + escapeHtml(item.rows == null ? '' : String(item.rows)) + '</td>' +
+        '<td>' + escapeHtml(item.scannedCards == null ? '' : String(item.scannedCards)) + '</td>' +
         '<td>' + escapeHtml(item.elapsedMs == null ? '' : String(item.elapsedMs)) + '</td>' +
         '<td>' + escapeHtml(item.restCalls == null ? '' : String(item.restCalls)) + '</td></tr>';
     }).join('');
+    var budget = limits && Number.isFinite(limits.restCalls) && Number.isFinite(limits.maxRestCalls) && Number.isFinite(limits.maxSelectionScanRowsMax)
+      ? '<p class="muted" data-execution-budget>' + escapeHtml(t('traceExecutionBudget', {
+        used: limits.restCalls, calls: limits.maxRestCalls, cards: limits.maxSelectionScanRowsMax
+      })) + '</p>' : '';
     return (warnings.length ? warnings.map(function (warning) { return renderNotice({ type: 'warning', text: warning }); }).join('') : '') +
+      budget +
       '<h3>' + t('executionTrace') + '</h3><table class="compact"><thead><tr><th>' + t('traceStep') + '</th><th>' +
       t('type') + '</th><th>' + t('assistantFlowBlockName') + '</th><th>' + t('traceStatus') + '</th><th>' +
-      t('traceRows') + '</th><th>' + t('traceMs') + '</th><th>' + t('traceRest') + '</th></tr></thead><tbody>' +
+      t('traceRows') + '</th><th>' + t('traceScannedCards') + '</th><th>' + t('traceMs') + '</th><th>' + t('traceRest') + '</th></tr></thead><tbody>' +
       rows + '</tbody></table>';
   }
 
@@ -27798,7 +28012,8 @@ function dynamicPagesClientScript() {
 
   function readViewLargeSelectorDraft(host) {
     var simple = host.querySelector('#cmdp-view-large-simple-field');
-    if (simple) return viewLargeSimpleSelector(host.getAttribute('data-view-large-source'), simple.value);
+    if (simple) return viewLargeSimpleSelector(host.getAttribute('data-view-large-source'),
+      simple.value || simple.getAttribute('data-view-large-saved-field') || '');
     if (!host.querySelector('[data-view-large-selector]')) return null;
     function fieldValue(name) {
       var input = host.querySelector('[data-view-large-field="' + name + '"]');
@@ -27822,15 +28037,15 @@ function dynamicPagesClientScript() {
 
   function rebindViewLargeTableSource(draft, oldSource, spec) {
     if (draft.sourceAlias === oldSource) return;
-    var fields = new Map(viewLargeAdvancedResultFields(spec, draft.sourceAlias, '').map(function (item) { return [item.value, item]; }));
     var drafts = draft.largeTableSelectorDrafts;
     if (drafts.simple) {
-      var simpleField = fields.get(drafts.simple.matchField);
-      drafts.simple = viewLargeSimpleSelector(draft.sourceAlias, simpleField && !simpleField.multiple ? simpleField.value : '');
+      var simpleField = drafts.simple.matchField;
+      var model = viewLargeSimpleFieldModel(spec, draft.sourceAlias, simpleField);
+      if (model.unavailable && !model.missing.length) simpleField = '';
+      drafts.simple = viewLargeSimpleSelector(draft.sourceAlias, simpleField);
     }
     var advancedField = drafts.advanced && drafts.advanced.matchField;
-    if (advancedField && !viewLargeAdvancedResultFields(spec, draft.sourceAlias, advancedField, true)
-      .some(function (item) { return item.value === advancedField; })) {
+    if (advancedField && !viewLargeResultFieldAvailable(spec, draft.sourceAlias, advancedField, true)) {
       drafts.advanced = Object.assign({}, drafts.advanced, { matchField: '' });
     }
     if (!draft.largeTable) return;
@@ -27854,14 +28069,13 @@ function dynamicPagesClientScript() {
       if (table.mode === 'key') {
         var selector = table.selector || {};
         if (draft.largeTableSelectorMode === 'simple') {
-          requireField(viewLargeSimpleFieldOptions(spec, draft.sourceAlias).some(function (item) { return item.value === selector.matchField; }), 'viewLargeSimpleField');
+          var model = viewLargeSimpleFieldModel(spec, draft.sourceAlias, selector.matchField);
+          requireField(selector.matchField && !model.missing.length && !model.unavailable, 'viewLargeSimpleField');
         }
         requireField(selector.source && (selector.kind !== 'result' || viewLargeResultOptions(spec).some(function (item) { return item.value === selector.source; })), 'viewLargeSource');
-        var projection = selector.kind === 'result' && reportClosedOutputFields(spec, selector.source);
-        var matchProjection = reportClosedOutputFields(spec, draft.sourceAlias);
-        requireField(selector.idField && (!projection || projection.has(selector.idField)), 'viewLargeId');
-        requireField(selector.labelField && (!projection || projection.has(selector.labelField)), 'viewLargeLabel');
-        requireField(selector.matchField && (!matchProjection || matchProjection.has(selector.matchField)), 'viewLargeMatch');
+        requireField(selector.kind === 'result' ? viewLargeResultFieldAvailable(spec, selector.source, selector.idField) : selector.idField, 'viewLargeId');
+        requireField(selector.kind === 'result' ? viewLargeResultFieldAvailable(spec, selector.source, selector.labelField) : selector.labelField, 'viewLargeLabel');
+        requireField(viewLargeResultFieldAvailable(spec, draft.sourceAlias, selector.matchField, true), 'viewLargeMatch');
         requireField(!selector.parameter || getParamRows(spec).some(function (param) { return param.name === selector.parameter; }), 'viewLargeParameter');
       }
       var groupKeys = columns.map(function (item) { return item.value; }).filter(function (field) { return table.groupKeys.indexOf(field) !== -1; });
@@ -30146,6 +30360,7 @@ function dynamicPagesClientScript() {
   function handleViewLargeTableChange(target) {
     var host = target && target.closest('#cmdp-view-large-table');
     if (!host) return;
+    if (target.id === 'cmdp-view-large-simple-field') target.removeAttribute('data-view-large-saved-field');
     markViewLargeTableEdited();
     var field = target.getAttribute('data-view-large-field');
     var spec = readCurrentSpec();
@@ -30166,8 +30381,12 @@ function dynamicPagesClientScript() {
     } else if (largeTable && target.id === 'cmdp-view-large-selector-mode') {
       var filter = host.querySelector('[data-view-large-filter]');
       var current = drafts[target.value];
-      if (!current) current = target.value === 'advanced' && drafts.simple ? Object.assign({}, drafts.simple)
-        : viewLargeSimpleSelector(draft.sourceAlias, '');
+      if (!current) {
+        var simpleField = drafts.simple && drafts.simple.matchField;
+        var available = simpleField && viewLargeAdvancedResultFields(spec, draft.sourceAlias, simpleField)
+          .some(function (item) { return item.value === simpleField; });
+        current = viewLargeSimpleSelector(draft.sourceAlias, available ? simpleField : '');
+      }
       largeTable.selector = drafts[target.value] = current;
       filter.innerHTML = renderViewLargeFilter(target.value, current, columns, spec, draft.sourceAlias);
     } else if (largeTable && (field === 'kind' || field === 'source')) {
@@ -30175,9 +30394,9 @@ function dynamicPagesClientScript() {
       var selector = largeTable.selector;
       if (field === 'kind') selector.source = '';
       ['idField', 'labelField'].forEach(function (name) {
-        var options = !selector.source ? [] : selector.kind === 'result'
-          ? viewLargeAdvancedResultFields(spec, selector.source, selector[name]) : viewLargeClassFieldOptions(selector.source);
-        if (!options.some(function (item) { return item.value === selector[name]; })) selector[name] = '';
+        var available = selector.source && (selector.kind === 'result' ? viewLargeResultFieldAvailable(spec, selector.source, selector[name])
+          : viewLargeClassFieldOptions(selector.source).some(function (item) { return item.value === selector[name]; }));
+        if (!available) selector[name] = '';
       });
       drafts.advanced = selector;
       selectorHost.innerHTML = renderViewLargeSelectorFields(selector, columns, spec, draft.sourceAlias);
@@ -30200,6 +30419,8 @@ function dynamicPagesClientScript() {
       }
     }
     state.viewComposerDraft = draft;
+    if (target.id === 'cmdp-view-large-mode' || target.id === 'cmdp-view-large-selector-mode' ||
+        target.id === 'cmdp-view-large-simple-field') hydrateViewLargeSimpleFields();
   }
 
   function clearViewComposerColumnRow(button) {
@@ -32419,21 +32640,27 @@ function dynamicPagesClientScript() {
         code: savedTemplate.code, id: String(savedTemplate.id || ''), specHash: savedTemplate.specHash, paramsMode: publishedMode.paramsMode,
         query: publishedMode.paramsMode === 'ignore' ? {} : exactReportLaunchQuery(publication.params), root: saveScope.root
       };
-      var baseline = await request(publicSnapshotRunPath(target.code, target.query, true, target.root), { owner: owner, maxRetries: 0 })
+      var publishPath = apiPrefix + '/templates/' + encodeURIComponent(savedTemplate.code) + '/publish';
+      var baseline = await request(publishPath + '?' + runtimeQuery(target.query, target.root).toString(), { owner: owner, maxRetries: 0 })
         .catch(function (error) { return { ok: false, diagnostic: error.diagnostic }; });
-      if (!sameScope()) return;
-      target.snapshotRevision = publicSnapshotRevision(baseline, target.code);
-      if (target.snapshotRevision === undefined) {
+      if (!sameEditor() || !sameDraft()) {
+        if (sameTemplate()) writeNotice({ type: 'warning', text: t('publishDraftChanged') });
+        return;
+      }
+      var info = baseline.ok ? baseline.json : null;
+      if (info?.success !== true || info.action !== 'publish' || info.savedSpecHash !== target.specHash ||
+          !(info.snapshotRevision === null || isSnapshotHash(info.snapshotRevision)) || !isSnapshotHash(info.publishBaseline)) {
         writeNotice({ type: 'error', text: t('snapshotBaselineUnavailable'), diagnostic: baseline.diagnostic });
         return;
       }
+      target.snapshotRevision = info.snapshotRevision || '';
       publicationTarget = target;
-      published = await request(apiPrefix + '/templates/' + encodeURIComponent(savedTemplate.code) + '/publish' + rootQuery, {
+      published = await request(publishPath + rootQuery, {
         method: 'POST',
         owner: owner,
         phase: 'publish',
         timeoutMs: boot.snapshotRefreshTimeoutMs,
-        body: { params: publication.params, savedSpecHash: savedTemplate.specHash }
+        body: { params: publication.params, savedSpecHash: savedTemplate.specHash, publishBaseline: info.publishBaseline }
       });
       if (!published.ok) throw createRequestError(published);
       validateSnapshotMutationResponse(published, 'publish', publicationTarget);
@@ -33572,32 +33799,25 @@ function dynamicPagesClientScript() {
 
   function applyRuntimeExecutionLimitFields(runtimeConfig) {
     var next = normalizeRuntimeConfigForEditor(runtimeConfig);
+    var caps = runtimeRequestBudgetCaps(next.executionLimits);
     var fields = [
-      ['cmdp-runtime-max-rows-default', 'runtimeMaxRowsDefault', 'maxRowsDefault'],
-      ['cmdp-runtime-max-rows-preview-default', 'runtimeMaxRowsPreviewDefault', 'maxRowsPreviewDefault'],
-      ['cmdp-runtime-max-rows-data-preview-default', 'runtimeMaxRowsDataPreviewDefault', 'maxRowsDataPreviewDefault'],
-      ['cmdp-runtime-max-rows-max', 'runtimeMaxRowsMax', 'maxRowsMax'],
-      ['cmdp-runtime-max-relations-per-card-default', 'runtimeMaxRelationsPerCardDefault', 'maxRelationsPerCardDefault'],
-      ['cmdp-runtime-max-relations-per-card-max', 'runtimeMaxRelationsPerCardMax', 'maxRelationsPerCardMax'],
-      ['cmdp-runtime-max-selection-scan-rows-default', 'runtimeMaxSelectionScanRowsDefault', 'maxSelectionScanRowsDefault'],
-      ['cmdp-runtime-max-selection-scan-rows-max', 'runtimeMaxSelectionScanRowsMax', 'maxSelectionScanRowsMax'],
-      ['cmdp-runtime-max-classes-default', 'runtimeMaxClassesDefault', 'maxClassesDefault'],
-      ['cmdp-runtime-max-classes-max', 'runtimeMaxClassesMax', 'maxClassesMax'],
-      ['cmdp-runtime-max-domains-default', 'runtimeMaxDomainsDefault', 'maxDomainsDefault'],
-      ['cmdp-runtime-max-domains-max', 'runtimeMaxDomainsMax', 'maxDomainsMax'],
-      ['cmdp-runtime-max-rest-calls-default', 'runtimeMaxRestCallsDefault', 'maxRestCallsDefault'],
-      ['cmdp-runtime-max-rest-calls-max', 'runtimeMaxRestCallsMax', 'maxRestCallsMax'],
-      ['cmdp-runtime-max-traversal-depth-default', 'runtimeMaxTraversalDepthDefault', 'maxTraversalDepthDefault'],
-      ['cmdp-runtime-max-traversal-depth-max', 'runtimeMaxTraversalDepthMax', 'maxTraversalDepthMax']
+      ['cmdp-runtime-max-rows-max', 'runtimeMaxRowsMax', 'maxRowsMax', boot.reportRowLimits.ordinary],
+      ['cmdp-report-page-size', 'runtimeReportPageSize', 'reportPageSize', boot.reportPaging?.maxSize || 100],
+      ['cmdp-runtime-max-selection-scan-rows-default', 'runtimeMaxSelectionScanRowsDefault', 'maxSelectionScanRowsDefault', caps.scanRows],
+      ['cmdp-runtime-max-rest-calls-default', 'runtimeMaxRestCallsDefault', 'maxRestCallsDefault', caps.restCalls]
     ];
-    fields.forEach(function (item) {
-      if (!hasField(item[0])) return;
-      next.executionLimits[item[2]] = readPositiveIntField(item[0], t(item[1]), next.executionLimits[item[2]]);
+    fields.forEach(function ([id, label, key, max]) {
+      var input = document.getElementById(id);
+      if (!input) return;
+      var value = input.value.trim() ? Number(input.value) : next.executionLimits[key];
+      if (key === 'maxRowsMax' && value > max) {
+        throw new Error(t('reportRowSavedAboveCeiling', { saved: value, limit: max, path: t('reportRowRuntimeSetting') }));
+      }
+      if (input.validity.badInput || !Number.isSafeInteger(value) || value < 1 || value > max) {
+        throw new Error(t('runtimeExecutionLimitRange', { field: t(label), max: max }));
+      }
+      next.executionLimits[key] = value;
     });
-    if (hasField('cmdp-runtime-max-rows-max') && next.executionLimits.maxRowsMax > boot.reportRowLimits.ordinary) {
-      throw new Error(t('reportRowSavedAboveCeiling', { saved: next.executionLimits.maxRowsMax,
-        limit: boot.reportRowLimits.ordinary, path: t('reportRowRuntimeSetting') }));
-    }
     return next;
   }
 
@@ -34269,14 +34489,13 @@ function dynamicPagesClientScript() {
   }
 
   var runtimeLargeTables = [];
-  var largeTablePageSize = 50;
 
   function largeTablePagePath(item, op, options) {
     var query = runtimeQuery(state.runParams);
     var viewId = item.view.kind === 'personal' ? item.view.viewId :
       item.view.kind === 'dynamic' && op !== 'options' ? item.viewId : undefined;
     query.set('cmdpTable', JSON.stringify(Object.assign({
-      table: item.table.name, op: op, limit: largeTablePageSize,
+      table: item.table.name, op: op, limit: item.view.pageSize || boot.reportPaging?.defaultSize || 50,
       key: op !== 'options' && item.selection ? item.selection.key : undefined,
       viewId: viewId || undefined, snapshotRevision: item.view.snapshotRevision || undefined
     }, options)));
@@ -34368,8 +34587,10 @@ function dynamicPagesClientScript() {
     var restoreFocus = focused && destination.contains(focused) &&
       (focusedAction === 'sort' || focusedAction && focusedAction.indexOf(op + '-') === 0);
     var params = { offset: offset };
-    if (picker) params.search = item.optionSearch;
-    else if (detail) params.group = item.detail.group;
+    if (picker) {
+      params.search = item.optionSearch;
+      params.limit = 10;
+    } else if (detail) params.group = item.detail.group;
     else {
       params.search = item.search;
       if (item.sort) { params.sort = item.sort; params.direction = item.direction; }
@@ -34930,6 +35151,7 @@ function dynamicPagesClientScript() {
     if (assistantDiagnosticsUi.handleAction(target)) { event.preventDefault(); return; }
     if (action === 'copy-error-diagnostics') { copyUiErrorDiagnostics(target); return; }
     if (action === 'check-current-snapshot') { checkCurrentSnapshot(); return; }
+    if (action === 'retry-view-large-fields') { hydrateViewLargeSimpleFields(true); return; }
     if (action === 'diagram-import-label-token-select') {
       selectDiagramImportLabelAutocompleteTarget(target);
       return;
@@ -36650,6 +36872,8 @@ function sanitizeAttribute(item) {
     name: item.name,
     description: item._description_translation || item.description || '',
     type: item.type || null,
+    ...(item.multiple === true ? { multiple: true } : {}),
+    ...(item.multiValued === true ? { multiValued: true } : {}),
     ...(item.help ? { help: String(item.help) } : {}),
     active: item.active === undefined ? null : Boolean(item.active),
     inherited: item.inherited === undefined ? null : Boolean(item.inherited),
@@ -38736,6 +38960,7 @@ function defaultRuntimeConfig() {
       maxRowsPreviewDefault: 25,
       maxRowsDataPreviewDefault: 100,
       maxRowsMax: REPORT_ROW_LIMITS.ordinary,
+      reportPageSize: LARGE_TABLE_DEFAULT_PAGE_SIZE,
       maxRelationsPerCardDefault: 100,
       maxRelationsPerCardMax: 5000,
       maxSelectionScanRowsDefault: 10000,
@@ -38831,32 +39056,55 @@ function assistantLimitConfigValue(limitName, value, fallback, max, options = {}
 function normalizeExecutionLimitConfig(runtimeConfig) {
   const defaults = defaultRuntimeConfig().executionLimits;
   const source = runtimeConfig && runtimeConfig.executionLimits ? runtimeConfig.executionLimits : {};
-  const maxRowsMax = toPositiveInt(source.maxRowsMax, defaults.maxRowsMax, ABSOLUTE_EXECUTION_LIMITS.maxRows);
+  const bounded = (key, cap) => toPositiveInt(source[key], Math.min(defaults[key], cap), cap);
+  const maxRowsMax = bounded('maxRowsMax', ABSOLUTE_EXECUTION_LIMITS.maxRows);
   const maxRelationsPerCardMax = toPositiveInt(source.maxRelationsPerCardMax, defaults.maxRelationsPerCardMax, ABSOLUTE_EXECUTION_LIMITS.maxRelationsPerCard);
-  const maxSelectionScanRowsMax = toPositiveInt(source.maxSelectionScanRowsMax, defaults.maxSelectionScanRowsMax, ABSOLUTE_EXECUTION_LIMITS.maxSelectionScanRows);
+  const maxSelectionScanRowsMax = bounded('maxSelectionScanRowsMax', ABSOLUTE_EXECUTION_LIMITS.maxSelectionScanRows);
   const maxClassesMax = toPositiveInt(source.maxClassesMax, defaults.maxClassesMax, ABSOLUTE_EXECUTION_LIMITS.maxClasses);
   const maxDomainsMax = toPositiveInt(source.maxDomainsMax, defaults.maxDomainsMax, ABSOLUTE_EXECUTION_LIMITS.maxDomains);
-  const maxRestCallsMax = toPositiveInt(source.maxRestCallsMax, defaults.maxRestCallsMax, ABSOLUTE_EXECUTION_LIMITS.maxRestCalls);
+  const maxRestCallsMax = bounded('maxRestCallsMax', ABSOLUTE_EXECUTION_LIMITS.maxRestCalls);
   const maxTraversalDepthMax = toPositiveInt(source.maxTraversalDepthMax, defaults.maxTraversalDepthMax, ABSOLUTE_EXECUTION_LIMITS.maxTraversalDepth);
 
   return {
-    maxRowsDefault: toPositiveInt(source.maxRowsDefault, defaults.maxRowsDefault, maxRowsMax),
+    maxRowsDefault: bounded('maxRowsDefault', maxRowsMax),
     maxRowsPreviewDefault: toPositiveInt(source.maxRowsPreviewDefault, defaults.maxRowsPreviewDefault, maxRowsMax),
     maxRowsDataPreviewDefault: toPositiveInt(source.maxRowsDataPreviewDefault, defaults.maxRowsDataPreviewDefault, maxRowsMax),
     maxRowsMax,
+    reportPageSize: normalizeReportPageSize(source.reportPageSize),
     maxRelationsPerCardDefault: toPositiveInt(source.maxRelationsPerCardDefault, defaults.maxRelationsPerCardDefault, maxRelationsPerCardMax),
     maxRelationsPerCardMax,
-    maxSelectionScanRowsDefault: toPositiveInt(source.maxSelectionScanRowsDefault, defaults.maxSelectionScanRowsDefault, maxSelectionScanRowsMax),
+    maxSelectionScanRowsDefault: bounded('maxSelectionScanRowsDefault', maxSelectionScanRowsMax),
     maxSelectionScanRowsMax,
     maxClassesDefault: toPositiveInt(source.maxClassesDefault, defaults.maxClassesDefault, maxClassesMax),
     maxClassesMax,
     maxDomainsDefault: toPositiveInt(source.maxDomainsDefault, defaults.maxDomainsDefault, maxDomainsMax),
     maxDomainsMax,
-    maxRestCallsDefault: toPositiveInt(source.maxRestCallsDefault, defaults.maxRestCallsDefault, maxRestCallsMax),
+    maxRestCallsDefault: bounded('maxRestCallsDefault', maxRestCallsMax),
     maxRestCallsMax,
     maxTraversalDepthDefault: toPositiveInt(source.maxTraversalDepthDefault, defaults.maxTraversalDepthDefault, maxTraversalDepthMax),
     maxTraversalDepthMax
   };
+}
+
+function normalizeReportPageSize(value) {
+  return toPositiveInt(value, LARGE_TABLE_DEFAULT_PAGE_SIZE, LARGE_TABLE_MAX_PAGE_SIZE);
+}
+
+function validateReportExecutionLimitConfig(runtimeConfig) {
+  const requested = runtimeConfig?.executionLimits;
+  const effective = normalizeExecutionLimitConfig(runtimeConfig);
+  const caps = {
+    maxRowsMax: REPORT_ROW_LIMITS.ordinary,
+    reportPageSize: LARGE_TABLE_MAX_PAGE_SIZE,
+    maxSelectionScanRowsDefault: effective.maxSelectionScanRowsMax,
+    maxRestCallsDefault: effective.maxRestCallsMax
+  };
+  return Object.entries(caps).flatMap(([key, max]) => {
+    const value = requested?.[key];
+    if (value === undefined || Number.isSafeInteger(value) && value >= 1 && value <= max) return [];
+    const path = `executionLimits.${key}`;
+    return [{ path, min: 1, max, message: `${path} must be an integer from 1 to ${max}.` }];
+  });
 }
 
 function normalizeRuntimeCacheConfig(runtimeConfig) {
@@ -39005,6 +39253,32 @@ async function getRuntimeConfig(authToken, root, requestOptions = {}) {
     return defaultRuntimeConfig();
   }
   return sanitizeConfigCard(found.card, found.schema.root).runtimeConfig || defaultRuntimeConfig();
+}
+
+async function getReportRuntimeConfig(authToken, root, requestOptions) {
+  const unavailable = () => snapshotStoreError('report_runtime_config_unavailable', 'Runtime settings could not be read. The report was not recalculated.', 502);
+  let found;
+  try {
+    found = await findConfigCard(authToken, root, requestOptions);
+  } catch (error) {
+    if (error.code === 'draft_preview_timeout') throw error;
+    throw unavailable();
+  }
+  const { response, card } = found;
+  if (isPermissionDeniedStatus(response.statusCode) || card?._can_read === false) {
+    throw Object.assign(unavailable(), { cmdbuildStatus: isPermissionDeniedStatus(response.statusCode) ? response.statusCode : 403 });
+  }
+  const data = response.json?.data;
+  const total = response.json?.meta?.total;
+  if (!response.ok || response.json?.success === false || !Array.isArray(data)) throw unavailable();
+  if (!card || card.Active === false) {
+    if (total > data.length || (data.length >= 1000 && total !== data.length)) throw unavailable();
+    return defaultRuntimeConfig();
+  }
+  const config = safeJsonValue(card.RuntimeConfigJson, null);
+  if (!config || typeof config !== 'object' || Array.isArray(config) || (config.executionLimits !== undefined &&
+    (!config.executionLimits || typeof config.executionLimits !== 'object' || Array.isArray(config.executionLimits)))) throw unavailable();
+  return mergeRuntimeConfigDefaults(config);
 }
 
 function truncateText(value, maxLength) {
@@ -39990,23 +40264,6 @@ async function readSnapshotState(key) {
   return value;
 }
 
-async function snapshotPublicationState(root, code) {
-  const key = snapshotStateKey(root, code);
-  try {
-    let state = await readSnapshotState(key);
-    if (state === null) {
-      const first = `ready:${crypto.randomUUID()}`;
-      if (SNAPSHOT_MEMORY_ONLY) snapshotStateMemory.set(key, first);
-      else await redisCommand(['SET', key, first, 'NX']);
-      state = await readSnapshotState(key);
-    }
-    if (state?.startsWith('ready:')) return state;
-  } catch {
-    throw snapshotStoreError('snapshot_storage_unavailable', 'Published report storage is temporarily unavailable.');
-  }
-  throw snapshotStoreError('snapshot_revocation_pending', 'Publication is blocked until the previous template mutation is reconciled.', 409);
-}
-
 async function beginSnapshotRevocation(res, root, codes) {
   const keys = codes.map((code) => snapshotStateKey(root, code));
   const operationId = crypto.randomUUID();
@@ -40288,6 +40545,41 @@ async function readStaticSnapshot(root, templateCode, params, publishConfig = { 
   return { key: exactKey, backend, snapshot: null };
 }
 
+async function readPublishBaseline(root, template, params, publishConfig) {
+  const key = staticSnapshotKey(root, template.code, params, publishConfig);
+  const stateKey = snapshotStateKey(root, template.code);
+  let generation;
+  let revision;
+  let content;
+  let snapshot;
+  try {
+    if (SNAPSHOT_MEMORY_ONLY) {
+      generation = snapshotStateMemory.get(stateKey) ?? null;
+      revision = staticSnapshotCache.get(key) ?? null;
+      snapshot = revision?.value ?? null;
+      content = revision === null ? null : JSON.stringify(snapshot);
+    } else {
+      [generation, revision] = await redisCommand(['MGET', stateKey, cacheKey('snapshot', key)]);
+      content = revision;
+      snapshot = revision === null ? null : JSON.parse(revision);
+    }
+    if (generation !== null && !SNAPSHOT_STATE.test(generation)) throw new Error('Invalid snapshot publication state.');
+  } catch {
+    throw snapshotStoreError('snapshot_storage_unavailable', 'Published report storage is temporarily unavailable.');
+  }
+  if (generation?.startsWith('pending:')) {
+    throw snapshotStoreError('snapshot_revocation_pending', 'Publication is blocked until the previous template mutation is reconciled.', 409);
+  }
+  const visible = generation && snapshot?.version === 3 && snapshot.generation === generation &&
+    snapshot.templateClass === snapshotTemplateClass(root) && snapshot.templateCode === template.code &&
+    snapshot.publish?.mode === 'staticSnapshot' && snapshot.publish.warningAccepted === true;
+  return { key, generation, revision,
+    snapshotRevision: visible ? staticSnapshotViewRevision(snapshot) : null,
+    // The digest is a concurrency condition, not authorization. Keep the stored value server-side.
+    publishBaseline: hashJson([String(template.id), template.specHash, key, generation, content === null ? null : sha256Hex(content)])
+  };
+}
+
 function snapshotDeadlineBudget(deadlineAt) {
   const expires = performance.now() + executionDeadlineRemainingMs(deadlineAt);
   return () => Math.min(executionDeadlineRemainingMs(deadlineAt), expires - performance.now());
@@ -40304,14 +40596,15 @@ async function writeStaticSnapshot(root, template, params, result, sessionData, 
   const specHash = hashJson(template.spec || {});
   const paramsHash = staticSnapshotParamsHash(params, publishConfig);
   const key = staticSnapshotKey(root, template.code, params, publishConfig);
-  if (replaces && (replaces.key !== key || !replaces.revision)) return null;
+  if (replaces.key !== key) return null;
+  const targetGeneration = generation ?? `ready:${crypto.randomUUID()}`;
   const now = new Date();
   const session = sanitizeSession(sessionData) || {};
   const snapshot = {
     version: 3,
     refreshRevision: crypto.randomUUID(),
     templateClass: snapshotTemplateClass(root),
-    generation,
+    generation: targetGeneration,
     templateCode: template.code,
     description: template.description || '',
     params: cloneJsonValueServer(params || {}, {}),
@@ -40322,7 +40615,7 @@ async function writeStaticSnapshot(root, template, params, result, sessionData, 
     publishedRole: session.role || '',
     publishedAt: now.toISOString(),
     result: cloneJsonValueServer(result, { tables: [] }),
-    ...(tableIndexes ? { tableIndexes } : {})
+    ...(tableIndexes ? { tableIndexes, reportPageSize: normalizeReportPageSize(boundary.pageSize) } : {})
   };
   const stateKey = snapshotStateKey(root, template.code);
   const memoryOnly = SNAPSHOT_MEMORY_ONLY;
@@ -40331,9 +40624,10 @@ async function writeStaticSnapshot(root, template, params, result, sessionData, 
     if (memoryOnly) {
       const value = cloneJsonValueServer(snapshot, null);
       assertSnapshotDeadline(remainingMs);
-      if (snapshotStateMemory.get(stateKey) !== generation) return null;
-      if (replaces && staticSnapshotCache.get(key) !== replaces.revision) return null;
+      if ((snapshotStateMemory.get(stateKey) ?? null) !== generation ||
+          (staticSnapshotCache.get(key) ?? null) !== replaces.revision) return null;
       staticSnapshotCache.set(key, { value, expiresAt: 0 });
+      if (generation === null) snapshotStateMemory.set(stateKey, targetGeneration);
       while (staticSnapshotCache.size > RUNTIME_CACHE_MAX_ENTRIES) {
         staticSnapshotCache.delete(staticSnapshotCache.keys().next().value);
       }
@@ -40344,16 +40638,20 @@ async function writeStaticSnapshot(root, template, params, result, sessionData, 
       if (response.destroyed) return null;
       const indexKey = cacheKey('snapshot-index', staticSnapshotTemplateIndexId(root, template.code));
       const stored = await redisCommand(['EVAL', `
-        local matches = redis.call('GET', KEYS[1]) == ARGV[1]
-          and (not ARGV[5] or redis.call('GET', KEYS[2]) == ARGV[5])
+        local state = redis.call('GET', KEYS[1])
+        local current = redis.call('GET', KEYS[2])
+        local matches = (state or '') == ARGV[1]
+          and ((ARGV[5] == 'missing' and not current) or (ARGV[5] == 'value' and current == ARGV[6]))
         local time = redis.call('TIME')
         if time[1] * 1000 + math.floor(time[2] / 1000) >= tonumber(ARGV[4]) then return -1 end
         if not matches then return 0 end
         redis.call('SADD', KEYS[3], ARGV[3])
         redis.call('SET', KEYS[2], ARGV[2])
+        if not state then redis.call('SET', KEYS[1], ARGV[7]) end
         return 1
       `, 3, stateKey, cacheKey('snapshot', key), indexKey, generation, snapshotJson, key], {
-        snapshotCommit: { remainingMs, isDisconnected: () => response.destroyed, revision: replaces?.revision }
+        snapshotCommit: { remainingMs, isDisconnected: () => response.destroyed,
+          compare: [replaces.revision === null ? 'missing' : 'value', replaces.revision ?? '', targetGeneration] }
       });
       if (stored === -1) throw executionDeadlineTimeoutError();
       if (stored === 0) return null;
@@ -40367,7 +40665,7 @@ async function writeStaticSnapshot(root, template, params, result, sessionData, 
   return {
     key,
     backend,
-    generation,
+    generation: targetGeneration,
     refreshRevision: snapshot.refreshRevision,
     paramsHash,
     specHash,
@@ -54606,7 +54904,7 @@ function sendPublicSnapshotResult(res, requestUrl, templateCode, lookup) {
   }
   if (!jsonOutput && browserTableShellRequested(requestUrl)) {
     sendJson(res, 200, runtimeDisplayResponsePayload(reportTableShell(payload, {
-      kind: 'public', snapshotRevision: staticSnapshotViewRevision(snapshot)
+      kind: 'public', snapshotRevision: staticSnapshotViewRevision(snapshot), pageSize: normalizeReportPageSize(snapshot.reportPageSize)
     }), { d2DownloadAllowed: sourceAllowed }));
     return;
   }
@@ -55146,6 +55444,7 @@ async function reportTableOptions(authToken, spec, settings, params, options, ta
   const { rendered, records, evidence } = await executeReportTableSource(authToken, optionSpec, {
     name: alias, columns: fields
   }, params, options, { phase: 'selector', publishedTable: tableName });
+  if (options.requireCompleteReport && rendered.truncated) throw incompleteReportTable(evidence);
   return {
     rows: rendered.rows.map((row, index) => ({
       ...row, [selector.idField]: reportTableKeyValue(runtimeRowValue(records[index], selector.idField), selector.idField)
@@ -55227,12 +55526,15 @@ async function materializePublishedReport(authToken, spec, params, options, runt
   const deadlineAt = options.executionDeadlineAt || Date.now() + DRAFT_PREVIEW_TIMEOUT_MS;
   const remainingMs = options.snapshotRemainingMs || snapshotDeadlineBudget(deadlineAt);
   const matchBudget = { checked: 0 };
+  const restBudget = { calls: 0 };
+  const executionLimits = normalizeExecutionLimitConfig(runtimeConfig);
+  const maxRestCalls = Math.min(options.maxRestCalls || executionLimits.maxRestCallsDefault, executionLimits.maxRestCallsMax);
   const tableOptions = { ...reportTableExecutionOptions(runtimeConfig, deadlineAt),
-    requireCompleteReport: true, matchBudget, isDisconnected: options.isDisconnected };
+    requireCompleteReport: true, matchBudget, restBudget, maxRestCalls, isDisconnected: options.isDisconnected };
   const tableName = paged.length === 1 ? paged[0].name : '';
   const includeDiagrams = options.includeDiagrams !== false;
   const shell = tableShellSpec(spec, includeDiagrams);
-  const ordinaryLimit = normalizeExecutionLimitConfig(runtimeConfig).maxRowsMax;
+  const ordinaryLimit = executionLimits.maxRowsMax;
   const labels = reportSavedResultLabels(spec);
   const rowScope = publicationRowScope(spec, shell, paged, ordinaryLimit, includeDiagrams, labels);
   const evidence = { table: shell.result.tables.length === 1 ? shell.result.tables[0].name : '', phase: 'rows',
@@ -55240,7 +55542,7 @@ async function materializePublishedReport(authToken, spec, params, options, runt
     rowLimitPresentation: rowScope.ordinary, stepIndexes: rowScope.stepIndexes };
   const result = await executeSnapshotReportPhase(authToken, shell, params, {
     ...options, maxRows: ordinaryLimit, maxRowsMax: ordinaryLimit, reportRowLimitCauses: rowScope.ordinaryCauses,
-    strictDataReads: true, executionDeadlineAt: deadlineAt, matchBudget
+    strictDataReads: true, executionDeadlineAt: deadlineAt, matchBudget, restBudget, maxRestCalls
   }, evidence);
   const incomplete = evidence.limits.length || snapshotExecutionIncomplete(result);
   if (remainingMs() <= 0) {
@@ -55276,6 +55578,7 @@ async function materializePublishedReport(authToken, spec, params, options, runt
       });
     }
     const prepared = attachPagedTableResults(spec, result, tables);
+    if (prepared.limits) prepared.limits = { ...prepared.limits, restCalls: restBudget.calls };
     assertSnapshotDeadline(remainingMs);
     return { result: prepared, indexes };
   } catch (error) {
@@ -55573,7 +55876,7 @@ async function handleSnapshotRefresh(req, res, requestUrl, authToken, root, temp
     deadlineAt = Date.now() + DRAFT_PREVIEW_TIMEOUT_MS;
     const remainingMs = snapshotDeadlineBudget(deadlineAt);
     const deadlineOptions = { deadlineAt, deadlineTimeoutMs: DRAFT_PREVIEW_TIMEOUT_MS };
-    const runtimeConfig = await waitForExecutionDeadline(getRuntimeConfig(authToken, root, deadlineOptions), deadlineAt);
+    const runtimeConfig = await waitForExecutionDeadline(getReportRuntimeConfig(authToken, root, deadlineOptions), deadlineAt);
     const limits = normalizeExecutionLimitConfig(runtimeConfig);
     const { result, indexes } = await materializePublishedReport(authToken, template.spec, params, {
       maxRows: limits.maxRowsDefault,
@@ -55609,7 +55912,7 @@ async function handleSnapshotRefresh(req, res, requestUrl, authToken, root, temp
       if (res.destroyed) return null;
       if (mode === 'shared') {
         const replacement = await writeStaticSnapshot(root, current, params, result, session.data, publish, snapshot.generation, lookup, indexes,
-          { remainingMs, response: res });
+          { remainingMs, response: res, pageSize: limits.reportPageSize });
         if (!replacement && !res.destroyed) conflict();
         return replacement;
       }
@@ -55630,8 +55933,9 @@ async function handleSnapshotRefresh(req, res, requestUrl, authToken, root, temp
     };
     let personalView;
     if (indexes && browserTableShellRequested(requestUrl)) {
-      const tableView = mode === 'shared' ? { kind: 'public', snapshotRevision: staticSnapshotViewRevision(saved) }
-        : { kind: 'personal', viewId: crypto.randomUUID() };
+      const tableView = mode === 'shared'
+        ? { kind: 'public', snapshotRevision: staticSnapshotViewRevision(saved), pageSize: limits.reportPageSize }
+        : { kind: 'personal', viewId: crypto.randomUUID(), pageSize: limits.reportPageSize };
       response = reportTableShell(response, tableView);
       if (mode === 'personal') personalView = tableView;
     }
@@ -61175,6 +61479,7 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
     truncated: true,
     rowLimitReached: true,
     rowLimit: maxRows,
+    scannedCards,
     selectionScan: selectionScan(),
     relationLimitReached: Boolean(pathCache.relationLimitReached)
   });
@@ -61261,6 +61566,7 @@ async function executeSelectCards(cmdbuildExecRequest, step, params, context, li
     truncated: classScopeTruncated || scanTruncated || Boolean(pathCache.relationLimitReached),
     rowLimitReached: false,
     rowLimit: maxRows,
+    scannedCards,
     selectionScan: selectionScan(),
     relationLimitReached: Boolean(pathCache.relationLimitReached)
   };
@@ -62497,7 +62803,7 @@ function executeComposeRows(step, params, context, limits) {
 }
 
 function createExecutionRequest(authToken, limits, options = {}) {
-  let restCalls = 0;
+  const restBudget = options.restBudget || { calls: 0 };
   let readError = null;
   const assertAccess = () => {
     if (readError) throw readError;
@@ -62507,9 +62813,9 @@ function createExecutionRequest(authToken, limits, options = {}) {
   const request = async (path, { optionalMissing = false, catalogPage = false } = {}) => {
     assertAccess();
     assertExecutionDeadline(deadlineAt, deadlineTimeoutMs);
-    if (restCalls >= limits.maxRestCalls) {
+    if (restBudget.calls >= limits.maxRestCalls) {
       if (options.reportLimitContext) {
-        recordReportLimit(options.reportLimitContext, reportLimitEvidence('maxRestCalls', limits.maxRestCalls, restCalls, 'calls', {
+        recordReportLimit(options.reportLimitContext, reportLimitEvidence('maxRestCalls', limits.maxRestCalls, restBudget.calls, 'calls', {
           source: 'runtime-settings', configKey: 'maxRestCallsDefault'
         }), true);
         readError = incompleteReportTable(options.reportLimitContext);
@@ -62517,7 +62823,7 @@ function createExecutionRequest(authToken, limits, options = {}) {
       }
       throw new Error(`Template execution exceeded REST call limit (${limits.maxRestCalls}).`);
     }
-    restCalls += 1;
+    restBudget.calls += 1;
     try {
       const response = await cmdbuildRequest(path, authToken, { deadlineAt, deadlineTimeoutMs });
       if ((options.relationSensitive || options.strictDataReads) && isPermissionDeniedStatus(response.statusCode)) {
@@ -62540,7 +62846,7 @@ function createExecutionRequest(authToken, limits, options = {}) {
       throw failure;
     }
   };
-  request.getRestCalls = () => restCalls;
+  request.getRestCalls = () => restBudget.calls;
   request.assertAccess = assertAccess;
   if (options.reportLimitContext) {
     request.recordReportLimit = (evidence, terminal) => recordReportLimit(options.reportLimitContext, evidence, terminal);
@@ -62925,6 +63231,7 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
     deadlineAt: executionDeadlineAt,
     deadlineTimeoutMs: executionDeadlineTimeoutMs,
     relationSensitive: dependencyMap.relationSensitive,
+    restBudget: options.restBudget,
     strictDataReads: options.strictDataReads === true,
     reportLimitContext: options.reportLimitContext
   });
@@ -63082,6 +63389,7 @@ async function executeTemplateSpec(authToken, spec, params, options = {}) {
         columns: Array.isArray(output.columns) ? output.columns.length : 0,
         truncated: Boolean(output.truncated),
         rowLimitReached,
+        ...(Number.isSafeInteger(output.scannedCards) ? { scannedCards: output.scannedCards } : {}),
         selectionScan,
         limitDiagnostics,
         warning: limitWarnings.join(' '),
@@ -63370,7 +63678,7 @@ function assistantExtractionTraceResponse(capture, payload) {
       limits: assistantTraceCounts(result?.limits || capture.extractionLimits, ASSISTANT_EXTRACTION_LIMIT_KEYS),
       ...(table ? { selectedTable: { name: capture.selectedExtractionAlias, rows: Array.isArray(table.rows) ? table.rows.length : 0 } } : {}),
       trace: trace.map((stage) => ({
-        ...assistantTraceCounts(stage, ['index', 'rows', 'columns', 'elapsedMs', 'restCalls']),
+        ...assistantTraceCounts(stage, ['index', 'rows', 'columns', 'scannedCards', 'elapsedMs', 'restCalls']),
         type: assistantTraceIdentifier(stage.type),
         as: assistantTraceIdentifier(stage.as),
         status: stage.status === 'error' ? 'error' : 'ok',
@@ -64609,12 +64917,8 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
             message: 'runtimeCache.refreshCooldownSec must be a positive integer.' });
         }
       } else {
-        numericErrors.push(...validateAssistantConfigurationNumbers(requestedRuntimeConfig), ...validateAssistantResponseFormat(requestedRuntimeConfig));
-        const maxRows = requestedRuntimeConfig?.executionLimits?.maxRowsMax;
-        if (maxRows !== undefined && (!Number.isSafeInteger(maxRows) || maxRows < 1 || maxRows > REPORT_ROW_LIMITS.ordinary)) {
-          numericErrors.push({ path: 'executionLimits.maxRowsMax',
-            message: `executionLimits.maxRowsMax must be an integer from 1 to ${REPORT_ROW_LIMITS.ordinary}.` });
-        }
+        numericErrors.push(...validateAssistantConfigurationNumbers(requestedRuntimeConfig), ...validateAssistantResponseFormat(requestedRuntimeConfig),
+          ...validateReportExecutionLimitConfig(requestedRuntimeConfig));
       }
       if (numericErrors.length) return sendJson(res, 422, { success: false, code: 'runtime_config_invalid',
         message: 'Runtime settings contain invalid values.', errors: numericErrors });
@@ -66777,23 +67081,24 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
         });
         return;
       }
-      const runtimeReadOnly = templateAction === 'run' && req.method === 'GET';
-      if (!methodAllowed(req, res, templateAction === 'run' ? ['GET', 'POST'] : 'POST')) return;
+      const publishBaselineRead = templateAction === 'publish' && req.method === 'GET';
+      const runtimeReadOnly = (templateAction === 'run' && req.method === 'GET') || publishBaselineRead;
+      if (!methodAllowed(req, res, ['run', 'publish'].includes(templateAction) ? ['GET', 'POST'] : 'POST')) return;
       if (!runtimeReadOnly) {
         if (!requireStateChangingRequest(req, res, authToken)) return;
         if (!requireJsonContentType(req, res)) return;
       }
 
       const runtimeLogContext = { requestId: req.cmdpRequestId || '', root, templateCode };
-      const runSession = templateAction === 'run'
+      const runSession = templateAction === 'run' || publishBaselineRead
         ? await requireValidBackendSession(authToken, res, runtimeLogContext)
         : null;
-      if (templateAction === 'run' && !runSession) return;
+      if ((templateAction === 'run' || publishBaselineRead) && !runSession) return;
 
       let body = {};
       let observedGeneration;
       let observation;
-      if (templateAction === 'publish') {
+      if (templateAction === 'publish' && !publishBaselineRead) {
         body = await readTemplateActionBody(req, res, templateAction);
         if (!body) return;
         // Keep the generation, not the lock, alive until the publish request ends.
@@ -66845,6 +67150,21 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
       if (templateAction === 'publish' && !await requireTemplateUpdatePermission(authToken, res, found.schema, found.card, templateCode)) return;
 
       const template = sanitizeTemplateCard(found.card);
+      if (publishBaselineRead) {
+        const publish = normalizePublishConfig(template.spec);
+        try {
+          if (!template.active || publish.mode !== 'staticSnapshot' || !publish.warningAccepted) {
+            throw snapshotStoreError('publication_settings_not_saved', 'Save and enable static snapshot publication first.', 400);
+          }
+          const { snapshotRevision, publishBaseline } = await readPublishBaseline(root, template, reportParamsFromUrl(requestUrl), publish);
+          sendJson(res, 200, { success: true, action: 'publish', savedSpecHash: template.specHash,
+            snapshotRevision, publishBaseline }, { 'cache-control': 'no-store' });
+        } catch (error) {
+          sendJson(res, error.statusCode || 503, { success: false, action: 'publish', code: error.code,
+            reason: error.reason, message: error.message });
+        }
+        return;
+      }
       if (observation && savedSpecHash.valid && savedSpecHash.value !== template.specHash) {
         sendPublicationVersionConflict(res, { root, templateCode, expectedSpecHash: savedSpecHash.value,
           currentTemplate: template, phase: 'publish_precondition', cause: 'spec_hash_changed' });
@@ -66901,16 +67221,14 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
       const d2Output = templateAction === 'run' && runtimeD2OutputRequested(requestUrl);
       const session = runSession || await getSessionData(authToken);
       const username = session.data && session.data.username ? session.data.username : '';
-      const runtimeConfig = await getRuntimeConfig(authToken, root);
-      const executionLimits = normalizeExecutionLimitConfig(runtimeConfig);
-      const runtimeCacheConfig = normalizeRuntimeCacheConfig(runtimeConfig);
+      const runtimeConfig = templateAction === 'publish' ? null : await getRuntimeConfig(authToken, root);
+      const executionLimits = runtimeConfig && normalizeExecutionLimitConfig(runtimeConfig);
+      const runtimeCacheConfig = runtimeConfig && normalizeRuntimeCacheConfig(runtimeConfig);
       const publishConfig = normalizePublishConfig(template.spec);
-      const maxRows = templateAction === 'preview'
-        ? getPositiveInt(requestUrl.searchParams, 'maxRows', executionLimits.maxRowsPreviewDefault, executionLimits.maxRowsMax)
-        : getPositiveInt(requestUrl.searchParams, 'maxRows', executionLimits.maxRowsDefault, executionLimits.maxRowsMax);
-      const executionOptions = {
+      const executionOptionsFor = (executionLimits) => ({
         isDisconnected: () => res.destroyed,
-        maxRows,
+        maxRows: getPositiveInt(requestUrl.searchParams, 'maxRows',
+          templateAction === 'preview' ? executionLimits.maxRowsPreviewDefault : executionLimits.maxRowsDefault, executionLimits.maxRowsMax),
         maxRowsMax: executionLimits.maxRowsMax,
         maxRelationsPerCard: executionLimits.maxRelationsPerCardDefault,
         maxRelationsPerCardMax: executionLimits.maxRelationsPerCardMax,
@@ -66927,7 +67245,8 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
         maxTraversalDepthMax: executionLimits.maxTraversalDepthMax,
         includeDiagrams,
         ...(includeDiagrams ? {} : { executionScope: 'tables' })
-      };
+      });
+      const executionOptions = executionLimits && executionOptionsFor(executionLimits);
       const cacheDisabled = requestUrl.searchParams.get('noCache') === '1' || body.noCache === true;
       const forceRefreshRequested = !runtimeReadOnly && (
         requestUrl.searchParams.get('forceRefresh') === '1' ||
@@ -66985,7 +67304,7 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
           return;
         }
         const viewerPayload = pagedShell && lookup.snapshot ? reportTableShell(payload, {
-          kind: 'public', snapshotRevision: staticSnapshotViewRevision(lookup.snapshot)
+          kind: 'public', snapshotRevision: staticSnapshotViewRevision(lookup.snapshot), pageSize: normalizeReportPageSize(lookup.snapshot.reportPageSize)
         }) : payload;
         sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) : runtimeDisplayResponsePayload(viewerPayload));
         return;
@@ -67055,9 +67374,17 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
             catch (error) { throw snapshotStoreError('snapshot_params_invalid', error.message, 400); }
           }
           const deadlineOptions = { deadlineAt: publicationDeadlineAt, deadlineTimeoutMs: DRAFT_PREVIEW_TIMEOUT_MS };
-          const snapshotGeneration = await waitForExecutionDeadline(snapshotPublicationState(root, templateCode), publicationDeadlineAt);
+          if (typeof body.publishBaseline !== 'string' || !/^[a-f0-9]{64}$/.test(body.publishBaseline)) {
+            throw snapshotStoreError('publication_baseline_required', 'Read a valid publication baseline before publishing.', 400);
+          }
+          const baseline = await waitForExecutionDeadline(readPublishBaseline(root, template, params, publishConfig), publicationDeadlineAt);
+          if (baseline.publishBaseline !== body.publishBaseline) {
+            throw snapshotStoreError('snapshot_publish_conflict', 'The published snapshot changed. Check the current snapshot before publishing again.', 409);
+          }
+          const runtimeConfig = await waitForExecutionDeadline(getReportRuntimeConfig(authToken, root, deadlineOptions), publicationDeadlineAt);
+          const executionLimits = normalizeExecutionLimitConfig(runtimeConfig);
           const preparedReport = await materializePublishedReport(authToken, template.spec, params, {
-            ...executionOptions, executionDeadlineAt: publicationDeadlineAt, snapshotRemainingMs: publicationRemainingMs
+            ...executionOptionsFor(executionLimits), executionDeadlineAt: publicationDeadlineAt, snapshotRemainingMs: publicationRemainingMs
           }, runtimeConfig);
           result = preparedReport.result;
           publicationPhase = 'commit';
@@ -67086,18 +67413,15 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
               return null;
             }
             const saved = await writeStaticSnapshot(root, currentTemplate, params, result, session.data, publishConfig,
-              snapshotGeneration, undefined, preparedReport.indexes, { remainingMs: publicationRemainingMs, response: res });
-            if (!saved && !res.destroyed) sendPublicationVersionConflict(res, { root, templateCode, expectedSpecHash: savedSpecHash.value,
-              currentTemplate, phase: 'publish_commit', cause: 'snapshot_generation_changed' });
+              baseline.generation, baseline, preparedReport.indexes,
+              { remainingMs: publicationRemainingMs, response: res, pageSize: executionLimits.reportPageSize });
+            if (!saved && !res.destroyed) {
+              throw snapshotStoreError('snapshot_publish_conflict', 'The published snapshot changed. Check the current snapshot before publishing again.', 409);
+            }
             return saved;
           }, { deadlineAt: publicationDeadlineAt });
           if (!snapshot) return;
-          cache = staticSnapshotCacheMeta({
-            publishedAt: snapshot.publishedAt,
-            publishedBy: snapshot.publishedBy,
-            paramsHash: snapshot.paramsHash,
-            specHash: snapshot.specHash
-          }, 'snapshot-published', snapshot.backend, snapshot.key);
+          cache = staticSnapshotCacheMeta(snapshot, 'snapshot-published', snapshot.backend, snapshot.key);
           logInfo('snapshot.published', {
             requestId: req.cmdpRequestId || '',
             templateCode: template.code,
@@ -67217,7 +67541,7 @@ async function handleBackendRequest(req, res, requestUrl, publication) {
         return;
       }
       sendJson(res, 200, jsonOutput ? runtimeJsonResponsePayload(payload) :
-        runtimeDisplayResponsePayload(pagedShell ? reportTableShell(payload, { kind: 'dynamic' }) : payload));
+        runtimeDisplayResponsePayload(pagedShell ? reportTableShell(payload, { kind: 'dynamic', pageSize: executionLimits.reportPageSize }) : payload));
       return;
     }
 

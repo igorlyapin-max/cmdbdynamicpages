@@ -6511,7 +6511,7 @@ test.skip('retired read-time D2 recovery is not part of the current-only contrac
   for (const [action, request] of [
     ['validate', () => requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}/validate`, {}, headers)],
     ['run', () => requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}/run?json=true`, undefined, { cookie })],
-    ['publish', () => requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}/publish`, { params: {}, savedSpecHash: recovered.specHash }, headers)]
+    ['publish', () => publishWithBaseline(`${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}/publish`, { params: {}, savedSpecHash: recovered.specHash }, headers)]
   ]) {
     const response = await request();
     assert.equal(response.statusCode, 409, `${action}: ${response.body}`);
@@ -6531,7 +6531,7 @@ test.skip('retired read-time D2 recovery is not part of the current-only contrac
   const tableOnlyRun = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}/run?json=true&noCache=1`, undefined, { cookie });
   assert.equal(tableOnlyRun.statusCode, 200, tableOnlyRun.body);
   assert.deepEqual(tableOnlyRun.json.diagrams, []);
-  const tableOnlyPublish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}/publish`, {
+  const tableOnlyPublish = await publishWithBaseline(`${backendOrigin}/cmdbuild/custom-api/templates/${templateCode}/publish`, {
     params: {},
     savedSpecHash: hashJson(tableOnlySpec)
   }, headers);
@@ -6792,7 +6792,11 @@ test('template publish rejects unsaved static snapshot settings with actionable 
   const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
   assert.equal(csrf.statusCode, 200);
 
-  const publish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/DynamicPublishTemplate/publish`, {
+  const publishUrl = `${backendOrigin}/cmdbuild/custom-api/templates/DynamicPublishTemplate/publish`;
+  const baseline = await requestPublishBaseline(publishUrl, {}, { cookie });
+  assert.equal(baseline.statusCode, 400, baseline.body);
+  assert.equal(baseline.json.reason, 'publication_settings_not_saved');
+  const publish = await requestJson('POST', publishUrl, {
     params: {},
     savedSpecHash: hashJson(spec)
   }, {
@@ -6833,7 +6837,7 @@ test('template publish blocks diagram output while a saved D2 source has no appl
   const cookie = 'CMDBuild-Authorization=pending-d2-publish-token';
   const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
 
-  const publish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/PendingD2PublishTemplate/publish`, {
+  const publish = await publishWithBaseline(`${backendOrigin}/cmdbuild/custom-api/templates/PendingD2PublishTemplate/publish`, {
     params: {}, savedSpecHash: hashJson(spec)
   }, { cookie, origin: backendOrigin, 'x-cmdbdynamicpages-csrf': csrf.json.token });
 
@@ -6857,7 +6861,7 @@ test('template publish rejects stale saved spec hash before executing the snapsh
   const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
   assert.equal(csrf.statusCode, 200);
 
-  const publish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/StalePublishTemplate/publish`, {
+  const publish = await publishWithBaseline(`${backendOrigin}/cmdbuild/custom-api/templates/StalePublishTemplate/publish`, {
     params: {},
     savedSpecHash: 'f'.repeat(64)
   }, {
@@ -6994,7 +6998,7 @@ for (const method of ['PUT', 'DELETE']) {
       }
     });
 
-    const publishing = requestJson('POST', `${templateUrl}/publish`, { params: {}, savedSpecHash }, headers, 8000);
+    const publishing = publishWithBaseline(`${templateUrl}/publish`, { params: {}, savedSpecHash }, headers, 8000);
     const mutating = (async () => {
       try {
         assert.equal(await signalBeforeTimeout(executionStarted.promise, 4000), true, 'publish began reading execution data');
@@ -7044,7 +7048,7 @@ test('snapshot revocation preserves the previous generation on confirmed CMDB re
     }
   }, redis.env);
   const expectedSpecHash = hashJson(spec);
-  const publish = await requestJson('POST', templateUrl + '/publish', { params: {}, savedSpecHash: expectedSpecHash }, headers);
+  const publish = await publishWithBaseline(templateUrl + '/publish', { params: {}, savedSpecHash: expectedSpecHash }, headers);
   assert.equal(publish.statusCode, 200, publish.body);
   const stateEntries = () => [...redis.values].filter(([key]) => key.includes(':snapshot-state:'));
   const previous = stateEntries();
@@ -7084,7 +7088,10 @@ for (const outcome of [200, 202, 408, 429, 502, 'disconnect']) {
       }
     });
     const body = { params: {}, savedSpecHash: hashJson(spec) };
-    assert.equal((await requestJson('POST', templateUrl + '/publish', body, headers)).statusCode, 200);
+    const publishUrl = templateUrl + '/publish';
+    assert.equal((await publishWithBaseline(publishUrl, body, headers)).statusCode, 200);
+    const baseline = await requestPublishBaseline(publishUrl, body.params, headers);
+    assert.equal(baseline.statusCode, 200, baseline.body);
     const requestId = 'unconfirmed-mutation-fixture';
     const changed = await requestJson('PUT', templateUrl, { code, expectedSpecHash: body.savedSpecHash,
       spec: { ...spec, publish: { mode: 'dynamicUser' } } }, { ...headers, 'x-request-id': requestId });
@@ -7097,7 +7104,10 @@ for (const outcome of [200, 202, 408, 429, 502, 'disconnect']) {
     assert.equal(pending.reason, 'mutation_unconfirmed');
     assert.equal(mock.requests.filter(({ method }) => method === 'PUT').length, 1, 'never retry an ambiguous write');
     assert.equal((await requestJson('GET', snapshotUrl)).json.snapshotFound, false);
-    const retry = await requestJson('POST', templateUrl + '/publish', body, headers);
+    const blocked = await requestPublishBaseline(publishUrl, body.params, headers);
+    assert.equal(blocked.statusCode, 409, blocked.body);
+    assert.equal(blocked.json.reason, 'snapshot_revocation_pending');
+    const retry = await requestJson('POST', publishUrl, { ...body, publishBaseline: baseline.json.publishBaseline }, headers);
     assert.equal(retry.statusCode, 409, retry.body);
     assert.equal(retry.json.reason, 'snapshot_revocation_pending');
   });
@@ -7109,7 +7119,7 @@ test('template delete denied by class permissions does not revoke a published sn
   const { mock, templateUrl, snapshotUrl, headers } = await startTemplateRace(t, code, {
     templates: [templateCard(code, spec)], templateClassCanDelete: false
   });
-  assert.equal((await requestJson('POST', templateUrl + '/publish', { params: {}, savedSpecHash: hashJson(spec) }, headers)).statusCode, 200);
+  assert.equal((await publishWithBaseline(templateUrl + '/publish', { params: {}, savedSpecHash: hashJson(spec) }, headers)).statusCode, 200);
   const denied = await requestJson('DELETE', templateUrl, undefined, headers);
   assert.equal(denied.statusCode, 403, denied.body);
   assert.equal(denied.json.reason, 'template_delete_forbidden');
@@ -7193,7 +7203,12 @@ test('template publish denies users without explicit update permission before pu
   const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
   assert.equal(csrf.statusCode, 200);
 
-  const publish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/DeniedPublishTemplate/publish`, {
+  const publishUrl = `${backendOrigin}/cmdbuild/custom-api/templates/DeniedPublishTemplate/publish`;
+  const baseline = await requestPublishBaseline(publishUrl, {}, { cookie });
+  assert.equal(baseline.statusCode, 403, baseline.body);
+  assert.equal(baseline.json.reason, 'template_update_forbidden');
+  assert.equal(baseline.json.publishBaseline, undefined);
+  const publish = await requestJson('POST', publishUrl, {
     params: {},
     savedSpecHash: hashJson(spec)
   }, {
@@ -7225,7 +7240,12 @@ test('template publish fails closed when the class update permission is denied',
   const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
   assert.equal(csrf.statusCode, 200);
 
-  const publish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/MissingPermissionPublishTemplate/publish`, {
+  const publishUrl = `${backendOrigin}/cmdbuild/custom-api/templates/MissingPermissionPublishTemplate/publish`;
+  const baseline = await requestPublishBaseline(publishUrl, {}, { cookie });
+  assert.equal(baseline.statusCode, 403, baseline.body);
+  assert.equal(baseline.json.reason, 'template_update_forbidden');
+  assert.equal(baseline.json.publishBaseline, undefined);
+  const publish = await requestJson('POST', publishUrl, {
     params: {},
     savedSpecHash: hashJson(spec)
   }, {
@@ -7459,7 +7479,7 @@ test('runtime and public snapshot caches isolate templates with the same code by
   assertRows(await run(runtimeCode, alternateRoot), 'hit', 'Alternate root row');
 
   const publishSnapshot = async (spec, query) => {
-    const response = await requestJson('POST', `${api}/templates/${snapshotCode}/publish${query}`, {
+    const response = await publishWithBaseline(`${api}/templates/${snapshotCode}/publish${query}`, {
       params, savedSpecHash: hashJson(spec)
     }, headers);
     assert.equal(response.statusCode, 200, response.body);
@@ -7580,13 +7600,22 @@ async function startSnapshotRedisFixture(t) {
           const keyCount = Number(args[0]);
           const keys = args.slice(1, 1 + keyCount);
           const [expected, ...next] = args.slice(1 + keyCount);
-          const writeSnapshot = key.includes('SADD');
-          if (!writeSnapshot && faults.finalize) return socket.end('-ERR cannot finalize revocation\r\n');
-          if (writeSnapshot && Date.now() >= Number(next[2])) return socket.end(resp(-1));
-          if ((writeSnapshot ? keys.slice(0, 1) : keys).some((item) => values.get(item) !== expected)) return socket.end(resp(0));
-          if (writeSnapshot && next[3] !== undefined && values.get(keys[1]) !== next[3]) return socket.end(resp(0));
-          if (writeSnapshot) { values.set(keys[1], next[0]); add(keys[2], next[1]); }
-          else keys.forEach((item, index) => next[index] === '-' ? values.delete(item) : values.set(item, next[index]));
+          if (key.includes('SADD')) {
+            const [snapshot, indexMember, deadline, compare, raw, generation] = next;
+            const [stateKey, snapshotKey, indexKey] = keys;
+            if (Date.now() >= Number(deadline)) return socket.end(resp(-1));
+            if ((values.get(stateKey) ?? '') !== expected ||
+                !(compare === 'missing' && !values.has(snapshotKey) || compare === 'value' && values.get(snapshotKey) === raw)) {
+              return socket.end(resp(0));
+            }
+            values.set(snapshotKey, snapshot);
+            add(indexKey, indexMember);
+            if (!values.has(stateKey)) values.set(stateKey, generation);
+          } else {
+            if (faults.finalize) return socket.end('-ERR cannot finalize revocation\r\n');
+            if (keys.some((item) => values.get(item) !== expected)) return socket.end(resp(0));
+            keys.forEach((item, index) => next[index] === '-' ? values.delete(item) : values.set(item, next[index]));
+          }
           return socket.end(resp(1));
         }
         default: return socket.end('-ERR unexpected fixture command\r\n');
@@ -7627,7 +7656,10 @@ test('snapshot revocation with a lost MSET ACK leaves both rename markers discov
   }, { ...redis.env, CMDBDYNAMIC_REDIS_RETRY_AFTER_MS: '1000', CMDBDYNAMIC_REDIS_TIMEOUT_MS: '2500' });
   const expectedSpecHash = hashJson(spec);
   const publishBody = { params: {}, savedSpecHash: expectedSpecHash };
-  assert.equal((await requestJson('POST', templateUrl + '/publish', publishBody, headers)).statusCode, 200);
+  const publishUrl = templateUrl + '/publish';
+  assert.equal((await publishWithBaseline(publishUrl, publishBody, headers)).statusCode, 200);
+  const baseline = await requestPublishBaseline(publishUrl, publishBody.params, headers);
+  assert.equal(baseline.statusCode, 200, baseline.body);
   assert.equal((await requestJson('GET', snapshotUrl)).json.snapshotFound, true);
 
   const requestId = 'lost-revocation-ack-fixture';
@@ -7656,7 +7688,10 @@ test('snapshot revocation with a lost MSET ACK leaves both rename markers discov
   // Wait for the client backoff; the persisted marker must still fence the old payload.
   await waitFor(async () => (await requestJson('GET', snapshotUrl)).statusCode === 200, 4000);
   assert.equal((await requestJson('GET', snapshotUrl)).json.snapshotFound, false);
-  const retry = await requestJson('POST', templateUrl + '/publish', publishBody, headers);
+  const blockedBaseline = await requestPublishBaseline(publishUrl, publishBody.params, headers);
+  assert.equal(blockedBaseline.statusCode, 409, blockedBaseline.body);
+  assert.equal(blockedBaseline.json.reason, 'snapshot_revocation_pending');
+  const retry = await requestJson('POST', publishUrl, { ...publishBody, publishBaseline: baseline.json.publishBaseline }, headers);
   assert.equal(retry.statusCode, 409, retry.body);
   assert.equal(retry.json.reason, 'snapshot_revocation_pending');
 });
@@ -7673,7 +7708,7 @@ test('snapshot revocation reports pending if restoration of a rejected write can
       }
     }
   }, redis.env);
-  assert.equal((await requestJson('POST', templateUrl + '/publish', { params: {}, savedSpecHash: hashJson(spec) }, headers)).statusCode, 200);
+  assert.equal((await publishWithBaseline(templateUrl + '/publish', { params: {}, savedSpecHash: hashJson(spec) }, headers)).statusCode, 200);
   redis.faults.finalize = true;
   const requestId = 'unconfirmed-restoration-fixture';
   const rejected = await requestJson('DELETE', templateUrl, undefined, { ...headers, 'x-request-id': requestId });
@@ -7707,7 +7742,7 @@ test('snapshot revocation uses the same class across root spellings and fences s
   const headers = await headersFor(origin);
   const templatePath = `/cmdbuild/custom-api/templates/${code}`;
   const oldPublicPath = `/cmdbuild/custom-api/public-snapshots/${code}/run?root=Cst_QueryTool&json=true`;
-  const publish = await requestJson('POST', `${origin}${templatePath}/publish?root=Cst_QueryTool`,
+  const publish = await publishWithBaseline(`${origin}${templatePath}/publish?root=Cst_QueryTool`,
     { params: {}, savedSpecHash: hashJson(spec) }, headers);
   assert.equal(publish.statusCode, 200, publish.body);
   assert.equal((await requestJson('GET', origin + oldPublicPath)).json.snapshotFound, true);
@@ -7794,7 +7829,7 @@ test('template publish executes static snapshot spec and returns published cache
   const csrf = await requestJson('GET', `${backendOrigin}/cmdbuild/custom-api/csrf`, undefined, { cookie });
   assert.equal(csrf.statusCode, 200);
 
-  const publish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/StaticPublishTemplate/publish`, {
+  const publish = await publishWithBaseline(`${backendOrigin}/cmdbuild/custom-api/templates/StaticPublishTemplate/publish`, {
     params: {},
     savedSpecHash: hashJson(spec)
   }, {
@@ -7885,7 +7920,7 @@ test('large-table publication accepts exactly 10000 projected rows and retains t
   const api = origin + '/cmdbuild/custom-api';
   const headers = { cookie: testCmdbuildAuthorizationCookie('editor'), origin };
   headers['x-cmdbdynamicpages-csrf'] = (await requestJson('GET', api + '/csrf', undefined, headers)).json.token;
-  const publish = await requestJson('POST', `${api}/templates/${code}/publish`, { savedSpecHash: hashJson(spec) }, headers);
+  const publish = await publishWithBaseline(`${api}/templates/${code}/publish`, { savedSpecHash: hashJson(spec) }, headers);
   assert.equal(publish.statusCode, 200, publish.body.slice(0, 2000));
   const publicPath = `${api}/public-snapshots/${code}`;
   const opened = await requestJson('GET', publicPath + '/run?cmdpTableShell=1');
@@ -7957,7 +7992,7 @@ test('large-table publication distinguishes relation totals, unconfirmed ends an
   const api = origin + '/cmdbuild/custom-api';
   const headers = { cookie: testCmdbuildAuthorizationCookie('editor'), origin };
   headers['x-cmdbdynamicpages-csrf'] = (await requestJson('GET', api + '/csrf', undefined, headers)).json.token;
-  const publish = (code, spec) => requestJson('POST', `${api}/templates/${code}/publish`, { savedSpecHash: hashJson(spec) }, headers);
+  const publish = (code, spec) => publishWithBaseline(`${api}/templates/${code}/publish`, { savedSpecHash: hashJson(spec) }, headers);
   for (const [upstreamTotal, returned] of [[2, 1], [2, 0], [null, 1]]) {
     totalRelations = upstreamTotal;
     relationsReturned = returned;
@@ -8013,7 +8048,7 @@ test('publication row ceilings respect the independent scan maximum without an e
           return { statusCode: 200, body: { data, meta: { total } } };
         }
       }, { CMDP_EXECUTION_MAX_ROWS_ABSOLUTE: '3000', CMDP_LARGE_TABLE_MAX_ROWS: '12000' });
-      const response = await requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+      const response = await publishWithBaseline(templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
       if (large) {
         assert.equal(response.statusCode, 200, response.body.slice(0, 1800));
         assert.equal(fetched, 11000);
@@ -8054,7 +8089,7 @@ test('matchRows with no matches stops at its budget without replacing the publis
       return { statusCode: 200, body: { data, meta: { total } } };
     }
   });
-  const publish = () => requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+  const publish = () => publishWithBaseline(templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
   const initial = await publish();
   assert.equal(initial.statusCode, 200, initial.body.slice(0, 1000));
   const before = await requestJson('GET', snapshotUrl);
@@ -8101,7 +8136,7 @@ test('large-table publication and personal refresh distinguish selector scan and
       };
     }
   });
-  const publish = () => requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+  const publish = () => publishWithBaseline(templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
   const initial = await publish();
   assert.equal(initial.statusCode, 200, initial.body);
   const before = await requestJson('GET', snapshotUrl);
@@ -8138,7 +8173,7 @@ test('large-table publication reports only CMDBuild REST calls sent before the b
       RuntimeConfigJson: JSON.stringify({ executionLimits: { maxRestCallsDefault: 1 } }) }]
   });
   const start = mock.requests.length;
-  const response = await requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+  const response = await publishWithBaseline(templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
   const executionCalls = mock.requests.slice(start).filter(({ pathname }) =>
     pathname.endsWith('/rest/v3/classes') || pathname.endsWith('/classes/ARM/cards'));
   assert.equal(executionCalls.length, 1);
@@ -8161,7 +8196,7 @@ test('large-table publish and shared refresh keep real deadlines at 504 and reta
     templates: [templateCard(code, spec)],
     delayByPath: (url) => slow && url.pathname.endsWith('/classes/ARM/cards') ? 1500 : 0
   }, { CMDP_DRAFT_PREVIEW_TIMEOUT_MS: '1000' });
-  const publish = () => requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+  const publish = () => publishWithBaseline(templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
   const initial = await publish();
   assert.equal(initial.statusCode, 200, initial.body);
   const before = await requestJson('GET', snapshotUrl);
@@ -8198,7 +8233,7 @@ test('snapshot lookahead blocked by the REST budget identifies the budget and ke
       } };
     }
   });
-  const publish = () => requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+  const publish = () => publishWithBaseline(templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
   const published = await publish();
   assert.equal(published.statusCode, 200, published.body);
   const before = await requestJson('GET', snapshotUrl);
@@ -8237,7 +8272,7 @@ test('snapshot completeness rejects ordinary publish and mixed personal refresh 
           };
         }
       });
-      const publish = () => requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+      const publish = () => publishWithBaseline(templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
       const initial = await publish();
       assert.equal(initial.statusCode, 200, initial.body);
       const before = await requestJson('GET', snapshotUrl);
@@ -8293,7 +8328,7 @@ test('snapshot report diagnostics bound overflow, retain deadline evidence and m
 
   for (const timedOut of [false, true]) {
     expire = timedOut;
-    const response = await requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+    const response = await publishWithBaseline(templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
     const expected = timedOut ? {
       phase: 'rows', limitName: 'executionTimeoutMs', effectiveLimit: timeoutMs,
       unit: 'milliseconds', reason: 'deadline_exceeded', timeout: true
@@ -8335,7 +8370,7 @@ test('snapshot index budget masks the complete diagnostic label before clipping 
     templates: [templateCard(code, spec)],
     armCards: [{ _id: 501, Code: 'asset', Membership: Array.from({ length: 100001 }, () => 'membership') }]
   }, { CMDP_LOG_LEVEL: 'warn' });
-  const failed = await requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+  const failed = await publishWithBaseline(templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
   const limits = assertSnapshotLimitError(failed, 'large_table_membership_limit', {
     table: prefix + '[REDACTED]', phase: 'index', limitName: 'maxIndexMemberships', observed: 100001
   });
@@ -8390,7 +8425,7 @@ test('snapshot deadline at template recheck prevents publish and shared refresh 
       }
     }
   }, { CMDP_DRAFT_PREVIEW_TIMEOUT_MS: String(timeoutMs) });
-  const publish = () => requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+  const publish = () => publishWithBaseline(templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
   const initial = await publish();
   assert.equal(initial.statusCode, 200, initial.body);
   const before = await requestJson('GET', snapshotUrl);
@@ -8439,7 +8474,7 @@ test('snapshot deadline in the mutation queue does not let the next writer overt
       }
     }
   }, { CMDP_DRAFT_PREVIEW_TIMEOUT_MS: String(timeoutMs) });
-  const initial = await requestJson('POST', templateUrl + '/publish', { savedSpecHash }, headers);
+  const initial = await publishWithBaseline(templateUrl + '/publish', { savedSpecHash }, headers);
   assert.equal(initial.statusCode, 200, initial.body);
   const before = await requestJson('GET', snapshotUrl);
   assert.equal(before.statusCode, 200, before.body);
@@ -8488,7 +8523,7 @@ test('snapshot catalog rejects invalid envelopes and conflicting counts without 
       if (url.pathname.endsWith('/domains/AssetLocation')) return { statusCode: 200, body: { data: domain } };
     }
   });
-  const publish = () => requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+  const publish = () => publishWithBaseline(templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
   const initial = await publish();
   assert.equal(initial.statusCode, 200, initial.body);
   const before = await requestJson('GET', snapshotUrl);
@@ -8508,6 +8543,110 @@ test('snapshot catalog rejects invalid envelopes and conflicting counts without 
     assert.deepEqual((await requestJson('GET', snapshotUrl)).json, before.json);
   }
 });
+
+for (const mode of ['shared', 'personal']) {
+  test(`runtime settings failures stop Publish and ${mode} refresh before reading report data`, async (t) => {
+    const code = `SnapshotStrictRuntimeConfig_${mode}`;
+    const spec = publishSpec({
+      steps: [{ type: 'selectCards', as: 'items', className: 'ARM' }],
+      result: { tables: [{ name: 'items', columns: ['Code'], published: true, presentation: { largeTable: { mode: 'all' } } }] },
+      publish: { ...publishSpec().publish, refreshMode: mode, sharedRefreshAccepted: mode === 'shared' }
+    });
+    let configFailure;
+    let configDelayed = false;
+    const { mock, templateUrl, snapshotUrl, headers } = await startTemplateRace(t, code, {
+      templates: [templateCard(code, spec)],
+      delayByPath: (url) => configDelayed && url.pathname.endsWith('/classes/Cst_QueryToolConfig/cards') ? 1400 : 0,
+      responseOverride(url) {
+        if (url.pathname.endsWith('/classes/Cst_QueryToolConfig/cards')) return configFailure;
+      }
+    }, { CMDP_DRAFT_PREVIEW_TIMEOUT_MS: '1000', CMDBUILD_RETRY_MAX_ATTEMPTS: '1' });
+    const publish = () => publishWithBaseline(templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+    const initial = await publish();
+    assert.equal(initial.statusCode, 200, initial.body); // A confirmed empty config collection uses defaults.
+    const before = await requestJson('GET', snapshotUrl);
+    const revision = before.json.cache.snapshotRevision;
+    const refresh = () => requestJson('POST', templateUrl + '/refresh-snapshot?cmdpTableShell=1', {
+      expectedMode: mode, expectedSnapshotRevision: revision
+    }, headers);
+    const failures = [
+      [503, { message: 'private upstream config detail' }, 502, 'report_runtime_config_unavailable'],
+      [200, { success: false, data: [] }, 502, 'report_runtime_config_unavailable'],
+      [200, { data: [], meta: { total: 1 } }, 502, 'report_runtime_config_unavailable'],
+      [200, { data: [{ Code: 'Cst_QueryTool', Active: true, RuntimeConfigJson: '{invalid' }] }, 502, 'report_runtime_config_unavailable'],
+      [403, { message: 'private upstream config detail' }, 403, 'data_access_denied']
+    ];
+    for (const [statusCode, body, expectedStatus, reason] of failures) {
+      configFailure = { statusCode, body };
+      const start = mock.requests.length;
+      for (const result of [await publish(), await refresh()]) {
+        assert.equal(result.statusCode, expectedStatus, result.body);
+        assert.equal(result.json.reason, reason, result.body);
+        assert.equal(result.json.tableView, undefined);
+        assert.doesNotMatch(result.body, /private upstream config detail|\{invalid/);
+      }
+      assert.equal(mock.requests.slice(start).filter(({ pathname }) => pathname.endsWith('/classes/ARM/cards')).length, 0);
+      assert.deepEqual((await requestJson('GET', snapshotUrl)).json, before.json);
+    }
+    configFailure = undefined;
+    configDelayed = true;
+    const start = mock.requests.length;
+    const publishTimeout = await publish();
+    const refreshTimeout = await refresh();
+    assert.equal(publishTimeout.statusCode, 504, publishTimeout.body);
+    assert.equal(publishTimeout.json.reason, 'draft_preview_timeout');
+    assert.equal(refreshTimeout.statusCode, 504, refreshTimeout.body);
+    assert.equal(refreshTimeout.json.reason, 'snapshot_refresh_timeout');
+    assert.equal(mock.requests.slice(start).filter(({ pathname }) => pathname.endsWith('/classes/ARM/cards')).length, 0);
+    assert.deepEqual((await requestJson('GET', snapshotUrl)).json, before.json);
+  });
+}
+
+for (const mode of ['shared', 'personal']) {
+  test(`snapshot selector and rows share the REST budget during Publish and ${mode} refresh`, async (t) => {
+    const code = `SnapshotCombinedRestBudget_${mode}`;
+    const spec = publishSpec({
+      steps: [{ type: 'selectCards', as: 'items', className: 'ARM' }],
+      result: { tables: [{ name: 'items', columns: ['Code'], published: true, presentation: { largeTable: {
+        mode: 'key', selector: { kind: 'class', source: 'IS', idField: 'Code', labelField: 'Description', matchField: 'Code' }
+      } } }] },
+      publish: { ...publishSpec().publish, refreshMode: mode, sharedRefreshAccepted: mode === 'shared' }
+    });
+    const configCard = { _id: 1, Code: 'Cst_QueryTool', Active: true,
+      RuntimeConfigJson: JSON.stringify({ executionLimits: { maxRestCallsDefault: 4 } }) };
+    const { mock, templateUrl, snapshotUrl, headers } = await startTemplateRace(t, code, {
+      templates: [templateCard(code, spec)],
+      configCards: [configCard],
+      responseOverride(url) {
+        if (!/\/classes\/(IS|ARM)\/cards$/.test(url.pathname)) return;
+        return { statusCode: 200, body: { data: [{ _id: 51, Code: 'item', Description: 'Option' }], meta: { total: 1 } } };
+      }
+    });
+    const publish = () => publishWithBaseline(templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+    const readPhases = (start) => mock.requests.slice(start).flatMap(({ pathname }) =>
+      /\/rest\/v3\/(classes(?:\/(?:IS|ARM)\/cards)?)\/?$/.exec(pathname)?.[1] || []);
+    const initial = await publish();
+    assert.equal(initial.statusCode, 200, initial.body);
+    assert.deepEqual(readPhases(0), ['classes', 'classes/IS/cards', 'classes', 'classes/ARM/cards'], 'each phase fits in two requests');
+    const before = await requestJson('GET', snapshotUrl);
+    const revision = before.json.cache.snapshotRevision;
+    configCard.RuntimeConfigJson = JSON.stringify({ executionLimits: { maxRestCallsDefault: 2 } });
+    const refresh = () => requestJson('POST', templateUrl + '/refresh-snapshot?cmdpTableShell=1', {
+      expectedMode: mode, expectedSnapshotRevision: revision
+    }, headers);
+    for (const execute of [publish, refresh]) {
+      const start = mock.requests.length;
+      const result = await execute();
+      assert.equal(result.statusCode, 422, result.body);
+      assert.equal(result.json.reason, 'table_result_incomplete', result.body);
+      assert.equal(result.json.tableView, undefined);
+      const { table, phase, effectiveLimit, observed } = result.json.diagnostics.limits.find((item) => item.limitName === 'maxRestCalls');
+      assert.deepEqual({ table, phase, effectiveLimit, observed }, { table: 'items', phase: 'rows', effectiveLimit: 2, observed: 2 });
+      assert.deepEqual(readPhases(start), ['classes', 'classes/IS/cards'], 'rows may not start another CMDBuild request');
+      assert.deepEqual((await requestJson('GET', snapshotUrl)).json, before.json);
+    }
+  });
+}
 
 test('snapshot traversal keeps the reverse row visible when a smaller depth cap rejects a replacement', async (t) => {
   const code = 'SnapshotReaderDomainDepth';
@@ -8534,7 +8673,7 @@ test('snapshot traversal keeps the reverse row visible when a smaller depth cap 
       if (domain) return { statusCode: 200, body: { data: domain } };
     }
   });
-  const publish = () => requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+  const publish = () => publishWithBaseline(templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
   const terminal = await publish();
   assert.equal(terminal.statusCode, 200, terminal.body);
   const before = await requestJson('GET', snapshotUrl);
@@ -8593,7 +8732,7 @@ test('snapshot reader resolves relation targets past a partial catalog without s
       };
     }
   });
-  const publish = () => requestJson('POST', templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
+  const publish = () => publishWithBaseline(templateUrl + '/publish', { savedSpecHash: hashJson(spec) }, headers);
   const complete = await publish();
   assert.equal(complete.statusCode, 200, complete.body);
   assert.deepEqual(complete.json.result.tables[0].rows, [{ RelatedClass: 'Child' }]);
@@ -8674,7 +8813,7 @@ test('large tables page 400 options, 4000 linked rows and 6000 unrestricted rows
   const before = readRows();
   const initial = await report('PagedKey');
   assert.equal(initial.statusCode, 200, initial.body);
-  assert.deepEqual(initial.json.tableView, { kind: 'dynamic' });
+  assert.deepEqual(initial.json.tableView, { kind: 'dynamic', pageSize: 50 });
   assert.deepEqual(initial.json.result.tables[0].rows, []);
   const options = await page('PagedKey', { op: 'options' });
   assert.equal(options.statusCode, 200, options.body);
@@ -8703,9 +8842,9 @@ test('large tables page 400 options, 4000 linked rows and 6000 unrestricted rows
   assert.equal(sixThousand.json.table.rows[0].Code, 'Row-00049');
   assert.equal(sixThousand.json.incomplete, false);
 
-  const publish = await requestJson('POST', api + '/templates/PagedSnapshot/publish', { savedSpecHash: hashJson(snapshotSpec) }, editor);
+  const publish = await publishWithBaseline(api + '/templates/PagedSnapshot/publish', { savedSpecHash: hashJson(snapshotSpec) }, editor);
   assert.equal(publish.statusCode, 200, publish.body);
-  const publishedPersonal = await requestJson('POST', api + '/templates/PagedPersonal/publish', { savedSpecHash: hashJson(personalSpec) }, editor);
+  const publishedPersonal = await publishWithBaseline(api + '/templates/PagedPersonal/publish', { savedSpecHash: hashJson(personalSpec) }, editor);
   assert.equal(publishedPersonal.statusCode, 200, publishedPersonal.body);
   const startPublic = mock.requests.length;
   const publicly = await report('PagedSnapshot', {}, 'public-snapshots');
@@ -8964,7 +9103,7 @@ test('static snapshot refresh keeps personal data local and uses the opened exac
   for (const [code, savedSpec] of [[exactCode, spec], [sharedCode, shared]]) {
     const missing = await requestJson('GET', refresh(code), undefined, reader);
     assert.equal(missing.statusCode, 404, missing.body);
-    const published = await requestJson('POST', `${api}/templates/${code}/publish`, { params, savedSpecHash: hashJson(savedSpec) }, editor);
+    const published = await publishWithBaseline(`${api}/templates/${code}/publish`, { params, savedSpecHash: hashJson(savedSpec) }, editor);
     assert.equal(published.statusCode, 200, published.body);
   }
   const anonymousGet = await requestJson('GET', refresh(exactCode));
@@ -9096,7 +9235,7 @@ test('static snapshot refresh CAS rejects another refresh or a generation change
       publicReport: () => requestJson('GET', `${api}/public-snapshots/${code}/run?json=true`) });
   }
   const [slow, fast] = endpoints;
-  const published = await requestJson('POST', `${fast.template}/publish`, { params: {}, savedSpecHash: hashJson(spec) }, fast.headers);
+  const published = await publishWithBaseline(`${fast.template}/publish`, { params: {}, savedSpecHash: hashJson(spec) }, fast.headers);
   assert.equal(published.statusCode, 200, published.body);
   let stateKey;
   for (const key of redis.values.keys()) if (key.includes(':snapshot-state:')) stateKey = key;
@@ -9148,7 +9287,7 @@ test('template deletion revokes all public static snapshots', async (t) => {
     'x-cmdbdynamicpages-csrf': csrf.json.token
   };
 
-  const publish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/StaticSnapshotRevoke/publish`, {
+  const publish = await publishWithBaseline(`${backendOrigin}/cmdbuild/custom-api/templates/StaticSnapshotRevoke/publish`, {
     params: {},
     savedSpecHash: hashJson(spec)
   }, headers);
@@ -9174,7 +9313,7 @@ test('template deletion revokes all public static snapshots', async (t) => {
   assert.equal(afterUpdate.statusCode, 200, afterUpdate.body);
   assert.equal(afterUpdate.json.snapshotFound, true);
 
-  const republished = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/StaticSnapshotRevoke/publish`, {
+  const republished = await publishWithBaseline(`${backendOrigin}/cmdbuild/custom-api/templates/StaticSnapshotRevoke/publish`, {
     params: {},
     savedSpecHash: hashJson(spec)
   }, headers);
@@ -9442,7 +9581,7 @@ test('public snapshots ignore retired generic D2 diagram definitions', async (t)
     'x-cmdbdynamicpages-csrf': csrf.json.token
   };
 
-  const blockedPublish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/D2PublicBlockedTemplate/publish`, {
+  const blockedPublish = await publishWithBaseline(`${backendOrigin}/cmdbuild/custom-api/templates/D2PublicBlockedTemplate/publish`, {
     params: {},
     savedSpecHash: hashJson(blockedSpec)
   }, headers, 10_000);
@@ -9458,7 +9597,7 @@ test('public snapshots ignore retired generic D2 diagram definitions', async (t)
   assert.equal(blockedJson.statusCode, 200, blockedJson.body);
   assert.deepEqual(blockedJson.json.diagrams, []);
 
-  const allowedPublish = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/templates/D2PublicAllowedTemplate/publish`, {
+  const allowedPublish = await publishWithBaseline(`${backendOrigin}/cmdbuild/custom-api/templates/D2PublicAllowedTemplate/publish`, {
     params: {},
     savedSpecHash: hashJson(allowedSpec)
   }, headers, 10_000);
@@ -10220,7 +10359,8 @@ test('general config save preserves an above-ceiling row limit and validates cha
   const configCard = {
     _id: 42, Code: 'Cst_QueryTool', RootCode: 'Cst_QueryTool', Description: 'Existing settings', Active: false,
     RuntimeConfigJson: JSON.stringify({
-      executionLimits: { maxRowsMax: 2000, maxRowsDefault: 600 },
+      executionLimits: { maxRowsMax: 2000, maxRowsDefault: 600, maxClassesDefault: 17, maxRelationsPerCardMax: 321,
+        maxSelectionScanRowsDefault: 30000, maxSelectionScanRowsMax: 50000, maxRestCallsDefault: 110, maxRestCallsMax: 110 },
       runtimeCache: { refreshCooldownSec: 180 },
       assistant: { llm: { maxTokens: 4096 } }
     })
@@ -10234,7 +10374,7 @@ test('general config save preserves an above-ceiling row limit and validates cha
       Object.assign(configCard, await readRequestJson(request));
       return { statusCode: 200, body: { data: configCard } };
     }
-  }, { CMDP_EXECUTION_MAX_ROWS_ABSOLUTE: '1800' });
+  }, { CMDP_EXECUTION_MAX_ROWS_ABSOLUTE: '1800', CMDP_EXECUTION_MAX_SELECTION_SCAN_ROWS_ABSOLUTE: '30000' });
   const configUrl = origin + '/cmdbuild/custom-api/config?root=Cst_QueryTool';
   const update = await requestJson('PUT', configUrl + '&scope=general', {
     active: true, runtimeConfig: { runtimeCache: { refreshCooldownSec: 240 }, executionLimits: { maxRowsMax: 1500 } }
@@ -10253,9 +10393,34 @@ test('general config save preserves an above-ceiling row limit and validates cha
   assert.equal(invalid.json.errors[0].path, 'executionLimits.maxRowsMax');
   assert.equal(writes, 1);
   runtimeConfig.executionLimits.maxRowsMax = 1800;
+  runtimeConfig.executionLimits.reportPageSize = 101;
+  const invalidPage = await requestJson('PUT', configUrl, { runtimeConfig }, headers);
+  assert.equal(invalidPage.statusCode, 422, invalidPage.body);
+  assert.equal(invalidPage.json.errors[0].path, 'executionLimits.reportPageSize');
+  assert.equal(writes, 1);
+  runtimeConfig.executionLimits.reportPageSize = 37;
+  for (const [key, cap] of [['maxSelectionScanRowsDefault', 30000], ['maxRestCallsDefault', 110]]) {
+    for (const invalidValue of [0, 1.5, '10', cap + 1]) {
+      runtimeConfig.executionLimits[key] = invalidValue;
+      const rejected = await requestJson('PUT', configUrl, { runtimeConfig }, headers);
+      assert.equal(rejected.statusCode, 422, rejected.body);
+      assert.equal(rejected.json.code, 'runtime_config_invalid');
+      const { path, max } = rejected.json.errors[0];
+      assert.deepEqual({ path, max }, { path: `executionLimits.${key}`, max: cap });
+      assert.equal(writes, 1, 'out-of-range config must not write a card');
+    }
+    runtimeConfig.executionLimits[key] = cap;
+  }
   const valid = await requestJson('PUT', configUrl, { runtimeConfig }, headers);
   assert.equal(valid.statusCode, 200, valid.body);
-  assert.equal(JSON.parse(configCard.RuntimeConfigJson).executionLimits.maxRowsMax, 1800);
+  const savedLimits = JSON.parse(configCard.RuntimeConfigJson).executionLimits;
+  assert.equal(savedLimits.maxRowsMax, 1800);
+  assert.equal(savedLimits.reportPageSize, 37);
+  assert.equal(savedLimits.maxClassesDefault, 17);
+  assert.equal(savedLimits.maxRelationsPerCardMax, 321);
+  assert.equal(savedLimits.maxSelectionScanRowsMax, 50000);
+  assert.equal(savedLimits.maxSelectionScanRowsDefault, 30000);
+  assert.equal(savedLimits.maxRestCallsDefault, 110);
   assert.equal(writes, 2);
 });
 
@@ -11642,6 +11807,10 @@ test('filtered selections scan beyond the result row limit and report an explici
   assert.equal(preview.statusCode, 200, preview.body);
   assert.deepEqual(preview.json.result.tables[0].rows.map((row) => row.Code), ['MATCH-AFTER-2000']);
   assert.equal(preview.json.result.trace[0].selectionScan, null);
+  const selection = preview.json.result.trace[0];
+  assert.equal(selection.scannedCards, cards.length);
+  assert.ok(selection.restCalls > 0);
+  assert.ok(preview.json.result.limits.restCalls >= selection.restCalls);
 
   const cappedPreview = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/preview?maxRows=10&maxClasses=20&maxRestCalls=20`, {
     template: { code: 'SelectionScanCappedPreview', spec: { ...spec, steps: [{ ...spec.steps[0], scanLimit: 2000 }] } }, params: {}
@@ -11649,6 +11818,7 @@ test('filtered selections scan beyond the result row limit and report an explici
   assert.equal(cappedPreview.statusCode, 200, cappedPreview.body);
   assert.deepEqual(cappedPreview.json.result.tables[0].rows, []);
   assert.equal(cappedPreview.json.result.trace[0].selectionScan.scanLimit, 2000);
+  assert.equal(cappedPreview.json.result.trace[0].scannedCards, 2000);
   assert.match(cappedPreview.json.result.warnings[0], /Results may be incomplete/i);
   assert.equal(backend.exitCode, null);
 });
@@ -11807,6 +11977,29 @@ async function startBackend(t, port, cmdbuildOrigin, envOverrides = {}) {
 
 function testCmdbuildAuthorizationCookie(fixture) {
   return ['CMDBuild', 'Authorization'].join('-') + '=' + fixture;
+}
+
+function requestPublishBaseline(url, params, headers) {
+  const baselineUrl = new URL(url);
+  const pairs = Object.entries(params ?? {});
+  if (pairs.length) baselineUrl.searchParams.set('snapshotParams', JSON.stringify(pairs));
+  return requestJson('GET', baselineUrl.href, undefined, headers);
+}
+
+async function publishWithBaseline(url, body, headers, timeoutMs) {
+  const baseline = await requestPublishBaseline(url, body.params, headers);
+  assert.equal(baseline.statusCode, 200, baseline.body);
+  assert.equal(baseline.json.success, true);
+  assert.equal(baseline.json.action, 'publish');
+  assert.match(baseline.json.savedSpecHash, /^[a-f0-9]{64}$/);
+  if (baseline.json.snapshotRevision !== null) assert.match(baseline.json.snapshotRevision, /^[a-f0-9]{64}$/);
+  assert.match(baseline.json.publishBaseline, /^[a-f0-9]{64}$/);
+  const response = await requestJson('POST', url, { ...body, publishBaseline: baseline.json.publishBaseline }, headers, timeoutMs);
+  if (response.statusCode === 200) {
+    assert.match(response.json.cache.snapshotRevision, /^[a-f0-9]{64}$/);
+    assert.notEqual(response.json.cache.snapshotRevision, baseline.json.snapshotRevision);
+  }
+  return response;
 }
 
 async function requestJson(method, url, body, extraHeaders = {}, timeoutMs = 5000) {
@@ -12090,7 +12283,7 @@ test('direct runtime enforces the published D2 source toggle even with a valid c
     }, headers);
     assert.equal(saved.statusCode, 200, saved.body);
     savedSpecHash = saved.json.template.specHash;
-    const published = await requestJson('POST', `${templateUrl}/publish`, { params, savedSpecHash }, headers);
+    const published = await publishWithBaseline(`${templateUrl}/publish`, { params, savedSpecHash }, headers);
     assert.equal(published.statusCode, 200, published.body);
     assert.equal(published.json.cache.status, 'snapshot-published');
 

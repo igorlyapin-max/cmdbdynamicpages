@@ -48,7 +48,7 @@ async function upstream(t, templates, read, userForToken = (token) => token) {
     let data = [];
     let status = 200;
     let total;
-    const override = await read(url, token);
+    const override = await read(url, token, req);
     if (override) ({ data = [], status = 200, total } = override);
     else if (path.endsWith('/sessions/current')) data = { username: userForToken(token), role: 'Reader' };
     else if (path.endsWith('/Cst_QueryTemplate/cards')) {
@@ -193,9 +193,12 @@ async function redisFixture(t) {
         }
         if (count === 3 && key.includes('SADD')) {
           if (redisNow() >= Number(argv[3])) return -1;
-          if (values.get(state) !== argv[0] || (argv[4] !== undefined && values.get(value) !== argv[4])) return 0;
+          const current = values.get(value);
+          if ((values.get(state) ?? '') !== argv[0] ||
+              (argv[4] === 'missing' ? current !== undefined : argv[4] !== 'value' || current !== argv[5])) return 0;
           add(index, argv[2]);
           values.set(value, argv[1]);
+          if (!values.has(state)) values.set(state, argv[6]);
           return 1;
         }
         throw new Error('Unexpected EVAL operation');
@@ -248,8 +251,16 @@ async function redisFixture(t) {
 }
 
 const rows = (...codes) => codes.map((Code, i) => ({ _id: i + 1, Code, Description: Code }));
-const publish = (request, name, spec, token = 'editor', params = {}) =>
-  request('/templates/' + name + '/publish', { token, method: 'POST', body: { savedSpecHash: specHash(spec), params } });
+const publishPath = (name) => '/templates/' + name + '/publish';
+const readBaseline = (request, name, params = {}, token = 'editor') =>
+  request(publishPath(name) + '?snapshotParams=' + encodeURIComponent(JSON.stringify(Object.entries(params))), { token });
+const postPublish = (request, name, spec, publishBaseline, token = 'editor', params = {}) =>
+  request(publishPath(name), { token, method: 'POST', body: { savedSpecHash: specHash(spec), params, publishBaseline } });
+async function publish(request, name, spec, token = 'editor', params = {}) {
+  const baseline = await readBaseline(request, name, params, token);
+  assert.equal(baseline.status, 200, JSON.stringify(baseline.json));
+  return postPublish(request, name, spec, baseline.json.publishBaseline, token, params);
+}
 
 test('invalid deployment row ceilings refuse startup and name the offending variable', { timeout: 5000 }, async (t) => {
   for (const [ordinary, paged, expected] of [
@@ -307,7 +318,7 @@ test('snapshot publication applies configured row ceilings and diagnoses explici
   const mock = await upstream(t, templates, (url) => {
     if (url.pathname.endsWith('/Cst_QueryToolConfig/cards')) return { data: [{
       _id: 1, Code: ROOT, RootCode: ROOT, Active: true,
-      RuntimeConfigJson: JSON.stringify({ executionLimits: { maxRowsDefault: 2, maxRowsMax: 6 } })
+      RuntimeConfigJson: JSON.stringify({ executionLimits: { maxRowsDefault: 2, maxRowsMax: 6, reportPageSize: 3 } })
     }] };
     if (!/\/classes\/Asset\/cards(?:\/|$)/.test(url.pathname)) return;
     sourceReads += 1;
@@ -410,6 +421,7 @@ test('snapshot publication applies configured row ceilings and diagnoses explici
     assert.equal(published.status, 200, JSON.stringify(published.json));
     const shell = await publicRun('Paged', 'cmdpTableShell=1');
     assert.equal(shell.status, 200);
+    assert.equal(shell.json.tableView.pageSize, 3, 'the viewer uses the snapshot page size, not the publication row ceiling');
     const snapshotRevision = shell.json.tableView.snapshotRevision;
     const pagePath = '/public-snapshots/Paged/table-page?cmdpTable=' + encodeURIComponent(JSON.stringify({
       table: 'items', op: 'rows', offset: pagedCap - 1, limit: 1, snapshotRevision
@@ -610,6 +622,147 @@ test('lost Redis ACK permits same-instance readback without repeating the write'
   assert.notEqual(republished.json.cache.snapshotRevision, shared.json.cache.snapshotRevision);
   assert.equal(republished.json.tables[0].rows[0].Code, 'republished');
   assert.deepEqual(redis.commits.map(({ outcome }) => outcome), [1, 1, 1], 'each write was dispatched exactly once');
+});
+
+test('a timed out Publish cannot replace a newer first publication or republish', { timeout: 10000 }, async (t) => {
+  const redis = await redisFixture(t);
+  const code = 'LatePublish';
+  const spec = { version: 1, steps: [SELECT], result: { tables: [PAGED] }, publish: SHARED };
+  const mock = await upstream(t, { [code]: spec }, (url, token) => {
+    if (url.pathname.endsWith('/classes/Asset/cards')) return { data: rows(token) };
+  });
+  const env = { CMDBDYNAMIC_REDIS_TIMEOUT_MS: '400', CMDP_DRAFT_PREVIEW_TIMEOUT_MS: '5000' };
+  const writer = await backend(t, mock, redis.origin, env);
+  const competitor = await backend(t, mock, redis.origin, env);
+  const publicPath = '/public-snapshots/' + code + '/run?cmdpTableShell=1';
+  assert.equal((await postPublish(writer, code, spec, undefined)).json.code, 'publication_baseline_required');
+  assert.equal(redis.values.size, 0, 'reading a missing baseline does not create a generation');
+
+  for (const action of ['first', 'replace']) {
+    const baseline = await readBaseline(writer, code);
+    assert.equal(baseline.status, 200);
+    if (action === 'first') assert.equal(baseline.json.snapshotRevision, null);
+    else assert.match(baseline.json.snapshotRevision, /^[a-f0-9]{64}$/);
+    const entered = deferredSignal();
+    const release = deferredSignal();
+    const previousCommits = redis.commits.length;
+    redis.faults.beforeCommit = () => {
+      entered.resolve();
+      return release.promise;
+    };
+    const pending = postPublish(writer, code, spec, baseline.json.publishBaseline, 'late-' + action);
+    let shell;
+    try {
+      await Promise.race([entered.promise, pending.then((response) => assert.fail(JSON.stringify(response)))]);
+      redis.faults.beforeCommit = null;
+      const uncertain = await pending;
+      assert.equal(uncertain.status, 503);
+      assert.equal(uncertain.json.code, 'snapshot_commit_outcome_unknown');
+      assert.deepEqual((await readBaseline(competitor, code)).json, baseline.json);
+      const winning = await postPublish(competitor, code, spec, baseline.json.publishBaseline, 'winner-' + action);
+      assert.equal(winning.status, 200, JSON.stringify(winning.json));
+      shell = await competitor(publicPath);
+      assert.equal(shell.json.tableView.snapshotRevision, winning.json.cache.snapshotRevision);
+    } finally {
+      redis.faults.beforeCommit = null;
+      release.resolve();
+    }
+    // The fixture resumes the delayed Redis command after the winner wrote.
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(redis.commits.slice(previousCommits).map(({ outcome }) => outcome), [0, 1]);
+    assert.deepEqual(await competitor(publicPath), shell);
+    const page = await competitor('/public-snapshots/' + code + '/table-page?cmdpTable=' + encodeURIComponent(JSON.stringify({
+      table: 'items', op: 'rows', limit: 10, snapshotRevision: shell.json.tableView.snapshotRevision
+    })));
+    assert.deepEqual(page.json.table.rows, [{ Code: 'winner-' + action }]);
+    const stale = await postPublish(writer, code, spec, baseline.json.publishBaseline);
+    assert.equal(stale.status, 409);
+    assert.equal(stale.json.code, 'snapshot_publish_conflict');
+    assert.equal(redis.commits.length, previousCommits + 2);
+  }
+  const state = [...redis.values.keys()].find((key) => key.includes(':snapshot-state:'));
+  redis.values.set(state, 'pending:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
+  const blocked = await readBaseline(writer, code);
+  assert.equal(blocked.status, 409);
+  assert.equal(blocked.json.code, 'snapshot_revocation_pending');
+});
+
+test('Publish baseline uses the configured exact or ignore key and never the public fallback', async (t) => {
+  const redis = await redisFixture(t);
+  const spec = { version: 1, steps: [SELECT], result: { tables: [TABLE] }, publish: { ...SHARED, paramsMode: 'exact' } };
+  const ignore = { ...spec, publish: { ...SHARED, paramsMode: 'ignore' } };
+  const mock = await upstream(t, { Exact: spec, Ignore: ignore }, (url) => {
+    if (url.pathname.endsWith('/classes/Asset/cards')) return { data: rows('asset') };
+  });
+  const request = await backend(t, mock, redis.origin);
+  const params = { count: 2, enabled: false };
+  const exact = await readBaseline(request, 'Exact', params);
+  assert.equal(exact.status, 200);
+  assert.equal((await postPublish(request, 'Exact', spec, exact.json.publishBaseline, 'editor', { count: '2', enabled: false })).status, 409);
+  assert.equal((await postPublish(request, 'Exact', spec, exact.json.publishBaseline, 'editor', params)).status, 200);
+  assert.equal((await readBaseline(request, 'Exact', {})).json.snapshotRevision, null);
+  const ignored = await readBaseline(request, 'Ignore');
+  assert.equal(ignored.status, 200);
+  assert.equal((await postPublish(request, 'Ignore', ignore, ignored.json.publishBaseline, 'editor', params)).status, 200);
+  assert.match((await readBaseline(request, 'Ignore', params)).json.snapshotRevision, /^[a-f0-9]{64}$/);
+});
+
+test('a stored page size reaches the public table and details only after shared refresh', async (t) => {
+  const redis = await redisFixture(t);
+  const code = 'PageSizing';
+  const largeTable = { mode: 'key', groupKeys: ['Band'],
+    selector: { kind: 'result', source: 'items', idField: 'Category', labelField: 'Category', matchField: 'Category' } };
+  const spec = { version: 1, steps: [SELECT, { type: 'enrichRows', from: 'items', as: 'view', purpose: 'viewComposer',
+    columns: [{ path: 'Band', as: 'Band' }] }],
+    result: { tables: [{ name: 'view', columns: ['Band', 'Code'], presentation: { largeTable } }] }, publish: SHARED };
+  const config = { _id: 9, Code: ROOT, RootCode: ROOT, Active: true,
+    RuntimeConfigJson: JSON.stringify({ executionLimits: { reportPageSize: 3 } }) };
+  const records = Array.from({ length: 12 * 4 * 4 }, (_, index) => ({
+    _id: index + 1, Code: 'item-' + index, Category: 'cat-' + Math.floor(index / 16), Band: 'band-' + Math.floor(index / 4) % 4
+  }));
+  const mock = await upstream(t, { [code]: spec }, async (url, token, req) => {
+    if (url.pathname.endsWith('/Cst_QueryToolConfig/cards/9') && req.method === 'PUT') {
+      const input = [];
+      for await (const chunk of req) input.push(chunk);
+      Object.assign(config, JSON.parse(Buffer.concat(input)));
+      return { data: config };
+    }
+    if (url.pathname.endsWith('/Cst_QueryToolConfig/cards')) return { data: [config] };
+    if (url.pathname.endsWith('/classes/Asset/cards')) return { data: records };
+  });
+  const request = await backend(t, mock, redis.origin);
+  const published = await publish(request, code, spec);
+  assert.equal(published.status, 200, JSON.stringify(published.json));
+  const shellPath = '/public-snapshots/' + code + '/run?cmdpTableShell=1';
+  const page = (snapshotRevision, query) => request('/public-snapshots/' + code + '/table-page?cmdpTable=' +
+    encodeURIComponent(JSON.stringify({ table: 'view', snapshotRevision, ...query })));
+  const verify = async (view, size) => {
+    assert.equal(view.pageSize, size);
+    const options = await page(view.snapshotRevision, { op: 'options', limit: 10 });
+    assert.equal(options.status, 200, JSON.stringify(options.json));
+    assert.equal(options.json.items.length, 10);
+    assert.equal(options.json.total, 12);
+    const key = options.json.items[0].key;
+    const summary = await page(view.snapshotRevision, { op: 'rows', key, limit: view.pageSize });
+    assert.equal(summary.status, 200, JSON.stringify(summary.json));
+    assert.equal(summary.json.table.rows.length, size);
+    assert.equal(summary.json.total, 4);
+    const details = await page(view.snapshotRevision, { op: 'details', key, group: summary.json.groupIds[0], limit: view.pageSize });
+    assert.equal(details.status, 200, JSON.stringify(details.json));
+    assert.equal(details.json.table.rows.length, size);
+    assert.equal(details.json.total, 4);
+  };
+  const before = (await request(shellPath)).json.tableView;
+  await verify(before, 3);
+  const saved = await request('/config', { token: 'editor', method: 'PUT', body: { runtimeConfig: { executionLimits: { reportPageSize: 2 } } } });
+  assert.equal(saved.status, 200, JSON.stringify(saved.json));
+  assert.deepEqual((await request(shellPath)).json.tableView, before);
+  const refreshed = await request('/templates/' + code + '/refresh-snapshot?cmdpTableShell=1', { token: 'editor', method: 'POST',
+    body: { expectedMode: 'shared', expectedSnapshotRevision: before.snapshotRevision } });
+  assert.equal(refreshed.status, 200, JSON.stringify(refreshed.json));
+  assert.notEqual(refreshed.json.tableView.snapshotRevision, before.snapshotRevision);
+  assert.deepEqual((await request(shellPath)).json.tableView, refreshed.json.tableView);
+  await verify(refreshed.json.tableView, 2);
 });
 
 test('snapshot command ACL denial and pre-write read failure are definitive; script errors are not', async (t) => {

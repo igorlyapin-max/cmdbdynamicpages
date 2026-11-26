@@ -2142,7 +2142,7 @@ test('runtime diagram view exposes D2 rendered SVG and source download affordanc
   assert.doesNotMatch(authenticatedLoad, /publicSnapshotRunPath/);
 });
 
-test('snapshot publication saves static settings before publish and uses saved template version', () => {
+test('snapshot publication saves static settings, reads a baseline and skips stale drafts before POST', () => {
   const publishStart = proxySource.indexOf('function publishSnapshot()');
   const launchStart = proxySource.indexOf('function refreshTemplateLaunchUrl()');
   const saveStart = proxySource.indexOf('function saveTemplate(options)');
@@ -2162,9 +2162,19 @@ test('snapshot publication saves static settings before publish and uses saved t
   assert.match(saveSource, /var savedTemplate = result\.json\.template/);
   assert.match(saveSource, /var unchanged = sameDraft\(\);[\s\S]*if \(!originalEditor \|\| !unchanged\) \{[^\n]*\n[^\n]*\n[^\n]*publishDraftChanged[^\n]*\n\s*return;/);
   assert.match(saveSource, /publishSavedSpecHashMissing/);
-  assert.match(saveSource, /encodeURIComponent\(savedTemplate\.code\) \+ '\/publish' \+ rootQuery/);
-  assert.match(saveSource, /phase: 'publish'/);
-  assert.match(saveSource, /savedSpecHash: savedTemplate\.specHash/);
+  assert.match(saveSource, /var publishPath = .*encodeURIComponent\(savedTemplate\.code\) \+ '\/publish'/);
+  const baselineStart = saveSource.indexOf("await request(publishPath + '?'");
+  const postStart = saveSource.indexOf('await request(publishPath + rootQuery');
+  assert.ok(baselineStart > saveSource.indexOf('var savedTemplate = result.json.template') && postStart > baselineStart);
+  const baselineSource = saveSource.slice(baselineStart, postStart);
+  assert.match(baselineSource, /runtimeQuery\(target\.query, target\.root\)/);
+  assert.match(baselineSource, /if \(!sameEditor\(\) \|\| !sameDraft\(\)\) \{[\s\S]*?return;/);
+  assert.match(baselineSource, /info\.savedSpecHash !== target\.specHash/);
+  assert.match(baselineSource, /target\.snapshotRevision = info\.snapshotRevision/);
+  assert.doesNotMatch(saveSource, /publicSnapshotRunPath\(/);
+  const postSource = saveSource.slice(postStart);
+  assert.match(postSource, /method: 'POST',[\s\S]*?phase: 'publish'/);
+  assert.match(postSource, /body: \{ params: publication\.params, savedSpecHash: savedTemplate\.specHash, publishBaseline: info\.publishBaseline \}/);
 });
 
 test('dynamic runtime explains that snapshot publication is unavailable', () => {
@@ -2174,8 +2184,8 @@ test('dynamic runtime explains that snapshot publication is unavailable', () => 
   assert.match(proxySource, /publishEnabled \? '' : t\('publicationDynamicHint'\)/);
 });
 
-test('catalog field pickers load attributes only after a search and retry transient errors', () => {
-  const ensureStart = proxySource.indexOf('function ensureCatalogAttributesForClass(className)');
+test('searchable catalog field pickers load attributes only after a search and retry transient errors', () => {
+  const ensureStart = proxySource.indexOf('function ensureCatalogAttributesForClass(className, quiet)');
   const viewClassesStart = proxySource.indexOf('function viewComposerCatalogClassNames(spec)');
   const ensureSectionStart = proxySource.indexOf('function ensureCatalogAttributesForDesignerSection()');
   const pickerClassesStart = proxySource.indexOf('function catalogFieldPickerClassNames(picker)');
@@ -2450,7 +2460,7 @@ test('Assistant-managed Object Flow aliases stay internal across deterministic a
   const aliasFieldStart = proxySource.indexOf('function renderResultAliasField(attribute, alias, spec)');
   const priorOptionsStart = proxySource.indexOf('function renderPriorMaterializedAliasOptions(model, operationIndex, selectedName, spec)');
   const diagramStagesStart = proxySource.indexOf('function renderDiagramImportStageOptions(spec, selectedId)');
-  const traceStart = proxySource.indexOf('function renderExecutionTrace(trace, spec)');
+  const traceStart = proxySource.indexOf('function renderExecutionTrace(');
   const diagnosticsStart = proxySource.indexOf('function userFacingAssistantDiagnostics(value, spec, fieldName)');
 
   assert.ok(resultLabelStart > -1);
@@ -2600,8 +2610,9 @@ test('shared relation limit controls explicit and deep relation reads', () => {
   const runtimeSource = proxySource.slice(runtimeStart, runtimeEnd);
   const relationSource = proxySource.slice(relationStart, relationEnd);
   const pathSource = proxySource.slice(pathStart, pathEnd);
-  assert.match(editorLimitsSource, /cmdp-runtime-max-relations-per-card-default/);
-  assert.match(editorLimitsSource, /cmdp-runtime-max-relations-per-card-max/);
+  assert.doesNotMatch(editorLimitsSource, /cmdp-runtime-max-relations-per-card-(?:default|max)/);
+  assert.match(editorLimitsSource, /\['runtimeMaxRelationsPerCardDefault', executionLimits\.maxRelationsPerCardDefault\]/);
+  assert.match(editorLimitsSource, /\['runtimeMaxRelationsPerCardMax', executionLimits\.maxRelationsPerCardMax\]/);
   assert.match(runtimeSource, /maxRelationsPerCardDefault/);
   assert.match(runtimeSource, /maxRelationsPerCardMax/);
   assert.match(relationSource, /limits\.maxRelationsPerCard/);
@@ -2640,13 +2651,17 @@ test('operation aliases immediately become available to later operations without
 
 test('runtime result UI renders execution-limit warnings returned by preview or run', () => {
   const renderStart = proxySource.indexOf('function renderActionResult(result)');
-  const traceStart = proxySource.indexOf('function renderExecutionTrace(trace, spec)', renderStart);
+  const traceStart = proxySource.indexOf('function renderExecutionTrace(', renderStart);
   assert.ok(renderStart > -1);
   assert.ok(traceStart > renderStart);
 
   const renderSource = proxySource.slice(renderStart, traceStart);
   assert.match(renderSource, /resultBody && Array\.isArray\(resultBody\.warnings\)/);
   assert.match(renderSource, /renderNotice\(\{ type: 'warning', text: warning \}\)/);
+  const traceSource = proxySource.slice(traceStart, proxySource.indexOf('function renderKeyValueTable', traceStart));
+  assert.match(renderSource, /renderExecutionTrace\(trace, null, resultBody && resultBody\.limits\)/);
+  assert.match(traceSource, /item\.scannedCards/);
+  assert.match(traceSource, /limits\.restCalls/);
   assert.match(proxySource, /runtimeMaxSelectionScanRowsDefault/);
   assert.match(proxySource, /runtimeMaxSelectionScanRowsMax/);
 });

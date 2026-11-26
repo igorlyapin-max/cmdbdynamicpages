@@ -84,17 +84,16 @@ async function withClient(viewport, scenario) {
         if (url.pathname === '/cmdbuild/custom-api/csrf') return route.fulfill({ json: { success: true, token: 'mock-csrf' } });
         if (url.pathname === '/cmdbuild/custom-api/client-log' && url.searchParams.get('stage') === 'script-loaded') return route.fulfill({ status: 204 });
         if (url.pathname === '/cmdbuild/custom-api/assistant/diagnostics/status') return route.fulfill({ json: { success: true, status: { mode: 'Off' } } });
-        if (url.pathname === '/cmdbuild/custom-api/public-snapshots/write-a/run') return route.fulfill({ json: {
-          success: true, action: 'run', template: { code: 'write-a' }, snapshotFound: false, result: { tables: [] },
-          cache: { scope: 'staticSnapshot', status: 'snapshot-miss' }
-        } });
       }
       unexpected.push(call);
       return route.abort('blockedbyclient');
     });
     await page.goto('http://remediation.test/');
     await page.evaluate(() => {
-      window.CMDP_BOOT = { reportRowLimits: { ordinary: 2000, paged: 10000, recommendedOrdinary: 2000, recommendedPaged: 10000 } };
+      window.CMDP_BOOT = {
+        reportRowLimits: { ordinary: 2000, paged: 10000, recommendedOrdinary: 2000, recommendedPaged: 10000 },
+        reportExecutionCaps: { restCalls: 1000, scanRows: 50000 }
+      };
     });
     await page.addScriptTag({ content: clientScript() });
     await page.evaluate(() => {
@@ -253,6 +252,12 @@ function assertWidgetExtractionRequest(call, compiledSpec) {
 
 const writeViewport = { width: 1280, height: 900 };
 const templateApi = '/cmdbuild/custom-api/templates';
+const writePublishPath = templateApi + '/write-a/publish';
+const publishBaseline = 'e'.repeat(64);
+const writePublishParams = { attrType: 'reference' };
+const publishBaselineResponse = (savedSpecHash) => ({
+  success: true, action: 'publish', savedSpecHash, snapshotRevision: null, publishBaseline
+});
 const writeAction = (page, action) => page.locator('button[data-action="' + action + '"]');
 const openSection = (page, section) => page.locator('a[data-designer-section="' + section + '"]').click();
 
@@ -330,12 +335,17 @@ test('publish failure survives section navigation and preserves a newer notice',
   await withClient(writeViewport, async ({ page, expectRequest }) => {
     const first = await openWriteFixture(page, 'publication');
     const save = expectRequest('PUT', templateApi + '/write-a');
-    const publish = expectRequest('POST', templateApi + '/write-a/publish');
+    const baseline = expectRequest('GET', writePublishPath);
+    const publish = expectRequest('POST', writePublishPath);
     await writeAction(page, 'publish-snapshot').click();
     const { body } = await save.received;
     const specHash = 'c'.repeat(64);
     save.respond({ success: true, template: { ...first, ...body, specHash }, executionValidation: { executable: true } });
-    assert.equal((await publish.received).body.savedSpecHash, specHash);
+    const { root, query } = await baseline.received;
+    assert.equal(root, 'Writes_QueryTool');
+    assert.deepEqual(JSON.parse(query.get('snapshotParams')), Object.entries(writePublishParams));
+    baseline.respond(publishBaselineResponse(specHash));
+    assert.deepEqual((await publish.received).body, { params: writePublishParams, savedSpecHash: specHash, publishBaseline });
     await openSection(page, 'cache');
     await writeAction(page, 'apply-cache').click();
     const notice = page.locator('#cmdp-designer-notice');
@@ -383,23 +393,67 @@ test('pending snapshot revocation keeps the Save ACK, localizes the warning and 
     await openSection(page, 'publication');
 
     const retry = expectRequest('PUT', templateApi + '/write-a');
-    const publication = expectRequest('POST', templateApi + '/write-a/publish');
+    const baseline = expectRequest('GET', writePublishPath);
+    const publication = expectRequest('POST', writePublishPath);
     await publish.click();
     const next = await retry.received;
     assert.equal(next.body.expectedSpecHash, savedHash);
     const freshHash = 'd'.repeat(64);
     retry.respond({ success: true, template: { ...first, ...next.body, specHash: freshHash, version: 3 },
       snapshotRevocationPending: false, executionValidation: { executable: true } });
+    await baseline.received;
+    baseline.respond(publishBaselineResponse(freshHash));
     const { body: published } = await publication.received;
-    assert.equal(published.savedSpecHash, freshHash);
+    assert.deepEqual(published, { params: writePublishParams, savedSpecHash: freshHash, publishBaseline });
     publication.respond({ success: true, action: 'publish', template: { code: first.code, active: true },
       params: published.params, result: { tables: [] }, cache: { enabled: true, scope: 'staticSnapshot', status: 'snapshot-published',
         sharedAcrossUsers: true, backend: 'memory', key: 'a'.repeat(16), specHash: freshHash, paramsHash: 'b'.repeat(64),
-        publishedAt: '2026-01-01T00:00:00Z' } });
+        publishedAt: '2026-01-01T00:00:00Z', snapshotRevision: 'f'.repeat(64) } });
     await page.locator('button[data-action="publish-snapshot"]:enabled').waitFor();
+    await page.getByText('Снимок опубликован.', { exact: true }).waitFor();
     assert.equal(await warning.count(), 0);
   });
 });
+
+for (const change of ['draft', 'template']) {
+  test(`Designer does not publish when the ${change} changes during the baseline GET`, async () => {
+    await withClient(writeViewport, async ({ page, expectRequest, writes }) => {
+      const first = await openWriteFixture(page, 'publication');
+      const save = expectRequest('PUT', templateApi + '/write-a');
+      const baseline = expectRequest('GET', writePublishPath);
+      const publish = writeAction(page, 'publish-snapshot');
+      await assertVisible(publish, writeViewport);
+      await publish.click();
+      const { body } = await save.received;
+      const savedHash = 'c'.repeat(64);
+      save.respond({ success: true, template: { ...first, ...body, specHash: savedHash }, executionValidation: { executable: true } });
+      const baselineRequest = await baseline.received;
+      assert.equal(baselineRequest.root, 'Writes_QueryTool');
+      assert.equal(baselineRequest.body, null);
+      assert.equal(await publish.isDisabled(), true);
+
+      if (change === 'draft') {
+        await page.locator('#cmdp-publish-public-d2-source').check();
+      } else {
+        await openSection(page, 'templates');
+        await selectWriteFixture(page, expectRequest, 'write-b');
+      }
+      baseline.respond(publishBaselineResponse(savedHash));
+      await page.waitForFunction(() => window.remediation.state.pendingTemplateWrites.size === 0);
+
+      assert.deepEqual(writes.map(({ method, path }) => [method, path]), [['PUT', templateApi + '/write-a']]);
+      if (change === 'draft') {
+        const warning = page.getByText(/Save and publish the current draft/);
+        await assertVisible(warning, writeViewport);
+        assert.equal(await page.locator('#cmdp-publish-public-d2-source').isChecked(), true);
+        assert.equal(await publish.isEnabled(), true);
+      } else {
+        assert.equal(await page.evaluate(() => window.remediation.state.selectedTemplate.code), 'write-b');
+        assert.equal(await page.getByText('Snapshot published.', { exact: true }).count(), 0);
+      }
+    });
+  });
+}
 
 test('pending writes for the same template code in different roots do not unlock or amend each other', async () => {
   await withClient(writeViewport, async ({ page, expectRequest }) => {

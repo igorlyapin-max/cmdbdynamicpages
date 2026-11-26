@@ -380,6 +380,7 @@ POST /cmdbuild/custom-api/templates/:code/validate
 POST /cmdbuild/custom-api/templates/:code/preview
 GET  /cmdbuild/custom-api/templates/:code/run
 POST /cmdbuild/custom-api/templates/:code/run
+GET  /cmdbuild/custom-api/templates/:code/publish
 POST /cmdbuild/custom-api/templates/:code/publish
 POST /cmdbuild/custom-api/draft/validate
 POST /cmdbuild/custom-api/draft/preview
