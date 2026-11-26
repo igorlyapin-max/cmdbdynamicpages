@@ -9857,7 +9857,7 @@ function extractDesignerSection(pathname, requestUrl) {
 
 function renderViewLargeExecutionHelpers() {
   return [
-    normalizeStringList, normalizePathColumnSpecs, normalizeComposeColumns, composeRightAlias,
+    readStepOrParam, normalizeStringList, normalizePathColumnSpecs, normalizeComposeColumns, composeRightAlias,
     buildMatchRowsColumnMapping, buildRightColumnMapping, normalizeRowOperationKeys, reportClosedOutputFields,
     operationInputAliases, executionScopeFromAliases, isRawObjectGroupTableNameServer, visibleRuntimeResultTables,
     normalizeRuntimeOutputMode, runtimeResultOutputMode, publishedReportTables,
@@ -9999,6 +9999,12 @@ function renderDynamicPagesShell({ mode, session, templateCode = '', designerSec
     .snapshot-toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:8px;min-height:36px;margin:0 0 8px}
     .snapshot-toolbar button[hidden]{display:none}.snapshot-toolbar [role="status"]{overflow-wrap:anywhere}
     .snapshot-toolbar .snapshot-error{color:#b91c1c}
+    .runtime-large-view{display:inline-grid;grid-template-columns:repeat(2,minmax(78px,1fr));flex:0 0 auto}
+    .runtime-large-view button{position:relative;min-height:32px;border-radius:0}
+    .runtime-large-view button:first-child{border-radius:4px 0 0 4px}
+    .runtime-large-view button:last-child{border-radius:0 4px 4px 0;border-left:0}
+    .runtime-large-view button[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700}
+    .runtime-large-view button:focus-visible{z-index:1;outline:2px solid var(--accent);outline-offset:2px}
     .runtime-large-table{min-width:0}.runtime-large-table [hidden]{display:none!important}.runtime-large-controls,.runtime-large-pager{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.runtime-large-controls{margin-bottom:8px}.runtime-large-controls input,.runtime-large-picker input{width:100%;min-width:0}.runtime-large-filter{flex:1 1 180px;max-width:320px}.runtime-large-selection{position:relative;flex:0 1 280px;min-width:0}.runtime-large-selection>button{width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}.runtime-large-picker{position:absolute;z-index:5;inset:100% 0 auto;background:#fff;border:1px solid var(--line);border-radius:6px;padding:8px;box-shadow:0 4px 12px #11182722}.runtime-large-options{list-style:none;padding:0;margin:4px 0;max-height:220px;overflow:auto}.runtime-large-options button{display:block;width:100%;text-align:left;overflow-wrap:anywhere}.runtime-large-options button[aria-pressed="true"]{font-weight:700;border-color:var(--accent)}.runtime-large-scroll{max-width:100%;overflow:auto}.runtime-large-scroll table{margin:0}.runtime-large-scroll td,.runtime-large-scroll th{overflow-wrap:anywhere}.runtime-large-pager{margin:6px 0}.runtime-large-pager [role="status"]{overflow-wrap:anywhere;min-width:8ch}.runtime-large-message{min-height:1.4em;overflow-wrap:anywhere}.runtime-large-details{padding:8px 0}.runtime-large-table :focus-visible{outline:2px solid var(--accent);outline-offset:1px}
     .runtime-large-picker{position:fixed;inset:auto;display:flex;flex-direction:column;box-sizing:border-box}.runtime-large-picker>:not(.runtime-large-options){flex-shrink:0}.runtime-large-picker .runtime-large-options{min-height:0;overscroll-behavior:contain}.runtime-large-picker .runtime-large-pager{min-height:32px}
     @media(max-width:768px){.runtime-large-table button,.runtime-large-table input{min-height:44px}.runtime-large-pager button{min-width:44px}.runtime-large-picker .runtime-large-pager{min-height:44px}.runtime-large-filter,.runtime-large-selection{flex:1 1 100%;max-width:none}}
@@ -11524,6 +11530,11 @@ function dynamicPagesClientScript() {
       largeTablePrevious: 'Previous page',
       largeTableNext: 'Next page',
       largeTableRange: '{first}–{last} of {total}',
+      largeTableGroupRange: 'Groups: {first}–{last} of {total}',
+      largeTableRowRange: 'Rows: {first}–{last} of {total}',
+      largeTableView: 'Table view',
+      largeTableSummaryView: 'Summary',
+      largeTableRowsView: 'Rows',
       largeTableDetails: 'Source rows',
       largeTableDetailsForRow: 'Source rows for row {row}',
       largeTableIncomplete: 'The table is incomplete. Execution limits were reached.',
@@ -13066,6 +13077,11 @@ function dynamicPagesClientScript() {
       largeTablePrevious: 'Предыдущая страница',
       largeTableNext: 'Следующая страница',
       largeTableRange: '{first}–{last} из {total}',
+      largeTableGroupRange: 'Группы: {first}–{last} из {total}',
+      largeTableRowRange: 'Строки: {first}–{last} из {total}',
+      largeTableView: 'Вид таблицы',
+      largeTableSummaryView: 'Сводка',
+      largeTableRowsView: 'Строки',
       largeTableDetails: 'Исходные строки',
       largeTableDetailsForRow: 'Исходные строки для строки {row}',
       largeTableIncomplete: 'Таблица неполная: достигнуты лимиты выполнения.',
@@ -26213,7 +26229,10 @@ function dynamicPagesClientScript() {
       return typeof value === 'string' ? value.trim() : '';
     }
     function isClassName(name) { return /^[A-Za-z][A-Za-z0-9_]*$/.test(name); }
-    if (step.type === 'expandRelations') return normalizeStringList(step.targetClass).filter(isClassName);
+    if (step.type === 'expandRelations') {
+      var params = step.targetClassParam ? resolveTemplateParameters(spec).values : {};
+      return normalizeStringList(readStepOrParam(step, params, 'targetClass', 'targetClassParam')).filter(isClassName);
+    }
     var className = String(step.className || '').trim();
     var expression = /^[$][{]param[.]([A-Za-z_][A-Za-z0-9_]*)[}]$/.exec(className);
     if (expression) className = classParam(expression[1]);
@@ -34508,17 +34527,40 @@ function dynamicPagesClientScript() {
       '" title="' + escapeHtml(t(label)) + '"' + (disabled ? ' disabled' : '') + '>' + text + '</button>';
   }
 
-  function largeTablePager(page, name) {
+  function largeTablePager(page, name, range) {
     if (!page || !page.total) return '';
     return largeTableButton(name + '-prev', 'largeTablePrevious', '&#8592;', page.offset <= 0) +
-      '<span role="status">' + escapeHtml(t('largeTableRange', {
+      '<span role="status">' + escapeHtml(t(range || 'largeTableRange', {
         first: page.offset + 1, last: Math.min(page.total, page.offset + page.limit), total: page.total
       })) + '</span>' + largeTableButton(name + '-next', 'largeTableNext', '&#8594;', page.offset + page.limit >= page.total);
+  }
+
+  function largeTableViewDisabled(item) {
+    return item.viewExpired || item.view.kind === 'dynamic' && !item.viewId;
+  }
+
+  function renderLargeTableViewControl(item, index) {
+    var buttons = [['summary', 'largeTableSummaryView'], ['rows', 'largeTableRowsView']];
+    return '<div class="runtime-large-view" role="group" aria-label="' + escapeHtml(t('largeTableView')) + '" data-large-view-control>' +
+      buttons.map(function (entry) {
+        return '<button type="button" data-large-action="table-view" data-large-view="' + entry[0] +
+          '" aria-controls="cmdp-large-table-' + index + '-rows" aria-pressed="' + (item.rowView === entry[0]) + '"' +
+          (largeTableViewDisabled(item) ? ' disabled' : '') + '>' + escapeHtml(t(entry[1])) + '</button>';
+      }).join('') + '</div>';
+  }
+
+  function syncLargeTableViewControl(item) {
+    if (!item.viewControl) return;
+    item.viewControl.querySelectorAll('[data-large-view]').forEach(function (button) {
+      button.disabled = Boolean(largeTableViewDisabled(item));
+      button.setAttribute('aria-pressed', String(button.getAttribute('data-large-view') === item.rowView));
+    });
   }
 
   function renderLargeTableShell(item, index, toolbar) {
     var id = 'cmdp-large-table-' + index;
     var table = item.table;
+    if (item.grouped && !item.viewInSnapshotToolbar) toolbar = (toolbar || '') + renderLargeTableViewControl(item, index);
     return '<section class="result-table-wrap runtime-large-table" data-result-table data-large-table="' + index + '" aria-labelledby="' + id + '">' +
       '<div class="result-table-header"><div class="result-table-title"' + titleAlignStyle(item.presentation, true) +
       '><h3 id="' + id + '">' + escapeHtml(displayTitleForResult(table.name, table.title || table.label || '')) + '</h3></div>' +
@@ -34536,7 +34578,7 @@ function dynamicPagesClientScript() {
         '><input type="search" maxlength="256" data-large-row-search aria-label="' + escapeHtml(t('largeTableSearchRows')) +
         '" placeholder="' + escapeHtml(t('largeTableSearchRows')) + '" value="' + escapeHtml(item.search) + '"></div>' : '') + '</div>' +
       '<div class="runtime-large-message" role="status" data-large-status></div><div data-large-message-action></div>' +
-      '<div class="runtime-large-scroll" data-large-rows></div><div class="runtime-large-pager" data-large-pager></div></section>';
+      '<div class="runtime-large-scroll" id="' + id + '-rows" data-large-rows></div><div class="runtime-large-pager" data-large-pager></div></section>';
   }
 
   function largeTableGrid(item, page, detail) {
@@ -34592,6 +34634,7 @@ function dynamicPagesClientScript() {
       params.limit = 10;
     } else if (detail) params.group = item.detail.group;
     else {
+      if (item.rowView === 'rows') params.view = 'rows';
       params.search = item.search;
       if (item.sort) { params.sort = item.sort; params.direction = item.direction; }
     }
@@ -34614,6 +34657,12 @@ function dynamicPagesClientScript() {
       var reason = result && result.json && result.json.reason;
       var conflict = result && (result.status === 409 || result.status === 410 || item.view.kind === 'public' && result.status === 404);
       var keyUnavailable = reason === 'table_key_unavailable' && item.keyed;
+      var recoverViewFocus = !picker && conflict && focusedAction === 'table-view' &&
+        item.viewControl?.contains(focused) && document.activeElement === focused;
+      if (!picker && conflict) {
+        item.viewExpired = true;
+        syncLargeTableViewControl(item);
+      }
       var message = conflict ? t(item.view.kind === 'public' ? 'largeTableSnapshotExpired' : 'largeTableViewExpired') :
         keyUnavailable ? t('largeTableKeyUnavailable') :
         result && result.status === 401 ? t('runtimeSessionInvalid') : reason === 'data_access_denied' ? t('runtimeDataAccessDenied') :
@@ -34625,6 +34674,7 @@ function dynamicPagesClientScript() {
       var action = conflict ? (item.view.kind === 'public' ? 'reload' : 'reopen') : keyUnavailable ? 'choose' : op + '-retry';
       var label = conflict ? (item.view.kind === 'public' ? 'snapshotReload' : 'largeTableReopen') : keyUnavailable ? 'largeTableChoose' : 'largeTableRetry';
       target.innerHTML = largeTableButton(action, label, escapeHtml(t(label)));
+      if (recoverViewFocus) target.querySelector('button').focus();
     }
     return request(largeTablePagePath(item, op, params), { signal: controller.signal, maxRetries: 0 }).then(function (response) {
       if (!active()) return;
@@ -34644,6 +34694,7 @@ function dynamicPagesClientScript() {
         statusNode.textContent = page.incomplete ? t('largeTableIncomplete') : !page.items.length ? t('largeTableNoOptions') : '';
       } else {
         if (op === 'rows' && item.view.kind === 'dynamic' && typeof page.viewId === 'string' && page.viewId) item.viewId = page.viewId;
+        if (op === 'rows') syncLargeTableViewControl(item);
         statusNode.textContent = page.incomplete ? t('largeTableIncomplete') : !page.table.rows.length ? t('largeTableNoRows') : '';
         if (detail) {
           item.detail.page = page;
@@ -34652,7 +34703,8 @@ function dynamicPagesClientScript() {
         } else {
           item.page = page;
           item.node.querySelector('[data-large-rows]').innerHTML = largeTableGrid(item, page, false);
-          item.node.querySelector('[data-large-pager]').innerHTML = largeTablePager(page, 'rows');
+          item.node.querySelector('[data-large-pager]').innerHTML = largeTablePager(page, 'rows', item.grouped
+            ? (item.rowView === 'summary' ? 'largeTableGroupRange' : 'largeTableRowRange') : undefined);
         }
       }
     }).catch(function () {
@@ -34700,6 +34752,19 @@ function dynamicPagesClientScript() {
     panel.style.top = (overlaysTrigger ? top : opensUp ? trigger.top - 4 - panel.offsetHeight : trigger.bottom + 4) + 'px';
   }
 
+  function openLargeTablePicker(item) {
+    var panel = item.node.querySelector('[data-large-picker]');
+    var trigger = item.node.querySelector('[data-large-action="picker"]');
+    panel.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    var input = panel.querySelector('[data-large-option-search]');
+    input.value = '';
+    item.optionSearch = '';
+    largeTableRequest(item, 'options', 0);
+    positionLargeTablePicker(item);
+    input.focus({ preventScroll: true });
+  }
+
   function closeLargeTablePicker(item, focus) {
     var panel = item.node.querySelector('[data-large-picker]');
     if (!panel || panel.hidden) return;
@@ -34727,31 +34792,47 @@ function dynamicPagesClientScript() {
     item.node.querySelector('[data-large-message-action]').innerHTML = '';
   }
 
+  function resetDynamicTableView(item) {
+    item.viewId = '';
+    item.viewExpired = false;
+    item.rowView = 'summary';
+    syncLargeTableViewControl(item);
+  }
+
   function mountLargeTable(item, node) {
     item.node = node;
+    if (item.grouped) {
+      var controlHost = item.viewInSnapshotToolbar ? app.querySelector('.snapshot-toolbar') : node;
+      item.viewControl = controlHost.querySelector('[data-large-view-control]');
+      item.viewControl.addEventListener('click', function (event) {
+        var button = event.target.closest('[data-large-view]');
+        if (!button || largeTableViewDisabled(item)) return;
+        var view = button.getAttribute('data-large-view');
+        if (view === item.rowView) return;
+        item.rowView = view;
+        syncLargeTableViewControl(item);
+        resetLargeTableRows(item);
+        if (!item.keyed || item.selection) largeTableRequest(item, 'rows', 0);
+      });
+    }
     node.addEventListener('click', function (event) {
       var button = event.target.closest('[data-large-action]');
       if (!button || button.disabled) return;
       var action = button.getAttribute('data-large-action');
       var index = Number(button.getAttribute('data-large-index'));
+      if (action === 'table-view') return;
       if (action === 'picker') {
         var panel = node.querySelector('[data-large-picker]');
-        if (!panel.hidden) { closeLargeTablePicker(item, true); return; }
-        panel.hidden = false;
-        button.setAttribute('aria-expanded', 'true');
-        var input = panel.querySelector('[data-large-option-search]');
-        input.value = '';
-        item.optionSearch = '';
-        largeTableRequest(item, 'options', 0);
-        positionLargeTablePicker(item);
-        input.focus({ preventScroll: true });
+        if (panel.hidden) openLargeTablePicker(item);
+        else closeLargeTablePicker(item, true);
       } else if (action === 'option') {
         var option = item.options && item.options.items[index];
         if (!option || typeof option.key !== 'string') return;
         closeLargeTablePicker(item, true);
-        if (item.selection && item.selection.key === option.key) return;
+        var needsDynamicView = item.view.kind === 'dynamic' && !item.pending.rows && (!item.viewId || item.viewExpired);
+        if (item.selection && item.selection.key === option.key && !needsDynamicView) return;
         item.selection = option;
-        if (item.view.kind === 'dynamic') item.viewId = '';
+        if (item.view.kind === 'dynamic') resetDynamicTableView(item);
         node.querySelector('[data-large-action="picker"]').textContent = option.label;
         var rowFilter = node.querySelector('.runtime-large-filter');
         if (rowFilter) rowFilter.hidden = false;
@@ -34776,13 +34857,13 @@ function dynamicPagesClientScript() {
       } else if (action === 'reload') {
         refreshOpenSnapshot(true);
       } else if (action === 'choose') {
-        node.querySelector('[data-large-action="picker"]').click();
+        openLargeTablePicker(item);
       } else if (action === 'reopen') {
         if (item.view.kind === 'personal') {
           refreshOpenSnapshot(state.snapshotRefreshMode !== 'personal');
         } else {
           var fromPicker = Boolean(button.closest('[data-large-picker]'));
-          item.viewId = '';
+          resetDynamicTableView(item);
           resetLargeTableRows(item);
           if (!item.keyed || item.selection) largeTableRequest(item, 'rows', 0);
           if (fromPicker) largeTableRequest(item, 'options', 0);
@@ -34834,9 +34915,10 @@ function dynamicPagesClientScript() {
 
   document.addEventListener('click', function (event) {
     var path = event.composedPath();
+    var choose = event.target.closest && event.target.closest('[data-large-action="choose"]');
     runtimeLargeTables.forEach(function (item) {
       var picker = item.node && item.node.querySelector('[data-large-selection]');
-      if (picker && path.indexOf(picker) === -1) closeLargeTablePicker(item, false);
+      if (picker && path.indexOf(picker) === -1 && !item.node.contains(choose)) closeLargeTablePicker(item, false);
     });
   });
 
@@ -34872,10 +34954,12 @@ function dynamicPagesClientScript() {
       var presentation = Object.assign(Object.create(null), global, named, table.presentation);
       delete presentation.tables;
       var keyed = presentation.largeTable.mode === 'key';
+      var grouped = Array.isArray(presentation.largeTable.groupKeys) && presentation.largeTable.groupKeys.length > 0;
       var previous = runtimeLargeTables.find(function (item) { return item.table.name === table.name; });
       var sort = previous && presentation.sortable !== false && (table.columns || []).indexOf(previous.sort) !== -1 ? previous.sort : '';
       return {
-        table: table, presentation: presentation, view: view, keyed: keyed, pending: {}, retry: {},
+        table: table, presentation: presentation, view: view, keyed: keyed, grouped: grouped, pending: {}, retry: {},
+        rowView: grouped && view.kind !== 'dynamic' && previous?.rowView === 'rows' ? 'rows' : 'summary',
         viewId: keyed ? '' : view.viewId,
         selection: keyed && previous ? previous.selection : null,
         search: previous && presentation.filters !== false ? previous.search : '', sort: sort, direction: sort ? previous.direction : ''
@@ -34891,10 +34975,15 @@ function dynamicPagesClientScript() {
       state.snapshotCache = snapshot ? cache : null;
     }
     runtimeLargeTables = prepareRuntimeLargeTables(result);
+    var soleTable = snapshot && runtimeLargeTables.length === 1 && runtimeLargeTables[0];
+    if (soleTable && soleTable.grouped) {
+      soleTable.viewInSnapshotToolbar = visibleResultTables(result.json.result.tables).every(function (table) { return table === soleTable.table; });
+    }
     app.innerHTML = (snapshot ? '<div class="snapshot-toolbar">' +
       '<button type="button" class="runtime-cache-button" data-action="snapshot-reload" title="' + escapeHtml(t('snapshotReload')) +
       '" aria-label="' + escapeHtml(t('snapshotReload')) + '">&#8635;</button>' +
       '<button type="button" data-action="snapshot-refresh" hidden></button>' +
+      (soleTable && soleTable.viewInSnapshotToolbar ? renderLargeTableViewControl(soleTable, 0) : '') +
       '<span data-snapshot-status role="status"></span></div><div data-snapshot-diagnostics hidden></div><div data-snapshot-current-check></div>' : '') + renderRuntimeResult(result, runtimeLargeTables);
     app.querySelectorAll('[data-large-table]').forEach(function (node) {
       mountLargeTable(runtimeLargeTables[Number(node.getAttribute('data-large-table'))], node);
@@ -55138,6 +55227,7 @@ function parseReportTableQuery(requestUrl) {
     const query = JSON.parse(payloads[0]);
     if (!query || typeof query.table !== 'string' || !query.table || query.table.length > 256 ||
       !['options', 'rows', 'details'].includes(query.op)) throw new Error();
+    if (query.view !== undefined && (query.op !== 'rows' || (query.view !== 'summary' && query.view !== 'rows'))) throw new Error();
     for (const field of ['key', 'group', 'search', 'sort', 'direction', 'viewId', 'snapshotRevision']) {
       if (query[field] !== undefined && (typeof query[field] !== 'string' || query[field].length > 2048)) throw new Error();
     }
@@ -55634,7 +55724,7 @@ async function handleReportTablePage(req, res, requestUrl, root, templateCode, a
       sendJson(res, 200, { ...tablePageResult(view.indexes[query.table], query), viewId: query.viewId });
       return;
     }
-    if (query.op === 'details' || normalizePublishConfig(template.spec).mode === 'staticSnapshot') {
+    if (query.op === 'details' || query.view === 'rows' || normalizePublishConfig(template.spec).mode === 'staticSnapshot') {
       throw snapshotStoreError('table_view_expired', 'A current table view is required.', 409);
     }
     slot = acquireExecutionSlot(req, res, { action, templateCode });
@@ -55671,12 +55761,13 @@ async function handleReportTablePage(req, res, requestUrl, root, templateCode, a
   } catch (error) {
     const denied = errorLooksPermissionDenied(error);
     const status = denied ? 403 : error.statusCode || 400;
-    const reason = denied ? 'data_access_denied' : error.reason || 'table_page_failed';
+    const queryInvalid = error.code === 'invalid_large_table_query';
+    const reason = denied ? 'data_access_denied' : error.reason || (queryInvalid ? 'table_page_invalid' : 'table_page_failed');
     const details = reportLimitErrorDetails(error, denied, authToken);
     logWarn('report.table_page_failed', { ...context, reason, status, ...details });
     if (!res.destroyed) sendJson(res, status, {
       success: false, reason, ...(error.reportLimits?.length ? { code: reason, ...details } : {}), message: denied ? DEFAULT_PERMISSION_DENIED_TEXT
-        : error.reason ? error.message : 'Could not load the report table.'
+        : error.reason || queryInvalid ? error.message : 'Could not load the report table.'
     });
   } finally {
     slot?.release();

@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 import yaml
+from jsonschema import Draft4Validator
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -37,6 +38,17 @@ class InputContractTests(unittest.TestCase):
     def test_shipped_owned_and_consumed_contracts(self):
         self.assertGreater(validate(ROOT), 0)
         self.assertGreater(self.check_contracts(), 0)
+
+    def test_table_view_is_only_valid_for_the_rows_operation(self):
+        schema = self.spec["components"]["parameters"]["RuntimeTableRequest"]["content"]["application/json"]["schema"]
+        validator = Draft4Validator(schema)
+        for op in ("rows", "options", "details"):
+            with self.subTest(op=op):
+                payload = {"table": "report", "op": op}
+                self.assertTrue(validator.is_valid(payload))
+                for view in ("summary", "rows"):
+                    self.assertEqual(validator.is_valid({**payload, "view": view}), op == "rows")
+        self.assertFalse(validator.is_valid({"table": "report", "op": "rows", "view": "raw"}))
 
     def test_missing_max_items_in_request_ref_is_detected(self):
         del self.schemas["ObjectFlowSelectionStage"]["properties"]["rules"]["maxItems"]

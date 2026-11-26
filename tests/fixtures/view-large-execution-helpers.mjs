@@ -9,7 +9,7 @@ function functionSource(source, name) {
 
 export function bindViewLargeExecutionHelpers(proxySource) {
   const helpers = [
-    'normalizeStringList', 'normalizePathColumnSpecs', 'normalizeComposeColumns', 'composeRightAlias',
+    'readStepOrParam', 'normalizeStringList', 'normalizePathColumnSpecs', 'normalizeComposeColumns', 'composeRightAlias',
     'buildMatchRowsColumnMapping', 'buildRightColumnMapping', 'normalizeRowOperationKeys', 'reportClosedOutputFields',
     'operationInputAliases', 'executionScopeFromAliases', 'isRawObjectGroupTableNameServer', 'visibleRuntimeResultTables',
     'normalizeRuntimeOutputMode', 'runtimeResultOutputMode', 'publishedReportTables',

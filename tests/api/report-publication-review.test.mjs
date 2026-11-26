@@ -765,6 +765,170 @@ test('a stored page size reaches the public table and details only after shared 
   await verify(refreshed.json.tableView, 2);
 });
 
+function toggleSpec(mode, publish = STATIC) {
+  const largeTable = { mode, groupKeys: ['Description'], reductions: [{ column: 'Code', kind: 'count' }] };
+  const steps = mode === 'key' ? [{ ...SELECT, as: 'source' }, {
+    type: 'enrichRows', from: 'source', as: 'items', purpose: 'viewComposer',
+    columns: [{ path: 'Description', as: 'Description' }]
+  }] : [SELECT];
+  if (mode === 'key') largeTable.selector = {
+    kind: 'result', source: 'source', idField: 'Description', labelField: 'Description', matchField: 'Description'
+  };
+  return { version: 1, steps, publish,
+    result: { tables: [{ ...TABLE, columns: ['Description', 'Code'], presentation: { largeTable } }] } };
+}
+
+const toggleCards = rows('needle-1', 'needle-2', 'needle-3', 'skip').map((card, index) => ({ ...card,
+  Description: index === 2 ? 'west' : 'east', Private: 'not projected'
+}));
+
+function togglePage(request, collection, code, query, options) {
+  return request(`/${collection}/${code}/table-page?cmdpTable=` + encodeURIComponent(JSON.stringify({
+    table: 'items', op: 'rows', ...query
+  })), options);
+}
+
+test('summary/rows toggle uses the published all or keyed index and rejects stale revisions', async (t) => {
+  const redis = await redisFixture(t);
+  const specs = { ToggleAll: toggleSpec('all'), ToggleKey: toggleSpec('key'),
+    Ungrouped: { ...toggleSpec('all'), result: { tables: [PAGED] } } };
+  let version = '';
+  const calls = [];
+  const mock = await upstream(t, specs, ({ pathname }) => {
+    calls.push(pathname);
+    if (pathname.endsWith('/Asset/cards')) return { data: toggleCards.map((card) => ({ ...card, Code: card.Code + version })) };
+  });
+  const request = await backend(t, mock, redis.origin);
+  for (const [code, spec] of Object.entries(specs)) {
+    const published = await publish(request, code, spec);
+    assert.equal(published.status, 200, JSON.stringify(published.json));
+    const before = calls.length;
+    const shell = await request(`/public-snapshots/${code}/run?cmdpTableShell=1`);
+    assert.equal(shell.status, 200, JSON.stringify(shell.json));
+    const { snapshotRevision } = shell.json.tableView;
+    const page = (query) => togglePage(request, 'public-snapshots', code, { snapshotRevision, ...query });
+    if (code === 'Ungrouped') {
+      assert.equal((await page({ view: 'summary' })).status, 200);
+      const invalid = await page({ view: 'rows' });
+      assert.equal(invalid.status, 400);
+      assert.equal(invalid.json.reason, 'table_page_invalid');
+    } else {
+      const keyed = code === 'ToggleKey';
+      const options = keyed && await page({ op: 'options' });
+      if (keyed) assert.equal(options.status, 200, JSON.stringify(options.json));
+      const scope = keyed ? { key: options.json.items.find(({ label }) => label === 'east').key } : {};
+      const summary = await page(scope);
+      assert.equal(summary.status, 200, JSON.stringify(summary.json));
+      assert.deepEqual(await page({ ...scope, view: 'summary' }), summary);
+      assert.equal(summary.json.total, keyed ? 1 : 2);
+      assert.equal(summary.json.groupIds.length, summary.json.total);
+      const raw = await page({ ...scope, view: 'rows', sort: 'Code', direction: 'desc', search: 'NEEDLE',
+        offset: keyed ? 0 : 1, limit: 1 });
+      assert.equal(raw.status, 200, JSON.stringify(raw.json));
+      assert.equal(raw.json.total, keyed ? 2 : 3);
+      assert.deepEqual(raw.json.table.rows, [{ Description: 'east', Code: 'needle-2' }]);
+      assert.equal(Object.hasOwn(raw.json, 'groupIds'), false);
+      assert.deepEqual(raw.json.table.presentation.largeTable, { mode: keyed ? 'key' : 'all', groupKeys: ['Description'] });
+      const east = summary.json.table.rows.findIndex(({ Description }) => Description === 'east');
+      const group = summary.json.groupIds[east];
+      const details = await page({ ...scope, op: 'details', group });
+      assert.equal(details.status, 200, JSON.stringify(details.json));
+      assert.equal(details.json.total, 3);
+      for (const query of [
+        { view: 'raw' }, { view: '' }, { view: null }, { view: ['rows'] }, { view: 1 },
+        { op: 'options', view: 'rows' }, { op: 'options', view: 'summary' },
+        { op: 'details', view: 'rows', group },
+        { op: 'details', view: 'summary', group }
+      ]) {
+        const invalid = await page({ ...scope, ...query });
+        assert.equal(invalid.status, 400, JSON.stringify(query));
+        assert.equal(invalid.json.reason, 'table_page_invalid');
+      }
+      if (keyed) {
+        assert.equal(calls.length, before, 'public paging contacted CMDBuild');
+        version = '-new';
+        assert.equal((await publish(request, code, spec)).status, 200);
+        version = '';
+        const afterRepublish = calls.length;
+        const stale = await page({ ...scope, view: 'rows' });
+        assert.equal(stale.status, 409);
+        assert.equal(stale.json.reason, 'table_snapshot_changed');
+        const current = await request(`/public-snapshots/${code}/run?cmdpTableShell=1`);
+        const fresh = await page({ ...scope, view: 'rows', snapshotRevision: current.json.tableView.snapshotRevision });
+        assert.equal(fresh.status, 200, JSON.stringify(fresh.json));
+        assert.match(fresh.json.table.rows[0].Code, /-new$/u);
+        assert.equal(calls.length, afterRepublish);
+        continue;
+      }
+    }
+    assert.equal(calls.length, before, 'public paging contacted CMDBuild');
+  }
+});
+
+test('summary/rows toggle requires the existing private index and preserves session and template checks', async (t) => {
+  const redis = await redisFixture(t);
+  const personalSpec = toggleSpec('all');
+  const specs = { Dynamic: toggleSpec('key', { mode: 'dynamic' }), Personal: personalSpec };
+  const calls = [];
+  let denyTemplate = false;
+  const mock = await upstream(t, specs, ({ pathname }, token) => {
+    calls.push(pathname);
+    if (pathname.endsWith('/sessions/current') && token === 'expired') return { status: 401 };
+    if (pathname.endsWith('/Cst_QueryTemplate/cards') && denyTemplate) return { status: 403 };
+    if (pathname.endsWith('/Asset/cards')) return { data: toggleCards };
+  });
+  const request = await backend(t, mock, redis.origin);
+  const reader = { token: 'reader' };
+  const page = (code, query, session = reader) => togglePage(request, 'templates', code, query, session);
+  const options = await page('Dynamic', { op: 'options' });
+  assert.equal(options.status, 200, JSON.stringify(options.json));
+  const key = options.json.items.find(({ label }) => label === 'east').key;
+  const otherKey = options.json.items.find(({ label }) => label === 'west').key;
+  const prepared = await page('Dynamic', { key, view: 'summary' });
+  assert.equal(prepared.status, 200, JSON.stringify(prepared.json));
+  assert.equal(prepared.json.total, 1);
+  const published = await publish(request, 'Personal', personalSpec);
+  assert.equal(published.status, 200, JSON.stringify(published.json));
+  const shell = await request('/public-snapshots/Personal/run?cmdpTableShell=1');
+  const personal = await request('/templates/Personal/refresh-snapshot?cmdpTableShell=1', { ...reader, method: 'POST',
+    body: { expectedMode: 'personal', expectedSnapshotRevision: shell.json.tableView.snapshotRevision } });
+  assert.equal(personal.status, 200, JSON.stringify(personal.json));
+  assert.equal(personal.json.tableView.kind, 'personal');
+  const before = calls.length;
+  for (const [code, viewId, scope, total] of [
+    ['Dynamic', prepared.json.viewId, { key }, 2], ['Personal', personal.json.tableView.viewId, {}, 3]
+  ]) {
+    assert.ok(viewId);
+    const rawQuery = { ...scope, view: 'rows', viewId, search: 'NEEDLE', sort: 'Code', direction: 'desc', limit: 1 };
+    const raw = await page(code, rawQuery);
+    assert.equal(raw.status, 200, JSON.stringify(raw.json));
+    assert.equal(raw.json.viewId, viewId);
+    assert.equal(raw.json.total, total);
+    assert.equal(Object.hasOwn(raw.json, 'groupIds'), false);
+    assert.deepEqual(raw.json.table.rows, [code === 'Dynamic' ? { Description: 'east', Code: 'needle-2' }
+      : { Description: 'west', Code: 'needle-3' }]);
+    const summary = await page(code, { ...scope, view: 'summary', viewId });
+    assert.equal(summary.status, 200, JSON.stringify(summary.json));
+    assert.equal(summary.json.viewId, viewId);
+    assert.ok(summary.json.groupIds.length);
+    for (const failure of [
+      await page(code, { ...rawQuery, viewId: undefined }),
+      await page(code, { ...rawQuery, viewId: 'not-a-prepared-view' }),
+      await page(code, rawQuery, { token: 'other-reader' }),
+      ...(code === 'Dynamic' ? [await page(code, { ...rawQuery, key: otherKey })] : [])
+    ]) {
+      assert.equal(failure.status, 409);
+      assert.equal(failure.json.reason, 'table_view_expired');
+    }
+    assert.equal((await page(code, rawQuery, { token: 'expired' })).status, 401);
+    denyTemplate = true;
+    assert.equal((await page(code, rawQuery)).status, 403);
+    denyTemplate = false;
+  }
+  assert.ok(calls.slice(before).every((path) => /\/(?:sessions\/current|Cst_QueryTemplate\/cards)$/u.test(path)),
+    'private paging made CMDBBuild reads other than session and saved template checks');
+});
+
 test('snapshot command ACL denial and pre-write read failure are definitive; script errors are not', async (t) => {
   const redis = await redisFixture(t);
   const code = 'CommitDenial';

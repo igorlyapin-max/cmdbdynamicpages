@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { chromium } from 'playwright';
 import { buildLargeTableIndex, queryLargeTablePage } from '../../scripts/report-table-pages.mjs';
 import { defaultRuntimeConfig, renderDynamicPagesShell, validateTemplateSpecForStorage } from '../../scripts/dev-proxy-server.mjs';
+import { resolveTemplateParameters } from '../../scripts/template-parameters.mjs';
 import { bindViewLargeExecutionHelpers } from '../fixtures/view-large-execution-helpers.mjs';
 
 const source = readFileSync(new URL('../../scripts/dev-proxy-server.mjs', import.meta.url), 'utf8');
@@ -191,6 +192,7 @@ URL.revokeObjectURL = function() {};
 HTMLAnchorElement.prototype.click = function() {};
 ${functions}
 ${viewLargeExecutionHelpers}
+${resolveTemplateParameters}
 document.addEventListener('input',handleTemplateTransferChange);
 document.addEventListener('change',handleTemplateTransferChange);
 document.addEventListener('change',handlePublicationRefreshChange);
@@ -821,6 +823,126 @@ test('Designer ignores late metadata from the previous filter source and can ret
       finishOld();
     }
   });
+});
+
+function relationFilterSpec(parameterSources, target = {}, field = 'Code') {
+  const selector = { kind: 'result', source: 'related', idField: field, labelField: field, matchField: field };
+  return {
+    version: 1, ...parameterSources,
+    steps: [
+      { type: 'selectCards', as: 'drivers', className: 'Driver' },
+      { type: 'expandRelations', as: 'related', from: 'drivers', includeSource: false, targetClassParam: 'target', ...target }
+    ],
+    result: { tables: [{ name: 'related', columns: ['Code'], presentation: { largeTable: { mode: 'key', selector } } }] }
+  };
+}
+
+async function openRelationFilter(page) {
+  await page.locator('[data-action="select-template"][data-code="existing"]').click();
+  await page.locator('a[data-designer-section="final-view"]').click();
+  const field = page.locator('#cmdp-view-large-simple-field');
+  await field.waitFor();
+  const box = await field.boundingBox();
+  assert.ok(box && box.width > 0 && box.height > 0);
+  return field;
+}
+
+async function saveRelationFilter(page) {
+  await Promise.all([
+    page.waitForResponse((response) => new URL(response.url()).pathname.endsWith('/templates/existing') && response.request().method() === 'PUT'),
+    page.locator('[data-action="save-template"]').click()
+  ]);
+}
+
+test('Designer saves a relation filter field from the effective targetClassParam default', async () => {
+  const spec = relationFilterSpec({
+    defaults: { target: ' Software ' }, paramDefaults: { target: 'ShadowedDefault' },
+    params: { target: { type: 'string', default: 'ShadowedDefinition' } }
+  });
+  const classes = [];
+  await withFullDesigner({ locale: 'en', section: 'templates', runtimeConfig: defaultRuntimeConfig(), spec, attributes: (name) => {
+    classes.push(name);
+    return { json: { data: [{ name: 'VendorName', description: 'Vendor', type: 'string' }] } };
+  } }, async (page, writes) => {
+    const field = await openRelationFilter(page);
+    await field.selectOption({ label: 'Vendor (VendorName)' });
+    await page.locator('[data-action="apply-view-composer"]').click();
+    await page.locator('.notice.ok').filter({ hasText: 'Final data applied to Spec JSON.' }).waitFor();
+    await saveRelationFilter(page);
+    assert.deepEqual(classes, ['Software']);
+    assert.equal(writes.length, 1);
+    const saved = writes[0].body.spec;
+    assert.deepEqual(saved.steps[1], spec.steps[1]);
+    assert.deepEqual(saved.result.tables[0].presentation.largeTable.selector,
+      { kind: 'result', source: 'related', idField: 'VendorName', labelField: 'VendorName', matchField: 'VendorName' });
+    assert.deepEqual(saved.result.tables[0].columns, ['Code']);
+    assert.deepEqual(validateTemplateSpecForStorage(saved), []);
+  });
+});
+
+test('Designer loads relation metadata for valid targetClassParam list entries and filters unreadable and multiple fields', async () => {
+  const spec = relationFilterSpec({ paramDefaults: { target: [' Software ', 'Hardware', 'Invalid/Class', '', 'Software'] } });
+  const classes = [];
+  await withFullDesigner({ locale: 'en', section: 'templates', runtimeConfig: defaultRuntimeConfig(), spec, attributes: (name) => {
+    classes.push(name);
+    return { json: { data: name === 'Software' ? [
+      { name: 'VendorName', type: 'string' }, { name: 'ReadDenied', type: 'string', permissions: { _can_read: false } },
+      { name: 'InactiveField', active: false }, { name: 'Tags', type: 'lookupArray' }
+    ] : [{ name: 'SerialNumber', type: 'string' }] } };
+  } }, async (page) => {
+    const field = await openRelationFilter(page);
+    await field.selectOption('VendorName');
+    await field.selectOption('SerialNumber');
+    assert.deepEqual(classes.sort(), ['Hardware', 'Software']);
+    assert.equal(await field.locator('option[value="ReadDenied"], option[value="InactiveField"], option[value="Tags"]').count(), 0);
+  });
+});
+
+test('Designer gives own expandRelations targetClass precedence, including empty and undefined values', async () => {
+  await withPage(async (page) => {
+    await selectOriginal(page);
+    for (const targetClass of ['Item', '', [], undefined]) {
+      const spec = relationFilterSpec({ defaults: { target: 'RightCard' } });
+      await page.evaluate(({ spec, targetClass }) => {
+        spec.steps[1].targetClass = targetClass; // JSON cannot carry an own undefined property.
+        state.selectedTemplate.spec = spec;
+        state.viewComposerDraft = null;
+        state.designerSection = 'view';
+        renderDesigner();
+      }, { spec, targetClass });
+      const field = page.locator('#cmdp-view-large-simple-field');
+      const box = await field.boundingBox();
+      assert.ok(box && box.width > 0 && box.height > 0);
+      assert.equal(await field.locator('option[value="Region"]').count(), 0);
+      assert.equal(await field.locator('option[value="HiddenParentId"]').count(), targetClass === 'Item' ? 1 : 0);
+      const status = page.locator('[data-view-large-field-status]');
+      assert.equal(await status.textContent(), targetClass === 'Item' ? '' : en.viewLargeFieldsDynamic);
+    }
+  });
+});
+
+test('Designer keeps a saved relation filter when the target is unresolved or the field is unreadable', async () => {
+  for (const target of [{ type: 'string' }, { type: 'string', default: 'Software' }]) {
+    const spec = relationFilterSpec({ params: { target } }, {}, 'VendorName');
+    const classes = [];
+    await withFullDesigner({ locale: 'en', section: 'templates', runtimeConfig: defaultRuntimeConfig(), spec, attributes: (name) => {
+      classes.push(name);
+      return { json: { data: [{ name: 'VendorName', type: 'string', permissions: { _can_read: false } }] } };
+    } }, async (page, writes) => {
+      const field = await openRelationFilter(page);
+      const status = page.locator('[data-view-large-field-status]').filter({ hasText: /The saved filter field VendorName is not available/ });
+      await status.waitFor();
+      assert.ok((await status.boundingBox()).height > 0);
+      assert.equal(await field.getAttribute('aria-invalid'), 'true');
+      assert.equal(await field.inputValue(), '');
+      assert.equal(await field.locator('option[value="VendorName"]').count(), 0);
+      await saveRelationFilter(page);
+      assert.deepEqual(classes, target.default ? ['Software'] : []);
+      assert.equal(writes.length, 1);
+      assert.deepEqual(writes[0].body.spec.result.tables[0].presentation.largeTable.selector,
+        spec.result.tables[0].presentation.largeTable.selector);
+    });
+  }
 });
 
 test('Designer simple large-table selection produces distinct non-empty options and filters matching rows', async () => {

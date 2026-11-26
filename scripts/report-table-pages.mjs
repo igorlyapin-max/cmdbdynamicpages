@@ -464,15 +464,17 @@ function readPageQuery(query) {
     return value;
   };
   const op = string('op', 16) || 'rows';
+  const view = pick('view');
   const direction = string('direction', 4);
   const key = string('key', 45);
   const group = string('group', 45);
   if (!OPERATIONS.includes(op)) invalid('op');
+  if (view !== undefined && (op !== 'rows' || (view !== 'summary' && view !== 'rows'))) invalid('view');
   if (direction && direction !== 'asc' && direction !== 'desc') invalid('direction');
   if (key && !/^k_[A-Za-z0-9_-]{43}$/u.test(key)) invalid('key');
   if (group && !/^g_[A-Za-z0-9_-]{43}$/u.test(group)) invalid('group');
   return {
-    op, key, group, direction, search: searchText(string('search', 256).trim()), sort: string('sort', 512),
+    op, view: view ?? 'summary', key, group, direction, search: searchText(string('search', 256).trim()), sort: string('sort', 512),
     offset: integer('offset', 0, 0),
     limit: Math.min(integer('limit', LARGE_TABLE_DEFAULT_PAGE_SIZE, 1), LARGE_TABLE_MAX_PAGE_SIZE)
   };
@@ -484,7 +486,7 @@ function searchText(value) {
 
 export function queryLargeTablePage(index, query = {}) {
   if (index == null) return null;
-  const { op, key, group, search, sort, direction, offset, limit } = readPageQuery(query);
+  const { op, view, key, group, search, sort, direction, offset, limit } = readPageQuery(query);
   const incomplete = Boolean(index.table.truncated);
   if (op === 'options') {
     const items = search ? index.options.filter(({ label }) => searchText(label).includes(search)) : index.options;
@@ -492,9 +494,13 @@ export function queryLargeTablePage(index, query = {}) {
   }
   const { columns, presentation } = index.table;
   const config = presentation.largeTable;
+  const grouped = config.groupKeys.length > 0;
+  if (view === 'rows' && !grouped) {
+    throw contractError('invalid_large_table_query', 'Rows view requires an aggregated table.');
+  }
   if (sort && !columns.includes(sort)) throw contractError('invalid_large_table_query', 'Sort column is not visible.');
   const scopeGroups = own(index.groupsByScope, config.mode === 'all' ? 'all' : key);
-  const summary = op === 'rows' && config.groupKeys.length > 0;
+  const summary = op === 'rows' && view === 'summary' && grouped;
   let rows;
   if (summary) rows = scopeGroups?.summaries ?? [];
   else if (op === 'details') rows = (own(scopeGroups?.membersByGroup, group) ?? []).map((rowIndex) => index.rows[rowIndex]);

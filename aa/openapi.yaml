@@ -2818,6 +2818,24 @@ components:
           schema:
             type: object
             required: [table, op]
+            oneOf:
+              - properties:
+                  op: { type: string, enum: [rows] }
+                  view:
+                    type: string
+                    enum: [summary, rows]
+                    default: summary
+                    description: >
+                      Для агрегированной таблицы rows возвращает исходные видимые
+                      строки вместо групп. Для обоих видов публичного снимка нужна
+                      актуальная ревизия. Первый динамический запрос summary без
+                      viewId может запустить расчёт и создать представление.
+                      Режим rows не запускает расчёт: для динамического или личного
+                      результата без действующего viewId сервер возвращает HTTP 409.
+              - properties:
+                  op: { type: string, enum: [options, details] }
+                not:
+                  required: [view]
             properties:
               table: { type: string }
               op: { type: string, enum: [options, rows, details] }

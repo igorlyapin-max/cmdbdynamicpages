@@ -41,6 +41,7 @@ const table = (name, mode) => ({ name, title: name, columns: ['value'], columnLa
   presentation: mode ? { largeTable: { mode } } : {}, rows: [] });
 const keyed = table('Linked objects', 'key');
 const all = table('All objects', 'all');
+const grouped = (item) => ({ ...item, presentation: { largeTable: { ...item.presentation.largeTable, groupKeys: ['value'] } } });
 const ordinary = { ...table('Ordinary'), published: true, rows: [{ value: 'Ordinary row' }] };
 const diagram = { name: 'Topology', nodes: [{ id: '1', label: 'System' }], edges: [], d2: { source: 'system' } };
 const collection = (kind) => kind === 'public' ? 'public-snapshots' : 'templates';
@@ -49,6 +50,27 @@ const shellPayload = (tableView, tables = [keyed], other = {}) => ({ success: tr
 const rowPage = (q, values, other = {}) => ({ table: { ...table(q.table), rows: values.map((value) => ({ value })) },
   total: values.length, offset: q.offset, limit: q.limit, ...other });
 const action = (root, name) => root.locator('[data-large-action="' + name + '"]');
+const viewGroup = (root, name = 'Table view') => root.getByRole('group', { name, exact: true }).and(root.locator('[data-large-view-control]'));
+const viewButton = (group, view, name) => group.getByRole('button', { name, exact: true })
+  .and(action(group, 'table-view')).and(group.locator('[data-large-view="' + view + '"]'));
+const tableQuery = (request) => JSON.parse(new URL(request.url()).searchParams.get('cmdpTable'));
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function assertViewMode(summary, rows, mode) {
+  assert.equal(await summary.getAttribute('aria-pressed'), String(mode === 'summary'));
+  assert.equal(await rows.getAttribute('aria-pressed'), String(mode === 'rows'));
+}
+
+async function assertVisibleInWidth(locator, width) {
+  await locator.waitFor({ state: 'visible' });
+  const bounds = await locator.boundingBox();
+  assert.ok(bounds && bounds.width > 0 && bounds.height > 0 && bounds.x >= 0 && bounds.x + bounds.width <= width);
+}
 
 async function withViewer({ kind, snapshotRefreshSessionPresent = false, locale = 'en', viewport = { width: 1280, height: 900 }, respond }, run) {
   const browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || '/usr/bin/google-chrome' });
@@ -248,6 +270,315 @@ test('paged tables use global, named and local flags in the same order as final 
   });
 });
 
+test('with multiple visible tables, only grouped tables have separate header controls', async () => {
+  const plain = table('Plain paged table', 'all');
+  for (const tables of [[ordinary, grouped(all), plain], [ordinary, grouped(all), grouped(keyed), plain]]) {
+    await withViewer({ kind: 'public', respond(call) {
+      if (!call.query) return shellPayload({ kind: 'public', snapshotRevision: 'fixture-revision' }, tables, {
+        snapshotFound: true, cache: { scope: 'staticSnapshot', snapshotRevision: 'fixture-revision' }
+      });
+      return rowPage(call.query, [(call.query.view === 'rows' ? 'Rows for ' : 'Data for ') + call.query.table]);
+    } }, async (page, calls) => {
+      await page.getByText('Ordinary row', { exact: true }).waitFor();
+      const toolbar = page.locator('.snapshot-toolbar');
+      await toolbar.waitFor();
+      assert.equal(await viewGroup(toolbar).count(), 0);
+      const visibleGrouped = tables.filter((item) => item.presentation.largeTable?.groupKeys?.length);
+      assert.equal(await page.locator('[data-large-view-control]').count(), visibleGrouped.length);
+      for (const item of visibleGrouped) {
+        const header = page.getByRole('region', { name: item.name }).locator('.result-table-header');
+        const group = viewGroup(header);
+        await assertVisibleInWidth(group, 1280);
+        await assertViewMode(viewButton(group, 'summary', 'Summary'), viewButton(group, 'rows', 'Rows'), 'summary');
+      }
+      const group = viewGroup(page.getByRole('region', { name: all.name }));
+      await viewButton(group, 'rows', 'Rows').click();
+      await page.getByText('Rows for ' + all.name, { exact: true }).waitFor();
+      const switched = calls.filter(({ query }) => query?.view === 'rows');
+      assert.deepEqual(switched.map(({ query }) => [query.table, query.op, query.snapshotRevision]), [
+        [all.name, 'rows', 'fixture-revision']
+      ]);
+      if (visibleGrouped.length === 2) {
+        const other = viewGroup(page.getByRole('region', { name: keyed.name }));
+        await assertViewMode(viewButton(other, 'summary', 'Summary'), viewButton(other, 'rows', 'Rows'), 'summary');
+      }
+    });
+  }
+});
+
+test('dynamic grouped view reuses its index when switching and aborts obsolete rows and detail', async () => {
+  const detail = deferred();
+  const pendingSummary = deferred();
+  let holdSummary = false;
+  const key = 'typed:&+/';
+  const viewId = 'selected-index';
+  try {
+    await withViewer({ kind: 'dynamic', respond: async ({ query: q }) => {
+      if (!q) return shellPayload({ kind: 'dynamic', pageSize: 3 }, [grouped(keyed)]);
+      if (q.op === 'options') return { items: [{ key, label: 'Selected object' }], total: 1, offset: q.offset, limit: q.limit };
+      if (q.op === 'details') {
+        await detail.promise;
+        return rowPage(q, ['Obsolete detail']);
+      }
+      if (holdSummary && !q.view) {
+        holdSummary = false;
+        await pendingSummary.promise;
+        return rowPage(q, ['Obsolete summary'], { viewId, groupIds: ['old-group'] });
+      }
+      const label = [q.view === 'rows' ? 'Row' : 'Group', q.offset, q.search || 'unfiltered', q.sort || 'unsorted'].join(' ');
+      return rowPage(q, [label], { total: 8, viewId, ...(!q.view ? { groupIds: ['group-' + q.offset] } : {}) });
+    } }, async (page, calls) => {
+      const region = page.getByRole('region', { name: keyed.name });
+      const group = viewGroup(region.locator('.result-table-header'));
+      const summary = viewButton(group, 'summary', 'Summary');
+      const rows = viewButton(group, 'rows', 'Rows');
+      const picker = action(region, 'picker');
+      const search = region.getByRole('searchbox', { name: 'Search table' });
+      await group.waitFor();
+      assert.equal(await summary.isDisabled(), true);
+      assert.equal(await rows.isDisabled(), true);
+      await picker.click();
+      await region.getByRole('button', { name: 'Selected object' }).click();
+      await region.getByText('Group 0 unfiltered unsorted', { exact: true }).waitFor();
+      assert.equal(await rows.isEnabled(), true);
+      await assertViewMode(summary, rows, 'summary');
+      await search.fill('needle');
+      await region.getByText('Group 0 needle unsorted', { exact: true }).waitFor();
+      await action(region, 'sort').click();
+      await region.getByText('Group 0 needle value', { exact: true }).waitFor();
+      await action(region, 'rows-next').click();
+      await region.getByText('Group 3 needle value', { exact: true }).waitFor();
+      await region.getByText('Groups: 4–6 of 8', { exact: true }).waitFor();
+
+      await Promise.all([
+        page.waitForRequest((request) => tableQuery(request)?.op === 'details'),
+        action(region, 'details').click()
+      ]);
+      await summary.focus();
+      await page.keyboard.press('Tab');
+      assert.equal(await rows.evaluate((button) => button === document.activeElement), true);
+      const [cancelledDetail] = await Promise.all([
+        page.waitForEvent('requestfailed', (request) => tableQuery(request)?.op === 'details'),
+        page.keyboard.press('Space')
+      ]);
+      assert.match(cancelledDetail.failure().errorText, /abort/i);
+      await region.getByText('Row 0 needle value', { exact: true }).waitFor();
+      await region.getByText('Rows: 1–3 of 8', { exact: true }).waitFor();
+      detail.resolve();
+      await assertViewMode(summary, rows, 'rows');
+      assert.equal(await action(region, 'details').count(), 0);
+      assert.equal(await region.locator('[data-large-detail-row]').count(), 0);
+      assert.equal(await search.inputValue(), 'needle');
+      assert.equal(await picker.innerText(), 'Selected object');
+      assert.equal(await region.locator('[aria-sort="ascending"]').count(), 1);
+      assert.equal(await rows.evaluate((button) => button === document.activeElement), true);
+
+      holdSummary = true;
+      const [oldRequest] = await Promise.all([
+        page.waitForRequest((request) => {
+          const q = tableQuery(request);
+          return q?.op === 'rows' && !q.view && q.offset === 0;
+        }),
+        summary.press('Enter')
+      ]);
+      await region.locator('[data-large-rows][aria-busy="true"]').waitFor({ state: 'attached' });
+      await assertViewMode(summary, rows, 'summary');
+      const [cancelledSummary] = await Promise.all([
+        page.waitForEvent('requestfailed', (request) => request === oldRequest),
+        rows.press('Enter')
+      ]);
+      assert.match(cancelledSummary.failure().errorText, /abort/i);
+      await region.getByText('Row 0 needle value', { exact: true }).waitFor();
+      pendingSummary.resolve();
+      await region.locator('[data-large-rows][aria-busy]').waitFor({ state: 'detached' });
+      await assertViewMode(summary, rows, 'rows');
+      assert.equal(await region.getByText(/^Obsolete /).count(), 0);
+      const requests = calls.filter(({ query }) => query?.op === 'rows');
+      assert.ok(requests.every(({ path, method, query }) => path === api + '/templates/Report/table-page' &&
+        method === 'GET' && query.key === key && query.limit === 3 && !Object.hasOwn(query, 'snapshotRevision')));
+      assert.deepEqual(requests.map(({ query: q }) => [q.offset, q.view, q.viewId, q.search, q.sort, q.direction]), [
+        [0, undefined, undefined, '', undefined, undefined],
+        [0, undefined, viewId, 'needle', undefined, undefined],
+        [0, undefined, viewId, 'needle', 'value', 'asc'],
+        [3, undefined, viewId, 'needle', 'value', 'asc'],
+        [0, 'rows', viewId, 'needle', 'value', 'asc'],
+        [0, undefined, viewId, 'needle', 'value', 'asc'],
+        [0, 'rows', viewId, 'needle', 'value', 'asc']
+      ]);
+    });
+  } finally {
+    detail.resolve();
+    pendingSummary.resolve();
+  }
+});
+
+test('dynamic grouped view resets on key change and does not calculate automatically after expiry', async () => {
+  const secondIndex = deferred();
+  const reopenedIndex = deferred();
+  const expiredResponse = deferred();
+  let expire = false;
+  try {
+    await withViewer({ kind: 'dynamic', respond: async ({ query: q }) => {
+      if (!q) return shellPayload({ kind: 'dynamic' }, [grouped(keyed)]);
+      if (q.op === 'options') return { items: [{ key: 'one', label: 'First object' }, { key: 'two', label: 'Second object' }],
+        total: 2, offset: q.offset, limit: q.limit };
+      if (expire && q.viewId) {
+        await expiredResponse.promise;
+        return { status: 409, body: { reason: 'table_view_expired' } };
+      }
+      if (!q.viewId && q.key === 'two') await (expire ? reopenedIndex.promise : secondIndex.promise);
+      return rowPage(q, [(q.view === 'rows' ? 'Rows for ' : 'Summary for ') + q.key], {
+        viewId: q.viewId || (expire ? 'reopened' : 'index-' + q.key)
+      });
+    } }, async (page, calls) => {
+      const region = page.getByRole('region', { name: keyed.name });
+      const group = viewGroup(region);
+      const summary = viewButton(group, 'summary', 'Summary');
+      const rows = viewButton(group, 'rows', 'Rows');
+      const select = async (name) => {
+        await action(region, 'picker').click();
+        await region.getByRole('button', { name, exact: true }).click();
+      };
+      await select('First object');
+      await region.getByText('Summary for one', { exact: true }).waitFor();
+      await rows.click();
+      await region.getByText('Rows for one', { exact: true }).waitFor();
+
+      await select('Second object');
+      await region.locator('[data-large-rows][aria-busy="true"]').waitFor({ state: 'attached' });
+      await assertViewMode(summary, rows, 'summary');
+      assert.equal(await summary.isDisabled(), true);
+      assert.equal(await rows.isDisabled(), true);
+      secondIndex.resolve();
+      await region.getByText('Summary for two', { exact: true }).waitFor();
+
+      expire = true;
+      const before = calls.length;
+      await Promise.all([
+        page.waitForRequest((request) => tableQuery(request)?.view === 'rows'),
+        rows.press('Enter')
+      ]);
+      const search = region.getByRole('searchbox', { name: 'Search table' });
+      await search.focus();
+      expiredResponse.resolve();
+      await region.getByRole('alert').filter({ hasText: 'This table view has expired.' }).waitFor();
+      const reopen = action(region, 'reopen');
+      await reopen.waitFor();
+      assert.equal(await summary.isDisabled(), true);
+      assert.equal(await rows.isDisabled(), true);
+      assert.equal(await search.evaluate((input) => document.activeElement === input), true,
+        'the error must not move focus after the user has left the view control');
+      // Observe automatic follow-up requests, including those after the table's search debounce.
+      await assert.rejects(page.waitForRequest((request) => {
+        const url = new URL(request.url());
+        return url.pathname.startsWith(api + '/templates/Report/');
+      }, { timeout: 400 }), { name: 'TimeoutError' });
+      assert.deepEqual(calls.slice(before).map(({ query: q }) => [q?.op, q?.key, q?.view, q?.viewId]), [
+        ['rows', 'two', 'rows', 'index-two']
+      ]);
+
+      await reopen.click();
+      await region.locator('[data-large-rows][aria-busy="true"]').waitFor({ state: 'attached' });
+      await assertViewMode(summary, rows, 'summary');
+      assert.equal(await rows.isDisabled(), true);
+      reopenedIndex.resolve();
+      await region.getByText('Summary for two', { exact: true }).waitFor();
+      assert.equal(await rows.isEnabled(), true);
+      const requests = calls.filter(({ query }) => query?.op === 'rows');
+      assert.deepEqual(requests.map(({ query: q }) => [q.key, q.offset, q.view, q.viewId]), [
+        ['one', 0, undefined, undefined], ['one', 0, 'rows', 'index-one'], ['two', 0, undefined, undefined],
+        ['two', 0, 'rows', 'index-two'], ['two', 0, undefined, undefined]
+      ]);
+    });
+  } finally {
+    secondIndex.resolve();
+    reopenedIndex.resolve();
+    expiredResponse.resolve();
+  }
+});
+
+test('an expired keyed view recovers after selecting the same object from refreshed options', async () => {
+  const recovery = deferred();
+  let optionLoads = 0;
+  let expired = false;
+  try {
+    await withViewer({ kind: 'dynamic', viewport: { width: 390, height: 740 }, respond: async ({ query: q }) => {
+      if (!q) return shellPayload({ kind: 'dynamic', pageSize: 3 }, [grouped(keyed)]);
+      if (q.op === 'options') {
+        optionLoads++;
+        return { items: [{ key: 'one', label: 'Only object' }], total: 1, offset: q.offset, limit: q.limit };
+      }
+      if (expired && q.viewId === 'original') return { status: 409, body: { reason: 'table_view_expired' } };
+      if (expired && !q.viewId && optionLoads === 1) return { status: 404, body: { reason: 'table_key_unavailable' } };
+      if (expired && !q.viewId) await recovery.promise;
+      const viewId = expired ? 'recovered' : 'original';
+      const label = [viewId, q.view || 'summary', q.search || '-', q.sort || '-'].join(' ');
+      return rowPage(q, [label], { viewId });
+    } }, async (page, calls) => {
+      const region = page.getByRole('region', { name: keyed.name });
+      const group = viewGroup(region);
+      const summary = viewButton(group, 'summary', 'Summary');
+      const rows = viewButton(group, 'rows', 'Rows');
+      const picker = action(region, 'picker');
+      const search = region.getByRole('searchbox', { name: 'Search table' });
+      const object = region.getByRole('button', { name: 'Only object', exact: true }).and(action(region, 'option'));
+      await assertVisibleInWidth(group, 390);
+      await picker.click();
+      await object.click();
+      await region.getByText('original summary - -', { exact: true }).waitFor();
+      await search.fill('needle');
+      await region.getByText('original summary needle -', { exact: true }).waitFor();
+      await action(region, 'sort').click();
+      await region.getByText('original summary needle value', { exact: true }).waitFor();
+
+      expired = true;
+      const before = calls.filter(({ query }) => query?.op === 'rows').length;
+      await rows.press('Enter');
+      const reopen = action(region, 'reopen');
+      await assertVisibleInWidth(reopen, 390);
+      assert.equal(await reopen.evaluate((button) => document.activeElement === button), true);
+      assert.equal(await rows.isDisabled(), true);
+      assert.equal(calls.filter(({ query }) => query?.op === 'rows').length, before + 1);
+
+      await reopen.press('Enter');
+      const choose = action(region, 'choose');
+      await assertVisibleInWidth(choose, 390);
+      assert.equal(await picker.textContent(), 'Only object');
+      assert.equal(await search.inputValue(), 'needle');
+      await choose.press('Enter');
+      await object.waitFor();
+      assert.equal(calls.filter(({ query }) => query?.op === 'rows').length, before + 2,
+        'opening the refreshed list must not recalculate the report');
+
+      const [opening] = await Promise.all([
+        page.waitForRequest((request) => tableQuery(request)?.op === 'rows'),
+        object.press('Enter')
+      ]);
+      const q = tableQuery(opening);
+      assert.deepEqual([q.key, q.view, q.viewId, q.search, q.sort, q.direction, q.offset, q.limit],
+        ['one', undefined, undefined, 'needle', 'value', 'asc', 0, 3]);
+      await assertViewMode(summary, rows, 'summary');
+      assert.equal(await rows.isDisabled(), true);
+      recovery.resolve();
+      await region.getByText('recovered summary needle value', { exact: true }).waitFor();
+      await rows.press('Enter');
+      await region.getByText('recovered rows needle value', { exact: true }).waitFor();
+      const last = calls.filter(({ query }) => query?.op === 'rows').at(-1).query;
+      assert.deepEqual([last.key, last.view, last.viewId], ['one', 'rows', 'recovered']);
+
+      await picker.click();
+      await object.waitFor();
+      const noDuplicate = assert.rejects(page.waitForRequest((request) => tableQuery(request)?.op === 'rows',
+        { timeout: 350 }), { name: 'TimeoutError' });
+      await object.press('Enter');
+      await noDuplicate;
+      await assertViewMode(summary, rows, 'rows');
+    });
+  } finally {
+    recovery.resolve();
+  }
+});
+
 test('object picker contains search, scrolling options and pager at 390x450', async () => {
   await withViewer({ kind: 'dynamic', viewport: { width: 390, height: 450 }, async respond(call) {
     if (!call.query) return { ...shellPayload({ kind: 'dynamic' }, [keyed]), result: { tables: [keyed] } };
@@ -340,7 +671,7 @@ test('published object picker shows ten choices and searches beyond the first pa
   });
 });
 
-test('public snapshot and personal refresh keep their own transport and restore a selection', async () => {
+test('public reload and personal refresh keep their transport, selected key and Rows mode', async () => {
   let revision = 'before';
   await withViewer({ kind: 'public', snapshotRefreshSessionPresent: true, locale: 'ru', viewport: { width: 390, height: 840 }, async respond(call) {
     const path = call.path;
@@ -348,18 +679,29 @@ test('public snapshot and personal refresh keep their own transport and restore 
     if (path.endsWith('/csrf')) return { success: true, token: 'fixture' };
     if (path.endsWith('/refresh-snapshot')) {
       if (call.method === 'GET') return { available: true, mode: 'personal' };
-      return shellPayload({ kind: 'personal', viewId: 'personal-id' }, [keyed], {
+      return shellPayload({ kind: 'personal', viewId: 'personal-id' }, [grouped(keyed)], {
         snapshotFound: true, action: 'refresh-snapshot', mode: 'personal', template: { code: 'Report', active: true }, cache: null
       });
     }
-    if (!q) return shellPayload({ kind: 'public', snapshotRevision: revision }, [keyed], { snapshotFound: true, cache: { scope: 'staticSnapshot', snapshotRevision: revision } });
+    if (!q) return shellPayload({ kind: 'public', snapshotRevision: revision }, [grouped(keyed)], {
+      snapshotFound: true, cache: { scope: 'staticSnapshot', snapshotRevision: revision }
+    });
     const personal = path.startsWith(api + '/templates/');
     if (!personal && q.snapshotRevision !== revision) return { status: 409, body: { reason: 'table_snapshot_changed' } };
     if (q.op === 'options') return { items: [{ key: 'one', label: 'Первая' }, { key: 'two', label: 'Вторая' }], total: 2, offset: 0, limit: q.limit };
-    return rowPage(q, [personal ? 'Личный результат ' + q.key : 'Снимок ' + revision], { total: 51 });
+    return rowPage(q, [personal ? 'Личный результат ' + q.key : 'Снимок ' + revision + (q.view === 'rows' ? ' строки' : '')], { total: 51 });
   } }, async (page, calls) => {
     const scoped = page.getByRole('region', { name: keyed.name });
     const picker = action(scoped, 'picker');
+    const toolbar = page.locator('.snapshot-toolbar');
+    const refresh = toolbar.getByRole('button', { name: 'Обновить для себя', exact: true });
+    const group = viewGroup(toolbar, 'Вид таблицы');
+    const summary = viewButton(group, 'summary', 'Сводка');
+    const rows = viewButton(group, 'rows', 'Строки');
+    for (const locator of [refresh, group, summary, rows]) await assertVisibleInWidth(locator, 390);
+    assert.equal(await scoped.locator('[data-large-view-control]').count(), 0);
+    assert.equal(await page.locator('[data-large-view-control]').count(), 1);
+    await assertViewMode(summary, rows, 'summary');
     await picker.click();
     const search = scoped.getByRole('searchbox', { name: 'Поиск объектов' });
     const bounds = await search.boundingBox();
@@ -369,29 +711,36 @@ test('public snapshot and personal refresh keep their own transport and restore 
     await picker.click();
     await scoped.getByRole('button', { name: 'Первая' }).click();
     await scoped.getByText('Снимок before', { exact: true }).waitFor();
+    await rows.press('Enter');
+    await scoped.getByText('Снимок before строки', { exact: true }).waitFor();
+    await assertViewMode(summary, rows, 'rows');
     revision = 'after';
     await action(scoped, 'rows-next').click();
     await scoped.getByText('Снимок изменился или истёк. Перечитайте снимок.', { exact: false }).waitFor();
     await action(scoped, 'reload').click();
-    await scoped.getByText('Снимок after', { exact: true }).waitFor();
-    await page.getByRole('button', { name: 'Обновить для себя' }).click();
+    await scoped.getByText('Снимок after строки', { exact: true }).waitFor();
+    await assertViewMode(summary, rows, 'rows');
+    await refresh.click();
     await scoped.getByText('Личный результат one', { exact: true }).waitFor();
+    await assertViewMode(summary, rows, 'rows');
     assert.equal(await page.locator('[data-d2-source-download]').count(), 0);
     await picker.click();
     await scoped.getByRole('button', { name: 'Вторая' }).click();
     await scoped.getByText('Личный результат two', { exact: true }).waitFor();
     assert.ok(calls.filter((call) => call.path.endsWith('/run') || call.method === 'POST').every((call) => call.params.cmdpTableShell === '1'));
     const personalCalls = calls.filter((call) => call.query && call.path === api + '/templates/Report/table-page');
-    assert.deepEqual(personalCalls.map(({ query: q }) => [q.op, q.key, q.viewId]), [
-      ['rows', 'one', 'personal-id'], ['options', undefined, 'personal-id'], ['rows', 'two', 'personal-id']
+    assert.deepEqual(personalCalls.map(({ query: q }) => [q.op, q.key, q.viewId, q.view]), [
+      ['rows', 'one', 'personal-id', 'rows'], ['options', undefined, 'personal-id', undefined], ['rows', 'two', 'personal-id', 'rows']
     ]);
     const publicCalls = calls.filter((call) => call.query && call.path === api + '/public-snapshots/Report/table-page');
     assert.ok(publicCalls.every(({ query: q }) => q.snapshotRevision && !q.viewId));
-    assert.ok(publicCalls.some(({ query: q }) => q.key === 'one' && q.snapshotRevision === 'after'));
+    assert.deepEqual(publicCalls.filter(({ query: q }) => q.op === 'rows').map(({ query: q }) => [q.key, q.snapshotRevision, q.offset, q.view]), [
+      ['one', 'before', 0, undefined], ['one', 'before', 0, 'rows'], ['one', 'before', 50, 'rows'], ['one', 'after', 0, 'rows']
+    ]);
   });
 });
 
-test('shared refresh replaces the row and detail page size but not the filter option size', async () => {
+test('shared refresh keeps Rows mode and changes the row and detail page size but not option size', async () => {
   const before = 'a'.repeat(64);
   const after = 'b'.repeat(64);
   const cache = (snapshotRevision, status) => ({
@@ -402,37 +751,46 @@ test('shared refresh replaces the row and detail page size but not the filter op
     if (call.path.endsWith('/csrf')) return { success: true, token: 'fixture' };
     if (call.path.endsWith('/refresh-snapshot')) {
       if (call.method === 'GET') return { available: true, mode: 'shared' };
-      return shellPayload({ kind: 'public', snapshotRevision: after, pageSize: 2 }, [keyed], {
+      return shellPayload({ kind: 'public', snapshotRevision: after, pageSize: 2 }, [grouped(keyed)], {
         snapshotFound: true, action: 'refresh-snapshot', mode: 'shared', template: { code: 'Report', active: true },
         cache: cache(after, 'snapshot-published')
       });
     }
     const q = call.query;
-    if (!q) return shellPayload({ kind: 'public', snapshotRevision: before, pageSize: 3 }, [keyed], {
+    if (!q) return shellPayload({ kind: 'public', snapshotRevision: before, pageSize: 3 }, [grouped(keyed)], {
       snapshotFound: true, action: 'run', cache: cache(before, 'snapshot-hit')
     });
     if (q.op === 'options') return { items: [{ key: 'item', label: 'Item' }], total: 1, offset: 0, limit: q.limit };
     if (q.op === 'details') return rowPage(q, ['Detail page ' + q.limit]);
+    if (q.view === 'rows') return rowPage(q, ['Row page ' + q.limit]);
     return rowPage(q, ['Group page ' + q.limit], { groupIds: ['group-1'] });
   } }, async (page, calls) => {
     const region = page.getByRole('region', { name: keyed.name });
     const trigger = action(region, 'picker');
+    const group = viewGroup(page.locator('.snapshot-toolbar'));
+    const summary = viewButton(group, 'summary', 'Summary');
+    const rows = viewButton(group, 'rows', 'Rows');
     await trigger.click();
     await region.getByRole('button', { name: 'Item', exact: true }).click();
     await region.getByText('Group page 3', { exact: true }).waitFor();
     await action(region, 'details').click();
     await region.getByText('Detail page 3', { exact: true }).waitFor();
+    await rows.click();
+    await region.getByText('Row page 3', { exact: true }).waitFor();
     page.once('dialog', (dialog) => dialog.accept());
     await page.getByRole('button', { name: 'Refresh shared snapshot' }).click();
+    await region.getByText('Row page 2', { exact: true }).waitFor();
+    await assertViewMode(summary, rows, 'rows');
+    await summary.click();
     await region.getByText('Group page 2', { exact: true }).waitFor();
     await action(region, 'details').click();
     await region.getByText('Detail page 2', { exact: true }).waitFor();
     await trigger.click();
     await region.getByRole('button', { name: 'Item', exact: true }).waitFor();
-    const requests = calls.filter(({ query }) => query).map(({ query }) => [query.snapshotRevision, query.op, query.limit]);
+    const requests = calls.filter(({ query }) => query).map(({ query }) => [query.snapshotRevision, query.op, query.limit, query.view]);
     assert.deepEqual(requests, [
-      [before, 'options', 10], [before, 'rows', 3], [before, 'details', 3],
-      [after, 'rows', 2], [after, 'details', 2], [after, 'options', 10]
+      [before, 'options', 10, undefined], [before, 'rows', 3, undefined], [before, 'details', 3, undefined], [before, 'rows', 3, 'rows'],
+      [after, 'rows', 2, 'rows'], [after, 'rows', 2, undefined], [after, 'details', 2, undefined], [after, 'options', 10, undefined]
     ]);
   });
 });

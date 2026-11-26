@@ -173,6 +173,58 @@ test('typed private group keys may share the same display without exposing raw v
   assert.throws(() => buildLargeTableIndex(source, [], { groupValues: [[raw]] }), { code: 'invalid_large_table_rows' });
 });
 
+test('summary/rows toggle pages projected rows with the same all or keyed index', () => {
+  const rows = [
+    { Group: 'Shared', Value: 10, Text: { label: 'Needle', private: 'private-value' }, Parent: 'A' },
+    { Group: 'Shared', Value: 2, Text: 'needle', Parent: 'A' },
+    { Group: 'Shared', Value: 12, Text: 'needle', Parent: 'B' },
+    { Group: 'Other', Value: 4, Text: 'skip', Parent: 'A' }
+  ];
+  for (const config of [allConfig, keyConfig]) {
+    const source = table({ ...config, groupKeys: ['Group'] }, ['Group', 'Value', 'Text'], rows);
+    source.truncated = true;
+    source.cellMeta = { 0: { Text: { attribute: 'Label', sourceId: 'private-id' } } };
+    const options = [{ identity: 'A', title: 'A' }, { identity: 'B', title: 'B' }, { identity: 'C', title: 'C' }];
+    const index = JSON.parse(JSON.stringify(buildLargeTableIndex(source, options)));
+    const scope = config.mode === 'key' ? { key: encodeLargeTableKey('A') } : {};
+    const query = { op: 'rows', ...scope, search: 'ＮＥＥＤＬＥ', sort: 'Value', direction: 'desc', limit: 1 };
+    const summary = queryLargeTablePage(index, query);
+    assert.deepEqual(queryLargeTablePage(index, { ...query, view: 'summary' }), summary);
+    assert.equal(summary.total, 1);
+    assert.equal(summary.groupIds.length, 1);
+
+    const raw = queryLargeTablePage(index, { ...query, view: 'rows', offset: config.mode === 'key' ? 0 : 1 });
+    assert.equal(raw.total, config.mode === 'key' ? 2 : 3);
+    assert.equal(raw.incomplete, true);
+    assert.equal(Object.hasOwn(raw, 'groupIds'), false);
+    assert.deepEqual(raw.table.rows, [{ Group: 'Shared', Value: 10, Text: 'Needle' }]);
+    assert.deepEqual(raw.table.cellMeta, { 0: { Text: { attribute: 'Label' } } });
+    assert.equal(queryLargeTablePage(index, { ...scope, op: 'rows', view: 'rows', search: 'private-value' }).total, 0);
+    if (config.mode === 'key') {
+      assert.deepEqual(queryLargeTablePage(index, { op: 'rows', view: 'rows', key: encodeLargeTableKey('C') }).table.rows, []);
+    }
+    assert.deepEqual(queryLargeTablePage(index, query), summary);
+  }
+});
+
+test('summary/rows toggle rejects malformed views, inapplicable operations and ungrouped raw requests', () => {
+  const source = table({ ...allConfig, groupKeys: ['Value'] }, ['Value'], [{ Value: 1 }]);
+  const index = buildLargeTableIndex(source);
+  for (const view of ['', null, false, 1, ['rows'], 'raw', 'Rows', ' rows ']) {
+    assert.throws(() => queryLargeTablePage(index, { op: 'rows', view }), { code: 'invalid_large_table_query' });
+  }
+  for (const op of ['options', 'details']) {
+    for (const view of ['summary', 'rows']) {
+      assert.throws(() => queryLargeTablePage(index, { op, view }), { code: 'invalid_large_table_query' });
+    }
+  }
+  assert.throws(() => queryLargeTablePage(index, new URLSearchParams('op=rows&view=summary&view=rows')),
+    { code: 'invalid_large_table_query' });
+  const ungrouped = buildLargeTableIndex(table(allConfig, ['Value'], [{ Value: 1 }]));
+  assert.deepEqual(queryLargeTablePage(ungrouped, { op: 'rows', view: 'summary' }), queryLargeTablePage(ungrouped));
+  assert.throws(() => queryLargeTablePage(ungrouped, { op: 'rows', view: 'rows' }), { code: 'invalid_large_table_query' });
+});
+
 test('projects regular page metadata to local indexes and makes a detached immutable index', () => {
   const source = table(allConfig, ['Text'], [{ Text: 0 }, { Text: { label: 'Display', data: 'sensitive' }, Hidden: 'hidden data' }]);
   source.columnLabels = { Text: 'Title', Hidden: 'hidden label' };
