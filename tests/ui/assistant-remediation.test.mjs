@@ -5,13 +5,14 @@ import { chromium } from 'playwright';
 import { compileObjectFlowToSpec } from '../../scripts/assistant-object-flow.mjs';
 import { createUiRequestDiagnostics } from '../../scripts/ui-request-diagnostics.mjs';
 import { createAssistantDiagnosticsUi } from '../../scripts/assistant-diagnostics-ui.mjs';
+import { defaultRuntimeConfig, renderDynamicPagesShell } from '../../scripts/dev-proxy-server.mjs';
 import { resolveTemplateParameters, staticSnapshotParamPairs } from '../../scripts/template-parameters.mjs';
 import { bindViewLargeExecutionHelpers } from '../fixtures/view-large-execution-helpers.mjs';
 
 function clientVersionConstants(source) {
   return Object.fromEntries(['D2_IMPORT_SEMANTIC_MODEL_REVISION', 'D2_IMPORT_ENDPOINT_PROFILE_VERSION',
     'D2_IMPORT_STRUCTURE_TREE_VERSION', 'D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION',
-    'D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION', 'ASSISTANT_PROMPT_CONTRACT_VERSION'].map((name) => {
+    'D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION', 'D2_IMPORT_DETERMINISTIC_SPEC_REVISION', 'ASSISTANT_PROMPT_CONTRACT_VERSION'].map((name) => {
     const match = source.match(new RegExp('^const ' + name + ' = ([0-9]+);', 'm'));
     assert.ok(match, name);
     return [name, Number(match[1])];
@@ -260,6 +261,198 @@ const publishBaselineResponse = (savedSpecHash) => ({
 });
 const writeAction = (page, action) => page.locator('button[data-action="' + action + '"]');
 const openSection = (page, section) => page.locator('a[data-designer-section="' + section + '"]').click();
+
+test('[required:final-data-picker] Designer resolves readable attributes and related paths only after a query', async () => {
+  const origin = 'https://final-data.test';
+  const designer = '/cmdbuild/dynamicpages/ui/designer';
+  const api = '/cmdbuild/custom-api';
+  const session = { username: 'fixture-editor', role: 'Admin', rolePrivileges: { admin_classes_modify: true } };
+  const root = 'Cst_QueryTool';
+  const inherited = 'InheritedName';
+  const denied = 'DeniedName';
+  const exactPath = 'Hub.DisplayCode';
+  const assetAttributes = [
+    { name: inherited, type: 'string', inherited: true, permissions: { _can_read: true } },
+    { name: denied, type: 'string', permissions: { _can_read: false } },
+    { name: 'Rank', type: 'integer' },
+    { name: 'Hub', type: 'reference', targetClass: 'Hub' }
+  ];
+  const catalog = {
+    classes: [
+      { name: 'Asset', attributes: [] },
+      { name: 'Hub', attributes: [{ name: 'DisplayCode', type: 'string' }, { name: 'Rank', type: 'integer' }] }
+    ],
+    domains: [],
+    limits: { includeAttributes: true },
+    warnings: { attributeErrors: [{ className: 'Asset' }] }
+  };
+  let saved = {
+    id: 7, code: 'final-data-picker', description: 'Final Data fixture', active: true, specHash: 'a'.repeat(64),
+    spec: {
+      version: 1, params: {},
+      steps: [{ type: 'selectCards', as: 'objects', className: 'Asset', columns: ['Code'], limit: 10 }],
+      result: { tables: [{ name: 'objects', columns: ['Code'] }] }
+    }
+  };
+  const modelRequests = [], writes = [], unexpected = [], errors = [];
+  const browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || '/usr/bin/google-chrome' });
+  try {
+    const page = await browser.newPage({ viewport: writeViewport, serviceWorkers: 'block' });
+    page.setDefaultTimeout(5000);
+    page.on('pageerror', (error) => errors.push(error.message));
+    await page.route('**/*', async (route) => {
+      const request = route.request();
+      const { origin: requestOrigin, pathname } = new URL(request.url());
+      const method = request.method();
+      if (requestOrigin === origin) {
+        if (method === 'GET' && pathname === designer) {
+          return route.fulfill({ contentType: 'text/html', body: renderDynamicPagesShell({ mode: 'designer', session, root }) });
+        }
+        if (method === 'GET' && pathname.startsWith(api + '/model/')) modelRequests.push(pathname);
+        if (method === 'GET') {
+          const responses = {
+            '/session': { session },
+            '/schema': { schema: { root, ready: true } },
+            '/schema/parents': { parents: [] },
+            '/config': { config: { exists: true, runtimeConfig: defaultRuntimeConfig() } },
+            '/templates': { data: [saved] },
+            ['/templates/' + saved.code + '/versions']: { data: [] },
+            '/csrf': { token: 'fixture-csrf' },
+            '/model/catalog': { catalog },
+            '/model/classes/Asset/attributes': { data: assetAttributes }
+          };
+          if (pathname === api + '/client-log') return route.fulfill({ status: 204 });
+          const response = responses[pathname.slice(api.length)];
+          if (response) return route.fulfill({ json: { success: true, ...response } });
+        }
+        if (method === 'PUT' && pathname === templateApi + '/' + saved.code) {
+          const body = request.postDataJSON();
+          writes.push(body);
+          saved = { ...saved, ...body, specHash: 'b'.repeat(64) };
+          return route.fulfill({ json: { success: true, template: saved, executionValidation: { executable: true } } });
+        }
+      }
+      unexpected.push(method + ' ' + requestOrigin + pathname);
+      return route.abort('blockedbyclient');
+    });
+
+    const openFinalData = async () => {
+      await page.locator('[data-action="select-template"][data-code="final-data-picker"]').click();
+      await openSection(page, 'final-view');
+      await page.locator('#cmdp-view-composer-editor').waitFor();
+    };
+    await page.goto(origin + designer + '?lang=ru');
+    await page.locator('[data-action="select-template"][data-code="final-data-picker"]').waitFor();
+    // Seed the related class through the real catalog cache, leaving Asset lazy.
+    await page.locator('#cmdp-catalog-header').click();
+    await page.getByText('каталог готов', { exact: true }).waitFor();
+    await page.clock.install();
+    await openFinalData();
+
+    const rows = page.locator('#cmdp-view-column-rows [data-view-column-row]');
+    const field = '[data-view-column-field="field"]';
+    const pickerFor = (row) => row.locator(field).locator('xpath=ancestor::*[@data-catalog-field-picker][1]');
+    const toggle = (picker) => writeAction(picker, 'catalog-field-picker-toggle');
+    const search = (picker) => picker.locator('[data-catalog-field-picker-search]');
+    const option = (scope, value) => scope.getByRole('option').and(scope.locator(
+      `[data-catalog-field-picker-value=${JSON.stringify(value)}]`
+    ));
+    const values = (scope) => scope.getByRole('option').evaluateAll((nodes) =>
+      nodes.map((node) => node.getAttribute('data-catalog-field-picker-value')));
+    const groups = (picker, language) => [language === 'ru' ? 'Атрибуты' : 'Attributes',
+      language === 'ru' ? 'Поля по связям' : 'Related fields'
+    ].map((name) => picker.getByRole('group', { name, exact: true }));
+    const query = async (picker, text) => {
+      await search(picker).fill(text);
+      await page.clock.runFor(200);
+    };
+
+    const directRow = rows.nth((await rows.count()) - 1);
+    const directPicker = pickerFor(directRow);
+    await toggle(directPicker).click();
+    await search(directPicker).waitFor();
+    assert.equal(await search(directPicker).inputValue(), '');
+    await query(directPicker, '  ');
+    await directPicker.getByText('Введите минимум 1 символ для поиска.', { exact: true }).waitFor();
+    assert.deepEqual(await values(directPicker), [], 'blank input must not enumerate fields');
+    assert.equal(await directPicker.locator('select').count(), 0, 'no eager select');
+    assert.deepEqual(modelRequests, [api + '/model/catalog'], 'opening Final Data and an empty picker must not load lazy metadata');
+
+    await query(directPicker, 'e');
+    const [directRu, relatedRu] = groups(directPicker, 'ru');
+    await option(directRu, inherited).waitFor();
+    await option(relatedRu, exactPath).waitFor();
+    const eResults = await values(directPicker);
+    assert.ok(eResults.every((value) => value.toLowerCase().includes('e')), `"e" matches names/paths only: ${JSON.stringify(eResults)}`);
+    for (const value of ['Rank', 'Hub', 'Hub.Rank', denied]) {
+      assert.ok(!eResults.includes(value), `"e" must not suggest ${value}`);
+    }
+    assert.ok(modelRequests.includes(api + '/model/classes/Asset/attributes'), 'non-empty input must resolve lazy metadata');
+
+    await query(directPicker, 'Rank');
+    await option(directRu, 'Rank').waitFor();
+    await option(relatedRu, 'Hub.Rank').waitFor();
+    const placeholders = ['id', 'label', 'group', 'parent', 'href', 'source', 'target', 'child'];
+    for (const prefix of ['Выборка1', 'Выборка 1']) {
+      await query(directPicker, '');
+      await directPicker.getByText('Введите минимум 1 символ для поиска.', { exact: true }).waitFor();
+      await query(directPicker, prefix);
+      await option(directRu, inherited).waitFor();
+      await option(relatedRu, exactPath).waitFor();
+      const matches = await values(directPicker);
+      assert.deepEqual(matches.filter((value) => value === denied || placeholders.includes(value)), [],
+        `${prefix} must not expose denied attributes or D2 placeholders`);
+      await query(directPicker, prefix + '.' + exactPath);
+      await option(relatedRu, exactPath).waitFor();
+      assert.deepEqual(await values(directPicker), [exactPath], 'qualified path search returns only the selected source field');
+    }
+    for (const unavailable of [denied, 'group']) {
+      await query(directPicker, unavailable);
+      await directPicker.getByText('Подходящих полей нет.', { exact: true }).waitFor();
+      assert.deepEqual(await values(directPicker), [], `${unavailable} is not a Final Data field`);
+    }
+    await query(directPicker, inherited);
+    await option(directRu, inherited).click();
+    assert.equal(await directRow.locator(field).inputValue(), inherited);
+    await directRow.locator('[data-view-column-field="title"]').fill('Inherited field');
+
+    const pathRow = rows.nth((await rows.count()) - 1);
+    const pathPicker = pickerFor(pathRow);
+    await toggle(pathPicker).click();
+    await query(pathPicker, exactPath);
+    const pathOption = option(groups(pathPicker, 'ru')[1], exactPath);
+    await pathOption.waitFor();
+    assert.deepEqual(await values(pathPicker), [exactPath], 'the exact path is resolved without unrelated columns');
+    await pathOption.click();
+    assert.equal(await pathRow.locator(field).inputValue(), exactPath);
+    await pathRow.locator('[data-view-column-field="title"]').fill('Related field');
+
+    await writeAction(page, 'apply-view-composer').click();
+    await page.locator('#cmdp-designer-notice').getByText('Итоговые данные применены к Spec JSON.', { exact: true }).waitFor();
+    const saveResponse = page.waitForResponse((response) =>
+      new URL(response.url()).pathname === templateApi + '/' + saved.code && response.request().method() === 'PUT');
+    await writeAction(page, 'save-template').click();
+    assert.equal((await saveResponse).status(), 200);
+    assert.equal(writes.length, 1);
+    assert.deepEqual(writes[0].spec.result.tables[0].columns, ['Code', inherited, exactPath]);
+    assert.deepEqual(writes[0].spec.result.tables[0].columnLabels, { [inherited]: 'Inherited field', [exactPath]: 'Related field' });
+
+    await page.goto(origin + designer + '?lang=en');
+    await openFinalData();
+    assert.deepEqual(await rows.locator(field).evaluateAll((nodes) => nodes.map((node) => node.value)),
+      ['Code', inherited, exactPath, ''], 'reopening the saved template restores the actual selected values');
+    const reopenedPicker = pickerFor(rows.last());
+    await toggle(reopenedPicker).click();
+    await query(reopenedPicker, 'e');
+    const [directEn, relatedEn] = groups(reopenedPicker, 'en');
+    await option(directEn, inherited).waitFor();
+    await option(relatedEn, exactPath).waitFor();
+    assert.deepEqual(unexpected, [], 'all browser requests are isolated fixture calls');
+    assert.deepEqual(errors, [], 'no browser runtime errors');
+  } finally {
+    await browser.close();
+  }
+});
 
 async function openWriteFixture(page, section) {
   await page.locator('#cmdp-language').selectOption('en');
@@ -975,6 +1168,113 @@ test('semantic request cleanup releases its own busy state after edits or naviga
       }
     });
   }
+});
+
+function reviewedD2Fixture(templateCode = 'write-a') {
+  const versions = clientVersionConstants(fs.readFileSync(new URL('../../scripts/dev-proxy-server.mjs', import.meta.url), 'utf8'));
+  const source = 'group: { class: container }';
+  const proposal = {
+    version: 3, semanticModelRevision: versions.D2_IMPORT_SEMANTIC_MODEL_REVISION,
+    endpointProfileVersion: versions.D2_IMPORT_ENDPOINT_PROFILE_VERSION,
+    proposalId: 'active-proposal', templateCode, deterministicSpecHash: 'b'.repeat(64),
+    deterministicSpecRevision: versions.D2_IMPORT_DETERMINISTIC_SPEC_REVISION, signature: 'c'.repeat(64),
+    sourceText: source, source: { hash: 'mock-source-hash', structureHash: 'structure', mappingContractHash: 'mapping' },
+    template: {}, structure: { nodes: [], groups: [{ key: 'group', classKeys: ['container'] }], edges: [] },
+    classes: [{ key: 'container' }],
+    roles: [{ id: 'role-container', kind: 'class', key: 'container', visualKind: 'container', visualKindOptions: ['container'], elementKeys: ['group'] }],
+    templateGrammar: { contexts: [{ key: 'group-context', roleId: 'role-container', parentContextKey: '', elementKeys: ['group'] }] },
+    relationRules: [], endpointProfiles: [],
+    structureTree: { version: versions.D2_IMPORT_STRUCTURE_TREE_VERSION, items: [
+      { id: 'group', roleId: 'role-container', templateContextKey: 'group-context', templateElementKey: 'group', templateElementKeys: ['group'], parentId: '',
+        mapping: { materialization: { kind: 'structural' }, primary: { labelTemplate: 'Current draft mapping' } } }
+    ] }
+  };
+  return { source, proposal };
+}
+
+test('Designer output mode retains the active D2 draft without implicit D2 operations', async () => {
+  const { source, proposal } = reviewedD2Fixture();
+  await withClient(writeViewport, async ({ page, expectRequest, writes }) => {
+    await openWriteFixture(page, 'diagram-assistant');
+    await page.locator('#cmdp-diagram-import-source').fill(source);
+    const analyze = expectRequest('POST', '/cmdbuild/custom-api/draft/diagram-import/analyze');
+    await writeAction(page, 'diagram-import-analyze').click();
+    await analyze.received;
+    analyze.respond({ success: true, proposal });
+    const apply = writeAction(page, 'diagram-import-apply');
+    await apply.waitFor();
+    assert.equal(await apply.isEnabled(), true, 'fixture has a current, applicable proposal');
+
+    await openSection(page, 'diagram');
+    await page.locator('[data-action="diagram-structure-select"][data-diagram-structure-item-id="group"]').click();
+    const label = page.locator('[data-diagram-import-placement-field="primary.labelTemplate"]');
+    await assertVisible(label, writeViewport);
+    assert.equal(await label.inputValue(), 'Current draft mapping');
+
+    const preview = { ok: true, json: { result: { diagrams: [{ name: 'mock-preview', nodes: [], edges: [] }] } } };
+    await page.evaluate((preview) => { window.remediation.state.diagramImportRuntimePreview = preview; }, preview);
+    const priorWrites = writes.length;
+    await page.getByRole('radiogroup', { name: 'Runtime output' }).locator('label:has(input[value="diagrams"])').click();
+    assert.equal(await page.locator('input[name="cmdp-output-mode"]:checked').inputValue(), 'diagrams');
+    assert.equal(await label.inputValue(), 'Current draft mapping');
+    await openSection(page, 'diagram-assistant');
+    assert.equal(await apply.isVisible(), true, 'the active proposal remains visible after navigation');
+    assert.equal(await apply.isEnabled(), true, 'a presentation-only change does not require another analysis');
+    const current = await page.evaluate(() => {
+      const state = window.remediation.state;
+      return { proposalId: state.diagramImportProposal?.proposalId, preview: state.diagramImportRuntimePreview,
+        stale: state.diagramImportRuntimePreviewStale, pending: state.diagramImportAppliedPendingPreview };
+    });
+    assert.deepEqual(current, { proposalId: proposal.proposalId, preview, stale: false, pending: false }, 'mode-only action keeps the D2 draft and preview');
+    assert.equal(writes.length, priorWrites, 'mode-only action does not call a D2 endpoint or write the template');
+
+    const applyRequest = expectRequest('POST', '/cmdbuild/custom-api/draft/diagram-import/apply');
+    await apply.click();
+    const call = await applyRequest.received;
+    assert.deepEqual(call.body.proposal, proposal, 'Apply sends the original signed proposal');
+    assert.equal(call.body.currentSpec.result.presentation.outputMode, 'diagrams');
+    await openSection(page, 'diagram');
+    await page.locator('label:has(input[name="cmdp-output-mode"][value="tables"])').click();
+    applyRequest.respond({ success: true, spec: call.body.currentSpec });
+    await page.waitForFunction(() => window.remediation.state.diagramImportAppliedPendingPreview);
+    assert.equal(await page.locator('input[name="cmdp-output-mode"]:checked').inputValue(), 'tables',
+      'an Apply response cannot overwrite a newer presentation change');
+  });
+});
+
+test('an incompatible restored D2 proposal cannot Apply before explicit analysis', async () => {
+  const { source, proposal } = reviewedD2Fixture('write-b');
+  await withClient(writeViewport, async ({ page, expectRequest, writes }) => {
+    await openWriteFixture(page, 'templates');
+    await page.evaluate(({ source, proposal }) => {
+      window.remediation.state.templates[1].spec = {
+        ...window.remediation.state.templates[1].spec,
+        authoring: { version: 1, d2: { source, analysisCheckpoint: { ...proposal, version: 1 } } }
+      };
+    }, { source, proposal });
+    const restore = expectRequest('POST', '/cmdbuild/custom-api/draft/diagram-import/restore');
+    const versions = expectRequest('GET', templateApi + '/write-b/versions');
+    await page.locator('[data-action="select-template"][data-code="write-b"]').click();
+    await versions.received;
+    versions.respond({ success: true, data: [] });
+    await restore.received;
+    const retired = { ...proposal };
+    delete retired.deterministicSpecRevision;
+    restore.respond({ success: true, restoreKind: 'analysis', proposal: retired });
+    await page.waitForFunction(() => window.remediation.state.diagramImportRestoreError.includes('Analyze the D2 source again'));
+    await openSection(page, 'diagram-assistant');
+    assert.equal(await writeAction(page, 'diagram-import-apply').count(), 0);
+    await page.locator('#cmdp-assistant-diagram-intent-prompt').fill('Review the restored draft.');
+    await writeAction(page, 'assistant-diagram-interpret').click();
+    await page.waitForFunction(() => window.remediation.state.message?.type === 'error');
+    assert.equal(writes.length, 1, 'Restore does not reanalyze or apply implicitly');
+
+    const analyze = expectRequest('POST', '/cmdbuild/custom-api/draft/diagram-import/analyze');
+    await writeAction(page, 'diagram-import-analyze').click();
+    await analyze.received;
+    analyze.respond({ success: true, proposal });
+    await writeAction(page, 'diagram-import-apply').and(page.locator(':enabled')).waitFor();
+  });
 });
 
 test('full client transfer preserves staged Save/export artifacts, defaults and pending D2 checkpoints outside Diagram', async () => {

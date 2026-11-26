@@ -181,6 +181,7 @@ const D2_IMPORT_ASSISTANT_CHECKPOINT_MAX_BYTES = Math.max(16 * 1024, Math.min(
 ));
 const D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION = 1;
 const D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION = 3;
+const D2_IMPORT_DETERMINISTIC_SPEC_REVISION = 2;
 const ASSISTANT_DIAGRAM_MAPPING_CHECKPOINT_VERSION = 3;
 const ASSISTANT_PROMPT_CONTRACT_VERSION = 4;
 const ASSISTANT_EDITOR_DELTA_VERSION = 1;
@@ -1479,6 +1480,7 @@ function normalizeD2AnalysisCheckpoint(value) {
     version: D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION,
     proposalId: truncateText(String(value.proposalId || ''), 128),
     deterministicSpecHash: truncateText(String(value.deterministicSpecHash || ''), 128),
+    ...(Number.isSafeInteger(value.deterministicSpecRevision) ? { deterministicSpecRevision: value.deterministicSpecRevision } : {}),
     source: {
       hash: truncateText(String(source.hash || ''), 128),
       structureHash: truncateText(String(source.structureHash || ''), 128),
@@ -1525,6 +1527,7 @@ function normalizeD2AssistantCheckpoint(value) {
     version: D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION,
     proposalId: analysis.proposalId,
     deterministicSpecHash: analysis.deterministicSpecHash,
+    ...(analysis.deterministicSpecRevision !== undefined ? { deterministicSpecRevision: analysis.deterministicSpecRevision } : {}),
     source: analysis.source,
     roles: roles.map((role) => ({
       id: truncateText(String(role && role.id || ''), 256),
@@ -1719,17 +1722,21 @@ function executionSpecHash(spec) {
 
 function diagramImportDeterministicSpec(spec) {
   const next = executionTemplateSpec(spec);
-  // Diagram mapping is an output of D2 authoring, not an input to its own
-  // semantic identity. Only Object Flow, parameters and table contracts may
-  // invalidate an analyzed source or resumable mapping checkpoint.
+  // Diagrams are a D2 authoring output; outputMode only selects what to show.
   if (next.result && typeof next.result === 'object' && !Array.isArray(next.result)) {
     delete next.result.diagrams;
+    const presentation = next.result.presentation;
+    if (presentation && typeof presentation === 'object' && !Array.isArray(presentation)) {
+      delete presentation.outputMode;
+      if (!Object.keys(presentation).length) delete next.result.presentation;
+    }
+    if (!Object.keys(next.result).length) delete next.result;
   }
   return next;
 }
 
 function diagramImportDeterministicSpecHash(spec) {
-  return hashJson(diagramImportDeterministicSpec(spec));
+  return hashJson({ revision: D2_IMPORT_DETERMINISTIC_SPEC_REVISION, spec: diagramImportDeterministicSpec(spec) });
 }
 
 const d2SourceStructureCache = new Map();
@@ -4757,6 +4764,7 @@ function createDiagramImportProposal(currentSpec, ir, options = {}) {
     templateCode: String(options.templateCode || '').trim(),
     baseSpecHash: String(options.baseSpecHash || '').trim(),
     deterministicSpecHash: diagramImportDeterministicSpecHash(sourceSpec),
+    deterministicSpecRevision: D2_IMPORT_DETERMINISTIC_SPEC_REVISION,
     source: ir.source,
     sourceText: String(options.sourceText || ''),
     template: ir.template,
@@ -5127,6 +5135,13 @@ function assertDiagramImportProposal(proposal, authToken) {
   if (!isSpecHash(String(proposal.deterministicSpecHash || ''))) {
     const error = new Error('D2 import proposal has no deterministic template revision. Analyze the D2 source again.');
     error.code = 'diagram_import_deterministic_revision_missing';
+    error.statusCode = 409;
+    throw error;
+  }
+  if (proposal.deterministicSpecRevision !== D2_IMPORT_DETERMINISTIC_SPEC_REVISION ||
+    proposal.semanticModelRevision !== D2_IMPORT_SEMANTIC_MODEL_REVISION) {
+    const error = new Error('D2 import proposal revision is no longer supported. Analyze the D2 source again.');
+    error.code = 'diagram_import_proposal_version';
     error.statusCode = 409;
     throw error;
   }
@@ -7789,7 +7804,7 @@ function rebaseStoredD2AnalysisCheckpoint(spec) {
     ? authoring.d2
     : null;
   const checkpoint = d2 && normalizeD2AnalysisCheckpoint(d2.analysisCheckpoint);
-  if (!checkpoint) return;
+  if (!checkpoint || checkpoint.deterministicSpecRevision !== D2_IMPORT_DETERMINISTIC_SPEC_REVISION) return;
   const sourceHash = String(d2.sourceHash || (d2.source ? sha256Hex(String(d2.source)) : '') || '');
   const imported = diagramImportForSpec(spec);
   const diagram = imported && imported.diagram;
@@ -7811,6 +7826,7 @@ function rebaseStoredD2AnalysisCheckpoint(spec) {
   if (!rebasedCheckpoint) return;
   const assistantCheckpoint = normalizeD2AssistantCheckpoint(d2.assistantCheckpoint);
   const assistantCheckpointMatchesMapping = assistantCheckpoint &&
+    assistantCheckpoint.deterministicSpecRevision === D2_IMPORT_DETERMINISTIC_SPEC_REVISION &&
     String(assistantCheckpoint.source && assistantCheckpoint.source.hash || '') === sourceHash &&
     String(assistantCheckpoint.source && assistantCheckpoint.source.structureHash || '') === String(mapping.structureHash || '') &&
     String(assistantCheckpoint.source && assistantCheckpoint.source.mappingContractHash || '') === String(mapping.mappingContractHash || '');
@@ -8153,6 +8169,12 @@ async function restoreD2AnalysisCheckpoint(source, currentSpec, checkpoint, opti
     error.statusCode = 409;
     throw error;
   }
+  if (restoredCheckpoint.deterministicSpecRevision !== D2_IMPORT_DETERMINISTIC_SPEC_REVISION) {
+    const error = new Error('Saved D2 analysis uses an unsupported revision. Analyze the current D2 source again.');
+    error.code = 'd2_import_analysis_checkpoint_revision';
+    error.statusCode = 409;
+    throw error;
+  }
   const currentSource = String(source || '');
   const currentSourceHash = sha256Hex(currentSource);
   const currentSpecHash = diagramImportDeterministicSpecHash(currentSpec || {});
@@ -8208,7 +8230,8 @@ function restoreD2AssistantCheckpointOverlay(restoredAnalysis, currentSpec, chec
     error.code = 'd2_import_assistant_checkpoint_analysis_missing';
     throw error;
   }
-  if (restoredCheckpoint.deterministicSpecHash !== String(proposal.deterministicSpecHash || '') ||
+  if (restoredCheckpoint.deterministicSpecRevision !== D2_IMPORT_DETERMINISTIC_SPEC_REVISION ||
+    restoredCheckpoint.deterministicSpecHash !== String(proposal.deterministicSpecHash || '') ||
     restoredCheckpoint.source.hash !== String(proposal.source && proposal.source.hash || '') ||
     restoredCheckpoint.source.structureHash !== String(proposal.source && proposal.source.structureHash || '') ||
     restoredCheckpoint.source.mappingContractHash !== String(proposal.source && proposal.source.mappingContractHash || '')) {
@@ -10040,6 +10063,7 @@ function dynamicPagesClientScript() {
   var D2_IMPORT_STRUCTURE_TREE_VERSION = ${JSON.stringify(D2_IMPORT_STRUCTURE_TREE_VERSION)};
   var D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION = ${JSON.stringify(D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION)};
   var D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION = ${JSON.stringify(D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION)};
+  var D2_IMPORT_DETERMINISTIC_SPEC_REVISION = ${JSON.stringify(D2_IMPORT_DETERMINISTIC_SPEC_REVISION)};
   function clientLog(stage, message) {
     try {
       var img = new Image();
@@ -10360,6 +10384,9 @@ function dynamicPagesClientScript() {
       multiSelectSearch: 'Search options',
       multiSelectNoMatches: 'No matching options.',
       fieldPickerNoMatches: 'No matching fields.',
+      viewColumnAttributes: 'Attributes',
+      viewColumnRelatedFields: 'Related fields',
+      viewColumnMetadataIncomplete: 'Some field metadata is unavailable. Check the catalog and try again.',
       fieldPickerPrompt: 'Enter at least 1 character to search.',
       fieldPickerChoose: 'Choose field',
       fieldPickerAdd: 'Add field',
@@ -10855,7 +10882,7 @@ function dynamicPagesClientScript() {
       diagramImportPendingProposalPriority: 'The current reviewed D2 proposal is shown here. Applying it replaces the saved mapping; the saved mapping is not an editable fallback.',
       diagramImportReadinessProposalMissing: 'No current reviewed D2 proposal is available.',
       diagramImportReadinessSemanticRevision: 'The D2 proposal uses an unsupported semantic model revision. Analyze the current source again.',
-      diagramImportReadinessRevisionChanged: 'The reviewed D2 proposal no longer matches the deterministic template configuration. Assistant prompt changes do not require another analysis.',
+      diagramImportReadinessRevisionChanged: 'The reviewed D2 proposal no longer matches the current analysis revision. Analyze the D2 source again.',
       diagramImportReadinessUnresolved: 'Complete the unresolved D2 mapping fields.',
       diagramImportReadinessLabelTemplates: 'Fix the highlighted composite label templates.',
       diagramImportRenderFailed: 'Designer could not display the D2 analysis result. Refresh Designer and analyze the source again.',
@@ -11165,13 +11192,17 @@ function dynamicPagesClientScript() {
       viewLargeAdvancedFields: 'Option and matching fields',
       viewLargeSimpleField: 'Filter by column',
       viewLargeSimpleFieldHelp: 'The list contains distinct, non-empty values from one column of this result. Choose a field with one value per row. It does not need to be a visible table column.',
+      viewLargeCurrentSource: 'Current source: {source}',
+      viewLargeNoCurrentSource: 'No current source is available.',
+      viewLargeTechnicalFields: 'Technical fields',
       viewLargeFieldsLoading: 'Loading source fields…',
       viewLargeFieldsError: 'Could not load source fields.',
+      viewLargeFieldsPartial: 'Some projected fields could not be loaded.',
       viewLargeFieldPending: 'Saved filter field: {field}.',
       viewLargeFieldsRetry: 'Retry',
       viewLargeFieldsEmpty: 'No single-value fields are available. Add one to the source result.',
       viewLargeFieldsDynamic: 'Some fields cannot be listed because the source class is only known at execution time.',
-      viewLargeFieldUnavailable: 'The saved filter field {field} is not available. Select another field.',
+      viewLargeFieldUnavailable: 'The saved filter field {field} is not available. This filter requires a readable, single-value field in the current source.',
       viewLargeSourceKind: 'Option source type',
       viewLargeSourceKindHelp: 'Use a confirmed flow result to keep the flow’s selection rules. A CMDBuild class is read separately and can include objects with no matching report rows.',
       viewLargeClass: 'CMDBuild class',
@@ -11907,6 +11938,9 @@ function dynamicPagesClientScript() {
       multiSelectSearch: 'Поиск вариантов',
       multiSelectNoMatches: 'Подходящих вариантов нет.',
       fieldPickerNoMatches: 'Подходящих полей нет.',
+      viewColumnAttributes: 'Атрибуты',
+      viewColumnRelatedFields: 'Поля по связям',
+      viewColumnMetadataIncomplete: 'Метаданные части полей недоступны. Проверьте каталог и повторите поиск.',
       fieldPickerPrompt: 'Введите минимум 1 символ для поиска.',
       fieldPickerChoose: 'Выберите поле',
       fieldPickerAdd: 'Добавить поле',
@@ -12402,7 +12436,7 @@ function dynamicPagesClientScript() {
       diagramImportPendingProposalPriority: 'Здесь показан текущий проверенный D2 proposal. Его применение заменит сохраненный mapping; сохраненный mapping не является редактируемым запасным вариантом.',
       diagramImportReadinessProposalMissing: 'Нет актуального проверенного D2 proposal.',
       diagramImportReadinessSemanticRevision: 'D2 proposal использует неподдерживаемую ревизию семантической модели. Повторно проанализируйте текущий source.',
-      diagramImportReadinessRevisionChanged: 'Проверенный D2 proposal больше не соответствует детерминированной схеме шаблона. Изменения prompts Assistant не требуют нового анализа.',
+      diagramImportReadinessRevisionChanged: 'Проверенное предложение D2 не соответствует текущей ревизии анализа. Выполните анализ исходника D2 повторно.',
       diagramImportReadinessUnresolved: 'Заполните незавершенные поля D2 mapping.',
       diagramImportReadinessLabelTemplates: 'Исправьте выделенные составные label template.',
       diagramImportRenderFailed: 'Дизайнер не смог отобразить результат анализа D2. Обновите Дизайнер и повторите анализ source.',
@@ -12712,13 +12746,17 @@ function dynamicPagesClientScript() {
       viewLargeAdvancedFields: 'Источник вариантов и сопоставление',
       viewLargeSimpleField: 'Фильтровать по колонке',
       viewLargeSimpleFieldHelp: 'В список попадут уникальные непустые значения одной колонки текущей выборки. Выберите поле с одним значением в каждой строке. Делать его видимой колонкой не нужно.',
+      viewLargeCurrentSource: 'Текущий источник: {source}',
+      viewLargeNoCurrentSource: 'Текущий источник недоступен.',
+      viewLargeTechnicalFields: 'Служебные колонки',
       viewLargeFieldsLoading: 'Загрузка полей источника…',
       viewLargeFieldsError: 'Не удалось загрузить поля источника.',
+      viewLargeFieldsPartial: 'Некоторые поля проекции не удалось загрузить.',
       viewLargeFieldPending: 'Сохранённое поле фильтра: {field}.',
       viewLargeFieldsRetry: 'Повторить',
       viewLargeFieldsEmpty: 'Нет доступных полей с одним значением. Добавьте такое поле в результат источника.',
       viewLargeFieldsDynamic: 'Часть полей недоступна для выбора: класс источника определяется только при выполнении.',
-      viewLargeFieldUnavailable: 'Сохранённое поле фильтра {field} недоступно. Выберите другое поле.',
+      viewLargeFieldUnavailable: 'Сохранённое поле фильтра {field} недоступно. Для фильтра нужно читаемое поле с одним значением из текущего источника.',
       viewLargeSourceKind: 'Тип источника вариантов',
       viewLargeSourceKindHelp: 'Результат потока сохраняет правила настроенной выборки. Класс CMDBuild читается отдельно: в список могут попасть объекты, для которых в таблице нет строк.',
       viewLargeClass: 'Класс CMDBuild',
@@ -13262,6 +13300,7 @@ function dynamicPagesClientScript() {
     diagramImportAssistantCheckpoint: null,
     diagramImportRestorePending: false,
     diagramImportRestoreError: '',
+    diagramImportRestoreRequiresAnalysis: false,
     diagramImportRestoreKind: '',
     diagramImportAssistantRestoreWarning: '',
     diagramImportProposal: null,
@@ -14454,7 +14493,7 @@ function dynamicPagesClientScript() {
       if (hasField('cmdp-diagram-import-source') || document.querySelector('[data-diagram-import-binding-row], [data-diagram-import-placement-mapping]')) {
         captureDiagramImportProposalFromDom();
       }
-      if (!state.diagramImportProposal && (hasField('cmdp-diagram-name') || document.querySelector('[data-diagram-mapping-row]'))) {
+      if (document.querySelector('#cmdp-visualization-editor[data-visualization-edited], #cmdp-diagram-editor[data-diagram-fields-edited]')) {
         updateSelectedFromEditor(applyVisualizationToSpec(state.selectedTemplate.spec || defaultSpec(), false));
       }
       if (hasField('cmdp-publish-mode')) {
@@ -14686,6 +14725,7 @@ function dynamicPagesClientScript() {
       version: D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION,
       proposalId: String(proposal.proposalId || ''),
       deterministicSpecHash: String(proposal.deterministicSpecHash || ''),
+      deterministicSpecRevision: proposal.deterministicSpecRevision,
       source: {
         hash: String(proposal.source && proposal.source.hash || ''),
         structureHash: String(proposal.source && proposal.source.structureHash || ''),
@@ -14717,6 +14757,7 @@ function dynamicPagesClientScript() {
       version: D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION,
       proposalId: String(proposal.proposalId || ''),
       deterministicSpecHash: String(proposal.deterministicSpecHash || ''),
+      deterministicSpecRevision: proposal.deterministicSpecRevision,
       source: {
         hash: String(proposal.source && proposal.source.hash || ''),
         structureHash: String(proposal.source && proposal.source.structureHash || ''),
@@ -15405,6 +15446,7 @@ function dynamicPagesClientScript() {
     state.diagramImportAssistantCheckpoint = cloneJsonValue(authoring.d2.assistantCheckpoint, null);
     state.diagramImportRestorePending = false;
     state.diagramImportRestoreError = '';
+    state.diagramImportRestoreRequiresAnalysis = false;
     state.diagramImportRestoreKind = '';
     state.diagramImportAssistantRestoreWarning = '';
     state.diagramImportProposal = null;
@@ -15455,6 +15497,19 @@ function dynamicPagesClientScript() {
   }
   document.addEventListener('input', invalidateUiDiagnosticRevision);
   document.addEventListener('change', invalidateUiDiagnosticRevision);
+
+  function markPresentationFieldsEdited(event) {
+    var field = event.target;
+    if (!field || !field.matches) return;
+    if (field.matches('[id^="cmdp-visual-"], [data-visualization-field], [data-visualization-link-field]')) {
+      field.closest('#cmdp-visualization-editor')?.setAttribute('data-visualization-edited', '');
+    }
+    if (field.matches('[data-diagram-editor-section="general"] input, [data-diagram-editor-section="general"] select, [data-diagram-mapping-field]')) {
+      field.closest('#cmdp-diagram-editor')?.setAttribute('data-diagram-fields-edited', '');
+    }
+  }
+  document.addEventListener('input', markPresentationFieldsEdited);
+  document.addEventListener('change', markPresentationFieldsEdited);
 
   function runUiOperation(action, callback) {
     state.uiDiagnosticGeneration = Number(state.uiDiagnosticGeneration || 0) + 1;
@@ -16139,13 +16194,13 @@ function dynamicPagesClientScript() {
     return base;
   }
 
-  function catalogScopePathOptions(className, searchQuery) {
+  function catalogScopePathOptions(className, searchQuery, forView) {
     var startedAt = performance.now();
     var maxDepth = Math.max(1, Math.min(5, Number(state.maxTraversalDepth) || 1));
     var maxOptions = Math.max(100, Math.min(50000, Number(state.maxCatalogPathCandidates) || 5000));
     var rootName = String(className || '').trim();
     var query = String(searchQuery || '').trim().toLowerCase();
-    var queryMode = Boolean(query);
+    var queryMode = Boolean(query) || forView === true;
     // Searching must not build the complete configured catalog before applying
     // the filter. The absolute scan cap keeps a depth-five graph responsive;
     // its hit is surfaced in the picker as an incomplete result.
@@ -16156,22 +16211,34 @@ function dynamicPagesClientScript() {
     var traversalDepth = queryMode ? maxDepth : 0;
     var resultLimit = queryMode ? 60 : Math.min(maxOptions, 250);
     var cache = state.catalogScopePathOptionsCache || (state.catalogScopePathOptionsCache = {});
-    var cacheKey = [Number(state.catalogRevision || 0), maxDepth, rootName.toLowerCase(), query].join(':');
+    var cacheKey = [Number(state.catalogRevision || 0), maxDepth, rootName.toLowerCase(), query, Boolean(forView)].join(':');
     if (Object.prototype.hasOwnProperty.call(cache, cacheKey)) return cache[cacheKey];
     var result = [];
     var seen = {};
     var scanned = 0;
+    var directCount = 0;
+    var relatedCount = 0;
 
-    function add(value, label, type, relation) {
+    function full() {
+      return forView ? directCount >= resultLimit && relatedCount >= resultLimit : result.length >= resultLimit;
+    }
+
+    function add(value, label, type, relation, related) {
       var text = String(value || '').trim();
-      if (!text || seen[text] || result.length >= resultLimit) return;
+      if (!text || seen[text] || full() || (forView && scanned >= searchCandidateLimit)) return;
       seen[text] = true;
       relation = relation || {};
       scanned += 1;
       if (queryMode && (String(label || '') + ' ' + text).toLowerCase().indexOf(query) === -1) return;
+      if (forView) {
+        if (related ? relatedCount >= resultLimit : directCount >= resultLimit) return;
+        if (related) relatedCount += 1;
+        else directCount += 1;
+      }
       result.push({
         value: text,
         label: label || text,
+        ...(forView ? { group: related ? 'viewColumnRelatedFields' : 'viewColumnAttributes' } : {}),
         type: type || '',
         domain: relation.domain || '',
         domainDescription: relation.domainDescription || '',
@@ -16185,12 +16252,18 @@ function dynamicPagesClientScript() {
 
     function addDirectAttributes(owner, prefix, displayPrefix, depth, relation) {
       if (!owner || depth > maxDepth) return;
-      catalogAttributeOptions(owner.name).forEach(function (attribute) {
+      var attributes = forView ? (owner.attributes || []) : catalogAttributeOptions(owner.name);
+      attributes.forEach(function (attribute) {
         if (!attribute || !attribute.name) return;
+        if (forView && (attribute.active === false || attribute.permissions?._can_read === false)) return;
         var path = prefix + attribute.name;
         var attributeLabel = attribute.description && attribute.description !== attribute.name
           ? attribute.description + ' (' + attribute.name + ')'
           : attribute.name;
+        if (forView) {
+          add(path, (prefix && displayPrefix ? displayPrefix + ' -> ' : '') + attributeLabel, attribute.type, relation, Boolean(prefix));
+          return;
+        }
         var label = (displayPrefix ? displayPrefix + ' -> ' : '') + attributeLabel + ' [' + path + ']';
         if (attribute.type) label += ' : ' + attribute.type;
         if (relation && relation.domain) {
@@ -16210,22 +16283,33 @@ function dynamicPagesClientScript() {
     var queue = root ? [{
       owner: root,
       prefix: '',
-      displayPrefix: String(root.description || root.name || rootName || ''),
+      displayPrefix: forView ? '' : String(root.description || root.name || rootName || ''),
       depth: 0,
       traversedHops: {},
       relation: null
     }] : [];
+    var visitedBranches = 0;
+    var branchLimitHit = false;
+    function enqueue(node) {
+      if (forView && queue.length + visitedBranches >= searchCandidateLimit) {
+        branchLimitHit = true;
+        return;
+      }
+      queue.push(node);
+    }
     // Breadth-first traversal keeps direct domain transitions available even when
     // an unrelated reference branch has a large number of descendant classes.
-    while (queue.length && result.length < resultLimit && (!queryMode || scanned < searchCandidateLimit)) {
+    while (queue.length && !full() && (!queryMode || scanned < searchCandidateLimit)) {
       var current = queue.shift();
+      visitedBranches += 1;
       var owner = current.owner;
       if (!owner || current.depth > traversalDepth) continue;
       addDirectAttributes(owner, current.prefix, current.displayPrefix, current.depth, current.relation);
-      if (current.depth >= traversalDepth || result.length >= resultLimit || (queryMode && scanned >= searchCandidateLimit)) continue;
+      if (current.depth >= traversalDepth || full() || (queryMode && scanned >= searchCandidateLimit)) continue;
 
       (owner.attributes || []).forEach(function (attribute) {
         if (!isReferenceAttribute(attribute)) return;
+        if (forView && (attribute.active === false || attribute.permissions?._can_read === false)) return;
         var targetClass = attribute.targetClass || attribute.targetType || '';
         var target = catalogClassByName(targetClass);
         if (!target) return;
@@ -16233,10 +16317,10 @@ function dynamicPagesClientScript() {
         if (current.traversedHops && current.traversedHops[referenceHop]) return;
         var nextReferenceHops = Object.assign({}, current.traversedHops || {});
         nextReferenceHops[referenceHop] = true;
-        queue.push({
+        enqueue({
           owner: target,
           prefix: current.prefix + attribute.name + '.',
-          displayPrefix: current.displayPrefix + ' -> ' + String(target.description || target.name || targetClass),
+          displayPrefix: [current.displayPrefix, forView ? (attribute.description || attribute.name) : (target.description || target.name || targetClass)].filter(Boolean).join(' -> '),
           depth: current.depth + 1,
           traversedHops: nextReferenceHops,
           relation: current.relation
@@ -16244,6 +16328,7 @@ function dynamicPagesClientScript() {
       });
 
       catalogDomains().forEach(function (domain) {
+        if (forView && (domain.active === false || domain.permissions?._can_read === false)) return;
         cachedDomainRelatedClasses(domain, owner.name).forEach(function (relatedClass) {
           var target = catalogClassByName(relatedClass);
           if (!target) return;
@@ -16252,10 +16337,10 @@ function dynamicPagesClientScript() {
           if (current.traversedHops && current.traversedHops[domainHop]) return;
           var nextDomainHops = Object.assign({}, current.traversedHops || {});
           nextDomainHops[domainHop] = true;
-          queue.push({
+          enqueue({
             owner: target,
             prefix: current.prefix + '{' + domain.name + ':' + relatedClass + '}.',
-            displayPrefix: current.displayPrefix + ' -> ' + String(target.description || target.name || relatedClass),
+            displayPrefix: [current.displayPrefix, forView ? (domain.description || domain.name) : (target.description || target.name || relatedClass)].filter(Boolean).join(' -> '),
             depth: current.depth + 1,
             traversedHops: nextDomainHops,
             relation: {
@@ -16271,7 +16356,8 @@ function dynamicPagesClientScript() {
         });
       });
     }
-    result.limitReached = queue.length > 0 || (queryMode && (scanned >= searchCandidateLimit || result.length >= resultLimit));
+    result.limitReached = queue.length > 0 || branchLimitHit || (queryMode && (scanned >= searchCandidateLimit || (forView
+      ? directCount >= resultLimit || relatedCount >= resultLimit : full())));
     result.configuredLimit = maxOptions;
     result.searchQuery = query;
     result.searchCandidateLimit = queryMode ? searchCandidateLimit : 0;
@@ -17651,20 +17737,39 @@ function dynamicPagesClientScript() {
   }
 
   function renderCatalogFieldPickerRows(options, selectedName, query) {
-    var matches = catalogFieldPickerMatches(options, selectedName, query);
+    var viewColumns = Boolean(options.viewColumns);
+    var matches = catalogFieldPickerMatches(options, selectedName, viewColumns ? '' : query);
     var visible = matches.slice(0, 60);
-    if (!visible.length) return '<div class="catalog-field-picker-empty">' + escapeHtml(t('fieldPickerNoMatches')) + '</div>';
+    var groups = [];
+    if (viewColumns) {
+      var direct = matches.filter(function (item) { return item.group === 'viewColumnAttributes'; });
+      var related = matches.filter(function (item) { return item.group === 'viewColumnRelatedFields'; });
+      groups = [
+        { name: 'viewColumnAttributes', fields: direct.slice(0, 60 - Math.min(30, related.length)) },
+        { name: 'viewColumnRelatedFields', fields: related.slice(0, 60 - Math.min(30, direct.length)) }
+      ];
+      visible = groups.flatMap(function (group) { return group.fields; });
+    }
     var summaryParts = [];
+    if (options.metadataIncomplete) summaryParts.push(t('viewColumnMetadataIncomplete'));
     if (matches.length > visible.length) summaryParts.push(t('fieldPickerFoundSummary', { found: matches.length, visible: visible.length }));
     if (matches.searchTruncated) summaryParts.push(t('fieldPickerSearchTruncated', { limit: matches.searchCandidateLimit || 0 }));
     else if (matches.limitReached) summaryParts.push(t('fieldPickerCatalogLimit', { limit: matches.configuredLimit || options && options.length || 0 }));
     var summary = summaryParts.length ? '<div class="catalog-field-picker-summary">' + escapeHtml(summaryParts.join(' ')) + '</div>' : '';
-    return summary + visible.map(function (item, index) {
+    function row(item, index) {
       var value = String(item && item.value || '');
       return '<button type="button" role="option" data-action="catalog-field-picker-select" data-catalog-field-picker-value="' + escapeHtml(value) + '"' +
         (Array.isArray(item && item.path) ? ' data-catalog-field-picker-path="' + escapeHtml(JSON.stringify(item.path)) + '"' : '') +
         (value === String(selectedName || '') ? ' aria-selected="true"' : '') + ' data-catalog-field-picker-index="' + escapeHtml(String(index)) + '"><span>' +
         escapeHtml(String(item && item.label || value)) + '</span><span class="catalog-field-picker-path">' + escapeHtml(value) + '</span></button>';
+    }
+    if (!visible.length) return summary + '<div class="catalog-field-picker-empty">' + escapeHtml(t('fieldPickerNoMatches')) + '</div>';
+    if (!viewColumns) return summary + visible.map(row).join('');
+    var index = 0;
+    return summary + groups.filter(function (group) { return group.fields.length; }).map(function (group) {
+      var groupLabel = escapeHtml(t(group.name));
+      return '<div role="group" aria-label="' + groupLabel + '"><div class="catalog-field-picker-summary" aria-hidden="true">' + groupLabel + '</div>' +
+        group.fields.map(function (item) { return row(item, index++); }).join('') + '</div>';
     }).join('');
   }
 
@@ -17775,6 +17880,83 @@ function dynamicPagesClientScript() {
       }).join('') + '</div></div></div>';
   }
 
+  function viewColumnQueryText(value) {
+    return String(value || '').trim().toLowerCase().replace(/(выборка|selection)[ ]+(?=[0-9])/g, '$1');
+  }
+
+  function viewColumnSearchContext(spec, alias, query) {
+    var steps = new Map((spec.steps || []).filter(Boolean).map(function (step) { return [step.as, step]; }));
+    var selectionRows = objectSelectionsFromModel(inferObjectGroupModel(spec));
+    var visited = new Set();
+    var sources = [];
+    function source(name, classes) {
+      var label = userFacingResultLabel(name, spec) || name;
+      var index = objectSelectionIndexFromList(selectionRows, name);
+      return { alias: name, label: label, classes: classes, qualifiers: uniqueList([
+        name, label, index >= 0 ? objectSelectionDisplayName(index) : ''
+      ]).map(viewColumnQueryText) };
+    }
+    function visit(name) {
+      if (!name || visited.has(name)) return;
+      visited.add(name);
+      var step = steps.get(name);
+      if (!step) return;
+      if (step.type === 'selectCards' || step.type === 'expandRelations' && step.fetchRelated !== false) {
+        sources.push(source(name, viewLargeSelectionClassNames(spec, step)));
+      } else if (['filterRows', 'semiJoinRows', 'existsRelatedRows', 'intersectRows', 'differenceRows', 'unionRows', 'enrichRows', 'matchRows', 'joinRows'].includes(step.type)) {
+        visit(step.from);
+        if (step.type === 'unionRows') visit(step.with);
+      }
+    }
+    visit(alias);
+    var output = source(alias, []);
+    var needle = viewColumnQueryText(query);
+    var qualifiers = [output].concat(sources).flatMap(function (item) {
+      return item.qualifiers.map(function (text) { return { text: text, alias: item.alias }; });
+    }).sort(function (left, right) { return right.text.length - left.text.length; });
+    var qualifier = qualifiers.find(function (item) { return needle === item.text || needle.startsWith(item.text + '.'); });
+    if (qualifier) needle = needle.slice(qualifier.text.length).replace(/^[.]/, '').trim();
+    var scopedAlias = qualifier && qualifier.alias !== alias ? qualifier.alias : '';
+    var scopedSources = scopedAlias ? sources.filter(function (item) { return item.alias === scopedAlias; }) : sources;
+    return { needle: needle, output: output, scopedAlias: scopedAlias, sources: scopedSources,
+      classNames: uniqueList(scopedSources.flatMap(function (item) { return item.classes; })
+        .concat(viewLargeFieldMetadata(spec, scopedAlias || alias).missing)) };
+  }
+
+  function viewColumnSearchOptions(spec, alias, query) {
+    var options = [];
+    options.viewColumns = true;
+    if (!String(query || '').trim() || !alias) return options;
+    var context = viewColumnSearchContext(spec, alias, query);
+    var seen = new Set();
+    var projected = reportClosedOutputFields(spec, alias);
+    var fields = viewLargeSourceFields(spec, alias);
+    var scopedFields = context.scopedAlias ? viewLargeSourceFields(spec, context.scopedAlias) : null;
+    function add(item, source, group) {
+      if (seen.has(item.value) || projected && !projected.has(item.value)) return;
+      seen.add(item.value);
+      options.push({ value: item.value, label: source.label ? source.label + ' / ' + item.label : item.label, group: group });
+    }
+    if (!projected) context.sources.forEach(function (source) {
+      source.classes.forEach(function (className) {
+        var paths = catalogScopePathOptions(className, context.needle, true);
+        options.limitReached = options.limitReached || paths.limitReached;
+        options.searchTruncated = options.searchTruncated || paths.searchTruncated;
+        options.searchCandidateLimit = paths.searchCandidateLimit;
+        paths.forEach(function (item) { add(item, source, item.group); });
+      });
+    });
+    fields.forEach(function (item) {
+      if (scopedFields && !scopedFields.has(item.value)) return;
+      if (context.needle && !viewColumnQueryText(item.label + ' ' + item.value).includes(context.needle)) return;
+      add(item, context.sources.length === 1 ? context.sources[0] : context.output, 'viewColumnAttributes');
+    });
+    options.metadataIncomplete = context.classNames.some(function (name) {
+      return state.catalogAttributeLoaded[catalogAttributeLoadKey(name)] !== true;
+    });
+    return options;
+  }
+
   function catalogFieldPickerOptions(picker, query) {
     if (!picker) return [];
     var kind = String(picker.getAttribute('data-catalog-field-picker-kind') || '').trim();
@@ -17797,7 +17979,10 @@ function dynamicPagesClientScript() {
       var sourceAlias = String(groupSelection && groupSelection.querySelector('[data-object-selection-field="from"]') && groupSelection.querySelector('[data-object-selection-field="from"]').value || '').trim();
       return objectGroupSourceColumnOptions(groupSelections, groupSelectionIndex, sourceAlias, query, readCurrentSpec());
     }
-    if (kind === 'diagram' || kind === 'view') {
+    if (kind === 'view') {
+      return viewColumnSearchOptions(readCurrentSpec(), picker.getAttribute('data-catalog-field-picker-source') || '', query);
+    }
+    if (kind === 'diagram') {
       return diagramColumnOptionRowsForSource(readCurrentSpec(), picker.getAttribute('data-catalog-field-picker-source') || '', query);
     }
     if (kind === 'selection') {
@@ -17837,7 +18022,7 @@ function dynamicPagesClientScript() {
     return flowColumnOptionRows(model, readCurrentSpec(), sourceAlias, operationIndex, {}, true, query);
   }
 
-  function catalogFieldPickerClassNames(picker) {
+  function catalogFieldPickerClassNames(picker, query) {
     if (!picker) return [];
     var kind = String(picker.getAttribute('data-catalog-field-picker-kind') || '').trim();
     var classes = [];
@@ -17853,7 +18038,9 @@ function dynamicPagesClientScript() {
       var draft = captureObjectGroupDraftFromDom();
       var sourceAlias = String(selection && selection.querySelector('[data-object-selection-field="from"]') && selection.querySelector('[data-object-selection-field="from"]').value || '').trim();
       flowCatalogRootClassNames(draft, readCurrentSpec(), sourceAlias, selectionIndex).forEach(add);
-    } else if (kind === 'diagram' || kind === 'view' || kind === 'selection' || kind === 'viewLargeMatch' || kind === 'viewLargeResult') {
+    } else if (kind === 'view') {
+      return viewColumnSearchContext(readCurrentSpec(), picker.getAttribute('data-catalog-field-picker-source') || '', query).classNames;
+    } else if (kind === 'diagram' || kind === 'selection' || kind === 'viewLargeMatch' || kind === 'viewLargeResult') {
       add(sourceClassForAlias(readCurrentSpec(), picker.getAttribute('data-catalog-field-picker-source') || ''));
     } else if (kind === 'stage') {
       var stageSpec = state.selectedTemplate && state.selectedTemplate.spec || defaultSpec();
@@ -17872,7 +18059,7 @@ function dynamicPagesClientScript() {
 
   function ensureCatalogFieldPickerSearchAttributes(picker, query) {
     if (!String(query || '').trim()) return Promise.resolve(false);
-    var classes = catalogFieldPickerClassNames(picker);
+    var classes = catalogFieldPickerClassNames(picker, query);
     if (!classes.length) return Promise.resolve(false);
     return Promise.all(classes.map(ensureCatalogAttributesForClass)).then(function (results) {
       return results.some(function (result) { return result === true || result === 'failed'; });
@@ -17972,7 +18159,7 @@ function dynamicPagesClientScript() {
       results.innerHTML = renderCatalogFieldPickerPrompt();
       return;
     }
-    var classes = catalogFieldPickerClassNames(picker);
+    var classes = catalogFieldPickerClassNames(picker, query);
     var needsLoad = classes.some(function (className) {
       var key = catalogAttributeLoadKey(className);
       var failedAt = Number(state.catalogAttributeFailedAt[key] || 0);
@@ -17981,7 +18168,7 @@ function dynamicPagesClientScript() {
     if (needsLoad) {
       results.innerHTML = '<div class="catalog-field-picker-empty">' + escapeHtml(t('fieldPickerLoading')) + '</div>';
       ensureCatalogFieldPickerSearchAttributes(picker, query).then(function () {
-        if (input.value === query && document.contains(input)) refreshCatalogFieldPickerResults(input);
+        if (input.value.trim() === query && document.contains(input)) refreshCatalogFieldPickerResults(input);
       });
       return;
     }
@@ -21862,6 +22049,20 @@ function dynamicPagesClientScript() {
     return '<div class="segmented-control" role="radiogroup" aria-label="' + escapeHtml(t('visualizationOutputMode')) + '">' + items.map(function (item) {
       return '<label><input type="radio" name="cmdp-output-mode" value="' + item[0] + '"' + (item[0] === mode ? ' checked' : '') + '> ' + escapeHtml(item[1]) + '</label>';
     }).join('') + '</div>';
+  }
+
+  function setDesignerOutputMode(value) {
+    var selected = state.selectedTemplate;
+    if (!selected) return;
+    var mode = normalizeOutputMode(value);
+    var result = selected.spec && selected.spec.result;
+    state.selectedTemplate = Object.assign({}, selected, { spec: Object.assign({}, selected.spec, {
+      result: Object.assign({}, result, { presentation: Object.assign({}, result && result.presentation, { outputMode: mode }) })
+    }) });
+    state.result = null;
+    state.lastDraftPreviewOk = false;
+    var tables = document.getElementById('cmdp-visualization-tables');
+    if (tables) tables.hidden = mode === 'diagrams';
   }
 
   function firstDiagramSpec(spec) {
@@ -26276,58 +26477,130 @@ function dynamicPagesClientScript() {
   }
 
   function viewLargeSourceFields(spec, sourceAlias) {
+    return viewLargeMaterializedFields(spec, sourceAlias);
+  }
+
+  function viewLargeMaterializedFields(spec, sourceAlias, missing) {
     var steps = new Map((spec.steps || []).filter(Boolean).map(function (step) { return [step.as, step]; }));
     var fieldsByAlias = new Map();
+    var classesByAlias = new Map();
+    var cardFieldsByAlias = new Map();
+    var composedAliases = new Set();
+    var attributesByClass = new Map();
     var standard = ['Class', '_id', 'Code', 'Description'];
-    function pathIsMultiple(path, className) {
-      return path.split('.').some(function (part) {
-        if (!className) return false;
-        var domain = /^\{[^:}]+:([^}]+)\}$/.exec(part);
-        if (domain) {
-          className = domain[1];
-          return false;
-        }
-        var attribute = catalogAttributeOptions(className).find(function (item) { return item.name === part; });
-        className = attribute && (attribute.targetClass || attribute.targetType) || '';
-        return viewLargeAttributeIsMultiple(attribute);
-      });
+    function attributesFor(className) {
+      var key = catalogAttributeLoadKey(className);
+      if (!attributesByClass.has(key)) {
+        var owner = catalogClassByName(className);
+        var attributes = new Map(catalogAttributeOptions(className).map(function (item) { return [item.name, item]; }));
+        // The generic catalog options supply built-ins before class-specific metadata.
+        (owner && owner.attributes || []).forEach(function (item) {
+          if (item && item.name) attributes.set(item.name, item);
+        });
+        attributesByClass.set(key, attributes);
+      }
+      return attributesByClass.get(key);
+    }
+    function readable(attribute) {
+      return attribute && attribute.active !== false && (!attribute.permissions || attribute.permissions._can_read !== false);
+    }
+    function nonScalar(attribute) {
+      return viewLargeAttributeIsMultiple(attribute) || /^(jsonb?|object|geometry|geopoint|geoline|geopolygon)$/i.test(attribute.type);
+    }
+    function standardAttribute(className, field) {
+      return attributesFor(className).get(field) || { name: field };
+    }
+    function pathField(path, className, multiple) {
+      if (!className) return null;
+      var key = catalogAttributeLoadKey(className);
+      if (state.catalogAttributeLoaded[key] !== true) {
+        if (missing) missing.add(className);
+        return null;
+      }
+      var domain = /^\{[^:}]+:([^}]+)\}(?:\.(.*))?$/.exec(path);
+      if (domain) return pathField(domain[2] || 'Code', domain[1], true);
+      var dot = path.indexOf('.');
+      var name = dot === -1 ? path : path.slice(0, dot);
+      var attribute = standard.includes(name) ? standardAttribute(className, name) : attributesFor(className).get(name);
+      if (!readable(attribute)) return null;
+      multiple = multiple || nonScalar(attribute);
+      return dot === -1 ? { label: attribute.description || name, multiple: multiple }
+        : pathField(path.slice(dot + 1), attribute.targetClass || attribute.targetType, multiple);
+    }
+    function copiedCardField(alias, field, records) {
+      var origin = cardFieldsByAlias.get(alias)?.get(field);
+      if (!origin) return null;
+      // Separate row instances even when both sides read the same alias or class.
+      if (!records.has(origin.record)) records.set(origin.record, { classes: origin.record.classes });
+      return { part: origin.part, record: records.get(origin.record) };
     }
     function fieldsFor(alias) {
       if (fieldsByAlias.has(alias)) return fieldsByAlias.get(alias);
       var step = steps.get(alias);
       if (!step) return new Map();
       var fields = new Map();
+      var cardFields = new Map();
       fieldsByAlias.set(alias, fields);
-      function add(name, multiple, label) {
-        if (name) fields.set(name, { value: name, label: label || name, multiple: Boolean(multiple) });
+      cardFieldsByAlias.set(alias, cardFields);
+      function add(name, multiple, label, technical, cardField) {
+        if (!name) return;
+        fields.set(name, { value: name, label: label || name, multiple: Boolean(multiple), technical: Boolean(technical) });
+        if (cardField && !multiple) cardFields.set(name, cardField);
+        else cardFields.delete(name);
       }
       function project(columns, classes) {
+        // Enrichment reads the input row; selection applies projections in place.
+        var inputCardFields = step.type === 'enrichRows' ? new Map(cardFields) : cardFields;
         normalizePathColumnSpecs(columns).forEach(function (column) {
-          var origin = fields.get(column.path);
-          add(column.as, origin ? origin.multiple : classes.some(function (name) { return pathIsMultiple(column.path, name); }));
+          var origins = column.sourceCandidates.length ? column.sourceCandidates.map(function (candidate) {
+            if (!fields.has(candidate.classColumn) || !fields.has(candidate.idColumn)) return null;
+            var prefix = candidate.classColumn.endsWith('Class') ? candidate.classColumn.slice(0, -5) : '';
+            var path = column.path === candidate.idColumn ? '_id' : column.path === candidate.classColumn ? 'Class'
+              : prefix && column.path.startsWith(prefix) ? column.path.slice(prefix.length) : column.path;
+            return pathField(path, candidate.className);
+          }) : fields.has(column.path) ? [fields.get(column.path)] : classes.map(function (name) { return pathField(column.path, name); });
+          origins = origins.filter(Boolean);
+          if (!origins.length) {
+            cardFields.delete(column.as);
+            return;
+          }
+          var cardField = !column.sourceCandidates.length && !column.correlationKey && inputCardFields.get(column.path);
+          add(column.as, origins.some(function (origin) { return origin.multiple; }), origins[0].label, origins[0].technical, cardField);
         });
       }
       if (step.type === 'selectCards' || step.type === 'expandRelations') {
         var relation = step.type === 'expandRelations';
         var classes = viewLargeSelectionClassNames(spec, step);
+        var record = { classes: classes };
+        classesByAlias.set(alias, classes);
         if (relation) {
           ['SourceClass', 'SourceId', 'SourceCode', 'SourceDescription', 'Domain', 'RelationId', 'RelationDirection', 'RelationSourceSide',
-            'RelatedClass', 'RelatedId', 'RelatedReadStatus'].forEach(function (name) { add(name); });
+            'RelatedClass', 'RelatedId', 'RelatedReadStatus'].forEach(function (name) {
+            var part = name === 'RelatedClass' ? 'class' : name === 'RelatedId' ? 'id' : '';
+            add(name, false, name, true, part && { part: part, record: record });
+          });
         }
-        standard.forEach(function (name) { add(name); });
+        standard.forEach(function (name) {
+          var attributes = classes.map(function (className) { return standardAttribute(className, name); }).filter(readable);
+          if (classes.length && !attributes.length) return;
+          var part = name === 'Class' ? 'class' : name === '_id' ? 'id' : '';
+          add(name, attributes.some(nonScalar), attributes.length && attributes[0].description, Boolean(part), part && { part: part, record: record });
+        });
         if (!relation) addAttributes();
         if (step.includeSource !== false && step.from) {
           var prefix = step.sourcePrefix === undefined ? 'Source_' : String(step.sourcePrefix);
+          var sourceRecords = new Map();
           fieldsFor(step.from).forEach(function (item, name) {
-            if (!relation || standard.indexOf(name) === -1) add(prefix + name, item.multiple);
+            if (!name.startsWith('__') && (!relation || !standard.includes(name))) {
+              add(prefix + name, item.multiple, item.label, item.technical, copiedCardField(step.from, name, sourceRecords));
+            }
           });
         }
         function addAttributes() {
           classes.forEach(function (name) {
-            catalogAttributeOptions(name).forEach(function (attribute) {
-              if (attribute.active !== false && (!attribute.permissions || attribute.permissions._can_read !== false) &&
-                  !attribute.name.startsWith('_') && standard.indexOf(attribute.name) === -1) {
-                add(attribute.name, (fields.get(attribute.name) || {}).multiple || viewLargeAttributeIsMultiple(attribute), attribute.description);
+            attributesFor(name).forEach(function (attribute) {
+              if (readable(attribute) && !attribute.name.startsWith('_') && !standard.includes(attribute.name)) {
+                add(attribute.name, (fields.get(attribute.name) || {}).multiple || nonScalar(attribute), attribute.description);
               }
             });
           });
@@ -26337,44 +26610,96 @@ function dynamicPagesClientScript() {
           return path.includes('.') || path.includes('{');
         }) : [].concat(step.columns || step.cardColumns || step.outputColumns || []), classes);
       } else if (step.type === 'composeRows' || step.type === 'compose') {
+        composedAliases.add(alias);
+        var rightAlias = composeRightAlias(step);
         var left = fieldsFor(step.from);
-        var right = fieldsFor(composeRightAlias(step));
+        var right = fieldsFor(rightAlias);
+        var leftRecords = new Map();
+        var rightRecords = new Map();
         normalizeComposeColumns(step).forEach(function (column) {
-          var origin = (column.source === 'right' ? right : left).get(column.column);
-          add(column.name, column.hasValue ? Array.isArray(column.value) : !column.valueParam && !column.template && origin && origin.multiple);
+          var fromRight = column.source === 'right';
+          var origin = (fromRight ? right : left).get(column.column);
+          if (column.valueParam || column.template) add(column.name);
+          else if (column.hasValue) add(column.name, column.value !== null && typeof column.value === 'object');
+          else if (origin) add(column.name, origin.multiple, origin.label, origin.technical,
+            copiedCardField(fromRight ? rightAlias : step.from, column.column, fromRight ? rightRecords : leftRecords));
+          else {
+            fields.delete(column.name);
+            cardFields.delete(column.name);
+          }
         });
       } else if (['filterRows', 'semiJoinRows', 'existsRelatedRows', 'intersectRows', 'differenceRows', 'unionRows', 'enrichRows', 'matchRows', 'joinRows'].includes(step.type)) {
         fieldsFor(step.from).forEach(function (item, name) { fields.set(name, item); });
-        if (step.type === 'unionRows') fieldsFor(step.with).forEach(function (item, name) {
-          var current = fields.get(name);
-          add(name, item.multiple || current && current.multiple, current && current.label || item.label);
-        });
+        (cardFieldsByAlias.get(step.from) || new Map()).forEach(function (origin, name) { cardFields.set(name, origin); });
+        if (composedAliases.has(step.from)) composedAliases.add(alias);
+        var rowClasses = classesByAlias.get(step.from) || [];
+        if (step.type === 'unionRows') {
+          var unionFields = fieldsFor(step.with);
+          var unionOrigins = cardFieldsByAlias.get(step.with);
+          var unionRecords = new Map();
+          cardFields.forEach(function (origin, name) { if (!unionOrigins?.has(name)) cardFields.delete(name); });
+          unionFields.forEach(function (item, name) {
+            var current = fields.get(name);
+            var leftOrigin = cardFields.get(name);
+            var rightOrigin = unionOrigins?.get(name);
+            var unionOrigin = null;
+            if (leftOrigin && rightOrigin && leftOrigin.part === rightOrigin.part) {
+              if (!unionRecords.has(leftOrigin.record)) unionRecords.set(leftOrigin.record, new Map());
+              var alternatives = unionRecords.get(leftOrigin.record);
+              if (!alternatives.has(rightOrigin.record)) alternatives.set(rightOrigin.record, {
+                classes: uniqueList(leftOrigin.record.classes.concat(rightOrigin.record.classes))
+              });
+              unionOrigin = { part: leftOrigin.part, record: alternatives.get(rightOrigin.record) };
+            }
+            add(name, item.multiple || current && current.multiple, current && current.label || item.label,
+              item.technical && (!current || current.technical), unionOrigin);
+          });
+          if (composedAliases.has(step.with)) composedAliases.add(alias);
+          rowClasses = uniqueList(rowClasses.concat(classesByAlias.get(step.with) || []));
+        }
+        classesByAlias.set(alias, rowClasses);
         if (step.type === 'matchRows' || step.type === 'joinRows') {
           var rightFields = fieldsFor(step.with);
-          var leftNames = Array.from(fields.keys());
-          var rightNames = Array.from(rightFields.keys());
+          if (composedAliases.has(step.with)) composedAliases.add(alias);
+          var leftNames = Array.from(reportClosedOutputFields(spec, step.from) || fields.keys());
+          var rightNames = Array.from(reportClosedOutputFields(spec, step.with) || rightFields.keys());
           var mapping;
           try {
             mapping = step.type === 'matchRows' ? buildMatchRowsColumnMapping(leftNames, rightNames, step)
               : buildRightColumnMapping(leftNames, rightNames, normalizeRowOperationKeys(step), step);
           } catch (_) {
             fields.clear();
+            cardFields.clear();
             return fields;
           }
+          var mappedRecords = new Map();
           mapping.mapping.forEach(function (item) {
             var origin = rightFields.get(item.source);
-            add(item.target, origin.multiple, item.target === item.source ? origin.label : item.target);
+            if (origin) add(item.target, origin.multiple, origin.label, origin.technical, copiedCardField(step.with, item.source, mappedRecords));
+            else cardFields.delete(item.target);
           });
         }
-        if (step.type === 'enrichRows') project(step.columns || step.fields, [sourceClassForAlias(spec, step.from)]);
+        if (step.type === 'enrichRows') {
+          var classColumn = step.classColumn || 'Class';
+          var idColumn = step.idColumn || '_id';
+          var classOrigin = cardFields.get(classColumn);
+          var idOrigin = cardFields.get(idColumn);
+          var provenPair = classOrigin?.part === 'class' && idOrigin?.part === 'id' && classOrigin.record === idOrigin.record;
+          var enrichClasses = composedAliases.has(alias) ? (provenPair ? classOrigin.record.classes : [])
+            : fields.has(classColumn) && fields.has(idColumn) ? rowClasses : [];
+          project(step.columns || step.fields, enrichClasses);
+        }
       }
       return fields;
     }
     return fieldsFor(sourceAlias);
   }
 
-  function viewLargeSourceFieldOptions(spec, sourceAlias) {
-    return viewLargeAdvancedResultFields(spec, sourceAlias, '').filter(function (item) { return !item.multiple; });
+  function viewLargeSourceFieldOptions(spec, sourceAlias, missing) {
+    var projection = reportClosedOutputFields(spec, sourceAlias);
+    return Array.from(viewLargeMaterializedFields(spec, sourceAlias, missing).values()).filter(function (item) {
+      return !item.multiple && (!projection || projection.has(item.value));
+    });
   }
 
   function viewLargeAdvancedResultFields(spec, alias, query, matching) {
@@ -26393,9 +26718,9 @@ function dynamicPagesClientScript() {
     return fields;
   }
 
-  function viewLargeSimpleFieldOptions(spec, sourceAlias) {
+  function viewLargeSimpleFieldOptions(spec, sourceAlias, missing) {
     return viewLargeResultOptions(spec).some(function (item) { return item.value === sourceAlias; })
-      ? viewLargeSourceFieldOptions(spec, sourceAlias) : [];
+      ? viewLargeSourceFieldOptions(spec, sourceAlias, missing) : [];
   }
 
   function viewLargeResultFieldAvailable(spec, alias, field, matching) {
@@ -26409,13 +26734,37 @@ function dynamicPagesClientScript() {
 
   function viewLargeSimpleFieldModel(spec, sourceAlias, selected) {
     var metadata = viewLargeFieldMetadata(spec, sourceAlias);
-    var options = viewLargeSimpleFieldOptions(spec, sourceAlias);
+    var missing = new Set(metadata.missing);
+    var roots = new Set(metadata.missing.map(catalogAttributeLoadKey));
+    var options = viewLargeSimpleFieldOptions(spec, sourceAlias, missing);
+    var failedPaths = [];
+    missing.forEach(function (name) {
+      var key = catalogAttributeLoadKey(name);
+      if (roots.has(key) || !(state.catalogAttributeFailedAt || {})[key]) return;
+      missing.delete(name);
+      failedPaths.push(name);
+    });
     var unavailable = selected && !options.some(function (item) { return item.value === selected; }) ? selected : '';
-    return { missing: metadata.missing, options: options, unavailable: unavailable, dynamic: metadata.dynamic };
+    return { missing: Array.from(missing), failedPaths: failedPaths, options: options, unavailable: unavailable, dynamic: metadata.dynamic };
   }
 
   function renderViewLargeSimpleFieldOptions(model, selected) {
-    return renderColumnSelectOptions(model.options, model.unavailable ? '' : selected);
+    function option(item) {
+      var label = item.label === item.value ? item.label : item.label + ' (' + item.value + ')';
+      return '<option value="' + escapeHtml(item.value) + '"' + (item.value === selected ? ' selected' : '') + '>' + escapeHtml(label) + '</option>';
+    }
+    var technical = model.options.filter(function (item) { return item.technical; }).map(option).join('');
+    return '<option value=""></option>' + model.options.filter(function (item) { return !item.technical; }).map(option).join('') +
+      (technical ? '<optgroup label="' + escapeHtml(t('viewLargeTechnicalFields')) + '">' + technical + '</optgroup>' : '');
+  }
+
+  function viewLargeSimpleFieldStatus(model, phase) {
+    if (phase) return t(phase === 'loading' ? 'viewLargeFieldsLoading' : 'viewLargeFieldsError') +
+      (model.unavailable ? ' ' + t('viewLargeFieldPending', { field: model.unavailable }) : '');
+    if (model.unavailable) return t('viewLargeFieldUnavailable', { field: model.unavailable });
+    if (model.failedPaths.length) return t('viewLargeFieldsPartial');
+    if (model.dynamic) return t('viewLargeFieldsDynamic');
+    return model.options.length ? '' : t('viewLargeFieldsEmpty');
   }
 
   function hydrateViewLargeSimpleFields(retry) {
@@ -26443,26 +26792,31 @@ function dynamicPagesClientScript() {
       var html = renderViewLargeSimpleFieldOptions(current, selected);
       if (input.innerHTML !== html) input.innerHTML = html;
       input.value = current.unavailable ? '' : selected;
-      status.textContent = phase ? t(phase === 'loading' ? 'viewLargeFieldsLoading' : 'viewLargeFieldsError') +
-        (current.unavailable ? ' ' + t('viewLargeFieldPending', { field: current.unavailable }) : '')
-        : current.unavailable ? t('viewLargeFieldUnavailable', { field: current.unavailable }) : current.dynamic ? t('viewLargeFieldsDynamic')
-          : !current.options.length ? t('viewLargeFieldsEmpty') : '';
-      retryButton.hidden = phase !== 'error';
+      status.textContent = viewLargeSimpleFieldStatus(current, phase);
+      retryButton.hidden = phase !== 'error' && (phase === 'loading' || !current.failedPaths.length);
     }
-    if (!model.missing.length) {
-      update(model, '');
-      return;
+    var attempted = new Set();
+    function load(current) {
+      var pending = current.missing.concat(retry ? current.failedPaths : []).filter(function (name) {
+        return !attempted.has(catalogAttributeLoadKey(name));
+      });
+      if (!pending.length) {
+        update(current, current.missing.length ? 'error' : '');
+        return;
+      }
+      update(current, 'loading');
+      Promise.all(pending.map(function (name) {
+        var key = catalogAttributeLoadKey(name);
+        attempted.add(key);
+        if (retry) delete state.catalogAttributeFailedAt[key];
+        return ensureCatalogAttributesForClass(name, true);
+      })).then(function () {
+        if (!input.isConnected || ticket !== input.viewLargeMetadataTicket || session !== state.session ||
+            !uiDiagnosticIsCurrent({ owner: owner }, false, true) || host.getAttribute('data-view-large-source') !== alias) return;
+        load(viewLargeSimpleFieldModel(readCurrentSpec(), alias, selectedField()));
+      });
     }
-    update(model, 'loading');
-    Promise.all(model.missing.map(function (name) {
-      if (retry) delete state.catalogAttributeFailedAt[catalogAttributeLoadKey(name)];
-      return ensureCatalogAttributesForClass(name, true);
-    })).then(function () {
-      if (!input.isConnected || ticket !== input.viewLargeMetadataTicket || session !== state.session ||
-          !uiDiagnosticIsCurrent({ owner: owner }, false, true) || host.getAttribute('data-view-large-source') !== alias) return;
-      var current = viewLargeSimpleFieldModel(readCurrentSpec(), alias, selectedField());
-      update(current, current.missing.length ? 'error' : '');
-    });
+    load(model);
   }
 
   function viewLargeSimpleSelector(sourceAlias, field) {
@@ -26493,8 +26847,9 @@ function dynamicPagesClientScript() {
       renderFieldHelp(id, label, help, true) + '</div>' + control + '</div>';
   }
 
-  function renderViewLargeSelect(id, label, attributes, options) {
-    return renderViewLargeField(id, label, '<select id="' + id + '" aria-describedby="' + id + '-help" ' + attributes + '>' + options + '</select>');
+  function renderViewLargeSelect(id, label, attributes, options, statusId) {
+    return renderViewLargeField(id, label, '<select id="' + id + '" aria-describedby="' + id + '-help' +
+      (statusId ? ' ' + statusId : '') + '" ' + attributes + '>' + options + '</select>');
   }
 
   function renderViewLargePicker(field, label, value, options, context) {
@@ -26530,12 +26885,15 @@ function dynamicPagesClientScript() {
     if (selectorMode === 'simple') {
       var field = selector.matchField || '';
       var model = viewLargeSimpleFieldModel(spec, sourceAlias, field);
-      return '<div class="settings-grid">' + renderViewLargeSelect('cmdp-view-large-simple-field', 'viewLargeSimpleField',
-        (model.missing.length || !model.options.length ? 'disabled ' : '') +
-        (model.unavailable ? 'data-view-large-saved-field="' + escapeHtml(model.unavailable) + '" ' : '') +
-        'aria-busy="' + (model.missing.length ? 'true' : 'false') + '"', renderViewLargeSimpleFieldOptions(model, field)) +
-        '</div><div class="muted" role="status" data-view-large-field-status>' +
-        (model.missing.length ? escapeHtml(t('viewLargeFieldsLoading')) : '') + '</div>' +
+      var source = viewLargeResultOptions(spec).find(function (item) { return item.value === sourceAlias; });
+      var statusId = 'cmdp-view-large-field-status';
+      return '<p class="muted" data-view-large-filter-source>' + escapeHtml(source ? t('viewLargeCurrentSource', { source: source.label }) : t('viewLargeNoCurrentSource')) + '</p>' +
+        '<div class="settings-grid">' + renderViewLargeSelect('cmdp-view-large-simple-field', 'viewLargeSimpleField',
+        'data-view-large-field="simpleField" ' + (model.missing.length || !model.options.length ? 'disabled ' : '') +
+        (model.unavailable ? 'data-view-large-saved-field="' + escapeHtml(model.unavailable) + '" ' + (model.missing.length ? '' : 'aria-invalid="true" ') : '') +
+        'aria-busy="' + (model.missing.length ? 'true' : 'false') + '"', renderViewLargeSimpleFieldOptions(model, field), statusId) +
+        '</div><div id="' + statusId + '" class="muted" role="status" data-view-large-field-status>' +
+        escapeHtml(viewLargeSimpleFieldStatus(model, model.missing.length ? 'loading' : '')) + '</div>' +
         '<button type="button" data-action="retry-view-large-fields" hidden>' + escapeHtml(t('viewLargeFieldsRetry')) + '</button>';
     }
     var kind = selector.kind === 'class' ? 'class' : 'result';
@@ -26621,7 +26979,7 @@ function dynamicPagesClientScript() {
       '<td>' + renderCatalogFieldPicker(
         'data-view-column-field="field"',
         column.field || '',
-        diagramInitialColumnOptionRowsForSource(spec, sourceAlias, column.field || ''),
+        [],
         { kind: 'view', source: sourceAlias }
       ) + '</td>',
       '<td><input data-view-column-field="title" value="' + escapeHtml(column.title || column.field || '') + '"></td>',
@@ -26757,7 +27115,7 @@ function dynamicPagesClientScript() {
       '<label class="checkbox checkbox-stacked"><input id="cmdp-visual-filters" type="checkbox" ' + (presentation.filters ? 'checked' : '') + '> <span><strong>' + t('visualizationRuntimeFilters') + '</strong><span class="muted">' + escapeHtml(t('visualizationRuntimeFiltersHelp')) + '</span></span></label>',
       '<label class="checkbox checkbox-stacked"><input id="cmdp-visual-sortable" type="checkbox" ' + (presentation.sortable ? 'checked' : '') + '> <span><strong>' + t('visualizationSortable') + '</strong></span></label>',
       '</div></div>',
-      outputMode === 'diagrams' ? '' : '<div class="settings-block"><h3>' + t('visualizationTables') + '</h3>' + (tables.length ? '<div class="visual-table-list" id="cmdp-visualization-rows">' + rows + '</div>' : '<div class="notice">' + t('visualizationNoTables') + '</div>') + '</div>',
+      '<div class="settings-block" id="cmdp-visualization-tables"' + (outputMode === 'diagrams' ? ' hidden' : '') + '><h3>' + t('visualizationTables') + '</h3>' + (tables.length ? '<div class="visual-table-list" id="cmdp-visualization-rows">' + rows + '</div>' : '<div class="notice">' + t('visualizationNoTables') + '</div>') + '</div>',
       renderDiagramImportPreviewWorkspace(spec),
       '</section>'
     ].join('');
@@ -26772,7 +27130,7 @@ function dynamicPagesClientScript() {
       '<p class="muted">' + t('diagramEditorHelp') + '</p>',
       '<div class="settings-block">',
       '<h3>' + t('visualizationOutputMode') + '</h3>',
-      renderOutputModeControl(outputMode === 'tables' ? 'both' : outputMode),
+      renderOutputModeControl(outputMode),
       '</div>',
       renderDiagramEditor(spec, outputMode, { force: true }),
       '</section>'
@@ -28340,15 +28698,14 @@ function dynamicPagesClientScript() {
 
   function readVisualizationSettings(required, currentSpec) {
     var currentPresentation = getPresentationModel(currentSpec || readCurrentSpec());
-    var hasGlobalFields = hasField('cmdp-visual-empty-text') || hasField('cmdp-visual-permission-denied-text') || hasField('cmdp-visual-font-size') || hasField('cmdp-visual-density');
     var rows = Array.prototype.slice.call(document.querySelectorAll('[data-visualization-row]'));
-    var outputField = document.querySelector('input[name="cmdp-output-mode"]:checked');
-    var hasDiagramFields = hasField('cmdp-diagram-name') || Boolean(document.querySelector('[data-diagram-mapping-row]'));
-    if (!hasGlobalFields && !rows.length && !hasDiagramFields && !outputField && !required) return null;
+    var hasDiagramFields = !state.diagramImportProposal && Boolean(document.querySelector('#cmdp-diagram-editor[data-diagram-fields-edited]'));
+    var hasVisualizationEdits = Boolean(document.querySelector('#cmdp-visualization-editor[data-visualization-edited]'));
+    if (!hasVisualizationEdits && !hasDiagramFields && !required) return null;
     var settings = {
       emptyText: hasField('cmdp-visual-empty-text') ? (String(readValue('cmdp-visual-empty-text') || '').trim() || DEFAULT_EMPTY_RESULT_TEXT) : currentPresentation.emptyText,
       permissionDeniedText: hasField('cmdp-visual-permission-denied-text') ? (String(readValue('cmdp-visual-permission-denied-text') || '').trim() || DEFAULT_PERMISSION_DENIED_TEXT) : currentPresentation.permissionDeniedText,
-      outputMode: normalizeOutputMode(outputField && outputField.value || currentPresentation.outputMode || 'both'),
+      outputMode: currentPresentation.outputMode,
       fontSize: hasField('cmdp-visual-font-size') ? (String(readValue('cmdp-visual-font-size') || 'normal').trim() || 'normal') : currentPresentation.fontSize,
       density: hasField('cmdp-visual-density') ? (String(readValue('cmdp-visual-density') || 'normal').trim() || 'normal') : currentPresentation.density,
       zebra: hasField('cmdp-visual-zebra') ? readChecked('cmdp-visual-zebra') : Boolean(currentPresentation.zebra),
@@ -28357,7 +28714,7 @@ function dynamicPagesClientScript() {
       tables: rows.length ? [] : currentPresentation.tables.slice(),
       diagram: null
     };
-    if (hasDiagramFields && settings.outputMode !== 'tables') {
+    if (hasDiagramFields) {
       var storedDiagram = firstDiagramSpec(currentSpec || readCurrentSpec());
       var diagramName = String(readValue('cmdp-diagram-name') || 'topology').trim() || 'topology';
       var maxNodes = readPositiveIntField('cmdp-diagram-max-nodes', t('visualizationDiagramMaxNodes'), 300);
@@ -28489,6 +28846,14 @@ function dynamicPagesClientScript() {
     var settings = readVisualizationSettings(required, spec);
     if (!settings) return spec;
     spec.result = spec.result && typeof spec.result === 'object' && !Array.isArray(spec.result) ? spec.result : {};
+    if (settings.diagram) {
+      var existingDiagrams = Array.isArray(spec.result.diagrams) ? spec.result.diagrams.slice() : [];
+      var restDiagrams = existingDiagrams.filter(function (diagram, index) {
+        return index > 0 && diagram && diagram.name !== settings.diagram.name;
+      });
+      spec.result.diagrams = [settings.diagram].concat(restDiagrams);
+    }
+    if (!document.getElementById('cmdp-visualization-editor')) return spec;
     spec.result.emptyText = settings.emptyText || DEFAULT_EMPTY_RESULT_TEXT;
     spec.result.permissionDeniedText = settings.permissionDeniedText || DEFAULT_PERMISSION_DENIED_TEXT;
     spec.result.presentation = {
@@ -28506,13 +28871,6 @@ function dynamicPagesClientScript() {
         return namedPresentation;
       })
     };
-    if (settings.outputMode !== 'tables' && settings.diagram) {
-      var existingDiagrams = Array.isArray(spec.result.diagrams) ? spec.result.diagrams.slice() : [];
-      var restDiagrams = existingDiagrams.filter(function (diagram, index) {
-        return index > 0 && diagram && diagram.name !== settings.diagram.name;
-      });
-      spec.result.diagrams = [settings.diagram].concat(restDiagrams);
-    }
     var byName = {};
     settings.tables.forEach(function (item) { byName[item.name] = item; });
     spec.result.tables = Array.isArray(spec.result.tables) ? spec.result.tables.map(function (table) {
@@ -29435,7 +29793,15 @@ function dynamicPagesClientScript() {
 
   function diagramImportDeterministicSpecSnapshot(spec) {
     var next = assistantSpecWithoutPromptDraft(spec);
-    if (next.result && typeof next.result === 'object' && !Array.isArray(next.result)) delete next.result.diagrams;
+    if (next.result && typeof next.result === 'object' && !Array.isArray(next.result)) {
+      delete next.result.diagrams;
+      var presentation = next.result.presentation;
+      if (presentation && typeof presentation === 'object' && !Array.isArray(presentation)) {
+        delete presentation.outputMode;
+        if (!Object.keys(presentation).length) delete next.result.presentation;
+      }
+      if (!Object.keys(next.result).length) delete next.result;
+    }
     return stableClientJsonStringify(next);
   }
 
@@ -30511,6 +30877,7 @@ function dynamicPagesClientScript() {
     var row = button && button.closest ? button.closest('[data-diagram-mapping-row]') : null;
     var body = row && row.parentElement;
     if (!row || !body) return;
+    row.closest('#cmdp-diagram-editor')?.setAttribute('data-diagram-fields-edited', '');
     markImportedDiagramChanged();
     var rows = Array.prototype.slice.call(body.querySelectorAll('[data-diagram-mapping-row]'));
     if (rows.length > 1) {
@@ -31870,6 +32237,7 @@ function dynamicPagesClientScript() {
       var revisionError = diagramImportRequestRevisionError(requestRevision, null);
       if (revisionError) throw revisionError;
       if (!result.ok || !result.json || !result.json.proposal) throw createRequestError(result);
+      if (!diagramImportSignedProposalHasCurrentContract(result.json.proposal)) throw new Error(t('diagramImportReadinessRevisionChanged'));
       state.diagramImportSignedProposal = cloneJsonValue(result.json.proposal, null);
       state.diagramImportProposal = cloneJsonValue(result.json.proposal, null);
       // The restore endpoint re-analyzes the D2 source and therefore owns the
@@ -31905,6 +32273,7 @@ function dynamicPagesClientScript() {
       markAssistantAuthoringChanged();
       state.message = { type: state.diagramImportStale ? 'error' : 'ok', text: state.diagramImportStale ? t('diagramImportStale') : t('diagramImportReady') };
       if (state.diagramImportStale) throw new Error(t('diagramImportStale'));
+      state.diagramImportRestoreRequiresAnalysis = false;
       return state.diagramImportSignedProposal;
     }).catch(function (error) {
       var message = String(error && error.message || error || t('requestFailed')).slice(0, 500);
@@ -31948,6 +32317,9 @@ function dynamicPagesClientScript() {
       var revisionError = diagramImportRequestRevisionError(requestRevision, null);
       if (revisionError) throw revisionError;
       if (!result.ok || !result.json || !result.json.proposal) throw createRequestError(result);
+      if (!diagramImportSignedProposalHasCurrentContract(result.json.proposal)) {
+        throw Object.assign(new Error(t('diagramImportReadinessRevisionChanged')), { code: 'diagram_import_proposal_version' });
+      }
       state.diagramImportSignedProposal = cloneJsonValue(result.json.proposal, null);
       state.diagramImportProposal = cloneJsonValue(result.json.proposal, null);
       applyDiagramImportAuthoringOverrides(state.diagramImportProposal);
@@ -31972,11 +32344,16 @@ function dynamicPagesClientScript() {
         writeCatalogCache(result.json.catalog);
       }
       state.diagramImportStale = false;
+      state.diagramImportRestoreRequiresAnalysis = false;
       state.message = { type: 'ok', text: state.diagramImportRestoreKind === 'assistant'
         ? t('diagramImportAssistantRestored')
         : t('diagramImportAnalysisRestored') };
       return true;
     }).catch(function (error) {
+      if (error && (error.code === 'diagram_import_proposal_version' ||
+        String(error.code || '').startsWith('d2_import_analysis_checkpoint_'))) {
+        state.diagramImportRestoreRequiresAnalysis = true;
+      }
       state.diagramImportRestoreError = String(error && error.message || error || t('requestFailed')).slice(0, 500);
       state.diagramImportPreviewError = state.diagramImportRestoreError;
       return false;
@@ -31985,13 +32362,21 @@ function dynamicPagesClientScript() {
     });
   }
 
+  function diagramImportSignedProposalHasCurrentContract(proposal) {
+    return Boolean(proposal && proposal.version === 3 &&
+      proposal.semanticModelRevision === D2_IMPORT_SEMANTIC_MODEL_REVISION &&
+      proposal.deterministicSpecRevision === D2_IMPORT_DETERMINISTIC_SPEC_REVISION &&
+      /^[0-9a-f]{64}$/i.test(String(proposal.deterministicSpecHash || '')) &&
+      /^[0-9a-f]{64}$/i.test(String(proposal.signature || '')));
+  }
+
   function diagramImportProposalMatchesCurrentRevision() {
     var selected = state.selectedTemplate;
     var proposal = state.diagramImportSignedProposal;
     return Boolean(
-      selected && proposal &&
+      selected && diagramImportSignedProposalHasCurrentContract(proposal) &&
       String(proposal.templateCode || '') === String(selected.code || '') &&
-      String(proposal.deterministicSpecHash || '').trim() &&
+      String(proposal.sourceText || '') === String(state.diagramImportSource || '') &&
       state.diagramImportEditorSpecSnapshot === diagramImportDeterministicSpecSnapshot(selected.spec || defaultSpec()) &&
       !state.diagramImportStale
     );
@@ -31999,6 +32384,7 @@ function dynamicPagesClientScript() {
 
   function ensureDiagramImportProposalForCurrentRevision() {
     if (diagramImportProposalMatchesCurrentRevision()) return Promise.resolve(state.diagramImportSignedProposal);
+    if (state.diagramImportRestoreRequiresAnalysis) return Promise.reject(new Error(t('diagramImportReadinessRevisionChanged')));
     return analyzeDiagramImport({ propagateErrors: true }).then(function (proposal) {
       if (!proposal || !diagramImportProposalMatchesCurrentRevision()) throw new Error(t('assistantResponseStale'));
       return proposal;
@@ -32265,13 +32651,15 @@ function dynamicPagesClientScript() {
       renderDesigner();
       return;
     }
-    if (diagramImportProposalHasReviewBlocker(proposal)) {
-      state.message = { type: 'error', text: state.diagramImportStale ? t('diagramImportStale') : t('diagramImportReviewBlocked') };
+    if (!diagramImportProposalMatchesCurrentRevision() || diagramImportProposalHasReviewBlocker(proposal)) {
+      state.message = { type: 'error', text: diagramImportReadinessMessages(diagramImportProposalReadiness(proposal))[0] || t('diagramImportReviewBlocked') };
       renderDesigner();
       return;
     }
     var requestSignedProposal = state.diagramImportSignedProposal;
     var requestRevision = diagramImportRequestRevisionSnapshot(requestSignedProposal, state.diagramImportSource);
+    var requestSpec = assistantSpecWithPrompts(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec());
+    var requestOutputMode = requestSpec.result?.presentation?.outputMode;
     state.diagramImportBusy = true;
     state.message = { type: 'ok', text: t('diagramImportApplying') };
     renderDesigner();
@@ -32282,7 +32670,7 @@ function dynamicPagesClientScript() {
         root: state.root,
         templateCode: state.selectedTemplate && state.selectedTemplate.code || '',
         baseSpecHash: state.selectedTemplate && state.selectedTemplate.specHash || '',
-        currentSpec: assistantSpecWithPrompts(state.selectedTemplate && state.selectedTemplate.spec || defaultSpec()),
+        currentSpec: requestSpec,
         d2Source: state.diagramImportSource,
         proposal: state.diagramImportSignedProposal,
         roles: diagramImportBindingOverrides(proposal),
@@ -32294,6 +32682,11 @@ function dynamicPagesClientScript() {
       var revisionError = diagramImportRequestRevisionError(requestRevision, state.diagramImportSignedProposal);
       if (revisionError) throw revisionError;
       if (!result.ok || !result.json || !result.json.spec) throw createRequestError(result);
+      var currentOutputMode = state.selectedTemplate?.spec?.result?.presentation?.outputMode;
+      var appliedSpec = result.json.spec;
+      if (currentOutputMode !== requestOutputMode) {
+        appliedSpec.result.presentation = Object.assign({}, appliedSpec.result.presentation, { outputMode: currentOutputMode });
+      }
       state.diagramImportProposal = null;
       state.diagramImportSignedProposal = null;
       state.diagramImportAnalysisCheckpoint = null;
@@ -32306,7 +32699,7 @@ function dynamicPagesClientScript() {
       state.diagramImportRuntimePreview = null;
       state.diagramImportRuntimePreviewError = '';
       state.diagramImportRuntimePreviewStale = false;
-      updateSelectedFromEditor(result.json.spec);
+      updateSelectedFromEditor(appliedSpec);
       state.lastDraftPreviewOk = false;
       state.diagramImportAppliedPendingPreview = true;
       state.diagramImportStale = false;
@@ -32424,6 +32817,7 @@ function dynamicPagesClientScript() {
     var row = button && button.closest ? button.closest('[data-visualization-row-group]') : null;
     var container = button && button.closest ? button.closest('[data-visualization-row-groups]') : null;
     if (!row || !container) return;
+    container.closest('#cmdp-visualization-editor')?.setAttribute('data-visualization-edited', '');
     var rows = Array.prototype.slice.call(container.querySelectorAll('[data-visualization-row-group]'));
     if (rows.length <= 1) {
       var select = row.querySelector('[data-visualization-field="rowGroupBy"]');
@@ -34508,6 +34902,7 @@ function dynamicPagesClientScript() {
   }
 
   var runtimeLargeTables = [];
+  var runtimeTableReopen = null;
 
   function largeTablePagePath(item, op, options) {
     var query = runtimeQuery(state.runParams);
@@ -34617,11 +35012,36 @@ function dynamicPagesClientScript() {
     delete item.pending[channel];
   }
 
+  function showLargeTableRecovery(item, message, focus) {
+    var node = item.node;
+    var focused = document.activeElement;
+    var focusRemoved = node.querySelector('[data-large-rows]').contains(focused) ||
+      node.querySelector('[data-large-picker]')?.contains(focused);
+    item.viewExpired = true;
+    largeTableStop(item, 'options');
+    if (item.keyed) {
+      closeLargeTablePicker(item, false);
+      node.querySelector('[data-large-action="picker"]').disabled = true;
+    }
+    resetLargeTableRows(item);
+    syncLargeTableViewControl(item);
+    var status = node.querySelector('[data-large-status]');
+    status.setAttribute('role', 'alert');
+    status.textContent = message;
+    var isPublic = item.view.kind === 'public';
+    var label = isPublic ? 'snapshotReload' : 'largeTableReopen';
+    var target = node.querySelector('[data-large-message-action]');
+    target.innerHTML = largeTableButton(isPublic ? 'reload' : 'reopen', label, escapeHtml(t(label)));
+    if (focus || focusRemoved) target.querySelector('button').focus();
+  }
+
   function largeTableRequest(item, op, offset) {
     largeTableStop(item, op);
     var picker = op === 'options';
     var detail = op === 'details';
-    var destination = detail ? item.detail.node : item.node;
+    var detailView = detail ? item.detail : null;
+    if (detail && !detailView) return;
+    var destination = detail ? detailView.node : item.node;
     var status = picker ? '[data-large-option-status]' : '[data-large-status]';
     var focused = document.activeElement;
     var focusedAction = focused && focused.getAttribute('data-large-action');
@@ -34632,7 +35052,7 @@ function dynamicPagesClientScript() {
     if (picker) {
       params.search = item.optionSearch;
       params.limit = 10;
-    } else if (detail) params.group = item.detail.group;
+    } else if (detail) params.group = detailView.group;
     else {
       if (item.rowView === 'rows') params.view = 'rows';
       params.search = item.search;
@@ -34652,29 +35072,31 @@ function dynamicPagesClientScript() {
       destination.querySelector('[data-large-message-action]').innerHTML = '';
       if (!detail) item.node.querySelector('[data-large-rows]').setAttribute('aria-busy', 'true');
     }
-    var active = function () { return item.node.isConnected && item.pending[op] === controller; };
+    var active = function () {
+      return item.node.isConnected && item.pending[op] === controller && (!detail || item.detail === detailView);
+    };
     function failed(result) {
       var reason = result && result.json && result.json.reason;
       var conflict = result && (result.status === 409 || result.status === 410 || item.view.kind === 'public' && result.status === 404);
       var keyUnavailable = reason === 'table_key_unavailable' && item.keyed;
       var recoverViewFocus = !picker && conflict && focusedAction === 'table-view' &&
         item.viewControl?.contains(focused) && document.activeElement === focused;
-      if (!picker && conflict) {
-        item.viewExpired = true;
-        syncLargeTableViewControl(item);
-      }
       var message = conflict ? t(item.view.kind === 'public' ? 'largeTableSnapshotExpired' : 'largeTableViewExpired') :
         keyUnavailable ? t('largeTableKeyUnavailable') :
         result && result.status === 401 ? t('runtimeSessionInvalid') : reason === 'data_access_denied' ? t('runtimeDataAccessDenied') :
         result && result.status === 403 ? t('runtimeTemplateAccessDenied') : t('largeTableError');
+      message += result && result.requestId ? ' ' + t('runtimeRequestId') + ': ' + result.requestId + '.' : '';
+      if ((!picker && conflict) || (picker && item.restoringSelection)) {
+        showLargeTableRecovery(item, message, recoverViewFocus);
+        return;
+      }
       statusNode.setAttribute('role', 'alert');
-      statusNode.textContent = message + (result && result.requestId ? ' ' + t('runtimeRequestId') + ': ' + result.requestId + '.' : '');
+      statusNode.textContent = message;
       var target = picker ? item.node.querySelector('[data-large-option-pager]') : destination.querySelector('[data-large-message-action]');
       item.retry[op] = offset;
       var action = conflict ? (item.view.kind === 'public' ? 'reload' : 'reopen') : keyUnavailable ? 'choose' : op + '-retry';
       var label = conflict ? (item.view.kind === 'public' ? 'snapshotReload' : 'largeTableReopen') : keyUnavailable ? 'largeTableChoose' : 'largeTableRetry';
       target.innerHTML = largeTableButton(action, label, escapeHtml(t(label)));
-      if (recoverViewFocus) target.querySelector('button').focus();
     }
     return request(largeTablePagePath(item, op, params), { signal: controller.signal, maxRetries: 0 }).then(function (response) {
       if (!active()) return;
@@ -34697,7 +35119,7 @@ function dynamicPagesClientScript() {
         if (op === 'rows') syncLargeTableViewControl(item);
         statusNode.textContent = page.incomplete ? t('largeTableIncomplete') : !page.table.rows.length ? t('largeTableNoRows') : '';
         if (detail) {
-          item.detail.page = page;
+          detailView.page = page;
           destination.querySelector('[data-large-detail-content]').innerHTML = largeTableGrid(item, page, true) +
             '<div class="runtime-large-pager">' + largeTablePager(page, 'details') + '</div>';
         } else {
@@ -34707,6 +35129,7 @@ function dynamicPagesClientScript() {
             ? (item.rowView === 'summary' ? 'largeTableGroupRange' : 'largeTableRowRange') : undefined);
         }
       }
+      return true;
     }).catch(function () {
       if (active()) failed();
     }).finally(function () {
@@ -34720,7 +35143,7 @@ function dynamicPagesClientScript() {
           return !button.disabled && button.getAttribute('data-large-action') === focusedAction && button.getAttribute('data-large-index') === focusIndex;
         }) || candidates.find(function (button) {
           return !button.disabled && [op + '-prev', op + '-next', op + '-retry', 'reopen', 'reload'].indexOf(button.getAttribute('data-large-action')) !== -1;
-        }) || (picker ? destination.querySelector('[data-large-option-search]') : detail ? item.detail.trigger : destination.querySelector('[data-large-row-search]'));
+        }) || (picker ? destination.querySelector('[data-large-option-search]') : detail ? detailView.trigger : destination.querySelector('[data-large-row-search]'));
         if (next) next.focus();
       }
     });
@@ -34787,7 +35210,9 @@ function dynamicPagesClientScript() {
     largeTableStop(item, 'rows');
     closeLargeTableDetails(item);
     item.page = null;
-    item.node.querySelector('[data-large-rows]').innerHTML = '';
+    var rows = item.node.querySelector('[data-large-rows]');
+    rows.innerHTML = '';
+    rows.removeAttribute('aria-busy');
     item.node.querySelector('[data-large-pager]').innerHTML = '';
     item.node.querySelector('[data-large-message-action]').innerHTML = '';
   }
@@ -34797,6 +35222,40 @@ function dynamicPagesClientScript() {
     item.viewExpired = false;
     item.rowView = 'summary';
     syncLargeTableViewControl(item);
+  }
+
+  function reopenDynamicReport(item, button) {
+    if (runtimeTableReopen) return;
+    var controller = new AbortController();
+    runtimeTableReopen = controller;
+    var hadFocus = document.activeElement === button;
+    function ownsFocus() {
+      return document.activeElement === button || (hadFocus && document.activeElement === document.body);
+    }
+    function active() { return runtimeTableReopen === controller && item.node.isConnected; }
+    button.disabled = true;
+    var status = item.node.querySelector('[data-large-status]');
+    status.setAttribute('role', 'status');
+    status.textContent = t('largeTableLoading');
+    return request(runtimeRunPath(boot.templateCode, state.runParams, false, false, true), {
+      signal: controller.signal, maxRetries: 0
+    }).then(function (result) {
+      if (!active()) return;
+      if (!result.ok || !result.json?.result) throw createRequestError(result);
+      var restoreFocus = ownsFocus();
+      runtimeTableReopen = null;
+      result.downloadMode = 'template';
+      renderRuntimeIntoApp(result, true);
+      if (restoreFocus) {
+        var updated = runtimeLargeTables.find(function (entry) { return entry.table.name === item.table.name; });
+        var title = updated?.node.querySelector('h3') || app.querySelector('[data-result-table] h3');
+        if (title) { title.tabIndex = -1; title.focus(); }
+      }
+    }).catch(function () {
+      if (active()) showLargeTableRecovery(item, t('largeTableError'), ownsFocus());
+    }).finally(function () {
+      if (runtimeTableReopen === controller) runtimeTableReopen = null;
+    });
   }
 
   function mountLargeTable(item, node) {
@@ -34819,6 +35278,7 @@ function dynamicPagesClientScript() {
       var button = event.target.closest('[data-large-action]');
       if (!button || button.disabled) return;
       var action = button.getAttribute('data-large-action');
+      if ((item.viewExpired || item.restoringSelection) && action !== 'reopen' && action !== 'reload') return;
       var index = Number(button.getAttribute('data-large-index'));
       if (action === 'table-view') return;
       if (action === 'picker') {
@@ -34862,11 +35322,7 @@ function dynamicPagesClientScript() {
         if (item.view.kind === 'personal') {
           refreshOpenSnapshot(state.snapshotRefreshMode !== 'personal');
         } else {
-          var fromPicker = Boolean(button.closest('[data-large-picker]'));
-          resetDynamicTableView(item);
-          resetLargeTableRows(item);
-          if (!item.keyed || item.selection) largeTableRequest(item, 'rows', 0);
-          if (fromPicker) largeTableRequest(item, 'options', 0);
+          reopenDynamicReport(item, button);
         }
       } else {
         var parts = action.split('-');
@@ -34892,6 +35348,7 @@ function dynamicPagesClientScript() {
         node.querySelector('[data-large-option-pager]').innerHTML = '';
       } else {
         item.search = event.target.value;
+        if (item.viewExpired || item.restoringSelection) return;
         resetLargeTableRows(item);
       }
       node.querySelector(options ? '[data-large-option-status]' : '[data-large-status]').textContent = t('largeTableLoading');
@@ -34910,7 +35367,18 @@ function dynamicPagesClientScript() {
       if (index !== -1 && next < 0) panel.querySelector('[data-large-option-search]').focus();
       else buttons[next < 0 ? buttons.length - 1 : Math.min(next, buttons.length - 1)].focus();
     });
-    if (!item.keyed || item.selection) largeTableRequest(item, 'rows', 0);
+    if (item.restoringSelection) {
+      var picker = node.querySelector('[data-large-action="picker"]');
+      picker.disabled = true;
+      // The keyed option cache belongs to the current saved template revision.
+      largeTableRequest(item, 'options', 0).then(function (loaded) {
+        if (!node.isConnected) return;
+        item.restoringSelection = false;
+        if (!loaded || item.viewExpired) return;
+        picker.disabled = false;
+        largeTableRequest(item, 'rows', 0);
+      });
+    } else if (!item.keyed || item.selection) largeTableRequest(item, 'rows', 0);
   }
 
   document.addEventListener('click', function (event) {
@@ -34934,12 +35402,16 @@ function dynamicPagesClientScript() {
   }
 
   function stopRuntimeLargeTables() {
+    if (runtimeTableReopen) {
+      runtimeTableReopen.abort();
+      runtimeTableReopen = null;
+    }
     runtimeLargeTables.forEach(function (item) {
       ['options', 'rows', 'details'].forEach(function (op) { largeTableStop(item, op); });
     });
   }
 
-  function prepareRuntimeLargeTables(result) {
+  function prepareRuntimeLargeTables(result, restoringDynamic) {
     stopRuntimeLargeTables();
     var payload = result.ok && result.json || {};
     var view = payload.tableView;
@@ -34957,24 +35429,26 @@ function dynamicPagesClientScript() {
       var grouped = Array.isArray(presentation.largeTable.groupKeys) && presentation.largeTable.groupKeys.length > 0;
       var previous = runtimeLargeTables.find(function (item) { return item.table.name === table.name; });
       var sort = previous && presentation.sortable !== false && (table.columns || []).indexOf(previous.sort) !== -1 ? previous.sort : '';
+      var selection = keyed && previous?.keyed ? previous.selection : null;
       return {
         table: table, presentation: presentation, view: view, keyed: keyed, grouped: grouped, pending: {}, retry: {},
         rowView: grouped && view.kind !== 'dynamic' && previous?.rowView === 'rows' ? 'rows' : 'summary',
         viewId: keyed ? '' : view.viewId,
-        selection: keyed && previous ? previous.selection : null,
+        selection: selection,
+        restoringSelection: Boolean(restoringDynamic && view.kind === 'dynamic' && selection),
         search: previous && presentation.filters !== false ? previous.search : '', sort: sort, direction: sort ? previous.direction : ''
       };
     });
   }
 
-  function renderRuntimeIntoApp(result) {
+  function renderRuntimeIntoApp(result, restoringDynamic) {
     var cache = result.json && result.json.cache;
     var snapshot = result.ok && (cache && cache.scope === 'staticSnapshot' || result.downloadMode === 'personal');
     if (result.downloadMode !== 'personal') {
       state.snapshotRevision = cache && cache.snapshotRevision || '';
       state.snapshotCache = snapshot ? cache : null;
     }
-    runtimeLargeTables = prepareRuntimeLargeTables(result);
+    runtimeLargeTables = prepareRuntimeLargeTables(result, restoringDynamic);
     var soleTable = snapshot && runtimeLargeTables.length === 1 && runtimeLargeTables[0];
     if (soleTable && soleTable.grouped) {
       soleTable.viewInSnapshotToolbar = visibleResultTables(result.json.result.tables).every(function (table) { return table === soleTable.table; });
@@ -36110,9 +36584,7 @@ function dynamicPagesClientScript() {
       updateVisualizationGroupTitleDefault(target);
     }
     if (target.matches && target.matches('input[name="cmdp-output-mode"]')) {
-      markImportedDiagramChanged();
-      captureVisibleDesignerState();
-      renderDesigner();
+      setDesignerOutputMode(target.value);
       return;
     }
     if (target.matches && target.matches('[data-diagram-mapping-field="from"]')) {

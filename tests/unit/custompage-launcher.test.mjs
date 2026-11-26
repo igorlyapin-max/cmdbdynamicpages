@@ -153,6 +153,7 @@ function generatedDynamicPagesClientScript() {
     'D2_IMPORT_STRUCTURE_TREE_VERSION',
     'D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION',
     'D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION',
+    'D2_IMPORT_DETERMINISTIC_SPEC_REVISION',
     'ASSISTANT_PROMPT_CONTRACT_VERSION',
     'DEFAULT_ASSISTANT_SYSTEM_PROMPT',
     'DEFAULT_ASSISTANT_OBJECT_FLOW_PROMPT',
@@ -166,7 +167,7 @@ function generatedDynamicPagesClientScript() {
   );
   const versions = ['D2_IMPORT_SEMANTIC_MODEL_REVISION', 'D2_IMPORT_ENDPOINT_PROFILE_VERSION',
     'D2_IMPORT_STRUCTURE_TREE_VERSION', 'D2_IMPORT_ANALYSIS_CHECKPOINT_VERSION',
-    'D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION', 'ASSISTANT_PROMPT_CONTRACT_VERSION'].map((name) => {
+    'D2_IMPORT_ASSISTANT_CHECKPOINT_VERSION', 'D2_IMPORT_DETERMINISTIC_SPEC_REVISION', 'ASSISTANT_PROMPT_CONTRACT_VERSION'].map((name) => {
     const match = proxySource.match(new RegExp('^const ' + name + ' = ([0-9]+);', 'm'));
     assert.ok(match, name);
     return Number(match[1]);
@@ -879,8 +880,20 @@ test('D2 placement filter catalog keeps a readable domain path at configured dep
   const candidate = first.find((item) => item.value === '{Vlan2super:vlan}.isNAT');
   assert.ok(candidate);
   assert.match(candidate.label, /IP range -> VLAN -> NAT/);
+  classes.ipRange.attributes = [
+    { name: 'Cidr', description: 'Подсеть', type: 'string', inherited: true },
+    { name: 'Private', description: 'Private', type: 'string', inherited: true, permissions: { _can_read: false } },
+    ...Array.from({ length: 80 }, (_, i) => ({ name: `Attr${i}`, type: 'integer' }))
+  ];
   state.catalogRevision += 1;
   assert.notStrictEqual(helpers.catalogScopePathOptions('ipRange', query), first, 'Catalog revision must invalidate traversal candidates.');
+  const scoped = helpers.catalogScopePathOptions('ipRange', '', true);
+  assert.equal(scoped.find((item) => item.value === 'Cidr')?.group, 'viewColumnAttributes');
+  assert.equal(scoped.find((item) => item.value === '{Vlan2super:vlan}.isNAT')?.group, 'viewColumnRelatedFields',
+    'A qualified result search still discovers related fields after filling its direct field bucket.');
+  assert.equal(scoped.some((item) => item.value === 'Private'), false);
+  const oneLetter = helpers.catalogScopePathOptions('ipRange', 'e', true);
+  assert.equal(oneLetter.some((item) => item.value.startsWith('Attr')), false, 'Type annotations are not searchable field names.');
 });
 
 test('D2 placement filter lazily loads every readable class on a deep catalog path', async () => {
@@ -1610,7 +1623,8 @@ test('diagram editor renders repeatable mapping tables with source-dependent fie
   assert.match(readRowsSource, /throw new Error\(t\('diagramMappingSourceRequired'\)\)/);
   assert.match(readRowsSource, /mappings\.push\(applyMappingDetails\(\{ from: from, fields: nodeFields \}/);
   assert.match(readRowsSource, /mappings\.push\(applyMappingDetails\(\{ type: type \|\| 'generic', from: from, fields: edgeFields \}/);
-  assert.match(captureSource, /document\.querySelector\('\[data-diagram-mapping-row\]'\)/);
+  assert.match(captureSource, /#cmdp-diagram-editor\[data-diagram-fields-edited\]/);
+  assert.match(readSource, /!state\.diagramImportProposal && Boolean\(document\.querySelector\('#cmdp-diagram-editor\[data-diagram-fields-edited\]'\)\)/);
   assert.match(captureSource, /applyVisualizationToSpec\(state\.selectedTemplate\.spec \|\| defaultSpec\(\), false\)/);
   assert.match(rowUiSource, /function addDiagramMappingRow\(button\)/);
   assert.match(proxySource, /function insertDiagramTemplateToken\(button\)/);
@@ -2133,7 +2147,7 @@ test('runtime diagram view exposes D2 rendered SVG and source download affordanc
   assert.match(proxySource, /templateAction === 'run' && !cacheDisabled/);
   assert.doesNotMatch(proxySource, /templateAction === 'run' && !cacheDisabled && !d2Output/);
   assert.match(runtimeSource, /renderResultDiagram\(diagram, toolbar, d2DownloadHref\)/);
-  assert.match(runtimeSource, /function renderRuntimeIntoApp\(result\)/);
+  assert.match(runtimeSource, /function renderRuntimeIntoApp\(result, restoringDynamic\)/);
   assert.match(runtimeSource, /initializeDiagramViewports\(app\)/);
   assert.match(loadSource, /runtimeSystemParam\(entry\[0\]\)/);
   assert.match(loadSource, /result\.downloadMode = 'template'/);
@@ -2188,7 +2202,7 @@ test('searchable catalog field pickers load attributes only after a search and r
   const ensureStart = proxySource.indexOf('function ensureCatalogAttributesForClass(className, quiet)');
   const viewClassesStart = proxySource.indexOf('function viewComposerCatalogClassNames(spec)');
   const ensureSectionStart = proxySource.indexOf('function ensureCatalogAttributesForDesignerSection()');
-  const pickerClassesStart = proxySource.indexOf('function catalogFieldPickerClassNames(picker)');
+  const pickerClassesStart = proxySource.indexOf('function catalogFieldPickerClassNames(picker, query)');
   const refreshStart = proxySource.indexOf('function refreshCatalogFieldPickerResults(input)');
   const scheduleStart = proxySource.indexOf('function scheduleCatalogFieldPickerResults(input)');
   const extractLanguageStart = proxySource.indexOf('function extractLanguageFromValue(value)');
@@ -2212,6 +2226,7 @@ test('searchable catalog field pickers load attributes only after a search and r
   assert.doesNotMatch(ensureSectionSource, /ensureCatalogAttributesForClass/);
   assert.match(pickerClassesSource, /kind === 'scope'/);
   assert.match(pickerClassesSource, /kind === 'objectGroupSource'/);
+  assert.match(pickerClassesSource, /viewColumnSearchContext\(readCurrentSpec\(\),[^\n]+query\)\.classNames/);
   assert.match(proxySource, /function ensureCatalogFieldPickerSearchAttributes\(picker, query\)/);
   assert.match(refreshSource, /if \(!query\) \{/);
   assert.match(refreshSource, /ensureCatalogFieldPickerSearchAttributes\(picker, query\)/);
@@ -2513,7 +2528,7 @@ test('Relations Apply preserves explicit operation order and source-driven colum
 });
 
 test('deep catalog fields are query-first, cached, and locally refreshed in the relation editor', () => {
-  const scopeStart = proxySource.indexOf('function catalogScopePathOptions(className, searchQuery)');
+  const scopeStart = proxySource.indexOf('function catalogScopePathOptions(className, searchQuery, forView)');
   const relationStart = proxySource.indexOf('function catalogRelationPathOptions(className, searchQuery)');
   const pickerRowsStart = proxySource.indexOf('function renderCatalogFieldPickerRows(options, selectedName, query)');
   const pickerStart = proxySource.indexOf('function renderCatalogFieldPicker(fieldAttribute, selectedName, initialOptions, context)');

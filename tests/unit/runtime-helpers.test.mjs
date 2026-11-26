@@ -2236,7 +2236,7 @@ test('D2 mapping keeps its signed executable inputs on reload and ignores a prom
   assert.equal((await d2WorkflowStatusForSpec(reviewed)).state, 'applied');
 });
 
-test('normal template Save keeps the D2 analysis identity stable after generated mapping materialization', () => {
+test('normal template Save keeps applied D2 validation and does not upgrade a retired analysis checkpoint', async () => {
   const { currentSpec, proposal, roles } = d2StructureTreeFixture();
   const tree = structureTreeWithStage(proposal.structureTree, roles.vlan.id, 'selection:systemsA');
   const applied = applyDiagramImportProposal(currentSpec, proposal, [], [], tree);
@@ -2245,6 +2245,7 @@ test('normal template Save keeps the D2 analysis identity stable after generated
     version: 1,
     proposalId: proposal.proposalId,
     deterministicSpecHash: beforeMaterializationHash,
+    deterministicSpecRevision: proposal.deterministicSpecRevision,
     source: {
       hash: proposal.source.hash,
       structureHash: proposal.source.structureHash,
@@ -2260,6 +2261,20 @@ test('normal template Save keeps the D2 analysis identity stable after generated
   assert.equal(diagramImportDeterministicSpecHash(applied), beforeMaterializationHash);
   assert.equal(checkpoint.deterministicSpecHash, diagramImportDeterministicSpecHash(stored));
   assert.equal(checkpoint.source.hash, stored.result.diagrams[0].authoring.d2Import.sourceHash);
+
+  const legacy = structuredClone(applied);
+  const legacyCheckpoint = legacy.authoring.d2.analysisCheckpoint;
+  delete legacyCheckpoint.deterministicSpecRevision;
+  legacyCheckpoint.deterministicSpecHash = 'a'.repeat(64);
+  const storedLegacy = normalizeTemplateSpecForStorage(legacy);
+  const unrevised = storedLegacy.authoring.d2.analysisCheckpoint;
+  assert.equal(unrevised.version, 1);
+  assert.equal(unrevised.deterministicSpecHash, legacyCheckpoint.deterministicSpecHash);
+  assert.equal(unrevised.deterministicSpecRevision, undefined);
+  const storedMapping = storedLegacy.result.diagrams[0].authoring.d2Import;
+  assert.deepEqual(storedMapping.mappingValidation, stored.result.diagrams[0].authoring.d2Import.mappingValidation);
+  assert.deepEqual(storedMapping.mappingInputRevision, stored.result.diagrams[0].authoring.d2Import.mappingInputRevision);
+  assert.equal((await d2WorkflowStatusForSpec(storedLegacy)).state, 'applied');
 });
 
 test('normal template Save rebases a checkpoint for a provisional D2 analysis diagram only', () => {
@@ -2268,6 +2283,7 @@ test('normal template Save rebases a checkpoint for a provisional D2 analysis di
     version: 1,
     proposalId: proposal.proposalId,
     deterministicSpecHash: proposal.deterministicSpecHash,
+    deterministicSpecRevision: proposal.deterministicSpecRevision,
     source: {
       hash: proposal.source.hash,
       structureHash: proposal.source.structureHash,
@@ -3513,6 +3529,7 @@ test('partial D2 Apply preserves reviewed authoring and previews only independen
         version: 1,
         proposalId: proposal.proposalId,
         deterministicSpecHash: proposal.deterministicSpecHash,
+        deterministicSpecRevision: proposal.deterministicSpecRevision,
         source: proposal.source,
         roles: proposal.roles.map((role) => ({ id: role.id, visualKind: role.visualKind, labelTemplate: role.labelTemplate })),
         relationRules: proposal.relationRules,

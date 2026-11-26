@@ -233,7 +233,8 @@ test('dynamic viewer separates table views and rejects late keyed rows', async (
     await scoped.getByText('This table view has expired.', { exact: false }).waitFor();
     await action(scoped, 'reopen').click();
     await scoped.getByText('Keyed row 0', { exact: true }).waitFor();
-    assert.deepEqual([calls.at(-1).query.key, calls.at(-1).query.search, calls.at(-1).query.viewId], ['typed:&+/', 'tcp', undefined]);
+    const reopened = calls.findLast((call) => call.query?.table === keyed.name && call.query.op === 'rows').query;
+    assert.deepEqual([reopened.key, reopened.search, reopened.viewId], ['typed:&+/', 'tcp', undefined]);
   });
 });
 
@@ -489,6 +490,10 @@ test('dynamic grouped view resets on key change and does not calculate automatic
         ['one', 0, undefined, undefined], ['one', 0, 'rows', 'index-one'], ['two', 0, undefined, undefined],
         ['two', 0, 'rows', 'index-two'], ['two', 0, undefined, undefined]
       ]);
+      assert.deepEqual(calls.slice(before).map(({ query }) => query?.op || 'shell'), ['rows', 'shell', 'options', 'rows']);
+      const shell = calls[before + 1];
+      assert.deepEqual([shell.method, shell.path, shell.params.cmdpTableShell, shell.params.snapshotParams, shell.params.refresh],
+        ['GET', api + '/templates/Report/run', '1', typed, undefined]);
     });
   } finally {
     secondIndex.resolve();
@@ -506,10 +511,11 @@ test('an expired keyed view recovers after selecting the same object from refres
       if (!q) return shellPayload({ kind: 'dynamic', pageSize: 3 }, [grouped(keyed)]);
       if (q.op === 'options') {
         optionLoads++;
+        if (optionLoads === 2) return { items: [{ key: 'two', label: 'Different object' }], total: 1, offset: q.offset, limit: q.limit };
         return { items: [{ key: 'one', label: 'Only object' }], total: 1, offset: q.offset, limit: q.limit };
       }
       if (expired && q.viewId === 'original') return { status: 409, body: { reason: 'table_view_expired' } };
-      if (expired && !q.viewId && optionLoads === 1) return { status: 404, body: { reason: 'table_key_unavailable' } };
+      if (expired && !q.viewId && optionLoads === 2) return { status: 404, body: { reason: 'table_key_unavailable' } };
       if (expired && !q.viewId) await recovery.promise;
       const viewId = expired ? 'recovered' : 'original';
       const label = [viewId, q.view || 'summary', q.search || '-', q.sort || '-'].join(' ');
@@ -576,6 +582,119 @@ test('an expired keyed view recovers after selecting the same object from refres
     });
   } finally {
     recovery.resolve();
+  }
+});
+
+test('reopening a dynamic report replaces the table shell when grouping is removed or added', async () => {
+  let revision = 1;
+  let failShell = true;
+  const finishShell = deferred();
+  try {
+    await withViewer({ kind: 'dynamic', async respond({ query: q }) {
+      const current = revision;
+      if (!q) {
+        if (current === 2 && failShell) {
+          failShell = false;
+          return { status: 502, body: { success: false } };
+        }
+        if (current === 2) await finishShell.promise;
+        return shellPayload({ kind: 'dynamic', pageSize: 3 }, [current === 2 ? all : grouped(all)]);
+      }
+      if (q.viewId && q.viewId !== 'view-' + current) return { status: 409, body: { reason: 'table_view_expired' } };
+      return rowPage(q, [`Revision ${current}: ${q.view || 'default'}`], { viewId: 'view-' + current });
+    } }, async (page, calls) => {
+      const region = page.getByRole('region', { name: all.name });
+      const group = viewGroup(region);
+      const rows = viewButton(group, 'rows', 'Rows');
+      const search = region.getByRole('searchbox', { name: 'Search table' });
+      await region.getByText('Revision 1: default', { exact: true }).waitFor();
+      revision = 2;
+      await rows.press('Enter');
+      const reopen = action(region, 'reopen');
+      await reopen.waitFor();
+      await search.fill('needle');
+      assert.equal(await reopen.isVisible(), true, 'editing the search does not clear the recovery action');
+      await reopen.press('Enter');
+      await region.getByRole('alert').waitFor();
+      assert.equal(await reopen.isEnabled(), true, 'an unavailable replacement shell leaves recovery retryable');
+      assert.equal(await rows.isDisabled(), true);
+      await reopen.press('Enter');
+      await page.waitForFunction(() => document.querySelector('[data-large-action="reopen"]')?.disabled);
+      assert.equal(calls.filter(({ query }) => query?.op === 'rows').length, 2, 'wait for the replacement shell before requesting rows');
+      finishShell.resolve();
+      await region.getByText('Revision 2: default', { exact: true }).waitFor();
+      assert.equal(await group.count(), 0);
+      assert.equal(await search.inputValue(), 'needle');
+      assert.equal(calls.at(-1).query.viewId, undefined);
+      assert.equal(calls.at(-1).query.search, 'needle');
+
+      revision = 3;
+      await action(region, 'sort').click();
+      await reopen.press('Enter');
+      await region.getByText('Revision 3: default', { exact: true }).waitFor();
+      await assertViewMode(viewButton(group, 'summary', 'Summary'), rows, 'summary');
+      assert.deepEqual([calls.at(-1).query.search, calls.at(-1).query.sort], ['needle', 'value']);
+      await rows.press('Enter');
+      await region.getByText('Revision 3: rows', { exact: true }).waitFor();
+      assert.deepEqual([calls.at(-1).query.viewId, calls.at(-1).query.view], ['view-3', 'rows']);
+      assert.equal(calls.filter(({ query }) => query === null).length, 4);
+    });
+  } finally {
+    finishShell.resolve();
+  }
+});
+
+test('details expiry exposes table-level recovery and ignores a retired details response', async () => {
+  const oldStarted = deferred();
+  const finishOld = deferred();
+  const expired = { status: 409, body: { reason: 'table_view_expired' } };
+  let revision = 1;
+  try {
+    await withViewer({ kind: 'dynamic', viewport: { width: 390, height: 740 }, async respond({ query: q }) {
+      if (!q) return shellPayload({ kind: 'dynamic', pageSize: 3 }, [grouped(all)]);
+      if (q.op === 'details') {
+        if (q.group === 'group-1') { oldStarted.resolve(); await finishOld.promise; }
+        return expired;
+      }
+      if (q.viewId && q.viewId !== 'view-' + revision) return expired;
+      return rowPage(q, ['Group ' + revision], { viewId: 'view-' + revision, groupIds: ['group-' + revision] });
+    } }, async (page, calls) => {
+      const region = page.getByRole('region', { name: all.name });
+      const details = action(region, 'details');
+      const reopen = action(region, 'reopen');
+      const rows = viewButton(viewGroup(region), 'rows', 'Rows');
+      await details.click();
+      await oldStarted.promise;
+      revision = 2;
+      await rows.press('Enter');
+      await reopen.press('Enter');
+      await region.getByText('Group 2', { exact: true }).waitFor();
+      const search = region.getByRole('searchbox', { name: 'Search table' });
+      await search.focus();
+      finishOld.resolve();
+      const noRequest = (request) => new URL(request.url()).pathname.startsWith(api + '/templates/Report/');
+      await assert.rejects(page.waitForRequest(noRequest, { timeout: 350 }), { name: 'TimeoutError' });
+      assert.equal(await reopen.count(), 0);
+      assert.equal(await rows.isEnabled(), true);
+      assert.equal(await search.evaluate((field) => field === document.activeElement), true);
+
+      const before = calls.length;
+      await details.press('Enter');
+      await assertVisibleInWidth(reopen, 390);
+      assert.equal(await reopen.evaluate((button) => button === document.activeElement), true);
+      assert.equal(await reopen.locator('xpath=parent::*').getAttribute('data-large-message-action'), '');
+      assert.equal(await region.locator('[data-large-detail-row]').count(), 0);
+      assert.equal(await rows.isDisabled(), true);
+      assert.equal(await region.locator('[data-large-rows][aria-busy]').count(), 0);
+      await assert.rejects(page.waitForRequest(noRequest, { timeout: 350 }), { name: 'TimeoutError' });
+      assert.deepEqual(calls.slice(before).map(({ query }) => query?.op), ['details']);
+      revision = 3;
+      await reopen.click();
+      await region.getByText('Group 3', { exact: true }).waitFor();
+      assert.equal(await rows.isEnabled(), true);
+    });
+  } finally {
+    finishOld.resolve();
   }
 });
 

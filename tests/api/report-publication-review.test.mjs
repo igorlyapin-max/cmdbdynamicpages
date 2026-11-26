@@ -441,6 +441,80 @@ test('snapshot publication applies configured row ceilings and diagnoses explici
   });
 });
 
+test('paged snapshot publication ignores retained diagram mappings only in tables output mode', async (t) => {
+  const stepLimit = 5000;
+  const ordinaryMax = 200;
+  const pageSize = 100;
+  const spec = (outputMode) => ({
+    version: 1,
+    steps: [{ ...SELECT, limit: stepLimit }],
+    result: {
+      presentation: { outputMode },
+      tables: [PAGED],
+      diagrams: [{ name: 'assets', type: 'topology',
+        nodeMappings: [{ from: 'items', fields: { id: 'Code', label: 'Description' } }] }]
+    },
+    publish: STATIC
+  });
+  const templates = { TablesOnly: spec('tables'), TablesAndDiagram: spec('both') };
+  const cards = rows(...Array.from({ length: 1201 }, (_, i) => `asset-${String(i + 1).padStart(4, '0')}`));
+  const redis = await redisFixture(t);
+  let sourceReads = 0;
+  const mock = await upstream(t, templates, (url) => {
+    if (url.pathname.endsWith('/Cst_QueryToolConfig/cards')) return { data: [{
+      _id: 1, Code: ROOT, RootCode: ROOT, Active: true,
+      RuntimeConfigJson: JSON.stringify({ executionLimits: {
+        maxRowsMax: ordinaryMax, reportPageSize: pageSize,
+        maxSelectionScanRowsDefault: stepLimit, maxSelectionScanRowsMax: stepLimit
+      } })
+    }] };
+    if (!url.pathname.endsWith('/classes/Asset/cards')) return;
+    sourceReads += 1;
+    const start = Number(url.searchParams.get('start') || 0);
+    const limit = Number(url.searchParams.get('limit') || cards.length);
+    return { data: cards.slice(start, start + limit), total: cards.length };
+  });
+  const request = await backend(t, mock, redis.origin, {
+    CMDP_EXECUTION_MAX_ROWS_ABSOLUTE: '2000', CMDP_LARGE_TABLE_MAX_ROWS: '10000'
+  });
+
+  const published = await publish(request, 'TablesOnly', templates.TablesOnly);
+  assert.equal(published.status, 200, JSON.stringify(published.json));
+  assert.deepEqual(published.json.result.diagrams, []);
+  const publicPath = '/public-snapshots/TablesOnly';
+  const shell = await request(publicPath + '/run?cmdpTableShell=1');
+  assert.equal(shell.status, 200, JSON.stringify(shell.json));
+  const { snapshotRevision } = shell.json.tableView;
+  assert.ok(snapshotRevision);
+  const readsAfterPublish = sourceReads;
+  for (let offset = 0; offset < cards.length; offset += pageSize) {
+    const page = await request(publicPath + '/table-page?cmdpTable=' + encodeURIComponent(JSON.stringify({
+      table: 'items', op: 'rows', offset, limit: pageSize, snapshotRevision
+    })));
+    assert.equal(page.status, 200, JSON.stringify(page.json));
+    assert.equal(page.json.total, cards.length);
+    assert.equal(page.json.incomplete, false);
+    assert.deepEqual(page.json.table.rows, cards.slice(offset, offset + pageSize).map(({ Code }) => ({ Code })));
+  }
+  assert.equal(sourceReads, readsAfterPublish, 'public paging reads the snapshot, not the source');
+
+  const commitsBefore = redis.commits.length;
+  const conflict = await publish(request, 'TablesAndDiagram', templates.TablesAndDiagram);
+  assert.equal(conflict.status, 422, JSON.stringify(conflict.json));
+  assert.equal(conflict.json.code, 'table_result_incomplete');
+  const diagnostic = conflict.json.diagnostics?.limits?.find(({ limitName }) => limitName === 'maxRows');
+  assert.ok(diagnostic, JSON.stringify(conflict.json));
+  for (const [key, value] of Object.entries({
+    stepAlias: 'items', rowLimitMode: 'ordinary', reason: 'row_limit_configuration_conflict',
+    requested: stepLimit, effectiveLimit: ordinaryMax, rowLimitCauses: ['runtimeMaximum'],
+    usedByDiagram: true, canUseLargeTable: false
+  })) {
+    assert.deepEqual(diagnostic[key], value, `${key}: ${JSON.stringify(diagnostic)}`);
+  }
+  assert.equal(sourceReads, readsAfterPublish, 'the configuration conflict must not read source data');
+  assert.equal(redis.commits.length, commitsBefore, 'the configuration conflict must not commit a snapshot');
+});
+
 test('anonymous run, viewer shell and public paging expose only the canonical table, even with an old index', async (t) => {
   const redis = await redisFixture(t);
   const hidden = { name: 'hidden', columns: ['Code'], presentation: { largeTable: { mode: 'key',

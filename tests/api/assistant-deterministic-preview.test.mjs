@@ -6095,6 +6095,7 @@ test('saved D2 Assistant checkpoint restores a fresh signed proposal without Lit
     version: 1,
     proposalId: proposal.proposalId,
     deterministicSpecHash: proposal.deterministicSpecHash,
+    deterministicSpecRevision: proposal.deterministicSpecRevision,
     source: {
       hash: proposal.source.hash,
       structureHash: proposal.source.structureHash,
@@ -6185,6 +6186,7 @@ test('saved deterministic D2 analysis restores without an Assistant checkpoint',
     version: 1,
     proposalId: proposal.proposalId,
     deterministicSpecHash: proposal.deterministicSpecHash,
+    deterministicSpecRevision: proposal.deterministicSpecRevision,
     source: {
       hash: proposal.source.hash,
       structureHash: proposal.source.structureHash,
@@ -6194,15 +6196,32 @@ test('saved deterministic D2 analysis restores without an Assistant checkpoint',
     relationRules: proposal.relationRules,
     structureTree: proposal.structureTree
   };
-  const restored = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/restore`, {
-    templateCode: 'RestoreD2Analysis', baseSpecHash: hashJson(initialSpec), currentSpec: initialSpec, analysisCheckpoint
-  }, headers);
+  const restoreUrl = `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/restore`;
+  const restoreBody = {
+    templateCode: 'RestoreD2Analysis', baseSpecHash: hashJson(initialSpec),
+    currentSpec: { ...initialSpec, result: { ...initialSpec.result, presentation: { outputMode: 'tables' } } },
+    analysisCheckpoint
+  };
+  const restored = await requestJson('POST', restoreUrl, restoreBody, headers);
   assert.equal(restored.statusCode, 200, restored.body);
   assert.equal(restored.json.restoreKind, 'analysis');
   assert.equal(restored.json.proposal.proposalId, analysisCheckpoint.proposalId);
+  assert.equal(restored.json.proposal.deterministicSpecHash, proposal.deterministicSpecHash);
+  assert.equal(restored.json.proposal.deterministicSpecRevision, proposal.deterministicSpecRevision);
   assert.ok(restored.json.proposal.signature, restored.body);
   assert.deepEqual(restored.json.interpretation, {});
   assert.deepEqual(restored.json.mapping, {});
+  const retiredCheckpoint = { ...analysisCheckpoint, deterministicSpecHash: hashJson(baseSpec) };
+  delete retiredCheckpoint.deterministicSpecRevision;
+  const retired = await requestJson('POST', restoreUrl, { ...restoreBody, analysisCheckpoint: retiredCheckpoint }, headers);
+  assert.equal(retired.statusCode, 409, retired.body);
+  assert.equal(retired.json.code, 'd2_import_analysis_checkpoint_revision');
+  assert.match(retired.json.message, /Analyze the current D2 source again/);
+  const staleHash = await requestJson('POST', restoreUrl, {
+    ...restoreBody, analysisCheckpoint: { ...analysisCheckpoint, deterministicSpecHash: retiredCheckpoint.deterministicSpecHash }
+  }, headers);
+  assert.equal(staleHash.statusCode, 409, staleHash.body);
+  assert.equal(staleHash.json.code, 'd2_import_analysis_checkpoint_spec_conflict');
   const fallback = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/restore`, {
     templateCode: 'RestoreD2Analysis',
     baseSpecHash: hashJson(initialSpec),
@@ -6216,7 +6235,7 @@ test('saved deterministic D2 analysis restores without an Assistant checkpoint',
   assert.equal(backend.exitCode, null);
 });
 
-test('D2 import Apply stays local until the normal template Save persists the mapping', async (t) => {
+test('signed D2 import Apply accepts an output mode change and stays local until normal Save', async (t) => {
   const currentSpec = apiObjectFlowSpec([
     { alias: 'routers', className: 'routerG', columns: ['Code', 'Description'] },
     { alias: 'switches', className: 'ARM', columns: ['Code', 'Description'] }
@@ -6228,6 +6247,8 @@ test('D2 import Apply stays local until the normal template Save persists the ma
     rightPrefix: 'Selection 2.',
     rules: [{ action: 'include', negate: false, operator: 'equals', leftColumn: 'Code', leftRegex: '', rightColumn: 'Code', rightRegex: '' }]
   }]);
+  const { diagrams: _diagrams, presentation: _presentation, ...analysisResult } = currentSpec.result;
+  currentSpec.result = analysisResult;
   const mock = await startMockCmdbuild(t, {
     domains: [{
       _id: 'AssetReference', name: 'AssetReference', source: 'routerG', sources: ['routerG'],
@@ -6251,6 +6272,7 @@ test('D2 import Apply stays local until the normal template Save persists the ma
   assert.equal(analyzed.statusCode, 200, analyzed.body);
   const currentSpecWithAuthoring = {
     ...currentSpec,
+    result: { ...currentSpec.result, presentation: { outputMode: 'diagrams' } },
     authoring: {
       version: 1,
       assistant: {
@@ -6271,13 +6293,15 @@ test('D2 import Apply stays local until the normal template Save persists the ma
         related: []
       });
   });
-  const structureTree = d2StructureTreeWithMaterialization(analyzed.json.proposal, roles);
-  const applied = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`, {
+  const proposal = analyzed.json.proposal;
+  const structureTree = d2StructureTreeWithMaterialization(proposal, roles);
+  const applyUrl = `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/apply`;
+  const applyBody = {
     templateCode: 'PersistedImport',
     baseSpecHash: hashJson(currentSpec),
     currentSpec: currentSpecWithAuthoring,
     d2Source: source,
-    proposal: analyzed.json.proposal,
+    proposal,
     persist: true,
     roles,
     structureTree,
@@ -6294,15 +6318,59 @@ test('D2 import Apply stays local until the normal template Save persists the ma
       targetField: 'Selection 2.Code',
       labelField: ''
     }]
-  }, headers);
+  };
+  const apply = (overrides = {}) => requestJson('POST', applyUrl, { ...applyBody, ...overrides }, headers);
+  assert.match(proposal.signature, /^[a-f0-9]{64}$/);
+  const applied = await apply();
   assert.equal(applied.statusCode, 200, applied.body);
   assert.equal(applied.json.success, true);
   assert.equal(applied.json.template, undefined);
   assert.equal(applied.json.versionLog, undefined);
   assert.equal(applied.json.cacheInvalidation, undefined);
+  assert.equal(applied.json.status, 'complete');
+  assert.equal(applied.json.spec.result.presentation.outputMode, 'diagrams');
   assert.equal(applied.json.spec.authoring.assistant.promptContractVersion, 4);
   assert.equal(applied.json.spec.authoring.assistant.diagramIntentPrompt, 'Проверить контейнеры.\n\nСопоставить этапы с ролями.');
   assert.equal(applied.json.spec.result.diagrams[0].authoring.d2Import.source, source);
+
+  const { proposalId, deterministicSpecHash, deterministicSpecRevision, source: sourceIdentity } = proposal;
+  const restored = await requestJson('POST', `${backendOrigin}/cmdbuild/custom-api/draft/diagram-import/restore`, {
+    templateCode: applyBody.templateCode, baseSpecHash: applyBody.baseSpecHash, currentSpec: currentSpecWithAuthoring,
+    analysisCheckpoint: {
+      version: 1, proposalId, deterministicSpecHash, deterministicSpecRevision,
+      source: sourceIdentity, roles: proposal.roles, relationRules: proposal.relationRules, structureTree: proposal.structureTree
+    }
+  }, headers);
+  assert.equal(restored.statusCode, 200, restored.body);
+  const switchedAgain = structuredClone(currentSpecWithAuthoring);
+  switchedAgain.result.presentation.outputMode = 'tables';
+  const appliedFromRestore = await apply({ proposal: restored.json.proposal, currentSpec: switchedAgain });
+  assert.equal(appliedFromRestore.statusCode, 200, appliedFromRestore.body);
+  assert.equal(appliedFromRestore.json.status, 'complete');
+  assert.equal(appliedFromRestore.json.spec.result.presentation.outputMode, 'tables');
+
+  const stepsChanged = structuredClone(currentSpecWithAuthoring);
+  stepsChanged.steps[0].limit += 1;
+  const changedPresentation = structuredClone(currentSpecWithAuthoring);
+  changedPresentation.result.presentation.tables = [{ name: 'routers', title: 'Changed title' }];
+  const changedSource = structuredClone(currentSpecWithAuthoring);
+  changedSource.authoring.d2.source = 'router: Different';
+  const { signature: _signature, deterministicSpecRevision: _revision, ...retiredProposal } = proposal;
+  retiredProposal.deterministicSpecHash = hashJson(currentSpec);
+  retiredProposal.signature = crypto.createHmac('sha256', 'preview-test-csrf-secret')
+    .update('d2-persist-test-token\n').update(stableJsonStringify(retiredProposal)).digest('hex');
+  for (const [overrides, code] of [
+    [{ currentSpec: stepsChanged }, 'diagram_import_deterministic_conflict'],
+    [{ currentSpec: changedPresentation }, 'diagram_import_deterministic_conflict'],
+    [{ currentSpec: changedSource, d2Source: changedSource.authoring.d2.source }, 'diagram_import_source_conflict'],
+    [{ proposal: { ...proposal, catalogHash: 'tampered' } }, 'diagram_import_proposal_invalid'],
+    [{ proposal: retiredProposal, currentSpec }, 'diagram_import_proposal_version']
+  ]) {
+    const rejected = await apply(overrides);
+    assert.equal(rejected.statusCode, 409, rejected.body);
+    assert.equal(rejected.json.code, code, rejected.body);
+    assert.match(rejected.json.message, /Analyze/);
+  }
   assert.equal(mock.requests.some((item) => item.method === 'PUT' && item.pathname.includes('/classes/Cst_QueryTemplate/cards/')), false);
 
   const saved = await requestJson('PUT', `${backendOrigin}/cmdbuild/custom-api/templates/PersistedImport`, {
@@ -10751,6 +10819,7 @@ test('template transfer rehydrates unapplied reviewed checkpoints and Save/read 
   }));
   const analysisCheckpoint = {
     version: 1, proposalId: proposal.proposalId, deterministicSpecHash: proposal.deterministicSpecHash,
+    deterministicSpecRevision: proposal.deterministicSpecRevision,
     source: { hash: proposal.source.hash, structureHash: proposal.source.structureHash, mappingContractHash: proposal.source.mappingContractHash },
     roles: reviewedRoles, relationRules: proposal.relationRules,
     structureTree: d2StructureTreeWithMaterialization(proposal, rolesWithMappings)
@@ -10767,9 +10836,12 @@ test('template transfer rehydrates unapplied reviewed checkpoints and Save/read 
   assert.equal(template.spec.result.diagrams?.length || 0, 0, 'checkpoint fixture must remain unapplied');
   const exported = await source.post('export', { template });
   assert.equal(exported.statusCode, 200, exported.body);
+  assert.equal(exported.json.package.formatVersion, 1);
+  assert.equal(exported.json.package.template.spec.version, 1);
   for (const name of ['analysisCheckpoint', 'assistantCheckpoint']) {
     const checkpoint = exported.json.package.template.spec.authoring.d2[name];
     for (const key of ['proposalId', 'deterministicSpecHash', 'source']) assert.equal(Object.hasOwn(checkpoint, key), false, `${name}.${key}`);
+    assert.equal(checkpoint.deterministicSpecRevision, proposal.deterministicSpecRevision);
   }
   const targetCode = 'UnappliedReviewedTarget';
   const target = await transferApiFixture(t, { configCards, persistNewTemplates: true, versionCards: [] },
@@ -10787,6 +10859,7 @@ test('template transfer rehydrates unapplied reviewed checkpoints and Save/read 
     assert.match(checkpoint.proposalId, /^[a-f0-9-]{36}$/);
     assert.notEqual(checkpoint.proposalId, proposal.proposalId);
     assert.match(checkpoint.deterministicSpecHash, /^[a-f0-9]{64}$/);
+    assert.equal(checkpoint.deterministicSpecRevision, proposal.deterministicSpecRevision);
     assert.deepEqual(checkpoint.source, analysisCheckpoint.source);
     for (const key of ['roles', 'structureTree', 'relationRules']) assert.deepEqual(checkpoint[key], analysisCheckpoint[key], `${name}.${key}`);
   }

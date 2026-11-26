@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { chromium } from 'playwright';
 import { buildLargeTableIndex, queryLargeTablePage } from '../../scripts/report-table-pages.mjs';
-import { defaultRuntimeConfig, renderDynamicPagesShell, validateTemplateSpecForStorage } from '../../scripts/dev-proxy-server.mjs';
+import { defaultRuntimeConfig, executeEnrichRows, renderDynamicPagesShell, validateTemplateSpecForStorage } from '../../scripts/dev-proxy-server.mjs';
 import { resolveTemplateParameters } from '../../scripts/template-parameters.mjs';
 import { bindViewLargeExecutionHelpers } from '../fixtures/view-large-execution-helpers.mjs';
 
@@ -24,9 +24,9 @@ const names = [
   'isSnapshotHash', 'isSnapshotResult', 'isPersistedSnapshotCache', 'validateSnapshotMutationResponse',
   'inferStoredViewLargeTable', 'inferViewComposerModel', 'normalizeViewComposerColumn', 'renderViewComposerMultiModeOptions',
   'viewLargeColumnOptions', 'viewLargeAttributeIsMultiple', 'viewLargeClassFieldOptions', 'viewLargeResultOptions',
-  'viewLargeDeclaredColumns', 'viewLargeSourceFields', 'viewLargeSourceFieldOptions', 'viewLargeSimpleFieldOptions',
+  'viewLargeDeclaredColumns', 'viewLargeSourceFields', 'viewLargeMaterializedFields', 'viewLargeSourceFieldOptions', 'viewLargeSimpleFieldOptions',
   'viewLargeSelectionClassNames', 'viewLargeFieldMetadata', 'viewLargeSimpleFieldModel', 'renderViewLargeSimpleFieldOptions',
-  'hydrateViewLargeSimpleFields', 'catalogAttributeLoadKey',
+  'hydrateViewLargeSimpleFields', 'viewLargeSimpleFieldStatus', 'catalogAttributeLoadKey',
   'viewLargeAdvancedResultFields', 'viewLargeResultFieldAvailable', 'boundedReportSetting', 'currentReportRowLimits', 'reportRowRecommendationHelp',
   'diagramImportUniqueStageCardSources',
   'viewLargeSimpleSelector', 'viewLargeSelectorMode', 'renderViewLargeChoiceOptions', 'renderFieldHelp',
@@ -127,8 +127,8 @@ function catalogScopePathOptions(className) {
 }
 function catalogAttributeOptions(className) {
   return [{name:'Code',description:'Code'},{name:'_id',description:'Identifier'},{name:'Description',description:'Description'}].concat({
-    Item: [{name:'HiddenParentId',type:'integer'},{name:'ScopeIds',type:'lookupArray'}],
-    Service: [{name:'ScopeIds',type:'lookupArray'}],
+    Item: [{name:'HiddenParentId',type:'integer'},{name:'ScopeIds',type:'lookupArray'},{name:'Region',type:'string'}],
+    Service: [{name:'ScopeIds',type:'lookupArray'},{name:'Environment',type:'string'}],
     RightCard: [{name:'TagSet',type:'lookupArray'},{name:'Region',type:'string'},{name:'Segment',type:'string'}]
   }[className] || []);
 }
@@ -332,6 +332,127 @@ async function withFullDesigner({ locale, section, runtimeConfig, spec, attribut
     finally { assert.deepEqual(errors, []); }
   } finally { await browser.close(); }
 }
+
+for (const section of ['visualization', 'diagram']) {
+  test(`Designer output mode persists from ${section} without changing unrelated settings`, async () => {
+    const spec = {
+      version: 1,
+      params: { region: { type: 'string', default: 'west' } },
+      steps: [{ type: 'selectCards', as: 'items', className: 'Item', columns: ['Code', 'Region'], limit: 100 }],
+      result: {
+        emptyText: 'No matching items',
+        presentation: {
+          outputMode: 'both', fontSize: 'small', density: 'compact', zebra: false, filters: false, sortable: true,
+          tables: [{ name: 'items', title: 'Inventory', titleAlign: 'center', sortColumn: 'Code', sortDirection: 'desc' }]
+        },
+        tables: [{ name: 'items', title: 'Inventory', columns: ['Code', 'Region'], presentation: {
+          largeTable: { mode: 'all', groupKeys: ['Region'], reductions: [{ column: 'Code', kind: 'count' }] }
+        } }]
+      },
+      cache: { enabled: true, ttlSeconds: 120 },
+      publish: { mode: 'dynamicUser', paramsMode: 'exact' }
+    };
+    await withFullDesigner({ locale: 'en', section: 'templates', runtimeConfig: defaultRuntimeConfig(), spec }, async (page, writes) => {
+      const modes = ['tables', 'diagrams', 'both'];
+      const otherSection = section === 'diagram' ? 'visualization' : 'diagram';
+      const openSection = (name) => page.locator(`a[data-designer-section="${name}"]`).click();
+      const selectTemplate = () => page.locator('[data-action="select-template"][data-code="existing"]').click();
+      const control = page.getByRole('radiogroup', { name: 'Runtime output' });
+      const tableSettings = page.locator('#cmdp-visualization-rows');
+      const assertMode = async (mode, message) => {
+        await control.waitFor();
+        const box = await control.boundingBox();
+        assert.ok(box && box.width > 0 && box.height > 0, 'output choices have visible geometry');
+        assert.deepEqual(await control.getByRole('radio').evaluateAll((radios) => radios.map((radio) => radio.value)), modes);
+        assert.equal(await control.locator('input:checked').inputValue(), mode, message);
+      };
+
+      await selectTemplate();
+      await openSection(section);
+      await assertMode('both', 'initial mode from saved template');
+      for (const [index, mode] of modes.entries()) {
+        await control.locator(`label:has(input[value="${mode}"])`).click();
+        await assertMode(mode, `${section} retains ${mode} after selection`);
+        if (section === 'visualization') assert.equal(await tableSettings.isVisible(), mode !== 'diagrams');
+        await openSection(otherSection);
+        await assertMode(mode, `${otherSection} shows the unsaved ${mode} choice`);
+        if (otherSection === 'visualization') assert.equal(await tableSettings.isVisible(), mode !== 'diagrams');
+        await openSection(section);
+        if (section === 'visualization') assert.equal(await tableSettings.isVisible(), mode !== 'diagrams');
+        assert.equal(writes.length, index, 'mode switches and navigation are draft-only');
+        await page.locator('[data-action="save-template"]').click();
+        await page.locator('.notice.ok').getByText('Saved.', { exact: true }).waitFor();
+        assert.equal(writes.length, index + 1, 'one write per explicit Save');
+        const savedSpec = writes[index].body.spec;
+        assert.equal(savedSpec.result.presentation.outputMode, mode, 'Save sends the selected mode');
+        assert.equal(Object.hasOwn(savedSpec.result, 'diagrams'), false, 'mode selection must not create a diagram');
+        const { authoring: _authoring, ...persisted } = savedSpec;
+        assert.deepEqual(persisted, { ...spec, result: { ...spec.result, presentation: { ...spec.result.presentation, outputMode: mode } } });
+
+        await openSection('templates');
+        await page.reload();
+        await selectTemplate();
+        await openSection(otherSection);
+        await assertMode(mode, `${otherSection} restores the saved ${mode} choice after reopen`);
+        await openSection(section);
+        await assertMode(mode, `${section} restores the saved ${mode} choice after reopen`);
+      }
+    });
+  });
+}
+
+test('Designer output mode preserves saved diagrams and unsaved editor fields', async () => {
+  const diagrams = [
+    { id: 'inventory', name: 'inventory', title: 'Saved inventory diagram', type: 'topology',
+      source: { nodes: 'items' }, fields: { nodeId: 'Code', nodeLabel: 'Description' },
+      layout: { type: 'layered' }, maxNodes: 140, metadata: { embedInSvg: false, maxBytes: 90000 } },
+    { id: 'secondary', name: 'secondary', title: 'Secondary diagram', type: 'topology', nodes: [] }
+  ];
+  const spec = {
+    version: 1,
+    steps: [{ type: 'selectCards', as: 'items', className: 'Item', columns: ['Code', 'Description'] }],
+    result: { tables: [{ name: 'items', title: 'Saved inventory table', columns: ['Code', 'Description'] }], diagrams,
+      presentation: { outputMode: 'both' } }
+  };
+  await withFullDesigner({ locale: 'en', section: 'templates', runtimeConfig: defaultRuntimeConfig(), spec }, async (page, writes) => {
+    const open = (section) => page.locator(`a[data-designer-section="${section}"]`).click();
+    const control = page.getByRole('radiogroup', { name: 'Runtime output' });
+    const choose = async (mode) => {
+      await control.locator(`label:has(input[value="${mode}"])`).click();
+      assert.equal(await control.locator('input:checked').inputValue(), mode);
+    };
+    const diagramTitle = page.locator('#cmdp-diagram-title');
+    const tableTitle = page.locator('[data-visualization-field="title"]');
+    await page.locator('[data-action="select-template"][data-code="existing"]').click();
+    await open('diagram');
+    assert.equal(await diagramTitle.inputValue(), diagrams[0].title);
+    await choose('diagrams');
+    assert.deepEqual(writes, []);
+    await page.locator('[data-action="save-template"]').click();
+    await page.locator('.notice.ok').getByText('Saved.', { exact: true }).waitFor();
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].body.spec.result.presentation.outputMode, 'diagrams');
+    assert.deepEqual(writes[0].body.spec.result.diagrams, diagrams, 'mode-only Save keeps both ordinary diagrams unchanged');
+
+    await open('visualization');
+    await choose('both');
+    await tableTitle.fill('Unsaved inventory table');
+    await choose('diagrams');
+    assert.equal(await tableTitle.isVisible(), false);
+    await choose('both');
+    assert.equal(await tableTitle.inputValue(), 'Unsaved inventory table');
+
+    await open('diagram');
+    await diagramTitle.fill('Unsaved inventory diagram');
+    await choose('tables');
+    assert.equal(await diagramTitle.inputValue(), 'Unsaved inventory diagram');
+    await open('visualization');
+    assert.equal(await tableTitle.inputValue(), 'Unsaved inventory table', 'table edit survives a section redraw');
+    await open('diagram');
+    assert.equal(await diagramTitle.inputValue(), 'Unsaved inventory diagram', 'diagram edit survives a section redraw in tables mode');
+    assert.equal(writes.length, 1, 'draft field and mode changes do not write');
+  });
+});
 
 test('Designer saves general settings without submitting an unchanged above-ceiling row limit', async () => {
   const ceiling = defaultRuntimeConfig().executionLimits.maxRowsMax;
@@ -913,7 +1034,7 @@ test('Designer gives own expandRelations targetClass precedence, including empty
       const field = page.locator('#cmdp-view-large-simple-field');
       const box = await field.boundingBox();
       assert.ok(box && box.width > 0 && box.height > 0);
-      assert.equal(await field.locator('option[value="Region"]').count(), 0);
+      assert.equal(await field.locator('option[value="Region"]').count(), targetClass === 'Item' ? 1 : 0);
       assert.equal(await field.locator('option[value="HiddenParentId"]').count(), targetClass === 'Item' ? 1 : 0);
       const status = page.locator('[data-view-large-field-status]');
       assert.equal(await status.textContent(), targetClass === 'Item' ? '' : en.viewLargeFieldsDynamic);
@@ -944,6 +1065,202 @@ test('Designer keeps a saved relation filter when the target is unresolved or th
     });
   }
 });
+
+test('Designer Big Table simple filter shows the current source and only materialized scalar fields', async () => {
+  const spec = {
+    version: 1,
+    steps: [
+      { type: 'selectCards', as: 'inventory', className: 'Inventory', columns: [
+        { path: 'Owner.Description', as: 'OwnerLabel' }, { path: 'Owner.Secret', as: 'OwnerSecret' },
+        { path: 'RestrictedOwner.Description', as: 'RestrictedOwnerLabel' },
+        { path: 'Region', as: 'InventoryRegion' },
+        { path: 'Denied', as: 'RenamedDenied' }, { path: 'Tags', as: 'RenamedTags' },
+        { path: 'Missing', as: 'MissingAlias' }
+      ] },
+      { type: 'selectCards', as: 'services', className: 'Service' }
+    ],
+    result: { tables: [
+      { name: 'services', title: 'Перечень услуг', columns: ['Code'] },
+      { name: 'inventory', title: 'Картотека оборудования', columns: ['Code'], presentation: {
+        largeTable: { mode: 'key', selector: { kind: 'result', source: 'inventory', idField: 'Code', labelField: 'Code', matchField: 'Code' } }
+      } }
+    ] }
+  };
+  const catalog = {
+    Inventory: [
+      { name: 'Code', description: 'Инвентарный номер', type: 'string' },
+      { name: 'Region', description: 'Регион размещения', type: 'string' },
+      { name: 'Owner', description: 'Владелец', type: 'reference', targetClass: 'Person' },
+      { name: 'RestrictedOwner', type: 'reference', targetClass: 'RestrictedPerson' },
+      { name: 'Denied', type: 'string', permissions: { _can_read: false } },
+      { name: 'Tags', type: 'lookupArray' }, { name: 'Payload', type: 'json' }
+    ],
+    Person: [
+      { name: 'Description', description: 'Имя владельца', type: 'string' },
+      { name: 'Region', type: 'string' }, { name: 'Secret', type: 'string', permissions: { _can_read: false } }
+    ],
+    Service: [{ name: 'Availability', description: 'Доступность', type: 'boolean' }]
+  };
+  await withFullDesigner({ locale: 'ru', section: 'templates', runtimeConfig: defaultRuntimeConfig(), spec,
+    attributes: name => name === 'RestrictedPerson' ? { status: 403, json: { success: false } } : { json: { data: catalog[name] || [] } }
+  }, async (page, writes) => {
+    const field = await openRelationFilter(page);
+    const source = page.locator('[data-view-large-filter-source]');
+    const technical = field.locator('optgroup[label="Служебные колонки"]');
+    await field.selectOption('Region');
+    await page.locator('[data-view-large-field-status]').filter({ hasText: 'Некоторые поля проекции не удалось загрузить.' }).waitFor();
+    assert.equal(await source.isVisible(), true);
+    assert.ok((await source.boundingBox()).height > 0);
+    assert.match(await source.textContent(), /Картотека оборудования/);
+    assert.equal(await field.locator('option[value="Code"]').textContent(), 'Инвентарный номер (Code)');
+    assert.equal(await field.locator('option[value="Region"]').textContent(), 'Регион размещения (Region)');
+    assert.equal(await field.locator(':scope > option[value="InventoryRegion"]').textContent(), 'Регион размещения (InventoryRegion)');
+    assert.equal(await field.locator(':scope > option[value="OwnerLabel"]').textContent(), 'Имя владельца (OwnerLabel)');
+    assert.deepEqual(await technical.locator('option').evaluateAll(options => options.map(option => option.value).sort()), ['Class', '_id']);
+    assert.equal(await field.locator('option').evaluateAll(options => options.some(option =>
+      ['OwnerSecret', 'Owner.Region', 'RestrictedOwnerLabel', 'MissingAlias', 'SourceId', 'Denied', 'RenamedDenied', 'Tags', 'RenamedTags', 'Payload'].includes(option.value))), false);
+
+    await page.locator('#cmdp-view-source').selectOption('services');
+    await field.selectOption('Availability');
+    assert.match(await source.textContent(), /Перечень услуг/);
+    assert.equal(await field.locator('option[value="Region"], option[value="OwnerLabel"]').count(), 0);
+
+    await page.locator('#cmdp-view-source').selectOption('inventory');
+    await field.selectOption('Region');
+    await saveRelationFilter(page);
+    const table = writes[0].body.spec.result.tables.find(table => table.presentation?.largeTable);
+    assert.deepEqual(table.columns, ['Code']);
+    assert.deepEqual(table.presentation.largeTable.selector, {
+      kind: 'result', source: 'inventory', idField: 'Region', labelField: 'Region', matchField: 'Region'
+    });
+  });
+});
+
+test('Designer Big Table simple filter keeps an unavailable binding through a closed projection', async () => {
+  const selector = { kind: 'result', source: 'closed', idField: 'DeniedAlias', labelField: 'DeniedAlias', matchField: 'DeniedAlias' };
+  const spec = {
+    version: 1,
+    steps: [
+      { type: 'selectCards', as: 'cards', className: 'Inventory' },
+      { type: 'composeRows', as: 'projected', from: 'cards', columns: [
+        { name: 'PublicCode', field: 'Code' }, { name: 'DeniedAlias', field: 'Denied' }, { name: 'TagList', field: 'Tags' }
+      ] },
+      { type: 'filterRows', as: 'closed', from: 'projected', filters: [{ field: 'PublicCode', op: 'notEmpty' }] }
+    ],
+    result: { tables: [{ name: 'closed', columns: ['PublicCode'], presentation: { largeTable: { mode: 'key', selector } } }] }
+  };
+  await withFullDesigner({ locale: 'en', section: 'templates', runtimeConfig: defaultRuntimeConfig(), spec,
+    attributes: () => ({ json: { data: [
+      { name: 'Code', description: 'Inventory number', type: 'string' }, { name: 'Region', type: 'string' },
+      { name: 'Denied', type: 'string', permissions: { _can_read: false } }, { name: 'Tags', type: 'lookupArray' }
+    ] } })
+  }, async (page, writes) => {
+    const field = await openRelationFilter(page);
+    const status = page.locator('[data-view-large-field-status]').filter({ hasText: /DeniedAlias is not available/ });
+    await status.waitFor({ state: 'visible' });
+    assert.ok((await status.boundingBox()).height > 0);
+    assert.equal(await field.getAttribute('aria-invalid'), 'true');
+    assert.equal(await field.getAttribute('data-view-large-saved-field'), 'DeniedAlias');
+    assert.deepEqual(await field.locator('option').evaluateAll(options => options.map(option => option.value)), ['', 'PublicCode']);
+    assert.equal(await field.locator('optgroup').count(), 0);
+    assert.equal(await field.locator('option[value="PublicCode"]').textContent(), 'Inventory number (PublicCode)');
+
+    await saveRelationFilter(page);
+    assert.deepEqual(writes[0].body.spec.result.tables[0].presentation.largeTable.selector, selector);
+    await page.locator('#cmdp-designer-current-notice .notice.ok').filter({ hasText: 'Saved.' }).waitFor();
+    await field.selectOption('PublicCode');
+    assert.equal(await field.getAttribute('aria-invalid'), null);
+    await saveRelationFilter(page);
+    assert.equal(writes[1].body.spec.result.tables[0].presentation.largeTable.selector.matchField, 'PublicCode');
+  });
+});
+
+for (const scenario of ['left', 'aliased right', 'mixed sides', 'overwritten class', 'reprojected class']) {
+  test(`Designer searches and restores a composed card enrichment only with a copied identity: ${scenario}`, async () => {
+    const aliased = scenario === 'aliased right';
+    const available = scenario === 'left' || aliased;
+    const reprojected = scenario === 'reprojected class';
+    const cardClass = aliased ? 'Warehouse' : 'Inventory';
+    const classColumn = aliased ? 'RecordKind' : 'Class';
+    const idColumn = aliased ? 'RecordKey' : '_id';
+    const selector = { kind: 'result', source: 'enriched', idField: 'Site', labelField: 'Site', matchField: 'Site' };
+    const spec = {
+      version: 1,
+      steps: [
+        { type: 'selectCards', as: 'leftCards', className: 'Inventory', ...(reprojected ? {
+          columns: [{ path: 'Code', as: 'Class' }, { path: 'Class', as: 'CopiedClass' }]
+        } : {}) },
+        { type: 'selectCards', as: 'rightCards', className: cardClass },
+        { type: 'composeRows', as: 'composed', from: 'leftCards', right: 'rightCards', leftKey: 'Code', rightKey: 'Code', columns: [
+          'Code', { as: classColumn, from: aliased ? 'right' : 'left', field: reprojected ? 'CopiedClass' : 'Class' },
+          { name: idColumn, source: aliased || scenario === 'mixed sides' ? 'right' : 'left', column: '_id' },
+          ...(scenario === 'overwritten class' ? [{ name: classColumn, value: 'Inventory' }] : [])
+        ] },
+        { type: 'enrichRows', as: 'enriched', from: 'composed', ...(aliased ? { classColumn, idColumn } : {}),
+          columns: [{ path: 'Region', as: 'Site' }] },
+        { type: 'enrichRows', as: 'enrichedView', from: 'enriched', purpose: 'viewComposer', columns: ['Code', 'Site'] }
+      ],
+      result: { tables: [{ name: 'enrichedView', columns: ['Code'], presentation: { largeTable: { mode: 'key', selector } } }] }
+    };
+    await withFullDesigner({ locale: 'en', section: 'templates', runtimeConfig: defaultRuntimeConfig(), spec,
+      attributes: name => ({ json: { data: name === cardClass ? [{ name: 'Region', description: 'Deployment region', type: 'string' }] : [] } })
+    }, async (page, writes) => {
+      const field = await openRelationFilter(page);
+      if (available) {
+        const site = field.locator('option[value="Site"]');
+        await site.waitFor({ state: 'attached' });
+        assert.equal(await site.textContent(), 'Deployment region (Site)');
+        assert.equal(await field.inputValue(), 'Site');
+        assert.equal(await field.getAttribute('aria-invalid'), null);
+      } else {
+        await page.locator('[data-view-large-field-status]').filter({ hasText: 'Site is not available' }).waitFor();
+        assert.equal(await field.getAttribute('aria-invalid'), 'true');
+        assert.equal(await field.getAttribute('data-view-large-saved-field'), 'Site');
+        assert.equal(await field.locator('option[value="Site"]').count(), 0);
+      }
+
+      const picker = page.locator('#cmdp-view-column-rows [data-view-column-row]').last().locator('[data-catalog-field-picker]');
+      await picker.locator('[data-action="catalog-field-picker-toggle"]').click();
+      await picker.getByRole('searchbox').fill('Site');
+      const option = picker.getByRole('option').filter({ hasText: 'Deployment region' });
+      if (!available) {
+        await picker.getByText('No matching fields.', { exact: true }).waitFor();
+        assert.equal(await picker.getByRole('option').count(), 0);
+        assert.deepEqual(writes, []);
+        return;
+      }
+      await option.waitFor();
+      assert.ok((await option.boundingBox()).height > 0);
+      assert.equal(await option.getAttribute('data-catalog-field-picker-value'), 'Site');
+
+      await saveRelationFilter(page);
+      const saved = writes[0].body.spec;
+      const table = saved.result.tables[0];
+      assert.deepEqual(validateTemplateSpecForStorage(saved), []);
+      assert.deepEqual(table.columns, ['Code']);
+      assert.deepEqual(table.presentation.largeTable.selector, selector);
+
+      const enrich = saved.steps.find(step => step.as === selector.source);
+      const view = saved.steps.find(step => step.as === table.name);
+      const regions = { 1: 'North', 2: 'South', 3: 'North' };
+      const composedRows = ['A', 'B', 'C'].map((Code, index) => ({ Code, [classColumn]: cardClass, [idColumn]: index + 1 }));
+      const request = async (path) => {
+        const id = path.match(new RegExp('/classes/' + cardClass + '/cards/(\\d+)$'))?.[1];
+        assert.ok(Object.hasOwn(regions, id), path);
+        return { ok: true, statusCode: 200, json: { data: { _id: Number(id), Region: regions[id] } } };
+      };
+      const limits = { maxRows: 10 };
+      const result = await executeEnrichRows(request, enrich, {}, { composed: { rows: composedRows } }, limits);
+      const output = await executeEnrichRows(request, view, {}, { enriched: result }, limits);
+      const index = buildLargeTableIndex({ ...table, rows: output.rows.map(({ Code }) => ({ Code })) }, result.rows, {
+        matchValues: output.rows.map(row => row[selector.matchField])
+      });
+      const { items } = queryLargeTablePage(index, { op: 'options' });
+      assert.deepEqual(items.map(({ label }) => label), ['North', 'South']);
+      assert.deepEqual(queryLargeTablePage(index, { op: 'rows', key: items[0].key }).table.rows, [{ Code: 'A' }, { Code: 'C' }]);
+    });
+  });
+}
 
 test('Designer simple large-table selection produces distinct non-empty options and filters matching rows', async () => {
   await withPage(async (page) => {

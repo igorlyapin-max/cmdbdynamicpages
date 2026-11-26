@@ -1719,8 +1719,10 @@ paths:
         проверяет _can_create технического класса. При отсутствии baseSpecHash
         использует hashJson(currentSpec || {}). D2 source берётся из
         currentSpec.authoring.d2.source либо сохранённого spec, не из d2Source.
-        Проверяет source/structure/mapping/deterministic hashes checkpoint,
-        перечитывает доступный каталог и повторно подписывает proposal.
+        Проверяет ревизию deterministicSpecRevision и точное совпадение
+        source/structure/mapping/deterministic hashes checkpoint, перечитывает
+        доступный каталог и повторно подписывает proposal. Для checkpoint
+        старой ревизии нужен явный повторный Analyze.
         Ошибка optional assistantCheckpoint возвращается как warning в 200,
         если детерминированный анализ восстановлен. LiteLLM не вызывается;
         карточки и версии не сохраняются. Лимит тела равен
@@ -4786,15 +4788,16 @@ components:
           description: Автономный D2 source без внешних imports
     D2AnalysisCheckpoint:
       type: object
-      required: [proposalId, deterministicSpecHash, source, structureTree]
+      required: [proposalId, deterministicSpecHash, deterministicSpecRevision, source, structureTree]
       description: >
-        Минимальная форма, принимаемая normalizeD2AnalysisCheckpoint. version
-        нормализуется в 1; roles и relationRules при отсутствии становятся [].
+        Минимальная форма для Restore. Версия хранения version нормализуется
+        в 1 и не зависит от ревизии хэша; roles и relationRules при отсутствии становятся [].
         Размер ограничен D2_IMPORT_ASSISTANT_CHECKPOINT_MAX_BYTES после нормализации.
       properties:
         version: { type: integer }
         proposalId: { type: string, minLength: 1 }
         deterministicSpecHash: { type: string, pattern: "^[a-f0-9]{64}$" }
+        deterministicSpecRevision: { type: integer, enum: [2] }
         source:
           type: object
           required: [hash, structureHash, mappingContractHash]
@@ -5217,7 +5220,7 @@ components:
     DiagramImportProposalEnvelope:
       type: object
       description: Подписанное неизменяемое предложение IR v3 с учётом классов, сформированное детерминированным анализом D2. Неизвестные подписанные внутренние поля должны возвращаться без изменений.
-      required: [version, proposalId, templateCode, baseSpecHash, editorSpecHash, signature]
+      required: [version, proposalId, templateCode, baseSpecHash, deterministicSpecHash, deterministicSpecRevision, signature]
       additionalProperties: true
       properties:
         version:
@@ -5229,10 +5232,15 @@ components:
           type: string
         baseSpecHash:
           type: string
-          pattern: "^[a-f0-9]{64}$"
-        editorSpecHash:
+          pattern: "^(?:[a-f0-9]{64})?$"
+        deterministicSpecHash:
           type: string
           pattern: "^[a-f0-9]{64}$"
+          description: Хэш входного Spec для D2. result.presentation.outputMode не участвует; полный baseSpecHash для CAS не меняет семантику.
+        deterministicSpecRevision:
+          type: integer
+          enum: [2]
+          description: Ревизия контракта хэша, включённая в подпись предложения. Несовместимая ревизия требует повторного Analyze.
         createdAt:
           type: integer
           format: int64

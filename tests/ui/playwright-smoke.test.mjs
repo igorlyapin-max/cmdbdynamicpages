@@ -5440,21 +5440,8 @@ test('Assistant generates an ARM by router Location object group and preview ren
 
     await page.locator('a[data-designer-section="final-view"]').click();
     await page.waitForSelector('#cmdp-view-composer-editor', { timeout: 10_000 });
-    await page.waitForFunction(() => {
-      const values = Array.from(document.querySelectorAll('[data-view-column-field="field"] option')).map((option) => option.value);
-      return values.some((value) => value === 'model' || /[._]model$/.test(value))
-        && values.some((value) => value === 'model2' || /[._]model2$/.test(value));
-    }, null, { timeout: 30_000 });
-    const finalFieldOptions = await viewComposerFieldOptions(page);
-    const modelField = finalFieldOptions.find((field) => field === 'model' || /[._]model$/.test(field));
-    const model2Field = finalFieldOptions.find((field) => field === 'model2' || /[._]model2$/.test(field));
-    assert.ok(modelField, `Final data field options do not include model: ${JSON.stringify(finalFieldOptions)}`);
-    assert.ok(model2Field, `Final data field options do not include model2: ${JSON.stringify(finalFieldOptions)}`);
     const finalRowsBeforeAutoAdd = await page.locator('[data-view-column-row]').count();
-    await setViewComposerColumns(page, [
-      { field: modelField, title: 'model' },
-      { field: model2Field, title: 'model2' }
-    ]);
+    for (const field of ['model', 'model2']) await addViewComposerColumn(page, field);
     const finalRowsAfterAutoAdd = await page.locator('[data-view-column-row]').count();
     assert.ok(finalRowsAfterAutoAdd >= finalRowsBeforeAutoAdd + 2, `Final data did not auto-add rows after filling the last empty row: before=${finalRowsBeforeAutoAdd} after=${finalRowsAfterAutoAdd}`);
     await page.locator('button[data-action="apply-view-composer"]').first().click();
@@ -7073,35 +7060,29 @@ async function extractionPreviewRows(page) {
     .filter(Boolean));
 }
 
-async function viewComposerFieldOptions(page) {
-  return await page.locator('[data-view-column-field="field"]').first().locator('option').evaluateAll((options) => options
-    .map((option) => String(option.value || '').trim())
-    .filter(Boolean));
-}
+async function addViewComposerColumn(page, field) {
+  const rows = page.locator('#cmdp-view-column-rows [data-view-column-row]');
+  const row = rows.nth((await rows.count()) - 1);
+  const value = row.locator('[data-view-column-field="field"]');
+  assert.equal(await value.inputValue(), '', 'Final Data must have a trailing blank row.');
 
-async function setViewComposerColumns(page, columns) {
-  for (const column of columns) {
-    const rowsBefore = await page.locator('[data-view-column-row]').count();
-    await page.locator('#cmdp-view-column-rows').evaluate((body, desiredColumn) => {
-      const rows = Array.from(body.querySelectorAll('[data-view-column-row]'));
-      const row = rows[rows.length - 1];
-      if (!row) throw new Error(`Missing empty Final data row for ${desiredColumn.field}`);
-      const field = row.querySelector('[data-view-column-field="field"]');
-      const title = row.querySelector('[data-view-column-field="title"]');
-      if (!field || !Array.from(field.options).some((option) => option.value === desiredColumn.field)) {
-        throw new Error(`Final data field option is missing: ${desiredColumn.field}`);
-      }
-      field.value = desiredColumn.field;
-      field.dispatchEvent(new Event('change', { bubbles: true }));
-      if (title) {
-        title.value = desiredColumn.title || desiredColumn.field;
-        title.dispatchEvent(new Event('input', { bubbles: true }));
-      }
-    }, column);
-    await page.waitForFunction((expectedMinimum) => {
-      return document.querySelectorAll('[data-view-column-row]').length > expectedMinimum;
-    }, rowsBefore, { timeout: 5_000 });
-  }
+  const picker = value.locator('xpath=ancestor::*[@data-catalog-field-picker][1]');
+  await picker.locator('[data-action="catalog-field-picker-toggle"]').click();
+  assert.equal(await picker.getByRole('option').count(), 0, 'An empty query must not show field options.');
+  await picker.locator('[data-catalog-field-picker-search]').fill(field);
+
+  const options = picker.getByRole('option');
+  const exact = options.and(picker.locator(`[data-catalog-field-picker-value=${JSON.stringify(field)}]`));
+  const qualified = options.and(picker.locator(
+    `[data-catalog-field-picker-value$=${JSON.stringify('.' + field)}], [data-catalog-field-picker-value$=${JSON.stringify('_' + field)}]`
+  ));
+  await exact.or(qualified).first().waitFor({ timeout: 30_000 });
+  const option = await exact.isVisible() ? exact : qualified.first();
+  const selectedField = await option.getAttribute('data-catalog-field-picker-value');
+  await option.click();
+  assert.equal(await value.inputValue(), selectedField);
+  await row.locator('[data-view-column-field="title"]').fill(field);
+  assert.equal(await rows.last().locator('[data-view-column-field="field"]').inputValue(), '');
 }
 
 function runtimeUrl() {
